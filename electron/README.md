@@ -4,33 +4,32 @@ This directory contains the Electron wrapper for New API, providing a native des
 
 ## Prerequisites
 
-### 1. Go Binary (Required)
-The Electron app requires the compiled Go binary to function. You have two options:
+### 1. Build Tools
+The Electron app packages the Go backend binary. Install Go, Bun, Node.js, and npm before building from source.
 
-**Option A: Use existing binary (without Go installed)**
-```bash
-# If you have a pre-built binary (e.g., new-api-macos)
-cp ../new-api-macos ../new-api
-```
-
-**Option B: Build from source (requires Go)**
-TODO
-
-### 3. Electron Dependencies
+### 2. Electron Dependencies
 ```bash
 cd electron
-npm install
+npm ci
 ```
 
 ## Development
 
 Run the app in development mode:
 ```bash
-npm start
+# Terminal 1
+docker compose -f docker-compose.dev.yml up -d
+
+# Terminal 2
+cd web && bun install && bun run dev
+
+# Terminal 3
+cd electron && npm ci && npm run dev-app
 ```
 
 This will:
-- Start the Go backend on port 3000
+- Connect to the frontend dev server on port 3001
+- Use the Go backend on port 3000
 - Open an Electron window with DevTools enabled
 - Create a system tray icon (menu bar on macOS)
 - Store database in `../data/new-api.db`
@@ -39,16 +38,8 @@ This will:
 
 ### Quick Build
 ```bash
-# Ensure Go binary exists in parent directory
-ls ../new-api  # Should exist
-
-# Build for current platform
-npm run build
-
-# Platform-specific builds
-npm run build:mac    # Creates .dmg and .zip
-npm run build:win    # Creates .exe installer
-npm run build:linux  # Creates .AppImage and .deb
+cd electron
+./build.sh
 ```
 
 ### Build Output

@@ -3,7 +3,7 @@
 # Usage:
 #   1. docker compose -f docker-compose.dev.yml up -d
 #   2. cd web && bun install && bun run dev
-#   3. Open http://localhost:3001 (Rsbuild dev server, API auto-proxied to :3000)
+#   3. Open http://localhost:3001 (frontend dev server, API auto-proxied to :3000)
 #
 # Rebuild backend after Go code changes:
 #   docker compose -f docker-compose.dev.yml up -d --build new-api
@@ -23,7 +23,8 @@ services:
     container_name: new-api-dev
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     ports:
       - "3000:3000"
     volumes:
@@ -35,7 +36,7 @@ services:
       - BATCH_UPDATE_ENABLED=true
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       postgres:
         condition: service_healthy
     networks:
@@ -47,6 +48,11 @@ services:
     restart: unless-stopped
     networks:
       - dev-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   postgres:
     image: postgres:15-alpine

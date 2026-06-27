@@ -1,8 +1,8 @@
 FRONTEND_DIR = ./web/default
 FRONTEND_CLASSIC_DIR = ./web/classic
 BACKEND_DIR = .
-DEV_FRONTEND_DEFAULT_PORT ?= 5173
-DEV_FRONTEND_CLASSIC_PORT ?= 5174
+DEV_FRONTEND_DEFAULT_PORT ?= 3001
+DEV_FRONTEND_CLASSIC_PORT ?= 3002
 DEV_COMPOSE_FILE = docker-compose.dev.yml
 DEV_POSTGRES_SERVICE = postgres
 DEV_BACKEND_SERVICE = new-api
@@ -17,12 +17,12 @@ all: build-all-frontends start-backend
 build-frontend:
 	@echo "Building default frontend..."
 	@cd ./web && bun install --frozen-lockfile
-	@cd $(FRONTEND_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+	@cd $(FRONTEND_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run build
 
 build-frontend-classic:
 	@echo "Building classic frontend..."
 	@cd ./web && bun install --frozen-lockfile
-	@cd $(FRONTEND_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+	@cd $(FRONTEND_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run build
 
 build-all-frontends: build-frontend build-frontend-classic
 
