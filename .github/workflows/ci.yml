@@ -32,8 +32,16 @@ jobs:
           printf '<!doctype html><html><head><title>ci</title></head><body>ci placeholder</body></html>' > web/default/dist/index.html
           printf '<!doctype html><html><head><title>ci</title></head><body>ci placeholder</body></html>' > web/classic/dist/index.html
 
+      - name: Validate release version format
+        run: |
+          VERSION=$(cat VERSION)
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+            exit 1
+          fi
+
       - name: Run backend tests
-        run: go test ./...
+        run: go list ./... | grep -v '/node_modules/' | xargs go test
 
   frontend-default:
     name: Default frontend build

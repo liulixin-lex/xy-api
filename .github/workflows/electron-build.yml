@@ -3,9 +3,8 @@ name: Build Electron App
 on:
   push:
     tags:
-      - '*'  # Triggers on version tags like v1.0.0
-      - '!*-*'  # Ignore pre-release tags like v1.0.0-beta
-      - '!*-alpha*' # Ignore alpha tags like v1.0.0-alpha
+      - 'v*'  # Triggers on stable version tags like v1.0.0
+      - '!v*-*'  # Ignore pre-release tags like v1.0.0-beta
   workflow_dispatch:  # Allows manual triggering
 
 jobs:
@@ -73,8 +72,11 @@ jobs:
         run: |
           cd electron
           VERSION=$(git describe --tags --exact-match 2>/dev/null || cat ../VERSION)
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Electron release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+            exit 1
+          fi
           VERSION=${VERSION#v}  # Remove 'v' prefix if present
-          VERSION=${VERSION#V}  # Remove 'V' prefix if present
           # Convert to valid semver: take first 3 components and convert rest to prerelease format
           # e.g., 0.9.3-patch.1 -> 0.9.3-patch.1
           if [[ $VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]]; then

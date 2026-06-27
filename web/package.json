@@ -1,6 +1,15 @@
 {
   "name": "new-api-web-workspace",
   "private": true,
+  "scripts": {
+    "dev": "bun run --cwd default dev",
+    "dev:default": "bun run --cwd default dev",
+    "dev:classic": "bun run --cwd classic dev",
+    "build": "bun run build:default && bun run build:classic",
+    "build:default": "bun run --cwd default build",
+    "build:classic": "bun run --cwd classic build",
+    "typecheck": "bun run --cwd default typecheck"
+  },
   "workspaces": [
     "default",
     "classic"

@@ -14,7 +14,7 @@
 
 services:
   new-api:
-    image: calciumion/new-api:latest
+    image: ghcr.io/liulixin-lex/xy-api:latest
     container_name: new-api
     restart: always
     command: --log-dir /app/logs
@@ -43,8 +43,10 @@ services:
 #      - UMAMI_SCRIPT_URL=https://analytics.umami.is/script.js  # Umami 脚本 URL，默认为官方地址 (Umami Script URL, defaults to official URL)
 
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 #      - mysql  # Uncomment if using MySQL
 #      - clickhouse  # Uncomment if using ClickHouse for LOG_SQL_DSN
     networks:
@@ -62,6 +64,11 @@ services:
     command: ["redis-server", "--requirepass", "123456"]  # ⚠️ IMPORTANT: Change this password in production!
     networks:
       - new-api-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "123456", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   postgres:
     image: postgres:15
@@ -75,6 +82,11 @@ services:
       - pg_data:/var/lib/postgresql/data
     networks:
       - new-api-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d new-api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 #    ports:
 #      - "5432:5432"  # Uncomment if you need to access PostgreSQL from outside Docker
 
