@@ -1,3 +1,4 @@
+import fs from 'fs'
 import path from 'path'
 import { createRequire } from 'module'
 import { fileURLToPath } from 'url'
@@ -10,7 +11,16 @@ const semiUiDir = path.resolve(
   path.dirname(require.resolve('@douyinfe/semi-ui')),
   '../..',
 )
-const semiDateFnsDir = path.resolve(semiUiDir, 'node_modules/date-fns')
+const dateFnsCandidates = [
+  path.resolve(__dirname, 'node_modules/date-fns'),
+  path.resolve(__dirname, '../node_modules/date-fns'),
+]
+const classicDateFnsDir = dateFnsCandidates.find((dir) =>
+  fs.existsSync(path.join(dir, 'package.json')),
+)
+if (!classicDateFnsDir) {
+  throw new Error('date-fns@2 is required for the classic frontend build')
+}
 
 export default defineConfig(({ envMode }) => {
   const env = loadEnv({ mode: envMode, prefixes: ['VITE_'] })
@@ -49,7 +59,7 @@ export default defineConfig(({ envMode }) => {
           'dist/css/semi.css',
         ),
         // date-fns-tz@1.x imports date-fns v2 internals used by Semi UI.
-        'date-fns': semiDateFnsDir,
+        'date-fns': classicDateFnsDir,
       },
     },
     html: {
