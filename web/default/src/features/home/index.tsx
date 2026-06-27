@@ -18,11 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 /* eslint-disable react/iframe-missing-sandbox -- Custom HomePageContent URLs need script and same-origin access for localStorage. */
 import { useTranslation } from 'react-i18next'
-
+import { useAuthStore } from '@/stores/auth-store'
+import { RichContent } from '@/components/rich-content'
 import { PublicLayout } from '@/components/layout'
 import { Footer } from '@/components/layout/components/footer'
-import { Markdown } from '@/components/ui/markdown'
-import { useAuthStore } from '@/stores/auth-store'
 
 import { CTA, Features, Hero, HowItWorks, Stats } from './components'
 import { useHomePageContent } from './hooks'
@@ -44,22 +43,24 @@ export function Home() {
   }
 
   if (content) {
+    if (isUrl) {
+      return (
+        <PublicLayout showMainContainer={false}>
+          <iframe
+            src={content}
+            className='h-screen w-full border-none'
+            title={t('Custom Home Page')}
+            sandbox='allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-same-origin allow-scripts'
+          />
+        </PublicLayout>
+      )
+    }
+
     return (
-      <PublicLayout showMainContainer={false}>
-        <main className='overflow-x-hidden'>
-          {isUrl ? (
-            <iframe
-              src={content}
-              className='h-screen w-full border-none'
-              sandbox='allow-scripts allow-same-origin allow-forms allow-popups allow-presentation'
-              title={t('Custom Home Page')}
-            />
-          ) : (
-            <div className='container mx-auto py-8'>
-              <Markdown className='custom-home-content'>{content}</Markdown>
-            </div>
-          )}
-        </main>
+      <PublicLayout>
+        <div className='mx-auto max-w-6xl px-4 py-8'>
+          <RichContent content={content} className='custom-home-content' />
+        </div>
       </PublicLayout>
     )
   }
