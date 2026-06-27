@@ -1,10 +1,11 @@
 {
   "name": "new-api-web-workspace",
   "private": true,
+  "packageManager": "bun@1.3.14",
   "scripts": {
-    "dev": "bun run --cwd default dev",
-    "dev:default": "bun run --cwd default dev",
-    "dev:classic": "bun run --cwd classic dev",
+    "dev": "VITE_REACT_APP_VERSION=$(cat ../VERSION) bun run --cwd default dev -- --host 0.0.0.0 --port 3001",
+    "dev:default": "VITE_REACT_APP_VERSION=$(cat ../VERSION) bun run --cwd default dev -- --host 0.0.0.0 --port 3001",
+    "dev:classic": "VITE_REACT_APP_VERSION=$(cat ../VERSION) bun run --cwd classic dev -- --host 0.0.0.0 --port 3002",
     "build": "bun run build:default && bun run build:classic",
     "build:default": "bun run --cwd default build",
     "build:classic": "bun run --cwd classic build",

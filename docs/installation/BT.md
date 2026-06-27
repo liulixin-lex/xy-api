@@ -139,7 +139,7 @@ docker-compose down && docker-compose up -d
 - [官方文档](https://docs.newapi.pro/zh/docs/installation)
 - [环境变量配置](https://docs.newapi.pro/zh/docs/installation/config-maintenance/environment-variables)
 - [常见问题](https://docs.newapi.pro/zh/docs/support/faq)
-- [GitHub 仓库](https://github.com/QuantumNous/new-api)
+- [GitHub 仓库](https://github.com/liulixin-lex/xy-api)
 
 ***
 

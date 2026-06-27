@@ -32,15 +32,27 @@ go mod download
 
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
     echo "Building backend for Windows..."
-    CGO_ENABLED=1 go build -ldflags="$GO_LDFLAGS" -o new-api.exe
+    CGO_ENABLED=0 GOEXPERIMENT=greenteagc GOOS=windows GOARCH="${GOARCH:-amd64}" go build -ldflags="$GO_LDFLAGS" -o new-api.exe
 else
     echo "Building backend for current platform..."
-    CGO_ENABLED=1 go build -ldflags="$GO_LDFLAGS" -o new-api
+    CGO_ENABLED=0 GOEXPERIMENT=greenteagc go build -ldflags="$GO_LDFLAGS" -o new-api
 fi
 
 echo "Step 5: Installing Electron dependencies..."
 cd "$ROOT_DIR/electron"
 npm ci
+
+PACKAGE_JSON_BACKUP="$(mktemp)"
+PACKAGE_LOCK_BACKUP="$(mktemp)"
+cp package.json "$PACKAGE_JSON_BACKUP"
+cp package-lock.json "$PACKAGE_LOCK_BACKUP"
+cleanup_package_version() {
+    cp "$PACKAGE_JSON_BACKUP" package.json
+    cp "$PACKAGE_LOCK_BACKUP" package-lock.json
+    rm -f "$PACKAGE_JSON_BACKUP" "$PACKAGE_LOCK_BACKUP"
+}
+trap cleanup_package_version EXIT
+
 npm version "$ELECTRON_VERSION" --no-git-tag-version --allow-same-version
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
