@@ -16,18 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { isLikelyHtml } from '@/lib/content-format'
 import { HtmlContent } from '@/components/html-content'
 import { Markdown } from '@/components/ui/markdown'
 
+type RichContentMode = 'markdown' | 'html'
+
 interface RichContentProps {
   content: string
+  mode?: RichContentMode
   breaks?: boolean
   className?: string
 }
 
 export function RichContent(props: RichContentProps) {
-  if (isLikelyHtml(props.content)) {
+  if (props.mode === 'html') {
     return <HtmlContent content={props.content} className={props.className} />
   }
 

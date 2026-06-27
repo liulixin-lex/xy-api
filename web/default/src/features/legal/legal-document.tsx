@@ -19,12 +19,14 @@ For commercial licensing, please contact support@quantumnous.com
 import { useQuery } from '@tanstack/react-query'
 import { FileWarning } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+
+import { PublicLayout } from '@/components/layout'
 import { RichContent } from '@/components/rich-content'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { PublicLayout } from '@/components/layout'
-import { isHttpUrl } from '@/lib/content-format'
+import { isHttpUrl, isLikelyHtml } from '@/lib/content-format'
+
 import type { LegalDocumentResponse } from './types'
 
 type LegalDocumentProps = {
@@ -127,6 +129,7 @@ export function LegalDocument({
         </div>
 
         <RichContent
+          mode={isLikelyHtml(rawContent) ? 'html' : 'markdown'}
           content={rawContent}
           className='prose-neutral dark:prose-invert max-w-none'
         />

@@ -19,10 +19,12 @@ For commercial licensing, please contact support@quantumnous.com
 import { useQuery } from '@tanstack/react-query'
 import { Construction } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+
+import { PublicLayout } from '@/components/layout'
 import { RichContent } from '@/components/rich-content'
 import { Skeleton } from '@/components/ui/skeleton'
-import { PublicLayout } from '@/components/layout'
-import { isHttpUrl } from '@/lib/content-format'
+import { isHttpUrl, isLikelyHtml } from '@/lib/content-format'
+
 import { getAboutContent } from './api'
 
 function EmptyAboutState() {
@@ -160,6 +162,7 @@ export function About() {
     <PublicLayout>
       <div className='mx-auto max-w-6xl px-4 py-8'>
         <RichContent
+          mode={isLikelyHtml(rawContent) ? 'html' : 'markdown'}
           content={rawContent}
           className='prose-neutral dark:prose-invert max-w-none'
         />
