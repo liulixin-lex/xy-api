@@ -154,6 +154,13 @@ import {
   collectInvalidStatusCodeEntries,
   collectNewDisallowedStatusCodeRedirects,
 } from '../../lib/status-code-risk-guard'
+import {
+  getVolcEngineBaseUrlSelectValue,
+  VOLCENGINE_AP_SOUTHEAST_BASE_URL,
+  VOLCENGINE_BASE_URL_OPTIONS,
+  VOLCENGINE_DEFAULT_BASE_URL,
+  VOLCENGINE_DOUBAO_CODING_PLAN,
+} from '../../lib/volcengine-base-url'
 import type { Channel } from '../../types'
 import { useChannels } from '../channels-provider'
 import { AdvancedCustomEditorDialog } from '../dialogs/advanced-custom-editor-dialog'
@@ -455,6 +462,24 @@ export function ChannelMutateDrawer({
   const isChannelDetailLoading = isEditing && isChannelLoading
   const supportsMultiKeyAddMode =
     currentType !== 57 && !(currentType === 41 && vertexKeyType === 'api_key')
+  const volcEngineBaseUrlLabels = useMemo<Record<string, string>>(
+    () => ({
+      [VOLCENGINE_DEFAULT_BASE_URL]: t('https://ark.cn-beijing.volces.com'),
+      [VOLCENGINE_AP_SOUTHEAST_BASE_URL]: t(
+        'https://ark.ap-southeast.bytepluses.com'
+      ),
+      [VOLCENGINE_DOUBAO_CODING_PLAN]: VOLCENGINE_DOUBAO_CODING_PLAN,
+    }),
+    [t]
+  )
+  const volcEngineBaseUrlSelectItems = useMemo(
+    () =>
+      VOLCENGINE_BASE_URL_OPTIONS.map((option) => ({
+        value: option.value,
+        label: volcEngineBaseUrlLabels[option.value] || option.value,
+      })),
+    [volcEngineBaseUrlLabels]
+  )
   const addModeOptions = useMemo(
     () =>
       supportsMultiKeyAddMode
@@ -677,7 +702,7 @@ export function ChannelMutateDrawer({
     if (currentType === 45) {
       const currentBaseUrlValue = form.getValues('base_url')
       if (!currentBaseUrlValue || currentBaseUrlValue === '') {
-        form.setValue('base_url', 'https://ark.cn-beijing.volces.com')
+        form.setValue('base_url', VOLCENGINE_DEFAULT_BASE_URL)
       }
     }
 
@@ -689,15 +714,6 @@ export function ChannelMutateDrawer({
       }
     }
   }, [currentType, isEditing, form])
-
-  useEffect(() => {
-    if (currentType !== 45 || currentBaseUrl !== 'doubao-coding-plan') return
-
-    form.setValue('base_url', 'https://ark.cn-beijing.volces.com', {
-      shouldDirty: false,
-      shouldValidate: true,
-    })
-  }, [currentBaseUrl, currentType, form])
 
   useEffect(() => {
     if (isEditing || supportsMultiKeyAddMode) return
@@ -1831,26 +1847,11 @@ export function ChannelMutateDrawer({
                               {t('API Base URL *')}
                             </FormLabel>
                             <Select
-                              items={[
-                                {
-                                  value: 'https://ark.cn-beijing.volces.com',
-                                  label: t('https://ark.cn-beijing.volces.com'),
-                                },
-                                {
-                                  value:
-                                    'https://ark.ap-southeast.bytepluses.com',
-                                  label: t(
-                                    'https://ark.ap-southeast.bytepluses.com'
-                                  ),
-                                },
-                              ]}
+                              items={volcEngineBaseUrlSelectItems}
                               onValueChange={field.onChange}
-                              value={
-                                field.value === 'doubao-coding-plan'
-                                  ? 'https://ark.cn-beijing.volces.com'
-                                  : field.value ||
-                                    'https://ark.cn-beijing.volces.com'
-                              }
+                              value={getVolcEngineBaseUrlSelectValue(
+                                field.value
+                              )}
                             >
                               <FormControl>
                                 <SelectTrigger>
@@ -1859,14 +1860,16 @@ export function ChannelMutateDrawer({
                               </FormControl>
                               <SelectContent alignItemWithTrigger={false}>
                                 <SelectGroup>
-                                  <SelectItem value='https://ark.cn-beijing.volces.com'>
-                                    {t('https://ark.cn-beijing.volces.com')}
-                                  </SelectItem>
-                                  <SelectItem value='https://ark.ap-southeast.bytepluses.com'>
-                                    {t(
-                                      'https://ark.ap-southeast.bytepluses.com'
-                                    )}
-                                  </SelectItem>
+                                  {volcEngineBaseUrlSelectItems.map(
+                                    (option) => (
+                                      <SelectItem
+                                        key={option.value}
+                                        value={option.value}
+                                      >
+                                        {option.label}
+                                      </SelectItem>
+                                    )
+                                  )}
                                 </SelectGroup>
                               </SelectContent>
                             </Select>
