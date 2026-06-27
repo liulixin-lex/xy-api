@@ -15,17 +15,17 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/Calcium-Ion/new-api/main/LICENSE">
-    <img src="https://img.shields.io/github/license/Calcium-Ion/new-api?color=brightgreen" alt="license">
+  <a href="https://raw.githubusercontent.com/liulixin-lex/xy-api/main/LICENSE">
+    <img src="https://img.shields.io/github/license/liulixin-lex/xy-api?color=brightgreen" alt="license">
   </a><!--
-  --><a href="https://github.com/Calcium-Ion/new-api/releases/latest">
-    <img src="https://img.shields.io/github/v/release/Calcium-Ion/new-api?color=brightgreen&include_prereleases" alt="release">
+  --><a href="https://github.com/liulixin-lex/xy-api/releases/latest">
+    <img src="https://img.shields.io/github/v/release/liulixin-lex/xy-api?color=brightgreen&include_prereleases" alt="release">
   </a><!--
-  --><a href="https://hub.docker.com/r/CalciumIon/new-api">
-    <img src="https://img.shields.io/badge/docker-dockerHub-blue" alt="docker">
+  --><a href="https://github.com/liulixin-lex/xy-api/pkgs/container/xy-api">
+    <img src="https://img.shields.io/badge/docker-ghcr.io-blue" alt="docker">
   </a><!--
-  --><a href="https://goreportcard.com/report/github.com/Calcium-Ion/new-api">
-    <img src="https://goreportcard.com/badge/github.com/Calcium-Ion/new-api" alt="GoReportCard">
+  --><a href="https://goreportcard.com/report/github.com/liulixin-lex/xy-api">
+    <img src="https://goreportcard.com/badge/github.com/liulixin-lex/xy-api" alt="GoReportCard">
   </a>
 </p>
 
@@ -163,7 +163,7 @@ docker run --name new-api -d --restart always \
 
 <div align="center">
 
-### 📖 [公式ドキュメント](https://docs.newapi.pro/ja/docs) | [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/QuantumNous/new-api)
+### 📖 [公式ドキュメント](https://docs.newapi.pro/ja/docs) | [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/liulixin-lex/xy-api)
 
 </div>
 
@@ -461,7 +461,7 @@ docker run --name new-api -d --restart always \
 
 <div align="center">
 
-[![スター履歴チャート](https://api.star-history.com/svg?repos=Calcium-Ion/new-api&type=Date)](https://star-history.com/#Calcium-Ion/new-api&Date)
+[![スター履歴チャート](https://api.star-history.com/svg?repos=liulixin-lex/xy-api&type=Date)](https://star-history.com/#liulixin-lex/xy-api&Date)
 
 </div>
 
@@ -473,7 +473,7 @@ docker run --name new-api -d --restart always \
 
 このプロジェクトがあなたのお役に立てたなら、ぜひ ⭐️ スターをください！
 
-**[公式ドキュメント](https://docs.newapi.pro/ja/docs)** • **[問題フィードバック](https://github.com/Calcium-Ion/new-api/issues)** • **[最新リリース](https://github.com/Calcium-Ion/new-api/releases)**
+**[公式ドキュメント](https://docs.newapi.pro/ja/docs)** • **[問題フィードバック](https://github.com/liulixin-lex/xy-api/issues)** • **[最新リリース](https://github.com/liulixin-lex/xy-api/releases)**
 
 <sub>❤️ で構築された QuantumNous</sub>
 

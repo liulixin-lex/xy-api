@@ -2,8 +2,9 @@
 #
 # Usage:
 #   1. docker compose -f docker-compose.dev.yml up -d
-#   2. cd web && bun install && bun run dev
-#   3. Open http://localhost:3001 (frontend dev server, API auto-proxied to :3000)
+#   2. make dev-web
+#   3. Open http://localhost:3001 (default frontend, API auto-proxied to :3000)
+#      Classic frontend is available at http://localhost:3002
 #
 # Rebuild backend after Go code changes:
 #   docker compose -f docker-compose.dev.yml up -d --build new-api
@@ -20,13 +21,12 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     image: new-api-dev:local
-    container_name: new-api-dev
     restart: unless-stopped
     env_file:
       - path: .env
         required: false
     ports:
-      - "3000:3000"
+      - "${NEW_API_DEV_PORT:-3000}:3000"
     volumes:
       - dev_data:/data
     environment:
@@ -44,7 +44,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: new-api-dev-redis
     restart: unless-stopped
     networks:
       - dev-network
@@ -56,7 +55,6 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    container_name: new-api-dev-pg
     restart: unless-stopped
     environment:
       POSTGRES_USER: root

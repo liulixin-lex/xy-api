@@ -6,6 +6,15 @@ on:
       - 'v*'  # Triggers on stable version tags like v1.0.0
       - '!v*-*'  # Ignore pre-release tags like v1.0.0-beta
   workflow_dispatch:  # Allows manual triggering
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g., v0.0.1)'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
 jobs:
   build:
@@ -23,7 +32,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 1
+
+      - name: Determine Version
+        run: |
+          VERSION="$RELEASE_TAG"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Electron release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -45,7 +64,6 @@ jobs:
           CI: ""
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
-          VERSION=$(git describe --tags --exact-match 2>/dev/null || cat VERSION)
           cd web
           bun install --frozen-lockfile
           cd default
@@ -58,24 +76,17 @@ jobs:
       #   if: runner.os != 'Windows'
       #   run: |
       #     go mod download
-      #     VERSION=$(git describe --tags --exact-match 2>/dev/null || cat VERSION)
       #     go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o new-api
 
       - name: Build Go binary (Windows)
         if: runner.os == 'Windows'
         run: |
           go mod download
-          VERSION=$(git describe --tags --exact-match 2>/dev/null || cat VERSION)
-          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api.exe
+          CGO_ENABLED=0 GOEXPERIMENT=greenteagc GOOS=windows GOARCH=amd64 go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api.exe
 
       - name: Update Electron version
         run: |
           cd electron
-          VERSION=$(git describe --tags --exact-match 2>/dev/null || cat ../VERSION)
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Electron release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
-            exit 1
-          fi
           VERSION=${VERSION#v}  # Remove 'v' prefix if present
           # Convert to valid semver: take first 3 components and convert rest to prerelease format
           # e.g., 0.9.3-patch.1 -> 0.9.3-patch.1
@@ -97,7 +108,7 @@ jobs:
       - name: Install Electron dependencies
         run: |
           cd electron
-          npm install
+          npm ci
 
       # - name: Build Electron app (macOS)
       #   if: runner.os == 'macOS'
@@ -133,7 +144,10 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: release-upload-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
 
@@ -144,6 +158,7 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             windows-build/*
         env:

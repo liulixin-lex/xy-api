@@ -42,10 +42,10 @@ dev-web:
 	@echo "Starting both frontend dev servers..."
 	@echo "Default frontend: http://localhost:$(DEV_FRONTEND_DEFAULT_PORT)"
 	@echo "Classic frontend: http://localhost:$(DEV_FRONTEND_CLASSIC_PORT)"
-	@cd ./web && bun install
-	@(cd $(FRONTEND_DIR) && bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_DEFAULT_PORT)) & \
+	@cd ./web && bun install --frozen-lockfile
+	@(cd $(FRONTEND_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_DEFAULT_PORT)) & \
 		default_pid=$$!; \
-		(cd $(FRONTEND_CLASSIC_DIR) && bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_CLASSIC_PORT)) & \
+		(cd $(FRONTEND_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_CLASSIC_PORT)) & \
 		classic_pid=$$!; \
 		trap 'kill $$default_pid $$classic_pid 2>/dev/null; wait $$default_pid $$classic_pid 2>/dev/null; exit 130' INT TERM; \
 		while kill -0 $$default_pid 2>/dev/null && kill -0 $$classic_pid 2>/dev/null; do \
@@ -66,8 +66,8 @@ dev-web:
 
 dev-web-classic:
 	@echo "Starting classic frontend dev server..."
-	@cd ./web && bun install
-	@cd $(FRONTEND_CLASSIC_DIR) && bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_CLASSIC_PORT)
+	@cd ./web && bun install --frozen-lockfile
+	@cd $(FRONTEND_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_CLASSIC_PORT)
 
 dev: dev-api dev-web
 

@@ -5,21 +5,20 @@
 #   2. Access at http://localhost:3000
 #
 # Using MySQL instead of PostgreSQL:
-#   1. Comment out the postgres service and SQL_DSN line 15
-#   2. Uncomment the mysql service and SQL_DSN line 16
-#   3. Uncomment mysql in depends_on (line 28)
-#   4. Uncomment mysql_data in volumes section (line 64)
+#   1. Comment out the postgres service and PostgreSQL SQL_DSN
+#   2. Uncomment the mysql service and MySQL SQL_DSN
+#   3. Uncomment mysql in depends_on using the same mapping format
+#   4. Uncomment mysql_data in the volumes section
 #
 # ⚠️  IMPORTANT: Change all default passwords before deploying to production!
 
 services:
   new-api:
     image: ghcr.io/liulixin-lex/xy-api:latest
-    container_name: new-api
     restart: always
     command: --log-dir /app/logs
     ports:
-      - "3000:3000"
+      - "${NEW_API_PORT:-3000}:3000"
     volumes:
       - ./data:/data
       - ./logs:/app/logs
@@ -47,8 +46,10 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-#      - mysql  # Uncomment if using MySQL
-#      - clickhouse  # Uncomment if using ClickHouse for LOG_SQL_DSN
+#      mysql:  # Uncomment if using MySQL
+#        condition: service_healthy
+#      clickhouse:  # Uncomment if using ClickHouse for LOG_SQL_DSN
+#        condition: service_healthy
     networks:
       - new-api-network
     healthcheck:
@@ -59,7 +60,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: redis
     restart: always
     command: ["redis-server", "--requirepass", "123456"]  # ⚠️ IMPORTANT: Change this password in production!
     networks:
@@ -72,7 +72,6 @@ services:
 
   postgres:
     image: postgres:15
-    container_name: postgres
     restart: always
     environment:
       POSTGRES_USER: root
@@ -92,7 +91,6 @@ services:
 
 #  mysql:
 #    image: mysql:8.2
-#    container_name: mysql
 #    restart: always
 #    environment:
 #      MYSQL_ROOT_PASSWORD: 123456  # ⚠️ IMPORTANT: Change this password in production!
@@ -103,10 +101,14 @@ services:
 #      - new-api-network
 #    ports:
 #      - "3306:3306"  # Uncomment if you need to access MySQL from outside Docker
+#    healthcheck:
+#      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p123456"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
 
 #  clickhouse:
 #    image: clickhouse/clickhouse-server:24.8
-#    container_name: clickhouse
 #    restart: always
 #    environment:
 #      CLICKHOUSE_DB: new_api_logs
@@ -120,6 +122,11 @@ services:
 #    ports:
 #      - "8123:8123"  # HTTP interface, uncomment if you need external access
 #      - "9000:9000"  # Native interface used by the LOG_SQL_DSN example above
+#    healthcheck:
+#      test: ["CMD-SHELL", "clickhouse-client --user default --password 123456 --query 'SELECT 1'"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
 
 volumes:
   pg_data:

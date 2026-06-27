@@ -15,17 +15,17 @@
 </p>
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/Calcium-Ion/new-api/main/LICENSE">
-    <img src="https://img.shields.io/github/license/Calcium-Ion/new-api?color=brightgreen" alt="license">
+  <a href="https://raw.githubusercontent.com/liulixin-lex/xy-api/main/LICENSE">
+    <img src="https://img.shields.io/github/license/liulixin-lex/xy-api?color=brightgreen" alt="license">
   </a><!--
-  --><a href="https://github.com/Calcium-Ion/new-api/releases/latest">
-    <img src="https://img.shields.io/github/v/release/Calcium-Ion/new-api?color=brightgreen&include_prereleases" alt="release">
+  --><a href="https://github.com/liulixin-lex/xy-api/releases/latest">
+    <img src="https://img.shields.io/github/v/release/liulixin-lex/xy-api?color=brightgreen&include_prereleases" alt="release">
   </a><!--
-  --><a href="https://hub.docker.com/r/CalciumIon/new-api">
-    <img src="https://img.shields.io/badge/docker-dockerHub-blue" alt="docker">
+  --><a href="https://github.com/liulixin-lex/xy-api/pkgs/container/xy-api">
+    <img src="https://img.shields.io/badge/docker-ghcr.io-blue" alt="docker">
   </a><!--
-  --><a href="https://goreportcard.com/report/github.com/Calcium-Ion/new-api">
-    <img src="https://goreportcard.com/badge/github.com/Calcium-Ion/new-api" alt="GoReportCard">
+  --><a href="https://goreportcard.com/report/github.com/liulixin-lex/xy-api">
+    <img src="https://goreportcard.com/badge/github.com/liulixin-lex/xy-api" alt="GoReportCard">
   </a>
 </p>
 
@@ -163,7 +163,7 @@ docker run --name new-api -d --restart always \
 
 <div align="center">
 
-### 📖 [Official Documentation](https://docs.newapi.pro/en/docs) | [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/QuantumNous/new-api)
+### 📖 [Official Documentation](https://docs.newapi.pro/en/docs) | [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/liulixin-lex/xy-api)
 
 </div>
 
@@ -470,7 +470,7 @@ If your organization's policies do not permit the use of AGPLv3-licensed softwar
 
 <div align="center">
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Calcium-Ion/new-api&type=Date)](https://star-history.com/#Calcium-Ion/new-api&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=liulixin-lex/xy-api&type=Date)](https://star-history.com/#liulixin-lex/xy-api&Date)
 
 </div>
 
@@ -482,7 +482,7 @@ If your organization's policies do not permit the use of AGPLv3-licensed softwar
 
 If this project is helpful to you, welcome to give us a ⭐️ Star！
 
-**[Official Documentation](https://docs.newapi.pro/en/docs)** • **[Issue Feedback](https://github.com/Calcium-Ion/new-api/issues)** • **[Latest Release](https://github.com/Calcium-Ion/new-api/releases)**
+**[Official Documentation](https://docs.newapi.pro/en/docs)** • **[Issue Feedback](https://github.com/liulixin-lex/xy-api/issues)** • **[Latest Release](https://github.com/liulixin-lex/xy-api/releases)**
 
 <sub>Built with ❤️ by QuantumNous</sub>
 

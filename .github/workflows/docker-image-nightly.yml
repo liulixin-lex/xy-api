@@ -11,8 +11,29 @@ on:
         required: false
 
 jobs:
+  prepare_version:
+    name: Prepare nightly version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Determine nightly version
+        id: version
+        run: |
+          VERSION="nightly-$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Prepared nightly version: $VERSION"
+
   build_single_arch:
     name: Build & push (${{ matrix.arch }}) [native]
+    needs: prepare_version
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +63,7 @@ jobs:
       - name: Determine nightly version
         id: version
         run: |
-          VERSION="nightly-$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          VERSION="${{ needs.prepare_version.outputs.version }}"
           echo "$VERSION" > VERSION
           echo "value=$VERSION" >> $GITHUB_OUTPUT
           echo "VERSION=$VERSION" >> $GITHUB_ENV
@@ -116,7 +137,7 @@ jobs:
 
   create_manifests:
     name: Create multi-arch manifests
-    needs: [build_single_arch]
+    needs: [prepare_version, build_single_arch]
     runs-on: ubuntu-latest
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -127,20 +148,13 @@ jobs:
       packages: write
 
     steps:
-      - name: Check out (shallow)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Determine nightly version
-        id: version
-        run: |
-          VERSION="nightly-$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
-          echo "value=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
       - name: Normalize GHCR repository
         run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Set nightly version
+        run: |
+          VERSION="${{ needs.prepare_version.outputs.version }}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''

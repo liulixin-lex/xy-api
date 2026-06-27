@@ -9,9 +9,16 @@ on:
     inputs:
       tag:
         description: 'Tag or version to build (e.g., v0.0.1)'
-        required: false
-        default: 'v0.0.1'
+        required: true
         type: string
+      confirm_tag:
+        description: 'Type the same tag again to confirm publishing this tag and latest'
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
 jobs:
   build_single_arch:
@@ -43,20 +50,16 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 1
 
       - name: Resolve tag & write VERSION
         id: version
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-            if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
-              echo "::error::Tag '$TAG' does not exist. Create and push the tag before publishing a stable Docker image."
-              exit 1
-            fi
-            git checkout "refs/tags/$TAG"
-          else
-            TAG=${GITHUB_REF#refs/tags/}
+          TAG="$RELEASE_TAG"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.confirm_tag }}" != "$TAG" ]; then
+            echo "::error::confirm_tag must exactly match tag before publishing a stable Docker image."
+            exit 1
           fi
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Docker release tags must use lowercase v semver, for example v0.0.1. Current value: $TAG"
