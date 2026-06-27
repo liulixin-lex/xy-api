@@ -46,11 +46,12 @@ jobs:
           CI: ""
           NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
-          cd web
-          bun install
           VERSION=$(git describe --tags --exact-match 2>/dev/null || cat VERSION)
+          cd web
+          bun install --frozen-lockfile
+          cd default
           DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ..
+          cd ../..
 
       # - name: Build Go binary (macos/Linux)
       #   if: runner.os != 'Windows'
@@ -71,6 +72,7 @@ jobs:
           cd electron
           VERSION=$(git describe --tags --exact-match 2>/dev/null || cat ../VERSION)
           VERSION=${VERSION#v}  # Remove 'v' prefix if present
+          VERSION=${VERSION#V}  # Remove 'V' prefix if present
           # Convert to valid semver: take first 3 components and convert rest to prerelease format
           # e.g., 0.9.3-patch.1 -> 0.9.3-patch.1
           if [[ $VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]]; then
