@@ -136,13 +136,13 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		}
 
 		quota = topUp.Money * common.QuotaPerUnit
+		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
 		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
 		if rewardErr != nil {
 			return rewardErr
 		}
 
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		err = tx.Save(topUp).Error
 		if err != nil {
@@ -205,6 +205,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 			topUp.PaymentMethod = actualPaymentMethod
 		}
 
+		topUp.CompleteTime = common.GetTimestamp()
 		dAmount := decimal.NewFromInt(topUp.Amount)
 		dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 		quotaToAdd = int(dAmount.Mul(dQuotaPerUnit).IntPart())
@@ -218,7 +219,6 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 			return rewardErr
 		}
 
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		if err := tx.Save(topUp).Error; err != nil {
 			return err
@@ -450,6 +450,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 			return errors.New("无效的充值额度")
 		}
 
+		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
 		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
@@ -457,7 +458,6 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		}
 
 		// 标记完成
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		if err := tx.Save(topUp).Error; err != nil {
 			return err
@@ -517,13 +517,13 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 
 		// Creem 直接使用 Amount 作为充值额度（整数）
 		quota = topUp.Amount
+		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
 		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
 		if rewardErr != nil {
 			return rewardErr
 		}
 
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		err = tx.Save(topUp).Error
 		if err != nil {
@@ -609,13 +609,13 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 			return errors.New("无效的充值额度")
 		}
 
+		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
 		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
 
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		if err := tx.Save(topUp).Error; err != nil {
 			return err
@@ -679,13 +679,13 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 			return errors.New("无效的充值额度")
 		}
 
+		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
 		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
 
-		topUp.CompleteTime = common.GetTimestamp()
 		topUp.Status = common.TopUpStatusSuccess
 		if err := tx.Save(topUp).Error; err != nil {
 			return err
@@ -785,7 +785,11 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, quotaToAdd int) (int, int, error) {
 	rule := InviteRewardRuleContinuous
 	rewardPercent := normalizeRewardPercent(user.InviteContinuousRewardPercent)
-	now := common.GetTimestamp()
+	recordCreatedAt := common.GetTimestamp()
+	rewardAvailableAt := topUp.CompleteTime + AffiliateRewardWaitSeconds
+	if topUp.CompleteTime <= 0 {
+		rewardAvailableAt = recordCreatedAt + AffiliateRewardWaitSeconds
+	}
 
 	var successCount int64
 	if err := tx.Model(&TopUp{}).Where("user_id = ? AND status = ? AND amount > ?", user.Id, common.TopUpStatusSuccess, 0).Count(&successCount).Error; err != nil {
@@ -817,8 +821,8 @@ func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, qu
 		TopUpQuota:          quotaToAdd,
 		RewardQuota:         reward,
 		Status:              AffiliateRewardStatusPending,
-		AvailableAt:         now + AffiliateRewardWaitSeconds,
-		CreatedAt:           now,
+		AvailableAt:         rewardAvailableAt,
+		CreatedAt:           recordCreatedAt,
 	}).Error
 	if err != nil {
 		return 0, 0, err

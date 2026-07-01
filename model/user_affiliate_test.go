@@ -166,3 +166,55 @@ func TestGetReferralRewardDashboardSettlesAndBuildsInviteLink(t *testing.T) {
 	assert.Equal(t, 200, inviter.AffQuota)
 	assert.Equal(t, 200, inviter.AffHistoryQuota)
 }
+
+func TestCancelAffiliateRewardRecordMarksCanceledAndReversesAvailableBalance(t *testing.T) {
+	truncateTables(t)
+	now := int64(1_800_000_000)
+
+	require.NoError(t, DB.Create(&[]User{
+		{
+			Id:              70,
+			Username:        "inviter",
+			Password:        "secret",
+			Status:          common.UserStatusEnabled,
+			AffCode:         "aff70",
+			AffQuota:        300,
+			AffHistoryQuota: 300,
+		},
+		{
+			Id:        71,
+			Username:  "invitee",
+			Password:  "secret",
+			Status:    common.UserStatusEnabled,
+			AffCode:   "aff71",
+			InviterId: 70,
+		},
+	}).Error)
+	require.NoError(t, DB.Create(&AffiliateRewardRecord{
+		Id:          710,
+		InviterId:   70,
+		InviteeId:   71,
+		TopUpId:     7101,
+		RewardQuota: 300,
+		Status:      AffiliateRewardStatusAvailable,
+		AvailableAt: now - 60,
+		CreatedAt:   now - 60,
+	}).Error)
+
+	require.NoError(t, CancelAffiliateRewardRecord(710, now))
+
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.First(&record, 710).Error)
+	assert.Equal(t, AffiliateRewardStatusCanceled, record.Status)
+	assert.Equal(t, now, record.CanceledAt)
+
+	var inviter User
+	require.NoError(t, DB.First(&inviter, 70).Error)
+	assert.Equal(t, 0, inviter.AffQuota)
+	assert.Equal(t, 0, inviter.AffHistoryQuota)
+
+	summary, err := GetReferralRewardDashboard(70, now)
+	require.NoError(t, err)
+	assert.Equal(t, int64(300), summary.CanceledRewardQuota)
+	assert.Equal(t, int64(0), summary.AvailableRewardQuota)
+}

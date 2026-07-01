@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   CheckCircle2,
+  ChevronsUpDown,
   Clock,
+  EyeOff,
   Gift,
   Link2,
   Search,
@@ -47,6 +49,13 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   Empty,
   EmptyDescription,
   EmptyHeader,
@@ -70,6 +79,10 @@ import { useTopupInfo } from '@/features/wallet/hooks'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 
 import { getReferralRewards } from './api'
+import {
+  formatShanghaiTimestamp,
+  renderTrustedActivityDescription,
+} from './lib/activity-description'
 import type {
   InviteLinkBatch,
   InvitedUser,
@@ -121,6 +134,8 @@ type InvitedUsersSearchField =
   | 'display_name'
   | 'reward_rate'
   | 'reward_quota'
+type SortDirection = 'asc' | 'desc'
+type InvitedUsersSortKey = 'sequence' | 'registered' | 'ratio' | 'reward'
 
 const defaultPresetActivityDescription: PresetActivityDescription = {
   title: '',
@@ -143,7 +158,7 @@ const invitedUsersSearchFields: Array<{
   { value: 'username', labelKey: 'Username' },
   { value: 'display_name', labelKey: 'Display Name' },
   { value: 'reward_rate', labelKey: 'Reward Ratio' },
-  { value: 'reward_quota', labelKey: 'Reward Amount' },
+  { value: 'reward_quota', labelKey: 'Contribution Rewards' },
 ]
 
 function parsePresetActivityDescription(
@@ -222,11 +237,49 @@ function RewardMetric(props: RewardMetricProps) {
   )
 }
 
-function TrustedActivityHtml(props: { html: string }) {
+function SortableHeader<TSort extends string>(props: {
+  label: string
+  sortKey: TSort
+  onSort: (key: TSort, direction: SortDirection) => void
+  onHide: (key: TSort) => void
+}) {
+  const { t } = useTranslation()
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={<Button variant='ghost' size='sm' className='-ms-3 h-8' />}
+      >
+        <span>{props.label}</span>
+        <ChevronsUpDown className='ms-2 size-3.5' />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align='start'>
+        <DropdownMenuItem onClick={() => props.onSort(props.sortKey, 'asc')}>
+          {props.label} ↑
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => props.onSort(props.sortKey, 'desc')}>
+          {props.label} ↓
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => props.onHide(props.sortKey)}>
+          <EyeOff className='text-muted-foreground size-3.5' />
+          {t('Hide')}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function TrustedActivityHtml(props: { content: string }) {
+  const html = useMemo(
+    () => renderTrustedActivityDescription(props.content),
+    [props.content]
+  )
+
   return (
     <div
       className='text-foreground/90 [&_a]:text-primary [&_a]:underline [&_li]:my-1 [&_ol]:list-decimal [&_ol]:ps-5 [&_p]:my-2 [&_ul]:list-disc [&_ul]:ps-5'
-      dangerouslySetInnerHTML={{ __html: props.html }}
+      dangerouslySetInnerHTML={{ __html: html }}
     />
   )
 }
@@ -285,7 +338,7 @@ function ActivityCard(props: ActivityCardProps) {
     </p>
   )
   if (showCustom) {
-    activityContent = <TrustedActivityHtml html={customDescription} />
+    activityContent = <TrustedActivityHtml content={customDescription} />
   } else if (preset.details.length > 0) {
     activityContent = (
       <div className='grid gap-2 sm:grid-cols-2'>
@@ -347,7 +400,9 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
       <CardHeader className='border-b p-4 !pb-4'>
         <CardTitle className='text-base'>{t('Referral Link')}</CardTitle>
         <CardDescription className='mt-1 text-sm'>
-          {t('Share this link so new users are bound to the active reward activity.')}
+          {t(
+            'Share this link so new users are bound to the active reward activity.'
+          )}
         </CardDescription>
       </CardHeader>
       <CardContent className='space-y-4 p-4'>
@@ -387,8 +442,8 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
           />
           {activeBatch ? (
             <span className='text-muted-foreground text-xs'>
-              {formatTimestamp(activeBatch.start_time)} -{' '}
-              {formatTimestamp(activeBatch.end_time)}
+              {formatShanghaiTimestamp(activeBatch.start_time)} -{' '}
+              {formatShanghaiTimestamp(activeBatch.end_time)}
             </span>
           ) : null}
         </div>
@@ -437,7 +492,9 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
           <div className='min-w-0'>
             <CardTitle className='text-base'>{t('Reward Summary')}</CardTitle>
             <CardDescription className='mt-1 text-sm'>
-              {t('Pending rewards become available after the reward waiting period.')}
+              {t(
+                'Pending rewards become available after the reward waiting period.'
+              )}
             </CardDescription>
           </div>
           <Button
@@ -507,18 +564,56 @@ function matchesInvitedUserSearch(
   )
 }
 
+function invitedUserContributionText(
+  user: InvitedUser,
+  t: (key: string) => string
+) {
+  return [
+    `${t('Pending Rewards')}: ${formatQuota(user.pending_reward_quota)}`,
+    `${t('Available Rewards')}: ${formatQuota(user.available_reward_quota)}`,
+    `${t('Transferred Rewards')}: ${formatQuota(user.transferred_reward_quota)}`,
+    `${t('Canceled Rewards')}: ${formatQuota(user.canceled_reward_quota)}`,
+  ].join(' / ')
+}
+
 function InvitedUsersTable(props: InvitedUsersTableProps) {
   const { t } = useTranslation()
   const [searchField, setSearchField] = useState<InvitedUsersSearchField>('all')
   const [search, setSearch] = useState('')
+  const [sort, setSort] = useState<{
+    key: InvitedUsersSortKey
+    direction: SortDirection
+  }>({ key: 'sequence', direction: 'desc' })
+  const [hiddenColumns, setHiddenColumns] = useState<
+    Partial<Record<InvitedUsersSortKey, boolean>>
+  >({})
 
-  const filteredUsers = useMemo(
-    () =>
-      props.users.filter((user) =>
-        matchesInvitedUserSearch(user, searchField, search)
-      ),
-    [props.users, search, searchField]
-  )
+  const filteredUsers = useMemo(() => {
+    const users = props.users.filter((user) =>
+      matchesInvitedUserSearch(user, searchField, search)
+    )
+    users.sort((a, b) => {
+      let left: string | number = a.id
+      let right: string | number = b.id
+      if (sort.key === 'registered') {
+        left = a.created_at
+        right = b.created_at
+      }
+      if (sort.key === 'ratio') {
+        left = a.first_topup_reward_percent + a.continuous_reward_percent
+        right = b.first_topup_reward_percent + b.continuous_reward_percent
+      }
+      if (sort.key === 'reward') {
+        left = a.contribution_quota
+        right = b.contribution_quota
+      }
+      const direction = sort.direction === 'asc' ? 1 : -1
+      if (left > right) return direction
+      if (left < right) return -direction
+      return 0
+    })
+    return users
+  }, [props.users, search, searchField, sort])
 
   if (props.loading) {
     return (
@@ -540,42 +635,94 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>{t('Username')}</TableHead>
-          <TableHead>{t('Registered At')}</TableHead>
-          <TableHead>{t('Reward Ratio')}</TableHead>
-          <TableHead>{t('Pending Rewards')}</TableHead>
-          <TableHead>{t('Available Rewards')}</TableHead>
-          <TableHead>{t('Transferred Rewards')}</TableHead>
+          {!hiddenColumns.sequence && (
+            <TableHead>
+              <SortableHeader
+                label={t('Invitation No.')}
+                sortKey='sequence'
+                onSort={(key, direction) => setSort({ key, direction })}
+                onHide={(key) =>
+                  setHiddenColumns((current) => ({ ...current, [key]: true }))
+                }
+              />
+            </TableHead>
+          )}
+          {!hiddenColumns.registered && (
+            <TableHead>
+              <SortableHeader
+                label={t('Registered At')}
+                sortKey='registered'
+                onSort={(key, direction) => setSort({ key, direction })}
+                onHide={(key) =>
+                  setHiddenColumns((current) => ({ ...current, [key]: true }))
+                }
+              />
+            </TableHead>
+          )}
+          {!hiddenColumns.ratio && (
+            <TableHead>
+              <SortableHeader
+                label={t('Reward Ratio')}
+                sortKey='ratio'
+                onSort={(key, direction) => setSort({ key, direction })}
+                onHide={(key) =>
+                  setHiddenColumns((current) => ({ ...current, [key]: true }))
+                }
+              />
+            </TableHead>
+          )}
+          {!hiddenColumns.reward && (
+            <TableHead>
+              <SortableHeader
+                label={t('Contribution Rewards')}
+                sortKey='reward'
+                onSort={(key, direction) => setSort({ key, direction })}
+                onHide={(key) =>
+                  setHiddenColumns((current) => ({ ...current, [key]: true }))
+                }
+              />
+            </TableHead>
+          )}
         </TableRow>
       </TableHeader>
       <TableBody>
         {filteredUsers.map((user) => (
           <TableRow key={user.id}>
-            <TableCell>
-              <div className='flex min-w-0 flex-col'>
-                <span className='font-medium'>{user.username}</span>
-                <span className='text-muted-foreground truncate text-xs'>
-                  {user.display_name || '-'}
-                </span>
-              </div>
-            </TableCell>
-            <TableCell>{formatTimestamp(user.created_at)}</TableCell>
-            <TableCell>
-              <RewardRatePair
-                first={user.first_topup_reward_percent}
-                continuous={user.continuous_reward_percent}
-              />
-            </TableCell>
-            <TableCell>{formatQuota(user.pending_reward_quota)}</TableCell>
-            <TableCell>{formatQuota(user.available_reward_quota)}</TableCell>
-            <TableCell>
-              <div>{formatQuota(user.transferred_reward_quota)}</div>
-              {user.canceled_reward_quota > 0 ? (
-                <div className='text-muted-foreground text-xs'>
-                  {t('Canceled')}: {formatQuota(user.canceled_reward_quota)}
+            {!hiddenColumns.sequence && (
+              <TableCell>
+                <div className='flex min-w-0 flex-col'>
+                  <span className='font-mono text-sm font-medium'>
+                    #{user.id}
+                  </span>
+                  <span className='text-muted-foreground truncate text-xs'>
+                    {user.display_name
+                      ? `${user.username} (${user.display_name})`
+                      : user.username}
+                  </span>
                 </div>
-              ) : null}
-            </TableCell>
+              </TableCell>
+            )}
+            {!hiddenColumns.registered && (
+              <TableCell>{formatTimestamp(user.created_at)}</TableCell>
+            )}
+            {!hiddenColumns.ratio && (
+              <TableCell>
+                <RewardRatePair
+                  first={user.first_topup_reward_percent}
+                  continuous={user.continuous_reward_percent}
+                />
+              </TableCell>
+            )}
+            {!hiddenColumns.reward && (
+              <TableCell>
+                <div className='font-medium'>
+                  {formatQuota(user.contribution_quota)}
+                </div>
+                <div className='text-muted-foreground max-w-[420px] text-xs'>
+                  {invitedUserContributionText(user, t)}
+                </div>
+              </TableCell>
+            )}
           </TableRow>
         ))}
       </TableBody>
@@ -699,7 +846,9 @@ export function InviteRewards() {
   return (
     <>
       <SectionPageLayout>
-        <SectionPageLayout.Title>{t('Referral Rewards')}</SectionPageLayout.Title>
+        <SectionPageLayout.Title>
+          {t('Referral Rewards')}
+        </SectionPageLayout.Title>
         <SectionPageLayout.Content>
           <div className='mx-auto flex w-full max-w-7xl flex-col gap-4 sm:gap-5'>
             <ActivityCard batch={dashboard?.active_batch} loading={loading} />

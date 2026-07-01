@@ -2,6 +2,7 @@ package model
 
 import (
 	"database/sql"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -463,7 +464,14 @@ func splitAffiliateRewardQuota(record AffiliateRewardRecord) (pending int, avail
 			transferred = record.RewardQuota
 		}
 	case AffiliateRewardStatusCanceled:
-		canceled = record.RewardQuota
+		transferred = record.TransferredQuota
+		if transferred < 0 {
+			transferred = 0
+		}
+		if transferred > record.RewardQuota {
+			transferred = record.RewardQuota
+		}
+		canceled = record.RewardQuota - transferred
 	case AffiliateRewardStatusAvailable, "":
 		available = record.RewardQuota - record.TransferredQuota
 		if available < 0 {
@@ -472,6 +480,48 @@ func splitAffiliateRewardQuota(record AffiliateRewardRecord) (pending int, avail
 		transferred = record.TransferredQuota
 	}
 	return pending, available, transferred, canceled
+}
+
+func CancelAffiliateRewardRecord(recordId int, now int64) error {
+	if recordId == 0 {
+		return errors.New("affiliate reward record id is required")
+	}
+	if now <= 0 {
+		now = GetDBTimestamp()
+	}
+
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var record AffiliateRewardRecord
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&record, recordId).Error; err != nil {
+			return err
+		}
+		if record.Status == AffiliateRewardStatusCanceled {
+			if record.CanceledAt != 0 {
+				return nil
+			}
+			return tx.Model(&AffiliateRewardRecord{}).Where("id = ?", record.Id).Update("canceled_at", now).Error
+		}
+
+		remainingQuota := record.RewardQuota - record.TransferredQuota
+		if remainingQuota < 0 {
+			remainingQuota = 0
+		}
+		if record.Status == AffiliateRewardStatusAvailable || record.Status == "" {
+			if remainingQuota > 0 {
+				if err := tx.Model(&User{}).Where("id = ?", record.InviterId).Updates(map[string]interface{}{
+					"aff_quota":   gorm.Expr("CASE WHEN aff_quota >= ? THEN aff_quota - ? ELSE 0 END", remainingQuota, remainingQuota),
+					"aff_history": gorm.Expr("CASE WHEN aff_history >= ? THEN aff_history - ? ELSE 0 END", remainingQuota, remainingQuota),
+				}).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		return tx.Model(&AffiliateRewardRecord{}).Where("id = ?", record.Id).Updates(map[string]interface{}{
+			"status":      AffiliateRewardStatusCanceled,
+			"canceled_at": now,
+		}).Error
+	})
 }
 
 func SettleAvailableAffiliateRewards(inviterId int, now int64) (int, error) {

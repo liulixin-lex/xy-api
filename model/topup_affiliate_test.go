@@ -344,6 +344,47 @@ func TestInviteLinkBatchTopUpRewardCreatesPendingFirstAndContinuousRecords(t *te
 	assert.Equal(t, 1_400, secondRecord.RewardQuota)
 }
 
+func TestInviteLinkBatchTopUpRewardUsesCompletionTimeForAvailability(t *testing.T) {
+	truncateTables(t)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       52,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff52",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            53,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff53",
+		InviterId:                     52,
+		InviteLinkBatchId:             72,
+		InviteFirstTopupRewardPercent: 35,
+		InviteContinuousRewardPercent: 7,
+		InviteBoundAt:                 1_800_000_000,
+	})
+
+	completedAt := int64(1_900_000_000)
+	topUp := &TopUp{
+		Id:           703,
+		UserId:       53,
+		Amount:       10,
+		Status:       common.TopUpStatusPending,
+		CompleteTime: completedAt,
+	}
+	require.NoError(t, DB.Create(topUp).Error)
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, topUp, 10_000)
+		return err
+	}))
+
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 703}).First(&record).Error)
+	assert.Equal(t, completedAt+AffiliateRewardWaitSeconds, record.AvailableAt)
+}
+
 func TestInviteLinkBatchFirstTopUpRewardIsClaimedOnlyOnceBeforeTopUpStatusChanges(t *testing.T) {
 	truncateTables(t)
 	insertAffiliateRewardUser(t, &User{

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -223,4 +224,23 @@ func TestListInviteLinkBatchesWithStatsPutsActiveBatchFirst(t *testing.T) {
 	assert.Equal(t, 1, batches[1].Id)
 	assert.False(t, batches[1].IsValid)
 	assert.Equal(t, int64(0), batches[1].UsageCount)
+}
+
+func TestCreateInviteLinkBatchRejectsOversizedActivityDescription(t *testing.T) {
+	truncateTables(t)
+
+	err := CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:                    "Oversized",
+		Code:                    "oversized",
+		BaseLink:                "https://example.com/sign-up?invite_batch=oversized",
+		FirstTopupRewardPercent: 30,
+		ContinuousRewardPercent: 5,
+		StartTime:               1_800_000_000,
+		EndTime:                 1_800_086_400,
+		DescriptionMode:         InviteDescriptionModeCustom,
+		CustomDescription:       strings.Repeat("x", 16*1024+1),
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "activity description is too long")
 }

@@ -27,6 +27,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Trash2,
   Users,
 } from 'lucide-react'
 import * as React from 'react'
@@ -69,6 +70,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
+import { formatShanghaiTimestamp } from '@/features/invite-rewards/lib/activity-description'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -92,6 +94,12 @@ type AffiliateRewardSettingsSectionProps = {
 type SortDirection = 'asc' | 'desc'
 type BatchSortKey = 'id' | 'name' | 'ratio' | 'link' | 'usage' | 'period'
 type RelationSortKey = 'inviter' | 'invitee' | 'registered' | 'ratio' | 'reward'
+type PresetDetailForm = {
+  key: string
+  title: string
+  first_topup_reward_percent: number
+  continuous_reward_percent: number
+}
 type BatchForm = {
   id: number
   name: string
@@ -104,7 +112,7 @@ type BatchForm = {
   description_mode: 'preset' | 'custom'
   preset_title: string
   preset_summary: string
-  preset_details: string
+  preset_details: PresetDetailForm[]
   custom_description: string
   is_active: boolean
 }
@@ -131,7 +139,7 @@ const defaultBatchForm: BatchForm = {
   description_mode: 'preset',
   preset_title: '',
   preset_summary: '',
-  preset_details: '',
+  preset_details: [],
   custom_description: '',
   is_active: false,
 }
@@ -143,22 +151,36 @@ function formatShanghaiDateTimeInput(timestamp: number) {
 
 function parseShanghaiDateTimeInput(value: string) {
   if (!value.trim()) return 0
-  const normalized = value.length === 16 ? `${value}:00+08:00` : `${value}+08:00`
+  const normalized =
+    value.length === 16 ? `${value}:00+08:00` : `${value}+08:00`
   const parsed = Date.parse(normalized)
   if (Number.isNaN(parsed)) return 0
   return Math.floor(parsed / 1000)
 }
 
+function createPresetDetailForm(
+  title: string,
+  firstTopupRewardPercent: number,
+  continuousRewardPercent: number
+): PresetDetailForm {
+  return {
+    key:
+      globalThis.crypto?.randomUUID?.() ??
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    title,
+    first_topup_reward_percent: firstTopupRewardPercent,
+    continuous_reward_percent: continuousRewardPercent,
+  }
+}
+
 function buildPresetDescription(form: BatchForm) {
   const details = form.preset_details
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((title) => ({
-      title,
-      first_topup_reward_percent: form.first_topup_reward_percent,
-      continuous_reward_percent: form.continuous_reward_percent,
+    .map((detail) => ({
+      title: detail.title.trim(),
+      first_topup_reward_percent: Number(detail.first_topup_reward_percent),
+      continuous_reward_percent: Number(detail.continuous_reward_percent),
     }))
+    .filter((detail) => detail.title)
   return JSON.stringify({
     title: form.preset_title,
     summary: form.preset_summary,
@@ -168,24 +190,34 @@ function buildPresetDescription(form: BatchForm) {
 
 function parsePresetDescription(batch?: InviteLinkBatch) {
   if (!batch?.preset_description) {
-    return { title: '', summary: '', details: '' }
+    return { title: '', summary: '', details: [] as PresetDetailForm[] }
   }
   try {
     const parsed = JSON.parse(batch.preset_description) as {
       title?: string
       summary?: string
-      details?: Array<{ title?: string }>
+      details?: Array<{
+        title?: string
+        first_topup_reward_percent?: number
+        continuous_reward_percent?: number
+      }>
     }
     return {
       title: parsed.title ?? '',
       summary: parsed.summary ?? '',
       details: (parsed.details ?? [])
-        .map((detail) => detail.title ?? '')
-        .filter(Boolean)
-        .join('\n'),
+        .map((detail) =>
+          createPresetDetailForm(
+            detail.title ?? '',
+            detail.first_topup_reward_percent ??
+              batch.first_topup_reward_percent,
+            detail.continuous_reward_percent ?? batch.continuous_reward_percent
+          )
+        )
+        .filter((detail) => detail.title.trim()),
     }
   } catch {
-    return { title: '', summary: '', details: '' }
+    return { title: '', summary: '', details: [] as PresetDetailForm[] }
   }
 }
 
@@ -215,9 +247,7 @@ function SortableHeader<TSort extends string>(props: {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        render={
-          <Button variant='ghost' size='sm' className='-ms-3 h-8' />
-        }
+        render={<Button variant='ghost' size='sm' className='-ms-3 h-8' />}
       >
         <span>{props.label}</span>
         <ChevronsUpDown className='ms-2 size-3.5' />
@@ -263,11 +293,14 @@ function StatTile(props: {
   )
 }
 
-function contributionText(relation: AffiliateRewardRelation) {
+function contributionText(
+  relation: AffiliateRewardRelation,
+  t: (key: string) => string
+) {
   return [
-    formatQuota(relation.pending_reward_quota),
-    formatQuota(relation.available_reward_quota),
-    formatQuota(relation.canceled_reward_quota),
+    `${t('Pending Rewards')}: ${formatQuota(relation.pending_reward_quota)}`,
+    `${t('Available Rewards')}: ${formatQuota(relation.available_reward_quota)}`,
+    `${t('Canceled Rewards')}: ${formatQuota(relation.canceled_reward_quota)}`,
   ].join(' / ')
 }
 
@@ -402,6 +435,38 @@ export function AffiliateRewardSettingsSection(
         base_link: response.data?.base_link ?? current.base_link,
       }))
     }
+  }
+
+  function addPresetDetail() {
+    setForm((current) => ({
+      ...current,
+      preset_details: [
+        ...current.preset_details,
+        createPresetDetailForm(
+          '',
+          current.first_topup_reward_percent,
+          current.continuous_reward_percent
+        ),
+      ],
+    }))
+  }
+
+  function updatePresetDetail(index: number, patch: Partial<PresetDetailForm>) {
+    setForm((current) => ({
+      ...current,
+      preset_details: current.preset_details.map((detail, detailIndex) =>
+        detailIndex === index ? { ...detail, ...patch } : detail
+      ),
+    }))
+  }
+
+  function removePresetDetail(index: number) {
+    setForm((current) => ({
+      ...current,
+      preset_details: current.preset_details.filter(
+        (_detail, detailIndex) => detailIndex !== index
+      ),
+    }))
   }
 
   async function handleSave() {
@@ -593,7 +658,9 @@ export function AffiliateRewardSettingsSection(
                     key={batch.id}
                     className={cn(batch.is_active && 'bg-primary/5')}
                   >
-                    {!hiddenBatchColumns.id && <TableCell>{batch.id}</TableCell>}
+                    {!hiddenBatchColumns.id && (
+                      <TableCell>{batch.id}</TableCell>
+                    )}
                     {!hiddenBatchColumns.name && (
                       <TableCell>
                         <div className='flex min-w-0 flex-col gap-1'>
@@ -632,9 +699,9 @@ export function AffiliateRewardSettingsSection(
                     )}
                     {!hiddenBatchColumns.period && (
                       <TableCell className='min-w-[220px] text-xs'>
-                        <div>{formatTimestamp(batch.start_time)}</div>
+                        <div>{formatShanghaiTimestamp(batch.start_time)}</div>
                         <div className='text-muted-foreground'>
-                          {formatTimestamp(batch.end_time)}
+                          {formatShanghaiTimestamp(batch.end_time)}
                         </div>
                       </TableCell>
                     )}
@@ -839,7 +906,9 @@ export function AffiliateRewardSettingsSection(
                     </TableCell>
                   )}
                   {!hiddenRelationColumns.registered && (
-                    <TableCell>{formatTimestamp(relation.registered_at)}</TableCell>
+                    <TableCell>
+                      {formatTimestamp(relation.registered_at)}
+                    </TableCell>
                   )}
                   {!hiddenRelationColumns.ratio && (
                     <TableCell>
@@ -855,7 +924,7 @@ export function AffiliateRewardSettingsSection(
                         {formatQuota(relation.reward_quota)}
                       </div>
                       <div className='text-muted-foreground text-xs'>
-                        {contributionText(relation)}
+                        {contributionText(relation, t)}
                       </div>
                     </TableCell>
                   )}
@@ -870,7 +939,9 @@ export function AffiliateRewardSettingsSection(
         <SheetContent className='sm:max-w-[640px]'>
           <SheetHeader>
             <SheetTitle>
-              {form.id > 0 ? t('Edit Invitation Link') : t('Create Invitation Link')}
+              {form.id > 0
+                ? t('Edit Invitation Link')
+                : t('Create Invitation Link')}
             </SheetTitle>
           </SheetHeader>
           <div className='flex-1 space-y-4 overflow-y-auto px-4'>
@@ -879,12 +950,17 @@ export function AffiliateRewardSettingsSection(
               <Input
                 value={form.name}
                 onChange={(event) =>
-                  setForm((current) => ({ ...current, name: event.target.value }))
+                  setForm((current) => ({
+                    ...current,
+                    name: event.target.value,
+                  }))
                 }
               />
             </label>
             <label className='flex flex-col gap-2'>
-              <span className='text-sm font-medium'>{t('Base Invite Link')}</span>
+              <span className='text-sm font-medium'>
+                {t('Base Invite Link')}
+              </span>
               <div className='flex gap-2'>
                 <Input
                   value={form.base_link}
@@ -895,7 +971,11 @@ export function AffiliateRewardSettingsSection(
                     }))
                   }
                 />
-                <Button type='button' variant='outline' onClick={handleRandomLink}>
+                <Button
+                  type='button'
+                  variant='outline'
+                  onClick={handleRandomLink}
+                >
                   <RefreshCw data-icon='inline-start' />
                   {t('Random')}
                 </Button>
@@ -1012,16 +1092,78 @@ export function AffiliateRewardSettingsSection(
                     }))
                   }
                 />
-                <Textarea
-                  value={form.preset_details}
-                  placeholder={t('One activity detail per line')}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      preset_details: event.target.value,
-                    }))
-                  }
-                />
+                <div className='space-y-2'>
+                  <div className='flex items-center justify-between gap-2'>
+                    <span className='text-sm font-medium'>
+                      {t('Activity details')}
+                    </span>
+                    <Button
+                      type='button'
+                      variant='outline'
+                      size='sm'
+                      onClick={addPresetDetail}
+                    >
+                      <Plus data-icon='inline-start' />
+                      {t('Add detail')}
+                    </Button>
+                  </div>
+                  <div className='space-y-2'>
+                    {form.preset_details.map((detail, index) => (
+                      <div
+                        key={detail.key}
+                        className='grid gap-2 rounded-lg border p-3 md:grid-cols-[minmax(0,1fr)_110px_110px_32px]'
+                      >
+                        <Input
+                          value={detail.title}
+                          placeholder={t('Activity detail')}
+                          aria-label={t('Activity detail')}
+                          onChange={(event) =>
+                            updatePresetDetail(index, {
+                              title: event.target.value,
+                            })
+                          }
+                        />
+                        <Input
+                          type='number'
+                          min={0}
+                          max={100}
+                          value={detail.first_topup_reward_percent}
+                          aria-label={t('First Top-up Reward Ratio')}
+                          onChange={(event) =>
+                            updatePresetDetail(index, {
+                              first_topup_reward_percent: Number(
+                                event.target.value
+                              ),
+                            })
+                          }
+                        />
+                        <Input
+                          type='number'
+                          min={0}
+                          max={100}
+                          value={detail.continuous_reward_percent}
+                          aria-label={t('Subsequent Reward Ratio')}
+                          onChange={(event) =>
+                            updatePresetDetail(index, {
+                              continuous_reward_percent: Number(
+                                event.target.value
+                              ),
+                            })
+                          }
+                        />
+                        <Button
+                          type='button'
+                          variant='ghost'
+                          size='icon-sm'
+                          onClick={() => removePresetDetail(index)}
+                          aria-label={t('Remove detail')}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
             ) : (
               <Textarea

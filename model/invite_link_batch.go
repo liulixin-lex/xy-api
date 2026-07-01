@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -13,6 +14,8 @@ import (
 const (
 	InviteDescriptionModePreset = "preset"
 	InviteDescriptionModeCustom = "custom"
+
+	InviteLinkBatchDescriptionMaxLength = 16 * 1024
 )
 
 type InviteLinkBatch struct {
@@ -61,6 +64,14 @@ func (batch *InviteLinkBatch) Normalize() {
 	}
 }
 
+func (batch InviteLinkBatch) Validate() error {
+	if utf8.RuneCountInString(batch.PresetDescription) > InviteLinkBatchDescriptionMaxLength ||
+		utf8.RuneCountInString(batch.CustomDescription) > InviteLinkBatchDescriptionMaxLength {
+		return errors.New("activity description is too long")
+	}
+	return nil
+}
+
 func GenerateInviteLinkBatchCode() string {
 	return strings.ToLower(common.GetRandomString(10))
 }
@@ -99,6 +110,9 @@ func CreateInviteLinkBatch(batch *InviteLinkBatch) error {
 		return errors.New("invite link batch is nil")
 	}
 	batch.Normalize()
+	if err := batch.Validate(); err != nil {
+		return err
+	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		if batch.IsActive {
 			if err := tx.Model(&InviteLinkBatch{}).Where("is_active = ?", true).Update("is_active", false).Error; err != nil {
@@ -114,6 +128,9 @@ func UpdateInviteLinkBatch(batch *InviteLinkBatch) error {
 		return errors.New("invite link batch id is required")
 	}
 	batch.Normalize()
+	if err := batch.Validate(); err != nil {
+		return err
+	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var existing InviteLinkBatch
 		if err := tx.First(&existing, batch.Id).Error; err != nil {
