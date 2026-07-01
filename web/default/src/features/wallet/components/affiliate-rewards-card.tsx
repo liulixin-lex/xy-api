@@ -70,11 +70,11 @@ export function AffiliateRewardsCard({
           </div>
           <div className='min-w-0'>
             <h3 className='truncate text-sm font-semibold'>
-              {t('Invite Rebate Program')}
+              {t('Referral Rewards')}
             </h3>
             <p className='text-muted-foreground line-clamp-1 text-xs'>
               {t(
-                'Earn rebates when invited users add funds. Transfer accumulated rebates to your balance anytime.'
+                'Earn rewards when invited users add funds. Transfer accumulated rewards to your balance anytime.'
               )}
             </p>
           </div>
@@ -108,8 +108,8 @@ export function AffiliateRewardsCard({
             variant='outline'
             className='bg-background size-9 shrink-0'
             iconClassName='size-4'
-            tooltip={t('Copy rebate link')}
-            aria-label={t('Copy rebate link')}
+            tooltip={t('Copy referral link')}
+            aria-label={t('Copy referral link')}
           />
           {hasRewards && (
             <Button
@@ -125,7 +125,7 @@ export function AffiliateRewardsCard({
         {!complianceConfirmed ? (
           <p className='text-muted-foreground text-xs lg:col-span-3'>
             {t(
-              'Rebate transfer is disabled until the administrator confirms compliance terms.'
+              'Reward transfer is disabled until the administrator confirms compliance terms.'
             )}
           </p>
         ) : null}

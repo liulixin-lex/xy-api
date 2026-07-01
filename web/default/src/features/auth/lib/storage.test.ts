@@ -19,7 +19,14 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
 
-import { getAffiliateRule, saveAffiliateRule } from './storage'
+import {
+  getAffiliateCode,
+  getAffiliateRule,
+  getInviteBatchCode,
+  saveAffiliateCode,
+  saveAffiliateRule,
+  saveInviteBatchCode,
+} from './storage'
 
 const originalWindow = globalThis.window
 
@@ -63,5 +70,19 @@ describe('affiliate rule storage', () => {
     saveAffiliateRule('first_topup_10')
 
     assert.equal(getAffiliateRule(), 'first_topup')
+  })
+})
+
+describe('referral parameter storage', () => {
+  test('clears affiliate and invite batch values when saving empty strings', () => {
+    installLocalStorage()
+
+    saveAffiliateCode(' aff123 ')
+    saveInviteBatchCode(' spring ')
+    saveAffiliateCode('')
+    saveInviteBatchCode('')
+
+    assert.equal(getAffiliateCode(), '')
+    assert.equal(getInviteBatchCode(), '')
   })
 })

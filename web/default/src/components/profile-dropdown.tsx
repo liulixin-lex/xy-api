@@ -120,7 +120,7 @@ export function ProfileDropdown() {
               onClick={() => navigate({ to: '/invite-rewards' })}
             >
               <Gift className='size-4' />
-              {t('Invite Rewards')}
+              {t('Referral Rewards')}
             </DropdownMenuItem>
           )}
 

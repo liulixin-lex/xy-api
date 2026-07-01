@@ -190,7 +190,7 @@ const BILLING_SECTIONS = [
   },
   {
     id: 'affiliate-rewards',
-    titleKey: 'Affiliate Rebate Rates',
+    titleKey: 'Referral Reward Settings',
     build: (settings: BillingSettings) => (
       <AffiliateRewardSettingsSection
         defaultValues={{

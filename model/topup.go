@@ -718,13 +718,17 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 
 	var user User
 	if err := tx.Set("gorm:query_option", "FOR UPDATE").
-		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent").
+		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent", "invite_link_batch_id", "invite_first_topup_reward_percent", "invite_continuous_reward_percent").
 		Where("id = ?", topUp.UserId).
 		First(&user).Error; err != nil {
 		return 0, 0, err
 	}
 	if user.InviterId == 0 {
 		return 0, 0, nil
+	}
+
+	if user.InviteLinkBatchId > 0 {
+		return createInviteLinkBatchTopUpRewardTx(tx, topUp, user, quotaToAdd)
 	}
 
 	rule := NormalizeInviteRewardRule(user.InviteRewardRule)
@@ -734,6 +738,13 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 			return 0, 0, err
 		}
 		if successCount != 0 {
+			return 0, 0, nil
+		}
+		claimed, err := claimInviteFirstTopupRewardTx(tx, user.Id)
+		if err != nil {
+			return 0, 0, err
+		}
+		if !claimed {
 			return 0, 0, nil
 		}
 	}
@@ -752,6 +763,8 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 		InviteRewardPercent: rewardPercent,
 		TopUpQuota:          quotaToAdd,
 		RewardQuota:         reward,
+		Status:              AffiliateRewardStatusAvailable,
+		AvailableAt:         common.GetTimestamp(),
 		CreatedAt:           common.GetTimestamp(),
 	}).Error
 	if err != nil {
@@ -769,9 +782,64 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 	return user.InviterId, reward, nil
 }
 
+func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, quotaToAdd int) (int, int, error) {
+	rule := InviteRewardRuleContinuous
+	rewardPercent := normalizeRewardPercent(user.InviteContinuousRewardPercent)
+	now := common.GetTimestamp()
+
+	var successCount int64
+	if err := tx.Model(&TopUp{}).Where("user_id = ? AND status = ? AND amount > ?", user.Id, common.TopUpStatusSuccess, 0).Count(&successCount).Error; err != nil {
+		return 0, 0, err
+	}
+	if successCount == 0 {
+		claimed, err := claimInviteFirstTopupRewardTx(tx, user.Id)
+		if err != nil {
+			return 0, 0, err
+		}
+		if claimed {
+			rule = InviteRewardRuleFirstTopUp
+			rewardPercent = normalizeRewardPercent(user.InviteFirstTopupRewardPercent)
+		}
+	}
+
+	reward := quotaToAdd * rewardPercent / 100
+	if reward <= 0 {
+		return 0, 0, nil
+	}
+
+	err := tx.Create(&AffiliateRewardRecord{
+		InviterId:           user.InviterId,
+		InviteeId:           user.Id,
+		TopUpId:             topUp.Id,
+		InviteLinkBatchId:   user.InviteLinkBatchId,
+		InviteRewardRule:    rule,
+		InviteRewardPercent: rewardPercent,
+		TopUpQuota:          quotaToAdd,
+		RewardQuota:         reward,
+		Status:              AffiliateRewardStatusPending,
+		AvailableAt:         now + AffiliateRewardWaitSeconds,
+		CreatedAt:           now,
+	}).Error
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return user.InviterId, reward, nil
+}
+
+func claimInviteFirstTopupRewardTx(tx *gorm.DB, userId int) (bool, error) {
+	result := tx.Model(&User{}).
+		Where("id = ? AND invite_first_topup_rewarded_at = ?", userId, 0).
+		Update("invite_first_topup_rewarded_at", common.GetTimestamp())
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
 func recordAffiliateTopUpRewardLog(inviterId int, reward int) {
 	if inviterId == 0 || reward <= 0 {
 		return
 	}
-	RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户充值返利 %s", logger.LogQuota(reward)))
+	RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("推荐用户充值奖励 %s", logger.LogQuota(reward)))
 }

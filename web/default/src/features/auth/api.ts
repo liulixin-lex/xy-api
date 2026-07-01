@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
-import { getAffiliateCode, getAffiliateRule } from './lib/storage'
+import { getAffiliateRule } from './lib/storage'
 import type {
   LoginPayload,
   LoginResponse,
@@ -88,10 +88,17 @@ export async function githubOAuthStart(clientId: string, state: string) {
 
 // Get OAuth state for CSRF protection
 export async function getOAuthState(): Promise<string> {
-  const aff = getAffiliateCode()
+  const params = new URLSearchParams(window.location.search)
+  const aff = params.get('aff')?.trim() ?? ''
+  const inviteBatch = params.get('invite_batch')?.trim() ?? ''
   const affRule = getAffiliateRule()
+  const hasReferralParams = aff !== '' && inviteBatch !== ''
   const res = await api.get('/api/oauth/state', {
-    params: { aff, aff_rule: affRule || undefined },
+    params: {
+      aff: hasReferralParams ? aff : undefined,
+      aff_rule: hasReferralParams ? affRule || undefined : undefined,
+      invite_batch: hasReferralParams ? inviteBatch : undefined,
+    },
   })
   if (res.data?.success) return res.data.data
   return ''

@@ -146,7 +146,7 @@ func UpdateOption(c *gin.Context) {
 	case "payment_setting.affiliate_continuous_percent", "payment_setting.affiliate_first_topup_percent":
 		percent, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
 		if parseErr != nil || percent < 1 || percent > 100 {
-			common.ApiErrorMsg(c, "返利比例必须是 1 到 100 之间的整数")
+			common.ApiErrorMsg(c, "推荐奖励比例必须是 1 到 100 之间的整数")
 			return
 		}
 	default:

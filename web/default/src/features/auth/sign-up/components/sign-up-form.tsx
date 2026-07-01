@@ -48,8 +48,10 @@ import { useTurnstile } from '@/features/auth/hooks/use-turnstile'
 import {
   getAffiliateCode,
   getAffiliateRule,
+  getInviteBatchCode,
   saveAffiliateCode,
   saveAffiliateRule,
+  saveInviteBatchCode,
 } from '@/features/auth/lib/storage'
 import { useStatus } from '@/hooks/use-status'
 import { cn } from '@/lib/utils'
@@ -132,10 +134,23 @@ export function SignUpForm({
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
-    const aff = params.get('aff')?.trim()
-    if (aff) {
-      saveAffiliateCode(aff)
+    const hasAff = params.has('aff')
+    const hasInviteBatch = params.has('invite_batch')
+    const aff = params.get('aff')?.trim() ?? ''
+    const inviteBatch = params.get('invite_batch')?.trim() ?? ''
+    if (hasAff || hasInviteBatch) {
+      if (aff && inviteBatch) {
+        saveAffiliateCode(aff)
+        saveInviteBatchCode(inviteBatch)
+      } else {
+        saveAffiliateCode('')
+        saveInviteBatchCode('')
+      }
       saveAffiliateRule(params.get('aff_rule')?.trim() ?? '')
+    } else {
+      saveAffiliateCode('')
+      saveInviteBatchCode('')
+      saveAffiliateRule('')
     }
   }, [])
 
@@ -167,6 +182,7 @@ export function SignUpForm({
         email: data.email || undefined,
         verification_code: verificationCode || undefined,
         aff_code: getAffiliateCode(),
+        invite_batch: getInviteBatchCode() || undefined,
         invite_reward_rule: getAffiliateRule() || undefined,
         turnstile: turnstileToken,
       })

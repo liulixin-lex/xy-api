@@ -58,7 +58,13 @@ export type AffiliateRewardRelation = {
   invitee_display_name: string
   invite_reward_rule: 'continuous' | 'first_topup'
   invite_reward_percent: number
+  first_topup_reward_percent: number
+  continuous_reward_percent: number
   reward_quota: number
+  pending_reward_quota: number
+  available_reward_quota: number
+  transferred_reward_quota: number
+  canceled_reward_quota: number
   registered_at: number
 }
 
@@ -66,7 +72,51 @@ export type AffiliateRewardSummary = {
   inviter_count: number
   invitee_count: number
   total_reward_quota: number
+  pending_reward_quota: number
+  available_reward_quota: number
+  transferred_reward_quota: number
+  canceled_reward_quota: number
   relations: AffiliateRewardRelation[]
+}
+
+export type InviteLinkBatch = {
+  id: number
+  name: string
+  code: string
+  base_link: string
+  first_topup_reward_percent: number
+  continuous_reward_percent: number
+  start_time: number
+  end_time: number
+  description_mode: 'preset' | 'custom'
+  preset_description: string
+  custom_description: string
+  is_active: boolean
+  usage_count?: number
+  is_valid?: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type InviteLinkBatchResponse = {
+  success: boolean
+  message: string
+  data?: InviteLinkBatch
+}
+
+export type InviteLinkBatchListResponse = {
+  success: boolean
+  message: string
+  data?: InviteLinkBatch[]
+}
+
+export type InviteLinkBatchRandomResponse = {
+  success: boolean
+  message: string
+  data?: {
+    code: string
+    base_link: string
+  }
 }
 
 export type AffiliateRewardSummaryResponse = {

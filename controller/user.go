@@ -214,16 +214,24 @@ func Register(c *gin.Context) {
 		return
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	inviterId, _ := model.GetUserIdByAffCode(affCode)
+	inviterId := 0
+	binding, err := model.ResolveInviteLinkBinding(user.InviteBatchCode, affCode, common.GetTimestamp())
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
 	cleanUser := model.User{
 		Username:    user.Username,
 		Password:    user.Password,
 		DisplayName: user.Username,
-		InviterId:   inviterId,
 		InviteRewardRule: model.NormalizeInviteRewardRule(
 			user.InviteRewardRule,
 		),
 		Role: common.RoleCommonUser, // 明确设置角色为普通用户
+	}
+	if binding != nil {
+		inviterId = binding.InviterId
+		cleanUser.ApplyInviteLinkBinding(binding)
 	}
 	if common.EmailVerificationEnabled {
 		cleanUser.Email = user.Email

@@ -32,6 +32,7 @@ import { ThemeCustomizationProvider } from '@/context/theme-customization-provid
 import {
   saveAffiliateCode,
   saveAffiliateRule,
+  saveInviteBatchCode,
 } from '@/features/auth/lib/storage'
 import { GeneralError } from '@/features/errors/general-error'
 import { NotFoundError } from '@/features/errors/not-found-error'
@@ -44,9 +45,18 @@ function RootComponent() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
-    const aff = params.get('aff')?.trim()
-    if (aff) {
-      saveAffiliateCode(aff)
+    const hasAff = params.has('aff')
+    const hasInviteBatch = params.has('invite_batch')
+    const aff = params.get('aff')?.trim() ?? ''
+    const inviteBatch = params.get('invite_batch')?.trim() ?? ''
+    if (hasAff || hasInviteBatch) {
+      if (aff && inviteBatch) {
+        saveAffiliateCode(aff)
+        saveInviteBatchCode(inviteBatch)
+      } else {
+        saveAffiliateCode('')
+        saveInviteBatchCode('')
+      }
       saveAffiliateRule(params.get('aff_rule')?.trim() ?? '')
     }
   }, [])

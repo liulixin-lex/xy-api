@@ -24,8 +24,13 @@ func GenerateOAuthCode(c *gin.Context) {
 	session := sessions.Default(c)
 	state := common.GetRandomString(12)
 	affCode := c.Query("aff")
-	if affCode != "" {
+	inviteBatch := c.Query("invite_batch")
+	session.Delete("aff")
+	session.Delete("invite_batch")
+	session.Delete("aff_rule")
+	if affCode != "" && inviteBatch != "" {
 		session.Set("aff", affCode)
+		session.Set("invite_batch", inviteBatch)
 		session.Set("aff_rule", c.Query("aff_rule"))
 	}
 	session.Set("oauth_state", state)
@@ -263,14 +268,26 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	user.Role = common.RoleCommonUser
 	user.Status = common.UserStatusEnabled
 
-	// Handle affiliate code
+	// Handle referral link binding. Both batch code and affiliate code are required.
 	affCode := session.Get("aff")
+	inviteBatch := session.Get("invite_batch")
 	inviterId := 0
-	if affCode != nil {
-		inviterId, _ = model.GetUserIdByAffCode(affCode.(string))
+	if affCode != nil && inviteBatch != nil {
+		affCodeValue, affOk := affCode.(string)
+		inviteBatchValue, batchOk := inviteBatch.(string)
+		if affOk && batchOk {
+			binding, err := model.ResolveInviteLinkBinding(inviteBatchValue, affCodeValue, common.GetTimestamp())
+			if err != nil {
+				return nil, err
+			}
+			if binding != nil {
+				inviterId = binding.InviterId
+				user.ApplyInviteLinkBinding(binding)
+			}
+		}
 	}
 	user.InviteRewardRule = model.NormalizeInviteRewardRule("")
-	if inviterId != 0 {
+	if inviterId != 0 && user.InviteLinkBatchId == 0 {
 		if affRule := session.Get("aff_rule"); affRule != nil {
 			if rule, ok := affRule.(string); ok {
 				user.InviteRewardRule = model.NormalizeInviteRewardRule(rule)

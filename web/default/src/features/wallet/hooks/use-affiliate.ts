@@ -19,10 +19,9 @@ For commercial licensing, please contact support@quantumnous.com
 import { useState, useEffect, useCallback } from 'react'
 import i18next from 'i18next'
 import { toast } from 'sonner'
-import { getSelf } from '@/lib/api'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
-import { getAffiliateCode, transferAffiliateQuota } from '../api'
-import { generateAffiliateLink } from '../lib'
+import { getReferralRewards } from '@/features/invite-rewards/api'
+import { transferAffiliateQuota } from '../api'
 
 // ============================================================================
 // Affiliate Hook
@@ -35,20 +34,30 @@ export function useAffiliate() {
   const [transferring, setTransferring] = useState(false)
   const { copyToClipboard } = useCopyToClipboard()
 
-  // Fetch affiliate code
+  // Fetch referral reward link
   const fetchAffiliateCode = useCallback(async () => {
     try {
       setLoading(true)
-      const response = await getAffiliateCode()
+      const response = await getReferralRewards()
 
       if (response.success && response.data) {
-        setAffiliateCode(response.data)
-        const link = generateAffiliateLink(response.data)
-        setAffiliateLink(link)
+        try {
+          const origin =
+            typeof window === 'undefined' ? undefined : window.location.origin
+          const link = new URL(
+            response.data.invite_link,
+            origin
+          )
+          setAffiliateLink(origin ? link.toString() : response.data.invite_link)
+          setAffiliateCode(link.searchParams.get('aff') ?? '')
+        } catch {
+          setAffiliateLink(response.data.invite_link)
+          setAffiliateCode('')
+        }
       }
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.error('Failed to fetch affiliate code:', error)
+      console.error('Failed to fetch referral reward link:', error)
     } finally {
       setLoading(false)
     }
@@ -67,19 +76,19 @@ export function useAffiliate() {
 
       if (response.success) {
         toast.success(response.message || i18next.t('Transfer successful'))
-        await getSelf()
+        await fetchAffiliateCode()
         return true
       }
 
       toast.error(response.message || i18next.t('Transfer failed'))
       return false
-    } catch (_error) {
+    } catch {
       toast.error(i18next.t('Transfer failed'))
       return false
     } finally {
       setTransferring(false)
     }
-  }, [])
+  }, [fetchAffiliateCode])
 
   useEffect(() => {
     fetchAffiliateCode()

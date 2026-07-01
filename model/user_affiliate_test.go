@@ -86,12 +86,13 @@ func TestGetAffiliateRewardSummaryUsesBindingsAndRewardRecords(t *testing.T) {
 	require.NoError(t, DB.Create(&[]User{
 		{Id: 30, Username: "inviter-a", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff30"},
 		{Id: 31, Username: "inviter-b", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff31"},
-		{Id: 32, Username: "alice", Password: "secret", DisplayName: "Alice", Status: common.UserStatusEnabled, AffCode: "aff32", InviterId: 30, InviteRewardRule: InviteRewardRuleFirstTopUp, InviteRewardPercent: 30, CreatedAt: 100},
+		{Id: 32, Username: "alice", Password: "secret", DisplayName: "Alice", Status: common.UserStatusEnabled, AffCode: "aff32", InviterId: 30, InviteRewardRule: InviteRewardRuleFirstTopUp, InviteRewardPercent: 30, InviteLinkBatchId: 301, InviteFirstTopupRewardPercent: 35, InviteContinuousRewardPercent: 7, CreatedAt: 100},
 		{Id: 33, Username: "bob", Password: "secret", DisplayName: "Bob", Status: common.UserStatusEnabled, AffCode: "aff33", InviterId: 31, InviteRewardRule: InviteRewardRuleContinuous, InviteRewardPercent: 5, CreatedAt: 200},
 	}).Error)
 	require.NoError(t, DB.Create(&[]AffiliateRewardRecord{
-		{InviterId: 30, InviteeId: 32, TopUpId: 21, InviteRewardRule: InviteRewardRuleFirstTopUp, InviteRewardPercent: 30, TopUpQuota: 1000, RewardQuota: 300, CreatedAt: 300},
+		{InviterId: 30, InviteeId: 32, TopUpId: 21, InviteRewardRule: InviteRewardRuleFirstTopUp, InviteRewardPercent: 30, TopUpQuota: 1000, RewardQuota: 300, Status: AffiliateRewardStatusAvailable, CreatedAt: 300},
 		{InviterId: 31, InviteeId: 33, TopUpId: 22, InviteRewardRule: InviteRewardRuleContinuous, InviteRewardPercent: 5, TopUpQuota: 1000, RewardQuota: 50, CreatedAt: 400},
+		{InviterId: 30, InviteeId: 32, TopUpId: 23, InviteRewardRule: InviteRewardRuleContinuous, InviteRewardPercent: 5, TopUpQuota: 2000, RewardQuota: 100, Status: AffiliateRewardStatusPending, CreatedAt: 500},
 	}).Error)
 
 	summary, err := GetAffiliateRewardSummary(AffiliateRelationQuery{
@@ -102,12 +103,66 @@ func TestGetAffiliateRewardSummaryUsesBindingsAndRewardRecords(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), summary.InviterCount)
 	assert.Equal(t, int64(2), summary.InviteeCount)
-	assert.Equal(t, int64(350), summary.TotalRewardQuota)
+	assert.Equal(t, int64(450), summary.TotalRewardQuota)
+	assert.Equal(t, int64(100), summary.PendingRewardQuota)
+	assert.Equal(t, int64(350), summary.AvailableRewardQuota)
 	require.Len(t, summary.Relations, 1)
 	assert.Equal(t, "inviter-a", summary.Relations[0].InviterUsername)
 	assert.Equal(t, "alice", summary.Relations[0].InviteeUsername)
 	assert.Equal(t, InviteRewardRuleFirstTopUp, summary.Relations[0].InviteRewardRule)
 	assert.Equal(t, 30, summary.Relations[0].InviteRewardPercent)
-	assert.Equal(t, 300, summary.Relations[0].RewardQuota)
+	assert.Equal(t, 35, summary.Relations[0].FirstTopupRewardPercent)
+	assert.Equal(t, 7, summary.Relations[0].ContinuousRewardPercent)
+	assert.Equal(t, 400, summary.Relations[0].RewardQuota)
+	assert.Equal(t, 100, summary.Relations[0].PendingRewardQuota)
+	assert.Equal(t, 300, summary.Relations[0].AvailableRewardQuota)
 	assert.Equal(t, int64(100), summary.Relations[0].RegisteredAt)
+}
+
+func TestGetReferralRewardDashboardSettlesAndBuildsInviteLink(t *testing.T) {
+	truncateTables(t)
+	now := common.GetTimestamp()
+
+	require.NoError(t, DB.Create(&[]User{
+		{Id: 60, Username: "inviter", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff60"},
+		{Id: 61, Username: "alice", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff61", InviterId: 60, InviteLinkBatchId: 70, InviteFirstTopupRewardPercent: 35, InviteContinuousRewardPercent: 7, CreatedAt: now - 100},
+	}).Error)
+	require.NoError(t, DB.Create(&InviteLinkBatch{
+		Id:                      70,
+		Name:                    "Spring",
+		Code:                    "spring",
+		BaseLink:                "https://example.com/sign-up?invite_batch=spring",
+		FirstTopupRewardPercent: 35,
+		ContinuousRewardPercent: 7,
+		StartTime:               now - 60,
+		EndTime:                 now + 3600,
+		IsActive:                true,
+	}).Error)
+	require.NoError(t, DB.Create(&[]AffiliateRewardRecord{
+		{InviterId: 60, InviteeId: 61, TopUpId: 601, InviteLinkBatchId: 70, RewardQuota: 300, Status: AffiliateRewardStatusPending, AvailableAt: now + 60, CreatedAt: now - 10},
+		{InviterId: 60, InviteeId: 61, TopUpId: 602, InviteLinkBatchId: 70, RewardQuota: 200, Status: AffiliateRewardStatusPending, AvailableAt: now - 1, CreatedAt: now - 20},
+		{InviterId: 60, InviteeId: 61, TopUpId: 603, InviteLinkBatchId: 70, RewardQuota: 70, TransferredQuota: 70, Status: AffiliateRewardStatusTransferred, AvailableAt: now - 100, CreatedAt: now - 100},
+		{InviterId: 60, InviteeId: 61, TopUpId: 604, InviteLinkBatchId: 70, RewardQuota: 50, Status: AffiliateRewardStatusCanceled, AvailableAt: now - 100, CreatedAt: now - 100},
+	}).Error)
+
+	dashboard, err := GetReferralRewardDashboard(60, now)
+	require.NoError(t, err)
+	require.NotNil(t, dashboard.ActiveBatch)
+	assert.Equal(t, 70, dashboard.ActiveBatch.Id)
+	assert.Equal(t, "https://example.com/sign-up?aff=aff60&invite_batch=spring", dashboard.InviteLink)
+	assert.Equal(t, int64(300), dashboard.PendingRewardQuota)
+	assert.Equal(t, int64(200), dashboard.AvailableRewardQuota)
+	assert.Equal(t, int64(70), dashboard.TransferredRewardQuota)
+	assert.Equal(t, int64(50), dashboard.CanceledRewardQuota)
+	assert.Equal(t, int64(1), dashboard.InvitedUserCount)
+	require.Len(t, dashboard.InvitedUsers, 1)
+	assert.Equal(t, 35, dashboard.InvitedUsers[0].FirstTopupRewardPercent)
+	assert.Equal(t, 7, dashboard.InvitedUsers[0].ContinuousRewardPercent)
+	assert.Equal(t, 300, dashboard.InvitedUsers[0].PendingRewardQuota)
+	assert.Equal(t, 200, dashboard.InvitedUsers[0].AvailableRewardQuota)
+
+	inviter := User{}
+	require.NoError(t, DB.First(&inviter, 60).Error)
+	assert.Equal(t, 200, inviter.AffQuota)
+	assert.Equal(t, 200, inviter.AffHistoryQuota)
 }

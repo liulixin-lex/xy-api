@@ -110,7 +110,7 @@ export function useSidebarData(): SidebarData {
             icon: Wallet,
           },
           {
-            title: t('Invite Rewards'),
+            title: t('Referral Rewards'),
             url: '/invite-rewards',
             icon: Gift,
           },

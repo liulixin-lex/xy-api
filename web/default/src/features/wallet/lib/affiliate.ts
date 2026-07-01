@@ -20,18 +20,13 @@ For commercial licensing, please contact support@quantumnous.com
 // Affiliate Functions
 // ============================================================================
 
-/**
- * Generate affiliate registration link
- */
-export function generateAffiliateLink(
-  affCode: string,
-  rewardRule?: 'continuous' | 'first_topup' | 'first_topup_10'
-): string {
-  if (typeof window === 'undefined') return ''
-  const url = new URL('/sign-up', window.location.origin)
-  url.searchParams.set('aff', affCode)
-  if (rewardRule === 'first_topup' || rewardRule === 'first_topup_10') {
-    url.searchParams.set('aff_rule', 'first_topup')
+export function generateReferralLink(baseLink: string, affCode: string): string {
+  if (!baseLink || !affCode) return ''
+  try {
+    const url = new URL(baseLink, window.location.origin)
+    url.searchParams.set('aff', affCode)
+    return url.toString()
+  } catch {
+    return ''
   }
-  return url.toString()
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func withQuotaPerUnitForAffiliateTest(t *testing.T, quotaPerUnit float64) {
@@ -261,4 +262,238 @@ func TestFirstTopUpAffiliateRewardIgnoresSubscriptionTopUpRecords(t *testing.T) 
 	inviter := getAffiliateRewardUser(t, 30)
 	assert.Equal(t, 6000, inviter.AffQuota)
 	assert.Equal(t, 6000, inviter.AffHistoryQuota)
+}
+
+func TestInviteLinkBatchTopUpRewardCreatesPendingFirstAndContinuousRecords(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1000)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       50,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff50",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            51,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff51",
+		InviterId:                     50,
+		InviteLinkBatchId:             70,
+		InviteFirstTopupRewardPercent: 35,
+		InviteContinuousRewardPercent: 7,
+		InviteBoundAt:                 1_800_000_000,
+	})
+	firstTopUp := &TopUp{
+		Id:              701,
+		UserId:          51,
+		Amount:          10,
+		Money:           10,
+		TradeNo:         "batch-first-topup",
+		PaymentProvider: PaymentProviderWaffo,
+		Status:          common.TopUpStatusPending,
+		CreateTime:      time.Now().Unix(),
+	}
+	require.NoError(t, DB.Create(firstTopUp).Error)
+
+	before := common.GetTimestamp()
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, firstTopUp, 10_000)
+		return err
+	}))
+
+	inviter := getAffiliateRewardUser(t, 50)
+	assert.Equal(t, 0, inviter.AffQuota)
+	assert.Equal(t, 0, inviter.AffHistoryQuota)
+
+	var firstRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 701}).First(&firstRecord).Error)
+	assert.Equal(t, AffiliateRewardStatusPending, firstRecord.Status)
+	assert.Equal(t, InviteRewardRuleFirstTopUp, firstRecord.InviteRewardRule)
+	assert.Equal(t, 35, firstRecord.InviteRewardPercent)
+	assert.Equal(t, 10_000, firstRecord.TopUpQuota)
+	assert.Equal(t, 3_500, firstRecord.RewardQuota)
+	assert.GreaterOrEqual(t, firstRecord.AvailableAt, before+AffiliateRewardWaitSeconds)
+
+	require.NoError(t, DB.Model(&TopUp{}).Where("id = ?", 701).Updates(map[string]interface{}{
+		"status":        common.TopUpStatusSuccess,
+		"complete_time": common.GetTimestamp(),
+	}).Error)
+	secondTopUp := &TopUp{
+		Id:              702,
+		UserId:          51,
+		Amount:          20,
+		Money:           20,
+		TradeNo:         "batch-second-topup",
+		PaymentProvider: PaymentProviderWaffo,
+		Status:          common.TopUpStatusPending,
+		CreateTime:      time.Now().Unix(),
+	}
+	require.NoError(t, DB.Create(secondTopUp).Error)
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, secondTopUp, 20_000)
+		return err
+	}))
+
+	var secondRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 702}).First(&secondRecord).Error)
+	assert.Equal(t, AffiliateRewardStatusPending, secondRecord.Status)
+	assert.Equal(t, InviteRewardRuleContinuous, secondRecord.InviteRewardRule)
+	assert.Equal(t, 7, secondRecord.InviteRewardPercent)
+	assert.Equal(t, 1_400, secondRecord.RewardQuota)
+}
+
+func TestInviteLinkBatchFirstTopUpRewardIsClaimedOnlyOnceBeforeTopUpStatusChanges(t *testing.T) {
+	truncateTables(t)
+	insertAffiliateRewardUser(t, &User{
+		Id:       54,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff54",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            55,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff55",
+		InviterId:                     54,
+		InviteLinkBatchId:             88,
+		InviteFirstTopupRewardPercent: 35,
+		InviteContinuousRewardPercent: 7,
+		InviteBoundAt:                 1_800_000_000,
+	})
+	require.NoError(t, DB.Create(&[]TopUp{
+		{Id: 711, UserId: 55, Amount: 10, Money: 10, TradeNo: "batch-first-claim-1", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+		{Id: 712, UserId: 55, Amount: 20, Money: 20, TradeNo: "batch-first-claim-2", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+	}).Error)
+
+	firstTopUp := &TopUp{Id: 711, UserId: 55}
+	secondTopUp := &TopUp{Id: 712, UserId: 55}
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, firstTopUp, 10_000)
+		return err
+	}))
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, secondTopUp, 20_000)
+		return err
+	}))
+
+	var firstRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 711}).First(&firstRecord).Error)
+	assert.Equal(t, InviteRewardRuleFirstTopUp, firstRecord.InviteRewardRule)
+	assert.Equal(t, 3_500, firstRecord.RewardQuota)
+
+	var secondRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 712}).First(&secondRecord).Error)
+	assert.Equal(t, InviteRewardRuleContinuous, secondRecord.InviteRewardRule)
+	assert.Equal(t, 1_400, secondRecord.RewardQuota)
+}
+
+func TestTransferAffQuotaSettlesAvailableRewardsBeforeTransfer(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1)
+	now := common.GetTimestamp()
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       80,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff80",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:        81,
+		Username:  "invitee",
+		Status:    common.UserStatusEnabled,
+		AffCode:   "aff81",
+		InviterId: 80,
+	})
+	require.NoError(t, DB.Create(&[]AffiliateRewardRecord{
+		{
+			InviterId:           80,
+			InviteeId:           81,
+			TopUpId:             801,
+			InviteLinkBatchId:   1,
+			InviteRewardRule:    InviteRewardRuleFirstTopUp,
+			InviteRewardPercent: 30,
+			TopUpQuota:          1_000,
+			RewardQuota:         300,
+			Status:              AffiliateRewardStatusPending,
+			AvailableAt:         now + 60,
+			CreatedAt:           now,
+		},
+		{
+			InviterId:           80,
+			InviteeId:           81,
+			TopUpId:             802,
+			InviteLinkBatchId:   1,
+			InviteRewardRule:    InviteRewardRuleContinuous,
+			InviteRewardPercent: 10,
+			TopUpQuota:          2_000,
+			RewardQuota:         200,
+			Status:              AffiliateRewardStatusPending,
+			AvailableAt:         now - 1,
+			CreatedAt:           now,
+		},
+	}).Error)
+
+	inviter := getAffiliateRewardUser(t, 80)
+	require.NoError(t, inviter.TransferAffQuotaToQuota(200))
+
+	inviter = getAffiliateRewardUser(t, 80)
+	assert.Equal(t, 0, inviter.AffQuota)
+	assert.Equal(t, 200, inviter.AffHistoryQuota)
+	assert.Equal(t, 200, inviter.Quota)
+
+	var future AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 801}).First(&future).Error)
+	assert.Equal(t, AffiliateRewardStatusPending, future.Status)
+	assert.Equal(t, 0, future.TransferredQuota)
+
+	var available AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 802}).First(&available).Error)
+	assert.Equal(t, AffiliateRewardStatusTransferred, available.Status)
+	assert.Equal(t, 200, available.TransferredQuota)
+	assert.NotZero(t, available.TransferredAt)
+
+	err := inviter.TransferAffQuotaToQuota(1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "邀请额度不足")
+}
+
+func TestTransferAffQuotaMarksLegacyEmptyStatusRewardsAsTransferred(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 300)
+	insertAffiliateRewardUser(t, &User{
+		Id:              90,
+		Username:        "inviter",
+		Status:          common.UserStatusEnabled,
+		AffCode:         "aff90",
+		AffQuota:        300,
+		AffHistoryQuota: 300,
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:        91,
+		Username:  "invitee",
+		Status:    common.UserStatusEnabled,
+		AffCode:   "aff91",
+		InviterId: 90,
+	})
+	require.NoError(t, DB.Create(&AffiliateRewardRecord{
+		InviterId:   90,
+		InviteeId:   91,
+		TopUpId:     901,
+		RewardQuota: 300,
+		Status:      "",
+		CreatedAt:   common.GetTimestamp(),
+	}).Error)
+
+	inviter := getAffiliateRewardUser(t, 90)
+	err := inviter.TransferAffQuotaToQuota(300)
+
+	require.NoError(t, err)
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 901}).First(&record).Error)
+	assert.Equal(t, AffiliateRewardStatusTransferred, record.Status)
+	assert.Equal(t, 300, record.TransferredQuota)
 }

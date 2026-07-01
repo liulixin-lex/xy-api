@@ -23,5 +23,41 @@ export interface InvitedUser {
   created_at: number
   invite_reward_rule: 'continuous' | 'first_topup'
   invite_reward_percent: number
+  first_topup_reward_percent: number
+  continuous_reward_percent: number
   contribution_quota: number
+  pending_reward_quota: number
+  available_reward_quota: number
+  transferred_reward_quota: number
+  canceled_reward_quota: number
+}
+
+export interface InviteLinkBatch {
+  id: number
+  name: string
+  code: string
+  base_link: string
+  first_topup_reward_percent: number
+  continuous_reward_percent: number
+  start_time: number
+  end_time: number
+  description_mode: 'preset' | 'custom'
+  preset_description: string
+  custom_description: string
+  is_active: boolean
+  is_valid?: boolean
+  usage_count?: number
+  created_at: number
+  updated_at: number
+}
+
+export interface ReferralRewardDashboard {
+  active_batch?: InviteLinkBatch
+  invite_link: string
+  pending_reward_quota: number
+  available_reward_quota: number
+  transferred_reward_quota: number
+  canceled_reward_quota: number
+  invited_user_count: number
+  invited_users: InvitedUser[]
 }

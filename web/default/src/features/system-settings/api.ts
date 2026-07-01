@@ -22,6 +22,10 @@ import type {
   AffiliateRewardSummaryResponse,
   ConfirmPaymentComplianceResponse,
   FetchUpstreamRatiosRequest,
+  InviteLinkBatch,
+  InviteLinkBatchListResponse,
+  InviteLinkBatchRandomResponse,
+  InviteLinkBatchResponse,
   LogCleanupTask,
   SystemOptionsResponse,
   SystemTaskListResponse,
@@ -58,6 +62,46 @@ export async function getAffiliateRewardSummary(params?: {
   const res = await api.get<AffiliateRewardSummaryResponse>(
     '/api/option/affiliate_rewards',
     { params }
+  )
+  return res.data
+}
+
+export async function getInviteLinkBatches() {
+  const res = await api.get<InviteLinkBatchListResponse>(
+    '/api/option/invite_link_batches'
+  )
+  return res.data
+}
+
+export async function createInviteLinkBatch(request: Partial<InviteLinkBatch>) {
+  const res = await api.post<InviteLinkBatchResponse>(
+    '/api/option/invite_link_batches',
+    request
+  )
+  return res.data
+}
+
+export async function updateInviteLinkBatch(
+  id: number,
+  request: Partial<InviteLinkBatch>
+) {
+  const res = await api.put<InviteLinkBatchResponse>(
+    `/api/option/invite_link_batches/${id}`,
+    request
+  )
+  return res.data
+}
+
+export async function activateInviteLinkBatch(id: number) {
+  const res = await api.post<UpdateOptionResponse>(
+    `/api/option/invite_link_batches/${id}/active`
+  )
+  return res.data
+}
+
+export async function generateInviteLinkBatchRandomLink() {
+  const res = await api.get<InviteLinkBatchRandomResponse>(
+    '/api/option/invite_link_batches/random'
   )
   return res.data
 }

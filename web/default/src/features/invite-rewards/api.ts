@@ -19,9 +19,16 @@ For commercial licensing, please contact support@quantumnous.com
 import type { ApiResponse } from '@/features/wallet/types'
 import { api } from '@/lib/api'
 
-import type { InvitedUser } from './types'
+import type { InvitedUser, ReferralRewardDashboard } from './types'
 
 export async function getInvitedUsers(): Promise<ApiResponse<InvitedUser[]>> {
   const res = await api.get('/api/user/aff/invited')
+  return res.data
+}
+
+export async function getReferralRewards(): Promise<
+  ApiResponse<ReferralRewardDashboard>
+> {
+  const res = await api.get('/api/user/referral_rewards')
   return res.data
 }

@@ -19,6 +19,15 @@ func GetAffInvitedUsers(c *gin.Context) {
 	common.ApiSuccess(c, users)
 }
 
+func GetReferralRewards(c *gin.Context) {
+	dashboard, err := model.GetReferralRewardDashboard(c.GetInt("id"), common.GetTimestamp())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, dashboard)
+}
+
 func GetAdminAffiliateRewards(c *gin.Context) {
 	summary, err := model.GetAffiliateRewardSummary(model.AffiliateRelationQuery{
 		SearchField: c.Query("search_field"),

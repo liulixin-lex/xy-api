@@ -17,12 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import {
-  BadgePercent,
+  CheckCircle2,
+  Clock,
   Gift,
-  Repeat2,
+  Link2,
   Search,
-  Sparkles,
   Users,
+  XCircle,
 } from 'lucide-react'
 import {
   useCallback,
@@ -63,158 +64,50 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { getAffiliateCode, transferAffiliateQuota } from '@/features/wallet/api'
+import { transferAffiliateQuota } from '@/features/wallet/api'
 import { TransferDialog } from '@/features/wallet/components/dialogs/transfer-dialog'
 import { useTopupInfo } from '@/features/wallet/hooks'
-import { generateAffiliateLink } from '@/features/wallet/lib'
-import type { UserWalletData } from '@/features/wallet/types'
-import { getSelf } from '@/lib/api'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 
-import { getInvitedUsers } from './api'
-import type { InvitedUser } from './types'
+import { getReferralRewards } from './api'
+import type {
+  InviteLinkBatch,
+  InvitedUser,
+  ReferralRewardDashboard,
+} from './types'
 
-type RuleCardProps = {
+type PresetActivityDescription = {
   title: string
-  description: string
-  rate: number
-  link: string
+  summary: string
+  details: Array<{
+    title: string
+    first_topup_reward_percent?: number
+    continuous_reward_percent?: number
+  }>
+}
+
+type RewardMetricProps = {
+  label: string
+  value: string
   loading: boolean
-  tone: 'steady' | 'prime'
   icon: ComponentType<{ className?: string }>
 }
 
-function RewardRateBadge(props: { rate: number; tone: 'steady' | 'prime' }) {
-  return (
-    <span
-      className={`inline-flex min-w-16 items-center justify-center rounded-lg border px-3 py-1.5 text-base font-semibold tabular-nums ${
-        props.tone === 'prime'
-          ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-      }`}
-    >
-      {props.rate}%
-    </span>
-  )
-}
-
-function RuleCard(props: RuleCardProps) {
-  const { t } = useTranslation()
-  const Icon = props.icon
-
-  return (
-    <Card data-card-hover='false' className='gap-0 py-0'>
-      <CardHeader className='border-b p-4 !pb-4'>
-        <div className='flex items-start justify-between gap-3'>
-          <div className='flex min-w-0 items-start gap-3'>
-            <div className='bg-muted flex size-9 shrink-0 items-center justify-center rounded-lg'>
-              <Icon className='text-muted-foreground size-4' />
-            </div>
-            <div className='min-w-0'>
-              <CardTitle className='text-base'>{props.title}</CardTitle>
-              <CardDescription className='mt-1 text-sm'>
-                {props.description}
-              </CardDescription>
-            </div>
-          </div>
-          <RewardRateBadge rate={props.rate} tone={props.tone} />
-        </div>
-      </CardHeader>
-      <CardContent className='p-4'>
-        {props.loading ? (
-          <Skeleton className='h-10 rounded-lg' />
-        ) : (
-          <div className='flex items-center gap-2'>
-            <Input
-              value={props.link}
-              readOnly
-              className='min-w-0 flex-1 font-mono text-xs'
-            />
-            <CopyButton
-              value={props.link}
-              variant='outline'
-              tooltip={t('Copy rebate link')}
-              aria-label={t('Copy rebate link')}
-            />
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-type SummaryCardProps = {
-  user: UserWalletData | null
+type ReferralSummaryCardProps = {
+  dashboard: ReferralRewardDashboard | null
   loading: boolean
   complianceConfirmed: boolean
   onTransfer: () => void
 }
 
-function SummaryCard(props: SummaryCardProps) {
-  const { t } = useTranslation()
-  const stats = [
-    {
-      label: t('Pending Balance'),
-      value: formatQuota(props.user?.aff_quota ?? 0),
-    },
-    {
-      label: t('Total Income'),
-      value: formatQuota(props.user?.aff_history_quota ?? 0),
-    },
-    {
-      label: t('Invited Users'),
-      value: String(props.user?.aff_count ?? 0),
-    },
-  ]
-  const hasRewards = (props.user?.aff_quota ?? 0) > 0
+type ActivityCardProps = {
+  batch?: InviteLinkBatch
+  loading: boolean
+}
 
-  return (
-    <Card data-card-hover='false' className='gap-0 py-0'>
-      <CardHeader className='border-b p-4 !pb-4'>
-        <div className='flex flex-wrap items-center justify-between gap-3'>
-          <div className='min-w-0'>
-            <CardTitle className='text-base'>{t('Rebate Summary')}</CardTitle>
-            <CardDescription className='mt-1 text-sm'>
-              {t('Track rebates and move pending rebates to your balance.')}
-            </CardDescription>
-          </div>
-          <Button
-            onClick={props.onTransfer}
-            disabled={!hasRewards || !props.complianceConfirmed}
-            size='sm'
-          >
-            <Gift data-icon='inline-start' />
-            {t('Transfer to Balance')}
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent className='p-4'>
-        <div className='grid gap-3 sm:grid-cols-3'>
-          {stats.map((stat) => (
-            <div key={stat.label} className='rounded-lg border p-3'>
-              <div className='text-muted-foreground text-xs font-medium'>
-                {stat.label}
-              </div>
-              {props.loading ? (
-                <Skeleton className='mt-2 h-6 w-24' />
-              ) : (
-                <div className='mt-2 truncate text-lg font-semibold tabular-nums'>
-                  {stat.value}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-        {!props.complianceConfirmed ? (
-          <p className='text-muted-foreground mt-3 text-sm'>
-            {t(
-              'Rebate transfer is disabled until the administrator confirms compliance terms.'
-            )}
-          </p>
-        ) : null}
-      </CardContent>
-    </Card>
-  )
+type ReferralLinkCardProps = {
+  dashboard: ReferralRewardDashboard | null
+  loading: boolean
 }
 
 type InvitedUsersTableProps = {
@@ -226,9 +119,14 @@ type InvitedUsersSearchField =
   | 'all'
   | 'username'
   | 'display_name'
-  | 'invite_type'
   | 'reward_rate'
-  | 'contribution_quota'
+  | 'reward_quota'
+
+const defaultPresetActivityDescription: PresetActivityDescription = {
+  title: '',
+  summary: '',
+  details: [],
+}
 
 const invitedUsersSkeletonRows = [
   'invite-row-1',
@@ -244,13 +142,336 @@ const invitedUsersSearchFields: Array<{
   { value: 'all', labelKey: 'All columns' },
   { value: 'username', labelKey: 'Username' },
   { value: 'display_name', labelKey: 'Display Name' },
-  { value: 'invite_type', labelKey: 'Invite Type' },
-  { value: 'reward_rate', labelKey: 'Rebate Rate' },
-  { value: 'contribution_quota', labelKey: 'Contribution Amount' },
+  { value: 'reward_rate', labelKey: 'Reward Ratio' },
+  { value: 'reward_quota', labelKey: 'Reward Amount' },
 ]
 
-function getInviteTypeLabel(rule: InvitedUser['invite_reward_rule']) {
-  return rule === 'first_topup' ? 'First Top-up Rebate' : 'Continuous Rebate'
+function parsePresetActivityDescription(
+  batch?: InviteLinkBatch
+): PresetActivityDescription {
+  if (!batch?.preset_description) return defaultPresetActivityDescription
+  try {
+    const parsed = JSON.parse(batch.preset_description) as {
+      title?: string
+      summary?: string
+      details?: Array<{
+        title?: string
+        first_topup_reward_percent?: number
+        continuous_reward_percent?: number
+      }>
+    }
+    return {
+      title: parsed.title ?? '',
+      summary: parsed.summary ?? '',
+      details: (parsed.details ?? [])
+        .map((detail) => ({
+          title: detail.title ?? '',
+          first_topup_reward_percent: detail.first_topup_reward_percent,
+          continuous_reward_percent: detail.continuous_reward_percent,
+        }))
+        .filter((detail) => detail.title.trim()),
+    }
+  } catch {
+    return defaultPresetActivityDescription
+  }
+}
+
+function toShareableReferralLink(link: string) {
+  if (!link || typeof window === 'undefined') return link
+  try {
+    return new URL(link, window.location.origin).toString()
+  } catch {
+    return link
+  }
+}
+
+function RewardRatePair(props: { first: number; continuous: number }) {
+  const { t } = useTranslation()
+
+  return (
+    <div className='flex flex-wrap gap-2'>
+      <span className='inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300'>
+        <span className='text-[11px]'>{t('First Top-up')}</span>
+        <span className='tabular-nums'>{props.first}%</span>
+      </span>
+      <span className='inline-flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300'>
+        <span className='text-[11px]'>{t('Subsequent')}</span>
+        <span className='tabular-nums'>{props.continuous}%</span>
+      </span>
+    </div>
+  )
+}
+
+function RewardMetric(props: RewardMetricProps) {
+  const Icon = props.icon
+
+  return (
+    <div className='rounded-lg border p-3'>
+      <div className='text-muted-foreground flex items-center gap-2 text-xs font-medium'>
+        <Icon className='size-3.5' />
+        {props.label}
+      </div>
+      {props.loading ? (
+        <Skeleton className='mt-2 h-6 w-24' />
+      ) : (
+        <div className='mt-2 truncate text-lg font-semibold tabular-nums'>
+          {props.value}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TrustedActivityHtml(props: { html: string }) {
+  return (
+    <div
+      className='text-foreground/90 [&_a]:text-primary [&_a]:underline [&_li]:my-1 [&_ol]:list-decimal [&_ol]:ps-5 [&_p]:my-2 [&_ul]:list-disc [&_ul]:ps-5'
+      dangerouslySetInnerHTML={{ __html: props.html }}
+    />
+  )
+}
+
+function ActivityCard(props: ActivityCardProps) {
+  const { t } = useTranslation()
+  const preset = useMemo(
+    () => parsePresetActivityDescription(props.batch),
+    [props.batch]
+  )
+  const customDescription = props.batch?.custom_description.trim() ?? ''
+  const showCustom =
+    props.batch?.description_mode === 'custom' && customDescription !== ''
+
+  if (props.loading) {
+    return (
+      <Card data-card-hover='false' className='gap-0 py-0'>
+        <CardHeader className='border-b p-4 !pb-4'>
+          <Skeleton className='h-5 w-40' />
+          <Skeleton className='h-4 w-72' />
+        </CardHeader>
+        <CardContent className='space-y-2 p-4'>
+          <Skeleton className='h-4 w-full' />
+          <Skeleton className='h-4 w-5/6' />
+          <Skeleton className='h-4 w-2/3' />
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (!props.batch) {
+    return (
+      <Card data-card-hover='false' className='gap-0 py-0'>
+        <CardContent className='p-0'>
+          <Empty className='py-10'>
+            <EmptyHeader>
+              <EmptyMedia variant='icon'>
+                <Link2 />
+              </EmptyMedia>
+              <EmptyTitle>{t('No active referral activity')}</EmptyTitle>
+              <EmptyDescription>
+                {t(
+                  'The referral link will appear here after an administrator publishes an active activity.'
+                )}
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </CardContent>
+      </Card>
+    )
+  }
+  const batch = props.batch
+  let activityContent = (
+    <p className='text-muted-foreground text-sm'>
+      {t('No activity description has been configured.')}
+    </p>
+  )
+  if (showCustom) {
+    activityContent = <TrustedActivityHtml html={customDescription} />
+  } else if (preset.details.length > 0) {
+    activityContent = (
+      <div className='grid gap-2 sm:grid-cols-2'>
+        {preset.details.map((detail) => (
+          <div key={detail.title} className='rounded-lg border p-3'>
+            <div className='text-sm font-medium'>{detail.title}</div>
+            <div className='mt-2'>
+              <RewardRatePair
+                first={
+                  detail.first_topup_reward_percent ??
+                  batch.first_topup_reward_percent
+                }
+                continuous={
+                  detail.continuous_reward_percent ??
+                  batch.continuous_reward_percent
+                }
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <Card data-card-hover='false' className='gap-0 py-0'>
+      <CardHeader className='border-b p-4 !pb-4'>
+        <div className='flex flex-wrap items-start justify-between gap-3'>
+          <div className='min-w-0'>
+            <div className='flex flex-wrap items-center gap-2'>
+              <CardTitle className='text-base'>
+                {preset.title || batch.name}
+              </CardTitle>
+              <Badge variant='secondary'>{t('Active')}</Badge>
+            </div>
+            <CardDescription className='mt-1 text-sm'>
+              {preset.summary ||
+                t('Invite users with your referral link and earn rewards.')}
+            </CardDescription>
+          </div>
+          <RewardRatePair
+            first={batch.first_topup_reward_percent}
+            continuous={batch.continuous_reward_percent}
+          />
+        </div>
+      </CardHeader>
+      <CardContent className='p-4'>{activityContent}</CardContent>
+    </Card>
+  )
+}
+
+function ReferralLinkCard(props: ReferralLinkCardProps) {
+  const { t } = useTranslation()
+  const link = toShareableReferralLink(props.dashboard?.invite_link ?? '')
+  const activeBatch = props.dashboard?.active_batch
+
+  return (
+    <Card data-card-hover='false' className='gap-0 py-0'>
+      <CardHeader className='border-b p-4 !pb-4'>
+        <CardTitle className='text-base'>{t('Referral Link')}</CardTitle>
+        <CardDescription className='mt-1 text-sm'>
+          {t('Share this link so new users are bound to the active reward activity.')}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className='space-y-4 p-4'>
+        {props.loading ? (
+          <Skeleton className='h-10 rounded-lg' />
+        ) : (
+          <div className='flex items-center gap-2'>
+            <Input
+              value={link}
+              readOnly
+              placeholder={t('No active referral link')}
+              className='min-w-0 flex-1 font-mono text-xs'
+            />
+            {link ? (
+              <CopyButton
+                value={link}
+                variant='outline'
+                tooltip={t('Copy referral link')}
+                aria-label={t('Copy referral link')}
+              />
+            ) : (
+              <Button
+                variant='outline'
+                size='icon'
+                disabled
+                aria-label={t('Copy referral link')}
+              >
+                <Link2 />
+              </Button>
+            )}
+          </div>
+        )}
+        <div className='flex flex-wrap items-center gap-3'>
+          <RewardRatePair
+            first={activeBatch?.first_topup_reward_percent ?? 0}
+            continuous={activeBatch?.continuous_reward_percent ?? 0}
+          />
+          {activeBatch ? (
+            <span className='text-muted-foreground text-xs'>
+              {formatTimestamp(activeBatch.start_time)} -{' '}
+              {formatTimestamp(activeBatch.end_time)}
+            </span>
+          ) : null}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ReferralSummaryCard(props: ReferralSummaryCardProps) {
+  const { t } = useTranslation()
+  const dashboard = props.dashboard
+  const availableQuota = dashboard?.available_reward_quota ?? 0
+  const hasAvailableRewards = availableQuota > 0
+  const stats = [
+    {
+      label: t('Pending Rewards'),
+      value: formatQuota(dashboard?.pending_reward_quota ?? 0),
+      icon: Clock,
+    },
+    {
+      label: t('Available Rewards'),
+      value: formatQuota(availableQuota),
+      icon: CheckCircle2,
+    },
+    {
+      label: t('Transferred Rewards'),
+      value: formatQuota(dashboard?.transferred_reward_quota ?? 0),
+      icon: Gift,
+    },
+    {
+      label: t('Canceled Rewards'),
+      value: formatQuota(dashboard?.canceled_reward_quota ?? 0),
+      icon: XCircle,
+    },
+    {
+      label: t('Invited Users'),
+      value: String(dashboard?.invited_user_count ?? 0),
+      icon: Users,
+    },
+  ]
+
+  return (
+    <Card data-card-hover='false' className='gap-0 py-0'>
+      <CardHeader className='border-b p-4 !pb-4'>
+        <div className='flex flex-wrap items-center justify-between gap-3'>
+          <div className='min-w-0'>
+            <CardTitle className='text-base'>{t('Reward Summary')}</CardTitle>
+            <CardDescription className='mt-1 text-sm'>
+              {t('Pending rewards become available after the reward waiting period.')}
+            </CardDescription>
+          </div>
+          <Button
+            onClick={props.onTransfer}
+            disabled={!hasAvailableRewards || !props.complianceConfirmed}
+            size='sm'
+          >
+            <Gift data-icon='inline-start' />
+            {t('Transfer to Balance')}
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className='space-y-3 p-4'>
+        <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-5'>
+          {stats.map((stat) => (
+            <RewardMetric
+              key={stat.label}
+              label={stat.label}
+              value={stat.value}
+              loading={props.loading}
+              icon={stat.icon}
+            />
+          ))}
+        </div>
+        {!props.complianceConfirmed ? (
+          <p className='text-muted-foreground text-sm'>
+            {t(
+              'Reward transfer is disabled until the administrator confirms compliance terms.'
+            )}
+          </p>
+        ) : null}
+      </CardContent>
+    </Card>
+  )
 }
 
 function matchesInvitedUserSearch(
@@ -261,20 +482,24 @@ function matchesInvitedUserSearch(
   const normalizedSearch = search.trim().toLowerCase()
   if (!normalizedSearch) return true
 
-  const typeLabel = getInviteTypeLabel(user.invite_reward_rule).toLowerCase()
+  const rewardRates = [
+    String(user.first_topup_reward_percent),
+    String(user.continuous_reward_percent),
+    String(user.invite_reward_percent),
+  ]
+  const rewardAmounts = [
+    String(user.contribution_quota),
+    String(user.pending_reward_quota),
+    String(user.available_reward_quota),
+    String(user.transferred_reward_quota),
+    String(user.canceled_reward_quota),
+  ]
   const values: Record<InvitedUsersSearchField, string[]> = {
-    all: [
-      user.username,
-      user.display_name,
-      typeLabel,
-      String(user.invite_reward_percent),
-      String(user.contribution_quota),
-    ],
+    all: [user.username, user.display_name, ...rewardRates, ...rewardAmounts],
     username: [user.username],
     display_name: [user.display_name],
-    invite_type: [typeLabel, user.invite_reward_rule],
-    reward_rate: [String(user.invite_reward_percent)],
-    contribution_quota: [String(user.contribution_quota)],
+    reward_rate: rewardRates,
+    reward_quota: rewardAmounts,
   }
 
   return values[field].some((value) =>
@@ -286,17 +511,13 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
   const { t } = useTranslation()
   const [searchField, setSearchField] = useState<InvitedUsersSearchField>('all')
   const [search, setSearch] = useState('')
-  const [inviteType, setInviteType] = useState('')
 
   const filteredUsers = useMemo(
     () =>
-      props.users.filter((user) => {
-        if (inviteType && user.invite_reward_rule !== inviteType) {
-          return false
-        }
-        return matchesInvitedUserSearch(user, searchField, search)
-      }),
-    [inviteType, props.users, search, searchField]
+      props.users.filter((user) =>
+        matchesInvitedUserSearch(user, searchField, search)
+      ),
+    [props.users, search, searchField]
   )
 
   if (props.loading) {
@@ -321,9 +542,10 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
         <TableRow>
           <TableHead>{t('Username')}</TableHead>
           <TableHead>{t('Registered At')}</TableHead>
-          <TableHead>{t('Rebate Rate')}</TableHead>
-          <TableHead>{t('Invite Type')}</TableHead>
-          <TableHead>{t('Contribution Amount')}</TableHead>
+          <TableHead>{t('Reward Ratio')}</TableHead>
+          <TableHead>{t('Pending Rewards')}</TableHead>
+          <TableHead>{t('Available Rewards')}</TableHead>
+          <TableHead>{t('Transferred Rewards')}</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -339,19 +561,21 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
             </TableCell>
             <TableCell>{formatTimestamp(user.created_at)}</TableCell>
             <TableCell>
-              <RewardRateBadge
-                rate={user.invite_reward_percent}
-                tone={
-                  user.invite_reward_rule === 'first_topup' ? 'prime' : 'steady'
-                }
+              <RewardRatePair
+                first={user.first_topup_reward_percent}
+                continuous={user.continuous_reward_percent}
               />
             </TableCell>
+            <TableCell>{formatQuota(user.pending_reward_quota)}</TableCell>
+            <TableCell>{formatQuota(user.available_reward_quota)}</TableCell>
             <TableCell>
-              <Badge variant='secondary'>
-                {t(getInviteTypeLabel(user.invite_reward_rule))}
-              </Badge>
+              <div>{formatQuota(user.transferred_reward_quota)}</div>
+              {user.canceled_reward_quota > 0 ? (
+                <div className='text-muted-foreground text-xs'>
+                  {t('Canceled')}: {formatQuota(user.canceled_reward_quota)}
+                </div>
+              ) : null}
             </TableCell>
-            <TableCell>{formatQuota(user.contribution_quota)}</TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -367,7 +591,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
           </EmptyMedia>
           <EmptyTitle>{t('No invited users yet')}</EmptyTitle>
           <EmptyDescription>
-            {t('Share either rebate link to start earning rebates.')}
+            {t('Share your referral link to start building rewards.')}
           </EmptyDescription>
         </EmptyHeader>
       </Empty>
@@ -387,7 +611,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
           <div>
             <CardTitle className='text-base'>{t('Invited Users')}</CardTitle>
             <CardDescription className='mt-1 text-sm'>
-              {t('Users who registered through your rebate links.')}
+              {t('Users who registered through your referral link.')}
             </CardDescription>
           </div>
           <div className='flex flex-col gap-2 lg:flex-row lg:items-center'>
@@ -413,23 +637,6 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
                 className='pl-8'
               />
             </div>
-            <div className='grid grid-cols-3 gap-2 lg:flex lg:shrink-0'>
-              {[
-                { value: '', labelKey: 'All' },
-                { value: 'continuous', labelKey: 'Continuous Rebate' },
-                { value: 'first_topup', labelKey: 'First Top-up Rebate' },
-              ].map((option) => (
-                <Button
-                  key={option.value}
-                  type='button'
-                  variant={inviteType === option.value ? 'default' : 'outline'}
-                  size='sm'
-                  onClick={() => setInviteType(option.value)}
-                >
-                  {t(option.labelKey)}
-                </Button>
-              ))}
-            </div>
           </div>
         </div>
       </CardHeader>
@@ -440,9 +647,9 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
 
 export function InviteRewards() {
   const { t } = useTranslation()
-  const [user, setUser] = useState<UserWalletData | null>(null)
-  const [affiliateCode, setAffiliateCode] = useState('')
-  const [invitedUsers, setInvitedUsers] = useState<InvitedUser[]>([])
+  const [dashboard, setDashboard] = useState<ReferralRewardDashboard | null>(
+    null
+  )
   const [loading, setLoading] = useState(true)
   const [transferDialogOpen, setTransferDialogOpen] = useState(false)
   const [transferring, setTransferring] = useState(false)
@@ -451,23 +658,13 @@ export function InviteRewards() {
   const fetchInviteRewards = useCallback(async () => {
     try {
       setLoading(true)
-      const [selfResponse, codeResponse, invitedResponse] = await Promise.all([
-        getSelf(),
-        getAffiliateCode(),
-        getInvitedUsers(),
-      ])
-      if (selfResponse.success && selfResponse.data) {
-        setUser(selfResponse.data as UserWalletData)
-      }
-      if (codeResponse.success && codeResponse.data) {
-        setAffiliateCode(codeResponse.data)
-      }
-      if (invitedResponse.success && invitedResponse.data) {
-        setInvitedUsers(invitedResponse.data)
+      const response = await getReferralRewards()
+      if (response.success && response.data) {
+        setDashboard(response.data)
       }
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.error('Failed to load invite rewards:', error)
+      console.error('Failed to load referral rewards:', error)
     } finally {
       setLoading(false)
     }
@@ -477,17 +674,8 @@ export function InviteRewards() {
     fetchInviteRewards()
   }, [fetchInviteRewards])
 
-  const continuousLink = useMemo(
-    () => generateAffiliateLink(affiliateCode, 'continuous'),
-    [affiliateCode]
-  )
-  const firstTopUpLink = useMemo(
-    () => generateAffiliateLink(affiliateCode, 'first_topup'),
-    [affiliateCode]
-  )
   const complianceConfirmed = topupInfo?.payment_compliance_confirmed !== false
-  const continuousPercent = topupInfo?.affiliate_continuous_percent ?? 5
-  const firstTopupPercent = topupInfo?.affiliate_first_topup_percent ?? 30
+  const availableQuota = dashboard?.available_reward_quota ?? 0
 
   const handleTransfer = async (amount: number) => {
     try {
@@ -511,62 +699,21 @@ export function InviteRewards() {
   return (
     <>
       <SectionPageLayout>
-        <SectionPageLayout.Title>{t('Invite Rebates')}</SectionPageLayout.Title>
+        <SectionPageLayout.Title>{t('Referral Rewards')}</SectionPageLayout.Title>
         <SectionPageLayout.Content>
           <div className='mx-auto flex w-full max-w-7xl flex-col gap-4 sm:gap-5'>
-            <Card data-card-hover='false' className='gap-0 py-0'>
-              <CardHeader className='border-b p-4 !pb-4'>
-                <div className='flex items-start gap-3'>
-                  <div className='bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-lg'>
-                    <Sparkles className='size-4' />
-                  </div>
-                  <div className='min-w-0'>
-                    <CardTitle className='text-base'>
-                      {t('Invite Rebate Program')}
-                    </CardTitle>
-                    <CardDescription className='mt-1 text-sm'>
-                      {t(
-                        'Earn rebates when invited users add funds. Transfer accumulated rebates to your balance anytime.'
-                      )}
-                    </CardDescription>
-                  </div>
-                </div>
-              </CardHeader>
-            </Card>
-
-            <div className='grid gap-4 lg:grid-cols-2'>
-              <RuleCard
-                title={t('Continuous Rebate')}
-                description={t(
-                  'Earn from every future top-up made by users registered through this link.'
-                )}
-                rate={continuousPercent}
-                link={continuousLink}
-                loading={loading}
-                tone='steady'
-                icon={Repeat2}
-              />
-              <RuleCard
-                title={t('First Top-up Rebate')}
-                description={t(
-                  'Earn from the first successful top-up made by users registered through this link.'
-                )}
-                rate={firstTopupPercent}
-                link={firstTopUpLink}
-                loading={loading}
-                tone='prime'
-                icon={BadgePercent}
-              />
-            </div>
-
-            <SummaryCard
-              user={user}
+            <ActivityCard batch={dashboard?.active_batch} loading={loading} />
+            <ReferralLinkCard dashboard={dashboard} loading={loading} />
+            <ReferralSummaryCard
+              dashboard={dashboard}
               loading={loading}
               complianceConfirmed={complianceConfirmed}
               onTransfer={() => setTransferDialogOpen(true)}
             />
-
-            <InvitedUsersTable users={invitedUsers} loading={loading} />
+            <InvitedUsersTable
+              users={dashboard?.invited_users ?? []}
+              loading={loading}
+            />
           </div>
         </SectionPageLayout.Content>
       </SectionPageLayout>
@@ -575,7 +722,7 @@ export function InviteRewards() {
         open={transferDialogOpen}
         onOpenChange={setTransferDialogOpen}
         onConfirm={handleTransfer}
-        availableQuota={user?.aff_quota ?? 0}
+        availableQuota={availableQuota}
         transferring={transferring}
       />
     </>

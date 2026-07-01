@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { getAffiliateCode, getAffiliateRule } from '@/features/auth/lib/storage'
+import { getAffiliateRule } from '@/features/auth/lib/storage'
 
 import { api } from './api'
 
@@ -83,9 +83,12 @@ export async function getOAuthState(): Promise<string | null> {
   try {
     const path = '/api/oauth/state'
     const params = new URLSearchParams()
-    const affCode = getAffiliateCode()
-    if (affCode && affCode.length > 0) {
+    const currentParams = new URLSearchParams(window.location.search)
+    const affCode = currentParams.get('aff')?.trim() ?? ''
+    const inviteBatch = currentParams.get('invite_batch')?.trim() ?? ''
+    if (affCode && inviteBatch) {
       params.set('aff', affCode)
+      params.set('invite_batch', inviteBatch)
       const affRule = getAffiliateRule()
       if (affRule) {
         params.set('aff_rule', affRule)
