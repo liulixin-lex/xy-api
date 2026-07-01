@@ -27,6 +27,7 @@ For commercial licensing, please contact support@quantumnous.com
 const STORAGE_KEYS = {
   USER_ID: 'uid',
   AFFILIATE: 'aff',
+  AFFILIATE_RULE: 'aff_rule',
   STATUS: 'status',
 } as const
 
@@ -102,5 +103,39 @@ export function saveAffiliateCode(code: string): void {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to save affiliate code:', error)
+  }
+}
+
+/**
+ * Get affiliate reward rule from localStorage
+ */
+export function getAffiliateRule(): string {
+  if (typeof window === 'undefined') return ''
+  try {
+    return window.localStorage.getItem(STORAGE_KEYS.AFFILIATE_RULE) ?? ''
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to get affiliate rule:', error)
+    return ''
+  }
+}
+
+/**
+ * Save affiliate reward rule to localStorage
+ */
+export function saveAffiliateRule(rule: string): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (rule === 'first_topup' || rule === 'first_topup_10') {
+      window.localStorage.setItem(
+        STORAGE_KEYS.AFFILIATE_RULE,
+        'first_topup_10'
+      )
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.AFFILIATE_RULE)
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to save affiliate rule:', error)
   }
 }

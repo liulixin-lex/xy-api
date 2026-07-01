@@ -16,32 +16,38 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect } from 'react'
-import { type QueryClient } from '@tanstack/react-query'
+import type { QueryClient } from '@tanstack/react-query'
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
 import {
   createRootRouteWithContext,
   Outlet,
   redirect,
 } from '@tanstack/react-router'
-import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
-import { ThemeCustomizationProvider } from '@/context/theme-customization-provider'
-import { useSystemConfig } from '@/hooks/use-system-config'
-import { Toaster } from '@/components/ui/sonner'
+import { useEffect } from 'react'
+
 import { NavigationProgress } from '@/components/navigation-progress'
-import { saveAffiliateCode } from '@/features/auth/lib/storage'
+import { Toaster } from '@/components/ui/sonner'
+import { ThemeCustomizationProvider } from '@/context/theme-customization-provider'
+import {
+  saveAffiliateCode,
+  saveAffiliateRule,
+} from '@/features/auth/lib/storage'
 import { GeneralError } from '@/features/errors/general-error'
 import { NotFoundError } from '@/features/errors/not-found-error'
 import { getSetupStatus } from '@/features/setup/api'
+import { useSystemConfig } from '@/hooks/use-system-config'
 
 function RootComponent() {
   // Load system configuration (logo, system name, etc.) from backend
   useSystemConfig({ autoLoad: true })
 
   useEffect(() => {
-    const aff = new URLSearchParams(window.location.search).get('aff')?.trim()
+    const params = new URLSearchParams(window.location.search)
+    const aff = params.get('aff')?.trim()
     if (aff) {
       saveAffiliateCode(aff)
+      saveAffiliateRule(params.get('aff_rule')?.trim() ?? '')
     }
   }, [])
 

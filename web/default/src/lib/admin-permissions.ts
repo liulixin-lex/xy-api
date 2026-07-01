@@ -1,11 +1,13 @@
-import { ROLE } from './roles'
 import type { AuthUser } from '@/stores/auth-store'
+
+import { ROLE } from './roles'
 
 export type AdminPermissionMatrix = Record<string, Record<string, boolean>>
 export type AdminCapabilities = AdminPermissionMatrix
 
 export const ADMIN_PERMISSION_RESOURCES = {
   CHANNEL: 'channel',
+  SYSTEM_SETTING: 'system_setting',
 } as const
 
 export const ADMIN_PERMISSION_ACTIONS = {
@@ -14,6 +16,7 @@ export const ADMIN_PERMISSION_ACTIONS = {
   WRITE: 'write',
   SENSITIVE_WRITE: 'sensitive_write',
   SECRET_VIEW: 'secret_view',
+  MANAGE: 'manage',
 } as const
 
 // The role whose baseline grants are used as defaults in the permission editor.
@@ -61,6 +64,16 @@ export function hasPermission(
   if (!user) return false
   if (user.role === ROLE.SUPER_ADMIN) return true
   return user.permissions?.admin_permissions?.[resource]?.[action] === true
+}
+
+export function canManageSystemSettings(
+  user: AuthUser | null | undefined
+): boolean {
+  return hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.SYSTEM_SETTING,
+    ADMIN_PERMISSION_ACTIONS.MANAGE
+  )
 }
 
 // roleGrants returns the baseline grant matrix for the given role key.

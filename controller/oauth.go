@@ -26,6 +26,7 @@ func GenerateOAuthCode(c *gin.Context) {
 	affCode := c.Query("aff")
 	if affCode != "" {
 		session.Set("aff", affCode)
+		session.Set("aff_rule", c.Query("aff_rule"))
 	}
 	session.Set("oauth_state", state)
 	err := session.Save()
@@ -267,6 +268,14 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	inviterId := 0
 	if affCode != nil {
 		inviterId, _ = model.GetUserIdByAffCode(affCode.(string))
+	}
+	user.InviteRewardRule = model.NormalizeInviteRewardRule("")
+	if inviterId != 0 {
+		if affRule := session.Get("aff_rule"); affRule != nil {
+			if rule, ok := affRule.(string); ok {
+				user.InviteRewardRule = model.NormalizeInviteRewardRule(rule)
+			}
+		}
 	}
 
 	// Use transaction to ensure user creation and OAuth binding are atomic

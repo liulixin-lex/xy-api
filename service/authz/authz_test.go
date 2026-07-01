@@ -105,6 +105,9 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 			ActionSensitiveWrite: true,
 			ActionSecretView:     false,
 		},
+		ResourceSystemSetting: {
+			ActionManage: false,
+		},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
 		ResourceChannel: {
@@ -132,6 +135,9 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 			ActionWrite:          true,
 			ActionSensitiveWrite: false,
 			ActionSecretView:     false,
+		},
+		ResourceSystemSetting: {
+			ActionManage: false,
 		},
 	}, ExplicitUserPermissions(42))
 	assert.Empty(t, ExplicitUserOverrides(42))
@@ -226,4 +232,21 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.True(t, capabilities[ResourceChannel][ActionWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSecretView])
+	assert.False(t, capabilities[ResourceSystemSetting][ActionManage])
+}
+
+func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+
+	assert.True(t, Can(1, common.RoleRootUser, SystemSettingManage))
+	assert.False(t, Can(2, common.RoleAdminUser, SystemSettingManage))
+
+	require.NoError(t, SetUserPermissions(2, PermissionsMap{
+		ResourceSystemSetting: {
+			ActionManage: true,
+		},
+	}))
+
+	assert.True(t, Can(2, common.RoleAdminUser, SystemSettingManage))
 }

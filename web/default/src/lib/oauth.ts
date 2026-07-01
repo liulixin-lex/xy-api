@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { getAffiliateCode, getAffiliateRule } from '@/features/auth/lib/storage'
+
 import { api } from './api'
 
 // ============================================================================
@@ -79,12 +81,18 @@ export function buildLinuxDOOAuthUrl(clientId: string, state: string): string {
  */
 export async function getOAuthState(): Promise<string | null> {
   try {
-    let path = '/api/oauth/state'
-    const affCode = localStorage.getItem('aff')
+    const path = '/api/oauth/state'
+    const params = new URLSearchParams()
+    const affCode = getAffiliateCode()
     if (affCode && affCode.length > 0) {
-      path += `?aff=${affCode}`
+      params.set('aff', affCode)
+      const affRule = getAffiliateRule()
+      if (affRule) {
+        params.set('aff_rule', affRule)
+      }
     }
-    const res = await api.get(path)
+    const query = params.toString()
+    const res = await api.get(query ? `${path}?${query}` : path)
     if (res.data.success) {
       return res.data.data
     }

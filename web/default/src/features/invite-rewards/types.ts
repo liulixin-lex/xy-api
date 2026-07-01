@@ -16,21 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { createFileRoute, redirect } from '@tanstack/react-router'
-
-import { SystemSettings } from '@/features/system-settings'
-import { canManageSystemSettings } from '@/lib/admin-permissions'
-import { useAuthStore } from '@/stores/auth-store'
-
-export const Route = createFileRoute('/_authenticated/system-settings')({
-  beforeLoad: () => {
-    const { auth } = useAuthStore.getState()
-
-    if (!canManageSystemSettings(auth.user)) {
-      throw redirect({
-        to: '/403',
-      })
-    }
-  },
-  component: SystemSettings,
-})
+export interface InvitedUser {
+  id: number
+  username: string
+  display_name: string
+  created_at: number
+}

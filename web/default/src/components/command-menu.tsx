@@ -23,6 +23,9 @@ import { useTranslation } from 'react-i18next'
 import { useSearch } from '@/context/search-provider'
 import { useTheme } from '@/context/theme-provider'
 import { useSidebarData } from '@/hooks/use-sidebar-data'
+import { canManageSystemSettings } from '@/lib/admin-permissions'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 import {
   Command,
   CommandDialog,
@@ -43,10 +46,28 @@ export function CommandMenu() {
   const { open, setOpen } = useSearch()
   const { pathname } = useLocation()
   const sidebarData = useSidebarData()
+  const user = useAuthStore((state) => state.auth.user)
+  const filteredRootNavGroups = React.useMemo(() => {
+    const role = user?.role ?? ROLE.GUEST
+    const isAdmin = role >= ROLE.ADMIN
+    return sidebarData.navGroups
+      .filter((group) => group.id !== 'admin' || isAdmin)
+      .map((group) => {
+        const items = group.items.filter((item) => {
+          if (item.requiredRole !== undefined && role < item.requiredRole) {
+            return false
+          }
+          if (item.url?.startsWith('/system-settings')) {
+            return canManageSystemSettings(user)
+          }
+          return true
+        })
+        return items.length === group.items.length ? group : { ...group, items }
+      })
+      .filter((group) => group.items.length > 0)
+  }, [sidebarData.navGroups, user])
 
-  // Use the active nested sidebar view's nav groups when one matches
-  // the current URL; otherwise fall back to the root navigation.
-  const navGroups = getNavGroupsForPath(pathname, t) ?? sidebarData.navGroups
+  const navGroups = getNavGroupsForPath(pathname, t) ?? filteredRootNavGroups
 
   const runCommand = React.useCallback(
     (command: () => unknown) => {
@@ -65,11 +86,11 @@ export function CommandMenu() {
             <CommandEmpty>{t('No results found.')}</CommandEmpty>
             {navGroups.map((group) => (
               <CommandGroup key={group.id || group.title} heading={group.title}>
-                {group.items.map((navItem, i) => {
-                  if (navItem.url)
+                {group.items.map((navItem) => {
+                  if (navItem.url) {
                     return (
                       <CommandItem
-                        key={`${navItem.url}-${i}`}
+                        key={navItem.url}
                         value={navItem.title}
                         onSelect={() => {
                           runCommand(() => navigate({ to: navItem.url }))
@@ -81,10 +102,11 @@ export function CommandMenu() {
                         {navItem.title}
                       </CommandItem>
                     )
+                  }
 
-                  return navItem.items?.map((subItem, i) => (
+                  return navItem.items?.map((subItem) => (
                     <CommandItem
-                      key={`${navItem.title}-${subItem.url}-${i}`}
+                      key={`${navItem.title}-${subItem.url}`}
                       value={`${navItem.title}-${subItem.url}`}
                       onSelect={() => {
                         runCommand(() => navigate({ to: subItem.url }))

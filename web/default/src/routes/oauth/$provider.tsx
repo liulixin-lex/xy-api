@@ -185,6 +185,17 @@ function OAuthCallback() {
           }
           // Otherwise it's a login, use payload user if available
           if (loginUser) {
+            try {
+              if (typeof window !== 'undefined' && loginUser.id != null) {
+                window.localStorage.setItem('uid', String(loginUser.id))
+              }
+            } catch (_error) {
+              void _error
+            }
+            if (await finalizeLogin()) {
+              redirectAfterLogin()
+              return
+            }
             useAuthStore.getState().auth.setUser(loginUser)
             try {
               if (typeof window !== 'undefined' && loginUser.id != null) {
