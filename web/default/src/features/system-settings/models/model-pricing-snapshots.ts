@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { splitBillingExprAndRequestRules } from '@/features/pricing/lib/billing-expr'
+import {
+  combineBillingExpr,
+  splitBillingExprAndRequestRules,
+} from '@/features/pricing/lib/billing-expr'
+
 import { safeJsonParse } from '../utils/json-parser'
 import { formatPricingNumber } from './pricing-format'
 
@@ -49,6 +53,21 @@ export type ModelPricingSnapshot = {
   hasConflict: boolean
 }
 
+export type ModelPricingEntryDraft = {
+  name: string
+  price?: string
+  ratio?: string
+  cacheRatio?: string
+  createCacheRatio?: string
+  completionRatio?: string
+  imageRatio?: string
+  audioRatio?: string
+  audioCompletionRatio?: string
+  billingMode?: string
+  billingExpr?: string
+  requestRuleExpr?: string
+}
+
 export type ModelRow = ModelPricingSnapshot & {
   saved?: ModelPricingSnapshot
   draft?: ModelPricingSnapshot
@@ -59,6 +78,155 @@ export type ModelRow = ModelPricingSnapshot & {
 
 export const hasPricingValue = (value?: string) =>
   value !== undefined && value !== ''
+
+const parseOptionRecord = <T>(value: string, context: string) =>
+  safeJsonParse<Record<string, T>>(value, {
+    fallback: {},
+    context,
+    silent: true,
+  })
+
+const stringifyOptionRecord = <T>(value: Record<string, T>) =>
+  JSON.stringify(value, null, 2)
+
+const setNumberIfPresent = (
+  target: Record<string, number>,
+  name: string,
+  value: string | undefined
+) => {
+  if (!value || value === '') return
+  const parsed = Number.parseFloat(value)
+  if (Number.isFinite(parsed)) target[name] = parsed
+}
+
+export const removeModelPricingEntry = (
+  input: ModelPricingSnapshotInput,
+  name: string
+): ModelPricingSnapshotInput => {
+  const priceMap = parseOptionRecord<number>(input.modelPrice, 'model prices')
+  const ratioMap = parseOptionRecord<number>(input.modelRatio, 'model ratios')
+  const cacheMap = parseOptionRecord<number>(input.cacheRatio, 'cache ratios')
+  const createCacheMap = parseOptionRecord<number>(
+    input.createCacheRatio,
+    'create cache ratios'
+  )
+  const completionMap = parseOptionRecord<number>(
+    input.completionRatio,
+    'completion ratios'
+  )
+  const imageMap = parseOptionRecord<number>(input.imageRatio, 'image ratios')
+  const audioMap = parseOptionRecord<number>(input.audioRatio, 'audio ratios')
+  const audioCompletionMap = parseOptionRecord<number>(
+    input.audioCompletionRatio,
+    'audio completion ratios'
+  )
+  const billingModeMap = parseOptionRecord<string>(
+    input.billingMode,
+    'billing mode'
+  )
+  const billingExprMap = parseOptionRecord<string>(
+    input.billingExpr,
+    'billing expression'
+  )
+
+  delete priceMap[name]
+  delete ratioMap[name]
+  delete cacheMap[name]
+  delete createCacheMap[name]
+  delete completionMap[name]
+  delete imageMap[name]
+  delete audioMap[name]
+  delete audioCompletionMap[name]
+  delete billingModeMap[name]
+  delete billingExprMap[name]
+
+  return {
+    modelPrice: stringifyOptionRecord(priceMap),
+    modelRatio: stringifyOptionRecord(ratioMap),
+    cacheRatio: stringifyOptionRecord(cacheMap),
+    createCacheRatio: stringifyOptionRecord(createCacheMap),
+    completionRatio: stringifyOptionRecord(completionMap),
+    imageRatio: stringifyOptionRecord(imageMap),
+    audioRatio: stringifyOptionRecord(audioMap),
+    audioCompletionRatio: stringifyOptionRecord(audioCompletionMap),
+    billingMode: stringifyOptionRecord(billingModeMap),
+    billingExpr: stringifyOptionRecord(billingExprMap),
+  }
+}
+
+export const upsertModelPricingEntry = (
+  input: ModelPricingSnapshotInput,
+  data: ModelPricingEntryDraft,
+  targetNames: string[] = [data.name]
+): ModelPricingSnapshotInput => {
+  let next = input
+
+  targetNames.forEach((name) => {
+    next = removeModelPricingEntry(next, name)
+
+    const priceMap = parseOptionRecord<number>(next.modelPrice, 'model prices')
+    const ratioMap = parseOptionRecord<number>(next.modelRatio, 'model ratios')
+    const cacheMap = parseOptionRecord<number>(next.cacheRatio, 'cache ratios')
+    const createCacheMap = parseOptionRecord<number>(
+      next.createCacheRatio,
+      'create cache ratios'
+    )
+    const completionMap = parseOptionRecord<number>(
+      next.completionRatio,
+      'completion ratios'
+    )
+    const imageMap = parseOptionRecord<number>(next.imageRatio, 'image ratios')
+    const audioMap = parseOptionRecord<number>(next.audioRatio, 'audio ratios')
+    const audioCompletionMap = parseOptionRecord<number>(
+      next.audioCompletionRatio,
+      'audio completion ratios'
+    )
+    const billingModeMap = parseOptionRecord<string>(
+      next.billingMode,
+      'billing mode'
+    )
+    const billingExprMap = parseOptionRecord<string>(
+      next.billingExpr,
+      'billing expression'
+    )
+
+    if (data.billingMode === 'tiered_expr') {
+      const combined = combineBillingExpr(
+        data.billingExpr || '',
+        data.requestRuleExpr || ''
+      )
+      if (combined) {
+        billingModeMap[name] = 'tiered_expr'
+        billingExprMap[name] = combined
+      }
+    } else if (data.price && data.price !== '') {
+      setNumberIfPresent(priceMap, name, data.price)
+    } else {
+      setNumberIfPresent(ratioMap, name, data.ratio)
+      setNumberIfPresent(cacheMap, name, data.cacheRatio)
+      setNumberIfPresent(createCacheMap, name, data.createCacheRatio)
+      setNumberIfPresent(completionMap, name, data.completionRatio)
+      setNumberIfPresent(imageMap, name, data.imageRatio)
+      setNumberIfPresent(audioMap, name, data.audioRatio)
+      setNumberIfPresent(audioCompletionMap, name, data.audioCompletionRatio)
+    }
+
+    next = {
+      modelPrice: stringifyOptionRecord(priceMap),
+      modelRatio: stringifyOptionRecord(ratioMap),
+      cacheRatio: stringifyOptionRecord(cacheMap),
+      createCacheRatio: stringifyOptionRecord(createCacheMap),
+      completionRatio: stringifyOptionRecord(completionMap),
+      imageRatio: stringifyOptionRecord(imageMap),
+      audioRatio: stringifyOptionRecord(audioMap),
+      audioCompletionRatio: stringifyOptionRecord(audioCompletionMap),
+      billingMode: stringifyOptionRecord(billingModeMap),
+      billingExpr: stringifyOptionRecord(billingExprMap),
+    }
+  })
+
+  return next
+}
 
 const toNumberOrNull = (value?: string) => {
   if (!hasPricingValue(value)) return null
@@ -222,7 +390,7 @@ export const buildModelSnapshots = ({
     ...Object.keys(billingExprMap),
   ])
 
-  return Array.from(modelNames).map((name) => {
+  return [...modelNames].map((name) => {
     const price = priceMap[name]?.toString() || ''
     const ratio = ratioMap[name]?.toString() || ''
     const cache = cacheMap[name]?.toString() || ''

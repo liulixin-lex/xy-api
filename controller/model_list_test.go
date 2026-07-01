@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -126,6 +127,27 @@ func withSelfUseModeDisabled(t *testing.T) {
 	t.Cleanup(func() {
 		operation_setting.SelfUseModeEnabled = original
 	})
+}
+
+func withModelPriceAndRatioConfig(t *testing.T, prices map[string]float64, ratios map[string]float64) {
+	t.Helper()
+
+	originalModelPrice := ratio_setting.ModelPrice2JSONString()
+	originalModelRatio := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(originalModelPrice))
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatio))
+		model.InvalidatePricingCache()
+	})
+
+	priceBytes, err := common.Marshal(prices)
+	require.NoError(t, err)
+	ratioBytes, err := common.Marshal(ratios)
+	require.NoError(t, err)
+
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(priceBytes)))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(ratioBytes)))
+	model.InvalidatePricingCache()
 }
 
 func decodeListModelsResponse(t *testing.T, recorder *httptest.ResponseRecorder) map[string]struct{} {
@@ -250,6 +272,36 @@ func TestListModelsIncludesTieredBillingModel(t *testing.T) {
 	require.True(t, ok)
 	require.Empty(t, missingExprPricing.BillingMode)
 	require.Empty(t, missingExprPricing.BillingExpr)
+}
+
+func TestPricingEndpointTieredBillingModelDoesNotExposeFallbackPriceOrRatio(t *testing.T) {
+	const modelName = "zz-tiered-priced-model"
+	withSelfUseModeDisabled(t)
+	withModelPriceAndRatioConfig(t, map[string]float64{
+		modelName: 0.42,
+	}, map[string]float64{
+		modelName: 12.5,
+	})
+	withTieredBillingConfig(t, map[string]string{
+		modelName: "tiered_expr",
+	}, map[string]string{
+		modelName: `tier("base", p * 1.5 + c * 3)`,
+	})
+
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.Create(&model.Ability{
+		Group: "default", Model: modelName, ChannelId: 1, Enabled: true,
+	}).Error)
+
+	pricingByName := pricingByModelName(model.GetPricing())
+	pricing, ok := pricingByName[modelName]
+	require.True(t, ok)
+	require.Equal(t, "tiered_expr", pricing.BillingMode)
+	require.NotEmpty(t, pricing.BillingExpr)
+	require.Zero(t, pricing.ModelPrice)
+	require.Zero(t, pricing.ModelRatio)
+	require.Zero(t, pricing.CompletionRatio)
+	require.Equal(t, 0, pricing.QuotaType)
 }
 
 func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
