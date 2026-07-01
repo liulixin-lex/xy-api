@@ -16,8 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Gift, Percent, Users } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  BadgePercent,
+  Gift,
+  Repeat2,
+  Search,
+  Sparkles,
+  Users,
+} from 'lucide-react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentType,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -40,6 +53,7 @@ import {
   EmptyTitle,
 } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -63,27 +77,47 @@ import type { InvitedUser } from './types'
 type RuleCardProps = {
   title: string
   description: string
-  rate: string
+  rate: number
   link: string
   loading: boolean
+  tone: 'steady' | 'prime'
+  icon: ComponentType<{ className?: string }>
+}
+
+function RewardRateBadge(props: { rate: number; tone: 'steady' | 'prime' }) {
+  return (
+    <span
+      className={`inline-flex min-w-16 items-center justify-center rounded-lg border px-3 py-1.5 text-base font-semibold tabular-nums ${
+        props.tone === 'prime'
+          ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+          : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+      }`}
+    >
+      {props.rate}%
+    </span>
+  )
 }
 
 function RuleCard(props: RuleCardProps) {
   const { t } = useTranslation()
+  const Icon = props.icon
 
   return (
     <Card data-card-hover='false' className='gap-0 py-0'>
       <CardHeader className='border-b p-4 !pb-4'>
         <div className='flex items-start justify-between gap-3'>
-          <div className='min-w-0'>
-            <CardTitle className='text-base'>{props.title}</CardTitle>
-            <CardDescription className='mt-1 text-sm'>
-              {props.description}
-            </CardDescription>
+          <div className='flex min-w-0 items-start gap-3'>
+            <div className='bg-muted flex size-9 shrink-0 items-center justify-center rounded-lg'>
+              <Icon className='text-muted-foreground size-4' />
+            </div>
+            <div className='min-w-0'>
+              <CardTitle className='text-base'>{props.title}</CardTitle>
+              <CardDescription className='mt-1 text-sm'>
+                {props.description}
+              </CardDescription>
+            </div>
           </div>
-          <Badge variant='secondary' className='shrink-0'>
-            {props.rate}
-          </Badge>
+          <RewardRateBadge rate={props.rate} tone={props.tone} />
         </div>
       </CardHeader>
       <CardContent className='p-4'>
@@ -99,8 +133,8 @@ function RuleCard(props: RuleCardProps) {
             <CopyButton
               value={props.link}
               variant='outline'
-              tooltip={t('Copy referral link')}
-              aria-label={t('Copy referral link')}
+              tooltip={t('Copy rebate link')}
+              aria-label={t('Copy rebate link')}
             />
           </div>
         )}
@@ -139,9 +173,9 @@ function SummaryCard(props: SummaryCardProps) {
       <CardHeader className='border-b p-4 !pb-4'>
         <div className='flex flex-wrap items-center justify-between gap-3'>
           <div className='min-w-0'>
-            <CardTitle className='text-base'>{t('Reward Summary')}</CardTitle>
+            <CardTitle className='text-base'>{t('Rebate Summary')}</CardTitle>
             <CardDescription className='mt-1 text-sm'>
-              {t('Track rewards and move pending rewards to your balance.')}
+              {t('Track rebates and move pending rebates to your balance.')}
             </CardDescription>
           </div>
           <Button
@@ -174,7 +208,7 @@ function SummaryCard(props: SummaryCardProps) {
         {!props.complianceConfirmed ? (
           <p className='text-muted-foreground mt-3 text-sm'>
             {t(
-              'Referral reward transfer is disabled until the administrator confirms compliance terms.'
+              'Rebate transfer is disabled until the administrator confirms compliance terms.'
             )}
           </p>
         ) : null}
@@ -188,10 +222,82 @@ type InvitedUsersTableProps = {
   loading: boolean
 }
 
-const invitedUsersSkeletonRows = ['invite-row-1', 'invite-row-2', 'invite-row-3', 'invite-row-4']
+type InvitedUsersSearchField =
+  | 'all'
+  | 'username'
+  | 'display_name'
+  | 'invite_type'
+  | 'reward_rate'
+  | 'contribution_quota'
+
+const invitedUsersSkeletonRows = [
+  'invite-row-1',
+  'invite-row-2',
+  'invite-row-3',
+  'invite-row-4',
+]
+
+const invitedUsersSearchFields: Array<{
+  value: InvitedUsersSearchField
+  labelKey: string
+}> = [
+  { value: 'all', labelKey: 'All columns' },
+  { value: 'username', labelKey: 'Username' },
+  { value: 'display_name', labelKey: 'Display Name' },
+  { value: 'invite_type', labelKey: 'Invite Type' },
+  { value: 'reward_rate', labelKey: 'Rebate Rate' },
+  { value: 'contribution_quota', labelKey: 'Contribution Amount' },
+]
+
+function getInviteTypeLabel(rule: InvitedUser['invite_reward_rule']) {
+  return rule === 'first_topup' ? 'First Top-up Rebate' : 'Continuous Rebate'
+}
+
+function matchesInvitedUserSearch(
+  user: InvitedUser,
+  field: InvitedUsersSearchField,
+  search: string
+) {
+  const normalizedSearch = search.trim().toLowerCase()
+  if (!normalizedSearch) return true
+
+  const typeLabel = getInviteTypeLabel(user.invite_reward_rule).toLowerCase()
+  const values: Record<InvitedUsersSearchField, string[]> = {
+    all: [
+      user.username,
+      user.display_name,
+      typeLabel,
+      String(user.invite_reward_percent),
+      String(user.contribution_quota),
+    ],
+    username: [user.username],
+    display_name: [user.display_name],
+    invite_type: [typeLabel, user.invite_reward_rule],
+    reward_rate: [String(user.invite_reward_percent)],
+    contribution_quota: [String(user.contribution_quota)],
+  }
+
+  return values[field].some((value) =>
+    value.toLowerCase().includes(normalizedSearch)
+  )
+}
 
 function InvitedUsersTable(props: InvitedUsersTableProps) {
   const { t } = useTranslation()
+  const [searchField, setSearchField] = useState<InvitedUsersSearchField>('all')
+  const [search, setSearch] = useState('')
+  const [inviteType, setInviteType] = useState('')
+
+  const filteredUsers = useMemo(
+    () =>
+      props.users.filter((user) => {
+        if (inviteType && user.invite_reward_rule !== inviteType) {
+          return false
+        }
+        return matchesInvitedUserSearch(user, searchField, search)
+      }),
+    [inviteType, props.users, search, searchField]
+  )
 
   if (props.loading) {
     return (
@@ -209,48 +315,125 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
     )
   }
 
+  let tableContent = (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t('Username')}</TableHead>
+          <TableHead>{t('Registered At')}</TableHead>
+          <TableHead>{t('Rebate Rate')}</TableHead>
+          <TableHead>{t('Invite Type')}</TableHead>
+          <TableHead>{t('Contribution Amount')}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {filteredUsers.map((user) => (
+          <TableRow key={user.id}>
+            <TableCell>
+              <div className='flex min-w-0 flex-col'>
+                <span className='font-medium'>{user.username}</span>
+                <span className='text-muted-foreground truncate text-xs'>
+                  {user.display_name || '-'}
+                </span>
+              </div>
+            </TableCell>
+            <TableCell>{formatTimestamp(user.created_at)}</TableCell>
+            <TableCell>
+              <RewardRateBadge
+                rate={user.invite_reward_percent}
+                tone={
+                  user.invite_reward_rule === 'first_topup' ? 'prime' : 'steady'
+                }
+              />
+            </TableCell>
+            <TableCell>
+              <Badge variant='secondary'>
+                {t(getInviteTypeLabel(user.invite_reward_rule))}
+              </Badge>
+            </TableCell>
+            <TableCell>{formatQuota(user.contribution_quota)}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+
+  if (props.users.length === 0) {
+    tableContent = (
+      <Empty className='rounded-none border-0 py-10'>
+        <EmptyHeader>
+          <EmptyMedia variant='icon'>
+            <Users />
+          </EmptyMedia>
+          <EmptyTitle>{t('No invited users yet')}</EmptyTitle>
+          <EmptyDescription>
+            {t('Share either rebate link to start earning rebates.')}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    )
+  } else if (filteredUsers.length === 0) {
+    tableContent = (
+      <div className='text-muted-foreground flex min-h-32 items-center justify-center px-4 text-sm'>
+        {t('No invited users match the current filters.')}
+      </div>
+    )
+  }
+
   return (
     <Card data-card-hover='false' className='gap-0 py-0'>
       <CardHeader className='border-b p-4 !pb-4'>
-        <CardTitle className='text-base'>{t('Invited Users')}</CardTitle>
-        <CardDescription className='mt-1 text-sm'>
-          {t('Users who registered through your referral links.')}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className='p-0'>
-        {props.users.length === 0 ? (
-          <Empty className='rounded-none border-0 py-10'>
-            <EmptyHeader>
-              <EmptyMedia variant='icon'>
-                <Users />
-              </EmptyMedia>
-              <EmptyTitle>{t('No invited users yet')}</EmptyTitle>
-              <EmptyDescription>
-                {t('Share either referral link to start building rewards.')}
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{t('Username')}</TableHead>
-                <TableHead>{t('Display Name')}</TableHead>
-                <TableHead>{t('Registered At')}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {props.users.map((user) => (
-                <TableRow key={user.id}>
-                  <TableCell className='font-medium'>{user.username}</TableCell>
-                  <TableCell>{user.display_name || '-'}</TableCell>
-                  <TableCell>{formatTimestamp(user.created_at)}</TableCell>
-                </TableRow>
+        <div className='flex flex-col gap-3'>
+          <div>
+            <CardTitle className='text-base'>{t('Invited Users')}</CardTitle>
+            <CardDescription className='mt-1 text-sm'>
+              {t('Users who registered through your rebate links.')}
+            </CardDescription>
+          </div>
+          <div className='flex flex-col gap-2 lg:flex-row lg:items-center'>
+            <NativeSelect
+              value={searchField}
+              onChange={(event) =>
+                setSearchField(event.target.value as InvitedUsersSearchField)
+              }
+              className='w-full lg:w-48'
+            >
+              {invitedUsersSearchFields.map((field) => (
+                <NativeSelectOption key={field.value} value={field.value}>
+                  {t(field.labelKey)}
+                </NativeSelectOption>
               ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
+            </NativeSelect>
+            <div className='relative min-w-0 flex-1'>
+              <Search className='text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2' />
+              <Input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder={t('Search invited users...')}
+                className='pl-8'
+              />
+            </div>
+            <div className='grid grid-cols-3 gap-2 lg:flex lg:shrink-0'>
+              {[
+                { value: '', labelKey: 'All' },
+                { value: 'continuous', labelKey: 'Continuous Rebate' },
+                { value: 'first_topup', labelKey: 'First Top-up Rebate' },
+              ].map((option) => (
+                <Button
+                  key={option.value}
+                  type='button'
+                  variant={inviteType === option.value ? 'default' : 'outline'}
+                  size='sm'
+                  onClick={() => setInviteType(option.value)}
+                >
+                  {t(option.labelKey)}
+                </Button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className='p-0'>{tableContent}</CardContent>
     </Card>
   )
 }
@@ -303,6 +486,8 @@ export function InviteRewards() {
     [affiliateCode]
   )
   const complianceConfirmed = topupInfo?.payment_compliance_confirmed !== false
+  const continuousPercent = topupInfo?.affiliate_continuous_percent ?? 5
+  const firstTopupPercent = topupInfo?.affiliate_first_topup_percent ?? 30
 
   const handleTransfer = async (amount: number) => {
     try {
@@ -326,22 +511,22 @@ export function InviteRewards() {
   return (
     <>
       <SectionPageLayout>
-        <SectionPageLayout.Title>{t('Invite Rewards')}</SectionPageLayout.Title>
+        <SectionPageLayout.Title>{t('Invite Rebates')}</SectionPageLayout.Title>
         <SectionPageLayout.Content>
           <div className='mx-auto flex w-full max-w-7xl flex-col gap-4 sm:gap-5'>
             <Card data-card-hover='false' className='gap-0 py-0'>
               <CardHeader className='border-b p-4 !pb-4'>
                 <div className='flex items-start gap-3'>
-                  <div className='bg-muted flex size-9 shrink-0 items-center justify-center rounded-lg'>
-                    <Percent className='text-muted-foreground size-4' />
+                  <div className='bg-primary/10 text-primary flex size-9 shrink-0 items-center justify-center rounded-lg'>
+                    <Sparkles className='size-4' />
                   </div>
                   <div className='min-w-0'>
                     <CardTitle className='text-base'>
-                      {t('Referral Program')}
+                      {t('Invite Rebate Program')}
                     </CardTitle>
                     <CardDescription className='mt-1 text-sm'>
                       {t(
-                        'Earn rewards when your referrals add funds. Transfer accumulated rewards to your balance anytime.'
+                        'Earn rebates when invited users add funds. Transfer accumulated rebates to your balance anytime.'
                       )}
                     </CardDescription>
                   </div>
@@ -351,22 +536,26 @@ export function InviteRewards() {
 
             <div className='grid gap-4 lg:grid-cols-2'>
               <RuleCard
-                title={t('Continuous Referral')}
+                title={t('Continuous Rebate')}
                 description={t(
-                  'Earn 5% from every future top-up made by users registered through this link.'
+                  'Earn from every future top-up made by users registered through this link.'
                 )}
-                rate='5%'
+                rate={continuousPercent}
                 link={continuousLink}
                 loading={loading}
+                tone='steady'
+                icon={Repeat2}
               />
               <RuleCard
-                title={t('One-time Referral')}
+                title={t('First Top-up Rebate')}
                 description={t(
-                  'Earn 10% from the first top-up made by users registered through this link.'
+                  'Earn from the first successful top-up made by users registered through this link.'
                 )}
-                rate='10%'
+                rate={firstTopupPercent}
                 link={firstTopUpLink}
                 loading={loading}
+                tone='prime'
+                icon={BadgePercent}
               />
             </div>
 

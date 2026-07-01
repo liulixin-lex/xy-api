@@ -50,6 +50,31 @@ export type ConfirmPaymentComplianceResponse = {
   }
 }
 
+export type AffiliateRewardRelation = {
+  inviter_id: number
+  inviter_username: string
+  invitee_id: number
+  invitee_username: string
+  invitee_display_name: string
+  invite_reward_rule: 'continuous' | 'first_topup'
+  invite_reward_percent: number
+  reward_quota: number
+  registered_at: number
+}
+
+export type AffiliateRewardSummary = {
+  inviter_count: number
+  invitee_count: number
+  total_reward_quota: number
+  relations: AffiliateRewardRelation[]
+}
+
+export type AffiliateRewardSummaryResponse = {
+  success: boolean
+  message: string
+  data?: AffiliateRewardSummary
+}
+
 export type SystemTaskStatus = 'pending' | 'running' | 'succeeded' | 'failed'
 
 export type SystemTask<
@@ -287,6 +312,8 @@ export type BillingSettings = {
   PayMethods: string
   'payment_setting.amount_options': string
   'payment_setting.amount_discount': string
+  'payment_setting.affiliate_continuous_percent': number
+  'payment_setting.affiliate_first_topup_percent': number
   'payment_setting.compliance_confirmed': boolean
   'payment_setting.compliance_terms_version': string
   'payment_setting.compliance_confirmed_at': number

@@ -143,6 +143,12 @@ func UpdateOption(c *gin.Context) {
 			common.ApiErrorI18n(c, i18n.MsgPaymentComplianceRequired)
 			return
 		}
+	case "payment_setting.affiliate_continuous_percent", "payment_setting.affiliate_first_topup_percent":
+		percent, parseErr := strconv.Atoi(strings.TrimSpace(option.Value.(string)))
+		if parseErr != nil || percent < 1 || percent > 100 {
+			common.ApiErrorMsg(c, "返利比例必须是 1 到 100 之间的整数")
+			return
+		}
 	default:
 		if isPaymentComplianceOptionKey(option.Key) {
 			common.ApiErrorMsg(c, "合规确认字段不允许通过通用设置接口修改")

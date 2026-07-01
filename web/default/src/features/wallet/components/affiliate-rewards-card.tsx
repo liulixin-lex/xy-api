@@ -18,12 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Share2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { formatQuota } from '@/lib/format'
+
+import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
-import { CopyButton } from '@/components/copy-button'
+import { formatQuota } from '@/lib/format'
+
 import type { UserWalletData } from '../types'
 
 interface AffiliateRewardsCardProps {
@@ -68,11 +70,11 @@ export function AffiliateRewardsCard({
           </div>
           <div className='min-w-0'>
             <h3 className='truncate text-sm font-semibold'>
-              {t('Referral Program')}
+              {t('Invite Rebate Program')}
             </h3>
             <p className='text-muted-foreground line-clamp-1 text-xs'>
               {t(
-                'Earn rewards when your referrals add funds. Transfer accumulated rewards to your balance anytime.'
+                'Earn rebates when invited users add funds. Transfer accumulated rebates to your balance anytime.'
               )}
             </p>
           </div>
@@ -106,8 +108,8 @@ export function AffiliateRewardsCard({
             variant='outline'
             className='bg-background size-9 shrink-0'
             iconClassName='size-4'
-            tooltip={t('Copy referral link')}
-            aria-label={t('Copy referral link')}
+            tooltip={t('Copy rebate link')}
+            aria-label={t('Copy rebate link')}
           />
           {hasRewards && (
             <Button
@@ -123,7 +125,7 @@ export function AffiliateRewardsCard({
         {!complianceConfirmed ? (
           <p className='text-muted-foreground text-xs lg:col-span-3'>
             {t(
-              'Referral reward transfer is disabled until the administrator confirms compliance terms.'
+              'Rebate transfer is disabled until the administrator confirms compliance terms.'
             )}
           </p>
         ) : null}

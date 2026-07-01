@@ -31,7 +31,7 @@ export function generateAffiliateLink(
   const url = new URL('/sign-up', window.location.origin)
   url.searchParams.set('aff', affCode)
   if (rewardRule === 'first_topup' || rewardRule === 'first_topup_10') {
-    url.searchParams.set('aff_rule', 'first_topup_10')
+    url.searchParams.set('aff_rule', 'first_topup')
   }
   return url.toString()
 }

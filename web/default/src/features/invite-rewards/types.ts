@@ -21,4 +21,7 @@ export interface InvitedUser {
   username: string
   display_name: string
   created_at: number
+  invite_reward_rule: 'continuous' | 'first_topup'
+  invite_reward_percent: number
+  contribution_quota: number
 }

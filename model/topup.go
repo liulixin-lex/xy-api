@@ -137,7 +137,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 
 		quota = topUp.Money * common.QuotaPerUnit
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, int(quota))
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -213,7 +213,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 		}
 
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, quotaToAdd)
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -451,7 +451,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		}
 
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, quotaToAdd)
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -518,7 +518,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 		// Creem 直接使用 Amount 作为充值额度（整数）
 		quota = topUp.Amount
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, int(quota))
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -610,7 +610,7 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 		}
 
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, quotaToAdd)
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -680,7 +680,7 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 		}
 
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp.UserId, quotaToAdd)
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -711,13 +711,16 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 	return nil
 }
 
-func applyAffiliateTopUpRewardTx(tx *gorm.DB, userId int, quotaToAdd int) (int, int, error) {
-	if quotaToAdd <= 0 {
+func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int, int, error) {
+	if topUp == nil || quotaToAdd <= 0 {
 		return 0, 0, nil
 	}
 
 	var user User
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").Select("id", "inviter_id", "invite_reward_rule").Where("id = ?", userId).First(&user).Error; err != nil {
+	if err := tx.Set("gorm:query_option", "FOR UPDATE").
+		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent").
+		Where("id = ?", topUp.UserId).
+		First(&user).Error; err != nil {
 		return 0, 0, err
 	}
 	if user.InviterId == 0 {
@@ -725,24 +728,37 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, userId int, quotaToAdd int) (int, 
 	}
 
 	rule := NormalizeInviteRewardRule(user.InviteRewardRule)
-	rewardPercent := 5
 	if rule == InviteRewardRuleFirstTopUp {
 		var successCount int64
-		if err := tx.Model(&TopUp{}).Where("user_id = ? AND status = ? AND amount > ?", userId, common.TopUpStatusSuccess, 0).Count(&successCount).Error; err != nil {
+		if err := tx.Model(&TopUp{}).Where("user_id = ? AND status = ? AND amount > ?", topUp.UserId, common.TopUpStatusSuccess, 0).Count(&successCount).Error; err != nil {
 			return 0, 0, err
 		}
 		if successCount != 0 {
 			return 0, 0, nil
 		}
-		rewardPercent = 10
 	}
 
+	rewardPercent := ResolveInviteRewardPercent(user.InviteRewardRule, user.InviteRewardPercent)
 	reward := quotaToAdd * rewardPercent / 100
 	if reward <= 0 {
 		return 0, 0, nil
 	}
 
-	err := tx.Model(&User{}).Where("id = ?", user.InviterId).Updates(map[string]interface{}{
+	err := tx.Create(&AffiliateRewardRecord{
+		InviterId:           user.InviterId,
+		InviteeId:           user.Id,
+		TopUpId:             topUp.Id,
+		InviteRewardRule:    rule,
+		InviteRewardPercent: rewardPercent,
+		TopUpQuota:          quotaToAdd,
+		RewardQuota:         reward,
+		CreatedAt:           common.GetTimestamp(),
+	}).Error
+	if err != nil {
+		return 0, 0, err
+	}
+
+	err = tx.Model(&User{}).Where("id = ?", user.InviterId).Updates(map[string]interface{}{
 		"aff_quota":   gorm.Expr("aff_quota + ?", reward),
 		"aff_history": gorm.Expr("aff_history + ?", reward),
 	}).Error

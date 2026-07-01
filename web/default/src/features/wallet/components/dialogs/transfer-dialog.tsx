@@ -16,14 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect } from 'react'
 import { Loader2 } from 'lucide-react'
+import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { formatQuota } from '@/lib/format'
+
+import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Dialog } from '@/components/dialog'
+import { formatQuota } from '@/lib/format'
+
 import { QUOTA_PER_DOLLAR } from '../../constants'
 
 interface TransferDialogProps {
@@ -62,8 +64,8 @@ export function TransferDialog({
     <Dialog
       open={open}
       onOpenChange={onOpenChange}
-      title={t('Transfer Rewards')}
-      description={t('Move affiliate rewards to your main balance')}
+      title={t('Transfer Rebates')}
+      description={t('Move affiliate rebates to your main balance')}
       contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
       titleClassName='text-xl font-semibold'
       footerClassName='grid grid-cols-2 gap-2 sm:flex'
@@ -88,7 +90,7 @@ export function TransferDialog({
       <div className='space-y-4 py-3 sm:space-y-6 sm:py-4'>
         <div className='space-y-2'>
           <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
-            {t('Available Rewards')}
+            {t('Available Rebates')}
           </Label>
           <div className='text-2xl font-semibold'>
             {formatQuota(availableQuota)}

@@ -116,8 +116,8 @@ export function SidebarModulesCard() {
         },
         {
           key: 'invite_rewards',
-          title: t('Invite Rewards'),
-          description: t('Referral reward links and income'),
+          title: t('Invite Rebates'),
+          description: t('Invite rebate links and income'),
         },
         {
           key: 'personal',

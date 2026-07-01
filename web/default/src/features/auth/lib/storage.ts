@@ -127,10 +127,7 @@ export function saveAffiliateRule(rule: string): void {
   if (typeof window === 'undefined') return
   try {
     if (rule === 'first_topup' || rule === 'first_topup_10') {
-      window.localStorage.setItem(
-        STORAGE_KEYS.AFFILIATE_RULE,
-        'first_topup_10'
-      )
+      window.localStorage.setItem(STORAGE_KEYS.AFFILIATE_RULE, 'first_topup')
     } else {
       window.localStorage.removeItem(STORAGE_KEYS.AFFILIATE_RULE)
     }

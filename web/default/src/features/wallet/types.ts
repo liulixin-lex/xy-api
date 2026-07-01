@@ -134,6 +134,10 @@ export interface TopupInfo {
   amount_options: number[]
   /** Discount rates by amount */
   discount: Record<number, number>
+  /** Current continuous referral reward percentage */
+  affiliate_continuous_percent?: number
+  /** Current first top-up referral reward percentage */
+  affiliate_first_topup_percent?: number
   /** Optional topup link for purchasing codes */
   topup_link?: string
   /** Whether Creem topup is enabled */

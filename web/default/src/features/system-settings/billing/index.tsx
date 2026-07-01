@@ -67,6 +67,8 @@ const defaultBillingSettings: BillingSettings = {
   PayMethods: '',
   'payment_setting.amount_options': '',
   'payment_setting.amount_discount': '',
+  'payment_setting.affiliate_continuous_percent': 5,
+  'payment_setting.affiliate_first_topup_percent': 30,
   'payment_setting.compliance_confirmed': false,
   'payment_setting.compliance_terms_version': '',
   'payment_setting.compliance_confirmed_at': 0,

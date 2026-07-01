@@ -17,7 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+
 import type {
+  AffiliateRewardSummaryResponse,
   ConfirmPaymentComplianceResponse,
   FetchUpstreamRatiosRequest,
   LogCleanupTask,
@@ -44,6 +46,18 @@ export async function confirmPaymentCompliance() {
   const res = await api.post<ConfirmPaymentComplianceResponse>(
     '/api/option/payment_compliance',
     { confirmed: true }
+  )
+  return res.data
+}
+
+export async function getAffiliateRewardSummary(params?: {
+  search_field?: string
+  search?: string
+  invite_type?: string
+}) {
+  const res = await api.get<AffiliateRewardSummaryResponse>(
+    '/api/option/affiliate_rewards',
+    { params }
   )
   return res.data
 }

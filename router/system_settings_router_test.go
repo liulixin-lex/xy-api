@@ -14,6 +14,7 @@ func TestSystemSettingsRoutesUseSystemSettingPermission(t *testing.T) {
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/option/", controller.GetOptions)
 	assertSystemSettingsRoutePermission(t, http.MethodPut, "/option/", controller.UpdateOption)
 	assertSystemSettingsRoutePermission(t, http.MethodPost, "/option/payment_compliance", controller.ConfirmPaymentCompliance)
+	assertSystemSettingsRoutePermission(t, http.MethodGet, "/option/affiliate_rewards", controller.GetAdminAffiliateRewards)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/custom-oauth-provider/", controller.GetCustomOAuthProviders)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/performance/stats", controller.GetPerformanceStats)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/ratio_sync/channels", controller.GetSyncableChannels)

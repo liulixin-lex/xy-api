@@ -6,6 +6,9 @@ type PaymentSetting struct {
 	AmountOptions  []int           `json:"amount_options"`
 	AmountDiscount map[int]float64 `json:"amount_discount"` // 充值金额对应的折扣，例如 100 元 0.9 表示 100 元充值享受 9 折优惠
 
+	AffiliateContinuousPercent int `json:"affiliate_continuous_percent"`
+	AffiliateFirstTopupPercent int `json:"affiliate_first_topup_percent"`
+
 	ComplianceConfirmed    bool   `json:"compliance_confirmed"`
 	ComplianceTermsVersion string `json:"compliance_terms_version"`
 	ComplianceConfirmedAt  int64  `json:"compliance_confirmed_at"`
@@ -17,8 +20,10 @@ const CurrentComplianceTermsVersion = "v1"
 
 // 默认配置
 var paymentSetting = PaymentSetting{
-	AmountOptions:  []int{10, 20, 50, 100, 200, 500},
-	AmountDiscount: map[int]float64{},
+	AmountOptions:              []int{10, 20, 50, 100, 200, 500},
+	AmountDiscount:             map[int]float64{},
+	AffiliateContinuousPercent: 5,
+	AffiliateFirstTopupPercent: 30,
 }
 
 func init() {

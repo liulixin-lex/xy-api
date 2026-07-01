@@ -23,6 +23,7 @@ var systemSettingsPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/option/", permission: authz.SystemSettingManage, handler: controller.GetOptions},
 	{method: http.MethodPut, path: "/option/", permission: authz.SystemSettingManage, handler: controller.UpdateOption},
 	{method: http.MethodPost, path: "/option/payment_compliance", permission: authz.SystemSettingManage, handler: controller.ConfirmPaymentCompliance},
+	{method: http.MethodGet, path: "/option/affiliate_rewards", permission: authz.SystemSettingManage, handler: controller.GetAdminAffiliateRewards},
 	{method: http.MethodGet, path: "/option/channel_affinity_cache", permission: authz.SystemSettingManage, handler: controller.GetChannelAffinityCacheStats},
 	{method: http.MethodDelete, path: "/option/channel_affinity_cache", permission: authz.SystemSettingManage, handler: controller.ClearChannelAffinityCache},
 	{method: http.MethodPost, path: "/option/rest_model_ratio", permission: authz.SystemSettingManage, handler: controller.ResetModelRatio},

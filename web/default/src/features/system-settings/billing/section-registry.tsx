@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { parseCurrencyDisplayType } from '@/lib/currency'
+
 import { CheckinSettingsSection } from '../general/checkin-settings-section'
 import { PricingSection } from '../general/pricing-section'
 import { QuotaSettingsSection } from '../general/quota-settings-section'
@@ -24,6 +25,7 @@ import { PaymentSettingsSection } from '../integrations/payment-settings-section
 import { RatioSettingsCard } from '../models/ratio-settings-card'
 import type { BillingSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
+import { AffiliateRewardSettingsSection } from './affiliate-reward-settings-section'
 
 const getModelDefaults = (settings: BillingSettings) => ({
   ModelPrice: settings.ModelPrice,
@@ -182,6 +184,20 @@ const BILLING_SECTIONS = [
             settings['payment_setting.compliance_terms_version'] ?? '',
           confirmedAt: settings['payment_setting.compliance_confirmed_at'] ?? 0,
           confirmedBy: settings['payment_setting.compliance_confirmed_by'] ?? 0,
+        }}
+      />
+    ),
+  },
+  {
+    id: 'affiliate-rewards',
+    titleKey: 'Affiliate Rebate Rates',
+    build: (settings: BillingSettings) => (
+      <AffiliateRewardSettingsSection
+        defaultValues={{
+          continuousPercent:
+            settings['payment_setting.affiliate_continuous_percent'],
+          firstTopupPercent:
+            settings['payment_setting.affiliate_first_topup_percent'],
         }}
       />
     ),
