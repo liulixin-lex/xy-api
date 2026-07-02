@@ -147,13 +147,10 @@ export function RedemptionsTable() {
           },
         ],
       }}
-      getRowClassName={(row, { isMobile }) =>
-        isDisabledRedemptionRow(row.original)
-          ? isMobile
-            ? DISABLED_ROW_MOBILE
-            : DISABLED_ROW_DESKTOP
-          : undefined
-      }
+      getRowClassName={(row, { isMobile }) => {
+        if (!isDisabledRedemptionRow(row.original)) return undefined
+        return isMobile ? DISABLED_ROW_MOBILE : DISABLED_ROW_DESKTOP
+      }}
       bulkActions={<DataTableBulkActions table={table} />}
     />
   )

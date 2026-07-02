@@ -100,7 +100,7 @@ export function TwoFASetupDialog({
       } else {
         toast.error(response.message || t('Failed to enable 2FA'))
       }
-    } catch (_error) {
+    } catch {
       toast.error(t('Failed to enable 2FA'))
     } finally {
       setLoading(false)
@@ -175,20 +175,27 @@ export function TwoFASetupDialog({
       }
     >
       <div className='space-y-4 py-4'>
-        {initializing ? (
+        {(() => {
+          if (initializing) {
+            return (
           <div className='flex flex-col items-center justify-center gap-3 py-8'>
             <div className='border-primary h-8 w-8 animate-spin rounded-full border-4 border-t-transparent' />
             <div className='text-muted-foreground text-sm'>
               {t('Setting up 2FA...')}
             </div>
           </div>
-        ) : !setupData ? (
+          )
+          }
+          if (!setupData) {
+            return (
           <div className='flex justify-center py-8'>
             <div className='text-muted-foreground'>
               {t('Failed to load setup data')}
             </div>
           </div>
-        ) : (
+          )
+          }
+          return (
           <>
             {/* Step 0: QR Code */}
             {step === 0 && (
@@ -234,9 +241,9 @@ export function TwoFASetupDialog({
                 </Alert>
                 <div className='rounded-lg border p-4'>
                   <div className='grid grid-cols-2 gap-2'>
-                    {setupData.backup_codes.map((code, index) => (
+                    {setupData.backup_codes.map((code) => (
                       <div
-                        key={index}
+                        key={code}
                         className='bg-muted rounded-md p-2 text-center font-mono text-sm'
                       >
                         {code}
@@ -278,7 +285,8 @@ export function TwoFASetupDialog({
               </div>
             )}
           </>
-        )}
+          )
+        })()}
       </div>
     </Dialog>
   )

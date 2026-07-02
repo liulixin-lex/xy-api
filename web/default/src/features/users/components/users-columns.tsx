@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type ColumnDef } from '@tanstack/react-table'
+import type { ColumnDef } from '@tanstack/react-table'
 import { useTranslation } from 'react-i18next'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 import { cn } from '@/lib/utils'
@@ -38,7 +38,7 @@ import {
   USER_ROLES,
   isUserDeleted,
 } from '../constants'
-import { type User } from '../types'
+import type { User } from '../types'
 import { DataTableRowActions } from './data-table-row-actions'
 
 function getQuotaProgressColor(percentage: number): string {

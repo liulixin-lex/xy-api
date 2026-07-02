@@ -18,10 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { type ChangeEvent, useCallback, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import {
-  type ColumnDef,
-  type RowSelectionState,
-  type Table as TanStackTable,
+import type {
+  ColumnDef,
+  RowSelectionState,
+  Table as TanStackTable,
 } from '@tanstack/react-table'
 import {
   Check,
@@ -222,7 +222,7 @@ function sleep(ms: number) {
 }
 
 function normalizeInlineError(errorText: string) {
-  return errorText.replace(/\s+/g, ' ').trim()
+  return errorText.replaceAll(/\s+/g, ' ').trim()
 }
 
 function getFirstErrorLine(errorText: string) {
@@ -569,9 +569,7 @@ function ChannelTestDialogContent({
 
   const handleBatchTest = useCallback(
     async (modelsToTest: string[]) => {
-      const uniqueModels = Array.from(
-        new Set(modelsToTest.map((model) => model.trim()).filter(Boolean))
-      )
+      const uniqueModels = [...new Set(modelsToTest.map((model) => model.trim()).filter(Boolean))]
       if (!uniqueModels.length) return
 
       batchStopRequestedRef.current = false
@@ -914,11 +912,9 @@ function ChannelTestDialogContent({
         contentHeight='auto'
         bodyClassName='space-y-4'
         footer={
-          <>
-            <Button variant='outline' onClick={handleClose}>
-              {t('Close')}
-            </Button>
-          </>
+          <Button variant='outline' onClick={handleClose}>
+            {t('Close')}
+          </Button>
         }
       >
         <div className='max-h-[78vh] space-y-4 overflow-y-auto py-4 pr-1'>

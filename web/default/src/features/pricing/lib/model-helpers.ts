@@ -43,7 +43,7 @@ export function getAvailableGroups(
  * Replace model placeholder in endpoint path
  */
 export function replaceModelInPath(path: string, modelName: string): string {
-  return path.replace(/\{model\}/g, modelName)
+  return path.replaceAll('{model}', modelName)
 }
 
 /**

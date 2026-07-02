@@ -160,7 +160,7 @@ export function CheckinCalendarCard({
           }
           toast.error(res.message || t('Check-in failed'))
         }
-      } catch (_error) {
+      } catch {
         toast.error(t('Check-in failed'))
       } finally {
         setCheckinLoading(false)
@@ -237,6 +237,13 @@ export function CheckinCalendarCard({
         </div>
       </Card>
     )
+  }
+
+  let checkinButtonLabel = t('Check in now')
+  if (checkinLoading) {
+    checkinButtonLabel = t('Loading...')
+  } else if (checkedToday) {
+    checkinButtonLabel = t('Checked in')
   }
 
   return (
@@ -318,11 +325,7 @@ export function CheckinCalendarCard({
               size='sm'
               className='w-full shrink-0 sm:w-auto'
             >
-              {checkinLoading
-                ? t('Loading...')
-                : checkedToday
-                  ? t('Checked in')
-                  : t('Check in now')}
+              {checkinButtonLabel}
             </Button>
           </div>
         </div>
@@ -403,7 +406,7 @@ export function CheckinCalendarCard({
                   ))}
 
                   {/* Calendar days */}
-                  {calendarDays.map((dayObj, idx) => {
+                  {calendarDays.map((dayObj) => {
                     const dateStr = `${dayObj.date.getFullYear()}-${String(
                       dayObj.date.getMonth() + 1
                     ).padStart(2, '0')}-${String(
@@ -416,7 +419,7 @@ export function CheckinCalendarCard({
 
                     const dayButton = (
                       <Button
-                        key={idx}
+                        key={dateStr}
                         variant={isToday ? 'default' : 'ghost'}
                         disabled={!dayObj.isCurrentMonth}
                         className={cn(
@@ -435,8 +438,8 @@ export function CheckinCalendarCard({
 
                     if (isCheckedIn && dayObj.isCurrentMonth) {
                       return (
-                        <Tooltip key={idx}>
-                          <TooltipTrigger render={dayButton}></TooltipTrigger>
+                        <Tooltip key={dateStr}>
+                          <TooltipTrigger render={dayButton} />
                           <TooltipContent>
                             <div className='text-xs'>
                               <div className='font-medium'>

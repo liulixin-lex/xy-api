@@ -82,7 +82,7 @@ export function ForgotPasswordForm({
       } else {
         toast.error(res?.message || t('Failed to send reset email'))
       }
-    } catch (_error) {
+    } catch {
       // Errors are handled by global interceptor
     } finally {
       setIsLoading(false)

@@ -368,7 +368,7 @@ export function AdvancedCustomEditorDialog({
           <div className='flex flex-col gap-4'>
             {routes.map((route, index) => (
               <RouteEditor
-                key={index}
+                key={JSON.stringify(route)}
                 route={route}
                 index={index}
                 onChange={(patch) => updateRoute(index, patch)}

@@ -68,7 +68,7 @@ function uid() {
 function parsePrefix(rawKey: string): { op: OpType; groupName: string } {
   if (rawKey.startsWith('+:')) return { op: OP_ADD, groupName: rawKey.slice(2) }
   if (rawKey.startsWith('-:'))
-    return { op: OP_REMOVE, groupName: rawKey.slice(2) }
+    {return { op: OP_REMOVE, groupName: rawKey.slice(2) }}
   return { op: OP_APPEND, groupName: rawKey }
 }
 
@@ -93,13 +93,18 @@ function flattenRules(nested: Record<string, Record<string, string>>): Rule[] {
     if (typeof inner !== 'object' || inner === null) continue
     for (const [rawKey, desc] of Object.entries(inner)) {
       const { op, groupName } = parsePrefix(rawKey)
+      let description = ''
+      if (op === OP_REMOVE) {
+        description = 'remove'
+      } else if (typeof desc === 'string') {
+        description = desc
+      }
       rules.push({
         _id: uid(),
         userGroup,
         op,
         targetGroup: groupName,
-        description:
-          op === OP_REMOVE ? 'remove' : typeof desc === 'string' ? desc : '',
+        description,
       })
     }
   }
@@ -331,7 +336,7 @@ export function GroupSpecialUsableRulesEditor(
           if (r._id !== id) return r
           const updated = { ...r, [field]: val }
           if (field === 'op' && val === OP_REMOVE)
-            updated.description = 'remove'
+            {updated.description = 'remove'}
           else if (field === 'op' && r.op === OP_REMOVE && val !== OP_REMOVE) {
             if (updated.description === 'remove') updated.description = ''
           }

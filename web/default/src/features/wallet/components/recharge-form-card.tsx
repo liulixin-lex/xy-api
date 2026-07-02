@@ -118,7 +118,7 @@ export function RechargeFormCard({
 
   const handleAmountChange = (value: string) => {
     setLocalAmount(value)
-    const numValue = parseInt(value) || 0
+    const numValue = Number.parseInt(value) || 0
     if (numValue >= 0) {
       onTopupAmountChange(numValue)
     }
@@ -150,8 +150,8 @@ export function RechargeFormCard({
             <div className='space-y-3'>
               <Skeleton className='h-3 w-16' />
               <div className='grid grid-cols-2 gap-3 sm:grid-cols-4'>
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <Skeleton key={i} className='h-[72px] rounded-lg' />
+                {Array.from({ length: 8 }, (_, i) => `amount-skeleton-${i}`).map((key) => (
+                  <Skeleton key={key} className='h-[72px] rounded-lg' />
                 ))}
               </div>
             </div>
@@ -166,8 +166,8 @@ export function RechargeFormCard({
             <div className='space-y-3'>
               <Skeleton className='h-3 w-32' />
               <div className='flex flex-wrap gap-3'>
-                {Array.from({ length: 3 }).map((_, i) => (
-                  <Skeleton key={i} className='h-10 w-24 rounded-lg' />
+                {Array.from({ length: 3 }, (_, i) => `gateway-skeleton-${i}`).map((key) => (
+                  <Skeleton key={key} className='h-10 w-24 rounded-lg' />
                 ))}
               </div>
             </div>
@@ -183,6 +183,79 @@ export function RechargeFormCard({
           </div>
         </CardContent>
       </Card>
+    )
+  }
+
+  let paymentMethodContent = null
+  if (hasStandardPaymentMethods) {
+    paymentMethodContent = (
+      <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
+        {topupInfo?.pay_methods?.map((method) => {
+          const minTopup = method.min_topup || 0
+          const disabled = minTopup > topupAmount
+          const disabledReason = disabled
+            ? t('Minimum topup amount: {{amount}}', {
+                amount: minTopup,
+              })
+            : undefined
+          const disabledLabel = disabled
+            ? `${t('Minimum:')} ${minTopup}`
+            : undefined
+          const ariaLabel = disabledReason
+            ? `${method.name}. ${disabledReason}`
+            : method.name
+          let paymentIcon = getPaymentIcon(
+            method.type,
+            'h-4 w-4',
+            method.icon,
+            method.name
+          )
+          if (paymentLoading === method.type) {
+            paymentIcon = <Loader2 className='h-4 w-4 animate-spin' />
+          }
+
+          const button = (
+            <Button
+              key={method.type}
+              variant='outline'
+              onClick={() => onPaymentMethodSelect(method)}
+              disabled={disabled || !!paymentLoading}
+              title={disabledReason}
+              aria-label={ariaLabel}
+              className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
+            >
+              {paymentIcon}
+              <span className='flex min-w-0 flex-col items-start gap-0.5'>
+                <span className='max-w-full truncate'>{method.name}</span>
+                {disabledLabel && (
+                  <span className='text-muted-foreground max-w-full truncate text-[11px] leading-4 font-normal'>
+                    {disabledLabel}
+                  </span>
+                )}
+              </span>
+            </Button>
+          )
+
+          return disabled ? (
+            <TooltipProvider key={method.type}>
+              <Tooltip>
+                <TooltipTrigger render={button} />
+                <TooltipContent>{disabledReason}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            button
+          )
+        })}
+      </div>
+    )
+  } else if (!hasWaffoPaymentMethods) {
+    paymentMethodContent = (
+      <Alert>
+        <AlertDescription>
+          {t('No payment methods available. Please contact administrator.')}
+        </AlertDescription>
+      </Alert>
     )
   }
 
@@ -218,7 +291,7 @@ export function RechargeFormCard({
                     {t('Amount')}
                   </Label>
                   <div className='grid grid-cols-2 gap-1.5 sm:gap-3 md:grid-cols-4'>
-                    {presetAmounts.map((preset, index) => {
+                    {presetAmounts.map((preset) => {
                       const discount =
                         preset.discount ||
                         topupInfo?.discount?.[preset.value] ||
@@ -236,7 +309,7 @@ export function RechargeFormCard({
                       )
                       return (
                         <Button
-                          key={index}
+                          key={preset.value}
                           variant='outline'
                           className={cn(
                             'flex min-h-16 flex-col items-start rounded-lg px-3 py-2.5 text-left whitespace-normal sm:min-h-[72px] sm:p-4',
@@ -308,78 +381,7 @@ export function RechargeFormCard({
                 <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
                   {t('Payment Method')}
                 </Label>
-                {hasStandardPaymentMethods ? (
-                  <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
-                    {topupInfo?.pay_methods?.map((method) => {
-                      const minTopup = method.min_topup || 0
-                      const disabled = minTopup > topupAmount
-                      const disabledReason = disabled
-                        ? t('Minimum topup amount: {{amount}}', {
-                            amount: minTopup,
-                          })
-                        : undefined
-                      const disabledLabel = disabled
-                        ? `${t('Minimum:')} ${minTopup}`
-                        : undefined
-
-                      const button = (
-                        <Button
-                          key={method.type}
-                          variant='outline'
-                          onClick={() => onPaymentMethodSelect(method)}
-                          disabled={disabled || !!paymentLoading}
-                          title={disabledReason}
-                          aria-label={
-                            disabledReason
-                              ? `${method.name}. ${disabledReason}`
-                              : method.name
-                          }
-                          className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
-                        >
-                          {paymentLoading === method.type ? (
-                            <Loader2 className='h-4 w-4 animate-spin' />
-                          ) : (
-                            getPaymentIcon(
-                              method.type,
-                              'h-4 w-4',
-                              method.icon,
-                              method.name
-                            )
-                          )}
-                          <span className='flex min-w-0 flex-col items-start gap-0.5'>
-                            <span className='max-w-full truncate'>
-                              {method.name}
-                            </span>
-                            {disabledLabel && (
-                              <span className='text-muted-foreground max-w-full truncate text-[11px] leading-4 font-normal'>
-                                {disabledLabel}
-                              </span>
-                            )}
-                          </span>
-                        </Button>
-                      )
-
-                      return disabled ? (
-                        <TooltipProvider key={method.type}>
-                          <Tooltip>
-                            <TooltipTrigger render={button}></TooltipTrigger>
-                            <TooltipContent>{disabledReason}</TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
-                      ) : (
-                        button
-                      )
-                    })}
-                  </div>
-                ) : hasWaffoPaymentMethods ? null : (
-                  <Alert>
-                    <AlertDescription>
-                      {t(
-                        'No payment methods available. Please contact administrator.'
-                      )}
-                    </AlertDescription>
-                  </Alert>
-                )}
+                {paymentMethodContent}
               </div>
 
               {enableWaffoTopup &&
@@ -402,32 +404,36 @@ export function RechargeFormCard({
                         const disabledLabel = belowMin
                           ? `${t('Minimum:')} ${waffoMin}`
                           : undefined
+                        const ariaLabel = disabledReason
+                          ? `${method.name}. ${disabledReason}`
+                          : method.name
+                        let paymentIcon = getPaymentIcon('waffo')
+                        if (method.icon) {
+                          paymentIcon = (
+                            <img
+                              src={method.icon}
+                              alt={method.name}
+                              className='h-4 w-4 object-contain'
+                            />
+                          )
+                        }
+                        if (paymentLoading === loadingKey) {
+                          paymentIcon = (
+                            <Loader2 className='h-4 w-4 animate-spin' />
+                          )
+                        }
 
                         const button = (
                           <Button
-                            key={`${method.name}-${index}`}
+                            key={method.name}
                             variant='outline'
                             onClick={() => onWaffoMethodSelect(method, index)}
                             disabled={belowMin || !!paymentLoading}
                             title={disabledReason}
-                            aria-label={
-                              disabledReason
-                                ? `${method.name}. ${disabledReason}`
-                                : method.name
-                            }
+                            aria-label={ariaLabel}
                             className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
                           >
-                            {paymentLoading === loadingKey ? (
-                              <Loader2 className='h-4 w-4 animate-spin' />
-                            ) : method.icon ? (
-                              <img
-                                src={method.icon}
-                                alt={method.name}
-                                className='h-4 w-4 object-contain'
-                              />
-                            ) : (
-                              getPaymentIcon('waffo')
-                            )}
+                            {paymentIcon}
                             <span className='flex min-w-0 flex-col items-start gap-0.5'>
                               <span className='max-w-full truncate'>
                                 {method.name}
@@ -442,9 +448,9 @@ export function RechargeFormCard({
                         )
 
                         return belowMin ? (
-                          <TooltipProvider key={`${method.name}-${index}`}>
+                          <TooltipProvider key={method.name}>
                             <Tooltip>
-                              <TooltipTrigger render={button}></TooltipTrigger>
+                              <TooltipTrigger render={button} />
                               <TooltipContent>{disabledReason}</TooltipContent>
                             </Tooltip>
                           </TooltipProvider>

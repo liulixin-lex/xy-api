@@ -22,7 +22,7 @@ import { toast } from 'sonner'
 import useDialogState from '@/hooks/use-dialog'
 import { fetchTokenKey, fetchTokenKeysBatch } from '../api'
 import { ERROR_MESSAGES } from '../constants'
-import { type ApiKey, type ApiKeysDialogType } from '../types'
+import type { ApiKey, ApiKeysDialogType } from '../types'
 
 type ApiKeysContextType = {
   open: ApiKeysDialogType | null

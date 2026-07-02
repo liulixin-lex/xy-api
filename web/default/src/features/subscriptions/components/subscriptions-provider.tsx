@@ -22,7 +22,7 @@ import {
   getOptionValue,
   useSystemOptions,
 } from '@/features/system-settings/hooks/use-system-options'
-import { type PlanRecord, type SubscriptionsDialogType } from '../types'
+import type { PlanRecord, SubscriptionsDialogType } from '../types'
 
 const CURRENT_COMPLIANCE_TERMS_VERSION = 'v1'
 
