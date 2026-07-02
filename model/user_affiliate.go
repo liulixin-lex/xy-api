@@ -6,13 +6,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
-	InviteRewardRuleContinuous = "continuous"
-	InviteRewardRuleFirstTopUp = "first_topup"
+	InviteRewardRuleContinuous   = "continuous"
+	InviteRewardRuleFirstTopUp   = "first_topup"
+	InviteRewardRuleInitialQuota = "initial_quota"
 
 	AffiliateRewardStatusPending     = "pending"
 	AffiliateRewardStatusAvailable   = "available"
@@ -47,6 +50,16 @@ type AffiliateRewardRecord struct {
 	CreatedAt           int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
 }
 
+type InviteInitialQuotaRecord struct {
+	Id                int    `json:"id"`
+	InviterId         int    `json:"inviter_id" gorm:"index"`
+	InviteeId         int    `json:"invitee_id" gorm:"uniqueIndex:idx_invite_initial_quota_once"`
+	InviteLinkBatchId int    `json:"invite_link_batch_id" gorm:"type:int;column:invite_link_batch_id;uniqueIndex:idx_invite_initial_quota_once;index"`
+	ActivityDetail    string `json:"activity_detail" gorm:"type:varchar(255);column:activity_detail"`
+	Quota             int    `json:"quota" gorm:"type:int;column:quota"`
+	CreatedAt         int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+}
+
 type InvitedUser struct {
 	Id                      int                    `json:"id"`
 	Username                string                 `json:"username"`
@@ -62,6 +75,7 @@ type InvitedUser struct {
 	AvailableRewardQuota    int                    `json:"available_reward_quota"`
 	TransferredRewardQuota  int                    `json:"transferred_reward_quota"`
 	CanceledRewardQuota     int                    `json:"canceled_reward_quota"`
+	InitialQuota            int                    `json:"initial_quota"`
 }
 
 type AffiliateRelation struct {
@@ -80,6 +94,7 @@ type AffiliateRelation struct {
 	AvailableRewardQuota    int                    `json:"available_reward_quota"`
 	TransferredRewardQuota  int                    `json:"transferred_reward_quota"`
 	CanceledRewardQuota     int                    `json:"canceled_reward_quota"`
+	InitialQuota            int                    `json:"initial_quota"`
 	RegisteredAt            int64                  `json:"registered_at"`
 }
 
@@ -87,6 +102,7 @@ type AffiliateRewardSummary struct {
 	InviterCount           int64               `json:"inviter_count"`
 	InviteeCount           int64               `json:"invitee_count"`
 	TotalRewardQuota       int64               `json:"total_reward_quota"`
+	TotalInitialQuota      int64               `json:"total_initial_quota"`
 	PendingRewardQuota     int64               `json:"pending_reward_quota"`
 	AvailableRewardQuota   int64               `json:"available_reward_quota"`
 	TransferredRewardQuota int64               `json:"transferred_reward_quota"`
@@ -126,6 +142,7 @@ type affiliateRelationRow struct {
 	ContinuousRewardPercent int
 	ActivityRules           InviteRewardActivities `gorm:"column:activity_rules"`
 	RewardQuota             int
+	InitialQuota            int
 	RegisteredAt            int64
 }
 
@@ -171,6 +188,70 @@ func ResolveInviteRewardPercent(rule string, percent int) int {
 	}
 }
 
+func IssueInviteInitialQuota(tx *gorm.DB, user *User) error {
+	if tx == nil {
+		tx = DB
+	}
+	if user == nil || user.Id == 0 || user.InviterId == 0 || user.InviteLinkBatchId == 0 {
+		return nil
+	}
+
+	activities := NormalizeInviteRewardActivities(user.InviteRewardRulesSnapshot)
+	quota := CalculateInviteInitialQuota(activities)
+	if quota <= 0 {
+		return nil
+	}
+
+	now := common.GetTimestamp()
+	result := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "invitee_id"},
+			{Name: "invite_link_batch_id"},
+		},
+		DoNothing: true,
+	}).Create(&InviteInitialQuotaRecord{
+		InviterId:         user.InviterId,
+		InviteeId:         user.Id,
+		InviteLinkBatchId: user.InviteLinkBatchId,
+		ActivityDetail:    inviteInitialQuotaActivityDetail(activities),
+		Quota:             quota,
+		CreatedAt:         now,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil
+	}
+
+	if err := tx.Model(&User{}).Where("id = ?", user.Id).Update("quota", gorm.Expr("quota + ?", quota)).Error; err != nil {
+		return err
+	}
+	user.Quota += quota
+	return nil
+}
+
+func inviteInitialQuotaActivityDetail(activities InviteRewardActivities) string {
+	parts := make([]string, 0)
+	for _, activity := range NormalizeInviteRewardActivities(activities) {
+		if activity.Type != InviteRewardRuleInitialQuota || activity.Quota <= 0 {
+			continue
+		}
+		if activity.ActivityDetail != "" {
+			parts = append(parts, activity.ActivityDetail)
+		}
+	}
+	if len(parts) == 0 {
+		return "Initial Quota"
+	}
+	detail := strings.Join(parts, ", ")
+	runes := []rune(detail)
+	if len(runes) > InviteRewardActivityDetailMaxLength {
+		return string(runes[:InviteRewardActivityDetailMaxLength])
+	}
+	return detail
+}
+
 func GetInvitedUsers(inviterId int, query AffiliateRelationQuery) ([]InvitedUser, error) {
 	rows, err := listAffiliateRelations(&inviterId, query)
 	if err != nil {
@@ -197,6 +278,7 @@ func GetInvitedUsers(inviterId int, query AffiliateRelationQuery) ([]InvitedUser
 			ContinuousRewardPercent: continuousPercent,
 			ActivityRules:           activityRules,
 			ContributionQuota:       row.RewardQuota,
+			InitialQuota:            row.InitialQuota,
 		})
 	}
 	if err := fillInvitedUserRewardBreakdowns(inviterId, users); err != nil {
@@ -260,6 +342,12 @@ func GetAffiliateRewardSummary(query AffiliateRelationQuery) (*AffiliateRewardSu
 	if total.Valid {
 		summary.TotalRewardQuota = total.Int64
 	}
+	if err := DB.Model(&InviteInitialQuotaRecord{}).Select("COALESCE(SUM(quota), 0)").Scan(&total).Error; err != nil {
+		return nil, err
+	}
+	if total.Valid {
+		summary.TotalInitialQuota = total.Int64
+	}
 	if err := fillAffiliateRewardSummaryBreakdown(summary); err != nil {
 		return nil, err
 	}
@@ -290,6 +378,7 @@ func GetAffiliateRewardSummary(query AffiliateRelationQuery) (*AffiliateRewardSu
 			ContinuousRewardPercent: continuousPercent,
 			ActivityRules:           activityRules,
 			RewardQuota:             row.RewardQuota,
+			InitialQuota:            row.InitialQuota,
 			RegisteredAt:            row.RegisteredAt,
 		}
 		if err := fillAffiliateRelationRewardBreakdown(&relation); err != nil {
@@ -380,6 +469,9 @@ func filterAffiliateRelationRowsByRewardPercent(rows []affiliateRelationRow, rew
 			row.ContinuousRewardPercent,
 		)
 		for _, activity := range resolveAffiliateRelationActivityRules(row, firstTopupPercent, continuousPercent) {
+			if activity.Type != InviteRewardRuleFirstTopUp && activity.Type != InviteRewardRuleContinuous {
+				continue
+			}
 			if activity.Percent == *rewardPercent {
 				filtered = append(filtered, row)
 				break
@@ -392,6 +484,9 @@ func filterAffiliateRelationRowsByRewardPercent(rows []affiliateRelationRow, rew
 func listAffiliateRelations(inviterId *int, query AffiliateRelationQuery) ([]affiliateRelationRow, error) {
 	rewardTotals := DB.Model(&AffiliateRewardRecord{}).
 		Select("inviter_id, invitee_id, SUM(reward_quota) AS reward_quota").
+		Group("inviter_id, invitee_id")
+	initialQuotaTotals := DB.Model(&InviteInitialQuotaRecord{}).
+		Select("inviter_id, invitee_id, SUM(quota) AS initial_quota").
 		Group("inviter_id, invitee_id")
 
 	db := DB.Table("users AS invitees").
@@ -406,9 +501,11 @@ func listAffiliateRelations(inviterId *int, query AffiliateRelationQuery) ([]aff
 				invitees.invite_continuous_reward_percent AS continuous_reward_percent,
 				invitees.invite_reward_rules_snapshot AS activity_rules,
 				invitees.created_at AS registered_at,
-				COALESCE(reward_totals.reward_quota, 0) AS reward_quota`).
+				COALESCE(reward_totals.reward_quota, 0) AS reward_quota,
+				COALESCE(initial_quota_totals.initial_quota, 0) AS initial_quota`).
 		Joins("LEFT JOIN users AS inviters ON inviters.id = invitees.inviter_id").
 		Joins("LEFT JOIN (?) AS reward_totals ON reward_totals.inviter_id = invitees.inviter_id AND reward_totals.invitee_id = invitees.id", rewardTotals).
+		Joins("LEFT JOIN (?) AS initial_quota_totals ON initial_quota_totals.inviter_id = invitees.inviter_id AND initial_quota_totals.invitee_id = invitees.id", initialQuotaTotals).
 		Where("invitees.inviter_id <> ?", 0)
 
 	if inviterId != nil {

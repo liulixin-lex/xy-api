@@ -74,6 +74,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { formatShanghaiTimestamp } from '@/features/invite-rewards/lib/activity-description'
 import {
+  getInitialQuotaTotal,
   getRewardActivities,
   getRewardRateSortValue,
 } from '@/features/invite-rewards/lib/reward-display'
@@ -102,13 +103,27 @@ type AffiliateRewardSettingsSectionProps = {
 }
 
 type SortDirection = 'asc' | 'desc'
-type BatchSortKey = 'id' | 'name' | 'ratio' | 'link' | 'usage' | 'period'
-type RelationSortKey = 'inviter' | 'invitee' | 'registered' | 'ratio' | 'reward'
+type BatchSortKey =
+  | 'id'
+  | 'name'
+  | 'ratio'
+  | 'initial_quota'
+  | 'link'
+  | 'usage'
+  | 'period'
+type RelationSortKey =
+  | 'inviter'
+  | 'invitee'
+  | 'registered'
+  | 'ratio'
+  | 'reward'
+  | 'initial_quota'
 type ActivityRuleForm = {
   key: string
   activity_detail: string
   type: RewardActivity['type']
   percent: number
+  quota: number
 }
 type BatchForm = {
   id: number
@@ -151,12 +166,14 @@ const defaultBatchForm: BatchForm = {
       activity_detail: 'One-time Referral',
       type: 'first_topup',
       percent: 30,
+      quota: 0,
     },
     {
       key: 'default-continuous',
       activity_detail: 'Continuous Referral',
       type: 'continuous',
       percent: 5,
+      quota: 0,
     },
   ],
   custom_description: '',
@@ -168,6 +185,8 @@ const rewardBadgeClassMap: Record<RewardActivity['type'], string> = {
     'border border-amber-200/45 bg-amber-50/35 !text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/15 dark:!text-amber-300',
   continuous:
     'border border-emerald-200/40 bg-emerald-50/35 !text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/15 dark:!text-emerald-300',
+  initial_quota:
+    'border border-sky-200/45 bg-sky-50/40 !text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/20 dark:!text-sky-300',
 }
 
 function formatShanghaiDateTimeInput(timestamp: number) {
@@ -187,7 +206,8 @@ function parseShanghaiDateTimeInput(value: string) {
 function createActivityRuleForm(
   activityDetail: string,
   type: RewardActivity['type'],
-  percent: number
+  percent: number,
+  quota = 0
 ): ActivityRuleForm {
   return {
     key:
@@ -196,6 +216,7 @@ function createActivityRuleForm(
     activity_detail: activityDetail,
     type,
     percent,
+    quota,
   }
 }
 
@@ -208,6 +229,7 @@ function buildPresetDescription(form: BatchForm) {
         title: rule.activity_detail.trim(),
         type: rule.type,
         percent: Number(rule.percent),
+        quota: Number(rule.quota),
       }))
       .filter((rule) => rule.title),
   })
@@ -236,6 +258,7 @@ function rewardActivityLabel(
   t: (key: string) => string
 ) {
   const type = activity.type
+  if (type === 'initial_quota') return t('Initial Quota')
   return type === 'first_topup' ? t('First Top-up') : t('Continuous')
 }
 
@@ -249,7 +272,7 @@ function RewardActivityBadges(props: { activities: RewardActivity[] }) {
       {props.activities.map((activity) => (
         <StatusBadge
           key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
-          label={`${rewardActivityLabel(activity, t)}${activity.percent}%`}
+          label={`${rewardActivityLabel(activity, t)}${activity.percent ?? 0}%`}
           variant='success'
           size='sm'
           copyable={false}
@@ -360,6 +383,7 @@ export function AffiliateRewardSettingsSection(
       { id: 'id' as const, label: t('ID') },
       { id: 'name' as const, label: t('Name') },
       { id: 'ratio' as const, label: t('Reward Ratio') },
+      { id: 'initial_quota' as const, label: t('Initial Quota') },
       { id: 'link' as const, label: t('Link') },
       { id: 'usage' as const, label: t('Using Users') },
       { id: 'period' as const, label: t('Valid Period') },
@@ -373,6 +397,7 @@ export function AffiliateRewardSettingsSection(
       { id: 'registered' as const, label: t('Registered At') },
       { id: 'ratio' as const, label: t('Reward Overview') },
       { id: 'reward' as const, label: t('Contribution Rewards') },
+      { id: 'initial_quota' as const, label: t('Initial Quota') },
     ],
     [t]
   )
@@ -399,6 +424,10 @@ export function AffiliateRewardSettingsSection(
       if (batchSort.key === 'ratio') {
         left = getRewardRateSortValue(a)
         right = getRewardRateSortValue(b)
+      }
+      if (batchSort.key === 'initial_quota') {
+        left = getInitialQuotaTotal(a)
+        right = getInitialQuotaTotal(b)
       }
       if (batchSort.key === 'link') {
         left = a.base_link
@@ -441,6 +470,10 @@ export function AffiliateRewardSettingsSection(
         left = a.reward_quota
         right = b.reward_quota
       }
+      if (relationSort.key === 'initial_quota') {
+        left = a.initial_quota
+        right = b.initial_quota
+      }
       const direction = relationSort.direction === 'asc' ? 1 : -1
       if (left > right) return direction
       if (left < right) return -direction
@@ -468,11 +501,15 @@ export function AffiliateRewardSettingsSection(
       description_mode: batch.description_mode,
       preset_title: preset.title,
       preset_summary: preset.summary,
-      activity_rules: getRewardActivities(batch).map((activity) =>
+      activity_rules: (batch.activity_rules?.length
+        ? batch.activity_rules
+        : getRewardActivities(batch)
+      ).map((activity) =>
         createActivityRuleForm(
           activity.activity_detail,
           activity.type,
-          activity.percent
+          activity.percent ?? 0,
+          activity.quota ?? 0
         )
       ),
       custom_description: batch.custom_description,
@@ -497,7 +534,7 @@ export function AffiliateRewardSettingsSection(
       ...current,
       activity_rules: [
         ...current.activity_rules,
-        createActivityRuleForm('', 'continuous', 5),
+        createActivityRuleForm('', 'continuous', 5, 0),
       ],
     }))
   }
@@ -530,9 +567,20 @@ export function AffiliateRewardSettingsSection(
         toast.error(t('Activity detail is required'))
         return
       }
-      if (rule.type !== 'first_topup' && rule.type !== 'continuous') {
+      if (
+        rule.type !== 'first_topup' &&
+        rule.type !== 'continuous' &&
+        rule.type !== 'initial_quota'
+      ) {
         toast.error(t('Activity type is required'))
         return
+      }
+      if (rule.type === 'initial_quota') {
+        if (!Number.isFinite(Number(rule.quota)) || Number(rule.quota) < 0) {
+          toast.error(t('Initial quota must be non-negative'))
+          return
+        }
+        continue
       }
       if (
         !Number.isFinite(Number(rule.percent)) ||
@@ -553,6 +601,7 @@ export function AffiliateRewardSettingsSection(
           activity_detail: rule.activity_detail.trim(),
           type: rule.type,
           percent: Number(rule.percent),
+          quota: Number(rule.quota),
         })),
         start_time: parseShanghaiDateTimeInput(form.start_time),
         end_time: parseShanghaiDateTimeInput(form.end_time),
@@ -679,6 +728,24 @@ export function AffiliateRewardSettingsSection(
                       />
                     </TableHead>
                   )}
+                  {!hiddenBatchColumns.initial_quota && (
+                    <TableHead>
+                      <SortableHeader
+                        label={t('Initial Quota')}
+                        sortKey='initial_quota'
+                        sort={batchSort}
+                        onSort={(key, direction) =>
+                          setBatchSort({ key, direction })
+                        }
+                        onHide={(key) =>
+                          setHiddenBatchColumns((current) => ({
+                            ...current,
+                            [key]: true,
+                          }))
+                        }
+                      />
+                    </TableHead>
+                  )}
                   {!hiddenBatchColumns.link && (
                     <TableHead>
                       <SortableHeader
@@ -762,6 +829,13 @@ export function AffiliateRewardSettingsSection(
                         />
                       </TableCell>
                     )}
+                    {!hiddenBatchColumns.initial_quota && (
+                      <TableCell>
+                        <span className='font-mono text-sm tabular-nums'>
+                          {formatQuota(getInitialQuotaTotal(batch))}
+                        </span>
+                      </TableCell>
+                    )}
                     {!hiddenBatchColumns.link && (
                       <TableCell>
                         <div className='flex max-w-[240px] items-center gap-2'>
@@ -837,7 +911,7 @@ export function AffiliateRewardSettingsSection(
           </div>
         </CardHeader>
         <CardContent className='space-y-4 p-4'>
-          <div className='grid gap-3 md:grid-cols-3'>
+          <div className='grid gap-3 md:grid-cols-4'>
             <StatTile
               label={t('Inviters')}
               value={String(summary?.inviter_count ?? 0)}
@@ -853,6 +927,12 @@ export function AffiliateRewardSettingsSection(
             <StatTile
               label={t('Total Rewards')}
               value={formatQuota(summary?.total_reward_quota ?? 0)}
+              loading={summaryQuery.isLoading}
+              icon={BadgeDollarSign}
+            />
+            <StatTile
+              label={t('Initial Quota Total')}
+              value={formatQuota(summary?.total_initial_quota ?? 0)}
               loading={summaryQuery.isLoading}
               icon={BadgeDollarSign}
             />
@@ -978,6 +1058,24 @@ export function AffiliateRewardSettingsSection(
                     />
                   </TableHead>
                 )}
+                {!hiddenRelationColumns.initial_quota && (
+                  <TableHead>
+                    <SortableHeader
+                      label={t('Initial Quota')}
+                      sortKey='initial_quota'
+                      sort={relationSort}
+                      onSort={(key, direction) =>
+                        setRelationSort({ key, direction })
+                      }
+                      onHide={(key) =>
+                        setHiddenRelationColumns((current) => ({
+                          ...current,
+                          [key]: true,
+                        }))
+                      }
+                    />
+                  </TableHead>
+                )}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -1010,6 +1108,13 @@ export function AffiliateRewardSettingsSection(
                       <div className='text-muted-foreground text-xs leading-relaxed break-words'>
                         {contributionText(relation, t)}
                       </div>
+                    </TableCell>
+                  )}
+                  {!hiddenRelationColumns.initial_quota && (
+                    <TableCell>
+                      <span className='font-mono text-sm tabular-nums'>
+                        {formatQuota(relation.initial_quota ?? 0)}
+                      </span>
                     </TableCell>
                   )}
                 </TableRow>
@@ -1173,7 +1278,7 @@ export function AffiliateRewardSettingsSection(
                 {form.activity_rules.map((detail, index) => (
                   <div
                     key={detail.key}
-                    className='grid gap-2 rounded-lg border p-3 md:grid-cols-[minmax(0,1fr)_120px_100px_32px]'
+                    className='grid gap-2 rounded-lg border p-3 md:grid-cols-[minmax(0,1fr)_128px_120px_32px]'
                   >
                     <Input
                       value={detail.activity_detail}
@@ -1201,16 +1306,34 @@ export function AffiliateRewardSettingsSection(
                       <NativeSelectOption value='continuous'>
                         {t('Continuous')}
                       </NativeSelectOption>
+                      <NativeSelectOption value='initial_quota'>
+                        {t('Initial Quota')}
+                      </NativeSelectOption>
                     </NativeSelect>
                     <Input
                       type='number'
                       min={0}
-                      max={100}
-                      value={detail.percent}
-                      aria-label={t('Reward Ratio')}
+                      max={detail.type === 'initial_quota' ? undefined : 100}
+                      value={
+                        detail.type === 'initial_quota'
+                          ? detail.quota
+                          : detail.percent
+                      }
+                      aria-label={
+                        detail.type === 'initial_quota'
+                          ? t('Initial Quota')
+                          : t('Reward Ratio')
+                      }
+                      placeholder={
+                        detail.type === 'initial_quota'
+                          ? t('Initial Quota')
+                          : t('Reward Ratio')
+                      }
                       onChange={(event) =>
                         updateActivityRule(index, {
-                          percent: Number(event.target.value),
+                          [detail.type === 'initial_quota'
+                            ? 'quota'
+                            : 'percent']: Number(event.target.value),
                         })
                       }
                     />

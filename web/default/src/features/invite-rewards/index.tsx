@@ -87,10 +87,15 @@ import {
 import { formatActivityDetailLabel } from './lib/activity-label'
 import {
   buildInviteSequenceMap,
+  formatInitialQuotaSummary,
   formatRewardRateSummary,
+  getInitialQuotaActivities,
+  getInitialQuotaSortValue,
+  getInitialQuotaTotal,
   getPendingRewardQuotaSortValue,
   getRewardActivities,
   getRewardRateSortValue,
+  type RewardRateSource,
 } from './lib/reward-display'
 import type {
   InviteLinkBatch,
@@ -138,7 +143,12 @@ type InvitedUsersTableProps = {
 }
 
 type SortDirection = 'asc' | 'desc'
-type InvitedUsersSortKey = 'sequence' | 'registered' | 'ratio' | 'reward'
+type InvitedUsersSortKey =
+  | 'sequence'
+  | 'registered'
+  | 'ratio'
+  | 'reward'
+  | 'initial_quota'
 
 const defaultPresetActivityDescription: PresetActivityDescription = {
   title: '',
@@ -158,6 +168,8 @@ const rewardBadgeClassMap: Record<RewardActivity['type'], string> = {
     'border border-amber-200/45 bg-amber-50/35 !text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/15 dark:!text-amber-300',
   continuous:
     'border border-emerald-200/40 bg-emerald-50/35 !text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/15 dark:!text-emerald-300',
+  initial_quota:
+    'border border-sky-200/45 bg-sky-50/40 !text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/20 dark:!text-sky-300',
 }
 
 function parsePresetActivityDescription(
@@ -204,6 +216,7 @@ function rewardActivityLabel(
   t: (key: string) => string
 ) {
   const type = activity.type
+  if (type === 'initial_quota') return t('Initial Quota')
   return type === 'first_topup' ? t('First Top-up') : t('Continuous')
 }
 
@@ -219,7 +232,7 @@ function RewardActivityBadges(props: { activities: RewardActivity[] }) {
       {props.activities.map((activity) => (
         <StatusBadge
           key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
-          label={`${rewardActivityLabel(activity, t)}${activity.percent}%`}
+          label={`${rewardActivityLabel(activity, t)}${activity.percent ?? 0}%`}
           variant='success'
           size='sm'
           copyable={false}
@@ -230,6 +243,25 @@ function RewardActivityBadges(props: { activities: RewardActivity[] }) {
         />
       ))}
     </div>
+  )
+}
+
+function InitialQuotaSummaryBadge(props: {
+  source?: RewardRateSource
+  showZero?: boolean
+}) {
+  const { t } = useTranslation()
+  const total = getInitialQuotaTotal(props.source)
+  if (total <= 0 && !props.showZero) return null
+
+  return (
+    <StatusBadge
+      label={formatInitialQuotaSummary(props.source, formatQuota, t)}
+      variant='info'
+      size='sm'
+      copyable={false}
+      className='rounded-md border border-sky-200/45 bg-sky-50/40 font-mono !text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/20 dark:!text-sky-300'
+    />
   )
 }
 
@@ -332,6 +364,10 @@ function ActivityCard(props: ActivityCardProps) {
     () => getRewardActivities(props.batch),
     [props.batch]
   )
+  const initialQuotaActivities = useMemo(
+    () => getInitialQuotaActivities(props.batch),
+    [props.batch]
+  )
 
   if (props.loading) {
     return (
@@ -380,7 +416,7 @@ function ActivityCard(props: ActivityCardProps) {
     activityContent = (
       <div className='space-y-4'>
         <TrustedActivityHtml content={customDescription} />
-        {activities.length > 0 ? (
+        {activities.length > 0 || initialQuotaActivities.length > 0 ? (
           <div className='grid gap-2 sm:grid-cols-2'>
             {activities.map((activity) => (
               <div
@@ -395,11 +431,26 @@ function ActivityCard(props: ActivityCardProps) {
                 </div>
               </div>
             ))}
+            {initialQuotaActivities.map((activity) => (
+              <div
+                key={`${activity.activity_detail}-${activity.type}-${activity.quota}`}
+                className='rounded-lg border p-3'
+              >
+                <div className='text-sm font-medium'>
+                  {formatActivityDetailLabel(activity.activity_detail, t)}
+                </div>
+                <div className='mt-2'>
+                  <InitialQuotaSummaryBadge
+                    source={{ activity_rules: [activity] }}
+                  />
+                </div>
+              </div>
+            ))}
           </div>
         ) : null}
       </div>
     )
-  } else if (activities.length > 0) {
+  } else if (activities.length > 0 || initialQuotaActivities.length > 0) {
     activityContent = (
       <div className='grid gap-2 sm:grid-cols-2'>
         {activities.map((activity) => (
@@ -412,6 +463,21 @@ function ActivityCard(props: ActivityCardProps) {
             </div>
             <div className='mt-2'>
               <RewardActivityBadges activities={[activity]} />
+            </div>
+          </div>
+        ))}
+        {initialQuotaActivities.map((activity) => (
+          <div
+            key={`${activity.activity_detail}-${activity.type}-${activity.quota}`}
+            className='rounded-lg border p-3'
+          >
+            <div className='text-sm font-medium'>
+              {formatActivityDetailLabel(activity.activity_detail, t)}
+            </div>
+            <div className='mt-2'>
+              <InitialQuotaSummaryBadge
+                source={{ activity_rules: [activity] }}
+              />
             </div>
           </div>
         ))}
@@ -481,6 +547,9 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
         )}
         <div className='flex flex-wrap items-center gap-3'>
           <RewardRateSummaryBadge batch={activeBatch} />
+          {activeBatch ? (
+            <InitialQuotaSummaryBadge source={activeBatch} showZero />
+          ) : null}
           {activeBatch ? (
             <span className='text-muted-foreground flex flex-wrap items-center gap-1.5 text-xs'>
               <span className='text-foreground/80 font-medium'>
@@ -606,6 +675,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
       { id: 'registered' as const, label: t('Registered At') },
       { id: 'ratio' as const, label: t('Reward Ratio') },
       { id: 'reward' as const, label: t('Contribution Rewards') },
+      { id: 'initial_quota' as const, label: t('Initial Quota') },
     ],
     [t]
   )
@@ -684,6 +754,10 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
         left = getPendingRewardQuotaSortValue(a)
         right = getPendingRewardQuotaSortValue(b)
       }
+      if (sort.key === 'initial_quota') {
+        left = getInitialQuotaSortValue(a)
+        right = getInitialQuotaSortValue(b)
+      }
       const direction = sort.direction === 'asc' ? 1 : -1
       if (left > right) return direction
       if (left < right) return -direction
@@ -760,6 +834,18 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
               />
             </TableHead>
           )}
+          {!hiddenColumns.initial_quota && (
+            <TableHead>
+              <SortableHeader
+                label={t('Initial Quota')}
+                sortKey='initial_quota'
+                onSort={(key, direction) => setSort({ key, direction })}
+                onHide={(key) =>
+                  setHiddenColumns((current) => ({ ...current, [key]: true }))
+                }
+              />
+            </TableHead>
+          )}
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -785,6 +871,13 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
                 <div className='text-muted-foreground text-xs leading-relaxed break-words'>
                   {invitedUserContributionText(user, t)}
                 </div>
+              </TableCell>
+            )}
+            {!hiddenColumns.initial_quota && (
+              <TableCell>
+                <span className='font-mono text-sm tabular-nums'>
+                  {formatQuota(user.initial_quota ?? 0)}
+                </span>
               </TableCell>
             )}
           </TableRow>
