@@ -60,6 +60,60 @@ func TestGetAffInvitedUsersReturnsCurrentUsersInvites(t *testing.T) {
 	assert.Equal(t, 300, response.Data[0].ContributionQuota)
 }
 
+func TestGetAffInvitedUsersAppliesRegisteredRangeAndRewardPercentParams(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.Create(&[]model.User{
+		{Id: 20, Username: "inviter", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff20"},
+		{
+			Id:                            21,
+			Username:                      "alice",
+			Password:                      "secret",
+			Status:                        common.UserStatusEnabled,
+			AffCode:                       "aff21",
+			InviterId:                     20,
+			InviteLinkBatchId:             201,
+			InviteFirstTopupRewardPercent: 30,
+			InviteContinuousRewardPercent: 5,
+			InviteRewardRulesSnapshot: model.InviteRewardActivities{
+				{ActivityDetail: "Launch first top-up", Type: model.InviteRewardRuleFirstTopUp, Percent: 20},
+				{ActivityDetail: "VIP first top-up", Type: model.InviteRewardRuleFirstTopUp, Percent: 10},
+				{ActivityDetail: "Ongoing partner", Type: model.InviteRewardRuleContinuous, Percent: 5},
+			},
+			CreatedAt: 1_800_000_100,
+		},
+		{
+			Id:                            22,
+			Username:                      "bob",
+			Password:                      "secret",
+			Status:                        common.UserStatusEnabled,
+			AffCode:                       "aff22",
+			InviterId:                     20,
+			InviteLinkBatchId:             202,
+			InviteFirstTopupRewardPercent: 40,
+			InviteContinuousRewardPercent: 8,
+			InviteRewardRulesSnapshot: model.InviteRewardActivities{
+				{ActivityDetail: "Partner first top-up", Type: model.InviteRewardRuleFirstTopUp, Percent: 40},
+				{ActivityDetail: "Partner ongoing", Type: model.InviteRewardRuleContinuous, Percent: 8},
+			},
+			CreatedAt: 1_800_000_300,
+		},
+	}).Error)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("id", 20)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/user/aff/invited?registered_start=1800000000&registered_end=1800000200&reward_percent=20", nil)
+
+	GetAffInvitedUsers(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response invitedUsersResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success)
+	require.Len(t, response.Data, 1)
+	assert.Equal(t, "alice", response.Data[0].Username)
+}
+
 func TestGetAdminAffiliateRewardsReturnsSummaryAndFilteredRelations(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.Create(&[]model.User{

@@ -16,6 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+export type RewardActivity = {
+  activity_detail: string
+  type: 'continuous' | 'first_topup'
+  percent: number
+}
+
 export interface InvitedUser {
   id: number
   username: string
@@ -25,6 +31,7 @@ export interface InvitedUser {
   invite_reward_percent: number
   first_topup_reward_percent: number
   continuous_reward_percent: number
+  activity_rules: RewardActivity[]
   contribution_quota: number
   pending_reward_quota: number
   available_reward_quota: number
@@ -39,6 +46,7 @@ export interface InviteLinkBatch {
   base_link: string
   first_topup_reward_percent: number
   continuous_reward_percent: number
+  activity_rules: RewardActivity[]
   start_time: number
   end_time: number
   description_mode: 'preset' | 'custom'

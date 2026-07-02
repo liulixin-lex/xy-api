@@ -90,7 +90,7 @@ export function TransferDialog({
       <div className='space-y-4 py-3 sm:space-y-6 sm:py-4'>
         <div className='space-y-2'>
           <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
-            {t('Available Rewards')}
+            {t('Transferable Rewards')}
           </Label>
           <div className='text-2xl font-semibold'>
             {formatQuota(availableQuota)}

@@ -34,6 +34,7 @@ type AffiliateRewardRecord struct {
 	InviteeId           int    `json:"invitee_id" gorm:"index"`
 	TopUpId             int    `json:"topup_id" gorm:"index"`
 	InviteLinkBatchId   int    `json:"invite_link_batch_id" gorm:"type:int;column:invite_link_batch_id;index"`
+	ActivityDetail      string `json:"activity_detail" gorm:"type:varchar(255);column:activity_detail"`
 	InviteRewardRule    string `json:"invite_reward_rule" gorm:"type:varchar(32);column:invite_reward_rule"`
 	InviteRewardPercent int    `json:"invite_reward_percent" gorm:"type:int;column:invite_reward_percent"`
 	TopUpQuota          int    `json:"topup_quota" gorm:"type:int;column:topup_quota"`
@@ -47,37 +48,39 @@ type AffiliateRewardRecord struct {
 }
 
 type InvitedUser struct {
-	Id                      int    `json:"id"`
-	Username                string `json:"username"`
-	DisplayName             string `json:"display_name"`
-	CreatedAt               int64  `json:"created_at"`
-	InviteRewardRule        string `json:"invite_reward_rule"`
-	InviteRewardPercent     int    `json:"invite_reward_percent"`
-	FirstTopupRewardPercent int    `json:"first_topup_reward_percent"`
-	ContinuousRewardPercent int    `json:"continuous_reward_percent"`
-	ContributionQuota       int    `json:"contribution_quota"`
-	PendingRewardQuota      int    `json:"pending_reward_quota"`
-	AvailableRewardQuota    int    `json:"available_reward_quota"`
-	TransferredRewardQuota  int    `json:"transferred_reward_quota"`
-	CanceledRewardQuota     int    `json:"canceled_reward_quota"`
+	Id                      int                    `json:"id"`
+	Username                string                 `json:"username"`
+	DisplayName             string                 `json:"display_name"`
+	CreatedAt               int64                  `json:"created_at"`
+	InviteRewardRule        string                 `json:"invite_reward_rule"`
+	InviteRewardPercent     int                    `json:"invite_reward_percent"`
+	FirstTopupRewardPercent int                    `json:"first_topup_reward_percent"`
+	ContinuousRewardPercent int                    `json:"continuous_reward_percent"`
+	ActivityRules           InviteRewardActivities `json:"activity_rules"`
+	ContributionQuota       int                    `json:"contribution_quota"`
+	PendingRewardQuota      int                    `json:"pending_reward_quota"`
+	AvailableRewardQuota    int                    `json:"available_reward_quota"`
+	TransferredRewardQuota  int                    `json:"transferred_reward_quota"`
+	CanceledRewardQuota     int                    `json:"canceled_reward_quota"`
 }
 
 type AffiliateRelation struct {
-	InviterId               int    `json:"inviter_id"`
-	InviterUsername         string `json:"inviter_username"`
-	InviteeId               int    `json:"invitee_id"`
-	InviteeUsername         string `json:"invitee_username"`
-	InviteeDisplayName      string `json:"invitee_display_name"`
-	InviteRewardRule        string `json:"invite_reward_rule"`
-	InviteRewardPercent     int    `json:"invite_reward_percent"`
-	FirstTopupRewardPercent int    `json:"first_topup_reward_percent"`
-	ContinuousRewardPercent int    `json:"continuous_reward_percent"`
-	RewardQuota             int    `json:"reward_quota"`
-	PendingRewardQuota      int    `json:"pending_reward_quota"`
-	AvailableRewardQuota    int    `json:"available_reward_quota"`
-	TransferredRewardQuota  int    `json:"transferred_reward_quota"`
-	CanceledRewardQuota     int    `json:"canceled_reward_quota"`
-	RegisteredAt            int64  `json:"registered_at"`
+	InviterId               int                    `json:"inviter_id"`
+	InviterUsername         string                 `json:"inviter_username"`
+	InviteeId               int                    `json:"invitee_id"`
+	InviteeUsername         string                 `json:"invitee_username"`
+	InviteeDisplayName      string                 `json:"invitee_display_name"`
+	InviteRewardRule        string                 `json:"invite_reward_rule"`
+	InviteRewardPercent     int                    `json:"invite_reward_percent"`
+	FirstTopupRewardPercent int                    `json:"first_topup_reward_percent"`
+	ContinuousRewardPercent int                    `json:"continuous_reward_percent"`
+	ActivityRules           InviteRewardActivities `json:"activity_rules"`
+	RewardQuota             int                    `json:"reward_quota"`
+	PendingRewardQuota      int                    `json:"pending_reward_quota"`
+	AvailableRewardQuota    int                    `json:"available_reward_quota"`
+	TransferredRewardQuota  int                    `json:"transferred_reward_quota"`
+	CanceledRewardQuota     int                    `json:"canceled_reward_quota"`
+	RegisteredAt            int64                  `json:"registered_at"`
 }
 
 type AffiliateRewardSummary struct {
@@ -103,9 +106,12 @@ type ReferralRewardDashboard struct {
 }
 
 type AffiliateRelationQuery struct {
-	SearchField string
-	Search      string
-	InviteType  string
+	SearchField     string
+	Search          string
+	InviteType      string
+	RegisteredStart int64
+	RegisteredEnd   int64
+	RewardPercent   *int
 }
 
 type affiliateRelationRow struct {
@@ -118,6 +124,7 @@ type affiliateRelationRow struct {
 	InviteRewardPercent     int
 	FirstTopupRewardPercent int
 	ContinuousRewardPercent int
+	ActivityRules           InviteRewardActivities `gorm:"column:activity_rules"`
 	RewardQuota             int
 	RegisteredAt            int64
 }
@@ -178,6 +185,7 @@ func GetInvitedUsers(inviterId int, query AffiliateRelationQuery) ([]InvitedUser
 			row.FirstTopupRewardPercent,
 			row.ContinuousRewardPercent,
 		)
+		activityRules := resolveAffiliateRelationActivityRules(row, firstTopupPercent, continuousPercent)
 		users = append(users, InvitedUser{
 			Id:                      row.InviteeId,
 			Username:                row.InviteeUsername,
@@ -187,6 +195,7 @@ func GetInvitedUsers(inviterId int, query AffiliateRelationQuery) ([]InvitedUser
 			InviteRewardPercent:     ResolveInviteRewardPercent(row.InviteRewardRule, row.InviteRewardPercent),
 			FirstTopupRewardPercent: firstTopupPercent,
 			ContinuousRewardPercent: continuousPercent,
+			ActivityRules:           activityRules,
 			ContributionQuota:       row.RewardQuota,
 		})
 	}
@@ -215,12 +224,9 @@ func GetReferralRewardDashboard(inviterId int, now int64) (*ReferralRewardDashbo
 		return nil, err
 	}
 
-	users, err := GetInvitedUsers(inviterId, AffiliateRelationQuery{})
-	if err != nil {
+	if err := DB.Model(&User{}).Where("inviter_id = ?", inviterId).Count(&dashboard.InvitedUserCount).Error; err != nil {
 		return nil, err
 	}
-	dashboard.InvitedUsers = users
-	dashboard.InvitedUserCount = int64(len(users))
 
 	var records []AffiliateRewardRecord
 	if err := DB.Where("inviter_id = ?", inviterId).Find(&records).Error; err != nil {
@@ -271,6 +277,7 @@ func GetAffiliateRewardSummary(query AffiliateRelationQuery) (*AffiliateRewardSu
 			row.FirstTopupRewardPercent,
 			row.ContinuousRewardPercent,
 		)
+		activityRules := resolveAffiliateRelationActivityRules(row, firstTopupPercent, continuousPercent)
 		relation := AffiliateRelation{
 			InviterId:               row.InviterId,
 			InviterUsername:         row.InviterUsername,
@@ -281,6 +288,7 @@ func GetAffiliateRewardSummary(query AffiliateRelationQuery) (*AffiliateRewardSu
 			InviteRewardPercent:     ResolveInviteRewardPercent(row.InviteRewardRule, row.InviteRewardPercent),
 			FirstTopupRewardPercent: firstTopupPercent,
 			ContinuousRewardPercent: continuousPercent,
+			ActivityRules:           activityRules,
 			RewardQuota:             row.RewardQuota,
 			RegisteredAt:            row.RegisteredAt,
 		}
@@ -352,6 +360,35 @@ func resolveInviteRewardPercents(rule string, percent int, firstTopupPercent int
 	return 0, resolvedPercent
 }
 
+func resolveAffiliateRelationActivityRules(row affiliateRelationRow, firstTopupPercent int, continuousPercent int) InviteRewardActivities {
+	if len(row.ActivityRules) > 0 {
+		return row.ActivityRules
+	}
+	return inviteRewardActivitiesFromSnapshotPercents(firstTopupPercent, continuousPercent)
+}
+
+func filterAffiliateRelationRowsByRewardPercent(rows []affiliateRelationRow, rewardPercent *int) []affiliateRelationRow {
+	if rewardPercent == nil {
+		return rows
+	}
+	filtered := make([]affiliateRelationRow, 0, len(rows))
+	for _, row := range rows {
+		firstTopupPercent, continuousPercent := resolveInviteRewardPercents(
+			row.InviteRewardRule,
+			row.InviteRewardPercent,
+			row.FirstTopupRewardPercent,
+			row.ContinuousRewardPercent,
+		)
+		for _, activity := range resolveAffiliateRelationActivityRules(row, firstTopupPercent, continuousPercent) {
+			if activity.Percent == *rewardPercent {
+				filtered = append(filtered, row)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
 func listAffiliateRelations(inviterId *int, query AffiliateRelationQuery) ([]affiliateRelationRow, error) {
 	rewardTotals := DB.Model(&AffiliateRewardRecord{}).
 		Select("inviter_id, invitee_id, SUM(reward_quota) AS reward_quota").
@@ -367,6 +404,7 @@ func listAffiliateRelations(inviterId *int, query AffiliateRelationQuery) ([]aff
 				invitees.invite_reward_percent AS invite_reward_percent,
 				invitees.invite_first_topup_reward_percent AS first_topup_reward_percent,
 				invitees.invite_continuous_reward_percent AS continuous_reward_percent,
+				invitees.invite_reward_rules_snapshot AS activity_rules,
 				invitees.created_at AS registered_at,
 				COALESCE(reward_totals.reward_quota, 0) AS reward_quota`).
 		Joins("LEFT JOIN users AS inviters ON inviters.id = invitees.inviter_id").
@@ -376,11 +414,20 @@ func listAffiliateRelations(inviterId *int, query AffiliateRelationQuery) ([]aff
 	if inviterId != nil {
 		db = db.Where("invitees.inviter_id = ?", *inviterId)
 	}
+	if query.RegisteredStart > 0 {
+		db = db.Where("invitees.created_at >= ?", query.RegisteredStart)
+	}
+	if query.RegisteredEnd > 0 {
+		db = db.Where("invitees.created_at <= ?", query.RegisteredEnd)
+	}
 	db = applyAffiliateRelationFilters(db, query)
 
 	rows := make([]affiliateRelationRow, 0)
 	err := db.Order("invitees.id desc").Scan(&rows).Error
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	return filterAffiliateRelationRowsByRewardPercent(rows, query.RewardPercent), nil
 }
 
 func applyAffiliateRelationFilters(db *gorm.DB, query AffiliateRelationQuery) *gorm.DB {
