@@ -35,7 +35,8 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
-import { Badge } from '@/components/ui/badge'
+import { DataTableManualViewOptions } from '@/components/data-table'
+import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -71,8 +72,11 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
-import { formatActivityDetailLabel } from '@/features/invite-rewards/lib/activity-label'
 import { formatShanghaiTimestamp } from '@/features/invite-rewards/lib/activity-description'
+import {
+  getRewardActivities,
+  getRewardRateSortValue,
+} from '@/features/invite-rewards/lib/reward-display'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -159,6 +163,13 @@ const defaultBatchForm: BatchForm = {
   is_active: false,
 }
 
+const rewardBadgeClassMap: Record<RewardActivity['type'], string> = {
+  first_topup:
+    'border border-amber-200/45 bg-amber-50/35 !text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/15 dark:!text-amber-300',
+  continuous:
+    'border border-emerald-200/40 bg-emerald-50/35 !text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/15 dark:!text-emerald-300',
+}
+
 function formatShanghaiDateTimeInput(timestamp: number) {
   if (!timestamp) return ''
   return shanghaiDateTimeFormatter.format(timestamp * 1000).replace(' ', 'T')
@@ -220,45 +231,15 @@ function parsePresetDescription(batch?: InviteLinkBatch) {
   }
 }
 
-function getRewardActivities(source: {
-  activity_rules?: RewardActivity[]
-  first_topup_reward_percent?: number
-  continuous_reward_percent?: number
-}) {
-  const rules = (source.activity_rules ?? []).filter(
-    (rule) => rule.activity_detail.trim() && rule.percent >= 0
-  )
-  if (rules.length > 0) return rules
-
-  const fallback: RewardActivity[] = []
-  if ((source.first_topup_reward_percent ?? 0) > 0) {
-    fallback.push({
-      activity_detail: 'One-time Referral',
-      type: 'first_topup',
-      percent: source.first_topup_reward_percent ?? 0,
-    })
-  }
-  if ((source.continuous_reward_percent ?? 0) > 0) {
-    fallback.push({
-      activity_detail: 'Continuous Referral',
-      type: 'continuous',
-      percent: source.continuous_reward_percent ?? 0,
-    })
-  }
-  return fallback
-}
-
-function rewardTypeLabel(
-  type: RewardActivity['type'],
+function rewardActivityLabel(
+  activity: RewardActivity,
   t: (key: string) => string
 ) {
+  const type = activity.type
   return type === 'first_topup' ? t('First Top-up') : t('Continuous')
 }
 
-function RewardActivityBadges(props: {
-  activities: RewardActivity[]
-  showDetail?: boolean
-}) {
+function RewardActivityBadges(props: { activities: RewardActivity[] }) {
   const { t } = useTranslation()
   if (props.activities.length === 0) {
     return <span className='text-muted-foreground text-xs'>-</span>
@@ -266,21 +247,17 @@ function RewardActivityBadges(props: {
   return (
     <div className='flex flex-wrap gap-1.5'>
       {props.activities.map((activity) => (
-        <Badge
+        <StatusBadge
           key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
-          variant='outline'
-          className='h-auto max-w-full justify-start gap-1.5 rounded-md px-2 py-1'
-        >
-          <span className='shrink-0 text-[11px]'>
-            {rewardTypeLabel(activity.type, t)}
-          </span>
-          <span className='shrink-0 tabular-nums'>{activity.percent}%</span>
-          {props.showDetail ? (
-            <span className='text-muted-foreground max-w-40 truncate'>
-              {formatActivityDetailLabel(activity.activity_detail, t)}
-            </span>
-          ) : null}
-        </Badge>
+          label={`${rewardActivityLabel(activity, t)}${activity.percent}%`}
+          variant='success'
+          size='sm'
+          copyable={false}
+          className={cn(
+            'rounded-md font-mono',
+            rewardBadgeClassMap[activity.type]
+          )}
+        />
       ))}
     </div>
   )
@@ -378,6 +355,27 @@ export function AffiliateRewardSettingsSection(
   const [drawerOpen, setDrawerOpen] = React.useState(false)
   const [form, setForm] = React.useState<BatchForm>(defaultBatchForm)
   const [saving, setSaving] = React.useState(false)
+  const batchColumns = React.useMemo(
+    () => [
+      { id: 'id' as const, label: t('ID') },
+      { id: 'name' as const, label: t('Name') },
+      { id: 'ratio' as const, label: t('Reward Ratio') },
+      { id: 'link' as const, label: t('Link') },
+      { id: 'usage' as const, label: t('Using Users') },
+      { id: 'period' as const, label: t('Valid Period') },
+    ],
+    [t]
+  )
+  const relationColumns = React.useMemo(
+    () => [
+      { id: 'inviter' as const, label: t('Inviter') },
+      { id: 'invitee' as const, label: t('Invited user') },
+      { id: 'registered' as const, label: t('Registered At') },
+      { id: 'ratio' as const, label: t('Reward Overview') },
+      { id: 'reward' as const, label: t('Contribution Rewards') },
+    ],
+    [t]
+  )
 
   const batchesQuery = useQuery({
     queryKey: ['invite-link-batches'],
@@ -399,14 +397,8 @@ export function AffiliateRewardSettingsSection(
         right = b.name
       }
       if (batchSort.key === 'ratio') {
-        left = getRewardActivities(a).reduce(
-          (total, activity) => total + activity.percent,
-          0
-        )
-        right = getRewardActivities(b).reduce(
-          (total, activity) => total + activity.percent,
-          0
-        )
+        left = getRewardRateSortValue(a)
+        right = getRewardRateSortValue(b)
       }
       if (batchSort.key === 'link') {
         left = a.base_link
@@ -442,14 +434,8 @@ export function AffiliateRewardSettingsSection(
         right = b.invitee_username
       }
       if (relationSort.key === 'ratio') {
-        left = getRewardActivities(a).reduce(
-          (total, activity) => total + activity.percent,
-          0
-        )
-        right = getRewardActivities(b).reduce(
-          (total, activity) => total + activity.percent,
-          0
-        )
+        left = getRewardRateSortValue(a)
+        right = getRewardRateSortValue(b)
       }
       if (relationSort.key === 'reward') {
         left = a.reward_quota
@@ -610,10 +596,22 @@ export function AffiliateRewardSettingsSection(
                 {t('Create referral link batches and choose one active link.')}
               </CardDescription>
             </div>
-            <Button size='sm' onClick={openCreateDrawer}>
-              <Plus data-icon='inline-start' />
-              {t('Create')}
-            </Button>
+            <div className='flex flex-wrap items-center justify-end gap-2'>
+              <DataTableManualViewOptions
+                columns={batchColumns}
+                hiddenColumns={hiddenBatchColumns}
+                onVisibilityChange={(column, visible) =>
+                  setHiddenBatchColumns((current) => ({
+                    ...current,
+                    [column]: !visible,
+                  }))
+                }
+              />
+              <Button size='sm' onClick={openCreateDrawer}>
+                <Plus data-icon='inline-start' />
+                {t('Create')}
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent className='p-0'>
@@ -761,7 +759,6 @@ export function AffiliateRewardSettingsSection(
                       <TableCell className='max-w-[360px] whitespace-normal'>
                         <RewardActivityBadges
                           activities={getRewardActivities(batch)}
-                          showDetail
                         />
                       </TableCell>
                     )}
@@ -823,9 +820,21 @@ export function AffiliateRewardSettingsSection(
 
       <Card data-card-hover='false' className='gap-0 py-0'>
         <CardHeader className='border-b p-4 !pb-4'>
-          <CardTitle className='text-base'>
-            {t('Invitation Reward Overview')}
-          </CardTitle>
+          <div className='flex flex-wrap items-center justify-between gap-3'>
+            <CardTitle className='text-base'>
+              {t('Invitation Reward Overview')}
+            </CardTitle>
+            <DataTableManualViewOptions
+              columns={relationColumns}
+              hiddenColumns={hiddenRelationColumns}
+              onVisibilityChange={(column, visible) =>
+                setHiddenRelationColumns((current) => ({
+                  ...current,
+                  [column]: !visible,
+                }))
+              }
+            />
+          </div>
         </CardHeader>
         <CardContent className='space-y-4 p-4'>
           <div className='grid gap-3 md:grid-cols-3'>
@@ -936,7 +945,7 @@ export function AffiliateRewardSettingsSection(
                 {!hiddenRelationColumns.ratio && (
                   <TableHead>
                     <SortableHeader
-                      label={t('Reward Ratio')}
+                      label={t('Reward Overview')}
                       sortKey='ratio'
                       sort={relationSort}
                       onSort={(key, direction) =>
@@ -993,7 +1002,6 @@ export function AffiliateRewardSettingsSection(
                     <TableCell className='max-w-[360px] whitespace-normal'>
                       <RewardActivityBadges
                         activities={getRewardActivities(relation)}
-                        showDetail
                       />
                     </TableCell>
                   )}

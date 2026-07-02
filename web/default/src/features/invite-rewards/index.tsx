@@ -37,8 +37,9 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
+import { DataTableManualViewOptions } from '@/components/data-table'
 import { SectionPageLayout } from '@/components/layout'
-import { Badge } from '@/components/ui/badge'
+import { StatusBadge } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -62,7 +63,6 @@ import {
   EmptyTitle,
 } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -77,13 +77,21 @@ import { transferAffiliateQuota } from '@/features/wallet/api'
 import { TransferDialog } from '@/features/wallet/components/dialogs/transfer-dialog'
 import { useTopupInfo } from '@/features/wallet/hooks'
 import { formatQuota, formatTimestamp } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 import { getInvitedUsers, getReferralRewards } from './api'
-import { formatActivityDetailLabel } from './lib/activity-label'
 import {
   formatShanghaiTimestamp,
   renderTrustedActivityDescription,
 } from './lib/activity-description'
+import { formatActivityDetailLabel } from './lib/activity-label'
+import {
+  buildInviteSequenceMap,
+  formatRewardRateSummary,
+  getPendingRewardQuotaSortValue,
+  getRewardActivities,
+  getRewardRateSortValue,
+} from './lib/reward-display'
 import type {
   InviteLinkBatch,
   InvitedUser,
@@ -129,12 +137,6 @@ type InvitedUsersTableProps = {
   refreshKey: number
 }
 
-type InvitedUsersSearchField =
-  | 'all'
-  | 'username'
-  | 'display_name'
-  | 'reward_rate'
-  | 'reward_quota'
 type SortDirection = 'asc' | 'desc'
 type InvitedUsersSortKey = 'sequence' | 'registered' | 'ratio' | 'reward'
 
@@ -151,16 +153,12 @@ const invitedUsersSkeletonRows = [
   'invite-row-4',
 ]
 
-const invitedUsersSearchFields: Array<{
-  value: InvitedUsersSearchField
-  labelKey: string
-}> = [
-  { value: 'all', labelKey: 'All columns' },
-  { value: 'username', labelKey: 'Username' },
-  { value: 'display_name', labelKey: 'Display Name' },
-  { value: 'reward_rate', labelKey: 'Reward Ratio' },
-  { value: 'reward_quota', labelKey: 'Contribution Rewards' },
-]
+const rewardBadgeClassMap: Record<RewardActivity['type'], string> = {
+  first_topup:
+    'border border-amber-200/45 bg-amber-50/35 !text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/15 dark:!text-amber-300',
+  continuous:
+    'border border-emerald-200/40 bg-emerald-50/35 !text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/15 dark:!text-emerald-300',
+}
 
 function parsePresetActivityDescription(
   batch?: InviteLinkBatch
@@ -201,45 +199,15 @@ function toShareableReferralLink(link: string) {
   }
 }
 
-function getRewardActivities(source?: {
-  activity_rules?: RewardActivity[]
-  first_topup_reward_percent?: number
-  continuous_reward_percent?: number
-}) {
-  const rules = (source?.activity_rules ?? []).filter(
-    (rule) => rule.activity_detail.trim() && rule.percent >= 0
-  )
-  if (rules.length > 0) return rules
-
-  const fallback: RewardActivity[] = []
-  if ((source?.first_topup_reward_percent ?? 0) > 0) {
-    fallback.push({
-      activity_detail: 'One-time Referral',
-      type: 'first_topup',
-      percent: source?.first_topup_reward_percent ?? 0,
-    })
-  }
-  if ((source?.continuous_reward_percent ?? 0) > 0) {
-    fallback.push({
-      activity_detail: 'Continuous Referral',
-      type: 'continuous',
-      percent: source?.continuous_reward_percent ?? 0,
-    })
-  }
-  return fallback
-}
-
-function rewardTypeLabel(
-  type: RewardActivity['type'],
+function rewardActivityLabel(
+  activity: RewardActivity,
   t: (key: string) => string
 ) {
+  const type = activity.type
   return type === 'first_topup' ? t('First Top-up') : t('Continuous')
 }
 
-function RewardActivityBadges(props: {
-  activities: RewardActivity[]
-  showDetail?: boolean
-}) {
+function RewardActivityBadges(props: { activities: RewardActivity[] }) {
   const { t } = useTranslation()
 
   if (props.activities.length === 0) {
@@ -249,23 +217,38 @@ function RewardActivityBadges(props: {
   return (
     <div className='flex flex-wrap gap-2'>
       {props.activities.map((activity) => (
-        <Badge
+        <StatusBadge
           key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
-          variant='outline'
-          className='h-auto max-w-full justify-start gap-1.5 rounded-md px-2 py-1'
-        >
-          <span className='shrink-0 text-[11px]'>
-            {rewardTypeLabel(activity.type, t)}
-          </span>
-          <span className='shrink-0 tabular-nums'>{activity.percent}%</span>
-          {props.showDetail ? (
-            <span className='text-muted-foreground max-w-40 truncate'>
-              {formatActivityDetailLabel(activity.activity_detail, t)}
-            </span>
-          ) : null}
-        </Badge>
+          label={`${rewardActivityLabel(activity, t)}${activity.percent}%`}
+          variant='success'
+          size='sm'
+          copyable={false}
+          className={cn(
+            'rounded-md font-mono',
+            rewardBadgeClassMap[activity.type]
+          )}
+        />
       ))}
     </div>
+  )
+}
+
+function RewardRateSummaryBadge(props: { batch?: InviteLinkBatch }) {
+  const { t } = useTranslation()
+  const summary = formatRewardRateSummary(props.batch, t)
+
+  if (!summary) {
+    return <span className='text-muted-foreground text-xs'>-</span>
+  }
+
+  return (
+    <StatusBadge
+      label={summary}
+      variant='success'
+      size='sm'
+      copyable={false}
+      className='border-primary/25 bg-primary/5 !text-primary rounded-md border font-mono'
+    />
   )
 }
 
@@ -460,20 +443,11 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
   const { t } = useTranslation()
   const link = toShareableReferralLink(props.dashboard?.invite_link ?? '')
   const activeBatch = props.dashboard?.active_batch
-  const activities = useMemo(
-    () => getRewardActivities(activeBatch),
-    [activeBatch]
-  )
 
   return (
     <Card data-card-hover='false' className='gap-0 py-0'>
       <CardHeader className='border-b p-4 !pb-4'>
         <CardTitle className='text-base'>{t('Referral Link')}</CardTitle>
-        <CardDescription className='mt-1 text-sm'>
-          {t(
-            'Share this link so new users are bound to the active reward activity.'
-          )}
-        </CardDescription>
       </CardHeader>
       <CardContent className='space-y-4 p-4'>
         {props.loading ? (
@@ -506,11 +480,16 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
           </div>
         )}
         <div className='flex flex-wrap items-center gap-3'>
-          <RewardActivityBadges activities={activities} showDetail />
+          <RewardRateSummaryBadge batch={activeBatch} />
           {activeBatch ? (
-            <span className='text-muted-foreground text-xs'>
-              {formatShanghaiTimestamp(activeBatch.start_time)} -{' '}
-              {formatShanghaiTimestamp(activeBatch.end_time)}
+            <span className='text-muted-foreground flex flex-wrap items-center gap-1.5 text-xs'>
+              <span className='text-foreground/80 font-medium'>
+                {t('Valid Period')}
+              </span>
+              <span>
+                {formatShanghaiTimestamp(activeBatch.start_time)} -{' '}
+                {formatShanghaiTimestamp(activeBatch.end_time)}
+              </span>
             </span>
           ) : null}
         </div>
@@ -604,14 +583,8 @@ function invitedUserContributionText(
   ].join(' / ')
 }
 
-function rewardActivitySortValue(user: InvitedUser) {
-  const activities = getRewardActivities(user)
-  return activities.reduce((total, activity) => total + activity.percent, 0)
-}
-
 function InvitedUsersTable(props: InvitedUsersTableProps) {
   const { t } = useTranslation()
-  const [searchField, setSearchField] = useState<InvitedUsersSearchField>('all')
   const [search, setSearch] = useState('')
   const [registeredRange, setRegisteredRange] = useState<{
     start?: Date
@@ -627,6 +600,15 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
   const [hiddenColumns, setHiddenColumns] = useState<
     Partial<Record<InvitedUsersSortKey, boolean>>
   >({})
+  const columns = useMemo(
+    () => [
+      { id: 'sequence' as const, label: t('Invitation No.') },
+      { id: 'registered' as const, label: t('Registered At') },
+      { id: 'ratio' as const, label: t('Reward Ratio') },
+      { id: 'reward' as const, label: t('Contribution Rewards') },
+    ],
+    [t]
+  )
 
   useEffect(() => {
     let ignore = false
@@ -635,8 +617,6 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
       setLoadError(false)
       const trimmedSearch = search.trim()
       const params: {
-        search_field?: string
-        search?: string
         registered_start?: number
         registered_end?: number
         reward_percent?: number
@@ -650,18 +630,11 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
         params.registered_end = Math.floor(registeredRange.end.getTime() / 1000)
       }
       if (trimmedSearch) {
-        if (searchField === 'reward_rate') {
-          const percent = Number(trimmedSearch)
-          if (Number.isFinite(percent)) params.reward_percent = percent
-        } else {
-          params.search = trimmedSearch
-          if (searchField !== 'all') {
-            params.search_field =
-              searchField === 'reward_quota'
-                ? 'contribution_quota'
-                : searchField
-          }
-        }
+        const normalizedSearch = trimmedSearch.endsWith('%')
+          ? trimmedSearch.slice(0, -1).trim()
+          : trimmedSearch
+        const percent = Number(normalizedSearch)
+        if (Number.isFinite(percent)) params.reward_percent = percent
       }
       try {
         const response = await getInvitedUsers(params)
@@ -687,36 +660,29 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
     return () => {
       ignore = true
     }
-  }, [
-    props.refreshKey,
-    registeredRange.end,
-    registeredRange.start,
-    search,
-    searchField,
-  ])
+  }, [props.refreshKey, registeredRange.end, registeredRange.start, search])
+
+  const inviteSequenceMap = useMemo(
+    () => buildInviteSequenceMap(users),
+    [users]
+  )
 
   const sortedUsers = useMemo(() => {
     const rows = [...users]
     rows.sort((a, b) => {
-      let left: string | number = a.id
-      let right: string | number = b.id
+      let left: string | number = inviteSequenceMap.get(a.id) ?? 0
+      let right: string | number = inviteSequenceMap.get(b.id) ?? 0
       if (sort.key === 'registered') {
         left = a.created_at
         right = b.created_at
       }
       if (sort.key === 'ratio') {
-        left = rewardActivitySortValue(a)
-        right = rewardActivitySortValue(b)
+        left = getRewardRateSortValue(a)
+        right = getRewardRateSortValue(b)
       }
       if (sort.key === 'reward') {
-        left =
-          a.pending_reward_quota +
-          a.available_reward_quota +
-          a.transferred_reward_quota
-        right =
-          b.pending_reward_quota +
-          b.available_reward_quota +
-          b.transferred_reward_quota
+        left = getPendingRewardQuotaSortValue(a)
+        right = getPendingRewardQuotaSortValue(b)
       }
       const direction = sort.direction === 'asc' ? 1 : -1
       if (left > right) return direction
@@ -724,7 +690,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
       return 0
     })
     return rows
-  }, [sort, users])
+  }, [inviteSequenceMap, sort, users])
 
   if (loading) {
     return (
@@ -801,16 +767,9 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
           <TableRow key={user.id}>
             {!hiddenColumns.sequence && (
               <TableCell>
-                <div className='flex min-w-0 flex-col'>
-                  <span className='font-mono text-sm font-medium'>
-                    #{user.id}
-                  </span>
-                  <span className='text-muted-foreground truncate text-xs'>
-                    {user.display_name
-                      ? `${user.username} (${user.display_name})`
-                      : user.username}
-                  </span>
-                </div>
+                <span className='font-mono text-sm font-semibold tabular-nums'>
+                  #{inviteSequenceMap.get(user.id) ?? '-'}
+                </span>
               </TableCell>
             )}
             {!hiddenColumns.registered && (
@@ -818,10 +777,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
             )}
             {!hiddenColumns.ratio && (
               <TableCell className='max-w-[360px] whitespace-normal'>
-                <RewardActivityBadges
-                  activities={getRewardActivities(user)}
-                  showDetail
-                />
+                <RewardActivityBadges activities={getRewardActivities(user)} />
               </TableCell>
             )}
             {!hiddenColumns.reward && (
@@ -875,25 +831,12 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
             </CardDescription>
           </div>
           <div className='flex flex-col gap-2 lg:flex-row lg:items-center'>
-            <NativeSelect
-              value={searchField}
-              onChange={(event) =>
-                setSearchField(event.target.value as InvitedUsersSearchField)
-              }
-              className='w-full lg:w-48'
-            >
-              {invitedUsersSearchFields.map((field) => (
-                <NativeSelectOption key={field.value} value={field.value}>
-                  {t(field.labelKey)}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
             <div className='relative min-w-0 flex-1'>
               <Search className='text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2' />
               <Input
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder={t('Search invited users...')}
+                placeholder={t('Search reward ratio...')}
                 className='pl-8'
               />
             </div>
@@ -902,6 +845,16 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
               end={registeredRange.end}
               onChange={setRegisteredRange}
               className='lg:w-72'
+            />
+            <DataTableManualViewOptions
+              columns={columns}
+              hiddenColumns={hiddenColumns}
+              onVisibilityChange={(column, visible) =>
+                setHiddenColumns((current) => ({
+                  ...current,
+                  [column]: !visible,
+                }))
+              }
             />
           </div>
         </div>
