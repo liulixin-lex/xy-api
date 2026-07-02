@@ -51,20 +51,20 @@ export function UptimePanel() {
   useEffect(() => {
     const abortController = new AbortController()
 
-    getUptimeStatus()
-      .then((res) => {
+    void (async () => {
+      try {
+        const res = await getUptimeStatus()
         if (abortController.signal.aborted) return
         setGroups(res?.data || [])
-      })
-      .catch(() => {
+      } catch {
         if (abortController.signal.aborted) return
         setGroups([])
-      })
-      .finally(() => {
+      } finally {
         if (!abortController.signal.aborted) {
           setLoading(false)
         }
-      })
+      }
+    })()
 
     return () => {
       abortController.abort()
@@ -75,20 +75,20 @@ export function UptimePanel() {
     const abortController = new AbortController()
     setRefreshing(true)
 
-    getUptimeStatus()
-      .then((res) => {
+    void (async () => {
+      try {
+        const res = await getUptimeStatus()
         if (abortController.signal.aborted) return
         setGroups(res?.data || [])
-      })
-      .catch(() => {
+      } catch {
         if (abortController.signal.aborted) return
         setGroups([])
-      })
-      .finally(() => {
+      } finally {
         if (!abortController.signal.aborted) {
           setRefreshing(false)
         }
-      })
+      }
+    })()
   }
 
   return (

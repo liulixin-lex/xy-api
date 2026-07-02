@@ -436,6 +436,52 @@ export function SystemInstancesPanel() {
   const loading = instancesQuery.isLoading
   const refreshing = instancesQuery.isFetching && !instancesQuery.isLoading
 
+  let instancesContent = (
+    <div className='p-4 sm:p-5'>
+      <SystemInstancesList instances={instances} />
+    </div>
+  )
+  if (loading) {
+    instancesContent = (
+      <div className='space-y-2 p-4 sm:p-5'>
+        {Array.from({ length: 3 }, (_, i) => `instance-skeleton-${i}`).map(
+          (key) => (
+            <Skeleton key={key} className='h-9 w-full rounded-md' />
+          )
+        )}
+      </div>
+    )
+  } else if (instancesQuery.isError) {
+    instancesContent = (
+      <ErrorState
+        title={t('We could not load instances.')}
+        description={
+          instancesQuery.error instanceof Error
+            ? instancesQuery.error.message
+            : undefined
+        }
+        onRetry={() => {
+          void instancesQuery.refetch()
+        }}
+        className='min-h-[220px]'
+      />
+    )
+  } else if (instances.length === 0) {
+    instancesContent = (
+      <div className='px-4 py-10 text-center sm:px-5'>
+        <div className='bg-muted mx-auto mb-3 flex size-10 items-center justify-center rounded-lg'>
+          <ServerCog
+            className='text-muted-foreground size-5'
+            aria-hidden='true'
+          />
+        </div>
+        <p className='text-muted-foreground text-sm'>
+          {t('No instances have reported yet.')}
+        </p>
+      </div>
+    )
+  }
+
   return (
     <section className='bg-card overflow-hidden rounded-lg border shadow-xs'>
       <div className='flex flex-col gap-3 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5'>
@@ -479,42 +525,7 @@ export function SystemInstancesPanel() {
       </div>
 
       <div aria-busy={instancesQuery.isFetching}>
-        {loading ? (
-          <div className='space-y-2 p-4 sm:p-5'>
-            {Array.from({ length: 3 }).map((_, i) => (
-              <Skeleton key={i} className='h-9 w-full rounded-md' />
-            ))}
-          </div>
-        ) : instancesQuery.isError ? (
-          <ErrorState
-            title={t('We could not load instances.')}
-            description={
-              instancesQuery.error instanceof Error
-                ? instancesQuery.error.message
-                : undefined
-            }
-            onRetry={() => {
-              void instancesQuery.refetch()
-            }}
-            className='min-h-[220px]'
-          />
-        ) : instances.length === 0 ? (
-          <div className='px-4 py-10 text-center sm:px-5'>
-            <div className='bg-muted mx-auto mb-3 flex size-10 items-center justify-center rounded-lg'>
-              <ServerCog
-                className='text-muted-foreground size-5'
-                aria-hidden='true'
-              />
-            </div>
-            <p className='text-muted-foreground text-sm'>
-              {t('No instances have reported yet.')}
-            </p>
-          </div>
-        ) : (
-          <div className='p-4 sm:p-5'>
-            <SystemInstancesList instances={instances} />
-          </div>
-        )}
+        {instancesContent}
       </div>
     </section>
   )

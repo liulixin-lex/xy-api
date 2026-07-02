@@ -48,6 +48,7 @@ export function Home() {
             <iframe
               src={content}
               className='h-screen w-full border-none'
+              sandbox='allow-scripts allow-forms allow-popups allow-presentation'
               title={t('Custom Home Page')}
             />
           ) : (

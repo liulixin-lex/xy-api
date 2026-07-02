@@ -34,7 +34,7 @@ import {
 } from '@/components/ui/tooltip'
 import { BadgeCell } from '@/components/data-table'
 import { StatusBadge } from '@/components/status-badge'
-import { type ApiKey } from '../types'
+import type { ApiKey } from '../types'
 import { useApiKeys } from './api-keys-provider'
 
 export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
@@ -75,6 +75,15 @@ export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
       if (ok) markKeyCopied(apiKey.id)
     }
   }, [resolvedFullKey, resolveRealKey, apiKey.id, markKeyCopied, t])
+  let copyIcon = <Copy className='size-3.5' />
+  let tooltipLabel = t('Copy API key')
+  if (isLoading) {
+    copyIcon = <Loader2 className='size-3.5 animate-spin' />
+    tooltipLabel = t('Loading...')
+  } else if (isCopied) {
+    copyIcon = <Check className='size-3.5 text-green-600' />
+    tooltipLabel = t('Copied!')
+  }
 
   return (
     <div className='flex max-w-full min-w-0 items-center'>
@@ -133,21 +142,9 @@ export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
             />
           }
         >
-          {isLoading ? (
-            <Loader2 className='size-3.5 animate-spin' />
-          ) : isCopied ? (
-            <Check className='size-3.5 text-green-600' />
-          ) : (
-            <Copy className='size-3.5' />
-          )}
+          {copyIcon}
         </TooltipTrigger>
-        <TooltipContent>
-          {isLoading
-            ? t('Loading...')
-            : isCopied
-              ? t('Copied!')
-              : t('Copy API key')}
-        </TooltipContent>
+        <TooltipContent>{tooltipLabel}</TooltipContent>
       </Tooltip>
     </div>
   )

@@ -254,7 +254,7 @@ function formatNumberWithSuffix(
   const abs = Math.abs(value)
   if (abbreviate && abs >= 1000) {
     const result = value / 1000
-    return removeTrailingZeros(result.toFixed(1)) + 'k'
+    return `${removeTrailingZeros(result.toFixed(1))  }k`
   }
 
   const digits = abs >= 1 ? digitsLarge : digitsSmall

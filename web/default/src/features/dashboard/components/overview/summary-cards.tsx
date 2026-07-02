@@ -207,6 +207,18 @@ export function SummaryCards() {
   const healthLevel = getHealthLevel(remainQuota, recentUsage)
   const healthCfg = HEALTH_CONFIG[healthLevel]
   const runwayDays = getRunwayDays(remainQuota, recentUsage)
+  let runwayLabel = t('No recent usage')
+  if (runwayDays !== null) {
+    if (runwayDays < 1) {
+      runwayLabel = t('Less than 1 day left')
+    } else if (runwayDays > 999) {
+      runwayLabel = `999+ ${t('days')}`
+    } else {
+      runwayLabel = `~${formatNumber(Math.floor(runwayDays))} ${t('days')}`
+    }
+  } else if (remainQuota <= 0) {
+    runwayLabel = t('Balance depleted')
+  }
 
   const todayUsageDisplay = formatQuota(recentUsage)
 
@@ -321,15 +333,7 @@ export function SummaryCards() {
                     healthLevel === 'caution' && 'text-warning'
                   )}
                 >
-                  {runwayDays !== null
-                    ? runwayDays < 1
-                      ? t('Less than 1 day left')
-                      : runwayDays > 999
-                        ? `999+ ${t('days')}`
-                        : `~${formatNumber(Math.floor(runwayDays))} ${t('days')}`
-                    : remainQuota <= 0
-                      ? t('Balance depleted')
-                      : t('No recent usage')}
+                  {runwayLabel}
                 </div>
               </div>
             </div>

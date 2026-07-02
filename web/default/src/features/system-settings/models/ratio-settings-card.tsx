@@ -56,18 +56,19 @@ function formatJsonValidationError(
     )
   }
 
-  const parts = [
-    error.line && error.column
-      ? t('JSON is invalid at line {{line}}, column {{column}}.', {
-          line: error.line,
-          column: error.column,
-        })
-      : error.position !== undefined
-        ? t('JSON is invalid at position {{position}}.', {
-            position: error.position,
-          })
-        : t('JSON is invalid. Please check the syntax.'),
-  ]
+  let syntaxMessage = t('JSON is invalid. Please check the syntax.')
+  if (error.line && error.column) {
+    syntaxMessage = t('JSON is invalid at line {{line}}, column {{column}}.', {
+      line: error.line,
+      column: error.column,
+    })
+  } else if (error.position !== undefined) {
+    syntaxMessage = t('JSON is invalid at position {{position}}.', {
+      position: error.position,
+    })
+  }
+
+  const parts = [syntaxMessage]
 
   if (error.missingCommaLine) {
     parts.push(

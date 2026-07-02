@@ -61,8 +61,8 @@ export function ProfileHeader({ profile, loading }: ProfileHeaderProps) {
         </CardContent>
         <div className='border-t'>
           <div className='divide-border/60 grid grid-cols-1 divide-y sm:grid-cols-3 sm:divide-x sm:divide-y-0'>
-            {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className='px-4 py-3.5 sm:px-5 sm:py-4'>
+            {Array.from({ length: 3 }, (_, i) => `profile-header-skeleton-${i}`).map((key) => (
+              <div key={key} className='px-4 py-3.5 sm:px-5 sm:py-4'>
                 <Skeleton className='h-3.5 w-20' />
                 <Skeleton className='mt-2 h-7 w-28' />
                 <Skeleton className='mt-1.5 h-3.5 w-24' />

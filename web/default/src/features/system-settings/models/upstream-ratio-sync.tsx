@@ -91,7 +91,7 @@ function getDefaultEndpointForChannel(channel: UpstreamChannel): string {
 function getBillingCategory(ratioType: string): 'price' | 'ratio' | 'tiered' {
   if (ratioType === 'model_price') return 'price'
   if (ratioType === 'billing_mode' || ratioType === 'billing_expr')
-    return 'tiered'
+    {return 'tiered'}
   return 'ratio'
 }
 
@@ -290,7 +290,7 @@ export function UpstreamRatioSync({ modelRatios }: UpstreamRatioSyncProps) {
       const category = getBillingCategory(finalType)
 
       setResolutions((prev) => {
-        const newModelRes = { ...(prev[model] || {}) }
+        const newModelRes = { ...prev[model] }
 
         // Clear conflicting categories
         Object.keys(newModelRes).forEach((rt) => {
@@ -369,7 +369,7 @@ export function UpstreamRatioSync({ modelRatios }: UpstreamRatioSyncProps) {
       currentRatios.AudioRatio[model] !== undefined ||
       currentRatios.AudioCompletionRatio[model] !== undefined
     )
-      return 'ratio'
+      {return 'ratio'}
     return null
   }
 

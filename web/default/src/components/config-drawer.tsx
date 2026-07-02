@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type SVGProps } from 'react'
+import type { SVGProps } from 'react'
 import { Radio as RadioPrimitive } from '@base-ui/react/radio'
 import { RadioGroup as Radio } from '@base-ui/react/radio-group'
 import { CircleCheck, Palette, RotateCcw } from 'lucide-react'
@@ -467,9 +467,9 @@ function ScalePreview(props: { rows: number; rowGap: string }) {
       className='absolute inset-2.5 flex flex-col justify-center'
       style={{ gap: props.rowGap }}
     >
-      {Array.from({ length: props.rows }).map((_, i) => (
+      {Array.from({ length: props.rows }, (_, i) => `layout-preview-row-${i}`).map((key, i) => (
         <span
-          key={i}
+          key={key}
           className='bg-foreground/60 block h-[2px] rounded-full'
           style={{ width: `${85 - i * 10}%` }}
         />

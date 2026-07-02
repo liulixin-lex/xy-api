@@ -167,6 +167,12 @@ export function ProviderFormDialog(props: ProviderFormDialogProps) {
   }
 
   const isPending = createProvider.isPending || updateProvider.isPending
+  let submitLabel = t('Create Provider')
+  if (isPending) {
+    submitLabel = t('Saving...')
+  } else if (isEditing) {
+    submitLabel = t('Update Provider')
+  }
 
   return (
     <Dialog
@@ -192,11 +198,7 @@ export function ProviderFormDialog(props: ProviderFormDialogProps) {
             {t('Cancel')}
           </Button>
           <Button type='submit' form={PROVIDER_FORM_ID} disabled={isPending}>
-            {isPending
-              ? t('Saving...')
-              : isEditing
-                ? t('Update Provider')
-                : t('Create Provider')}
+            {submitLabel}
           </Button>
         </>
       }
@@ -339,12 +341,10 @@ export function ProviderFormDialog(props: ProviderFormDialogProps) {
                 <FormItem>
                   <FormLabel>{t('Auth Style')}</FormLabel>
                   <Select
-                    items={[
-                      ...AUTH_STYLE_OPTIONS.map((option) => ({
+                    items={AUTH_STYLE_OPTIONS.map((option) => ({
                         value: String(option.value),
                         label: t(option.labelKey),
-                      })),
-                    ]}
+                      }))}
                     value={String(field.value)}
                     onValueChange={(val) => field.onChange(Number(val))}
                   >

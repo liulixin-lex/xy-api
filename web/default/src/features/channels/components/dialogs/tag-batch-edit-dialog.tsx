@@ -71,7 +71,7 @@ export function TagBatchEditDialog({
   const groupOptions = useMemo(() => {
     if (!groupsData?.data) return []
     const allGroups = new Set([...groupsData.data, ...groups])
-    return Array.from(allGroups).map((group) => ({
+    return [...allGroups].map((group) => ({
       value: group,
       label: group,
     }))
@@ -119,7 +119,7 @@ export function TagBatchEditDialog({
     if (modelMapping.trim()) {
       try {
         JSON.parse(modelMapping)
-      } catch (_error) {
+      } catch {
         toast.error(t('Model mapping must be valid JSON'))
         return
       }
@@ -217,8 +217,7 @@ export function TagBatchEditDialog({
           <Loader2 className='text-muted-foreground h-8 w-8 animate-spin' />
         </div>
       ) : (
-        <>
-          <div className='space-y-4 py-4'>
+        <div className='space-y-4 py-4'>
             <Alert>
               <AlertCircle className='h-4 w-4' />
               <AlertDescription>
@@ -292,8 +291,7 @@ export function TagBatchEditDialog({
                 {t('User groups that can access channels with this tag')}
               </p>
             </div>
-          </div>
-        </>
+        </div>
       )}
     </Dialog>
   )

@@ -54,8 +54,8 @@ export function ProfileSettingsCard({
         </CardHeader>
         <CardContent className='space-y-4 p-3 sm:p-5'>
           <Skeleton className='h-10 w-full' />
-          {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className='h-20 w-full' />
+          {Array.from({ length: 3 }, (_, i) => `settings-skeleton-${i}`).map((key) => (
+            <Skeleton key={key} className='h-20 w-full' />
           ))}
         </CardContent>
       </Card>

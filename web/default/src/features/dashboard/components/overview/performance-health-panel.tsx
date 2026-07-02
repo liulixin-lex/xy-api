@@ -50,7 +50,7 @@ function simpleAverage(
     total += value
     count++
   }
-  return count > 0 ? total / count : NaN
+  return count > 0 ? total / count : Number.NaN
 }
 
 export function PerformanceHealthPanel() {
@@ -127,8 +127,8 @@ export function PerformanceHealthPanel() {
 
         {loading ? (
           <div className='space-y-1'>
-            {Array.from({ length: 3 }).map((_, i) => (
-              <Skeleton key={i} className='h-5 w-full rounded' />
+            {Array.from({ length: 3 }, (_, i) => `model-traffic-skeleton-${i}`).map((key) => (
+              <Skeleton key={key} className='h-5 w-full rounded' />
             ))}
           </div>
         ) : (

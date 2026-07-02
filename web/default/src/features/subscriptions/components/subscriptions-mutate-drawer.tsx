@@ -326,7 +326,7 @@ export function SubscriptionsMutateDrawer({
                           step='0.01'
                           min={0}
                           onChange={(e) =>
-                            field.onChange(parseFloat(e.target.value) || 0)
+                            field.onChange(Number.parseFloat(e.target.value) || 0)
                           }
                         />
                       </FormControl>
@@ -362,7 +362,7 @@ export function SubscriptionsMutateDrawer({
                                 })
                           }
                           onChange={(e) =>
-                            field.onChange(parseFloat(e.target.value) || 0)
+                            field.onChange(Number.parseFloat(e.target.value) || 0)
                           }
                         />
                       </FormControl>
@@ -476,7 +476,7 @@ export function SubscriptionsMutateDrawer({
                           type='number'
                           min={0}
                           onChange={(e) =>
-                            field.onChange(parseInt(e.target.value, 10) || 0)
+                            field.onChange(Number.parseInt(e.target.value, 10) || 0)
                           }
                         />
                       </FormControl>
@@ -500,7 +500,7 @@ export function SubscriptionsMutateDrawer({
                         {...field}
                         type='number'
                         onChange={(e) =>
-                          field.onChange(parseInt(e.target.value, 10) || 0)
+                          field.onChange(Number.parseInt(e.target.value, 10) || 0)
                         }
                       />
                     </FormControl>
@@ -581,12 +581,10 @@ export function SubscriptionsMutateDrawer({
                     <FormItem>
                       <FormLabel>{t('Duration Unit')}</FormLabel>
                       <Select
-                        items={[
-                          ...durationUnitOpts.map((o) => ({
+                        items={durationUnitOpts.map((o) => ({
                             value: o.value,
                             label: o.label,
-                          })),
-                        ]}
+                          }))}
                         onValueChange={field.onChange}
                         value={field.value}
                       >
@@ -623,7 +621,7 @@ export function SubscriptionsMutateDrawer({
                             type='number'
                             min={1}
                             onChange={(e) =>
-                              field.onChange(parseInt(e.target.value, 10) || 0)
+                              field.onChange(Number.parseInt(e.target.value, 10) || 0)
                             }
                           />
                         </FormControl>
@@ -644,7 +642,7 @@ export function SubscriptionsMutateDrawer({
                             type='number'
                             min={1}
                             onChange={(e) =>
-                              field.onChange(parseInt(e.target.value, 10) || 0)
+                              field.onChange(Number.parseInt(e.target.value, 10) || 0)
                             }
                           />
                         </FormControl>
@@ -671,12 +669,10 @@ export function SubscriptionsMutateDrawer({
                     <FormItem>
                       <FormLabel>{t('Reset Cycle')}</FormLabel>
                       <Select
-                        items={[
-                          ...resetPeriodOpts.map((o) => ({
+                        items={resetPeriodOpts.map((o) => ({
                             value: o.value,
                             label: o.label,
-                          })),
-                        ]}
+                          }))}
                         onValueChange={field.onChange}
                         value={field.value}
                       >
@@ -713,7 +709,7 @@ export function SubscriptionsMutateDrawer({
                           min={0}
                           disabled={resetPeriod !== 'custom'}
                           onChange={(e) =>
-                            field.onChange(parseInt(e.target.value, 10) || 0)
+                            field.onChange(Number.parseInt(e.target.value, 10) || 0)
                           }
                         />
                       </FormControl>

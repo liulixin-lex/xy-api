@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
@@ -79,7 +79,7 @@ export function CopyButton({
   if (tooltip || successTooltip) {
     return (
       <Tooltip>
-        <TooltipTrigger render={button}></TooltipTrigger>
+        <TooltipTrigger render={button} />
         <TooltipContent>
           <p>{isCopied ? resolvedSuccessTooltip : resolvedTooltip}</p>
         </TooltipContent>

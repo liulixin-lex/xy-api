@@ -198,5 +198,5 @@ export function DeploymentAccessGuard({
     )
   }
 
-  return <>{children}</>
+  return children
 }

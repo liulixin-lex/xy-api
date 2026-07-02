@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { type ColumnDef, type RowSelectionState } from '@tanstack/react-table'
+import type { ColumnDef, RowSelectionState } from '@tanstack/react-table'
 import { Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
@@ -224,12 +224,10 @@ export function ChannelSelectorDialog({
           return (
             <div className='flex items-center gap-2'>
               <Select
-                items={[
-                  ...ENDPOINT_OPTIONS.map((option) => ({
+                items={ENDPOINT_OPTIONS.map((option) => ({
                     value: option.value,
                     label: option.label,
-                  })),
-                ]}
+                  }))}
                 value={endpointType}
                 onValueChange={(v) => v !== null && handleTypeChange(v)}
               >

@@ -110,7 +110,7 @@ export function UpstreamRatioSyncTable({
         }
       )
     })
-    return Array.from(set)
+    return [...set]
   }, [filteredData, ratioTypeFilter])
 
   const handleBulkSelect = useCallback(

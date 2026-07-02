@@ -73,7 +73,7 @@ function getRelativeTime(publishDate: string | Date, t: TFunction): string {
 
   // If invalid date, return original string
   if (isNaN(pubDate.getTime()))
-    return typeof publishDate === 'string' ? publishDate : ''
+    {return typeof publishDate === 'string' ? publishDate : ''}
 
   const diffMs = now.getTime() - pubDate.getTime()
   const diffSeconds = Math.floor(diffMs / 1000)
@@ -90,25 +90,25 @@ function getRelativeTime(publishDate: string | Date, t: TFunction): string {
   // Return relative time based on difference
   if (diffSeconds < 60) return t('Just now')
   if (diffMinutes < 60)
-    return diffMinutes === 1
+    {return diffMinutes === 1
       ? t('1 minute ago')
-      : t('{{count}} minutes ago', { count: diffMinutes })
+      : t('{{count}} minutes ago', { count: diffMinutes })}
   if (diffHours < 24)
-    return diffHours === 1
+    {return diffHours === 1
       ? t('1 hour ago')
-      : t('{{count}} hours ago', { count: diffHours })
+      : t('{{count}} hours ago', { count: diffHours })}
   if (diffDays < 7)
-    return diffDays === 1
+    {return diffDays === 1
       ? t('1 day ago')
-      : t('{{count}} days ago', { count: diffDays })
+      : t('{{count}} days ago', { count: diffDays })}
   if (diffWeeks < 4)
-    return diffWeeks === 1
+    {return diffWeeks === 1
       ? t('1 week ago')
-      : t('{{count}} weeks ago', { count: diffWeeks })
+      : t('{{count}} weeks ago', { count: diffWeeks })}
   if (diffMonths < 12)
-    return diffMonths === 1
+    {return diffMonths === 1
       ? t('1 month ago')
-      : t('{{count}} months ago', { count: diffMonths })
+      : t('{{count}} months ago', { count: diffMonths })}
   if (diffYears < 2) return t('1 year ago')
 
   // Over 2 years, show specific date
@@ -232,7 +232,7 @@ function AnnouncementsContent({
             : ''
 
           return (
-            <div key={idx}>
+            <div key={`${item.publishDate ?? 'draft'}-${item.type}-${item.content}`}>
               <div className='py-3'>
                 <div className='flex items-start gap-3'>
                   <AnnouncementDot type={item.type} />
