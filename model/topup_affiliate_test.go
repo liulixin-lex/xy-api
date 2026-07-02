@@ -344,6 +344,179 @@ func TestInviteLinkBatchTopUpRewardCreatesPendingFirstAndContinuousRecords(t *te
 	assert.Equal(t, 1_400, secondRecord.RewardQuota)
 }
 
+func TestInviteLinkBatchTopUpRewardStacksMultipleActivityRules(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1000)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       56,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff56",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            57,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff57",
+		InviterId:                     56,
+		InviteLinkBatchId:             90,
+		InviteFirstTopupRewardPercent: 30,
+		InviteContinuousRewardPercent: 5,
+		InviteRewardRulesSnapshot: InviteRewardActivities{
+			{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+			{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+			{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+		},
+		InviteBoundAt: 1_800_000_000,
+	})
+	require.NoError(t, DB.Create(&[]TopUp{
+		{Id: 721, UserId: 57, Amount: 10, Money: 10, TradeNo: "stacked-first", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+		{Id: 722, UserId: 57, Amount: 20, Money: 20, TradeNo: "stacked-continuous", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+	}).Error)
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 721, UserId: 57}, 10_000)
+		return err
+	}))
+	require.NoError(t, DB.Model(&TopUp{}).Where("id = ?", 721).Updates(map[string]interface{}{
+		"status":        common.TopUpStatusSuccess,
+		"complete_time": common.GetTimestamp(),
+	}).Error)
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 722, UserId: 57}, 20_000)
+		return err
+	}))
+
+	var firstRecords []AffiliateRewardRecord
+	require.NoError(t, DB.Where("top_up_id = ?", 721).Order("id asc").Find(&firstRecords).Error)
+	require.Len(t, firstRecords, 2)
+	assert.Equal(t, "Launch first top-up", firstRecords[0].ActivityDetail)
+	assert.Equal(t, InviteRewardRuleFirstTopUp, firstRecords[0].InviteRewardRule)
+	assert.Equal(t, 20, firstRecords[0].InviteRewardPercent)
+	assert.Equal(t, 2_000, firstRecords[0].RewardQuota)
+	assert.Equal(t, "VIP first top-up", firstRecords[1].ActivityDetail)
+	assert.Equal(t, InviteRewardRuleFirstTopUp, firstRecords[1].InviteRewardRule)
+	assert.Equal(t, 10, firstRecords[1].InviteRewardPercent)
+	assert.Equal(t, 1_000, firstRecords[1].RewardQuota)
+
+	var continuousRecords []AffiliateRewardRecord
+	require.NoError(t, DB.Where("top_up_id = ?", 722).Find(&continuousRecords).Error)
+	require.Len(t, continuousRecords, 1)
+	assert.Equal(t, "Ongoing partner", continuousRecords[0].ActivityDetail)
+	assert.Equal(t, InviteRewardRuleContinuous, continuousRecords[0].InviteRewardRule)
+	assert.Equal(t, 5, continuousRecords[0].InviteRewardPercent)
+	assert.Equal(t, 1_000, continuousRecords[0].RewardQuota)
+}
+
+func TestInviteLinkBatchTopUpRewardUsesContinuousRulesForFirstTopUpWhenNoFirstRules(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1000)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       58,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff58",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            59,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff59",
+		InviterId:                     58,
+		InviteLinkBatchId:             91,
+		InviteFirstTopupRewardPercent: 5,
+		InviteContinuousRewardPercent: 5,
+		InviteRewardRulesSnapshot: InviteRewardActivities{
+			{ActivityDetail: "Ongoing only", Type: InviteRewardRuleContinuous, Percent: 5},
+		},
+		InviteBoundAt: 1_800_000_000,
+	})
+	require.NoError(t, DB.Create(&[]TopUp{
+		{Id: 723, UserId: 59, Amount: 10, Money: 10, TradeNo: "continuous-only-first", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+		{Id: 724, UserId: 59, Amount: 20, Money: 20, TradeNo: "continuous-only-second", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+	}).Error)
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 723, UserId: 59}, 10_000)
+		return err
+	}))
+	require.NoError(t, DB.Model(&TopUp{}).Where("id = ?", 723).Updates(map[string]interface{}{
+		"status":        common.TopUpStatusSuccess,
+		"complete_time": common.GetTimestamp(),
+	}).Error)
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 724, UserId: 59}, 20_000)
+		return err
+	}))
+
+	var firstRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 723}).First(&firstRecord).Error)
+	assert.Equal(t, InviteRewardRuleContinuous, firstRecord.InviteRewardRule)
+	assert.Equal(t, 5, firstRecord.InviteRewardPercent)
+	assert.Equal(t, 500, firstRecord.RewardQuota)
+
+	var secondRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 724}).First(&secondRecord).Error)
+	assert.Equal(t, InviteRewardRuleContinuous, secondRecord.InviteRewardRule)
+	assert.Equal(t, 5, secondRecord.InviteRewardPercent)
+	assert.Equal(t, 1_000, secondRecord.RewardQuota)
+}
+
+func TestInviteLinkBatchTopUpRewardDoesNotCreateContinuousRewardWhenOnlyFirstRulesExist(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1000)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       60,
+		Username: "inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff60",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                            61,
+		Username:                      "invitee",
+		Status:                        common.UserStatusEnabled,
+		AffCode:                       "aff61",
+		InviterId:                     60,
+		InviteLinkBatchId:             92,
+		InviteFirstTopupRewardPercent: 30,
+		InviteContinuousRewardPercent: 0,
+		InviteRewardRulesSnapshot: InviteRewardActivities{
+			{ActivityDetail: "First only", Type: InviteRewardRuleFirstTopUp, Percent: 30},
+		},
+		InviteBoundAt: 1_800_000_000,
+	})
+	require.NoError(t, DB.Create(&[]TopUp{
+		{Id: 725, UserId: 61, Amount: 10, Money: 10, TradeNo: "first-only-first", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+		{Id: 726, UserId: 61, Amount: 20, Money: 20, TradeNo: "first-only-second", PaymentProvider: PaymentProviderWaffo, Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()},
+	}).Error)
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 725, UserId: 61}, 10_000)
+		return err
+	}))
+	require.NoError(t, DB.Model(&TopUp{}).Where("id = ?", 725).Updates(map[string]interface{}{
+		"status":        common.TopUpStatusSuccess,
+		"complete_time": common.GetTimestamp(),
+	}).Error)
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := applyAffiliateTopUpRewardTx(tx, &TopUp{Id: 726, UserId: 61}, 20_000)
+		return err
+	}))
+
+	var firstRecord AffiliateRewardRecord
+	require.NoError(t, DB.Where(&AffiliateRewardRecord{TopUpId: 725}).First(&firstRecord).Error)
+	assert.Equal(t, InviteRewardRuleFirstTopUp, firstRecord.InviteRewardRule)
+	assert.Equal(t, 30, firstRecord.InviteRewardPercent)
+	assert.Equal(t, 3_000, firstRecord.RewardQuota)
+
+	var secondCount int64
+	require.NoError(t, DB.Model(&AffiliateRewardRecord{}).Where("top_up_id = ?", 726).Count(&secondCount).Error)
+	assert.Equal(t, int64(0), secondCount)
+}
+
 func TestInviteLinkBatchTopUpRewardUsesCompletionTimeForAvailability(t *testing.T) {
 	truncateTables(t)
 

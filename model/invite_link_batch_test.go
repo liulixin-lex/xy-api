@@ -111,6 +111,106 @@ func TestResolveInviteLinkBindingRequiresBatchAndAffiliateCode(t *testing.T) {
 	assert.Equal(t, now, binding.BoundAt)
 }
 
+func TestResolveInviteLinkBindingSnapshotsActivityRules(t *testing.T) {
+	truncateTables(t)
+	now := int64(1_800_000_001)
+
+	require.NoError(t, DB.Create(&User{
+		Id:       12,
+		Username: "inviter",
+		Password: "secret",
+		AffCode:  "aff12",
+	}).Error)
+	require.NoError(t, DB.Create(&InviteLinkBatch{
+		Id:       22,
+		Name:     "Stacked",
+		Code:     "stacked",
+		BaseLink: "https://example.com/sign-up?invite_batch=stacked",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+			{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+			{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+		IsActive:  true,
+	}).Error)
+
+	binding, err := ResolveInviteLinkBinding("stacked", "aff12", now)
+	require.NoError(t, err)
+	require.NotNil(t, binding)
+	assert.Equal(t, 30, binding.FirstTopupRewardPercent)
+	assert.Equal(t, 5, binding.ContinuousRewardPercent)
+	assert.Equal(t, InviteRewardActivities{
+		{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+		{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+		{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+	}, binding.ActivityRules)
+
+	user := &User{
+		Username: "activity-snapshot",
+		Password: "password",
+		Status:   1,
+	}
+	user.ApplyInviteLinkBinding(binding)
+	require.NoError(t, user.Insert(binding.InviterId))
+
+	require.NoError(t, UpdateInviteLinkBatch(&InviteLinkBatch{
+		Id:       22,
+		Name:     "Stacked edited",
+		Code:     "stacked",
+		BaseLink: "https://example.com/sign-up?invite_batch=stacked",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "Edited continuous", Type: InviteRewardRuleContinuous, Percent: 50},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+		IsActive:  true,
+	}))
+
+	var inserted User
+	require.NoError(t, DB.Where("username = ?", "activity-snapshot").First(&inserted).Error)
+	assert.Equal(t, InviteRewardActivities{
+		{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+		{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+		{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+	}, inserted.InviteRewardRulesSnapshot)
+	assert.Equal(t, 30, inserted.InviteFirstTopupRewardPercent)
+	assert.Equal(t, 5, inserted.InviteContinuousRewardPercent)
+}
+
+func TestResolveInviteLinkBindingKeepsZeroPercentFirstTopupActivity(t *testing.T) {
+	truncateTables(t)
+	now := int64(1_800_000_001)
+
+	require.NoError(t, DB.Create(&User{
+		Id:       13,
+		Username: "inviter-zero-first",
+		Password: "secret",
+		AffCode:  "aff13",
+	}).Error)
+	require.NoError(t, DB.Create(&InviteLinkBatch{
+		Id:       23,
+		Name:     "Zero first top-up",
+		Code:     "zero-first",
+		BaseLink: "https://example.com/sign-up?invite_batch=zero-first",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "No first top-up bonus", Type: InviteRewardRuleFirstTopUp, Percent: 0},
+			{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+		IsActive:  true,
+	}).Error)
+
+	binding, err := ResolveInviteLinkBinding("zero-first", "aff13", now)
+
+	require.NoError(t, err)
+	require.NotNil(t, binding)
+	assert.Equal(t, 0, binding.FirstTopupRewardPercent)
+	assert.Equal(t, 5, binding.ContinuousRewardPercent)
+}
+
 func TestResolveInviteLinkBindingRequiresActiveBatch(t *testing.T) {
 	truncateTables(t)
 	now := int64(1_800_000_001)
@@ -243,4 +343,64 @@ func TestCreateInviteLinkBatchRejectsOversizedActivityDescription(t *testing.T) 
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "activity description is too long")
+}
+
+func TestCreateInviteLinkBatchValidatesActivityRules(t *testing.T) {
+	truncateTables(t)
+
+	err := CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:     "Invalid",
+		Code:     "invalid",
+		BaseLink: "https://example.com/sign-up?invite_batch=invalid",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "", Type: InviteRewardRuleFirstTopUp, Percent: 30},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "activity detail is required")
+
+	err = CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:     "Invalid",
+		Code:     "invalid",
+		BaseLink: "https://example.com/sign-up?invite_batch=invalid",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: strings.Repeat("x", 256), Type: InviteRewardRuleFirstTopUp, Percent: 30},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "activity detail is too long")
+
+	err = CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:     "Invalid",
+		Code:     "invalid",
+		BaseLink: "https://example.com/sign-up?invite_batch=invalid",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "Launch", Type: "", Percent: 30},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "activity type is required")
+
+	err = CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:     "Invalid",
+		Code:     "invalid",
+		BaseLink: "https://example.com/sign-up?invite_batch=invalid",
+		ActivityRules: InviteRewardActivities{
+			{ActivityDetail: "Launch", Type: InviteRewardRuleFirstTopUp, Percent: 101},
+		},
+		StartTime: 1_800_000_000,
+		EndTime:   1_800_086_400,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "activity reward percent must be between 0 and 100")
 }

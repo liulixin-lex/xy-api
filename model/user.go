@@ -50,6 +50,7 @@ type User struct {
 	InviteLinkBatchId             int                        `json:"invite_link_batch_id" gorm:"type:int;column:invite_link_batch_id;index"`
 	InviteFirstTopupRewardPercent int                        `json:"invite_first_topup_reward_percent" gorm:"type:int;column:invite_first_topup_reward_percent"`
 	InviteContinuousRewardPercent int                        `json:"invite_continuous_reward_percent" gorm:"type:int;column:invite_continuous_reward_percent"`
+	InviteRewardRulesSnapshot     InviteRewardActivities     `json:"invite_reward_rules_snapshot" gorm:"type:text;column:invite_reward_rules_snapshot"`
 	InviteFirstTopupRewardedAt    int64                      `json:"invite_first_topup_rewarded_at" gorm:"column:invite_first_topup_rewarded_at;index"`
 	InviteBoundAt                 int64                      `json:"invite_bound_at" gorm:"column:invite_bound_at"`
 	InviteBatchCode               string                     `json:"invite_batch" gorm:"-:all"`

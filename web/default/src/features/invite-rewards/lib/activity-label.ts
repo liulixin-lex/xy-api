@@ -16,25 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { ApiResponse } from '@/features/wallet/types'
-import { api } from '@/lib/api'
-
-import type { InvitedUser, ReferralRewardDashboard } from './types'
-
-export async function getInvitedUsers(params?: {
-  search_field?: string
-  search?: string
-  registered_start?: number
-  registered_end?: number
-  reward_percent?: number
-}): Promise<ApiResponse<InvitedUser[]>> {
-  const res = await api.get('/api/user/aff/invited', { params })
-  return res.data
-}
-
-export async function getReferralRewards(): Promise<
-  ApiResponse<ReferralRewardDashboard>
-> {
-  const res = await api.get('/api/user/referral_rewards')
-  return res.data
+export function formatActivityDetailLabel(
+  activityDetail: string,
+  translate: (key: string) => string
+) {
+  switch (activityDetail) {
+    case 'One-time Referral':
+    case 'Continuous Referral':
+      return translate(activityDetail)
+    default:
+      return activityDetail
+  }
 }

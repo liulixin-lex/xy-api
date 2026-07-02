@@ -25,7 +25,6 @@ import {
   Link2,
   Search,
   Users,
-  XCircle,
 } from 'lucide-react'
 import {
   useCallback,
@@ -73,12 +72,14 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { CompactDateTimeRangePicker } from '@/features/usage-logs/components/compact-date-time-range-picker'
 import { transferAffiliateQuota } from '@/features/wallet/api'
 import { TransferDialog } from '@/features/wallet/components/dialogs/transfer-dialog'
 import { useTopupInfo } from '@/features/wallet/hooks'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 
-import { getReferralRewards } from './api'
+import { getInvitedUsers, getReferralRewards } from './api'
+import { formatActivityDetailLabel } from './lib/activity-label'
 import {
   formatShanghaiTimestamp,
   renderTrustedActivityDescription,
@@ -87,6 +88,7 @@ import type {
   InviteLinkBatch,
   InvitedUser,
   ReferralRewardDashboard,
+  RewardActivity,
 } from './types'
 
 type PresetActivityDescription = {
@@ -124,8 +126,7 @@ type ReferralLinkCardProps = {
 }
 
 type InvitedUsersTableProps = {
-  users: InvitedUser[]
-  loading: boolean
+  refreshKey: number
 }
 
 type InvitedUsersSearchField =
@@ -200,19 +201,70 @@ function toShareableReferralLink(link: string) {
   }
 }
 
-function RewardRatePair(props: { first: number; continuous: number }) {
+function getRewardActivities(source?: {
+  activity_rules?: RewardActivity[]
+  first_topup_reward_percent?: number
+  continuous_reward_percent?: number
+}) {
+  const rules = (source?.activity_rules ?? []).filter(
+    (rule) => rule.activity_detail.trim() && rule.percent >= 0
+  )
+  if (rules.length > 0) return rules
+
+  const fallback: RewardActivity[] = []
+  if ((source?.first_topup_reward_percent ?? 0) > 0) {
+    fallback.push({
+      activity_detail: 'One-time Referral',
+      type: 'first_topup',
+      percent: source?.first_topup_reward_percent ?? 0,
+    })
+  }
+  if ((source?.continuous_reward_percent ?? 0) > 0) {
+    fallback.push({
+      activity_detail: 'Continuous Referral',
+      type: 'continuous',
+      percent: source?.continuous_reward_percent ?? 0,
+    })
+  }
+  return fallback
+}
+
+function rewardTypeLabel(
+  type: RewardActivity['type'],
+  t: (key: string) => string
+) {
+  return type === 'first_topup' ? t('First Top-up') : t('Continuous')
+}
+
+function RewardActivityBadges(props: {
+  activities: RewardActivity[]
+  showDetail?: boolean
+}) {
   const { t } = useTranslation()
+
+  if (props.activities.length === 0) {
+    return <span className='text-muted-foreground text-xs'>-</span>
+  }
 
   return (
     <div className='flex flex-wrap gap-2'>
-      <span className='inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300'>
-        <span className='text-[11px]'>{t('First Top-up')}</span>
-        <span className='tabular-nums'>{props.first}%</span>
-      </span>
-      <span className='inline-flex items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300'>
-        <span className='text-[11px]'>{t('Subsequent')}</span>
-        <span className='tabular-nums'>{props.continuous}%</span>
-      </span>
+      {props.activities.map((activity) => (
+        <Badge
+          key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
+          variant='outline'
+          className='h-auto max-w-full justify-start gap-1.5 rounded-md px-2 py-1'
+        >
+          <span className='shrink-0 text-[11px]'>
+            {rewardTypeLabel(activity.type, t)}
+          </span>
+          <span className='shrink-0 tabular-nums'>{activity.percent}%</span>
+          {props.showDetail ? (
+            <span className='text-muted-foreground max-w-40 truncate'>
+              {formatActivityDetailLabel(activity.activity_detail, t)}
+            </span>
+          ) : null}
+        </Badge>
+      ))}
     </div>
   )
 }
@@ -293,6 +345,10 @@ function ActivityCard(props: ActivityCardProps) {
   const customDescription = props.batch?.custom_description.trim() ?? ''
   const showCustom =
     props.batch?.description_mode === 'custom' && customDescription !== ''
+  const activities = useMemo(
+    () => getRewardActivities(props.batch),
+    [props.batch]
+  )
 
   if (props.loading) {
     return (
@@ -338,24 +394,41 @@ function ActivityCard(props: ActivityCardProps) {
     </p>
   )
   if (showCustom) {
-    activityContent = <TrustedActivityHtml content={customDescription} />
-  } else if (preset.details.length > 0) {
+    activityContent = (
+      <div className='space-y-4'>
+        <TrustedActivityHtml content={customDescription} />
+        {activities.length > 0 ? (
+          <div className='grid gap-2 sm:grid-cols-2'>
+            {activities.map((activity) => (
+              <div
+                key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
+                className='rounded-lg border p-3'
+              >
+                <div className='text-sm font-medium'>
+                  {formatActivityDetailLabel(activity.activity_detail, t)}
+                </div>
+                <div className='mt-2'>
+                  <RewardActivityBadges activities={[activity]} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    )
+  } else if (activities.length > 0) {
     activityContent = (
       <div className='grid gap-2 sm:grid-cols-2'>
-        {preset.details.map((detail) => (
-          <div key={detail.title} className='rounded-lg border p-3'>
-            <div className='text-sm font-medium'>{detail.title}</div>
+        {activities.map((activity) => (
+          <div
+            key={`${activity.activity_detail}-${activity.type}-${activity.percent}`}
+            className='rounded-lg border p-3'
+          >
+            <div className='text-sm font-medium'>
+              {formatActivityDetailLabel(activity.activity_detail, t)}
+            </div>
             <div className='mt-2'>
-              <RewardRatePair
-                first={
-                  detail.first_topup_reward_percent ??
-                  batch.first_topup_reward_percent
-                }
-                continuous={
-                  detail.continuous_reward_percent ??
-                  batch.continuous_reward_percent
-                }
-              />
+              <RewardActivityBadges activities={[activity]} />
             </div>
           </div>
         ))}
@@ -368,21 +441,14 @@ function ActivityCard(props: ActivityCardProps) {
       <CardHeader className='border-b p-4 !pb-4'>
         <div className='flex flex-wrap items-start justify-between gap-3'>
           <div className='min-w-0'>
-            <div className='flex flex-wrap items-center gap-2'>
-              <CardTitle className='text-base'>
-                {preset.title || batch.name}
-              </CardTitle>
-              <Badge variant='secondary'>{t('Active')}</Badge>
-            </div>
+            <CardTitle className='text-base'>
+              {preset.title || batch.name}
+            </CardTitle>
             <CardDescription className='mt-1 text-sm'>
               {preset.summary ||
                 t('Invite users with your referral link and earn rewards.')}
             </CardDescription>
           </div>
-          <RewardRatePair
-            first={batch.first_topup_reward_percent}
-            continuous={batch.continuous_reward_percent}
-          />
         </div>
       </CardHeader>
       <CardContent className='p-4'>{activityContent}</CardContent>
@@ -394,6 +460,10 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
   const { t } = useTranslation()
   const link = toShareableReferralLink(props.dashboard?.invite_link ?? '')
   const activeBatch = props.dashboard?.active_batch
+  const activities = useMemo(
+    () => getRewardActivities(activeBatch),
+    [activeBatch]
+  )
 
   return (
     <Card data-card-hover='false' className='gap-0 py-0'>
@@ -436,10 +506,7 @@ function ReferralLinkCard(props: ReferralLinkCardProps) {
           </div>
         )}
         <div className='flex flex-wrap items-center gap-3'>
-          <RewardRatePair
-            first={activeBatch?.first_topup_reward_percent ?? 0}
-            continuous={activeBatch?.continuous_reward_percent ?? 0}
-          />
+          <RewardActivityBadges activities={activities} showDetail />
           {activeBatch ? (
             <span className='text-muted-foreground text-xs'>
               {formatShanghaiTimestamp(activeBatch.start_time)} -{' '}
@@ -464,7 +531,7 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
       icon: Clock,
     },
     {
-      label: t('Available Rewards'),
+      label: t('Transferable Rewards'),
       value: formatQuota(availableQuota),
       icon: CheckCircle2,
     },
@@ -472,11 +539,6 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
       label: t('Transferred Rewards'),
       value: formatQuota(dashboard?.transferred_reward_quota ?? 0),
       icon: Gift,
-    },
-    {
-      label: t('Canceled Rewards'),
-      value: formatQuota(dashboard?.canceled_reward_quota ?? 0),
-      icon: XCircle,
     },
     {
       label: t('Invited Users'),
@@ -493,7 +555,7 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
             <CardTitle className='text-base'>{t('Reward Summary')}</CardTitle>
             <CardDescription className='mt-1 text-sm'>
               {t(
-                'Pending rewards become available after the reward waiting period.'
+                'Pending rewards automatically become transferable rewards 7 days after the user tops up.'
               )}
             </CardDescription>
           </div>
@@ -508,7 +570,7 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
         </div>
       </CardHeader>
       <CardContent className='space-y-3 p-4'>
-        <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-5'>
+        <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
           {stats.map((stat) => (
             <RewardMetric
               key={stat.label}
@@ -531,55 +593,33 @@ function ReferralSummaryCard(props: ReferralSummaryCardProps) {
   )
 }
 
-function matchesInvitedUserSearch(
-  user: InvitedUser,
-  field: InvitedUsersSearchField,
-  search: string
-) {
-  const normalizedSearch = search.trim().toLowerCase()
-  if (!normalizedSearch) return true
-
-  const rewardRates = [
-    String(user.first_topup_reward_percent),
-    String(user.continuous_reward_percent),
-    String(user.invite_reward_percent),
-  ]
-  const rewardAmounts = [
-    String(user.contribution_quota),
-    String(user.pending_reward_quota),
-    String(user.available_reward_quota),
-    String(user.transferred_reward_quota),
-    String(user.canceled_reward_quota),
-  ]
-  const values: Record<InvitedUsersSearchField, string[]> = {
-    all: [user.username, user.display_name, ...rewardRates, ...rewardAmounts],
-    username: [user.username],
-    display_name: [user.display_name],
-    reward_rate: rewardRates,
-    reward_quota: rewardAmounts,
-  }
-
-  return values[field].some((value) =>
-    value.toLowerCase().includes(normalizedSearch)
-  )
-}
-
 function invitedUserContributionText(
   user: InvitedUser,
   t: (key: string) => string
 ) {
   return [
     `${t('Pending Rewards')}: ${formatQuota(user.pending_reward_quota)}`,
-    `${t('Available Rewards')}: ${formatQuota(user.available_reward_quota)}`,
+    `${t('Transferable Rewards')}: ${formatQuota(user.available_reward_quota)}`,
     `${t('Transferred Rewards')}: ${formatQuota(user.transferred_reward_quota)}`,
-    `${t('Canceled Rewards')}: ${formatQuota(user.canceled_reward_quota)}`,
   ].join(' / ')
+}
+
+function rewardActivitySortValue(user: InvitedUser) {
+  const activities = getRewardActivities(user)
+  return activities.reduce((total, activity) => total + activity.percent, 0)
 }
 
 function InvitedUsersTable(props: InvitedUsersTableProps) {
   const { t } = useTranslation()
   const [searchField, setSearchField] = useState<InvitedUsersSearchField>('all')
   const [search, setSearch] = useState('')
+  const [registeredRange, setRegisteredRange] = useState<{
+    start?: Date
+    end?: Date
+  }>({})
+  const [users, setUsers] = useState<InvitedUser[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(false)
   const [sort, setSort] = useState<{
     key: InvitedUsersSortKey
     direction: SortDirection
@@ -588,11 +628,76 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
     Partial<Record<InvitedUsersSortKey, boolean>>
   >({})
 
-  const filteredUsers = useMemo(() => {
-    const users = props.users.filter((user) =>
-      matchesInvitedUserSearch(user, searchField, search)
-    )
-    users.sort((a, b) => {
+  useEffect(() => {
+    let ignore = false
+    const fetchUsers = async () => {
+      setLoading(true)
+      setLoadError(false)
+      const trimmedSearch = search.trim()
+      const params: {
+        search_field?: string
+        search?: string
+        registered_start?: number
+        registered_end?: number
+        reward_percent?: number
+      } = {}
+      if (registeredRange.start) {
+        params.registered_start = Math.floor(
+          registeredRange.start.getTime() / 1000
+        )
+      }
+      if (registeredRange.end) {
+        params.registered_end = Math.floor(registeredRange.end.getTime() / 1000)
+      }
+      if (trimmedSearch) {
+        if (searchField === 'reward_rate') {
+          const percent = Number(trimmedSearch)
+          if (Number.isFinite(percent)) params.reward_percent = percent
+        } else {
+          params.search = trimmedSearch
+          if (searchField !== 'all') {
+            params.search_field =
+              searchField === 'reward_quota'
+                ? 'contribution_quota'
+                : searchField
+          }
+        }
+      }
+      try {
+        const response = await getInvitedUsers(params)
+        if (!ignore) {
+          if (response.success) {
+            setUsers(response.data ?? [])
+          } else {
+            setUsers([])
+            setLoadError(true)
+          }
+        }
+      } catch {
+        if (!ignore) {
+          setUsers([])
+          setLoadError(true)
+        }
+      } finally {
+        if (!ignore) setLoading(false)
+      }
+    }
+
+    fetchUsers()
+    return () => {
+      ignore = true
+    }
+  }, [
+    props.refreshKey,
+    registeredRange.end,
+    registeredRange.start,
+    search,
+    searchField,
+  ])
+
+  const sortedUsers = useMemo(() => {
+    const rows = [...users]
+    rows.sort((a, b) => {
       let left: string | number = a.id
       let right: string | number = b.id
       if (sort.key === 'registered') {
@@ -600,22 +705,28 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
         right = b.created_at
       }
       if (sort.key === 'ratio') {
-        left = a.first_topup_reward_percent + a.continuous_reward_percent
-        right = b.first_topup_reward_percent + b.continuous_reward_percent
+        left = rewardActivitySortValue(a)
+        right = rewardActivitySortValue(b)
       }
       if (sort.key === 'reward') {
-        left = a.contribution_quota
-        right = b.contribution_quota
+        left =
+          a.pending_reward_quota +
+          a.available_reward_quota +
+          a.transferred_reward_quota
+        right =
+          b.pending_reward_quota +
+          b.available_reward_quota +
+          b.transferred_reward_quota
       }
       const direction = sort.direction === 'asc' ? 1 : -1
       if (left > right) return direction
       if (left < right) return -direction
       return 0
     })
-    return users
-  }, [props.users, search, searchField, sort])
+    return rows
+  }, [sort, users])
 
-  if (props.loading) {
+  if (loading) {
     return (
       <Card data-card-hover='false' className='gap-0 py-0'>
         <CardHeader className='border-b p-4 !pb-4'>
@@ -686,7 +797,7 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
         </TableRow>
       </TableHeader>
       <TableBody>
-        {filteredUsers.map((user) => (
+        {sortedUsers.map((user) => (
           <TableRow key={user.id}>
             {!hiddenColumns.sequence && (
               <TableCell>
@@ -706,19 +817,16 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
               <TableCell>{formatTimestamp(user.created_at)}</TableCell>
             )}
             {!hiddenColumns.ratio && (
-              <TableCell>
-                <RewardRatePair
-                  first={user.first_topup_reward_percent}
-                  continuous={user.continuous_reward_percent}
+              <TableCell className='max-w-[360px] whitespace-normal'>
+                <RewardActivityBadges
+                  activities={getRewardActivities(user)}
+                  showDetail
                 />
               </TableCell>
             )}
             {!hiddenColumns.reward && (
-              <TableCell>
-                <div className='font-medium'>
-                  {formatQuota(user.contribution_quota)}
-                </div>
-                <div className='text-muted-foreground max-w-[420px] text-xs'>
+              <TableCell className='max-w-[380px] whitespace-normal'>
+                <div className='text-muted-foreground text-xs leading-relaxed break-words'>
                   {invitedUserContributionText(user, t)}
                 </div>
               </TableCell>
@@ -729,7 +837,18 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
     </Table>
   )
 
-  if (props.users.length === 0) {
+  if (loadError) {
+    tableContent = (
+      <Empty className='rounded-none border-0 py-10'>
+        <EmptyHeader>
+          <EmptyMedia variant='icon'>
+            <Users />
+          </EmptyMedia>
+          <EmptyTitle>{t('Request failed')}</EmptyTitle>
+        </EmptyHeader>
+      </Empty>
+    )
+  } else if (users.length === 0) {
     tableContent = (
       <Empty className='rounded-none border-0 py-10'>
         <EmptyHeader>
@@ -742,12 +861,6 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
           </EmptyDescription>
         </EmptyHeader>
       </Empty>
-    )
-  } else if (filteredUsers.length === 0) {
-    tableContent = (
-      <div className='text-muted-foreground flex min-h-32 items-center justify-center px-4 text-sm'>
-        {t('No invited users match the current filters.')}
-      </div>
     )
   }
 
@@ -784,6 +897,12 @@ function InvitedUsersTable(props: InvitedUsersTableProps) {
                 className='pl-8'
               />
             </div>
+            <CompactDateTimeRangePicker
+              start={registeredRange.start}
+              end={registeredRange.end}
+              onChange={setRegisteredRange}
+              className='lg:w-72'
+            />
           </div>
         </div>
       </CardHeader>
@@ -800,6 +919,7 @@ export function InviteRewards() {
   const [loading, setLoading] = useState(true)
   const [transferDialogOpen, setTransferDialogOpen] = useState(false)
   const [transferring, setTransferring] = useState(false)
+  const [invitedUsersRefreshKey, setInvitedUsersRefreshKey] = useState(0)
   const { topupInfo } = useTopupInfo()
 
   const fetchInviteRewards = useCallback(async () => {
@@ -831,6 +951,7 @@ export function InviteRewards() {
       if (response.success) {
         toast.success(response.message || t('Transfer successful'))
         await fetchInviteRewards()
+        setInvitedUsersRefreshKey((current) => current + 1)
         return true
       }
       toast.error(response.message || t('Transfer failed'))
@@ -859,10 +980,7 @@ export function InviteRewards() {
               complianceConfirmed={complianceConfirmed}
               onTransfer={() => setTransferDialogOpen(true)}
             />
-            <InvitedUsersTable
-              users={dashboard?.invited_users ?? []}
-              loading={loading}
-            />
+            <InvitedUsersTable refreshKey={invitedUsersRefreshKey} />
           </div>
         </SectionPageLayout.Content>
       </SectionPageLayout>

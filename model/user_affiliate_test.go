@@ -119,6 +119,62 @@ func TestGetAffiliateRewardSummaryUsesBindingsAndRewardRecords(t *testing.T) {
 	assert.Equal(t, int64(100), summary.Relations[0].RegisteredAt)
 }
 
+func TestGetInvitedUsersFiltersByRegisteredRangeAndActivityPercent(t *testing.T) {
+	truncateTables(t)
+	require.NoError(t, DB.Create(&[]User{
+		{Id: 40, Username: "inviter", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff40"},
+		{
+			Id:                            41,
+			Username:                      "alice",
+			Password:                      "secret",
+			Status:                        common.UserStatusEnabled,
+			AffCode:                       "aff41",
+			InviterId:                     40,
+			InviteLinkBatchId:             401,
+			InviteFirstTopupRewardPercent: 30,
+			InviteContinuousRewardPercent: 5,
+			InviteRewardRulesSnapshot: InviteRewardActivities{
+				{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+				{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+				{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+			},
+			CreatedAt: 1_800_000_100,
+		},
+		{
+			Id:                            42,
+			Username:                      "bob",
+			Password:                      "secret",
+			Status:                        common.UserStatusEnabled,
+			AffCode:                       "aff42",
+			InviterId:                     40,
+			InviteLinkBatchId:             402,
+			InviteFirstTopupRewardPercent: 40,
+			InviteContinuousRewardPercent: 8,
+			InviteRewardRulesSnapshot: InviteRewardActivities{
+				{ActivityDetail: "Partner first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 40},
+				{ActivityDetail: "Partner ongoing", Type: InviteRewardRuleContinuous, Percent: 8},
+			},
+			CreatedAt: 1_800_000_300,
+		},
+	}).Error)
+
+	percent := 20
+	users, err := GetInvitedUsers(40, AffiliateRelationQuery{
+		RegisteredStart: 1_800_000_000,
+		RegisteredEnd:   1_800_000_200,
+		RewardPercent:   &percent,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, users, 1)
+	assert.Equal(t, "alice", users[0].Username)
+	assert.Equal(t, InviteRewardActivities{
+		{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
+		{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
+		{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+	}, users[0].ActivityRules)
+}
+
 func TestGetReferralRewardDashboardSettlesAndBuildsInviteLink(t *testing.T) {
 	truncateTables(t)
 	now := common.GetTimestamp()
@@ -155,11 +211,7 @@ func TestGetReferralRewardDashboardSettlesAndBuildsInviteLink(t *testing.T) {
 	assert.Equal(t, int64(70), dashboard.TransferredRewardQuota)
 	assert.Equal(t, int64(50), dashboard.CanceledRewardQuota)
 	assert.Equal(t, int64(1), dashboard.InvitedUserCount)
-	require.Len(t, dashboard.InvitedUsers, 1)
-	assert.Equal(t, 35, dashboard.InvitedUsers[0].FirstTopupRewardPercent)
-	assert.Equal(t, 7, dashboard.InvitedUsers[0].ContinuousRewardPercent)
-	assert.Equal(t, 300, dashboard.InvitedUsers[0].PendingRewardQuota)
-	assert.Equal(t, 200, dashboard.InvitedUsers[0].AvailableRewardQuota)
+	assert.Empty(t, dashboard.InvitedUsers)
 
 	inviter := User{}
 	require.NoError(t, DB.First(&inviter, 60).Error)

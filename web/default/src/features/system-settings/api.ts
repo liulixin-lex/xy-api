@@ -58,6 +58,9 @@ export async function getAffiliateRewardSummary(params?: {
   search_field?: string
   search?: string
   invite_type?: string
+  registered_start?: number
+  registered_end?: number
+  reward_percent?: number
 }) {
   const res = await api.get<AffiliateRewardSummaryResponse>(
     '/api/option/affiliate_rewards',

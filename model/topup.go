@@ -718,7 +718,7 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 
 	var user User
 	if err := tx.Set("gorm:query_option", "FOR UPDATE").
-		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent", "invite_link_batch_id", "invite_first_topup_reward_percent", "invite_continuous_reward_percent").
+		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent", "invite_link_batch_id", "invite_first_topup_reward_percent", "invite_continuous_reward_percent", "invite_reward_rules_snapshot").
 		Where("id = ?", topUp.UserId).
 		First(&user).Error; err != nil {
 		return 0, 0, err
@@ -783,8 +783,6 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 }
 
 func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, quotaToAdd int) (int, int, error) {
-	rule := InviteRewardRuleContinuous
-	rewardPercent := normalizeRewardPercent(user.InviteContinuousRewardPercent)
 	recordCreatedAt := common.GetTimestamp()
 	rewardAvailableAt := topUp.CompleteTime + AffiliateRewardWaitSeconds
 	if topUp.CompleteTime <= 0 {
@@ -795,40 +793,99 @@ func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, qu
 	if err := tx.Model(&TopUp{}).Where("user_id = ? AND status = ? AND amount > ?", user.Id, common.TopUpStatusSuccess, 0).Count(&successCount).Error; err != nil {
 		return 0, 0, err
 	}
+	activities := user.InviteRewardRulesSnapshot
+	if len(activities) == 0 {
+		activities = inviteRewardActivitiesFromSnapshotPercents(
+			user.InviteFirstTopupRewardPercent,
+			user.InviteContinuousRewardPercent,
+		)
+	}
+
+	activityType := InviteRewardRuleContinuous
 	if successCount == 0 {
 		claimed, err := claimInviteFirstTopupRewardTx(tx, user.Id)
 		if err != nil {
 			return 0, 0, err
 		}
 		if claimed {
-			rule = InviteRewardRuleFirstTopUp
-			rewardPercent = normalizeRewardPercent(user.InviteFirstTopupRewardPercent)
+			activityType = InviteRewardRuleFirstTopUp
 		}
 	}
 
-	reward := quotaToAdd * rewardPercent / 100
-	if reward <= 0 {
+	applicableActivities := applicableInviteRewardActivities(activities, activityType)
+	if len(applicableActivities) == 0 {
 		return 0, 0, nil
 	}
 
-	err := tx.Create(&AffiliateRewardRecord{
-		InviterId:           user.InviterId,
-		InviteeId:           user.Id,
-		TopUpId:             topUp.Id,
-		InviteLinkBatchId:   user.InviteLinkBatchId,
-		InviteRewardRule:    rule,
-		InviteRewardPercent: rewardPercent,
-		TopUpQuota:          quotaToAdd,
-		RewardQuota:         reward,
-		Status:              AffiliateRewardStatusPending,
-		AvailableAt:         rewardAvailableAt,
-		CreatedAt:           recordCreatedAt,
-	}).Error
-	if err != nil {
-		return 0, 0, err
+	totalReward := 0
+	for _, activity := range applicableActivities {
+		rewardPercent := activity.Percent
+		reward := quotaToAdd * rewardPercent / 100
+		if reward <= 0 {
+			continue
+		}
+
+		err := tx.Create(&AffiliateRewardRecord{
+			InviterId:           user.InviterId,
+			InviteeId:           user.Id,
+			TopUpId:             topUp.Id,
+			InviteLinkBatchId:   user.InviteLinkBatchId,
+			ActivityDetail:      activity.ActivityDetail,
+			InviteRewardRule:    activity.Type,
+			InviteRewardPercent: rewardPercent,
+			TopUpQuota:          quotaToAdd,
+			RewardQuota:         reward,
+			Status:              AffiliateRewardStatusPending,
+			AvailableAt:         rewardAvailableAt,
+			CreatedAt:           recordCreatedAt,
+		}).Error
+		if err != nil {
+			return 0, 0, err
+		}
+		totalReward += reward
 	}
 
-	return user.InviterId, reward, nil
+	return user.InviterId, totalReward, nil
+}
+
+func inviteRewardActivitiesFromSnapshotPercents(firstTopupPercent int, continuousPercent int) InviteRewardActivities {
+	result := make(InviteRewardActivities, 0, 2)
+	if firstTopupPercent > 0 {
+		result = append(result, InviteRewardActivity{
+			ActivityDetail: "One-time Referral",
+			Type:           InviteRewardRuleFirstTopUp,
+			Percent:        normalizeRewardPercent(firstTopupPercent),
+		})
+	}
+	if continuousPercent > 0 {
+		result = append(result, InviteRewardActivity{
+			ActivityDetail: "Continuous Referral",
+			Type:           InviteRewardRuleContinuous,
+			Percent:        normalizeRewardPercent(continuousPercent),
+		})
+	}
+	return result
+}
+
+func applicableInviteRewardActivities(activities InviteRewardActivities, activityType string) InviteRewardActivities {
+	activities = NormalizeInviteRewardActivities(activities)
+	firstTopupActivities := make(InviteRewardActivities, 0)
+	continuousActivities := make(InviteRewardActivities, 0)
+	for _, activity := range activities {
+		switch activity.Type {
+		case InviteRewardRuleFirstTopUp:
+			firstTopupActivities = append(firstTopupActivities, activity)
+		case InviteRewardRuleContinuous:
+			continuousActivities = append(continuousActivities, activity)
+		}
+	}
+	if activityType == InviteRewardRuleFirstTopUp && len(firstTopupActivities) > 0 {
+		return firstTopupActivities
+	}
+	if activityType == InviteRewardRuleFirstTopUp {
+		return continuousActivities
+	}
+	return continuousActivities
 }
 
 func claimInviteFirstTopupRewardTx(tx *gorm.DB, userId int) (bool, error) {

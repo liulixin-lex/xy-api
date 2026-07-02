@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,23 +17,110 @@ const (
 	InviteDescriptionModeCustom = "custom"
 
 	InviteLinkBatchDescriptionMaxLength = 16 * 1024
+	InviteRewardActivityDetailMaxLength = 255
 )
 
+type InviteRewardActivity struct {
+	ActivityDetail string `json:"activity_detail"`
+	Type           string `json:"type"`
+	Percent        int    `json:"percent"`
+}
+
+type InviteRewardActivities []InviteRewardActivity
+
+func (activities InviteRewardActivities) Value() (driver.Value, error) {
+	if len(activities) == 0 {
+		return "", nil
+	}
+	data, err := common.Marshal(activities)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
+}
+
+func (activities *InviteRewardActivities) Scan(value interface{}) error {
+	if activities == nil {
+		return nil
+	}
+	if value == nil {
+		*activities = nil
+		return nil
+	}
+
+	var data []byte
+	switch typed := value.(type) {
+	case []byte:
+		data = typed
+	case string:
+		data = []byte(typed)
+	default:
+		return fmt.Errorf("unsupported invite reward activities value %T", value)
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		*activities = nil
+		return nil
+	}
+
+	var parsed []InviteRewardActivity
+	if err := common.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	*activities = NormalizeInviteRewardActivities(parsed)
+	return nil
+}
+
+func NormalizeInviteRewardActivities(activities InviteRewardActivities) InviteRewardActivities {
+	normalized := make(InviteRewardActivities, 0, len(activities))
+	for _, activity := range activities {
+		ruleType := strings.ToLower(strings.TrimSpace(activity.Type))
+		switch ruleType {
+		case InviteRewardRuleFirstTopUp, InviteRewardRuleContinuous:
+		default:
+			ruleType = strings.TrimSpace(activity.Type)
+		}
+		normalized = append(normalized, InviteRewardActivity{
+			ActivityDetail: strings.TrimSpace(activity.ActivityDetail),
+			Type:           ruleType,
+			Percent:        activity.Percent,
+		})
+	}
+	return normalized
+}
+
+func CalculateInviteRewardPercents(activities InviteRewardActivities) (firstTopupPercent int, continuousPercent int) {
+	hasFirstTopupActivity := false
+	for _, activity := range NormalizeInviteRewardActivities(activities) {
+		switch activity.Type {
+		case InviteRewardRuleFirstTopUp:
+			hasFirstTopupActivity = true
+			firstTopupPercent += activity.Percent
+		case InviteRewardRuleContinuous:
+			continuousPercent += activity.Percent
+		}
+	}
+	if !hasFirstTopupActivity && continuousPercent > 0 {
+		firstTopupPercent = continuousPercent
+	}
+	return firstTopupPercent, continuousPercent
+}
+
 type InviteLinkBatch struct {
-	Id                      int    `json:"id"`
-	Name                    string `json:"name" gorm:"type:varchar(64);index"`
-	Code                    string `json:"code" gorm:"type:varchar(64);uniqueIndex"`
-	BaseLink                string `json:"base_link" gorm:"type:varchar(512)"`
-	FirstTopupRewardPercent int    `json:"first_topup_reward_percent" gorm:"type:int"`
-	ContinuousRewardPercent int    `json:"continuous_reward_percent" gorm:"type:int"`
-	StartTime               int64  `json:"start_time" gorm:"index"`
-	EndTime                 int64  `json:"end_time" gorm:"index"`
-	DescriptionMode         string `json:"description_mode" gorm:"type:varchar(16)"`
-	PresetDescription       string `json:"preset_description" gorm:"type:text"`
-	CustomDescription       string `json:"custom_description" gorm:"type:text"`
-	IsActive                bool   `json:"is_active" gorm:"index"`
-	CreatedAt               int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	UpdatedAt               int64  `json:"updated_at" gorm:"autoUpdateTime;column:updated_at"`
+	Id                      int                    `json:"id"`
+	Name                    string                 `json:"name" gorm:"type:varchar(64);index"`
+	Code                    string                 `json:"code" gorm:"type:varchar(64);uniqueIndex"`
+	BaseLink                string                 `json:"base_link" gorm:"type:varchar(512)"`
+	FirstTopupRewardPercent int                    `json:"first_topup_reward_percent" gorm:"type:int"`
+	ContinuousRewardPercent int                    `json:"continuous_reward_percent" gorm:"type:int"`
+	ActivityRules           InviteRewardActivities `json:"activity_rules" gorm:"type:text;column:activity_rules"`
+	StartTime               int64                  `json:"start_time" gorm:"index"`
+	EndTime                 int64                  `json:"end_time" gorm:"index"`
+	DescriptionMode         string                 `json:"description_mode" gorm:"type:varchar(16)"`
+	PresetDescription       string                 `json:"preset_description" gorm:"type:text"`
+	CustomDescription       string                 `json:"custom_description" gorm:"type:text"`
+	IsActive                bool                   `json:"is_active" gorm:"index"`
+	CreatedAt               int64                  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	UpdatedAt               int64                  `json:"updated_at" gorm:"autoUpdateTime;column:updated_at"`
 }
 
 type InviteLinkBatchWithStats struct {
@@ -56,6 +144,10 @@ func (batch *InviteLinkBatch) Normalize() {
 	}
 	batch.FirstTopupRewardPercent = normalizeRewardPercent(batch.FirstTopupRewardPercent)
 	batch.ContinuousRewardPercent = normalizeRewardPercent(batch.ContinuousRewardPercent)
+	batch.ActivityRules = NormalizeInviteRewardActivities(batch.ActivityRules)
+	if len(batch.ActivityRules) > 0 {
+		batch.FirstTopupRewardPercent, batch.ContinuousRewardPercent = CalculateInviteRewardPercents(batch.ActivityRules)
+	}
 	switch strings.TrimSpace(batch.DescriptionMode) {
 	case InviteDescriptionModeCustom:
 		batch.DescriptionMode = InviteDescriptionModeCustom
@@ -69,7 +161,45 @@ func (batch InviteLinkBatch) Validate() error {
 		utf8.RuneCountInString(batch.CustomDescription) > InviteLinkBatchDescriptionMaxLength {
 		return errors.New("activity description is too long")
 	}
+	for _, activity := range batch.ActivityRules {
+		if strings.TrimSpace(activity.ActivityDetail) == "" {
+			return errors.New("activity detail is required")
+		}
+		if utf8.RuneCountInString(activity.ActivityDetail) > InviteRewardActivityDetailMaxLength {
+			return errors.New("activity detail is too long")
+		}
+		if activity.Type != InviteRewardRuleFirstTopUp && activity.Type != InviteRewardRuleContinuous {
+			return errors.New("activity type is required")
+		}
+		if activity.Percent < 0 || activity.Percent > 100 {
+			return errors.New("activity reward percent must be between 0 and 100")
+		}
+	}
 	return nil
+}
+
+func (batch InviteLinkBatch) EffectiveActivityRules() InviteRewardActivities {
+	activities := NormalizeInviteRewardActivities(batch.ActivityRules)
+	if len(activities) > 0 {
+		return activities
+	}
+
+	result := make(InviteRewardActivities, 0, 2)
+	if batch.FirstTopupRewardPercent > 0 {
+		result = append(result, InviteRewardActivity{
+			ActivityDetail: "One-time Referral",
+			Type:           InviteRewardRuleFirstTopUp,
+			Percent:        normalizeRewardPercent(batch.FirstTopupRewardPercent),
+		})
+	}
+	if batch.ContinuousRewardPercent > 0 {
+		result = append(result, InviteRewardActivity{
+			ActivityDetail: "Continuous Referral",
+			Type:           InviteRewardRuleContinuous,
+			Percent:        normalizeRewardPercent(batch.ContinuousRewardPercent),
+		})
+	}
+	return result
 }
 
 func GenerateInviteLinkBatchCode() string {
@@ -147,6 +277,7 @@ func UpdateInviteLinkBatch(batch *InviteLinkBatch) error {
 			"base_link":                  batch.BaseLink,
 			"first_topup_reward_percent": batch.FirstTopupRewardPercent,
 			"continuous_reward_percent":  batch.ContinuousRewardPercent,
+			"activity_rules":             batch.ActivityRules,
 			"start_time":                 batch.StartTime,
 			"end_time":                   batch.EndTime,
 			"description_mode":           batch.DescriptionMode,
@@ -220,6 +351,7 @@ type InviteLinkBinding struct {
 	InviteLinkBatchId       int
 	FirstTopupRewardPercent int
 	ContinuousRewardPercent int
+	ActivityRules           InviteRewardActivities
 	BoundAt                 int64
 }
 
@@ -246,11 +378,15 @@ func ResolveInviteLinkBinding(batchCode string, affCode string, now int64) (*Inv
 		return nil, nil
 	}
 
+	activityRules := batch.EffectiveActivityRules()
+	firstTopupRewardPercent, continuousRewardPercent := CalculateInviteRewardPercents(activityRules)
+
 	return &InviteLinkBinding{
 		InviterId:               inviterId,
 		InviteLinkBatchId:       batch.Id,
-		FirstTopupRewardPercent: normalizeRewardPercent(batch.FirstTopupRewardPercent),
-		ContinuousRewardPercent: normalizeRewardPercent(batch.ContinuousRewardPercent),
+		FirstTopupRewardPercent: firstTopupRewardPercent,
+		ContinuousRewardPercent: continuousRewardPercent,
+		ActivityRules:           activityRules,
 		BoundAt:                 now,
 	}, nil
 }
@@ -263,5 +399,6 @@ func (user *User) ApplyInviteLinkBinding(binding *InviteLinkBinding) {
 	user.InviteLinkBatchId = binding.InviteLinkBatchId
 	user.InviteFirstTopupRewardPercent = binding.FirstTopupRewardPercent
 	user.InviteContinuousRewardPercent = binding.ContinuousRewardPercent
+	user.InviteRewardRulesSnapshot = binding.ActivityRules
 	user.InviteBoundAt = binding.BoundAt
 }

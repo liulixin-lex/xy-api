@@ -50,6 +50,12 @@ export type ConfirmPaymentComplianceResponse = {
   }
 }
 
+export type RewardActivity = {
+  activity_detail: string
+  type: 'continuous' | 'first_topup'
+  percent: number
+}
+
 export type AffiliateRewardRelation = {
   inviter_id: number
   inviter_username: string
@@ -60,6 +66,7 @@ export type AffiliateRewardRelation = {
   invite_reward_percent: number
   first_topup_reward_percent: number
   continuous_reward_percent: number
+  activity_rules: RewardActivity[]
   reward_quota: number
   pending_reward_quota: number
   available_reward_quota: number
@@ -86,6 +93,7 @@ export type InviteLinkBatch = {
   base_link: string
   first_topup_reward_percent: number
   continuous_reward_percent: number
+  activity_rules: RewardActivity[]
   start_time: number
   end_time: number
   description_mode: 'preset' | 'custom'
