@@ -22,7 +22,7 @@ import { describe, test } from 'node:test'
 import {
   formatShanghaiTimestamp,
   renderTrustedActivityDescription,
-} from './activity-description'
+} from './activity-description.ts'
 
 describe('activity description helpers', () => {
   test('renders markdown while preserving trusted raw HTML', () => {
@@ -36,10 +36,7 @@ describe('activity description helpers', () => {
   })
 
   test('formats timestamps in Shanghai time', () => {
-    assert.equal(
-      formatShanghaiTimestamp(1_800_000_000),
-      '2027-01-15 16:00 GMT+8'
-    )
+    assert.equal(formatShanghaiTimestamp(1_800_000_000), '2027-01-15 16:00')
     assert.equal(formatShanghaiTimestamp(0), '-')
   })
 })

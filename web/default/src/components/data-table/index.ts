@@ -22,6 +22,10 @@ export { BadgeCell } from './core/badge-cell'
 export { BadgeListCell } from './core/badge-list-cell'
 export { TruncatedCell } from './core/truncated-cell'
 export { DataTableViewOptions } from './toolbar/view-options'
+export {
+  DataTableManualViewOptions,
+  type DataTableManualViewOption,
+} from './toolbar/manual-view-options'
 export { DataTableToolbar } from './toolbar/toolbar'
 export { DataTableBulkActions } from './toolbar/bulk-actions'
 export {

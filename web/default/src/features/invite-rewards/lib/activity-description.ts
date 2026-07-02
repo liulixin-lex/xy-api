@@ -40,5 +40,5 @@ export function renderTrustedActivityDescription(content: string) {
 
 export function formatShanghaiTimestamp(timestamp: number) {
   if (!timestamp) return '-'
-  return `${shanghaiTimestampFormatter.format(timestamp * 1000)} GMT+8`
+  return shanghaiTimestampFormatter.format(timestamp * 1000)
 }
