@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { RewardActivity } from '../types'
 
 export type RewardRateSource = {
-  activity_rules?: RewardActivity[]
+  activity_rules?: readonly RewardActivity[]
   first_topup_reward_percent?: number
   continuous_reward_percent?: number
 }
@@ -35,20 +35,39 @@ type PendingRewardSource = {
   transferred_reward_quota?: number
 }
 
-const rewardTypeOrder: Record<RewardActivity['type'], number> = {
+type InitialQuotaSource = {
+  initial_quota?: number
+}
+
+const rewardTypeOrder: Record<'first_topup' | 'continuous', number> = {
   first_topup: 0,
   continuous: 1,
+}
+
+type RewardRateActivity = RewardActivity & {
+  type: 'first_topup' | 'continuous'
+  percent: number
+}
+
+function isRewardRateActivity(
+  rule: RewardActivity
+): rule is RewardRateActivity {
+  return (
+    (rule.type === 'first_topup' || rule.type === 'continuous') &&
+    rule.activity_detail.trim() !== '' &&
+    (rule.percent ?? 0) > 0
+  )
 }
 
 export function getRewardActivities(
   source?: RewardRateSource
 ): RewardActivity[] {
   const rules = (source?.activity_rules ?? [])
-    .filter((rule) => rule.activity_detail.trim() && rule.percent > 0)
+    .filter(isRewardRateActivity)
     .sort(
       (left, right) =>
         rewardTypeOrder[left.type] - rewardTypeOrder[right.type] ||
-        right.percent - left.percent
+        (right.percent ?? 0) - (left.percent ?? 0)
     )
   if (rules.length > 0) return rules
 
@@ -78,16 +97,46 @@ export function formatRewardRateSummary(
     .map((activity) => {
       const label =
         activity.type === 'first_topup' ? t('First Top-up') : t('Continuous')
-      return `${label}${activity.percent}%`
+      return `${label}${activity.percent ?? 0}%`
     })
     .join('+')
 }
 
 export function getRewardRateSortValue(source?: RewardRateSource) {
   return getRewardActivities(source).reduce(
-    (total, activity) => total + activity.percent,
+    (total, activity) => total + (activity.percent ?? 0),
     0
   )
+}
+
+export function getInitialQuotaActivities(
+  source?: RewardRateSource
+): RewardActivity[] {
+  return (source?.activity_rules ?? []).filter(
+    (rule) =>
+      rule.type === 'initial_quota' &&
+      rule.activity_detail.trim() &&
+      (rule.quota ?? 0) > 0
+  )
+}
+
+export function getInitialQuotaTotal(source?: RewardRateSource) {
+  return getInitialQuotaActivities(source).reduce(
+    (total, activity) => total + (activity.quota ?? 0),
+    0
+  )
+}
+
+export function getInitialQuotaSortValue(source: InitialQuotaSource) {
+  return source.initial_quota ?? 0
+}
+
+export function formatInitialQuotaSummary(
+  source: RewardRateSource | undefined,
+  formatQuotaValue: (quota: number) => string,
+  t: (key: string) => string
+) {
+  return `${t('Initial Quota')} ${formatQuotaValue(getInitialQuotaTotal(source))}`
 }
 
 export function buildInviteSequenceMap(rows: InvitedSequenceSource[]) {

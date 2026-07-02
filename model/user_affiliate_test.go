@@ -119,6 +119,41 @@ func TestGetAffiliateRewardSummaryUsesBindingsAndRewardRecords(t *testing.T) {
 	assert.Equal(t, int64(100), summary.Relations[0].RegisteredAt)
 }
 
+func TestGetAffiliateRewardSummaryIncludesInitialQuotaSeparately(t *testing.T) {
+	truncateTables(t)
+	require.NoError(t, DB.Create(&[]User{
+		{Id: 170, Username: "inviter", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff170"},
+		{Id: 171, Username: "alice", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff171", InviterId: 170, InviteLinkBatchId: 180, CreatedAt: 1_800_000_100},
+		{Id: 172, Username: "bob", Password: "secret", Status: common.UserStatusEnabled, AffCode: "aff172", InviterId: 170, InviteLinkBatchId: 180, CreatedAt: 1_800_000_200},
+	}).Error)
+	require.NoError(t, DB.Create(&[]InviteInitialQuotaRecord{
+		{InviterId: 170, InviteeId: 171, InviteLinkBatchId: 180, ActivityDetail: "Signup quota", Quota: 500, CreatedAt: 1_800_000_101},
+		{InviterId: 170, InviteeId: 172, InviteLinkBatchId: 180, ActivityDetail: "Signup quota", Quota: 250, CreatedAt: 1_800_000_201},
+	}).Error)
+	require.NoError(t, DB.Create(&AffiliateRewardRecord{
+		InviterId:           170,
+		InviteeId:           171,
+		TopUpId:             900,
+		InviteLinkBatchId:   180,
+		InviteRewardRule:    InviteRewardRuleFirstTopUp,
+		InviteRewardPercent: 30,
+		TopUpQuota:          1000,
+		RewardQuota:         300,
+		CreatedAt:           1_800_000_300,
+	}).Error)
+
+	summary, err := GetAffiliateRewardSummary(AffiliateRelationQuery{})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(300), summary.TotalRewardQuota)
+	assert.Equal(t, int64(750), summary.TotalInitialQuota)
+	require.Len(t, summary.Relations, 2)
+	assert.Equal(t, 0, summary.Relations[0].RewardQuota)
+	assert.Equal(t, 250, summary.Relations[0].InitialQuota)
+	assert.Equal(t, 300, summary.Relations[1].RewardQuota)
+	assert.Equal(t, 500, summary.Relations[1].InitialQuota)
+}
+
 func TestGetInvitedUsersFiltersByRegisteredRangeAndActivityPercent(t *testing.T) {
 	truncateTables(t)
 	require.NoError(t, DB.Create(&[]User{

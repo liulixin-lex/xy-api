@@ -77,6 +77,74 @@ func TestRegisterRequiresInviteBatchAndAffCodeForReferralBinding(t *testing.T) {
 	assert.NotZero(t, withBatch.InviteBoundAt)
 }
 
+func TestRegisterAppliesInviteInitialQuotaFromBatch(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	now := common.GetTimestamp()
+
+	originalRegisterEnabled := common.RegisterEnabled
+	originalPasswordRegisterEnabled := common.PasswordRegisterEnabled
+	originalEmailVerificationEnabled := common.EmailVerificationEnabled
+	originalGenerateDefaultToken := constant.GenerateDefaultToken
+	originalQuotaForNewUser := common.QuotaForNewUser
+	common.RegisterEnabled = true
+	common.PasswordRegisterEnabled = true
+	common.EmailVerificationEnabled = false
+	common.QuotaForNewUser = 100
+	constant.GenerateDefaultToken = false
+	t.Cleanup(func() {
+		common.RegisterEnabled = originalRegisterEnabled
+		common.PasswordRegisterEnabled = originalPasswordRegisterEnabled
+		common.EmailVerificationEnabled = originalEmailVerificationEnabled
+		common.QuotaForNewUser = originalQuotaForNewUser
+		constant.GenerateDefaultToken = originalGenerateDefaultToken
+	})
+
+	require.NoError(t, db.Create(&model.User{
+		Id:       101,
+		Username: "inviter-initial-quota",
+		Password: "secret",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff101",
+	}).Error)
+	require.NoError(t, db.Create(&model.InviteLinkBatch{
+		Id:       102,
+		Name:     "Initial quota",
+		Code:     "initial-quota",
+		BaseLink: "https://example.com/sign-up?invite_batch=initial-quota",
+		ActivityRules: model.InviteRewardActivities{
+			{ActivityDetail: "Signup quota", Type: model.InviteRewardRuleInitialQuota, Quota: 500},
+			{ActivityDetail: "Launch first top-up", Type: model.InviteRewardRuleFirstTopUp, Percent: 30},
+			{ActivityDetail: "Ongoing", Type: model.InviteRewardRuleContinuous, Percent: 5},
+		},
+		StartTime: now - 60,
+		EndTime:   now + 3600,
+		IsActive:  true,
+	}).Error)
+
+	registerUser(t, gin.H{
+		"username":     "withinitialquota",
+		"password":     "password123",
+		"aff_code":     "aff101",
+		"invite_batch": "initial-quota",
+	})
+
+	var registered model.User
+	require.NoError(t, db.Where("username = ?", "withinitialquota").First(&registered).Error)
+	assert.Equal(t, 600, registered.Quota)
+
+	var initialRecords []model.InviteInitialQuotaRecord
+	require.NoError(t, db.Find(&initialRecords).Error)
+	require.Len(t, initialRecords, 1)
+	assert.Equal(t, 101, initialRecords[0].InviterId)
+	assert.Equal(t, registered.Id, initialRecords[0].InviteeId)
+	assert.Equal(t, 102, initialRecords[0].InviteLinkBatchId)
+	assert.Equal(t, 500, initialRecords[0].Quota)
+
+	var affiliateRewardCount int64
+	require.NoError(t, db.Model(&model.AffiliateRewardRecord{}).Count(&affiliateRewardCount).Error)
+	assert.Equal(t, int64(0), affiliateRewardCount)
+}
+
 func registerUser(t *testing.T, payload gin.H) {
 	t.Helper()
 	body, err := common.Marshal(payload)

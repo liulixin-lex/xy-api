@@ -18,8 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 export type RewardActivity = {
   activity_detail: string
-  type: 'continuous' | 'first_topup'
-  percent: number
+  type: 'continuous' | 'first_topup' | 'initial_quota'
+  percent?: number
+  quota?: number
 }
 
 export interface InvitedUser {
@@ -37,6 +38,7 @@ export interface InvitedUser {
   available_reward_quota: number
   transferred_reward_quota: number
   canceled_reward_quota: number
+  initial_quota: number
 }
 
 export interface InviteLinkBatch {

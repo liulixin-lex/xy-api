@@ -52,8 +52,9 @@ export type ConfirmPaymentComplianceResponse = {
 
 export type RewardActivity = {
   activity_detail: string
-  type: 'continuous' | 'first_topup'
-  percent: number
+  type: 'continuous' | 'first_topup' | 'initial_quota'
+  percent?: number
+  quota?: number
 }
 
 export type AffiliateRewardRelation = {
@@ -72,6 +73,7 @@ export type AffiliateRewardRelation = {
   available_reward_quota: number
   transferred_reward_quota: number
   canceled_reward_quota: number
+  initial_quota: number
   registered_at: number
 }
 
@@ -79,6 +81,7 @@ export type AffiliateRewardSummary = {
   inviter_count: number
   invitee_count: number
   total_reward_quota: number
+  total_initial_quota: number
   pending_reward_quota: number
   available_reward_quota: number
   transferred_reward_quota: number

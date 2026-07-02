@@ -424,9 +424,13 @@ func (user *User) Insert(inviterId int) error {
 		user.SetSetting(defaultSetting)
 	}
 
-	result := DB.Create(user)
-	if result.Error != nil {
-		return result.Error
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		return IssueInviteInitialQuota(tx, user)
+	}); err != nil {
+		return err
 	}
 
 	user.finishInsert(inviterId)
@@ -490,12 +494,11 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 		user.SetSetting(defaultSetting)
 	}
 
-	result := tx.Create(user)
-	if result.Error != nil {
-		return result.Error
+	if err := tx.Create(user).Error; err != nil {
+		return err
 	}
 
-	return nil
+	return IssueInviteInitialQuota(tx, user)
 }
 
 // FinalizeOAuthUserCreation performs post-transaction tasks for OAuth user creation.

@@ -367,6 +367,7 @@ func TestInviteLinkBatchTopUpRewardStacksMultipleActivityRules(t *testing.T) {
 			{ActivityDetail: "Launch first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 20},
 			{ActivityDetail: "VIP first top-up", Type: InviteRewardRuleFirstTopUp, Percent: 10},
 			{ActivityDetail: "Ongoing partner", Type: InviteRewardRuleContinuous, Percent: 5},
+			{ActivityDetail: "Signup quota", Type: InviteRewardRuleInitialQuota, Quota: 500},
 		},
 		InviteBoundAt: 1_800_000_000,
 	})
@@ -407,6 +408,10 @@ func TestInviteLinkBatchTopUpRewardStacksMultipleActivityRules(t *testing.T) {
 	assert.Equal(t, InviteRewardRuleContinuous, continuousRecords[0].InviteRewardRule)
 	assert.Equal(t, 5, continuousRecords[0].InviteRewardPercent)
 	assert.Equal(t, 1_000, continuousRecords[0].RewardQuota)
+
+	var initialRewardRecords int64
+	require.NoError(t, DB.Model(&AffiliateRewardRecord{}).Where("invite_reward_rule = ?", InviteRewardRuleInitialQuota).Count(&initialRewardRecords).Error)
+	assert.Equal(t, int64(0), initialRewardRecords)
 }
 
 func TestInviteLinkBatchTopUpRewardUsesContinuousRulesForFirstTopUpWhenNoFirstRules(t *testing.T) {

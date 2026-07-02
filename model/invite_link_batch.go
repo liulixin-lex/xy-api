@@ -24,6 +24,7 @@ type InviteRewardActivity struct {
 	ActivityDetail string `json:"activity_detail"`
 	Type           string `json:"type"`
 	Percent        int    `json:"percent"`
+	Quota          int    `json:"quota,omitempty"`
 }
 
 type InviteRewardActivities []InviteRewardActivity
@@ -75,7 +76,7 @@ func NormalizeInviteRewardActivities(activities InviteRewardActivities) InviteRe
 	for _, activity := range activities {
 		ruleType := strings.ToLower(strings.TrimSpace(activity.Type))
 		switch ruleType {
-		case InviteRewardRuleFirstTopUp, InviteRewardRuleContinuous:
+		case InviteRewardRuleFirstTopUp, InviteRewardRuleContinuous, InviteRewardRuleInitialQuota:
 		default:
 			ruleType = strings.TrimSpace(activity.Type)
 		}
@@ -83,6 +84,7 @@ func NormalizeInviteRewardActivities(activities InviteRewardActivities) InviteRe
 			ActivityDetail: strings.TrimSpace(activity.ActivityDetail),
 			Type:           ruleType,
 			Percent:        activity.Percent,
+			Quota:          activity.Quota,
 		})
 	}
 	return normalized
@@ -103,6 +105,16 @@ func CalculateInviteRewardPercents(activities InviteRewardActivities) (firstTopu
 		firstTopupPercent = continuousPercent
 	}
 	return firstTopupPercent, continuousPercent
+}
+
+func CalculateInviteInitialQuota(activities InviteRewardActivities) int {
+	total := 0
+	for _, activity := range NormalizeInviteRewardActivities(activities) {
+		if activity.Type == InviteRewardRuleInitialQuota {
+			total += activity.Quota
+		}
+	}
+	return total
 }
 
 type InviteLinkBatch struct {
@@ -168,8 +180,14 @@ func (batch InviteLinkBatch) Validate() error {
 		if utf8.RuneCountInString(activity.ActivityDetail) > InviteRewardActivityDetailMaxLength {
 			return errors.New("activity detail is too long")
 		}
-		if activity.Type != InviteRewardRuleFirstTopUp && activity.Type != InviteRewardRuleContinuous {
+		if activity.Type != InviteRewardRuleFirstTopUp && activity.Type != InviteRewardRuleContinuous && activity.Type != InviteRewardRuleInitialQuota {
 			return errors.New("activity type is required")
+		}
+		if activity.Type == InviteRewardRuleInitialQuota {
+			if activity.Quota < 0 {
+				return errors.New("activity quota must be non-negative")
+			}
+			continue
 		}
 		if activity.Percent < 0 || activity.Percent > 100 {
 			return errors.New("activity reward percent must be between 0 and 100")
