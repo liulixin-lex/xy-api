@@ -108,6 +108,21 @@ func (user *User) SetSetting(setting dto.UserSetting) {
 	user.Setting = string(settingBytes)
 }
 
+func UpdateUserSetting(userId int, setting dto.UserSetting) error {
+	if userId == 0 {
+		return errors.New("id 为空！")
+	}
+	settingBytes, err := common.Marshal(setting)
+	if err != nil {
+		return err
+	}
+	settingValue := string(settingBytes)
+	if err = DB.Model(&User{}).Where("id = ?", userId).Update("setting", settingValue).Error; err != nil {
+		return err
+	}
+	return updateUserSettingCache(userId, settingValue)
+}
+
 // 根据用户角色生成默认的边栏配置
 func generateDefaultSidebarConfigForRole(userRole int) string {
 	defaultConfig := map[string]interface{}{}
@@ -675,7 +690,10 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		}
 	}
 	newUser := *user
-	tx.First(&user, user.Id)
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
 	updates := map[string]interface{}{
 		"username":     newUser.Username,
 		"display_name": newUser.DisplayName,
@@ -699,19 +717,10 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	if updatePassword {
 		updates["password"] = newUser.Password
 	}
-	if err = tx.Model(user).Updates(updates).Error; err != nil {
+	if err = tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
 	}
-	return nil
-}
-
-func UpdateUserSetting(id int, setting dto.UserSetting) error {
-	user := User{Id: id}
-	user.SetSetting(setting)
-	if err := DB.Model(&User{}).Where("id = ?", id).Update("setting", user.Setting).Error; err != nil {
-		return err
-	}
-	return updateUserSettingCache(id, user.Setting)
+	return tx.First(user, user.Id).Error
 }
 
 func (user *User) Edit(updatePassword bool) error {
@@ -741,11 +750,14 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		updates["password"] = newUser.Password
 	}
 
-	tx.First(&user, user.Id)
-	if err = tx.Model(user).Updates(updates).Error; err != nil {
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
 		return err
 	}
-	return nil
+	if err = tx.Model(&current).Updates(updates).Error; err != nil {
+		return err
+	}
+	return tx.First(user, user.Id).Error
 }
 
 func (user *User) ClearBinding(bindingType string) error {
