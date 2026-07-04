@@ -16,7 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { resolveApiInfoActionVisibility } from '@/features/dashboard/lib/api-info'
 import { useStatus } from '@/hooks/use-status'
+
 import type { AnnouncementItem, ApiInfoItem, FAQItem } from '../types'
 
 /**
@@ -37,7 +39,15 @@ export function useStatusData<T = unknown>(
  * Get API info list
  */
 export function useApiInfo() {
-  return useStatusData<ApiInfoItem>('api_info_enabled', 'api_info')
+  const { status, loading } = useStatus()
+  const enabled = status ? status.api_info_enabled !== false : false
+  const items = (enabled ? status?.api_info || [] : []) as ApiInfoItem[]
+
+  return {
+    items,
+    loading,
+    actionVisibility: resolveApiInfoActionVisibility(status),
+  }
 }
 
 /**

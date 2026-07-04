@@ -18,20 +18,26 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Zap, ExternalLink, Gauge } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { getBgColorClass } from '@/lib/colors'
-import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
+
 import { CopyButton } from '@/components/copy-button'
 import { StatusBadge } from '@/components/status-badge'
+import { Button } from '@/components/ui/button'
 import {
   getLatencyColorClass,
   openExternalSpeedTest,
 } from '@/features/dashboard/lib/api-info'
-import type { ApiInfoItem, PingStatus } from '@/features/dashboard/types'
+import type {
+  ApiInfoActionVisibility,
+  ApiInfoItem,
+  PingStatus,
+} from '@/features/dashboard/types'
+import { getBgColorClass } from '@/lib/colors'
+import { cn } from '@/lib/utils'
 
 interface ApiInfoItemProps {
   item: ApiInfoItem
   status: PingStatus
+  actionVisibility: ApiInfoActionVisibility
   onTest: (url: string) => void
 }
 
@@ -92,28 +98,32 @@ export function ApiInfoItemComponent(props: ApiInfoItemProps) {
         </div>
 
         <div className='flex items-center gap-0.5'>
-          <Button
-            variant='ghost'
-            size='sm'
-            onClick={() => props.onTest(item.url)}
-            disabled={status.testing}
-            className='size-7 p-0'
-            title={t('Test Latency')}
-          >
-            <Zap
-              className={cn('size-3.5', status.testing && 'animate-pulse')}
-            />
-          </Button>
+          {props.actionVisibility.testLatency ? (
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={() => props.onTest(item.url)}
+              disabled={status.testing}
+              className='size-7 p-0'
+              title={t('Test Latency')}
+            >
+              <Zap
+                className={cn('size-3.5', status.testing && 'animate-pulse')}
+              />
+            </Button>
+          ) : null}
 
-          <Button
-            variant='ghost'
-            size='sm'
-            onClick={() => openExternalSpeedTest(item.url)}
-            className='hidden size-7 p-0 sm:inline-flex'
-            title={t('External Speed Test')}
-          >
-            <Gauge className='size-3.5' />
-          </Button>
+          {props.actionVisibility.externalSpeedTest ? (
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={() => openExternalSpeedTest(item.url)}
+              className='hidden size-7 p-0 sm:inline-flex'
+              title={t('External Speed Test')}
+            >
+              <Gauge className='size-3.5' />
+            </Button>
+          ) : null}
 
           <CopyButton
             value={item.url}
@@ -125,15 +135,17 @@ export function ApiInfoItemComponent(props: ApiInfoItemProps) {
             aria-label={t('Copy URL')}
           />
 
-          <Button
-            variant='ghost'
-            size='sm'
-            className='hidden size-7 p-0 sm:inline-flex'
-            title={t('Open in New Tab')}
-            render={<a href={item.url} target='_blank' rel='noreferrer' />}
-          >
-            <ExternalLink className='size-3.5' />
-          </Button>
+          {props.actionVisibility.openNewTab ? (
+            <Button
+              variant='ghost'
+              size='sm'
+              className='hidden size-7 p-0 sm:inline-flex'
+              title={t('Open in New Tab')}
+              render={<a href={item.url} target='_blank' rel='noreferrer' />}
+            >
+              <ExternalLink className='size-3.5' />
+            </Button>
+          ) : null}
         </div>
       </div>
     </div>

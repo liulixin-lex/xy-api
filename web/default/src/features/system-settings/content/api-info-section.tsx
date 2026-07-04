@@ -16,14 +16,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo, useState } from 'react'
-import * as z from 'zod'
-import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Plus, Trash2, Save } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { getBgColorClass } from '@/lib/colors'
+import * as z from 'zod'
+
+import { BadgeCell } from '@/components/data-table/core/badge-cell'
+import { StaticDataTable } from '@/components/data-table/static/static-data-table'
+import { StaticRowActions } from '@/components/data-table/static/static-row-actions'
+import { Dialog } from '@/components/dialog'
+import { StatusBadge } from '@/components/status-badge'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -36,6 +41,15 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+} from '@/components/ui/field'
 import {
   Form,
   FormControl,
@@ -54,11 +68,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { BadgeCell } from '@/components/data-table/core/badge-cell'
-import { StaticDataTable } from '@/components/data-table/static/static-data-table'
-import { StaticRowActions } from '@/components/data-table/static/static-row-actions'
-import { Dialog } from '@/components/dialog'
-import { StatusBadge } from '@/components/status-badge'
+import { getBgColorClass } from '@/lib/colors'
+
 import { SettingsSwitchField } from '../components/settings-form-layout'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
@@ -73,6 +84,9 @@ type ApiInfo = {
 
 type ApiInfoSectionProps = {
   enabled: boolean
+  showTestLatencyButton: boolean
+  showExternalSpeedTestButton: boolean
+  showOpenNewTabButton: boolean
   data: string
 }
 
@@ -87,6 +101,29 @@ const createApiInfoSchema = (t: (key: string) => string) =>
 type ApiInfoFormValues = z.infer<ReturnType<typeof createApiInfoSchema>>
 
 const API_INFO_FORM_ID = 'api-info-form'
+
+type ApiInfoActionVisibilityKey =
+  | 'showTestLatencyButton'
+  | 'showExternalSpeedTestButton'
+  | 'showOpenNewTabButton'
+
+const apiInfoActionOptions = [
+  {
+    key: 'showTestLatencyButton',
+    optionKey: 'console_setting.api_info_test_latency_enabled',
+    labelKey: 'Test Latency',
+  },
+  {
+    key: 'showExternalSpeedTestButton',
+    optionKey: 'console_setting.api_info_external_speed_test_enabled',
+    labelKey: 'External Speed Test',
+  },
+  {
+    key: 'showOpenNewTabButton',
+    optionKey: 'console_setting.api_info_open_new_tab_enabled',
+    labelKey: 'Open in New Tab',
+  },
+] as const
 
 const colorOptions = [
   { value: 'blue', label: 'Blue' },
@@ -119,7 +156,13 @@ function parseApiInfoList(data: string): ApiInfo[] {
   }
 }
 
-export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
+export function ApiInfoSection({
+  enabled,
+  showTestLatencyButton,
+  showExternalSpeedTestButton,
+  showOpenNewTabButton,
+  data,
+}: ApiInfoSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
   const apiInfoSchema = createApiInfoSchema(t)
@@ -128,6 +171,9 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
     null
   )
   const [isEnabledDraft, setIsEnabledDraft] = useState<boolean | null>(null)
+  const [actionVisibilityDraft, setActionVisibilityDraft] = useState<
+    Partial<Record<ApiInfoActionVisibilityKey, boolean>>
+  >({})
   const [selectedIds, setSelectedIds] = useState<number[]>([])
   const [showDialog, setShowDialog] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -135,6 +181,15 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
   const [deleteTarget, setDeleteTarget] = useState<'single' | 'batch'>('single')
   const apiInfoList = draftApiInfoList ?? parsedApiInfoList
   const isEnabled = isEnabledDraft ?? enabled
+  const actionVisibility = {
+    showTestLatencyButton:
+      actionVisibilityDraft.showTestLatencyButton ?? showTestLatencyButton,
+    showExternalSpeedTestButton:
+      actionVisibilityDraft.showExternalSpeedTestButton ??
+      showExternalSpeedTestButton,
+    showOpenNewTabButton:
+      actionVisibilityDraft.showOpenNewTabButton ?? showOpenNewTabButton,
+  }
   const hasChanges = draftApiInfoList !== null
 
   const form = useForm<ApiInfoFormValues>({
@@ -154,6 +209,23 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
         value: checked,
       })
       setIsEnabledDraft(checked)
+      toast.success(t('Setting saved'))
+    } catch {
+      toast.error(t('Failed to update setting'))
+    }
+  }
+
+  const handleToggleActionVisibility = async (
+    key: ApiInfoActionVisibilityKey,
+    optionKey: string,
+    checked: boolean
+  ) => {
+    try {
+      await updateOption.mutateAsync({
+        key: optionKey,
+        value: checked,
+      })
+      setActionVisibilityDraft((prev) => ({ ...prev, [key]: checked }))
       toast.success(t('Setting saved'))
     } catch {
       toast.error(t('Failed to update setting'))
@@ -296,6 +368,43 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
             className='py-0'
           />
         </div>
+
+        <FieldSet className='bg-muted/20 rounded-lg border px-3 py-3'>
+          <div>
+            <FieldLegend variant='label'>{t('Visible buttons')}</FieldLegend>
+            <FieldDescription>
+              {t(
+                'Choose which API address actions are shown on the dashboard.'
+              )}
+            </FieldDescription>
+          </div>
+          <FieldGroup
+            data-slot='checkbox-group'
+            className='grid gap-3 sm:grid-cols-3'
+          >
+            {apiInfoActionOptions.map((option) => (
+              <Field key={option.key} orientation='horizontal'>
+                <Checkbox
+                  id={`api-info-action-${option.key}`}
+                  checked={actionVisibility[option.key]}
+                  disabled={updateOption.isPending}
+                  onCheckedChange={(checked) =>
+                    handleToggleActionVisibility(
+                      option.key,
+                      option.optionKey,
+                      checked === true
+                    )
+                  }
+                />
+                <FieldContent>
+                  <FieldLabel htmlFor={`api-info-action-${option.key}`}>
+                    {t(option.labelKey)}
+                  </FieldLabel>
+                </FieldContent>
+              </Field>
+            ))}
+          </FieldGroup>
+        </FieldSet>
 
         <StaticDataTable
           data={apiInfoList}
@@ -468,16 +577,16 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
                   <FormLabel>{t('Badge Color')}</FormLabel>
                   <Select
                     items={colorOptions.map((option) => ({
-                        value: option.value,
-                        label: (
-                          <div className='flex items-center gap-2'>
-                            <div
-                              className={`h-4 w-4 rounded-full ${getBgColorClass(option.value)}`}
-                            />
-                            {option.label}
-                          </div>
-                        ),
-                      }))}
+                      value: option.value,
+                      label: (
+                        <div className='flex items-center gap-2'>
+                          <div
+                            className={`h-4 w-4 rounded-full ${getBgColorClass(option.value)}`}
+                          />
+                          {option.label}
+                        </div>
+                      ),
+                    }))}
                     onValueChange={field.onChange}
                     value={field.value}
                   >
@@ -519,10 +628,9 @@ export function ApiInfoSection({ enabled, data }: ApiInfoSectionProps) {
             <AlertDialogDescription>
               {deleteTarget === 'single'
                 ? t('This API shortcut will be removed from the list.')
-                : t(
-                    '{{count}} API shortcuts will be removed from the list.',
-                    { count: selectedIds.length }
-                  )}
+                : t('{{count}} API shortcuts will be removed from the list.', {
+                    count: selectedIds.length,
+                  })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

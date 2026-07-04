@@ -221,6 +221,12 @@ export interface ApiInfoItem {
   color: string
 }
 
+export interface ApiInfoActionVisibility {
+  testLatency: boolean
+  externalSpeedTest: boolean
+  openNewTab: boolean
+}
+
 export interface PingStatus {
   latency: number | null
   testing: boolean

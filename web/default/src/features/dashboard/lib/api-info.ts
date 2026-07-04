@@ -16,7 +16,35 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { PingStatus } from '@/features/dashboard/types'
+import type {
+  ApiInfoActionVisibility,
+  PingStatus,
+} from '@/features/dashboard/types'
+
+function isActionEnabled(value: unknown): boolean {
+  return value !== false
+}
+
+function getActionSetting(status: unknown, key: string): unknown {
+  if (!status || typeof status !== 'object') return undefined
+  return (status as Record<string, unknown>)[key]
+}
+
+export function resolveApiInfoActionVisibility(
+  status: unknown
+): ApiInfoActionVisibility {
+  return {
+    testLatency: isActionEnabled(
+      getActionSetting(status, 'api_info_test_latency_enabled')
+    ),
+    externalSpeedTest: isActionEnabled(
+      getActionSetting(status, 'api_info_external_speed_test_enabled')
+    ),
+    openNewTab: isActionEnabled(
+      getActionSetting(status, 'api_info_open_new_tab_enabled')
+    ),
+  }
+}
 
 /**
  * Get color class for latency status

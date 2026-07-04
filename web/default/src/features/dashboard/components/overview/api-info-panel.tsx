@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useState, useCallback } from 'react'
 import { Route } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useApiInfo } from '@/features/dashboard/hooks/use-status-data'
 import {
@@ -26,12 +27,13 @@ import {
   getDefaultPingStatus,
 } from '@/features/dashboard/lib/api-info'
 import type { PingStatusMap, ApiInfoItem } from '@/features/dashboard/types'
+
 import { PanelWrapper } from '../ui/panel-wrapper'
 import { ApiInfoItemComponent } from './api-info-item'
 
 export function ApiInfoPanel() {
   const { t } = useTranslation()
-  const { items: list, loading } = useApiInfo()
+  const { items: list, loading, actionVisibility } = useApiInfo()
   const [pingStatus, setPingStatus] = useState<PingStatusMap>({})
 
   const handleTest = useCallback(async (url: string) => {
@@ -71,6 +73,7 @@ export function ApiInfoPanel() {
               <ApiInfoItemComponent
                 item={item}
                 status={pingStatus[item.url] || getDefaultPingStatus()}
+                actionVisibility={actionVisibility}
                 onTest={handleTest}
               />
             </div>

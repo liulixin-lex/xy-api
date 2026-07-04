@@ -69,6 +69,15 @@ const CONTENT_SECTIONS = [
     build: (settings: ContentSettings) => (
       <ApiInfoSection
         enabled={settings['console_setting.api_info_enabled']}
+        showTestLatencyButton={
+          settings['console_setting.api_info_test_latency_enabled']
+        }
+        showExternalSpeedTestButton={
+          settings['console_setting.api_info_external_speed_test_enabled']
+        }
+        showOpenNewTabButton={
+          settings['console_setting.api_info_open_new_tab_enabled']
+        }
         data={settings['console_setting.api_info']}
       />
     ),
