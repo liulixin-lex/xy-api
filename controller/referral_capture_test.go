@@ -93,6 +93,30 @@ func TestCaptureReferralLinkCreatesCaptureCookieAndCapsExpiryAtBatchEnd(t *testi
 	assert.InDelta(t, common.GetTimestamp()+3600, captures[0].ExpiresAt, 3)
 }
 
+func TestCaptureReferralLinkThroughGinRoute(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	seedReferralUserAndBatch(t, 1, "aff1", 2, "short", 3600)
+
+	router := gin.New()
+	router.GET("/r/:invite_batch", CaptureReferralLink)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/r/short?aff=aff1", nil)
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusFound, recorder.Code)
+	assert.Equal(t, "/", recorder.Header().Get("Location"))
+	cookie := referralCookieFromRecorder(t, recorder)
+	assert.True(t, cookie.HttpOnly)
+	assert.Equal(t, "/", cookie.Path)
+	assert.Equal(t, http.SameSiteLaxMode, cookie.SameSite)
+
+	var capture model.ReferralCapture
+	require.NoError(t, db.Where("aff_code = ? AND invite_batch_code = ?", "aff1", "short").First(&capture).Error)
+	assert.Equal(t, 1, capture.InviterId)
+	assert.Equal(t, 2, capture.InviteLinkBatchId)
+}
+
 func TestCaptureReferralLinkRedirectsHomeWithoutCookieForInvalidLink(t *testing.T) {
 	setupModelListControllerTestDB(t)
 	seedReferralUserAndBatch(t, 1, "aff1", 2, "short", 3600)
