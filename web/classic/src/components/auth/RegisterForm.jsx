@@ -246,6 +246,8 @@ const RegisterForm = () => {
         );
         const { success, message } = res.data;
         if (success) {
+          localStorage.removeItem('aff');
+          localStorage.removeItem('invite_batch');
           navigate('/login');
           showSuccess('注册成功！');
         } else {
