@@ -47,7 +47,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}, &model.ReferralCapture{}))
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()

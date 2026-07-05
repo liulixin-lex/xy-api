@@ -34,6 +34,7 @@ type OAuthProvidersProps = {
   disabled?: boolean
   className?: string
   onWeChatLogin?: () => void
+  onBeforeOAuth?: () => boolean | Promise<boolean>
   isWeChatLoading?: boolean
 }
 
@@ -50,6 +51,7 @@ export function OAuthProviders({
   disabled = false,
   className,
   onWeChatLogin,
+  onBeforeOAuth,
   isWeChatLoading = false,
 }: OAuthProvidersProps) {
   const { t } = useTranslation()
@@ -135,6 +137,14 @@ export function OAuthProviders({
 
   if (providerButtons.length === 0) return null
 
+  const handleProviderClick = async (onClick: () => void) => {
+    if (onBeforeOAuth) {
+      const canContinue = await onBeforeOAuth()
+      if (!canContinue) return
+    }
+    onClick()
+  }
+
   return (
     <div className={cn('space-y-3', className)}>
       <div className='relative'>
@@ -156,7 +166,7 @@ export function OAuthProviders({
               variant='outline'
               type='button'
               disabled={disabled || isLoading || extraDisabled}
-              onClick={onClick}
+              onClick={() => void handleProviderClick(onClick)}
               className='h-11 w-full justify-center gap-2 rounded-lg'
             >
               {icon}

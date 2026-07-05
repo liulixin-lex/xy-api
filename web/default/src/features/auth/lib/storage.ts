@@ -172,3 +172,9 @@ export function saveInviteBatchCode(code: string): void {
     console.error('Failed to save invite batch code:', error)
   }
 }
+
+export function clearReferralStorage(): void {
+  saveAffiliateCode('')
+  saveAffiliateRule('')
+  saveInviteBatchCode('')
+}

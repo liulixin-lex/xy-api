@@ -21,7 +21,10 @@ import i18next from 'i18next'
 import { toast } from 'sonner'
 import { useCountdown } from '@/hooks/use-countdown'
 import { sendEmailVerification } from '../api'
-import { EMAIL_VERIFICATION_COUNTDOWN } from '../constants'
+import {
+  EMAIL_VERIFICATION_COUNTDOWN,
+  MAINSTREAM_EMAIL_PROVIDER_MESSAGE,
+} from '../constants'
 
 interface UseEmailVerificationOptions {
   turnstileToken?: string
@@ -61,9 +64,11 @@ export function useEmailVerification(options?: UseEmailVerificationOptions) {
         toast.success(i18next.t('Verification email sent'))
         return true
       }
-      toast.error(
-        res?.message || i18next.t('Failed to send verification email')
-      )
+      const message =
+        res?.message === MAINSTREAM_EMAIL_PROVIDER_MESSAGE
+          ? i18next.t(MAINSTREAM_EMAIL_PROVIDER_MESSAGE)
+          : res?.message
+      toast.error(message || i18next.t('Failed to send verification email'))
       return false
     } catch {
       // Errors are handled by global interceptor

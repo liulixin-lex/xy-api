@@ -36,7 +36,6 @@ export let API = axios.create({
   },
 });
 
-
 function redirectToOAuthUrl(url, options = {}) {
   const { openInNewTab = false } = options;
   const targetUrl = typeof url === 'string' ? url : url.toString();
@@ -48,7 +47,6 @@ function redirectToOAuthUrl(url, options = {}) {
 
   window.location.assign(targetUrl);
 }
-
 
 function patchAPIInstance(instance) {
   const originalGet = instance.get.bind(instance);
@@ -240,13 +238,35 @@ export const processGroupsData = (data, userGroup) => {
 
 // 原来components中的utils.js
 
+export async function captureReferralParamsFromLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const affCode = params.get('aff')?.trim() || '';
+  const inviteBatch = params.get('invite_batch')?.trim() || '';
+  if (!affCode || !inviteBatch) return null;
+
+  try {
+    const res = await API.post(
+      '/api/referral/capture',
+      {
+        aff_code: affCode,
+        invite_batch: inviteBatch,
+      },
+      { skipErrorHandler: true },
+    );
+    const { success, data } = res.data;
+    if (success && data?.aff_code && data?.invite_batch_code) {
+      localStorage.setItem('aff', data.aff_code);
+      localStorage.setItem('invite_batch', data.invite_batch_code);
+      return data;
+    }
+  } catch (err) {}
+
+  return null;
+}
+
 export async function getOAuthState() {
-  let path = '/api/oauth/state';
-  let affCode = localStorage.getItem('aff');
-  if (affCode && affCode.length > 0) {
-    path += `?aff=${affCode}`;
-  }
-  const res = await API.get(path);
+  await captureReferralParamsFromLocation();
+  const res = await API.get('/api/oauth/state', { disableDuplicate: true });
   const { success, message, data } = res.data;
   if (success) {
     return data;

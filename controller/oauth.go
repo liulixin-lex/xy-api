@@ -23,15 +23,9 @@ func providerParams(name string) map[string]any {
 func GenerateOAuthCode(c *gin.Context) {
 	session := sessions.Default(c)
 	state := common.GetRandomString(12)
-	affCode := c.Query("aff")
-	inviteBatch := c.Query("invite_batch")
-	session.Delete("aff")
-	session.Delete("invite_batch")
-	session.Delete("aff_rule")
-	if affCode != "" && inviteBatch != "" {
-		session.Set("aff", affCode)
-		session.Set("invite_batch", inviteBatch)
-		session.Set("aff_rule", c.Query("aff_rule"))
+	if err := syncReferralToOAuthSession(c, session, common.GetTimestamp()); err != nil {
+		common.ApiError(c, err)
+		return
 	}
 	session.Set("oauth_state", state)
 	err := session.Save()
@@ -110,7 +104,7 @@ func HandleOAuth(c *gin.Context) {
 	}
 
 	// 7. Find or create user
-	user, err := findOrCreateOAuthUser(c, provider, oauthUser, session)
+	user, created, err := findOrCreateOAuthUser(c, provider, oauthUser, session)
 	if err != nil {
 		switch err.(type) {
 		case *OAuthUserDeletedError:
@@ -127,6 +121,13 @@ func HandleOAuth(c *gin.Context) {
 	if user.Status != common.UserStatusEnabled {
 		common.ApiErrorI18n(c, i18n.MsgOAuthUserBanned)
 		return
+	}
+	if created || session.Get(oauthReferralTokenHashSessionKey) != nil || referralTokenFromCookie(c) != "" {
+		clearOAuthReferralState(c, session)
+		if err := session.Save(); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	}
 
 	// 9. Setup login
@@ -202,20 +203,20 @@ func handleOAuthBind(c *gin.Context, provider oauth.Provider) {
 }
 
 // findOrCreateOAuthUser finds existing user or creates new user
-func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *oauth.OAuthUser, session sessions.Session) (*model.User, error) {
+func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *oauth.OAuthUser, session sessions.Session) (*model.User, bool, error) {
 	user := &model.User{}
 
 	// Check if user already exists with new ID
 	if provider.IsUserIDTaken(oauthUser.ProviderUserID) {
 		err := provider.FillUserByProviderID(user, oauthUser.ProviderUserID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// Check if user has been deleted
 		if user.Id == 0 {
-			return nil, &OAuthUserDeletedError{}
+			return nil, false, &OAuthUserDeletedError{}
 		}
-		return user, nil
+		return user, false, nil
 	}
 
 	// Try to find user with legacy ID (for GitHub migration from login to numeric ID)
@@ -223,7 +224,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		if provider.IsUserIDTaken(legacyID) {
 			err := provider.FillUserByProviderID(user, legacyID)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if user.Id != 0 {
 				// Found user with legacy ID, migrate to new ID
@@ -233,14 +234,14 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 					common.SysError(fmt.Sprintf("[OAuth] Failed to migrate user %d: %s", user.Id, err.Error()))
 					// Continue with login even if migration fails
 				}
-				return user, nil
+				return user, false, nil
 			}
 		}
 	}
 
 	// User doesn't exist, create new user if registration is enabled
 	if !common.RegisterEnabled {
-		return nil, &OAuthRegistrationDisabledError{}
+		return nil, false, &OAuthRegistrationDisabledError{}
 	}
 
 	// Set up new user
@@ -268,17 +269,29 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	user.Role = common.RoleCommonUser
 	user.Status = common.UserStatusEnabled
 
-	// Handle referral link binding. Both batch code and affiliate code are required.
+	// Handle referral capture binding. Fall back to legacy session params for old clients.
+	now := common.GetTimestamp()
+	var referralCapture *model.ReferralCapture
+	if tokenHash, ok := session.Get(oauthReferralTokenHashSessionKey).(string); ok && tokenHash != "" {
+		capture, err := model.GetValidReferralCaptureByTokenHash(tokenHash, now)
+		if err != nil {
+			return nil, false, err
+		}
+		referralCapture = capture
+	}
 	affCode := session.Get("aff")
 	inviteBatch := session.Get("invite_batch")
 	inviterId := 0
-	if affCode != nil && inviteBatch != nil {
+	if referralCapture != nil {
+		inviterId = referralCapture.InviterId
+		user.ApplyInviteLinkBinding(referralCapture.InviteLinkBinding())
+	} else if affCode != nil && inviteBatch != nil {
 		affCodeValue, affOk := affCode.(string)
 		inviteBatchValue, batchOk := inviteBatch.(string)
 		if affOk && batchOk {
-			binding, err := model.ResolveInviteLinkBinding(inviteBatchValue, affCodeValue, common.GetTimestamp())
+			binding, err := model.ResolveInviteLinkBinding(inviteBatchValue, affCodeValue, now)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if binding != nil {
 				inviterId = binding.InviterId
@@ -303,6 +316,15 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
 				return err
 			}
+			if referralCapture != nil {
+				consumed, err := model.ConsumeReferralCaptureTx(tx, referralCapture.TokenHash, user.Id, now)
+				if err != nil {
+					return err
+				}
+				if !consumed {
+					return model.ErrReferralCaptureConsumed
+				}
+			}
 
 			// Create OAuth binding
 			binding := &model.UserOAuthBinding{
@@ -317,7 +339,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		// Perform post-transaction tasks (logs, sidebar config, inviter rewards)
@@ -328,6 +350,15 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 			// Create user
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
 				return err
+			}
+			if referralCapture != nil {
+				consumed, err := model.ConsumeReferralCaptureTx(tx, referralCapture.TokenHash, user.Id, now)
+				if err != nil {
+					return err
+				}
+				if !consumed {
+					return model.ErrReferralCaptureConsumed
+				}
 			}
 
 			// Set the provider user ID on the user model and update
@@ -346,14 +377,14 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		// Perform post-transaction tasks
 		user.FinalizeOAuthUserCreation(inviterId)
 	}
 
-	return user, nil
+	return user, true, nil
 }
 
 // Error types for OAuth

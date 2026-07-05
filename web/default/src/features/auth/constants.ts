@@ -31,6 +31,7 @@ export const registerFormSchema = z
   .object({
     username: z.string().min(1, 'Please enter your username'),
     email: z.string().optional(),
+    invitationCode: z.string().optional(),
     password: z
       .string()
       .min(1, 'Please enter your password')
@@ -76,3 +77,6 @@ export const PASSWORD_RESET_COUNTDOWN = 30 // seconds
 // ============================================================================
 
 export const OAUTH_BIND_STORAGE_KEY = 'oauth:binding:result'
+
+export const MAINSTREAM_EMAIL_PROVIDER_MESSAGE =
+  'Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.'

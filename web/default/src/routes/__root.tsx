@@ -29,11 +29,7 @@ import { useEffect } from 'react'
 import { NavigationProgress } from '@/components/navigation-progress'
 import { Toaster } from '@/components/ui/sonner'
 import { ThemeCustomizationProvider } from '@/context/theme-customization-provider'
-import {
-  saveAffiliateCode,
-  saveAffiliateRule,
-  saveInviteBatchCode,
-} from '@/features/auth/lib/storage'
+import { captureReferralParamsFromLocation } from '@/features/auth/lib/referral-capture'
 import { GeneralError } from '@/features/errors/general-error'
 import { NotFoundError } from '@/features/errors/not-found-error'
 import { getSetupStatus } from '@/features/setup/api'
@@ -44,21 +40,7 @@ function RootComponent() {
   useSystemConfig({ autoLoad: true })
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    const hasAff = params.has('aff')
-    const hasInviteBatch = params.has('invite_batch')
-    const aff = params.get('aff')?.trim() ?? ''
-    const inviteBatch = params.get('invite_batch')?.trim() ?? ''
-    if (hasAff || hasInviteBatch) {
-      if (aff && inviteBatch) {
-        saveAffiliateCode(aff)
-        saveInviteBatchCode(inviteBatch)
-      } else {
-        saveAffiliateCode('')
-        saveInviteBatchCode('')
-      }
-      saveAffiliateRule(params.get('aff_rule')?.trim() ?? '')
-    }
+    void captureReferralParamsFromLocation()
   }, [])
 
   return (

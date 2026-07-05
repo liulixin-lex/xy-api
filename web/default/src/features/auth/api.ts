@@ -18,7 +18,6 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
-import { getAffiliateRule } from './lib/storage'
 import type {
   LoginPayload,
   LoginResponse,
@@ -26,6 +25,7 @@ import type {
   TwoFAPayload,
   RegisterPayload,
   ApiResponse,
+  ReferralCaptureCurrent,
 } from './types'
 
 // ============================================================================
@@ -88,18 +88,7 @@ export async function githubOAuthStart(clientId: string, state: string) {
 
 // Get OAuth state for CSRF protection
 export async function getOAuthState(): Promise<string> {
-  const params = new URLSearchParams(window.location.search)
-  const aff = params.get('aff')?.trim() ?? ''
-  const inviteBatch = params.get('invite_batch')?.trim() ?? ''
-  const affRule = getAffiliateRule()
-  const hasReferralParams = aff !== '' && inviteBatch !== ''
-  const res = await api.get('/api/oauth/state', {
-    params: {
-      aff: hasReferralParams ? aff : undefined,
-      aff_rule: hasReferralParams ? affRule || undefined : undefined,
-      invite_batch: hasReferralParams ? inviteBatch : undefined,
-    },
-  })
+  const res = await api.get('/api/oauth/state', { disableDuplicate: true })
   if (res.data?.success) return res.data.data
   return ''
 }
@@ -129,6 +118,7 @@ export async function sendEmailVerification(
 ): Promise<ApiResponse> {
   const res = await api.get('/api/verification', {
     params: { email, turnstile },
+    skipBusinessError: true,
   })
   return res.data
 }
@@ -141,6 +131,49 @@ export async function bindEmail(
   const res = await api.post('/api/oauth/email/bind', {
     email,
     code,
+  })
+  return res.data
+}
+
+export async function getCurrentReferral(): Promise<
+  ApiResponse & { data?: ReferralCaptureCurrent }
+> {
+  const res = await api.get('/api/referral/current', {
+    disableDuplicate: true,
+    skipBusinessError: true,
+  })
+  return res.data
+}
+
+export async function captureReferral(payload: {
+  affCode: string
+  inviteBatch: string
+}): Promise<ApiResponse & { data?: ReferralCaptureCurrent }> {
+  const res = await api.post(
+    '/api/referral/capture',
+    {
+      aff_code: payload.affCode,
+      invite_batch: payload.inviteBatch,
+    },
+    { skipBusinessError: true }
+  )
+  return res.data
+}
+
+export async function captureManualReferral(
+  affCode: string
+): Promise<ApiResponse & { data?: ReferralCaptureCurrent }> {
+  const res = await api.post(
+    '/api/referral/manual',
+    { aff_code: affCode },
+    { skipBusinessError: true }
+  )
+  return res.data
+}
+
+export async function clearCurrentReferral(): Promise<ApiResponse> {
+  const res = await api.delete('/api/referral/current', {
+    skipBusinessError: true,
   })
   return res.data
 }

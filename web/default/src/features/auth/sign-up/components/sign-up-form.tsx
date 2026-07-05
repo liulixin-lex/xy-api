@@ -38,21 +38,22 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { register, wechatLoginByCode } from '@/features/auth/api'
+import {
+  captureManualReferral,
+  clearCurrentReferral,
+  getCurrentReferral,
+  register,
+  wechatLoginByCode,
+} from '@/features/auth/api'
 import { LegalConsent } from '@/features/auth/components/legal-consent'
 import { OAuthProviders } from '@/features/auth/components/oauth-providers'
 import { registerFormSchema } from '@/features/auth/constants'
 import { useAuthRedirect } from '@/features/auth/hooks/use-auth-redirect'
 import { useEmailVerification } from '@/features/auth/hooks/use-email-verification'
 import { useTurnstile } from '@/features/auth/hooks/use-turnstile'
-import {
-  getAffiliateCode,
-  getAffiliateRule,
-  getInviteBatchCode,
-  saveAffiliateCode,
-  saveAffiliateRule,
-  saveInviteBatchCode,
-} from '@/features/auth/lib/storage'
+import { captureReferralParamsFromLocation } from '@/features/auth/lib/referral-capture'
+import { clearReferralStorage } from '@/features/auth/lib/storage'
+import type { ReferralCaptureCurrent } from '@/features/auth/types'
 import { useStatus } from '@/hooks/use-status'
 import { cn } from '@/lib/utils'
 
@@ -67,6 +68,9 @@ export function SignUpForm({
   const [wechatCode, setWeChatCode] = useState('')
   const [isWeChatDialogOpen, setIsWeChatDialogOpen] = useState(false)
   const [isWeChatSubmitting, setIsWeChatSubmitting] = useState(false)
+  const [referral, setReferral] = useState<ReferralCaptureCurrent | null>(null)
+  const [isReferralLoading, setIsReferralLoading] = useState(false)
+  const [isReferralValidating, setIsReferralValidating] = useState(false)
   const legalConsentErrorMessage = t('Please agree to the legal terms first')
 
   const { status } = useStatus()
@@ -93,6 +97,7 @@ export function SignUpForm({
     defaultValues: {
       username: '',
       email: '',
+      invitationCode: '',
       password: '',
       confirmPassword: '',
     },
@@ -109,6 +114,7 @@ export function SignUpForm({
     true
   const hasWeChatLogin = Boolean(status?.wechat_login)
   const turnstileReady = !isTurnstileEnabled || Boolean(turnstileToken)
+  const referralLocked = Boolean(referral?.locked)
 
   const wechatQrCodeUrl = useMemo(() => {
     return (
@@ -133,26 +139,66 @@ export function SignUpForm({
   }, [requiresLegalConsent])
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    const hasAff = params.has('aff')
-    const hasInviteBatch = params.has('invite_batch')
-    const aff = params.get('aff')?.trim() ?? ''
-    const inviteBatch = params.get('invite_batch')?.trim() ?? ''
-    if (hasAff || hasInviteBatch) {
-      if (aff && inviteBatch) {
-        saveAffiliateCode(aff)
-        saveInviteBatchCode(inviteBatch)
-      } else {
-        saveAffiliateCode('')
-        saveInviteBatchCode('')
+    let isMounted = true
+
+    async function loadReferral() {
+      setIsReferralLoading(true)
+      try {
+        await captureReferralParamsFromLocation()
+        const res = await getCurrentReferral()
+        if (!isMounted) return
+        const current =
+          res?.success && res.data?.aff_code ? res.data : null
+        setReferral(current)
+        form.setValue('invitationCode', current?.aff_code ?? '')
+      } catch {
+        if (isMounted) {
+          setReferral(null)
+        }
+      } finally {
+        if (isMounted) {
+          setIsReferralLoading(false)
+        }
       }
-      saveAffiliateRule(params.get('aff_rule')?.trim() ?? '')
-    } else {
-      saveAffiliateCode('')
-      saveInviteBatchCode('')
-      saveAffiliateRule('')
     }
-  }, [])
+
+    void loadReferral()
+
+    return () => {
+      isMounted = false
+    }
+  }, [form])
+
+  async function ensureReferralBeforeAuth() {
+    if (referralLocked) return true
+
+    const invitationCode = form.getValues('invitationCode')?.trim() ?? ''
+    if (!invitationCode) {
+      if (referral?.source === 'manual') {
+        await clearCurrentReferral()
+        setReferral(null)
+        clearReferralStorage()
+      }
+      return true
+    }
+
+    setIsReferralValidating(true)
+    try {
+      const res = await captureManualReferral(invitationCode)
+      if (res?.success && res.data?.aff_code) {
+        setReferral(res.data)
+        form.setValue('invitationCode', res.data.aff_code)
+        return true
+      }
+      toast.error(t('Failed to validate invitation code'))
+      return false
+    } catch {
+      toast.error(t('Failed to validate invitation code'))
+      return false
+    } finally {
+      setIsReferralValidating(false)
+    }
+  }
 
   async function onSubmit(data: z.infer<typeof registerFormSchema>) {
     if (requiresLegalConsent && !agreedToLegal) {
@@ -173,6 +219,7 @@ export function SignUpForm({
     }
 
     if (!validateTurnstile()) return
+    if (!(await ensureReferralBeforeAuth())) return
 
     setIsLoading(true)
     try {
@@ -181,13 +228,11 @@ export function SignUpForm({
         password: data.password,
         email: data.email || undefined,
         verification_code: verificationCode || undefined,
-        aff_code: getAffiliateCode(),
-        invite_batch: getInviteBatchCode() || undefined,
-        invite_reward_rule: getAffiliateRule() || undefined,
         turnstile: turnstileToken,
       })
 
       if (res?.success) {
+        clearReferralStorage()
         toast.success(t('Account created! Please sign in'))
         redirectToLogin()
       } else {
@@ -204,7 +249,7 @@ export function SignUpForm({
     await sendCode(emailValue || '')
   }
 
-  const handleOpenWeChatDialog = () => {
+  const handleOpenWeChatDialog = async () => {
     if (requiresLegalConsent && !agreedToLegal) {
       toast.error(legalConsentErrorMessage)
       return
@@ -308,6 +353,30 @@ export function SignUpForm({
           )}
         />
 
+        <FormField
+          control={form.control}
+          name='invitationCode'
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>{t('Invitation Code')}</FormLabel>
+              <FormControl>
+                <Input
+                  placeholder={t('Enter invitation code')}
+                  readOnly={referralLocked || isReferralLoading}
+                  className={cn(
+                    referralLocked || isReferralLoading
+                      ? 'bg-muted text-muted-foreground'
+                      : ''
+                  )}
+                  {...field}
+                  value={field.value ?? ''}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
         {/* Email Verification Section */}
         {emailVerificationRequired && (
           <>
@@ -382,18 +451,26 @@ export function SignUpForm({
           className='mt-2 w-full justify-center gap-2'
           disabled={
             isLoading ||
+            isReferralValidating ||
             (requiresLegalConsent && !agreedToLegal) ||
             !turnstileReady
           }
         >
-          {isLoading ? <Loader2 className='h-4 w-4 animate-spin' /> : null}
+          {isLoading || isReferralValidating ? (
+            <Loader2 className='h-4 w-4 animate-spin' />
+          ) : null}
           {t('Create account')}
         </Button>
 
         {oauthRegisterEnabled && (
           <OAuthProviders
             status={status}
-            disabled={isLoading || (requiresLegalConsent && !agreedToLegal)}
+            disabled={
+              isLoading ||
+              isReferralValidating ||
+              (requiresLegalConsent && !agreedToLegal)
+            }
+            onBeforeOAuth={ensureReferralBeforeAuth}
             onWeChatLogin={hasWeChatLogin ? handleOpenWeChatDialog : undefined}
             isWeChatLoading={isWeChatSubmitting}
             className='pt-2'

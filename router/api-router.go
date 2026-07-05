@@ -32,6 +32,13 @@ func SetApiRouter(router *gin.Engine) {
 		//apiRouter.GET("/midjourney", controller.GetMidjourney)
 		apiRouter.GET("/home_page_content", controller.GetHomePageContent)
 		apiRouter.GET("/pricing", middleware.HeaderNavModuleAuth("pricing"), controller.GetPricing)
+		referralRoute := apiRouter.Group("/referral")
+		{
+			referralRoute.GET("/current", controller.GetCurrentReferral)
+			referralRoute.POST("/capture", middleware.CriticalRateLimit(), anonymousRequestBodyLimit, controller.CaptureLegacyReferral)
+			referralRoute.POST("/manual", middleware.CriticalRateLimit(), anonymousRequestBodyLimit, controller.CaptureManualReferral)
+			referralRoute.DELETE("/current", middleware.CriticalRateLimit(), controller.ClearCurrentReferral)
+		}
 		perfMetricsRoute := apiRouter.Group("/perf-metrics")
 		perfMetricsRoute.Use(middleware.HeaderNavModulePublicOrUserAuth("pricing"))
 		{

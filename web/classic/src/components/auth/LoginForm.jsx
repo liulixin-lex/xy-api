@@ -36,6 +36,7 @@ import {
   onOIDCClicked,
   onLinuxDOOAuthClicked,
   onCustomOAuthClicked,
+  captureReferralParamsFromLocation,
   prepareCredentialRequestOptions,
   buildAssertionResult,
   isPasskeySupported,
@@ -116,11 +117,6 @@ const LoginForm = () => {
   const logo = getLogo();
   const systemName = getSystemName();
 
-  let affCode = new URLSearchParams(window.location.search).get('aff');
-  if (affCode) {
-    localStorage.setItem('aff', affCode);
-  }
-
   const status = useMemo(() => {
     if (statusState?.status) return statusState.status;
     const savedStatus = localStorage.getItem('status');
@@ -135,15 +131,16 @@ const LoginForm = () => {
     (status.custom_oauth_providers || []).length > 0;
   const hasOAuthLoginOptions = Boolean(
     status.github_oauth ||
-      status.discord_oauth ||
-      status.oidc_enabled ||
-      status.wechat_login ||
-      status.linuxdo_oauth ||
-      status.telegram_oauth ||
-      hasCustomOAuthProviders,
+    status.discord_oauth ||
+    status.oidc_enabled ||
+    status.wechat_login ||
+    status.linuxdo_oauth ||
+    status.telegram_oauth ||
+    hasCustomOAuthProviders,
   );
 
   useEffect(() => {
+    void captureReferralParamsFromLocation();
     if (status?.turnstile_check) {
       setTurnstileEnabled(true);
       setTurnstileSiteKey(status.turnstile_site_key);
@@ -958,8 +955,7 @@ const LoginForm = () => {
         style={{ top: '50%', left: '-120px' }}
       />
       <div className='w-full max-w-sm mt-[60px]'>
-        {showEmailLogin ||
-        !hasOAuthLoginOptions
+        {showEmailLogin || !hasOAuthLoginOptions
           ? renderEmailLoginForm()
           : renderOAuthOptions()}
         {renderWeChatLoginModal()}

@@ -43,6 +43,17 @@ export interface RegisterPayload {
   turnstile?: string
 }
 
+export interface ReferralCaptureCurrent {
+  aff_code?: string
+  source?: 'link' | 'manual' | 'legacy' | ''
+  locked?: boolean
+  expires_at?: number
+  invite_link_batch_id?: number
+  invite_batch_code?: string
+  first_topup_reward_percent?: number
+  continuous_reward_percent?: number
+}
+
 export interface PasswordResetPayload {
   email: string
   turnstile?: string

@@ -142,6 +142,9 @@ func setupLogin(user *model.User, c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserSessionSaveFailed)
 		return
 	}
+	if referralTokenFromCookie(c) != "" {
+		clearReferralCookie(c)
+	}
 	recordLoginAudit(user, c)
 	c.JSON(http.StatusOK, gin.H{
 		"message": "",
@@ -213,12 +216,24 @@ func Register(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserExists)
 		return
 	}
-	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	inviterId := 0
-	binding, err := model.ResolveInviteLinkBinding(user.InviteBatchCode, affCode, common.GetTimestamp())
+	now := common.GetTimestamp()
+	hadReferralCookie := referralTokenFromCookie(c) != ""
+	referralCapture, err := currentReferralCaptureFromRequest(c, now)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
 		return
+	}
+	affCode := user.AffCode // this code is the inviter's code, not the user's own code
+	inviterId := 0
+	var binding *model.InviteLinkBinding
+	if referralCapture != nil {
+		binding = referralCapture.InviteLinkBinding()
+	} else {
+		binding, err = model.ResolveInviteLinkBinding(user.InviteBatchCode, affCode, now)
+		if err != nil {
+			common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+			return
+		}
 	}
 	cleanUser := model.User{
 		Username:    user.Username,
@@ -236,17 +251,32 @@ func Register(c *gin.Context) {
 	if common.EmailVerificationEnabled {
 		cleanUser.Email = user.Email
 	}
-	if err := cleanUser.Insert(inviterId); err != nil {
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := cleanUser.InsertWithTx(tx, inviterId); err != nil {
+			return err
+		}
+		if referralCapture == nil {
+			return nil
+		}
+		consumed, err := model.ConsumeReferralCaptureTx(tx, referralCapture.TokenHash, cleanUser.Id, now)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			return model.ErrReferralCaptureConsumed
+		}
+		return nil
+	}); err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	cleanUser.FinishInsert(inviterId)
+	if referralCapture != nil || hadReferralCookie {
+		clearReferralCookie(c)
+	}
 
 	// 获取插入后的用户ID
-	var insertedUser model.User
-	if err := model.DB.Where("username = ?", cleanUser.Username).First(&insertedUser).Error; err != nil {
-		common.ApiErrorI18n(c, i18n.MsgUserRegisterFailed)
-		return
-	}
+	insertedUser := cleanUser
 	// 生成默认令牌
 	if constant.GenerateDefaultToken {
 		key, err := common.GenerateKey()

@@ -31,6 +31,7 @@ import {
   setUserData,
   onDiscordOAuthClicked,
   onCustomOAuthClicked,
+  captureReferralParamsFromLocation,
 } from '../../helpers';
 import Turnstile from 'react-turnstile';
 import {
@@ -114,10 +115,8 @@ const RegisterForm = () => {
   const logo = getLogo();
   const systemName = getSystemName();
 
-  let affCode = new URLSearchParams(window.location.search).get('aff');
-  if (affCode) {
-    localStorage.setItem('aff', affCode);
-  }
+  const mainstreamEmailProviderMessage =
+    'Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.';
 
   const status = useMemo(() => {
     if (statusState?.status) return statusState.status;
@@ -133,15 +132,19 @@ const RegisterForm = () => {
     (status.custom_oauth_providers || []).length > 0;
   const hasOAuthRegisterOptions = Boolean(
     status.github_oauth ||
-      status.discord_oauth ||
-      status.oidc_enabled ||
-      status.wechat_login ||
-      status.linuxdo_oauth ||
-      status.telegram_oauth ||
-      hasCustomOAuthProviders,
+    status.discord_oauth ||
+    status.oidc_enabled ||
+    status.wechat_login ||
+    status.linuxdo_oauth ||
+    status.telegram_oauth ||
+    hasCustomOAuthProviders,
   );
 
   const [showEmailVerification, setShowEmailVerification] = useState(false);
+
+  useEffect(() => {
+    void captureReferralParamsFromLocation();
+  }, []);
 
   useEffect(() => {
     setShowEmailVerification(!!status?.email_verification);
@@ -231,13 +234,15 @@ const RegisterForm = () => {
       }
       setRegisterLoading(true);
       try {
-        if (!affCode) {
-          affCode = localStorage.getItem('aff');
-        }
-        inputs.aff_code = affCode;
+        await captureReferralParamsFromLocation();
+        const payload = {
+          ...inputs,
+          aff_code: localStorage.getItem('aff') || undefined,
+          invite_batch: localStorage.getItem('invite_batch') || undefined,
+        };
         const res = await API.post(
           `/api/user/register?turnstile=${turnstileToken}`,
-          inputs,
+          payload,
         );
         const { success, message } = res.data;
         if (success) {
@@ -267,13 +272,15 @@ const RegisterForm = () => {
       );
       const { success, message } = res.data;
       if (success) {
-        showSuccess('验证码发送成功，请检查你的邮箱！');
+        showSuccess(t('验证码发送成功，请检查邮箱！'));
         setDisableButton(true); // 发送成功后禁用按钮，开始倒计时
       } else {
-        showError(message);
+        showError(
+          message === mainstreamEmailProviderMessage ? t(message) : message,
+        );
       }
     } catch (error) {
-      showError('发送验证码失败，请重试');
+      showError(t('操作失败，请重试'));
     } finally {
       setVerificationCodeLoading(false);
     }
@@ -781,8 +788,7 @@ const RegisterForm = () => {
         style={{ top: '50%', left: '-120px' }}
       />
       <div className='w-full max-w-sm mt-[60px]'>
-        {showEmailRegister ||
-        !hasOAuthRegisterOptions
+        {showEmailRegister || !hasOAuthRegisterOptions
           ? renderEmailRegisterForm()
           : renderOAuthOptions()}
         {renderWeChatLoginModal()}
