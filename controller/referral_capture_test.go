@@ -53,6 +53,7 @@ func captureReferral(t *testing.T, inviteBatch string, aff string, cookies ...*h
 	CaptureReferralLink(ctx)
 
 	require.Equal(t, http.StatusFound, w.Code)
+	assert.Equal(t, "/", w.Header().Get("Location"))
 	return w
 }
 
@@ -90,6 +91,46 @@ func TestCaptureReferralLinkCreatesCaptureCookieAndCapsExpiryAtBatchEnd(t *testi
 	assert.Equal(t, "short", captures[0].InviteBatchCode)
 	assert.Equal(t, model.ReferralCaptureSourceLink, captures[0].Source)
 	assert.InDelta(t, common.GetTimestamp()+3600, captures[0].ExpiresAt, 3)
+}
+
+func TestCaptureReferralLinkRedirectsHomeWithoutCookieForInvalidLink(t *testing.T) {
+	setupModelListControllerTestDB(t)
+	seedReferralUserAndBatch(t, 1, "aff1", 2, "short", 3600)
+
+	for _, tc := range []struct {
+		name        string
+		inviteBatch string
+		aff         string
+	}{
+		{name: "missing batch", inviteBatch: "missing", aff: "aff1"},
+		{name: "missing affiliate", inviteBatch: "short", aff: "missing-aff"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := captureReferral(t, tc.inviteBatch, tc.aff)
+
+			for _, cookie := range w.Result().Cookies() {
+				if cookie.Name != model.ReferralCookieName {
+					continue
+				}
+				assert.Empty(t, cookie.Value)
+				assert.Equal(t, -1, cookie.MaxAge)
+			}
+		})
+	}
+}
+
+func TestCaptureReferralLinkClearsExistingCookieForInvalidLink(t *testing.T) {
+	setupModelListControllerTestDB(t)
+	seedReferralUserAndBatch(t, 1, "aff1", 2, "short", 3600)
+
+	w := captureReferral(t, "short", "missing-aff", &http.Cookie{Name: model.ReferralCookieName, Value: "old-token"})
+
+	cookie := referralCookieFromRecorder(t, w)
+	assert.Equal(t, "", cookie.Value)
+	assert.Equal(t, -1, cookie.MaxAge)
+	assert.Equal(t, "/", cookie.Path)
+	assert.True(t, cookie.HttpOnly)
+	assert.Equal(t, http.SameSiteLaxMode, cookie.SameSite)
 }
 
 func TestCaptureReferralLinkLaterValidClickSupersedesPreviousCookie(t *testing.T) {
