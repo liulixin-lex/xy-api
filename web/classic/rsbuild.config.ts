@@ -1,43 +1,41 @@
-import fs from 'fs'
-import path from 'path'
-import { createRequire } from 'module'
-import { fileURLToPath } from 'url'
-import { defineConfig, loadEnv } from '@rsbuild/core'
-import { pluginReact } from '@rsbuild/plugin-react'
+import fs from 'fs';
+import path from 'path';
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { defineConfig, loadEnv } from '@rsbuild/core';
+import { pluginReact } from '@rsbuild/plugin-react';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const require = createRequire(import.meta.url)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const semiUiDir = path.resolve(
   path.dirname(require.resolve('@douyinfe/semi-ui')),
   '../..',
-)
+);
 const dateFnsCandidates = [
   path.resolve(__dirname, 'node_modules/date-fns'),
   path.resolve(__dirname, '../node_modules/date-fns'),
-]
+];
 const classicDateFnsDir = dateFnsCandidates.find((dir) =>
   fs.existsSync(path.join(dir, 'package.json')),
-)
+);
 if (!classicDateFnsDir) {
-  throw new Error('date-fns@2 is required for the classic frontend build')
+  throw new Error('date-fns@2 is required for the classic frontend build');
 }
 
 export default defineConfig(({ envMode }) => {
-  const env = loadEnv({ mode: envMode, prefixes: ['VITE_'] })
+  const env = loadEnv({ mode: envMode, prefixes: ['VITE_'] });
   const clientServerUrl =
     process.env.VITE_REACT_APP_SERVER_URL ||
     env.rawPublicVars.VITE_REACT_APP_SERVER_URL ||
-    ''
-  const proxyServerUrl =
-    clientServerUrl ||
-    'http://localhost:3000'
-  const isProd = envMode === 'production'
+    '';
+  const proxyServerUrl = clientServerUrl || 'http://localhost:3000';
+  const isProd = envMode === 'production';
   const devProxy = Object.fromEntries(
     (['/api', '/mj', '/pg'] as const).map((key) => [
       key,
       { target: proxyServerUrl, changeOrigin: true },
     ]),
-  ) as Record<string, { target: string; changeOrigin: boolean }>
+  ) as Record<string, { target: string; changeOrigin: boolean }>;
 
   return {
     plugins: [pluginReact()],
@@ -46,9 +44,8 @@ export default defineConfig(({ envMode }) => {
         index: './src/index.jsx',
       },
       define: {
-        'import.meta.env.VITE_REACT_APP_SERVER_URL': JSON.stringify(
-          clientServerUrl,
-        ),
+        'import.meta.env.VITE_REACT_APP_SERVER_URL':
+          JSON.stringify(clientServerUrl),
       },
     },
     resolve: {
@@ -116,5 +113,5 @@ export default defineConfig(({ envMode }) => {
         },
       },
     },
-  }
-})
+  };
+});
