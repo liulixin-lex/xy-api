@@ -23,6 +23,31 @@ func TestInviteLinkBatchValidityUsesShanghaiWindow(t *testing.T) {
 	assert.False(t, batch.IsValidAt(1_800_086_401))
 }
 
+func TestBuildInviteLinkBatchDefaultsToReferralRoute(t *testing.T) {
+	baseLink := BuildInviteLinkBatchBaseLink("", "spring")
+
+	assert.Equal(t, "/r/spring", baseLink)
+	assert.Equal(t, "/r/spring?aff=aff123", BuildInviteLinkForUser(baseLink, "aff123"))
+}
+
+func TestCreateInviteLinkBatchDefaultsBaseLinkToReferralRoute(t *testing.T) {
+	truncateTables(t)
+
+	require.NoError(t, CreateInviteLinkBatch(&InviteLinkBatch{
+		Name:                    "Default referral route",
+		Code:                    "default-route",
+		FirstTopupRewardPercent: 30,
+		ContinuousRewardPercent: 5,
+		StartTime:               1_800_000_000,
+		EndTime:                 1_800_086_400,
+		IsActive:                true,
+	}))
+
+	var batch InviteLinkBatch
+	require.NoError(t, DB.Where("code = ?", "default-route").First(&batch).Error)
+	assert.Equal(t, "/r/default-route", batch.BaseLink)
+}
+
 func TestSetActiveInviteLinkBatchKeepsSingleActiveBatch(t *testing.T) {
 	truncateTables(t)
 

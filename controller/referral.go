@@ -28,16 +28,21 @@ func CaptureReferralLink(c *gin.Context) {
 		now,
 	)
 	if err != nil {
-		common.ApiError(c, err)
+		common.SysError("failed to capture referral link: " + err.Error())
+		clearReferralCookie(c)
+		c.Redirect(http.StatusFound, "/")
 		return
 	}
-	if capture != nil {
-		if oldToken := referralTokenFromCookie(c); oldToken != "" {
-			_ = model.SupersedeReferralCaptureByToken(oldToken, now)
-		}
-		setReferralCookie(c, token, int(capture.ExpiresAt-now))
+	if capture == nil {
+		clearReferralCookie(c)
+		c.Redirect(http.StatusFound, "/")
+		return
 	}
-	c.Redirect(http.StatusFound, "/sign-up")
+	if oldToken := referralTokenFromCookie(c); oldToken != "" {
+		_ = model.SupersedeReferralCaptureByToken(oldToken, now)
+	}
+	setReferralCookie(c, token, int(capture.ExpiresAt-now))
+	c.Redirect(http.StatusFound, "/")
 }
 
 func CaptureLegacyReferral(c *gin.Context) {

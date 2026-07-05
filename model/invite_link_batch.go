@@ -227,7 +227,7 @@ func GenerateInviteLinkBatchCode() string {
 func BuildInviteLinkBatchBaseLink(origin string, code string) string {
 	trimmedOrigin := strings.TrimRight(strings.TrimSpace(origin), "/")
 	if trimmedOrigin == "" {
-		trimmedOrigin = "/sign-up"
+		return fmt.Sprintf("/r/%s", url.PathEscape(strings.TrimSpace(code)))
 	}
 	link, err := url.Parse(trimmedOrigin)
 	if err != nil {
