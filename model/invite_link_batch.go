@@ -169,6 +169,9 @@ func (batch *InviteLinkBatch) Normalize() {
 }
 
 func (batch InviteLinkBatch) Validate() error {
+	if !isValidInviteLinkBatchCode(batch.Code) {
+		return errors.New("invite link batch code may only contain letters, numbers, hyphens, and underscores")
+	}
 	if utf8.RuneCountInString(batch.PresetDescription) > InviteLinkBatchDescriptionMaxLength ||
 		utf8.RuneCountInString(batch.CustomDescription) > InviteLinkBatchDescriptionMaxLength {
 		return errors.New("activity description is too long")
@@ -194,6 +197,28 @@ func (batch InviteLinkBatch) Validate() error {
 		}
 	}
 	return nil
+}
+
+func isValidInviteLinkBatchCode(code string) bool {
+	if code == "" {
+		return false
+	}
+	for _, r := range code {
+		if r >= 'a' && r <= 'z' {
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			continue
+		}
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (batch InviteLinkBatch) EffectiveActivityRules() InviteRewardActivities {

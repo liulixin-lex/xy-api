@@ -48,6 +48,47 @@ func TestCreateInviteLinkBatchDefaultsBaseLinkToReferralRoute(t *testing.T) {
 	assert.Equal(t, "/r/default-route", batch.BaseLink)
 }
 
+func TestCreateInviteLinkBatchValidatesCodeForReferralRoute(t *testing.T) {
+	validCodes := []string{"spring", "spring-2026", "partner_abc", "ABC123"}
+	for _, code := range validCodes {
+		t.Run("valid "+code, func(t *testing.T) {
+			truncateTables(t)
+
+			err := CreateInviteLinkBatch(&InviteLinkBatch{
+				Name:                    "Valid code",
+				Code:                    code,
+				FirstTopupRewardPercent: 30,
+				ContinuousRewardPercent: 5,
+				StartTime:               1_800_000_000,
+				EndTime:                 1_800_086_400,
+				IsActive:                true,
+			})
+
+			require.NoError(t, err)
+		})
+	}
+
+	invalidCodes := []string{"spring/2026", "spring 2026", "春季", "spring?x=1", "spring#top"}
+	for _, code := range invalidCodes {
+		t.Run("invalid "+code, func(t *testing.T) {
+			truncateTables(t)
+
+			err := CreateInviteLinkBatch(&InviteLinkBatch{
+				Name:                    "Invalid code",
+				Code:                    code,
+				FirstTopupRewardPercent: 30,
+				ContinuousRewardPercent: 5,
+				StartTime:               1_800_000_000,
+				EndTime:                 1_800_086_400,
+				IsActive:                true,
+			})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invite link batch code")
+		})
+	}
+}
+
 func TestSetActiveInviteLinkBatchKeepsSingleActiveBatch(t *testing.T) {
 	truncateTables(t)
 
