@@ -145,15 +145,13 @@ func composeTieredTextQuota(relayInfo *relaycommon.RelayInfo, summary textQuotaS
 
 	if tieredResult != nil {
 		if snap := relayInfo.TieredBillingSnapshot; snap != nil {
-			return int(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup).
+			return decimalToQuota(decimal.NewFromFloat(tieredResult.ActualQuotaBeforeGroup).
 				Mul(decimal.NewFromFloat(snap.GroupRatio)).
-				Add(summary.ToolCallSurchargeQuota).
-				Round(0).
-				IntPart())
+				Add(summary.ToolCallSurchargeQuota))
 		}
 	}
 
-	return tieredQuota + int(summary.ToolCallSurchargeQuota.Round(0).IntPart())
+	return tieredQuota + decimalToQuota(summary.ToolCallSurchargeQuota)
 }
 
 func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage) textQuotaSummary {

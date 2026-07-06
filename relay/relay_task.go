@@ -121,14 +121,15 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 			if seconds <= 0 {
 				seconds = 4
 			}
-			sizeStr, _ := taskData["size"].(string)
-			if info.PriceData.OtherRatios == nil {
-				info.PriceData.OtherRatios = map[string]float64{}
+			// 历史任务数据可能包含未经校验的时长，作为计费乘数前必须钳制
+			if seconds > relaycommon.MaxTaskDurationSeconds {
+				seconds = relaycommon.MaxTaskDurationSeconds
 			}
-			info.PriceData.OtherRatios["seconds"] = float64(seconds)
-			info.PriceData.OtherRatios["size"] = 1
+			sizeStr, _ := taskData["size"].(string)
+			info.PriceData.AddOtherRatio("seconds", float64(seconds))
+			info.PriceData.AddOtherRatio("size", 1)
 			if sizeStr == "1792x1024" || sizeStr == "1024x1792" {
-				info.PriceData.OtherRatios["size"] = 1.666667
+				info.PriceData.AddOtherRatio("size", 1.666667)
 			}
 		}
 	}
