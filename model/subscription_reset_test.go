@@ -1,13 +1,34 @@
 package model
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/utils/tests"
 )
+
+type subscriptionResetSQLLogger struct {
+	logger.Interface
+	statements []string
+}
+
+func (l *subscriptionResetSQLLogger) LogMode(level logger.LogLevel) logger.Interface {
+	return l
+}
+
+func (l *subscriptionResetSQLLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
+	sql, _ := fc()
+	if sql != "" {
+		l.statements = append(l.statements, sql)
+	}
+}
 
 func seedSubscriptionResetPlan(t *testing.T, plan *SubscriptionPlan) {
 	t.Helper()
@@ -135,6 +156,46 @@ func TestAdminResetUserSubscriptionsByPlanNoActiveMatchReturnsError(t *testing.T
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.True(t, strings.Contains(err.Error(), "该用户没有有效的此套餐订阅"))
+}
+
+func TestAdminResetUserSubscriptionsByPlanTxUsesRowLock(t *testing.T) {
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	})
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeSQLite)
+
+	sqlLogger := &subscriptionResetSQLLogger{Interface: logger.Discard}
+	dryDB, err := gorm.Open(tests.DummyDialector{}, &gorm.Config{
+		DryRun: true,
+		Logger: sqlLogger,
+	})
+	require.NoError(t, err)
+
+	plan := &SubscriptionPlan{Id: 9701, Title: "Locked reset"}
+	_, _ = adminResetUserSubscriptionsByPlanTx(dryDB, 501, plan, 1000, true)
+
+	require.NotEmpty(t, sqlLogger.statements)
+	assert.Contains(t, strings.Join(sqlLogger.statements, "\n"), "FOR UPDATE")
+}
+
+func TestAdminResetPlanSubscriptionsTxUsesRowLock(t *testing.T) {
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	})
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeSQLite)
+
+	sqlLogger := &subscriptionResetSQLLogger{Interface: logger.Discard}
+	dryDB, err := gorm.Open(tests.DummyDialector{}, &gorm.Config{
+		DryRun: true,
+		Logger: sqlLogger,
+	})
+	require.NoError(t, err)
+
+	plan := &SubscriptionPlan{Id: 9702, Title: "Locked plan reset"}
+	_, _ = adminResetPlanSubscriptionsTx(dryDB, plan, 1000, true)
+
+	require.NotEmpty(t, sqlLogger.statements)
+	assert.Contains(t, strings.Join(sqlLogger.statements, "\n"), "FOR UPDATE")
 }
 
 func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
