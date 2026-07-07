@@ -3054,6 +3054,7 @@
     "OpenAI Audio Speech": "OpenAI 音声生成",
     "OpenAI Audio Transcriptions": "OpenAI 音声文字起こし",
     "OpenAI Audio Translations": "OpenAI 音声翻訳",
+    "OpenAI Chat": "OpenAI チャット",
     "OpenAI Chat Completions": "OpenAI チャット補完",
     "OpenAI Chat to Anthropic Messages": "OpenAI Chat から Anthropic Messages",
     "OpenAI Chat to Gemini Generate Content": "OpenAI Chat から Gemini Generate Content",

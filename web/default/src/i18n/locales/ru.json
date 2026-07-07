@@ -3054,6 +3054,7 @@
     "OpenAI Audio Speech": "Синтез речи OpenAI",
     "OpenAI Audio Transcriptions": "Транскрибация аудио OpenAI",
     "OpenAI Audio Translations": "Перевод аудио OpenAI",
+    "OpenAI Chat": "Чат OpenAI",
     "OpenAI Chat Completions": "Чат-завершения OpenAI",
     "OpenAI Chat to Anthropic Messages": "OpenAI Chat в Anthropic Messages",
     "OpenAI Chat to Gemini Generate Content": "OpenAI Chat в Gemini Generate Content",
