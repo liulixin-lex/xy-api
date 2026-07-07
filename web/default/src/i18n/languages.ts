@@ -18,7 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 export const INTERFACE_LANGUAGE_OPTIONS = [
-  { code: 'zh', label: '简体中文' },
+  { code: 'zhCN', label: '简体中文' },
+  { code: 'zhTW', label: '繁體中文' },
   { code: 'en', label: 'English' },
   { code: 'fr', label: 'Français' },
   { code: 'ru', label: 'Русский' },
@@ -33,9 +34,51 @@ export function normalizeInterfaceLanguage(value?: string | null): string {
   if (!value) return 'en'
 
   const normalized = value.trim().replaceAll('_', '-').toLowerCase()
-  if (normalized.startsWith('zh')) return 'zh'
+  if (normalized.startsWith('zh')) {
+    if (
+      normalized === 'zh-tw' ||
+      normalized === 'zh-hk' ||
+      normalized === 'zh-mo' ||
+      normalized === 'zhtw' ||
+      normalized.startsWith('zh-hant')
+    ) {
+      return 'zhTW'
+    }
+    return 'zhCN'
+  }
 
   return INTERFACE_LANGUAGE_OPTIONS.some((lang) => lang.code === normalized)
     ? normalized
     : 'en'
+}
+
+export function convertDetectedLanguage(value: string): string {
+  const normalized = value.trim().replaceAll('_', '-').toLowerCase()
+  if (!normalized.startsWith('zh')) return value
+  if (
+    normalized === 'zh-tw' ||
+    normalized === 'zh-hk' ||
+    normalized === 'zh-mo' ||
+    normalized.startsWith('zh-hant')
+  ) {
+    return 'zhTW'
+  }
+  return 'zhCN'
+}
+
+export function toIntlLocale(value?: string | null): string | undefined {
+  if (!value) return undefined
+  switch (normalizeInterfaceLanguage(value)) {
+    case 'zhCN':
+      return 'zh-CN'
+    case 'zhTW':
+      return 'zh-TW'
+    default:
+      break
+  }
+  try {
+    return Intl.getCanonicalLocales(value)[0]
+  } catch {
+    return undefined
+  }
 }

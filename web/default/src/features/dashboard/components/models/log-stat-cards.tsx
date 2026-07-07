@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '@/stores/auth-store'
+import { toIntlLocale } from '@/i18n/languages'
 import { formatCompactNumber, formatNumber, formatQuota } from '@/lib/format'
 import { computeTimeRange } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -120,7 +121,7 @@ export function LogStatCards(props: LogStatCardsProps) {
 
   const items = statCardsConfig.map((config) => {
     const rawValue = config.getValue(adaptedStats, timeRangeMinutes)
-    const locale = i18n.resolvedLanguage || i18n.language
+    const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
     const formatted =
       config.key === 'quota'
         ? {

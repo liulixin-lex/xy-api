@@ -48,6 +48,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { toIntlLocale } from '@/i18n/languages'
 import { listSystemInstances } from '../api'
 import type { SystemInstance, SystemInstanceStatus } from '../types'
 
@@ -404,7 +405,7 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
                   {formatTimestampRelative(
                     instance.last_seen_at,
                     'seconds',
-                    i18n.language
+                    toIntlLocale(i18n.language)
                   )}
                 </TableCell>
               </TableRow>
