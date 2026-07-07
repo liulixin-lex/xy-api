@@ -57,4 +57,6 @@ var systemSettingsPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/system-task/current", permission: authz.SystemSettingManage, handler: controller.GetCurrentSystemTask},
 	{method: http.MethodGet, path: "/system-task/:task_id", permission: authz.SystemSettingManage, handler: controller.GetSystemTask},
 	{method: http.MethodGet, path: "/system-info/instances", permission: authz.SystemSettingManage, handler: controller.ListSystemInstances},
+	{method: http.MethodDelete, path: "/system-info/stale-instances", permission: authz.SystemSettingManage, handler: controller.DeleteStaleSystemInstances},
+	{method: http.MethodDelete, path: "/system-info/instances/:node_name", permission: authz.SystemSettingManage, handler: controller.DeleteStaleSystemInstance},
 }
