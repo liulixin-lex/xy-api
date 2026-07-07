@@ -16,22 +16,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-// ============================================================================
-// Utility Functions
-// ============================================================================
-export { isRedemptionExpired, isTimestampExpired } from './utils'
-export {
-  getRedemptionStatusFilterValue,
-  shouldSearchRedemptions,
-} from './redemption-query'
+import type { ColumnFiltersState } from '@tanstack/react-table'
 
-// ============================================================================
-// Form Utilities
-// ============================================================================
-export {
-  getRedemptionFormSchema,
-  type RedemptionFormValues,
-  REDEMPTION_FORM_DEFAULT_VALUES,
-  transformFormDataToPayload,
-  transformRedemptionToFormDefaults,
-} from './redemption-form'
+export function getRedemptionStatusFilterValue(
+  columnFilters: ColumnFiltersState
+) {
+  const statusFilter = columnFilters.find((filter) => filter.id === 'status')
+    ?.value
+
+  if (!Array.isArray(statusFilter)) return ''
+
+  const value = statusFilter.find(
+    (item): item is string => typeof item === 'string' && item !== ''
+  )
+  return value ?? ''
+}
+
+export function shouldSearchRedemptions(keyword: string, status: string) {
+  return keyword.trim() !== '' || status !== ''
+}

@@ -16,22 +16,27 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-// ============================================================================
-// Utility Functions
-// ============================================================================
-export { isRedemptionExpired, isTimestampExpired } from './utils'
-export {
-  getRedemptionStatusFilterValue,
-  shouldSearchRedemptions,
-} from './redemption-query'
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 
-// ============================================================================
-// Form Utilities
-// ============================================================================
-export {
-  getRedemptionFormSchema,
-  type RedemptionFormValues,
-  REDEMPTION_FORM_DEFAULT_VALUES,
-  transformFormDataToPayload,
-  transformRedemptionToFormDefaults,
-} from './redemption-form'
+import '@/i18n/config'
+
+import { RedemptionsProvider } from './redemptions-provider'
+import { RedemptionsPrimaryButtons } from './redemptions-primary-buttons'
+
+describe('RedemptionsPrimaryButtons', () => {
+  test('surfaces invalid-code cleanup next to create code', () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RedemptionsProvider,
+        null,
+        createElement(RedemptionsPrimaryButtons)
+      )
+    )
+
+    assert.match(html, /Delete Invalid/)
+    assert.match(html, /Create Code/)
+  })
+})

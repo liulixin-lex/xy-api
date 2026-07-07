@@ -16,22 +16,31 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-// ============================================================================
-// Utility Functions
-// ============================================================================
-export { isRedemptionExpired, isTimestampExpired } from './utils'
-export {
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import {
   getRedemptionStatusFilterValue,
   shouldSearchRedemptions,
 } from './redemption-query'
 
-// ============================================================================
-// Form Utilities
-// ============================================================================
-export {
-  getRedemptionFormSchema,
-  type RedemptionFormValues,
-  REDEMPTION_FORM_DEFAULT_VALUES,
-  transformFormDataToPayload,
-  transformRedemptionToFormDefaults,
-} from './redemption-form'
+describe('redemption query helpers', () => {
+  test('uses the selected status filter as a server-side search parameter', () => {
+    assert.equal(
+      getRedemptionStatusFilterValue([
+        { id: 'status', value: ['expired'] },
+        { id: 'name', value: 'alpha' },
+      ]),
+      'expired'
+    )
+    assert.equal(shouldSearchRedemptions('', 'expired'), true)
+  })
+
+  test('ignores empty status filter values', () => {
+    assert.equal(
+      getRedemptionStatusFilterValue([{ id: 'status', value: [] }]),
+      ''
+    )
+    assert.equal(shouldSearchRedemptions('   ', ''), false)
+  })
+})
