@@ -37,14 +37,23 @@ describe('channel batch mode wiring', () => {
 
     assert.match(providerSource, /batchMode: boolean/)
     assert.match(providerSource, /setBatchMode: \(enabled: boolean\) => void/)
-    assert.match(providerSource, /const \[batchMode, setBatchMode\] = useState\(false\)/)
+    assert.match(
+      providerSource,
+      /const \[batchMode, setBatchMode\] = useState\(false\)/
+    )
 
     assert.match(columnsSource, /enableSelection\?: boolean/)
     assert.match(columnsSource, /\.\.\.\(enableSelection\s*\?/)
 
-    assert.match(tableSource, /const columns = useChannelsColumns\(\{ enableSelection: batchMode \}\)/)
+    assert.match(
+      tableSource,
+      /const columns = useChannelsColumns\(\{ enableSelection: batchMode \}\)/
+    )
     assert.match(tableSource, /enableRowSelection: batchMode/)
-    assert.match(tableSource, /bulkActions=\{batchMode \? <DataTableBulkActions table=\{table\} \/> : null\}/)
+    assert.match(
+      tableSource,
+      /bulkActions=\{batchMode \? <DataTableBulkActions table=\{table\} \/> : null\}/
+    )
 
     assert.match(buttonsSource, /checked=\{batchMode\}/)
     assert.match(buttonsSource, /setBatchMode\(checked\)/)
@@ -73,5 +82,25 @@ describe('channel batch mode wiring', () => {
       actionsSource,
       /i18next\.t\('Failed to repair channel consistency'\)/
     )
+  })
+
+  test('passes card layout context to balance display for compact card values', () => {
+    const cardSource = readSibling('channel-card.tsx')
+    const columnsSource = readSibling('channels-columns.tsx')
+
+    assert.match(
+      cardSource,
+      /<ChannelRowActionsLayoutContext\.Provider value='card'>[\s\S]*<div[\s\S]*data-state=\{isSelected \? 'selected' : undefined\}/
+    )
+    assert.doesNotMatch(
+      cardSource,
+      /<ChannelRowActionsLayoutContext\.Provider value='card'>\s*\{actionsCell\}\s*<\/ChannelRowActionsLayoutContext\.Provider>/
+    )
+    assert.match(
+      columnsSource,
+      /const layout = useContext\(ChannelRowActionsLayoutContext\)/
+    )
+    assert.match(columnsSource, /const showBalanceSymbol = layout !== 'card'/)
+    assert.match(columnsSource, /showSymbol: showBalanceSymbol/)
   })
 })
