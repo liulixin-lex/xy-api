@@ -3681,6 +3681,10 @@
     "运营和收费行为产生的法律责任": "operation and charging behavior",
     "，": ", ",
     "、": ", ",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Veuillez vous inscrire avec un fournisseur de messagerie courant : gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com ou outlook.com."
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Veuillez vous inscrire avec un fournisseur de messagerie courant : gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com ou outlook.com.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "Vous utilisez le frontend classique. Cette version ne sera bientôt plus maintenue et certaines fonctionnalités peuvent être indisponibles. Passez au nouveau frontend pour profiter de l’expérience complète.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "Vous utilisez le frontend classique. Cette version ne sera bientôt plus maintenue et certaines fonctionnalités peuvent être indisponibles. Contactez un administrateur pour passer au nouveau frontend.",
+    "旧版前端即将停止维护": "Le frontend classique ne sera bientôt plus maintenu",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "Conseil : si la page ne s’affiche pas correctement après le changement, videz le cache du navigateur puis réessayez."
   }
 }

@@ -3674,6 +3674,10 @@
     "运营和收费行为产生的法律责任": "營運和收費行為產生的法律責任",
     "，": "，",
     "、": "、",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "請使用gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com主流信箱註冊"
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "請使用gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com主流信箱註冊",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "你正在使用舊版前端，此版本即將停止維護，部分功能可能無法使用。建議切換到新版前端以獲得完整體驗。",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "你正在使用舊版前端，此版本即將停止維護，部分功能可能無法使用。請聯絡管理員切換到新版前端。",
+    "旧版前端即将停止维护": "舊版前端即將停止維護",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "提示：如果切換後頁面無法正常渲染，請清除瀏覽器快取後重試。"
   }
 }

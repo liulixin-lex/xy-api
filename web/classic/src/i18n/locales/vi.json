@@ -4215,6 +4215,10 @@
     "运营和收费行为产生的法律责任": "operation and charging behavior",
     "，": ", ",
     "、": ", ",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Vui lòng đăng ký bằng nhà cung cấp email phổ biến: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com hoặc outlook.com."
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Vui lòng đăng ký bằng nhà cung cấp email phổ biến: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com hoặc outlook.com.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "Bạn đang sử dụng frontend cũ. Phiên bản này sắp ngừng được bảo trì và một số tính năng có thể không khả dụng. Hãy chuyển sang frontend mới để có trải nghiệm đầy đủ.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "Bạn đang sử dụng frontend cũ. Phiên bản này sắp ngừng được bảo trì và một số tính năng có thể không khả dụng. Vui lòng liên hệ quản trị viên để chuyển sang frontend mới.",
+    "旧版前端即将停止维护": "Frontend cũ sắp ngừng bảo trì",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "Gợi ý: Nếu trang không hiển thị đúng sau khi chuyển đổi, hãy xóa bộ nhớ đệm của trình duyệt rồi thử lại."
   }
 }
