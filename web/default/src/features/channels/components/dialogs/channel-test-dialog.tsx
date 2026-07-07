@@ -34,6 +34,7 @@ import {
   Check,
   CheckCircle2,
   Copy,
+  Gauge,
   Info,
   Loader2,
   Settings,
@@ -291,7 +292,7 @@ function getTestTableColumnClass(columnId: string) {
     case 'result':
       return 'w-80 min-w-80 max-w-80 whitespace-normal'
     case 'actions':
-      return 'bg-popover w-24 min-w-24 whitespace-nowrap sm:w-28 sm:min-w-28'
+      return 'bg-popover w-px whitespace-nowrap'
     default:
       return undefined
   }
@@ -920,17 +921,26 @@ function ChannelTestDialogContent({
           const isTestingModel = testingModels.has(model)
 
           return (
-            <Button
-              variant='outline'
-              size='sm'
-              onClick={() => testSingleModel(model)}
-              disabled={isTestingModel || isBatchTesting}
-            >
-              {isTestingModel && (
-                <Loader2 className='animate-spin' data-icon='inline-start' />
-              )}
-              {t('Test')}
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant='ghost'
+                    size='icon-sm'
+                    onClick={() => testSingleModel(model)}
+                    disabled={isTestingModel || isBatchTesting}
+                    aria-label={t('Test Connection')}
+                  />
+                }
+              >
+                {isTestingModel ? (
+                  <Loader2 className='size-4 animate-spin' />
+                ) : (
+                  <Gauge className='size-4' />
+                )}
+              </TooltipTrigger>
+              <TooltipContent>{t('Test Connection')}</TooltipContent>
+            </Tooltip>
           )
         },
         enableSorting: false,
@@ -1128,7 +1138,7 @@ function ChannelTestDialogContent({
                     <col className='w-auto' />
                     <col className='w-28' />
                     <col className='w-80' />
-                    <col className='w-auto' />
+                    <col className='w-px' />
                   </colgroup>
                 }
                 getColumnClassName={(columnId) =>
