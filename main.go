@@ -221,6 +221,7 @@ func main() {
 		}
 	}()
 
+	time.Sleep(100 * time.Millisecond)
 	common.LogStartupSuccess(startTime, port)
 
 	quit := make(chan os.Signal, 1)
