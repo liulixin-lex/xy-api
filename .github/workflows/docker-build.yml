@@ -158,6 +158,7 @@ jobs:
     permissions:
       packages: write
       contents: read
+      id-token: write
 
     steps:
       - name: Set version
@@ -209,6 +210,18 @@ jobs:
             -t ${DOCKERHUB_REPOSITORY}:latest \
             ${DOCKERHUB_REPOSITORY}:latest-amd64 \
             ${DOCKERHUB_REPOSITORY}:latest-arm64
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign manifests with cosign
+        run: |
+          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:${TAG}
+          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:latest
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            cosign sign --yes ${DOCKERHUB_REPOSITORY}:${TAG}
+            cosign sign --yes ${DOCKERHUB_REPOSITORY}:latest
+          fi
 
       - name: Manifest summary
         run: |
