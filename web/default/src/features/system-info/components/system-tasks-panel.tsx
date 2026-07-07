@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useQuery } from '@tanstack/react-query'
 import { ListChecks, RefreshCw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { toIntlLocale } from '@/i18n/languages'
 import { formatTimestampRelative, formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { ErrorState } from '@/components/error-state'
@@ -183,7 +184,7 @@ function SystemTasksTable(props: SystemTasksTableProps) {
                   {formatTimestampRelative(
                     task.updated_at,
                     'seconds',
-                    i18n.language
+                    toIntlLocale(i18n.language)
                   )}
                 </TableCell>
                 <TableCell

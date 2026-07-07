@@ -196,9 +196,9 @@ export const channelFormSchema = z
     aws_key_type: z.enum(['ak_sk', 'api_key']).optional(), // AWS specific
     azure_responses_version: z.string().optional(), // Azure specific
     // Field passthrough controls (stored in settings JSON)
-    allow_service_tier: z.boolean().optional(), // OpenAI/Anthropic
-    disable_store: z.boolean().optional(), // OpenAI only
-    allow_safety_identifier: z.boolean().optional(), // OpenAI only
+    allow_service_tier: z.boolean().optional(), // OpenAI/Anthropic/Codex
+    disable_store: z.boolean().optional(), // OpenAI/Codex
+    allow_safety_identifier: z.boolean().optional(), // OpenAI/Codex
     allow_include_obfuscation: z.boolean().optional(), // OpenAI: include usage obfuscation
     allow_inference_geo: z.boolean().optional(), // OpenAI/Anthropic: inference geography
     allow_speed: z.boolean().optional(), // Anthropic: speed mode control
@@ -546,15 +546,15 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
   }
 
   // Field passthrough controls:
-  // - OpenAI (type 1) and Anthropic (type 14): allow_service_tier
-  // - OpenAI only: disable_store, allow_safety_identifier
-  if (formData.type === 1 || formData.type === 14) {
+  // - OpenAI (type 1), Anthropic (type 14), and Codex (type 57): allow_service_tier
+  // - OpenAI and Codex only: disable_store, allow_safety_identifier
+  if (formData.type === 1 || formData.type === 14 || formData.type === 57) {
     settingsObj.allow_service_tier = formData.allow_service_tier === true
   } else if ('allow_service_tier' in settingsObj) {
     delete settingsObj.allow_service_tier
   }
 
-  if (formData.type === 1) {
+  if (formData.type === 1 || formData.type === 57) {
     settingsObj.disable_store = formData.disable_store === true
     settingsObj.allow_safety_identifier =
       formData.allow_safety_identifier === true
@@ -563,12 +563,15 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.allow_inference_geo = formData.allow_inference_geo === true
   } else {
     if ('disable_store' in settingsObj) delete settingsObj.disable_store
-    if ('allow_safety_identifier' in settingsObj)
-      {delete settingsObj.allow_safety_identifier}
-    if ('allow_include_obfuscation' in settingsObj)
-      {delete settingsObj.allow_include_obfuscation}
-    if (formData.type !== 14 && 'allow_inference_geo' in settingsObj)
-      {delete settingsObj.allow_inference_geo}
+    if ('allow_safety_identifier' in settingsObj) {
+      delete settingsObj.allow_safety_identifier
+    }
+    if ('allow_include_obfuscation' in settingsObj) {
+      delete settingsObj.allow_include_obfuscation
+    }
+    if (formData.type !== 14 && 'allow_inference_geo' in settingsObj) {
+      delete settingsObj.allow_inference_geo
+    }
   }
 
   // Anthropic (type 14): claude_beta_query, allow_inference_geo, allow_speed
