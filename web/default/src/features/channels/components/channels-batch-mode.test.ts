@@ -50,4 +50,28 @@ describe('channel batch mode wiring', () => {
     assert.match(buttonsSource, /setBatchMode\(checked\)/)
     assert.match(buttonsSource, /t\('Batch Operations'\)/)
   })
+
+  test('requires confirmation before repairing channel consistency', () => {
+    const buttonsSource = readSibling('channels-primary-buttons.tsx')
+    const actionsSource = readFileSync(
+      join(currentDir, '../lib/channel-actions.ts'),
+      'utf8'
+    )
+
+    assert.match(buttonsSource, /showConsistencyDialog/)
+    assert.match(buttonsSource, /setShowConsistencyDialog\(true\)/)
+    assert.match(buttonsSource, /t\('Repair Channel Consistency'\)/)
+    assert.match(buttonsSource, /t\('Repair channel consistency\?'\)/)
+    assert.match(buttonsSource, /confirmText=\{t\('Repair'\)\}/)
+    assert.match(buttonsSource, /handleFixAbilities\(queryClient/)
+
+    assert.match(
+      actionsSource,
+      /i18next\.t\(\s*'Channel consistency repaired: \{\{success\}\} succeeded, \{\{fails\}\} failed'/
+    )
+    assert.match(
+      actionsSource,
+      /i18next\.t\('Failed to repair channel consistency'\)/
+    )
+  })
 })

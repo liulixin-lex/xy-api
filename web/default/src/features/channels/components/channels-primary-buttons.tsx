@@ -79,6 +79,8 @@ export function ChannelsPrimaryButtons() {
   } = useChannels()
   const queryClient = useQueryClient()
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showConsistencyDialog, setShowConsistencyDialog] = useState(false)
+  const [isRepairingConsistency, setIsRepairingConsistency] = useState(false)
   const currentUser = useAuthStore((s) => s.auth.user)
   const canEditSensitive = hasPermission(
     currentUser,
@@ -250,14 +252,12 @@ export function ChannelsPrimaryButtons() {
             <DropdownMenuSeparator />
 
             <DropdownMenuItem
-              onClick={() => {
-                handleFixAbilities(queryClient, (_result) => {
-                  // eslint-disable-next-line no-console
-                  console.log('Fix abilities result:', _result)
-                })
+              onSelect={(e) => {
+                e.preventDefault()
+                setShowConsistencyDialog(true)
               }}
             >
-              {t('Fix Abilities')}
+              {t('Repair Channel Consistency')}
               <DropdownMenuShortcut>
                 <Settings2 className='h-4 w-4' />
               </DropdownMenuShortcut>
@@ -298,6 +298,29 @@ export function ChannelsPrimaryButtons() {
             console.log(`Deleted ${_count} channels`)
           })
           setShowDeleteDialog(false)
+        }}
+      />
+
+      <ConfirmDialog
+        open={showConsistencyDialog}
+        onOpenChange={setShowConsistencyDialog}
+        title={t('Repair channel consistency?')}
+        desc={t(
+          'This will rebuild the channel routing index from every channel configuration, including supported models, groups, priorities, and weights. Routing may be briefly incomplete while the rebuild is running. Continue?'
+        )}
+        confirmText={t('Repair')}
+        isLoading={isRepairingConsistency}
+        handleConfirm={async () => {
+          setIsRepairingConsistency(true)
+          try {
+            await handleFixAbilities(queryClient, (_result) => {
+              // eslint-disable-next-line no-console
+              console.log('Repair channel consistency result:', _result)
+            })
+            setShowConsistencyDialog(false)
+          } finally {
+            setIsRepairingConsistency(false)
+          }
         }}
       />
     </>

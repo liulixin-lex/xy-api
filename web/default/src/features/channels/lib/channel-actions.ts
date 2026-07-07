@@ -630,7 +630,7 @@ export async function handleDeleteAllDisabled(
 }
 
 /**
- * Fix channel abilities
+ * Repair channel consistency
  */
 export async function handleFixAbilities(
   queryClient?: QueryClient,
@@ -640,18 +640,23 @@ export async function handleFixAbilities(
     const response = await fixChannelAbilities()
     if (response.success && response.data) {
       toast.success(
-        i18next.t('Fixed abilities: {{success}} succeeded, {{fails}} failed', {
-          success: response.data.success,
-          fails: response.data.fails,
-        })
+        i18next.t(
+          'Channel consistency repaired: {{success}} succeeded, {{fails}} failed',
+          {
+            success: response.data.success,
+            fails: response.data.fails,
+          }
+        )
       )
       queryClient?.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
       onSuccess?.(response.data)
     } else {
-      toast.error(response.message || i18next.t('Failed to fix abilities'))
+      toast.error(
+        response.message || i18next.t('Failed to repair channel consistency')
+      )
     }
   } catch {
-    toast.error(i18next.t('Failed to fix abilities'))
+    toast.error(i18next.t('Failed to repair channel consistency'))
   }
 }
 
