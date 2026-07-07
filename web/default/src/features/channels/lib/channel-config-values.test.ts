@@ -16,13 +16,25 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-// Re-export all library functions
-export * from './channel-actions'
-export * from './advanced-custom'
-export * from './channel-config-values'
-export * from './channel-form-errors'
-export * from './channel-form'
-export * from './channel-type-config'
-export * from './channel-utils'
-export * from './multi-key-utils'
-export * from './model-mapping-validation'
+import assert from 'node:assert/strict'
+import { describe, test } from 'node:test'
+
+import { hasConfiguredOverrideValue } from './channel-config-values'
+
+describe('channel config value helpers', () => {
+  test('treats empty JSON override values as not configured', () => {
+    for (const value of [undefined, '', '   ', 'null', '{}', '[]']) {
+      assert.equal(hasConfiguredOverrideValue(value), false)
+    }
+
+    for (const value of [
+      '{"temperature":0}',
+      '[{"path":"temperature","value":0}]',
+      'not-json-yet',
+      '0',
+      'false',
+    ]) {
+      assert.equal(hasConfiguredOverrideValue(value), true)
+    }
+  })
+})

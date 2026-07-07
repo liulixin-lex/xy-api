@@ -149,6 +149,7 @@ import {
   findMissingModelsInMapping,
   validateModelMappingJson,
   hasAdvancedSettingsErrors,
+  hasConfiguredOverrideValue,
 } from '../../lib'
 import {
   collectInvalidStatusCodeEntries,
@@ -254,10 +255,10 @@ function readAdvancedSettingsPreference(): boolean {
 
 function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
   return Boolean(
-    values.param_override?.trim() ||
-    values.header_override?.trim() ||
+    hasConfiguredOverrideValue(values.param_override) ||
+    hasConfiguredOverrideValue(values.header_override) ||
     values.advanced_custom?.trim() ||
-    values.status_code_mapping?.trim() ||
+    hasConfiguredOverrideValue(values.status_code_mapping) ||
     values.tag?.trim() ||
     values.remark?.trim() ||
     values.priority ||

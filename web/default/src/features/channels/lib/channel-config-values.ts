@@ -16,13 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-// Re-export all library functions
-export * from './channel-actions'
-export * from './advanced-custom'
-export * from './channel-config-values'
-export * from './channel-form-errors'
-export * from './channel-form'
-export * from './channel-type-config'
-export * from './channel-utils'
-export * from './multi-key-utils'
-export * from './model-mapping-validation'
+
+export function hasConfiguredOverrideValue(value: string | undefined): boolean {
+  if (typeof value !== 'string') return false
+
+  const trimmed = value.trim()
+  if (!trimmed || trimmed === 'null') return false
+
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (parsed === null) return false
+    if (Array.isArray(parsed)) return parsed.length > 0
+    if (typeof parsed === 'object') return Object.keys(parsed).length > 0
+  } catch {
+    return true
+  }
+
+  return true
+}
