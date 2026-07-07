@@ -43,7 +43,6 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "catalog:",
     "cmdk": "^1.1.1",
-    "date-fns": "^4.3.0",
     "dayjs": "catalog:",
     "dompurify": "3.4.11",
     "i18next": "^26.2.0",
