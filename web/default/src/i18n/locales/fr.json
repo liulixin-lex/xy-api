@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "Modifiez par lot tous les canaux avec ce tag. Laissez les champs vides pour conserver les valeurs actuelles.",
     "Batch Edit by Tag": "Modification par lot par tag",
     "Batch enable failed": "Échec de l'activation par lots",
+    "Batch Operations": "Opérations groupées",
     "Batch processing failed": "Échec du traitement par lot",
     "Batch set tag for {{count}} channels": "Étiquette définie par lot pour {{count}} canaux",
     "Batch test completed: {{count}} succeeded": "Test par lots terminé : {{count}} réussi(s)",

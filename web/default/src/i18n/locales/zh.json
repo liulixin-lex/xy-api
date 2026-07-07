@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "批量编辑带有此标签的所有渠道。留空字段以保留当前值。",
     "Batch Edit by Tag": "按标签批量编辑",
     "Batch enable failed": "批量启用失败",
+    "Batch Operations": "批量操作",
     "Batch processing failed": "批量处理失败",
     "Batch set tag for {{count}} channels": "批量为 {{count}} 个渠道设置标签",
     "Batch test completed: {{count}} succeeded": "批量测试完成：{{count}} 个成功",

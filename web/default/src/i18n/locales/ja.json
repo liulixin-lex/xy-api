@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "このタグを持つすべてのチャネルを一括編集します。現在の値を維持するには、フィールドを空のままにしてください。",
     "Batch Edit by Tag": "タグによる一括編集",
     "Batch enable failed": "一括有効化に失敗しました",
+    "Batch Operations": "一括操作",
     "Batch processing failed": "一括処理に失敗しました",
     "Batch set tag for {{count}} channels": "{{count}} 件のチャネルにタグを一括設定しました",
     "Batch test completed: {{count}} succeeded": "バッチテストが完了しました: {{count}} 件成功",

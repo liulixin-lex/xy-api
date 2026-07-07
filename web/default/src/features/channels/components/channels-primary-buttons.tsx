@@ -26,6 +26,7 @@ import {
   Tags,
   TestTube,
   DollarSign,
+  ListChecks,
   SortAsc,
   RefreshCw,
   ArrowUpFromLine,
@@ -72,6 +73,8 @@ export function ChannelsPrimaryButtons() {
     setEnableTagMode,
     idSort,
     setIdSort,
+    batchMode,
+    setBatchMode,
     upstream,
   } = useChannels()
   const queryClient = useQueryClient()
@@ -93,10 +96,29 @@ export function ChannelsPrimaryButtons() {
     setIdSort(checked)
   }
 
+  const handleBatchModeToggle = (checked: boolean) => {
+    setBatchMode(checked)
+  }
+
   return (
     <>
       <div className='flex items-center gap-2'>
         {/* Desktop: Toggle switches visible */}
+        <div className='hidden items-center gap-2 rounded-md border px-3 py-1.5 sm:flex'>
+          <ListChecks className='text-muted-foreground h-4 w-4' />
+          <Label
+            htmlFor='channel-batch-mode'
+            className='cursor-pointer text-sm'
+          >
+            {t('Batch Operations')}
+          </Label>
+          <Switch
+            id='channel-batch-mode'
+            checked={batchMode}
+            onCheckedChange={handleBatchModeToggle}
+          />
+        </div>
+
         <div className='hidden items-center gap-2 rounded-md border px-3 py-1.5 sm:flex'>
           <Tags className='text-muted-foreground h-4 w-4' />
           <Label htmlFor='tag-mode' className='cursor-pointer text-sm'>
@@ -152,6 +174,15 @@ export function ChannelsPrimaryButtons() {
           </DropdownMenuTrigger>
           <DropdownMenuContent align='end' className='w-56'>
             {/* Mobile-only: toggle switches */}
+            <DropdownMenuCheckboxItem
+              className='sm:hidden'
+              checked={batchMode}
+              onCheckedChange={handleBatchModeToggle}
+            >
+              <ListChecks className='mr-2 h-4 w-4' />
+              {t('Batch Operations')}
+            </DropdownMenuCheckboxItem>
+
             <DropdownMenuCheckboxItem
               className='sm:hidden'
               checked={enableTagMode}

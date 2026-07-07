@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "Chỉnh sửa hàng loạt tất cả các kênh có gắn thẻ này. Để trống các trường để giữ nguyên giá trị hiện tại.",
     "Batch Edit by Tag": "Chỉnh sửa hàng loạt theo Thẻ",
     "Batch enable failed": "Kích hoạt hàng loạt thất bại",
+    "Batch Operations": "Thao tác hàng loạt",
     "Batch processing failed": "Xử lý hàng loạt thất bại",
     "Batch set tag for {{count}} channels": "Đã đặt thẻ hàng loạt cho {{count}} kênh",
     "Batch test completed: {{count}} succeeded": "Kiểm thử hàng loạt hoàn tất: {{count}} thành công",

@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "Batch edit all channels with this tag. Leave fields empty to keep current values.",
     "Batch Edit by Tag": "Batch Edit by Tag",
     "Batch enable failed": "Batch enable failed",
+    "Batch Operations": "Batch Operations",
     "Batch processing failed": "Batch processing failed",
     "Batch set tag for {{count}} channels": "Batch set tag for {{count}} channels",
     "Batch test completed: {{count}} succeeded": "Batch test completed: {{count}} succeeded",

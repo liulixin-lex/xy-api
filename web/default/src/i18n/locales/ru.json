@@ -594,6 +594,7 @@
     "Batch edit all channels with this tag. Leave fields empty to keep current values.": "Пакетно редактировать все каналы с этим тегом. Оставьте поля пустыми, чтобы сохранить текущие значения.",
     "Batch Edit by Tag": "Пакетное редактирование по тегу",
     "Batch enable failed": "Пакетное включение не удалось",
+    "Batch Operations": "Массовые операции",
     "Batch processing failed": "Пакетная обработка не удалась",
     "Batch set tag for {{count}} channels": "Тег пакетно задан для {{count}} каналов",
     "Batch test completed: {{count}} succeeded": "Пакетный тест завершен: {{count}} успешно",
