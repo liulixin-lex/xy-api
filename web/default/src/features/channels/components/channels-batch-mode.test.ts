@@ -103,4 +103,17 @@ describe('channel batch mode wiring', () => {
     assert.match(columnsSource, /const showBalanceSymbol = layout !== 'card'/)
     assert.match(columnsSource, /showSymbol: showBalanceSymbol/)
   })
+
+  test('keeps the card edit action inside the overflow menu', () => {
+    const rowActionsSource = readSibling('data-table-row-actions.tsx')
+
+    assert.match(
+      rowActionsSource,
+      /layout !== 'card'[\s\S]*aria-label=\{t\('Edit'\)\}/
+    )
+    assert.match(
+      rowActionsSource,
+      /layout === 'card'[\s\S]*<DropdownMenuItem onClick=\{handleEdit\}>[\s\S]*\{t\('Edit'\)\}/
+    )
+  })
 })
