@@ -16,11 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Ban, Plus, RotateCcw, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Plus } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { DataTableRowActionMenu, StaticDataTable } from '@/components/data-table'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+} from '@/components/ui/dropdown-menu'
 import {
   Select,
   SelectContent,
@@ -36,8 +43,7 @@ import {
   SheetTitle,
   SheetDescription,
 } from '@/components/ui/sheet'
-import { ConfirmDialog } from '@/components/confirm-dialog'
-import { StaticDataTable } from '@/components/data-table'
+import { Switch } from '@/components/ui/switch'
 import {
   sideDrawerContentClassName,
   sideDrawerFormClassName,
@@ -51,9 +57,11 @@ import {
   createUserSubscription,
   invalidateUserSubscription,
   deleteUserSubscription,
+  resetUserSubscriptionsByPlan,
 } from '../../api'
 import { formatQuota } from '@/lib/format'
 import { formatTimestamp } from '../../lib'
+import { getUserSubscriptionRowActionLabels } from '../../lib/user-subscription-actions'
 import type { PlanRecord, UserSubscriptionRecord } from '../../types'
 
 interface Props {
@@ -61,6 +69,81 @@ interface Props {
   onOpenChange: (open: boolean) => void
   user: { id: number; username?: string } | null
   onSuccess?: () => void
+}
+
+type ResetAction = {
+  planId: number
+  planTitle: string
+}
+
+type ConfirmAction = {
+  type: 'invalidate' | 'delete'
+  subId: number
+}
+
+type UserSubscriptionRowActionsProps = {
+  isActive: boolean
+  planId: number
+  planTitle: string
+  subId: number
+  onReset: (action: ResetAction) => void
+  onConfirm: (action: ConfirmAction) => void
+}
+
+export function UserSubscriptionRowActions(
+  props: UserSubscriptionRowActionsProps
+) {
+  const { t } = useTranslation()
+  const [resetLabel, invalidateLabel, deleteLabel] =
+    getUserSubscriptionRowActionLabels(t)
+
+  return (
+    <DataTableRowActionMenu ariaLabel={t('Actions')}>
+      <DropdownMenuItem
+        disabled={!props.isActive}
+        onClick={() =>
+          props.onReset({
+            planId: props.planId,
+            planTitle: props.planTitle,
+          })
+        }
+      >
+        {resetLabel}
+        <DropdownMenuShortcut>
+          <RotateCcw size={16} />
+        </DropdownMenuShortcut>
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        disabled={!props.isActive}
+        onClick={() =>
+          props.onConfirm({
+            type: 'invalidate',
+            subId: props.subId,
+          })
+        }
+      >
+        {invalidateLabel}
+        <DropdownMenuShortcut>
+          <Ban size={16} />
+        </DropdownMenuShortcut>
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem
+        variant='destructive'
+        onClick={() =>
+          props.onConfirm({
+            type: 'delete',
+            subId: props.subId,
+          })
+        }
+      >
+        {deleteLabel}
+        <DropdownMenuShortcut>
+          <Trash2 size={16} />
+        </DropdownMenuShortcut>
+      </DropdownMenuItem>
+    </DataTableRowActionMenu>
+  )
 }
 
 function SubscriptionStatusBadge(props: {
@@ -71,22 +154,24 @@ function SubscriptionStatusBadge(props: {
   const now = Date.now() / 1000
   const isExpired = (props.sub.end_time || 0) > 0 && props.sub.end_time < now
   const isActive = props.sub.status === 'active' && !isExpired
-  if (isActive)
-    {return (
+  if (isActive) {
+    return (
       <StatusBadge
         label={props.t('Active')}
         variant='success'
         copyable={false}
       />
-    )}
-  if (props.sub.status === 'cancelled')
-    {return (
+    )
+  }
+  if (props.sub.status === 'cancelled') {
+    return (
       <StatusBadge
         label={props.t('Invalidated')}
         variant='neutral'
         copyable={false}
       />
-    )}
+    )
+  }
   return (
     <StatusBadge
       label={props.t('Expired')}
@@ -103,10 +188,12 @@ export function UserSubscriptionsDialog(props: Props) {
   const [plans, setPlans] = useState<PlanRecord[]>([])
   const [subs, setSubs] = useState<UserSubscriptionRecord[]>([])
   const [selectedPlanId, setSelectedPlanId] = useState<string>('')
-  const [confirmAction, setConfirmAction] = useState<{
-    type: 'invalidate' | 'delete'
-    subId: number
-  } | null>(null)
+  const [resetting, setResetting] = useState(false)
+  const [advanceResetTime, setAdvanceResetTime] = useState(true)
+  const [resetAction, setResetAction] = useState<ResetAction | null>(null)
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(
+    null
+  )
 
   const planTitleMap = useMemo(() => {
     const map = new Map<number, string>()
@@ -185,6 +272,31 @@ export function UserSubscriptionsDialog(props: Props) {
       toast.error(t('Operation failed'))
     } finally {
       setConfirmAction(null)
+    }
+  }
+
+  const handleResetConfirm = async () => {
+    if (!props.user?.id || !resetAction) return
+    setResetting(true)
+    try {
+      const res = await resetUserSubscriptionsByPlan(props.user.id, {
+        plan_id: resetAction.planId,
+        advance_reset_time: advanceResetTime,
+      })
+      if (res.success) {
+        toast.success(
+          t('Reset {{count}} active subscriptions', {
+            count: res.data?.reset_count || 0,
+          })
+        )
+        await loadData()
+        props.onSuccess?.()
+      }
+    } catch {
+      toast.error(t('Operation failed'))
+    } finally {
+      setResetting(false)
+      setResetAction(null)
     }
   }
 
@@ -318,33 +430,19 @@ export function UserSubscriptionsDialog(props: Props) {
                     const isActive = sub.status === 'active' && !isExpired
 
                     return (
-                      <div className='flex justify-end gap-1'>
-                        <Button
-                          size='sm'
-                          variant='outline'
-                          disabled={!isActive}
-                          onClick={() =>
-                            setConfirmAction({
-                              type: 'invalidate',
-                              subId: sub.id,
-                            })
-                          }
-                        >
-                          {t('Invalidate')}
-                        </Button>
-                        <Button
-                          size='sm'
-                          variant='destructive'
-                          onClick={() =>
-                            setConfirmAction({
-                              type: 'delete',
-                              subId: sub.id,
-                            })
-                          }
-                        >
-                          {t('Delete')}
-                        </Button>
-                      </div>
+                      <UserSubscriptionRowActions
+                        isActive={isActive}
+                        planId={sub.plan_id}
+                        planTitle={
+                          planTitleMap.get(sub.plan_id) || `#${sub.plan_id}`
+                        }
+                        subId={sub.id}
+                        onReset={(action) => {
+                          setAdvanceResetTime(true)
+                          setResetAction(action)
+                        }}
+                        onConfirm={setConfirmAction}
+                      />
                     )
                   },
                 },
@@ -375,6 +473,29 @@ export function UserSubscriptionsDialog(props: Props) {
           handleConfirm={handleConfirmAction}
           destructive={confirmAction.type === 'delete'}
         />
+      )}
+
+      {resetAction && (
+        <ConfirmDialog
+          open
+          onOpenChange={(v) => !v && setResetAction(null)}
+          title={t('Reset subscription quota')}
+          desc={t('Reset active {{plan}} subscriptions for this user?', {
+            plan: resetAction.planTitle,
+          })}
+          confirmText={t('Reset quota')}
+          handleConfirm={handleResetConfirm}
+          isLoading={resetting}
+        >
+          <label className='flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-sm'>
+            <span>{t('Advance next reset time')}</span>
+            <Switch
+              checked={advanceResetTime}
+              onCheckedChange={(checked) => setAdvanceResetTime(!!checked)}
+              aria-label={t('Advance next reset time')}
+            />
+          </label>
+        </ConfirmDialog>
       )}
     </>
   )
