@@ -636,7 +636,7 @@ func CancelAffiliateRewardRecord(recordId int, now int64) error {
 
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var record AffiliateRewardRecord
-		if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&record, recordId).Error; err != nil {
+		if err := lockForUpdate(tx).First(&record, recordId).Error; err != nil {
 			return err
 		}
 		if record.Status == AffiliateRewardStatusCanceled {
@@ -683,7 +683,7 @@ func SettleAvailableAffiliateRewards(inviterId int, now int64) (int, error) {
 
 func settleAvailableAffiliateRewardsTx(tx *gorm.DB, inviterId int, now int64) (int, error) {
 	var records []AffiliateRewardRecord
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").
+	if err := lockForUpdate(tx).
 		Where("inviter_id = ? AND status = ? AND available_at <= ?", inviterId, AffiliateRewardStatusPending, now).
 		Order("available_at asc, id asc").
 		Find(&records).Error; err != nil {
@@ -724,7 +724,7 @@ func markTransferredAffiliateRewardsTx(tx *gorm.DB, inviterId int, quota int, no
 	}
 
 	var records []AffiliateRewardRecord
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").
+	if err := lockForUpdate(tx).
 		Where("inviter_id = ? AND status IN ?", inviterId, []string{AffiliateRewardStatusAvailable, ""}).
 		Order("available_at asc, id asc").
 		Find(&records).Error; err != nil {

@@ -224,6 +224,93 @@ func TestRechargeEpayAppliesContinuousAffiliateRewardOnce(t *testing.T) {
 	assert.Equal(t, 1000, inviter.AffHistoryQuota)
 }
 
+func TestRechargeEpaySaturatesOversizedQuotaAndAffiliateReward(t *testing.T) {
+	truncateTables(t)
+	withQuotaPerUnitForAffiliateTest(t, 1)
+	withAffiliateRewardPercents(t, 100, 100)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       22,
+		Username: "oversized-inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff22",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                  23,
+		Username:            "oversized-invitee",
+		Status:              common.UserStatusEnabled,
+		AffCode:             "aff23",
+		InviterId:           22,
+		InviteRewardRule:    InviteRewardRuleContinuous,
+		InviteRewardPercent: 100,
+	})
+	insertAffiliateRewardTopUp(t, "epay-oversized-affiliate", 23, int64(common.MaxQuota)+1, PaymentProviderEpay)
+
+	require.NoError(t, RechargeEpay("epay-oversized-affiliate", "wxpay", "127.0.0.1"))
+
+	invitee := getAffiliateRewardUser(t, 23)
+	assert.Equal(t, common.MaxQuota, invitee.Quota)
+
+	inviter := getAffiliateRewardUser(t, 22)
+	assert.Equal(t, common.MaxQuota, inviter.AffQuota)
+	assert.Equal(t, common.MaxQuota, inviter.AffHistoryQuota)
+
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.Where("invitee_id = ?", 23).First(&record).Error)
+	assert.Equal(t, common.MaxQuota, record.TopUpQuota)
+	assert.Equal(t, common.MaxQuota, record.RewardQuota)
+}
+
+func TestAffiliateTopUpRewardSaturatesOversizedDirectQuota(t *testing.T) {
+	truncateTables(t)
+	withAffiliateRewardPercents(t, 100, 100)
+
+	insertAffiliateRewardUser(t, &User{
+		Id:       24,
+		Username: "direct-oversized-inviter",
+		Status:   common.UserStatusEnabled,
+		AffCode:  "aff24",
+	})
+	insertAffiliateRewardUser(t, &User{
+		Id:                  25,
+		Username:            "direct-oversized-invitee",
+		Status:              common.UserStatusEnabled,
+		AffCode:             "aff25",
+		InviterId:           24,
+		InviteRewardRule:    InviteRewardRuleContinuous,
+		InviteRewardPercent: 100,
+	})
+	topUp := &TopUp{
+		Id:              251,
+		UserId:          25,
+		Amount:          int64(common.MaxQuota) + 1,
+		Money:           float64(common.MaxQuota) + 1,
+		TradeNo:         "direct-oversized-affiliate",
+		PaymentProvider: PaymentProviderEpay,
+		Status:          common.TopUpStatusPending,
+		CreateTime:      time.Now().Unix(),
+	}
+	require.NoError(t, DB.Create(topUp).Error)
+
+	var reward int
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		_, reward, err = applyAffiliateTopUpRewardTx(tx, topUp, common.MaxQuota+1)
+		return err
+	}))
+
+	assert.Equal(t, common.MaxQuota, reward)
+
+	inviter := getAffiliateRewardUser(t, 24)
+	assert.Equal(t, common.MaxQuota, inviter.AffQuota)
+	assert.Equal(t, common.MaxQuota, inviter.AffHistoryQuota)
+
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.Where("top_up_id = ?", 251).First(&record).Error)
+	assert.Equal(t, common.MaxQuota, record.TopUpQuota)
+	assert.Equal(t, common.MaxQuota, record.RewardQuota)
+}
+
 func TestFirstTopUpAffiliateRewardIgnoresSubscriptionTopUpRecords(t *testing.T) {
 	truncateTables(t)
 	withQuotaPerUnitForAffiliateTest(t, 1000)

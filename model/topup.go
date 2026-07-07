@@ -111,7 +111,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		return errors.New("未提供支付单号")
 	}
 
-	var quota float64
+	var quotaToAdd int
 	var affiliateReward int
 	var affiliateInviterId int
 	topUp := &TopUp{}
@@ -135,10 +135,10 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 			return errors.New("充值订单状态错误")
 		}
 
-		quota = topUp.Money * common.QuotaPerUnit
+		quotaToAdd = common.QuotaFromFloat(topUp.Money * common.QuotaPerUnit)
 		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quotaToAdd)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -149,7 +149,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 			return err
 		}
 
-		err = tx.Model(&User{}).Where("id = ?", topUp.UserId).Updates(map[string]interface{}{"stripe_customer": customerId, "quota": gorm.Expr("quota + ?", quota)}).Error
+		err = tx.Model(&User{}).Where("id = ?", topUp.UserId).Updates(map[string]interface{}{"stripe_customer": customerId, "quota": gorm.Expr("quota + ?", quotaToAdd)}).Error
 		if err != nil {
 			return err
 		}
@@ -162,7 +162,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		return errors.New("充值失败，请稍后重试")
 	}
 
-	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用在线充值成功，充值金额: %v，支付金额：%d", logger.FormatQuota(int(quota)), topUp.Amount), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
+	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用在线充值成功，充值金额: %v，支付金额：%d", logger.FormatQuota(quotaToAdd), topUp.Amount), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
 	recordAffiliateTopUpRewardLog(affiliateInviterId, affiliateReward)
 
 	return nil
@@ -184,7 +184,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 	}
 
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Set("gorm:query_option", "FOR UPDATE").Where(refCol+" = ?", tradeNo).First(topUp).Error
+		err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error
 		if err != nil {
 			return errors.New("充值订单不存在")
 		}
@@ -208,7 +208,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 		topUp.CompleteTime = common.GetTimestamp()
 		dAmount := decimal.NewFromInt(topUp.Amount)
 		dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
-		quotaToAdd = int(dAmount.Mul(dQuotaPerUnit).IntPart())
+		quotaToAdd = topUpQuotaFromDecimal(dAmount.Mul(dQuotaPerUnit))
 		if quotaToAdd <= 0 {
 			return errors.New("无效的充值额度")
 		}
@@ -440,11 +440,11 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		// - 其他订单（如易支付）：Amount 为美元数量，* QuotaPerUnit
 		if topUp.PaymentProvider == PaymentProviderStripe {
 			dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
-			quotaToAdd = int(decimal.NewFromFloat(topUp.Money).Mul(dQuotaPerUnit).IntPart())
+			quotaToAdd = topUpQuotaFromDecimal(decimal.NewFromFloat(topUp.Money).Mul(dQuotaPerUnit))
 		} else {
 			dAmount := decimal.NewFromInt(topUp.Amount)
 			dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
-			quotaToAdd = int(dAmount.Mul(dQuotaPerUnit).IntPart())
+			quotaToAdd = topUpQuotaFromDecimal(dAmount.Mul(dQuotaPerUnit))
 		}
 		if quotaToAdd <= 0 {
 			return errors.New("无效的充值额度")
@@ -491,7 +491,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 		return errors.New("未提供支付单号")
 	}
 
-	var quota int64
+	var quota int
 	var affiliateReward int
 	var affiliateInviterId int
 	topUp := &TopUp{}
@@ -516,10 +516,10 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 		}
 
 		// Creem 直接使用 Amount 作为充值额度（整数）
-		quota = topUp.Amount
+		quota = topUpQuotaFromDecimal(decimal.NewFromInt(topUp.Amount))
 		topUp.CompleteTime = common.GetTimestamp()
 		var rewardErr error
-		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, int(quota))
+		affiliateInviterId, affiliateReward, rewardErr = applyAffiliateTopUpRewardTx(tx, topUp, quota)
 		if rewardErr != nil {
 			return rewardErr
 		}
@@ -604,7 +604,7 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 
 		dAmount := decimal.NewFromInt(topUp.Amount)
 		dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
-		quotaToAdd = int(dAmount.Mul(dQuotaPerUnit).IntPart())
+		quotaToAdd = topUpQuotaFromDecimal(dAmount.Mul(dQuotaPerUnit))
 		if quotaToAdd <= 0 {
 			return errors.New("无效的充值额度")
 		}
@@ -674,7 +674,7 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 			return errors.New("充值订单状态错误")
 		}
 
-		quotaToAdd = int(decimal.NewFromInt(topUp.Amount).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).IntPart())
+		quotaToAdd = topUpQuotaFromDecimal(decimal.NewFromInt(topUp.Amount).Mul(decimal.NewFromFloat(common.QuotaPerUnit)))
 		if quotaToAdd <= 0 {
 			return errors.New("无效的充值额度")
 		}
@@ -715,9 +715,10 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 	if topUp == nil || quotaToAdd <= 0 {
 		return 0, 0, nil
 	}
+	quotaToAdd = common.QuotaFromFloat(float64(quotaToAdd))
 
 	var user User
-	if err := tx.Set("gorm:query_option", "FOR UPDATE").
+	if err := lockForUpdate(tx).
 		Select("id", "inviter_id", "invite_reward_rule", "invite_reward_percent", "invite_link_batch_id", "invite_first_topup_reward_percent", "invite_continuous_reward_percent", "invite_reward_rules_snapshot").
 		Where("id = ?", topUp.UserId).
 		First(&user).Error; err != nil {
@@ -750,7 +751,7 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 	}
 
 	rewardPercent := ResolveInviteRewardPercent(user.InviteRewardRule, user.InviteRewardPercent)
-	reward := quotaToAdd * rewardPercent / 100
+	reward := affiliateRewardQuota(quotaToAdd, rewardPercent)
 	if reward <= 0 {
 		return 0, 0, nil
 	}
@@ -783,6 +784,7 @@ func applyAffiliateTopUpRewardTx(tx *gorm.DB, topUp *TopUp, quotaToAdd int) (int
 }
 
 func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, quotaToAdd int) (int, int, error) {
+	quotaToAdd = common.QuotaFromFloat(float64(quotaToAdd))
 	recordCreatedAt := common.GetTimestamp()
 	rewardAvailableAt := topUp.CompleteTime + AffiliateRewardWaitSeconds
 	if topUp.CompleteTime <= 0 {
@@ -820,7 +822,7 @@ func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, qu
 	totalReward := 0
 	for _, activity := range applicableActivities {
 		rewardPercent := activity.Percent
-		reward := quotaToAdd * rewardPercent / 100
+		reward := affiliateRewardQuota(quotaToAdd, rewardPercent)
 		if reward <= 0 {
 			continue
 		}
@@ -842,10 +844,25 @@ func createInviteLinkBatchTopUpRewardTx(tx *gorm.DB, topUp *TopUp, user User, qu
 		if err != nil {
 			return 0, 0, err
 		}
-		totalReward += reward
+		totalReward = common.QuotaFromFloat(float64(totalReward) + float64(reward))
 	}
 
 	return user.InviterId, totalReward, nil
+}
+
+func topUpQuotaFromDecimal(value decimal.Decimal) int {
+	f, _ := value.Float64()
+	return common.QuotaFromFloat(f)
+}
+
+func affiliateRewardQuota(quotaToAdd int, rewardPercent int) int {
+	if quotaToAdd <= 0 || rewardPercent <= 0 {
+		return 0
+	}
+	reward := decimal.NewFromInt(int64(quotaToAdd)).
+		Mul(decimal.NewFromInt(int64(rewardPercent))).
+		Div(decimal.NewFromInt(100))
+	return topUpQuotaFromDecimal(reward)
 }
 
 func inviteRewardActivitiesFromSnapshotPercents(firstTopupPercent int, continuousPercent int) InviteRewardActivities {
