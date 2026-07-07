@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import type {
@@ -89,6 +89,7 @@ export function ChannelsTable() {
   const {
     enableTagMode,
     idSort,
+    batchMode,
     sensitiveVisible,
     setSensitiveVisible,
   } = useChannels()
@@ -301,7 +302,7 @@ export function ChannelsTable() {
   const typeCounts = data?.data?.type_counts
 
   // Columns configuration
-  const columns = useChannelsColumns()
+  const columns = useChannelsColumns({ enableSelection: batchMode })
 
   // React Table instance
   const { table } = useDataTable({
@@ -317,7 +318,9 @@ export function ChannelsTable() {
     columnFilters,
     pagination,
     globalFilter,
-    enableRowSelection: (row: Row<Channel>) => !isTagAggregateRow(row.original),
+    enableRowSelection: batchMode
+      ? (row: Row<Channel>) => !isTagAggregateRow(row.original)
+      : false,
     onSortingChange: handleSortingChange,
     onColumnFiltersChange: handleColumnFiltersChange,
     onPaginationChange,
@@ -329,6 +332,12 @@ export function ChannelsTable() {
     withExpandedRowModel: true,
     ensurePageInRange,
   })
+
+  useEffect(() => {
+    if (!batchMode) {
+      table.resetRowSelection()
+    }
+  }, [batchMode, table])
 
   // Prepare filter options from existing channel types only.
   const typeFilterOptions = useMemo(() => {
@@ -474,7 +483,7 @@ export function ChannelsTable() {
         }
         return DISABLED_ROW_DESKTOP
       }}
-      bulkActions={<DataTableBulkActions table={table} />}
+      bulkActions={batchMode ? <DataTableBulkActions table={table} /> : null}
     />
   )
 }

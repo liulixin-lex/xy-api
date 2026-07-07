@@ -62,6 +62,13 @@ export const REDEMPTION_STATUSES: Record<
 // Note: "Expired" is not a real DB status, it's computed from expired_time
 export const REDEMPTION_FILTER_EXPIRED = 'expired'
 
+export const REDEMPTION_FILTER_VALUES = [
+  String(REDEMPTION_STATUS.ENABLED),
+  String(REDEMPTION_STATUS.DISABLED),
+  String(REDEMPTION_STATUS.USED),
+  REDEMPTION_FILTER_EXPIRED,
+] as const
+
 export function getRedemptionStatusOptions(t: TFunction) {
   return [
     ...Object.values(REDEMPTION_STATUSES).map((config) => ({

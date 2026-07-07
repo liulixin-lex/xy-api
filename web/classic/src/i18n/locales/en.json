@@ -3827,6 +3827,10 @@
     "运营和收费行为产生的法律责任": "operation and charging behavior",
     "，": ", ",
     "、": ", ",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com."
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "You are using the classic frontend. This version will stop receiving maintenance soon, and some features may be unavailable. Switch to the new frontend for the complete experience.",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "You are using the classic frontend. This version will stop receiving maintenance soon, and some features may be unavailable. Contact an administrator to switch to the new frontend.",
+    "旧版前端即将停止维护": "Classic frontend maintenance will end soon",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "Tip: If the page does not render correctly after switching, clear your browser cache and try again."
   }
 }

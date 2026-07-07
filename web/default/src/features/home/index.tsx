@@ -78,7 +78,7 @@ export function Home() {
             src={content}
             className='h-screen w-full border-none'
             title={t('Custom Home Page')}
-            sandbox='allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-same-origin allow-scripts'
+            sandbox='allow-scripts allow-same-origin allow-forms allow-popups allow-presentation'
             onLoad={syncIframePreferences}
           />
         </PublicLayout>

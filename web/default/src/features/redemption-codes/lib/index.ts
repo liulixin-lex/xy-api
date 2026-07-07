@@ -20,6 +20,10 @@ For commercial licensing, please contact support@quantumnous.com
 // Utility Functions
 // ============================================================================
 export { isRedemptionExpired, isTimestampExpired } from './utils'
+export {
+  getRedemptionStatusFilterValue,
+  shouldSearchRedemptions,
+} from './redemption-query'
 
 // ============================================================================
 // Form Utilities

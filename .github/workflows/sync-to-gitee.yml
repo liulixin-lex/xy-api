@@ -39,10 +39,10 @@ jobs:
         run: |
           # 获取 release 信息
           RELEASE_INFO=$(gh release view "$TAG_NAME" --json name,body,tagName,targetCommitish)
-          
+
           RELEASE_NAME=$(echo "$RELEASE_INFO" | jq -r '.name')
           TARGET_COMMITISH=$(echo "$RELEASE_INFO" | jq -r '.targetCommitish')
-          
+
           # 使用多行字符串输出
           {
             echo "release_name=$RELEASE_NAME"
@@ -51,10 +51,10 @@ jobs:
             echo "$RELEASE_INFO" | jq -r '.body'
             echo "EOF"
           } >> $GITHUB_OUTPUT
-          
+
           # 下载 release 的所有附件
           gh release download "$TAG_NAME" --dir ./release_assets || echo "No assets to download"
-          
+
           # 列出下载的文件
           ls -la ./release_assets/ || echo "No assets directory"
 

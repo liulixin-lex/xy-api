@@ -2631,6 +2631,10 @@
     "运营和收费行为产生的法律责任": "运营和收费行为产生的法律责任",
     "，": "，",
     "、": "、",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "请使用gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com主流邮箱注册"
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "请使用gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com主流邮箱注册",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。",
+    "旧版前端即将停止维护": "旧版前端即将停止维护",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。"
   }
 }

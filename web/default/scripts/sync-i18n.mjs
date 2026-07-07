@@ -118,12 +118,16 @@ function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
+function hasOwnEnumerableProperty(obj, key) {
+  return Object.prototype.propertyIsEnumerable.call(obj, key)
+}
+
 function stableStringify(obj) {
   let text = JSON.stringify(obj, null, 2)
   for (const key of OBFUSCATED_KEYS) {
     text = text.replaceAll(`"${key.runtime}":`, `"${key.serialized}":`)
   }
-  return `${text  }\n`
+  return `${text}\n`
 }
 
 function countLeafKeys(obj) {
@@ -147,7 +151,7 @@ function reorderLikeBase(base, target, fill, extras, missing, currentPath = []) 
 
     for (const key of Object.keys(base)) {
       const nextPath = [...currentPath, key]
-      if (Object.hasOwn(t, key)) {
+      if (hasOwnEnumerableProperty(t, key)) {
         out[key] = reorderLikeBase(base[key], t[key], f[key], extras, missing, nextPath)
       } else {
         missing.push(nextPath.join('.'))
@@ -156,7 +160,7 @@ function reorderLikeBase(base, target, fill, extras, missing, currentPath = []) 
     }
 
     for (const key of Object.keys(t)) {
-      if (! Object.hasOwn(base, key)) {
+      if (!hasOwnEnumerableProperty(base, key)) {
         const nextPath = [...currentPath, key].join('.')
         extras[nextPath] = t[key]
       }

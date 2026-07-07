@@ -10,7 +10,7 @@ DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
 
-.PHONY: all build-frontend build-frontend-classic build-all-frontends start-backend dev dev-api dev-api-rebuild dev-web dev-web-classic reset-setup
+.PHONY: all build-frontend build-frontend-classic build-all-frontends build-web build-web-classic build-all-web start-backend start-api dev dev-api dev-api-rebuild dev-web dev-web-all dev-web-classic reset-setup
 
 all: build-all-frontends start-backend
 
@@ -26,9 +26,17 @@ build-frontend-classic:
 
 build-all-frontends: build-frontend build-frontend-classic
 
+build-web: build-frontend
+
+build-web-classic: build-frontend-classic
+
+build-all-web: build-all-frontends
+
 start-backend:
 	@echo "Starting backend dev server..."
 	@cd $(BACKEND_DIR) && go run main.go &
+
+start-api: start-backend
 
 dev-api:
 	@echo "Starting backend services (docker)..."
@@ -39,6 +47,12 @@ dev-api-rebuild:
 	@docker compose -f $(DEV_COMPOSE_FILE) up -d --build $(DEV_BACKEND_SERVICE)
 
 dev-web:
+	@echo "Starting default frontend dev server..."
+	@echo "Default frontend: http://localhost:$(DEV_FRONTEND_DEFAULT_PORT)"
+	@cd ./web && bun install --frozen-lockfile --filter ./default
+	@cd $(FRONTEND_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_DEFAULT_PORT)
+
+dev-web-all:
 	@echo "Starting both frontend dev servers..."
 	@echo "Default frontend: http://localhost:$(DEV_FRONTEND_DEFAULT_PORT)"
 	@echo "Classic frontend: http://localhost:$(DEV_FRONTEND_CLASSIC_PORT)"
@@ -66,7 +80,7 @@ dev-web:
 
 dev-web-classic:
 	@echo "Starting classic frontend dev server..."
-	@cd ./web && bun install --frozen-lockfile
+	@cd ./web && bun install --frozen-lockfile --filter ./classic
 	@cd $(FRONTEND_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$$(cat ../../VERSION) bun run dev -- --host 0.0.0.0 --port $(DEV_FRONTEND_CLASSIC_PORT)
 
 dev: dev-api dev-web

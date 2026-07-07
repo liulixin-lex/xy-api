@@ -3650,6 +3650,10 @@
     "运营和收费行为产生的法律责任": "operation and charging behavior",
     "，": ", ",
     "、": ", ",
-    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com などの主要なメールアドレスで登録してください。"
+    "Please register with a mainstream email provider: gmail.com, 163.com, 126.com, qq.com, icloud.com, 139.com, or outlook.com.": "gmail.com、163.com、126.com、qq.com、icloud.com、139.com、outlook.com などの主要なメールアドレスで登録してください。",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。建议切换到新版前端以获得完整体验。": "旧版フロントエンドを使用しています。このバージョンはまもなくメンテナンスを終了するため、一部の機能が利用できない場合があります。完全な体験のため、新しいフロントエンドへ切り替えてください。",
+    "你正在使用旧版前端，该版本即将停止维护，部分功能可能无法使用。请联系管理员切换到新版前端。": "旧版フロントエンドを使用しています。このバージョンはまもなくメンテナンスを終了するため、一部の機能が利用できない場合があります。新しいフロントエンドへの切り替えは管理者に連絡してください。",
+    "旧版前端即将停止维护": "旧版フロントエンドはまもなくメンテナンス終了",
+    "提示：如果切换后页面无法正常渲染，请清空浏览器缓存后重试。": "ヒント：切り替え後にページが正常に表示されない場合は、ブラウザのキャッシュを削除してからもう一度お試しください。"
   }
 }

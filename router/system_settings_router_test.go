@@ -25,6 +25,8 @@ func TestSystemSettingsRoutesUseSystemSettingPermission(t *testing.T) {
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/ratio_sync/channels", controller.GetSyncableChannels)
 	assertSystemSettingsRoutePermission(t, http.MethodPost, "/system-task/log-cleanup", controller.CreateLogCleanupSystemTask)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/system-info/instances", controller.ListSystemInstances)
+	assertSystemSettingsRoutePermission(t, http.MethodDelete, "/system-info/stale-instances", controller.DeleteStaleSystemInstances)
+	assertSystemSettingsRoutePermission(t, http.MethodDelete, "/system-info/instances/:node_name", controller.DeleteStaleSystemInstance)
 }
 
 func assertSystemSettingsRoutePermission(t *testing.T, method string, path string, handler any) {

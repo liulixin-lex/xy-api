@@ -16,13 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo } from 'react'
 import { Tag as TagIcon } from 'lucide-react'
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useSystemConfigStore } from '@/stores/system-config-store'
-import { cn } from '@/lib/utils'
-import { Badge } from '@/components/ui/badge'
+
 import { StaticDataTable } from '@/components/data-table'
+import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
 import {
   BILLING_PRICING_VARS,
   MATCH_CONTAINS,
@@ -151,6 +153,12 @@ function describeGroup(
     .join(' && ')
 }
 
+function makeOccurrenceKey(base: string, counts: Map<string, number>): string {
+  const count = counts.get(base) ?? 0
+  counts.set(base, count + 1)
+  return count === 0 ? base : `${base}-${count}`
+}
+
 export function DynamicPricingBreakdown({
   billingExpr,
   matchedTierLabel,
@@ -227,6 +235,8 @@ export function DynamicPricingBreakdown({
       (tier) => Number(tier[v.field as string as keyof ParsedTier] || 0) > 0
     )
   })
+  const tierMobileKeyCounts = new Map<string, number>()
+  const ruleGroupKeyCounts = new Map<string, number>()
 
   return (
     <section className={cn('min-w-0', !compact && 'py-3 sm:py-4')}>
@@ -260,13 +270,17 @@ export function DynamicPricingBreakdown({
           <div className='space-y-1.5 sm:hidden'>
             {tiers.map((tier) => {
               const condSummary = formatConditionSummary(tier.conditions, t)
+              const tierKey = makeOccurrenceKey(
+                `tier-mobile-${tier.label || condSummary || 'default'}`,
+                tierMobileKeyCounts
+              )
               const isMatched =
                 matchedTierLabel != null &&
                 matchedTierLabel !== '' &&
                 tier.label === matchedTierLabel
               return (
                 <div
-                  key={`tier-mobile-${tier.label || condSummary}`}
+                  key={tierKey}
                   className={cn(
                     'rounded-md border p-2',
                     isMatched && 'border-emerald-500/40 bg-emerald-500/10'
@@ -423,27 +437,34 @@ export function DynamicPricingBreakdown({
             {t('Conditional multipliers')}
           </div>
           <ul className='space-y-1.5'>
-            {ruleGroups.map((group) => (
-              <li
-                key={describeGroup(group, t)}
-                className='bg-muted/50 flex items-center justify-between gap-3 rounded-md px-3 py-2'
-              >
-                <span
-                  className={cn(
-                    'text-foreground break-all',
-                    compact ? 'text-xs' : 'text-sm'
-                  )}
+            {ruleGroups.map((group) => {
+              const description = describeGroup(group, t)
+              const groupKey = makeOccurrenceKey(
+                `group-${description}-${group.multiplier}`,
+                ruleGroupKeyCounts
+              )
+              return (
+                <li
+                  key={groupKey}
+                  className='bg-muted/50 flex items-center justify-between gap-3 rounded-md px-3 py-2'
                 >
-                  {describeGroup(group, t)}
-                </span>
-                <Badge
-                  variant='secondary'
-                  className='shrink-0 bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
-                >
-                  {group.multiplier}x
-                </Badge>
-              </li>
-            ))}
+                  <span
+                    className={cn(
+                      'text-foreground break-all',
+                      compact ? 'text-xs' : 'text-sm'
+                    )}
+                  >
+                    {description}
+                  </span>
+                  <Badge
+                    variant='secondary'
+                    className='shrink-0 bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
+                  >
+                    {group.multiplier}x
+                  </Badge>
+                </li>
+              )
+            })}
           </ul>
         </div>
       )}
