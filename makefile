@@ -10,7 +10,7 @@ DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
 
-.PHONY: all build-frontend build-frontend-classic build-all-frontends start-backend dev dev-api dev-api-rebuild dev-web dev-web-classic reset-setup
+.PHONY: all build-frontend build-frontend-classic build-all-frontends build-web build-web-classic build-all-web start-backend start-api dev dev-api dev-api-rebuild dev-web dev-web-classic reset-setup
 
 all: build-all-frontends start-backend
 
@@ -26,9 +26,17 @@ build-frontend-classic:
 
 build-all-frontends: build-frontend build-frontend-classic
 
+build-web: build-frontend
+
+build-web-classic: build-frontend-classic
+
+build-all-web: build-all-frontends
+
 start-backend:
 	@echo "Starting backend dev server..."
 	@cd $(BACKEND_DIR) && go run main.go &
+
+start-api: start-backend
 
 dev-api:
 	@echo "Starting backend services (docker)..."
