@@ -70,11 +70,11 @@ export function AffiliateRewardsCard({
           </div>
           <div className='min-w-0'>
             <h3 className='truncate text-sm font-semibold'>
-              {t('Referral Rewards')}
+              {t('Referral Program')}
             </h3>
             <p className='text-muted-foreground line-clamp-1 text-xs'>
               {t(
-                'Earn rewards when invited users add funds. Transfer accumulated rewards to your balance anytime.'
+                'Earn rewards when your referrals add funds. Transfer accumulated rewards to your balance anytime.'
               )}
             </p>
           </div>
@@ -125,7 +125,7 @@ export function AffiliateRewardsCard({
         {!complianceConfirmed ? (
           <p className='text-muted-foreground text-xs lg:col-span-3'>
             {t(
-              'Reward transfer is disabled until the administrator confirms compliance terms.'
+              'Referral reward transfer is disabled until the administrator confirms compliance terms.'
             )}
           </p>
         ) : null}
