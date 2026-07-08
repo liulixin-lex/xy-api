@@ -202,6 +202,45 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	return nil, errors.New("channel not found")
 }
 
+func GetRankedSatisfiedChannels(group string, model string, requestPath string) ([]*Channel, error) {
+	if !common.MemoryCacheEnabled {
+		return GetRankedChannels(group, model, requestPath)
+	}
+
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+
+	channels := rankedChannelIDs(group, model, requestPath)
+	if len(channels) == 0 {
+		normalizedModel := ratio_setting.FormatMatchingModelName(model)
+		channels = rankedChannelIDs(group, normalizedModel, requestPath)
+	}
+	if len(channels) == 0 {
+		return nil, nil
+	}
+
+	result := make([]*Channel, 0, len(channels))
+	for _, channelID := range channels {
+		channel, ok := channelsIDM[channelID]
+		if !ok {
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
+		}
+		result = append(result, channel)
+	}
+	return result, nil
+}
+
+func rankedChannelIDs(group string, model string, requestPath string) []int {
+	if group2model2channels == nil {
+		return nil
+	}
+	model2channels := group2model2channels[group]
+	if model2channels == nil {
+		return nil
+	}
+	return filterChannelsByRequestPath(model2channels[model], requestPath)
+}
+
 // filterChannelsByRequestPath restricts candidates by request path. Only Advanced
 // Custom (type 58) channels are path-checked: they are kept only when one of their
 // configured routes matches requestPath. All other channel types always pass.

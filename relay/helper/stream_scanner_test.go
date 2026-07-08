@@ -14,8 +14,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -486,6 +489,121 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
 	assert.False(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestStreamScannerHandler_FirstByteTimeoutStopsBeforeWritingClient(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           30,
+		FirstByteCapMs:           30,
+		FirstByteP95Multiplier:   1,
+	})
+	t.Cleanup(smart_routing_setting.ResetForTest)
+
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: pr}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n"))
+		_ = pw.Close()
+	}()
+
+	start := time.Now()
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		sr.Error(fmt.Errorf("late data should not be handled: %s", data))
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(start), 150*time.Millisecond)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestFirstByteGuardClosesBodyOnTimeout(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           20,
+		FirstByteCapMs:           20,
+		FirstByteP95Multiplier:   1,
+	})
+	t.Cleanup(smart_routing_setting.ResetForTest)
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+	guard := NewFirstByteGuard(info, pr)
+	defer guard.Stop()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := pr.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		require.Error(t, err)
+	case <-time.After(200 * time.Millisecond):
+		require.Fail(t, "first-byte guard did not close the blocked body")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.True(t, guard.TimedOutBeforeResponse())
+}
+
+func TestFirstByteFailoverTimeoutUsesMetricP95WithinCap(t *testing.T) {
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           30,
+		FirstByteCapMs:           100,
+		FirstByteP95Multiplier:   2,
+	})
+	routinghotcache.SetMetricForTest(routinghotcache.Key{
+		ChannelID:   77,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "vip",
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 40})
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-test",
+		UsingGroup:      "vip",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 77,
+		},
+	}
+
+	assert.Equal(t, 80*time.Millisecond, firstByteFailoverTimeout(info))
+
+	routinghotcache.SetMetricForTest(routinghotcache.Key{
+		ChannelID:   77,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "vip",
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 90})
+	assert.Equal(t, 100*time.Millisecond, firstByteFailoverTimeout(info))
 }
 
 func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {

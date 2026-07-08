@@ -45,8 +45,12 @@ func TestMain(m *testing.M) {
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
+		&model.Ability{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
 	); err != nil {
@@ -68,8 +72,12 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM tokens")
 		model.DB.Exec("DELETE FROM logs")
 		model.DB.Exec("DELETE FROM channels")
+		model.DB.Exec("DELETE FROM abilities")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
+		model.DB.Exec("DELETE FROM routing_cost_snapshots")
+		model.DB.Exec("DELETE FROM routing_channel_metrics")
+		model.DB.Exec("DELETE FROM routing_breaker_states")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
 	})

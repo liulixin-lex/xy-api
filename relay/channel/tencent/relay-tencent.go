@@ -94,6 +94,8 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 	var responseText string
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 
 	helper.SetEventStreamHeaders(c)
 
@@ -103,6 +105,7 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			continue
 		}
 		data = strings.TrimPrefix(data, "data:")
+		firstByteGuard.MarkReceived()
 
 		var tencentResponse TencentChatResponse
 		err := common.Unmarshal([]byte(data), &tencentResponse)
@@ -122,10 +125,14 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
 		common.SysLog("error reading stream: " + err.Error())
 	}
 
+	if firstByteGuard.TimedOutBeforeResponse() {
+		service.CloseResponseBodyGracefully(resp)
+		return &dto.Usage{}, nil
+	}
 	helper.Done(c)
 
 	service.CloseResponseBodyGracefully(resp)

@@ -130,6 +130,10 @@ export function SidebarModulesSection({
         title: t('Channels'),
         description: t('Configure upstream providers and routing.'),
       },
+      smart_routing: {
+        title: t('Smart Routing'),
+        description: t('Tune dynamic provider selection and health breakers.'),
+      },
       models: {
         title: t('Models'),
         description: t('Manage catalog visibility and pricing.'),

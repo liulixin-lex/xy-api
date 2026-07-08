@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/samber/lo"
 	"gorm.io/gorm"
@@ -144,6 +145,57 @@ func GetChannel(group string, model string, retry int, requestPath string) (*Cha
 	}
 	err = DB.First(&channel, "id = ?", channel.Id).Error
 	return &channel, err
+}
+
+func GetRankedChannels(group string, modelName string, requestPath string) ([]*Channel, error) {
+	abilities, err := getRankedAbilities(group, modelName, requestPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(abilities) == 0 {
+		normalizedModel := ratio_setting.FormatMatchingModelName(modelName)
+		abilities, err = getRankedAbilities(group, normalizedModel, requestPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(abilities) == 0 {
+		return nil, nil
+	}
+
+	channelIDs := make([]int, 0, len(abilities))
+	for _, ability := range abilities {
+		channelIDs = append(channelIDs, ability.ChannelId)
+	}
+	var channels []Channel
+	if err = DB.Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+		return nil, err
+	}
+	channelByID := make(map[int]*Channel, len(channels))
+	for i := range channels {
+		channelByID[channels[i].Id] = &channels[i]
+	}
+	result := make([]*Channel, 0, len(abilities))
+	for _, ability := range abilities {
+		channel, ok := channelByID[ability.ChannelId]
+		if !ok {
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", ability.ChannelId)
+		}
+		result = append(result, channel)
+	}
+	return result, nil
+}
+
+func getRankedAbilities(group string, modelName string, requestPath string) ([]Ability, error) {
+	var abilities []Ability
+	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, modelName, true).
+		Order("priority DESC").
+		Order("weight DESC").
+		Find(&abilities).Error
+	if err != nil {
+		return nil, err
+	}
+	return filterAbilitiesByRequestPath(abilities, requestPath), nil
 }
 
 // filterAbilitiesByRequestPath restricts candidates by request path for the DB

@@ -100,6 +100,8 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 	helper.SetEventStreamHeaders(c)
 	id := helper.GetResponseID(c)
 	var responseText string
@@ -114,6 +116,7 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		if line == "" {
 			if currentEvent != "" && currentData != "" {
 				// handle last event
+				firstByteGuard.MarkReceived()
 				handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info)
 				currentEvent = ""
 				currentData = ""
@@ -133,12 +136,16 @@ func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	}
 
 	// Last event
-	if currentEvent != "" && currentData != "" {
+	if currentEvent != "" && currentData != "" && !firstByteGuard.TimedOutBeforeResponse() {
+		firstByteGuard.MarkReceived()
 		handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info)
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	if firstByteGuard.TimedOutBeforeResponse() {
+		return &dto.Usage{}, nil
 	}
 	helper.Done(c)
 

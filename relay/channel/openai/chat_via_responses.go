@@ -84,6 +84,8 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) < 6 || line[:5] != "data:" {
@@ -98,6 +100,7 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 			continue
 		}
 
+		firstByteGuard.MarkReceived()
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, "failed to unmarshal buffered responses stream event: "+err.Error())
@@ -132,8 +135,11 @@ func OaiResponsesToChatBufferedStreamHandler(c *gin.Context, info *relaycommon.R
 	if streamErr != nil {
 		return nil, streamErr
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+	if firstByteGuard.TimedOutBeforeResponse() {
+		return nil, nil
 	}
 	if finalResponse == nil {
 		finalResponse = &dto.OpenAIResponsesResponse{
@@ -259,6 +265,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 	if streamErr != nil {
 		return nil, streamErr
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil, nil
 	}
 
 	usage := state.Usage

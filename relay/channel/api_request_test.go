@@ -1,14 +1,83 @@
 package channel
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var smartRoutingSettingTestMu sync.Mutex
+
+type testWssAdaptor struct {
+	url string
+}
+
+func (a testWssAdaptor) Init(info *relaycommon.RelayInfo) {}
+
+func (a testWssAdaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	return a.url, nil
+}
+
+func (a testWssAdaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
+	return nil
+}
+
+func (a testWssAdaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.NewAPIError) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) GetModelList() []string { return nil }
+
+func (a testWssAdaptor) GetChannelName() string { return "test" }
+
+func (a testWssAdaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	return nil, nil
+}
+
+func (a testWssAdaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
+	return nil, nil
+}
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()
@@ -190,4 +259,171 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.Equal(t, "Codex CLI", upstreamReq.Header.Get("Originator"))
 	require.Equal(t, "sess-123", upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
+}
+
+func TestShouldStartPreResponseStreamPing_DisabledDuringFirstByteFailover(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	defer smart_routing_setting.ResetForTest()
+
+	info := &relaycommon.RelayInfo{
+		IsStream:        true,
+		OriginModelName: "gpt-test",
+		UsingGroup:      "default",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 123,
+		},
+	}
+
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           3000,
+		FirstByteCapMs:           12000,
+		FirstByteP95Multiplier:   2,
+	})
+
+	assert.False(t, shouldStartPreResponseStreamPing(info))
+
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeObserve,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           3000,
+		FirstByteCapMs:           12000,
+		FirstByteP95Multiplier:   2,
+	})
+
+	assert.True(t, shouldStartPreResponseStreamPing(info))
+}
+
+func TestDoRequestUsesFirstByteTimeoutBeforeResponseHeaders(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           20,
+		FirstByteCapMs:           20,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte("late"))
+	}))
+	t.Cleanup(server.Close)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	req.Body = http.NoBody
+	info := &relaycommon.RelayInfo{
+		IsStream:        true,
+		OriginModelName: "gpt-test",
+		UsingGroup:      "default",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 124},
+	}
+
+	resp, err := doRequest(ctx, req, info)
+
+	require.Nil(t, resp)
+	require.Error(t, err)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestDoRequestDoesNotUseFirstByteTimeoutForNonStream(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           20,
+		FirstByteCapMs:           20,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(server.Close)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	req.Body = http.NoBody
+	info := &relaycommon.RelayInfo{
+		IsStream:        false,
+		OriginModelName: "gpt-test",
+		UsingGroup:      "default",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 125},
+	}
+
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestDoWssRequestUsesFirstByteTimeoutBeforeUpstreamHandshake(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           20,
+		FirstByteCapMs:           20,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:        true,
+		OriginModelName: "gpt-realtime",
+		UsingGroup:      "default",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 126},
+	}
+
+	start := time.Now()
+	conn, err := DoWssRequest(testWssAdaptor{url: "ws" + server.URL[len("http"):]}, ctx, info, nil)
+
+	require.Nil(t, conn)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 80*time.Millisecond)
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
 }

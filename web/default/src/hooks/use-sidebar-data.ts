@@ -28,6 +28,7 @@ import {
   ListTodo,
   MessageSquare,
   Radio,
+  Route,
   ServerCog,
   Settings,
   Ticket,
@@ -129,6 +130,11 @@ export function useSidebarData(): SidebarData {
             title: t('Channels'),
             url: '/channels',
             icon: Radio,
+          },
+          {
+            title: t('Smart Routing'),
+            url: '/smart-routing',
+            icon: Route,
           },
           {
             title: t('Models'),
