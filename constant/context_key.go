@@ -38,9 +38,14 @@ const (
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
 
-	ContextKeyAutoGroup           ContextKey = "auto_group"
-	ContextKeyAutoGroupIndex      ContextKey = "auto_group_index"
-	ContextKeyAutoGroupRetryIndex ContextKey = "auto_group_retry_index"
+	ContextKeyAutoGroup               ContextKey = "auto_group"
+	ContextKeyAutoGroupIndex          ContextKey = "auto_group_index"
+	ContextKeyAutoGroupRetryIndex     ContextKey = "auto_group_retry_index"
+	ContextKeyRoutingCandidateMemo    ContextKey = "routing_candidate_memo"
+	ContextKeyRoutingLastDecision     ContextKey = "routing_last_decision"
+	ContextKeyRoutingExcludedChannels ContextKey = "routing_excluded_channels"
+	ContextKeyRoutingSwitchCount      ContextKey = "routing_switch_count"
+	ContextKeyRoutingAutoGroupIndex   ContextKey = "routing_auto_group_index"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"

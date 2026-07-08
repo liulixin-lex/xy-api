@@ -80,6 +80,12 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		if newApiErr != nil {
 			return newApiErr
 		}
+		if info.FirstByteTimedOutBeforeResponse() {
+			return nil
+		}
+		if usage == nil {
+			return types.NewOpenAIError(fmt.Errorf("empty usage from responses adapter"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		}
 
 		var containAudioTokens = usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
 		var containsAudioRatios = ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
@@ -209,6 +215,12 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		// reset status code 重置状态码
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return newApiErr
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil
+	}
+	if usage == nil {
+		return types.NewOpenAIError(fmt.Errorf("empty usage from channel response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 
 	var containAudioTokens = usage.(*dto.Usage).CompletionTokenDetails.AudioTokens > 0 || usage.(*dto.Usage).PromptTokensDetails.AudioTokens > 0

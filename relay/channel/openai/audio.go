@@ -35,7 +35,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 		c.Writer.Header().Set(k, v[0])
 	}
-	c.Writer.WriteHeader(resp.StatusCode)
+	if !info.IsStream || helper.FirstByteFailoverTimeout(info) == 0 {
+		c.Writer.WriteHeader(resp.StatusCode)
+	}
 
 	if info.IsStream {
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
@@ -54,6 +56,9 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				sr.Error(err)
 			}
 		})
+		if info.FirstByteTimedOutBeforeResponse() {
+			return usage
+		}
 	} else {
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		// 读取响应体到缓冲区

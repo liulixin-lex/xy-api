@@ -2,14 +2,23 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
 // RegisterScheduledSystemTasks wires the periodic channel test, upstream model
@@ -22,6 +31,8 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(routingCostSyncHandler{})
+	service.RegisterSystemTaskHandler(routingAgentHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -150,6 +161,481 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type routingCostSyncHandler struct{}
+
+func (routingCostSyncHandler) Type() string { return model.SystemTaskTypeRoutingCostSync }
+
+func (routingCostSyncHandler) Enabled() bool {
+	return smart_routing_setting.GetSetting().Enabled
+}
+
+func (routingCostSyncHandler) Interval() time.Duration {
+	minutes := smart_routing_setting.GetSetting().SyncIntervalMin
+	if minutes < 1 {
+		minutes = 1
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (routingCostSyncHandler) NewPayload() any { return nil }
+
+func (routingCostSyncHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := runRoutingCostSyncTask(ctx)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type routingPricingResponse struct {
+	Success        bool                 `json:"success"`
+	Data           []routingPricingItem `json:"data"`
+	GroupRatio     map[string]float64   `json:"group_ratio"`
+	UsableGroup    map[string]string    `json:"usable_group"`
+	PricingVersion string               `json:"pricing_version"`
+	Message        string               `json:"message"`
+}
+
+type routingUserSelfResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Quota     float64 `json:"quota"`
+		UsedQuota float64 `json:"used_quota"`
+	} `json:"data"`
+	Message string `json:"message"`
+}
+
+type routingPricingItem struct {
+	ModelName       string   `json:"model_name"`
+	QuotaType       int      `json:"quota_type"`
+	ModelRatio      float64  `json:"model_ratio"`
+	ModelPrice      float64  `json:"model_price"`
+	CompletionRatio float64  `json:"completion_ratio"`
+	EnableGroups    []string `json:"enable_groups"`
+	BillingMode     string   `json:"billing_mode"`
+	BillingExpr     string   `json:"billing_expr"`
+}
+
+func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
+	summary := map[string]any{
+		"bindings":  0,
+		"snapshots": 0,
+		"metrics":   0,
+		"breakers":  0,
+		"errors":    0,
+	}
+
+	drainedMetrics := routingmetrics.DrainSnapshots()
+	for i := range drainedMetrics {
+		metric := drainedMetrics[i]
+		if err := model.UpsertRoutingChannelMetric(&metric); err != nil {
+			routingmetrics.RequeueSnapshots(drainedMetrics[i:])
+			return summary, err
+		}
+	}
+	routinghotcache.LoadMetricSnapshots(drainedMetrics, smart_routing_setting.GetSetting().MetricBucketSec)
+	summary["metrics"] = len(drainedMetrics)
+
+	dirtyBreakers := routingbreaker.DirtySnapshots()
+	for i, snapshot := range dirtyBreakers {
+		state := routingBreakerSnapshotToModel(snapshot)
+		if err := model.UpsertRoutingBreakerState(&state); err != nil {
+			routingbreaker.RequeueDirtySnapshots(dirtyBreakers[i:])
+			return summary, err
+		}
+	}
+	summary["breakers"] = len(dirtyBreakers)
+
+	var bindings []model.RoutingChannelBinding
+	if err := model.DB.Where("enabled = ?", true).Order("channel_id asc").Find(&bindings).Error; err != nil {
+		return summary, err
+	}
+	summary["bindings"] = len(bindings)
+
+	syncedSnapshots := 0
+	syncErrors := 0
+	for _, binding := range bindings {
+		snapshots, err := fetchRoutingCostSnapshots(ctx, binding)
+		if err != nil {
+			syncErrors++
+			message := err.Error()
+			_ = model.DB.Model(&model.RoutingChannelBinding{}).
+				Where("id = ?", binding.ID).
+				Updates(map[string]any{
+					"last_sync_error":    &message,
+					"sync_backoff_until": common.GetTimestamp() + 60,
+				}).Error
+			continue
+		}
+		for i := range snapshots {
+			snapshot := snapshots[i]
+			if err := model.UpsertRoutingCostSnapshot(&snapshot); err != nil {
+				return summary, err
+			}
+			syncedSnapshots++
+		}
+		routinghotcache.LoadCostSnapshots(snapshots)
+		_ = model.DB.Model(&model.RoutingChannelBinding{}).
+			Where("id = ?", binding.ID).
+			Updates(map[string]any{
+				"last_sync_error":    nil,
+				"sync_backoff_until": 0,
+			}).Error
+	}
+	summary["snapshots"] = syncedSnapshots
+	summary["errors"] = syncErrors
+	return summary, nil
+}
+
+func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannelBinding) ([]model.RoutingCostSnapshot, error) {
+	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
+		credentials, err := binding.GetCredentials()
+		if err != nil {
+			return nil, err
+		}
+		return fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
+	}
+
+	payload, err := fetchRoutingPricingPayload(ctx, binding)
+	if err != nil {
+		return nil, err
+	}
+
+	now := common.GetTimestamp()
+	groupRatio, hasGroupRatio := payload.GroupRatio[binding.UpstreamGroup]
+	if !hasGroupRatio || groupRatio <= 0 {
+		groupRatio = 1
+	}
+	confidence := model.RoutingCostConfidenceFull
+	if !hasGroupRatio {
+		confidence = model.RoutingCostConfidenceGroupOnly
+	}
+	modelNameMap := routingModelReverseMapping(binding.ChannelID)
+
+	snapshots := make([]model.RoutingCostSnapshot, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ModelName) == "" || !routingPricingItemServesGroup(item.EnableGroups, binding.UpstreamGroup) {
+			continue
+		}
+		modelName := strings.TrimSpace(item.ModelName)
+		if localName, ok := modelNameMap[modelName]; ok {
+			modelName = localName
+		}
+		snapshot := model.RoutingCostSnapshot{
+			ChannelID:       binding.ChannelID,
+			ModelName:       modelName,
+			GroupRatio:      groupRatio,
+			BaseRatio:       item.ModelRatio,
+			CompletionRatio: item.CompletionRatio,
+			ModelPrice:      item.ModelPrice,
+			BillingMode:     item.BillingMode,
+			Confidence:      confidence,
+			SnapshotTS:      now,
+			PricingVersion:  payload.PricingVersion,
+		}
+		if strings.TrimSpace(item.BillingExpr) != "" {
+			tiersJSON, err := common.Marshal(map[string]string{
+				"type": "expr",
+				"expr": item.BillingExpr,
+			})
+			if err != nil {
+				return nil, err
+			}
+			encoded := string(tiersJSON)
+			snapshot.TiersJSON = &encoded
+			snapshot.Confidence = model.RoutingCostConfidenceUnknown
+		} else if strings.TrimSpace(item.BillingMode) == "tiered_expr" {
+			snapshot.Confidence = model.RoutingCostConfidenceUnknown
+		}
+		if item.QuotaType == 1 && snapshot.ModelPrice <= 0 {
+			snapshot.Confidence = model.RoutingCostConfidenceUnknown
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots, nil
+}
+
+func routingModelReverseMapping(channelID int) map[string]string {
+	if channelID <= 0 {
+		return nil
+	}
+	var channel model.Channel
+	if err := model.DB.Select("id", "model_mapping").Where("id = ?", channelID).First(&channel).Error; err != nil {
+		return nil
+	}
+	if channel.ModelMapping == nil || strings.TrimSpace(*channel.ModelMapping) == "" {
+		return nil
+	}
+	var mapping map[string]string
+	if err := common.UnmarshalJsonStr(*channel.ModelMapping, &mapping); err != nil {
+		return nil
+	}
+	localNames := make([]string, 0, len(mapping))
+	for localName := range mapping {
+		if strings.TrimSpace(localName) != "" {
+			localNames = append(localNames, localName)
+		}
+	}
+	sort.Strings(localNames)
+	reverse := make(map[string]string, len(mapping))
+	for _, localName := range localNames {
+		upstreamName := strings.TrimSpace(mapping[localName])
+		if upstreamName == "" {
+			continue
+		}
+		if _, exists := reverse[upstreamName]; !exists {
+			reverse[upstreamName] = localName
+		}
+	}
+	return reverse
+}
+
+func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChannelBinding) (routingPricingResponse, error) {
+	credentials, err := binding.GetCredentials()
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
+		snapshots, err := fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
+		if err != nil {
+			return routingPricingResponse{}, err
+		}
+		items := make([]routingPricingItem, 0, len(snapshots))
+		groupRatio := map[string]float64{binding.UpstreamGroup: 1}
+		for _, snapshot := range snapshots {
+			groupRatio[binding.UpstreamGroup] = snapshot.GroupRatio
+			items = append(items, routingPricingItem{
+				ModelName:       snapshot.ModelName,
+				QuotaType:       0,
+				ModelRatio:      snapshot.BaseRatio,
+				ModelPrice:      snapshot.ModelPrice,
+				CompletionRatio: snapshot.CompletionRatio,
+				EnableGroups:    []string{binding.UpstreamGroup},
+				BillingMode:     snapshot.BillingMode,
+			})
+		}
+		return routingPricingResponse{
+			Success:     true,
+			Data:        items,
+			GroupRatio:  groupRatio,
+			UsableGroup: map[string]string{binding.UpstreamGroup: binding.UpstreamGroup},
+		}, nil
+	}
+	if binding.UpstreamType == model.RoutingUpstreamTypeNewAPI {
+		if err = fetchRoutingUpstreamBalance(ctx, binding, credentials); err != nil && routingUpstreamAuthError(err) {
+			return routingPricingResponse{}, err
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/pricing", nil)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	applyRoutingAuthHeaders(request, binding, credentials)
+
+	client := &http.Client{Timeout: time.Duration(defaultTimeoutSeconds) * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			markRoutingAuthFailure(binding.ChannelID)
+			return routingPricingResponse{}, routingAuthErrorf("pricing endpoint returned %s", response.Status)
+		}
+		return routingPricingResponse{}, fmt.Errorf("pricing endpoint returned %s", response.Status)
+	}
+
+	var payload routingPricingResponse
+	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &payload); err != nil {
+		return routingPricingResponse{}, err
+	}
+	if !payload.Success {
+		markRoutingAuthFailure(binding.ChannelID)
+		if payload.Message == "" {
+			payload.Message = "pricing endpoint returned success=false"
+		}
+		return routingPricingResponse{}, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
+	}
+	routinghotcache.ClearAuthFailure(binding.ChannelID)
+	return payload, nil
+}
+
+type routingAuthError struct {
+	message string
+}
+
+func (err routingAuthError) Error() string {
+	return err.message
+}
+
+func routingAuthErrorf(format string, args ...any) error {
+	return routingAuthError{message: fmt.Sprintf(format, args...)}
+}
+
+func routingUpstreamAuthError(err error) bool {
+	var authErr routingAuthError
+	return errors.As(err, &authErr)
+}
+
+func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/user/self", nil)
+	if err != nil {
+		return err
+	}
+	applyRoutingAuthHeaders(request, binding, credentials)
+
+	client := &http.Client{Timeout: time.Duration(defaultTimeoutSeconds) * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		markRoutingAuthFailure(binding.ChannelID)
+		return routingAuthErrorf("user self endpoint returned %s", response.Status)
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("user self endpoint returned %s", response.Status)
+	}
+
+	var payload routingUserSelfResponse
+	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &payload); err != nil {
+		return err
+	}
+	if !payload.Success {
+		markRoutingAuthFailure(binding.ChannelID)
+		if payload.Message == "" {
+			payload.Message = "user self endpoint returned success=false"
+		}
+		return routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
+	}
+
+	balanceQuota := payload.Data.Quota - payload.Data.UsedQuota
+	routinghotcache.SetBalance(binding.ChannelID, routinghotcache.BalanceSnapshot{
+		Known:       true,
+		Balance:     balanceQuota / common.QuotaPerUnit,
+		UpdatedUnix: common.GetTimestamp(),
+	})
+	routinghotcache.ClearAuthFailure(binding.ChannelID)
+	return nil
+}
+
+func applyRoutingAuthHeaders(request *http.Request, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) {
+	if token := routingBearerToken(credentials); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	if binding.NewAPIUserID != nil && *binding.NewAPIUserID > 0 {
+		request.Header.Set("New-Api-User", fmt.Sprintf("%d", *binding.NewAPIUserID))
+	}
+}
+
+func markRoutingAuthFailure(channelID int) {
+	routinghotcache.SetAuthFailure(channelID, routinghotcache.HealthMarker{
+		Marked:      true,
+		UpdatedUnix: common.GetTimestamp(),
+	})
+}
+
+func routingCleanUpstreamErrorMessage(message string) string {
+	message = strings.TrimSpace(common.MaskSensitiveInfo(message))
+	if message == "" {
+		return "upstream auth failed"
+	}
+	return message
+}
+
+func routingBearerToken(credentials model.RoutingCredentials) string {
+	switch {
+	case strings.TrimSpace(credentials.NewAPIAccessToken) != "":
+		return strings.TrimSpace(credentials.NewAPIAccessToken)
+	case strings.TrimSpace(credentials.Sub2APIToken) != "":
+		return strings.TrimSpace(credentials.Sub2APIToken)
+	case strings.TrimSpace(credentials.GatewayAPIKey) != "":
+		return strings.TrimSpace(credentials.GatewayAPIKey)
+	default:
+		return ""
+	}
+}
+
+func routingPricingItemServesGroup(enableGroups []string, group string) bool {
+	if len(enableGroups) == 0 {
+		return true
+	}
+	for _, enabledGroup := range enableGroups {
+		if enabledGroup == "all" || enabledGroup == group {
+			return true
+		}
+	}
+	return false
+}
+
+func routingPricingGroups(payload routingPricingResponse) []string {
+	groupSet := map[string]struct{}{}
+	for group := range payload.GroupRatio {
+		groupSet[group] = struct{}{}
+	}
+	for group := range payload.UsableGroup {
+		groupSet[group] = struct{}{}
+	}
+	for _, item := range payload.Data {
+		for _, group := range item.EnableGroups {
+			if group != "" && group != "all" {
+				groupSet[group] = struct{}{}
+			}
+		}
+	}
+	groups := make([]string, 0, len(groupSet))
+	for group := range groupSet {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.RoutingBreakerState {
+	state := model.RoutingBreakerState{
+		ChannelID:           snapshot.Key.ChannelID,
+		APIKeyIndex:         snapshot.Key.APIKeyIndex,
+		ModelName:           snapshot.Key.Model,
+		Group:               snapshot.Key.Group,
+		State:               string(snapshot.State),
+		Reason:              snapshot.Reason,
+		ConsecutiveFailures: int64(snapshot.ConsecutiveFailures),
+		EjectionCount:       int64(snapshot.EjectionCount),
+		HalfOpenInflight:    int64(snapshot.HalfOpenInflight),
+		UpdatedTime:         snapshot.UpdatedAt.Unix(),
+	}
+	if !snapshot.OpenedAt.IsZero() {
+		state.OpenedAt = snapshot.OpenedAt.Unix()
+	}
+	if !snapshot.CooldownUntil.IsZero() {
+		state.CooldownUntil = snapshot.CooldownUntil.Unix()
+	}
+	return state
+}
+
+type routingAgentHandler struct{}
+
+func (routingAgentHandler) Type() string { return model.SystemTaskTypeRoutingAgent }
+
+func (routingAgentHandler) Enabled() bool {
+	setting := smart_routing_setting.GetSetting()
+	return setting.Enabled && setting.AgentEnabled
+}
+
+func (routingAgentHandler) Interval() time.Duration { return time.Hour }
+
+func (routingAgentHandler) NewPayload() any { return nil }
+
+func (routingAgentHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, map[string]any{
+		"analyzed": false,
+		"reason":   "routing agent is read-only until v2 providers are configured",
+	}, nil)
 }
 
 func finishSystemTaskHandler(task *model.SystemTask, runnerID string, status model.SystemTaskStatus, result any, runErr error) {

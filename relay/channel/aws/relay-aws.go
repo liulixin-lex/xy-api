@@ -263,6 +263,20 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
+	firstByteTimeout := helper.FirstByteFailoverTimeout(info)
+	var firstByteTimer *time.Timer
+	var firstByteC <-chan time.Time
+	if firstByteTimeout > 0 {
+		firstByteTimer = time.NewTimer(firstByteTimeout)
+		firstByteC = firstByteTimer.C
+		defer firstByteTimer.Stop()
+	}
+	markFirstByteSeen := func() {
+		if firstByteTimer != nil {
+			firstByteTimer.Stop()
+		}
+		firstByteC = nil
+	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -272,25 +286,41 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 		Usage:        &dto.Usage{},
 	}
 
-	for event := range stream.Events() {
-		switch v := event.(type) {
-		case *bedrockruntimeTypes.ResponseStreamMemberChunk:
-			info.SetFirstResponseTime()
-			respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
-			if respErr != nil {
-				return respErr, nil
+	events := stream.Events()
+	for {
+		select {
+		case <-firstByteC:
+			if info.FirstByteTimedOutBeforeResponse() || (info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 && !info.HasSendResponse()) {
+				if info.StreamStatus == nil {
+					info.StreamStatus = relaycommon.NewStreamStatus()
+				}
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
+				cancel()
+				return types.NewErrorWithStatusCode(errors.New("aws stream first byte timeout"), types.ErrorCodeAwsInvokeError, http.StatusGatewayTimeout), nil
 			}
-		case *bedrockruntimeTypes.UnknownUnionMember:
-			fmt.Println("unknown tag:", v.Tag)
-			return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
-		default:
-			fmt.Println("union is nil or unknown type")
-			return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), nil
+		case event, ok := <-events:
+			if !ok {
+				claude.HandleStreamFinalResponse(c, info, claudeInfo)
+				return nil, claudeInfo.Usage
+			}
+			markFirstByteSeen()
+			switch v := event.(type) {
+			case *bedrockruntimeTypes.ResponseStreamMemberChunk:
+				info.SetFirstResponseTime()
+				info.ReceivedResponseCount++
+				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
+				if respErr != nil {
+					return respErr, nil
+				}
+			case *bedrockruntimeTypes.UnknownUnionMember:
+				fmt.Println("unknown tag:", v.Tag)
+				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
+			default:
+				fmt.Println("union is nil or unknown type")
+				return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), nil
+			}
 		}
 	}
-
-	claude.HandleStreamFinalResponse(c, info, claudeInfo)
-	return nil, claudeInfo.Usage
 }
 
 // Nova模型处理函数

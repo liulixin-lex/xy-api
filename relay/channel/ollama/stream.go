@@ -99,15 +99,14 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 	helper.SetEventStreamHeaders(c)
 	scanner := helper.NewStreamScanner(resp.Body)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 	usage := &dto.Usage{}
 	var model = info.UpstreamModelName
 	var responseId = common.GetUUID()
 	var created = time.Now().Unix()
 	var toolCallIndex int
-	start := helper.GenerateStartEmptyResponse(responseId, created, model, nil)
-	if data, err := common.Marshal(start); err == nil {
-		_ = helper.StringData(c, string(data))
-	}
+	sentStart := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -124,6 +123,14 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			model = chunk.Model
 		}
 		created = toUnix(chunk.CreatedAt)
+		firstByteGuard.MarkReceived()
+		if !sentStart {
+			start := helper.GenerateStartEmptyResponse(responseId, created, model, nil)
+			if data, err := common.Marshal(start); err == nil {
+				_ = helper.StringData(c, string(data))
+			}
+			sentStart = true
+		}
 
 		if !chunk.Done {
 			// delta content
@@ -197,7 +204,9 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		break
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		logger.LogError(c, "ollama stream scan error: "+err.Error())
+		if !firstByteGuard.TimedOutBeforeResponse() {
+			logger.LogError(c, "ollama stream scan error: "+err.Error())
+		}
 	}
 	return usage, nil
 }

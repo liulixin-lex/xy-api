@@ -1,0 +1,354 @@
+package routing
+
+import (
+	"math"
+	"testing"
+
+	"github.com/QuantumNous/new-api/model"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRankCandidatesHandlesCostNaNFreeAndUnknown(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		WeightCost:         1,
+		MinVolume:          10,
+	}
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, &CostSnapshot{Known: true, Cost: 0}, nil),
+		testCandidate(2, 1, 100, 10, &CostSnapshot{Known: true, Cost: 2}, nil),
+		testCandidate(3, 1, 100, 10, &CostSnapshot{Known: true, Cost: 4}, nil),
+		testCandidate(4, 1, 100, 10, &CostSnapshot{Known: true, Cost: math.NaN()}, nil),
+		testCandidate(5, 1, 100, 10, nil, nil),
+	}
+
+	decision := RankCandidates(candidates, settings)
+
+	require.Len(t, decision.Ranked, len(candidates))
+	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+	assert.Greater(t, rankedByID(t, decision, 1).Score, rankedByID(t, decision, 3).Score)
+	assert.Greater(t, rankedByID(t, decision, 2).Score, rankedByID(t, decision, 3).Score)
+	assert.False(t, rankedByID(t, decision, 4).CostKnown)
+	assert.False(t, rankedByID(t, decision, 5).CostKnown)
+	for _, ranked := range decision.Ranked {
+		assert.False(t, math.IsNaN(ranked.Score))
+		assert.False(t, math.IsInf(ranked.Score, 0))
+	}
+}
+
+func TestRankCandidatesDropsCostWeightWhenAllCostsUnknownAndKeepsHealthyAhead(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		WeightCost:         9,
+		MinVolume:          10,
+	}
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateDegraded}),
+		testCandidate(2, 0.1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy}),
+	}
+
+	decision := RankCandidates(candidates, settings)
+
+	require.Len(t, decision.Ranked, len(candidates))
+	assert.InDelta(t, 1.0, decision.Weights.Availability, 0.000001)
+	assert.Zero(t, decision.Weights.Cost)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+	assert.False(t, decision.Ranked[0].Degraded)
+	assert.True(t, decision.Ranked[1].Degraded)
+	assert.Greater(t, decision.Ranked[1].Score, decision.Ranked[0].Score)
+}
+
+func TestRankCandidatesNormalizesWeights(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 2,
+		WeightLatency:      3,
+		WeightThroughput:   0,
+		WeightCost:         5,
+		MinVolume:          10,
+	}
+
+	decision := RankCandidates([]Candidate{
+		testCandidate(1, 1, 100, 10, &CostSnapshot{Known: true, Cost: 1}, nil),
+	}, settings)
+
+	assert.InDelta(t, 1.0, decision.Weights.Availability+decision.Weights.Latency+decision.Weights.Throughput+decision.Weights.Cost, 0.000001)
+	assert.InDelta(t, 0.2, decision.Weights.Availability, 0.000001)
+	assert.InDelta(t, 0.3, decision.Weights.Latency, 0.000001)
+	assert.Zero(t, decision.Weights.Throughput)
+	assert.InDelta(t, 0.5, decision.Weights.Cost, 0.000001)
+}
+
+func TestRankCandidatesTreatsStaleCostsAsUnknown(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		WeightCost:         9,
+		MinVolume:          10,
+		NowUnix:            2000,
+		SnapshotStaleSec:   60,
+	}
+
+	decision := RankCandidates([]Candidate{
+		testCandidate(1, 1, 100, 10, &CostSnapshot{Known: true, Cost: 0.01, UpdatedUnix: 1000}, nil),
+		testCandidate(2, 1, 100, 10, &CostSnapshot{Known: true, Cost: 100, UpdatedUnix: 1000}, nil),
+	}, settings)
+
+	require.Len(t, decision.Ranked, 2)
+	assert.False(t, decision.Ranked[0].CostKnown)
+	assert.False(t, decision.Ranked[1].CostKnown)
+	assert.Zero(t, decision.Weights.Cost)
+}
+
+func TestSelectRankedFromCandidatesTopKDeterministic(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		TopK:               3,
+		RandomSeed:         99,
+	}
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, nil, nil),
+		testCandidate(2, 0.9, 100, 10, nil, nil),
+		testCandidate(3, 0.8, 100, 10, nil, nil),
+		testCandidate(4, 0.7, 100, 10, nil, nil),
+		testCandidate(5, 0.6, 100, 10, nil, nil),
+	}
+
+	first := SelectRankedFromCandidates(candidates, settings)
+	second := SelectRankedFromCandidates(candidates, settings)
+	expectedIndex := weightedTopKIndex(first.Ranked[:settings.TopK], settings.RandomSeed)
+
+	require.NotNil(t, first.Selected)
+	require.NotNil(t, second.Selected)
+	assert.Equal(t, first.Selected.Channel.Id, second.Selected.Channel.Id)
+	assert.Equal(t, first.Ranked[expectedIndex].Channel.Id, first.Selected.Channel.Id)
+	assert.LessOrEqual(t, expectedIndex, 2)
+
+	settings.TopK = 1
+	topOnly := SelectRankedFromCandidates(candidates, settings)
+	require.NotNil(t, topOnly.Selected)
+	assert.Equal(t, 1, topOnly.Selected.Channel.Id)
+}
+
+func TestSelectRankedFromCandidatesWeightsTopKByScore(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		TopK:               3,
+		RandomSeed:         99,
+	}
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, nil, nil),
+		testCandidate(2, 0, 100, 10, nil, nil),
+		testCandidate(3, 0, 100, 10, nil, nil),
+	}
+
+	decision := SelectRankedFromCandidates(candidates, settings)
+
+	require.NotNil(t, decision.Selected)
+	assert.Equal(t, 1, decision.Selected.Channel.Id)
+}
+
+func TestDegradedCandidateDoesNotOutrankHealthyCandidate(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+	}
+	candidates := []Candidate{
+		testCandidate(10, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateDegraded}),
+		testCandidate(20, 0.1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy}),
+	}
+
+	decision := RankCandidates(candidates, settings)
+
+	require.Len(t, decision.Ranked, len(candidates))
+	assert.Equal(t, 20, decision.Ranked[0].Channel.Id)
+	assert.False(t, decision.Ranked[0].Degraded)
+	assert.True(t, decision.Ranked[1].Degraded)
+}
+
+func TestRankCandidatesAppliesAvailabilityFloorWithEnoughVolume(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		WeightCost:         9,
+		MinVolume:          10,
+		AvailabilityFloor:  0.95,
+	}
+	candidates := []Candidate{
+		testCandidate(1, 0.90, 100, 10, &CostSnapshot{Known: true, Cost: 0.01}, nil),
+		testCandidate(2, 0.96, 200, 5, &CostSnapshot{Known: true, Cost: 100}, nil),
+	}
+
+	decision := RankCandidates(candidates, settings)
+
+	require.Len(t, decision.Ranked, 1)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+}
+
+func TestRankCandidatesKeepsLowVolumeCandidatesDespiteAvailabilityFloor(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          50,
+		AvailabilityFloor:  0.95,
+	}
+	candidate := testCandidate(1, 0.1, 100, 10, nil, nil)
+	candidate.Metric.RequestCount = 3
+	candidate.Metric.SuccessCount = 0
+
+	decision := RankCandidates([]Candidate{candidate}, settings)
+
+	require.Len(t, decision.Ranked, 1)
+	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+}
+
+func TestRankCandidatesOrdersAdminPriorityBeforeScore(t *testing.T) {
+	highPriority := int64(100)
+	lowPriority := int64(1)
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, nil, nil),
+		testCandidate(2, 0.1, 100, 10, nil, nil),
+	}
+	candidates[0].Channel.Priority = &lowPriority
+	candidates[1].Channel.Priority = &highPriority
+
+	decision := RankCandidates(candidates, Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+	})
+
+	require.Len(t, decision.Ranked, 2)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+	assert.Greater(t, decision.Ranked[1].Score, decision.Ranked[0].Score)
+}
+
+func TestRankCandidatesPrefersLowerInflightWhenScoreTies(t *testing.T) {
+	candidates := []Candidate{
+		testCandidate(1, 1, 100, 10, nil, nil),
+		testCandidate(2, 1, 100, 10, nil, nil),
+	}
+	candidates[0].Metric.Inflight = 3
+
+	decision := RankCandidates(candidates, Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+	})
+
+	require.Len(t, decision.Ranked, 2)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+	assert.Equal(t, int64(0), decision.Ranked[0].Inflight)
+	assert.Equal(t, int64(3), decision.Ranked[1].Inflight)
+}
+
+func TestOpenBreakerFilteredUnlessMaxEjectedPctExceeded(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		MaxEjectedPct:      50,
+		NowUnix:            1000,
+		SnapshotStaleSec:   60,
+	}
+
+	t.Run("filters fresh open breaker", func(t *testing.T) {
+		decision := RankCandidates([]Candidate{
+			testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, UpdatedUnix: 1000}),
+			testCandidate(2, 0.5, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 1000}),
+		}, settings)
+
+		require.Len(t, decision.Ranked, 1)
+		assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+		assert.False(t, decision.BreakerBypassed)
+		assert.Equal(t, 1, decision.FilteredOpen)
+	})
+
+	t.Run("bypasses open filter when ejected percent is too high", func(t *testing.T) {
+		decision := RankCandidates([]Candidate{
+			testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, UpdatedUnix: 1000}),
+			testCandidate(2, 0.9, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, UpdatedUnix: 1000}),
+			testCandidate(3, 0.1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 1000}),
+		}, settings)
+
+		require.Len(t, decision.Ranked, 3)
+		assert.True(t, decision.BreakerBypassed)
+		assert.Zero(t, decision.FilteredOpen)
+	})
+
+	t.Run("stale open breaker fails open", func(t *testing.T) {
+		decision := RankCandidates([]Candidate{
+			testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, Reason: BreakerReasonAuthFail, UpdatedUnix: 900}),
+			testCandidate(2, 0.5, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 1000}),
+		}, settings)
+
+		require.Len(t, decision.Ranked, 2)
+		assert.False(t, decision.BreakerBypassed)
+		assert.Zero(t, decision.FilteredOpen)
+	})
+}
+
+func TestRankCandidatesDoesNotModifyOriginalChannelPointer(t *testing.T) {
+	weight := uint(42)
+	priority := int64(7)
+	channel := &model.Channel{
+		Id:       100,
+		Name:     "immutable",
+		Weight:   &weight,
+		Priority: &priority,
+		Balance:  12.5,
+	}
+	metric := &MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 123, TPS: 4}
+	cost := &CostSnapshot{Known: true, Cost: 1.25}
+	breaker := &BreakerSnapshot{State: BreakerStateDegraded}
+	candidate := Candidate{
+		Channel: channel,
+		Metric:  metric,
+		Cost:    cost,
+		Breaker: breaker,
+	}
+	beforeChannel := *channel
+	beforeMetric := *metric
+	beforeCost := *cost
+	beforeBreaker := *breaker
+
+	decision := SelectRankedFromCandidates([]Candidate{candidate}, Settings{
+		WeightAvailability: 1,
+		WeightLatency:      1,
+		WeightThroughput:   1,
+		WeightCost:         1,
+		MinVolume:          10,
+		TopK:               1,
+	})
+
+	require.Len(t, decision.Ranked, 1)
+	assert.Same(t, channel, decision.Ranked[0].Channel)
+	assert.Equal(t, beforeChannel, *channel)
+	assert.Equal(t, beforeMetric, *metric)
+	assert.Equal(t, beforeCost, *cost)
+	assert.Equal(t, beforeBreaker, *breaker)
+}
+
+func testCandidate(id int, availability float64, p95LatencyMs float64, tps float64, cost *CostSnapshot, breaker *BreakerSnapshot) Candidate {
+	requests := int64(100)
+	successes := int64(math.Round(availability * float64(requests)))
+	return Candidate{
+		Channel: &model.Channel{Id: id},
+		Metric: &MetricSnapshot{
+			RequestCount: requests,
+			SuccessCount: successes,
+			P95LatencyMs: p95LatencyMs,
+			TPS:          tps,
+		},
+		Cost:    cost,
+		Breaker: breaker,
+	}
+}
+
+func rankedByID(t *testing.T, decision Decision, channelID int) RankedCandidate {
+	t.Helper()
+	for _, ranked := range decision.Ranked {
+		if ranked.Channel != nil && ranked.Channel.Id == channelID {
+			return ranked
+		}
+	}
+	require.Failf(t, "ranked candidate not found", "channel_id=%d", channelID)
+	return RankedCandidate{}
+}

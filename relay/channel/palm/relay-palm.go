@@ -50,20 +50,25 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 	return &response
 }
 
-func palmStreamHandler(c *gin.Context, resp *http.Response) (*types.NewAPIError, string) {
+func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
 	responseText := ""
 	responseId := helper.GetResponseID(c)
 	createdTime := common.GetTimestamp()
 	dataChan := make(chan string)
 	stopChan := make(chan bool)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 	go func() {
 		responseBody, err := io.ReadAll(resp.Body)
 		if err != nil {
-			common.SysLog("error reading stream response: " + err.Error())
+			if !firstByteGuard.TimedOutBeforeResponse() {
+				common.SysLog("error reading stream response: " + err.Error())
+			}
 			stopChan <- true
 			return
 		}
 		service.CloseResponseBodyGracefully(resp)
+		firstByteGuard.MarkReceived()
 		var palmResponse PaLMChatResponse
 		err = json.Unmarshal(responseBody, &palmResponse)
 		if err != nil {
@@ -93,6 +98,9 @@ func palmStreamHandler(c *gin.Context, resp *http.Response) (*types.NewAPIError,
 			c.Render(-1, common.CustomEvent{Data: "data: " + data})
 			return true
 		case <-stopChan:
+			if firstByteGuard.TimedOutBeforeResponse() {
+				return false
+			}
 			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
 			return false
 		}

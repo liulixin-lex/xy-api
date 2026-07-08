@@ -194,11 +194,17 @@ func extractOpenAIImageStreamErrorMessage(data []byte) string {
 
 func OpenaiImageJSONAsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
+	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
+	defer firstByteGuard.Stop()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if firstByteGuard.TimedOutBeforeResponse() {
+			return nil, nil
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
+	firstByteGuard.MarkReceived()
 
 	var imageResp dto.ImageResponse
 	if err := common.Unmarshal(responseBody, &imageResp); err != nil {

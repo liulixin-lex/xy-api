@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -386,14 +387,43 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+
+	dialCtx := c.Request.Context()
+	firstByteTimeout := helper.FirstByteFailoverTimeout(info)
+	var cancelFirstByte context.CancelFunc
+	if firstByteTimeout > 0 {
+		dialCtx, cancelFirstByte = context.WithTimeout(dialCtx, firstByteTimeout)
+	}
+	if cancelFirstByte != nil {
+		defer cancelFirstByte()
+	}
+
+	dialer := *websocket.DefaultDialer
+	targetConn, _, err := dialer.DialContext(dialCtx, fullRequestURL, targetHeader)
 	if err != nil {
+		if firstByteTimeout > 0 && firstByteDeadlineExceeded(dialCtx, err) {
+			if info.StreamStatus == nil {
+				info.StreamStatus = common.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(common.StreamEndReasonFirstByteTimeout, err)
+		}
 		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
 	}
 	// send request body
 	//all, err := io.ReadAll(requestBody)
 	//err = service.WssString(c, targetConn, string(all))
 	return targetConn, nil
+}
+
+func firstByteDeadlineExceeded(ctx context.Context, err error) bool {
+	if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.CancelFunc, <-chan struct{}) {
@@ -486,13 +516,27 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		client = service.GetHttpClient()
 	}
 
+	firstByteTimeout := time.Duration(0)
+	if info.IsStream {
+		firstByteTimeout = helper.FirstByteFailoverTimeout(info)
+	}
+	var cancelFirstByte context.CancelFunc
+	if firstByteTimeout > 0 && req != nil {
+		reqCtx, cancel := context.WithTimeout(req.Context(), firstByteTimeout)
+		cancelFirstByte = cancel
+		req = req.WithContext(reqCtx)
+	}
+	if cancelFirstByte != nil {
+		defer cancelFirstByte()
+	}
+
 	var stopPinger context.CancelFunc
 	var pingerDone <-chan struct{}
 	if info.IsStream {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()
-		if generalSettings.PingIntervalEnabled && !info.DisablePing {
+		if generalSettings.PingIntervalEnabled && !info.DisablePing && shouldStartPreResponseStreamPing(info) {
 			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
 			stopPinger, pingerDone = startPingKeepAlive(c, pingInterval)
 			// 使用defer确保在任何情况下都能停止ping goroutine
@@ -509,6 +553,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
+		if firstByteTimeout > 0 && errors.Is(req.Context().Err(), context.DeadlineExceeded) {
+			if info.StreamStatus == nil {
+				info.StreamStatus = common.NewStreamStatus()
+			}
+			info.StreamStatus.SetEndReason(common.StreamEndReasonFirstByteTimeout, err)
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeDoRequestFailed, http.StatusGatewayTimeout, types.ErrOptionWithHideErrMsg("upstream error: first byte timeout"))
+		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
@@ -522,6 +573,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	_ = req.Body.Close()
 	_ = c.Request.Body.Close()
 	return resp, nil
+}
+
+func shouldStartPreResponseStreamPing(info *common.RelayInfo) bool {
+	if info == nil || !info.IsStream {
+		return false
+	}
+	return helper.FirstByteFailoverTimeout(info) == 0
 }
 
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {

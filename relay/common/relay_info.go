@@ -112,6 +112,7 @@ type RelayInfo struct {
 	InputAudioFormat       string
 	OutputAudioFormat      string
 	RealtimeTools          []dto.RealTimeTool
+	RealtimeReplayMessages [][]byte
 	IsFirstRequest         bool
 	AudioUsage             bool
 	ReasoningEffort        string
@@ -670,6 +671,16 @@ func (info *RelayInfo) SetFirstResponseTime() {
 
 func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
+}
+
+func (info *RelayInfo) FirstByteTimedOutBeforeResponse() bool {
+	if info == nil || info.StreamStatus == nil {
+		return false
+	}
+	if info.StreamStatus.EndReason != StreamEndReasonFirstByteTimeout {
+		return false
+	}
+	return info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 && !info.HasSendResponse()
 }
 
 type TaskRelayInfo struct {

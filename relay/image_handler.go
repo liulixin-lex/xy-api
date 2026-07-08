@@ -117,6 +117,12 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil
+	}
+	if usage == nil {
+		return types.NewOpenAIError(fmt.Errorf("empty usage from channel response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
 
 	imageN := uint(1)
 	if request.N != nil {

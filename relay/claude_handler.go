@@ -144,6 +144,12 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		if newApiErr != nil {
 			return newApiErr
 		}
+		if info.FirstByteTimedOutBeforeResponse() {
+			return nil
+		}
+		if usage == nil {
+			return types.NewOpenAIError(fmt.Errorf("empty usage from responses adapter"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		}
 
 		service.PostTextConsumeQuota(c, info, usage, nil)
 		return nil
@@ -216,6 +222,12 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil
+	}
+	if usage == nil {
+		return types.NewOpenAIError(fmt.Errorf("empty usage from channel response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 
 	service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)

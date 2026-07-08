@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -85,6 +86,10 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
+	retryAfterHeader := resp.Header.Get("Retry-After")
+	defer func() {
+		attachRetryAfterMetadata(newApiErr, retryAfterHeader, time.Now())
+	}()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -128,6 +133,46 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		newApiErr.Err = buildErrWithBody(newApiErr.Error())
 	}
 	return
+}
+
+func attachRetryAfterMetadata(newApiErr *types.NewAPIError, header string, now time.Time) {
+	if newApiErr == nil || strings.TrimSpace(header) == "" {
+		return
+	}
+	retryAfter := parseRetryAfterHeader(header, now)
+	if retryAfter <= 0 {
+		return
+	}
+	metadata := map[string]any{}
+	if len(newApiErr.Metadata) > 0 {
+		_ = common.Unmarshal(newApiErr.Metadata, &metadata)
+	}
+	metadata["retry_after_ms"] = retryAfter.Milliseconds()
+	data, err := common.Marshal(metadata)
+	if err != nil {
+		return
+	}
+	newApiErr.Metadata = data
+}
+
+func parseRetryAfterHeader(header string, now time.Time) time.Duration {
+	value := strings.TrimSpace(header)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
+		if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+			return 0
+		}
+		return time.Duration(seconds * float64(time.Second))
+	}
+	if deadline, err := http.ParseTime(value); err == nil {
+		delay := deadline.Sub(now)
+		if delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) {
