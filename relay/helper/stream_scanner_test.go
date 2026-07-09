@@ -585,7 +585,7 @@ func TestFirstByteFailoverTimeoutUsesMetricP95WithinCap(t *testing.T) {
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "vip",
-	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 40})
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 400, P95TTFTMs: 40})
 
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-test",
@@ -602,7 +602,7 @@ func TestFirstByteFailoverTimeoutUsesMetricP95WithinCap(t *testing.T) {
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "vip",
-	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 90})
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 400, P95TTFTMs: 90})
 	assert.Equal(t, 100*time.Millisecond, firstByteFailoverTimeout(info))
 }
 

@@ -319,6 +319,7 @@ func refreshRoutingHotcacheFromDB() (map[string]any, error) {
 		"costs":    0,
 		"metrics":  0,
 		"breakers": 0,
+		"health":   0,
 	}
 	setting := smart_routing_setting.GetSetting()
 	now := common.GetTimestamp()
@@ -351,6 +352,13 @@ func refreshRoutingHotcacheFromDB() (map[string]any, error) {
 	}
 	routingbreaker.HydrateDefaultSnapshots(routingBreakerModelsToSnapshots(breakerStates))
 	summary["breakers"] = len(breakerStates)
+
+	var healthStates []model.RoutingChannelHealthState
+	if err := model.DB.Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
+		return summary, err
+	}
+	routinghotcache.LoadHealthSnapshots(healthStates, now)
+	summary["health"] = len(healthStates)
 	return summary, nil
 }
 
@@ -400,8 +408,14 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 	syncedSnapshots := 0
 	syncErrors := 0
 	for _, binding := range eligibleBindings {
+		if err := ctx.Err(); err != nil {
+			return summary, err
+		}
 		snapshots, err := fetchRoutingCostSnapshots(ctx, binding)
 		if err != nil {
+			if ctx.Err() != nil {
+				return summary, ctx.Err()
+			}
 			syncErrors++
 			message := err.Error()
 			_ = model.DB.Model(&model.RoutingChannelBinding{}).
@@ -418,6 +432,9 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 				return summary, err
 			}
 			syncedSnapshots++
+		}
+		if err := ctx.Err(); err != nil {
+			return summary, err
 		}
 		routinghotcache.LoadCostSnapshots(snapshots)
 		_ = model.DB.Model(&model.RoutingChannelBinding{}).
@@ -469,6 +486,7 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 		snapshot := model.RoutingCostSnapshot{
 			ChannelID:       binding.ChannelID,
 			ModelName:       modelName,
+			QuotaType:       item.QuotaType,
 			GroupRatio:      groupRatio,
 			BaseRatio:       item.ModelRatio,
 			CompletionRatio: item.CompletionRatio,
@@ -490,6 +508,9 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 			snapshot.TiersJSON = &encoded
 			snapshot.Confidence = model.RoutingCostConfidenceUnknown
 		} else if strings.TrimSpace(item.BillingMode) == "tiered_expr" {
+			snapshot.Confidence = model.RoutingCostConfidenceUnknown
+		}
+		if item.QuotaType == 0 && snapshot.BaseRatio <= 0 {
 			snapshot.Confidence = model.RoutingCostConfidenceUnknown
 		}
 		if item.QuotaType == 1 && snapshot.ModelPrice <= 0 {
@@ -602,7 +623,7 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 		}
 		return routingPricingResponse{}, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
 	}
-	routinghotcache.ClearAuthFailure(binding.ChannelID)
+	clearRoutingAuthFailure(binding.ChannelID)
 	return payload, nil
 }
 
@@ -662,7 +683,8 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 		Balance:     balanceQuota / common.QuotaPerUnit,
 		UpdatedUnix: common.GetTimestamp(),
 	})
-	routinghotcache.ClearAuthFailure(binding.ChannelID)
+	_ = model.UpsertRoutingChannelBalance(binding.ChannelID, balanceQuota/common.QuotaPerUnit, common.GetTimestamp())
+	clearRoutingAuthFailure(binding.ChannelID)
 	return nil
 }
 
@@ -676,10 +698,21 @@ func applyRoutingAuthHeaders(request *http.Request, binding model.RoutingChannel
 }
 
 func markRoutingAuthFailure(channelID int) {
+	until := common.GetTimestamp() + 300
 	routinghotcache.SetAuthFailure(channelID, routinghotcache.HealthMarker{
 		Marked:      true,
 		UpdatedUnix: common.GetTimestamp(),
 	})
+	if err := model.UpsertRoutingChannelAuthFailure(channelID, true, "authfail", until); err != nil {
+		common.SysError(fmt.Sprintf("persist routing auth failure failed: channel_id=%d err=%v", channelID, err))
+	}
+}
+
+func clearRoutingAuthFailure(channelID int) {
+	routinghotcache.ClearAuthFailure(channelID)
+	if err := model.ClearRoutingChannelAuthFailure(channelID, common.GetTimestamp()); err != nil {
+		common.SysError(fmt.Sprintf("clear routing auth failure failed: channel_id=%d err=%v", channelID, err))
+	}
 }
 
 func routingCleanUpstreamErrorMessage(message string) string {
@@ -747,8 +780,10 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 		State:               string(snapshot.State),
 		Reason:              snapshot.Reason,
 		ConsecutiveFailures: int64(snapshot.ConsecutiveFailures),
+		Consecutive5xx:      int64(snapshot.Consecutive5xx),
 		EjectionCount:       int64(snapshot.EjectionCount),
-		HalfOpenInflight:    int64(snapshot.HalfOpenInflight),
+		WindowRequests:      int64(snapshot.WindowRequests),
+		WindowFailures:      int64(snapshot.WindowFailures),
 	}
 	if !snapshot.UpdatedAt.IsZero() {
 		state.UpdatedTime = snapshot.UpdatedAt.Unix()
@@ -780,11 +815,11 @@ func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routi
 			State:               routingbreaker.State(state.State),
 			Reason:              state.Reason,
 			ConsecutiveFailures: int(state.ConsecutiveFailures),
-			Consecutive5xx:      int(state.ConsecutiveFailures),
+			Consecutive5xx:      int(state.Consecutive5xx),
 			EjectionCount:       int(state.EjectionCount),
-			HalfOpenInflight:    int(state.HalfOpenInflight),
-			WindowRequests:      int(state.ConsecutiveFailures),
-			WindowFailures:      int(state.ConsecutiveFailures),
+			HalfOpenInflight:    0,
+			WindowRequests:      int(state.WindowRequests),
+			WindowFailures:      int(state.WindowFailures),
 		}
 		if state.OpenedAt > 0 {
 			snapshot.OpenedAt = time.Unix(state.OpenedAt, 0)

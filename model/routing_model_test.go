@@ -111,6 +111,7 @@ var routingMigrationModels = []interface{}{
 	&RoutingCostSnapshot{},
 	&RoutingChannelMetric{},
 	&RoutingBreakerState{},
+	&RoutingChannelHealthState{},
 	&RoutingAgentRecommendation{},
 }
 
@@ -144,6 +145,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.NoError(t, UpsertRoutingCostSnapshot(&RoutingCostSnapshot{
 		ChannelID:       1,
 		ModelName:       "gpt-test",
+		QuotaType:       0,
 		GroupRatio:      1,
 		BaseRatio:       2,
 		CompletionRatio: 3,
@@ -159,6 +161,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.NoError(t, UpsertRoutingCostSnapshot(&RoutingCostSnapshot{
 		ChannelID:       1,
 		ModelName:       "gpt-test",
+		QuotaType:       0,
 		GroupRatio:      10,
 		BaseRatio:       20,
 		CompletionRatio: 30,
@@ -242,10 +245,13 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		State:               RoutingBreakerStateOpen,
 		Reason:              "5xx",
 		ConsecutiveFailures: 3,
+		Consecutive5xx:      3,
 		EjectionCount:       1,
 		OpenedAt:            100,
 		CooldownUntil:       500,
 		HalfOpenInflight:    2,
+		WindowRequests:      50,
+		WindowFailures:      25,
 		UpdatedTime:         1000,
 	}))
 	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
@@ -256,11 +262,31 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		State:               RoutingBreakerStateHealthy,
 		Reason:              "recovered",
 		ConsecutiveFailures: 0,
+		Consecutive5xx:      0,
 		EjectionCount:       2,
 		OpenedAt:            0,
 		CooldownUntil:       0,
 		HalfOpenInflight:    0,
+		WindowRequests:      51,
+		WindowFailures:      2,
 		UpdatedTime:         2000,
+	}))
+	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
+		ChannelID:           1,
+		APIKeyIndex:         2,
+		ModelName:           "gpt-test",
+		Group:               "default",
+		State:               RoutingBreakerStateOpen,
+		Reason:              "stale",
+		ConsecutiveFailures: 9,
+		Consecutive5xx:      9,
+		EjectionCount:       9,
+		OpenedAt:            1500,
+		CooldownUntil:       2500,
+		HalfOpenInflight:    3,
+		WindowRequests:      99,
+		WindowFailures:      99,
+		UpdatedTime:         1500,
 	}))
 
 	var breakerCount int64
@@ -274,11 +300,31 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, RoutingBreakerStateHealthy, savedBreaker.State)
 	assert.Equal(t, "recovered", savedBreaker.Reason)
 	assert.Equal(t, int64(0), savedBreaker.ConsecutiveFailures)
+	assert.Equal(t, int64(0), savedBreaker.Consecutive5xx)
 	assert.Equal(t, int64(2), savedBreaker.EjectionCount)
 	assert.Equal(t, int64(0), savedBreaker.OpenedAt)
 	assert.Equal(t, int64(0), savedBreaker.CooldownUntil)
 	assert.Equal(t, int64(0), savedBreaker.HalfOpenInflight)
+	assert.Equal(t, int64(51), savedBreaker.WindowRequests)
+	assert.Equal(t, int64(2), savedBreaker.WindowFailures)
 	assert.Equal(t, int64(2000), savedBreaker.UpdatedTime)
+
+	require.NoError(t, UpsertRoutingChannelAuthFailure(1, true, "unauthorized", 3000))
+	require.NoError(t, UpsertRoutingChannelBalance(1, 0.75, 3100))
+	var health RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", 1).First(&health).Error)
+	assert.True(t, health.AuthFailure)
+	assert.Equal(t, "unauthorized", health.AuthFailureReason)
+	assert.Equal(t, int64(3000), health.AuthFailureUntil)
+	assert.True(t, health.BalanceKnown)
+	assert.Equal(t, 0.75, health.Balance)
+	assert.Equal(t, int64(3100), health.BalanceUpdatedTime)
+
+	require.NoError(t, ClearRoutingChannelAuthFailure(1, 3200))
+	require.NoError(t, DB.Where("channel_id = ?", 1).First(&health).Error)
+	assert.False(t, health.AuthFailure)
+	assert.True(t, health.BalanceKnown)
+	assert.Equal(t, 0.75, health.Balance)
 }
 
 func openRoutingSQLiteTestDB(t *testing.T) *gorm.DB {

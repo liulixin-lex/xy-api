@@ -51,6 +51,7 @@ func TestMain(m *testing.M) {
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},
 		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
 	); err != nil {
@@ -78,6 +79,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM routing_cost_snapshots")
 		model.DB.Exec("DELETE FROM routing_channel_metrics")
 		model.DB.Exec("DELETE FROM routing_breaker_states")
+		model.DB.Exec("DELETE FROM routing_channel_health_states")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
 	})

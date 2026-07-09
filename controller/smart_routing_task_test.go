@@ -59,7 +59,7 @@ func TestRoutingAgentHandlerRequiresAgentEnabled(t *testing.T) {
 
 func TestRunRoutingCostSyncTaskFetchesNewAPIPricingSnapshots(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -139,7 +139,7 @@ func TestRunRoutingCostSyncTaskFetchesNewAPIPricingSnapshots(t *testing.T) {
 
 func TestRunRoutingCostSyncTaskMarksAuthFailureOnUnauthorizedUpstream(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -183,7 +183,7 @@ func TestRunRoutingCostSyncTaskMarksAuthFailureOnUnauthorizedUpstream(t *testing
 
 func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +213,7 @@ func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
 
 func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -240,7 +240,7 @@ func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testin
 
 func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 	now := common.GetTimestamp()
@@ -271,6 +271,16 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 		State:       model.RoutingBreakerStateDegraded,
 		UpdatedTime: now,
 	}).Error)
+	require.NoError(t, db.Create(&model.RoutingChannelHealthState{
+		ChannelID:          782,
+		AuthFailure:        true,
+		AuthFailureReason:  "unauthorized",
+		AuthFailureUntil:   now + 300,
+		BalanceKnown:       true,
+		Balance:            0.5,
+		BalanceUpdatedTime: now,
+		UpdatedTime:        now,
+	}).Error)
 
 	summary, err := refreshRoutingHotcacheFromDB()
 
@@ -278,6 +288,7 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 	assert.EqualValues(t, 1, summary["costs"])
 	assert.EqualValues(t, 1, summary["metrics"])
 	assert.EqualValues(t, 1, summary["breakers"])
+	assert.EqualValues(t, 1, summary["health"])
 	metric, ok := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 782, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	require.True(t, ok)
 	assert.Equal(t, 250.0, metric.P95LatencyMs)
@@ -287,11 +298,19 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 	breaker, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 782, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	require.True(t, ok)
 	assert.Equal(t, model.RoutingBreakerStateDegraded, breaker.State)
+	authFailure, ok := routinghotcache.GetAuthFailure(782)
+	require.True(t, ok)
+	assert.True(t, authFailure.Marked)
+	assert.Equal(t, now, authFailure.UpdatedUnix)
+	balance, ok := routinghotcache.GetBalance(782)
+	require.True(t, ok)
+	assert.True(t, balance.Known)
+	assert.Equal(t, 0.5, balance.Balance)
 }
 
 func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 	now := common.GetTimestamp()
@@ -355,7 +374,7 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 
 func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -394,7 +413,7 @@ func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 
 func TestFetchRoutingCostSnapshotsMapsUpstreamModelNameToLocalName(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -442,7 +461,7 @@ func TestFetchRoutingCostSnapshotsMapsUpstreamModelNameToLocalName(t *testing.T)
 
 func TestFetchRoutingCostSnapshotsPreservesTieredExprAsUnknownCost(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -500,7 +519,7 @@ func TestFetchRoutingCostSnapshotsPreservesTieredExprAsUnknownCost(t *testing.T)
 
 func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJWT(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 	resetRoutingSub2APITestState()
@@ -558,6 +577,7 @@ func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJ
 		GatewayAPIKey:   "sk-gateway",
 	}))
 	require.NoError(t, db.Create(&binding).Error)
+	require.NoError(t, model.UpsertRoutingChannelAuthFailure(880, true, "authfail", common.GetTimestamp()+300))
 
 	for range 2 {
 		summary, err := runRoutingCostSyncTask(context.Background())
@@ -596,11 +616,20 @@ func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJ
 	require.True(t, ok)
 	assert.True(t, balance.Known)
 	assert.Equal(t, 9.25, balance.Balance)
+
+	var health model.RoutingChannelHealthState
+	require.NoError(t, db.Where("channel_id = ?", 880).First(&health).Error)
+	assert.False(t, health.AuthFailure)
+	assert.Empty(t, health.AuthFailureReason)
+	assert.Zero(t, health.AuthFailureUntil)
+	assert.True(t, health.BalanceKnown)
+	assert.Equal(t, 9.25, health.Balance)
+	assert.NotZero(t, health.BalanceUpdatedTime)
 }
 
 func TestFetchRoutingCostSnapshotsSub2APILoginFailureMarksAuthAndMasksSecrets(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 	resetRoutingSub2APITestState()
@@ -642,4 +671,171 @@ func TestFetchRoutingCostSnapshotsSub2APILoginFailureMarksAuthAndMasksSecrets(t 
 	require.NoError(t, db.Where("channel_id = ?", 881).First(&updated).Error)
 	require.NotNil(t, updated.LastSyncError)
 	assert.NotContains(t, *updated.LastSyncError, "pw-secret")
+}
+
+func TestFetchRoutingCostSnapshotsSub2APISuccessClearsPersistedAuthFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/usage":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"balance":3.5}}`)
+		case "/api/v1/groups/available":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":[{"id":"vip","rate_multiplier":1}]}`)
+		case "/api/v1/groups/rates":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"vip":1}}`)
+		case "/api/v1/channels/available":
+			_, _ = fmt.Fprint(w, `{"code":0,"data":[{"models":["claude-3"],"input_price":2,"output_price":4}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	require.NoError(t, model.UpsertRoutingChannelAuthFailure(882, true, "authfail", common.GetTimestamp()+300))
+	routinghotcache.SetAuthFailure(882, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: common.GetTimestamp()})
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     882,
+		UpstreamType:  model.RoutingUpstreamTypeSub2API,
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{Sub2APIToken: "jwt-secret"}))
+
+	snapshots, err := fetchRoutingCostSnapshots(context.Background(), binding)
+
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	_, cached := routinghotcache.GetAuthFailure(882)
+	assert.False(t, cached)
+
+	var health model.RoutingChannelHealthState
+	require.NoError(t, db.Where("channel_id = ?", 882).First(&health).Error)
+	assert.False(t, health.AuthFailure)
+	assert.Empty(t, health.AuthFailureReason)
+	assert.Zero(t, health.AuthFailureUntil)
+}
+
+func TestRoutingSub2APIRequestDoesNotMarkAuthFailureForNonAuthErrors(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{
+			name:       "http 500",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"code":500,"message":"database is unavailable"}`,
+		},
+		{
+			name:       "envelope code non auth",
+			statusCode: http.StatusOK,
+			body:       `{"code":5001,"message":"provider capacity exhausted for sk-secret"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.statusCode)
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			t.Cleanup(server.Close)
+
+			binding := model.RoutingChannelBinding{ChannelID: 883, BaseURL: server.URL}
+			credentials := model.RoutingCredentials{Sub2APIToken: "sk-secret"}
+
+			_, err := routingSub2APIRequest(context.Background(), binding, credentials, http.MethodGet, "/api/test", "sk-secret", nil)
+
+			require.Error(t, err)
+			assert.False(t, routingUpstreamAuthError(err))
+			assert.NotContains(t, err.Error(), "sk-secret")
+			_, cached := routinghotcache.GetAuthFailure(883)
+			assert.False(t, cached)
+
+			var count int64
+			require.NoError(t, db.Model(&model.RoutingChannelHealthState{}).Where("channel_id = ? AND auth_failure = ?", 883, true).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
+func TestRoutingSub2APIRequestMarksAuthFailureForAuthErrors(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	tests := []struct {
+		name       string
+		channelID  int
+		statusCode int
+		body       string
+	}{
+		{
+			name:       "http 401",
+			channelID:  884,
+			statusCode: http.StatusUnauthorized,
+			body:       `{"code":401,"message":"expired token sk-secret"}`,
+		},
+		{
+			name:       "http 403",
+			channelID:  885,
+			statusCode: http.StatusForbidden,
+			body:       `{"code":403,"message":"forbidden"}`,
+		},
+		{
+			name:       "auth message",
+			channelID:  886,
+			statusCode: http.StatusOK,
+			body:       `{"code":1001,"message":"invalid token sk-secret"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.statusCode)
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			t.Cleanup(server.Close)
+
+			binding := model.RoutingChannelBinding{ChannelID: tt.channelID, BaseURL: server.URL}
+			credentials := model.RoutingCredentials{Sub2APIToken: "sk-secret"}
+
+			_, err := routingSub2APIRequest(context.Background(), binding, credentials, http.MethodGet, "/api/test", "sk-secret", nil)
+
+			require.Error(t, err)
+			assert.True(t, routingUpstreamAuthError(err))
+			authFailure, ok := routinghotcache.GetAuthFailure(tt.channelID)
+			require.True(t, ok)
+			assert.True(t, authFailure.Marked)
+
+			var health model.RoutingChannelHealthState
+			require.NoError(t, db.Where("channel_id = ?", tt.channelID).First(&health).Error)
+			assert.True(t, health.AuthFailure)
+			assert.Equal(t, "authfail", health.AuthFailureReason)
+			assert.NotZero(t, health.AuthFailureUntil)
+		})
+	}
 }

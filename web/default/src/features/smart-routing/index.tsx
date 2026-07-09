@@ -133,7 +133,9 @@ import type {
 } from './types'
 
 const QUERY_STALE_MS = 30 * 1000
-const TABLE_LIMIT = 100
+const TABLE_INITIAL_LIMIT = 50
+const TABLE_LIMIT_STEP = 50
+const TABLE_MAX_LIMIT = 500
 
 const EMPTY_BINDING_REQUEST: RoutingBindingRequest = {
   channel_id: 0,
@@ -372,6 +374,41 @@ function LoadingRows() {
   )
 }
 
+function LoadMoreFooter(props: {
+  loadedCount: number
+  limit: number
+  isFetching: boolean
+  onLoadMore: () => void
+}) {
+  const { t } = useTranslation()
+  const canLoadMore =
+    props.loadedCount >= props.limit && props.limit < TABLE_MAX_LIMIT
+
+  if (props.loadedCount === 0 || !canLoadMore) return null
+
+  return (
+    <div className='flex flex-col gap-2 border-t px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between sm:px-5'>
+      <div className='text-muted-foreground'>
+        <span>{t('Loaded {{count}} rows', { count: props.loadedCount })}</span>
+        <span className='hidden sm:inline'> · </span>
+        <span className='block sm:inline'>
+          {t('Increase the limit to inspect older rows.')}
+        </span>
+      </div>
+      <Button
+        type='button'
+        variant='outline'
+        size='sm'
+        onClick={props.onLoadMore}
+        disabled={props.isFetching}
+        aria-label={t('Load more')}
+      >
+        {props.isFetching ? t('Loading') : t('Load more')}
+      </Button>
+    </div>
+  )
+}
+
 function NumericInput(props: {
   id: string
   value: number
@@ -599,9 +636,16 @@ function SettingsPanel(props: {
       <FieldSet disabled={formDisabled}>
         <FieldLegend>{t('Scoring')}</FieldLegend>
         {enterpriseWeightsLocked && (
-          <FieldDescription>
-            {t('Enterprise SLO uses fixed scoring weights.')}
-          </FieldDescription>
+          <div className='text-muted-foreground flex flex-col gap-1 text-sm'>
+            <FieldDescription>
+              {t('Enterprise SLO uses fixed scoring weights.')}
+            </FieldDescription>
+            <FieldDescription>
+              {t(
+                'Enterprise SLO mode is enforced by the backend; scoring weights are fixed at 55% availability, 30% latency, 10% throughput, and 5% cost.'
+              )}
+            </FieldDescription>
+          </div>
         )}
         <FieldGroup className='grid gap-4 lg:grid-cols-4'>
           <Field>
@@ -790,6 +834,30 @@ function SettingsPanel(props: {
             />
           </Field>
           <Field>
+            <FieldLabel htmlFor='backoff-base-5xx'>
+              {t('5xx Backoff Base Milliseconds')}
+            </FieldLabel>
+            <NumericInput
+              id='backoff-base-5xx'
+              value={draft.backoff_base_ms_5xx}
+              min={1}
+              step={100}
+              onChange={(value) => setField('backoff_base_ms_5xx', value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor='backoff-base-429'>
+              {t('429 Backoff Base Milliseconds')}
+            </FieldLabel>
+            <NumericInput
+              id='backoff-base-429'
+              value={draft.backoff_base_ms_429}
+              min={1}
+              step={100}
+              onChange={(value) => setField('backoff_base_ms_429', value)}
+            />
+          </Field>
+          <Field>
             <FieldLabel htmlFor='backoff-cap'>
               {t('Backoff Cap Milliseconds')}
             </FieldLabel>
@@ -844,6 +912,42 @@ function SettingsPanel(props: {
             />
           </Field>
           <Field>
+            <FieldLabel htmlFor='snapshot-live'>
+              {t('Snapshot Live Seconds')}
+            </FieldLabel>
+            <NumericInput
+              id='snapshot-live'
+              value={draft.snapshot_live_sec}
+              min={1}
+              step={1}
+              onChange={(value) => setField('snapshot_live_sec', value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor='snapshot-stale'>
+              {t('Snapshot Stale Seconds')}
+            </FieldLabel>
+            <NumericInput
+              id='snapshot-stale'
+              value={draft.snapshot_stale_sec}
+              min={1}
+              step={1}
+              onChange={(value) => setField('snapshot_stale_sec', value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor='flush-interval'>
+              {t('Flush Interval Minutes')}
+            </FieldLabel>
+            <NumericInput
+              id='flush-interval'
+              value={draft.flush_interval_min}
+              min={1}
+              step={1}
+              onChange={(value) => setField('flush_interval_min', value)}
+            />
+          </Field>
+          <Field>
             <FieldLabel htmlFor='retention-days'>
               {t('Retention Days')}
             </FieldLabel>
@@ -883,6 +987,20 @@ function SettingsPanel(props: {
               min={1}
               step={100}
               onChange={(value) => setField('first_byte_min_ms', value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor='first-byte-p95-multiplier'>
+              {t('First-byte P95 Multiplier')}
+            </FieldLabel>
+            <NumericInput
+              id='first-byte-p95-multiplier'
+              value={draft.first_byte_p95_multiplier}
+              min={1}
+              step={0.1}
+              onChange={(value) =>
+                setField('first_byte_p95_multiplier', value)
+              }
             />
           </Field>
           <Field>
@@ -983,7 +1101,7 @@ function BindingDialog(props: {
 
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className='max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl'>
+      <DialogContent className='max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] overflow-y-auto sm:max-h-[calc(100dvh-2rem)] sm:max-w-2xl'>
         <DialogHeader>
           <DialogTitle>
             {props.binding
@@ -1861,10 +1979,16 @@ function BindingsPanel(props: {
 function MetricsPanel(props: {
   metrics?: RoutingMetric[]
   snapshots?: RoutingCostSnapshot[]
+  metricsLimit: number
+  snapshotsLimit: number
   isLoading: boolean
+  isFetchingMetrics: boolean
+  isFetchingSnapshots: boolean
   isError: boolean
   error: unknown
   onRetry: () => void
+  onLoadMoreMetrics: () => void
+  onLoadMoreSnapshots: () => void
 }) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.language)
@@ -1899,76 +2023,84 @@ function MetricsPanel(props: {
             description={t('Metrics appear after routed requests are flushed.')}
           />
         ) : (
-          <div className='overflow-x-auto'>
-            <Table className='min-w-[980px]'>
-              <TableHeader>
-                <TableRow className='bg-muted/40 hover:bg-muted/40'>
-                  <TableHead className='h-9 px-4 text-xs'>
-                    {t('Channel')}
-                  </TableHead>
-                  <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
-                  <TableHead className='h-9 text-xs'>{t('Group')}</TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Requests')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Success Rate')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Avg Latency')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Errors')}
-                  </TableHead>
-                  <TableHead className='h-9 pr-4 text-xs'>
-                    {t('Bucket')}
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {metrics.map((metric) => (
-                  <TableRow key={metric.id}>
-                    <TableCell className='px-4 py-3'>
-                      #{metric.channel_id}
-                    </TableCell>
-                    <TableCell className='py-3 font-mono text-xs'>
-                      {metric.model_name}
-                    </TableCell>
-                    <TableCell className='py-3'>{metric.group}</TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(metric.request_count, locale)}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {successRate(metric) == null
-                        ? '-'
-                        : `${formatNumber(successRate(metric), locale)}%`}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {averageLatency(metric) == null
-                        ? '-'
-                        : `${formatNumber(averageLatency(metric), locale)}ms`}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(
-                        metric.err_4xx + metric.err_5xx + metric.err_429,
-                        locale
-                      )}
-                    </TableCell>
-                    <TableCell
-                      className='text-muted-foreground py-3 pr-4 text-xs'
-                      title={formatTimestampToDate(metric.bucket_ts)}
-                    >
-                      {formatTimestampRelative(
-                        metric.bucket_ts,
-                        'seconds',
-                        locale
-                      )}
-                    </TableCell>
+          <>
+            <div className='overflow-x-auto'>
+              <Table className='min-w-[980px]'>
+                <TableHeader>
+                  <TableRow className='bg-muted/40 hover:bg-muted/40'>
+                    <TableHead className='h-9 px-4 text-xs'>
+                      {t('Channel')}
+                    </TableHead>
+                    <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
+                    <TableHead className='h-9 text-xs'>{t('Group')}</TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Requests')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Success Rate')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Avg Latency')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Errors')}
+                    </TableHead>
+                    <TableHead className='h-9 pr-4 text-xs'>
+                      {t('Bucket')}
+                    </TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {metrics.map((metric) => (
+                    <TableRow key={metric.id}>
+                      <TableCell className='px-4 py-3'>
+                        #{metric.channel_id}
+                      </TableCell>
+                      <TableCell className='py-3 font-mono text-xs'>
+                        {metric.model_name}
+                      </TableCell>
+                      <TableCell className='py-3'>{metric.group}</TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(metric.request_count, locale)}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {successRate(metric) == null
+                          ? '-'
+                          : `${formatNumber(successRate(metric), locale)}%`}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {averageLatency(metric) == null
+                          ? '-'
+                          : `${formatNumber(averageLatency(metric), locale)}ms`}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(
+                          metric.err_4xx + metric.err_5xx + metric.err_429,
+                          locale
+                        )}
+                      </TableCell>
+                      <TableCell
+                        className='text-muted-foreground py-3 pr-4 text-xs'
+                        title={formatTimestampToDate(metric.bucket_ts)}
+                      >
+                        {formatTimestampRelative(
+                          metric.bucket_ts,
+                          'seconds',
+                          locale
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <LoadMoreFooter
+              loadedCount={metrics.length}
+              limit={props.metricsLimit}
+              isFetching={props.isFetchingMetrics}
+              onLoadMore={props.onLoadMoreMetrics}
+            />
+          </>
         )}
       </Panel>
 
@@ -1985,77 +2117,85 @@ function MetricsPanel(props: {
             description={t('Run sync after creating upstream bindings.')}
           />
         ) : (
-          <div className='overflow-x-auto'>
-            <Table className='min-w-[980px]'>
-              <TableHeader>
-                <TableRow className='bg-muted/40 hover:bg-muted/40'>
-                  <TableHead className='h-9 px-4 text-xs'>
-                    {t('Channel')}
-                  </TableHead>
-                  <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Group Ratio')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Base Ratio')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Completion Ratio')}
-                  </TableHead>
-                  <TableHead className='h-9 text-right text-xs'>
-                    {t('Cost')}
-                  </TableHead>
-                  <TableHead className='h-9 text-xs'>
-                    {t('Confidence')}
-                  </TableHead>
-                  <TableHead className='h-9 pr-4 text-xs'>
-                    {t('Updated')}
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {snapshots.map((snapshot) => (
-                  <TableRow
-                    key={`${snapshot.channel_id}-${snapshot.model_name}`}
-                  >
-                    <TableCell className='px-4 py-3'>
-                      #{snapshot.channel_id}
-                    </TableCell>
-                    <TableCell className='py-3 font-mono text-xs'>
-                      {snapshot.model_name}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(snapshot.group_ratio, locale)}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(snapshot.base_ratio, locale)}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(snapshot.completion_ratio, locale)}
-                    </TableCell>
-                    <TableCell className='py-3 text-right'>
-                      {formatNumber(costValue(snapshot), locale)}
-                    </TableCell>
-                    <TableCell className='py-3'>
-                      <Badge variant='outline'>
-                        {t(confidenceLabel(snapshot.confidence))}
-                      </Badge>
-                    </TableCell>
-                    <TableCell
-                      className='text-muted-foreground py-3 pr-4 text-xs'
-                      title={formatTimestampToDate(snapshot.snapshot_ts)}
-                    >
-                      {formatTimestampRelative(
-                        snapshot.snapshot_ts,
-                        'seconds',
-                        locale
-                      )}
-                    </TableCell>
+          <>
+            <div className='overflow-x-auto'>
+              <Table className='min-w-[980px]'>
+                <TableHeader>
+                  <TableRow className='bg-muted/40 hover:bg-muted/40'>
+                    <TableHead className='h-9 px-4 text-xs'>
+                      {t('Channel')}
+                    </TableHead>
+                    <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Group Ratio')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Base Ratio')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Completion Ratio')}
+                    </TableHead>
+                    <TableHead className='h-9 text-right text-xs'>
+                      {t('Cost')}
+                    </TableHead>
+                    <TableHead className='h-9 text-xs'>
+                      {t('Confidence')}
+                    </TableHead>
+                    <TableHead className='h-9 pr-4 text-xs'>
+                      {t('Updated')}
+                    </TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+                </TableHeader>
+                <TableBody>
+                  {snapshots.map((snapshot) => (
+                    <TableRow
+                      key={`${snapshot.channel_id}-${snapshot.model_name}`}
+                    >
+                      <TableCell className='px-4 py-3'>
+                        #{snapshot.channel_id}
+                      </TableCell>
+                      <TableCell className='py-3 font-mono text-xs'>
+                        {snapshot.model_name}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(snapshot.group_ratio, locale)}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(snapshot.base_ratio, locale)}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(snapshot.completion_ratio, locale)}
+                      </TableCell>
+                      <TableCell className='py-3 text-right'>
+                        {formatNumber(costValue(snapshot), locale)}
+                      </TableCell>
+                      <TableCell className='py-3'>
+                        <Badge variant='outline'>
+                          {t(confidenceLabel(snapshot.confidence))}
+                        </Badge>
+                      </TableCell>
+                      <TableCell
+                        className='text-muted-foreground py-3 pr-4 text-xs'
+                        title={formatTimestampToDate(snapshot.snapshot_ts)}
+                      >
+                        {formatTimestampRelative(
+                          snapshot.snapshot_ts,
+                          'seconds',
+                          locale
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <LoadMoreFooter
+              loadedCount={snapshots.length}
+              limit={props.snapshotsLimit}
+              isFetching={props.isFetchingSnapshots}
+              onLoadMore={props.onLoadMoreSnapshots}
+            />
+          </>
         )}
       </Panel>
     </div>
@@ -2064,10 +2204,13 @@ function MetricsPanel(props: {
 
 function BreakersPanel(props: {
   breakers?: RoutingBreaker[]
+  limit: number
   isLoading: boolean
+  isFetching: boolean
   isError: boolean
   error: unknown
   onRetry: () => void
+  onLoadMore: () => void
   canOperate: boolean
 }) {
   const { t, i18n } = useTranslation()
@@ -2120,88 +2263,96 @@ function BreakersPanel(props: {
           )}
         />
       ) : (
-        <div className='overflow-x-auto'>
-          <Table className='min-w-[1000px]'>
-            <TableHeader>
-              <TableRow className='bg-muted/40 hover:bg-muted/40'>
-                <TableHead className='h-9 px-4 text-xs'>
-                  {t('Channel')}
-                </TableHead>
-                <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
-                <TableHead className='h-9 text-xs'>{t('Group')}</TableHead>
-                <TableHead className='h-9 text-xs'>{t('State')}</TableHead>
-                <TableHead className='h-9 text-right text-xs'>
-                  {t('Failures')}
-                </TableHead>
-                <TableHead className='h-9 text-right text-xs'>
-                  {t('Ejections')}
-                </TableHead>
-                <TableHead className='h-9 text-xs'>{t('Cooldown')}</TableHead>
-                <TableHead className='h-9 pr-4 text-right text-xs'>
-                  {t('Actions')}
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {breakers.map((breaker) => (
-                <TableRow key={breaker.id}>
-                  <TableCell className='px-4 py-3'>
-                    <div className='flex flex-col gap-1'>
-                      <span>#{breaker.channel_id}</span>
-                      <span className='text-muted-foreground text-xs'>
-                        {t('Key')} {breaker.api_key_index}
-                      </span>
-                    </div>
-                  </TableCell>
-                  <TableCell className='py-3 font-mono text-xs'>
-                    {breaker.model_name}
-                  </TableCell>
-                  <TableCell className='py-3'>{breaker.group}</TableCell>
-                  <TableCell className='py-3'>
-                    <div className='flex flex-col gap-1'>
-                      <Badge variant={statusBadgeVariant(breaker.state)}>
-                        {t(breaker.state)}
-                      </Badge>
-                      {breaker.reason && (
-                        <span className='text-muted-foreground text-xs'>
-                          {breaker.reason}
-                        </span>
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell className='py-3 text-right'>
-                    {formatNumber(breaker.consecutive_failures, locale)}
-                  </TableCell>
-                  <TableCell className='py-3 text-right'>
-                    {formatNumber(breaker.ejection_count, locale)}
-                  </TableCell>
-                  <TableCell
-                    className='text-muted-foreground py-3 text-xs'
-                    title={formatTimestampToDate(breaker.cooldown_until)}
-                  >
-                    {formatTimestampRelative(
-                      breaker.cooldown_until,
-                      'seconds',
-                      locale
-                    )}
-                  </TableCell>
-                  <TableCell className='py-3 pr-4 text-right'>
-                    <Button
-                      type='button'
-                      variant='outline'
-                      size='sm'
-                      disabled={resetMutation.isPending || !props.canOperate}
-                      onClick={() => resetMutation.mutate(breaker.id)}
-                    >
-                      <RotateCcw data-icon='inline-start' />
-                      {t('Reset')}
-                    </Button>
-                  </TableCell>
+        <>
+          <div className='overflow-x-auto'>
+            <Table className='min-w-[1000px]'>
+              <TableHeader>
+                <TableRow className='bg-muted/40 hover:bg-muted/40'>
+                  <TableHead className='h-9 px-4 text-xs'>
+                    {t('Channel')}
+                  </TableHead>
+                  <TableHead className='h-9 text-xs'>{t('Model')}</TableHead>
+                  <TableHead className='h-9 text-xs'>{t('Group')}</TableHead>
+                  <TableHead className='h-9 text-xs'>{t('State')}</TableHead>
+                  <TableHead className='h-9 text-right text-xs'>
+                    {t('Failures')}
+                  </TableHead>
+                  <TableHead className='h-9 text-right text-xs'>
+                    {t('Ejections')}
+                  </TableHead>
+                  <TableHead className='h-9 text-xs'>{t('Cooldown')}</TableHead>
+                  <TableHead className='h-9 pr-4 text-right text-xs'>
+                    {t('Actions')}
+                  </TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+              </TableHeader>
+              <TableBody>
+                {breakers.map((breaker) => (
+                  <TableRow key={breaker.id}>
+                    <TableCell className='px-4 py-3'>
+                      <div className='flex flex-col gap-1'>
+                        <span>#{breaker.channel_id}</span>
+                        <span className='text-muted-foreground text-xs'>
+                          {t('Key')} {breaker.api_key_index}
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className='py-3 font-mono text-xs'>
+                      {breaker.model_name}
+                    </TableCell>
+                    <TableCell className='py-3'>{breaker.group}</TableCell>
+                    <TableCell className='py-3'>
+                      <div className='flex flex-col gap-1'>
+                        <Badge variant={statusBadgeVariant(breaker.state)}>
+                          {t(breaker.state)}
+                        </Badge>
+                        {breaker.reason && (
+                          <span className='text-muted-foreground text-xs'>
+                            {breaker.reason}
+                          </span>
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className='py-3 text-right'>
+                      {formatNumber(breaker.consecutive_failures, locale)}
+                    </TableCell>
+                    <TableCell className='py-3 text-right'>
+                      {formatNumber(breaker.ejection_count, locale)}
+                    </TableCell>
+                    <TableCell
+                      className='text-muted-foreground py-3 text-xs'
+                      title={formatTimestampToDate(breaker.cooldown_until)}
+                    >
+                      {formatTimestampRelative(
+                        breaker.cooldown_until,
+                        'seconds',
+                        locale
+                      )}
+                    </TableCell>
+                    <TableCell className='py-3 pr-4 text-right'>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        size='sm'
+                        disabled={resetMutation.isPending || !props.canOperate}
+                        onClick={() => resetMutation.mutate(breaker.id)}
+                      >
+                        <RotateCcw data-icon='inline-start' />
+                        {t('Reset')}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <LoadMoreFooter
+            loadedCount={breakers.length}
+            limit={props.limit}
+            isFetching={props.isFetching}
+            onLoadMore={props.onLoadMore}
+          />
+        </>
       )}
     </Panel>
   )
@@ -2403,6 +2554,9 @@ export function SmartRouting() {
   const [activeTab, setActiveTab] = useState<
     'settings' | 'bindings' | 'metrics' | 'breakers' | 'agent'
   >('settings')
+  const [metricsLimit, setMetricsLimit] = useState(TABLE_INITIAL_LIMIT)
+  const [snapshotsLimit, setSnapshotsLimit] = useState(TABLE_INITIAL_LIMIT)
+  const [breakersLimit, setBreakersLimit] = useState(TABLE_INITIAL_LIMIT)
 
   const settingsQuery = useQuery({
     queryKey: ['smart-routing', 'settings'],
@@ -2417,30 +2571,33 @@ export function SmartRouting() {
     enabled: canRead && activeTab === 'bindings',
   })
   const metricsQuery = useQuery({
-    queryKey: ['smart-routing', 'metrics'],
+    queryKey: ['smart-routing', 'metrics', metricsLimit],
     queryFn: async () =>
-      requireData(await listSmartRoutingMetrics(TABLE_LIMIT)),
+      requireData(await listSmartRoutingMetrics(metricsLimit)),
+    placeholderData: (previousData) => previousData,
     staleTime: QUERY_STALE_MS,
     enabled: canRead && activeTab === 'metrics',
   })
   const snapshotsQuery = useQuery({
-    queryKey: ['smart-routing', 'snapshots'],
+    queryKey: ['smart-routing', 'snapshots', snapshotsLimit],
     queryFn: async () =>
-      requireData(await listSmartRoutingSnapshots(TABLE_LIMIT)),
+      requireData(await listSmartRoutingSnapshots(snapshotsLimit)),
+    placeholderData: (previousData) => previousData,
     staleTime: QUERY_STALE_MS,
     enabled: canRead && (activeTab === 'bindings' || activeTab === 'metrics'),
   })
   const breakersQuery = useQuery({
-    queryKey: ['smart-routing', 'breakers'],
+    queryKey: ['smart-routing', 'breakers', breakersLimit],
     queryFn: async () =>
-      requireData(await listSmartRoutingBreakers(TABLE_LIMIT)),
+      requireData(await listSmartRoutingBreakers(breakersLimit)),
+    placeholderData: (previousData) => previousData,
     staleTime: QUERY_STALE_MS,
     enabled: canRead && activeTab === 'breakers',
   })
   const recommendationsQuery = useQuery({
     queryKey: ['smart-routing', 'agent-recommendations'],
     queryFn: async () =>
-      requireData(await listSmartRoutingAgentRecommendations(TABLE_LIMIT)),
+      requireData(await listSmartRoutingAgentRecommendations(TABLE_INITIAL_LIMIT)),
     staleTime: QUERY_STALE_MS,
     enabled: canRead && activeTab === 'agent',
   })
@@ -2588,13 +2745,27 @@ export function SmartRouting() {
               <MetricsPanel
                 metrics={metricsQuery.data}
                 snapshots={snapshotsQuery.data}
+                metricsLimit={metricsLimit}
+                snapshotsLimit={snapshotsLimit}
                 isLoading={metricsQuery.isLoading || snapshotsQuery.isLoading}
+                isFetchingMetrics={metricsQuery.isFetching}
+                isFetchingSnapshots={snapshotsQuery.isFetching}
                 isError={metricsQuery.isError || snapshotsQuery.isError}
                 error={metricsQuery.error ?? snapshotsQuery.error}
                 onRetry={() => {
                   void metricsQuery.refetch()
                   void snapshotsQuery.refetch()
                 }}
+                onLoadMoreMetrics={() =>
+                  setMetricsLimit((current) =>
+                    Math.min(current + TABLE_LIMIT_STEP, TABLE_MAX_LIMIT)
+                  )
+                }
+                onLoadMoreSnapshots={() =>
+                  setSnapshotsLimit((current) =>
+                    Math.min(current + TABLE_LIMIT_STEP, TABLE_MAX_LIMIT)
+                  )
+                }
               />
             )}
           </TabsContent>
@@ -2602,11 +2773,18 @@ export function SmartRouting() {
             {activeTab === 'breakers' && (
               <BreakersPanel
                 breakers={breakersQuery.data}
+                limit={breakersLimit}
                 isLoading={breakersQuery.isLoading}
+                isFetching={breakersQuery.isFetching}
                 isError={breakersQuery.isError}
                 error={breakersQuery.error}
                 canOperate={canOperate}
                 onRetry={() => void breakersQuery.refetch()}
+                onLoadMore={() =>
+                  setBreakersLimit((current) =>
+                    Math.min(current + TABLE_LIMIT_STEP, TABLE_MAX_LIMIT)
+                  )
+                }
               />
             )}
           </TabsContent>

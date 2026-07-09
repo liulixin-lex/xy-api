@@ -197,6 +197,10 @@ func (channel *Channel) GetKeys() []string {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.GetNextEnabledKeyFiltered(nil)
+}
+
+func (channel *Channel) GetNextEnabledKeyFiltered(allowIndex func(index int) bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -228,7 +232,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	// Collect indexes of enabled keys
 	enabledIdx := make([]int, 0, len(keys))
 	for i := range keys {
-		if getStatus(i) == common.ChannelStatusEnabled {
+		if getStatus(i) == common.ChannelStatusEnabled && (allowIndex == nil || allowIndex(i)) {
 			enabledIdx = append(enabledIdx, i)
 		}
 	}
@@ -268,7 +272,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		}
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
-			if getStatus(idx) == common.ChannelStatusEnabled {
+			if getStatus(idx) == common.ChannelStatusEnabled && (allowIndex == nil || allowIndex(idx)) {
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil

@@ -38,6 +38,7 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		setRoutingPromptCostProxy(c)
 		if ok {
 			id, err := strconv.Atoi(channelId.(string))
 			if err != nil {
@@ -103,29 +104,11 @@ func Distribute() func(c *gin.Context) {
 
 				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
 					affinityUsable := false
-					preferred, err := model.CacheGetChannel(preferredChannelID)
-					if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled &&
-						channelSupportsRequestPath(preferred, c.Request.URL.Path) &&
-						service.AffinityAdmissible(preferred.Id) {
-						if usingGroup == "auto" {
-							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-							autoGroups := service.GetUserAutoGroup(userGroup)
-							for _, g := range autoGroups {
-								if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
-									selectGroup = g
-									common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
-									channel = preferred
-									affinityUsable = true
-									service.MarkChannelAffinityUsed(c, g, preferred.Id)
-									break
-								}
-							}
-						} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
-							channel = preferred
-							selectGroup = usingGroup
-							affinityUsable = true
-							service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
-						}
+					if preferred, affinityGroup, ok := service.GetAdmissibleAffinityChannel(c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path); ok {
+						channel = preferred
+						selectGroup = affinityGroup
+						affinityUsable = true
+						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
 					}
 					if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
@@ -162,12 +145,53 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if channel != nil {
+			if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
+				return
+			}
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+
+func setRoutingPromptCostProxy(c *gin.Context) {
+	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+		return
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return
+	}
+	body, err := storage.Bytes()
+	if err != nil || len(body) == 0 || !gjson.ValidBytes(body) {
+		return
+	}
+	proxy := len(body) / 4
+	if proxy < 1 {
+		proxy = 1
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingPromptProxy, proxy)
+	outputCap := proxy + proxy/2
+	if outputCap < 1 {
+		outputCap = 1
+	}
+	if outputCap > 512 {
+		outputCap = 512
+	}
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		value := gjson.GetBytes(body, field)
+		if value.Exists() && value.Num > 0 {
+			if value.Num < float64(outputCap) {
+				outputCap = int(value.Num)
+			}
+			break
+		}
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingEstimatedOutput, outputCap)
 }
 
 // channelSupportsRequestPath reports whether a channel can serve the request path.
@@ -466,7 +490,29 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
+	if routingGroup == "" {
+		routingGroup = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	}
+	disallowedIndexes := map[int]struct{}{}
+	var key string
+	var index int
+	var newAPIError *types.NewAPIError
+	for {
+		key, index, newAPIError = channel.GetNextEnabledKeyFiltered(func(index int) bool {
+			if _, disallowed := disallowedIndexes[index]; disallowed {
+				return false
+			}
+			return service.IsMultiKeyIndexRoutingAdmissible(c, channel.Id, index, modelName, routingGroup)
+		})
+		if newAPIError != nil || !channel.ChannelInfo.IsMultiKey {
+			break
+		}
+		if service.AcquireMultiKeyRoutingHalfOpenProbe(c, channel.Id, index, modelName, routingGroup) {
+			break
+		}
+		disallowedIndexes[index] = struct{}{}
+	}
 	if newAPIError != nil {
 		return newAPIError
 	}

@@ -53,6 +53,8 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 		SuccessCount:   3,
 		TotalLatencyMs: 800,
 		LatencyP95Ms:   750,
+		TtftCount:      4,
+		TtftP95Ms:      120,
 	}}, 60)
 
 	metric, ok := GetMetric(Key{ChannelID: 77, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"})
@@ -60,6 +62,7 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 	assert.Equal(t, int64(4), metric.RequestCount)
 	assert.Equal(t, int64(3), metric.SuccessCount)
 	assert.Equal(t, 750.0, metric.P95LatencyMs)
+	assert.Equal(t, 120.0, metric.P95TTFTMs)
 	assert.InDelta(t, 4.0/60.0, metric.TPS, 0.000001)
 	assert.Equal(t, int64(120), metric.UpdatedUnix)
 }

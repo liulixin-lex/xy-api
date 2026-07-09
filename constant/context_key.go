@@ -47,6 +47,9 @@ const (
 	ContextKeyRoutingSwitchCount      ContextKey = "routing_switch_count"
 	ContextKeyRoutingAutoGroupIndex   ContextKey = "routing_auto_group_index"
 	ContextKeyRoutingHalfOpenProbes   ContextKey = "routing_half_open_probes"
+	ContextKeyRoutingHalfOpenLeases   ContextKey = "routing_half_open_leases"
+	ContextKeyRoutingPromptProxy      ContextKey = "routing_prompt_proxy"
+	ContextKeyRoutingEstimatedOutput  ContextKey = "routing_estimated_output"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"
