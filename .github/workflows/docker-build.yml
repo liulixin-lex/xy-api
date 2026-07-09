@@ -130,9 +130,24 @@ jobs:
 
       - name: Sign image with cosign
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}
+          sign_with_retry() {
+            local target="$1"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if cosign sign --yes "$target"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                break
+              fi
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+
+          sign_with_retry ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
+            sign_with_retry ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
           fi
 
       - name: Image summary
@@ -216,11 +231,26 @@ jobs:
 
       - name: Sign manifests with cosign
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:${TAG}
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:latest
+          sign_with_retry() {
+            local target="$1"
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if cosign sign --yes "$target"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                break
+              fi
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+
+          sign_with_retry ghcr.io/${GHCR_REPOSITORY}:${TAG}
+          sign_with_retry ghcr.io/${GHCR_REPOSITORY}:latest
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:${TAG}
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:latest
+            sign_with_retry ${DOCKERHUB_REPOSITORY}:${TAG}
+            sign_with_retry ${DOCKERHUB_REPOSITORY}:latest
           fi
 
       - name: Manifest summary
