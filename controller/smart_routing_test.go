@@ -262,7 +262,7 @@ func TestRoutingBindingForActionRejectsInvalidJSON(t *testing.T) {
 
 func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
 	routingmetrics.ResetForTest()
 	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
@@ -276,6 +276,7 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	require.NoError(t, db.Create(&model.RoutingCostSnapshot{ChannelID: 66, ModelName: "gpt-test"}).Error)
 	require.NoError(t, db.Create(&model.RoutingBreakerState{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", State: model.RoutingBreakerStateOpen}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelMetric{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", BucketTs: 60, RequestCount: 1}).Error)
+	require.NoError(t, db.Create(&model.RoutingChannelHealthState{ChannelID: 66, AuthFailure: true, UpdatedTime: common.GetTimestamp()}).Error)
 	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen})
 	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"}, routinghotcache.CostSnapshot{Known: true, Cost: 1})
 	routingbreaker.RecordAttempt(routingbreaker.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, false, http.StatusBadGateway, 0)
@@ -296,7 +297,7 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	DeleteSmartRoutingBinding(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	for _, table := range []any{&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}} {
+	for _, table := range []any{&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}, &model.RoutingChannelHealthState{}} {
 		var count int64
 		require.NoError(t, db.Model(table).Where("channel_id = ?", 66).Count(&count).Error)
 		assert.Zero(t, count)

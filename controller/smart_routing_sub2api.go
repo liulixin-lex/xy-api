@@ -131,7 +131,7 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 			snapshots = append(snapshots, snapshot)
 		}
 	}
-	routinghotcache.ClearAuthFailure(binding.ChannelID)
+	clearRoutingAuthFailure(binding.ChannelID)
 	return snapshots, nil
 }
 
@@ -255,6 +255,7 @@ func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBindin
 		markRoutingAuthFailure(binding.ChannelID)
 		return "", 0, routingAuthErrorf("sub2api login did not return a token")
 	}
+	clearRoutingAuthFailure(binding.ChannelID)
 	ttl := time.Duration(response.ExpiresIn) * time.Second
 	if ttl <= routingSub2APITokenTTLBuffer {
 		ttl = time.Hour
@@ -298,15 +299,58 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &envelope); err != nil {
 		return nil, err
 	}
-	if envelope.Success != nil && !*envelope.Success || envelope.Code != 0 {
-		markRoutingAuthFailure(binding.ChannelID)
+	if (envelope.Success != nil && !*envelope.Success) || envelope.Code != 0 {
 		message := envelope.Message
 		if strings.TrimSpace(message) == "" {
 			message = "sub2api endpoint returned code != 0"
 		}
-		return nil, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(message, credentials))
+		authFailure := routingSub2APIEnvelopeAuthFailure(envelope)
+		message = routingCleanCredentialErrorMessage(message, credentials)
+		if authFailure {
+			markRoutingAuthFailure(binding.ChannelID)
+			return nil, routingAuthErrorf("%s", message)
+		}
+		return nil, fmt.Errorf("%s", message)
 	}
 	return envelope.Data, nil
+}
+
+func routingSub2APIEnvelopeAuthFailure(envelope routingSub2APIEnvelope) bool {
+	if envelope.Code == http.StatusUnauthorized || envelope.Code == http.StatusForbidden {
+		return true
+	}
+	normalized := strings.ToLower(strings.TrimSpace(envelope.Message))
+	if normalized == "" {
+		return false
+	}
+	authMarkers := []string{
+		"unauthorized",
+		"unauthorised",
+		"forbidden",
+		"invalid token",
+		"expired token",
+		"token invalid",
+		"token expired",
+		"missing token",
+		"token missing",
+		"access token",
+		"jwt",
+		"bearer",
+		"credential",
+		"authentication",
+		"authorization",
+		"not authorized",
+		"not authorised",
+		"password",
+		"login",
+		"permission denied",
+	}
+	for _, marker := range authMarkers {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func fetchRoutingSub2APIBalance(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) error {
@@ -322,11 +366,15 @@ func fetchRoutingSub2APIBalance(ctx context.Context, binding model.RoutingChanne
 		return err
 	}
 	if balance, ok := parseRoutingSub2APIBalance(raw); ok {
+		now := common.GetTimestamp()
 		routinghotcache.SetBalance(binding.ChannelID, routinghotcache.BalanceSnapshot{
 			Known:       true,
 			Balance:     balance,
-			UpdatedUnix: common.GetTimestamp(),
+			UpdatedUnix: now,
 		})
+		if err = model.UpsertRoutingChannelBalance(binding.ChannelID, balance, now); err != nil {
+			common.SysError(fmt.Sprintf("persist routing balance failed: channel_id=%d err=%v", binding.ChannelID, err))
+		}
 	}
 	return nil
 }

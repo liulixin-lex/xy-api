@@ -59,20 +59,31 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 
 	breakerBypassed := shouldBypassOpenFilter(openCount, len(candidates), settings.MaxEjectedPct)
 	included := make([]candidateHealth, 0, len(health))
+	bypassedOpen := make([]candidateHealth, 0)
 	filteredOpen := 0
 	for _, item := range health {
 		if item.hardOpen {
 			filteredOpen++
 			continue
 		}
-		if item.open && !breakerBypassed {
-			filteredOpen++
+		if item.open {
+			if breakerBypassed {
+				item.degraded = true
+				bypassedOpen = append(bypassedOpen, item)
+			} else {
+				filteredOpen++
+			}
 			continue
 		}
 		if belowAvailabilityFloor(item.candidate.Metric, settings) {
 			continue
 		}
 		included = append(included, item)
+	}
+	if len(included) == 0 && breakerBypassed {
+		included = append(included, bypassedOpen...)
+	} else {
+		filteredOpen += len(bypassedOpen)
 	}
 
 	bounds := collectScoreBounds(included, settings)

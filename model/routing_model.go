@@ -137,6 +137,7 @@ type RoutingCostSnapshot struct {
 	ID              int     `json:"id" gorm:"primaryKey"`
 	ChannelID       int     `json:"channel_id" gorm:"uniqueIndex:idx_routing_cost_channel_model,priority:1;index"`
 	ModelName       string  `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_cost_channel_model,priority:2;index"`
+	QuotaType       int     `json:"quota_type"`
 	GroupRatio      float64 `json:"group_ratio"`
 	BaseRatio       float64 `json:"base_ratio"`
 	CompletionRatio float64 `json:"completion_ratio"`
@@ -163,6 +164,7 @@ func UpsertRoutingCostSnapshot(snapshot *RoutingCostSnapshot) error {
 			{Name: "model_name"},
 		},
 		DoUpdates: clause.Assignments(map[string]interface{}{
+			"quota_type":       snapshot.QuotaType,
 			"group_ratio":      snapshot.GroupRatio,
 			"base_ratio":       snapshot.BaseRatio,
 			"completion_ratio": snapshot.CompletionRatio,
@@ -242,10 +244,14 @@ type RoutingBreakerState struct {
 	State               string `json:"state" gorm:"type:varchar(32);index"`
 	Reason              string `json:"reason" gorm:"type:varchar(64);index"`
 	ConsecutiveFailures int64  `json:"consecutive_failures"`
+	Consecutive5xx      int64  `json:"consecutive_5xx" gorm:"column:consecutive_5xx"`
 	EjectionCount       int64  `json:"ejection_count"`
 	OpenedAt            int64  `json:"opened_at" gorm:"bigint"`
 	CooldownUntil       int64  `json:"cooldown_until" gorm:"bigint;index"`
 	HalfOpenInflight    int64  `json:"half_open_inflight"`
+	WindowRequests      int64  `json:"window_requests"`
+	WindowFailures      int64  `json:"window_failures"`
+	LastProbeAt         int64  `json:"last_probe_at" gorm:"bigint"`
 	UpdatedTime         int64  `json:"updated_time" gorm:"bigint;index"`
 }
 
@@ -269,24 +275,135 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 		return nil
 	}
+	updates := map[string]interface{}{
+		"state":                state.State,
+		"reason":               state.Reason,
+		"consecutive_failures": state.ConsecutiveFailures,
+		"consecutive_5xx":      state.Consecutive5xx,
+		"ejection_count":       state.EjectionCount,
+		"opened_at":            state.OpenedAt,
+		"cooldown_until":       state.CooldownUntil,
+		"half_open_inflight":   state.HalfOpenInflight,
+		"window_requests":      state.WindowRequests,
+		"window_failures":      state.WindowFailures,
+		"last_probe_at":        state.LastProbeAt,
+		"updated_time":         state.UpdatedTime,
+	}
+	breakerKeyWhere := func() *gorm.DB {
+		return DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
+			state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group)
+	}
+	result := breakerKeyWhere().Where("updated_time <= ?", state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	createErr := DB.Create(state).Error
+	if createErr == nil {
+		return nil
+	}
+	// A concurrent writer may have inserted the row after our conditional update.
+	return breakerKeyWhere().Where("updated_time <= ?", state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates).Error
+}
+
+type RoutingChannelHealthState struct {
+	ID                 int     `json:"id" gorm:"primaryKey"`
+	ChannelID          int     `json:"channel_id" gorm:"uniqueIndex;not null"`
+	AuthFailure        bool    `json:"auth_failure"`
+	AuthFailureReason  string  `json:"auth_failure_reason" gorm:"type:varchar(128)"`
+	AuthFailureUntil   int64   `json:"auth_failure_until" gorm:"bigint;index"`
+	BalanceKnown       bool    `json:"balance_known"`
+	Balance            float64 `json:"balance"`
+	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
+	UpdatedTime        int64   `json:"updated_time" gorm:"bigint;index"`
+}
+
+func (RoutingChannelHealthState) TableName() string {
+	return "routing_channel_health_states"
+}
+
+func (state *RoutingChannelHealthState) BeforeCreate(_ *gorm.DB) error {
+	if state.UpdatedTime == 0 {
+		state.UpdatedTime = common.GetTimestamp()
+	}
+	return nil
+}
+
+func (state *RoutingChannelHealthState) BeforeUpdate(_ *gorm.DB) error {
+	state.UpdatedTime = common.GetTimestamp()
+	return nil
+}
+
+func UpsertRoutingChannelAuthFailure(channelID int, marked bool, reason string, until int64) error {
+	if channelID <= 0 {
+		return nil
+	}
+	now := common.GetTimestamp()
+	if until <= 0 {
+		until = now
+	}
 	return DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{
-			{Name: "channel_id"},
-			{Name: "api_key_index"},
-			{Name: "model_name"},
-			{Name: "group"},
-		},
+		Columns: []clause.Column{{Name: "channel_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"state":                state.State,
-			"reason":               state.Reason,
-			"consecutive_failures": state.ConsecutiveFailures,
-			"ejection_count":       state.EjectionCount,
-			"opened_at":            state.OpenedAt,
-			"cooldown_until":       state.CooldownUntil,
-			"half_open_inflight":   state.HalfOpenInflight,
-			"updated_time":         state.UpdatedTime,
+			"auth_failure":        marked,
+			"auth_failure_reason": reason,
+			"auth_failure_until":  until,
+			"updated_time":        now,
 		}),
-	}).Create(state).Error
+	}).Create(&RoutingChannelHealthState{
+		ChannelID:         channelID,
+		AuthFailure:       marked,
+		AuthFailureReason: reason,
+		AuthFailureUntil:  until,
+		UpdatedTime:       now,
+	}).Error
+}
+
+func ClearRoutingChannelAuthFailure(channelID int, updatedTime int64) error {
+	if channelID <= 0 {
+		return nil
+	}
+	if updatedTime <= 0 {
+		updatedTime = common.GetTimestamp()
+	}
+	return DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "channel_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"auth_failure":        false,
+			"auth_failure_reason": "",
+			"auth_failure_until":  int64(0),
+			"updated_time":        updatedTime,
+		}),
+	}).Create(&RoutingChannelHealthState{
+		ChannelID:   channelID,
+		UpdatedTime: updatedTime,
+	}).Error
+}
+
+func UpsertRoutingChannelBalance(channelID int, balance float64, updatedTime int64) error {
+	if channelID <= 0 {
+		return nil
+	}
+	if updatedTime <= 0 {
+		updatedTime = common.GetTimestamp()
+	}
+	return DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "channel_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"balance_known":        true,
+			"balance":              balance,
+			"balance_updated_time": updatedTime,
+			"updated_time":         updatedTime,
+		}),
+	}).Create(&RoutingChannelHealthState{
+		ChannelID:          channelID,
+		BalanceKnown:       true,
+		Balance:            balance,
+		BalanceUpdatedTime: updatedTime,
+		UpdatedTime:        updatedTime,
+	}).Error
 }
 
 type RoutingAgentRecommendation struct {

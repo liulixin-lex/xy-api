@@ -292,6 +292,9 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 		Group:       group,
 	}
 	breakerSetting := smart_routing_setting.GetSetting()
+	if breakerSetting.Enabled {
+		syncRoutingBreakerConfigFromSetting(breakerSetting)
+	}
 	retryAfterCap := time.Duration(breakerSetting.MaxCooldownSec) * time.Second
 	if retryAfterCap <= 0 {
 		retryAfterCap = routingbreaker.DefaultConfig().MaxCooldown
@@ -421,7 +424,7 @@ func streamFirstByteTimeoutError(relayInfo *relaycommon.RelayInfo) *types.NewAPI
 	if !relayInfo.FirstByteTimedOutBeforeResponse() {
 		return nil
 	}
-	return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeBadResponseStatusCode, http.StatusGatewayTimeout)
+	return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeFirstByteTimeout, http.StatusGatewayTimeout)
 }
 
 func sleepRoutingRetryBackoff(apiErr *types.NewAPIError, attempt int) {
@@ -856,7 +859,10 @@ func RelayTask(c *gin.Context) {
 	if taskErr == nil {
 		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 			common.SysError("settle task billing error: " + settleErr.Error())
+			taskErr = service.TaskErrorWrapperLocal(settleErr, "settle_billing_failed", http.StatusInternalServerError)
 		}
+	}
+	if taskErr == nil {
 		service.LogTaskConsumption(c, relayInfo)
 
 		task := model.InitTask(result.Platform, relayInfo)

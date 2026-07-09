@@ -23,15 +23,22 @@ type MetricSnapshot struct {
 	RequestCount int64
 	SuccessCount int64
 	P95LatencyMs float64
+	P95TTFTMs    float64
 	TPS          float64
 	UpdatedUnix  int64
 }
 
 type CostSnapshot struct {
-	Known       bool
-	Cost        float64
-	Confidence  string
-	UpdatedUnix int64
+	Known           bool
+	Cost            float64
+	Confidence      string
+	QuotaType       int
+	GroupRatio      float64
+	BaseRatio       float64
+	CompletionRatio float64
+	ModelPrice      float64
+	BillingMode     string
+	UpdatedUnix     int64
 }
 
 type BreakerSnapshot struct {
@@ -213,10 +220,16 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 			continue
 		}
 		cache.costs[key] = CostSnapshot{
-			Known:       snapshot.Confidence != model.RoutingCostConfidenceUnknown && !math.IsNaN(cost) && !math.IsInf(cost, 0),
-			Cost:        cost,
-			Confidence:  snapshot.Confidence,
-			UpdatedUnix: snapshot.SnapshotTS,
+			Known:           routingSnapshotCostKnown(snapshot, cost),
+			Cost:            cost,
+			Confidence:      snapshot.Confidence,
+			QuotaType:       snapshot.QuotaType,
+			GroupRatio:      snapshot.GroupRatio,
+			BaseRatio:       snapshot.BaseRatio,
+			CompletionRatio: snapshot.CompletionRatio,
+			ModelPrice:      snapshot.ModelPrice,
+			BillingMode:     snapshot.BillingMode,
+			UpdatedUnix:     snapshot.SnapshotTS,
 		}
 	}
 }
@@ -234,6 +247,10 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 		latencyMs := float64(snapshot.LatencyP95Ms)
 		if latencyMs <= 0 {
 			latencyMs = float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
+		}
+		ttftMs := float64(snapshot.TtftP95Ms)
+		if ttftMs <= 0 && snapshot.TtftCount > 0 {
+			ttftMs = float64(snapshot.TtftSumMs) / float64(snapshot.TtftCount)
 		}
 		key := Key{
 			ChannelID:   snapshot.ChannelID,
@@ -253,6 +270,7 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 			RequestCount: snapshot.RequestCount,
 			SuccessCount: snapshot.SuccessCount,
 			P95LatencyMs: latencyMs,
+			P95TTFTMs:    ttftMs,
 			TPS:          float64(snapshot.RequestCount) / float64(bucketSeconds),
 			UpdatedUnix:  snapshot.BucketTs,
 		}
@@ -285,11 +303,49 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 	}
 }
 
+func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix int64) {
+	cache.Lock()
+	defer cache.Unlock()
+	for _, snapshot := range snapshots {
+		if snapshot.ChannelID <= 0 {
+			continue
+		}
+		if snapshot.AuthFailure && (snapshot.AuthFailureUntil <= 0 || snapshot.AuthFailureUntil > nowUnix) {
+			cache.authFailures[snapshot.ChannelID] = HealthMarker{
+				Marked:      true,
+				UpdatedUnix: snapshot.UpdatedTime,
+			}
+		} else {
+			delete(cache.authFailures, snapshot.ChannelID)
+		}
+		if snapshot.BalanceKnown {
+			cache.balances[snapshot.ChannelID] = BalanceSnapshot{
+				Known:       true,
+				Balance:     snapshot.Balance,
+				UpdatedUnix: snapshot.BalanceUpdatedTime,
+			}
+		}
+	}
+}
+
 func routingSnapshotCost(snapshot model.RoutingCostSnapshot) float64 {
 	if snapshot.ModelPrice > 0 {
 		return snapshot.ModelPrice
 	}
 	return snapshot.GroupRatio * snapshot.BaseRatio
+}
+
+func routingSnapshotCostKnown(snapshot model.RoutingCostSnapshot, cost float64) bool {
+	if snapshot.Confidence == model.RoutingCostConfidenceUnknown || math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return false
+	}
+	if snapshot.QuotaType == 1 {
+		return snapshot.ModelPrice > 0
+	}
+	if snapshot.BaseRatio <= 0 && snapshot.ModelPrice <= 0 {
+		return false
+	}
+	return true
 }
 
 func ResetForTest() {

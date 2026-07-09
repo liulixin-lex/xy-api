@@ -451,8 +451,8 @@ func FirstByteFailoverTimeout(info *relaycommon.RelayInfo) time.Duration {
 			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 			Model:       info.OriginModelName,
 			Group:       group,
-		}); ok && metric.P95LatencyMs > 0 && setting.FirstByteP95Multiplier > 0 {
-			derived := int(metric.P95LatencyMs * setting.FirstByteP95Multiplier)
+		}); ok && metric.P95TTFTMs > 0 && setting.FirstByteP95Multiplier > 0 {
+			derived := int(metric.P95TTFTMs * setting.FirstByteP95Multiplier)
 			if derived > timeoutMs {
 				timeoutMs = derived
 			}

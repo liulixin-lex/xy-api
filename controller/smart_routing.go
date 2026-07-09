@@ -213,7 +213,10 @@ func DeleteSmartRoutingBinding(c *gin.Context) {
 		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingBreakerState{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelMetric{}).Error
+		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelHealthState{}).Error
 	}); err != nil {
 		common.ApiError(c, err)
 		return

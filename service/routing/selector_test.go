@@ -293,9 +293,23 @@ func TestOpenBreakerFilteredUnlessMaxEjectedPctExceeded(t *testing.T) {
 			testCandidate(3, 0.1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 1000}),
 		}, settings)
 
-		require.Len(t, decision.Ranked, 3)
+		require.Len(t, decision.Ranked, 1)
+		assert.True(t, decision.BreakerBypassed)
+		assert.Equal(t, 2, decision.FilteredOpen)
+		assert.Equal(t, 3, decision.Ranked[0].Channel.Id)
+	})
+
+	t.Run("uses bypassed open breakers only when every soft candidate is open", func(t *testing.T) {
+		decision := RankCandidates([]Candidate{
+			testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, UpdatedUnix: 1000}),
+			testCandidate(2, 0.9, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, UpdatedUnix: 1000}),
+		}, settings)
+
+		require.Len(t, decision.Ranked, 2)
 		assert.True(t, decision.BreakerBypassed)
 		assert.Zero(t, decision.FilteredOpen)
+		assert.True(t, decision.Ranked[0].Degraded)
+		assert.True(t, decision.Ranked[0].Open)
 	})
 
 	t.Run("stale open breaker fails open", func(t *testing.T) {

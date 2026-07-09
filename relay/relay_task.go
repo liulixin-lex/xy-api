@@ -179,11 +179,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 4. 价格计算：基础模型价格
 	info.OriginModelName = modelName
+	preservedRatios := info.PriceData.OtherRatios()
 	priceData, err := helper.ModelPriceHelperPerCall(c, info)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "model_price_error", http.StatusBadRequest)
 	}
 	info.PriceData = priceData
+	for k, v := range preservedRatios {
+		info.PriceData.AddOtherRatio(k, v)
+	}
 
 	// 5. 计费估算：让适配器根据用户请求提供 OtherRatios（时长、分辨率等）
 	//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
@@ -207,6 +211,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
+		}
+	}
+	if info.Billing != nil && !info.PriceData.FreeModel {
+		if err := info.Billing.Reserve(info.PriceData.Quota); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "pre_consume_task_quota_failed", http.StatusForbidden)
 		}
 	}
 

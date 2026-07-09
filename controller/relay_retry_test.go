@@ -69,6 +69,7 @@ func TestStreamFirstByteTimeoutErrorOnlyBeforeClientWrite(t *testing.T) {
 
 	require.NotNil(t, apiErr)
 	assert.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+	assert.Equal(t, types.ErrorCodeFirstByteTimeout, apiErr.GetErrorCode())
 
 	info.SendResponseCount = 1
 	assert.Nil(t, streamFirstByteTimeoutError(info))
@@ -261,7 +262,7 @@ func TestRecordRoutingBreakerAttemptUsesSmartRoutingBreakerSettings(t *testing.T
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
 	})
-	setting := smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
 		Mode:               smart_routing_setting.ModeBalanced,
 		Consecutive5xx:     2,
@@ -273,7 +274,6 @@ func TestRecordRoutingBreakerAttemptUsesSmartRoutingBreakerSettings(t *testing.T
 		SyncIntervalMin:    1,
 		HotcacheRefreshSec: 1,
 	})
-	syncRoutingBreakerConfigFromSetting(setting)
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",
@@ -364,7 +364,7 @@ func TestRelayInvalidRequestReleasesReservedHalfOpenProbe(t *testing.T) {
 	require.True(t, acquired)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenProbes, map[int]routingbreaker.Key{35: key})
+	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenProbes, map[routingbreaker.Key]struct{}{key: {}})
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
