@@ -2,14 +2,19 @@ package controller
 
 import (
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -18,11 +23,11 @@ import (
 )
 
 type routingCredentialRequest struct {
-	NewAPIAccessToken string `json:"new_api_access_token"`
-	GatewayAPIKey     string `json:"gateway_api_key"`
-	Sub2APIEmail      string `json:"sub2api_email"`
-	Sub2APIPassword   string `json:"sub2api_password"`
-	Sub2APIToken      string `json:"sub2api_token"`
+	NewAPIAccessToken *string `json:"new_api_access_token"`
+	GatewayAPIKey     *string `json:"gateway_api_key"`
+	Sub2APIEmail      *string `json:"sub2api_email"`
+	Sub2APIPassword   *string `json:"sub2api_password"`
+	Sub2APIToken      *string `json:"sub2api_token"`
 }
 
 type routingBindingRequest struct {
@@ -72,6 +77,7 @@ func UpdateSmartRoutingSettings(c *gin.Context) {
 		return
 	}
 	updated := smart_routing_setting.UpdateSetting(request)
+	syncRoutingBreakerConfigFromSetting(updated)
 	values, err := config.ConfigToMap(updated)
 	if err != nil {
 		common.ApiError(c, err)
@@ -169,11 +175,16 @@ func UpdateSmartRoutingBinding(c *gin.Context) {
 	updated.CreatedTime = binding.CreatedTime
 	updated.EncCredentials = binding.EncCredentials
 	updated.KeyVersion = binding.KeyVersion
-	if !hasRoutingCredentials(request.Credentials) {
-		updated.EncCredentials = binding.EncCredentials
-	} else if err := updated.SetCredentials(buildRoutingCredentials(request)); err != nil {
-		common.ApiError(c, err)
-		return
+	if hasRoutingCredentials(request.Credentials) {
+		existingCredentials, err := binding.GetCredentials()
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if err := updated.SetCredentials(buildRoutingCredentials(request, existingCredentials)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	}
 	if err := model.DB.Save(&updated).Error; err != nil {
 		common.ApiError(c, err)
@@ -192,10 +203,24 @@ func DeleteSmartRoutingBinding(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := model.DB.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingCostSnapshot{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingBreakerState{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelMetric{}).Error
+	}); err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	routingmetrics.ClearChannel(channelID)
+	routingbreaker.ClearDefaultChannel(channelID)
+	routinghotcache.ClearChannel(channelID)
 	common.ApiSuccess(c, nil)
 }
 
@@ -292,7 +317,7 @@ func ResetSmartRoutingBreaker(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	routingbreaker.ResetDefaultKey(routingbreaker.Key{
+	routingbreaker.ClearDefaultKey(routingbreaker.Key{
 		ChannelID:   state.ChannelID,
 		APIKeyIndex: state.APIKeyIndex,
 		Model:       state.ModelName,
@@ -346,7 +371,7 @@ func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials mo
 		CredentialMasks: routingCredentialMasks{
 			NewAPIAccessToken: maskRoutingToken(credentials.NewAPIAccessToken),
 			GatewayAPIKey:     maskRoutingToken(credentials.GatewayAPIKey),
-			Sub2APIEmail:      credentials.Sub2APIEmail,
+			Sub2APIEmail:      maskRoutingEmail(credentials.Sub2APIEmail),
 			Sub2APIPassword:   maskRoutingPassword(credentials.Sub2APIPassword),
 			Sub2APIToken:      maskRoutingToken(credentials.Sub2APIToken),
 		},
@@ -355,14 +380,27 @@ func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials mo
 	}
 }
 
-func buildRoutingCredentials(request routingBindingRequest) model.RoutingCredentials {
-	return model.RoutingCredentials{
-		NewAPIAccessToken: strings.TrimSpace(request.Credentials.NewAPIAccessToken),
-		GatewayAPIKey:     strings.TrimSpace(request.Credentials.GatewayAPIKey),
-		Sub2APIEmail:      strings.TrimSpace(request.Credentials.Sub2APIEmail),
-		Sub2APIPassword:   request.Credentials.Sub2APIPassword,
-		Sub2APIToken:      strings.TrimSpace(request.Credentials.Sub2APIToken),
+func buildRoutingCredentials(request routingBindingRequest, base ...model.RoutingCredentials) model.RoutingCredentials {
+	credentials := model.RoutingCredentials{}
+	if len(base) > 0 {
+		credentials = base[0]
 	}
+	if request.Credentials.NewAPIAccessToken != nil {
+		credentials.NewAPIAccessToken = strings.TrimSpace(*request.Credentials.NewAPIAccessToken)
+	}
+	if request.Credentials.GatewayAPIKey != nil {
+		credentials.GatewayAPIKey = strings.TrimSpace(*request.Credentials.GatewayAPIKey)
+	}
+	if request.Credentials.Sub2APIEmail != nil {
+		credentials.Sub2APIEmail = strings.TrimSpace(*request.Credentials.Sub2APIEmail)
+	}
+	if request.Credentials.Sub2APIPassword != nil {
+		credentials.Sub2APIPassword = *request.Credentials.Sub2APIPassword
+	}
+	if request.Credentials.Sub2APIToken != nil {
+		credentials.Sub2APIToken = strings.TrimSpace(*request.Credentials.Sub2APIToken)
+	}
+	return credentials
 }
 
 func routingBindingViewWithStoredCredentials(binding model.RoutingChannelBinding) (routingBindingView, error) {
@@ -409,6 +447,9 @@ func validateRoutingBindingRequest(request routingBindingRequest, requireChannel
 	if strings.TrimSpace(request.BaseURL) == "" {
 		return errors.New("base_url is required")
 	}
+	if err := validateRoutingBaseURL(request.BaseURL); err != nil {
+		return err
+	}
 	if strings.TrimSpace(request.UpstreamGroup) == "" {
 		return errors.New("upstream_group is required")
 	}
@@ -416,11 +457,35 @@ func validateRoutingBindingRequest(request routingBindingRequest, requireChannel
 }
 
 func hasRoutingCredentials(credentials routingCredentialRequest) bool {
-	return strings.TrimSpace(credentials.NewAPIAccessToken) != "" ||
-		strings.TrimSpace(credentials.GatewayAPIKey) != "" ||
-		strings.TrimSpace(credentials.Sub2APIEmail) != "" ||
-		credentials.Sub2APIPassword != "" ||
-		strings.TrimSpace(credentials.Sub2APIToken) != ""
+	return credentials.NewAPIAccessToken != nil ||
+		credentials.GatewayAPIKey != nil ||
+		credentials.Sub2APIEmail != nil ||
+		credentials.Sub2APIPassword != nil ||
+		credentials.Sub2APIToken != nil
+}
+
+func validateRoutingBaseURL(value string) error {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return errors.New("invalid base_url")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("base_url must use http or https")
+	}
+	if parsed.User != nil {
+		return errors.New("base_url must not contain credentials")
+	}
+	for key := range parsed.Query() {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		if strings.Contains(normalized, "token") ||
+			strings.Contains(normalized, "key") ||
+			strings.Contains(normalized, "secret") ||
+			strings.Contains(normalized, "password") ||
+			strings.Contains(normalized, "authorization") {
+			return errors.New("base_url must not contain sensitive query parameters")
+		}
+	}
+	return nil
 }
 
 func maskRoutingToken(value string) string {
@@ -439,6 +504,22 @@ func maskRoutingPassword(value string) string {
 		return ""
 	}
 	return "********"
+}
+
+func maskRoutingEmail(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parts := strings.SplitN(value, "@", 2)
+	if len(parts) != 2 {
+		return maskRoutingToken(value)
+	}
+	local := parts[0]
+	if len(local) <= 2 {
+		return strings.Repeat("*", len(local)) + "@" + parts[1]
+	}
+	return local[:1] + strings.Repeat("*", len(local)-2) + local[len(local)-1:] + "@" + parts[1]
 }
 
 func parseRoutingChannelID(c *gin.Context) (int, bool) {
@@ -470,12 +551,18 @@ func loadRoutingBinding(c *gin.Context) (*model.RoutingChannelBinding, bool) {
 
 func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool) {
 	var request routingBindingRequest
-	if c.Request.Body != nil {
-		_ = common.DecodeJson(c.Request.Body, &request)
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := common.DecodeJson(c.Request.Body, &request); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid routing binding"})
+			return nil, false
+		}
 	}
 
 	rawChannelID := strings.TrimSpace(c.Param("channelId"))
 	if rawChannelID == "new" {
+		if !requireRoutingSensitiveWriteForInline(c) {
+			return nil, false
+		}
 		if err := validateRoutingBindingRequest(request, true); err != nil {
 			common.ApiError(c, err)
 			return nil, false
@@ -491,6 +578,9 @@ func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool
 		request.ChannelID = channelID
 	}
 	if hasInlineRoutingBindingRequest(request) {
+		if !requireRoutingSensitiveWriteForInline(c) {
+			return nil, false
+		}
 		request.ChannelID = channelID
 		if err := validateRoutingBindingRequest(request, true); err != nil {
 			common.ApiError(c, err)
@@ -500,6 +590,14 @@ func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool
 	}
 
 	return loadRoutingBinding(c)
+}
+
+func requireRoutingSensitiveWriteForInline(c *gin.Context) bool {
+	if authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
+		return true
+	}
+	c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "insufficient privilege"})
+	return false
 }
 
 func hasInlineRoutingBindingRequest(request routingBindingRequest) bool {

@@ -35,9 +35,11 @@ type CostSnapshot struct {
 }
 
 type BreakerSnapshot struct {
-	State       string
-	Reason      string
-	UpdatedUnix int64
+	State             string
+	Reason            string
+	CooldownUntilUnix int64
+	HalfOpenInflight  int64
+	UpdatedUnix       int64
 }
 
 type HealthMarker struct {
@@ -135,6 +137,12 @@ func SetBreaker(key Key, snapshot BreakerSnapshot) {
 	cache.breakers[key] = snapshot
 }
 
+func ClearBreaker(key Key) {
+	cache.Lock()
+	defer cache.Unlock()
+	delete(cache.breakers, key)
+}
+
 func SetAuthFailureForTest(channelID int, marker HealthMarker) {
 	SetAuthFailure(channelID, marker)
 }
@@ -167,6 +175,31 @@ func SetBalance(channelID int, snapshot BalanceSnapshot) {
 	cache.balances[channelID] = snapshot
 }
 
+func ClearChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	for key := range cache.metrics {
+		if key.ChannelID == channelID {
+			delete(cache.metrics, key)
+		}
+	}
+	for key := range cache.costs {
+		if key.ChannelID == channelID {
+			delete(cache.costs, key)
+		}
+	}
+	for key := range cache.breakers {
+		if key.ChannelID == channelID {
+			delete(cache.breakers, key)
+		}
+	}
+	delete(cache.authFailures, channelID)
+	delete(cache.balances, channelID)
+}
+
 func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
@@ -175,7 +208,11 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 			continue
 		}
 		cost := routingSnapshotCost(snapshot)
-		cache.costs[CostKey{ChannelID: snapshot.ChannelID, Model: snapshot.ModelName}] = CostSnapshot{
+		key := CostKey{ChannelID: snapshot.ChannelID, Model: snapshot.ModelName}
+		if existing, ok := cache.costs[key]; ok && existing.UpdatedUnix >= snapshot.SnapshotTS {
+			continue
+		}
+		cache.costs[key] = CostSnapshot{
 			Known:       snapshot.Confidence != model.RoutingCostConfidenceUnknown && !math.IsNaN(cost) && !math.IsInf(cost, 0),
 			Cost:        cost,
 			Confidence:  snapshot.Confidence,
@@ -194,18 +231,56 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
 		}
-		latencyMs := float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
-		cache.metrics[Key{
+		latencyMs := float64(snapshot.LatencyP95Ms)
+		if latencyMs <= 0 {
+			latencyMs = float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
+		}
+		key := Key{
 			ChannelID:   snapshot.ChannelID,
 			APIKeyIndex: snapshot.APIKeyIndex,
 			Model:       snapshot.ModelName,
 			Group:       snapshot.Group,
-		}] = MetricSnapshot{
+		}
+		if existing, ok := cache.metrics[key]; ok {
+			if existing.UpdatedUnix > snapshot.BucketTs {
+				continue
+			}
+			if existing.UpdatedUnix == snapshot.BucketTs && existing.RequestCount >= snapshot.RequestCount {
+				continue
+			}
+		}
+		cache.metrics[key] = MetricSnapshot{
 			RequestCount: snapshot.RequestCount,
 			SuccessCount: snapshot.SuccessCount,
 			P95LatencyMs: latencyMs,
 			TPS:          float64(snapshot.RequestCount) / float64(bucketSeconds),
 			UpdatedUnix:  snapshot.BucketTs,
+		}
+	}
+}
+
+func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
+	cache.Lock()
+	defer cache.Unlock()
+	for _, snapshot := range snapshots {
+		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
+			continue
+		}
+		key := Key{
+			ChannelID:   snapshot.ChannelID,
+			APIKeyIndex: snapshot.APIKeyIndex,
+			Model:       snapshot.ModelName,
+			Group:       snapshot.Group,
+		}
+		if existing, ok := cache.breakers[key]; ok && existing.UpdatedUnix >= snapshot.UpdatedTime {
+			continue
+		}
+		cache.breakers[key] = BreakerSnapshot{
+			State:             snapshot.State,
+			Reason:            snapshot.Reason,
+			CooldownUntilUnix: snapshot.CooldownUntil,
+			HalfOpenInflight:  snapshot.HalfOpenInflight,
+			UpdatedUnix:       snapshot.UpdatedTime,
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
@@ -95,7 +96,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 		if err != nil {
 			return channel, selectGroup, err
 		}
-		if handled && channel != nil {
+		if handled {
 			return channel, selectGroup, nil
 		}
 	} else if shouldObserveSmartRouting(smartSetting) {
@@ -189,11 +190,17 @@ func shouldActivateSmartRouting(setting smart_routing_setting.SmartRoutingSettin
 	if !setting.Enabled {
 		return false
 	}
+	if !common.MemoryCacheEnabled {
+		return false
+	}
 	return setting.Mode == smart_routing_setting.ModeBalanced || setting.Mode == smart_routing_setting.ModeEnterpriseSLO
 }
 
 func shouldObserveSmartRouting(setting smart_routing_setting.SmartRoutingSetting) bool {
 	if !setting.Enabled {
+		return false
+	}
+	if !common.MemoryCacheEnabled {
 		return false
 	}
 	return setting.Mode == smart_routing_setting.ModeObserve || setting.Mode == smart_routing_setting.ModeShadow
@@ -206,13 +213,13 @@ func recordSmartRoutingDecision(param *RetryParam, setting smart_routing_setting
 	if param.TokenGroup == "auto" {
 		userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 		for _, group := range GetUserAutoGroup(userGroup) {
-			if channel, _ := selectSmartChannelForGroup(param, group, setting); channel != nil {
+			if channel, _ := selectSmartChannelForGroup(param, group, setting, false); channel != nil {
 				return
 			}
 		}
 		return
 	}
-	_, _ = selectSmartChannelForGroup(param, param.TokenGroup, setting)
+	_, _ = selectSmartChannelForGroup(param, param.TokenGroup, setting, false)
 }
 
 func cacheGetSmartSatisfiedChannel(param *RetryParam, smartSetting smart_routing_setting.SmartRoutingSetting) (*model.Channel, string, bool, error) {
@@ -220,7 +227,7 @@ func cacheGetSmartSatisfiedChannel(param *RetryParam, smartSetting smart_routing
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 
 	if param.TokenGroup != "auto" {
-		channel, err := selectSmartChannelForGroup(param, param.TokenGroup, smartSetting)
+		channel, err := selectSmartChannelForGroup(param, param.TokenGroup, smartSetting, true)
 		return channel, selectGroup, true, err
 	}
 
@@ -244,7 +251,7 @@ func cacheGetSmartSatisfiedChannel(param *RetryParam, smartSetting smart_routing
 		}
 		logger.LogDebug(param.Ctx, "Smart routing auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-		channel, err := selectSmartChannelForGroup(param, autoGroup, smartSetting)
+		channel, err := selectSmartChannelForGroup(param, autoGroup, smartSetting, true)
 		if err != nil {
 			return nil, autoGroup, true, err
 		}
@@ -271,7 +278,7 @@ func cacheGetSmartSatisfiedChannel(param *RetryParam, smartSetting smart_routing
 	return nil, selectGroup, true, nil
 }
 
-func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_routing_setting.SmartRoutingSetting) (*model.Channel, error) {
+func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_routing_setting.SmartRoutingSetting, reserveHalfOpen bool) (*model.Channel, error) {
 	candidates, err := smartRoutingCandidatesForGroup(param, group)
 	if err != nil || len(candidates) == 0 {
 		return nil, err
@@ -282,14 +289,90 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		return nil, nil
 	}
 
-	decision := routingselector.SelectRankedFromCandidates(filtered, routingSelectorSettings(setting))
-	if param.Ctx != nil {
-		common.SetContextKey(param.Ctx, constant.ContextKeyRoutingLastDecision, decision)
+	selectorSettings := routingSelectorSettings(setting)
+	for len(filtered) > 0 {
+		decision := routingselector.SelectRankedFromCandidates(filtered, selectorSettings)
+		if param.Ctx != nil {
+			common.SetContextKey(param.Ctx, constant.ContextKeyRoutingLastDecision, decision)
+		}
+		if decision.Selected == nil || decision.Selected.Channel == nil {
+			return nil, nil
+		}
+		if !reserveHalfOpen || acquireRoutingHalfOpenProbe(param.Ctx, decision.Selected, param.ModelName, group, selectorSettings.HalfOpenProbes, selectorSettings.NowUnix) {
+			return decision.Selected.Channel, nil
+		}
+		selectedID := decision.Selected.Channel.Id
+		next := filtered[:0]
+		for _, candidate := range filtered {
+			if candidate.Channel == nil || candidate.Channel.Id != selectedID {
+				next = append(next, candidate)
+			}
+		}
+		filtered = next
 	}
-	if decision.Selected == nil || decision.Selected.Channel == nil {
-		return nil, nil
+	return nil, nil
+}
+
+func acquireRoutingHalfOpenProbe(c *gin.Context, candidate *routingselector.RankedCandidate, modelName string, group string, maxProbes int, nowUnix int64) bool {
+	if candidate == nil || candidate.Channel == nil || candidate.Candidate.Breaker == nil {
+		return true
 	}
-	return decision.Selected.Channel, nil
+	breaker := candidate.Candidate.Breaker
+	state := strings.ToLower(strings.TrimSpace(breaker.State))
+	needsProbe := state == routingselector.BreakerStateHalfOpen
+	if state == routingselector.BreakerStateOpen && breaker.CooldownUntilUnix > 0 && nowUnix >= breaker.CooldownUntilUnix {
+		needsProbe = true
+	}
+	if !needsProbe {
+		return true
+	}
+	key := routingbreaker.Key{
+		ChannelID:   candidate.Channel.Id,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       modelName,
+		Group:       group,
+	}
+	_, ok := routingbreaker.AcquireDefaultHalfOpenProbe(key, maxProbes)
+	if ok && c != nil {
+		probes, _ := common.GetContextKeyType[map[int]routingbreaker.Key](c, constant.ContextKeyRoutingHalfOpenProbes)
+		if probes == nil {
+			probes = map[int]routingbreaker.Key{}
+		}
+		probes[candidate.Channel.Id] = key
+		common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, probes)
+	}
+	return ok
+}
+
+func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string, group string) {
+	if channelID <= 0 || c == nil {
+		return
+	}
+	probes, ok := common.GetContextKeyType[map[int]routingbreaker.Key](c, constant.ContextKeyRoutingHalfOpenProbes)
+	if !ok {
+		return
+	}
+	key, ok := probes[channelID]
+	if !ok {
+		return
+	}
+	delete(probes, channelID)
+	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, probes)
+	routingbreaker.ReleaseDefaultHalfOpenProbe(key)
+}
+
+func ReleaseAllRoutingHalfOpenProbes(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	probes, ok := common.GetContextKeyType[map[int]routingbreaker.Key](c, constant.ContextKeyRoutingHalfOpenProbes)
+	if !ok || len(probes) == 0 {
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, map[int]routingbreaker.Key{})
+	for _, key := range probes {
+		routingbreaker.ReleaseDefaultHalfOpenProbe(key)
+	}
 }
 
 type smartRoutingCandidateMemo map[string][]routingselector.Candidate
@@ -351,9 +434,11 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 		}
 		if breaker, ok := routinghotcache.GetBreaker(cacheKey); ok {
 			candidate.Breaker = &routingselector.BreakerSnapshot{
-				State:       breaker.State,
-				Reason:      breaker.Reason,
-				UpdatedUnix: breaker.UpdatedUnix,
+				State:             breaker.State,
+				Reason:            breaker.Reason,
+				CooldownUntilUnix: breaker.CooldownUntilUnix,
+				HalfOpenInflight:  breaker.HalfOpenInflight,
+				UpdatedUnix:       breaker.UpdatedUnix,
 			}
 		}
 		applyRoutingHealthMarkers(&candidate, channel.Id, smart_routing_setting.GetSetting())
@@ -385,6 +470,7 @@ func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting) 
 		MinVolume:          setting.MinVolume,
 		TopK:               setting.TopK,
 		MaxEjectedPct:      setting.MaxEjectedPct,
+		HalfOpenProbes:     setting.HalfOpenProbes,
 		SnapshotStaleSec:   setting.SnapshotStaleSec,
 		NowUnix:            common.GetTimestamp(),
 		RandomSeed:         time.Now().UnixNano(),

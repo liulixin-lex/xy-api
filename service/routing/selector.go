@@ -26,6 +26,7 @@ type candidateHealth struct {
 	index     int
 	degraded  bool
 	open      bool
+	hardOpen  bool
 }
 
 type scoreBounds struct {
@@ -43,8 +44,8 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	health := make([]candidateHealth, 0, len(candidates))
 	openCount := 0
 	for i, candidate := range candidates {
-		degraded, open := classifyBreaker(candidate.Breaker, settings)
-		if open {
+		degraded, open, hardOpen := classifyBreaker(candidate.Breaker, settings)
+		if open && !hardOpen {
 			openCount++
 		}
 		health = append(health, candidateHealth{
@@ -52,6 +53,7 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 			index:     i,
 			degraded:  degraded,
 			open:      open,
+			hardOpen:  hardOpen,
 		})
 	}
 
@@ -59,6 +61,10 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	included := make([]candidateHealth, 0, len(health))
 	filteredOpen := 0
 	for _, item := range health {
+		if item.hardOpen {
+			filteredOpen++
+			continue
+		}
 		if item.open && !breakerBypassed {
 			filteredOpen++
 			continue
@@ -123,12 +129,36 @@ func SelectRankedFromCandidates(candidates []Candidate, settings Settings) Decis
 		topK = len(decision.Ranked)
 	}
 
+	poolSize := topKSelectionPoolSize(decision.Ranked, topK)
 	selectedIndex := 0
-	if topK > 1 {
-		selectedIndex = weightedTopKIndex(decision.Ranked[:topK], settings.RandomSeed)
+	if poolSize > 1 {
+		selectedIndex = weightedTopKIndex(decision.Ranked[:poolSize], settings.RandomSeed)
 	}
 	decision.Selected = &decision.Ranked[selectedIndex]
 	return decision
+}
+
+func topKSelectionPoolSize(ranked []RankedCandidate, topK int) int {
+	if len(ranked) == 0 {
+		return 0
+	}
+	if topK < 1 {
+		topK = 1
+	}
+	if topK > len(ranked) {
+		topK = len(ranked)
+	}
+	firstHealthOrder := ranked[0].healthSortOrder
+	firstPriority := channelPriority(ranked[0].Channel)
+	poolSize := 1
+	for poolSize < topK {
+		candidate := ranked[poolSize]
+		if candidate.healthSortOrder != firstHealthOrder || channelPriority(candidate.Channel) != firstPriority {
+			break
+		}
+		poolSize++
+	}
+	return poolSize
 }
 
 func weightedTopKIndex(ranked []RankedCandidate, seed int64) int {
@@ -330,23 +360,33 @@ func normalizeWeights(settings Settings, includeCost bool) Weights {
 	return weights.normalized()
 }
 
-func classifyBreaker(breaker *BreakerSnapshot, settings Settings) (bool, bool) {
+func classifyBreaker(breaker *BreakerSnapshot, settings Settings) (bool, bool, bool) {
 	if breaker == nil || breakerStale(breaker, settings) {
-		return false, false
+		return false, false, false
 	}
 	state := strings.ToLower(strings.TrimSpace(breaker.State))
 	reason := strings.ToLower(strings.TrimSpace(breaker.Reason))
 	switch {
-	case state == BreakerStateDegraded:
-		return true, false
-	case state == BreakerStateOpen,
-		state == BreakerReasonAuthFail,
-		state == BreakerReasonBalance,
-		reason == BreakerReasonAuthFail,
+	case state == BreakerReasonAuthFail,
+		reason == BreakerReasonAuthFail:
+		return false, true, true
+	case state == BreakerReasonBalance,
 		reason == BreakerReasonBalance:
-		return false, true
+		return false, true, true
+	case state == BreakerStateDegraded:
+		return true, false, false
+	case state == BreakerStateHalfOpen:
+		if settings.HalfOpenProbes > 0 && breaker.HalfOpenInflight >= int64(settings.HalfOpenProbes) {
+			return false, true, false
+		}
+		return true, false, false
+	case state == BreakerStateOpen:
+		if settings.NowUnix > 0 && breaker.CooldownUntilUnix > 0 && settings.NowUnix >= breaker.CooldownUntilUnix {
+			return true, false, false
+		}
+		return false, true, false
 	default:
-		return false, false
+		return false, false, false
 	}
 }
 

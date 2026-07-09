@@ -65,6 +65,32 @@ func TestUpdateSettingNormalizesAndStoresValues(t *testing.T) {
 	assert.Equal(t, updated, GetSetting())
 }
 
+func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
+	ResetForTest()
+
+	updated := UpdateSetting(SmartRoutingSetting{
+		Enabled:           true,
+		Mode:              ModeBalanced,
+		AvailabilityFloor: 2,
+		FailureRatePct:    -10,
+		BaseCooldownSec:   -1,
+		MaxCooldownSec:    1,
+		MaxEjectedPct:     500,
+		HalfOpenProbes:    0,
+		MaxSwitches:       -3,
+		BackoffCapMs:      -1,
+	})
+
+	assert.Equal(t, 1.0, updated.AvailabilityFloor)
+	assert.Equal(t, 50, updated.FailureRatePct)
+	assert.Equal(t, 30, updated.BaseCooldownSec)
+	assert.Equal(t, 30, updated.MaxCooldownSec)
+	assert.Equal(t, 100, updated.MaxEjectedPct)
+	assert.Equal(t, 1, updated.HalfOpenProbes)
+	assert.Equal(t, 0, updated.MaxSwitches)
+	assert.Equal(t, 20000, updated.BackoffCapMs)
+}
+
 func TestEnterpriseSLOModeUsesEnterpriseWeights(t *testing.T) {
 	ResetForTest()
 	t.Cleanup(ResetForTest)

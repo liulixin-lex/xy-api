@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -21,6 +22,19 @@ import (
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
+var smartRoutingRuntimeOnce sync.Once
+var smartRoutingFlushMu sync.Mutex
+var smartRoutingBreakerConfigMu sync.Mutex
+var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
+
+type routingBreakerConfigIdentity struct {
+	consecutive5xx int
+	failureRatePct int
+	minVolume      int
+	baseCooldown   int
+	maxCooldown    int
+}
+
 // RegisterScheduledSystemTasks wires the periodic channel test, upstream model
 // update, and async task polling (Midjourney / Suno / video) jobs into the
 // system task framework so a DB lease dedups execution across multiple master
@@ -33,6 +47,56 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(routingCostSyncHandler{})
 	service.RegisterSystemTaskHandler(routingAgentHandler{})
+}
+
+func syncRoutingBreakerConfigFromSetting(setting smart_routing_setting.SmartRoutingSetting) {
+	identity := routingBreakerConfigIdentity{
+		consecutive5xx: setting.Consecutive5xx,
+		failureRatePct: setting.FailureRatePct,
+		minVolume:      setting.MinVolume,
+		baseCooldown:   setting.BaseCooldownSec,
+		maxCooldown:    setting.MaxCooldownSec,
+	}
+	smartRoutingBreakerConfigMu.Lock()
+	defer smartRoutingBreakerConfigMu.Unlock()
+	if identity == smartRoutingBreakerConfigLast {
+		return
+	}
+	routingbreaker.ConfigureDefault(routingBreakerConfigFromSetting(setting))
+	smartRoutingBreakerConfigLast = identity
+}
+
+func StartSmartRoutingRuntime() {
+	smartRoutingRuntimeOnce.Do(func() {
+		go func() {
+			for {
+				setting := smart_routing_setting.GetSetting()
+				if setting.Enabled {
+					syncRoutingBreakerConfigFromSetting(setting)
+					_, _ = refreshRoutingHotcacheFromDB()
+				}
+				interval := time.Duration(setting.HotcacheRefreshSec) * time.Second
+				if interval <= 0 {
+					interval = 3 * time.Second
+				}
+				time.Sleep(interval)
+			}
+		}()
+		go func() {
+			for {
+				setting := smart_routing_setting.GetSetting()
+				if setting.Enabled {
+					syncRoutingBreakerConfigFromSetting(setting)
+					_, _ = flushRoutingRuntimeState()
+				}
+				interval := time.Duration(setting.FlushIntervalMin) * time.Minute
+				if interval <= 0 {
+					interval = time.Minute
+				}
+				time.Sleep(interval)
+			}
+		}()
+	})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -219,15 +283,14 @@ type routingPricingItem struct {
 	BillingExpr     string   `json:"billing_expr"`
 }
 
-func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
-	summary := map[string]any{
-		"bindings":  0,
-		"snapshots": 0,
-		"metrics":   0,
-		"breakers":  0,
-		"errors":    0,
-	}
+func flushRoutingRuntimeState() (map[string]any, error) {
+	smartRoutingFlushMu.Lock()
+	defer smartRoutingFlushMu.Unlock()
 
+	summary := map[string]any{
+		"metrics":  0,
+		"breakers": 0,
+	}
 	drainedMetrics := routingmetrics.DrainSnapshots()
 	for i := range drainedMetrics {
 		metric := drainedMetrics[i]
@@ -248,16 +311,95 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 		}
 	}
 	summary["breakers"] = len(dirtyBreakers)
+	return summary, nil
+}
+
+func refreshRoutingHotcacheFromDB() (map[string]any, error) {
+	summary := map[string]any{
+		"costs":    0,
+		"metrics":  0,
+		"breakers": 0,
+	}
+	setting := smart_routing_setting.GetSetting()
+	now := common.GetTimestamp()
+	staleSeconds := int64(setting.SnapshotStaleSec)
+	if staleSeconds <= 0 {
+		staleSeconds = 1800
+	}
+
+	var costs []model.RoutingCostSnapshot
+	if err := model.DB.Where("snapshot_ts >= ?", now-staleSeconds).Order("snapshot_ts desc").Limit(5000).Find(&costs).Error; err != nil {
+		return summary, err
+	}
+	routinghotcache.LoadCostSnapshots(costs)
+	summary["costs"] = len(costs)
+
+	metricWindow := staleSeconds
+	if bucketWindow := int64(setting.MetricBucketSec * 5); bucketWindow > metricWindow {
+		metricWindow = bucketWindow
+	}
+	var metrics []model.RoutingChannelMetric
+	if err := model.DB.Where("bucket_ts >= ?", now-metricWindow).Order("bucket_ts desc").Limit(5000).Find(&metrics).Error; err != nil {
+		return summary, err
+	}
+	routinghotcache.LoadMetricSnapshots(metrics, setting.MetricBucketSec)
+	summary["metrics"] = len(metrics)
+
+	var breakerStates []model.RoutingBreakerState
+	if err := model.DB.Order("updated_time desc").Limit(5000).Find(&breakerStates).Error; err != nil {
+		return summary, err
+	}
+	routingbreaker.HydrateDefaultSnapshots(routingBreakerModelsToSnapshots(breakerStates))
+	summary["breakers"] = len(breakerStates)
+	return summary, nil
+}
+
+func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
+	syncRoutingBreakerConfigFromSetting(smart_routing_setting.GetSetting())
+
+	summary := map[string]any{
+		"bindings":        0,
+		"snapshots":       0,
+		"metrics":         0,
+		"breakers":        0,
+		"loaded_breakers": 0,
+		"errors":          0,
+		"skipped_backoff": 0,
+	}
+
+	flushSummary, err := flushRoutingRuntimeState()
+	if err != nil {
+		return summary, err
+	}
+	summary["metrics"] = flushSummary["metrics"]
+	summary["breakers"] = flushSummary["breakers"]
+
+	refreshSummary, err := refreshRoutingHotcacheFromDB()
+	if err != nil {
+		return summary, err
+	}
+	summary["loaded_breakers"] = refreshSummary["breakers"]
 
 	var bindings []model.RoutingChannelBinding
 	if err := model.DB.Where("enabled = ?", true).Order("channel_id asc").Find(&bindings).Error; err != nil {
 		return summary, err
 	}
-	summary["bindings"] = len(bindings)
+	now := common.GetTimestamp()
+	eligibleBindings := make([]model.RoutingChannelBinding, 0, len(bindings))
+	skippedBackoff := 0
+	for _, binding := range bindings {
+		if binding.SyncBackoffUntil > now {
+			skippedBackoff++
+			continue
+		}
+		eligibleBindings = append(eligibleBindings, binding)
+	}
+	summary["bindings"] = len(eligibleBindings)
+	summary["skipped_backoff"] = skippedBackoff
 
 	syncedSnapshots := 0
 	syncErrors := 0
-	for _, binding := range bindings {
+	for _, binding := range eligibleBindings {
 		snapshots, err := fetchRoutingCostSnapshots(ctx, binding)
 		if err != nil {
 			syncErrors++
@@ -607,7 +749,11 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 		ConsecutiveFailures: int64(snapshot.ConsecutiveFailures),
 		EjectionCount:       int64(snapshot.EjectionCount),
 		HalfOpenInflight:    int64(snapshot.HalfOpenInflight),
-		UpdatedTime:         snapshot.UpdatedAt.Unix(),
+	}
+	if !snapshot.UpdatedAt.IsZero() {
+		state.UpdatedTime = snapshot.UpdatedAt.Unix()
+	} else {
+		state.UpdatedTime = common.GetTimestamp()
 	}
 	if !snapshot.OpenedAt.IsZero() {
 		state.OpenedAt = snapshot.OpenedAt.Unix()
@@ -616,6 +762,42 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 		state.CooldownUntil = snapshot.CooldownUntil.Unix()
 	}
 	return state
+}
+
+func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routingbreaker.Snapshot {
+	snapshots := make([]routingbreaker.Snapshot, 0, len(states))
+	for _, state := range states {
+		if state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
+			continue
+		}
+		snapshot := routingbreaker.Snapshot{
+			Key: routingbreaker.Key{
+				ChannelID:   state.ChannelID,
+				APIKeyIndex: state.APIKeyIndex,
+				Model:       state.ModelName,
+				Group:       state.Group,
+			},
+			State:               routingbreaker.State(state.State),
+			Reason:              state.Reason,
+			ConsecutiveFailures: int(state.ConsecutiveFailures),
+			Consecutive5xx:      int(state.ConsecutiveFailures),
+			EjectionCount:       int(state.EjectionCount),
+			HalfOpenInflight:    int(state.HalfOpenInflight),
+			WindowRequests:      int(state.ConsecutiveFailures),
+			WindowFailures:      int(state.ConsecutiveFailures),
+		}
+		if state.OpenedAt > 0 {
+			snapshot.OpenedAt = time.Unix(state.OpenedAt, 0)
+		}
+		if state.CooldownUntil > 0 {
+			snapshot.CooldownUntil = time.Unix(state.CooldownUntil, 0)
+		}
+		if state.UpdatedTime > 0 {
+			snapshot.UpdatedAt = time.Unix(state.UpdatedTime, 0)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots
 }
 
 type routingAgentHandler struct{}

@@ -77,16 +77,30 @@ func RecordAttempt(key Key, success bool, statusCode int, retryAfter time.Durati
 	} else {
 		snapshot = defaultBreaker.OnFailure(key, statusCode, retryAfter)
 	}
-	routinghotcache.SetBreaker(routinghotcache.Key{
-		ChannelID:   key.ChannelID,
-		APIKeyIndex: key.APIKeyIndex,
-		Model:       key.Model,
-		Group:       key.Group,
-	}, routinghotcache.BreakerSnapshot{
-		State:       string(snapshot.State),
-		Reason:      snapshot.Reason,
-		UpdatedUnix: snapshot.UpdatedAt.Unix(),
-	})
+	publishSnapshot(snapshot)
+	return snapshot
+}
+
+func ConfigureDefault(config Config) {
+	defaultBreaker.Configure(config)
+}
+
+func HydrateDefaultSnapshots(snapshots []Snapshot) {
+	accepted := defaultBreaker.Hydrate(snapshots)
+	for _, snapshot := range accepted {
+		publishSnapshot(defaultBreaker.GetSnapshot(snapshot.Key))
+	}
+}
+
+func AcquireDefaultHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) {
+	snapshot, ok := defaultBreaker.AcquireHalfOpenProbe(key, maxProbes)
+	publishSnapshot(snapshot)
+	return snapshot, ok
+}
+
+func ReleaseDefaultHalfOpenProbe(key Key) Snapshot {
+	snapshot := defaultBreaker.ReleaseHalfOpenProbe(key)
+	publishSnapshot(snapshot)
 	return snapshot
 }
 
@@ -100,17 +114,23 @@ func RequeueDirtySnapshots(snapshots []Snapshot) {
 
 func ResetDefaultKey(key Key) Snapshot {
 	snapshot := defaultBreaker.Reset(key)
-	routinghotcache.SetBreaker(routinghotcache.Key{
+	publishSnapshot(snapshot)
+	return snapshot
+}
+
+func ClearDefaultKey(key Key) {
+	defaultBreaker.Clear(key)
+	routinghotcache.ClearBreaker(routinghotcache.Key{
 		ChannelID:   key.ChannelID,
 		APIKeyIndex: key.APIKeyIndex,
 		Model:       key.Model,
 		Group:       key.Group,
-	}, routinghotcache.BreakerSnapshot{
-		State:       string(snapshot.State),
-		Reason:      snapshot.Reason,
-		UpdatedUnix: snapshot.UpdatedAt.Unix(),
 	})
-	return snapshot
+}
+
+func ClearDefaultChannel(channelID int) {
+	defaultBreaker.ClearChannel(channelID)
+	routinghotcache.ClearChannel(channelID)
 }
 
 func ResetDefaultForTest(config Config) {
@@ -187,6 +207,9 @@ func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) S
 
 	if record.snapshot.State == StateOpen {
 		if statusCode == 429 && retryAfter > 0 {
+			if retryAfter > b.config.MaxCooldown {
+				retryAfter = b.config.MaxCooldown
+			}
 			cooldownUntil := now.Add(retryAfter)
 			if cooldownUntil.After(record.snapshot.CooldownUntil) {
 				record.snapshot.CooldownUntil = cooldownUntil
@@ -258,6 +281,99 @@ func (b *Breaker) Reset(key Key) Snapshot {
 	return record.snapshot
 }
 
+func (b *Breaker) Clear(key Key) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	delete(b.states, key)
+	delete(b.dirty, key)
+}
+
+func (b *Breaker) ClearChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for key := range b.states {
+		if key.ChannelID == channelID {
+			delete(b.states, key)
+		}
+	}
+	for key := range b.dirty {
+		if key.ChannelID == channelID {
+			delete(b.dirty, key)
+		}
+	}
+}
+
+func (b *Breaker) AcquireHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := b.config.Now()
+	record := b.getOrCreate(key, now)
+	if b.advanceOpen(record, now) {
+		b.markDirty(key)
+	}
+	if record.snapshot.State != StateHalfOpen {
+		return record.snapshot, true
+	}
+	if maxProbes <= 0 {
+		maxProbes = 1
+	}
+	if record.snapshot.HalfOpenInflight >= maxProbes {
+		return record.snapshot, false
+	}
+	record.snapshot.HalfOpenInflight++
+	record.snapshot.UpdatedAt = now
+	b.markDirty(key)
+	return record.snapshot, true
+}
+
+func (b *Breaker) ReleaseHalfOpenProbe(key Key) Snapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := b.config.Now()
+	record := b.getOrCreate(key, now)
+	if record.snapshot.State == StateHalfOpen && record.snapshot.HalfOpenInflight > 0 {
+		record.snapshot.HalfOpenInflight--
+		record.snapshot.UpdatedAt = now
+		b.markDirty(key)
+	}
+	return record.snapshot
+}
+
+func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	accepted := make([]Snapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.Key.ChannelID <= 0 || snapshot.Key.Model == "" || snapshot.Key.Group == "" {
+			continue
+		}
+		snapshot.State = normalizeState(snapshot.State)
+		if snapshot.UpdatedAt.IsZero() {
+			snapshot.UpdatedAt = b.config.Now()
+		}
+		if _, dirty := b.dirty[snapshot.Key]; dirty {
+			continue
+		}
+		if existing, ok := b.states[snapshot.Key]; ok && !snapshot.UpdatedAt.After(existing.snapshot.UpdatedAt) {
+			continue
+		}
+		b.states[snapshot.Key] = &entry{
+			snapshot: snapshot,
+			window:   reconstructWindow(snapshot.WindowRequests, snapshot.WindowFailures),
+		}
+		accepted = append(accepted, snapshot)
+	}
+	return accepted
+}
+
 func (b *Breaker) DirtySnapshots() []Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -296,12 +412,18 @@ func (b *Breaker) RequeueDirtySnapshots(snapshots []Snapshot) {
 	}
 }
 
+func (b *Breaker) Configure(config Config) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config = normalizeConfig(config)
+}
+
 func normalizeConfig(config Config) Config {
 	defaults := DefaultConfig()
 	if config.Consecutive5xxThreshold <= 0 {
 		config.Consecutive5xxThreshold = defaults.Consecutive5xxThreshold
 	}
-	if config.FailureRateThreshold <= 0 || config.FailureRateThreshold >= 1 {
+	if config.FailureRateThreshold <= 0 || config.FailureRateThreshold > 1 {
 		config.FailureRateThreshold = defaults.FailureRateThreshold
 	}
 	if config.FailureRateMinSamples <= 0 {
@@ -361,6 +483,7 @@ func (b *Breaker) advanceOpen(record *entry, now time.Time) bool {
 		return false
 	}
 	record.snapshot.State = StateHalfOpen
+	record.snapshot.HalfOpenInflight = 0
 	record.snapshot.UpdatedAt = now
 	return true
 }
@@ -370,7 +493,11 @@ func (b *Breaker) open(record *entry, now time.Time, retryAfter time.Duration, r
 	record.snapshot.Reason = reason
 	record.snapshot.EjectionCount++
 	record.snapshot.OpenedAt = now
+	record.snapshot.HalfOpenInflight = 0
 	cooldown := b.cooldown(record.snapshot.EjectionCount)
+	if retryAfter > b.config.MaxCooldown {
+		retryAfter = b.config.MaxCooldown
+	}
 	if retryAfter > cooldown {
 		cooldown = retryAfter
 	}
@@ -467,4 +594,55 @@ func lessKey(a, b Key) bool {
 		return a.Model < b.Model
 	}
 	return a.Group < b.Group
+}
+
+func unixOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.Unix()
+}
+
+func publishSnapshot(snapshot Snapshot) {
+	routinghotcache.SetBreaker(routinghotcache.Key{
+		ChannelID:   snapshot.Key.ChannelID,
+		APIKeyIndex: snapshot.Key.APIKeyIndex,
+		Model:       snapshot.Key.Model,
+		Group:       snapshot.Key.Group,
+	}, routinghotcache.BreakerSnapshot{
+		State:             string(snapshot.State),
+		Reason:            snapshot.Reason,
+		CooldownUntilUnix: unixOrZero(snapshot.CooldownUntil),
+		HalfOpenInflight:  int64(snapshot.HalfOpenInflight),
+		UpdatedUnix:       snapshot.UpdatedAt.Unix(),
+	})
+}
+
+func normalizeState(state State) State {
+	switch state {
+	case StateHealthy, StateDegraded, StateOpen, StateHalfOpen:
+		return state
+	default:
+		return StateHealthy
+	}
+}
+
+func reconstructWindow(requests int, failures int) []bool {
+	if requests <= 0 {
+		return nil
+	}
+	if failures < 0 {
+		failures = 0
+	}
+	if failures > requests {
+		failures = requests
+	}
+	window := make([]bool, 0, requests)
+	for range requests - failures {
+		window = append(window, false)
+	}
+	for range failures {
+		window = append(window, true)
+	}
+	return window
 }

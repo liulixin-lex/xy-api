@@ -181,6 +181,178 @@ func TestRunRoutingCostSyncTaskMarksAuthFailureOnUnauthorizedUpstream(t *testing
 	assert.NotContains(t, *updated.LastSyncError, "secret-token")
 }
 
+func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:        780,
+		UpstreamType:     model.RoutingUpstreamTypeNewAPI,
+		BaseURL:          server.URL,
+		UpstreamGroup:    "vip",
+		NewAPIUserID:     common.GetPointer(42),
+		Enabled:          true,
+		SyncBackoffUntil: common.GetTimestamp() + 600,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	summary, err := runRoutingCostSyncTask(context.Background())
+
+	require.NoError(t, err)
+	assert.Equal(t, 0, requestCount)
+	assert.EqualValues(t, 0, summary["bindings"])
+	assert.EqualValues(t, 1, summary["skipped_backoff"])
+}
+
+func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	require.NoError(t, db.Create(&model.RoutingBreakerState{
+		ChannelID:     781,
+		APIKeyIndex:   model.RoutingMetricSingleKeyIndex,
+		ModelName:     "gpt-test",
+		Group:         "vip",
+		State:         model.RoutingBreakerStateOpen,
+		Reason:        "5xx",
+		CooldownUntil: common.GetTimestamp() + 60,
+		UpdatedTime:   common.GetTimestamp(),
+	}).Error)
+
+	summary, err := runRoutingCostSyncTask(context.Background())
+
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, summary["loaded_breakers"])
+	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 781, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	require.True(t, ok)
+	assert.Equal(t, model.RoutingBreakerStateOpen, cached.State)
+	assert.Equal(t, "5xx", cached.Reason)
+}
+
+func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	now := common.GetTimestamp()
+
+	require.NoError(t, db.Create(&model.RoutingCostSnapshot{
+		ChannelID:  782,
+		ModelName:  "gpt-test",
+		GroupRatio: 2,
+		BaseRatio:  3,
+		Confidence: model.RoutingCostConfidenceFull,
+		SnapshotTS: now,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingChannelMetric{
+		ChannelID:    782,
+		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
+		ModelName:    "gpt-test",
+		Group:        "vip",
+		BucketTs:     now,
+		RequestCount: 10,
+		SuccessCount: 9,
+		LatencyP95Ms: 250,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingBreakerState{
+		ChannelID:   782,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		ModelName:   "gpt-test",
+		Group:       "vip",
+		State:       model.RoutingBreakerStateDegraded,
+		UpdatedTime: now,
+	}).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB()
+
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, summary["costs"])
+	assert.EqualValues(t, 1, summary["metrics"])
+	assert.EqualValues(t, 1, summary["breakers"])
+	metric, ok := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 782, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	require.True(t, ok)
+	assert.Equal(t, 250.0, metric.P95LatencyMs)
+	cost, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 782, Model: "gpt-test"})
+	require.True(t, ok)
+	assert.Equal(t, 6.0, cost.Cost)
+	breaker, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 782, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	require.True(t, ok)
+	assert.Equal(t, model.RoutingBreakerStateDegraded, breaker.State)
+}
+
+func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	now := common.GetTimestamp()
+
+	costs := make([]model.RoutingCostSnapshot, 0, 5001)
+	metrics := make([]model.RoutingChannelMetric, 0, 5001)
+	for i := 0; i < 5000; i++ {
+		channelID := 10_000 + i
+		costs = append(costs, model.RoutingCostSnapshot{
+			ChannelID:  channelID,
+			ModelName:  "old-cost",
+			GroupRatio: 9,
+			BaseRatio:  1,
+			Confidence: model.RoutingCostConfidenceFull,
+			SnapshotTS: now - 10,
+		})
+		metrics = append(metrics, model.RoutingChannelMetric{
+			ChannelID:    channelID,
+			APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
+			ModelName:    "old-metric",
+			Group:        "vip",
+			BucketTs:     now - 10,
+			RequestCount: 1,
+			SuccessCount: 1,
+			LatencyP95Ms: 900,
+		})
+	}
+	costs = append(costs, model.RoutingCostSnapshot{
+		ChannelID:  99_999,
+		ModelName:  "latest-cost",
+		GroupRatio: 2,
+		BaseRatio:  1,
+		Confidence: model.RoutingCostConfidenceFull,
+		SnapshotTS: now,
+	})
+	metrics = append(metrics, model.RoutingChannelMetric{
+		ChannelID:    99_999,
+		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
+		ModelName:    "latest-metric",
+		Group:        "vip",
+		BucketTs:     now,
+		RequestCount: 10,
+		SuccessCount: 10,
+		LatencyP95Ms: 100,
+	})
+	require.NoError(t, db.CreateInBatches(costs, 500).Error)
+	require.NoError(t, db.CreateInBatches(metrics, 500).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB()
+
+	require.NoError(t, err)
+	assert.EqualValues(t, 5000, summary["costs"])
+	assert.EqualValues(t, 5000, summary["metrics"])
+	cost, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 99_999, Model: "latest-cost"})
+	require.True(t, ok)
+	assert.Equal(t, 2.0, cost.Cost)
+	metric, ok := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 99_999, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "latest-metric", Group: "vip"})
+	require.True(t, ok)
+	assert.Equal(t, 100.0, metric.P95LatencyMs)
+}
+
 func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))

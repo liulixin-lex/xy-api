@@ -74,6 +74,7 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	requestId := c.GetString(common.RequestIdKey)
+	defer service.ReleaseAllRoutingHalfOpenProbes(c)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 
@@ -206,6 +207,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
 				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
@@ -283,15 +285,62 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 	if apiErr != nil {
 		statusCode = apiErr.StatusCode
 	}
-	routingbreaker.RecordAttempt(routingbreaker.Key{
+	key := routingbreaker.Key{
 		ChannelID:   channelID,
 		APIKeyIndex: apiKeyIndex,
 		Model:       relayInfo.OriginModelName,
 		Group:       group,
-	}, apiErr == nil, statusCode, retryAfterFromAPIError(apiErr))
+	}
+	breakerSetting := smart_routing_setting.GetSetting()
+	retryAfterCap := time.Duration(breakerSetting.MaxCooldownSec) * time.Second
+	if retryAfterCap <= 0 {
+		retryAfterCap = routingbreaker.DefaultConfig().MaxCooldown
+	}
+	retryAfter := retryAfterFromAPIError(apiErr, retryAfterCap)
+	routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
+	if apiKeyIndex != model.RoutingMetricSingleKeyIndex {
+		key.APIKeyIndex = model.RoutingMetricSingleKeyIndex
+		routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
+	}
 }
 
-func retryAfterFromAPIError(apiErr *types.NewAPIError) time.Duration {
+func routingBreakerConfigFromSetting(setting smart_routing_setting.SmartRoutingSetting) routingbreaker.Config {
+	failureRate := float64(setting.FailureRatePct) / 100
+	if failureRate <= 0 || failureRate > 1 {
+		failureRate = routingbreaker.DefaultConfig().FailureRateThreshold
+	}
+	minSamples := setting.MinVolume
+	if minSamples <= 0 {
+		minSamples = routingbreaker.DefaultConfig().FailureRateMinSamples
+	}
+	windowSize := minSamples * 2
+	if windowSize < routingbreaker.DefaultConfig().WindowSize {
+		windowSize = routingbreaker.DefaultConfig().WindowSize
+	}
+	consecutive5xx := setting.Consecutive5xx
+	if consecutive5xx <= 0 {
+		consecutive5xx = routingbreaker.DefaultConfig().Consecutive5xxThreshold
+	}
+	degradedFailures := consecutive5xx / 2
+	if degradedFailures < 1 {
+		degradedFailures = 1
+	}
+	return routingbreaker.Config{
+		Consecutive5xxThreshold:      consecutive5xx,
+		FailureRateThreshold:         failureRate,
+		FailureRateMinSamples:        minSamples,
+		WindowSize:                   windowSize,
+		BaseCooldown:                 time.Duration(setting.BaseCooldownSec) * time.Second,
+		MaxCooldown:                  time.Duration(setting.MaxCooldownSec) * time.Second,
+		DegradedConsecutiveFailures:  degradedFailures,
+		DegradedFailureRateThreshold: failureRate / 2,
+		DegradedMinSamples:           minSamples,
+	}
+}
+
+const maxRetryAfterDuration = time.Duration(1<<63 - 1)
+
+func retryAfterFromAPIError(apiErr *types.NewAPIError, capDuration time.Duration) time.Duration {
 	if apiErr == nil || len(apiErr.Metadata) == 0 {
 		return 0
 	}
@@ -304,10 +353,10 @@ func retryAfterFromAPIError(apiErr *types.NewAPIError) time.Duration {
 		return 0
 	}
 	if metadata.RetryAfterMS > 0 {
-		return time.Duration(metadata.RetryAfterMS) * time.Millisecond
+		return cappedMillisecondsDuration(metadata.RetryAfterMS, capDuration)
 	}
 	if metadata.RetryAfterSeconds > 0 && !math.IsNaN(metadata.RetryAfterSeconds) && !math.IsInf(metadata.RetryAfterSeconds, 0) {
-		return time.Duration(metadata.RetryAfterSeconds * float64(time.Second))
+		return cappedSecondsDuration(metadata.RetryAfterSeconds, capDuration)
 	}
 	value := strings.TrimSpace(metadata.RetryAfter)
 	if value == "" {
@@ -317,15 +366,55 @@ func retryAfterFromAPIError(apiErr *types.NewAPIError) time.Duration {
 		if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
 			return 0
 		}
-		return time.Duration(seconds * float64(time.Second))
+		return cappedSecondsDuration(seconds, capDuration)
 	}
 	if deadline, err := http.ParseTime(value); err == nil {
 		delay := time.Until(deadline)
 		if delay > 0 {
+			if capDuration > 0 && delay > capDuration {
+				return capDuration
+			}
 			return delay
 		}
 	}
 	return 0
+}
+
+func cappedMillisecondsDuration(milliseconds int64, capDuration time.Duration) time.Duration {
+	if milliseconds <= 0 {
+		return 0
+	}
+	if capDuration > 0 {
+		capMilliseconds := capDuration.Milliseconds()
+		if capMilliseconds <= 0 || milliseconds >= capMilliseconds {
+			return capDuration
+		}
+	}
+	maxMilliseconds := int64(maxRetryAfterDuration / time.Millisecond)
+	if milliseconds > maxMilliseconds {
+		if capDuration > 0 {
+			return capDuration
+		}
+		return maxRetryAfterDuration
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func cappedSecondsDuration(seconds float64, capDuration time.Duration) time.Duration {
+	if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0
+	}
+	if capDuration > 0 && seconds >= capDuration.Seconds() {
+		return capDuration
+	}
+	maxSeconds := float64(maxRetryAfterDuration) / float64(time.Second)
+	if seconds > maxSeconds {
+		if capDuration > 0 {
+			return capDuration
+		}
+		return maxRetryAfterDuration
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 func streamFirstByteTimeoutError(relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
@@ -386,8 +475,15 @@ func routingRetryBackoffDuration(setting smart_routing_setting.SmartRoutingSetti
 		}
 	}
 	backoff := time.Duration(jitter * float64(ceilingMs) * float64(time.Millisecond))
-	if retryAfter := retryAfterFromAPIError(apiErr); retryAfter > 0 {
-		return retryAfter + backoff
+	if retryAfter := retryAfterFromAPIError(apiErr, time.Duration(capMs)*time.Millisecond); retryAfter > 0 {
+		if retryAfter > time.Duration(capMs)*time.Millisecond {
+			return time.Duration(capMs) * time.Millisecond
+		}
+		total := retryAfter + backoff
+		if total > time.Duration(capMs)*time.Millisecond {
+			return time.Duration(capMs) * time.Millisecond
+		}
+		return total
 	}
 	return backoff
 }
@@ -479,6 +575,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 	if newAPIError != nil {
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, info.OriginModelName, selectGroup)
 		return nil, newAPIError
 	}
 	return channel, nil
@@ -664,6 +761,8 @@ func RelayTaskFetch(c *gin.Context) {
 }
 
 func RelayTask(c *gin.Context) {
+	defer service.ReleaseAllRoutingHalfOpenProbes(c)
+
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, &dto.TaskError{
@@ -719,6 +818,7 @@ func RelayTask(c *gin.Context) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
 				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusRequestEntityTooLarge)
 			} else {

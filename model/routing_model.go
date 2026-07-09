@@ -187,8 +187,10 @@ type RoutingChannelMetric struct {
 	RequestCount    int64  `json:"request_count"`
 	SuccessCount    int64  `json:"success_count"`
 	TotalLatencyMs  int64  `json:"total_latency_ms"`
+	LatencyP95Ms    int64  `json:"latency_p95_ms"`
 	TtftSumMs       int64  `json:"ttft_sum_ms"`
 	TtftCount       int64  `json:"ttft_count"`
+	TtftP95Ms       int64  `json:"ttft_p95_ms"`
 	OutputTokens    int64  `json:"output_tokens"`
 	GenerationMs    int64  `json:"generation_ms"`
 	Err4xx          int64  `json:"err_4xx" gorm:"column:err_4xx"`
@@ -217,8 +219,10 @@ func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
 			"request_count":      gorm.Expr("routing_channel_metrics.request_count + ?", metric.RequestCount),
 			"success_count":      gorm.Expr("routing_channel_metrics.success_count + ?", metric.SuccessCount),
 			"total_latency_ms":   gorm.Expr("routing_channel_metrics.total_latency_ms + ?", metric.TotalLatencyMs),
+			"latency_p95_ms":     gorm.Expr("CASE WHEN routing_channel_metrics.latency_p95_ms > ? THEN routing_channel_metrics.latency_p95_ms ELSE ? END", metric.LatencyP95Ms, metric.LatencyP95Ms),
 			"ttft_sum_ms":        gorm.Expr("routing_channel_metrics.ttft_sum_ms + ?", metric.TtftSumMs),
 			"ttft_count":         gorm.Expr("routing_channel_metrics.ttft_count + ?", metric.TtftCount),
+			"ttft_p95_ms":        gorm.Expr("CASE WHEN routing_channel_metrics.ttft_p95_ms > ? THEN routing_channel_metrics.ttft_p95_ms ELSE ? END", metric.TtftP95Ms, metric.TtftP95Ms),
 			"output_tokens":      gorm.Expr("routing_channel_metrics.output_tokens + ?", metric.OutputTokens),
 			"generation_ms":      gorm.Expr("routing_channel_metrics.generation_ms + ?", metric.GenerationMs),
 			"err_4xx":            gorm.Expr("routing_channel_metrics.err_4xx + ?", metric.Err4xx),

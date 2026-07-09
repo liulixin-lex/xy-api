@@ -247,6 +247,86 @@ func TestRequeueDirtySnapshotsRestoresPersistenceRetry(t *testing.T) {
 	assert.Equal(t, StateOpen, requeued[0].State)
 }
 
+func TestAcquireHalfOpenProbeLimitsConcurrentProbes(t *testing.T) {
+	breaker, clock, key := testBreaker(t)
+	for i := 0; i < 5; i++ {
+		breaker.OnFailure(key, 500, 0)
+	}
+	clock.Advance(10 * time.Second)
+
+	first, ok := breaker.AcquireHalfOpenProbe(key, 1)
+	require.True(t, ok)
+	require.Equal(t, StateHalfOpen, first.State)
+	assert.Equal(t, 1, first.HalfOpenInflight)
+
+	second, ok := breaker.AcquireHalfOpenProbe(key, 1)
+	require.False(t, ok)
+	assert.Equal(t, 1, second.HalfOpenInflight)
+
+	reopened := breaker.OnFailure(key, 500, 0)
+	require.Equal(t, StateOpen, reopened.State)
+	assert.Zero(t, reopened.HalfOpenInflight)
+}
+
+func TestBreakerHydrateRestoresOpenStateForHalfOpenFailure(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 30, 0, time.UTC)}
+	breaker := New(Config{
+		Consecutive5xxThreshold: 5,
+		BaseCooldown:            10 * time.Second,
+		MaxCooldown:             time.Minute,
+		Now:                     clock.Now,
+	})
+	key := Key{ChannelID: 90, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
+	breaker.Hydrate([]Snapshot{{
+		Key:                 key,
+		State:               StateOpen,
+		Reason:              "5xx",
+		ConsecutiveFailures: 5,
+		Consecutive5xx:      5,
+		EjectionCount:       1,
+		OpenedAt:            clock.now.Add(-30 * time.Second),
+		CooldownUntil:       clock.now.Add(-20 * time.Second),
+		UpdatedAt:           clock.now.Add(-20 * time.Second),
+	}})
+
+	require.Equal(t, StateHalfOpen, breaker.GetSnapshot(key).State)
+	snapshot := breaker.OnFailure(key, 500, 0)
+
+	require.Equal(t, StateOpen, snapshot.State)
+	assert.Equal(t, "half_open_failure", snapshot.Reason)
+	assert.Equal(t, 2, snapshot.EjectionCount)
+}
+
+func TestBreakerHydrateDoesNotOverwriteDirtyOrNewerLocalState(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 30, 0, time.UTC)}
+	breaker := New(Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            10 * time.Second,
+		MaxCooldown:             time.Minute,
+		Now:                     clock.Now,
+	})
+	key := Key{ChannelID: 91, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
+	local := breaker.OnFailure(key, 500, 0)
+	require.Equal(t, StateOpen, local.State)
+
+	accepted := breaker.Hydrate([]Snapshot{{
+		Key:       key,
+		State:     StateHealthy,
+		UpdatedAt: clock.now.Add(time.Second),
+	}})
+	assert.Empty(t, accepted)
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(key).State)
+
+	breaker.DirtySnapshots()
+	accepted = breaker.Hydrate([]Snapshot{{
+		Key:       key,
+		State:     StateHealthy,
+		UpdatedAt: clock.now.Add(-time.Second),
+	}})
+	assert.Empty(t, accepted)
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(key).State)
+}
+
 func TestRecordAttemptStoresReasonAndResetDefaultKeyClearsHotcache(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
 	ResetDefaultForTest(Config{
