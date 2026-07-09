@@ -171,6 +171,45 @@ func normalize(setting *SmartRoutingSetting) {
 	if setting.MinVolume < 0 {
 		setting.MinVolume = 0
 	}
+	if setting.AvailabilityFloor < 0 {
+		setting.AvailabilityFloor = 0
+	}
+	if setting.AvailabilityFloor > 1 {
+		setting.AvailabilityFloor = 1
+	}
+	if setting.Consecutive5xx < 1 {
+		setting.Consecutive5xx = defaultSmartRoutingSetting.Consecutive5xx
+	}
+	if setting.FailureRatePct <= 0 || setting.FailureRatePct > 100 {
+		setting.FailureRatePct = defaultSmartRoutingSetting.FailureRatePct
+	}
+	if setting.BaseCooldownSec < 1 {
+		setting.BaseCooldownSec = defaultSmartRoutingSetting.BaseCooldownSec
+	}
+	if setting.MaxCooldownSec < setting.BaseCooldownSec {
+		setting.MaxCooldownSec = setting.BaseCooldownSec
+	}
+	if setting.MaxEjectedPct < 0 {
+		setting.MaxEjectedPct = 0
+	}
+	if setting.MaxEjectedPct > 100 {
+		setting.MaxEjectedPct = 100
+	}
+	if setting.HalfOpenProbes < 1 {
+		setting.HalfOpenProbes = defaultSmartRoutingSetting.HalfOpenProbes
+	}
+	if setting.MaxSwitches < 0 {
+		setting.MaxSwitches = 0
+	}
+	if setting.BackoffBaseMs5xx < 1 {
+		setting.BackoffBaseMs5xx = defaultSmartRoutingSetting.BackoffBaseMs5xx
+	}
+	if setting.BackoffBaseMs429 < 1 {
+		setting.BackoffBaseMs429 = defaultSmartRoutingSetting.BackoffBaseMs429
+	}
+	if setting.BackoffCapMs < 1 {
+		setting.BackoffCapMs = defaultSmartRoutingSetting.BackoffCapMs
+	}
 	if setting.FirstByteMinMs < 1 {
 		setting.FirstByteMinMs = defaultSmartRoutingSetting.FirstByteMinMs
 	}

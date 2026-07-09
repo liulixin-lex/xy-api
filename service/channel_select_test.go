@@ -3,10 +3,12 @@ package service
 import (
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -69,7 +71,7 @@ func TestSelectSmartChannelForGroupUsesHotcacheScoreWithinPriority(t *testing.T)
 		SnapshotStaleSec:   300,
 	}
 
-	channel, err := selectSmartChannelForGroup(param, "default", setting)
+	channel, err := selectSmartChannelForGroup(param, "default", setting, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, channel)
@@ -130,7 +132,7 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	assert.NotEmpty(t, decision.Ranked)
 }
 
-func TestCacheGetRandomSatisfiedChannelFallsBackLegacyWhenSmartRankingEmpty(t *testing.T) {
+func TestCacheGetRandomSatisfiedChannelDoesNotFallbackWhenSmartSafetyFiltersEmptyPool(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
@@ -178,9 +180,25 @@ func TestCacheGetRandomSatisfiedChannelFallsBackLegacyWhenSmartRankingEmpty(t *t
 	})
 
 	require.NoError(t, err)
-	require.NotNil(t, channel)
+	require.Nil(t, channel)
 	assert.Equal(t, "default", group)
-	assert.Contains(t, []int{211, 212}, channel.Id)
+}
+
+func TestSmartRoutingFallsBackToLegacyWhenMemoryCacheDisabled(t *testing.T) {
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+	})
+
+	assert.False(t, shouldActivateSmartRouting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true,
+		Mode:    smart_routing_setting.ModeBalanced,
+	}))
+	assert.False(t, shouldObserveSmartRouting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true,
+		Mode:    smart_routing_setting.ModeObserve,
+	}))
 }
 
 func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *testing.T) {
@@ -230,11 +248,158 @@ func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *t
 		MaxEjectedPct:      100,
 		SnapshotStaleSec:   300,
 		BalanceMarginUSD:   1,
-	})
+	}, true)
 
 	require.NoError(t, err)
 	require.NotNil(t, channel)
 	assert.Equal(t, 303, channel.Id)
+}
+
+func TestSelectSmartChannelForGroupReservesHalfOpenProbe(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 311, Name: "half-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 311, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	model.InitChannelCache()
+
+	now := time.Now()
+	breakerKey := routingbreaker.Key{ChannelID: 311, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key:           breakerKey,
+		State:         routingbreaker.StateHalfOpen,
+		EjectionCount: 1,
+		UpdatedAt:     now,
+	}})
+	cacheKey := routinghotcache.Key{ChannelID: 311, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
+	setting := smart_routing_setting.SmartRoutingSetting{
+		Enabled:            true,
+		Mode:               smart_routing_setting.ModeBalanced,
+		WeightAvailability: 1,
+		TopK:               1,
+		MinVolume:          10,
+		HalfOpenProbes:     1,
+		MaxEjectedPct:      100,
+		SnapshotStaleSec:   300,
+	}
+
+	firstCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	first, err := selectSmartChannelForGroup(&RetryParam{Ctx: firstCtx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0)}, "default", setting, true)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, 311, first.Id)
+	cached, ok := routinghotcache.GetBreaker(cacheKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(1), cached.HalfOpenInflight)
+
+	secondCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	second, err := selectSmartChannelForGroup(&RetryParam{Ctx: secondCtx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0)}, "default", setting, true)
+	require.NoError(t, err)
+	assert.Nil(t, second)
+}
+
+func TestReleaseAllRoutingHalfOpenProbesReleasesReservedProbe(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	key := routingbreaker.Key{ChannelID: 313, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	now := time.Now()
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key:       key,
+		State:     routingbreaker.StateHalfOpen,
+		UpdatedAt: now,
+	}})
+	_, ok := routingbreaker.AcquireDefaultHalfOpenProbe(key, 1)
+	require.True(t, ok)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenProbes, map[int]routingbreaker.Key{313: key})
+	cacheKey := routinghotcache.Key{ChannelID: 313, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	cached, ok := routinghotcache.GetBreaker(cacheKey)
+	require.True(t, ok)
+	require.Equal(t, int64(1), cached.HalfOpenInflight)
+
+	ReleaseAllRoutingHalfOpenProbes(ctx)
+
+	cached, ok = routinghotcache.GetBreaker(cacheKey)
+	require.True(t, ok)
+	assert.Zero(t, cached.HalfOpenInflight)
+	probes, _ := common.GetContextKeyType[map[int]routingbreaker.Key](ctx, constant.ContextKeyRoutingHalfOpenProbes)
+	assert.Empty(t, probes)
+}
+
+func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 312, Name: "observe-half-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 312, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	model.InitChannelCache()
+
+	now := time.Now()
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key:           routingbreaker.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
+		State:         routingbreaker.StateHalfOpen,
+		EjectionCount: 1,
+		UpdatedAt:     now,
+	}})
+	cacheKey := routinghotcache.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	recordSmartRoutingDecision(&RetryParam{Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0)}, smart_routing_setting.SmartRoutingSetting{
+		Enabled:            true,
+		Mode:               smart_routing_setting.ModeObserve,
+		WeightAvailability: 1,
+		TopK:               1,
+		MinVolume:          10,
+		HalfOpenProbes:     1,
+		MaxEjectedPct:      100,
+		SnapshotStaleSec:   300,
+	})
+
+	decision, ok := common.GetContextKeyType[routingselector.Decision](ctx, constant.ContextKeyRoutingLastDecision)
+	require.True(t, ok)
+	require.NotNil(t, decision.Selected)
+	assert.Equal(t, 312, decision.Selected.Channel.Id)
+	cached, ok := routinghotcache.GetBreaker(cacheKey)
+	require.True(t, ok)
+	assert.Zero(t, cached.HalfOpenInflight)
+	_, ok = common.GetContextKeyType[map[int]routingbreaker.Key](ctx, constant.ContextKeyRoutingHalfOpenProbes)
+	assert.False(t, ok)
 }
 
 func TestAffinityAdmissibleHardFiltersOnlyFreshAuthFailureAndLowBalance(t *testing.T) {
@@ -298,4 +463,47 @@ func TestFilterSmartRoutingExcludedCandidatesHonorsSwitchLimit(t *testing.T) {
 
 	filtered = filterSmartRoutingExcludedCandidates(candidates, map[int]struct{}{1: {}, 2: {}, 3: {}}, 2, 2)
 	assert.Empty(t, filtered)
+}
+
+func TestSelectSmartChannelForGroupDoesNotFallBackWhenSwitchLimitExhausted(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(100)
+	weight := uint(10)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 501, Name: "already-used", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 501, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	model.InitChannelCache()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingExcludedChannels, map[int]struct{}{501: {}})
+	common.SetContextKey(ctx, constant.ContextKeyRoutingSwitchCount, 1)
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:            true,
+		Mode:               smart_routing_setting.ModeBalanced,
+		WeightAvailability: 1,
+		TopK:               1,
+		MinVolume:          10,
+		MaxSwitches:        1,
+		MaxEjectedPct:      100,
+	})
+
+	channel, _, err := CacheGetRandomSatisfiedChannel(&RetryParam{
+		Ctx:         ctx,
+		TokenGroup:  "default",
+		ModelName:   "gpt-test",
+		RequestPath: "/v1/chat/completions",
+		Retry:       common.GetPointer(1),
+	})
+
+	require.NoError(t, err)
+	assert.Nil(t, channel)
 }

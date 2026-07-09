@@ -52,15 +52,56 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 		RequestCount:   4,
 		SuccessCount:   3,
 		TotalLatencyMs: 800,
+		LatencyP95Ms:   750,
 	}}, 60)
 
 	metric, ok := GetMetric(Key{ChannelID: 77, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"})
 	require.True(t, ok)
 	assert.Equal(t, int64(4), metric.RequestCount)
 	assert.Equal(t, int64(3), metric.SuccessCount)
-	assert.Equal(t, 200.0, metric.P95LatencyMs)
+	assert.Equal(t, 750.0, metric.P95LatencyMs)
 	assert.InDelta(t, 4.0/60.0, metric.TPS, 0.000001)
 	assert.Equal(t, int64(120), metric.UpdatedUnix)
+}
+
+func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	metricKey := Key{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	LoadMetricSnapshots([]model.RoutingChannelMetric{
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", BucketTs: 200, RequestCount: 10, SuccessCount: 10, TotalLatencyMs: 1000, LatencyP95Ms: 100},
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", BucketTs: 100, RequestCount: 10, SuccessCount: 1, TotalLatencyMs: 9000, LatencyP95Ms: 900},
+	}, 60)
+	metric, ok := GetMetric(metricKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(200), metric.UpdatedUnix)
+	assert.Equal(t, int64(10), metric.SuccessCount)
+	assert.Equal(t, 100.0, metric.P95LatencyMs)
+	LoadMetricSnapshots([]model.RoutingChannelMetric{{
+		ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", BucketTs: 200, RequestCount: 10, SuccessCount: 0, TotalLatencyMs: 5000, LatencyP95Ms: 500,
+	}}, 60)
+	metric, ok = GetMetric(metricKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(10), metric.RequestCount)
+	assert.Equal(t, int64(10), metric.SuccessCount)
+	assert.Equal(t, 100.0, metric.P95LatencyMs)
+
+	costKey := CostKey{ChannelID: 78, Model: "gpt-test"}
+	LoadCostSnapshots([]model.RoutingCostSnapshot{
+		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 2, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
+		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 9, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 100},
+	})
+	cost, ok := GetCost(costKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(200), cost.UpdatedUnix)
+	assert.Equal(t, 2.0, cost.Cost)
+	LoadCostSnapshots([]model.RoutingCostSnapshot{
+		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 5, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
+	})
+	cost, ok = GetCost(costKey)
+	require.True(t, ok)
+	assert.Equal(t, 2.0, cost.Cost)
 }
 
 func TestHotcacheStoresAuthFailureAndBalanceMarkers(t *testing.T) {

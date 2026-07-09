@@ -150,6 +150,31 @@ func TestSelectRankedFromCandidatesWeightsTopKByScore(t *testing.T) {
 	assert.Equal(t, 1, decision.Selected.Channel.Id)
 }
 
+func TestSelectRankedFromCandidatesSamplesTopKWithinHighestPriorityPool(t *testing.T) {
+	highPriority := int64(100)
+	lowPriority := int64(1)
+	candidates := []Candidate{
+		testCandidate(1, 0.1, 100, 10, nil, nil),
+		testCandidate(2, 0.1, 100, 10, nil, nil),
+		testCandidate(3, 1, 100, 10, nil, nil),
+	}
+	candidates[0].Channel.Priority = &highPriority
+	candidates[1].Channel.Priority = &highPriority
+	candidates[2].Channel.Priority = &lowPriority
+
+	for seed := int64(0); seed < 20; seed++ {
+		decision := SelectRankedFromCandidates(candidates, Settings{
+			WeightAvailability: 1,
+			MinVolume:          10,
+			TopK:               3,
+			RandomSeed:         seed,
+		})
+
+		require.NotNil(t, decision.Selected)
+		assert.NotEqual(t, 3, decision.Selected.Channel.Id, "seed %d selected a lower-priority channel", seed)
+	}
+}
+
 func TestDegradedCandidateDoesNotOutrankHealthyCandidate(t *testing.T) {
 	settings := Settings{
 		WeightAvailability: 1,
@@ -283,6 +308,54 @@ func TestOpenBreakerFilteredUnlessMaxEjectedPctExceeded(t *testing.T) {
 		assert.False(t, decision.BreakerBypassed)
 		assert.Zero(t, decision.FilteredOpen)
 	})
+}
+
+func TestOpenBreakerAfterCooldownIsEligibleAsHalfOpen(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		MaxEjectedPct:      50,
+		NowUnix:            2000,
+		SnapshotStaleSec:   300,
+	}
+
+	decision := RankCandidates([]Candidate{
+		testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{
+			State:             BreakerStateOpen,
+			UpdatedUnix:       1990,
+			CooldownUntilUnix: 1999,
+		}),
+		testCandidate(2, 0.5, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 2000}),
+	}, settings)
+
+	require.Len(t, decision.Ranked, 2)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+	assert.Equal(t, 1, decision.Ranked[1].Channel.Id)
+	assert.True(t, decision.Ranked[1].Degraded)
+	assert.False(t, decision.Ranked[1].Open)
+	assert.False(t, decision.BreakerBypassed)
+	assert.Zero(t, decision.FilteredOpen)
+}
+
+func TestAuthFailureAndLowBalanceAreHardFilteredEvenWhenBreakerBypassWouldApply(t *testing.T) {
+	settings := Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		MaxEjectedPct:      50,
+		NowUnix:            1000,
+		SnapshotStaleSec:   60,
+	}
+
+	decision := RankCandidates([]Candidate{
+		testCandidate(1, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, Reason: BreakerReasonAuthFail, UpdatedUnix: 1000}),
+		testCandidate(2, 1, 100, 10, nil, &BreakerSnapshot{State: BreakerStateOpen, Reason: BreakerReasonBalance, UpdatedUnix: 1000}),
+		testCandidate(3, 0.5, 100, 10, nil, &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 1000}),
+	}, settings)
+
+	require.Len(t, decision.Ranked, 1)
+	assert.Equal(t, 3, decision.Ranked[0].Channel.Id)
+	assert.False(t, decision.BreakerBypassed)
+	assert.Equal(t, 2, decision.FilteredOpen)
 }
 
 func TestRankCandidatesDoesNotModifyOriginalChannelPointer(t *testing.T) {

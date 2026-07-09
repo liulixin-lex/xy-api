@@ -36,6 +36,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ErrorState } from '@/components/error-state'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { SectionPageLayout } from '@/components/layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -156,6 +157,13 @@ const upstreamOptions = [
   { value: 'sub2api', label: 'Sub2API' },
 ] as const
 
+const enterpriseSLOWeights = {
+  weight_availability: 0.55,
+  weight_latency: 0.3,
+  weight_throughput: 0.1,
+  weight_cost: 0.05,
+} as const
+
 function requireData<T>(response: {
   success: boolean
   message?: string
@@ -213,6 +221,42 @@ function translatedModeLabel(
       return t('Enterprise SLO')
     default:
       return ''
+  }
+}
+
+function translatedRecommendationStatus(
+  status: string | undefined,
+  t: (key: string) => string
+) {
+  switch (status) {
+    case 'pending':
+      return t('Pending')
+    case 'approved':
+      return t('Approved')
+    case 'rejected':
+      return t('Rejected')
+    case 'auto_applied':
+      return t('Auto applied')
+    default:
+      return status || '-'
+  }
+}
+
+function translatedSeverity(
+  severity: string | undefined,
+  t: (key: string) => string
+) {
+  switch (severity) {
+    case 'critical':
+      return t('Critical')
+    case 'high':
+      return t('High')
+    case 'medium':
+      return t('Medium')
+    case 'low':
+      return t('Low')
+    default:
+      return severity || '-'
   }
 }
 
@@ -334,6 +378,7 @@ function NumericInput(props: {
   min?: number
   max?: number
   step?: number
+  disabled?: boolean
   onChange: (value: number) => void
 }) {
   const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -350,6 +395,7 @@ function NumericInput(props: {
       min={props.min}
       max={props.max}
       step={props.step}
+      disabled={props.disabled}
       onChange={handleChange}
     />
   )
@@ -419,6 +465,9 @@ function SettingsPanel(props: {
       />
     )
   }
+  const formDisabled = !props.canWrite || updateMutation.isPending
+  const enterpriseWeightsLocked = draft.mode === 'enterprise_slo'
+  const agentControlsDisabled = true
 
   return (
     <form
@@ -432,7 +481,12 @@ function SettingsPanel(props: {
         updateMutation.mutate(draft)
       }}
     >
-      <FieldSet>
+      {!props.canWrite && (
+        <div className='bg-muted/50 text-muted-foreground rounded-md px-3 py-2 text-sm'>
+          {t('Smart Routing settings are read-only for your role.')}
+        </div>
+      )}
+      <FieldSet disabled={formDisabled}>
         <FieldLegend>{t('Routing Mode')}</FieldLegend>
         <FieldGroup className='grid gap-4 lg:grid-cols-2'>
           <Field
@@ -448,6 +502,7 @@ function SettingsPanel(props: {
               </FieldDescription>
             </div>
             <Switch
+              aria-label={t('Enable Smart Routing')}
               checked={draft.enabled}
               onCheckedChange={(value) => setField('enabled', value)}
             />
@@ -458,7 +513,18 @@ function SettingsPanel(props: {
               items={modeOptions}
               value={draft.mode}
               onValueChange={(value) => {
-                if (value) setField('mode', value as SmartRoutingMode)
+                if (!value) return
+                setDraft((current) => {
+                  if (!current) return current
+                  if (value === 'enterprise_slo') {
+                    return {
+                      ...current,
+                      mode: value as SmartRoutingMode,
+                      ...enterpriseSLOWeights,
+                    }
+                  }
+                  return { ...current, mode: value as SmartRoutingMode }
+                })
               }}
             >
               <SelectTrigger id='smart-routing-mode' className='w-full'>
@@ -482,8 +548,14 @@ function SettingsPanel(props: {
             <Input
               id='smart-routing-agent-model'
               value={draft.agent_model}
+              disabled={agentControlsDisabled}
               onChange={(event) => setField('agent_model', event.target.value)}
             />
+            <FieldDescription>
+              {t(
+                'Agent recommendations are planned for v2 and are currently read-only.'
+              )}
+            </FieldDescription>
           </Field>
           <Field
             orientation='horizontal'
@@ -496,7 +568,9 @@ function SettingsPanel(props: {
               </FieldDescription>
             </div>
             <Switch
+              aria-label={t('Enable Agent Recommendations')}
               checked={draft.agent_enabled}
+              disabled={agentControlsDisabled}
               onCheckedChange={(value) => setField('agent_enabled', value)}
             />
           </Field>
@@ -513,15 +587,22 @@ function SettingsPanel(props: {
               </FieldDescription>
             </div>
             <Switch
+              aria-label={t('Auto Apply Agent Changes')}
               checked={draft.agent_auto_apply}
+              disabled={agentControlsDisabled}
               onCheckedChange={(value) => setField('agent_auto_apply', value)}
             />
           </Field>
         </FieldGroup>
       </FieldSet>
 
-      <FieldSet>
+      <FieldSet disabled={formDisabled}>
         <FieldLegend>{t('Scoring')}</FieldLegend>
+        {enterpriseWeightsLocked && (
+          <FieldDescription>
+            {t('Enterprise SLO uses fixed scoring weights.')}
+          </FieldDescription>
+        )}
         <FieldGroup className='grid gap-4 lg:grid-cols-4'>
           <Field>
             <FieldLabel htmlFor='weight-availability'>
@@ -532,6 +613,7 @@ function SettingsPanel(props: {
               value={draft.weight_availability}
               min={0}
               step={0.01}
+              disabled={enterpriseWeightsLocked}
               onChange={(value) => setField('weight_availability', value)}
             />
           </Field>
@@ -544,6 +626,7 @@ function SettingsPanel(props: {
               value={draft.weight_latency}
               min={0}
               step={0.01}
+              disabled={enterpriseWeightsLocked}
               onChange={(value) => setField('weight_latency', value)}
             />
           </Field>
@@ -556,6 +639,7 @@ function SettingsPanel(props: {
               value={draft.weight_throughput}
               min={0}
               step={0.01}
+              disabled={enterpriseWeightsLocked}
               onChange={(value) => setField('weight_throughput', value)}
             />
           </Field>
@@ -566,6 +650,7 @@ function SettingsPanel(props: {
               value={draft.weight_cost}
               min={0}
               step={0.01}
+              disabled={enterpriseWeightsLocked}
               onChange={(value) => setField('weight_cost', value)}
             />
           </Field>
@@ -617,7 +702,7 @@ function SettingsPanel(props: {
         </FieldGroup>
       </FieldSet>
 
-      <FieldSet>
+      <FieldSet disabled={formDisabled}>
         <FieldLegend>{t('Breaker and Retry')}</FieldLegend>
         <FieldGroup className='grid gap-4 lg:grid-cols-4'>
           <Field>
@@ -719,7 +804,7 @@ function SettingsPanel(props: {
         </FieldGroup>
       </FieldSet>
 
-      <FieldSet>
+      <FieldSet disabled={formDisabled}>
         <FieldLegend>{t('Synchronization')}</FieldLegend>
         <FieldGroup className='grid gap-4 lg:grid-cols-4'>
           <Field>
@@ -781,6 +866,7 @@ function SettingsPanel(props: {
               </FieldDescription>
             </div>
             <Switch
+              aria-label={t('First-byte Failover')}
               checked={draft.first_byte_failover_enabled}
               onCheckedChange={(value) =>
                 setField('first_byte_failover_enabled', value)
@@ -897,7 +983,7 @@ function BindingDialog(props: {
 
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className='sm:max-w-2xl'>
+      <DialogContent className='max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl'>
         <DialogHeader>
           <DialogTitle>
             {props.binding
@@ -1109,16 +1195,21 @@ function BindingDialog(props: {
                 <Input
                   id='binding-new-api-user'
                   type='number'
+                  min={1}
+                  step={1}
                   value={form.new_api_user_id ?? ''}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const parsed = Number(event.target.value)
                     setForm((current) => ({
                       ...current,
                       new_api_user_id:
-                        event.target.value === ''
+                        event.target.value === '' ||
+                        !Number.isFinite(parsed) ||
+                        parsed < 1
                           ? undefined
-                          : Number(event.target.value),
+                          : Math.trunc(parsed),
                     }))
-                  }
+                  }}
                 />
               </Field>
             )}
@@ -1135,6 +1226,7 @@ function BindingDialog(props: {
                 </FieldDescription>
               </div>
               <Switch
+                aria-label={t('Enabled')}
                 checked={form.enabled}
                 onCheckedChange={(value) =>
                   setForm((current) => ({ ...current, enabled: value }))
@@ -1155,6 +1247,7 @@ function BindingDialog(props: {
                   </FieldDescription>
                 </div>
                 <Switch
+                  aria-label={t('Serves Claude Code')}
                   checked={form.serves_claude_code}
                   onCheckedChange={(value) =>
                     setForm((current) => ({
@@ -1352,6 +1445,8 @@ function BindingsPanel(props: {
   const [editingBinding, setEditingBinding] = useState<RoutingBinding | null>(
     null
   )
+  const [pendingDeleteBinding, setPendingDeleteBinding] =
+    useState<RoutingBinding | null>(null)
   const [groupResults, setGroupResults] = useState<
     Record<number, RoutingBindingActionResult>
   >({})
@@ -1376,6 +1471,7 @@ function BindingsPanel(props: {
       return response.data?.items ?? []
     },
     staleTime: QUERY_STALE_MS,
+    enabled: props.canSensitiveWrite && dialogOpen && editingBinding == null,
   })
   const availableChannels = useMemo(
     () =>
@@ -1431,6 +1527,7 @@ function BindingsPanel(props: {
         return
       }
       toast.success(t('Routing binding deleted'))
+      setPendingDeleteBinding(null)
       invalidateBindings()
     },
     onError: (error: Error) => {
@@ -1691,9 +1788,7 @@ function BindingsPanel(props: {
                             variant='destructive'
                             size='icon-sm'
                             aria-label={t('Delete')}
-                            onClick={() =>
-                              deleteMutation.mutate(binding.channel_id)
-                            }
+                            onClick={() => setPendingDeleteBinding(binding)}
                             disabled={
                               deleteMutation.isPending ||
                               !props.canSensitiveWrite
@@ -1737,6 +1832,25 @@ function BindingsPanel(props: {
             })
           } else {
             createMutation.mutate(request)
+          }
+        }}
+      />
+      <ConfirmDialog
+        open={pendingDeleteBinding != null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteBinding(null)
+        }}
+        title={t('Delete routing binding')}
+        desc={t(
+          'Delete binding for channel #{{channelId}}? This removes synced routing snapshots and breaker state. This cannot be undone.',
+          { channelId: pendingDeleteBinding?.channel_id ?? '-' }
+        )}
+        confirmText={t('Delete Binding')}
+        destructive
+        isLoading={deleteMutation.isPending}
+        handleConfirm={() => {
+          if (pendingDeleteBinding) {
+            deleteMutation.mutate(pendingDeleteBinding.channel_id)
           }
         }}
       />
@@ -2158,7 +2272,7 @@ function AgentPanel(props: {
     <Panel
       title={t('Agent Recommendations')}
       description={t(
-        'Review proposed routing changes before they are applied.'
+        'Agent recommendations are planned for v2 and are currently read-only.'
       )}
       icon={Bot}
     >
@@ -2191,7 +2305,9 @@ function AgentPanel(props: {
                 <TableRow key={recommendation.id}>
                   <TableCell className='px-4 py-3'>
                     <div className='flex flex-col gap-1'>
-                      <span className='font-medium'>{recommendation.type}</span>
+                      <span className='font-medium'>
+                        {recommendation.type || t('Read-only preview')}
+                      </span>
                       <span className='text-muted-foreground text-xs'>
                         {formatTimestampRelative(
                           recommendation.created_time,
@@ -2203,7 +2319,7 @@ function AgentPanel(props: {
                   </TableCell>
                   <TableCell className='py-3'>
                     <Badge variant='outline'>
-                      {recommendation.severity || '-'}
+                      {translatedSeverity(recommendation.severity, t)}
                     </Badge>
                   </TableCell>
                   <TableCell className='max-w-[260px] py-3 align-top'>
@@ -2217,7 +2333,12 @@ function AgentPanel(props: {
                     </code>
                   </TableCell>
                   <TableCell className='py-3'>
-                    <Badge variant='secondary'>{recommendation.status}</Badge>
+                    <Badge variant='secondary'>
+                      {translatedRecommendationStatus(
+                        recommendation.status,
+                        t
+                      )}
+                    </Badge>
                   </TableCell>
                   <TableCell className='py-3 pr-4'>
                     <div className='flex justify-end gap-1'>
@@ -2225,11 +2346,7 @@ function AgentPanel(props: {
                         type='button'
                         variant='outline'
                         size='sm'
-                        disabled={
-                          approveMutation.isPending ||
-                          recommendation.status !== 'pending' ||
-                          !props.canWrite
-                        }
+                        disabled
                         onClick={() =>
                           approveMutation.mutate(recommendation.id)
                         }
@@ -2241,11 +2358,7 @@ function AgentPanel(props: {
                         type='button'
                         variant='ghost'
                         size='sm'
-                        disabled={
-                          rejectMutation.isPending ||
-                          recommendation.status !== 'pending' ||
-                          !props.canWrite
-                        }
+                        disabled
                         onClick={() => rejectMutation.mutate(recommendation.id)}
                       >
                         <X data-icon='inline-start' />
@@ -2287,6 +2400,9 @@ export function SmartRouting() {
     ADMIN_PERMISSION_RESOURCES.CHANNEL,
     ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
   )
+  const [activeTab, setActiveTab] = useState<
+    'settings' | 'bindings' | 'metrics' | 'breakers' | 'agent'
+  >('settings')
 
   const settingsQuery = useQuery({
     queryKey: ['smart-routing', 'settings'],
@@ -2298,35 +2414,35 @@ export function SmartRouting() {
     queryKey: ['smart-routing', 'bindings'],
     queryFn: async () => requireData(await listSmartRoutingBindings()),
     staleTime: QUERY_STALE_MS,
-    enabled: canRead,
+    enabled: canRead && activeTab === 'bindings',
   })
   const metricsQuery = useQuery({
     queryKey: ['smart-routing', 'metrics'],
     queryFn: async () =>
       requireData(await listSmartRoutingMetrics(TABLE_LIMIT)),
     staleTime: QUERY_STALE_MS,
-    enabled: canRead,
+    enabled: canRead && activeTab === 'metrics',
   })
   const snapshotsQuery = useQuery({
     queryKey: ['smart-routing', 'snapshots'],
     queryFn: async () =>
       requireData(await listSmartRoutingSnapshots(TABLE_LIMIT)),
     staleTime: QUERY_STALE_MS,
-    enabled: canRead,
+    enabled: canRead && (activeTab === 'bindings' || activeTab === 'metrics'),
   })
   const breakersQuery = useQuery({
     queryKey: ['smart-routing', 'breakers'],
     queryFn: async () =>
       requireData(await listSmartRoutingBreakers(TABLE_LIMIT)),
     staleTime: QUERY_STALE_MS,
-    enabled: canRead,
+    enabled: canRead && activeTab === 'breakers',
   })
   const recommendationsQuery = useQuery({
     queryKey: ['smart-routing', 'agent-recommendations'],
     queryFn: async () =>
       requireData(await listSmartRoutingAgentRecommendations(TABLE_LIMIT)),
     staleTime: QUERY_STALE_MS,
-    enabled: canRead,
+    enabled: canRead && activeTab === 'agent',
   })
 
   const syncMutation = useMutation({
@@ -2415,7 +2531,15 @@ export function SmartRouting() {
         </Button>
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
-        <Tabs defaultValue='settings' className='flex min-h-0 flex-col gap-4'>
+        <Tabs
+          value={activeTab}
+          onValueChange={(value) =>
+            setActiveTab(
+              value as 'settings' | 'bindings' | 'metrics' | 'breakers' | 'agent'
+            )
+          }
+          className='flex min-h-0 flex-col gap-4'
+        >
           <TabsList className='max-w-full flex-wrap justify-start group-data-horizontal/tabs:h-auto'>
             <TabsTrigger value='settings'>{t('Settings')}</TabsTrigger>
             <TabsTrigger value='bindings'>{t('Bindings')}</TabsTrigger>
@@ -2443,52 +2567,60 @@ export function SmartRouting() {
             </Panel>
           </TabsContent>
           <TabsContent value='bindings'>
-            <BindingsPanel
-              bindings={bindingsQuery.data}
-              snapshots={snapshotsQuery.data}
-              isLoading={bindingsQuery.isLoading}
-              isError={bindingsQuery.isError}
-              error={bindingsQuery.error}
-              canOperate={canOperate}
-              canSensitiveWrite={canSensitiveWrite}
-              onRetry={() => {
-                void bindingsQuery.refetch()
-                void snapshotsQuery.refetch()
-              }}
-            />
+            {activeTab === 'bindings' && (
+              <BindingsPanel
+                bindings={bindingsQuery.data}
+                snapshots={snapshotsQuery.data}
+                isLoading={bindingsQuery.isLoading}
+                isError={bindingsQuery.isError}
+                error={bindingsQuery.error}
+                canOperate={canOperate}
+                canSensitiveWrite={canSensitiveWrite}
+                onRetry={() => {
+                  void bindingsQuery.refetch()
+                  void snapshotsQuery.refetch()
+                }}
+              />
+            )}
           </TabsContent>
           <TabsContent value='metrics'>
-            <MetricsPanel
-              metrics={metricsQuery.data}
-              snapshots={snapshotsQuery.data}
-              isLoading={metricsQuery.isLoading || snapshotsQuery.isLoading}
-              isError={metricsQuery.isError || snapshotsQuery.isError}
-              error={metricsQuery.error ?? snapshotsQuery.error}
-              onRetry={() => {
-                void metricsQuery.refetch()
-                void snapshotsQuery.refetch()
-              }}
-            />
+            {activeTab === 'metrics' && (
+              <MetricsPanel
+                metrics={metricsQuery.data}
+                snapshots={snapshotsQuery.data}
+                isLoading={metricsQuery.isLoading || snapshotsQuery.isLoading}
+                isError={metricsQuery.isError || snapshotsQuery.isError}
+                error={metricsQuery.error ?? snapshotsQuery.error}
+                onRetry={() => {
+                  void metricsQuery.refetch()
+                  void snapshotsQuery.refetch()
+                }}
+              />
+            )}
           </TabsContent>
           <TabsContent value='breakers'>
-            <BreakersPanel
-              breakers={breakersQuery.data}
-              isLoading={breakersQuery.isLoading}
-              isError={breakersQuery.isError}
-              error={breakersQuery.error}
-              canOperate={canOperate}
-              onRetry={() => void breakersQuery.refetch()}
-            />
+            {activeTab === 'breakers' && (
+              <BreakersPanel
+                breakers={breakersQuery.data}
+                isLoading={breakersQuery.isLoading}
+                isError={breakersQuery.isError}
+                error={breakersQuery.error}
+                canOperate={canOperate}
+                onRetry={() => void breakersQuery.refetch()}
+              />
+            )}
           </TabsContent>
           <TabsContent value='agent'>
-            <AgentPanel
-              recommendations={recommendationsQuery.data}
-              isLoading={recommendationsQuery.isLoading}
-              isError={recommendationsQuery.isError}
-              error={recommendationsQuery.error}
-              canWrite={canWrite}
-              onRetry={() => void recommendationsQuery.refetch()}
-            />
+            {activeTab === 'agent' && (
+              <AgentPanel
+                recommendations={recommendationsQuery.data}
+                isLoading={recommendationsQuery.isLoading}
+                isError={recommendationsQuery.isError}
+                error={recommendationsQuery.error}
+                canWrite={canWrite}
+                onRetry={() => void recommendationsQuery.refetch()}
+              />
+            )}
           </TabsContent>
         </Tabs>
       </SectionPageLayout.Content>

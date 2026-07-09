@@ -33,11 +33,16 @@ type InflightKey struct {
 
 type bucket struct {
 	mu              sync.Mutex
+	draining        bool
 	requestCount    int64
 	successCount    int64
 	totalLatencyMs  int64
+	latencySamples  []int64
+	latencyP95Ms    int64
 	ttftSumMs       int64
 	ttftCount       int64
+	ttftSamples     []int64
+	ttftP95Ms       int64
 	outputTokens    int64
 	generationMs    int64
 	err4xx          int64
@@ -54,13 +59,23 @@ func BeginInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID int) f
 	if !ok {
 		return func() {}
 	}
-	counter := inflightCounter(key)
-	counter.Add(1)
+	keys := []InflightKey{key}
+	if key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+		aggregate := key
+		aggregate.APIKeyIndex = model.RoutingMetricSingleKeyIndex
+		keys = append(keys, aggregate)
+	}
+	for _, item := range keys {
+		inflightCounter(item).Add(1)
+	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			if counter.Add(-1) <= 0 {
-				inflight.Delete(key)
+			for _, item := range keys {
+				counter := inflightCounter(item)
+				if counter.Add(-1) <= 0 {
+					inflight.Delete(item)
+				}
 			}
 		})
 	}
@@ -110,8 +125,11 @@ func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, a
 		}
 	}
 
-	actual, _ := buckets.LoadOrStore(key, &bucket{})
-	actual.(*bucket).add(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	if key.apiKeyIndex != model.RoutingMetricSingleKeyIndex {
+		key.apiKeyIndex = model.RoutingMetricSingleKeyIndex
+		recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	}
 }
 
 func Snapshots() []model.RoutingChannelMetric {
@@ -129,11 +147,21 @@ func Snapshots() []model.RoutingChannelMetric {
 }
 
 func DrainSnapshots() []model.RoutingChannelMetric {
-	snapshots := Snapshots()
+	snapshots := make([]model.RoutingChannelMetric, 0)
 	buckets.Range(func(key any, value any) bool {
-		buckets.Delete(key)
+		k := key.(bucketKey)
+		b := value.(*bucket)
+		b.mu.Lock()
+		b.draining = true
+		snapshot := b.snapshotLocked(k)
+		b.mu.Unlock()
+		if snapshot.RequestCount > 0 {
+			snapshots = append(snapshots, snapshot)
+		}
+		buckets.CompareAndDelete(key, value)
 		return true
 	})
+	sortRoutingMetrics(snapshots)
 	return snapshots
 }
 
@@ -143,16 +171,26 @@ func RequeueSnapshots(snapshots []model.RoutingChannelMetric) {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
 		}
-		key := bucketKey{
-			channelID:   snapshot.ChannelID,
-			apiKeyIndex: snapshot.APIKeyIndex,
-			modelName:   snapshot.ModelName,
-			group:       snapshot.Group,
-			bucketTs:    snapshot.BucketTs,
-		}
-		actual, _ := buckets.LoadOrStore(key, &bucket{})
-		actual.(*bucket).addSnapshot(snapshot)
+		recordSnapshot(snapshot)
 	}
+}
+
+func ClearChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	buckets.Range(func(key any, value any) bool {
+		if k, ok := key.(bucketKey); ok && k.channelID == channelID {
+			buckets.Delete(key)
+		}
+		return true
+	})
+	inflight.Range(func(key any, value any) bool {
+		if k, ok := key.(InflightKey); ok && k.ChannelID == channelID {
+			inflight.Delete(key)
+		}
+		return true
+	})
 }
 
 func ResetForTest() {
@@ -166,18 +204,57 @@ func ResetForTest() {
 	})
 }
 
+func recordBucket(key bucketKey, latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+	withWritableBucket(key, func(b *bucket) {
+		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	})
+}
+
+func recordSnapshot(snapshot model.RoutingChannelMetric) {
+	key := bucketKey{
+		channelID:   snapshot.ChannelID,
+		apiKeyIndex: snapshot.APIKeyIndex,
+		modelName:   snapshot.ModelName,
+		group:       snapshot.Group,
+		bucketTs:    snapshot.BucketTs,
+	}
+	withWritableBucket(key, func(b *bucket) {
+		b.addSnapshotLocked(snapshot)
+	})
+}
+
+func withWritableBucket(key bucketKey, write func(*bucket)) {
+	for {
+		actual, _ := buckets.LoadOrStore(key, &bucket{})
+		b := actual.(*bucket)
+		b.mu.Lock()
+		if b.draining {
+			b.mu.Unlock()
+			continue
+		}
+		write(b)
+		b.mu.Unlock()
+		return
+	}
+}
+
 func (b *bucket) add(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+}
 
+func (b *bucket) addLocked(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
 	b.requestCount++
 	if apiErr == nil {
 		b.successCount++
 	}
 	b.totalLatencyMs += latencyMs
+	b.latencySamples = appendBoundedSample(b.latencySamples, latencyMs)
 	if hasTtft {
 		b.ttftSumMs += ttftMs
 		b.ttftCount++
+		b.ttftSamples = appendBoundedSample(b.ttftSamples, ttftMs)
 	}
 	b.generationMs += generationMs
 
@@ -201,12 +278,21 @@ func (b *bucket) add(latencyMs int64, ttftMs int64, hasTtft bool, generationMs i
 func (b *bucket) addSnapshot(snapshot model.RoutingChannelMetric) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.addSnapshotLocked(snapshot)
+}
 
+func (b *bucket) addSnapshotLocked(snapshot model.RoutingChannelMetric) {
 	b.requestCount += snapshot.RequestCount
 	b.successCount += snapshot.SuccessCount
 	b.totalLatencyMs += snapshot.TotalLatencyMs
+	if snapshot.LatencyP95Ms > b.latencyP95Ms {
+		b.latencyP95Ms = snapshot.LatencyP95Ms
+	}
 	b.ttftSumMs += snapshot.TtftSumMs
 	b.ttftCount += snapshot.TtftCount
+	if snapshot.TtftP95Ms > b.ttftP95Ms {
+		b.ttftP95Ms = snapshot.TtftP95Ms
+	}
 	b.outputTokens += snapshot.OutputTokens
 	b.generationMs += snapshot.GenerationMs
 	b.err4xx += snapshot.Err4xx
@@ -233,6 +319,10 @@ func retryAfterMaxMS(apiErr *types.NewAPIError) int64 {
 func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.snapshotLocked(key)
+}
+
+func (b *bucket) snapshotLocked(key bucketKey) model.RoutingChannelMetric {
 	return model.RoutingChannelMetric{
 		ChannelID:       key.channelID,
 		APIKeyIndex:     key.apiKeyIndex,
@@ -242,8 +332,10 @@ func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 		RequestCount:    b.requestCount,
 		SuccessCount:    b.successCount,
 		TotalLatencyMs:  b.totalLatencyMs,
+		LatencyP95Ms:    b.latencyP95(),
 		TtftSumMs:       b.ttftSumMs,
 		TtftCount:       b.ttftCount,
+		TtftP95Ms:       b.ttftP95(),
 		OutputTokens:    b.outputTokens,
 		GenerationMs:    b.generationMs,
 		Err4xx:          b.err4xx,
@@ -251,6 +343,20 @@ func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 		Err429:          b.err429,
 		RetryAfterMaxMs: b.retryAfterMaxMs,
 	}
+}
+
+func (b *bucket) latencyP95() int64 {
+	if len(b.latencySamples) > 0 {
+		return percentileNearestRank(b.latencySamples, 0.95)
+	}
+	return b.latencyP95Ms
+}
+
+func (b *bucket) ttftP95() int64 {
+	if len(b.ttftSamples) > 0 {
+		return percentileNearestRank(b.ttftSamples, 0.95)
+	}
+	return b.ttftP95Ms
 }
 
 func apiKeyIndex(info *relaycommon.RelayInfo) int {
@@ -283,6 +389,37 @@ func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (In
 		Model:       info.OriginModelName,
 		Group:       group,
 	}, true
+}
+
+func appendBoundedSample(samples []int64, value int64) []int64 {
+	const maxSamples = 128
+	if value < 0 {
+		value = 0
+	}
+	if len(samples) >= maxSamples {
+		copy(samples, samples[1:])
+		samples[len(samples)-1] = value
+		return samples
+	}
+	return append(samples, value)
+}
+
+func percentileNearestRank(samples []int64, percentile float64) int64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	copySamples := append([]int64(nil), samples...)
+	sort.Slice(copySamples, func(i, j int) bool {
+		return copySamples[i] < copySamples[j]
+	})
+	index := int(percentile*float64(len(copySamples))+0.999999999) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(copySamples) {
+		index = len(copySamples) - 1
+	}
+	return copySamples[index]
 }
 
 func attemptBucketKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int, now time.Time) (bucketKey, bool) {

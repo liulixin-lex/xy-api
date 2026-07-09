@@ -135,8 +135,10 @@ export type RoutingMetric = {
   request_count: number
   success_count: number
   total_latency_ms: number
+  latency_p95_ms: number
   ttft_sum_ms: number
   ttft_count: number
+  ttft_p95_ms: number
   output_tokens: number
   generation_ms: number
   err_4xx: number

@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
@@ -71,14 +72,66 @@ func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
 	RecordAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad request"), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest))
 
 	snapshots := Snapshots()
-	require.Len(t, snapshots, 1)
-	metric := snapshots[0]
-	assert.Equal(t, 3, metric.APIKeyIndex)
-	assert.Equal(t, int64(3), metric.RequestCount)
-	assert.Zero(t, metric.SuccessCount)
-	assert.Equal(t, int64(1), metric.Err429)
-	assert.Equal(t, int64(1), metric.Err5xx)
-	assert.Equal(t, int64(1), metric.Err4xx)
+	require.Len(t, snapshots, 2)
+	for _, metric := range snapshots {
+		assert.Contains(t, []int{model.RoutingMetricSingleKeyIndex, 3}, metric.APIKeyIndex)
+		assert.Equal(t, int64(3), metric.RequestCount)
+		assert.Zero(t, metric.SuccessCount)
+		assert.Equal(t, int64(1), metric.Err429)
+		assert.Equal(t, int64(1), metric.Err5xx)
+		assert.Equal(t, int64(1), metric.Err4xx)
+	}
+}
+
+func TestRecordAttemptAddsAggregateSnapshotForMultiKeyChannels(t *testing.T) {
+	ResetForTest()
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "vip",
+		OriginModelName: "gpt-test",
+		StartTime:       time.Now(),
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:            25,
+			ChannelIsMultiKey:    true,
+			ChannelMultiKeyIndex: 3,
+		},
+	}
+
+	RecordAttempt(nil, info, 25, nil)
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 2)
+	assert.Equal(t, model.RoutingMetricSingleKeyIndex, snapshots[0].APIKeyIndex)
+	assert.Equal(t, 3, snapshots[1].APIKeyIndex)
+	for _, metric := range snapshots {
+		assert.Equal(t, 25, metric.ChannelID)
+		assert.Equal(t, "gpt-test", metric.ModelName)
+		assert.Equal(t, "vip", metric.Group)
+		assert.Equal(t, int64(1), metric.RequestCount)
+		assert.Equal(t, int64(1), metric.SuccessCount)
+	}
+}
+
+func TestInflightCountersAlsoTrackAggregateForMultiKeyChannels(t *testing.T) {
+	ResetForTest()
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "vip",
+		OriginModelName: "gpt-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:            26,
+			ChannelIsMultiKey:    true,
+			ChannelMultiKeyIndex: 2,
+		},
+	}
+	aggregate := InflightKey{ChannelID: 26, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}
+	perKey := InflightKey{ChannelID: 26, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"}
+
+	release := BeginInflight(nil, info, 26)
+
+	assert.Equal(t, int64(1), InflightCount(aggregate))
+	assert.Equal(t, int64(1), InflightCount(perKey))
+	release()
+	assert.Zero(t, InflightCount(aggregate))
+	assert.Zero(t, InflightCount(perKey))
 }
 
 func TestRecordAttemptCapturesRetryAfterMax(t *testing.T) {
@@ -104,6 +157,31 @@ func TestRecordAttemptCapturesRetryAfterMax(t *testing.T) {
 	snapshots := Snapshots()
 	require.Len(t, snapshots, 1)
 	assert.Equal(t, int64(2500), snapshots[0].RetryAfterMaxMs)
+}
+
+func TestRecordAttemptComputesLatencyAndTTFTP95(t *testing.T) {
+	ResetForTest()
+	now := time.Now()
+	info := &relaycommon.RelayInfo{
+		UsingGroup:        "vip",
+		OriginModelName:   "gpt-test",
+		IsStream:          true,
+		ChannelMeta:       &relaycommon.ChannelMeta{ChannelId: 27},
+		FirstResponseTime: now,
+	}
+
+	for _, duration := range []time.Duration{100, 200, 300, 400, 500} {
+		start := time.Now().Add(-duration * time.Millisecond)
+		info.StartTime = start
+		info.FirstResponseTime = start.Add(duration * time.Millisecond)
+		RecordAttempt(nil, info, 27, nil)
+	}
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(5), snapshots[0].RequestCount)
+	assert.InDelta(t, 500, snapshots[0].LatencyP95Ms, 20)
+	assert.InDelta(t, 500, snapshots[0].TtftP95Ms, 20)
 }
 
 func TestInflightCountersUseRoutingKeyAndReleaseOnce(t *testing.T) {

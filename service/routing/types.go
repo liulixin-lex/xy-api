@@ -34,9 +34,11 @@ type CostSnapshot struct {
 }
 
 type BreakerSnapshot struct {
-	State       string
-	Reason      string
-	UpdatedUnix int64
+	State             string
+	Reason            string
+	CooldownUntilUnix int64
+	HalfOpenInflight  int64
+	UpdatedUnix       int64
 }
 
 type Settings struct {
@@ -48,6 +50,7 @@ type Settings struct {
 	MinVolume          int
 	TopK               int
 	MaxEjectedPct      int
+	HalfOpenProbes     int
 	SnapshotStaleSec   int
 	NowUnix            int64
 	RandomSeed         int64
