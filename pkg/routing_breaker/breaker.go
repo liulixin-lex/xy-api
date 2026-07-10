@@ -12,11 +12,16 @@ const SingleAPIKeyIndex = -1
 
 type State string
 
+type FailureKind string
+
 const (
 	StateHealthy  State = "healthy"
 	StateDegraded State = "degraded"
 	StateOpen     State = "open"
 	StateHalfOpen State = "half_open"
+
+	FailureProvider5xx FailureKind = "provider_5xx"
+	FailureNetwork     FailureKind = "network"
 )
 
 type Key struct {
@@ -90,22 +95,24 @@ type mutationResult struct {
 
 var defaultBreaker = newDefaultBreaker(DefaultConfig())
 
-func RecordAttempt(key Key, success bool, statusCode int, retryAfter time.Duration) Snapshot {
-	var result mutationResult
-	if success {
-		result = defaultBreaker.onSuccess(key)
-	} else {
-		result = defaultBreaker.onFailure(key, statusCode, retryAfter)
-	}
-	return result.snapshot
+func RecordReliabilitySuccess(key Key) Snapshot {
+	return defaultBreaker.onSuccess(key).snapshot
+}
+
+func RecordReliabilityFailure(key Key, kind FailureKind) Snapshot {
+	return defaultBreaker.onReliabilityFailure(key, kind).snapshot
+}
+
+func RecordAttempt(key Key, success bool, statusCode int, _ time.Duration) Snapshot {
+	return defaultBreaker.RecordHTTPAttempt(key, success, statusCode)
 }
 
 func ConfigureDefault(config Config) {
 	defaultBreaker.Configure(config)
 }
 
-func HydrateDefaultSnapshots(snapshots []Snapshot) {
-	defaultBreaker.Hydrate(snapshots)
+func HydrateDefaultSnapshots(snapshots []Snapshot) []Snapshot {
+	return defaultBreaker.Hydrate(snapshots)
 }
 
 func AcquireDefaultHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) {
@@ -204,6 +211,16 @@ func (b *Breaker) OnSuccess(key Key) Snapshot {
 	return b.onSuccess(key).snapshot
 }
 
+func (b *Breaker) RecordHTTPAttempt(key Key, success bool, statusCode int) Snapshot {
+	if success {
+		return b.OnSuccess(key)
+	}
+	if !isReliabilityHTTPStatus(statusCode) {
+		return b.Peek(key)
+	}
+	return b.OnReliabilityFailure(key, FailureProvider5xx)
+}
+
 func (b *Breaker) onSuccess(key Key) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -241,11 +258,11 @@ func (b *Breaker) onSuccess(key Key) mutationResult {
 	return b.finishMutationLocked(record, created, now)
 }
 
-func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) Snapshot {
-	return b.onFailure(key, statusCode, retryAfter).snapshot
+func (b *Breaker) OnReliabilityFailure(key Key, kind FailureKind) Snapshot {
+	return b.onReliabilityFailure(key, kind).snapshot
 }
 
-func (b *Breaker) onFailure(key Key, statusCode int, retryAfter time.Duration) mutationResult {
+func (b *Breaker) onReliabilityFailure(key Key, kind FailureKind) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -254,46 +271,43 @@ func (b *Breaker) onFailure(key Key, statusCode int, retryAfter time.Duration) m
 	b.advanceOpen(record, now)
 
 	if record.snapshot.State == StateOpen {
-		if statusCode == 429 && retryAfter > 0 {
-			if retryAfter > b.config.MaxCooldown {
-				retryAfter = b.config.MaxCooldown
-			}
-			cooldownUntil := now.Add(retryAfter)
-			if cooldownUntil.After(record.snapshot.CooldownUntil) {
-				record.snapshot.CooldownUntil = cooldownUntil
-				record.snapshot.UpdatedAt = now
-				b.markDirty(key)
-			}
-		}
 		return b.finishMutationLocked(record, created, now)
 	}
 
 	failedHalfOpen := record.snapshot.State == StateHalfOpen
 	record.addOutcome(true, b.config.WindowSize)
 	record.snapshot.ConsecutiveFailures++
-	if is5xx(statusCode) {
+	if kind == FailureProvider5xx {
 		record.snapshot.Consecutive5xx++
 	} else {
 		record.snapshot.Consecutive5xx = 0
 	}
 
 	if failedHalfOpen ||
-		statusCode == 429 ||
 		record.snapshot.Consecutive5xx >= b.config.Consecutive5xxThreshold ||
 		b.exceedsFailureRate(record) {
-		b.open(record, now, retryAfter, b.failureReason(record, statusCode, failedHalfOpen))
+		b.open(record, now, b.failureReason(record, kind, failedHalfOpen))
 		return b.finishMutationLocked(record, created, now)
 	}
 
 	record.snapshot.State = b.closedState(record)
 	if record.snapshot.State == StateDegraded {
-		record.snapshot.Reason = b.degradedReason(record, statusCode)
+		record.snapshot.Reason = b.degradedReason(record, kind)
 	} else {
 		record.snapshot.Reason = ""
 	}
 	record.snapshot.UpdatedAt = now
 	b.markDirty(key)
 	return b.finishMutationLocked(record, created, now)
+}
+
+func (b *Breaker) Peek(key Key) Snapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if record, ok := b.states[key]; ok {
+		return record.snapshot
+	}
+	return Snapshot{Key: key, State: StateHealthy}
 }
 
 func (b *Breaker) GetSnapshot(key Key) Snapshot {
@@ -701,40 +715,37 @@ func (b *Breaker) advanceOpen(record *entry, now time.Time) bool {
 	return true
 }
 
-func (b *Breaker) open(record *entry, now time.Time, retryAfter time.Duration, reason string) {
+func (b *Breaker) open(record *entry, now time.Time, reason string) {
 	record.snapshot.State = StateOpen
 	record.snapshot.Reason = reason
 	record.snapshot.EjectionCount++
 	record.snapshot.OpenedAt = now
 	record.snapshot.HalfOpenInflight = 0
 	cooldown := b.cooldown(record.snapshot.EjectionCount)
-	if retryAfter > b.config.MaxCooldown {
-		retryAfter = b.config.MaxCooldown
-	}
-	if retryAfter > cooldown {
-		cooldown = retryAfter
-	}
 	record.snapshot.CooldownUntil = now.Add(cooldown)
 	record.snapshot.UpdatedAt = now
 	b.markDirty(record.snapshot.Key)
 }
 
-func (b *Breaker) failureReason(record *entry, statusCode int, failedHalfOpen bool) string {
+func (b *Breaker) failureReason(record *entry, kind FailureKind, failedHalfOpen bool) string {
 	if failedHalfOpen {
 		return "half_open_failure"
 	}
-	if statusCode == 429 {
-		return "rate_limit"
-	}
-	if is5xx(statusCode) && record.snapshot.Consecutive5xx >= b.config.Consecutive5xxThreshold {
+	if kind == FailureProvider5xx && record.snapshot.Consecutive5xx >= b.config.Consecutive5xxThreshold {
 		return "5xx"
+	}
+	if kind == FailureNetwork {
+		return "network"
 	}
 	return "failure_rate"
 }
 
-func (b *Breaker) degradedReason(record *entry, statusCode int) string {
-	if is5xx(statusCode) && record.snapshot.ConsecutiveFailures >= b.config.DegradedConsecutiveFailures {
+func (b *Breaker) degradedReason(record *entry, kind FailureKind) string {
+	if kind == FailureProvider5xx && record.snapshot.Consecutive5xx >= b.config.DegradedConsecutiveFailures {
 		return "5xx"
+	}
+	if kind == FailureNetwork {
+		return "network"
 	}
 	return "failure_rate"
 }
@@ -792,8 +803,13 @@ func (e *entry) resetWindow() {
 	e.snapshot.WindowFailures = 0
 }
 
-func is5xx(statusCode int) bool {
-	return statusCode >= 500 && statusCode < 600
+func isReliabilityHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case 500, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
 }
 
 func lessKey(a, b Key) bool {

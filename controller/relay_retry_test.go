@@ -223,7 +223,7 @@ func TestRecordRoutingBreakerAttemptDoesNothingWhenDisabled(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestRecordRoutingBreakerAttemptRespectsRetryAfterMetadata(t *testing.T) {
+func TestRecordRoutingBreakerAttemptIgnoresRetryAfterMetadataForCapacityStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	configureRoutingBreakerAttemptTest(t, true)
@@ -246,18 +246,12 @@ func TestRecordRoutingBreakerAttemptRespectsRetryAfterMetadata(t *testing.T) {
 	apiErr := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 	apiErr.Metadata = metadata
 
-	before := time.Now()
 	recordRoutingBreakerAttempt(ctx, info, 32, apiErr)
-	after := time.Now()
 
-	breakers := routingbreaker.DirtySnapshots()
-	require.Len(t, breakers, 1)
-	assert.Equal(t, routingbreaker.StateOpen, breakers[0].State)
-	assert.False(t, breakers[0].CooldownUntil.Before(before.Add(4500*time.Millisecond)))
-	assert.False(t, breakers[0].CooldownUntil.After(after.Add(4500*time.Millisecond)))
-	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 32, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
-	require.True(t, ok)
-	assert.Equal(t, breakers[0].CooldownUntil.Unix(), cached.CooldownUntilUnix)
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	assert.Equal(t, routingbreaker.Stats{}, routingbreaker.RuntimeStats())
+	_, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 32, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	assert.False(t, ok)
 }
 
 func TestRecordRoutingBreakerAttemptAlsoUpdatesAggregateForMultiKey(t *testing.T) {

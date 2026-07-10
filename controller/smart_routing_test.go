@@ -275,7 +275,14 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 
 	require.NoError(t, db.Create(&model.RoutingChannelBinding{ChannelID: 66, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: "https://upstream.example.com", UpstreamGroup: "vip", Enabled: true}).Error)
 	require.NoError(t, db.Create(&model.RoutingCostSnapshot{ChannelID: 66, ModelName: "gpt-test"}).Error)
-	require.NoError(t, db.Create(&model.RoutingBreakerState{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", State: model.RoutingBreakerStateOpen}).Error)
+	require.NoError(t, db.Create(&model.RoutingBreakerState{
+		ChannelID:       66,
+		APIKeyIndex:     model.RoutingMetricSingleKeyIndex,
+		ModelName:       "gpt-test",
+		Group:           "vip",
+		State:           model.RoutingBreakerStateOpen,
+		SemanticVersion: model.RoutingBreakerSemanticVersion,
+	}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelMetric{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", BucketTs: 60, RequestCount: 1}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelHealthState{ChannelID: 66, AuthFailure: true, UpdatedTime: common.GetTimestamp()}).Error)
 	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen})
@@ -348,6 +355,7 @@ func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 		Group:               "default",
 		State:               model.RoutingBreakerStateOpen,
 		Reason:              "5xx",
+		SemanticVersion:     model.RoutingBreakerSemanticVersion,
 		ConsecutiveFailures: 5,
 		EjectionCount:       1,
 	}

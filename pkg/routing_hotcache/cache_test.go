@@ -257,8 +257,8 @@ func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
 
 	breakerKey := Key{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	LoadBreakerSnapshots([]model.RoutingBreakerState{
-		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "open", UpdatedTime: 200},
-		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "healthy", UpdatedTime: 100},
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "open", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 200},
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "healthy", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 100},
 	})
 	breaker, ok := GetBreaker(breakerKey)
 	require.True(t, ok)
@@ -284,9 +284,9 @@ func TestHotcacheLoadSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
 		{ChannelID: 203, ModelName: "new", BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 20},
 	})
 	LoadBreakerSnapshots([]model.RoutingBreakerState{
-		{ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "old", Group: "default", State: "healthy", UpdatedTime: 10},
-		{ChannelID: 302, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "newest", Group: "default", State: "open", UpdatedTime: 30},
-		{ChannelID: 303, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "new", Group: "default", State: "degraded", UpdatedTime: 20},
+		{ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "old", Group: "default", State: "healthy", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 10},
+		{ChannelID: 302, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "newest", Group: "default", State: "open", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 30},
+		{ChannelID: 303, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "new", Group: "default", State: "degraded", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 20},
 	})
 	LoadHealthSnapshots([]model.RoutingChannelHealthState{
 		{ChannelID: 401, AuthFailure: true, AuthFailureUntil: 100, UpdatedTime: 10, BalanceKnown: true, Balance: 1, BalanceUpdatedTime: 10},
@@ -316,6 +316,21 @@ func TestHotcacheLoadSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = GetBalance(401)
 	assert.False(t, ok)
+}
+
+func TestLoadBreakerSnapshotsRejectsLegacySemanticVersion(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	LoadBreakerSnapshots([]model.RoutingBreakerState{
+		{ChannelID: 601, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "legacy", Group: "default", State: "open", SemanticVersion: 0, UpdatedTime: 100},
+		{ChannelID: 602, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "current", Group: "default", State: "open", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 100},
+	})
+
+	_, legacy := GetBreaker(Key{ChannelID: 601, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "legacy", Group: "default"})
+	_, current := GetBreaker(Key{ChannelID: 602, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "current", Group: "default"})
+	assert.False(t, legacy)
+	assert.True(t, current)
 }
 
 func TestLoadMetricSnapshotsCountsOnlyFinalBatchEviction(t *testing.T) {

@@ -454,7 +454,8 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
 	for _, snapshot := range snapshots {
-		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
+		if snapshot.SemanticVersion != model.RoutingBreakerSemanticVersion ||
+			snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
 			continue
 		}
 		key := Key{

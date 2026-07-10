@@ -1,6 +1,7 @@
 package routingbreaker
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -45,7 +46,7 @@ func TestBreakerEvictsExpiredAndOldestEntriesAtLimit(t *testing.T) {
 	config := DefaultConfig()
 	config.EntryTTL = time.Minute
 	config.MaxEntries = 2
-	config.Consecutive5xxThreshold = 10
+	config.Consecutive5xxThreshold = 1
 	config.FailureRateMinSamples = 100
 	config.WindowSize = 100
 	config.DegradedConsecutiveFailures = 1
@@ -65,7 +66,7 @@ func TestBreakerEvictsExpiredAndOldestEntriesAtLimit(t *testing.T) {
 	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, breaker.Stats())
 
 	clock.Advance(61 * time.Second)
-	breaker.OnFailure(oldOpenKey, 429, 0)
+	breaker.OnReliabilityFailure(oldOpenKey, FailureProvider5xx)
 	assert.Equal(t, Stats{Entries: 1, Dirty: 1, Evictions: 1}, breaker.Stats())
 
 	clock.Advance(time.Second)
@@ -77,15 +78,17 @@ func TestBreakerEvictsExpiredAndOldestEntriesAtLimit(t *testing.T) {
 	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 2}, breaker.Stats())
 
 	clock.Advance(time.Second)
-	require.Equal(t, StateDegraded, breaker.OnFailure(degradedKey, 500, 0).State)
+	require.Equal(t, StateDegraded, breaker.OnReliabilityFailure(degradedKey, FailureNetwork).State)
 	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 3}, breaker.Stats())
 
 	clock.Advance(time.Second)
-	require.Equal(t, StateOpen, breaker.OnFailure(newOpenKey, 429, 0).State)
+	breaker.OnReliabilityFailure(newOpenKey, FailureProvider5xx)
+	require.Equal(t, StateOpen, breaker.Peek(newOpenKey).State)
 	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 4}, breaker.Stats())
 
 	clock.Advance(time.Second)
-	require.Equal(t, StateOpen, breaker.OnFailure(newestOpenKey, 429, 0).State)
+	breaker.OnReliabilityFailure(newestOpenKey, FailureProvider5xx)
+	require.Equal(t, StateOpen, breaker.Peek(newestOpenKey).State)
 	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 5}, breaker.Stats())
 
 	dirty := breaker.DirtySnapshots()
@@ -254,6 +257,7 @@ func TestDefaultBreakerEvictionRemovesPublishedSnapshot(t *testing.T) {
 	config := DefaultConfig()
 	config.EntryTTL = time.Hour
 	config.MaxEntries = 2
+	config.Consecutive5xxThreshold = 1
 	config.Now = func() time.Time { return now }
 	ResetDefaultForTest(config)
 	routinghotcache.ResetForTest()
@@ -271,7 +275,7 @@ func TestDefaultBreakerEvictionRemovesPublishedSnapshot(t *testing.T) {
 	})
 	require.Equal(t, Stats{Entries: 2}, RuntimeStats())
 
-	opened := RecordAttempt(openKey, false, 429, 0)
+	opened := RecordAttempt(openKey, false, http.StatusInternalServerError, 0)
 
 	require.Equal(t, StateOpen, opened.State)
 	assert.Equal(t, Stats{Entries: 2, Dirty: 1, Evictions: 1}, RuntimeStats())
@@ -288,6 +292,7 @@ func TestDefaultBreakerSerializesPublicationWithConcurrentEviction(t *testing.T)
 	config := DefaultConfig()
 	config.EntryTTL = time.Hour
 	config.MaxEntries = 1
+	config.Consecutive5xxThreshold = 1
 	config.Now = func() time.Time { return now }
 	ResetDefaultForTest(config)
 	routinghotcache.ResetForTest()
@@ -324,7 +329,7 @@ func TestDefaultBreakerSerializesPublicationWithConcurrentEviction(t *testing.T)
 	secondDone := make(chan struct{})
 	go func() {
 		close(secondStarted)
-		RecordAttempt(secondKey, false, 429, 0)
+		RecordAttempt(secondKey, false, http.StatusInternalServerError, 0)
 		close(secondDone)
 	}()
 	<-secondStarted
@@ -345,6 +350,7 @@ func TestClearDefaultKeySerializesCacheClearWithConcurrentRecord(t *testing.T) {
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	config := DefaultConfig()
 	config.EntryTTL = time.Hour
+	config.Consecutive5xxThreshold = 1
 	config.Now = func() time.Time { return now }
 	ResetDefaultForTest(config)
 	routinghotcache.ResetForTest()
@@ -354,7 +360,7 @@ func TestClearDefaultKeySerializesCacheClearWithConcurrentRecord(t *testing.T) {
 	})
 
 	key := Key{ChannelID: 49, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-key", Group: "default"}
-	RecordAttempt(key, false, 429, 0)
+	RecordAttempt(key, false, http.StatusInternalServerError, 0)
 	require.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
 
 	clearStarted := make(chan bool, 1)
@@ -408,6 +414,7 @@ func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	config := DefaultConfig()
 	config.EntryTTL = time.Hour
+	config.Consecutive5xxThreshold = 1
 	config.Now = func() time.Time { return now }
 	ResetDefaultForTest(config)
 	routinghotcache.ResetForTest()
@@ -419,9 +426,10 @@ func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord
 	const channelID = 50
 	key := Key{ChannelID: channelID, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-channel", Group: "default"}
 	cacheKey := routinghotcache.Key{ChannelID: channelID, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-channel", Group: "default"}
-	RecordAttempt(key, false, 429, 0)
+	RecordAttempt(key, false, http.StatusInternalServerError, 0)
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{UpdatedUnix: now.Unix()})
 	routinghotcache.SetCostForTest(cacheKey.CostKey(), routinghotcache.CostSnapshot{UpdatedUnix: now.Unix()})
+	routinghotcache.SetCapacityCooldownForTest(cacheKey, routinghotcache.CapacityCooldownSnapshot{CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
 	routinghotcache.SetAuthFailureForTest(channelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now.Unix()})
 	routinghotcache.SetBalanceForTest(channelID, routinghotcache.BalanceSnapshot{Known: true, UpdatedUnix: now.Unix()})
 	require.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
@@ -482,10 +490,12 @@ func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord
 	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
 	_, metricOK := routinghotcache.GetMetric(cacheKey)
 	_, costOK := routinghotcache.GetCost(cacheKey.CostKey())
+	_, capacityOK := routinghotcache.GetCapacityCooldown(cacheKey)
 	_, authOK := routinghotcache.GetAuthFailure(channelID)
 	_, balanceOK := routinghotcache.GetBalance(channelID)
 	assert.False(t, metricOK)
 	assert.False(t, costOK)
+	assert.False(t, capacityOK)
 	assert.False(t, authOK)
 	assert.False(t, balanceOK)
 	cached, ok := routinghotcache.GetBreaker(cacheKey)
@@ -569,12 +579,12 @@ func TestBreakerOpensAfterFiveConsecutive5xx(t *testing.T) {
 	breaker, clock, key := testBreaker(t)
 
 	for i := 1; i < 5; i++ {
-		snapshot := breaker.OnFailure(key, 502, 0)
+		snapshot := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 		assert.NotEqual(t, StateOpen, snapshot.State)
 		assert.Equal(t, i, snapshot.Consecutive5xx)
 	}
 
-	snapshot := breaker.OnFailure(key, 502, 0)
+	snapshot := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, snapshot.State)
 	assert.Equal(t, 5, snapshot.ConsecutiveFailures)
 	assert.Equal(t, 5, snapshot.Consecutive5xx)
@@ -587,7 +597,7 @@ func TestBreakerOpensWhenWindowFailureRateExceedsThreshold(t *testing.T) {
 
 	var snapshot Snapshot
 	for i := 0; i < 25; i++ {
-		snapshot = breaker.OnFailure(key, 503, 0)
+		snapshot = breaker.OnReliabilityFailure(key, FailureProvider5xx)
 		if i < 24 {
 			snapshot = breaker.OnSuccess(key)
 		}
@@ -596,27 +606,97 @@ func TestBreakerOpensWhenWindowFailureRateExceedsThreshold(t *testing.T) {
 	assert.Equal(t, 49, snapshot.WindowRequests)
 	assert.Equal(t, 25, snapshot.WindowFailures)
 
-	snapshot = breaker.OnFailure(key, 503, 0)
+	snapshot = breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, snapshot.State)
 	assert.Equal(t, 50, snapshot.WindowRequests)
 	assert.Equal(t, 26, snapshot.WindowFailures)
 	assert.Equal(t, 2, snapshot.Consecutive5xx)
 }
 
-func TestBreaker429OpensAndHonorsRetryAfter(t *testing.T) {
+func TestBreakerIgnoresCapacityStatusesWithoutCreatingState(t *testing.T) {
+	breaker, _, key := testBreaker(t)
+
+	for _, status := range []int{http.StatusPaymentRequired, http.StatusTooManyRequests, 529} {
+		snapshot := breaker.RecordHTTPAttempt(key, false, status)
+		assert.Equal(t, StateHealthy, snapshot.State)
+	}
+
+	assert.Equal(t, Stats{}, breaker.Stats())
+}
+
+func TestBreakerIgnoresNonReliability5xxWithoutCreatingState(t *testing.T) {
+	breaker, _, key := testBreaker(t)
+
+	for _, status := range []int{http.StatusNotImplemented, http.StatusHTTPVersionNotSupported} {
+		assert.Equal(t, StateHealthy, breaker.RecordHTTPAttempt(key, false, status).State)
+	}
+
+	assert.Equal(t, Stats{}, breaker.Stats())
+}
+
+func TestCapacityStatusDoesNotMutateExistingReliabilityState(t *testing.T) {
+	breaker, _, key := testBreaker(t)
+	before := breaker.OnReliabilityFailure(key, FailureProvider5xx)
+
+	breaker.RecordHTTPAttempt(key, false, http.StatusTooManyRequests)
+	breaker.RecordHTTPAttempt(key, false, 529)
+
+	after := breaker.Peek(key)
+	assert.Equal(t, before, after)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, breaker.Stats())
+}
+
+func TestCapacityStatusDoesNotAdvanceOrReopenHalfOpenReliabilityState(t *testing.T) {
 	breaker, clock, key := testBreaker(t)
+	for range 5 {
+		breaker.OnReliabilityFailure(key, FailureProvider5xx)
+	}
+	opened := breaker.Peek(key)
+	clock.Advance(opened.CooldownUntil.Sub(clock.now))
 
-	snapshot := breaker.OnFailure(key, 429, 45*time.Second)
+	breaker.RecordHTTPAttempt(key, false, http.StatusTooManyRequests)
+
+	assert.Equal(t, StateOpen, breaker.Peek(key).State)
+}
+
+func TestBreakerReliabilityHTTPStatuses(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 504} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			breaker, _, key := testBreaker(t)
+
+			snapshot := breaker.RecordHTTPAttempt(key, false, status)
+
+			assert.Equal(t, 1, snapshot.WindowRequests)
+			assert.Equal(t, 1, snapshot.WindowFailures)
+			assert.Equal(t, 1, snapshot.ConsecutiveFailures)
+			assert.Equal(t, 1, snapshot.Consecutive5xx)
+			assert.Equal(t, Stats{Entries: 1, Dirty: 1}, breaker.Stats())
+		})
+	}
+}
+
+func TestNetworkFailuresEnterReliabilityWindow(t *testing.T) {
+	breaker, _, key := testBreaker(t)
+
+	snapshot := breaker.OnReliabilityFailure(key, FailureNetwork)
+
+	assert.Equal(t, 1, snapshot.WindowRequests)
+	assert.Equal(t, 1, snapshot.WindowFailures)
+	assert.Equal(t, 1, snapshot.ConsecutiveFailures)
+	assert.Zero(t, snapshot.Consecutive5xx)
+}
+
+func TestRecordAttemptIgnoresRetryAfter(t *testing.T) {
+	breaker, clock, key := testBreaker(t)
+	breaker.config.Consecutive5xxThreshold = 1
+	previous := defaultBreaker
+	defaultBreaker = breaker
+	t.Cleanup(func() { defaultBreaker = previous })
+
+	snapshot := RecordAttempt(key, false, http.StatusInternalServerError, 45*time.Second)
+
 	require.Equal(t, StateOpen, snapshot.State)
-	assert.Equal(t, clock.now.Add(45*time.Second), snapshot.CooldownUntil)
-
-	clock.Advance(44 * time.Second)
-	snapshot = breaker.GetSnapshot(key)
-	require.Equal(t, StateOpen, snapshot.State)
-
-	clock.Advance(time.Second)
-	snapshot = breaker.GetSnapshot(key)
-	require.Equal(t, StateHalfOpen, snapshot.State)
+	assert.Equal(t, clock.now.Add(10*time.Second), snapshot.CooldownUntil)
 }
 
 func TestBreakerHalfOpenTransitions(t *testing.T) {
@@ -638,7 +718,7 @@ func TestBreakerHalfOpenTransitions(t *testing.T) {
 		{
 			name: "failure reopens",
 			event: func(breaker *Breaker, key Key) Snapshot {
-				return breaker.OnFailure(key, 500, 0)
+				return breaker.OnReliabilityFailure(key, FailureProvider5xx)
 			},
 			wantState:         StateOpen,
 			wantEjectionCount: 2,
@@ -650,7 +730,7 @@ func TestBreakerHalfOpenTransitions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			breaker, clock, key := testBreaker(t)
 			for i := 0; i < 5; i++ {
-				breaker.OnFailure(key, 500, 0)
+				breaker.OnReliabilityFailure(key, FailureProvider5xx)
 			}
 			clock.Advance(10 * time.Second)
 			require.Equal(t, StateHalfOpen, breaker.GetSnapshot(key).State)
@@ -677,18 +757,18 @@ func TestBreakerCooldownIsCapped(t *testing.T) {
 	key := Key{ChannelID: 77, APIKeyIndex: SingleAPIKeyIndex, Model: "claude-sonnet-4", Group: "vip"}
 
 	for i := 0; i < 5; i++ {
-		breaker.OnFailure(key, 500, 0)
+		breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	}
 	clock.Advance(10 * time.Second)
 	require.Equal(t, StateHalfOpen, breaker.GetSnapshot(key).State)
 
-	snapshot := breaker.OnFailure(key, 500, 0)
+	snapshot := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, snapshot.State)
 	assert.Equal(t, clock.now.Add(20*time.Second), snapshot.CooldownUntil)
 
 	clock.Advance(20 * time.Second)
 	require.Equal(t, StateHalfOpen, breaker.GetSnapshot(key).State)
-	snapshot = breaker.OnFailure(key, 500, 0)
+	snapshot = breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, snapshot.State)
 	assert.Equal(t, 3, snapshot.EjectionCount)
 	assert.Equal(t, clock.now.Add(25*time.Second), snapshot.CooldownUntil)
@@ -697,7 +777,7 @@ func TestBreakerCooldownIsCapped(t *testing.T) {
 func TestBreakerResetClearsState(t *testing.T) {
 	breaker, _, key := testBreaker(t)
 	for i := 0; i < 5; i++ {
-		breaker.OnFailure(key, 500, 0)
+		breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	}
 	require.Equal(t, StateOpen, breaker.GetSnapshot(key).State)
 
@@ -775,7 +855,7 @@ func TestRequeueDirtySnapshotsRestoresPersistenceRetry(t *testing.T) {
 func TestAcquireHalfOpenProbeLimitsConcurrentProbes(t *testing.T) {
 	breaker, clock, key := testBreaker(t)
 	for i := 0; i < 5; i++ {
-		breaker.OnFailure(key, 500, 0)
+		breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	}
 	clock.Advance(10 * time.Second)
 
@@ -788,7 +868,7 @@ func TestAcquireHalfOpenProbeLimitsConcurrentProbes(t *testing.T) {
 	require.False(t, ok)
 	assert.Equal(t, 1, second.HalfOpenInflight)
 
-	reopened := breaker.OnFailure(key, 500, 0)
+	reopened := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, reopened.State)
 	assert.Zero(t, reopened.HalfOpenInflight)
 }
@@ -815,7 +895,7 @@ func TestBreakerHydrateRestoresOpenStateForHalfOpenFailure(t *testing.T) {
 	}})
 
 	require.Equal(t, StateHalfOpen, breaker.GetSnapshot(key).State)
-	snapshot := breaker.OnFailure(key, 500, 0)
+	snapshot := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 
 	require.Equal(t, StateOpen, snapshot.State)
 	assert.Equal(t, "half_open_failure", snapshot.Reason)
@@ -831,7 +911,7 @@ func TestBreakerHydrateDoesNotOverwriteDirtyOrNewerLocalState(t *testing.T) {
 		Now:                     clock.Now,
 	})
 	key := Key{ChannelID: 91, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
-	local := breaker.OnFailure(key, 500, 0)
+	local := breaker.OnReliabilityFailure(key, FailureProvider5xx)
 	require.Equal(t, StateOpen, local.State)
 
 	accepted := breaker.Hydrate([]Snapshot{{
@@ -852,7 +932,7 @@ func TestBreakerHydrateDoesNotOverwriteDirtyOrNewerLocalState(t *testing.T) {
 	assert.Equal(t, StateOpen, breaker.GetSnapshot(key).State)
 }
 
-func TestRecordAttemptStoresReasonAndResetDefaultKeyClearsHotcache(t *testing.T) {
+func TestRecordAttemptStoresReliabilityReasonAndResetDefaultKeyPublishesHealthy(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
 	ResetDefaultForTest(Config{
 		Consecutive5xxThreshold: 1,
@@ -867,14 +947,14 @@ func TestRecordAttemptStoresReasonAndResetDefaultKeyClearsHotcache(t *testing.T)
 	})
 
 	key := Key{ChannelID: 88, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
-	snapshot := RecordAttempt(key, false, 429, 2*time.Second)
+	snapshot := RecordAttempt(key, false, http.StatusInternalServerError, 2*time.Second)
 
 	require.Equal(t, StateOpen, snapshot.State)
-	assert.Equal(t, "rate_limit", snapshot.Reason)
+	assert.Equal(t, "5xx", snapshot.Reason)
 	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 88, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"})
 	require.True(t, ok)
 	assert.Equal(t, string(StateOpen), cached.State)
-	assert.Equal(t, "rate_limit", cached.Reason)
+	assert.Equal(t, "5xx", cached.Reason)
 
 	reset := ResetDefaultKey(key)
 
@@ -884,4 +964,36 @@ func TestRecordAttemptStoresReasonAndResetDefaultKeyClearsHotcache(t *testing.T)
 	require.True(t, ok)
 	assert.Equal(t, string(StateHealthy), cached.State)
 	assert.Empty(t, cached.Reason)
+}
+
+func TestResetDefaultKeyDoesNotClearCapacityCooldown(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	ResetDefaultForTest(Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+		Now:                     clock.Now,
+	})
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	key := Key{ChannelID: 92, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: key.ChannelID, APIKeyIndex: key.APIKeyIndex, Model: key.Model, Group: key.Group}
+	routinghotcache.SetCapacityCooldownForTest(cacheKey, routinghotcache.CapacityCooldownSnapshot{
+		SourceStatusCode:       http.StatusTooManyRequests,
+		CooldownUntilUnixMilli: clock.now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       clock.now.UnixMilli(),
+	})
+	RecordReliabilityFailure(key, FailureProvider5xx)
+
+	ResetDefaultKey(key)
+
+	_, ok := routinghotcache.GetCapacityCooldown(cacheKey)
+	assert.True(t, ok)
+	ClearDefaultChannel(key.ChannelID)
+	_, ok = routinghotcache.GetCapacityCooldown(cacheKey)
+	assert.False(t, ok)
 }

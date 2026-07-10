@@ -436,12 +436,13 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	routinghotcache.LoadMetricSnapshots(metrics, setting.MetricBucketSec)
 	summary["metrics"] = len(metrics)
 
-	var breakerStates []model.RoutingBreakerState
-	if err := model.DB.Order("updated_time desc").Limit(5000).Find(&breakerStates).Error; err != nil {
+	breakerStates, err := model.GetRoutingBreakerStatesForHydration(5000)
+	if err != nil {
 		return summary, err
 	}
-	routingbreaker.HydrateDefaultSnapshots(routingBreakerModelsToSnapshots(breakerStates))
-	summary["breakers"] = len(breakerStates)
+	accepted := routingBreakerModelsToSnapshots(breakerStates)
+	retained := routingbreaker.HydrateDefaultSnapshots(accepted)
+	summary["breakers"] = len(retained)
 
 	var healthStates []model.RoutingChannelHealthState
 	if err := model.DB.Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
@@ -868,6 +869,7 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 		APIKeyIndex:         snapshot.Key.APIKeyIndex,
 		ModelName:           snapshot.Key.Model,
 		Group:               snapshot.Key.Group,
+		SemanticVersion:     model.RoutingBreakerSemanticVersion,
 		State:               string(snapshot.State),
 		Reason:              snapshot.Reason,
 		ConsecutiveFailures: int64(snapshot.ConsecutiveFailures),
@@ -893,7 +895,7 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routingbreaker.Snapshot {
 	snapshots := make([]routingbreaker.Snapshot, 0, len(states))
 	for _, state := range states {
-		if state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
+		if state.SemanticVersion != model.RoutingBreakerSemanticVersion || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 			continue
 		}
 		snapshot := routingbreaker.Snapshot{

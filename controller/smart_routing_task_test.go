@@ -251,14 +251,15 @@ func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testin
 	t.Cleanup(routinghotcache.ResetForTest)
 
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
-		ChannelID:     781,
-		APIKeyIndex:   model.RoutingMetricSingleKeyIndex,
-		ModelName:     "gpt-test",
-		Group:         "vip",
-		State:         model.RoutingBreakerStateOpen,
-		Reason:        "5xx",
-		CooldownUntil: common.GetTimestamp() + 60,
-		UpdatedTime:   common.GetTimestamp(),
+		ChannelID:       781,
+		APIKeyIndex:     model.RoutingMetricSingleKeyIndex,
+		ModelName:       "gpt-test",
+		Group:           "vip",
+		State:           model.RoutingBreakerStateOpen,
+		Reason:          "5xx",
+		SemanticVersion: model.RoutingBreakerSemanticVersion,
+		CooldownUntil:   common.GetTimestamp() + 60,
+		UpdatedTime:     common.GetTimestamp(),
 	}).Error)
 
 	summary, err := runRoutingCostSyncTask(context.Background())
@@ -297,12 +298,13 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 		LatencyP95Ms: 250,
 	}).Error)
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
-		ChannelID:   782,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		ModelName:   "gpt-test",
-		Group:       "vip",
-		State:       model.RoutingBreakerStateDegraded,
-		UpdatedTime: now,
+		ChannelID:       782,
+		APIKeyIndex:     model.RoutingMetricSingleKeyIndex,
+		ModelName:       "gpt-test",
+		Group:           "vip",
+		State:           model.RoutingBreakerStateDegraded,
+		SemanticVersion: model.RoutingBreakerSemanticVersion,
+		UpdatedTime:     now,
 	}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelHealthState{
 		ChannelID:          782,

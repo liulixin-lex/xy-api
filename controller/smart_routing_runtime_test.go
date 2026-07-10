@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -95,6 +96,38 @@ func TestSmartRoutingRuntimeDoesNotRunWithCanceledParent(t *testing.T) {
 
 	assert.Zero(t, refreshCount.Load())
 	assert.Zero(t, flushCount.Load())
+}
+
+func TestRoutingBreakerModelsToSnapshotsRejectsLegacySemanticVersion(t *testing.T) {
+	states := []model.RoutingBreakerState{
+		{ChannelID: 1, APIKeyIndex: -1, ModelName: "legacy", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: 0, UpdatedTime: 100},
+		{ChannelID: 2, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 100},
+	}
+
+	snapshots := routingBreakerModelsToSnapshots(states)
+
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, 2, snapshots[0].Key.ChannelID)
+}
+
+func TestRefreshRoutingHotcacheHydratesOnlyCurrentBreakerSemanticVersion(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+	require.NoError(t, db.Create(&[]model.RoutingBreakerState{
+		{ChannelID: 10, APIKeyIndex: -1, ModelName: "legacy", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: 0, UpdatedTime: common.GetTimestamp()},
+		{ChannelID: 11, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: common.GetTimestamp()},
+	}).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.GetSetting())
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["breakers"])
+	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
 }
 
 func TestSmartRoutingRuntimePrunesStaleHotcacheWhenDisabled(t *testing.T) {

@@ -22,10 +22,11 @@ const (
 	RoutingCostConfidenceGroupOnly = "group_only"
 	RoutingCostConfidenceUnknown   = "unknown"
 
-	RoutingBreakerStateHealthy  = "healthy"
-	RoutingBreakerStateDegraded = "degraded"
-	RoutingBreakerStateOpen     = "open"
-	RoutingBreakerStateHalfOpen = "half_open"
+	RoutingBreakerStateHealthy    = "healthy"
+	RoutingBreakerStateDegraded   = "degraded"
+	RoutingBreakerStateOpen       = "open"
+	RoutingBreakerStateHalfOpen   = "half_open"
+	RoutingBreakerSemanticVersion = 2
 )
 
 var (
@@ -255,6 +256,7 @@ type RoutingBreakerState struct {
 	APIKeyIndex         int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_breaker_key,priority:2"`
 	ModelName           string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_breaker_key,priority:3"`
 	Group               string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_breaker_key,priority:4"`
+	SemanticVersion     int    `json:"semantic_version" gorm:"index"`
 	State               string `json:"state" gorm:"type:varchar(32);index"`
 	Reason              string `json:"reason" gorm:"type:varchar(64);index"`
 	ConsecutiveFailures int64  `json:"consecutive_failures"`
@@ -289,7 +291,9 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 		return nil
 	}
+	state.SemanticVersion = RoutingBreakerSemanticVersion
 	updates := map[string]interface{}{
+		"semantic_version":     state.SemanticVersion,
 		"state":                state.State,
 		"reason":               state.Reason,
 		"consecutive_failures": state.ConsecutiveFailures,
@@ -307,7 +311,8 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 		return DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
 			state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group)
 	}
-	result := breakerKeyWhere().Where("updated_time <= ?", state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates)
+	versionWhere := "(semantic_version IS NULL OR semantic_version <> ? OR updated_time <= ?)"
+	result := breakerKeyWhere().Where(versionWhere, RoutingBreakerSemanticVersion, state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -319,7 +324,19 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 		return nil
 	}
 	// A concurrent writer may have inserted the row after our conditional update.
-	return breakerKeyWhere().Where("updated_time <= ?", state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates).Error
+	return breakerKeyWhere().Where(versionWhere, RoutingBreakerSemanticVersion, state.UpdatedTime).Model(&RoutingBreakerState{}).UpdateColumns(updates).Error
+}
+
+func GetRoutingBreakerStatesForHydration(limit int) ([]RoutingBreakerState, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	var states []RoutingBreakerState
+	err := DB.Where("semantic_version = ?", RoutingBreakerSemanticVersion).
+		Order("updated_time desc").
+		Limit(limit).
+		Find(&states).Error
+	return states, err
 }
 
 type RoutingChannelHealthState struct {
