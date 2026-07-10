@@ -473,7 +473,7 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				refreshed := append([]routingselector.Candidate(nil), candidates...)
 				for i := range refreshed {
 					refreshed[i].Capacity = nil
-					if refreshed[i].Channel == nil {
+					if refreshed[i].Channel == nil || refreshed[i].Channel.ChannelInfo.IsMultiKey {
 						continue
 					}
 					cacheKey := routinghotcache.Key{
@@ -505,38 +505,40 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 			Group:       group,
 		}
 		candidate := routingselector.Candidate{Channel: channel}
-		if metric, ok := routinghotcache.GetMetric(cacheKey); ok {
-			candidate.Metric = &routingselector.MetricSnapshot{
-				RequestCount:            metric.RequestCount,
-				SuccessCount:            metric.SuccessCount,
-				ReliabilityRequestCount: metric.ReliabilityRequestCount,
-				ReliabilityFailureCount: metric.ReliabilityFailureCount,
-				P95LatencyMs:            metric.P95LatencyMs,
-				TPS:                     metric.TPS,
-			}
-		}
-		candidate.Capacity = routingCapacityForKey(cacheKey)
-		inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
-			ChannelID:   channel.Id,
-			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model:       param.ModelName,
-			Group:       group,
-		})
-		if candidate.Metric != nil {
-			candidate.Metric.Inflight = inflight
-		} else if inflight > 0 {
-			candidate.Metric = &routingselector.MetricSnapshot{Inflight: inflight}
-		}
 		if cost, ok := routinghotcache.GetCost(cacheKey.CostKey()); ok {
 			candidate.Cost = routingCostForRequest(param.Ctx, cost)
 		}
-		if breaker, ok := routinghotcache.GetBreaker(cacheKey); ok {
-			candidate.Breaker = &routingselector.BreakerSnapshot{
-				State:             breaker.State,
-				Reason:            breaker.Reason,
-				CooldownUntilUnix: breaker.CooldownUntilUnix,
-				HalfOpenInflight:  breaker.HalfOpenInflight,
-				UpdatedUnix:       breaker.UpdatedUnix,
+		if !channel.ChannelInfo.IsMultiKey {
+			if metric, ok := routinghotcache.GetMetric(cacheKey); ok {
+				candidate.Metric = &routingselector.MetricSnapshot{
+					RequestCount:            metric.RequestCount,
+					SuccessCount:            metric.SuccessCount,
+					ReliabilityRequestCount: metric.ReliabilityRequestCount,
+					ReliabilityFailureCount: metric.ReliabilityFailureCount,
+					P95LatencyMs:            metric.P95LatencyMs,
+					TPS:                     metric.TPS,
+				}
+			}
+			candidate.Capacity = routingCapacityForKey(cacheKey)
+			inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
+				ChannelID:   channel.Id,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       param.ModelName,
+				Group:       group,
+			})
+			if candidate.Metric != nil {
+				candidate.Metric.Inflight = inflight
+			} else if inflight > 0 {
+				candidate.Metric = &routingselector.MetricSnapshot{Inflight: inflight}
+			}
+			if breaker, ok := routinghotcache.GetBreaker(cacheKey); ok {
+				candidate.Breaker = &routingselector.BreakerSnapshot{
+					State:             breaker.State,
+					Reason:            breaker.Reason,
+					CooldownUntilUnix: breaker.CooldownUntilUnix,
+					HalfOpenInflight:  breaker.HalfOpenInflight,
+					UpdatedUnix:       breaker.UpdatedUnix,
+				}
 			}
 		}
 		applyRoutingHealthMarkers(&candidate, channel.Id, smart_routing_setting.GetSetting())
@@ -718,9 +720,6 @@ func AffinityAdmissible(channelID int) bool {
 	if !setting.Enabled {
 		return true
 	}
-	if authFailure, ok := routinghotcache.GetAuthFailure(channelID); ok && authFailure.Marked && routingMarkerFresh(authFailure.UpdatedUnix, setting) {
-		return false
-	}
 	if balance, ok := routinghotcache.GetBalance(channelID); ok && balance.Known && routingMarkerFresh(balance.UpdatedUnix, setting) && balance.Balance < setting.BalanceMarginUSD {
 		return false
 	}
@@ -819,93 +818,6 @@ func channelSupportsSmartRoutingRequestPath(channel *model.Channel, requestPath 
 	return config != nil && config.SupportsPath(requestPath)
 }
 
-func IsMultiKeyIndexRoutingAdmissible(c *gin.Context, channelID int, index int, modelName string, group string) bool {
-	if channelID <= 0 || index < 0 {
-		return true
-	}
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || !common.MemoryCacheEnabled {
-		return true
-	}
-	if !AffinityAdmissible(channelID) {
-		return false
-	}
-	if group == "" && c != nil {
-		group = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
-		if group == "" {
-			group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-		}
-	}
-	if modelName == "" || group == "" {
-		return true
-	}
-	breaker, ok := routinghotcache.GetBreaker(routinghotcache.Key{
-		ChannelID:   channelID,
-		APIKeyIndex: index,
-		Model:       modelName,
-		Group:       group,
-	})
-	if !ok || !routingMarkerFresh(breaker.UpdatedUnix, setting) {
-		return true
-	}
-	state := strings.ToLower(strings.TrimSpace(breaker.State))
-	reason := strings.ToLower(strings.TrimSpace(breaker.Reason))
-	if state == routingselector.BreakerReasonAuthFail || reason == routingselector.BreakerReasonAuthFail ||
-		state == routingselector.BreakerReasonBalance || reason == routingselector.BreakerReasonBalance {
-		return false
-	}
-	now := common.GetTimestamp()
-	switch state {
-	case routingselector.BreakerStateOpen:
-		return breaker.CooldownUntilUnix > 0 && now >= breaker.CooldownUntilUnix
-	case routingselector.BreakerStateHalfOpen:
-		return setting.HalfOpenProbes <= 0 || breaker.HalfOpenInflight < int64(setting.HalfOpenProbes)
-	default:
-		return true
-	}
-}
-
-func AcquireMultiKeyRoutingHalfOpenProbe(c *gin.Context, channelID int, index int, modelName string, group string) bool {
-	if channelID <= 0 || index < 0 {
-		return true
-	}
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || !common.MemoryCacheEnabled {
-		return true
-	}
-	if group == "" && c != nil {
-		group = common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
-		if group == "" {
-			group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-		}
-	}
-	if modelName == "" || group == "" {
-		return true
-	}
-	cacheKey := routinghotcache.Key{
-		ChannelID:   channelID,
-		APIKeyIndex: index,
-		Model:       modelName,
-		Group:       group,
-	}
-	breaker, ok := routinghotcache.GetBreaker(cacheKey)
-	if !ok || !routingMarkerFresh(breaker.UpdatedUnix, setting) {
-		return true
-	}
-	return acquireRoutingHalfOpenProbeForKey(c, routingbreaker.Key{
-		ChannelID:   channelID,
-		APIKeyIndex: index,
-		Model:       modelName,
-		Group:       group,
-	}, &routingselector.BreakerSnapshot{
-		State:             breaker.State,
-		Reason:            breaker.Reason,
-		CooldownUntilUnix: breaker.CooldownUntilUnix,
-		HalfOpenInflight:  breaker.HalfOpenInflight,
-		UpdatedUnix:       breaker.UpdatedUnix,
-	}, setting.HalfOpenProbes, common.GetTimestamp())
-}
-
 func filterSmartRoutingExcludedCandidates(candidates []routingselector.Candidate, excluded map[int]struct{}, switchCount int, maxSwitches int) []routingselector.Candidate {
 	if len(candidates) == 0 || len(excluded) == 0 {
 		return candidates
@@ -928,14 +840,6 @@ func filterSmartRoutingExcludedCandidates(candidates []routingselector.Candidate
 
 func applyRoutingHealthMarkers(candidate *routingselector.Candidate, channelID int, setting smart_routing_setting.SmartRoutingSetting) {
 	if candidate == nil || channelID <= 0 {
-		return
-	}
-	if authFailure, ok := routinghotcache.GetAuthFailure(channelID); ok && authFailure.Marked && routingMarkerFresh(authFailure.UpdatedUnix, setting) {
-		candidate.Breaker = &routingselector.BreakerSnapshot{
-			State:       routingselector.BreakerStateOpen,
-			Reason:      routingselector.BreakerReasonAuthFail,
-			UpdatedUnix: authFailure.UpdatedUnix,
-		}
 		return
 	}
 	if balance, ok := routinghotcache.GetBalance(channelID); ok && balance.Known && routingMarkerFresh(balance.UpdatedUnix, setting) && balance.Balance < setting.BalanceMarginUSD {

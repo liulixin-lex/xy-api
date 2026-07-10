@@ -172,6 +172,14 @@ func (c *ChannelInfo) Scan(value interface{}) error {
 	return common.Unmarshal(bytesValue, c)
 }
 
+func SupportsLegacyRoutingState(channelID int, apiKeyIndex int) bool {
+	if channelID <= 0 || apiKeyIndex != RoutingMetricSingleKeyIndex {
+		return false
+	}
+	info, err := CacheGetChannelInfo(channelID)
+	return err == nil && info != nil && !info.IsMultiKey
+}
+
 func (channel *Channel) GetKeys() []string {
 	if channel.Key == "" {
 		return []string{}

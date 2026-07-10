@@ -216,6 +216,35 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 	assert.Equal(t, int64(120), metric.UpdatedUnix)
 }
 
+func TestLoadMetricAndBreakerSnapshotsRejectPositiveAPIKeyIndexes(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	LoadMetricSnapshots([]model.RoutingChannelMetric{
+		{ChannelID: 771, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "single", Group: "default", BucketTs: 120, RequestCount: 1},
+		{ChannelID: 772, APIKeyIndex: 2, ModelName: "positive", Group: "default", BucketTs: 120, RequestCount: 1},
+	}, 60)
+	ApplyMetricDeltas([]model.RoutingChannelMetric{
+		{ChannelID: 773, APIKeyIndex: 3, ModelName: "positive-delta", Group: "default", BucketTs: 120, RequestCount: 1},
+	}, 60)
+	LoadBreakerSnapshots([]model.RoutingBreakerState{
+		{ChannelID: 771, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "single", Group: "default", State: "open", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 120},
+		{ChannelID: 772, APIKeyIndex: 2, ModelName: "positive", Group: "default", State: "open", SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 120},
+	})
+
+	_, singleMetric := GetMetric(Key{ChannelID: 771, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "single", Group: "default"})
+	_, positiveMetric := GetMetric(Key{ChannelID: 772, APIKeyIndex: 2, Model: "positive", Group: "default"})
+	_, positiveDelta := GetMetric(Key{ChannelID: 773, APIKeyIndex: 3, Model: "positive-delta", Group: "default"})
+	_, singleBreaker := GetBreaker(Key{ChannelID: 771, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "single", Group: "default"})
+	_, positiveBreaker := GetBreaker(Key{ChannelID: 772, APIKeyIndex: 2, Model: "positive", Group: "default"})
+	assert.True(t, singleMetric)
+	assert.False(t, positiveMetric)
+	assert.False(t, positiveDelta)
+	assert.True(t, singleBreaker)
+	assert.False(t, positiveBreaker)
+	assert.Equal(t, Stats{Metrics: 1, Breakers: 1}, RuntimeStats())
+}
+
 func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
 	ResetForTest()
 	t.Cleanup(ResetForTest)

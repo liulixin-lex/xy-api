@@ -194,6 +194,13 @@ type RelayInfo struct {
 	*TaskRelayInfo
 }
 
+func (info *RelayInfo) CurrentAttemptIsMultiKey(c *gin.Context) bool {
+	if c != nil {
+		return common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
+	}
+	return info != nil && info.ChannelMeta != nil && info.ChannelMeta.ChannelIsMultiKey
+}
+
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)

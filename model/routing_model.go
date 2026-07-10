@@ -213,6 +213,9 @@ func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
 	if metric == nil || metric.RequestCount == 0 {
 		return nil
 	}
+	if !SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex) {
+		return nil
+	}
 	return DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "channel_id"},
@@ -291,6 +294,9 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 		return nil
 	}
+	if !SupportsLegacyRoutingState(state.ChannelID, state.APIKeyIndex) {
+		return nil
+	}
 	state.SemanticVersion = RoutingBreakerSemanticVersion
 	updates := map[string]interface{}{
 		"semantic_version":     state.SemanticVersion,
@@ -328,12 +334,20 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 }
 
 func GetRoutingBreakerStatesForHydration(limit int) ([]RoutingBreakerState, error) {
+	return GetRoutingBreakerStatesForHydrationPage(limit, 0, 0)
+}
+
+func GetRoutingBreakerStatesForHydrationPage(limit int, beforeUpdatedTime int64, beforeID int) ([]RoutingBreakerState, error) {
 	if limit <= 0 {
 		limit = 5000
 	}
 	var states []RoutingBreakerState
-	err := DB.Where("semantic_version = ?", RoutingBreakerSemanticVersion).
-		Order("updated_time desc").
+	query := DB.Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex)
+	if beforeID > 0 {
+		query = query.Where("(updated_time < ? OR (updated_time = ? AND id < ?))", beforeUpdatedTime, beforeUpdatedTime, beforeID)
+	}
+	err := query.Order("updated_time desc").
+		Order("id desc").
 		Limit(limit).
 		Find(&states).Error
 	return states, err

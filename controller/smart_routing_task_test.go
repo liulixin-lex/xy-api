@@ -247,8 +247,14 @@ func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
 func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
 	routinghotcache.ResetForTest()
-	t.Cleanup(routinghotcache.ResetForTest)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+	})
+	require.NoError(t, db.Create(&model.Channel{Id: 781, Name: "single", Key: "single-key"}).Error)
 
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
 		ChannelID:       781,
@@ -275,9 +281,15 @@ func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testin
 func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
 	routinghotcache.ResetForTest()
-	t.Cleanup(routinghotcache.ResetForTest)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+	})
 	now := common.GetTimestamp()
+	require.NoError(t, db.Create(&model.Channel{Id: 782, Name: "single", Key: "single-key"}).Error)
 
 	require.NoError(t, db.Create(&model.RoutingCostSnapshot{
 		ChannelID:  782,
@@ -346,17 +358,23 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
 	routinghotcache.ResetForTest()
-	t.Cleanup(routinghotcache.ResetForTest)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+	})
 	now := common.GetTimestamp()
+	const channelID = 99_999
+	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
 
 	costs := make([]model.RoutingCostSnapshot, 0, 5001)
 	metrics := make([]model.RoutingChannelMetric, 0, 5001)
 	for i := 0; i < 5000; i++ {
-		channelID := 10_000 + i
 		costs = append(costs, model.RoutingCostSnapshot{
 			ChannelID:  channelID,
-			ModelName:  "old-cost",
+			ModelName:  fmt.Sprintf("old-cost-%d", i),
 			GroupRatio: 9,
 			BaseRatio:  1,
 			Confidence: model.RoutingCostConfidenceFull,
@@ -365,7 +383,7 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 		metrics = append(metrics, model.RoutingChannelMetric{
 			ChannelID:    channelID,
 			APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
-			ModelName:    "old-metric",
+			ModelName:    fmt.Sprintf("old-metric-%d", i),
 			Group:        "vip",
 			BucketTs:     now - 10,
 			RequestCount: 1,
@@ -374,7 +392,7 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 		})
 	}
 	costs = append(costs, model.RoutingCostSnapshot{
-		ChannelID:  99_999,
+		ChannelID:  channelID,
 		ModelName:  "latest-cost",
 		GroupRatio: 2,
 		BaseRatio:  1,
@@ -382,7 +400,7 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 		SnapshotTS: now,
 	})
 	metrics = append(metrics, model.RoutingChannelMetric{
-		ChannelID:    99_999,
+		ChannelID:    channelID,
 		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
 		ModelName:    "latest-metric",
 		Group:        "vip",
@@ -399,10 +417,10 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 5000, summary["costs"])
 	assert.EqualValues(t, 5000, summary["metrics"])
-	cost, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 99_999, Model: "latest-cost"})
+	cost, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: channelID, Model: "latest-cost"})
 	require.True(t, ok)
 	assert.Equal(t, 2.0, cost.Cost)
-	metric, ok := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 99_999, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "latest-metric", Group: "vip"})
+	metric, ok := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "latest-metric", Group: "vip"})
 	require.True(t, ok)
 	assert.Equal(t, 100.0, metric.P95LatencyMs)
 }

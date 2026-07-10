@@ -430,9 +430,8 @@ func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
 		OriginModelName: "gpt-test",
 		StartTime:       time.Now(),
 		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelId:            22,
-			ChannelIsMultiKey:    true,
-			ChannelMultiKeyIndex: 3,
+			ChannelId:         22,
+			ChannelIsMultiKey: false,
 		},
 	}
 
@@ -441,9 +440,9 @@ func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
 	RecordAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad request"), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest))
 
 	snapshots := Snapshots()
-	require.Len(t, snapshots, 2)
+	require.Len(t, snapshots, 1)
 	for _, metric := range snapshots {
-		assert.Contains(t, []int{model.RoutingMetricSingleKeyIndex, 3}, metric.APIKeyIndex)
+		assert.Equal(t, model.RoutingMetricSingleKeyIndex, metric.APIKeyIndex)
 		assert.Equal(t, int64(3), metric.RequestCount)
 		assert.Zero(t, metric.SuccessCount)
 		assert.Equal(t, int64(1), metric.Err429)
@@ -578,39 +577,43 @@ func TestRecordClassifiedAttemptUsesSourceStatusAndSeparates529(t *testing.T) {
 	assert.Equal(t, int64(1), snapshots[0].Err5xx)
 }
 
-func TestRecordAttemptAddsAggregateSnapshotForMultiKeyChannels(t *testing.T) {
+func TestRoutingMetricsIgnoreCurrentMultiKeyAttempt(t *testing.T) {
 	enableRoutingMetricsForTest(t)
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",
 		StartTime:       time.Now(),
 		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelId:            25,
-			ChannelIsMultiKey:    true,
-			ChannelMultiKeyIndex: 3,
+			ChannelId:         25,
+			ChannelIsMultiKey: false,
 		},
 	}
+	aggregate := InflightKey{ChannelID: 25, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}
+	perKey := InflightKey{ChannelID: 25, APIKeyIndex: 3, Model: "gpt-test", Group: "vip"}
 
-	RecordAttempt(nil, info, 25, nil)
+	release := BeginInflight(ctx, info, 25)
+	RecordAttempt(ctx, info, 25, nil)
 
-	snapshots := Snapshots()
-	require.Len(t, snapshots, 2)
-	assert.Equal(t, model.RoutingMetricSingleKeyIndex, snapshots[0].APIKeyIndex)
-	assert.Equal(t, 3, snapshots[1].APIKeyIndex)
-	for _, metric := range snapshots {
-		assert.Equal(t, 25, metric.ChannelID)
-		assert.Equal(t, "gpt-test", metric.ModelName)
-		assert.Equal(t, "vip", metric.Group)
-		assert.Equal(t, int64(1), metric.RequestCount)
-		assert.Equal(t, int64(1), metric.SuccessCount)
-	}
+	assert.Empty(t, Snapshots())
+	assert.Zero(t, InflightCount(aggregate))
+	assert.Zero(t, InflightCount(perKey))
+	assert.Equal(t, Stats{}, RuntimeStats())
+	release()
+	assert.Equal(t, Stats{}, RuntimeStats())
 }
 
-func TestInflightCountersAlsoTrackAggregateForMultiKeyChannels(t *testing.T) {
+func TestRoutingMetricsUseOnlyMinusOneForCurrentSingleKeyAttempt(t *testing.T) {
 	enableRoutingMetricsForTest(t)
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",
+		StartTime:       time.Now(),
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ChannelId:            26,
 			ChannelIsMultiKey:    true,
@@ -620,13 +623,19 @@ func TestInflightCountersAlsoTrackAggregateForMultiKeyChannels(t *testing.T) {
 	aggregate := InflightKey{ChannelID: 26, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}
 	perKey := InflightKey{ChannelID: 26, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"}
 
-	release := BeginInflight(nil, info, 26)
+	release := BeginInflight(ctx, info, 26)
+	RecordAttempt(ctx, info, 26, nil)
 
 	assert.Equal(t, int64(1), InflightCount(aggregate))
-	assert.Equal(t, int64(1), InflightCount(perKey))
+	assert.Zero(t, InflightCount(perKey))
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, model.RoutingMetricSingleKeyIndex, snapshots[0].APIKeyIndex)
+	assert.Equal(t, Stats{Buckets: 1, InflightKeys: 1}, RuntimeStats())
 	release()
 	assert.Zero(t, InflightCount(aggregate))
 	assert.Zero(t, InflightCount(perKey))
+	assert.Equal(t, Stats{Buckets: 1}, RuntimeStats())
 }
 
 func TestRecordAttemptCapturesRetryAfterMax(t *testing.T) {
@@ -685,14 +694,13 @@ func TestInflightCountersUseRoutingKeyAndReleaseOnce(t *testing.T) {
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",
 		ChannelMeta: &relaycommon.ChannelMeta{
-			ChannelId:            24,
-			ChannelIsMultiKey:    true,
-			ChannelMultiKeyIndex: 2,
+			ChannelId:         24,
+			ChannelIsMultiKey: false,
 		},
 	}
 	key := InflightKey{
 		ChannelID:   24,
-		APIKeyIndex: 2,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "vip",
 	}

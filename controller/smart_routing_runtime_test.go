@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestSmartRoutingRuntimeRunsAndStopsWithoutLeakingWorkers(t *testing.T) {
@@ -102,6 +106,7 @@ func TestRoutingBreakerModelsToSnapshotsRejectsLegacySemanticVersion(t *testing.
 	states := []model.RoutingBreakerState{
 		{ChannelID: 1, APIKeyIndex: -1, ModelName: "legacy", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: 0, UpdatedTime: 100},
 		{ChannelID: 2, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 100},
+		{ChannelID: 3, APIKeyIndex: 2, ModelName: "positive", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: 100},
 	}
 
 	snapshots := routingBreakerModelsToSnapshots(states)
@@ -113,12 +118,16 @@ func TestRoutingBreakerModelsToSnapshotsRejectsLegacySemanticVersion(t *testing.
 func TestRefreshRoutingHotcacheHydratesOnlyCurrentBreakerSemanticVersion(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
 	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	routinghotcache.ResetForTest()
 	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 	})
+	require.NoError(t, db.Create(&model.Channel{Id: 11, Name: "current-single", Key: "single-key"}).Error)
 	require.NoError(t, db.Create(&[]model.RoutingBreakerState{
 		{ChannelID: 10, APIKeyIndex: -1, ModelName: "legacy", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: 0, UpdatedTime: common.GetTimestamp()},
 		{ChannelID: 11, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: common.GetTimestamp()},
@@ -128,6 +137,322 @@ func TestRefreshRoutingHotcacheHydratesOnlyCurrentBreakerSemanticVersion(t *test
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["breakers"])
 	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
+}
+
+func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 21, Name: "single", Key: "single-key"},
+		{Id: 22, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}).Error)
+	now := common.GetTimestamp()
+	type routingKey struct {
+		channelID   int
+		apiKeyIndex int
+		modelName   string
+	}
+	keys := []routingKey{
+		{channelID: 21, apiKeyIndex: model.RoutingMetricSingleKeyIndex, modelName: "single-minus-one"},
+		{channelID: 21, apiKeyIndex: 1, modelName: "single-positive"},
+		{channelID: 22, apiKeyIndex: model.RoutingMetricSingleKeyIndex, modelName: "multi-minus-one"},
+		{channelID: 22, apiKeyIndex: 1, modelName: "multi-positive"},
+	}
+	metrics := make([]model.RoutingChannelMetric, 0, len(keys))
+	breakers := make([]model.RoutingBreakerState, 0, len(keys))
+	for _, key := range keys {
+		metrics = append(metrics, model.RoutingChannelMetric{
+			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
+			Group: "default", BucketTs: now, RequestCount: 1, SuccessCount: 1,
+		})
+		breakers = append(breakers, model.RoutingBreakerState{
+			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
+			Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
+			State: model.RoutingBreakerStateOpen, UpdatedTime: now,
+		})
+	}
+	require.NoError(t, db.Create(&metrics).Error)
+	require.NoError(t, db.Create(&breakers).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+		MetricBucketSec:  60,
+		SnapshotStaleSec: 300,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["metrics"])
+	assert.Equal(t, 1, summary["breakers"])
+	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
+
+	for _, key := range keys {
+		cacheKey := routinghotcache.Key{ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, Model: key.modelName, Group: "default"}
+		_, metricOK := routinghotcache.GetMetric(cacheKey)
+		_, breakerOK := routinghotcache.GetBreaker(cacheKey)
+		want := key.channelID == 21 && key.apiKeyIndex == model.RoutingMetricSingleKeyIndex
+		assert.Equal(t, want, metricOK, "metric key %+v", key)
+		assert.Equal(t, want, breakerOK, "breaker key %+v", key)
+	}
+}
+
+func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 23, Name: "single", Key: "single-key"},
+		{Id: 24, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}).Error)
+
+	const invalidRows = 5000
+	now := common.GetTimestamp()
+	require.NoError(t, db.Create(&model.RoutingChannelMetric{
+		ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
+		Group: "default", BucketTs: now, RequestCount: 1, SuccessCount: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingBreakerState{
+		ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
+		Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
+		State: model.RoutingBreakerStateDegraded, UpdatedTime: now,
+	}).Error)
+	metrics := make([]model.RoutingChannelMetric, 0, invalidRows)
+	breakers := make([]model.RoutingBreakerState, 0, invalidRows)
+	for i := 0; i < invalidRows; i++ {
+		modelName := fmt.Sprintf("legacy-multi-%04d", i)
+		metrics = append(metrics, model.RoutingChannelMetric{
+			ChannelID: 24, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
+			Group: "default", BucketTs: now, RequestCount: 1,
+		})
+		breakers = append(breakers, model.RoutingBreakerState{
+			ChannelID: 24, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
+			Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
+			State: model.RoutingBreakerStateOpen, UpdatedTime: now,
+		})
+	}
+	require.NoError(t, db.CreateInBatches(metrics, 500).Error)
+	require.NoError(t, db.CreateInBatches(breakers, 500).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+		MetricBucketSec:  60,
+		SnapshotStaleSec: 300,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["metrics"])
+	assert.Equal(t, 1, summary["breakers"])
+	cacheKey := routinghotcache.Key{ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "valid-single", Group: "default"}
+	_, metricOK := routinghotcache.GetMetric(cacheKey)
+	_, breakerOK := routinghotcache.GetBreaker(cacheKey)
+	assert.True(t, metricOK)
+	assert.True(t, breakerOK)
+}
+
+func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+	})
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 31, Name: "single", Key: "single-key"},
+		{Id: 32, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}).Error)
+
+	type routingKey struct {
+		channelID   int
+		apiKeyIndex int
+		modelName   string
+	}
+	keys := []routingKey{
+		{channelID: 31, apiKeyIndex: model.RoutingMetricSingleKeyIndex, modelName: "single-minus-one"},
+		{channelID: 31, apiKeyIndex: 1, modelName: "single-positive"},
+		{channelID: 32, apiKeyIndex: model.RoutingMetricSingleKeyIndex, modelName: "multi-minus-one"},
+		{channelID: 32, apiKeyIndex: 1, modelName: "multi-positive"},
+	}
+	metrics := make([]model.RoutingChannelMetric, 0, len(keys))
+	for _, key := range keys {
+		metrics = append(metrics, model.RoutingChannelMetric{
+			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
+			Group: "default", BucketTs: 60, RequestCount: 1,
+		})
+		routingbreaker.RecordAttempt(routingbreaker.Key{
+			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, Model: key.modelName, Group: "default",
+		}, false, http.StatusBadGateway, 0)
+	}
+	routingmetrics.RequeueSnapshots(metrics)
+
+	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["metrics"])
+	assert.Equal(t, 1, summary["breakers"])
+	assert.Empty(t, routingmetrics.Snapshots())
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+
+	var metricCount int64
+	require.NoError(t, db.Model(&model.RoutingChannelMetric{}).Count(&metricCount).Error)
+	assert.Equal(t, int64(1), metricCount)
+	var breakerCount int64
+	require.NoError(t, db.Model(&model.RoutingBreakerState{}).Count(&breakerCount).Error)
+	assert.Equal(t, int64(1), breakerCount)
+}
+
+func TestFlushRoutingRuntimeStateRequeuesOnlyValidMetricSuffixAfterPersistenceFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+	})
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 41, Name: "single", Key: "single-key"},
+		{Id: 42, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}).Error)
+
+	const callbackName = "test:fail_second_routing_metric_create"
+	createCount := 0
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelMetric{}).TableName() {
+			return
+		}
+		createCount++
+		if createCount == 2 {
+			tx.AddError(errors.New("forced metric persistence failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{
+		{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "a-valid-prefix", Group: "default", BucketTs: 60, RequestCount: 1},
+		{ChannelID: 41, APIKeyIndex: 1, ModelName: "b-invalid-positive", Group: "default", BucketTs: 60, RequestCount: 1},
+		{ChannelID: 42, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "c-invalid-multi", Group: "default", BucketTs: 60, RequestCount: 1},
+		{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "d-valid-suffix", Group: "default", BucketTs: 60, RequestCount: 1},
+	})
+
+	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	require.ErrorContains(t, err, "forced metric persistence failure")
+	assert.Equal(t, 0, summary["metrics"])
+
+	var persisted []model.RoutingChannelMetric
+	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, "a-valid-prefix", persisted[0].ModelName)
+	_, prefixCached := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "a-valid-prefix", Group: "default"})
+	_, suffixCached := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "d-valid-suffix", Group: "default"})
+	assert.True(t, prefixCached)
+	assert.False(t, suffixCached)
+	requeued := routingmetrics.Snapshots()
+	require.Len(t, requeued, 1)
+	assert.Equal(t, "d-valid-suffix", requeued[0].ModelName)
+
+	require.NoError(t, db.Callback().Create().Remove(callbackName))
+	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["metrics"])
+	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
+	require.Len(t, persisted, 2)
+	assert.Equal(t, "a-valid-prefix", persisted[0].ModelName)
+	assert.Equal(t, "d-valid-suffix", persisted[1].ModelName)
+	assert.Empty(t, routingmetrics.Snapshots())
+}
+
+func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingBreakerState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+	})
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 51, Name: "single", Key: "single-key"},
+		{Id: 52, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}).Error)
+
+	keys := []routingbreaker.Key{
+		{ChannelID: 51, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "a-valid-prefix", Group: "default"},
+		{ChannelID: 51, APIKeyIndex: 1, Model: "b-invalid-positive", Group: "default"},
+		{ChannelID: 52, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "c-invalid-multi", Group: "default"},
+		{ChannelID: 51, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "d-valid-suffix", Group: "default"},
+	}
+	for _, key := range keys {
+		routingbreaker.RecordAttempt(key, false, http.StatusBadGateway, 0)
+	}
+
+	const callbackName = "test:fail_second_routing_breaker_update"
+	updateCount := 0
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingBreakerState{}).TableName() {
+			return
+		}
+		updateCount++
+		if updateCount == 2 {
+			tx.AddError(errors.New("forced breaker persistence failure"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
+
+	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	require.ErrorContains(t, err, "forced breaker persistence failure")
+	assert.Equal(t, 0, summary["breakers"])
+
+	var persisted []model.RoutingBreakerState
+	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, "a-valid-prefix", persisted[0].ModelName)
+	requeued := routingbreaker.DirtySnapshots()
+	require.Len(t, requeued, 1)
+	assert.Equal(t, "d-valid-suffix", requeued[0].Key.Model)
+	routingbreaker.RequeueDirtySnapshots(requeued)
+
+	require.NoError(t, db.Callback().Update().Remove(callbackName))
+	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary["breakers"])
+	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
+	require.Len(t, persisted, 2)
+	assert.Equal(t, "a-valid-prefix", persisted[0].ModelName)
+	assert.Equal(t, "d-valid-suffix", persisted[1].ModelName)
+	assert.Empty(t, routingbreaker.DirtySnapshots())
 }
 
 func TestSmartRoutingRuntimePrunesStaleHotcacheWhenDisabled(t *testing.T) {
@@ -246,9 +571,12 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
 	routingmetrics.ResetForTest()
 	routinghotcache.ResetForTest()
 	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
 		routingmetrics.ResetForTest()
 		routinghotcache.ResetForTest()
 	})
@@ -257,6 +585,7 @@ func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testi
 		channelID = 906
 		bucketTs  = 120
 	)
+	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
 	key := routinghotcache.Key{
 		ChannelID:   channelID,
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,

@@ -360,26 +360,55 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 		"breakers": 0,
 	}
 	drainedMetrics := routingmetrics.DrainSnapshots()
-	for i := range drainedMetrics {
-		metric := drainedMetrics[i]
+	supportedChannels := make(map[int]bool)
+	validMetrics := make([]model.RoutingChannelMetric, 0, len(drainedMetrics))
+	for _, metric := range drainedMetrics {
+		if metric.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			continue
+		}
+		supported, checked := supportedChannels[metric.ChannelID]
+		if !checked {
+			supported = model.SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex)
+			supportedChannels[metric.ChannelID] = supported
+		}
+		if supported {
+			validMetrics = append(validMetrics, metric)
+		}
+	}
+	for i := range validMetrics {
+		metric := validMetrics[i]
 		if err := model.UpsertRoutingChannelMetric(&metric); err != nil {
-			routinghotcache.ApplyMetricDeltas(drainedMetrics[:i], setting.MetricBucketSec)
-			routingmetrics.RequeueSnapshots(drainedMetrics[i:])
+			routinghotcache.ApplyMetricDeltas(validMetrics[:i], setting.MetricBucketSec)
+			routingmetrics.RequeueSnapshots(validMetrics[i:])
 			return summary, err
 		}
 	}
-	routinghotcache.ApplyMetricDeltas(drainedMetrics, setting.MetricBucketSec)
-	summary["metrics"] = len(drainedMetrics)
+	routinghotcache.ApplyMetricDeltas(validMetrics, setting.MetricBucketSec)
+	summary["metrics"] = len(validMetrics)
 
 	dirtyBreakers := routingbreaker.DirtySnapshots()
-	for i, snapshot := range dirtyBreakers {
+	validBreakers := make([]routingbreaker.Snapshot, 0, len(dirtyBreakers))
+	for _, snapshot := range dirtyBreakers {
+		if snapshot.Key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			continue
+		}
+		supported, checked := supportedChannels[snapshot.Key.ChannelID]
+		if !checked {
+			supported = model.SupportsLegacyRoutingState(snapshot.Key.ChannelID, snapshot.Key.APIKeyIndex)
+			supportedChannels[snapshot.Key.ChannelID] = supported
+		}
+		if supported {
+			validBreakers = append(validBreakers, snapshot)
+		}
+	}
+	for i, snapshot := range validBreakers {
 		state := routingBreakerSnapshotToModel(snapshot)
 		if err := model.UpsertRoutingBreakerState(&state); err != nil {
-			routingbreaker.RequeueDirtySnapshots(dirtyBreakers[i:])
+			routingbreaker.RequeueDirtySnapshots(validBreakers[i:])
 			return summary, err
 		}
 	}
-	summary["breakers"] = len(dirtyBreakers)
+	summary["breakers"] = len(validBreakers)
 
 	now := common.GetTimestamp()
 	const (
@@ -429,18 +458,78 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	if bucketWindow := int64(setting.MetricBucketSec * 5); bucketWindow > metricWindow {
 		metricWindow = bucketWindow
 	}
-	var metrics []model.RoutingChannelMetric
-	if err := model.DB.Where("bucket_ts >= ?", now-metricWindow).Order("bucket_ts desc").Limit(5000).Find(&metrics).Error; err != nil {
-		return summary, err
+	const routingSnapshotLimit = 5000
+	supportedChannels := make(map[int]bool)
+	validMetrics := make([]model.RoutingChannelMetric, 0, routingSnapshotLimit)
+	lastMetricBucketTs := int64(0)
+	lastMetricID := 0
+	for len(validMetrics) < routingSnapshotLimit {
+		query := model.DB.Where("bucket_ts >= ? AND api_key_index = ?", now-metricWindow, model.RoutingMetricSingleKeyIndex)
+		if lastMetricID > 0 {
+			query = query.Where("(bucket_ts < ? OR (bucket_ts = ? AND id < ?))", lastMetricBucketTs, lastMetricBucketTs, lastMetricID)
+		}
+		var page []model.RoutingChannelMetric
+		if err := query.Order("bucket_ts desc").Order("id desc").Limit(routingSnapshotLimit).Find(&page).Error; err != nil {
+			return summary, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, metric := range page {
+			supported, checked := supportedChannels[metric.ChannelID]
+			if !checked {
+				supported = model.SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex)
+				supportedChannels[metric.ChannelID] = supported
+			}
+			if supported {
+				validMetrics = append(validMetrics, metric)
+				if len(validMetrics) == routingSnapshotLimit {
+					break
+				}
+			}
+		}
+		lastMetric := page[len(page)-1]
+		lastMetricBucketTs = lastMetric.BucketTs
+		lastMetricID = lastMetric.ID
+		if len(page) < routingSnapshotLimit {
+			break
+		}
 	}
-	routinghotcache.LoadMetricSnapshots(metrics, setting.MetricBucketSec)
-	summary["metrics"] = len(metrics)
+	routinghotcache.LoadMetricSnapshots(validMetrics, setting.MetricBucketSec)
+	summary["metrics"] = len(validMetrics)
 
-	breakerStates, err := model.GetRoutingBreakerStatesForHydration(5000)
-	if err != nil {
-		return summary, err
+	validBreakerStates := make([]model.RoutingBreakerState, 0, routingSnapshotLimit)
+	lastBreakerUpdatedTime := int64(0)
+	lastBreakerID := 0
+	for len(validBreakerStates) < routingSnapshotLimit {
+		page, err := model.GetRoutingBreakerStatesForHydrationPage(routingSnapshotLimit, lastBreakerUpdatedTime, lastBreakerID)
+		if err != nil {
+			return summary, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, state := range page {
+			supported, checked := supportedChannels[state.ChannelID]
+			if !checked {
+				supported = model.SupportsLegacyRoutingState(state.ChannelID, state.APIKeyIndex)
+				supportedChannels[state.ChannelID] = supported
+			}
+			if supported {
+				validBreakerStates = append(validBreakerStates, state)
+				if len(validBreakerStates) == routingSnapshotLimit {
+					break
+				}
+			}
+		}
+		lastBreaker := page[len(page)-1]
+		lastBreakerUpdatedTime = lastBreaker.UpdatedTime
+		lastBreakerID = lastBreaker.ID
+		if len(page) < routingSnapshotLimit {
+			break
+		}
 	}
-	accepted := routingBreakerModelsToSnapshots(breakerStates)
+	accepted := routingBreakerModelsToSnapshots(validBreakerStates)
 	retained := routingbreaker.HydrateDefaultSnapshots(accepted)
 	summary["breakers"] = len(retained)
 
@@ -895,7 +984,9 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routingbreaker.Snapshot {
 	snapshots := make([]routingbreaker.Snapshot, 0, len(states))
 	for _, state := range states {
-		if state.SemanticVersion != model.RoutingBreakerSemanticVersion || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
+		if state.SemanticVersion != model.RoutingBreakerSemanticVersion ||
+			state.APIKeyIndex != model.RoutingMetricSingleKeyIndex ||
+			state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 			continue
 		}
 		snapshot := routingbreaker.Snapshot{

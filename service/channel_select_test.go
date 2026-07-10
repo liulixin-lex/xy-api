@@ -14,6 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -93,6 +95,101 @@ func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *
 	require.NoError(t, err)
 	require.NotNil(t, channel)
 	assert.Equal(t, 102, channel.Id)
+}
+
+func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMultiKey(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	routingmetrics.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		routingmetrics.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true,
+		Mode:    smart_routing_setting.ModeObserve,
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	channels := []model.Channel{
+		{Id: 141, Name: "single", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 142, Name: "multi", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+	}
+	for i := range channels {
+		require.NoError(t, model.DB.Create(&channels[i]).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channels[i].Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	}
+	model.InitChannelCache()
+
+	now := time.Now()
+	singleAggregate := routinghotcache.Key{ChannelID: 141, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	singlePositive := routinghotcache.Key{ChannelID: 141, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
+	multiAggregate := routinghotcache.Key{ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	multiPositive := routinghotcache.Key{ChannelID: 142, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
+
+	routinghotcache.SetMetricForTest(singleAggregate, routinghotcache.MetricSnapshot{RequestCount: 11, ReliabilityRequestCount: 10, ReliabilityFailureCount: 1})
+	routinghotcache.SetMetricForTest(singlePositive, routinghotcache.MetricSnapshot{RequestCount: 99, ReliabilityRequestCount: 99, ReliabilityFailureCount: 99})
+	routinghotcache.SetBreakerForTest(singleAggregate, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateDegraded, UpdatedUnix: now.Unix()})
+	routinghotcache.SetBreakerForTest(singlePositive, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateOpen, UpdatedUnix: now.Unix()})
+	routinghotcache.SetCapacityCooldownForTest(singleAggregate, routinghotcache.CapacityCooldownSnapshot{SourceStatusCode: http.StatusTooManyRequests, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
+	routinghotcache.SetCapacityCooldownForTest(singlePositive, routinghotcache.CapacityCooldownSnapshot{SourceStatusCode: http.StatusPaymentRequired, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
+
+	for _, key := range []routinghotcache.Key{multiAggregate, multiPositive} {
+		routinghotcache.SetMetricForTest(key, routinghotcache.MetricSnapshot{RequestCount: 88, ReliabilityRequestCount: 88, ReliabilityFailureCount: 80})
+		routinghotcache.SetBreakerForTest(key, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateOpen, UpdatedUnix: now.Unix()})
+		routinghotcache.SetCapacityCooldownForTest(key, routinghotcache.CapacityCooldownSnapshot{SourceStatusCode: http.StatusTooManyRequests, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
+	}
+	routinghotcache.SetCostForTest(multiAggregate.CostKey(), routinghotcache.CostSnapshot{Known: true, Confidence: model.RoutingCostConfidenceFull, BillingMode: "per_request", GroupRatio: 2, ModelPrice: 0.25, UpdatedUnix: now.Unix()})
+
+	legacyInflightRelease := routingmetrics.BeginInflight(nil, &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 142, ChannelIsMultiKey: false},
+	}, 142)
+	t.Cleanup(legacyInflightRelease)
+	require.Equal(t, int64(1), routingmetrics.InflightCount(routingmetrics.InflightKey{
+		ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+	}))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	param := &RetryParam{Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0)}
+	candidates, err := smartRoutingCandidatesForGroup(param, "default")
+	require.NoError(t, err)
+	require.Len(t, candidates, 2)
+
+	byChannelID := make(map[int]routingselector.Candidate, len(candidates))
+	for _, candidate := range candidates {
+		byChannelID[candidate.Channel.Id] = candidate
+	}
+	single := byChannelID[141]
+	require.NotNil(t, single.Metric)
+	assert.Equal(t, int64(11), single.Metric.RequestCount)
+	require.NotNil(t, single.Breaker)
+	assert.Equal(t, routingselector.BreakerStateDegraded, single.Breaker.State)
+	require.NotNil(t, single.Capacity)
+	assert.Equal(t, http.StatusTooManyRequests, single.Capacity.SourceStatusCode)
+
+	multi := byChannelID[142]
+	assert.Nil(t, multi.Metric)
+	assert.Nil(t, multi.Breaker)
+	assert.Nil(t, multi.Capacity)
+	require.NotNil(t, multi.Cost)
+	assert.Equal(t, 0.5, multi.Cost.Cost)
+
+	routinghotcache.SetCapacityCooldownForTest(multiAggregate, routinghotcache.CapacityCooldownSnapshot{SourceStatusCode: http.StatusPaymentRequired, CooldownUntilUnixMilli: now.Add(2 * time.Minute).UnixMilli(), UpdatedUnixMilli: now.Add(time.Second).UnixMilli()})
+	memoized, err := smartRoutingCandidatesForGroup(param, "default")
+	require.NoError(t, err)
+	for _, candidate := range memoized {
+		if candidate.Channel.Id == 142 {
+			assert.Nil(t, candidate.Capacity)
+		}
+	}
 }
 
 func TestSelectSmartChannelForGroupCapacityCooldownBlocksHalfOpenProbeAndRestoresAtDeadline(t *testing.T) {
@@ -358,7 +455,7 @@ func TestSmartRoutingFallsBackToLegacyWhenMemoryCacheDisabled(t *testing.T) {
 	}))
 }
 
-func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *testing.T) {
+func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
@@ -373,8 +470,8 @@ func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *t
 	priority := int64(10)
 	weight := uint(10)
 	for _, channel := range []model.Channel{
-		{Id: 301, Name: "authfail", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
-		{Id: 302, Name: "low-balance", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 301, Name: "authfail", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+		{Id: 302, Name: "low-balance", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 		{Id: 303, Name: "healthy", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
 	} {
 		channel := channel
@@ -386,6 +483,12 @@ func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *t
 	now := common.GetTimestamp()
 	routinghotcache.SetAuthFailureForTest(301, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
 	routinghotcache.SetBalanceForTest(302, routinghotcache.BalanceSnapshot{Known: true, Balance: 0.25, UpdatedUnix: now})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:          true,
+		Mode:             smart_routing_setting.ModeBalanced,
+		SnapshotStaleSec: 300,
+		BalanceMarginUSD: 1,
+	})
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	param := &RetryParam{
@@ -396,20 +499,18 @@ func TestSelectSmartChannelForGroupHardFiltersFreshAuthFailureAndLowBalance(t *t
 		Retry:       common.GetPointer(0),
 	}
 
-	channel, err := selectSmartChannelForGroup(param, "default", smart_routing_setting.SmartRoutingSetting{
-		Enabled:            true,
-		Mode:               smart_routing_setting.ModeBalanced,
-		WeightAvailability: 1,
-		TopK:               1,
-		MinVolume:          10,
-		MaxEjectedPct:      100,
-		SnapshotStaleSec:   300,
-		BalanceMarginUSD:   1,
-	}, true)
+	candidates, err := smartRoutingCandidatesForGroup(param, "default")
 
 	require.NoError(t, err)
-	require.NotNil(t, channel)
-	assert.Equal(t, 303, channel.Id)
+	require.Len(t, candidates, 3)
+	byChannelID := make(map[int]routingselector.Candidate, len(candidates))
+	for _, candidate := range candidates {
+		byChannelID[candidate.Channel.Id] = candidate
+	}
+	assert.Nil(t, byChannelID[301].Breaker)
+	require.NotNil(t, byChannelID[302].Breaker)
+	assert.Equal(t, routingselector.BreakerReasonBalance, byChannelID[302].Breaker.Reason)
+	assert.Nil(t, byChannelID[303].Breaker)
 }
 
 func TestSelectSmartChannelForGroupReservesHalfOpenProbe(t *testing.T) {
@@ -624,7 +725,7 @@ func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestAffinityAdmissibleHardFiltersOnlyFreshAuthFailureAndLowBalance(t *testing.T) {
+func TestAffinityAdmissibleIgnoresLegacyAuthFailureAndStillFiltersLowBalance(t *testing.T) {
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(func() {
@@ -644,7 +745,7 @@ func TestAffinityAdmissibleHardFiltersOnlyFreshAuthFailureAndLowBalance(t *testi
 	routinghotcache.SetAuthFailureForTest(403, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now - 600})
 	routinghotcache.SetBalanceForTest(404, routinghotcache.BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: now})
 
-	assert.False(t, AffinityAdmissible(401))
+	assert.True(t, AffinityAdmissible(401))
 	assert.False(t, AffinityAdmissible(402))
 	assert.True(t, AffinityAdmissible(403))
 	assert.True(t, AffinityAdmissible(404))
@@ -739,56 +840,6 @@ func TestRoutingCostForRequestUsesPerRequestPrice(t *testing.T) {
 	require.NotNil(t, cost)
 	assert.True(t, cost.Known)
 	assert.Equal(t, 0.375, cost.Cost)
-}
-
-func TestIsMultiKeyIndexRoutingAdmissibleRejectsFreshOpenAndHardHealth(t *testing.T) {
-	routinghotcache.ResetForTest()
-	smart_routing_setting.ResetForTest()
-	previousMemoryCache := common.MemoryCacheEnabled
-	common.MemoryCacheEnabled = true
-	t.Cleanup(func() {
-		common.MemoryCacheEnabled = previousMemoryCache
-		routinghotcache.ResetForTest()
-		smart_routing_setting.ResetForTest()
-	})
-	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
-		Enabled:          true,
-		Mode:             smart_routing_setting.ModeBalanced,
-		SnapshotStaleSec: 300,
-		BalanceMarginUSD: 1,
-		HalfOpenProbes:   1,
-	})
-	now := common.GetTimestamp()
-
-	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 411, APIKeyIndex: 0, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{
-		State:             routingselector.BreakerStateOpen,
-		CooldownUntilUnix: now + 60,
-		UpdatedUnix:       now,
-	})
-	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 411, APIKeyIndex: 1, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{
-		State:             routingselector.BreakerStateOpen,
-		CooldownUntilUnix: now - 1,
-		UpdatedUnix:       now,
-	})
-	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 411, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{
-		State:       routingselector.BreakerStateOpen,
-		Reason:      routingselector.BreakerReasonAuthFail,
-		UpdatedUnix: now,
-	})
-	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 411, APIKeyIndex: 3, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{
-		State:       routingselector.BreakerStateOpen,
-		UpdatedUnix: now - 600,
-	})
-
-	assert.False(t, IsMultiKeyIndexRoutingAdmissible(nil, 411, 0, "gpt-test", "vip"))
-	assert.True(t, IsMultiKeyIndexRoutingAdmissible(nil, 411, 1, "gpt-test", "vip"))
-	assert.False(t, IsMultiKeyIndexRoutingAdmissible(nil, 411, 2, "gpt-test", "vip"))
-	assert.True(t, IsMultiKeyIndexRoutingAdmissible(nil, 411, 3, "gpt-test", "vip"))
-
-	routinghotcache.SetAuthFailureForTest(412, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
-	routinghotcache.SetBalanceForTest(413, routinghotcache.BalanceSnapshot{Known: true, Balance: 0.25, UpdatedUnix: now})
-	assert.False(t, IsMultiKeyIndexRoutingAdmissible(nil, 412, 0, "gpt-test", "vip"))
-	assert.False(t, IsMultiKeyIndexRoutingAdmissible(nil, 413, 0, "gpt-test", "vip"))
 }
 
 func TestMarkRoutingTriedTracksExcludedChannelsAndSwitchCount(t *testing.T) {

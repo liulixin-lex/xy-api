@@ -267,6 +267,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 }
 
 func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
+	if relayInfo.CurrentAttemptIsMultiKey(c) {
+		return
+	}
 	if relayInfo == nil || relayInfo.OriginModelName == "" {
 		return
 	}
@@ -282,17 +285,13 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 	if group == "" {
 		group = "default"
 	}
-	apiKeyIndex := model.RoutingMetricSingleKeyIndex
-	if relayInfo.ChannelMeta != nil && relayInfo.ChannelMeta.ChannelIsMultiKey {
-		apiKeyIndex = relayInfo.ChannelMeta.ChannelMultiKeyIndex
-	}
 	statusCode := 0
 	if apiErr != nil {
 		statusCode = apiErr.StatusCode
 	}
 	key := routingbreaker.Key{
 		ChannelID:   channelID,
-		APIKeyIndex: apiKeyIndex,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       relayInfo.OriginModelName,
 		Group:       group,
 	}
@@ -302,10 +301,6 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 	}
 	retryAfter := retryAfterFromAPIError(apiErr, retryAfterCap)
 	routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
-	if apiKeyIndex != model.RoutingMetricSingleKeyIndex {
-		key.APIKeyIndex = model.RoutingMetricSingleKeyIndex
-		routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
-	}
 }
 
 func routingBreakerConfigFromSetting(setting smart_routing_setting.SmartRoutingSetting) routingbreaker.Config {

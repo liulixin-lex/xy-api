@@ -106,6 +106,95 @@ func TestRoutingModelsExternalDatabaseCompatibility(t *testing.T) {
 	}
 }
 
+func TestRoutingPersistenceAcceptsOnlySingleKeyMinusOne(t *testing.T) {
+	tests := []struct {
+		name   string
+		envKey string
+		dbType common.DatabaseType
+	}{
+		{name: "sqlite", dbType: common.DatabaseTypeSQLite},
+		{name: "mysql", envKey: "ROUTING_TEST_MYSQL_DSN", dbType: common.DatabaseTypeMySQL},
+		{name: "postgres", envKey: "ROUTING_TEST_POSTGRES_DSN", dbType: common.DatabaseTypePostgreSQL},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var db *gorm.DB
+			if test.dbType == common.DatabaseTypeSQLite {
+				db = openRoutingSQLiteTestDB(t)
+			} else {
+				dsn := os.Getenv(test.envKey)
+				if dsn == "" {
+					t.Skipf("%s is not set", test.envKey)
+				}
+				db = openRoutingExternalTestDB(t, test.dbType, dsn)
+			}
+			if db.Migrator().HasTable(&Channel{}) {
+				t.Skip("refusing to run against external database because channels already exists")
+			}
+			withRoutingTestDB(t, db, test.dbType)
+			t.Cleanup(func() { _ = db.Migrator().DropTable(&Channel{}) })
+
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+			require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+			require.NoError(t, DB.Create(&Channel{Id: 1001, Name: "single", Key: "single-key"}).Error)
+			require.NoError(t, DB.Create(&Channel{Id: 1002, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: ChannelInfo{IsMultiKey: true}}).Error)
+
+			assert.True(t, SupportsLegacyRoutingState(1001, RoutingMetricSingleKeyIndex))
+			assert.False(t, SupportsLegacyRoutingState(1001, 2))
+			assert.False(t, SupportsLegacyRoutingState(1002, RoutingMetricSingleKeyIndex))
+			assert.False(t, SupportsLegacyRoutingState(1002, 2))
+
+			states := []struct {
+				channelID   int
+				apiKeyIndex int
+				modelName   string
+			}{
+				{channelID: 1001, apiKeyIndex: RoutingMetricSingleKeyIndex, modelName: "single-minus-one"},
+				{channelID: 1001, apiKeyIndex: 2, modelName: "single-positive"},
+				{channelID: 1002, apiKeyIndex: RoutingMetricSingleKeyIndex, modelName: "multi-minus-one"},
+				{channelID: 1002, apiKeyIndex: 2, modelName: "multi-positive"},
+			}
+			for _, state := range states {
+				require.NoError(t, UpsertRoutingChannelMetric(&RoutingChannelMetric{
+					ChannelID: state.channelID, APIKeyIndex: state.apiKeyIndex, ModelName: state.modelName,
+					Group: "default", BucketTs: 60, RequestCount: 1,
+				}))
+				require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
+					ChannelID: state.channelID, APIKeyIndex: state.apiKeyIndex, ModelName: state.modelName,
+					Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 100,
+				}))
+			}
+
+			var metricCount int64
+			require.NoError(t, DB.Model(&RoutingChannelMetric{}).Count(&metricCount).Error)
+			assert.Equal(t, int64(1), metricCount)
+			var savedMetric RoutingChannelMetric
+			require.NoError(t, DB.First(&savedMetric).Error)
+			assert.Equal(t, 1001, savedMetric.ChannelID)
+			assert.Equal(t, RoutingMetricSingleKeyIndex, savedMetric.APIKeyIndex)
+			var breakerCount int64
+			require.NoError(t, DB.Model(&RoutingBreakerState{}).Count(&breakerCount).Error)
+			assert.Equal(t, int64(1), breakerCount)
+			var savedBreaker RoutingBreakerState
+			require.NoError(t, DB.First(&savedBreaker).Error)
+			assert.Equal(t, 1001, savedBreaker.ChannelID)
+			assert.Equal(t, RoutingMetricSingleKeyIndex, savedBreaker.APIKeyIndex)
+		})
+	}
+}
+
+func TestSupportsLegacyRoutingStateFailsClosedWhenMemoryCacheMissesChannel(t *testing.T) {
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+	assert.False(t, SupportsLegacyRoutingState(int(^uint(0)>>1), RoutingMetricSingleKeyIndex))
+}
+
 var routingMigrationModels = []interface{}{
 	&RoutingChannelBinding{},
 	&RoutingCostSnapshot{},
@@ -158,6 +247,9 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	t.Helper()
 
 	withRoutingTestDB(t, db, dbType)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
 	require.NoError(t, DB.AutoMigrate(&routingChannelMetricBeforeReliability{}, &routingBreakerStateBeforeSemanticVersion{}))
 	legacyMetric := routingChannelMetricBeforeReliability{
 		ChannelID:    91,
@@ -191,6 +283,12 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.NoError(t, DB.Create(&legacyBreaker).Error)
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
+	t.Cleanup(func() { _ = db.Migrator().DropTable(&Channel{}) })
+	require.NoError(t, DB.AutoMigrate(&Channel{}))
+	require.NoError(t, DB.Create(&[]Channel{
+		{Id: 1, Name: "single-one", Key: "single-key-one"},
+		{Id: 91, Name: "single-ninety-one", Key: "single-key-ninety-one"},
+	}).Error)
 
 	for _, model := range routingMigrationModels {
 		require.True(t, DB.Migrator().HasTable(model))
@@ -394,7 +492,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 
 	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
 		ChannelID:           1,
-		APIKeyIndex:         2,
+		APIKeyIndex:         RoutingMetricSingleKeyIndex,
 		ModelName:           "gpt-test",
 		Group:               "default",
 		State:               RoutingBreakerStateOpen,
@@ -412,7 +510,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 
 	var currentBreaker RoutingBreakerState
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, 2, "gpt-test", "default").First(&currentBreaker).Error)
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").First(&currentBreaker).Error)
 	assert.Equal(t, RoutingBreakerSemanticVersion, currentBreaker.SemanticVersion)
 	assert.Equal(t, RoutingBreakerStateOpen, currentBreaker.State)
 	assert.Equal(t, "5xx", currentBreaker.Reason)
@@ -429,7 +527,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 
 	var breakerCount int64
 	require.NoError(t, DB.Model(&RoutingBreakerState{}).Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, 2, "gpt-test", "default").Count(&breakerCount).Error)
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").Count(&breakerCount).Error)
 	assert.Equal(t, int64(1), breakerCount)
 
 	hydrationStates, err = GetRoutingBreakerStatesForHydration(5000)
@@ -437,10 +535,13 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.Len(t, hydrationStates, 1)
 	assert.Equal(t, RoutingBreakerSemanticVersion, hydrationStates[0].SemanticVersion)
 	assert.Equal(t, int64(1000), hydrationStates[0].UpdatedTime)
+	nextHydrationPage, err := GetRoutingBreakerStatesForHydrationPage(5000, hydrationStates[0].UpdatedTime, hydrationStates[0].ID)
+	require.NoError(t, err)
+	assert.Empty(t, nextHydrationPage)
 
 	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
 		ChannelID:           1,
-		APIKeyIndex:         2,
+		APIKeyIndex:         RoutingMetricSingleKeyIndex,
 		ModelName:           "gpt-test",
 		Group:               "default",
 		State:               RoutingBreakerStateHealthy,
@@ -457,7 +558,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	}))
 	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
 		ChannelID:           1,
-		APIKeyIndex:         2,
+		APIKeyIndex:         RoutingMetricSingleKeyIndex,
 		ModelName:           "gpt-test",
 		Group:               "default",
 		State:               RoutingBreakerStateOpen,
@@ -475,12 +576,12 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 
 	breakerCount = 0
 	require.NoError(t, DB.Model(&RoutingBreakerState{}).Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, 2, "gpt-test", "default").Count(&breakerCount).Error)
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").Count(&breakerCount).Error)
 	assert.Equal(t, int64(1), breakerCount)
 
 	var savedBreaker RoutingBreakerState
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, 2, "gpt-test", "default").First(&savedBreaker).Error)
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").First(&savedBreaker).Error)
 	assert.Equal(t, RoutingBreakerStateHealthy, savedBreaker.State)
 	assert.Equal(t, "recovered", savedBreaker.Reason)
 	assert.Equal(t, int64(0), savedBreaker.ConsecutiveFailures)
@@ -549,6 +650,9 @@ func openRoutingExternalTestDB(t *testing.T, dbType common.DatabaseType, dsn str
 	require.NoError(t, sqlDB.Ping())
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
+	if db.Migrator().HasTable(&Channel{}) {
+		t.Skip("refusing to run against external database because channels already exists")
+	}
 	for _, model := range routingMigrationModels {
 		if db.Migrator().HasTable(model) {
 			t.Skipf("refusing to run against external database because %s already exists", model.(interface{ TableName() string }).TableName())

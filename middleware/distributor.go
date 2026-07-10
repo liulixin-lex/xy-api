@@ -490,39 +490,16 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	routingGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
-	if routingGroup == "" {
-		routingGroup = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-	}
-	disallowedIndexes := map[int]struct{}{}
-	var key string
-	var index int
-	var newAPIError *types.NewAPIError
-	for {
-		key, index, newAPIError = channel.GetNextEnabledKeyFiltered(func(index int) bool {
-			if _, disallowed := disallowedIndexes[index]; disallowed {
-				return false
-			}
-			return service.IsMultiKeyIndexRoutingAdmissible(c, channel.Id, index, modelName, routingGroup)
-		})
-		if newAPIError != nil || !channel.ChannelInfo.IsMultiKey {
-			break
-		}
-		if service.AcquireMultiKeyRoutingHalfOpenProbe(c, channel.Id, index, modelName, routingGroup) {
-			break
-		}
-		disallowedIndexes[index] = struct{}{}
-	}
+	key, index, newAPIError := channel.GetNextEnabledKey()
 	if newAPIError != nil {
 		return newAPIError
 	}
-	if channel.ChannelInfo.IsMultiKey {
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
-	} else {
-		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	isMultiKey := channel.ChannelInfo.IsMultiKey
+	if !isMultiKey {
+		index = model.RoutingMetricSingleKeyIndex
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, isMultiKey)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())

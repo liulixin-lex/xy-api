@@ -364,7 +364,8 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
 	for _, snapshot := range snapshots {
-		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
+		if snapshot.APIKeyIndex != model.RoutingMetricSingleKeyIndex ||
+			snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
 		}
 		key := Key{
@@ -394,7 +395,8 @@ func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, bucketSeconds int) {
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
 	for _, delta := range deltas {
-		if delta.ChannelID <= 0 || delta.ModelName == "" || delta.Group == "" || delta.RequestCount <= 0 {
+		if delta.APIKeyIndex != model.RoutingMetricSingleKeyIndex ||
+			delta.ChannelID <= 0 || delta.ModelName == "" || delta.Group == "" || delta.RequestCount <= 0 {
 			continue
 		}
 		key := Key{
@@ -455,6 +457,7 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 	cache.limits = normalizedLimits(cache.limits)
 	for _, snapshot := range snapshots {
 		if snapshot.SemanticVersion != model.RoutingBreakerSemanticVersion ||
+			snapshot.APIKeyIndex != model.RoutingMetricSingleKeyIndex ||
 			snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
 			continue
 		}

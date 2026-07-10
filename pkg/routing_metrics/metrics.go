@@ -93,6 +93,9 @@ var bucketEvictionCount atomic.Int64
 var inflightDropCount atomic.Int64
 
 func BeginInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID int) func() {
+	if info.CurrentAttemptIsMultiKey(c) {
+		return func() {}
+	}
 	if !smart_routing_setting.Enabled() {
 		return func() {}
 	}
@@ -101,11 +104,6 @@ func BeginInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID int) f
 		return func() {}
 	}
 	keys := []InflightKey{key}
-	if key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
-		aggregate := key
-		aggregate.APIKeyIndex = model.RoutingMetricSingleKeyIndex
-		keys = append(keys, aggregate)
-	}
 	trackedKeys := make([]InflightKey, 0, len(keys))
 	trackedCounters := make([]*inflightCounter, 0, len(keys))
 	for _, item := range keys {
@@ -166,6 +164,9 @@ func RecordClassifiedAttempt(
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
 ) {
+	if info.CurrentAttemptIsMultiKey(c) {
+		return
+	}
 	if !smart_routing_setting.Enabled() {
 		return
 	}
@@ -196,10 +197,6 @@ func RecordClassifiedAttempt(
 	}
 
 	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
-	if key.apiKeyIndex != model.RoutingMetricSingleKeyIndex {
-		key.apiKeyIndex = model.RoutingMetricSingleKeyIndex
-		recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
-	}
 }
 
 func Snapshots() []model.RoutingChannelMetric {
@@ -685,13 +682,6 @@ func (b *bucket) ttftP95() int64 {
 	return b.ttftP95Ms
 }
 
-func apiKeyIndex(info *relaycommon.RelayInfo) int {
-	if info == nil || info.ChannelMeta == nil || !info.ChannelMeta.ChannelIsMultiKey {
-		return model.RoutingMetricSingleKeyIndex
-	}
-	return info.ChannelMeta.ChannelMultiKeyIndex
-}
-
 func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (InflightKey, bool) {
 	if info == nil {
 		return InflightKey{}, false
@@ -711,7 +701,7 @@ func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (In
 	}
 	return InflightKey{
 		ChannelID:   channelID,
-		APIKeyIndex: apiKeyIndex(info),
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       info.OriginModelName,
 		Group:       group,
 	}, true

@@ -200,6 +200,35 @@ func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	assert.Equal(t, "5xx", breakers[0].Reason)
 }
 
+func TestRecordRoutingTaskAttemptIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
+	configureRoutingBreakerAttemptTest(t, true)
+	routingSetting := smart_routing_setting.GetSetting()
+	routingSetting.Enabled = true
+	routingSetting.Mode = smart_routing_setting.ModeObserve
+	routingSetting.Consecutive5xx = 1
+	smart_routing_setting.UpdateSetting(routingSetting)
+	routingmetrics.ResetForTest()
+	t.Cleanup(routingmetrics.ResetForTest)
+
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "vip",
+		OriginModelName: "mj-test",
+		StartTime:       time.Now(),
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelIsMultiKey: false},
+	}
+	taskErr := &dto.TaskError{StatusCode: http.StatusBadGateway, Error: errors.New("upstream failed")}
+
+	recordRoutingTaskAttempt(ctx, info, 37, taskErr)
+
+	assert.Empty(t, routingmetrics.Snapshots())
+	assert.Equal(t, routingmetrics.Stats{}, routingmetrics.RuntimeStats())
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	assert.Equal(t, routingbreaker.Stats{}, routingbreaker.RuntimeStats())
+}
+
 func TestRecordRoutingBreakerAttemptDoesNothingWhenDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	configureRoutingBreakerAttemptTest(t, false)
@@ -254,9 +283,41 @@ func TestRecordRoutingBreakerAttemptIgnoresRetryAfterMetadataForCapacityStatus(t
 	assert.False(t, ok)
 }
 
-func TestRecordRoutingBreakerAttemptAlsoUpdatesAggregateForMultiKey(t *testing.T) {
+func TestRecordRoutingBreakerAttemptIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
+	configureRoutingBreakerAttemptTest(t, true)
+	setting := smart_routing_setting.GetSetting()
+	setting.Consecutive5xx = 1
+	setting.BaseCooldownSec = 1
+	setting.MaxCooldownSec = 1
+	smart_routing_setting.UpdateSetting(setting)
+	resetRoutingBreakerConfigIdentityForTest()
+
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "vip",
+		OriginModelName: "gpt-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelIsMultiKey: false,
+		},
+	}
+	apiErr := types.NewErrorWithStatusCode(errors.New("bad gateway"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+
+	recordRoutingBreakerAttempt(ctx, info, 34, apiErr)
+
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	assert.Equal(t, routingbreaker.Stats{}, routingbreaker.RuntimeStats())
+	_, aggregate := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 34, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	_, perKey := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 34, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"})
+	assert.False(t, aggregate)
+	assert.False(t, perKey)
+}
+
+func TestRecordRoutingBreakerAttemptUsesOnlyMinusOneForCurrentSingleKeyWithStaleMultiKeyMeta(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
 	configureRoutingBreakerAttemptTest(t, true)
 	setting := smart_routing_setting.GetSetting()
 	setting.Consecutive5xx = 1
@@ -275,16 +336,16 @@ func TestRecordRoutingBreakerAttemptAlsoUpdatesAggregateForMultiKey(t *testing.T
 	}
 	apiErr := types.NewErrorWithStatusCode(errors.New("bad gateway"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
 
-	recordRoutingBreakerAttempt(ctx, info, 34, apiErr)
+	recordRoutingBreakerAttempt(ctx, info, 36, apiErr)
 
 	breakers := routingbreaker.DirtySnapshots()
-	require.Len(t, breakers, 2)
-	cachedAggregate, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 34, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	require.Len(t, breakers, 1)
+	assert.Equal(t, model.RoutingMetricSingleKeyIndex, breakers[0].Key.APIKeyIndex)
+	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 36, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	require.True(t, ok)
-	assert.Equal(t, string(routingbreaker.StateOpen), cachedAggregate.State)
-	cachedKey, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 34, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"})
-	require.True(t, ok)
-	assert.Equal(t, string(routingbreaker.StateOpen), cachedKey.State)
+	assert.Equal(t, string(routingbreaker.StateOpen), cached.State)
+	_, perKey := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 36, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"})
+	assert.False(t, perKey)
 }
 
 func TestRecordRoutingBreakerAttemptUsesSmartRoutingBreakerSettings(t *testing.T) {
