@@ -148,37 +148,46 @@ func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding,
 		return token, nil
 	}
 
-	value, err, _ := routingSub2APILoginGroup.Do(strconv.Itoa(binding.ChannelID), func() (any, error) {
-		if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+	resultChannel := routingSub2APILoginGroup.DoChan(strconv.Itoa(binding.ChannelID), func() (any, error) {
+		sharedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APILockTTL)
+		defer cancel()
+
+		if token, ok := getRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID); ok {
 			return token, nil
 		}
 
-		unlockRedis, lockErr := acquireRoutingSub2APIRedisLock(ctx, binding.ChannelID)
+		unlockRedis, lockErr := acquireRoutingSub2APIRedisLock(sharedCtx, binding.ChannelID)
 		if lockErr != nil {
 			return "", lockErr
 		}
 		if unlockRedis != nil {
 			defer unlockRedis()
 		}
-		if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+		if token, ok := getRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID); ok {
 			return token, nil
 		}
 
-		token, ttl, loginErr := loginRoutingSub2API(ctx, binding, credentials)
+		token, ttl, loginErr := loginRoutingSub2API(sharedCtx, binding, credentials)
 		if loginErr != nil {
 			return "", loginErr
 		}
-		setRoutingSub2APICachedJWT(ctx, binding.ChannelID, token, ttl)
+		setRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID, token, ttl)
 		return token, nil
 	})
-	if err != nil {
-		return "", err
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-resultChannel:
+		if result.Err != nil {
+			return "", result.Err
+		}
+		token, ok := result.Val.(string)
+		if !ok {
+			return "", fmt.Errorf("sub2api login returned unexpected result type %T", result.Val)
+		}
+		return token, nil
 	}
-	token, ok := value.(string)
-	if !ok {
-		return "", fmt.Errorf("sub2api login returned unexpected result type %T", value)
-	}
-	return token, nil
 }
 
 func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(), error) {
