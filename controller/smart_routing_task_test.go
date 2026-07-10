@@ -897,7 +897,12 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 
 	firstLoginStarted := make(chan struct{})
 	secondLoginStarted := make(chan struct{})
-	releaseFirstLogin := make(chan struct{})
+	firstLoginRelease := make(chan struct{})
+	var releaseFirstLoginOnce sync.Once
+	releaseFirstLogin := func() {
+		releaseFirstLoginOnce.Do(func() { close(firstLoginRelease) })
+	}
+	defer releaseFirstLogin()
 	var loginMu sync.Mutex
 	loginCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -913,7 +918,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 
 		if requestNumber == 1 {
 			close(firstLoginStarted)
-			<-releaseFirstLogin
+			<-firstLoginRelease
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"retired-jwt","expires_in":3600}}`)
 			return
 		}
@@ -966,7 +971,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 	default:
 	}
 
-	close(releaseFirstLogin)
+	releaseFirstLogin()
 	var retired loginResult
 	select {
 	case retired = <-retiredResult:
