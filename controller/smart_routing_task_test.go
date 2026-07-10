@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,9 +17,41 @@ import (
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type blockingRoutingSub2APIEvalHook struct {
+	started chan<- bool
+}
+
+func (h blockingRoutingSub2APIEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if cmd.Name() != "eval" && cmd.Name() != "evalsha" {
+		return ctx, nil
+	}
+	h.started <- ctx.Err() != nil
+	<-ctx.Done()
+	return ctx, ctx.Err()
+}
+
+func (blockingRoutingSub2APIEvalHook) AfterProcess(_ context.Context, cmd redis.Cmder) error {
+	if cmd.Name() == "set" {
+		if boolCmd, ok := cmd.(*redis.BoolCmd); ok {
+			boolCmd.SetVal(true)
+			boolCmd.SetErr(nil)
+		}
+	}
+	return nil
+}
+
+func (blockingRoutingSub2APIEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (blockingRoutingSub2APIEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
 
 func TestRoutingCostSyncHandlerUsesSmartRoutingSetting(t *testing.T) {
 	smart_routing_setting.ResetForTest()
@@ -711,6 +744,55 @@ func TestRoutingSub2APIJWTCoalescesConcurrentLogin(t *testing.T) {
 	assert.Equal(t, 1, actualLoginCount)
 }
 
+func TestRoutingSub2APIRedisUnlockUsesIndependentBoundedContext(t *testing.T) {
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	evalStarted := make(chan bool, 1)
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "unused:0",
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("unexpected Redis network access")
+		},
+		MaxRetries: -1,
+	})
+	redisClient.AddHook(blockingRoutingSub2APIEvalHook{started: evalStarted})
+	common.RedisEnabled = true
+	common.RDB = redisClient
+	t.Cleanup(func() {
+		_ = redisClient.Close()
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+	})
+
+	previousUnlockTimeout := routingSub2APIUnlockTimeout
+	routingSub2APIUnlockTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { routingSub2APIUnlockTimeout = previousUnlockTimeout })
+
+	sharedCtx, cancelShared := context.WithCancel(context.Background())
+	unlock, err := acquireRoutingSub2APIRedisLock(sharedCtx, 890)
+	require.NoError(t, err)
+	require.NotNil(t, unlock)
+	cancelShared()
+
+	done := make(chan struct{})
+	go func() {
+		unlock()
+		close(done)
+	}()
+
+	select {
+	case canceledAtStart := <-evalStarted:
+		assert.False(t, canceledAtStart)
+	case <-time.After(time.Second):
+		t.Fatal("Redis unlock did not execute EVAL")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Redis unlock did not stop at its context deadline")
+	}
+}
+
 func TestRoutingSub2APIJWTLeaderCancellationDoesNotCancelSharedLogin(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
@@ -814,6 +896,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 	t.Cleanup(func() { common.CryptoSecret = previousSecret })
 
 	firstLoginStarted := make(chan struct{})
+	secondLoginStarted := make(chan struct{})
 	releaseFirstLogin := make(chan struct{})
 	var loginMu sync.Mutex
 	loginCount := 0
@@ -833,6 +916,9 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 			<-releaseFirstLogin
 			_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"retired-jwt","expires_in":3600}}`)
 			return
+		}
+		if requestNumber == 2 {
+			close(secondLoginStarted)
 		}
 		_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"current-jwt","expires_in":3600}}`)
 	}))
@@ -855,16 +941,43 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 
 	<-firstLoginStarted
 	resetRoutingSub2APITestState()
+	currentResult := make(chan loginResult, 1)
+	go func() {
+		token, err := routingSub2APIJWT(context.Background(), binding, credentials)
+		currentResult <- loginResult{token: token, err: err}
+	}()
+
+	select {
+	case <-secondLoginStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset login joined the retired singleflight group")
+	}
+	var current loginResult
+	select {
+	case current = <-currentResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset login did not finish while the retired login was blocked")
+	}
+	require.NoError(t, current.err)
+	assert.Equal(t, "current-jwt", current.token)
+	select {
+	case result := <-retiredResult:
+		t.Fatalf("retired login finished before release: token=%q err=%v", result.token, result.err)
+	default:
+	}
+
 	close(releaseFirstLogin)
-	result := <-retiredResult
-	require.NoError(t, result.err)
-	assert.Equal(t, "retired-jwt", result.token)
-	assert.Empty(t, routingSub2APICachedJWTForTest(binding.ChannelID))
-
-	token, err := routingSub2APIJWT(context.Background(), binding, credentials)
-
+	var retired loginResult
+	select {
+	case retired = <-retiredResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retired login did not finish after release")
+	}
+	require.NoError(t, retired.err)
+	assert.Equal(t, "retired-jwt", retired.token)
+	cachedToken, err := common.DecryptAESGCMString(routingSub2APICachedJWTForTest(binding.ChannelID))
 	require.NoError(t, err)
-	assert.Equal(t, "current-jwt", token)
+	assert.Equal(t, "current-jwt", cachedToken)
 	loginMu.Lock()
 	actualLoginCount := loginCount
 	loginMu.Unlock()

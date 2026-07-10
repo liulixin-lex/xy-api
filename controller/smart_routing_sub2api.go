@@ -24,6 +24,7 @@ import (
 
 const (
 	routingSub2APILockTTL              = 30 * time.Second
+	routingSub2APIDefaultUnlockTimeout = 2 * time.Second
 	routingSub2APITokenTTLBuffer       = 60 * time.Second
 	routingSub2APIDefaultMaxJWTEntries = 4_096
 )
@@ -84,6 +85,7 @@ var routingSub2APIJWTCache = struct {
 }
 
 var routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
+var routingSub2APIUnlockTimeout = routingSub2APIDefaultUnlockTimeout
 var routingSub2APILoginCoordinator = struct {
 	sync.RWMutex
 	group      *singleflight.Group
@@ -218,8 +220,7 @@ func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(),
 		}
 		if acquired {
 			return func() {
-				script := redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`)
-				_ = script.Run(context.Background(), common.RDB, []string{lockKey}, lockOwner).Err()
+				releaseRoutingSub2APIRedisLock(channelID, lockOwner)
 			}, nil
 		}
 		if _, ok := getRoutingSub2APICachedJWT(ctx, channelID); ok {
@@ -233,6 +234,16 @@ func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(),
 			return nil, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+func releaseRoutingSub2APIRedisLock(channelID int, lockOwner string) {
+	ctx, cancel := context.WithTimeout(context.Background(), routingSub2APIUnlockTimeout)
+	defer cancel()
+
+	script := redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`)
+	if err := script.Run(ctx, common.RDB, []string{routingSub2APIRedisLockKey(channelID)}, lockOwner).Err(); err != nil {
+		common.SysError(fmt.Sprintf("sub2api login lock release failed: channel_id=%d err=%v", channelID, err))
 	}
 }
 
