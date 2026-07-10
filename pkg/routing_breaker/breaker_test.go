@@ -218,6 +218,37 @@ func TestDefaultBreakerDoesNotPublishRejectedHealthyAdmission(t *testing.T) {
 	assert.Equal(t, string(StateHalfOpen), halfOpenCached.State)
 }
 
+func TestHydrateDefaultSnapshotsAdvancesExpiredOpenBeforePublishing(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.Now = clock.Now
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	key := Key{ChannelID: 48, APIKeyIndex: SingleAPIKeyIndex, Model: "expired-open", Group: "default"}
+	HydrateDefaultSnapshots([]Snapshot{{
+		Key:           key,
+		State:         StateOpen,
+		CooldownUntil: clock.now.Add(-time.Second),
+		UpdatedAt:     clock.now.Add(-2 * time.Second),
+	}})
+
+	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 48, APIKeyIndex: SingleAPIKeyIndex, Model: "expired-open", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateHalfOpen), cached.State)
+	assert.Zero(t, cached.HalfOpenInflight)
+	dirty := DirtySnapshots()
+	require.Len(t, dirty, 1)
+	assert.Equal(t, key, dirty[0].Key)
+	assert.Equal(t, StateHalfOpen, dirty[0].State)
+	assert.Zero(t, dirty[0].HalfOpenInflight)
+}
+
 func TestDefaultBreakerEvictionRemovesPublishedSnapshot(t *testing.T) {
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	config := DefaultConfig()

@@ -439,6 +439,9 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 	for _, snapshot := range accepted {
 		record, ok := b.states[snapshot.Key]
 		if ok && record.snapshot.UpdatedAt.Equal(snapshot.UpdatedAt) {
+			if b.advanceOpen(record, now) {
+				b.markDirty(snapshot.Key)
+			}
 			retained = append(retained, record.snapshot)
 			if b.onRetained != nil {
 				b.onRetained(record.snapshot)
