@@ -40,6 +40,164 @@ func testBreaker(t *testing.T) (*Breaker, *fakeClock, Key) {
 	return breaker, clock, key
 }
 
+func TestBreakerEvictsExpiredAndOldestEntriesAtLimit(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	config := DefaultConfig()
+	config.EntryTTL = time.Minute
+	config.MaxEntries = 2
+	config.Consecutive5xxThreshold = 10
+	config.FailureRateMinSamples = 100
+	config.WindowSize = 100
+	config.DegradedConsecutiveFailures = 1
+	config.DegradedMinSamples = 100
+	config.Now = clock.Now
+	breaker := New(config)
+
+	expiredKey := Key{ChannelID: 1, APIKeyIndex: SingleAPIKeyIndex, Model: "expired", Group: "default"}
+	oldOpenKey := Key{ChannelID: 2, APIKeyIndex: SingleAPIKeyIndex, Model: "old-open", Group: "default"}
+	oldHealthyKey := Key{ChannelID: 3, APIKeyIndex: SingleAPIKeyIndex, Model: "old-healthy", Group: "default"}
+	newHealthyKey := Key{ChannelID: 4, APIKeyIndex: SingleAPIKeyIndex, Model: "new-healthy", Group: "default"}
+	degradedKey := Key{ChannelID: 5, APIKeyIndex: SingleAPIKeyIndex, Model: "degraded", Group: "default"}
+	newOpenKey := Key{ChannelID: 6, APIKeyIndex: SingleAPIKeyIndex, Model: "new-open", Group: "default"}
+	newestOpenKey := Key{ChannelID: 7, APIKeyIndex: SingleAPIKeyIndex, Model: "newest-open", Group: "default"}
+
+	breaker.OnSuccess(expiredKey)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, breaker.Stats())
+
+	clock.Advance(61 * time.Second)
+	breaker.OnFailure(oldOpenKey, 429, 0)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1, Evictions: 1}, breaker.Stats())
+
+	clock.Advance(time.Second)
+	breaker.OnSuccess(oldHealthyKey)
+	assert.Equal(t, 2, breaker.Stats().Entries)
+
+	clock.Advance(time.Second)
+	breaker.OnSuccess(newHealthyKey)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 2}, breaker.Stats())
+
+	clock.Advance(time.Second)
+	require.Equal(t, StateDegraded, breaker.OnFailure(degradedKey, 500, 0).State)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 3}, breaker.Stats())
+
+	clock.Advance(time.Second)
+	require.Equal(t, StateOpen, breaker.OnFailure(newOpenKey, 429, 0).State)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 4}, breaker.Stats())
+
+	clock.Advance(time.Second)
+	require.Equal(t, StateOpen, breaker.OnFailure(newestOpenKey, 429, 0).State)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 2, Evictions: 5}, breaker.Stats())
+
+	dirty := breaker.DirtySnapshots()
+	require.Len(t, dirty, 2)
+	assert.Equal(t, []Key{newOpenKey, newestOpenKey}, []Key{dirty[0].Key, dirty[1].Key})
+	assert.Equal(t, []State{StateOpen, StateOpen}, []State{dirty[0].State, dirty[1].State})
+	assert.Equal(t, Stats{Entries: 2, Evictions: 5}, breaker.Stats())
+}
+
+func TestBreakerHydrateAndResetRespectMaxEntries(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	breaker := New(Config{EntryTTL: time.Hour, MaxEntries: 2, Now: clock.Now})
+	keys := []Key{
+		{ChannelID: 10, APIKeyIndex: SingleAPIKeyIndex, Model: "oldest", Group: "default"},
+		{ChannelID: 11, APIKeyIndex: SingleAPIKeyIndex, Model: "middle", Group: "default"},
+		{ChannelID: 12, APIKeyIndex: SingleAPIKeyIndex, Model: "newest", Group: "default"},
+	}
+
+	breaker.Hydrate([]Snapshot{
+		{Key: keys[0], State: StateOpen, CooldownUntil: clock.now.Add(time.Hour), UpdatedAt: clock.now.Add(-3 * time.Minute)},
+		{Key: keys[1], State: StateOpen, CooldownUntil: clock.now.Add(time.Hour), UpdatedAt: clock.now.Add(-2 * time.Minute)},
+		{Key: keys[2], State: StateOpen, CooldownUntil: clock.now.Add(time.Hour), UpdatedAt: clock.now.Add(-time.Minute)},
+	})
+
+	assert.Equal(t, Stats{Entries: 2, Evictions: 1}, breaker.Stats())
+	assert.Equal(t, StateHealthy, breaker.GetSnapshot(keys[0]).State)
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(keys[1]).State)
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(keys[2]).State)
+
+	resetKey := Key{ChannelID: 13, APIKeyIndex: SingleAPIKeyIndex, Model: "reset", Group: "default"}
+	require.Equal(t, StateHealthy, breaker.Reset(resetKey).State)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 1, Evictions: 2}, breaker.Stats())
+	assert.Equal(t, StateHealthy, breaker.GetSnapshot(keys[1]).State)
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(keys[2]).State)
+
+	dirty := breaker.DirtySnapshots()
+	require.Len(t, dirty, 1)
+	assert.Equal(t, resetKey, dirty[0].Key)
+}
+
+func TestBreakerCapacityEvictionUsesStableKeyOrder(t *testing.T) {
+	tests := []struct {
+		name string
+		keys []Key
+	}{
+		{
+			name: "channel",
+			keys: []Key{
+				{ChannelID: 1, APIKeyIndex: 3, Model: "c", Group: "c"},
+				{ChannelID: 2, APIKeyIndex: 2, Model: "b", Group: "b"},
+				{ChannelID: 3, APIKeyIndex: 1, Model: "a", Group: "a"},
+			},
+		},
+		{
+			name: "api key",
+			keys: []Key{
+				{ChannelID: 10, APIKeyIndex: 1, Model: "c", Group: "c"},
+				{ChannelID: 10, APIKeyIndex: 2, Model: "b", Group: "b"},
+				{ChannelID: 10, APIKeyIndex: 3, Model: "a", Group: "a"},
+			},
+		},
+		{
+			name: "model",
+			keys: []Key{
+				{ChannelID: 10, APIKeyIndex: 5, Model: "a", Group: "c"},
+				{ChannelID: 10, APIKeyIndex: 5, Model: "b", Group: "b"},
+				{ChannelID: 10, APIKeyIndex: 5, Model: "c", Group: "a"},
+			},
+		},
+		{
+			name: "group",
+			keys: []Key{
+				{ChannelID: 10, APIKeyIndex: 5, Model: "same", Group: "a"},
+				{ChannelID: 10, APIKeyIndex: 5, Model: "same", Group: "b"},
+				{ChannelID: 10, APIKeyIndex: 5, Model: "same", Group: "c"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+			breaker := New(Config{EntryTTL: time.Hour, MaxEntries: 2, Now: func() time.Time { return now }})
+			breaker.Hydrate([]Snapshot{
+				{Key: test.keys[0], State: StateOpen, CooldownUntil: now.Add(time.Hour), UpdatedAt: now},
+				{Key: test.keys[1], State: StateOpen, CooldownUntil: now.Add(time.Hour), UpdatedAt: now},
+				{Key: test.keys[2], State: StateOpen, CooldownUntil: now.Add(time.Hour), UpdatedAt: now},
+			})
+
+			assert.Equal(t, StateHealthy, breaker.GetSnapshot(test.keys[0]).State)
+			assert.Equal(t, StateOpen, breaker.GetSnapshot(test.keys[1]).State)
+			assert.Equal(t, StateOpen, breaker.GetSnapshot(test.keys[2]).State)
+			assert.Equal(t, Stats{Entries: 2, Evictions: 1}, breaker.Stats())
+		})
+	}
+}
+
+func TestBreakerDefaultsAndNormalizesEntryRetentionLimits(t *testing.T) {
+	defaults := DefaultConfig()
+	assert.Equal(t, 30*time.Minute, defaults.EntryTTL)
+	assert.Equal(t, 20_000, defaults.MaxEntries)
+
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	breaker := New(Config{EntryTTL: 0, MaxEntries: -1, Now: clock.Now})
+	breaker.OnSuccess(Key{ChannelID: 20, APIKeyIndex: SingleAPIKeyIndex, Model: "first", Group: "default"})
+	clock.Advance(2 * time.Minute)
+	breaker.OnSuccess(Key{ChannelID: 21, APIKeyIndex: SingleAPIKeyIndex, Model: "second", Group: "default"})
+	breaker.OnSuccess(Key{ChannelID: 22, APIKeyIndex: SingleAPIKeyIndex, Model: "third", Group: "default"})
+
+	assert.Equal(t, Stats{Entries: 3, Dirty: 3}, breaker.Stats())
+}
+
 func TestBreakerOpensAfterFiveConsecutive5xx(t *testing.T) {
 	breaker, clock, key := testBreaker(t)
 

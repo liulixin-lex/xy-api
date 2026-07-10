@@ -24,6 +24,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func configureRoutingBreakerAttemptTest(t *testing.T, enabled bool) {
+	t.Helper()
+	if enabled {
+		t.Setenv("SMART_ROUTING_ENABLED", "true")
+	} else {
+		t.Setenv("SMART_ROUTING_ENABLED", "false")
+	}
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeObserve)
+	smart_routing_setting.ResetForTest()
+	setting := smart_routing_setting.GetSetting()
+	setting.Enabled = enabled
+	setting.Mode = smart_routing_setting.ModeObserve
+	smart_routing_setting.UpdateSetting(setting)
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	resetRoutingBreakerConfigIdentityForTest()
+
+	t.Cleanup(func() {
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		routinghotcache.ResetForTest()
+		resetRoutingBreakerConfigIdentityForTest()
+	})
+}
+
+func resetRoutingBreakerConfigIdentityForTest() {
+	smartRoutingBreakerConfigMu.Lock()
+	smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
+	smartRoutingBreakerConfigMu.Unlock()
+}
+
 func TestShouldRetryStopsAfterResponseWasSent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -123,9 +154,7 @@ func TestShouldRetryBlocksFirstByteTimeoutAfterHTTPWriterWritten(t *testing.T) {
 func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	t.Setenv("SMART_ROUTING_ENABLED", "true")
-	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeObserve)
-	smart_routing_setting.ResetForTest()
+	configureRoutingBreakerAttemptTest(t, true)
 	routingSetting := smart_routing_setting.GetSetting()
 	routingSetting.Enabled = true
 	routingSetting.Mode = smart_routing_setting.ModeObserve
@@ -134,19 +163,9 @@ func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	routingSetting.MaxCooldownSec = 1
 	smart_routing_setting.UpdateSetting(routingSetting)
 	routingmetrics.ResetForTest()
-	routinghotcache.ResetForTest()
-	smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
-	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
-		Consecutive5xxThreshold: 1,
-		BaseCooldown:            time.Second,
-		MaxCooldown:             time.Second,
-	})
+	resetRoutingBreakerConfigIdentityForTest()
 	t.Cleanup(func() {
-		smart_routing_setting.ResetForTest()
 		routingmetrics.ResetForTest()
-		routinghotcache.ResetForTest()
-		smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
-		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	})
 
 	start := time.Now().Add(-1500 * time.Millisecond)
@@ -181,23 +200,39 @@ func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	assert.Equal(t, "5xx", breakers[0].Reason)
 }
 
+func TestRecordRoutingBreakerAttemptDoesNothingWhenDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configureRoutingBreakerAttemptTest(t, false)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "vip",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelIsMultiKey: false},
+	}
+	apiErr := types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway)
+
+	recordRoutingBreakerAttempt(ctx, info, 30, apiErr)
+
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	_, ok := routinghotcache.GetBreaker(routinghotcache.Key{
+		ChannelID:   30,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "vip",
+	})
+	assert.False(t, ok)
+}
+
 func TestRecordRoutingBreakerAttemptRespectsRetryAfterMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routinghotcache.ResetForTest()
-	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
-		Consecutive5xxThreshold: 5,
-		BaseCooldown:            time.Second,
-		MaxCooldown:             time.Minute,
-		Now: func() time.Time {
-			return now
-		},
-	})
-	t.Cleanup(func() {
-		routinghotcache.ResetForTest()
-		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-	})
+	configureRoutingBreakerAttemptTest(t, true)
+	setting := smart_routing_setting.GetSetting()
+	setting.Consecutive5xx = 5
+	setting.BaseCooldownSec = 1
+	setting.MaxCooldownSec = 60
+	smart_routing_setting.UpdateSetting(setting)
+	resetRoutingBreakerConfigIdentityForTest()
 
 	metadata, err := common.Marshal(map[string]int64{"retry_after_ms": 4500})
 	require.NoError(t, err)
@@ -211,34 +246,30 @@ func TestRecordRoutingBreakerAttemptRespectsRetryAfterMetadata(t *testing.T) {
 	apiErr := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 	apiErr.Metadata = metadata
 
+	before := time.Now()
 	recordRoutingBreakerAttempt(ctx, info, 32, apiErr)
+	after := time.Now()
 
 	breakers := routingbreaker.DirtySnapshots()
 	require.Len(t, breakers, 1)
 	assert.Equal(t, routingbreaker.StateOpen, breakers[0].State)
-	assert.Equal(t, now.Add(4500*time.Millisecond), breakers[0].CooldownUntil)
+	assert.False(t, breakers[0].CooldownUntil.Before(before.Add(4500*time.Millisecond)))
+	assert.False(t, breakers[0].CooldownUntil.After(after.Add(4500*time.Millisecond)))
 	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 32, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	require.True(t, ok)
-	assert.Equal(t, now.Add(4500*time.Millisecond).Unix(), cached.CooldownUntilUnix)
+	assert.Equal(t, breakers[0].CooldownUntil.Unix(), cached.CooldownUntilUnix)
 }
 
 func TestRecordRoutingBreakerAttemptAlsoUpdatesAggregateForMultiKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routinghotcache.ResetForTest()
-	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
-		Consecutive5xxThreshold: 1,
-		BaseCooldown:            time.Second,
-		MaxCooldown:             time.Second,
-		Now: func() time.Time {
-			return now
-		},
-	})
-	t.Cleanup(func() {
-		routinghotcache.ResetForTest()
-		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-	})
+	configureRoutingBreakerAttemptTest(t, true)
+	setting := smart_routing_setting.GetSetting()
+	setting.Consecutive5xx = 1
+	setting.BaseCooldownSec = 1
+	setting.MaxCooldownSec = 1
+	smart_routing_setting.UpdateSetting(setting)
+	resetRoutingBreakerConfigIdentityForTest()
 
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
@@ -265,19 +296,10 @@ func TestRecordRoutingBreakerAttemptAlsoUpdatesAggregateForMultiKey(t *testing.T
 func TestRecordRoutingBreakerAttemptUsesSmartRoutingBreakerSettings(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routinghotcache.ResetForTest()
-	smart_routing_setting.ResetForTest()
-	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-	smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
-	t.Cleanup(func() {
-		routinghotcache.ResetForTest()
-		smart_routing_setting.ResetForTest()
-		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-		smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
-	})
+	configureRoutingBreakerAttemptTest(t, true)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
-		Mode:               smart_routing_setting.ModeBalanced,
+		Mode:               smart_routing_setting.ModeObserve,
 		Consecutive5xx:     2,
 		FailureRatePct:     90,
 		BaseCooldownSec:    7,
@@ -287,6 +309,7 @@ func TestRecordRoutingBreakerAttemptUsesSmartRoutingBreakerSettings(t *testing.T
 		SyncIntervalMin:    1,
 		HotcacheRefreshSec: 1,
 	})
+	resetRoutingBreakerConfigIdentityForTest()
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",

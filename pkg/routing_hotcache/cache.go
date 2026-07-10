@@ -60,6 +60,29 @@ type BalanceSnapshot struct {
 	UpdatedUnix int64
 }
 
+type Limits struct {
+	MaxMetrics  int
+	MaxCosts    int
+	MaxBreakers int
+	MaxHealth   int
+}
+
+type Stats struct {
+	Metrics      int
+	Costs        int
+	Breakers     int
+	AuthFailures int
+	Balances     int
+	Evictions    int64
+}
+
+var defaultLimits = Limits{
+	MaxMetrics:  20_000,
+	MaxCosts:    10_000,
+	MaxBreakers: 20_000,
+	MaxHealth:   10_000,
+}
+
 var cache = struct {
 	sync.RWMutex
 	metrics      map[Key]MetricSnapshot
@@ -67,12 +90,15 @@ var cache = struct {
 	breakers     map[Key]BreakerSnapshot
 	authFailures map[int]HealthMarker
 	balances     map[int]BalanceSnapshot
+	limits       Limits
+	evictions    int64
 }{
 	metrics:      map[Key]MetricSnapshot{},
 	costs:        map[CostKey]CostSnapshot{},
 	breakers:     map[Key]BreakerSnapshot{},
 	authFailures: map[int]HealthMarker{},
 	balances:     map[int]BalanceSnapshot{},
+	limits:       defaultLimits,
 }
 
 func (key Key) CostKey() CostKey {
@@ -114,6 +140,68 @@ func GetBalance(channelID int) (BalanceSnapshot, bool) {
 	return snapshot, ok
 }
 
+func RuntimeStats() Stats {
+	cache.RLock()
+	defer cache.RUnlock()
+	return Stats{
+		Metrics:      len(cache.metrics),
+		Costs:        len(cache.costs),
+		Breakers:     len(cache.breakers),
+		AuthFailures: len(cache.authFailures),
+		Balances:     len(cache.balances),
+		Evictions:    cache.evictions,
+	}
+}
+
+func Prune(nowUnix int64, staleSeconds int64) int {
+	cache.Lock()
+	defer cache.Unlock()
+
+	deleted := 0
+	if staleSeconds > 0 {
+		cutoff := nowUnix - staleSeconds
+		for key, snapshot := range cache.metrics {
+			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
+				delete(cache.metrics, key)
+				deleted++
+			}
+		}
+		for key, snapshot := range cache.costs {
+			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
+				delete(cache.costs, key)
+				deleted++
+			}
+		}
+		for key, snapshot := range cache.breakers {
+			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
+				delete(cache.breakers, key)
+				deleted++
+			}
+		}
+		for channelID, marker := range cache.authFailures {
+			if marker.UpdatedUnix > 0 && marker.UpdatedUnix < cutoff {
+				delete(cache.authFailures, channelID)
+				deleted++
+			}
+		}
+		for channelID, snapshot := range cache.balances {
+			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
+				delete(cache.balances, channelID)
+				deleted++
+			}
+		}
+	}
+
+	cache.limits = normalizedLimits(cache.limits)
+	deleted += trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess)
+	deleted += trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess)
+	deleted += trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess)
+	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess)
+	deleted += trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess)
+	cache.evictions += int64(deleted)
+	return deleted
+}
+
 func SetMetricForTest(key Key, snapshot MetricSnapshot) {
 	SetMetric(key, snapshot)
 }
@@ -122,6 +210,8 @@ func SetMetric(key Key, snapshot MetricSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.metrics[key] = snapshot
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 }
 
 func SetCostForTest(key CostKey, snapshot CostSnapshot) {
@@ -132,6 +222,8 @@ func SetCost(key CostKey, snapshot CostSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.costs[key] = snapshot
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 }
 
 func SetBreakerForTest(key Key, snapshot BreakerSnapshot) {
@@ -142,6 +234,8 @@ func SetBreaker(key Key, snapshot BreakerSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.breakers[key] = snapshot
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 }
 
 func ClearBreaker(key Key) {
@@ -161,6 +255,8 @@ func SetAuthFailure(channelID int, marker HealthMarker) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.authFailures[channelID] = marker
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
 }
 
 func ClearAuthFailure(channelID int) {
@@ -180,6 +276,8 @@ func SetBalance(channelID int, snapshot BalanceSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.balances[channelID] = snapshot
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 }
 
 func ClearChannel(channelID int) {
@@ -210,6 +308,8 @@ func ClearChannel(channelID int) {
 func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" {
 			continue
@@ -231,6 +331,7 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 			BillingMode:     snapshot.BillingMode,
 			UpdatedUnix:     snapshot.SnapshotTS,
 		}
+		cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 	}
 }
 
@@ -240,6 +341,8 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 	}
 	cache.Lock()
 	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
@@ -274,12 +377,15 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 			TPS:          float64(snapshot.RequestCount) / float64(bucketSeconds),
 			UpdatedUnix:  snapshot.BucketTs,
 		}
+		cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 	}
 }
 
 func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 	cache.Lock()
 	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
 			continue
@@ -300,12 +406,16 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 			HalfOpenInflight:  snapshot.HalfOpenInflight,
 			UpdatedUnix:       snapshot.UpdatedTime,
 		}
+		cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 	}
 }
 
 func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix int64) {
 	cache.Lock()
 	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
+	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 {
 			continue
@@ -318,12 +428,14 @@ func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix in
 		} else {
 			delete(cache.authFailures, snapshot.ChannelID)
 		}
+		cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
 		if snapshot.BalanceKnown {
 			cache.balances[snapshot.ChannelID] = BalanceSnapshot{
 				Known:       true,
 				Balance:     snapshot.Balance,
 				UpdatedUnix: snapshot.BalanceUpdatedTime,
 			}
+			cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 		}
 	}
 }
@@ -348,6 +460,92 @@ func routingSnapshotCostKnown(snapshot model.RoutingCostSnapshot, cost float64) 
 	return true
 }
 
+func normalizedLimits(value Limits) Limits {
+	if value.MaxMetrics <= 0 {
+		value.MaxMetrics = defaultLimits.MaxMetrics
+	}
+	if value.MaxCosts <= 0 {
+		value.MaxCosts = defaultLimits.MaxCosts
+	}
+	if value.MaxBreakers <= 0 {
+		value.MaxBreakers = defaultLimits.MaxBreakers
+	}
+	if value.MaxHealth <= 0 {
+		value.MaxHealth = defaultLimits.MaxHealth
+	}
+	return value
+}
+
+func trimBoundedMap[K comparable, V any](entries map[K]V, limit int, updatedUnix func(V) int64, less func(K, K) bool) int {
+	if limit < 0 {
+		limit = 0
+	}
+	deleted := 0
+	for len(entries) > limit {
+		var oldestKey K
+		var oldestUpdated int64
+		found := false
+		for key, snapshot := range entries {
+			updated := updatedUnix(snapshot)
+			if !found || updated < oldestUpdated || (updated == oldestUpdated && less(key, oldestKey)) {
+				oldestKey = key
+				oldestUpdated = updated
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(entries, oldestKey)
+		deleted++
+	}
+	return deleted
+}
+
+func metricUpdatedUnix(snapshot MetricSnapshot) int64 {
+	return snapshot.UpdatedUnix
+}
+
+func costUpdatedUnix(snapshot CostSnapshot) int64 {
+	return snapshot.UpdatedUnix
+}
+
+func breakerUpdatedUnix(snapshot BreakerSnapshot) int64 {
+	return snapshot.UpdatedUnix
+}
+
+func healthUpdatedUnix(marker HealthMarker) int64 {
+	return marker.UpdatedUnix
+}
+
+func balanceUpdatedUnix(snapshot BalanceSnapshot) int64 {
+	return snapshot.UpdatedUnix
+}
+
+func keyLess(left Key, right Key) bool {
+	if left.ChannelID != right.ChannelID {
+		return left.ChannelID < right.ChannelID
+	}
+	if left.APIKeyIndex != right.APIKeyIndex {
+		return left.APIKeyIndex < right.APIKeyIndex
+	}
+	if left.Model != right.Model {
+		return left.Model < right.Model
+	}
+	return left.Group < right.Group
+}
+
+func costKeyLess(left CostKey, right CostKey) bool {
+	if left.ChannelID != right.ChannelID {
+		return left.ChannelID < right.ChannelID
+	}
+	return left.Model < right.Model
+}
+
+func intLess(left int, right int) bool {
+	return left < right
+}
+
 func ResetForTest() {
 	cache.Lock()
 	defer cache.Unlock()
@@ -356,4 +554,6 @@ func ResetForTest() {
 	cache.breakers = map[Key]BreakerSnapshot{}
 	cache.authFailures = map[int]HealthMarker{}
 	cache.balances = map[int]BalanceSnapshot{}
+	cache.limits = defaultLimits
+	cache.evictions = 0
 }

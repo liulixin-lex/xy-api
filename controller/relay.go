@@ -270,6 +270,11 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 	if relayInfo == nil || relayInfo.OriginModelName == "" {
 		return
 	}
+	breakerSetting := smart_routing_setting.GetSetting()
+	if !breakerSetting.Enabled {
+		return
+	}
+	syncRoutingBreakerConfigFromSetting(breakerSetting)
 	group := relayInfo.UsingGroup
 	if group == "" {
 		group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -290,10 +295,6 @@ func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInf
 		APIKeyIndex: apiKeyIndex,
 		Model:       relayInfo.OriginModelName,
 		Group:       group,
-	}
-	breakerSetting := smart_routing_setting.GetSetting()
-	if breakerSetting.Enabled {
-		syncRoutingBreakerConfigFromSetting(breakerSetting)
 	}
 	retryAfterCap := time.Duration(breakerSetting.MaxCooldownSec) * time.Second
 	if retryAfterCap <= 0 {

@@ -33,6 +33,8 @@ type Config struct {
 	WindowSize              int
 	BaseCooldown            time.Duration
 	MaxCooldown             time.Duration
+	EntryTTL                time.Duration
+	MaxEntries              int
 
 	DegradedConsecutiveFailures  int
 	DegradedFailureRateThreshold float64
@@ -56,11 +58,18 @@ type Snapshot struct {
 	UpdatedAt           time.Time
 }
 
+type Stats struct {
+	Entries   int
+	Dirty     int
+	Evictions int64
+}
+
 type Breaker struct {
-	mu     sync.Mutex
-	config Config
-	states map[Key]*entry
-	dirty  map[Key]struct{}
+	mu        sync.Mutex
+	config    Config
+	states    map[Key]*entry
+	dirty     map[Key]struct{}
+	evictions int64
 }
 
 type entry struct {
@@ -145,6 +154,8 @@ func DefaultConfig() Config {
 		WindowSize:                   100,
 		BaseCooldown:                 30 * time.Second,
 		MaxCooldown:                  5 * time.Minute,
+		EntryTTL:                     30 * time.Minute,
+		MaxEntries:                   20_000,
 		DegradedConsecutiveFailures:  2,
 		DegradedFailureRateThreshold: 0.2,
 		DegradedMinSamples:           10,
@@ -157,6 +168,18 @@ func New(config Config) *Breaker {
 		config: normalizeConfig(config),
 		states: make(map[Key]*entry),
 		dirty:  make(map[Key]struct{}),
+	}
+}
+
+func (b *Breaker) Stats() Stats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.pruneLocked(b.config.Now(), 0)
+	return Stats{
+		Entries:   len(b.states),
+		Dirty:     len(b.dirty),
+		Evictions: b.evictions,
 	}
 }
 
@@ -254,6 +277,10 @@ func (b *Breaker) GetSnapshot(key Key) Snapshot {
 
 	now := b.config.Now()
 	record, ok := b.states[key]
+	if ok && record.snapshot.UpdatedAt.Before(now.Add(-b.config.EntryTTL)) {
+		b.evictLocked(key)
+		ok = false
+	}
 	if !ok {
 		return Snapshot{Key: key, State: StateHealthy, UpdatedAt: now}
 	}
@@ -268,15 +295,14 @@ func (b *Breaker) Reset(key Key) Snapshot {
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := &entry{
-		snapshot: Snapshot{
-			Key:       key,
-			State:     StateHealthy,
-			Reason:    "",
-			UpdatedAt: now,
-		},
+	record := b.getOrCreate(key, now)
+	record.snapshot = Snapshot{
+		Key:       key,
+		State:     StateHealthy,
+		Reason:    "",
+		UpdatedAt: now,
 	}
-	b.states[key] = record
+	record.window = nil
 	b.markDirty(key)
 	return record.snapshot
 }
@@ -350,6 +376,8 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	now := b.config.Now()
+	b.pruneLocked(now, 0)
 	accepted := make([]Snapshot, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		if snapshot.Key.ChannelID <= 0 || snapshot.Key.Model == "" || snapshot.Key.Group == "" {
@@ -357,13 +385,20 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 		}
 		snapshot.State = normalizeState(snapshot.State)
 		if snapshot.UpdatedAt.IsZero() {
-			snapshot.UpdatedAt = b.config.Now()
+			snapshot.UpdatedAt = now
+		}
+		if snapshot.UpdatedAt.Before(now.Add(-b.config.EntryTTL)) {
+			continue
 		}
 		if _, dirty := b.dirty[snapshot.Key]; dirty {
 			continue
 		}
-		if existing, ok := b.states[snapshot.Key]; ok && !snapshot.UpdatedAt.After(existing.snapshot.UpdatedAt) {
-			continue
+		if existing, ok := b.states[snapshot.Key]; ok {
+			if !snapshot.UpdatedAt.After(existing.snapshot.UpdatedAt) {
+				continue
+			}
+		} else {
+			b.pruneLocked(now, 1)
 		}
 		b.states[snapshot.Key] = &entry{
 			snapshot: snapshot,
@@ -371,13 +406,22 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 		}
 		accepted = append(accepted, snapshot)
 	}
-	return accepted
+
+	retained := accepted[:0]
+	for _, snapshot := range accepted {
+		record, ok := b.states[snapshot.Key]
+		if ok && record.snapshot.UpdatedAt.Equal(snapshot.UpdatedAt) {
+			retained = append(retained, record.snapshot)
+		}
+	}
+	return retained
 }
 
 func (b *Breaker) DirtySnapshots() []Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.pruneLocked(b.config.Now(), 0)
 	if len(b.dirty) == 0 {
 		return nil
 	}
@@ -404,11 +448,14 @@ func (b *Breaker) RequeueDirtySnapshots(snapshots []Snapshot) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	b.pruneLocked(b.config.Now(), 0)
 	for _, snapshot := range snapshots {
 		if snapshot.Key.ChannelID <= 0 || snapshot.Key.Model == "" || snapshot.Key.Group == "" {
 			continue
 		}
-		b.dirty[snapshot.Key] = struct{}{}
+		if _, ok := b.states[snapshot.Key]; ok {
+			b.dirty[snapshot.Key] = struct{}{}
+		}
 	}
 }
 
@@ -416,6 +463,7 @@ func (b *Breaker) Configure(config Config) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.config = normalizeConfig(config)
+	b.pruneLocked(b.config.Now(), 0)
 }
 
 func normalizeConfig(config Config) Config {
@@ -441,6 +489,12 @@ func normalizeConfig(config Config) Config {
 	if config.MaxCooldown <= 0 {
 		config.MaxCooldown = defaults.MaxCooldown
 	}
+	if config.EntryTTL <= 0 {
+		config.EntryTTL = defaults.EntryTTL
+	}
+	if config.MaxEntries <= 0 {
+		config.MaxEntries = defaults.MaxEntries
+	}
 	if config.DegradedConsecutiveFailures <= 0 {
 		config.DegradedConsecutiveFailures = defaults.DegradedConsecutiveFailures
 	}
@@ -461,9 +515,13 @@ func normalizeConfig(config Config) Config {
 
 func (b *Breaker) getOrCreate(key Key, now time.Time) *entry {
 	record, ok := b.states[key]
-	if ok {
+	if ok && !record.snapshot.UpdatedAt.Before(now.Add(-b.config.EntryTTL)) {
 		return record
 	}
+	if ok {
+		b.evictLocked(key)
+	}
+	b.pruneLocked(now, 1)
 	record = &entry{
 		snapshot: Snapshot{
 			Key:       key,
@@ -473,6 +531,72 @@ func (b *Breaker) getOrCreate(key Key, now time.Time) *entry {
 	}
 	b.states[key] = record
 	return record
+}
+
+func (b *Breaker) pruneLocked(now time.Time, reserve int) {
+	cutoff := now.Add(-b.config.EntryTTL)
+	for key, record := range b.states {
+		if record.snapshot.UpdatedAt.Before(cutoff) {
+			b.evictLocked(key)
+		}
+	}
+
+	if reserve < 0 {
+		reserve = 0
+	}
+	limit := b.config.MaxEntries - reserve
+	if limit < 0 {
+		limit = 0
+	}
+	if len(b.states) <= limit {
+		return
+	}
+
+	keys := make([]Key, 0, len(b.states))
+	for key := range b.states {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left := b.states[keys[i]].snapshot
+		right := b.states[keys[j]].snapshot
+		leftPriority := evictionPriority(left.State)
+		rightPriority := evictionPriority(right.State)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if !left.UpdatedAt.Equal(right.UpdatedAt) {
+			return left.UpdatedAt.Before(right.UpdatedAt)
+		}
+		return lessKey(keys[i], keys[j])
+	})
+	for _, key := range keys[:len(b.states)-limit] {
+		b.evictLocked(key)
+	}
+}
+
+func (b *Breaker) evictLocked(key Key) {
+	if _, ok := b.states[key]; !ok {
+		return
+	}
+	// At extreme key cardinality, the hard memory boundary takes precedence
+	// over persisting every dirty transition. The independently bounded hot
+	// cache keeps the most recently published snapshot until its own eviction.
+	delete(b.states, key)
+	delete(b.dirty, key)
+	b.evictions++
+}
+
+func evictionPriority(state State) int {
+	switch state {
+	case StateHealthy:
+		return 0
+	case StateDegraded:
+		return 1
+	case StateOpen, StateHalfOpen:
+		return 2
+	default:
+		return 0
+	}
 }
 
 func (b *Breaker) advanceOpen(record *entry, now time.Time) bool {

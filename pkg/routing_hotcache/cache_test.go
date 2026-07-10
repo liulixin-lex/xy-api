@@ -41,6 +41,151 @@ func TestHotcacheResetClearsSnapshots(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestHotcachePruneRemovesStaleSnapshotsAcrossAllMaps(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	oldKey := Key{ChannelID: 1, APIKeyIndex: -1, Model: "old", Group: "default"}
+	newKey := Key{ChannelID: 2, APIKeyIndex: -1, Model: "new", Group: "default"}
+	SetMetricForTest(oldKey, MetricSnapshot{UpdatedUnix: 100})
+	SetMetricForTest(newKey, MetricSnapshot{UpdatedUnix: 200})
+	SetCostForTest(oldKey.CostKey(), CostSnapshot{UpdatedUnix: 100})
+	SetCostForTest(newKey.CostKey(), CostSnapshot{UpdatedUnix: 200})
+	SetBreakerForTest(oldKey, BreakerSnapshot{UpdatedUnix: 100})
+	SetBreakerForTest(newKey, BreakerSnapshot{UpdatedUnix: 200})
+	SetAuthFailureForTest(1, HealthMarker{Marked: true, UpdatedUnix: 100})
+	SetAuthFailureForTest(2, HealthMarker{Marked: true, UpdatedUnix: 200})
+	SetBalanceForTest(1, BalanceSnapshot{Known: true, UpdatedUnix: 100})
+	SetBalanceForTest(2, BalanceSnapshot{Known: true, UpdatedUnix: 200})
+
+	deleted := Prune(300, 150)
+
+	assert.Equal(t, 5, deleted)
+	assert.Equal(t, Stats{
+		Metrics:      1,
+		Costs:        1,
+		Breakers:     1,
+		AuthFailures: 1,
+		Balances:     1,
+		Evictions:    5,
+	}, RuntimeStats())
+	_, ok := GetMetric(oldKey)
+	assert.False(t, ok)
+	_, ok = GetMetric(newKey)
+	assert.True(t, ok)
+	_, ok = GetCost(oldKey.CostKey())
+	assert.False(t, ok)
+	_, ok = GetCost(newKey.CostKey())
+	assert.True(t, ok)
+	_, ok = GetBreaker(oldKey)
+	assert.False(t, ok)
+	_, ok = GetBreaker(newKey)
+	assert.True(t, ok)
+	_, ok = GetAuthFailure(1)
+	assert.False(t, ok)
+	_, ok = GetAuthFailure(2)
+	assert.True(t, ok)
+	_, ok = GetBalance(1)
+	assert.False(t, ok)
+	_, ok = GetBalance(2)
+	assert.True(t, ok)
+}
+
+func TestHotcacheSetSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	cache.Lock()
+	cache.limits = Limits{MaxMetrics: 2, MaxCosts: 2, MaxBreakers: 2, MaxHealth: 2}
+	cache.Unlock()
+
+	metricKeys := []Key{
+		{ChannelID: 10, APIKeyIndex: -1, Model: "metric-old", Group: "default"},
+		{ChannelID: 11, APIKeyIndex: -1, Model: "metric-newest", Group: "default"},
+		{ChannelID: 12, APIKeyIndex: -1, Model: "metric-new", Group: "default"},
+	}
+	SetMetricForTest(metricKeys[0], MetricSnapshot{UpdatedUnix: 10})
+	SetMetricForTest(metricKeys[1], MetricSnapshot{UpdatedUnix: 30})
+	SetMetricForTest(metricKeys[2], MetricSnapshot{UpdatedUnix: 20})
+
+	costKeys := []CostKey{{ChannelID: 20, Model: "old"}, {ChannelID: 21, Model: "newest"}, {ChannelID: 22, Model: "new"}}
+	SetCostForTest(costKeys[0], CostSnapshot{UpdatedUnix: 10})
+	SetCostForTest(costKeys[1], CostSnapshot{UpdatedUnix: 30})
+	SetCostForTest(costKeys[2], CostSnapshot{UpdatedUnix: 20})
+
+	breakerKeys := []Key{
+		{ChannelID: 30, APIKeyIndex: -1, Model: "breaker-old", Group: "default"},
+		{ChannelID: 31, APIKeyIndex: -1, Model: "breaker-newest", Group: "default"},
+		{ChannelID: 32, APIKeyIndex: -1, Model: "breaker-new", Group: "default"},
+	}
+	SetBreakerForTest(breakerKeys[0], BreakerSnapshot{UpdatedUnix: 10})
+	SetBreakerForTest(breakerKeys[1], BreakerSnapshot{UpdatedUnix: 30})
+	SetBreakerForTest(breakerKeys[2], BreakerSnapshot{UpdatedUnix: 20})
+
+	SetAuthFailureForTest(40, HealthMarker{Marked: true, UpdatedUnix: 10})
+	SetAuthFailureForTest(41, HealthMarker{Marked: true, UpdatedUnix: 30})
+	SetAuthFailureForTest(42, HealthMarker{Marked: true, UpdatedUnix: 20})
+	SetBalanceForTest(50, BalanceSnapshot{Known: true, UpdatedUnix: 10})
+	SetBalanceForTest(51, BalanceSnapshot{Known: true, UpdatedUnix: 30})
+	SetBalanceForTest(52, BalanceSnapshot{Known: true, UpdatedUnix: 20})
+
+	assert.Equal(t, Stats{
+		Metrics:      2,
+		Costs:        2,
+		Breakers:     2,
+		AuthFailures: 2,
+		Balances:     2,
+		Evictions:    5,
+	}, RuntimeStats())
+	_, ok := GetMetric(metricKeys[0])
+	assert.False(t, ok)
+	_, ok = GetMetric(metricKeys[1])
+	assert.True(t, ok)
+	_, ok = GetMetric(metricKeys[2])
+	assert.True(t, ok)
+	_, ok = GetCost(costKeys[0])
+	assert.False(t, ok)
+	_, ok = GetBreaker(breakerKeys[0])
+	assert.False(t, ok)
+	_, ok = GetAuthFailure(40)
+	assert.False(t, ok)
+	_, ok = GetBalance(50)
+	assert.False(t, ok)
+}
+
+func TestHotcacheCapacityEvictionUsesStableKeyOrder(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	cache.Lock()
+	cache.limits = Limits{MaxMetrics: 2, MaxCosts: 2, MaxBreakers: 2, MaxHealth: 2}
+	cache.Unlock()
+
+	for _, channelID := range []int{3, 1, 2} {
+		SetMetricForTest(Key{ChannelID: channelID, APIKeyIndex: -1, Model: "same", Group: "default"}, MetricSnapshot{UpdatedUnix: 100})
+		SetCostForTest(CostKey{ChannelID: channelID, Model: "same"}, CostSnapshot{UpdatedUnix: 100})
+		SetAuthFailureForTest(channelID, HealthMarker{Marked: true, UpdatedUnix: 100})
+	}
+
+	_, metricOne := GetMetric(Key{ChannelID: 1, APIKeyIndex: -1, Model: "same", Group: "default"})
+	_, metricTwo := GetMetric(Key{ChannelID: 2, APIKeyIndex: -1, Model: "same", Group: "default"})
+	_, metricThree := GetMetric(Key{ChannelID: 3, APIKeyIndex: -1, Model: "same", Group: "default"})
+	assert.False(t, metricOne)
+	assert.True(t, metricTwo)
+	assert.True(t, metricThree)
+	_, costOne := GetCost(CostKey{ChannelID: 1, Model: "same"})
+	_, costTwo := GetCost(CostKey{ChannelID: 2, Model: "same"})
+	_, costThree := GetCost(CostKey{ChannelID: 3, Model: "same"})
+	assert.False(t, costOne)
+	assert.True(t, costTwo)
+	assert.True(t, costThree)
+	_, authOne := GetAuthFailure(1)
+	_, authTwo := GetAuthFailure(2)
+	_, authThree := GetAuthFailure(3)
+	assert.False(t, authOne)
+	assert.True(t, authTwo)
+	assert.True(t, authThree)
+	assert.Equal(t, int64(3), RuntimeStats().Evictions)
+}
+
 func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 	ResetForTest()
 	LoadMetricSnapshots([]model.RoutingChannelMetric{{
@@ -105,6 +250,86 @@ func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
 	cost, ok = GetCost(costKey)
 	require.True(t, ok)
 	assert.Equal(t, 2.0, cost.Cost)
+
+	breakerKey := Key{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	LoadBreakerSnapshots([]model.RoutingBreakerState{
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "open", UpdatedTime: 200},
+		{ChannelID: 78, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", State: "healthy", UpdatedTime: 100},
+	})
+	breaker, ok := GetBreaker(breakerKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(200), breaker.UpdatedUnix)
+	assert.Equal(t, "open", breaker.State)
+}
+
+func TestHotcacheLoadSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	cache.Lock()
+	cache.limits = Limits{MaxMetrics: 2, MaxCosts: 2, MaxBreakers: 2, MaxHealth: 2}
+	cache.Unlock()
+
+	LoadMetricSnapshots([]model.RoutingChannelMetric{
+		{ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "old", Group: "default", BucketTs: 10, RequestCount: 1},
+		{ChannelID: 102, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "newest", Group: "default", BucketTs: 30, RequestCount: 1},
+		{ChannelID: 103, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "new", Group: "default", BucketTs: 20, RequestCount: 1},
+	}, 60)
+	LoadCostSnapshots([]model.RoutingCostSnapshot{
+		{ChannelID: 201, ModelName: "old", BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 10},
+		{ChannelID: 202, ModelName: "newest", BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 30},
+		{ChannelID: 203, ModelName: "new", BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 20},
+	})
+	LoadBreakerSnapshots([]model.RoutingBreakerState{
+		{ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "old", Group: "default", State: "healthy", UpdatedTime: 10},
+		{ChannelID: 302, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "newest", Group: "default", State: "open", UpdatedTime: 30},
+		{ChannelID: 303, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "new", Group: "default", State: "degraded", UpdatedTime: 20},
+	})
+	LoadHealthSnapshots([]model.RoutingChannelHealthState{
+		{ChannelID: 401, AuthFailure: true, AuthFailureUntil: 100, UpdatedTime: 10, BalanceKnown: true, Balance: 1, BalanceUpdatedTime: 10},
+		{ChannelID: 402, AuthFailure: true, AuthFailureUntil: 100, UpdatedTime: 30, BalanceKnown: true, Balance: 2, BalanceUpdatedTime: 30},
+		{ChannelID: 403, AuthFailure: true, AuthFailureUntil: 100, UpdatedTime: 20, BalanceKnown: true, Balance: 3, BalanceUpdatedTime: 20},
+	}, 0)
+
+	assert.Equal(t, Stats{
+		Metrics:      2,
+		Costs:        2,
+		Breakers:     2,
+		AuthFailures: 2,
+		Balances:     2,
+		Evictions:    5,
+	}, RuntimeStats())
+	_, ok := GetMetric(Key{ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "old", Group: "default"})
+	assert.False(t, ok)
+	_, ok = GetMetric(Key{ChannelID: 102, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "newest", Group: "default"})
+	assert.True(t, ok)
+	_, ok = GetMetric(Key{ChannelID: 103, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "new", Group: "default"})
+	assert.True(t, ok)
+	_, ok = GetCost(CostKey{ChannelID: 201, Model: "old"})
+	assert.False(t, ok)
+	_, ok = GetBreaker(Key{ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "old", Group: "default"})
+	assert.False(t, ok)
+	_, ok = GetAuthFailure(401)
+	assert.False(t, ok)
+	_, ok = GetBalance(401)
+	assert.False(t, ok)
+}
+
+func TestHotcacheResetRestoresDefaultLimitsAndEvictionStats(t *testing.T) {
+	ResetForTest()
+	cache.Lock()
+	cache.limits = Limits{MaxMetrics: 1, MaxCosts: 1, MaxBreakers: 1, MaxHealth: 1}
+	cache.Unlock()
+	SetMetricForTest(Key{ChannelID: 1, APIKeyIndex: -1, Model: "first", Group: "default"}, MetricSnapshot{UpdatedUnix: 1})
+	SetMetricForTest(Key{ChannelID: 2, APIKeyIndex: -1, Model: "second", Group: "default"}, MetricSnapshot{UpdatedUnix: 2})
+	require.Equal(t, int64(1), RuntimeStats().Evictions)
+
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	SetMetricForTest(Key{ChannelID: 1, APIKeyIndex: -1, Model: "first", Group: "default"}, MetricSnapshot{UpdatedUnix: 1})
+	SetMetricForTest(Key{ChannelID: 2, APIKeyIndex: -1, Model: "second", Group: "default"}, MetricSnapshot{UpdatedUnix: 2})
+	SetMetricForTest(Key{ChannelID: 3, APIKeyIndex: -1, Model: "third", Group: "default"}, MetricSnapshot{UpdatedUnix: 3})
+
+	assert.Equal(t, Stats{Metrics: 3}, RuntimeStats())
 }
 
 func TestHotcacheStoresAuthFailureAndBalanceMarkers(t *testing.T) {
