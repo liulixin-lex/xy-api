@@ -123,16 +123,29 @@ func TestShouldRetryBlocksFirstByteTimeoutAfterHTTPWriterWritten(t *testing.T) {
 func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	t.Setenv("SMART_ROUTING_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeObserve)
+	smart_routing_setting.ResetForTest()
+	routingSetting := smart_routing_setting.GetSetting()
+	routingSetting.Enabled = true
+	routingSetting.Mode = smart_routing_setting.ModeObserve
+	routingSetting.Consecutive5xx = 1
+	routingSetting.BaseCooldownSec = 1
+	routingSetting.MaxCooldownSec = 1
+	smart_routing_setting.UpdateSetting(routingSetting)
 	routingmetrics.ResetForTest()
 	routinghotcache.ResetForTest()
+	smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
 	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
 		Consecutive5xxThreshold: 1,
 		BaseCooldown:            time.Second,
 		MaxCooldown:             time.Second,
 	})
 	t.Cleanup(func() {
+		smart_routing_setting.ResetForTest()
 		routingmetrics.ResetForTest()
 		routinghotcache.ResetForTest()
+		smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	})
 

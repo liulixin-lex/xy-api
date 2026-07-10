@@ -91,6 +91,70 @@ func TestRoutingMetricsEnforceBucketLimitAndEvictOldest(t *testing.T) {
 	assert.Equal(t, Stats{Buckets: 2, BucketEvictions: 1}, RuntimeStats())
 }
 
+func TestRoutingMetricsEvictOldestUsesStableTieBreakOrder(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	maintenanceMu.Lock()
+	limits = Limits{MaxBuckets: 2, BucketTTL: time.Hour, MaxInflightKeys: 2}
+	maintenanceMu.Unlock()
+
+	const bucketTs = int64(100)
+	tieBreaks := []struct {
+		name    string
+		earlier bucketKey
+		later   bucketKey
+	}{
+		{
+			name:    "channel",
+			earlier: bucketKey{channelID: 1, apiKeyIndex: 9, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
+			later:   bucketKey{channelID: 2, apiKeyIndex: 1, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+		},
+		{
+			name:    "api key",
+			earlier: bucketKey{channelID: 2, apiKeyIndex: 1, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
+			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+		},
+		{
+			name:    "model",
+			earlier: bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "a-model", group: "z-group", bucketTs: bucketTs},
+			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "a-group", bucketTs: bucketTs},
+		},
+		{
+			name:    "group",
+			earlier: bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "a-group", bucketTs: bucketTs},
+			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "b-group", bucketTs: bucketTs},
+		},
+	}
+	// Verify every tie-break dimension directly so the regression does not
+	// depend on sync.Map.Range iteration order.
+	for _, tieBreak := range tieBreaks {
+		assert.True(t, bucketKeyLess(tieBreak.earlier, tieBreak.later), "%s must break equal timestamps", tieBreak.name)
+	}
+
+	keys := []bucketKey{
+		{channelID: 1, apiKeyIndex: 9, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
+		{channelID: 2, apiKeyIndex: 1, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
+		{channelID: 2, apiKeyIndex: 2, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
+	}
+	for _, key := range keys {
+		recordBucket(key, 1, 0, false, 1, nil)
+	}
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 2)
+	retained := make([]bucketKey, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		retained = append(retained, bucketKey{
+			channelID:   snapshot.ChannelID,
+			apiKeyIndex: snapshot.APIKeyIndex,
+			modelName:   snapshot.ModelName,
+			group:       snapshot.Group,
+			bucketTs:    snapshot.BucketTs,
+		})
+	}
+	assert.Equal(t, keys[1:], retained)
+	assert.Equal(t, Stats{Buckets: 2, BucketEvictions: 1}, RuntimeStats())
+}
+
 func TestRoutingMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	maintenanceMu.Lock()
