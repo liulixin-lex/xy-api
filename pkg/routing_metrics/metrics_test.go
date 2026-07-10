@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -205,6 +206,28 @@ func TestRoutingMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
 	assert.Equal(t, Stats{Buckets: 1, BucketEvictions: 2}, RuntimeStats())
 }
 
+func TestRoutingMetricsBucketTTLDoesNotExpirePartialSecond(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	maintenanceMu.Lock()
+	limits = Limits{MaxBuckets: 2, BucketTTL: 1500 * time.Millisecond, MaxInflightKeys: 2}
+	maintenanceMu.Unlock()
+
+	for _, bucketTs := range []int64{9, 10} {
+		recordBucket(bucketKey{
+			channelID:   1,
+			apiKeyIndex: model.RoutingMetricSingleKeyIndex,
+			modelName:   "gpt-test",
+			group:       "default",
+			bucketTs:    bucketTs,
+		}, 1, 0, false, 1, nil)
+	}
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 2)
+	assert.Equal(t, []int64{9, 10}, []int64{snapshots[0].BucketTs, snapshots[1].BucketTs})
+	assert.Equal(t, Stats{Buckets: 2}, RuntimeStats())
+}
+
 func TestRoutingMetricsDropNewInflightKeyAtLimit(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	maintenanceMu.Lock()
@@ -232,6 +255,135 @@ func TestRoutingMetricsDropNewInflightKeyAtLimit(t *testing.T) {
 	releaseSecond()
 	releaseFirst()
 	assert.Equal(t, Stats{InflightDrops: 1}, RuntimeStats())
+}
+
+func TestRoutingMetricsNormalizeNonPositiveLimits(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	maintenanceMu.Lock()
+	limits = Limits{}
+	maintenanceMu.Unlock()
+	metricKey := bucketKey{
+		channelID:   1,
+		apiKeyIndex: model.RoutingMetricSingleKeyIndex,
+		modelName:   "gpt-test",
+		group:       "default",
+		bucketTs:    1,
+	}
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 1},
+	}
+	inflightKey := InflightKey{ChannelID: 1, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+
+	recordBucket(metricKey, 1, 0, false, 1, nil)
+	release := BeginInflight(nil, info, 1)
+
+	require.Len(t, Snapshots(), 1)
+	assert.Equal(t, int64(1), InflightCount(inflightKey))
+	assert.Equal(t, Stats{Buckets: 1, InflightKeys: 1}, RuntimeStats())
+	release()
+	assert.Equal(t, Stats{Buckets: 1}, RuntimeStats())
+}
+
+func TestRoutingMetricsConcurrentFinalReleaseAndBeginPreserveActiveKey(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 41},
+	}
+	key := InflightKey{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	oldRelease := BeginInflight(nil, info, 41)
+	require.Equal(t, int64(1), InflightCount(key))
+
+	start := make(chan struct{})
+	oldReleaseResult := make(chan struct{}, 1)
+	newReleaseResult := make(chan func(), 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		oldRelease()
+		oldReleaseResult <- struct{}{}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		newReleaseResult <- BeginInflight(nil, info, 41)
+	}()
+	close(start)
+	wg.Wait()
+	<-oldReleaseResult
+	newRelease := <-newReleaseResult
+
+	assert.Equal(t, int64(1), InflightCount(key))
+	assert.Equal(t, Stats{InflightKeys: 1}, RuntimeStats())
+	newRelease()
+	assert.Zero(t, InflightCount(key))
+	assert.Equal(t, Stats{}, RuntimeStats())
+}
+
+func TestRoutingMetricsClearChannelOldReleaseDoesNotAffectReplacement(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 42},
+	}
+	key := InflightKey{ChannelID: 42, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	oldRelease := BeginInflight(nil, info, 42)
+	require.Equal(t, int64(1), InflightCount(key))
+
+	ClearChannel(42)
+	require.Zero(t, InflightCount(key))
+	require.Equal(t, Stats{}, RuntimeStats())
+	replacementRelease := BeginInflight(nil, info, 42)
+	require.Equal(t, int64(1), InflightCount(key))
+
+	oldRelease()
+	assert.Equal(t, int64(1), InflightCount(key))
+	assert.Equal(t, Stats{InflightKeys: 1}, RuntimeStats())
+	replacementRelease()
+	assert.Zero(t, InflightCount(key))
+	assert.Equal(t, Stats{}, RuntimeStats())
+}
+
+func TestRoutingMetricsResetOldReleaseDoesNotAffectReplacement(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	testLimits := Limits{MaxBuckets: 2, BucketTTL: time.Hour, MaxInflightKeys: 2}
+	maintenanceMu.Lock()
+	limits = testLimits
+	maintenanceMu.Unlock()
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 43},
+	}
+	key := InflightKey{ChannelID: 43, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	oldRelease := BeginInflight(nil, info, 43)
+	require.Equal(t, int64(1), InflightCount(key))
+
+	ResetForTest()
+	routingSetting := smart_routing_setting.GetSetting()
+	routingSetting.Enabled = true
+	routingSetting.Mode = smart_routing_setting.ModeObserve
+	smart_routing_setting.UpdateSetting(routingSetting)
+	maintenanceMu.Lock()
+	limits = testLimits
+	maintenanceMu.Unlock()
+	require.Zero(t, InflightCount(key))
+	require.Equal(t, Stats{}, RuntimeStats())
+	replacementRelease := BeginInflight(nil, info, 43)
+	require.Equal(t, int64(1), InflightCount(key))
+
+	oldRelease()
+	assert.Equal(t, int64(1), InflightCount(key))
+	assert.Equal(t, Stats{InflightKeys: 1}, RuntimeStats())
+	replacementRelease()
+	assert.Zero(t, InflightCount(key))
+	assert.Equal(t, Stats{}, RuntimeStats())
 }
 
 func TestRecordAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.T) {
@@ -424,6 +576,61 @@ func TestInflightCountersUseRoutingKeyAndReleaseOnce(t *testing.T) {
 	release()
 
 	assert.Zero(t, InflightCount(key))
+}
+
+func TestRoutingMetricsConcurrentDrainAndRecordPreserveAttempts(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	key := bucketKey{
+		channelID:   44,
+		apiKeyIndex: model.RoutingMetricSingleKeyIndex,
+		modelName:   "gpt-test",
+		group:       "default",
+		bucketTs:    1,
+	}
+	recordBucket(key, 1, 0, false, 1, nil)
+	value, ok := buckets.Load(key)
+	require.True(t, ok)
+	b := value.(*bucket)
+
+	b.mu.Lock()
+	start := make(chan struct{})
+	ready := make(chan struct{}, 2)
+	drainResult := make(chan []model.RoutingChannelMetric, 1)
+	recordResult := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ready <- struct{}{}
+		<-start
+		drainResult <- DrainSnapshots()
+	}()
+	go func() {
+		defer wg.Done()
+		ready <- struct{}{}
+		<-start
+		recordBucket(key, 1, 0, false, 1, nil)
+		recordResult <- struct{}{}
+	}()
+	<-ready
+	<-ready
+	close(start)
+	b.mu.Unlock()
+	wg.Wait()
+	drained := <-drainResult
+	<-recordResult
+
+	// The second record may be drained or remain in a replacement bucket.
+	remaining := Snapshots()
+	totalRequests := int64(0)
+	for _, snapshot := range drained {
+		totalRequests += snapshot.RequestCount
+	}
+	for _, snapshot := range remaining {
+		totalRequests += snapshot.RequestCount
+	}
+	assert.Equal(t, int64(2), totalRequests)
+	assert.Equal(t, Stats{Buckets: int64(len(remaining))}, RuntimeStats())
 }
 
 func TestDrainSnapshotsClearsInMemoryBuckets(t *testing.T) {

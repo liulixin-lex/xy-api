@@ -322,10 +322,13 @@ func loadOrCreateBucket(key bucketKey) *bucket {
 	activeLimits := normalizedLimits(limits)
 	limits = activeLimits
 	ttlSeconds := int64(activeLimits.BucketTTL / time.Second)
-	if ttlSeconds < 1 {
-		ttlSeconds = 1
+	if activeLimits.BucketTTL%time.Second != 0 {
+		ttlSeconds++
 	}
-	evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
+	const minBucketTimestamp int64 = -1 << 63
+	if key.bucketTs >= minBucketTimestamp+ttlSeconds {
+		evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
+	}
 	for bucketCount.Load() >= int64(activeLimits.MaxBuckets) {
 		if !evictOldestBucketLocked() {
 			return nil
