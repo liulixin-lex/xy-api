@@ -64,44 +64,49 @@ type BalanceSnapshot struct {
 }
 
 type Limits struct {
-	MaxMetrics  int
-	MaxCosts    int
-	MaxBreakers int
-	MaxHealth   int
+	MaxMetrics           int
+	MaxCosts             int
+	MaxBreakers          int
+	MaxHealth            int
+	MaxCapacityCooldowns int
 }
 
 type Stats struct {
-	Metrics      int
-	Costs        int
-	Breakers     int
-	AuthFailures int
-	Balances     int
-	Evictions    int64
+	Metrics           int
+	Costs             int
+	Breakers          int
+	CapacityCooldowns int
+	AuthFailures      int
+	Balances          int
+	Evictions         int64
 }
 
 var defaultLimits = Limits{
-	MaxMetrics:  20_000,
-	MaxCosts:    10_000,
-	MaxBreakers: 20_000,
-	MaxHealth:   10_000,
+	MaxMetrics:           20_000,
+	MaxCosts:             10_000,
+	MaxBreakers:          20_000,
+	MaxHealth:            10_000,
+	MaxCapacityCooldowns: 20_000,
 }
 
 var cache = struct {
 	sync.RWMutex
-	metrics      map[Key]MetricSnapshot
-	costs        map[CostKey]CostSnapshot
-	breakers     map[Key]BreakerSnapshot
-	authFailures map[int]HealthMarker
-	balances     map[int]BalanceSnapshot
-	limits       Limits
-	evictions    int64
+	metrics           map[Key]MetricSnapshot
+	costs             map[CostKey]CostSnapshot
+	breakers          map[Key]BreakerSnapshot
+	capacityCooldowns map[Key]CapacityCooldownSnapshot
+	authFailures      map[int]HealthMarker
+	balances          map[int]BalanceSnapshot
+	limits            Limits
+	evictions         int64
 }{
-	metrics:      map[Key]MetricSnapshot{},
-	costs:        map[CostKey]CostSnapshot{},
-	breakers:     map[Key]BreakerSnapshot{},
-	authFailures: map[int]HealthMarker{},
-	balances:     map[int]BalanceSnapshot{},
-	limits:       defaultLimits,
+	metrics:           map[Key]MetricSnapshot{},
+	costs:             map[CostKey]CostSnapshot{},
+	breakers:          map[Key]BreakerSnapshot{},
+	capacityCooldowns: map[Key]CapacityCooldownSnapshot{},
+	authFailures:      map[int]HealthMarker{},
+	balances:          map[int]BalanceSnapshot{},
+	limits:            defaultLimits,
 }
 
 func (key Key) CostKey() CostKey {
@@ -147,12 +152,13 @@ func RuntimeStats() Stats {
 	cache.RLock()
 	defer cache.RUnlock()
 	return Stats{
-		Metrics:      len(cache.metrics),
-		Costs:        len(cache.costs),
-		Breakers:     len(cache.breakers),
-		AuthFailures: len(cache.authFailures),
-		Balances:     len(cache.balances),
-		Evictions:    cache.evictions,
+		Metrics:           len(cache.metrics),
+		Costs:             len(cache.costs),
+		Breakers:          len(cache.breakers),
+		CapacityCooldowns: len(cache.capacityCooldowns),
+		AuthFailures:      len(cache.authFailures),
+		Balances:          len(cache.balances),
+		Evictions:         cache.evictions,
 	}
 }
 
@@ -194,11 +200,19 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 			}
 		}
 	}
+	deadline := nowUnix * 1000
+	for key, snapshot := range cache.capacityCooldowns {
+		if snapshot.CooldownUntilUnixMilli <= deadline {
+			delete(cache.capacityCooldowns, key)
+			deleted++
+		}
+	}
 
 	cache.limits = normalizedLimits(cache.limits)
 	deleted += trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess)
 	deleted += trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess)
+	deleted += trimBoundedMap(cache.capacityCooldowns, cache.limits.MaxCapacityCooldowns, capacityUpdatedUnixMilli, keyLess)
 	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess)
 	deleted += trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess)
 	cache.evictions += int64(deleted)
@@ -302,6 +316,11 @@ func ClearChannel(channelID int) {
 	for key := range cache.breakers {
 		if key.ChannelID == channelID {
 			delete(cache.breakers, key)
+		}
+	}
+	for key := range cache.capacityCooldowns {
+		if key.ChannelID == channelID {
+			delete(cache.capacityCooldowns, key)
 		}
 	}
 	delete(cache.authFailures, channelID)
@@ -519,6 +538,9 @@ func normalizedLimits(value Limits) Limits {
 	if value.MaxHealth <= 0 {
 		value.MaxHealth = defaultLimits.MaxHealth
 	}
+	if value.MaxCapacityCooldowns <= 0 {
+		value.MaxCapacityCooldowns = defaultLimits.MaxCapacityCooldowns
+	}
 	return value
 }
 
@@ -579,6 +601,10 @@ func breakerUpdatedUnix(snapshot BreakerSnapshot) int64 {
 	return snapshot.UpdatedUnix
 }
 
+func capacityUpdatedUnixMilli(snapshot CapacityCooldownSnapshot) int64 {
+	return snapshot.UpdatedUnixMilli
+}
+
 func healthUpdatedUnix(marker HealthMarker) int64 {
 	return marker.UpdatedUnix
 }
@@ -617,6 +643,7 @@ func ResetForTest() {
 	cache.metrics = map[Key]MetricSnapshot{}
 	cache.costs = map[CostKey]CostSnapshot{}
 	cache.breakers = map[Key]BreakerSnapshot{}
+	cache.capacityCooldowns = map[Key]CapacityCooldownSnapshot{}
 	cache.authFailures = map[int]HealthMarker{}
 	cache.balances = map[int]BalanceSnapshot{}
 	cache.limits = defaultLimits

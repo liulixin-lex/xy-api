@@ -265,6 +265,34 @@ func TestAvailabilityFloorUsesReliabilityVolumeOnly(t *testing.T) {
 	require.Len(t, decision.Ranked, 1)
 }
 
+func TestRankCandidatesCapacityCooldownIsHardFilterWithoutBreakerBypass(t *testing.T) {
+	cooling := testCandidate(1, 1, 100, 1, nil, &BreakerSnapshot{State: BreakerStateHealthy})
+	cooling.Capacity = &CapacityCooldownSnapshot{CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000}
+	open := testCandidate(2, 1, 100, 1, nil, &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 300, UpdatedUnix: 100})
+
+	decision := RankCandidates([]Candidate{cooling, open}, Settings{
+		WeightAvailability: 1,
+		MaxEjectedPct:      0,
+		NowUnix:            150,
+		NowUnixMilli:       150_000,
+	})
+
+	assert.Equal(t, 1, decision.FilteredCapacity)
+	assert.True(t, decision.BreakerBypassed)
+	require.Len(t, decision.Ranked, 1)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+}
+
+func TestRankCandidatesRestoresCapacityCandidateAtDeadline(t *testing.T) {
+	candidate := testCandidate(1, 1, 100, 1, nil, nil)
+	candidate.Capacity = &CapacityCooldownSnapshot{CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000}
+
+	decision := RankCandidates([]Candidate{candidate}, Settings{WeightAvailability: 1, NowUnix: 200, NowUnixMilli: 200_000})
+
+	assert.Zero(t, decision.FilteredCapacity)
+	require.Len(t, decision.Ranked, 1)
+}
+
 func TestRankCandidatesOrdersAdminPriorityBeforeScore(t *testing.T) {
 	highPriority := int64(100)
 	lowPriority := int64(1)

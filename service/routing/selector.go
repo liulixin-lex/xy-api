@@ -43,7 +43,13 @@ type scoreBounds struct {
 func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	health := make([]candidateHealth, 0, len(candidates))
 	openCount := 0
+	filteredCapacity := 0
 	for i, candidate := range candidates {
+		if candidate.Capacity != nil && settings.NowUnixMilli > 0 &&
+			candidate.Capacity.CooldownUntilUnixMilli > settings.NowUnixMilli {
+			filteredCapacity++
+			continue
+		}
 		degraded, open, hardOpen := classifyBreaker(candidate.Breaker, settings)
 		if open && !hardOpen {
 			openCount++
@@ -57,7 +63,7 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 		})
 	}
 
-	breakerBypassed := shouldBypassOpenFilter(openCount, len(candidates), settings.MaxEjectedPct)
+	breakerBypassed := shouldBypassOpenFilter(openCount, len(health), settings.MaxEjectedPct)
 	included := make([]candidateHealth, 0, len(health))
 	bypassedOpen := make([]candidateHealth, 0)
 	filteredOpen := 0
@@ -119,10 +125,11 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	})
 
 	return Decision{
-		Ranked:          ranked,
-		Weights:         weights,
-		BreakerBypassed: breakerBypassed,
-		FilteredOpen:    filteredOpen,
+		Ranked:           ranked,
+		Weights:          weights,
+		BreakerBypassed:  breakerBypassed,
+		FilteredOpen:     filteredOpen,
+		FilteredCapacity: filteredCapacity,
 	}
 }
 

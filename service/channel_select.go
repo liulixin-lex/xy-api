@@ -501,6 +501,13 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				TPS:                     metric.TPS,
 			}
 		}
+		if capacity, ok := routinghotcache.GetCapacityCooldown(cacheKey); ok {
+			candidate.Capacity = &routingselector.CapacityCooldownSnapshot{
+				SourceStatusCode:       capacity.SourceStatusCode,
+				CooldownUntilUnixMilli: capacity.CooldownUntilUnixMilli,
+				UpdatedUnixMilli:       capacity.UpdatedUnixMilli,
+			}
+		}
 		inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
 			ChannelID:   channel.Id,
 			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
@@ -615,6 +622,7 @@ func smartRoutingMemoKey(group string, modelName string, requestPath string) str
 }
 
 func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting) routingselector.Settings {
+	now := time.Now()
 	return routingselector.Settings{
 		WeightAvailability: setting.WeightAvailability,
 		WeightLatency:      setting.WeightLatency,
@@ -626,8 +634,9 @@ func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting) 
 		MaxEjectedPct:      setting.MaxEjectedPct,
 		HalfOpenProbes:     setting.HalfOpenProbes,
 		SnapshotStaleSec:   setting.SnapshotStaleSec,
-		NowUnix:            common.GetTimestamp(),
-		RandomSeed:         time.Now().UnixNano(),
+		NowUnix:            now.Unix(),
+		NowUnixMilli:       now.UnixMilli(),
+		RandomSeed:         now.UnixNano(),
 	}
 }
 
