@@ -237,6 +237,37 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, int64(2), saved.Err429)
 	assert.Equal(t, int64(250), saved.RetryAfterMaxMs)
 
+	require.NoError(t, DB.Delete(&saved).Error)
+	retentionMetrics := []RoutingChannelMetric{
+		{
+			ChannelID:    2,
+			APIKeyIndex:  RoutingMetricSingleKeyIndex,
+			ModelName:    "retention-test",
+			Group:        "retention",
+			BucketTs:     100,
+			RequestCount: 1,
+		},
+		{
+			ChannelID:    2,
+			APIKeyIndex:  RoutingMetricSingleKeyIndex,
+			ModelName:    "retention-test",
+			Group:        "retention",
+			BucketTs:     200,
+			RequestCount: 1,
+		},
+	}
+	require.NoError(t, DB.Create(&retentionMetrics).Error)
+
+	deleted, err := DeleteRoutingMetricsBefore(150)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	var retainedMetrics []RoutingChannelMetric
+	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
+		2, RoutingMetricSingleKeyIndex, "retention-test", "retention").Order("bucket_ts asc").Find(&retainedMetrics).Error)
+	require.Len(t, retainedMetrics, 1)
+	assert.Equal(t, int64(200), retainedMetrics[0].BucketTs)
+
 	require.NoError(t, UpsertRoutingBreakerState(&RoutingBreakerState{
 		ChannelID:           1,
 		APIKeyIndex:         2,

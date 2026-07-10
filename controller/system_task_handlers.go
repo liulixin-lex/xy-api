@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -22,10 +23,24 @@ import (
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
-var smartRoutingRuntimeOnce sync.Once
 var smartRoutingFlushMu sync.Mutex
+var smartRoutingRetentionLast atomic.Int64
 var smartRoutingBreakerConfigMu sync.Mutex
 var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
+
+type SmartRoutingRuntime struct {
+	cancel context.CancelFunc
+	wait   sync.WaitGroup
+	close  sync.Once
+}
+
+type smartRoutingRuntimeDeps struct {
+	getSetting  func() smart_routing_setting.SmartRoutingSetting
+	refresh     func(smart_routing_setting.SmartRoutingSetting)
+	flush       func(smart_routing_setting.SmartRoutingSetting)
+	waitRefresh func(context.Context, time.Duration) bool
+	waitFlush   func(context.Context, time.Duration) bool
+}
 
 type routingBreakerConfigIdentity struct {
 	consecutive5xx int
@@ -66,37 +81,86 @@ func syncRoutingBreakerConfigFromSetting(setting smart_routing_setting.SmartRout
 	smartRoutingBreakerConfigLast = identity
 }
 
-func StartSmartRoutingRuntime() {
-	smartRoutingRuntimeOnce.Do(func() {
-		go func() {
-			for {
-				setting := smart_routing_setting.GetSetting()
-				if setting.Enabled {
-					syncRoutingBreakerConfigFromSetting(setting)
-					_, _ = refreshRoutingHotcacheFromDB()
-				}
-				interval := time.Duration(setting.HotcacheRefreshSec) * time.Second
-				if interval <= 0 {
-					interval = 3 * time.Second
-				}
-				time.Sleep(interval)
+func StartSmartRoutingRuntime(parent context.Context) *SmartRoutingRuntime {
+	return newSmartRoutingRuntime(parent, smartRoutingRuntimeDeps{
+		getSetting: smart_routing_setting.GetSetting,
+		refresh: func(setting smart_routing_setting.SmartRoutingSetting) {
+			if setting.Enabled {
+				syncRoutingBreakerConfigFromSetting(setting)
+				_, _ = refreshRoutingHotcacheFromDB(setting)
 			}
-		}()
-		go func() {
-			for {
-				setting := smart_routing_setting.GetSetting()
-				if setting.Enabled {
-					syncRoutingBreakerConfigFromSetting(setting)
-					_, _ = flushRoutingRuntimeState()
-				}
-				interval := time.Duration(setting.FlushIntervalMin) * time.Minute
-				if interval <= 0 {
-					interval = time.Minute
-				}
-				time.Sleep(interval)
+			routinghotcache.Prune(common.GetTimestamp(), int64(setting.SnapshotStaleSec))
+		},
+		flush: func(setting smart_routing_setting.SmartRoutingSetting) {
+			if !setting.Enabled {
+				return
 			}
-		}()
+			syncRoutingBreakerConfigFromSetting(setting)
+			_, _ = flushRoutingRuntimeState(setting)
+		},
+		waitRefresh: waitRoutingRuntime,
+		waitFlush:   waitRoutingRuntime,
 	})
+}
+
+func newSmartRoutingRuntime(parent context.Context, deps smartRoutingRuntimeDeps) *SmartRoutingRuntime {
+	ctx, cancel := context.WithCancel(parent)
+	runtime := &SmartRoutingRuntime{cancel: cancel}
+	runtime.wait.Add(2)
+
+	go func() {
+		defer runtime.wait.Done()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			setting := deps.getSetting()
+			deps.refresh(setting)
+			interval := time.Duration(setting.HotcacheRefreshSec) * time.Second
+			if interval <= 0 {
+				interval = 3 * time.Second
+			}
+			if !deps.waitRefresh(ctx, interval) || ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer runtime.wait.Done()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			setting := deps.getSetting()
+			deps.flush(setting)
+			interval := time.Duration(setting.FlushIntervalMin) * time.Minute
+			if interval <= 0 {
+				interval = time.Minute
+			}
+			if !deps.waitFlush(ctx, interval) || ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+
+	return runtime
+}
+
+func (runtime *SmartRoutingRuntime) Close() {
+	runtime.close.Do(runtime.cancel)
+	runtime.wait.Wait()
+}
+
+func waitRoutingRuntime(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -283,7 +347,7 @@ type routingPricingItem struct {
 	BillingExpr     string   `json:"billing_expr"`
 }
 
-func flushRoutingRuntimeState() (map[string]any, error) {
+func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
 	smartRoutingFlushMu.Lock()
 	defer smartRoutingFlushMu.Unlock()
 
@@ -299,7 +363,7 @@ func flushRoutingRuntimeState() (map[string]any, error) {
 			return summary, err
 		}
 	}
-	routinghotcache.LoadMetricSnapshots(drainedMetrics, smart_routing_setting.GetSetting().MetricBucketSec)
+	routinghotcache.LoadMetricSnapshots(drainedMetrics, setting.MetricBucketSec)
 	summary["metrics"] = len(drainedMetrics)
 
 	dirtyBreakers := routingbreaker.DirtySnapshots()
@@ -311,17 +375,28 @@ func flushRoutingRuntimeState() (map[string]any, error) {
 		}
 	}
 	summary["breakers"] = len(dirtyBreakers)
+
+	now := common.GetTimestamp()
+	const retentionIntervalSeconds int64 = 6 * 60 * 60
+	if setting.RetentionDays > 0 && now-smartRoutingRetentionLast.Load() >= retentionIntervalSeconds {
+		cutoffTs := now - int64(setting.RetentionDays)*86400
+		deleted, err := model.DeleteRoutingMetricsBefore(cutoffTs)
+		if err != nil {
+			return summary, err
+		}
+		summary["retained_metrics_deleted"] = deleted
+		smartRoutingRetentionLast.Store(now)
+	}
 	return summary, nil
 }
 
-func refreshRoutingHotcacheFromDB() (map[string]any, error) {
+func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
 	summary := map[string]any{
 		"costs":    0,
 		"metrics":  0,
 		"breakers": 0,
 		"health":   0,
 	}
-	setting := smart_routing_setting.GetSetting()
 	now := common.GetTimestamp()
 	staleSeconds := int64(setting.SnapshotStaleSec)
 	if staleSeconds <= 0 {
@@ -363,7 +438,8 @@ func refreshRoutingHotcacheFromDB() (map[string]any, error) {
 }
 
 func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
-	syncRoutingBreakerConfigFromSetting(smart_routing_setting.GetSetting())
+	setting := smart_routing_setting.GetSetting()
+	syncRoutingBreakerConfigFromSetting(setting)
 
 	summary := map[string]any{
 		"bindings":        0,
@@ -375,14 +451,14 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 		"skipped_backoff": 0,
 	}
 
-	flushSummary, err := flushRoutingRuntimeState()
+	flushSummary, err := flushRoutingRuntimeState(setting)
 	if err != nil {
 		return summary, err
 	}
 	summary["metrics"] = flushSummary["metrics"]
 	summary["breakers"] = flushSummary["breakers"]
 
-	refreshSummary, err := refreshRoutingHotcacheFromDB()
+	refreshSummary, err := refreshRoutingHotcacheFromDB(setting)
 	if err != nil {
 		return summary, err
 	}

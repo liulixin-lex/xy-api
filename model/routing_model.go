@@ -235,6 +235,14 @@ func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
 	}).Create(metric).Error
 }
 
+func DeleteRoutingMetricsBefore(cutoffTs int64) (int64, error) {
+	if cutoffTs <= 0 {
+		return 0, nil
+	}
+	result := DB.Where("bucket_ts < ?", cutoffTs).Delete(&RoutingChannelMetric{})
+	return result.RowsAffected, result.Error
+}
+
 type RoutingBreakerState struct {
 	ID                  int    `json:"id" gorm:"primaryKey"`
 	ChannelID           int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_breaker_key,priority:1;index"`

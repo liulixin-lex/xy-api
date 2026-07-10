@@ -14,6 +14,7 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -306,7 +307,7 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	_, costOK := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"})
 	assert.False(t, breakerOK)
 	assert.False(t, costOK)
-	_, err := flushRoutingRuntimeState()
+	_, err := flushRoutingRuntimeState(smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	for _, table := range []any{&model.RoutingBreakerState{}, &model.RoutingChannelMetric{}} {
 		var count int64
@@ -372,7 +373,7 @@ func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 		Group:       state.Group,
 	})
 	assert.False(t, ok)
-	_, err := flushRoutingRuntimeState()
+	_, err := flushRoutingRuntimeState(smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	require.NoError(t, breakerQuery.Count(&count).Error)
 	assert.Zero(t, count)

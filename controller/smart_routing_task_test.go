@@ -315,7 +315,7 @@ func TestRefreshRoutingHotcacheFromDBLoadsRoutingSnapshots(t *testing.T) {
 		UpdatedTime:        now,
 	}).Error)
 
-	summary, err := refreshRoutingHotcacheFromDB()
+	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.GetSetting())
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, summary["costs"])
@@ -392,7 +392,7 @@ func TestRefreshRoutingHotcacheFromDBPrefersLatestRowsUnderLimit(t *testing.T) {
 	require.NoError(t, db.CreateInBatches(costs, 500).Error)
 	require.NoError(t, db.CreateInBatches(metrics, 500).Error)
 
-	summary, err := refreshRoutingHotcacheFromDB()
+	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.GetSetting())
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 5000, summary["costs"])
