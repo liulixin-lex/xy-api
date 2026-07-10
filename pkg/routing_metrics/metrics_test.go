@@ -92,67 +92,95 @@ func TestRoutingMetricsEnforceBucketLimitAndEvictOldest(t *testing.T) {
 }
 
 func TestRoutingMetricsEvictOldestUsesStableTieBreakOrder(t *testing.T) {
-	enableRoutingMetricsForTest(t)
-	maintenanceMu.Lock()
-	limits = Limits{MaxBuckets: 2, BucketTTL: time.Hour, MaxInflightKeys: 2}
-	maintenanceMu.Unlock()
-
 	const bucketTs = int64(100)
-	tieBreaks := []struct {
-		name    string
-		earlier bucketKey
-		later   bucketKey
+	type visibleBucketKey struct {
+		ChannelID   int
+		APIKeyIndex int
+		ModelName   string
+		Group       string
+		BucketTs    int64
+	}
+	tests := []struct {
+		name string
+		keys []bucketKey
+		want []visibleBucketKey
 	}{
 		{
-			name:    "channel",
-			earlier: bucketKey{channelID: 1, apiKeyIndex: 9, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
-			later:   bucketKey{channelID: 2, apiKeyIndex: 1, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+			name: "channel",
+			keys: []bucketKey{
+				{channelID: 1, apiKeyIndex: 3, modelName: "c-model", group: "c-group", bucketTs: bucketTs},
+				{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "b-group", bucketTs: bucketTs},
+				{channelID: 3, apiKeyIndex: 1, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+			},
+			want: []visibleBucketKey{
+				{ChannelID: 2, APIKeyIndex: 2, ModelName: "b-model", Group: "b-group", BucketTs: bucketTs},
+				{ChannelID: 3, APIKeyIndex: 1, ModelName: "a-model", Group: "a-group", BucketTs: bucketTs},
+			},
 		},
 		{
-			name:    "api key",
-			earlier: bucketKey{channelID: 2, apiKeyIndex: 1, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
-			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+			name: "api_key",
+			keys: []bucketKey{
+				{channelID: 10, apiKeyIndex: 1, modelName: "c-model", group: "c-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 2, modelName: "b-model", group: "b-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 3, modelName: "a-model", group: "a-group", bucketTs: bucketTs},
+			},
+			want: []visibleBucketKey{
+				{ChannelID: 10, APIKeyIndex: 2, ModelName: "b-model", Group: "b-group", BucketTs: bucketTs},
+				{ChannelID: 10, APIKeyIndex: 3, ModelName: "a-model", Group: "a-group", BucketTs: bucketTs},
+			},
 		},
 		{
-			name:    "model",
-			earlier: bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "a-model", group: "z-group", bucketTs: bucketTs},
-			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "a-group", bucketTs: bucketTs},
+			name: "model",
+			keys: []bucketKey{
+				{channelID: 10, apiKeyIndex: 5, modelName: "a-model", group: "c-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 5, modelName: "b-model", group: "b-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 5, modelName: "c-model", group: "a-group", bucketTs: bucketTs},
+			},
+			want: []visibleBucketKey{
+				{ChannelID: 10, APIKeyIndex: 5, ModelName: "b-model", Group: "b-group", BucketTs: bucketTs},
+				{ChannelID: 10, APIKeyIndex: 5, ModelName: "c-model", Group: "a-group", BucketTs: bucketTs},
+			},
 		},
 		{
-			name:    "group",
-			earlier: bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "a-group", bucketTs: bucketTs},
-			later:   bucketKey{channelID: 2, apiKeyIndex: 2, modelName: "b-model", group: "b-group", bucketTs: bucketTs},
+			name: "group",
+			keys: []bucketKey{
+				{channelID: 10, apiKeyIndex: 5, modelName: "same-model", group: "a-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 5, modelName: "same-model", group: "b-group", bucketTs: bucketTs},
+				{channelID: 10, apiKeyIndex: 5, modelName: "same-model", group: "c-group", bucketTs: bucketTs},
+			},
+			want: []visibleBucketKey{
+				{ChannelID: 10, APIKeyIndex: 5, ModelName: "same-model", Group: "b-group", BucketTs: bucketTs},
+				{ChannelID: 10, APIKeyIndex: 5, ModelName: "same-model", Group: "c-group", BucketTs: bucketTs},
+			},
 		},
 	}
-	// Verify every tie-break dimension directly so the regression does not
-	// depend on sync.Map.Range iteration order.
-	for _, tieBreak := range tieBreaks {
-		assert.True(t, bucketKeyLess(tieBreak.earlier, tieBreak.later), "%s must break equal timestamps", tieBreak.name)
-	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			enableRoutingMetricsForTest(t)
+			maintenanceMu.Lock()
+			limits = Limits{MaxBuckets: 2, BucketTTL: time.Hour, MaxInflightKeys: 2}
+			maintenanceMu.Unlock()
 
-	keys := []bucketKey{
-		{channelID: 1, apiKeyIndex: 9, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
-		{channelID: 2, apiKeyIndex: 1, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
-		{channelID: 2, apiKeyIndex: 2, modelName: "z-model", group: "z-group", bucketTs: bucketTs},
-	}
-	for _, key := range keys {
-		recordBucket(key, 1, 0, false, 1, nil)
-	}
+			for _, key := range test.keys {
+				recordBucket(key, 1, 0, false, 1, nil)
+			}
 
-	snapshots := Snapshots()
-	require.Len(t, snapshots, 2)
-	retained := make([]bucketKey, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		retained = append(retained, bucketKey{
-			channelID:   snapshot.ChannelID,
-			apiKeyIndex: snapshot.APIKeyIndex,
-			modelName:   snapshot.ModelName,
-			group:       snapshot.Group,
-			bucketTs:    snapshot.BucketTs,
+			snapshots := Snapshots()
+			require.Len(t, snapshots, 2)
+			retained := make([]visibleBucketKey, 0, len(snapshots))
+			for _, snapshot := range snapshots {
+				retained = append(retained, visibleBucketKey{
+					ChannelID:   snapshot.ChannelID,
+					APIKeyIndex: snapshot.APIKeyIndex,
+					ModelName:   snapshot.ModelName,
+					Group:       snapshot.Group,
+					BucketTs:    snapshot.BucketTs,
+				})
+			}
+			assert.Equal(t, test.want, retained)
+			assert.Equal(t, Stats{Buckets: 2, BucketEvictions: 1}, RuntimeStats())
 		})
 	}
-	assert.Equal(t, keys[1:], retained)
-	assert.Equal(t, Stats{Buckets: 2, BucketEvictions: 1}, RuntimeStats())
 }
 
 func TestRoutingMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
