@@ -784,12 +784,12 @@ func TestRoutingSub2APIRedisUnlockUsesIndependentBoundedContext(t *testing.T) {
 	case canceledAtStart := <-evalStarted:
 		assert.False(t, canceledAtStart)
 	case <-time.After(time.Second):
-		t.Fatal("Redis unlock did not execute EVAL")
+		require.FailNow(t, "Redis unlock did not execute EVAL")
 	}
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Redis unlock did not stop at its context deadline")
+		require.FailNow(t, "Redis unlock did not stop at its context deadline")
 	}
 }
 
@@ -955,19 +955,19 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 	select {
 	case <-secondLoginStarted:
 	case <-time.After(5 * time.Second):
-		t.Fatal("reset login joined the retired singleflight group")
+		require.FailNow(t, "reset login joined the retired singleflight group")
 	}
 	var current loginResult
 	select {
 	case current = <-currentResult:
 	case <-time.After(5 * time.Second):
-		t.Fatal("reset login did not finish while the retired login was blocked")
+		require.FailNow(t, "reset login did not finish while the retired login was blocked")
 	}
 	require.NoError(t, current.err)
 	assert.Equal(t, "current-jwt", current.token)
 	select {
 	case result := <-retiredResult:
-		t.Fatalf("retired login finished before release: token=%q err=%v", result.token, result.err)
+		require.FailNowf(t, "retired login finished before release", "token=%q err=%v", result.token, result.err)
 	default:
 	}
 
@@ -976,7 +976,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 	select {
 	case retired = <-retiredResult:
 	case <-time.After(5 * time.Second):
-		t.Fatal("retired login did not finish after release")
+		require.FailNow(t, "retired login did not finish after release")
 	}
 	require.NoError(t, retired.err)
 	assert.Equal(t, "retired-jwt", retired.token)
