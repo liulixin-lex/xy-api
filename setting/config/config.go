@@ -38,9 +38,10 @@ func (cm *ConfigManager) Get(name string) interface{} {
 	return cm.configs[name]
 }
 
-// Snapshot shallow-copies a registered configuration value while holding the
+// Snapshot copies only the top-level registered value while holding the
 // manager's read lock. The registered value and destination must both be
-// non-nil pointers, and their element types must match exactly.
+// non-nil pointers, and their element types must match exactly. Reference
+// fields must be immutable/copy-on-write or updated through UpdateFromMap.
 func (cm *ConfigManager) Snapshot(name string, destination any) bool {
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
@@ -65,9 +66,10 @@ func (cm *ConfigManager) Snapshot(name string, destination any) bool {
 	return true
 }
 
-// Replace updates a registered non-nil pointer while holding the manager's
-// write lock. The replacement may be either the concrete value or a non-nil
-// pointer to that exact type.
+// Replace assigns only the top-level value of a registered non-nil pointer
+// while holding the manager's write lock. The replacement may be either the
+// concrete value or a non-nil pointer to that exact type. Reference fields
+// must be immutable/copy-on-write or updated through UpdateFromMap.
 func (cm *ConfigManager) Replace(name string, replacement any) bool {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
@@ -94,6 +96,23 @@ func (cm *ConfigManager) Replace(name string, replacement any) bool {
 	}
 	registeredValue.Set(source.Elem())
 	return true
+}
+
+// UpdateFromMap updates a registered configuration while holding the
+// manager's write lock for the complete lookup and mutation.
+func (cm *ConfigManager) UpdateFromMap(name string, values map[string]string) (bool, error) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false, nil
+	}
+	target := reflect.ValueOf(registered)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false, nil
+	}
+	return true, updateConfigFromMap(registered, values)
 }
 
 // LoadFromDB 从数据库加载配置
@@ -335,7 +354,7 @@ func ConfigToMap(config interface{}) (map[string]string, error) {
 	return configToMap(config)
 }
 
-// UpdateConfigFromMap 从map更新配置对象（导出函数）
+// UpdateConfigFromMap 从map更新配置对象（导出函数）。调用方负责同步；已注册配置应使用 ConfigManager.UpdateFromMap。
 func UpdateConfigFromMap(config interface{}, configMap map[string]string) error {
 	return updateConfigFromMap(config, configMap)
 }
