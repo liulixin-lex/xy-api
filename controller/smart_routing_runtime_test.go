@@ -210,6 +210,77 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 	assert.Equal(t, fresh.BucketTs, remaining[0].BucketTs)
 }
 
+func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+	})
+
+	const (
+		channelID = 906
+		bucketTs  = 120
+	)
+	key := routinghotcache.Key{
+		ChannelID:   channelID,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "default",
+	}
+	firstDelta := model.RoutingChannelMetric{
+		ChannelID:               channelID,
+		APIKeyIndex:             model.RoutingMetricSingleKeyIndex,
+		ModelName:               key.Model,
+		Group:                   key.Group,
+		BucketTs:                bucketTs,
+		RequestCount:            10,
+		SuccessCount:            1,
+		ReliabilityRequestCount: 10,
+		ReliabilityFailureCount: 9,
+	}
+	secondDelta := model.RoutingChannelMetric{
+		ChannelID:               channelID,
+		APIKeyIndex:             model.RoutingMetricSingleKeyIndex,
+		ModelName:               key.Model,
+		Group:                   key.Group,
+		BucketTs:                bucketTs,
+		RequestCount:            10,
+		SuccessCount:            10,
+		ReliabilityRequestCount: 10,
+	}
+	setting := smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60}
+
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{firstDelta})
+	_, err := flushRoutingRuntimeState(setting)
+	require.NoError(t, err)
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{secondDelta})
+	_, err = flushRoutingRuntimeState(setting)
+	require.NoError(t, err)
+
+	var persisted model.RoutingChannelMetric
+	require.NoError(t, db.Where(&model.RoutingChannelMetric{
+		ChannelID:   channelID,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		ModelName:   key.Model,
+		Group:       key.Group,
+		BucketTs:    bucketTs,
+	}).First(&persisted).Error)
+	assert.Equal(t, int64(20), persisted.RequestCount)
+	assert.Equal(t, int64(11), persisted.SuccessCount)
+	assert.Equal(t, int64(20), persisted.ReliabilityRequestCount)
+	assert.Equal(t, int64(9), persisted.ReliabilityFailureCount)
+
+	cached, ok := routinghotcache.GetMetric(key)
+	require.True(t, ok)
+	assert.Equal(t, persisted.RequestCount, cached.RequestCount)
+	assert.Equal(t, persisted.SuccessCount, cached.SuccessCount)
+	assert.Equal(t, persisted.ReliabilityRequestCount, cached.ReliabilityRequestCount)
+	assert.Equal(t, persisted.ReliabilityFailureCount, cached.ReliabilityFailureCount)
+}
+
 func TestFlushRoutingRuntimeStateSkipsRetentionWithinThrottleWindow(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))

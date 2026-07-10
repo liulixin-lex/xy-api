@@ -348,14 +348,6 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
 		}
-		latencyMs := float64(snapshot.LatencyP95Ms)
-		if latencyMs <= 0 {
-			latencyMs = float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
-		}
-		ttftMs := float64(snapshot.TtftP95Ms)
-		if ttftMs <= 0 && snapshot.TtftCount > 0 {
-			ttftMs = float64(snapshot.TtftSumMs) / float64(snapshot.TtftCount)
-		}
 		key := Key{
 			ChannelID:   snapshot.ChannelID,
 			APIKeyIndex: snapshot.APIKeyIndex,
@@ -370,18 +362,72 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 				continue
 			}
 		}
-		cache.metrics[key] = MetricSnapshot{
-			RequestCount:            snapshot.RequestCount,
-			SuccessCount:            snapshot.SuccessCount,
-			ReliabilityRequestCount: snapshot.ReliabilityRequestCount,
-			ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
-			P95LatencyMs:            latencyMs,
-			P95TTFTMs:               ttftMs,
-			TPS:                     float64(snapshot.RequestCount) / float64(bucketSeconds),
-			UpdatedUnix:             snapshot.BucketTs,
-		}
+		cache.metrics[key] = metricSnapshotFromModel(snapshot, bucketSeconds)
 	}
 	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
+}
+
+func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, bucketSeconds int) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 60
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	for _, delta := range deltas {
+		if delta.ChannelID <= 0 || delta.ModelName == "" || delta.Group == "" || delta.RequestCount <= 0 {
+			continue
+		}
+		key := Key{
+			ChannelID:   delta.ChannelID,
+			APIKeyIndex: delta.APIKeyIndex,
+			Model:       delta.ModelName,
+			Group:       delta.Group,
+		}
+		incoming := metricSnapshotFromModel(delta, bucketSeconds)
+		existing, ok := cache.metrics[key]
+		if !ok || existing.UpdatedUnix < delta.BucketTs {
+			cache.metrics[key] = incoming
+			continue
+		}
+		if existing.UpdatedUnix > delta.BucketTs {
+			continue
+		}
+		existing.RequestCount += delta.RequestCount
+		existing.SuccessCount += delta.SuccessCount
+		existing.ReliabilityRequestCount += delta.ReliabilityRequestCount
+		existing.ReliabilityFailureCount += delta.ReliabilityFailureCount
+		if incoming.P95LatencyMs > existing.P95LatencyMs {
+			existing.P95LatencyMs = incoming.P95LatencyMs
+		}
+		if incoming.P95TTFTMs > existing.P95TTFTMs {
+			existing.P95TTFTMs = incoming.P95TTFTMs
+		}
+		existing.TPS = float64(existing.RequestCount) / float64(bucketSeconds)
+		cache.metrics[key] = existing
+	}
+	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
+}
+
+func metricSnapshotFromModel(snapshot model.RoutingChannelMetric, bucketSeconds int) MetricSnapshot {
+	latencyMs := float64(snapshot.LatencyP95Ms)
+	if latencyMs <= 0 {
+		latencyMs = float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
+	}
+	ttftMs := float64(snapshot.TtftP95Ms)
+	if ttftMs <= 0 && snapshot.TtftCount > 0 {
+		ttftMs = float64(snapshot.TtftSumMs) / float64(snapshot.TtftCount)
+	}
+	return MetricSnapshot{
+		RequestCount:            snapshot.RequestCount,
+		SuccessCount:            snapshot.SuccessCount,
+		ReliabilityRequestCount: snapshot.ReliabilityRequestCount,
+		ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
+		P95LatencyMs:            latencyMs,
+		P95TTFTMs:               ttftMs,
+		TPS:                     float64(snapshot.RequestCount) / float64(bucketSeconds),
+		UpdatedUnix:             snapshot.BucketTs,
+	}
 }
 
 func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {

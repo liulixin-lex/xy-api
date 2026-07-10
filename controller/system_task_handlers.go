@@ -23,7 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
-var smartRoutingFlushMu sync.Mutex
+var smartRoutingRuntimeStateMu sync.Mutex
 var smartRoutingRetentionLast atomic.Int64
 var smartRoutingBreakerConfigMu sync.Mutex
 var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
@@ -352,8 +352,8 @@ type routingPricingItem struct {
 }
 
 func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
-	smartRoutingFlushMu.Lock()
-	defer smartRoutingFlushMu.Unlock()
+	smartRoutingRuntimeStateMu.Lock()
+	defer smartRoutingRuntimeStateMu.Unlock()
 
 	summary := map[string]any{
 		"metrics":  0,
@@ -363,11 +363,12 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 	for i := range drainedMetrics {
 		metric := drainedMetrics[i]
 		if err := model.UpsertRoutingChannelMetric(&metric); err != nil {
+			routinghotcache.ApplyMetricDeltas(drainedMetrics[:i], setting.MetricBucketSec)
 			routingmetrics.RequeueSnapshots(drainedMetrics[i:])
 			return summary, err
 		}
 	}
-	routinghotcache.LoadMetricSnapshots(drainedMetrics, setting.MetricBucketSec)
+	routinghotcache.ApplyMetricDeltas(drainedMetrics, setting.MetricBucketSec)
 	summary["metrics"] = len(drainedMetrics)
 
 	dirtyBreakers := routingbreaker.DirtySnapshots()
@@ -402,6 +403,9 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 }
 
 func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
+	smartRoutingRuntimeStateMu.Lock()
+	defer smartRoutingRuntimeStateMu.Unlock()
+
 	summary := map[string]any{
 		"costs":    0,
 		"metrics":  0,
