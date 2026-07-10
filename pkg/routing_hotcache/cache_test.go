@@ -314,6 +314,27 @@ func TestHotcacheLoadSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestLoadMetricSnapshotsCountsOnlyFinalBatchEviction(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	cache.Lock()
+	cache.limits = Limits{MaxMetrics: 1, MaxCosts: 1, MaxBreakers: 1, MaxHealth: 1}
+	cache.Unlock()
+
+	SetMetricForTest(Key{ChannelID: 501, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "retained", Group: "default"}, MetricSnapshot{UpdatedUnix: 100})
+	LoadMetricSnapshots([]model.RoutingChannelMetric{
+		{ChannelID: 502, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "batch", Group: "default", BucketTs: 10, RequestCount: 1},
+		{ChannelID: 502, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "batch", Group: "default", BucketTs: 20, RequestCount: 1},
+		{ChannelID: 502, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "batch", Group: "default", BucketTs: 30, RequestCount: 1},
+	}, 60)
+
+	assert.Equal(t, Stats{Metrics: 1, Evictions: 1}, RuntimeStats())
+	_, ok := GetMetric(Key{ChannelID: 501, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "retained", Group: "default"})
+	assert.True(t, ok)
+	_, ok = GetMetric(Key{ChannelID: 502, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "batch", Group: "default"})
+	assert.False(t, ok)
+}
+
 func TestHotcacheResetRestoresDefaultLimitsAndEvictionStats(t *testing.T) {
 	ResetForTest()
 	cache.Lock()

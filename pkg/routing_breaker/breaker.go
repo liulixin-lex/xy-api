@@ -70,6 +70,10 @@ type Breaker struct {
 	states    map[Key]*entry
 	dirty     map[Key]struct{}
 	evictions int64
+	// Callbacks run while mu is held so default-breaker publication and
+	// eviction stay linearized. They must not call back into Breaker.
+	onRetained func(Snapshot)
+	onEvict    func(Key)
 }
 
 type entry struct {
@@ -77,17 +81,21 @@ type entry struct {
 	window   []bool
 }
 
-var defaultBreaker = New(DefaultConfig())
+type mutationResult struct {
+	snapshot Snapshot
+	retained bool
+}
+
+var defaultBreaker = newDefaultBreaker(DefaultConfig())
 
 func RecordAttempt(key Key, success bool, statusCode int, retryAfter time.Duration) Snapshot {
-	var snapshot Snapshot
+	var result mutationResult
 	if success {
-		snapshot = defaultBreaker.OnSuccess(key)
+		result = defaultBreaker.onSuccess(key)
 	} else {
-		snapshot = defaultBreaker.OnFailure(key, statusCode, retryAfter)
+		result = defaultBreaker.onFailure(key, statusCode, retryAfter)
 	}
-	publishSnapshot(snapshot)
-	return snapshot
+	return result.snapshot
 }
 
 func ConfigureDefault(config Config) {
@@ -95,22 +103,21 @@ func ConfigureDefault(config Config) {
 }
 
 func HydrateDefaultSnapshots(snapshots []Snapshot) {
-	accepted := defaultBreaker.Hydrate(snapshots)
-	for _, snapshot := range accepted {
-		publishSnapshot(defaultBreaker.GetSnapshot(snapshot.Key))
-	}
+	defaultBreaker.Hydrate(snapshots)
 }
 
 func AcquireDefaultHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) {
-	snapshot, ok := defaultBreaker.AcquireHalfOpenProbe(key, maxProbes)
-	publishSnapshot(snapshot)
-	return snapshot, ok
+	result, ok := defaultBreaker.acquireHalfOpenProbe(key, maxProbes)
+	return result.snapshot, ok
 }
 
 func ReleaseDefaultHalfOpenProbe(key Key) Snapshot {
-	snapshot := defaultBreaker.ReleaseHalfOpenProbe(key)
-	publishSnapshot(snapshot)
-	return snapshot
+	result := defaultBreaker.releaseHalfOpenProbe(key)
+	return result.snapshot
+}
+
+func RuntimeStats() Stats {
+	return defaultBreaker.Stats()
 }
 
 func DirtySnapshots() []Snapshot {
@@ -122,19 +129,13 @@ func RequeueDirtySnapshots(snapshots []Snapshot) {
 }
 
 func ResetDefaultKey(key Key) Snapshot {
-	snapshot := defaultBreaker.Reset(key)
-	publishSnapshot(snapshot)
-	return snapshot
+	result := defaultBreaker.reset(key)
+	return result.snapshot
 }
 
 func ClearDefaultKey(key Key) {
 	defaultBreaker.Clear(key)
-	routinghotcache.ClearBreaker(routinghotcache.Key{
-		ChannelID:   key.ChannelID,
-		APIKeyIndex: key.APIKeyIndex,
-		Model:       key.Model,
-		Group:       key.Group,
-	})
+	clearPublishedSnapshot(key)
 }
 
 func ClearDefaultChannel(channelID int) {
@@ -143,7 +144,7 @@ func ClearDefaultChannel(channelID int) {
 }
 
 func ResetDefaultForTest(config Config) {
-	defaultBreaker = New(config)
+	defaultBreaker = newDefaultBreaker(config)
 }
 
 func DefaultConfig() Config {
@@ -171,6 +172,13 @@ func New(config Config) *Breaker {
 	}
 }
 
+func newDefaultBreaker(config Config) *Breaker {
+	breaker := New(config)
+	breaker.onRetained = publishSnapshot
+	breaker.onEvict = clearPublishedSnapshot
+	return breaker
+}
+
 func (b *Breaker) Stats() Stats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -184,17 +192,20 @@ func (b *Breaker) Stats() Stats {
 }
 
 func (b *Breaker) OnSuccess(key Key) Snapshot {
+	return b.onSuccess(key).snapshot
+}
+
+func (b *Breaker) onSuccess(key Key) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := b.getOrCreate(key, now)
-	defer b.pruneLocked(now, 0)
+	record, created := b.getOrCreate(key, now)
 	b.advanceOpen(record, now)
 
 	switch record.snapshot.State {
 	case StateOpen:
-		return record.snapshot
+		return b.finishMutationLocked(record, created, now)
 	case StateHalfOpen:
 		record.resetWindow()
 		record.addOutcome(false, b.config.WindowSize)
@@ -218,16 +229,19 @@ func (b *Breaker) OnSuccess(key Key) Snapshot {
 
 	record.snapshot.UpdatedAt = now
 	b.markDirty(key)
-	return record.snapshot
+	return b.finishMutationLocked(record, created, now)
 }
 
 func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) Snapshot {
+	return b.onFailure(key, statusCode, retryAfter).snapshot
+}
+
+func (b *Breaker) onFailure(key Key, statusCode int, retryAfter time.Duration) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := b.getOrCreate(key, now)
-	defer b.pruneLocked(now, 0)
+	record, created := b.getOrCreate(key, now)
 	b.advanceOpen(record, now)
 
 	if record.snapshot.State == StateOpen {
@@ -242,7 +256,7 @@ func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) S
 				b.markDirty(key)
 			}
 		}
-		return record.snapshot
+		return b.finishMutationLocked(record, created, now)
 	}
 
 	failedHalfOpen := record.snapshot.State == StateHalfOpen
@@ -259,7 +273,7 @@ func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) S
 		record.snapshot.Consecutive5xx >= b.config.Consecutive5xxThreshold ||
 		b.exceedsFailureRate(record) {
 		b.open(record, now, retryAfter, b.failureReason(record, statusCode, failedHalfOpen))
-		return record.snapshot
+		return b.finishMutationLocked(record, created, now)
 	}
 
 	record.snapshot.State = b.closedState(record)
@@ -270,7 +284,7 @@ func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) S
 	}
 	record.snapshot.UpdatedAt = now
 	b.markDirty(key)
-	return record.snapshot
+	return b.finishMutationLocked(record, created, now)
 }
 
 func (b *Breaker) GetSnapshot(key Key) Snapshot {
@@ -293,12 +307,15 @@ func (b *Breaker) GetSnapshot(key Key) Snapshot {
 }
 
 func (b *Breaker) Reset(key Key) Snapshot {
+	return b.reset(key).snapshot
+}
+
+func (b *Breaker) reset(key Key) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := b.getOrCreate(key, now)
-	defer b.pruneLocked(now, 0)
+	record, created := b.getOrCreate(key, now)
 	record.snapshot = Snapshot{
 		Key:       key,
 		State:     StateHealthy,
@@ -307,7 +324,7 @@ func (b *Breaker) Reset(key Key) Snapshot {
 	}
 	record.window = nil
 	b.markDirty(key)
-	return record.snapshot
+	return b.finishMutationLocked(record, created, now)
 }
 
 func (b *Breaker) Clear(key Key) {
@@ -338,43 +355,50 @@ func (b *Breaker) ClearChannel(channelID int) {
 }
 
 func (b *Breaker) AcquireHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) {
+	result, ok := b.acquireHalfOpenProbe(key, maxProbes)
+	return result.snapshot, ok
+}
+
+func (b *Breaker) acquireHalfOpenProbe(key Key, maxProbes int) (mutationResult, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := b.getOrCreate(key, now)
-	defer b.pruneLocked(now, 0)
+	record, created := b.getOrCreate(key, now)
 	if b.advanceOpen(record, now) {
 		b.markDirty(key)
 	}
 	if record.snapshot.State != StateHalfOpen {
-		return record.snapshot, true
+		return b.finishMutationLocked(record, created, now), true
 	}
 	if maxProbes <= 0 {
 		maxProbes = 1
 	}
 	if record.snapshot.HalfOpenInflight >= maxProbes {
-		return record.snapshot, false
+		return b.finishMutationLocked(record, created, now), false
 	}
 	record.snapshot.HalfOpenInflight++
 	record.snapshot.UpdatedAt = now
 	b.markDirty(key)
-	return record.snapshot, true
+	return b.finishMutationLocked(record, created, now), true
 }
 
 func (b *Breaker) ReleaseHalfOpenProbe(key Key) Snapshot {
+	return b.releaseHalfOpenProbe(key).snapshot
+}
+
+func (b *Breaker) releaseHalfOpenProbe(key Key) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
-	record := b.getOrCreate(key, now)
-	defer b.pruneLocked(now, 0)
+	record, created := b.getOrCreate(key, now)
 	if record.snapshot.State == StateHalfOpen && record.snapshot.HalfOpenInflight > 0 {
 		record.snapshot.HalfOpenInflight--
 		record.snapshot.UpdatedAt = now
 		b.markDirty(key)
 	}
-	return record.snapshot
+	return b.finishMutationLocked(record, created, now)
 }
 
 func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
@@ -407,17 +431,18 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 			snapshot: snapshot,
 			window:   reconstructWindow(snapshot.WindowRequests, snapshot.WindowFailures),
 		}
-		b.pruneLocked(now, 0)
-		if record, ok := b.states[snapshot.Key]; ok && record.snapshot.UpdatedAt.Equal(snapshot.UpdatedAt) {
-			accepted = append(accepted, record.snapshot)
-		}
+		accepted = append(accepted, snapshot)
 	}
+	b.pruneLocked(now, 0)
 
 	retained := accepted[:0]
 	for _, snapshot := range accepted {
 		record, ok := b.states[snapshot.Key]
 		if ok && record.snapshot.UpdatedAt.Equal(snapshot.UpdatedAt) {
 			retained = append(retained, record.snapshot)
+			if b.onRetained != nil {
+				b.onRetained(record.snapshot)
+			}
 		}
 	}
 	return retained
@@ -519,15 +544,14 @@ func normalizeConfig(config Config) Config {
 	return config
 }
 
-func (b *Breaker) getOrCreate(key Key, now time.Time) *entry {
+func (b *Breaker) getOrCreate(key Key, now time.Time) (*entry, bool) {
 	record, ok := b.states[key]
 	if ok && !record.snapshot.UpdatedAt.Before(now.Add(-b.config.EntryTTL)) {
-		return record
+		return record, false
 	}
 	if ok {
 		b.evictLocked(key)
 	}
-	b.pruneLocked(now, 0)
 	record = &entry{
 		snapshot: Snapshot{
 			Key:       key,
@@ -536,7 +560,22 @@ func (b *Breaker) getOrCreate(key Key, now time.Time) *entry {
 		},
 	}
 	b.states[key] = record
-	return record
+	return record, true
+}
+
+func (b *Breaker) finishMutationLocked(record *entry, created bool, now time.Time) mutationResult {
+	if created {
+		b.pruneLocked(now, 0)
+	}
+	retained, ok := b.states[record.snapshot.Key]
+	result := mutationResult{
+		snapshot: record.snapshot,
+		retained: ok && retained == record,
+	}
+	if result.retained && b.onRetained != nil {
+		b.onRetained(result.snapshot)
+	}
+	return result
 }
 
 func (b *Breaker) pruneLocked(now time.Time, reserve int) {
@@ -557,27 +596,46 @@ func (b *Breaker) pruneLocked(now time.Time, reserve int) {
 	if len(b.states) <= limit {
 		return
 	}
+	overflow := len(b.states) - limit
+	if overflow == 1 {
+		var victim Key
+		found := false
+		for key := range b.states {
+			if !found || b.lessEvictionCandidate(key, victim) {
+				victim = key
+				found = true
+			}
+		}
+		if found {
+			b.evictLocked(victim)
+		}
+		return
+	}
 
 	keys := make([]Key, 0, len(b.states))
 	for key := range b.states {
 		keys = append(keys, key)
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		left := b.states[keys[i]].snapshot
-		right := b.states[keys[j]].snapshot
-		leftPriority := evictionPriority(left.State)
-		rightPriority := evictionPriority(right.State)
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
-		}
-		if !left.UpdatedAt.Equal(right.UpdatedAt) {
-			return left.UpdatedAt.Before(right.UpdatedAt)
-		}
-		return lessKey(keys[i], keys[j])
+		return b.lessEvictionCandidate(keys[i], keys[j])
 	})
-	for _, key := range keys[:len(b.states)-limit] {
+	for _, key := range keys[:overflow] {
 		b.evictLocked(key)
 	}
+}
+
+func (b *Breaker) lessEvictionCandidate(leftKey Key, rightKey Key) bool {
+	left := b.states[leftKey].snapshot
+	right := b.states[rightKey].snapshot
+	leftPriority := evictionPriority(left.State)
+	rightPriority := evictionPriority(right.State)
+	if leftPriority != rightPriority {
+		return leftPriority < rightPriority
+	}
+	if !left.UpdatedAt.Equal(right.UpdatedAt) {
+		return left.UpdatedAt.Before(right.UpdatedAt)
+	}
+	return lessKey(leftKey, rightKey)
 }
 
 func (b *Breaker) evictLocked(key Key) {
@@ -585,11 +643,14 @@ func (b *Breaker) evictLocked(key Key) {
 		return
 	}
 	// At extreme key cardinality, the hard memory boundary takes precedence
-	// over persisting every dirty transition. The independently bounded hot
-	// cache keeps the most recently published snapshot until its own eviction.
+	// over persisting every dirty transition. The default breaker removes the
+	// corresponding published snapshot through onEvict before releasing mu.
 	delete(b.states, key)
 	delete(b.dirty, key)
 	b.evictions++
+	if b.onEvict != nil {
+		b.onEvict(key)
+	}
 }
 
 func evictionPriority(state State) int {
@@ -745,6 +806,15 @@ func publishSnapshot(snapshot Snapshot) {
 		CooldownUntilUnix: unixOrZero(snapshot.CooldownUntil),
 		HalfOpenInflight:  int64(snapshot.HalfOpenInflight),
 		UpdatedUnix:       snapshot.UpdatedAt.Unix(),
+	})
+}
+
+func clearPublishedSnapshot(key Key) {
+	routinghotcache.ClearBreaker(routinghotcache.Key{
+		ChannelID:   key.ChannelID,
+		APIKeyIndex: key.APIKeyIndex,
+		Model:       key.Model,
+		Group:       key.Group,
 	})
 }
 

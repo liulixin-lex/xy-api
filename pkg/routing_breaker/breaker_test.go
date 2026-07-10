@@ -175,6 +175,141 @@ func TestBreakerAdmissionPreservesCriticalStatesOverNewHealthyEntries(t *testing
 	}
 }
 
+func TestDefaultBreakerDoesNotPublishRejectedHealthyAdmission(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.MaxEntries = 2
+	config.Now = func() time.Time { return now }
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	openKey := Key{ChannelID: 40, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"}
+	halfOpenKey := Key{ChannelID: 41, APIKeyIndex: SingleAPIKeyIndex, Model: "half-open", Group: "default"}
+	newKey := Key{ChannelID: 42, APIKeyIndex: SingleAPIKeyIndex, Model: "healthy", Group: "default"}
+	HydrateDefaultSnapshots([]Snapshot{
+		{Key: openKey, State: StateOpen, CooldownUntil: now.Add(time.Hour), UpdatedAt: now.Add(-2 * time.Second)},
+		{Key: halfOpenKey, State: StateHalfOpen, UpdatedAt: now.Add(-time.Second)},
+	})
+
+	openCached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 40, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateOpen), openCached.State)
+	halfOpenCached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 41, APIKeyIndex: SingleAPIKeyIndex, Model: "half-open", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateHalfOpen), halfOpenCached.State)
+
+	snapshot := RecordAttempt(newKey, true, 0, 0)
+
+	assert.Equal(t, StateHealthy, snapshot.State)
+	assert.Equal(t, Stats{Entries: 2, Evictions: 1}, RuntimeStats())
+	assert.Empty(t, DirtySnapshots())
+	_, ok = routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 42, APIKeyIndex: SingleAPIKeyIndex, Model: "healthy", Group: "default"})
+	assert.False(t, ok)
+	openCached, ok = routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 40, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateOpen), openCached.State)
+	halfOpenCached, ok = routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 41, APIKeyIndex: SingleAPIKeyIndex, Model: "half-open", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateHalfOpen), halfOpenCached.State)
+}
+
+func TestDefaultBreakerEvictionRemovesPublishedSnapshot(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.MaxEntries = 2
+	config.Now = func() time.Time { return now }
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	oldestKey := Key{ChannelID: 43, APIKeyIndex: SingleAPIKeyIndex, Model: "oldest", Group: "default"}
+	newerKey := Key{ChannelID: 44, APIKeyIndex: SingleAPIKeyIndex, Model: "newer", Group: "default"}
+	openKey := Key{ChannelID: 45, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"}
+	HydrateDefaultSnapshots([]Snapshot{
+		{Key: oldestKey, State: StateHealthy, UpdatedAt: now.Add(-2 * time.Second)},
+		{Key: newerKey, State: StateHealthy, UpdatedAt: now.Add(-time.Second)},
+	})
+	require.Equal(t, Stats{Entries: 2}, RuntimeStats())
+
+	opened := RecordAttempt(openKey, false, 429, 0)
+
+	require.Equal(t, StateOpen, opened.State)
+	assert.Equal(t, Stats{Entries: 2, Dirty: 1, Evictions: 1}, RuntimeStats())
+	_, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 43, APIKeyIndex: SingleAPIKeyIndex, Model: "oldest", Group: "default"})
+	assert.False(t, ok)
+	_, ok = routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 44, APIKeyIndex: SingleAPIKeyIndex, Model: "newer", Group: "default"})
+	assert.True(t, ok)
+	_, ok = routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 45, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"})
+	assert.True(t, ok)
+}
+
+func TestDefaultBreakerSerializesPublicationWithConcurrentEviction(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.MaxEntries = 1
+	config.Now = func() time.Time { return now }
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	firstKey := Key{ChannelID: 46, APIKeyIndex: SingleAPIKeyIndex, Model: "first", Group: "default"}
+	secondKey := Key{ChannelID: 47, APIKeyIndex: SingleAPIKeyIndex, Model: "second", Group: "default"}
+	publishStarted := make(chan struct{})
+	allowPublish := make(chan struct{})
+	defaultBreaker.onRetained = func(snapshot Snapshot) {
+		if snapshot.Key == firstKey {
+			close(publishStarted)
+			<-allowPublish
+		}
+		publishSnapshot(snapshot)
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		RecordAttempt(firstKey, true, 0, 0)
+		close(firstDone)
+	}()
+	<-publishStarted
+
+	mutationLockWasAvailable := defaultBreaker.mu.TryLock()
+	if mutationLockWasAvailable {
+		defaultBreaker.mu.Unlock()
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		RecordAttempt(secondKey, false, 429, 0)
+		close(secondDone)
+	}()
+	<-secondStarted
+	close(allowPublish)
+	<-firstDone
+	<-secondDone
+
+	assert.False(t, mutationLockWasAvailable)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1, Evictions: 1}, RuntimeStats())
+	_, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 46, APIKeyIndex: SingleAPIKeyIndex, Model: "first", Group: "default"})
+	assert.False(t, ok)
+	secondCached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 47, APIKeyIndex: SingleAPIKeyIndex, Model: "second", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateOpen), secondCached.State)
+}
+
 func TestBreakerCapacityEvictionUsesStableKeyOrder(t *testing.T) {
 	tests := []struct {
 		name string

@@ -2,6 +2,7 @@ package routinghotcache
 
 import (
 	"math"
+	"sort"
 	"sync"
 
 	"github.com/QuantumNous/new-api/model"
@@ -309,7 +310,6 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" {
 			continue
@@ -331,8 +331,8 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 			BillingMode:     snapshot.BillingMode,
 			UpdatedUnix:     snapshot.SnapshotTS,
 		}
-		cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 	}
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 }
 
 func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds int) {
@@ -342,7 +342,6 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" || snapshot.RequestCount <= 0 {
 			continue
@@ -377,15 +376,14 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 			TPS:          float64(snapshot.RequestCount) / float64(bucketSeconds),
 			UpdatedUnix:  snapshot.BucketTs,
 		}
-		cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 	}
+	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 }
 
 func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" || snapshot.Group == "" {
 			continue
@@ -406,16 +404,14 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 			HalfOpenInflight:  snapshot.HalfOpenInflight,
 			UpdatedUnix:       snapshot.UpdatedTime,
 		}
-		cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 	}
+	cache.evictions += int64(trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess))
 }
 
 func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix int64) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
-	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 {
 			continue
@@ -428,16 +424,16 @@ func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix in
 		} else {
 			delete(cache.authFailures, snapshot.ChannelID)
 		}
-		cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
 		if snapshot.BalanceKnown {
 			cache.balances[snapshot.ChannelID] = BalanceSnapshot{
 				Known:       true,
 				Balance:     snapshot.Balance,
 				UpdatedUnix: snapshot.BalanceUpdatedTime,
 			}
-			cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 		}
 	}
+	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
+	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 }
 
 func routingSnapshotCost(snapshot model.RoutingCostSnapshot) float64 {
@@ -480,8 +476,11 @@ func trimBoundedMap[K comparable, V any](entries map[K]V, limit int, updatedUnix
 	if limit < 0 {
 		limit = 0
 	}
-	deleted := 0
-	for len(entries) > limit {
+	overflow := len(entries) - limit
+	if overflow <= 0 {
+		return 0
+	}
+	if overflow == 1 {
 		var oldestKey K
 		var oldestUpdated int64
 		found := false
@@ -494,12 +493,28 @@ func trimBoundedMap[K comparable, V any](entries map[K]V, limit int, updatedUnix
 			}
 		}
 		if !found {
-			break
+			return 0
 		}
 		delete(entries, oldestKey)
-		deleted++
+		return 1
 	}
-	return deleted
+
+	keys := make([]K, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		leftUpdated := updatedUnix(entries[keys[i]])
+		rightUpdated := updatedUnix(entries[keys[j]])
+		if leftUpdated != rightUpdated {
+			return leftUpdated < rightUpdated
+		}
+		return less(keys[i], keys[j])
+	})
+	for _, key := range keys[:overflow] {
+		delete(entries, key)
+	}
+	return overflow
 }
 
 func metricUpdatedUnix(snapshot MetricSnapshot) int64 {
