@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -163,6 +164,75 @@ func TestSelectSmartChannelForGroupCapacityCooldownBlocksHalfOpenProbeAndRestore
 	require.NotNil(t, channel)
 	assert.Equal(t, 151, channel.Id)
 	ReleaseAllRoutingHalfOpenProbes(recoveredCtx)
+}
+
+func TestSelectSmartChannelForGroupRefreshesCapacityOnMemoizedRetry(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	for _, channel := range []model.Channel{
+		{Id: 152, Name: "first", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 153, Name: "cooling-retry", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+	} {
+		channel := channel
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	}
+	model.InitChannelCache()
+
+	firstKey := routinghotcache.Key{ChannelID: 152, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	retryKey := routinghotcache.Key{ChannelID: 153, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	routinghotcache.SetMetricForTest(firstKey, routinghotcache.MetricSnapshot{ReliabilityRequestCount: 100, ReliabilityFailureCount: 0})
+	routinghotcache.SetMetricForTest(retryKey, routinghotcache.MetricSnapshot{ReliabilityRequestCount: 100, ReliabilityFailureCount: 10})
+	routinghotcache.SetBreakerForTest(retryKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key:       routingbreaker.Key{ChannelID: 153, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
+		State:     routingbreaker.StateHalfOpen,
+		UpdatedAt: time.Now(),
+	}})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	param := &RetryParam{Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0)}
+	setting := smart_routing_setting.SmartRoutingSetting{
+		Enabled:            true,
+		Mode:               smart_routing_setting.ModeBalanced,
+		WeightAvailability: 1,
+		TopK:               1,
+		MinVolume:          10,
+		HalfOpenProbes:     1,
+		MaxEjectedPct:      100,
+		MaxSwitches:        5,
+	}
+
+	selected, err := selectSmartChannelForGroup(param, "default", setting, true)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, 152, selected.Id)
+	MarkRoutingTried(ctx, selected.Id)
+	routinghotcache.SetCapacityCooldownForTest(retryKey, routinghotcache.CapacityCooldownSnapshot{
+		SourceStatusCode:       http.StatusTooManyRequests,
+		CooldownUntilUnixMilli: time.Now().Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       time.Now().UnixMilli(),
+	})
+
+	selected, err = selectSmartChannelForGroup(param, "default", setting, true)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+	probes, ok := common.GetContextKeyType[map[routingbreaker.Key]struct{}](ctx, constant.ContextKeyRoutingHalfOpenProbes)
+	assert.False(t, ok)
+	assert.Empty(t, probes)
 }
 
 func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *testing.T) {

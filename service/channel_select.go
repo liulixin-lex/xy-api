@@ -470,7 +470,21 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 	if param.Ctx != nil {
 		if memo, ok := common.GetContextKeyType[smartRoutingCandidateMemo](param.Ctx, constant.ContextKeyRoutingCandidateMemo); ok {
 			if candidates, exists := memo[memoKey]; exists {
-				return candidates, nil
+				refreshed := append([]routingselector.Candidate(nil), candidates...)
+				for i := range refreshed {
+					refreshed[i].Capacity = nil
+					if refreshed[i].Channel == nil {
+						continue
+					}
+					cacheKey := routinghotcache.Key{
+						ChannelID:   refreshed[i].Channel.Id,
+						APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+						Model:       param.ModelName,
+						Group:       group,
+					}
+					refreshed[i].Capacity = routingCapacityForKey(cacheKey)
+				}
+				return refreshed, nil
 			}
 		}
 	}
@@ -501,13 +515,7 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				TPS:                     metric.TPS,
 			}
 		}
-		if capacity, ok := routinghotcache.GetCapacityCooldown(cacheKey); ok {
-			candidate.Capacity = &routingselector.CapacityCooldownSnapshot{
-				SourceStatusCode:       capacity.SourceStatusCode,
-				CooldownUntilUnixMilli: capacity.CooldownUntilUnixMilli,
-				UpdatedUnixMilli:       capacity.UpdatedUnixMilli,
-			}
-		}
+		candidate.Capacity = routingCapacityForKey(cacheKey)
 		inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
 			ChannelID:   channel.Id,
 			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
@@ -572,6 +580,18 @@ func routingCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot
 		Known:       known,
 		Cost:        cost,
 		UpdatedUnix: snapshot.UpdatedUnix,
+	}
+}
+
+func routingCapacityForKey(key routinghotcache.Key) *routingselector.CapacityCooldownSnapshot {
+	capacity, ok := routinghotcache.GetCapacityCooldown(key)
+	if !ok {
+		return nil
+	}
+	return &routingselector.CapacityCooldownSnapshot{
+		SourceStatusCode:       capacity.SourceStatusCode,
+		CooldownUntilUnixMilli: capacity.CooldownUntilUnixMilli,
+		UpdatedUnixMilli:       capacity.UpdatedUnixMilli,
 	}
 }
 
