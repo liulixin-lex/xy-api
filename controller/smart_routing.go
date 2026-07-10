@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -221,7 +222,7 @@ func DeleteSmartRoutingBinding(c *gin.Context) {
 		return
 	}
 	routingmetrics.ClearChannel(channelID)
-	routingbreaker.ClearDefaultChannel(channelID)
+	routingbreaker.ClearDefaultChannelWithCache(channelID, routinghotcache.ClearChannel)
 	common.ApiSuccess(c, nil)
 }
 

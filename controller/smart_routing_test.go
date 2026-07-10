@@ -280,7 +280,12 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	require.NoError(t, db.Create(&model.RoutingChannelHealthState{ChannelID: 66, AuthFailure: true, UpdatedTime: common.GetTimestamp()}).Error)
 	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen})
 	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"}, routinghotcache.CostSnapshot{Known: true, Cost: 1})
+	routinghotcache.SetMetricForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.MetricSnapshot{RequestCount: 1})
+	routinghotcache.SetAuthFailureForTest(66, routinghotcache.HealthMarker{Marked: true})
+	routinghotcache.SetBalanceForTest(66, routinghotcache.BalanceSnapshot{Known: true, Balance: 1})
 	routingbreaker.RecordAttempt(routingbreaker.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, false, http.StatusBadGateway, 0)
+	statsBeforeClear := routingbreaker.RuntimeStats()
+	require.Equal(t, routingbreaker.Stats{Entries: 1, Dirty: 1}, statsBeforeClear)
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
 		ChannelID:    66,
 		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
@@ -305,8 +310,18 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	}
 	_, breakerOK := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	_, costOK := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"})
+	_, metricOK := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
+	_, authOK := routinghotcache.GetAuthFailure(66)
+	_, balanceOK := routinghotcache.GetBalance(66)
 	assert.False(t, breakerOK)
 	assert.False(t, costOK)
+	assert.False(t, metricOK)
+	assert.False(t, authOK)
+	assert.False(t, balanceOK)
+	statsAfterClear := routingbreaker.RuntimeStats()
+	assert.Zero(t, statsAfterClear.Entries)
+	assert.Zero(t, statsAfterClear.Dirty)
+	assert.Equal(t, statsBeforeClear.Evictions, statsAfterClear.Evictions)
 	_, err := flushRoutingRuntimeState(smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	for _, table := range []any{&model.RoutingBreakerState{}, &model.RoutingChannelMetric{}} {

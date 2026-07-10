@@ -77,9 +77,19 @@ type routingSub2APIJWTCacheEntry struct {
 	ExpiresAt  int64
 }
 
+// RoutingSub2APIJWTCacheStats reports this process's local JWT cache only.
+// Redis-backed JWT cache activity is intentionally excluded.
+type RoutingSub2APIJWTCacheStats struct {
+	Entries     int
+	Expirations int64
+	Evictions   int64
+}
+
 var routingSub2APIJWTCache = struct {
 	sync.Mutex
-	values map[int]routingSub2APIJWTCacheEntry
+	values      map[int]routingSub2APIJWTCacheEntry
+	expirations int64
+	evictions   int64
 }{
 	values: map[int]routingSub2APIJWTCacheEntry{},
 }
@@ -675,11 +685,7 @@ func getRoutingSub2APICachedJWT(ctx context.Context, channelID int) (string, boo
 
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
-	for cachedChannelID, cachedEntry := range routingSub2APIJWTCache.values {
-		if cachedEntry.ExpiresAt <= now {
-			delete(routingSub2APIJWTCache.values, cachedChannelID)
-		}
-	}
+	deleteRoutingSub2APIJWTCacheExpiredLocked(now)
 	entry, ok := routingSub2APIJWTCache.values[channelID]
 	routingSub2APIJWTCache.Unlock()
 	if !ok {
@@ -714,11 +720,7 @@ func setRoutingSub2APICachedJWT(ctx context.Context, channelID int, token string
 }
 
 func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
-	for channelID, entry := range routingSub2APIJWTCache.values {
-		if entry.ExpiresAt <= now {
-			delete(routingSub2APIJWTCache.values, channelID)
-		}
-	}
+	deleteRoutingSub2APIJWTCacheExpiredLocked(now)
 	if maxEntries <= 0 {
 		maxEntries = routingSub2APIDefaultMaxJWTEntries
 	}
@@ -742,7 +744,32 @@ func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
 		return candidates[i].expiresAt < candidates[j].expiresAt
 	})
 	for _, entry := range candidates[:excess] {
+		if _, ok := routingSub2APIJWTCache.values[entry.channelID]; !ok {
+			continue
+		}
 		delete(routingSub2APIJWTCache.values, entry.channelID)
+		routingSub2APIJWTCache.evictions++
+	}
+}
+
+func deleteRoutingSub2APIJWTCacheExpiredLocked(now int64) {
+	for channelID, entry := range routingSub2APIJWTCache.values {
+		if entry.ExpiresAt <= now {
+			delete(routingSub2APIJWTCache.values, channelID)
+			routingSub2APIJWTCache.expirations++
+		}
+	}
+}
+
+// RoutingSub2APIJWTCacheRuntimeStats returns a read-only snapshot of the
+// current process's local JWT cache counters and entry count.
+func RoutingSub2APIJWTCacheRuntimeStats() RoutingSub2APIJWTCacheStats {
+	routingSub2APIJWTCache.Lock()
+	defer routingSub2APIJWTCache.Unlock()
+	return RoutingSub2APIJWTCacheStats{
+		Entries:     len(routingSub2APIJWTCache.values),
+		Expirations: routingSub2APIJWTCache.expirations,
+		Evictions:   routingSub2APIJWTCache.evictions,
 	}
 }
 
@@ -786,5 +813,7 @@ func resetRoutingSub2APITestState() {
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
 	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{}
+	routingSub2APIJWTCache.expirations = 0
+	routingSub2APIJWTCache.evictions = 0
 	routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
 }

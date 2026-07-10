@@ -143,6 +143,13 @@ func ClearDefaultChannel(channelID int) {
 	defaultBreaker.ClearChannel(channelID)
 }
 
+// ClearDefaultChannelWithCache clears a channel and invokes clearCache while
+// the default breaker lock is held, keeping both removals linearized.
+// clearCache must not call back into this package.
+func ClearDefaultChannelWithCache(channelID int, clearCache func(int)) {
+	defaultBreaker.clearChannel(channelID, clearCache)
+}
+
 func ResetDefaultForTest(config Config) {
 	defaultBreaker = newDefaultBreaker(config)
 }
@@ -341,6 +348,10 @@ func (b *Breaker) Clear(key Key) {
 }
 
 func (b *Breaker) ClearChannel(channelID int) {
+	b.clearChannel(channelID, b.onClearChannel)
+}
+
+func (b *Breaker) clearChannel(channelID int, clearCache func(int)) {
 	if channelID <= 0 {
 		return
 	}
@@ -357,8 +368,8 @@ func (b *Breaker) ClearChannel(channelID int) {
 			delete(b.dirty, key)
 		}
 	}
-	if b.onClearChannel != nil {
-		b.onClearChannel(channelID)
+	if clearCache != nil {
+		clearCache(channelID)
 	}
 }
 

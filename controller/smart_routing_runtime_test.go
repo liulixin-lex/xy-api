@@ -210,6 +210,39 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 	assert.Equal(t, fresh.BucketTs, remaining[0].BucketTs)
 }
 
+func TestFlushRoutingRuntimeStateSkipsRetentionWithinThrottleWindow(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	routingmetrics.ResetForTest()
+	now := common.GetTimestamp()
+	smartRoutingRetentionLast.Store(now)
+	t.Cleanup(func() {
+		routingmetrics.ResetForTest()
+		smartRoutingRetentionLast.Store(0)
+	})
+
+	expired := model.RoutingChannelMetric{
+		ChannelID:    905,
+		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
+		ModelName:    "throttled-expired-model",
+		Group:        "default",
+		BucketTs:     now - 2*86400,
+		RequestCount: 1,
+	}
+	require.NoError(t, db.Create(&expired).Error)
+
+	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{
+		MetricBucketSec: 60,
+		RetentionDays:   1,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, summary, "retained_metrics_deleted")
+
+	var remaining int64
+	require.NoError(t, db.Model(&model.RoutingChannelMetric{}).Where("channel_id = ?", expired.ChannelID).Count(&remaining).Error)
+	assert.Equal(t, int64(1), remaining)
+}
+
 func TestFlushRoutingRuntimeStateDoesNotOverflowRetentionCutoff(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))

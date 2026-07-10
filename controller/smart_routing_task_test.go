@@ -1017,6 +1017,11 @@ func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
 	assert.True(t, hasTiedLargerChannel)
 	assert.True(t, hasNewest)
 	assert.Equal(t, 2, cacheSize)
+	assert.Equal(t, RoutingSub2APIJWTCacheStats{
+		Entries:     2,
+		Expirations: 1,
+		Evictions:   2,
+	}, RoutingSub2APIJWTCacheRuntimeStats())
 }
 
 func TestRoutingSub2APIJWTCacheNeverExceedsLimitOnSet(t *testing.T) {
@@ -1062,6 +1067,64 @@ func TestRoutingSub2APIJWTCacheNeverExceedsLimitOnSet(t *testing.T) {
 	assert.True(t, latestFound)
 	assert.Equal(t, "jwt-newest", latestToken)
 	assert.False(t, oldestFound)
+	assert.Equal(t, RoutingSub2APIJWTCacheStats{
+		Entries:   2,
+		Evictions: 1,
+	}, RoutingSub2APIJWTCacheRuntimeStats())
+}
+
+func TestRoutingSub2APIJWTCacheGetCountsExpiredEntries(t *testing.T) {
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	common.RedisEnabled = false
+	common.RDB = nil
+	t.Cleanup(func() {
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+	})
+
+	now := common.GetTimestamp()
+	routingSub2APIJWTCache.Lock()
+	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
+		910: {Ciphertext: "expired", ExpiresAt: now},
+		911: {Ciphertext: "live", ExpiresAt: now + 60},
+	}
+	routingSub2APIJWTCache.Unlock()
+
+	_, found := getRoutingSub2APICachedJWT(context.Background(), 910)
+
+	assert.False(t, found)
+	assert.Equal(t, RoutingSub2APIJWTCacheStats{
+		Entries:     1,
+		Expirations: 1,
+	}, RoutingSub2APIJWTCacheRuntimeStats())
+}
+
+func TestResetRoutingSub2APIJWTCacheClearsRuntimeStats(t *testing.T) {
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	now := common.GetTimestamp()
+	routingSub2APIJWTCache.Lock()
+	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
+		920: {Ciphertext: "expired", ExpiresAt: now},
+		921: {Ciphertext: "oldest", ExpiresAt: now + 10},
+		922: {Ciphertext: "newest", ExpiresAt: now + 20},
+	}
+	pruneRoutingSub2APIJWTCacheLocked(now, 1)
+	routingSub2APIJWTCache.Unlock()
+	require.Equal(t, RoutingSub2APIJWTCacheStats{
+		Entries:     1,
+		Expirations: 1,
+		Evictions:   1,
+	}, RoutingSub2APIJWTCacheRuntimeStats())
+
+	resetRoutingSub2APITestState()
+
+	assert.Equal(t, RoutingSub2APIJWTCacheStats{}, RoutingSub2APIJWTCacheRuntimeStats())
 }
 
 func TestFetchRoutingCostSnapshotsSub2APILoginFailureMarksAuthAndMasksSecrets(t *testing.T) {

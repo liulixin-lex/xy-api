@@ -404,7 +404,7 @@ func TestClearDefaultKeySerializesCacheClearWithConcurrentRecord(t *testing.T) {
 	assert.Equal(t, string(StateHealthy), cached.State)
 }
 
-func TestClearDefaultChannelSerializesAllCacheClearWithConcurrentRecord(t *testing.T) {
+func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord(t *testing.T) {
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	config := DefaultConfig()
 	config.EntryTTL = time.Hour
@@ -428,7 +428,9 @@ func TestClearDefaultChannelSerializesAllCacheClearWithConcurrentRecord(t *testi
 
 	clearStarted := make(chan bool, 1)
 	allowClear := make(chan struct{})
-	defaultBreaker.onClearChannel = func(clearedChannelID int) {
+	clearCalls := 0
+	clearCache := func(clearedChannelID int) {
+		clearCalls++
 		internalStatePresent := false
 		for stateKey := range defaultBreaker.states {
 			if stateKey.ChannelID == clearedChannelID {
@@ -451,7 +453,7 @@ func TestClearDefaultChannelSerializesAllCacheClearWithConcurrentRecord(t *testi
 
 	clearDone := make(chan struct{})
 	go func() {
-		ClearDefaultChannel(channelID)
+		ClearDefaultChannelWithCache(channelID, clearCache)
 		close(clearDone)
 	}()
 	internalStatePresent := <-clearStarted
@@ -476,6 +478,7 @@ func TestClearDefaultChannelSerializesAllCacheClearWithConcurrentRecord(t *testi
 
 	assert.False(t, internalStatePresent)
 	assert.False(t, mutationLockWasAvailable)
+	assert.Equal(t, 1, clearCalls)
 	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
 	_, metricOK := routinghotcache.GetMetric(cacheKey)
 	_, costOK := routinghotcache.GetCost(cacheKey.CostKey())
