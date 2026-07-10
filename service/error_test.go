@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,39 @@ func TestResetStatusCode(t *testing.T) {
 			require.Equal(t, tc.expectedCode, newAPIError.StatusCode)
 		})
 	}
+}
+
+func TestResetStatusCodePreservesSourceStatusCode(t *testing.T) {
+	newAPIError := types.NewErrorWithStatusCode(
+		errors.New("rate limited"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+
+	ResetStatusCode(newAPIError, `{"429":503}`)
+
+	assert.Equal(t, http.StatusServiceUnavailable, newAPIError.StatusCode)
+	assert.Equal(t, http.StatusTooManyRequests, newAPIError.SourceStatusCode())
+}
+
+func TestTaskErrorFromAPIErrorKeepsPublicMessageAndWrappedCause(t *testing.T) {
+	cause := errors.New("billing failure")
+	apiErr := types.NewErrorWithStatusCode(
+		cause,
+		types.ErrorCodePreConsumeTokenQuotaFailed,
+		http.StatusTooManyRequests,
+		types.ErrOptionWithHideErrMsg("public task error"),
+	)
+
+	taskErr := TaskErrorFromAPIError(apiErr)
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "public task error", taskErr.Message)
+	assert.Equal(t, string(types.ErrorCodePreConsumeTokenQuotaFailed), taskErr.Code)
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.True(t, taskErr.LocalError)
+	assert.Same(t, apiErr, taskErr.Error)
+	assert.ErrorIs(t, taskErr.Error, cause)
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {

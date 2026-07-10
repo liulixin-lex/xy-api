@@ -196,7 +196,7 @@ func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) 
 		if !ok {
 			return
 		}
-		newApiErr.StatusCode = intCode
+		newApiErr.SetResponseStatusCode(intCode)
 	}
 }
 
@@ -261,8 +261,9 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *dto.TaskError {
 	}
 	return &dto.TaskError{
 		Code:       string(apiErr.GetErrorCode()),
-		Message:    apiErr.Err.Error(),
+		Message:    apiErr.Error(),
 		StatusCode: apiErr.StatusCode,
-		Error:      apiErr.Err,
+		LocalError: true,
+		Error:      apiErr,
 	}
 }

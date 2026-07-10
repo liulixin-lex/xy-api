@@ -89,22 +89,53 @@ const (
 )
 
 type NewAPIError struct {
-	Err            error
-	RelayError     any
-	skipRetry      bool
-	recordErrorLog *bool
-	errorType      ErrorType
-	errorCode      ErrorCode
-	StatusCode     int
-	Metadata       json.RawMessage
+	Err              error
+	RelayError       any
+	displayMessage   string
+	skipRetry        bool
+	recordErrorLog   *bool
+	errorType        ErrorType
+	errorCode        ErrorCode
+	StatusCode       int
+	sourceStatusCode int
+	Metadata         json.RawMessage
 }
 
-// Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
-func (e *NewAPIError) Unwrap() error {
+func (e *NewAPIError) Cause() error {
 	if e == nil {
 		return nil
 	}
 	return e.Err
+}
+
+func (e *NewAPIError) SourceStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	if e.sourceStatusCode > 0 {
+		return e.sourceStatusCode
+	}
+	return e.StatusCode
+}
+
+func (e *NewAPIError) SetResponseStatusCode(statusCode int) {
+	if e == nil {
+		return
+	}
+	e.initializeSourceStatus()
+	e.StatusCode = statusCode
+}
+
+func (e *NewAPIError) initializeSourceStatus() {
+	if e == nil || e.sourceStatusCode > 0 || e.StatusCode <= 0 {
+		return
+	}
+	e.sourceStatusCode = e.StatusCode
+}
+
+// Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
+func (e *NewAPIError) Unwrap() error {
+	return e.Cause()
 }
 
 func (e *NewAPIError) GetErrorCode() ErrorCode {
@@ -125,11 +156,13 @@ func (e *NewAPIError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if e.Err == nil {
-		// fallback message when underlying error is missing
-		return string(e.errorCode)
+	if e.displayMessage != "" {
+		return e.displayMessage
 	}
-	return e.Err.Error()
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return string(e.errorCode)
 }
 
 func (e *NewAPIError) ErrorWithStatusCode() string {
@@ -150,10 +183,7 @@ func (e *NewAPIError) MaskSensitiveError() string {
 	if e == nil {
 		return ""
 	}
-	if e.Err == nil {
-		return string(e.errorCode)
-	}
-	errStr := e.Err.Error()
+	errStr := e.Error()
 	if e.errorCode == ErrorCodeCountTokenFailed {
 		return errStr
 	}
@@ -175,7 +205,10 @@ func (e *NewAPIError) MaskSensitiveErrorWithStatusCode() string {
 }
 
 func (e *NewAPIError) SetMessage(message string) {
-	e.Err = errors.New(message)
+	if e == nil {
+		return
+	}
+	e.displayMessage = message
 }
 
 func (e *NewAPIError) ToOpenAIError() OpenAIError {
@@ -202,6 +235,7 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 			Code:    e.errorCode,
 		}
 	}
+	result.Message = e.Error()
 	if e.errorCode != ErrorCodeCountTokenFailed {
 		result.Message = common.MaskSensitiveInfo(result.Message)
 	}
@@ -231,6 +265,7 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 			Type:    string(e.errorType),
 		}
 	}
+	result.Message = e.Error()
 	if e.errorCode != ErrorCodeCountTokenFailed {
 		result.Message = common.MaskSensitiveInfo(result.Message)
 	}
@@ -249,6 +284,7 @@ func NewError(err error, errorCode ErrorCode, ops ...NewAPIErrorOptions) *NewAPI
 		for _, op := range ops {
 			op(newErr)
 		}
+		newErr.initializeSourceStatus()
 		return newErr
 	}
 	e := &NewAPIError{
@@ -261,6 +297,7 @@ func NewError(err error, errorCode ErrorCode, ops ...NewAPIErrorOptions) *NewAPI
 	for _, op := range ops {
 		op(e)
 	}
+	e.initializeSourceStatus()
 	return e
 }
 
@@ -279,14 +316,30 @@ func NewOpenAIError(err error, errorCode ErrorCode, statusCode int, ops ...NewAP
 		for _, op := range ops {
 			op(newErr)
 		}
+		newErr.initializeSourceStatus()
 		return newErr
 	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
 	openaiError := OpenAIError{
-		Message: err.Error(),
+		Message: message,
 		Type:    string(errorCode),
 		Code:    errorCode,
 	}
-	return WithOpenAIError(openaiError, statusCode, ops...)
+	e := &NewAPIError{
+		Err:        err,
+		RelayError: openaiError,
+		errorType:  ErrorTypeOpenAIError,
+		StatusCode: statusCode,
+		errorCode:  errorCode,
+	}
+	for _, op := range ops {
+		op(e)
+	}
+	e.initializeSourceStatus()
+	return e
 }
 
 func InitOpenAIError(errorCode ErrorCode, statusCode int, ops ...NewAPIErrorOptions) *NewAPIError {
@@ -298,10 +351,14 @@ func InitOpenAIError(errorCode ErrorCode, statusCode int, ops ...NewAPIErrorOpti
 }
 
 func NewErrorWithStatusCode(err error, errorCode ErrorCode, statusCode int, ops ...NewAPIErrorOptions) *NewAPIError {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
 	e := &NewAPIError{
 		Err: err,
 		RelayError: OpenAIError{
-			Message: err.Error(),
+			Message: message,
 			Type:    string(errorCode),
 		},
 		errorType:  ErrorTypeNewAPIError,
@@ -311,7 +368,7 @@ func NewErrorWithStatusCode(err error, errorCode ErrorCode, statusCode int, ops 
 	for _, op := range ops {
 		op(e)
 	}
-
+	e.initializeSourceStatus()
 	return e
 }
 
@@ -344,6 +401,7 @@ func WithOpenAIError(openAIError OpenAIError, statusCode int, ops ...NewAPIError
 	for _, op := range ops {
 		op(e)
 	}
+	e.initializeSourceStatus()
 	return e
 }
 
@@ -361,6 +419,7 @@ func WithClaudeError(claudeError ClaudeError, statusCode int, ops ...NewAPIError
 	for _, op := range ops {
 		op(e)
 	}
+	e.initializeSourceStatus()
 	return e
 }
 
@@ -402,7 +461,7 @@ func ErrOptionWithHideErrMsg(replaceStr string) NewAPIErrorOptions {
 		if common.DebugEnabled {
 			fmt.Printf("ErrOptionWithHideErrMsg: %s, origin error: %s", replaceStr, e.Err)
 		}
-		e.Err = errors.New(replaceStr)
+		e.displayMessage = replaceStr
 	}
 }
 
