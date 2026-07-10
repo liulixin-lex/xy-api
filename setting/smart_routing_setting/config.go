@@ -14,6 +14,8 @@ const (
 	ModeEnterpriseSLO = "enterprise_slo"
 )
 
+const configName = "smart_routing_setting"
+
 const (
 	enterpriseWeightAvailability = 0.55
 	enterpriseWeightLatency      = 0.30
@@ -98,11 +100,15 @@ var defaultSmartRoutingSetting = SmartRoutingSetting{
 var smartRoutingSetting = defaultSmartRoutingSetting
 
 func init() {
-	config.GlobalConfig.Register("smart_routing_setting", &smartRoutingSetting)
+	config.GlobalConfig.Register(configName, &smartRoutingSetting)
 }
 
 func GetSetting() SmartRoutingSetting {
-	setting := smartRoutingSetting
+	setting := defaultSmartRoutingSetting
+	// Snapshot is a shallow copy; SmartRoutingSetting contains scalar fields only.
+	if !config.GlobalConfig.Snapshot(configName, &setting) {
+		setting = defaultSmartRoutingSetting
+	}
 	applyEnvOverrides(&setting)
 	normalize(&setting)
 	return setting
@@ -110,7 +116,7 @@ func GetSetting() SmartRoutingSetting {
 
 func UpdateSetting(setting SmartRoutingSetting) SmartRoutingSetting {
 	normalize(&setting)
-	smartRoutingSetting = setting
+	config.GlobalConfig.Replace(configName, setting)
 	return GetSetting()
 }
 
@@ -123,7 +129,7 @@ func Mode() string {
 }
 
 func ResetForTest() {
-	smartRoutingSetting = defaultSmartRoutingSetting
+	config.GlobalConfig.Replace(configName, defaultSmartRoutingSetting)
 }
 
 func applyEnvOverrides(setting *SmartRoutingSetting) {
@@ -230,6 +236,9 @@ func normalize(setting *SmartRoutingSetting) {
 	}
 	if setting.FlushIntervalMin < 1 {
 		setting.FlushIntervalMin = 1
+	}
+	if setting.RetentionDays < 1 {
+		setting.RetentionDays = defaultSmartRoutingSetting.RetentionDays
 	}
 }
 

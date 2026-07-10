@@ -1,6 +1,9 @@
 package smart_routing_setting
 
 import (
+	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -79,6 +82,7 @@ func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
 		HalfOpenProbes:    0,
 		MaxSwitches:       -3,
 		BackoffCapMs:      -1,
+		RetentionDays:     0,
 	})
 
 	assert.Equal(t, 1.0, updated.AvailabilityFloor)
@@ -89,6 +93,7 @@ func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
 	assert.Equal(t, 1, updated.HalfOpenProbes)
 	assert.Equal(t, 0, updated.MaxSwitches)
 	assert.Equal(t, 20000, updated.BackoffCapMs)
+	assert.Equal(t, 7, updated.RetentionDays)
 }
 
 func TestEnterpriseSLOModeUsesEnterpriseWeights(t *testing.T) {
@@ -108,4 +113,40 @@ func TestEnterpriseSLOModeUsesEnterpriseWeights(t *testing.T) {
 	assert.InDelta(t, 0.30, updated.WeightLatency, 0.000001)
 	assert.InDelta(t, 0.10, updated.WeightThroughput, 0.000001)
 	assert.InDelta(t, 0.05, updated.WeightCost, 0.000001)
+}
+
+func TestSettingConcurrentReadWriteKeepsNormalizedSnapshot(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	var wait sync.WaitGroup
+	var invalid atomic.Bool
+	for worker := 0; worker < 8; worker++ {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				if worker%2 == 0 {
+					UpdateSetting(SmartRoutingSetting{
+						Enabled:            true,
+						Mode:               ModeBalanced,
+						WeightAvailability: 2,
+						WeightLatency:      1,
+						WeightThroughput:   1,
+						TopK:               3,
+					})
+					continue
+				}
+				snapshot := GetSetting()
+				total := snapshot.WeightAvailability + snapshot.WeightLatency +
+					snapshot.WeightThroughput + snapshot.WeightCost
+				if math.Abs(total-1.0) > 0.000001 {
+					invalid.Store(true)
+				}
+			}
+		}(worker)
+	}
+	wait.Wait()
+
+	assert.False(t, invalid.Load())
 }

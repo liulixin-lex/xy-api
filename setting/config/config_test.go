@@ -2,6 +2,9 @@ package config
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testConfigWithMap struct {
@@ -93,4 +96,64 @@ func TestUpdateConfigFromMap_ScalarFieldsUnchanged(t *testing.T) {
 	if cfg.Modes["m"] != "v" {
 		t.Errorf("Modes should be unchanged, got %v", cfg.Modes)
 	}
+}
+
+func TestConfigManagerSnapshotAndReplaceUseRegisteredValue(t *testing.T) {
+	manager := NewConfigManager()
+	registered := &testConfigWithMap{Name: "before", Modes: map[string]string{"a": "one"}}
+	manager.Register("test", registered)
+
+	var snapshot testConfigWithMap
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, "before", snapshot.Name)
+
+	replacement := testConfigWithMap{Name: "after", Modes: map[string]string{"b": "two"}}
+	require.True(t, manager.Replace("test", replacement))
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, "after", snapshot.Name)
+	assert.Equal(t, map[string]string{"b": "two"}, snapshot.Modes)
+
+	pointerReplacement := &testConfigWithMap{Name: "pointer", Modes: map[string]string{"c": "three"}}
+	require.True(t, manager.Replace("test", pointerReplacement))
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, "pointer", snapshot.Name)
+	assert.Equal(t, map[string]string{"c": "three"}, snapshot.Modes)
+}
+
+func TestConfigManagerSnapshotRejectsMismatchedDestination(t *testing.T) {
+	manager := NewConfigManager()
+	manager.Register("test", &testConfigWithMap{Name: "value"})
+
+	var wrong string
+	var nilConfig *testConfigWithMap
+	assert.False(t, manager.Snapshot("missing", &testConfigWithMap{}))
+	assert.False(t, manager.Snapshot("test", nil))
+	assert.False(t, manager.Snapshot("test", nilConfig))
+	assert.False(t, manager.Snapshot("test", testConfigWithMap{}))
+	assert.False(t, manager.Snapshot("test", &wrong))
+
+	manager.Register("value", testConfigWithMap{Name: "value"})
+	assert.False(t, manager.Snapshot("value", &testConfigWithMap{}))
+	manager.Register("nil", nilConfig)
+	assert.False(t, manager.Snapshot("nil", &testConfigWithMap{}))
+}
+
+func TestConfigManagerReplaceRejectsMismatchedReplacement(t *testing.T) {
+	manager := NewConfigManager()
+	manager.Register("test", &testConfigWithMap{Name: "value"})
+
+	var nilConfig *testConfigWithMap
+	assert.False(t, manager.Replace("missing", testConfigWithMap{}))
+	var replaced bool
+	assert.NotPanics(t, func() {
+		replaced = manager.Replace("test", nil)
+	})
+	assert.False(t, replaced)
+	assert.False(t, manager.Replace("test", nilConfig))
+	assert.False(t, manager.Replace("test", "wrong"))
+
+	manager.Register("value", testConfigWithMap{Name: "value"})
+	assert.False(t, manager.Replace("value", testConfigWithMap{}))
+	manager.Register("nil", nilConfig)
+	assert.False(t, manager.Replace("nil", testConfigWithMap{}))
 }

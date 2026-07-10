@@ -38,6 +38,64 @@ func (cm *ConfigManager) Get(name string) interface{} {
 	return cm.configs[name]
 }
 
+// Snapshot shallow-copies a registered configuration value while holding the
+// manager's read lock. The registered value and destination must both be
+// non-nil pointers, and their element types must match exactly.
+func (cm *ConfigManager) Snapshot(name string, destination any) bool {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false
+	}
+	target := reflect.ValueOf(destination)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false
+	}
+	source := reflect.ValueOf(registered)
+	if source.Kind() != reflect.Ptr || source.IsNil() {
+		return false
+	}
+	source = source.Elem()
+	if target.Elem().Type() != source.Type() {
+		return false
+	}
+	target.Elem().Set(source)
+	return true
+}
+
+// Replace updates a registered non-nil pointer while holding the manager's
+// write lock. The replacement may be either the concrete value or a non-nil
+// pointer to that exact type.
+func (cm *ConfigManager) Replace(name string, replacement any) bool {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false
+	}
+	target := reflect.ValueOf(registered)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false
+	}
+	source := reflect.ValueOf(replacement)
+	if !source.IsValid() {
+		return false
+	}
+	registeredValue := target.Elem()
+	if source.Type() == registeredValue.Type() {
+		registeredValue.Set(source)
+		return true
+	}
+	if source.Kind() != reflect.Ptr || source.IsNil() || source.Elem().Type() != registeredValue.Type() {
+		return false
+	}
+	registeredValue.Set(source.Elem())
+	return true
+}
+
 // LoadFromDB 从数据库加载配置
 func (cm *ConfigManager) LoadFromDB(options map[string]string) error {
 	cm.mutex.Lock()
