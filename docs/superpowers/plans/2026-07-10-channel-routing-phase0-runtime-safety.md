@@ -36,7 +36,7 @@
 - Modify: `setting/smart_routing_setting/config.go`
 - Modify: `setting/smart_routing_setting/config_test.go`
 
-- [ ] **Step 1: 为 ConfigManager 快照/替换写失败测试**
+- [x] **Step 1: 为 ConfigManager 快照/替换写失败测试**
 
 在 `setting/config/config_test.go` 增加：
 
@@ -78,13 +78,13 @@ import (
 )
 ```
 
-- [ ] **Step 2: 运行测试确认 RED**
+- [x] **Step 2: 运行测试确认 RED**
 
 Run: `go test ./setting/config -run 'TestConfigManagerSnapshot' -count=1`
 
 Expected: FAIL，提示 `Snapshot` / `Replace` 未定义。
 
-- [ ] **Step 3: 实现锁内快照与替换**
+- [x] **Step 3: 实现锁内快照与替换**
 
 在 `setting/config/config.go` 的 `Get` 后增加：
 
@@ -141,7 +141,7 @@ func (cm *ConfigManager) Replace(name string, replacement any) bool {
 
 `Snapshot` 是浅复制；本阶段的 `SmartRoutingSetting` 只含标量，因此没有共享 Map/Slice。后续若有复合策略对象，必须在不可变 Revision 中单独处理。
 
-- [ ] **Step 4: 让 SmartRoutingSetting 只通过 ConfigManager 访问**
+- [x] **Step 4: 让 SmartRoutingSetting 只通过 ConfigManager 访问**
 
 将 `setting/smart_routing_setting/config.go` 中直接读写全局变量的函数替换为：
 
@@ -173,7 +173,7 @@ func ResetForTest() {
 }
 ```
 
-- [ ] **Step 5: 增加并发契约测试**
+- [x] **Step 5: 增加并发契约测试**
 
 先在现有 `TestUpdateSettingClampsBreakerAndRetryRanges` 的输入中加入 `RetentionDays: 0`，并增加 `assert.Equal(t, 7, updated.RetentionDays)`；该断言在 `normalize` 尚未处理 Retention 时先失败。
 
@@ -215,7 +215,7 @@ func TestSettingConcurrentReadWriteKeepsNormalizedSnapshot(t *testing.T) {
 
 补充 `math`、`sync`、`sync/atomic` import。该测试断言真实快照不变量，不断言锁调用次数，也不从工作 Goroutine 直接调用测试断言。
 
-- [ ] **Step 6: 运行 GREEN 与 Race 验证**
+- [x] **Step 6: 运行 GREEN 与 Race 验证**
 
 Run: `go test ./setting/config ./setting/smart_routing_setting -count=1`
 
@@ -225,7 +225,7 @@ Run: `go test -race ./setting/config ./setting/smart_routing_setting -count=1`
 
 Expected: PASS，且无 race report。
 
-- [ ] **Step 7: 提交配置并发安全**
+- [x] **Step 7: 提交配置并发安全**
 
 ```bash
 git add setting/config/config.go setting/config/config_test.go setting/smart_routing_setting/config.go setting/smart_routing_setting/config_test.go
@@ -238,7 +238,7 @@ git commit -m "fix: make routing settings concurrency safe"
 - Modify: `pkg/routing_metrics/metrics.go`
 - Modify: `pkg/routing_metrics/metrics_test.go`
 
-- [ ] **Step 1: 写关闭态和容量边界失败测试**
+- [x] **Step 1: 写关闭态和容量边界失败测试**
 
 在 `pkg/routing_metrics/metrics_test.go` 增加：
 
@@ -311,13 +311,13 @@ func TestRoutingMetricsDropNewInflightKeyAtLimit(t *testing.T) {
 
 现有所有调用 `RecordAttempt` / `BeginInflight` 的测试必须通过一个 `_test.go` 内的 `enableRoutingMetricsForTest(t)` 显式启用 Observe 模式；这样关闭态测试与正常收集测试的前置状态不会相互隐式依赖。
 
-- [ ] **Step 2: 运行测试确认 RED**
+- [x] **Step 2: 运行测试确认 RED**
 
 Run: `go test ./pkg/routing_metrics -run 'TestRoutingMetrics(DoNotAllocate|EnforceBucket|DropNewInflight)' -count=1`
 
 Expected: FAIL，缺少 `Limits`、`RuntimeStats`，且关闭态仍产生快照。
 
-- [ ] **Step 3: 定义运行时限制与统计**
+- [x] **Step 3: 定义运行时限制与统计**
 
 在 `pkg/routing_metrics/metrics.go` 增加：
 
@@ -359,7 +359,7 @@ func RuntimeStats() Stats {
 
 Limits 的测试配置直接由同包测试保存/恢复 `limits`；生产代码只使用归一化后的默认值。
 
-- [ ] **Step 4: 在入口处阻止关闭态分配**
+- [x] **Step 4: 在入口处阻止关闭态分配**
 
 在 `BeginInflight` 与 `RecordAttempt` 的第一行加入：
 
@@ -377,7 +377,7 @@ if !smart_routing_setting.Enabled() {
 }
 ```
 
-- [ ] **Step 5: 实现有界 Bucket 创建与删除**
+- [x] **Step 5: 实现有界 Bucket 创建与删除**
 
 把 `withWritableBucket` 的 `LoadOrStore` 改为调用 `writableBucket(key)`。核心逻辑为：
 
@@ -407,7 +407,7 @@ func writableBucket(key bucketKey) *bucket {
 
 `evictOldestBucketLocked` 必须按 `bucketTs`、Channel、Key、Model、Group 的稳定顺序选择最旧项；锁住 Bucket、设置 `draining=true` 后再 `CompareAndDelete`，成功时减少 `bucketEntries` 并增加 `bucketEvictions`。`DrainSnapshots`、`ClearChannel`、`ResetForTest` 也必须只在实际删除成功时减少计数。
 
-- [ ] **Step 6: 实现有界 Inflight Key**
+- [x] **Step 6: 实现有界 Inflight Key**
 
 将 `inflightCounter` 改为：
 
@@ -434,7 +434,7 @@ func inflightCounter(key InflightKey) (*atomic.Int64, bool) {
 
 `BeginInflight` 只保存成功获得 Counter 的键；Release 使用 `CompareAndDelete`，并在成功删除时减少 `inflightEntries`。
 
-- [ ] **Step 7: 运行完整指标测试与 Race**
+- [x] **Step 7: 运行完整指标测试与 Race**
 
 Run: `go test ./pkg/routing_metrics -count=1`
 
@@ -444,7 +444,7 @@ Run: `go test -race ./pkg/routing_metrics -count=1`
 
 Expected: PASS，且无 race report。
 
-- [ ] **Step 8: 提交有界指标收集器**
+- [x] **Step 8: 提交有界指标收集器**
 
 ```bash
 git add pkg/routing_metrics/metrics.go pkg/routing_metrics/metrics_test.go
@@ -461,7 +461,7 @@ git commit -m "fix: bound routing telemetry state"
 - Modify: `controller/relay.go`
 - Modify: `controller/relay_retry_test.go`
 
-- [ ] **Step 1: 写 Breaker 容量与 TTL 失败测试**
+- [x] **Step 1: 写 Breaker 容量与 TTL 失败测试**
 
 在 `pkg/routing_breaker/breaker_test.go` 增加：
 
@@ -495,7 +495,7 @@ func TestBreakerEvictsExpiredAndOldestEntriesAtLimit(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 写 Hot Cache 清理失败测试**
+- [x] **Step 2: 写 Hot Cache 清理失败测试**
 
 在 `pkg/routing_hotcache/cache_test.go` 增加：
 
@@ -521,7 +521,7 @@ func TestHotcachePruneRemovesStaleEntries(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 写关闭态 Breaker 失败测试**
+- [x] **Step 3: 写关闭态 Breaker 失败测试**
 
 将 `controller/relay_retry_test.go` 中任务/Breaker 测试显式启用设置，并新增：
 
@@ -551,13 +551,13 @@ func TestRecordRoutingBreakerAttemptDoesNothingWhenDisabled(t *testing.T) {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认 RED**
+- [x] **Step 4: 运行测试确认 RED**
 
 Run: `go test ./pkg/routing_breaker ./pkg/routing_hotcache ./controller -run 'Test(BreakerEvicts|HotcachePrune|RecordRoutingBreakerAttemptDoesNothing)' -count=1`
 
 Expected: FAIL，缺少容量字段、Stats、Prune，且关闭态仍写 Breaker。
 
-- [ ] **Step 5: 为 Breaker 增加硬边界**
+- [x] **Step 5: 为 Breaker 增加硬边界**
 
 扩展 `Config`：
 
@@ -590,7 +590,7 @@ func (b *Breaker) Stats() Stats {
 
 `DefaultConfig` 使用 `EntryTTL: 30 * time.Minute`、`MaxEntries: 20_000`。`normalizeConfig` 修正非正值。`getOrCreate` 在创建新条目前调用 `pruneLocked(now)`；先删除超 TTL 条目，再按 Healthy → Degraded → Open/Half-open、最后更新时间、Key 稳定排序裁剪到 `MaxEntries-1`。每次 Eviction 同时删除 `states` 和 `dirty` 并增加统计，确保硬上限优先于保留低价值旧状态。
 
-- [ ] **Step 6: 为 Hot Cache 增加 Prune 与分类上限**
+- [x] **Step 6: 为 Hot Cache 增加 Prune 与分类上限**
 
 在 `pkg/routing_hotcache/cache.go` 增加：
 
@@ -654,7 +654,7 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 
 扩展前面的 Hot Cache 测试：同包测试先保存 `limits`，把 `MaxMetricEntries` 设为 2，写入三个不同 Key 后断言只保留更新时间最新的两个，再由 `t.Cleanup` 恢复。不得用 20,000 次循环模拟容量测试。
 
-- [ ] **Step 7: 关闭态直接返回**
+- [x] **Step 7: 关闭态直接返回**
 
 在 `recordRoutingBreakerAttempt` 开头读取一次设置并返回：
 
@@ -667,7 +667,7 @@ if !breakerSetting.Enabled {
 
 后续删除重复的 `GetSetting` 和 `if Enabled` 包裹，直接使用该快照同步配置。
 
-- [ ] **Step 8: 运行 GREEN 与 Race**
+- [x] **Step 8: 运行 GREEN 与 Race**
 
 Run: `go test ./pkg/routing_breaker ./pkg/routing_hotcache ./controller -count=1`
 
@@ -677,7 +677,7 @@ Run: `go test -race ./pkg/routing_breaker ./pkg/routing_hotcache ./controller -c
 
 Expected: PASS，且无 race report。
 
-- [ ] **Step 9: 提交 Breaker/Hot Cache 边界**
+- [x] **Step 9: 提交 Breaker/Hot Cache 边界**
 
 ```bash
 git add pkg/routing_breaker/breaker.go pkg/routing_breaker/breaker_test.go pkg/routing_hotcache/cache.go pkg/routing_hotcache/cache_test.go controller/relay.go controller/relay_retry_test.go
@@ -690,7 +690,7 @@ git commit -m "fix: bound routing health caches"
 - Modify: `controller/smart_routing_sub2api.go`
 - Modify: `controller/smart_routing_task_test.go`
 
-- [ ] **Step 1: 写并发登录只执行一次的失败测试**
+- [x] **Step 1: 写并发登录只执行一次的失败测试**
 
 在 `controller/smart_routing_task_test.go` 增加使用真实 `httptest.Server` 的测试：
 
@@ -742,7 +742,7 @@ func TestRoutingSub2APIJWTCoalescesConcurrentLogin(t *testing.T) {
 
 该测试验证真实 HTTP 登录副作用，不检查 Singleflight 内部调用。
 
-- [ ] **Step 2: 写本机 JWT 缓存裁剪失败测试**
+- [x] **Step 2: 写本机 JWT 缓存裁剪失败测试**
 
 ```go
 func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
@@ -763,13 +763,13 @@ func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 运行测试确认 RED**
+- [x] **Step 3: 运行测试确认 RED**
 
 Run: `go test ./controller -run 'TestRoutingSub2APIJWT(Coalesces|CachePrunes)' -count=1`
 
 Expected: FAIL，永久 Lock Map 仍存在且缺少 Prune helper。
 
-- [ ] **Step 4: 用 Singleflight 取代 Lock Map**
+- [x] **Step 4: 用 Singleflight 取代 Lock Map**
 
 增加 import：
 
@@ -822,7 +822,7 @@ return result.(string), nil
 
 删除 `routingSub2APILocalLock` 与 `locks` Map。
 
-- [ ] **Step 5: 实现缓存 TTL 与硬容量裁剪**
+- [x] **Step 5: 实现缓存 TTL 与硬容量裁剪**
 
 增加：
 
@@ -851,7 +851,7 @@ func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
 
 `get` 在读前清理过期项；`set` 写入后调用 `pruneRoutingSub2APIJWTCacheLocked(now, routingSub2APIMaxJWTEntries)`。`resetRoutingSub2APITestState` 同时将 `routingSub2APILoginGroup` 重置为零值。
 
-- [ ] **Step 6: 运行 GREEN 与 Race**
+- [x] **Step 6: 运行 GREEN 与 Race**
 
 Run: `go test ./controller -run 'RoutingSub2API' -count=1`
 
@@ -861,7 +861,7 @@ Run: `go test -race ./controller -run 'RoutingSub2API' -count=1`
 
 Expected: PASS，且并发登录测试只收到一次 HTTP 登录。
 
-- [ ] **Step 7: 提交 JWT 协调修复**
+- [x] **Step 7: 提交 JWT 协调修复**
 
 ```bash
 git add controller/smart_routing_sub2api.go controller/smart_routing_task_test.go
@@ -877,7 +877,7 @@ git commit -m "fix: bound sub2api routing auth state"
 - Create: `controller/smart_routing_runtime_test.go`
 - Modify: `main.go`
 
-- [ ] **Step 1: 写跨数据库 Retention 失败测试**
+- [x] **Step 1: 写跨数据库 Retention 失败测试**
 
 在 `model/routing_model_test.go` 的 `runRoutingMigrationAndUpsertContract` 中，在已有 metric upsert 后插入新旧两个桶，并断言：
 
@@ -901,7 +901,7 @@ require.Len(t, remaining, 1)
 assert.Equal(t, int64(200), remaining[0].BucketTs)
 ```
 
-- [ ] **Step 2: 写 Runtime 生命周期失败测试**
+- [x] **Step 2: 写 Runtime 生命周期失败测试**
 
 创建 `controller/smart_routing_runtime_test.go`：
 
@@ -1002,13 +1002,13 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 
 补充 `common`、`model`、`routingmetrics` import。第一个测试执行真实循环并用通道观察首次运行；Wait 依赖只替换时钟边界，Context 取消后必须解除阻塞，不断言内部锁或 Goroutine 数。第二个测试使用真实 SQLite/GORM 路径证明设置确实驱动清理。
 
-- [ ] **Step 3: 运行测试确认 RED**
+- [x] **Step 3: 运行测试确认 RED**
 
 Run: `go test ./model ./controller -run 'TestSmartRoutingRuntimeRunsAndStops|TestFlushRoutingRuntimeStateAppliesConfiguredRetention|TestRoutingModels' -count=1`
 
 Expected: FAIL，缺少 `DeleteRoutingMetricsBefore` 和 Runtime 类型。
 
-- [ ] **Step 4: 实现跨数据库 Retention 删除**
+- [x] **Step 4: 实现跨数据库 Retention 删除**
 
 在 `model/routing_model.go` 增加：
 
@@ -1024,7 +1024,7 @@ func DeleteRoutingMetricsBefore(cutoffTs int64) (int64, error) {
 
 只使用 GORM Where/Delete，确保三种数据库一致。
 
-- [ ] **Step 5: 实现可取消 Runtime**
+- [x] **Step 5: 实现可取消 Runtime**
 
 在 `controller/system_task_handlers.go` 用以下结构替代 `sync.Once` 和两个永久 Goroutine：
 
@@ -1078,7 +1078,7 @@ func waitRoutingRuntime(ctx context.Context, duration time.Duration) bool {
 
 `newSmartRoutingRuntime` 启动两个循环；每轮只读取一次设置，把同一快照传给任务，再按该快照计算下一间隔。首次任务立即运行，之后等待；`Close` 使用 `sync.Once` 取消 Context 并等待两个循环退出。
 
-- [ ] **Step 6: 把 Retention 接入 Flush**
+- [x] **Step 6: 把 Retention 接入 Flush**
 
 增加包级 `smartRoutingRetentionLast atomic.Int64`。在 `flushRoutingRuntimeState` 成功持久化后：
 
@@ -1098,7 +1098,7 @@ if setting.RetentionDays > 0 && now-smartRoutingRetentionLast.Load() >= 6*60*60 
 
 `normalize` 将 `RetentionDays < 1` 恢复为默认 7，防止无意关闭清理。
 
-- [ ] **Step 7: 在 main 持有并关闭 Runtime**
+- [x] **Step 7: 在 main 持有并关闭 Runtime**
 
 将：
 
@@ -1118,7 +1118,7 @@ routingRuntime := controller.StartSmartRoutingRuntime(context.Background())
 routingRuntime.Close()
 ```
 
-- [ ] **Step 8: 运行 GREEN、Race 与全量测试**
+- [x] **Step 8: 运行 GREEN、Race 与全量测试**
 
 Run: `go test ./model ./controller -count=1`
 
@@ -1132,7 +1132,7 @@ Run: `go test ./... -count=1`
 
 Expected: PASS（执行前确保 `web/default/dist` 与 `web/classic/dist` 已由构建生成）。
 
-- [ ] **Step 9: 提交 Runtime 与 Retention**
+- [x] **Step 9: 提交 Runtime 与 Retention**
 
 ```bash
 git add model/routing_model.go model/routing_model_test.go controller/system_task_handlers.go controller/smart_routing_runtime_test.go main.go
@@ -1145,7 +1145,7 @@ git commit -m "fix: lifecycle routing runtime workers"
 - Modify if needed: files changed in Tasks 1–5
 - Update: `docs/superpowers/plans/2026-07-10-channel-routing-phase0-runtime-safety.md`
 
-- [ ] **Step 1: 对照设计逐项审计**
+- [x] **Step 1: 对照设计逐项审计**
 
 确认并记录证据：
 
@@ -1158,7 +1158,7 @@ git commit -m "fix: lifecycle routing runtime workers"
 - `RetentionDays` 能实际删除过期指标，且使用跨数据库兼容 GORM。
 - Sub2API 登录不再保留永久 Lock Map。
 
-- [ ] **Step 2: 运行格式和静态检查**
+- [x] **Step 2: 运行格式和静态检查**
 
 Run: `gofmt -w setting/config/config.go setting/config/config_test.go setting/smart_routing_setting/config.go setting/smart_routing_setting/config_test.go pkg/routing_metrics/metrics.go pkg/routing_metrics/metrics_test.go pkg/routing_breaker/breaker.go pkg/routing_breaker/breaker_test.go pkg/routing_hotcache/cache.go pkg/routing_hotcache/cache_test.go controller/relay.go controller/relay_retry_test.go controller/smart_routing_sub2api.go controller/smart_routing_task_test.go controller/system_task_handlers.go controller/smart_routing_runtime_test.go model/routing_model.go model/routing_model_test.go main.go`
 
@@ -1168,7 +1168,7 @@ Run: `go vet ./setting/config ./setting/smart_routing_setting ./pkg/routing_metr
 
 Expected: exit 0。
 
-- [ ] **Step 3: 运行新鲜全量验证**
+- [x] **Step 3: 运行新鲜全量验证**
 
 Run: `go test ./... -count=1`
 
@@ -1186,7 +1186,7 @@ Run: `bun run build`（workdir: `web/default`）
 
 Expected: exit 0。
 
-- [ ] **Step 4: 检查 Diff 和工作树**
+- [x] **Step 4: 检查 Diff 和工作树**
 
 Run: `git diff --check`
 
@@ -1196,7 +1196,7 @@ Run: `git status --short`
 
 Expected: 只包含本计划文档的勾选更新（若已提交所有代码）。
 
-- [ ] **Step 5: 提交计划执行记录**
+- [x] **Step 5: 提交计划执行记录**
 
 ```bash
 git add docs/superpowers/plans/2026-07-10-channel-routing-phase0-runtime-safety.md
@@ -1204,3 +1204,16 @@ git commit -m "docs: record phase 0a routing verification"
 ```
 
 完成本计划后，下一份计划必须是 `Phase 0B：错误责任分类、Reliability/Capacity 分离与 Multi-Key 语义`；不得直接进入前端或扩大路由流量。
+
+## Phase 0A 验证记录（2026-07-10）
+
+- 实现范围：86462f7c..3891db1d；Task 6 的独立规格审查与独立代码质量审查均通过，无未解决的 Critical、Important 或 Minor 问题。
+- gofmt 已覆盖本计划列出的 Go 文件；执行后工作树保持干净。
+- go vet ./setting/config ./setting/smart_routing_setting ./pkg/routing_metrics ./pkg/routing_breaker ./pkg/routing_hotcache ./controller ./model：退出码 0。
+- go test ./... -count=1：退出码 0，全部 Go 包通过。
+- go test -race ./setting/config ./setting/smart_routing_setting ./pkg/routing_metrics ./pkg/routing_breaker ./pkg/routing_hotcache ./controller -count=1：退出码 0，无 race report。
+- web/default 中 bun run typecheck：退出码 0。
+- web/default 中 bun run build：退出码 0，Rsbuild 成功完成生产构建。
+- git diff --check 与 git status --short：均无输出；86462f7c..HEAD 的受保护标识删除审计无输出。
+- TEST_MYSQL_DSN 与 TEST_POSTGRES_DSN 均未配置，因此外部 MySQL/PostgreSQL 契约未执行；SQLite/GORM 路径已包含在全量 Go 测试中并通过。
+- 未执行生产部署或生产迁移。
