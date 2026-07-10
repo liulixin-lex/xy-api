@@ -1122,7 +1122,7 @@ routingRuntime.Close()
 
 Run: `go test ./model ./controller -count=1`
 
-Expected: PASS；若配置了 `TEST_MYSQL_DSN` / `TEST_POSTGRES_DSN`，外部数据库契约同步执行。
+Expected: PASS；若配置了 `ROUTING_TEST_MYSQL_DSN` / `ROUTING_TEST_POSTGRES_DSN`，外部数据库契约同步执行。
 
 Run: `go test -race ./controller ./pkg/routing_metrics ./pkg/routing_breaker ./pkg/routing_hotcache ./setting/smart_routing_setting -count=1`
 
@@ -1207,7 +1207,7 @@ git commit -m "docs: record phase 0a routing verification"
 
 ## Phase 0A 验证记录（2026-07-10）
 
-- 实现范围：86462f7c..3891db1d；Task 6 的独立规格审查与独立代码质量审查均通过，无未解决的 Critical、Important 或 Minor 问题。
+- 实现范围：86462f7c..cf2cb268；Task 6 的独立规格审查与独立代码质量审查均通过；最终审查发现的新增测试 fatal assertion 规范问题已修复。
 - gofmt 已覆盖本计划列出的 Go 文件；执行后工作树保持干净。
 - go vet ./setting/config ./setting/smart_routing_setting ./pkg/routing_metrics ./pkg/routing_breaker ./pkg/routing_hotcache ./controller ./model：退出码 0。
 - go test ./... -count=1：退出码 0，全部 Go 包通过。
@@ -1215,5 +1215,5 @@ git commit -m "docs: record phase 0a routing verification"
 - web/default 中 bun run typecheck：退出码 0。
 - web/default 中 bun run build：退出码 0，Rsbuild 成功完成生产构建。
 - git diff --check 与 git status --short：均无输出；86462f7c..HEAD 的受保护标识删除审计无输出。
-- TEST_MYSQL_DSN 与 TEST_POSTGRES_DSN 均未配置，因此外部 MySQL/PostgreSQL 契约未执行；SQLite/GORM 路径已包含在全量 Go 测试中并通过。
+- ROUTING_TEST_MYSQL_DSN 与 ROUTING_TEST_POSTGRES_DSN 均未配置，因此外部 MySQL/PostgreSQL 契约未执行；SQLite/GORM 路径已包含在全量 Go 测试中并通过。
 - 未执行生产部署或生产迁移。
