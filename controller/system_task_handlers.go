@@ -82,7 +82,11 @@ func syncRoutingBreakerConfigFromSetting(setting smart_routing_setting.SmartRout
 }
 
 func StartSmartRoutingRuntime(parent context.Context) *SmartRoutingRuntime {
-	return newSmartRoutingRuntime(parent, smartRoutingRuntimeDeps{
+	return newSmartRoutingRuntime(parent, defaultSmartRoutingRuntimeDeps())
+}
+
+func defaultSmartRoutingRuntimeDeps() smartRoutingRuntimeDeps {
+	return smartRoutingRuntimeDeps{
 		getSetting: smart_routing_setting.GetSetting,
 		refresh: func(setting smart_routing_setting.SmartRoutingSetting) {
 			if setting.Enabled {
@@ -100,7 +104,7 @@ func StartSmartRoutingRuntime(parent context.Context) *SmartRoutingRuntime {
 		},
 		waitRefresh: waitRoutingRuntime,
 		waitFlush:   waitRoutingRuntime,
-	})
+	}
 }
 
 func newSmartRoutingRuntime(parent context.Context, deps smartRoutingRuntimeDeps) *SmartRoutingRuntime {
@@ -377,9 +381,16 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 	summary["breakers"] = len(dirtyBreakers)
 
 	now := common.GetTimestamp()
-	const retentionIntervalSeconds int64 = 6 * 60 * 60
+	const (
+		retentionIntervalSeconds int64 = 6 * 60 * 60
+		secondsPerDay            int64 = 24 * 60 * 60
+	)
 	if setting.RetentionDays > 0 && now-smartRoutingRetentionLast.Load() >= retentionIntervalSeconds {
-		cutoffTs := now - int64(setting.RetentionDays)*86400
+		cutoffTs := int64(0)
+		retentionDays := int64(setting.RetentionDays)
+		if retentionDays <= now/secondsPerDay {
+			cutoffTs = now - retentionDays*secondsPerDay
+		}
 		deleted, err := model.DeleteRoutingMetricsBefore(cutoffTs)
 		if err != nil {
 			return summary, err

@@ -225,6 +225,12 @@ func normalize(setting *SmartRoutingSetting) {
 	if setting.FirstByteP95Multiplier <= 0 {
 		setting.FirstByteP95Multiplier = defaultSmartRoutingSetting.FirstByteP95Multiplier
 	}
+	if setting.SnapshotLiveSec < 1 {
+		setting.SnapshotLiveSec = defaultSmartRoutingSetting.SnapshotLiveSec
+	}
+	if setting.SnapshotStaleSec < 1 {
+		setting.SnapshotStaleSec = defaultSmartRoutingSetting.SnapshotStaleSec
+	}
 	if setting.SyncIntervalMin < 1 {
 		setting.SyncIntervalMin = 1
 	}

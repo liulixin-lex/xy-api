@@ -82,6 +82,8 @@ func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
 		HalfOpenProbes:    0,
 		MaxSwitches:       -3,
 		BackoffCapMs:      -1,
+		SnapshotLiveSec:   0,
+		SnapshotStaleSec:  0,
 		RetentionDays:     0,
 	})
 
@@ -93,6 +95,8 @@ func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
 	assert.Equal(t, 1, updated.HalfOpenProbes)
 	assert.Equal(t, 0, updated.MaxSwitches)
 	assert.Equal(t, 20000, updated.BackoffCapMs)
+	assert.Equal(t, 300, updated.SnapshotLiveSec)
+	assert.Equal(t, 1800, updated.SnapshotStaleSec)
 	assert.Equal(t, 7, updated.RetentionDays)
 }
 
