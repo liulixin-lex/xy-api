@@ -627,6 +627,162 @@ func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJ
 	assert.NotZero(t, health.BalanceUpdatedTime)
 }
 
+func TestRoutingSub2APIJWTCoalescesConcurrentLogin(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	common.RedisEnabled = false
+	common.RDB = nil
+	t.Cleanup(func() {
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+	})
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	const callers = 8
+	ready := make(chan struct{}, callers)
+	start := make(chan struct{})
+	entered := make(chan struct{}, callers)
+	respond := make(chan struct{})
+	type loginResult struct {
+		token string
+		err   error
+	}
+	results := make(chan loginResult, callers)
+
+	var loginMu sync.Mutex
+	loginCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/login" {
+			http.NotFound(w, r)
+			return
+		}
+		loginMu.Lock()
+		loginCount++
+		loginMu.Unlock()
+		<-respond
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"shared-jwt","expires_in":3600}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{ChannelID: 887, BaseURL: server.URL}
+	credentials := model.RoutingCredentials{
+		Sub2APIEmail:    "admin@example.com",
+		Sub2APIPassword: "pw-secret",
+	}
+	for range callers {
+		go func() {
+			ready <- struct{}{}
+			<-start
+			entered <- struct{}{}
+			token, err := routingSub2APIJWT(context.Background(), binding, credentials)
+			results <- loginResult{token: token, err: err}
+		}()
+	}
+	for range callers {
+		<-ready
+	}
+	close(start)
+	for range callers {
+		<-entered
+	}
+	close(respond)
+
+	for range callers {
+		result := <-results
+		require.NoError(t, result.err)
+		assert.Equal(t, "shared-jwt", result.token)
+	}
+	loginMu.Lock()
+	actualLoginCount := loginCount
+	loginMu.Unlock()
+	assert.Equal(t, 1, actualLoginCount)
+}
+
+func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	now := common.GetTimestamp()
+	routingSub2APIJWTCache.Lock()
+	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
+		10: {Ciphertext: "expired", ExpiresAt: now},
+		20: {Ciphertext: "oldest", ExpiresAt: now + 10},
+		30: {Ciphertext: "tied-smaller-channel", ExpiresAt: now + 20},
+		40: {Ciphertext: "tied-larger-channel", ExpiresAt: now + 20},
+		50: {Ciphertext: "newest", ExpiresAt: now + 30},
+	}
+	pruneRoutingSub2APIJWTCacheLocked(now, 2)
+	_, hasExpired := routingSub2APIJWTCache.values[10]
+	_, hasOldest := routingSub2APIJWTCache.values[20]
+	_, hasTiedSmallerChannel := routingSub2APIJWTCache.values[30]
+	_, hasTiedLargerChannel := routingSub2APIJWTCache.values[40]
+	_, hasNewest := routingSub2APIJWTCache.values[50]
+	cacheSize := len(routingSub2APIJWTCache.values)
+	routingSub2APIJWTCache.Unlock()
+
+	assert.False(t, hasExpired)
+	assert.False(t, hasOldest)
+	assert.False(t, hasTiedSmallerChannel)
+	assert.True(t, hasTiedLargerChannel)
+	assert.True(t, hasNewest)
+	assert.Equal(t, 2, cacheSize)
+}
+
+func TestRoutingSub2APIJWTCacheNeverExceedsLimitOnSet(t *testing.T) {
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	common.RedisEnabled = false
+	common.RDB = nil
+	t.Cleanup(func() {
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+	})
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	routingSub2APIJWTCache.Lock()
+	previousMaxEntries := routingSub2APIMaxJWTEntries
+	routingSub2APIMaxJWTEntries = 2
+	routingSub2APIJWTCache.Unlock()
+	t.Cleanup(func() {
+		routingSub2APIJWTCache.Lock()
+		routingSub2APIMaxJWTEntries = previousMaxEntries
+		routingSub2APIJWTCache.Unlock()
+	})
+
+	ctx := context.Background()
+	setRoutingSub2APICachedJWT(ctx, 901, "jwt-oldest", time.Hour)
+	setRoutingSub2APICachedJWT(ctx, 902, "jwt-middle", 2*time.Hour)
+	setRoutingSub2APICachedJWT(ctx, 903, "jwt-newest", 3*time.Hour)
+
+	routingSub2APIJWTCache.Lock()
+	cacheSize := len(routingSub2APIJWTCache.values)
+	routingSub2APIJWTCache.Unlock()
+	latestToken, latestFound := getRoutingSub2APICachedJWT(ctx, 903)
+	_, oldestFound := getRoutingSub2APICachedJWT(ctx, 901)
+
+	assert.LessOrEqual(t, cacheSize, 2)
+	assert.True(t, latestFound)
+	assert.Equal(t, "jwt-newest", latestToken)
+	assert.False(t, oldestFound)
+}
+
 func TestFetchRoutingCostSnapshotsSub2APILoginFailureMarksAuthAndMasksSecrets(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))

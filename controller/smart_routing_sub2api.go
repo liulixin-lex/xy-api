@@ -9,6 +9,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +19,13 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/go-redis/redis/v8"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	routingSub2APILockTTL        = 30 * time.Second
-	routingSub2APITokenTTLBuffer = 60 * time.Second
+	routingSub2APILockTTL              = 30 * time.Second
+	routingSub2APITokenTTLBuffer       = 60 * time.Second
+	routingSub2APIDefaultMaxJWTEntries = 4_096
 )
 
 type routingSub2APIEnvelope struct {
@@ -75,11 +79,12 @@ type routingSub2APIJWTCacheEntry struct {
 var routingSub2APIJWTCache = struct {
 	sync.Mutex
 	values map[int]routingSub2APIJWTCacheEntry
-	locks  map[int]*sync.Mutex
 }{
 	values: map[int]routingSub2APIJWTCacheEntry{},
-	locks:  map[int]*sync.Mutex{},
 }
+
+var routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
+var routingSub2APILoginGroup singleflight.Group
 
 func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) ([]model.RoutingCostSnapshot, error) {
 	jwt, err := routingSub2APIJWT(ctx, binding, credentials)
@@ -143,42 +148,37 @@ func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding,
 		return token, nil
 	}
 
-	mutex := routingSub2APILocalLock(binding.ChannelID)
-	mutex.Lock()
-	defer mutex.Unlock()
+	value, err, _ := routingSub2APILoginGroup.Do(strconv.Itoa(binding.ChannelID), func() (any, error) {
+		if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+			return token, nil
+		}
 
-	if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+		unlockRedis, lockErr := acquireRoutingSub2APIRedisLock(ctx, binding.ChannelID)
+		if lockErr != nil {
+			return "", lockErr
+		}
+		if unlockRedis != nil {
+			defer unlockRedis()
+		}
+		if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+			return token, nil
+		}
+
+		token, ttl, loginErr := loginRoutingSub2API(ctx, binding, credentials)
+		if loginErr != nil {
+			return "", loginErr
+		}
+		setRoutingSub2APICachedJWT(ctx, binding.ChannelID, token, ttl)
 		return token, nil
-	}
-
-	unlockRedis, err := acquireRoutingSub2APIRedisLock(ctx, binding.ChannelID)
+	})
 	if err != nil {
 		return "", err
 	}
-	if unlockRedis != nil {
-		defer unlockRedis()
+	token, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("sub2api login returned unexpected result type %T", value)
 	}
-	if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
-		return token, nil
-	}
-
-	token, ttl, err := loginRoutingSub2API(ctx, binding, credentials)
-	if err != nil {
-		return "", err
-	}
-	setRoutingSub2APICachedJWT(ctx, binding.ChannelID, token, ttl)
 	return token, nil
-}
-
-func routingSub2APILocalLock(channelID int) *sync.Mutex {
-	routingSub2APIJWTCache.Lock()
-	defer routingSub2APIJWTCache.Unlock()
-	lock := routingSub2APIJWTCache.locks[channelID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		routingSub2APIJWTCache.locks[channelID] = lock
-	}
-	return lock
 }
 
 func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(), error) {
@@ -639,11 +639,16 @@ func getRoutingSub2APICachedJWT(ctx context.Context, channelID int) (string, boo
 		}
 	}
 
+	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
-	defer routingSub2APIJWTCache.Unlock()
+	for cachedChannelID, cachedEntry := range routingSub2APIJWTCache.values {
+		if cachedEntry.ExpiresAt <= now {
+			delete(routingSub2APIJWTCache.values, cachedChannelID)
+		}
+	}
 	entry, ok := routingSub2APIJWTCache.values[channelID]
-	if !ok || entry.ExpiresAt <= common.GetTimestamp() {
-		delete(routingSub2APIJWTCache.values, channelID)
+	routingSub2APIJWTCache.Unlock()
+	if !ok {
 		return "", false
 	}
 	token, err := common.DecryptAESGCMString(entry.Ciphertext)
@@ -664,11 +669,46 @@ func setRoutingSub2APICachedJWT(ctx context.Context, channelID int, token string
 			common.SysError(fmt.Sprintf("sub2api jwt cache set failed: channel_id=%d err=%v", channelID, err))
 		}
 	}
+	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
 	routingSub2APIJWTCache.values[channelID] = routingSub2APIJWTCacheEntry{
 		Ciphertext: encrypted,
-		ExpiresAt:  common.GetTimestamp() + int64(ttl.Seconds()),
+		ExpiresAt:  now + int64(ttl.Seconds()),
+	}
+	pruneRoutingSub2APIJWTCacheLocked(now, routingSub2APIMaxJWTEntries)
+}
+
+func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
+	for channelID, entry := range routingSub2APIJWTCache.values {
+		if entry.ExpiresAt <= now {
+			delete(routingSub2APIJWTCache.values, channelID)
+		}
+	}
+	if maxEntries <= 0 {
+		maxEntries = routingSub2APIDefaultMaxJWTEntries
+	}
+	excess := len(routingSub2APIJWTCache.values) - maxEntries
+	if excess <= 0 {
+		return
+	}
+
+	type candidate struct {
+		channelID int
+		expiresAt int64
+	}
+	candidates := make([]candidate, 0, len(routingSub2APIJWTCache.values))
+	for channelID, entry := range routingSub2APIJWTCache.values {
+		candidates = append(candidates, candidate{channelID: channelID, expiresAt: entry.ExpiresAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].expiresAt == candidates[j].expiresAt {
+			return candidates[i].channelID < candidates[j].channelID
+		}
+		return candidates[i].expiresAt < candidates[j].expiresAt
+	})
+	for _, entry := range candidates[:excess] {
+		delete(routingSub2APIJWTCache.values, entry.channelID)
 	}
 }
 
@@ -707,5 +747,6 @@ func resetRoutingSub2APITestState() {
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
 	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{}
-	routingSub2APIJWTCache.locks = map[int]*sync.Mutex{}
+	routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
+	routingSub2APILoginGroup = singleflight.Group{}
 }
