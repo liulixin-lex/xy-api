@@ -117,13 +117,62 @@ func TestBreakerHydrateAndResetRespectMaxEntries(t *testing.T) {
 
 	resetKey := Key{ChannelID: 13, APIKeyIndex: SingleAPIKeyIndex, Model: "reset", Group: "default"}
 	require.Equal(t, StateHealthy, breaker.Reset(resetKey).State)
-	assert.Equal(t, Stats{Entries: 2, Dirty: 1, Evictions: 2}, breaker.Stats())
-	assert.Equal(t, StateHealthy, breaker.GetSnapshot(keys[1]).State)
+	assert.Equal(t, Stats{Entries: 2, Evictions: 2}, breaker.Stats())
+	assert.Equal(t, StateOpen, breaker.GetSnapshot(keys[1]).State)
 	assert.Equal(t, StateOpen, breaker.GetSnapshot(keys[2]).State)
+	assert.Empty(t, breaker.DirtySnapshots())
+}
 
-	dirty := breaker.DirtySnapshots()
-	require.Len(t, dirty, 1)
-	assert.Equal(t, resetKey, dirty[0].Key)
+func TestBreakerAdmissionPreservesCriticalStatesOverNewHealthyEntries(t *testing.T) {
+	tests := []struct {
+		name  string
+		admit func(*Breaker, Key, time.Time) (Snapshot, []Snapshot)
+	}{
+		{
+			name: "success",
+			admit: func(breaker *Breaker, key Key, _ time.Time) (Snapshot, []Snapshot) {
+				return breaker.OnSuccess(key), nil
+			},
+		},
+		{
+			name: "reset",
+			admit: func(breaker *Breaker, key Key, _ time.Time) (Snapshot, []Snapshot) {
+				return breaker.Reset(key), nil
+			},
+		},
+		{
+			name: "hydrate",
+			admit: func(breaker *Breaker, key Key, now time.Time) (Snapshot, []Snapshot) {
+				return Snapshot{}, breaker.Hydrate([]Snapshot{{Key: key, State: StateHealthy, UpdatedAt: now}})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+			breaker := New(Config{EntryTTL: time.Hour, MaxEntries: 2, Now: func() time.Time { return now }})
+			openKey := Key{ChannelID: 30, APIKeyIndex: SingleAPIKeyIndex, Model: "open", Group: "default"}
+			halfOpenKey := Key{ChannelID: 31, APIKeyIndex: SingleAPIKeyIndex, Model: "half-open", Group: "default"}
+			newKey := Key{ChannelID: 32, APIKeyIndex: SingleAPIKeyIndex, Model: "healthy", Group: "default"}
+			accepted := breaker.Hydrate([]Snapshot{
+				{Key: openKey, State: StateOpen, CooldownUntil: now.Add(time.Hour), UpdatedAt: now.Add(-2 * time.Second)},
+				{Key: halfOpenKey, State: StateHalfOpen, UpdatedAt: now.Add(-time.Second)},
+			})
+			require.Len(t, accepted, 2)
+
+			result, admitted := test.admit(breaker, newKey, now)
+
+			if test.name != "hydrate" {
+				assert.Equal(t, StateHealthy, result.State)
+			}
+			assert.Empty(t, admitted)
+			assert.Equal(t, Stats{Entries: 2, Evictions: 1}, breaker.Stats())
+			assert.Equal(t, StateOpen, breaker.GetSnapshot(openKey).State)
+			assert.Equal(t, StateHalfOpen, breaker.GetSnapshot(halfOpenKey).State)
+			assert.Empty(t, breaker.DirtySnapshots())
+		})
+	}
 }
 
 func TestBreakerCapacityEvictionUsesStableKeyOrder(t *testing.T) {

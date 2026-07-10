@@ -189,6 +189,7 @@ func (b *Breaker) OnSuccess(key Key) Snapshot {
 
 	now := b.config.Now()
 	record := b.getOrCreate(key, now)
+	defer b.pruneLocked(now, 0)
 	b.advanceOpen(record, now)
 
 	switch record.snapshot.State {
@@ -226,6 +227,7 @@ func (b *Breaker) OnFailure(key Key, statusCode int, retryAfter time.Duration) S
 
 	now := b.config.Now()
 	record := b.getOrCreate(key, now)
+	defer b.pruneLocked(now, 0)
 	b.advanceOpen(record, now)
 
 	if record.snapshot.State == StateOpen {
@@ -296,6 +298,7 @@ func (b *Breaker) Reset(key Key) Snapshot {
 
 	now := b.config.Now()
 	record := b.getOrCreate(key, now)
+	defer b.pruneLocked(now, 0)
 	record.snapshot = Snapshot{
 		Key:       key,
 		State:     StateHealthy,
@@ -340,6 +343,7 @@ func (b *Breaker) AcquireHalfOpenProbe(key Key, maxProbes int) (Snapshot, bool) 
 
 	now := b.config.Now()
 	record := b.getOrCreate(key, now)
+	defer b.pruneLocked(now, 0)
 	if b.advanceOpen(record, now) {
 		b.markDirty(key)
 	}
@@ -364,6 +368,7 @@ func (b *Breaker) ReleaseHalfOpenProbe(key Key) Snapshot {
 
 	now := b.config.Now()
 	record := b.getOrCreate(key, now)
+	defer b.pruneLocked(now, 0)
 	if record.snapshot.State == StateHalfOpen && record.snapshot.HalfOpenInflight > 0 {
 		record.snapshot.HalfOpenInflight--
 		record.snapshot.UpdatedAt = now
@@ -397,14 +402,15 @@ func (b *Breaker) Hydrate(snapshots []Snapshot) []Snapshot {
 			if !snapshot.UpdatedAt.After(existing.snapshot.UpdatedAt) {
 				continue
 			}
-		} else {
-			b.pruneLocked(now, 1)
 		}
 		b.states[snapshot.Key] = &entry{
 			snapshot: snapshot,
 			window:   reconstructWindow(snapshot.WindowRequests, snapshot.WindowFailures),
 		}
-		accepted = append(accepted, snapshot)
+		b.pruneLocked(now, 0)
+		if record, ok := b.states[snapshot.Key]; ok && record.snapshot.UpdatedAt.Equal(snapshot.UpdatedAt) {
+			accepted = append(accepted, record.snapshot)
+		}
 	}
 
 	retained := accepted[:0]
@@ -521,7 +527,7 @@ func (b *Breaker) getOrCreate(key Key, now time.Time) *entry {
 	if ok {
 		b.evictLocked(key)
 	}
-	b.pruneLocked(now, 1)
+	b.pruneLocked(now, 0)
 	record = &entry{
 		snapshot: Snapshot{
 			Key:       key,
