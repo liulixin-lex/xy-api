@@ -517,14 +517,6 @@ func TestFetchRoutingCostSnapshotsPreservesTieredExprAsUnknownCost(t *testing.T)
 	assert.Contains(t, *snapshots[0].TiersJSON, `tier(\"base\", p * 2.5 + c * 15)`)
 }
 
-func waitForRoutingSub2APILoginGroup() {
-	// DoChan publishes buffered results before releasing the group mutex.
-	// A synchronous call on another key waits for that release before returning.
-	_, _, _ = routingSub2APILoginGroup.Do("routing-sub2api-test-barrier", func() (any, error) {
-		return nil, nil
-	})
-}
-
 func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJWT(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
@@ -589,7 +581,6 @@ func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJ
 
 	for range 2 {
 		summary, err := runRoutingCostSyncTask(context.Background())
-		waitForRoutingSub2APILoginGroup()
 		require.NoError(t, err)
 		assert.EqualValues(t, 1, summary["bindings"])
 		assert.EqualValues(t, 1, summary["snapshots"])
@@ -710,7 +701,6 @@ func TestRoutingSub2APIJWTCoalescesConcurrentLogin(t *testing.T) {
 	for range callers {
 		collectedResults = append(collectedResults, <-results)
 	}
-	waitForRoutingSub2APILoginGroup()
 	for _, result := range collectedResults {
 		require.NoError(t, result.err)
 		assert.Equal(t, "shared-jwt", result.token)
@@ -794,7 +784,6 @@ func TestRoutingSub2APIJWTLeaderCancellationDoesNotCancelSharedLogin(t *testing.
 	close(release)
 	<-completed
 	token, err := routingSub2APIJWT(context.Background(), binding, credentials)
-	waitForRoutingSub2APILoginGroup()
 
 	require.NoError(t, err)
 	assert.Equal(t, "shared-jwt", token)
@@ -802,6 +791,84 @@ func TestRoutingSub2APIJWTLeaderCancellationDoesNotCancelSharedLogin(t *testing.
 	actualLoginCount := loginCount
 	loginMu.Unlock()
 	assert.Equal(t, 1, actualLoginCount)
+}
+
+func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
+	resetRoutingSub2APITestState()
+	t.Cleanup(resetRoutingSub2APITestState)
+
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	common.RedisEnabled = false
+	common.RDB = nil
+	t.Cleanup(func() {
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+	})
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	firstLoginStarted := make(chan struct{})
+	releaseFirstLogin := make(chan struct{})
+	var loginMu sync.Mutex
+	loginCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/login" {
+			http.NotFound(w, r)
+			return
+		}
+
+		loginMu.Lock()
+		loginCount++
+		requestNumber := loginCount
+		loginMu.Unlock()
+
+		if requestNumber == 1 {
+			close(firstLoginStarted)
+			<-releaseFirstLogin
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"retired-jwt","expires_in":3600}}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"code":0,"data":{"token":"current-jwt","expires_in":3600}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{ChannelID: 889, BaseURL: server.URL}
+	credentials := model.RoutingCredentials{
+		Sub2APIEmail:    "admin@example.com",
+		Sub2APIPassword: "pw-secret",
+	}
+	type loginResult struct {
+		token string
+		err   error
+	}
+	retiredResult := make(chan loginResult, 1)
+	go func() {
+		token, err := routingSub2APIJWT(context.Background(), binding, credentials)
+		retiredResult <- loginResult{token: token, err: err}
+	}()
+
+	<-firstLoginStarted
+	resetRoutingSub2APITestState()
+	close(releaseFirstLogin)
+	result := <-retiredResult
+	require.NoError(t, result.err)
+	assert.Equal(t, "retired-jwt", result.token)
+	assert.Empty(t, routingSub2APICachedJWTForTest(binding.ChannelID))
+
+	token, err := routingSub2APIJWT(context.Background(), binding, credentials)
+
+	require.NoError(t, err)
+	assert.Equal(t, "current-jwt", token)
+	loginMu.Lock()
+	actualLoginCount := loginCount
+	loginMu.Unlock()
+	assert.Equal(t, 2, actualLoginCount)
 }
 
 func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
@@ -912,7 +979,6 @@ func TestFetchRoutingCostSnapshotsSub2APILoginFailureMarksAuthAndMasksSecrets(t 
 	require.NoError(t, db.Create(&binding).Error)
 
 	summary, err := runRoutingCostSyncTask(context.Background())
-	waitForRoutingSub2APILoginGroup()
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, summary["errors"])

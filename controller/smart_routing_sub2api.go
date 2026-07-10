@@ -84,7 +84,13 @@ var routingSub2APIJWTCache = struct {
 }
 
 var routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
-var routingSub2APILoginGroup singleflight.Group
+var routingSub2APILoginCoordinator = struct {
+	sync.RWMutex
+	group      *singleflight.Group
+	generation uint64
+}{
+	group: &singleflight.Group{},
+}
 
 func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) ([]model.RoutingCostSnapshot, error) {
 	jwt, err := routingSub2APIJWT(ctx, binding, credentials)
@@ -148,7 +154,10 @@ func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding,
 		return token, nil
 	}
 
-	resultChannel := routingSub2APILoginGroup.DoChan(strconv.Itoa(binding.ChannelID), func() (any, error) {
+	routingSub2APILoginCoordinator.RLock()
+	loginGroup := routingSub2APILoginCoordinator.group
+	loginGeneration := routingSub2APILoginCoordinator.generation
+	resultChannel := loginGroup.DoChan(strconv.Itoa(binding.ChannelID), func() (any, error) {
 		sharedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APILockTTL)
 		defer cancel()
 
@@ -171,9 +180,14 @@ func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding,
 		if loginErr != nil {
 			return "", loginErr
 		}
-		setRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID, token, ttl)
+		routingSub2APILoginCoordinator.RLock()
+		if loginGeneration == routingSub2APILoginCoordinator.generation {
+			setRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID, token, ttl)
+		}
+		routingSub2APILoginCoordinator.RUnlock()
 		return token, nil
 	})
+	routingSub2APILoginCoordinator.RUnlock()
 
 	select {
 	case <-ctx.Done():
@@ -753,9 +767,13 @@ func routingSub2APICachedJWTForTest(channelID int) string {
 }
 
 func resetRoutingSub2APITestState() {
+	routingSub2APILoginCoordinator.Lock()
+	defer routingSub2APILoginCoordinator.Unlock()
+	routingSub2APILoginCoordinator.group = &singleflight.Group{}
+	routingSub2APILoginCoordinator.generation++
+
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
 	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{}
 	routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
-	routingSub2APILoginGroup = singleflight.Group{}
 }
