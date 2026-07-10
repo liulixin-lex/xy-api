@@ -341,6 +341,155 @@ func TestDefaultBreakerSerializesPublicationWithConcurrentEviction(t *testing.T)
 	assert.Equal(t, string(StateOpen), secondCached.State)
 }
 
+func TestClearDefaultKeySerializesCacheClearWithConcurrentRecord(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.Now = func() time.Time { return now }
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	key := Key{ChannelID: 49, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-key", Group: "default"}
+	RecordAttempt(key, false, 429, 0)
+	require.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
+
+	clearStarted := make(chan bool, 1)
+	allowClear := make(chan struct{})
+	defaultBreaker.onClearKey = func(clearedKey Key) {
+		_, statePresent := defaultBreaker.states[clearedKey]
+		_, dirtyPresent := defaultBreaker.dirty[clearedKey]
+		clearStarted <- statePresent || dirtyPresent
+		<-allowClear
+		clearPublishedSnapshot(clearedKey)
+	}
+
+	clearDone := make(chan struct{})
+	go func() {
+		ClearDefaultKey(key)
+		close(clearDone)
+	}()
+	internalStatePresent := <-clearStarted
+	mutationLockWasAvailable := defaultBreaker.mu.TryLock()
+	if mutationLockWasAvailable {
+		defaultBreaker.mu.Unlock()
+	}
+
+	recordDone := make(chan struct{})
+	if mutationLockWasAvailable {
+		RecordAttempt(key, true, 0, 0)
+		close(recordDone)
+	} else {
+		go func() {
+			RecordAttempt(key, true, 0, 0)
+			close(recordDone)
+		}()
+	}
+	close(allowClear)
+	<-clearDone
+	<-recordDone
+
+	assert.False(t, internalStatePresent)
+	assert.False(t, mutationLockWasAvailable)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
+	dirty := DirtySnapshots()
+	require.Len(t, dirty, 1)
+	assert.Equal(t, key, dirty[0].Key)
+	assert.Equal(t, StateHealthy, dirty[0].State)
+	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 49, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-key", Group: "default"})
+	require.True(t, ok)
+	assert.Equal(t, string(StateHealthy), cached.State)
+}
+
+func TestClearDefaultChannelSerializesAllCacheClearWithConcurrentRecord(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	config := DefaultConfig()
+	config.EntryTTL = time.Hour
+	config.Now = func() time.Time { return now }
+	ResetDefaultForTest(config)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	const channelID = 50
+	key := Key{ChannelID: channelID, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-channel", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: channelID, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-channel", Group: "default"}
+	RecordAttempt(key, false, 429, 0)
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{UpdatedUnix: now.Unix()})
+	routinghotcache.SetCostForTest(cacheKey.CostKey(), routinghotcache.CostSnapshot{UpdatedUnix: now.Unix()})
+	routinghotcache.SetAuthFailureForTest(channelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now.Unix()})
+	routinghotcache.SetBalanceForTest(channelID, routinghotcache.BalanceSnapshot{Known: true, UpdatedUnix: now.Unix()})
+	require.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
+
+	clearStarted := make(chan bool, 1)
+	allowClear := make(chan struct{})
+	defaultBreaker.onClearChannel = func(clearedChannelID int) {
+		internalStatePresent := false
+		for stateKey := range defaultBreaker.states {
+			if stateKey.ChannelID == clearedChannelID {
+				internalStatePresent = true
+				break
+			}
+		}
+		if !internalStatePresent {
+			for dirtyKey := range defaultBreaker.dirty {
+				if dirtyKey.ChannelID == clearedChannelID {
+					internalStatePresent = true
+					break
+				}
+			}
+		}
+		clearStarted <- internalStatePresent
+		<-allowClear
+		routinghotcache.ClearChannel(clearedChannelID)
+	}
+
+	clearDone := make(chan struct{})
+	go func() {
+		ClearDefaultChannel(channelID)
+		close(clearDone)
+	}()
+	internalStatePresent := <-clearStarted
+	mutationLockWasAvailable := defaultBreaker.mu.TryLock()
+	if mutationLockWasAvailable {
+		defaultBreaker.mu.Unlock()
+	}
+
+	recordDone := make(chan struct{})
+	if mutationLockWasAvailable {
+		RecordAttempt(key, true, 0, 0)
+		close(recordDone)
+	} else {
+		go func() {
+			RecordAttempt(key, true, 0, 0)
+			close(recordDone)
+		}()
+	}
+	close(allowClear)
+	<-clearDone
+	<-recordDone
+
+	assert.False(t, internalStatePresent)
+	assert.False(t, mutationLockWasAvailable)
+	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
+	_, metricOK := routinghotcache.GetMetric(cacheKey)
+	_, costOK := routinghotcache.GetCost(cacheKey.CostKey())
+	_, authOK := routinghotcache.GetAuthFailure(channelID)
+	_, balanceOK := routinghotcache.GetBalance(channelID)
+	assert.False(t, metricOK)
+	assert.False(t, costOK)
+	assert.False(t, authOK)
+	assert.False(t, balanceOK)
+	cached, ok := routinghotcache.GetBreaker(cacheKey)
+	require.True(t, ok)
+	assert.Equal(t, string(StateHealthy), cached.State)
+}
+
 func TestBreakerCapacityEvictionUsesStableKeyOrder(t *testing.T) {
 	tests := []struct {
 		name string

@@ -71,9 +71,11 @@ type Breaker struct {
 	dirty     map[Key]struct{}
 	evictions int64
 	// Callbacks run while mu is held so default-breaker publication and
-	// eviction stay linearized. They must not call back into Breaker.
-	onRetained func(Snapshot)
-	onEvict    func(Key)
+	// removal stay linearized. They must not call back into Breaker.
+	onRetained     func(Snapshot)
+	onEvict        func(Key)
+	onClearKey     func(Key)
+	onClearChannel func(int)
 }
 
 type entry struct {
@@ -135,12 +137,10 @@ func ResetDefaultKey(key Key) Snapshot {
 
 func ClearDefaultKey(key Key) {
 	defaultBreaker.Clear(key)
-	clearPublishedSnapshot(key)
 }
 
 func ClearDefaultChannel(channelID int) {
 	defaultBreaker.ClearChannel(channelID)
-	routinghotcache.ClearChannel(channelID)
 }
 
 func ResetDefaultForTest(config Config) {
@@ -176,6 +176,8 @@ func newDefaultBreaker(config Config) *Breaker {
 	breaker := New(config)
 	breaker.onRetained = publishSnapshot
 	breaker.onEvict = clearPublishedSnapshot
+	breaker.onClearKey = clearPublishedSnapshot
+	breaker.onClearChannel = routinghotcache.ClearChannel
 	return breaker
 }
 
@@ -333,6 +335,9 @@ func (b *Breaker) Clear(key Key) {
 
 	delete(b.states, key)
 	delete(b.dirty, key)
+	if b.onClearKey != nil {
+		b.onClearKey(key)
+	}
 }
 
 func (b *Breaker) ClearChannel(channelID int) {
@@ -351,6 +356,9 @@ func (b *Breaker) ClearChannel(channelID int) {
 		if key.ChannelID == channelID {
 			delete(b.dirty, key)
 		}
+	}
+	if b.onClearChannel != nil {
+		b.onClearChannel(channelID)
 	}
 }
 
