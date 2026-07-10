@@ -187,12 +187,117 @@ func TestRoutingPersistenceAcceptsOnlySingleKeyMinusOne(t *testing.T) {
 	}
 }
 
-func TestSupportsLegacyRoutingStateFailsClosedWhenMemoryCacheMissesChannel(t *testing.T) {
+func TestResolveLegacyRoutingStateEligibilityFailsClosedWhenMemoryCacheMissesChannel(t *testing.T) {
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
 
-	assert.False(t, SupportsLegacyRoutingState(int(^uint(0)>>1), RoutingMetricSingleKeyIndex))
+	channelID := int(^uint(0) >> 1)
+	eligibility, err := ResolveLegacyRoutingStateEligibility(channelID, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+	assert.False(t, eligibility.Supported())
+	assert.False(t, SupportsLegacyRoutingState(channelID, RoutingMetricSingleKeyIndex))
+}
+
+func TestResolveLegacyRoutingStateEligibilityTreatsRecordNotFoundAsUnsupported(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}))
+
+	eligibility, err := ResolveLegacyRoutingStateEligibility(404, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+	assert.False(t, eligibility.Supported())
+	assert.False(t, SupportsLegacyRoutingState(404, RoutingMetricSingleKeyIndex))
+}
+
+func TestRoutingStateUpsertsPropagateEligibilityQueryErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []interface{}
+		upsert func() error
+	}{
+		{
+			name:   "metric",
+			models: []interface{}{&Channel{}, &RoutingChannelMetric{}},
+			upsert: func() error {
+				return UpsertRoutingChannelMetric(&RoutingChannelMetric{
+					ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+					Group: "default", BucketTs: 60, RequestCount: 1,
+				})
+			},
+		},
+		{
+			name:   "breaker",
+			models: []interface{}{&Channel{}, &RoutingBreakerState{}},
+			upsert: func() error {
+				return UpsertRoutingBreakerState(&RoutingBreakerState{
+					ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+					Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 100,
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openRoutingSQLiteTestDB(t)
+			withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+
+			require.NoError(t, DB.AutoMigrate(test.models...))
+			require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
+
+			forcedErr := errors.New("forced channel eligibility query failure")
+			callbackName := "test:fail_" + test.name + "_channel_eligibility_query"
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channels" {
+					tx.AddError(forcedErr)
+				}
+			}))
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			require.ErrorIs(t, test.upsert(), forcedErr)
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+			var persistedCount int64
+			require.NoError(t, DB.Model(test.models[1]).Count(&persistedCount).Error)
+			assert.Zero(t, persistedCount)
+		})
+	}
+}
+
+func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
+
+	eligibility, err := ResolveLegacyRoutingStateEligibility(1, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+	require.True(t, eligibility.Supported())
+
+	require.ErrorIs(t, eligibility.UpsertRoutingChannelMetric(&RoutingChannelMetric{
+		ChannelID: 2, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+		Group: "default", BucketTs: 60, RequestCount: 1,
+	}), ErrLegacyRoutingStateEligibilityMismatch)
+	require.ErrorIs(t, eligibility.UpsertRoutingBreakerState(&RoutingBreakerState{
+		ChannelID: 2, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 100,
+	}), ErrLegacyRoutingStateEligibilityMismatch)
+
+	var metricCount int64
+	require.NoError(t, DB.Model(&RoutingChannelMetric{}).Count(&metricCount).Error)
+	assert.Zero(t, metricCount)
+	var breakerCount int64
+	require.NoError(t, DB.Model(&RoutingBreakerState{}).Count(&breakerCount).Error)
+	assert.Zero(t, breakerCount)
 }
 
 var routingMigrationModels = []interface{}{
@@ -264,7 +369,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	const legacyBreakerUpdatedTime int64 = 9_000_000_000
 	legacyBreaker := routingBreakerStateBeforeSemanticVersion{
 		ChannelID:           1,
-		APIKeyIndex:         2,
+		APIKeyIndex:         RoutingMetricSingleKeyIndex,
 		ModelName:           "gpt-test",
 		Group:               "default",
 		State:               RoutingBreakerStateOpen,
@@ -309,7 +414,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 
 	var migratedLegacyBreaker RoutingBreakerState
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, 2, "gpt-test", "default").First(&migratedLegacyBreaker).Error)
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").First(&migratedLegacyBreaker).Error)
 	assert.Zero(t, migratedLegacyBreaker.SemanticVersion)
 	assert.Equal(t, legacyBreakerUpdatedTime, migratedLegacyBreaker.UpdatedTime)
 	assert.Equal(t, int64(999), migratedLegacyBreaker.WindowRequests)
@@ -524,6 +629,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, int64(25), currentBreaker.WindowFailures)
 	assert.Zero(t, currentBreaker.LastProbeAt)
 	assert.Equal(t, int64(1000), currentBreaker.UpdatedTime)
+	assert.Equal(t, legacyBreaker.ID, currentBreaker.ID)
 
 	var breakerCount int64
 	require.NoError(t, DB.Model(&RoutingBreakerState{}).Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
@@ -535,7 +641,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.Len(t, hydrationStates, 1)
 	assert.Equal(t, RoutingBreakerSemanticVersion, hydrationStates[0].SemanticVersion)
 	assert.Equal(t, int64(1000), hydrationStates[0].UpdatedTime)
-	nextHydrationPage, err := GetRoutingBreakerStatesForHydrationPage(5000, hydrationStates[0].UpdatedTime, hydrationStates[0].ID)
+	nextHydrationPage, err := GetRoutingBreakerStatesForHydrationPage(5000, 0, hydrationStates[0].UpdatedTime, hydrationStates[0].ID)
 	require.NoError(t, err)
 	assert.Empty(t, nextHydrationPage)
 

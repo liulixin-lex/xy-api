@@ -111,6 +111,12 @@ func ConfigureDefault(config Config) {
 	defaultBreaker.Configure(config)
 }
 
+func DefaultEntryTTL() time.Duration {
+	defaultBreaker.mu.Lock()
+	defer defaultBreaker.mu.Unlock()
+	return defaultBreaker.config.EntryTTL
+}
+
 func HydrateDefaultSnapshots(snapshots []Snapshot) []Snapshot {
 	return defaultBreaker.Hydrate(snapshots)
 }

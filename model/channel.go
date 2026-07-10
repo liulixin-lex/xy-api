@@ -172,12 +172,44 @@ func (c *ChannelInfo) Scan(value interface{}) error {
 	return common.Unmarshal(bytesValue, c)
 }
 
-func SupportsLegacyRoutingState(channelID int, apiKeyIndex int) bool {
+type LegacyRoutingStateEligibility struct {
+	channelID   int
+	apiKeyIndex int
+	supported   bool
+}
+
+func (eligibility LegacyRoutingStateEligibility) Supported() bool {
+	return eligibility.supported &&
+		eligibility.channelID > 0 &&
+		eligibility.apiKeyIndex == RoutingMetricSingleKeyIndex
+}
+
+func ResolveLegacyRoutingStateEligibility(channelID int, apiKeyIndex int) (LegacyRoutingStateEligibility, error) {
+	unsupported := LegacyRoutingStateEligibility{}
 	if channelID <= 0 || apiKeyIndex != RoutingMetricSingleKeyIndex {
-		return false
+		return unsupported, nil
 	}
+	memoryCacheEnabled := common.MemoryCacheEnabled
 	info, err := CacheGetChannelInfo(channelID)
-	return err == nil && info != nil && !info.IsMultiKey
+	if err != nil {
+		if memoryCacheEnabled || errors.Is(err, gorm.ErrRecordNotFound) {
+			return unsupported, nil
+		}
+		return unsupported, err
+	}
+	if info == nil || info.IsMultiKey {
+		return unsupported, nil
+	}
+	return LegacyRoutingStateEligibility{
+		channelID:   channelID,
+		apiKeyIndex: apiKeyIndex,
+		supported:   true,
+	}, nil
+}
+
+func SupportsLegacyRoutingState(channelID int, apiKeyIndex int) bool {
+	eligibility, err := ResolveLegacyRoutingStateEligibility(channelID, apiKeyIndex)
+	return err == nil && eligibility.Supported()
 }
 
 func (channel *Channel) GetKeys() []string {

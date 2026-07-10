@@ -575,6 +575,16 @@ func TestBreakerDefaultsAndNormalizesEntryRetentionLimits(t *testing.T) {
 	assert.Equal(t, Stats{Entries: 3, Dirty: 3}, breaker.Stats())
 }
 
+func TestDefaultEntryTTLReturnsNormalizedActiveConfig(t *testing.T) {
+	ResetDefaultForTest(Config{})
+	t.Cleanup(func() { ResetDefaultForTest(DefaultConfig()) })
+
+	assert.Equal(t, DefaultConfig().EntryTTL, DefaultEntryTTL())
+
+	ConfigureDefault(Config{EntryTTL: 7 * time.Minute})
+	assert.Equal(t, 7*time.Minute, DefaultEntryTTL())
+}
+
 func TestBreakerOpensAfterFiveConsecutive5xx(t *testing.T) {
 	breaker, clock, key := testBreaker(t)
 

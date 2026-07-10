@@ -30,8 +30,9 @@ const (
 )
 
 var (
-	ErrCredentialSecretUnstable = errors.New("routing credential secret is not persistent")
-	ErrCredentialKeyMismatch    = errors.New("routing credential key mismatch")
+	ErrCredentialSecretUnstable              = errors.New("routing credential secret is not persistent")
+	ErrCredentialKeyMismatch                 = errors.New("routing credential key mismatch")
+	ErrLegacyRoutingStateEligibilityMismatch = errors.New("legacy routing state eligibility does not match record")
 )
 
 type RoutingCredentials struct {
@@ -213,8 +214,23 @@ func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
 	if metric == nil || metric.RequestCount == 0 {
 		return nil
 	}
-	if !SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex) {
+	eligibility, err := ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+	if err != nil {
+		return err
+	}
+	return eligibility.UpsertRoutingChannelMetric(metric)
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
+	if metric == nil || metric.RequestCount == 0 || !eligibility.Supported() {
 		return nil
+	}
+	if metric.ChannelID != eligibility.channelID || metric.APIKeyIndex != eligibility.apiKeyIndex {
+		return fmt.Errorf("%w: eligibility=(%d,%d) metric=(%d,%d)",
+			ErrLegacyRoutingStateEligibilityMismatch,
+			eligibility.channelID, eligibility.apiKeyIndex,
+			metric.ChannelID, metric.APIKeyIndex,
+		)
 	}
 	return DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
@@ -294,8 +310,23 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 		return nil
 	}
-	if !SupportsLegacyRoutingState(state.ChannelID, state.APIKeyIndex) {
+	eligibility, err := ResolveLegacyRoutingStateEligibility(state.ChannelID, state.APIKeyIndex)
+	if err != nil {
+		return err
+	}
+	return eligibility.UpsertRoutingBreakerState(state)
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state *RoutingBreakerState) error {
+	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" || !eligibility.Supported() {
 		return nil
+	}
+	if state.ChannelID != eligibility.channelID || state.APIKeyIndex != eligibility.apiKeyIndex {
+		return fmt.Errorf("%w: eligibility=(%d,%d) breaker=(%d,%d)",
+			ErrLegacyRoutingStateEligibilityMismatch,
+			eligibility.channelID, eligibility.apiKeyIndex,
+			state.ChannelID, state.APIKeyIndex,
+		)
 	}
 	state.SemanticVersion = RoutingBreakerSemanticVersion
 	updates := map[string]interface{}{
@@ -334,15 +365,18 @@ func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
 }
 
 func GetRoutingBreakerStatesForHydration(limit int) ([]RoutingBreakerState, error) {
-	return GetRoutingBreakerStatesForHydrationPage(limit, 0, 0)
+	return GetRoutingBreakerStatesForHydrationPage(limit, 0, 0, 0)
 }
 
-func GetRoutingBreakerStatesForHydrationPage(limit int, beforeUpdatedTime int64, beforeID int) ([]RoutingBreakerState, error) {
+func GetRoutingBreakerStatesForHydrationPage(limit int, cutoffUpdatedTime int64, beforeUpdatedTime int64, beforeID int) ([]RoutingBreakerState, error) {
 	if limit <= 0 {
 		limit = 5000
 	}
 	var states []RoutingBreakerState
 	query := DB.Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex)
+	if cutoffUpdatedTime > 0 {
+		query = query.Where("updated_time >= ?", cutoffUpdatedTime)
+	}
 	if beforeID > 0 {
 		query = query.Where("(updated_time < ? OR (updated_time = ? AND id < ?))", beforeUpdatedTime, beforeUpdatedTime, beforeID)
 	}

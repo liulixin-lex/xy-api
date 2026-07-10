@@ -360,24 +360,41 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 		"breakers": 0,
 	}
 	drainedMetrics := routingmetrics.DrainSnapshots()
-	supportedChannels := make(map[int]bool)
+	eligibilityByChannel := make(map[int]model.LegacyRoutingStateEligibility)
 	validMetrics := make([]model.RoutingChannelMetric, 0, len(drainedMetrics))
-	for _, metric := range drainedMetrics {
+	for metricIndex, metric := range drainedMetrics {
 		if metric.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
 			continue
 		}
-		supported, checked := supportedChannels[metric.ChannelID]
+		eligibility, checked := eligibilityByChannel[metric.ChannelID]
 		if !checked {
-			supported = model.SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex)
-			supportedChannels[metric.ChannelID] = supported
+			var err error
+			eligibility, err = model.ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+			if err != nil {
+				retryMetrics := make([]model.RoutingChannelMetric, 0, len(validMetrics)+len(drainedMetrics)-metricIndex)
+				retryMetrics = append(retryMetrics, validMetrics...)
+				for _, pending := range drainedMetrics[metricIndex:] {
+					if pending.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+						continue
+					}
+					if knownEligibility, known := eligibilityByChannel[pending.ChannelID]; known && !knownEligibility.Supported() {
+						continue
+					}
+					retryMetrics = append(retryMetrics, pending)
+				}
+				routingmetrics.RequeueSnapshots(retryMetrics)
+				return summary, err
+			}
+			eligibilityByChannel[metric.ChannelID] = eligibility
 		}
-		if supported {
+		if eligibility.Supported() {
 			validMetrics = append(validMetrics, metric)
 		}
 	}
 	for i := range validMetrics {
 		metric := validMetrics[i]
-		if err := model.UpsertRoutingChannelMetric(&metric); err != nil {
+		eligibility := eligibilityByChannel[metric.ChannelID]
+		if err := eligibility.UpsertRoutingChannelMetric(&metric); err != nil {
 			routinghotcache.ApplyMetricDeltas(validMetrics[:i], setting.MetricBucketSec)
 			routingmetrics.RequeueSnapshots(validMetrics[i:])
 			return summary, err
@@ -388,22 +405,39 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 
 	dirtyBreakers := routingbreaker.DirtySnapshots()
 	validBreakers := make([]routingbreaker.Snapshot, 0, len(dirtyBreakers))
-	for _, snapshot := range dirtyBreakers {
+	for breakerIndex, snapshot := range dirtyBreakers {
 		if snapshot.Key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
 			continue
 		}
-		supported, checked := supportedChannels[snapshot.Key.ChannelID]
+		eligibility, checked := eligibilityByChannel[snapshot.Key.ChannelID]
 		if !checked {
-			supported = model.SupportsLegacyRoutingState(snapshot.Key.ChannelID, snapshot.Key.APIKeyIndex)
-			supportedChannels[snapshot.Key.ChannelID] = supported
+			var err error
+			eligibility, err = model.ResolveLegacyRoutingStateEligibility(snapshot.Key.ChannelID, snapshot.Key.APIKeyIndex)
+			if err != nil {
+				retryBreakers := make([]routingbreaker.Snapshot, 0, len(validBreakers)+len(dirtyBreakers)-breakerIndex)
+				retryBreakers = append(retryBreakers, validBreakers...)
+				for _, pending := range dirtyBreakers[breakerIndex:] {
+					if pending.Key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+						continue
+					}
+					if knownEligibility, known := eligibilityByChannel[pending.Key.ChannelID]; known && !knownEligibility.Supported() {
+						continue
+					}
+					retryBreakers = append(retryBreakers, pending)
+				}
+				routingbreaker.RequeueDirtySnapshots(retryBreakers)
+				return summary, err
+			}
+			eligibilityByChannel[snapshot.Key.ChannelID] = eligibility
 		}
-		if supported {
+		if eligibility.Supported() {
 			validBreakers = append(validBreakers, snapshot)
 		}
 	}
 	for i, snapshot := range validBreakers {
 		state := routingBreakerSnapshotToModel(snapshot)
-		if err := model.UpsertRoutingBreakerState(&state); err != nil {
+		eligibility := eligibilityByChannel[snapshot.Key.ChannelID]
+		if err := eligibility.UpsertRoutingBreakerState(&state); err != nil {
 			routingbreaker.RequeueDirtySnapshots(validBreakers[i:])
 			return summary, err
 		}
@@ -459,7 +493,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 		metricWindow = bucketWindow
 	}
 	const routingSnapshotLimit = 5000
-	supportedChannels := make(map[int]bool)
+	eligibilityByChannel := make(map[int]model.LegacyRoutingStateEligibility)
 	validMetrics := make([]model.RoutingChannelMetric, 0, routingSnapshotLimit)
 	lastMetricBucketTs := int64(0)
 	lastMetricID := 0
@@ -476,12 +510,16 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 			break
 		}
 		for _, metric := range page {
-			supported, checked := supportedChannels[metric.ChannelID]
+			eligibility, checked := eligibilityByChannel[metric.ChannelID]
 			if !checked {
-				supported = model.SupportsLegacyRoutingState(metric.ChannelID, metric.APIKeyIndex)
-				supportedChannels[metric.ChannelID] = supported
+				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+				if resolveErr != nil {
+					return summary, resolveErr
+				}
+				eligibility = resolved
+				eligibilityByChannel[metric.ChannelID] = eligibility
 			}
-			if supported {
+			if eligibility.Supported() {
 				validMetrics = append(validMetrics, metric)
 				if len(validMetrics) == routingSnapshotLimit {
 					break
@@ -498,11 +536,17 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	routinghotcache.LoadMetricSnapshots(validMetrics, setting.MetricBucketSec)
 	summary["metrics"] = len(validMetrics)
 
+	breakerCutoffUpdatedTime := time.Unix(now, 0).Add(-routingbreaker.DefaultEntryTTL()).Unix()
 	validBreakerStates := make([]model.RoutingBreakerState, 0, routingSnapshotLimit)
 	lastBreakerUpdatedTime := int64(0)
 	lastBreakerID := 0
 	for len(validBreakerStates) < routingSnapshotLimit {
-		page, err := model.GetRoutingBreakerStatesForHydrationPage(routingSnapshotLimit, lastBreakerUpdatedTime, lastBreakerID)
+		page, err := model.GetRoutingBreakerStatesForHydrationPage(
+			routingSnapshotLimit,
+			breakerCutoffUpdatedTime,
+			lastBreakerUpdatedTime,
+			lastBreakerID,
+		)
 		if err != nil {
 			return summary, err
 		}
@@ -510,12 +554,16 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 			break
 		}
 		for _, state := range page {
-			supported, checked := supportedChannels[state.ChannelID]
+			eligibility, checked := eligibilityByChannel[state.ChannelID]
 			if !checked {
-				supported = model.SupportsLegacyRoutingState(state.ChannelID, state.APIKeyIndex)
-				supportedChannels[state.ChannelID] = supported
+				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibility(state.ChannelID, state.APIKeyIndex)
+				if resolveErr != nil {
+					return summary, resolveErr
+				}
+				eligibility = resolved
+				eligibilityByChannel[state.ChannelID] = eligibility
 			}
-			if supported {
+			if eligibility.Supported() {
 				validBreakerStates = append(validBreakerStates, state)
 				if len(validBreakerStates) == routingSnapshotLimit {
 					break
