@@ -180,25 +180,28 @@ func UpsertRoutingCostSnapshot(snapshot *RoutingCostSnapshot) error {
 }
 
 type RoutingChannelMetric struct {
-	ID              int    `json:"id" gorm:"primaryKey"`
-	ChannelID       int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_metric_key,priority:1;index"`
-	APIKeyIndex     int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_metric_key,priority:2"`
-	ModelName       string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_metric_key,priority:3"`
-	Group           string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_metric_key,priority:4"`
-	BucketTs        int64  `json:"bucket_ts" gorm:"uniqueIndex:idx_routing_metric_key,priority:5;index:idx_routing_metric_bucket_ts"`
-	RequestCount    int64  `json:"request_count"`
-	SuccessCount    int64  `json:"success_count"`
-	TotalLatencyMs  int64  `json:"total_latency_ms"`
-	LatencyP95Ms    int64  `json:"latency_p95_ms"`
-	TtftSumMs       int64  `json:"ttft_sum_ms"`
-	TtftCount       int64  `json:"ttft_count"`
-	TtftP95Ms       int64  `json:"ttft_p95_ms"`
-	OutputTokens    int64  `json:"output_tokens"`
-	GenerationMs    int64  `json:"generation_ms"`
-	Err4xx          int64  `json:"err_4xx" gorm:"column:err_4xx"`
-	Err5xx          int64  `json:"err_5xx" gorm:"column:err_5xx"`
-	Err429          int64  `json:"err_429" gorm:"column:err_429"`
-	RetryAfterMaxMs int64  `json:"retry_after_max_ms"`
+	ID                      int    `json:"id" gorm:"primaryKey"`
+	ChannelID               int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_metric_key,priority:1;index"`
+	APIKeyIndex             int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_metric_key,priority:2"`
+	ModelName               string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_metric_key,priority:3"`
+	Group                   string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_metric_key,priority:4"`
+	BucketTs                int64  `json:"bucket_ts" gorm:"uniqueIndex:idx_routing_metric_key,priority:5;index:idx_routing_metric_bucket_ts"`
+	RequestCount            int64  `json:"request_count"`
+	SuccessCount            int64  `json:"success_count"`
+	ReliabilityRequestCount int64  `json:"reliability_request_count" gorm:"not null;default:0"`
+	ReliabilityFailureCount int64  `json:"reliability_failure_count" gorm:"not null;default:0"`
+	TotalLatencyMs          int64  `json:"total_latency_ms"`
+	LatencyP95Ms            int64  `json:"latency_p95_ms"`
+	TtftSumMs               int64  `json:"ttft_sum_ms"`
+	TtftCount               int64  `json:"ttft_count"`
+	TtftP95Ms               int64  `json:"ttft_p95_ms"`
+	OutputTokens            int64  `json:"output_tokens"`
+	GenerationMs            int64  `json:"generation_ms"`
+	Err4xx                  int64  `json:"err_4xx" gorm:"column:err_4xx"`
+	Err5xx                  int64  `json:"err_5xx" gorm:"column:err_5xx"`
+	Err429                  int64  `json:"err_429" gorm:"column:err_429"`
+	Err529                  int64  `json:"err_529" gorm:"column:err_529;not null;default:0"`
+	RetryAfterMaxMs         int64  `json:"retry_after_max_ms"`
 }
 
 func (RoutingChannelMetric) TableName() string {
@@ -218,19 +221,22 @@ func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
 			{Name: "bucket_ts"},
 		},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"request_count":      gorm.Expr("routing_channel_metrics.request_count + ?", metric.RequestCount),
-			"success_count":      gorm.Expr("routing_channel_metrics.success_count + ?", metric.SuccessCount),
-			"total_latency_ms":   gorm.Expr("routing_channel_metrics.total_latency_ms + ?", metric.TotalLatencyMs),
-			"latency_p95_ms":     gorm.Expr("CASE WHEN routing_channel_metrics.latency_p95_ms > ? THEN routing_channel_metrics.latency_p95_ms ELSE ? END", metric.LatencyP95Ms, metric.LatencyP95Ms),
-			"ttft_sum_ms":        gorm.Expr("routing_channel_metrics.ttft_sum_ms + ?", metric.TtftSumMs),
-			"ttft_count":         gorm.Expr("routing_channel_metrics.ttft_count + ?", metric.TtftCount),
-			"ttft_p95_ms":        gorm.Expr("CASE WHEN routing_channel_metrics.ttft_p95_ms > ? THEN routing_channel_metrics.ttft_p95_ms ELSE ? END", metric.TtftP95Ms, metric.TtftP95Ms),
-			"output_tokens":      gorm.Expr("routing_channel_metrics.output_tokens + ?", metric.OutputTokens),
-			"generation_ms":      gorm.Expr("routing_channel_metrics.generation_ms + ?", metric.GenerationMs),
-			"err_4xx":            gorm.Expr("routing_channel_metrics.err_4xx + ?", metric.Err4xx),
-			"err_5xx":            gorm.Expr("routing_channel_metrics.err_5xx + ?", metric.Err5xx),
-			"err_429":            gorm.Expr("routing_channel_metrics.err_429 + ?", metric.Err429),
-			"retry_after_max_ms": gorm.Expr("CASE WHEN routing_channel_metrics.retry_after_max_ms > ? THEN routing_channel_metrics.retry_after_max_ms ELSE ? END", metric.RetryAfterMaxMs, metric.RetryAfterMaxMs),
+			"request_count":             gorm.Expr("routing_channel_metrics.request_count + ?", metric.RequestCount),
+			"success_count":             gorm.Expr("routing_channel_metrics.success_count + ?", metric.SuccessCount),
+			"reliability_request_count": gorm.Expr("routing_channel_metrics.reliability_request_count + ?", metric.ReliabilityRequestCount),
+			"reliability_failure_count": gorm.Expr("routing_channel_metrics.reliability_failure_count + ?", metric.ReliabilityFailureCount),
+			"total_latency_ms":          gorm.Expr("routing_channel_metrics.total_latency_ms + ?", metric.TotalLatencyMs),
+			"latency_p95_ms":            gorm.Expr("CASE WHEN routing_channel_metrics.latency_p95_ms > ? THEN routing_channel_metrics.latency_p95_ms ELSE ? END", metric.LatencyP95Ms, metric.LatencyP95Ms),
+			"ttft_sum_ms":               gorm.Expr("routing_channel_metrics.ttft_sum_ms + ?", metric.TtftSumMs),
+			"ttft_count":                gorm.Expr("routing_channel_metrics.ttft_count + ?", metric.TtftCount),
+			"ttft_p95_ms":               gorm.Expr("CASE WHEN routing_channel_metrics.ttft_p95_ms > ? THEN routing_channel_metrics.ttft_p95_ms ELSE ? END", metric.TtftP95Ms, metric.TtftP95Ms),
+			"output_tokens":             gorm.Expr("routing_channel_metrics.output_tokens + ?", metric.OutputTokens),
+			"generation_ms":             gorm.Expr("routing_channel_metrics.generation_ms + ?", metric.GenerationMs),
+			"err_4xx":                   gorm.Expr("routing_channel_metrics.err_4xx + ?", metric.Err4xx),
+			"err_5xx":                   gorm.Expr("routing_channel_metrics.err_5xx + ?", metric.Err5xx),
+			"err_429":                   gorm.Expr("routing_channel_metrics.err_429 + ?", metric.Err429),
+			"err_529":                   gorm.Expr("routing_channel_metrics.err_529 + ?", metric.Err529),
+			"retry_after_max_ms":        gorm.Expr("CASE WHEN routing_channel_metrics.retry_after_max_ms > ? THEN routing_channel_metrics.retry_after_max_ms ELSE ? END", metric.RetryAfterMaxMs, metric.RetryAfterMaxMs),
 		}),
 	}).Create(metric).Error
 }

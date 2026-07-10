@@ -220,11 +220,49 @@ func TestRankCandidatesKeepsLowVolumeCandidatesDespiteAvailabilityFloor(t *testi
 	candidate := testCandidate(1, 0.1, 100, 10, nil, nil)
 	candidate.Metric.RequestCount = 3
 	candidate.Metric.SuccessCount = 0
+	candidate.Metric.ReliabilityRequestCount = 3
+	candidate.Metric.ReliabilityFailureCount = 3
 
 	decision := RankCandidates([]Candidate{candidate}, settings)
 
 	require.Len(t, decision.Ranked, 1)
 	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+}
+
+func TestAvailabilityUsesReliabilitySamplesAndLegacyRowsStayNeutral(t *testing.T) {
+	settings := Settings{WeightAvailability: 1, MinVolume: 1}
+	reliable := testCandidate(1, 1, 100, 1, nil, nil)
+	reliable.Metric.ReliabilityRequestCount = 10
+	reliable.Metric.ReliabilityFailureCount = 2
+	reliable.Metric.RequestCount = 100
+	reliable.Metric.SuccessCount = 1
+
+	legacy := testCandidate(2, 0, 100, 1, nil, nil)
+	legacy.Metric.ReliabilityRequestCount = 0
+	legacy.Metric.ReliabilityFailureCount = 0
+	legacy.Metric.RequestCount = 100
+	legacy.Metric.SuccessCount = 0
+
+	decision := RankCandidates([]Candidate{reliable, legacy}, settings)
+
+	assert.InDelta(t, 0.8, rankedByID(t, decision, 1).Availability, 0.000001)
+	assert.InDelta(t, availabilityNeutralPrior, rankedByID(t, decision, 2).Availability, 0.000001)
+}
+
+func TestAvailabilityFloorUsesReliabilityVolumeOnly(t *testing.T) {
+	candidate := testCandidate(1, 0, 100, 1, nil, nil)
+	candidate.Metric.RequestCount = 1000
+	candidate.Metric.SuccessCount = 0
+	candidate.Metric.ReliabilityRequestCount = 3
+	candidate.Metric.ReliabilityFailureCount = 3
+
+	decision := RankCandidates([]Candidate{candidate}, Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		AvailabilityFloor:  0.99,
+	})
+
+	require.Len(t, decision.Ranked, 1)
 }
 
 func TestRankCandidatesOrdersAdminPriorityBeforeScore(t *testing.T) {
@@ -419,10 +457,12 @@ func testCandidate(id int, availability float64, p95LatencyMs float64, tps float
 	return Candidate{
 		Channel: &model.Channel{Id: id},
 		Metric: &MetricSnapshot{
-			RequestCount: requests,
-			SuccessCount: successes,
-			P95LatencyMs: p95LatencyMs,
-			TPS:          tps,
+			RequestCount:            requests,
+			SuccessCount:            successes,
+			ReliabilityRequestCount: requests,
+			ReliabilityFailureCount: requests - successes,
+			P95LatencyMs:            p95LatencyMs,
+			TPS:                     tps,
 		},
 		Cost:    cost,
 		Breaker: breaker,

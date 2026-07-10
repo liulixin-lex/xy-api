@@ -115,16 +115,74 @@ var routingMigrationModels = []interface{}{
 	&RoutingAgentRecommendation{},
 }
 
+type routingChannelMetricBeforeReliability struct {
+	ID           int    `gorm:"primaryKey"`
+	ChannelID    int    `gorm:"uniqueIndex:idx_routing_metric_key,priority:1"`
+	APIKeyIndex  int    `gorm:"uniqueIndex:idx_routing_metric_key,priority:2"`
+	ModelName    string `gorm:"type:varchar(128);uniqueIndex:idx_routing_metric_key,priority:3"`
+	Group        string `gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_metric_key,priority:4"`
+	BucketTs     int64  `gorm:"uniqueIndex:idx_routing_metric_key,priority:5"`
+	RequestCount int64
+	SuccessCount int64
+}
+
+func (routingChannelMetricBeforeReliability) TableName() string {
+	return "routing_channel_metrics"
+}
+
 func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType common.DatabaseType) {
 	t.Helper()
 
 	withRoutingTestDB(t, db, dbType)
+	require.NoError(t, DB.AutoMigrate(&routingChannelMetricBeforeReliability{}))
+	legacyMetric := routingChannelMetricBeforeReliability{
+		ChannelID:    91,
+		APIKeyIndex:  RoutingMetricSingleKeyIndex,
+		ModelName:    "legacy-gpt-test",
+		Group:        "legacy",
+		BucketTs:     6000,
+		RequestCount: 7,
+		SuccessCount: 6,
+	}
+	require.NoError(t, DB.Create(&legacyMetric).Error)
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 
 	for _, model := range routingMigrationModels {
 		require.True(t, DB.Migrator().HasTable(model))
 	}
+	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "ReliabilityRequestCount"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "ReliabilityFailureCount"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "Err529"))
+
+	var migratedLegacyMetric RoutingChannelMetric
+	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
+		91, RoutingMetricSingleKeyIndex, "legacy-gpt-test", "legacy", 6000).First(&migratedLegacyMetric).Error)
+	assert.Equal(t, int64(7), migratedLegacyMetric.RequestCount)
+	assert.Equal(t, int64(6), migratedLegacyMetric.SuccessCount)
+	assert.Zero(t, migratedLegacyMetric.ReliabilityRequestCount)
+	assert.Zero(t, migratedLegacyMetric.ReliabilityFailureCount)
+	assert.Zero(t, migratedLegacyMetric.Err529)
+
+	require.NoError(t, UpsertRoutingChannelMetric(&RoutingChannelMetric{
+		ChannelID:               91,
+		APIKeyIndex:             RoutingMetricSingleKeyIndex,
+		ModelName:               "legacy-gpt-test",
+		Group:                   "legacy",
+		BucketTs:                6000,
+		RequestCount:            1,
+		SuccessCount:            1,
+		ReliabilityRequestCount: 2,
+		ReliabilityFailureCount: 1,
+		Err529:                  1,
+	}))
+	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
+		91, RoutingMetricSingleKeyIndex, "legacy-gpt-test", "legacy", 6000).First(&migratedLegacyMetric).Error)
+	assert.Equal(t, int64(8), migratedLegacyMetric.RequestCount)
+	assert.Equal(t, int64(7), migratedLegacyMetric.SuccessCount)
+	assert.Equal(t, int64(2), migratedLegacyMetric.ReliabilityRequestCount)
+	assert.Equal(t, int64(1), migratedLegacyMetric.ReliabilityFailureCount)
+	assert.Equal(t, int64(1), migratedLegacyMetric.Err529)
 
 	binding := RoutingChannelBinding{
 		ChannelID:     1,
@@ -194,25 +252,30 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, "v2", savedCostSnapshot.PricingVersion)
 
 	metric := &RoutingChannelMetric{
-		ChannelID:       1,
-		APIKeyIndex:     RoutingMetricSingleKeyIndex,
-		ModelName:       "gpt-test",
-		Group:           "default",
-		BucketTs:        60,
-		RequestCount:    1,
-		SuccessCount:    1,
-		TotalLatencyMs:  100,
-		TtftSumMs:       40,
-		TtftCount:       1,
-		OutputTokens:    20,
-		GenerationMs:    90,
-		Err5xx:          1,
-		RetryAfterMaxMs: 250,
+		ChannelID:               1,
+		APIKeyIndex:             RoutingMetricSingleKeyIndex,
+		ModelName:               "gpt-test",
+		Group:                   "default",
+		BucketTs:                60,
+		RequestCount:            1,
+		SuccessCount:            1,
+		ReliabilityRequestCount: 2,
+		ReliabilityFailureCount: 1,
+		TotalLatencyMs:          100,
+		TtftSumMs:               40,
+		TtftCount:               1,
+		OutputTokens:            20,
+		GenerationMs:            90,
+		Err5xx:                  1,
+		Err529:                  1,
+		RetryAfterMaxMs:         250,
 	}
 	require.NoError(t, UpsertRoutingChannelMetric(metric))
 
 	metric.RequestCount = 2
 	metric.SuccessCount = 1
+	metric.ReliabilityRequestCount = 3
+	metric.ReliabilityFailureCount = 2
 	metric.TotalLatencyMs = 300
 	metric.TtftSumMs = 80
 	metric.TtftCount = 2
@@ -220,6 +283,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	metric.GenerationMs = 270
 	metric.Err5xx = 0
 	metric.Err429 = 2
+	metric.Err529 = 2
 	metric.RetryAfterMaxMs = 150
 	require.NoError(t, UpsertRoutingChannelMetric(metric))
 
@@ -228,6 +292,8 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		1, RoutingMetricSingleKeyIndex, "gpt-test", "default", 60).First(&saved).Error)
 	assert.Equal(t, int64(3), saved.RequestCount)
 	assert.Equal(t, int64(2), saved.SuccessCount)
+	assert.Equal(t, int64(5), saved.ReliabilityRequestCount)
+	assert.Equal(t, int64(3), saved.ReliabilityFailureCount)
 	assert.Equal(t, int64(400), saved.TotalLatencyMs)
 	assert.Equal(t, int64(120), saved.TtftSumMs)
 	assert.Equal(t, int64(3), saved.TtftCount)
@@ -235,6 +301,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, int64(360), saved.GenerationMs)
 	assert.Equal(t, int64(1), saved.Err5xx)
 	assert.Equal(t, int64(2), saved.Err429)
+	assert.Equal(t, int64(3), saved.Err529)
 	assert.Equal(t, int64(250), saved.RetryAfterMaxMs)
 
 	require.NoError(t, DB.Delete(&saved).Error)

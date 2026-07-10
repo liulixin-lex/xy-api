@@ -20,11 +20,13 @@ type Candidate struct {
 }
 
 type MetricSnapshot struct {
-	RequestCount int64
-	SuccessCount int64
-	P95LatencyMs float64
-	TPS          float64
-	Inflight     int64
+	RequestCount            int64
+	SuccessCount            int64
+	ReliabilityRequestCount int64
+	ReliabilityFailureCount int64
+	P95LatencyMs            float64
+	TPS                     float64
+	Inflight                int64
 }
 
 type CostSnapshot struct {

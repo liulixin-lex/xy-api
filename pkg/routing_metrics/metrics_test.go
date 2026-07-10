@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -83,7 +84,7 @@ func TestRoutingMetricsEnforceBucketLimitAndEvictOldest(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, nil)
+		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -163,7 +164,7 @@ func TestRoutingMetricsEvictOldestUsesStableTieBreakOrder(t *testing.T) {
 			maintenanceMu.Unlock()
 
 			for _, key := range test.keys {
-				recordBucket(key, 1, 0, false, 1, nil)
+				recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
 			}
 
 			snapshots := Snapshots()
@@ -197,7 +198,7 @@ func TestRoutingMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, nil)
+		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -219,7 +220,7 @@ func TestRoutingMetricsBucketTTLDoesNotExpirePartialSecond(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, nil)
+		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -276,7 +277,7 @@ func TestRoutingMetricsNormalizeNonPositiveLimits(t *testing.T) {
 	}
 	inflightKey := InflightKey{ChannelID: 1, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 
-	recordBucket(metricKey, 1, 0, false, 1, nil)
+	recordBucket(metricKey, 1, 0, false, 1, true, nil, routingerror.Classification{})
 	release := BeginInflight(nil, info, 1)
 
 	require.Len(t, Snapshots(), 1)
@@ -451,6 +452,132 @@ func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
 	}
 }
 
+func TestRecordClassifiedAttemptSeparatesReliabilityFromCapacityAndCallerErrors(t *testing.T) {
+	tests := []struct {
+		name           string
+		success        bool
+		status         int
+		classification routingerror.Classification
+		want           model.RoutingChannelMetric
+	}{
+		{
+			name:    "success enters reliability sample",
+			success: true,
+			classification: routingerror.Classification{
+				HealthEffect: routingerror.HealthIgnore,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1},
+		},
+		{
+			name:   "provider 502 is reliability failure",
+			status: http.StatusBadGateway,
+			classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityProvider,
+				HealthEffect:   routingerror.HealthDegrade,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, ReliabilityRequestCount: 1, ReliabilityFailureCount: 1, Err5xx: 1},
+		},
+		{
+			name:   "network failure is reliability failure",
+			status: http.StatusGatewayTimeout,
+			classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityNetwork,
+				HealthEffect:   routingerror.HealthDegrade,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, ReliabilityRequestCount: 1, ReliabilityFailureCount: 1, Err5xx: 1},
+		},
+		{
+			name:   "429 is capacity only",
+			status: http.StatusTooManyRequests,
+			classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityCapacity,
+				HealthEffect:   routingerror.HealthIgnore,
+				CapacityEffect: routingerror.CapacityCooldown,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, Err429: 1},
+		},
+		{
+			name:   "529 is capacity only and not generic 5xx",
+			status: 529,
+			classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityCapacity,
+				HealthEffect:   routingerror.HealthIgnore,
+				CapacityEffect: routingerror.CapacityCooldown,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, Err529: 1},
+		},
+		{
+			name:   "caller 400 does not enter reliability sample",
+			status: http.StatusBadRequest,
+			classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityCaller,
+				HealthEffect:   routingerror.HealthIgnore,
+			},
+			want: model.RoutingChannelMetric{RequestCount: 1, Err4xx: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			enableRoutingMetricsForTest(t)
+			info := &relaycommon.RelayInfo{
+				UsingGroup:      "default",
+				OriginModelName: "gpt-test",
+				StartTime:       time.Now(),
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 101},
+			}
+			var apiErr *types.NewAPIError
+			if tt.status != 0 {
+				apiErr = types.NewErrorWithStatusCode(errors.New("attempt failed"), types.ErrorCodeBadResponseStatusCode, tt.status)
+			}
+
+			RecordClassifiedAttempt(nil, info, 101, tt.success, apiErr, tt.classification)
+
+			snapshots := Snapshots()
+			require.Len(t, snapshots, 1)
+			got := snapshots[0]
+			assert.Equal(t, tt.want.RequestCount, got.RequestCount)
+			assert.Equal(t, tt.want.SuccessCount, got.SuccessCount)
+			assert.Equal(t, tt.want.ReliabilityRequestCount, got.ReliabilityRequestCount)
+			assert.Equal(t, tt.want.ReliabilityFailureCount, got.ReliabilityFailureCount)
+			assert.Equal(t, tt.want.Err4xx, got.Err4xx)
+			assert.Equal(t, tt.want.Err5xx, got.Err5xx)
+			assert.Equal(t, tt.want.Err429, got.Err429)
+			assert.Equal(t, tt.want.Err529, got.Err529)
+		})
+	}
+}
+
+func TestRecordClassifiedAttemptUsesSourceStatusAndSeparates529(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		StartTime:       time.Now(),
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 102},
+	}
+	mapped429 := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+	mapped429.SetResponseStatusCode(http.StatusServiceUnavailable)
+	errorsToRecord := []*types.NewAPIError{
+		mapped429,
+		types.NewErrorWithStatusCode(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, 529),
+		types.NewErrorWithStatusCode(errors.New("bad gateway"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway),
+	}
+
+	for _, apiErr := range errorsToRecord {
+		RecordClassifiedAttempt(nil, info, 102, false, apiErr, routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+			Component: routingerror.ComponentServing,
+			Operation: routingerror.OperationRelay,
+		}))
+	}
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(1), snapshots[0].Err429)
+	assert.Equal(t, int64(1), snapshots[0].Err529)
+	assert.Equal(t, int64(1), snapshots[0].Err5xx)
+}
+
 func TestRecordAttemptAddsAggregateSnapshotForMultiKeyChannels(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	info := &relaycommon.RelayInfo{
@@ -587,7 +714,7 @@ func TestRoutingMetricsConcurrentDrainAndRecordPreserveAttempts(t *testing.T) {
 		group:       "default",
 		bucketTs:    1,
 	}
-	recordBucket(key, 1, 0, false, 1, nil)
+	recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
 	value, ok := buckets.Load(key)
 	require.True(t, ok)
 	b := value.(*bucket)
@@ -609,7 +736,7 @@ func TestRoutingMetricsConcurrentDrainAndRecordPreserveAttempts(t *testing.T) {
 		defer wg.Done()
 		ready <- struct{}{}
 		<-start
-		recordBucket(key, 1, 0, false, 1, nil)
+		recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
 		recordResult <- struct{}{}
 	}()
 	<-ready
@@ -670,4 +797,35 @@ func TestRequeueSnapshotsRestoresDrainedBuckets(t *testing.T) {
 	assert.Equal(t, drained[0].ModelName, snapshots[0].ModelName)
 	assert.Equal(t, drained[0].RequestCount, snapshots[0].RequestCount)
 	assert.Equal(t, drained[0].SuccessCount, snapshots[0].SuccessCount)
+}
+
+func TestDrainAndRequeuePreserveReliabilityCounters(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		StartTime:       time.Now(),
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 35},
+	}
+	for _, statusCode := range []int{http.StatusBadGateway, http.StatusTooManyRequests, 529} {
+		apiErr := types.NewErrorWithStatusCode(errors.New("attempt failed"), types.ErrorCodeBadResponseStatusCode, statusCode)
+		RecordClassifiedAttempt(nil, info, 35, false, apiErr, routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+			Component: routingerror.ComponentServing,
+			Operation: routingerror.OperationRelay,
+		}))
+	}
+
+	drained := DrainSnapshots()
+	require.Len(t, drained, 1)
+	require.Empty(t, Snapshots())
+	RequeueSnapshots(drained)
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(3), snapshots[0].RequestCount)
+	assert.Equal(t, int64(1), snapshots[0].ReliabilityRequestCount)
+	assert.Equal(t, int64(1), snapshots[0].ReliabilityFailureCount)
+	assert.Equal(t, int64(1), snapshots[0].Err5xx)
+	assert.Equal(t, int64(1), snapshots[0].Err429)
+	assert.Equal(t, int64(1), snapshots[0].Err529)
 }

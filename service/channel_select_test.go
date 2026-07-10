@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSelectSmartChannelForGroupUsesHotcacheScoreWithinPriority(t *testing.T) {
+func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
@@ -47,13 +47,27 @@ func TestSelectSmartChannelForGroupUsesHotcacheScoreWithinPriority(t *testing.T)
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "default",
-	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 10, P95LatencyMs: 900, TPS: 1})
+	}, routinghotcache.MetricSnapshot{
+		RequestCount:            100,
+		SuccessCount:            99,
+		ReliabilityRequestCount: 10,
+		ReliabilityFailureCount: 9,
+		P95LatencyMs:            900,
+		TPS:                     1,
+	})
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
 		ChannelID:   102,
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "default",
-	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	}, routinghotcache.MetricSnapshot{
+		RequestCount:            100,
+		SuccessCount:            10,
+		ReliabilityRequestCount: 10,
+		ReliabilityFailureCount: 1,
+		P95LatencyMs:            100,
+		TPS:                     10,
+	})
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	param := &RetryParam{
@@ -67,8 +81,6 @@ func TestSelectSmartChannelForGroupUsesHotcacheScoreWithinPriority(t *testing.T)
 		Enabled:            true,
 		Mode:               smart_routing_setting.ModeBalanced,
 		WeightAvailability: 1,
-		WeightLatency:      1,
-		WeightThroughput:   1,
 		TopK:               1,
 		MinVolume:          10,
 		MaxEjectedPct:      100,
@@ -108,7 +120,7 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       "gpt-test",
 		Group:       "default",
-	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 100, P95LatencyMs: 50, TPS: 10})
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 100, ReliabilityRequestCount: 100, ReliabilityFailureCount: 0, P95LatencyMs: 50, TPS: 10})
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
 		Mode:               smart_routing_setting.ModeObserve,
@@ -162,7 +174,7 @@ func TestCacheGetRandomSatisfiedChannelDoesNotFallbackWhenSmartSafetyFiltersEmpt
 			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 			Model:       "gpt-test",
 			Group:       "default",
-		}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 10, P95LatencyMs: 100, TPS: 10})
+		}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 10, ReliabilityRequestCount: 100, ReliabilityFailureCount: 90, P95LatencyMs: 100, TPS: 10})
 	}
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
@@ -288,7 +300,7 @@ func TestSelectSmartChannelForGroupReservesHalfOpenProbe(t *testing.T) {
 		UpdatedAt:     now,
 	}})
 	cacheKey := routinghotcache.Key{ChannelID: 311, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 	setting := smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
@@ -358,7 +370,7 @@ func TestSelectSmartChannelForGroupFallsBackToLocalHalfOpenProbeWhenRedisLeaseFa
 		UpdatedAt:     time.Now(),
 	}})
 	cacheKey := routinghotcache.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -445,7 +457,7 @@ func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
 		UpdatedAt:     now,
 	}})
 	cacheKey := routinghotcache.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 100, TPS: 10})
+	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())

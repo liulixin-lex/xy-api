@@ -285,34 +285,38 @@ func weightedScore(weights Weights, availability float64, latency float64, throu
 }
 
 func availabilityScore(metric *MetricSnapshot, minVolume int) float64 {
-	if metric == nil {
+	if metric == nil || metric.ReliabilityRequestCount <= 0 {
 		return availabilityNeutralPrior
 	}
 	if minVolume < 0 {
 		minVolume = 0
 	}
-	if metric.RequestCount < int64(minVolume) {
+	if metric.ReliabilityRequestCount < int64(minVolume) {
 		return availabilityNeutralPrior
 	}
-	if metric.RequestCount <= 0 {
-		return availabilityNeutralPrior
+	failures := metric.ReliabilityFailureCount
+	if failures < 0 {
+		failures = 0
 	}
-	return clamp01(float64(metric.SuccessCount) / float64(metric.RequestCount))
+	if failures > metric.ReliabilityRequestCount {
+		failures = metric.ReliabilityRequestCount
+	}
+	return clamp01(1 - float64(failures)/float64(metric.ReliabilityRequestCount))
 }
 
 func belowAvailabilityFloor(metric *MetricSnapshot, settings Settings) bool {
 	floor := settings.AvailabilityFloor
-	if floor <= 0 || floor > 1 || metric == nil {
+	if floor <= 0 || floor > 1 || metric == nil || metric.ReliabilityRequestCount <= 0 {
 		return false
 	}
 	minVolume := settings.MinVolume
 	if minVolume < 0 {
 		minVolume = 0
 	}
-	if metric.RequestCount < int64(minVolume) || metric.RequestCount <= 0 {
+	if metric.ReliabilityRequestCount < int64(minVolume) {
 		return false
 	}
-	return float64(metric.SuccessCount)/float64(metric.RequestCount) < floor
+	return availabilityScore(metric, 0) < floor
 }
 
 func latencyScore(metric *MetricSnapshot, bounds scoreBounds) float64 {

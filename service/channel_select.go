@@ -493,10 +493,12 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 		candidate := routingselector.Candidate{Channel: channel}
 		if metric, ok := routinghotcache.GetMetric(cacheKey); ok {
 			candidate.Metric = &routingselector.MetricSnapshot{
-				RequestCount: metric.RequestCount,
-				SuccessCount: metric.SuccessCount,
-				P95LatencyMs: metric.P95LatencyMs,
-				TPS:          metric.TPS,
+				RequestCount:            metric.RequestCount,
+				SuccessCount:            metric.SuccessCount,
+				ReliabilityRequestCount: metric.ReliabilityRequestCount,
+				ReliabilityFailureCount: metric.ReliabilityFailureCount,
+				P95LatencyMs:            metric.P95LatencyMs,
+				TPS:                     metric.TPS,
 			}
 		}
 		inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{

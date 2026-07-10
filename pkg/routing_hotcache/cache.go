@@ -21,12 +21,14 @@ type CostKey struct {
 }
 
 type MetricSnapshot struct {
-	RequestCount int64
-	SuccessCount int64
-	P95LatencyMs float64
-	P95TTFTMs    float64
-	TPS          float64
-	UpdatedUnix  int64
+	RequestCount            int64
+	SuccessCount            int64
+	ReliabilityRequestCount int64
+	ReliabilityFailureCount int64
+	P95LatencyMs            float64
+	P95TTFTMs               float64
+	TPS                     float64
+	UpdatedUnix             int64
 }
 
 type CostSnapshot struct {
@@ -369,12 +371,14 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 			}
 		}
 		cache.metrics[key] = MetricSnapshot{
-			RequestCount: snapshot.RequestCount,
-			SuccessCount: snapshot.SuccessCount,
-			P95LatencyMs: latencyMs,
-			P95TTFTMs:    ttftMs,
-			TPS:          float64(snapshot.RequestCount) / float64(bucketSeconds),
-			UpdatedUnix:  snapshot.BucketTs,
+			RequestCount:            snapshot.RequestCount,
+			SuccessCount:            snapshot.SuccessCount,
+			ReliabilityRequestCount: snapshot.ReliabilityRequestCount,
+			ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
+			P95LatencyMs:            latencyMs,
+			P95TTFTMs:               ttftMs,
+			TPS:                     float64(snapshot.RequestCount) / float64(bucketSeconds),
+			UpdatedUnix:             snapshot.BucketTs,
 		}
 	}
 	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))

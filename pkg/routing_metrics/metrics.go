@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -45,23 +46,26 @@ type Stats struct {
 }
 
 type bucket struct {
-	mu              sync.Mutex
-	draining        bool
-	requestCount    int64
-	successCount    int64
-	totalLatencyMs  int64
-	latencySamples  []int64
-	latencyP95Ms    int64
-	ttftSumMs       int64
-	ttftCount       int64
-	ttftSamples     []int64
-	ttftP95Ms       int64
-	outputTokens    int64
-	generationMs    int64
-	err4xx          int64
-	err5xx          int64
-	err429          int64
-	retryAfterMaxMs int64
+	mu                      sync.Mutex
+	draining                bool
+	requestCount            int64
+	successCount            int64
+	reliabilityRequestCount int64
+	reliabilityFailureCount int64
+	totalLatencyMs          int64
+	latencySamples          []int64
+	latencyP95Ms            int64
+	ttftSumMs               int64
+	ttftCount               int64
+	ttftSamples             []int64
+	ttftP95Ms               int64
+	outputTokens            int64
+	generationMs            int64
+	err4xx                  int64
+	err5xx                  int64
+	err429                  int64
+	err529                  int64
+	retryAfterMaxMs         int64
 }
 
 type inflightCounter struct {
@@ -147,6 +151,21 @@ func RuntimeStats() Stats {
 }
 
 func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationRelay,
+	})
+	RecordClassifiedAttempt(c, info, channelID, apiErr == nil, apiErr, classification)
+}
+
+func RecordClassifiedAttempt(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channelID int,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	if !smart_routing_setting.Enabled() {
 		return
 	}
@@ -176,10 +195,10 @@ func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, a
 		}
 	}
 
-	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
 	if key.apiKeyIndex != model.RoutingMetricSingleKeyIndex {
 		key.apiKeyIndex = model.RoutingMetricSingleKeyIndex
-		recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+		recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
 	}
 }
 
@@ -270,9 +289,18 @@ func ResetForTest() {
 	limits = defaultLimits
 }
 
-func recordBucket(key bucketKey, latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+func recordBucket(
+	key bucketKey,
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	withWritableBucket(key, func(b *bucket) {
-		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
 	})
 }
 
@@ -505,16 +533,39 @@ func decrementCount(counter *atomic.Int64) {
 	}
 }
 
-func (b *bucket) add(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+func (b *bucket) add(
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
 }
 
-func (b *bucket) addLocked(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+func (b *bucket) addLocked(
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	b.requestCount++
-	if apiErr == nil {
+	if success {
 		b.successCount++
+		b.reliabilityRequestCount++
+	} else if (classification.Responsibility == routingerror.ResponsibilityProvider ||
+		classification.Responsibility == routingerror.ResponsibilityNetwork) &&
+		(classification.HealthEffect == routingerror.HealthDegrade ||
+			classification.HealthEffect == routingerror.HealthOpen) {
+		b.reliabilityRequestCount++
+		b.reliabilityFailureCount++
 	}
 	b.totalLatencyMs += latencyMs
 	b.latencySamples = appendBoundedSample(b.latencySamples, latencyMs)
@@ -527,11 +578,13 @@ func (b *bucket) addLocked(latencyMs int64, ttftMs int64, hasTtft bool, generati
 
 	statusCode := 0
 	if apiErr != nil {
-		statusCode = apiErr.StatusCode
+		statusCode = apiErr.SourceStatusCode()
 	}
 	switch {
 	case statusCode == 429:
 		b.err429++
+	case statusCode == 529:
+		b.err529++
 	case statusCode >= 500 && statusCode <= 599:
 		b.err5xx++
 	case statusCode >= 400 && statusCode <= 499:
@@ -551,6 +604,8 @@ func (b *bucket) addSnapshot(snapshot model.RoutingChannelMetric) {
 func (b *bucket) addSnapshotLocked(snapshot model.RoutingChannelMetric) {
 	b.requestCount += snapshot.RequestCount
 	b.successCount += snapshot.SuccessCount
+	b.reliabilityRequestCount += snapshot.ReliabilityRequestCount
+	b.reliabilityFailureCount += snapshot.ReliabilityFailureCount
 	b.totalLatencyMs += snapshot.TotalLatencyMs
 	if snapshot.LatencyP95Ms > b.latencyP95Ms {
 		b.latencyP95Ms = snapshot.LatencyP95Ms
@@ -565,6 +620,7 @@ func (b *bucket) addSnapshotLocked(snapshot model.RoutingChannelMetric) {
 	b.err4xx += snapshot.Err4xx
 	b.err5xx += snapshot.Err5xx
 	b.err429 += snapshot.Err429
+	b.err529 += snapshot.Err529
 	if snapshot.RetryAfterMaxMs > b.retryAfterMaxMs {
 		b.retryAfterMaxMs = snapshot.RetryAfterMaxMs
 	}
@@ -591,24 +647,27 @@ func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 
 func (b *bucket) snapshotLocked(key bucketKey) model.RoutingChannelMetric {
 	return model.RoutingChannelMetric{
-		ChannelID:       key.channelID,
-		APIKeyIndex:     key.apiKeyIndex,
-		ModelName:       key.modelName,
-		Group:           key.group,
-		BucketTs:        key.bucketTs,
-		RequestCount:    b.requestCount,
-		SuccessCount:    b.successCount,
-		TotalLatencyMs:  b.totalLatencyMs,
-		LatencyP95Ms:    b.latencyP95(),
-		TtftSumMs:       b.ttftSumMs,
-		TtftCount:       b.ttftCount,
-		TtftP95Ms:       b.ttftP95(),
-		OutputTokens:    b.outputTokens,
-		GenerationMs:    b.generationMs,
-		Err4xx:          b.err4xx,
-		Err5xx:          b.err5xx,
-		Err429:          b.err429,
-		RetryAfterMaxMs: b.retryAfterMaxMs,
+		ChannelID:               key.channelID,
+		APIKeyIndex:             key.apiKeyIndex,
+		ModelName:               key.modelName,
+		Group:                   key.group,
+		BucketTs:                key.bucketTs,
+		RequestCount:            b.requestCount,
+		SuccessCount:            b.successCount,
+		ReliabilityRequestCount: b.reliabilityRequestCount,
+		ReliabilityFailureCount: b.reliabilityFailureCount,
+		TotalLatencyMs:          b.totalLatencyMs,
+		LatencyP95Ms:            b.latencyP95(),
+		TtftSumMs:               b.ttftSumMs,
+		TtftCount:               b.ttftCount,
+		TtftP95Ms:               b.ttftP95(),
+		OutputTokens:            b.outputTokens,
+		GenerationMs:            b.generationMs,
+		Err4xx:                  b.err4xx,
+		Err5xx:                  b.err5xx,
+		Err429:                  b.err429,
+		Err529:                  b.err529,
+		RetryAfterMaxMs:         b.retryAfterMaxMs,
 	}
 }
 

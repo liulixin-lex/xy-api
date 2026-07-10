@@ -189,23 +189,27 @@ func TestHotcacheCapacityEvictionUsesStableKeyOrder(t *testing.T) {
 func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 	ResetForTest()
 	LoadMetricSnapshots([]model.RoutingChannelMetric{{
-		ChannelID:      77,
-		APIKeyIndex:    model.RoutingMetricSingleKeyIndex,
-		ModelName:      "gpt-test",
-		Group:          "default",
-		BucketTs:       120,
-		RequestCount:   4,
-		SuccessCount:   3,
-		TotalLatencyMs: 800,
-		LatencyP95Ms:   750,
-		TtftCount:      4,
-		TtftP95Ms:      120,
+		ChannelID:               77,
+		APIKeyIndex:             model.RoutingMetricSingleKeyIndex,
+		ModelName:               "gpt-test",
+		Group:                   "default",
+		BucketTs:                120,
+		RequestCount:            4,
+		SuccessCount:            3,
+		ReliabilityRequestCount: 3,
+		ReliabilityFailureCount: 1,
+		TotalLatencyMs:          800,
+		LatencyP95Ms:            750,
+		TtftCount:               4,
+		TtftP95Ms:               120,
 	}}, 60)
 
 	metric, ok := GetMetric(Key{ChannelID: 77, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"})
 	require.True(t, ok)
 	assert.Equal(t, int64(4), metric.RequestCount)
 	assert.Equal(t, int64(3), metric.SuccessCount)
+	assert.Equal(t, int64(3), metric.ReliabilityRequestCount)
+	assert.Equal(t, int64(1), metric.ReliabilityFailureCount)
 	assert.Equal(t, 750.0, metric.P95LatencyMs)
 	assert.Equal(t, 120.0, metric.P95TTFTMs)
 	assert.InDelta(t, 4.0/60.0, metric.TPS, 0.000001)
