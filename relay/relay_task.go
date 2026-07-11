@@ -89,20 +89,21 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	}
 	info.LockedChannel = ch
 
-	if originTask.ChannelId != info.ChannelId {
-		key, _, newAPIError := ch.GetNextEnabledKey()
-		if newAPIError != nil {
-			return service.TaskErrorWrapper(newAPIError, "channel_no_available_key", newAPIError.StatusCode)
+	if originTask.ChannelId != common.GetContextKeyInt(c, constant.ContextKeyChannelId) {
+		key, index, apiErr := ch.GetNextEnabledKey()
+		if apiErr != nil {
+			return service.TaskErrorWrapperLocal(apiErr, string(apiErr.GetErrorCode()), apiErr.StatusCode)
 		}
+		isMultiKey := ch.ChannelInfo.IsMultiKey
+		if !isMultiKey {
+			index = model.RoutingMetricSingleKeyIndex
+		}
+		common.SetContextKey(c, constant.ContextKeyChannelId, originTask.ChannelId)
 		common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 		common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
 		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, ch.GetBaseURL())
-		common.SetContextKey(c, constant.ContextKeyChannelId, originTask.ChannelId)
-
-		info.ChannelBaseUrl = ch.GetBaseURL()
-		info.ChannelId = originTask.ChannelId
-		info.ChannelType = ch.Type
-		info.ApiKey = key
+		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, isMultiKey)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	}
 
 	// 提取 remix 参数（时长、分辨率 → OtherRatios）

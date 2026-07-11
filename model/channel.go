@@ -69,6 +69,48 @@ type ChannelInfo struct {
 	MultiKeyMode           constant.MultiKeyMode `json:"multi_key_mode"`
 }
 
+func (info *ChannelInfo) RemapMultiKeyState(oldKeys []string, newKeys []string) {
+	oldKeyCounts := make(map[string]int, len(oldKeys))
+	oldKeyIndexes := make(map[string]int, len(oldKeys))
+	for index, key := range oldKeys {
+		oldKeyCounts[key]++
+		oldKeyIndexes[key] = index
+	}
+
+	newKeyCounts := make(map[string]int, len(newKeys))
+	for _, key := range newKeys {
+		newKeyCounts[key]++
+	}
+
+	newStatusList := make(map[int]int)
+	newDisabledReason := make(map[int]string)
+	newDisabledTime := make(map[int]int64)
+	for newIndex, key := range newKeys {
+		if oldKeyCounts[key] != 1 || newKeyCounts[key] != 1 {
+			continue
+		}
+
+		oldIndex := oldKeyIndexes[key]
+		status, ok := info.MultiKeyStatusList[oldIndex]
+		if !ok || (status != common.ChannelStatusManuallyDisabled && status != common.ChannelStatusAutoDisabled) {
+			continue
+		}
+		newStatusList[newIndex] = status
+		if reason, ok := info.MultiKeyDisabledReason[oldIndex]; ok {
+			newDisabledReason[newIndex] = reason
+		}
+		if disabledTime, ok := info.MultiKeyDisabledTime[oldIndex]; ok {
+			newDisabledTime[newIndex] = disabledTime
+		}
+	}
+
+	info.MultiKeySize = len(newKeys)
+	info.MultiKeyStatusList = newStatusList
+	info.MultiKeyDisabledReason = newDisabledReason
+	info.MultiKeyDisabledTime = newDisabledTime
+	info.MultiKeyPollingIndex = 0
+}
+
 type ChannelSortOptions struct {
 	SortBy    string
 	SortOrder string
@@ -600,10 +642,27 @@ func (channel *Channel) Update() error {
 		// Clean up status data that exceeds the new key count to prevent index out of range
 		if channel.ChannelInfo.MultiKeyStatusList != nil {
 			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
 					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
 				}
 			}
+		}
+		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
+			for idx := range channel.ChannelInfo.MultiKeyDisabledReason {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
+					delete(channel.ChannelInfo.MultiKeyDisabledReason, idx)
+				}
+			}
+		}
+		if channel.ChannelInfo.MultiKeyDisabledTime != nil {
+			for idx := range channel.ChannelInfo.MultiKeyDisabledTime {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
+					delete(channel.ChannelInfo.MultiKeyDisabledTime, idx)
+				}
+			}
+		}
+		if channel.ChannelInfo.MultiKeyPollingIndex < 0 || channel.ChannelInfo.MultiKeyPollingIndex >= channel.ChannelInfo.MultiKeySize {
+			channel.ChannelInfo.MultiKeyPollingIndex = 0
 		}
 	}
 	var err error
@@ -711,6 +770,8 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 		}
 		if status == common.ChannelStatusEnabled {
 			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+			delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
 		} else {
 			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
 			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
