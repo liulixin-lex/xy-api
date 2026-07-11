@@ -28,6 +28,12 @@ var smartRoutingRetentionLast atomic.Int64
 var smartRoutingBreakerConfigMu sync.Mutex
 var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
 
+type routingCostDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+var routingCostHTTPDoer routingCostDoer = service.GetRoutingCostHTTPClient()
+
 type SmartRoutingRuntime struct {
 	cancel       context.CancelFunc
 	wait         sync.WaitGroup
@@ -936,8 +942,7 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 	}
 	applyRoutingAuthHeaders(request, binding, credentials)
 
-	client := &http.Client{Timeout: time.Duration(defaultTimeoutSeconds) * time.Second}
-	response, err := client.Do(request)
+	response, err := routingCostHTTPDoer.Do(request)
 	if err != nil {
 		return routingPricingResponse{}, err
 	}
@@ -986,8 +991,7 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 	}
 	applyRoutingAuthHeaders(request, binding, credentials)
 
-	client := &http.Client{Timeout: time.Duration(defaultTimeoutSeconds) * time.Second}
-	response, err := client.Do(request)
+	response, err := routingCostHTTPDoer.Do(request)
 	if err != nil {
 		return err
 	}

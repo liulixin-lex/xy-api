@@ -26,6 +26,37 @@ type blockingRoutingSub2APIEvalHook struct {
 	started chan<- bool
 }
 
+func newRoutingCostTLSServerForTest(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	server := httptest.NewTLSServer(handler)
+	client := server.Client()
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	transport = transport.Clone()
+	serverAddress := server.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: time.Second}
+		return dialer.DialContext(ctx, network, serverAddress)
+	}
+	client.Transport = transport
+	client.Timeout = 5 * time.Second
+	restoreRoutingCostHTTPDoerForTest(t, client)
+
+	_, port, err := net.SplitHostPort(serverAddress)
+	require.NoError(t, err)
+	server.URL = "https://routing.example.com:" + port
+	return server
+}
+
+func restoreRoutingCostHTTPDoerForTest(t *testing.T, replacement interface {
+	Do(*http.Request) (*http.Response, error)
+}) {
+	t.Helper()
+	previous := routingCostHTTPDoer
+	routingCostHTTPDoer = replacement
+	t.Cleanup(func() { routingCostHTTPDoer = previous })
+}
+
 func (h blockingRoutingSub2APIEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	if cmd.Name() != "eval" && cmd.Name() != "evalsha" {
 		return ctx, nil
@@ -97,7 +128,7 @@ func TestRunRoutingCostSyncTaskFetchesNewAPIPricingSnapshots(t *testing.T) {
 	t.Cleanup(routinghotcache.ResetForTest)
 
 	requests := map[string]int{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests[r.URL.Path]++
 		assert.Equal(t, "Bearer upstream-token", r.Header.Get("Authorization"))
 		assert.Equal(t, "42", r.Header.Get("New-Api-User"))
@@ -185,7 +216,7 @@ func TestRunRoutingCostSyncTaskDoesNotMarkServingAuthFailureOnUnauthorizedUpstre
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = fmt.Fprint(w, `{"success":false,"message":"invalid token"}`)
@@ -233,7 +264,7 @@ func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 
 	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
 		http.NotFound(w, r)
 	}))
@@ -445,7 +476,7 @@ func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"success":false,"message":"bad token secret-token"}`)
 	}))
@@ -484,7 +515,7 @@ func TestFetchRoutingCostSnapshotsMapsUpstreamModelNameToLocalName(t *testing.T)
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/user/self":
@@ -532,7 +563,7 @@ func TestFetchRoutingCostSnapshotsPreservesTieredExprAsUnknownCost(t *testing.T)
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/user/self":
@@ -594,7 +625,7 @@ func TestRunRoutingCostSyncTaskFetchesSub2APIPricingSnapshotsAndCachesEncryptedJ
 
 	var mu sync.Mutex
 	requests := map[string]int{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		requests[r.URL.Path]++
 		mu.Unlock()
@@ -731,7 +762,7 @@ func TestRoutingSub2APIJWTCoalescesConcurrentLogin(t *testing.T) {
 
 	var loginMu sync.Mutex
 	loginCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/login" {
 			http.NotFound(w, r)
 			return
@@ -858,7 +889,7 @@ func TestRoutingSub2APIJWTLeaderCancellationDoesNotCancelSharedLogin(t *testing.
 	var completedOnce sync.Once
 	var loginMu sync.Mutex
 	loginCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/login" {
 			http.NotFound(w, r)
 			return
@@ -943,7 +974,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 	defer releaseFirstLogin()
 	var loginMu sync.Mutex
 	loginCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/login" {
 			http.NotFound(w, r)
 			return
@@ -1173,7 +1204,7 @@ func TestFetchRoutingCostSnapshotsSub2APILoginFailureDoesNotMarkServingAuthAndMa
 	resetRoutingSub2APITestState()
 	t.Cleanup(resetRoutingSub2APITestState)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"code":401,"message":"login failed for pw-secret"}`)
 	}))
@@ -1224,7 +1255,7 @@ func TestFetchRoutingCostSnapshotsSub2APISuccessDoesNotClearServingAuthFailure(t
 	resetRoutingSub2APITestState()
 	t.Cleanup(resetRoutingSub2APITestState)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/usage":
@@ -1298,7 +1329,7 @@ func TestRoutingSub2APIRequestDoesNotMarkAuthFailureForNonAuthErrors(t *testing.
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tt.statusCode)
 				_, _ = fmt.Fprint(w, tt.body)
@@ -1357,7 +1388,7 @@ func TestRoutingSub2APIRequestReturnsTypedAuthErrorsWithoutMarkingServingHealth(
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tt.statusCode)
 				_, _ = fmt.Fprint(w, tt.body)

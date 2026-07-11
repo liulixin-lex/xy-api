@@ -472,8 +472,8 @@ func validateRoutingBaseURL(value string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return errors.New("invalid base_url")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("base_url must use http or https")
+	if parsed.Scheme != "https" {
+		return errors.New("base_url must use https")
 	}
 	if parsed.User != nil {
 		return errors.New("base_url must not contain credentials")
@@ -487,6 +487,9 @@ func validateRoutingBaseURL(value string) error {
 			strings.Contains(normalized, "authorization") {
 			return errors.New("base_url must not contain sensitive query parameters")
 		}
+	}
+	if err = service.ValidateRoutingCostURL(parsed.String()); err != nil {
+		return err
 	}
 	return nil
 }

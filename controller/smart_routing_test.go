@@ -260,8 +260,12 @@ func TestValidateRoutingBindingRequestRejectsUnsafeBaseURL(t *testing.T) {
 		name    string
 		baseURL string
 	}{
+		{name: "plain http", baseURL: "http://example.com"},
 		{name: "userinfo", baseURL: "https://token@example.com"},
 		{name: "sensitive query", baseURL: "https://example.com?access_token=secret"},
+		{name: "loopback", baseURL: "https://127.0.0.1"},
+		{name: "private network", baseURL: "https://10.0.0.1"},
+		{name: "metadata", baseURL: "https://169.254.169.254"},
 		{name: "unsupported scheme", baseURL: "file:///tmp/socket"},
 	}
 
@@ -328,7 +332,7 @@ func TestLoadSmartRoutingBindingGroupsAcceptsInlineCreateBinding(t *testing.T) {
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer upstream-token", r.Header.Get("Authorization"))
 		assert.Equal(t, "42", r.Header.Get("New-Api-User"))
 		w.Header().Set("Content-Type", "application/json")

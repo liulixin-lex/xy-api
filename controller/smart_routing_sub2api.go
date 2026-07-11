@@ -321,8 +321,7 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{Timeout: time.Duration(defaultTimeoutSeconds) * time.Second}
-	response, err := client.Do(request)
+	response, err := routingCostHTTPDoer.Do(request)
 	if err != nil {
 		return nil, err
 	}
