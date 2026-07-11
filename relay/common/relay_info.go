@@ -98,7 +98,7 @@ type RelayInfo struct {
 	FirstResponseTime       time.Time
 	isFirstResponse         bool
 	routingAttemptStartTime time.Time
-	routingOutputTokens     atomic.Int64
+	routingOutputTokens     int64
 
 	attemptBaselineCaptured        bool
 	attemptIsStream                bool
@@ -693,8 +693,8 @@ func (info *RelayInfo) ObserveRoutingOutputTokens(tokens int64) {
 		return
 	}
 	for {
-		current := info.routingOutputTokens.Load()
-		if tokens <= current || info.routingOutputTokens.CompareAndSwap(current, tokens) {
+		current := atomic.LoadInt64(&info.routingOutputTokens)
+		if tokens <= current || atomic.CompareAndSwapInt64(&info.routingOutputTokens, current, tokens) {
 			return
 		}
 	}
@@ -704,7 +704,7 @@ func (info *RelayInfo) RoutingOutputTokens() int64 {
 	if info == nil {
 		return 0
 	}
-	return info.routingOutputTokens.Load()
+	return atomic.LoadInt64(&info.routingOutputTokens)
 }
 
 func (info *RelayInfo) RoutingAttemptStartTime() time.Time {
@@ -722,7 +722,7 @@ func (info *RelayInfo) ResetStreamAttemptState() {
 		return
 	}
 	info.routingAttemptStartTime = time.Now()
-	info.routingOutputTokens.Store(0)
+	atomic.StoreInt64(&info.routingOutputTokens, 0)
 	if !info.attemptBaselineCaptured {
 		info.attemptBaselineCaptured = true
 		info.attemptIsStream = info.IsStream
