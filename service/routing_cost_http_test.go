@@ -32,6 +32,12 @@ func (r routingCostStaticResolver) LookupNetIP(_ context.Context, _ string, host
 	return addresses, nil
 }
 
+type routingCostResolverFunc func(context.Context, string, string) ([]netip.Addr, error)
+
+func (resolve routingCostResolverFunc) LookupNetIP(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+	return resolve(ctx, network, host)
+}
+
 func TestRoutingCostHTTPClientUsesDedicatedTransport(t *testing.T) {
 	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{})
 	roundTripper, ok := client.Transport.(*routingCostRoundTripper)
@@ -406,6 +412,53 @@ func TestRoutingCostRedirectRejectsFourthHop(t *testing.T) {
 	response.Body.Close()
 	assert.Equal(t, http.StatusFound, response.StatusCode)
 	assert.EqualValues(t, 4, hits.Load())
+}
+
+func TestRoutingCostRedirectRevalidatesDNSWhenAReconnectIsRequired(t *testing.T) {
+	var finalHits atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			w.Header().Set("Connection", "close")
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			finalHits.Add(1)
+			_, _ = io.WriteString(w, "unexpected")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err)
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(server.Certificate())
+
+	var resolveCalls atomic.Int32
+	var dialCalls atomic.Int32
+	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
+		resolver: routingCostResolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+			if resolveCalls.Add(1) == 1 {
+				return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+			}
+			return []netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil
+		}),
+		dialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			dialCalls.Add(1)
+			dialer := &net.Dialer{Timeout: time.Second}
+			return dialer.DialContext(ctx, network, server.Listener.Addr().String())
+		},
+		rootCAs: rootCAs,
+	})
+
+	response, err := client.Get("https://routing.example.com:" + port + "/start")
+	if response != nil {
+		response.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Equal(t, int32(2), resolveCalls.Load())
+	assert.Equal(t, int32(1), dialCalls.Load())
+	assert.Zero(t, finalHits.Load())
 }
 
 func newRoutingCostTLSTestClient(t *testing.T, server *httptest.Server, trustServer bool) (*http.Client, string) {
