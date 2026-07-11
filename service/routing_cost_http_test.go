@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,9 +22,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type routingCostStaticResolver map[string][]net.IPAddr
+type routingCostStaticResolver map[string][]netip.Addr
 
-func (r routingCostStaticResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
+func (r routingCostStaticResolver) LookupNetIP(_ context.Context, _ string, host string) ([]netip.Addr, error) {
 	addresses, ok := r[host]
 	if !ok {
 		return nil, fmt.Errorf("unexpected DNS lookup for %s", host)
@@ -86,6 +87,9 @@ func TestRoutingCostURLValidation(t *testing.T) {
 		{name: "multicast", rawURL: "https://224.0.0.1/api/pricing", wantErr: true},
 		{name: "special use", rawURL: "https://192.0.2.10/api/pricing", wantErr: true},
 		{name: "IPv6 loopback", rawURL: "https://[::1]/api/pricing", wantErr: true},
+		{name: "IPv4 mapped IPv6", rawURL: "https://[::ffff:8.8.8.8]/api/pricing", wantErr: true},
+		{name: "local NAT64 prefix", rawURL: "https://[64:ff9b:1::a9fe:a9fe]/api/pricing", wantErr: true},
+		{name: "6to4 prefix", rawURL: "https://[2002:a9fe:a9fe::]/api/pricing", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -100,13 +104,62 @@ func TestRoutingCostURLValidation(t *testing.T) {
 	}
 }
 
+func TestRoutingCostDialerRejectsIPv6TransitionAddressWithoutDialing(t *testing.T) {
+	for _, resolvedIP := range []string{
+		"::ffff:8.8.8.8",
+		"64:ff9b:1::a9fe:a9fe",
+		"2002:a9fe:a9fe::",
+	} {
+		t.Run(resolvedIP, func(t *testing.T) {
+			var dialCount atomic.Int32
+			client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
+				resolver: routingCostStaticResolver{
+					"routing.example.com": {netip.MustParseAddr(resolvedIP)},
+				},
+				dialContext: func(context.Context, string, string) (net.Conn, error) {
+					dialCount.Add(1)
+					return nil, errors.New("unsafe target must not be dialed")
+				},
+			})
+			request, err := http.NewRequest(http.MethodGet, "https://routing.example.com/api/pricing", nil)
+			require.NoError(t, err)
+
+			response, err := client.Do(request)
+			if response != nil {
+				response.Body.Close()
+			}
+			require.Error(t, err)
+			assert.Zero(t, dialCount.Load())
+		})
+	}
+}
+
+func TestRoutingCostRedirectRejectionDoesNotExposeRejectedLocation(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://user:password@other.example.com/path?access_token=redirect-secret")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+
+	client, baseURL := newRoutingCostTLSTestClient(t, server, true)
+	response, err := client.Get(baseURL + "/start")
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	defer response.Body.Close()
+	assert.Equal(t, http.StatusFound, response.StatusCode)
+	assert.Equal(t, baseURL+"/start", response.Request.URL.String())
+	for _, secret := range []string{"user", "password", "access_token", "redirect-secret", "other.example.com"} {
+		assert.NotContains(t, response.Request.URL.String(), secret)
+	}
+}
+
 func TestRoutingCostDialerRejectsMixedResolvedIPsWithoutDialing(t *testing.T) {
 	var dialCount atomic.Int32
 	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
 		resolver: routingCostStaticResolver{
 			"routing.example.com": {
-				{IP: net.ParseIP("8.8.8.8")},
-				{IP: net.ParseIP("10.0.0.1")},
+				netip.MustParseAddr("8.8.8.8"),
+				netip.MustParseAddr("10.0.0.1"),
 			},
 		},
 		dialContext: func(context.Context, string, string) (net.Conn, error) {
@@ -123,14 +176,14 @@ func TestRoutingCostDialerRejectsMixedResolvedIPsWithoutDialing(t *testing.T) {
 	}
 	require.Error(t, err)
 	assert.Zero(t, dialCount.Load())
-	assert.Contains(t, err.Error(), "10.0.0.1")
+	assert.NotContains(t, err.Error(), "10.0.0.1")
 }
 
 func TestRoutingCostDialerPinsConnectionToValidatedIP(t *testing.T) {
 	var dialed []string
 	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
 		resolver: routingCostStaticResolver{
-			"routing.example.com": {{IP: net.ParseIP("8.8.8.8")}},
+			"routing.example.com": {netip.MustParseAddr("8.8.8.8")},
 		},
 		dialContext: func(_ context.Context, _ string, address string) (net.Conn, error) {
 			dialed = append(dialed, address)
@@ -324,10 +377,10 @@ func TestRoutingCostRedirectRejectsUnsafeRedirects(t *testing.T) {
 			request, err := http.NewRequest(tt.method, baseURL+"/start", tt.body)
 			require.NoError(t, err)
 			response, err := client.Do(request)
-			if response != nil {
-				response.Body.Close()
-			}
-			require.Error(t, err)
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			response.Body.Close()
+			assert.Equal(t, tt.statusCode, response.StatusCode)
 			assert.Zero(t, finalHits.Load())
 		})
 	}
@@ -348,10 +401,10 @@ func TestRoutingCostRedirectRejectsFourthHop(t *testing.T) {
 
 	client, baseURL := newRoutingCostTLSTestClient(t, server, true)
 	response, err := client.Get(baseURL + "/0")
-	if response != nil {
-		response.Body.Close()
-	}
-	require.Error(t, err)
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	response.Body.Close()
+	assert.Equal(t, http.StatusFound, response.StatusCode)
 	assert.EqualValues(t, 4, hits.Load())
 }
 
@@ -367,7 +420,7 @@ func newRoutingCostTLSTestClient(t *testing.T, server *httptest.Server, trustSer
 	}
 	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
 		resolver: routingCostStaticResolver{
-			"routing.example.com": {{IP: net.ParseIP("8.8.8.8")}},
+			"routing.example.com": {netip.MustParseAddr("8.8.8.8")},
 		},
 		dialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			dialer := &net.Dialer{Timeout: time.Second}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -25,7 +27,7 @@ const (
 )
 
 type routingCostResolver interface {
-	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+	LookupNetIP(ctx context.Context, network string, host string) ([]netip.Addr, error)
 }
 
 type routingCostHTTPClientOptions struct {
@@ -48,6 +50,12 @@ var routingCostNetworkProtection = common.SSRFProtection{
 	DomainFilterMode:       false,
 	IpFilterMode:           false,
 	ApplyIPFilterForDomain: true,
+}
+
+var routingCostRejectedIPv6Prefixes = []netip.Prefix{
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
 }
 
 var routingCostHTTPClient = newRoutingCostHTTPClient(routingCostHTTPClientOptions{})
@@ -131,47 +139,45 @@ func (d *routingCostDialer) DialContext(ctx context.Context, network, address st
 		return nil, fmt.Errorf("invalid routing cost port %q", port)
 	}
 	if err = routingCostNetworkProtection.ValidateNetworkTarget(host, portNumber); err != nil {
-		return nil, fmt.Errorf("routing cost target rejected: %w", err)
+		return nil, errors.New("routing cost target rejected")
 	}
 
-	if ip := net.ParseIP(host); ip != nil {
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		if err = validateRoutingCostIP(host, ip); err != nil {
+			return nil, err
+		}
 		return d.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
 
-	resolved, err := d.resolver.LookupIPAddr(ctx, host)
+	resolved, err := d.resolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return nil, fmt.Errorf("routing cost DNS resolution failed for %s: %w", host, err)
+		return nil, errors.New("routing cost DNS resolution failed")
 	}
 	if len(resolved) == 0 {
 		return nil, fmt.Errorf("routing cost DNS resolution for %s returned no addresses", host)
 	}
 
-	verified := make([]net.IP, 0, len(resolved))
+	verified := make([]netip.Addr, 0, len(resolved))
 	for _, address := range resolved {
-		if address.IP == nil || address.Zone != "" {
-			return nil, fmt.Errorf("routing cost DNS resolution for %s returned an invalid address", host)
+		if !address.IsValid() || address.Zone() != "" {
+			return nil, errors.New("routing cost DNS resolution returned an invalid address")
 		}
-		if err = routingCostNetworkProtection.ValidateResolvedIP(host, address.IP); err != nil {
-			return nil, fmt.Errorf("routing cost target rejected: %w", err)
+		if err = validateRoutingCostIP(host, address); err != nil {
+			return nil, err
 		}
-		verified = append(verified, address.IP)
+		verified = append(verified, address)
 	}
 
-	var lastDialError error
 	for _, ip := range verified {
-		if !networkAllowsIP(network, ip) {
+		if !routingCostNetworkAllowsIP(network, ip) {
 			continue
 		}
 		connection, dialErr := d.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 		if dialErr == nil {
 			return connection, nil
 		}
-		lastDialError = dialErr
 	}
-	if lastDialError != nil {
-		return nil, lastDialError
-	}
-	return nil, fmt.Errorf("routing cost DNS resolution for %s returned no usable addresses", host)
+	return nil, errors.New("routing cost connection failed")
 }
 
 func validateRoutingCostURL(parsed *url.URL) error {
@@ -205,37 +211,78 @@ func validateRoutingCostURL(parsed *url.URL) error {
 		return fmt.Errorf("invalid routing cost port")
 	}
 	if err := routingCostNetworkProtection.ValidateNetworkTarget(host, port); err != nil {
-		return fmt.Errorf("routing cost target rejected: %w", err)
+		return errors.New("routing cost target rejected")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return validateRoutingCostIP(host, ip)
 	}
 	return nil
 }
 
+func validateRoutingCostIP(host string, ip netip.Addr) error {
+	if !ip.IsValid() || ip.Is4In6() {
+		return errors.New("routing cost target rejected")
+	}
+	if ip.Is6() {
+		for _, prefix := range routingCostRejectedIPv6Prefixes {
+			if prefix.Contains(ip) {
+				return errors.New("routing cost target rejected")
+			}
+		}
+	}
+	if err := routingCostNetworkProtection.ValidateResolvedIP(host, net.IP(ip.AsSlice())); err != nil {
+		return errors.New("routing cost target rejected")
+	}
+	return nil
+}
+
+func routingCostNetworkAllowsIP(network string, ip netip.Addr) bool {
+	switch network {
+	case "tcp4":
+		return ip.Is4()
+	case "tcp6":
+		return ip.Is6()
+	default:
+		return true
+	}
+}
+
 func checkRoutingCostRedirect(request *http.Request, via []*http.Request) error {
 	if request == nil || request.URL == nil || len(via) == 0 {
-		return fmt.Errorf("invalid routing cost redirect")
+		return rejectRoutingCostRedirect(request)
 	}
 	if len(via) > routingCostMaxRedirects {
-		return fmt.Errorf("routing cost request stopped after %d redirects", routingCostMaxRedirects)
+		return rejectRoutingCostRedirect(request)
 	}
 
 	original := via[0]
 	if !routingCostRedirectMethodAllowed(original.Method) || routingCostRequestHasBody(original) {
-		return fmt.Errorf("routing cost redirects require a GET or HEAD request without a body")
+		return rejectRoutingCostRedirect(request)
 	}
 	if !routingCostRedirectMethodAllowed(request.Method) || routingCostRequestHasBody(request) {
-		return fmt.Errorf("routing cost redirects require a GET or HEAD request without a body")
+		return rejectRoutingCostRedirect(request)
 	}
 	if !strings.EqualFold(request.URL.Scheme, original.URL.Scheme) || !strings.EqualFold(request.URL.Host, original.URL.Host) {
-		return fmt.Errorf("routing cost redirect must keep the original scheme and host")
+		return rejectRoutingCostRedirect(request)
 	}
 	if err := validateRoutingCostURL(request.URL); err != nil {
-		return fmt.Errorf("routing cost redirect rejected: %w", err)
+		return rejectRoutingCostRedirect(request)
 	}
 
 	for _, header := range []string{"Authorization", "Proxy-Authorization", "Cookie", "New-Api-User"} {
 		request.Header.Del(header)
 	}
 	return nil
+}
+
+func rejectRoutingCostRedirect(request *http.Request) error {
+	if request != nil {
+		request.URL = &url.URL{Scheme: "https", Host: "redacted.invalid"}
+		request.Host = ""
+		request.RequestURI = ""
+		request.Header = make(http.Header)
+	}
+	return http.ErrUseLastResponse
 }
 
 func routingCostRedirectMethodAllowed(method string) bool {
