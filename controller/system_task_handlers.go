@@ -20,9 +20,10 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
+	"gorm.io/gorm"
 )
 
-var smartRoutingRuntimeStateMu sync.Mutex
+var smartRoutingRuntimeStateMu = newRoutingContextMutex()
 var smartRoutingRetentionLast atomic.Int64
 var smartRoutingBreakerConfigMu sync.Mutex
 var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
@@ -49,14 +50,45 @@ type SmartRoutingRuntime struct {
 	cancel       context.CancelFunc
 	wait         sync.WaitGroup
 	done         chan struct{}
+	finalDone    chan struct{}
 	close        sync.Once
-	finalize     sync.Once
+	finalStarted atomic.Bool
 	finalErr     error
 	deps         smartRoutingRuntimeDeps
 	refreshStats smartRoutingWorkerStats
 	flushStats   smartRoutingWorkerStats
 	finalRuns    atomic.Int64
 	finalErrors  atomic.Int64
+}
+
+type routingContextMutex struct {
+	token chan struct{}
+}
+
+func newRoutingContextMutex() *routingContextMutex {
+	mutex := &routingContextMutex{token: make(chan struct{}, 1)}
+	mutex.token <- struct{}{}
+	return mutex
+}
+
+func (mutex *routingContextMutex) Lock() {
+	<-mutex.token
+}
+
+func (mutex *routingContextMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-mutex.token:
+		return nil
+	}
+}
+
+func (mutex *routingContextMutex) Unlock() {
+	mutex.token <- struct{}{}
 }
 
 type smartRoutingRuntimeDeps struct {
@@ -163,9 +195,10 @@ func newSmartRoutingRuntime(parent context.Context, deps smartRoutingRuntimeDeps
 	}
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &SmartRoutingRuntime{
-		cancel: cancel,
-		done:   make(chan struct{}),
-		deps:   deps,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		finalDone: make(chan struct{}),
+		deps:      deps,
 	}
 	runtime.wait.Add(2)
 
@@ -217,14 +250,21 @@ func (runtime *SmartRoutingRuntime) Wait(ctx context.Context) error {
 		return err
 	}
 
-	runtime.finalize.Do(func() {
+	if runtime.finalStarted.CompareAndSwap(false, true) {
 		runtime.finalRuns.Add(1)
 		runtime.finalErr = runtime.deps.flush(ctx, runtime.deps.getSetting())
 		if runtime.finalErr != nil {
 			runtime.finalErrors.Add(1)
 		}
-	})
-	return runtime.finalErr
+		close(runtime.finalDone)
+		return runtime.finalErr
+	}
+	select {
+	case <-runtime.finalDone:
+		return runtime.finalErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (runtime *SmartRoutingRuntime) Stats() SmartRoutingRuntimeStats {
@@ -474,17 +514,51 @@ type routingPricingItem struct {
 	BillingExpr     string   `json:"billing_expr"`
 }
 
-func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
-	smartRoutingRuntimeStateMu.Lock()
+func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) (summary map[string]any, resultErr error) {
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return map[string]any{"metrics": 0, "breakers": 0}, err
+	}
 	defer smartRoutingRuntimeStateMu.Unlock()
 
-	summary := map[string]any{
+	summary = map[string]any{
 		"metrics":  0,
 		"breakers": 0,
 	}
 	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
+	acceptedBindingIDs := make(map[int]int)
+	fencedBindingIDs := make(map[int]int)
+	rejectedChannels := make(map[int]struct{})
+	persistedMetricsByChannel := make(map[int][]model.RoutingChannelMetric)
+	persistedBreakerCounts := make(map[int]int)
+	defer func() {
+		persistedMetrics := make([]model.RoutingChannelMetric, 0)
+		for channelID, metrics := range persistedMetricsByChannel {
+			if _, accepted := acceptedBindingIDs[channelID]; accepted {
+				persistedMetrics = append(persistedMetrics, metrics...)
+			}
+		}
+		routinghotcache.ApplyMetricDeltas(persistedMetrics, setting.MetricBucketSec)
+
+		metricCount, breakerCount, verifyErr := finalizeFlushedRoutingBindingState(
+			ctx,
+			acceptedBindingIDs,
+			persistedMetricsByChannel,
+			persistedBreakerCounts,
+		)
+		if verifyErr != nil {
+			if resultErr == nil {
+				resultErr = verifyErr
+			}
+			return
+		}
+		if resultErr == nil {
+			summary["metrics"] = metricCount
+			summary["breakers"] = breakerCount
+		}
+	}()
+
 	drainedMetrics := routingmetrics.DrainSnapshots()
 	eligibilityByChannel := make(map[int]model.LegacyRoutingStateEligibility)
 	validMetrics := make([]model.RoutingChannelMetric, 0, len(drainedMetrics))
@@ -519,18 +593,80 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 	}
 	for i := range validMetrics {
 		metric := validMetrics[i]
+		if _, rejected := rejectedChannels[metric.ChannelID]; rejected {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			continue
+		}
 		eligibility := eligibilityByChannel[metric.ChannelID]
-		if err := eligibility.UpsertRoutingChannelMetricContext(ctx, &metric); err != nil {
-			routinghotcache.ApplyMetricDeltas(validMetrics[:i], setting.MetricBucketSec)
+		expectedBindingID := fencedBindingIDs[metric.ChannelID]
+		bindingID, stateAccepted, err := eligibility.UpsertRoutingChannelMetricForBindingContext(ctx, &metric, expectedBindingID)
+		if err != nil {
 			routingmetrics.RequeueSnapshots(validMetrics[i:])
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return summary, ctxErr
 			}
 			return summary, err
 		}
+		if bindingID == 0 {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			rejectedChannels[metric.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(persistedMetricsByChannel, metric.ChannelID)
+			delete(persistedBreakerCounts, metric.ChannelID)
+			continue
+		}
+		if expectedBindingID == 0 {
+			fencedBindingIDs[metric.ChannelID] = bindingID
+		} else if bindingID != expectedBindingID {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			rejectedChannels[metric.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(persistedMetricsByChannel, metric.ChannelID)
+			delete(persistedBreakerCounts, metric.ChannelID)
+			continue
+		}
+		if !stateAccepted {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			rejectedChannels[metric.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(persistedMetricsByChannel, metric.ChannelID)
+			delete(persistedBreakerCounts, metric.ChannelID)
+			continue
+		}
+		matches, verifyErr := model.RoutingChannelBindingMatchesContext(ctx, metric.ChannelID, bindingID)
+		if verifyErr != nil {
+			if acceptedBindingID, accepted := acceptedBindingIDs[metric.ChannelID]; accepted && acceptedBindingID != bindingID {
+				clearRoutingRuntimeChannelState(metric.ChannelID)
+				rejectedChannels[metric.ChannelID] = struct{}{}
+				delete(acceptedBindingIDs, metric.ChannelID)
+				delete(persistedMetricsByChannel, metric.ChannelID)
+				delete(persistedBreakerCounts, metric.ChannelID)
+			} else {
+				acceptedBindingIDs[metric.ChannelID] = bindingID
+				persistedMetricsByChannel[metric.ChannelID] = append(persistedMetricsByChannel[metric.ChannelID], metric)
+			}
+			routingmetrics.RequeueSnapshots(validMetrics[i+1:])
+			return summary, verifyErr
+		}
+		if !matches {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			rejectedChannels[metric.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(persistedMetricsByChannel, metric.ChannelID)
+			delete(persistedBreakerCounts, metric.ChannelID)
+			continue
+		}
+		if acceptedBindingID, accepted := acceptedBindingIDs[metric.ChannelID]; accepted && acceptedBindingID != bindingID {
+			clearRoutingRuntimeChannelState(metric.ChannelID)
+			rejectedChannels[metric.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(persistedMetricsByChannel, metric.ChannelID)
+			delete(persistedBreakerCounts, metric.ChannelID)
+			continue
+		}
+		acceptedBindingIDs[metric.ChannelID] = bindingID
+		persistedMetricsByChannel[metric.ChannelID] = append(persistedMetricsByChannel[metric.ChannelID], metric)
 	}
-	routinghotcache.ApplyMetricDeltas(validMetrics, setting.MetricBucketSec)
-	summary["metrics"] = len(validMetrics)
 
 	dirtyBreakers := routingbreaker.DirtySnapshots()
 	validBreakers := make([]routingbreaker.Snapshot, 0, len(dirtyBreakers))
@@ -564,17 +700,81 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		}
 	}
 	for i, snapshot := range validBreakers {
+		if _, rejected := rejectedChannels[snapshot.Key.ChannelID]; rejected {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			continue
+		}
 		state := routingBreakerSnapshotToModel(snapshot)
 		eligibility := eligibilityByChannel[snapshot.Key.ChannelID]
-		if err := eligibility.UpsertRoutingBreakerStateContext(ctx, &state); err != nil {
+		expectedBindingID := fencedBindingIDs[snapshot.Key.ChannelID]
+		bindingID, stateAccepted, err := eligibility.UpsertRoutingBreakerStateForBindingContext(ctx, &state, expectedBindingID)
+		if err != nil {
 			routingbreaker.RequeueDirtySnapshots(validBreakers[i:])
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return summary, ctxErr
 			}
 			return summary, err
 		}
+		if bindingID == 0 {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			continue
+		}
+		if expectedBindingID == 0 {
+			fencedBindingIDs[snapshot.Key.ChannelID] = bindingID
+		} else if bindingID != expectedBindingID {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			continue
+		}
+		if !stateAccepted {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			continue
+		}
+		matches, verifyErr := model.RoutingChannelBindingMatchesContext(ctx, snapshot.Key.ChannelID, bindingID)
+		if verifyErr != nil {
+			if acceptedBindingID, accepted := acceptedBindingIDs[snapshot.Key.ChannelID]; accepted && acceptedBindingID != bindingID {
+				clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+				rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+				delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+				delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+				delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			} else {
+				acceptedBindingIDs[snapshot.Key.ChannelID] = bindingID
+				persistedBreakerCounts[snapshot.Key.ChannelID]++
+			}
+			routingbreaker.RequeueDirtySnapshots(validBreakers[i+1:])
+			return summary, verifyErr
+		}
+		if !matches {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			continue
+		}
+		if acceptedBindingID, accepted := acceptedBindingIDs[snapshot.Key.ChannelID]; accepted && acceptedBindingID != bindingID {
+			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
+			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
+			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
+			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
+			continue
+		}
+		acceptedBindingIDs[snapshot.Key.ChannelID] = bindingID
+		persistedBreakerCounts[snapshot.Key.ChannelID]++
 	}
-	summary["breakers"] = len(validBreakers)
 
 	now := common.GetTimestamp()
 	const (
@@ -597,8 +797,52 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 	return summary, nil
 }
 
+func clearRoutingRuntimeChannelState(channelID int) {
+	routingmetrics.ClearChannel(channelID)
+	routingbreaker.ClearDefaultChannelWithCache(channelID, routinghotcache.ClearChannel)
+}
+
+func finalizeFlushedRoutingBindingState(
+	ctx context.Context,
+	acceptedBindingIDs map[int]int,
+	persistedMetricsByChannel map[int][]model.RoutingChannelMetric,
+	persistedBreakerCounts map[int]int,
+) (int, int, error) {
+	for channelID, bindingID := range acceptedBindingIDs {
+		matches, err := model.RoutingChannelBindingMatchesContext(ctx, channelID, bindingID)
+		if err != nil {
+			for acceptedChannelID := range acceptedBindingIDs {
+				clearRoutingRuntimeChannelState(acceptedChannelID)
+			}
+			return 0, 0, err
+		}
+		if matches {
+			continue
+		}
+		clearRoutingRuntimeChannelState(channelID)
+		delete(persistedMetricsByChannel, channelID)
+		delete(persistedBreakerCounts, channelID)
+	}
+
+	metricCount := 0
+	for channelID, metrics := range persistedMetricsByChannel {
+		if _, accepted := acceptedBindingIDs[channelID]; accepted {
+			metricCount += len(metrics)
+		}
+	}
+	breakerCount := 0
+	for channelID, count := range persistedBreakerCounts {
+		if _, accepted := acceptedBindingIDs[channelID]; accepted {
+			breakerCount += count
+		}
+	}
+	return metricCount, breakerCount, nil
+}
+
 func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
-	smartRoutingRuntimeStateMu.Lock()
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return map[string]any{"costs": 0, "metrics": 0, "breakers": 0, "health": 0}, err
+	}
 	defer smartRoutingRuntimeStateMu.Unlock()
 
 	summary := map[string]any{
@@ -616,11 +860,11 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 		staleSeconds = 1800
 	}
 
+	costCutoff := now - staleSeconds
 	var costs []model.RoutingCostSnapshot
-	if err := model.DB.WithContext(ctx).Where("snapshot_ts >= ?", now-staleSeconds).Order("snapshot_ts desc").Limit(5000).Find(&costs).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("snapshot_ts >= ?", costCutoff).Order("snapshot_ts desc").Limit(5000).Find(&costs).Error; err != nil {
 		return summary, err
 	}
-	routinghotcache.LoadCostSnapshots(costs)
 	summary["costs"] = len(costs)
 
 	metricWindow := staleSeconds
@@ -721,7 +965,57 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 	if err := model.DB.WithContext(ctx).Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
 		return summary, err
 	}
+	cachedCostKeys, cachedBalanceChannels := routinghotcache.CostConnectorCachedState()
+	cachedCosts := make([]model.RoutingCostSnapshot, 0, len(cachedCostKeys))
+	const costReconcileBatchSize = 200
+	for start := 0; start < len(cachedCostKeys); start += costReconcileBatchSize {
+		end := start + costReconcileBatchSize
+		if end > len(cachedCostKeys) {
+			end = len(cachedCostKeys)
+		}
+		conditions := make([]string, 0, end-start)
+		args := make([]any, 0, 1+(end-start)*2)
+		args = append(args, costCutoff)
+		for _, key := range cachedCostKeys[start:end] {
+			conditions = append(conditions, "(channel_id = ? AND model_name = ?)")
+			args = append(args, key.ChannelID, key.Model)
+		}
+		var batch []model.RoutingCostSnapshot
+		if err := model.DB.WithContext(ctx).
+			Where("snapshot_ts >= ? AND ("+strings.Join(conditions, " OR ")+")", args...).
+			Find(&batch).Error; err != nil {
+			return summary, err
+		}
+		cachedCosts = append(cachedCosts, batch...)
+	}
+
+	cachedHealth := make([]model.RoutingChannelHealthState, 0, len(cachedBalanceChannels))
+	const balanceReconcileBatchSize = 500
+	for start := 0; start < len(cachedBalanceChannels); start += balanceReconcileBatchSize {
+		end := start + balanceReconcileBatchSize
+		if end > len(cachedBalanceChannels) {
+			end = len(cachedBalanceChannels)
+		}
+		var batch []model.RoutingChannelHealthState
+		if err := model.DB.WithContext(ctx).
+			Where("channel_id IN ?", cachedBalanceChannels[start:end]).
+			Find(&batch).Error; err != nil {
+			return summary, err
+		}
+		cachedHealth = append(cachedHealth, batch...)
+	}
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
 	routinghotcache.LoadHealthSnapshots(healthStates, now)
+	routinghotcache.ReconcileCostConnectorSnapshots(routinghotcache.CostConnectorReconcileSnapshot{
+		CachedCostKeys:        cachedCostKeys,
+		RecentCosts:           costs,
+		CachedCosts:           cachedCosts,
+		CachedBalanceChannels: cachedBalanceChannels,
+		RecentHealth:          healthStates,
+		CachedHealth:          cachedHealth,
+	})
 	summary["health"] = len(healthStates)
 	return summary, nil
 }
@@ -749,6 +1043,7 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 		"loaded_breakers": 0,
 		"errors":          0,
 		"skipped_backoff": 0,
+		"stale_bindings":  0,
 	}
 
 	flushSummary, err := flushRoutingRuntimeState(ctx, setting)
@@ -783,6 +1078,7 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 
 	syncedSnapshots := 0
 	syncErrors := 0
+	staleBindings := 0
 	for _, binding := range eligibleBindings {
 		if err := ctx.Err(); err != nil {
 			return summary, err
@@ -792,7 +1088,6 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 			if ctx.Err() != nil {
 				return summary, ctx.Err()
 			}
-			syncErrors++
 			failureCount := binding.SyncFailureCount
 			if failureCount < 0 {
 				failureCount = 0
@@ -809,13 +1104,14 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 			if delaySeconds <= 0 {
 				delaySeconds = 1
 			}
-			backoffUntil := now
+			failureObservedAt := deps.now()
+			backoffUntil := failureObservedAt
 			maxInt64 := int64(^uint64(0) >> 1)
 			if delaySeconds > 0 {
-				if now > maxInt64-delaySeconds {
+				if failureObservedAt > maxInt64-delaySeconds {
 					backoffUntil = maxInt64
 				} else {
-					backoffUntil = now + delaySeconds
+					backoffUntil = failureObservedAt + delaySeconds
 				}
 			}
 			credentials, _ := binding.GetCredentials()
@@ -823,40 +1119,39 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 			if message == "" {
 				message = "routing cost sync failed"
 			}
-			if updateErr := model.DB.WithContext(ctx).Model(&model.RoutingChannelBinding{}).
-				Where("id = ?", binding.ID).
-				Updates(map[string]any{
-					"last_sync_error":    &message,
-					"sync_failure_count": failureCount,
-					"sync_backoff_until": backoffUntil,
-				}).Error; updateErr != nil {
+			if updateErr := model.UpdateRoutingCostSyncFailureContext(ctx, binding, failureCount, backoffUntil, message); updateErr != nil {
+				if errors.Is(updateErr, model.ErrRoutingBindingChanged) {
+					staleBindings++
+					continue
+				}
 				return summary, fmt.Errorf("persist routing cost sync failure state: %w", updateErr)
 			}
+			syncErrors++
 			continue
 		}
-		for i := range snapshots {
-			snapshot := snapshots[i]
-			if err := model.UpsertRoutingCostSnapshot(&snapshot); err != nil {
-				return summary, err
-			}
-			syncedSnapshots++
-		}
-		if err := ctx.Err(); err != nil {
+		if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
 			return summary, err
 		}
-		routinghotcache.LoadCostSnapshots(snapshots)
-		if updateErr := model.DB.WithContext(ctx).Model(&model.RoutingChannelBinding{}).
-			Where("id = ?", binding.ID).
-			Updates(map[string]any{
-				"last_sync_error":    nil,
-				"sync_failure_count": 0,
-				"sync_backoff_until": 0,
-			}).Error; updateErr != nil {
-			return summary, fmt.Errorf("clear routing cost sync failure state: %w", updateErr)
+		persistErr := model.CompleteRoutingCostSyncContext(ctx, binding, snapshots)
+		if persistErr == nil {
+			routinghotcache.LoadCostSnapshots(snapshots)
 		}
+		smartRoutingRuntimeStateMu.Unlock()
+		if persistErr != nil {
+			if errors.Is(persistErr, model.ErrRoutingBindingChanged) {
+				staleBindings++
+				continue
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return summary, ctxErr
+			}
+			return summary, fmt.Errorf("persist routing cost snapshots: %w", persistErr)
+		}
+		syncedSnapshots += len(snapshots)
 	}
 	summary["snapshots"] = syncedSnapshots
 	summary["errors"] = syncErrors
+	summary["stale_bindings"] = staleBindings
 	return summary, nil
 }
 
@@ -883,7 +1178,10 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 	if !hasGroupRatio {
 		confidence = model.RoutingCostConfidenceGroupOnly
 	}
-	modelNameMap := routingModelReverseMapping(binding.ChannelID)
+	modelNameMap, err := routingModelReverseMapping(ctx, binding.ChannelID)
+	if err != nil {
+		return nil, err
+	}
 
 	snapshots := make([]model.RoutingCostSnapshot, 0, len(payload.Data))
 	for _, item := range payload.Data {
@@ -932,20 +1230,23 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 	return snapshots, nil
 }
 
-func routingModelReverseMapping(channelID int) map[string]string {
+func routingModelReverseMapping(ctx context.Context, channelID int) (map[string]string, error) {
 	if channelID <= 0 {
-		return nil
+		return nil, nil
 	}
 	var channel model.Channel
-	if err := model.DB.Select("id", "model_mapping").Where("id = ?", channelID).First(&channel).Error; err != nil {
-		return nil
+	if err := model.DB.WithContext(ctx).Select("id", "model_mapping").Where("id = ?", channelID).First(&channel).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	if channel.ModelMapping == nil || strings.TrimSpace(*channel.ModelMapping) == "" {
-		return nil
+		return nil, nil
 	}
 	var mapping map[string]string
 	if err := common.UnmarshalJsonStr(*channel.ModelMapping, &mapping); err != nil {
-		return nil
+		return nil, nil
 	}
 	localNames := make([]string, 0, len(mapping))
 	for localName := range mapping {
@@ -964,7 +1265,7 @@ func routingModelReverseMapping(channelID int) map[string]string {
 			reverse[upstreamName] = localName
 		}
 	}
-	return reverse
+	return reverse, nil
 }
 
 func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChannelBinding) (_ routingPricingResponse, err error) {
@@ -1115,12 +1416,25 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 	}
 
 	balanceQuota := payload.Data.Quota - payload.Data.UsedQuota
+	updatedTime := common.GetTimestamp()
+	return persistRoutingBalance(ctx, binding, balanceQuota/common.QuotaPerUnit, updatedTime)
+}
+
+func persistRoutingBalance(ctx context.Context, binding model.RoutingChannelBinding, balance float64, updatedTime int64) error {
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer smartRoutingRuntimeStateMu.Unlock()
+
+	applied, err := model.UpdateRoutingChannelBalanceForBindingContext(ctx, binding, balance, updatedTime)
+	if err != nil || !applied {
+		return err
+	}
 	routinghotcache.SetBalance(binding.ChannelID, routinghotcache.BalanceSnapshot{
 		Known:       true,
-		Balance:     balanceQuota / common.QuotaPerUnit,
-		UpdatedUnix: common.GetTimestamp(),
+		Balance:     balance,
+		UpdatedUnix: updatedTime,
 	})
-	_ = model.UpsertRoutingChannelBalance(binding.ChannelID, balanceQuota/common.QuotaPerUnit, common.GetTimestamp())
 	return nil
 }
 

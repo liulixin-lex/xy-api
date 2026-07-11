@@ -20,6 +20,37 @@ import (
 	"gorm.io/gorm"
 )
 
+type observedSmartWaitContext struct {
+	context.Context
+	checks      atomic.Int64
+	afterSecond chan struct{}
+}
+
+func createRoutingRuntimeBindings(t *testing.T, db *gorm.DB, channelIDs ...int) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}))
+	for _, channelID := range channelIDs {
+		binding := model.RoutingChannelBinding{
+			ChannelID:     channelID,
+			UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+			BaseURL:       fmt.Sprintf("https://routing-%d.example.com", channelID),
+			UpstreamGroup: "default",
+			Enabled:       true,
+			CreatedTime:   1,
+			UpdatedTime:   1,
+		}
+		require.NoError(t, db.Where("channel_id = ?", channelID).FirstOrCreate(&binding).Error)
+	}
+}
+
+func (ctx *observedSmartWaitContext) Err() error {
+	err := ctx.Context.Err()
+	if ctx.checks.Add(1) == 2 {
+		close(ctx.afterSecond)
+	}
+	return err
+}
+
 func TestSmartRoutingRuntimeRunsAndStopsWithoutLeakingWorkers(t *testing.T) {
 	refreshRan := make(chan struct{}, 1)
 	flushRan := make(chan struct{}, 1)
@@ -372,6 +403,93 @@ func TestSmartRoutingRuntimeFinalFlushReturnsErrorOnlyOnce(t *testing.T) {
 	}, runtime.Stats())
 }
 
+func TestSmartRoutingRuntimeConcurrentWaiterHonorsOwnContextDuringFinalFlush(t *testing.T) {
+	refreshReady := make(chan struct{}, 1)
+	flushReady := make(chan struct{}, 1)
+	finalFlushStarted := make(chan struct{})
+	releaseFinalFlush := make(chan struct{})
+	var flushCalls atomic.Int64
+
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            false,
+				HotcacheRefreshSec: 1,
+				FlushIntervalMin:   1,
+			}
+		},
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil },
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			flushCalls.Add(1)
+			close(finalFlushStarted)
+			<-releaseFinalFlush
+			return nil
+		},
+		waitRefresh: func(ctx context.Context, _ time.Duration) bool {
+			refreshReady <- struct{}{}
+			<-ctx.Done()
+			return false
+		},
+		waitFlush: func(ctx context.Context, _ time.Duration) bool {
+			flushReady <- struct{}{}
+			<-ctx.Done()
+			return false
+		},
+	})
+	<-refreshReady
+	<-flushReady
+	runtime.Close()
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- runtime.Wait(context.Background()) }()
+	<-finalFlushStarted
+
+	secondBase, cancelSecond := context.WithCancel(context.Background())
+	secondContext := &observedSmartWaitContext{Context: secondBase, afterSecond: make(chan struct{})}
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- runtime.Wait(secondContext) }()
+	<-secondContext.afterSecond
+	cancelSecond()
+
+	select {
+	case err := <-secondResult:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		close(releaseFinalFlush)
+		require.NoError(t, <-firstResult)
+		require.Fail(t, "concurrent Wait ignored its own context")
+	}
+
+	close(releaseFinalFlush)
+	require.NoError(t, <-firstResult)
+	assert.Equal(t, int64(1), flushCalls.Load())
+}
+
+func TestFlushRoutingRuntimeStateLockWaitHonorsContext(t *testing.T) {
+	smartRoutingRuntimeStateMu.Lock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := flushRoutingRuntimeState(ctx, smart_routing_setting.SmartRoutingSetting{})
+		result <- err
+	}()
+	<-started
+	cancel()
+
+	select {
+	case err := <-result:
+		smartRoutingRuntimeStateMu.Unlock()
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		smartRoutingRuntimeStateMu.Unlock()
+		<-result
+		require.Fail(t, "routing runtime state lock ignored context cancellation")
+	}
+}
+
 func TestSmartRoutingRuntimeFinalFlushPersistsDirtyStateWhenDisabled(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
@@ -393,6 +511,7 @@ func TestSmartRoutingRuntimeFinalFlushPersistsDirtyStateWhenDisabled(t *testing.
 
 	const channelID = 1201
 	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "final-flush", Key: "single-key"}).Error)
+	createRoutingRuntimeBindings(t, db, channelID)
 	setting := smart_routing_setting.SmartRoutingSetting{
 		Enabled:            false,
 		HotcacheRefreshSec: 1,
@@ -552,6 +671,135 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 		assert.Equal(t, want, metricOK, "metric key %+v", key)
 		assert.Equal(t, want, breakerOK, "breaker key %+v", key)
 	}
+}
+
+func TestRefreshRoutingHotcacheReconcilesCostConnectorState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+		&model.RoutingCostSnapshot{},
+	))
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	now := common.GetTimestamp()
+	staleCostKey := routinghotcache.CostKey{ChannelID: 2201, Model: "stale-cost"}
+	outsideDetailCostKey := routinghotcache.CostKey{ChannelID: 2203, Model: "outside-detail-limit"}
+	outsideDetailUpdatedTime := now - 1
+	servingKey := routinghotcache.Key{
+		ChannelID:   2201,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "serving-state",
+		Group:       "default",
+	}
+	routinghotcache.SetCostForTest(staleCostKey, routinghotcache.CostSnapshot{Known: true, Cost: 9, UpdatedUnix: now})
+	routinghotcache.SetBalanceForTest(2201, routinghotcache.BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: now})
+	routinghotcache.SetCostForTest(outsideDetailCostKey, routinghotcache.CostSnapshot{Known: true, Cost: 1, UpdatedUnix: outsideDetailUpdatedTime})
+	routinghotcache.SetBalanceForTest(2203, routinghotcache.BalanceSnapshot{Known: true, Balance: 1, UpdatedUnix: outsideDetailUpdatedTime})
+	routinghotcache.SetMetricForTest(servingKey, routinghotcache.MetricSnapshot{RequestCount: 1, UpdatedUnix: now})
+	routinghotcache.SetBreakerForTest(servingKey, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen, UpdatedUnix: now})
+	routinghotcache.SetAuthFailureForTest(2201, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
+
+	costs := []model.RoutingCostSnapshot{
+		{
+			ChannelID:  2202,
+			ModelName:  "current-cost",
+			GroupRatio: 1,
+			BaseRatio:  2,
+			Confidence: model.RoutingCostConfidenceFull,
+			SnapshotTS: now + 1,
+		},
+		{
+			ChannelID:  2203,
+			ModelName:  outsideDetailCostKey.Model,
+			GroupRatio: 1,
+			BaseRatio:  9,
+			Confidence: model.RoutingCostConfidenceFull,
+			SnapshotTS: outsideDetailUpdatedTime,
+		},
+	}
+	healthStates := []model.RoutingChannelHealthState{
+		{
+			ChannelID:        2201,
+			AuthFailure:      true,
+			AuthFailureUntil: now + 60,
+			BalanceKnown:     false,
+			UpdatedTime:      now + 2,
+		},
+		{
+			ChannelID:          2202,
+			BalanceKnown:       true,
+			Balance:            4,
+			BalanceUpdatedTime: now + 1,
+			UpdatedTime:        now + 1,
+		},
+		{
+			ChannelID:          2203,
+			BalanceKnown:       true,
+			Balance:            9,
+			BalanceUpdatedTime: outsideDetailUpdatedTime,
+			UpdatedTime:        outsideDetailUpdatedTime,
+		},
+	}
+	const recentDetailLimit = 5000
+	for i := 0; i < recentDetailLimit; i++ {
+		costs = append(costs, model.RoutingCostSnapshot{
+			ChannelID:  30_000 + i,
+			ModelName:  fmt.Sprintf("recent-cost-%04d", i),
+			GroupRatio: 1,
+			BaseRatio:  1,
+			Confidence: model.RoutingCostConfidenceFull,
+			SnapshotTS: now,
+		})
+		healthStates = append(healthStates, model.RoutingChannelHealthState{
+			ChannelID:          40_000 + i,
+			BalanceKnown:       true,
+			Balance:            1,
+			BalanceUpdatedTime: now,
+			UpdatedTime:        now,
+		})
+	}
+	require.NoError(t, db.CreateInBatches(costs, 500).Error)
+	require.NoError(t, db.CreateInBatches(healthStates, 500).Error)
+
+	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
+		MetricBucketSec:  60,
+		SnapshotStaleSec: 300,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, recentDetailLimit, summary["costs"])
+	assert.Equal(t, recentDetailLimit, summary["health"])
+
+	_, staleCostFound := routinghotcache.GetCost(staleCostKey)
+	_, staleBalanceFound := routinghotcache.GetBalance(2201)
+	assert.False(t, staleCostFound)
+	assert.False(t, staleBalanceFound)
+
+	currentCost, currentCostFound := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 2202, Model: "current-cost"})
+	currentBalance, currentBalanceFound := routinghotcache.GetBalance(2202)
+	require.True(t, currentCostFound)
+	assert.Equal(t, 2.0, currentCost.Cost)
+	require.True(t, currentBalanceFound)
+	assert.Equal(t, 4.0, currentBalance.Balance)
+	outsideDetailCost, outsideDetailCostFound := routinghotcache.GetCost(outsideDetailCostKey)
+	outsideDetailBalance, outsideDetailBalanceFound := routinghotcache.GetBalance(2203)
+	require.True(t, outsideDetailCostFound)
+	assert.Equal(t, 9.0, outsideDetailCost.Cost)
+	require.True(t, outsideDetailBalanceFound)
+	assert.Equal(t, 9.0, outsideDetailBalance.Balance)
+
+	_, metricFound := routinghotcache.GetMetric(servingKey)
+	_, breakerFound := routinghotcache.GetBreaker(servingKey)
+	_, authFailureFound := routinghotcache.GetAuthFailure(2201)
+	assert.True(t, metricFound)
+	assert.True(t, breakerFound)
+	assert.True(t, authFailureFound)
 }
 
 func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
@@ -770,6 +1018,7 @@ func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
 		{Id: 31, Name: "single", Key: "single-key"},
 		{Id: 32, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 	}).Error)
+	createRoutingRuntimeBindings(t, db, 31)
 
 	type routingKey struct {
 		channelID   int
@@ -830,6 +1079,7 @@ func TestFlushRoutingRuntimeStateContextCancellationRequeuesDirtyState(t *testin
 
 	const channelID = 1202
 	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "cancel-flush", Key: "single-key"}).Error)
+	createRoutingRuntimeBindings(t, db, channelID)
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
 		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "cancel-metric",
 		Group: "default", BucketTs: 60, RequestCount: 1,
@@ -868,6 +1118,742 @@ func TestFlushRoutingRuntimeStateContextCancellationRequeuesDirtyState(t *testin
 	assert.Equal(t, "cancel-breaker", requeuedBreakers[0].Key.Model)
 }
 
+func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeFirstWrite(t *testing.T) {
+	testCases := []struct {
+		name      string
+		channelID int
+		metric    bool
+	}{
+		{name: "metric_bucket_crosses_recreation", channelID: 1203, metric: true},
+		{name: "breaker_same_second_as_recreation", channelID: 1204},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.RoutingChannelBinding{},
+				&model.RoutingChannelMetric{},
+				&model.RoutingBreakerState{},
+			))
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			routingmetrics.ResetForTest()
+			routinghotcache.ResetForTest()
+			const replacementCreatedTime int64 = 630
+			routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+				Consecutive5xxThreshold: 1,
+				BaseCooldown:            time.Second,
+				MaxCooldown:             time.Second,
+				EntryTTL:                time.Hour,
+				Now: func() time.Time {
+					return time.Unix(replacementCreatedTime, 0)
+				},
+			})
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				routingmetrics.ResetForTest()
+				routinghotcache.ResetForTest()
+				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+			})
+
+			require.NoError(t, db.Create(&model.Channel{
+				Id: testCase.channelID, Name: "pre-flush-recreation-" + testCase.name, Key: "single-key",
+			}).Error)
+			oldBinding := model.RoutingChannelBinding{
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://old-routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   100,
+				UpdatedTime:   100,
+			}
+			require.NoError(t, db.Create(&oldBinding).Error)
+
+			cacheKey := routinghotcache.Key{
+				ChannelID:   testCase.channelID,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       "old-generation-" + testCase.name,
+				Group:       "default",
+			}
+			if testCase.metric {
+				routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					ModelName: cacheKey.Model, Group: cacheKey.Group, BucketTs: 600, RequestCount: 1,
+				}})
+			} else {
+				routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					Model: cacheKey.Model, Group: cacheKey.Group,
+				}, routingbreaker.FailureProvider5xx)
+			}
+
+			replacementBinding := model.RoutingChannelBinding{
+				ID:            oldBinding.ID + 10_000,
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://replacement-routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   replacementCreatedTime,
+				UpdatedTime:   replacementCreatedTime,
+			}
+			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Where("id = ?", oldBinding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+					return err
+				}
+				return tx.Create(&replacementBinding).Error
+			}))
+
+			summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+			require.NoError(t, err)
+			assert.Equal(t, 0, summary["metrics"])
+			assert.Equal(t, 0, summary["breakers"])
+
+			var currentBinding model.RoutingChannelBinding
+			require.NoError(t, db.Where("channel_id = ?", testCase.channelID).First(&currentBinding).Error)
+			assert.Equal(t, replacementBinding.ID, currentBinding.ID)
+			for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
+				var count int64
+				require.NoError(t, db.Model(table).Where("channel_id = ?", testCase.channelID).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+			_, metricCached := routinghotcache.GetMetric(cacheKey)
+			_, breakerCached := routinghotcache.GetBreaker(cacheKey)
+			assert.False(t, metricCached)
+			assert.False(t, breakerCached)
+			assert.Empty(t, routingmetrics.Snapshots())
+			assert.Empty(t, routingbreaker.DirtySnapshots())
+			assert.Zero(t, routingbreaker.RuntimeStats().Entries)
+		})
+	}
+}
+
+func TestFlushRoutingRuntimeStateDoesNotRecreateStateAfterRemoteBindingDelete(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+	))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+	})
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	const channelID = 1203
+	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "remote-delete", Key: "single-key"}).Error)
+	binding := model.RoutingChannelBinding{
+		ChannelID:     channelID,
+		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+		BaseURL:       "https://routing.example.com",
+		UpstreamGroup: "default",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "deleted-metric",
+		Group: "default", BucketTs: 60, RequestCount: 1,
+	}})
+	routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "deleted-breaker", Group: "default",
+	}, routingbreaker.FailureProvider5xx)
+
+	// Simulate another node deleting the binding without touching this process's dirty state.
+	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
+
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	require.NoError(t, err)
+	assert.Equal(t, 0, summary["metrics"])
+	assert.Equal(t, 0, summary["breakers"])
+	for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
+		var count int64
+		require.NoError(t, db.Model(table).Where("channel_id = ?", channelID).Count(&count).Error)
+		assert.Zero(t, count)
+	}
+	assert.Empty(t, routingmetrics.Snapshots())
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+}
+
+func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforePublish(t *testing.T) {
+	testCases := []struct {
+		name           string
+		channelID      int
+		metric         bool
+		afterPostCheck bool
+	}{
+		{name: "metric_before_post_check", channelID: 1204, metric: true},
+		{name: "breaker_before_post_check", channelID: 1205},
+		{name: "metric_after_post_check", channelID: 1206, metric: true, afterPostCheck: true},
+		{name: "breaker_after_post_check", channelID: 1207, afterPostCheck: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.RoutingChannelBinding{},
+				&model.RoutingChannelMetric{},
+				&model.RoutingBreakerState{},
+			))
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			routingmetrics.ResetForTest()
+			routinghotcache.ResetForTest()
+			routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+				Consecutive5xxThreshold: 1,
+				BaseCooldown:            time.Second,
+				MaxCooldown:             time.Second,
+			})
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				routingmetrics.ResetForTest()
+				routinghotcache.ResetForTest()
+				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+			})
+
+			require.NoError(t, db.Create(&model.Channel{
+				Id: testCase.channelID, Name: "flush-first-" + testCase.name, Key: "single-key",
+			}).Error)
+			binding := model.RoutingChannelBinding{
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   1,
+				UpdatedTime:   1,
+			}
+			require.NoError(t, db.Create(&binding).Error)
+
+			cacheKey := routinghotcache.Key{
+				ChannelID:   testCase.channelID,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       "committed-" + testCase.name,
+				Group:       "default",
+			}
+			if testCase.metric {
+				routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					ModelName: cacheKey.Model, Group: cacheKey.Group, BucketTs: 60, RequestCount: 1,
+				}})
+			} else {
+				routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					Model: cacheKey.Model, Group: cacheKey.Group,
+				}, routingbreaker.FailureProvider5xx)
+			}
+
+			afterCommit := make(chan struct{})
+			releasePostCommitCheck := make(chan struct{})
+			released := false
+			defer func() {
+				if !released {
+					close(releasePostCommitCheck)
+				}
+			}()
+			var bindingQueries atomic.Int64
+			callbackName := "test:block_flush_post_commit_binding_check_" + testCase.name
+			blockSecondBindingQuery := func(tx *gorm.DB) {
+				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelBinding{}).TableName() {
+					return
+				}
+				if bindingQueries.Add(1) == 2 {
+					close(afterCommit)
+					<-releasePostCommitCheck
+				}
+			}
+			if testCase.afterPostCheck {
+				require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, blockSecondBindingQuery))
+			} else {
+				require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, blockSecondBindingQuery))
+			}
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			type flushResult struct {
+				summary map[string]any
+				err     error
+			}
+			result := make(chan flushResult, 1)
+			go func() {
+				summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+				result <- flushResult{summary: summary, err: err}
+			}()
+
+			select {
+			case <-afterCommit:
+			case <-time.After(time.Second):
+				require.FailNow(t, "flush did not reach the post-commit binding check")
+			}
+
+			persistedModel := any(&model.RoutingBreakerState{})
+			if testCase.metric {
+				persistedModel = &model.RoutingChannelMetric{}
+			}
+			var committedCount int64
+			require.NoError(t, db.Model(persistedModel).
+				Where("channel_id = ? AND model_name = ?", testCase.channelID, cacheKey.Model).
+				Count(&committedCount).Error)
+			assert.Equal(t, int64(1), committedCount)
+
+			// Simulate the binding and its persisted runtime state being deleted by another node
+			// after this flush commits. The after-query cases delete after the first post-check
+			// has already observed the binding, covering the check-to-publish/return window.
+			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Where("id = ?", binding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
+					return err
+				}
+				return tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingBreakerState{}).Error
+			}))
+			close(releasePostCommitCheck)
+			released = true
+
+			flush := <-result
+			require.NoError(t, flush.err)
+			assert.Equal(t, 0, flush.summary["metrics"])
+			assert.Equal(t, 0, flush.summary["breakers"])
+
+			for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
+				var count int64
+				require.NoError(t, db.Model(table).Where("channel_id = ?", testCase.channelID).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+			_, metricCached := routinghotcache.GetMetric(cacheKey)
+			_, breakerCached := routinghotcache.GetBreaker(cacheKey)
+			assert.False(t, metricCached)
+			assert.False(t, breakerCached)
+			assert.Empty(t, routingmetrics.Snapshots())
+			assert.Empty(t, routingbreaker.DirtySnapshots())
+			assert.Zero(t, routingbreaker.RuntimeStats().Entries)
+		})
+	}
+}
+
+func TestFlushRoutingRuntimeStateFailsClosedWhenFinalBindingCheckFails(t *testing.T) {
+	testCases := []struct {
+		name      string
+		channelID int
+		metric    bool
+	}{
+		{name: "metric", channelID: 1208, metric: true},
+		{name: "breaker", channelID: 1209},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.RoutingChannelBinding{},
+				&model.RoutingChannelMetric{},
+				&model.RoutingBreakerState{},
+			))
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			routingmetrics.ResetForTest()
+			routinghotcache.ResetForTest()
+			routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+				Consecutive5xxThreshold: 1,
+				BaseCooldown:            time.Second,
+				MaxCooldown:             time.Second,
+			})
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				routingmetrics.ResetForTest()
+				routinghotcache.ResetForTest()
+				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+			})
+
+			require.NoError(t, db.Create(&model.Channel{
+				Id: testCase.channelID, Name: "final-check-error-" + testCase.name, Key: "single-key",
+			}).Error)
+			require.NoError(t, db.Create(&model.RoutingChannelBinding{
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   1,
+				UpdatedTime:   1,
+			}).Error)
+			cacheKey := routinghotcache.Key{
+				ChannelID:   testCase.channelID,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       "final-check-error-" + testCase.name,
+				Group:       "default",
+			}
+			if testCase.metric {
+				routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					ModelName: cacheKey.Model, Group: cacheKey.Group, BucketTs: 60, RequestCount: 1,
+				}})
+			} else {
+				routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					Model: cacheKey.Model, Group: cacheKey.Group,
+				}, routingbreaker.FailureProvider5xx)
+			}
+
+			forcedErr := errors.New("forced final binding verification failure")
+			var bindingQueries atomic.Int64
+			callbackName := "test:fail_final_flush_binding_check_" + testCase.name
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == (model.RoutingChannelBinding{}).TableName() &&
+					bindingQueries.Add(1) == 3 {
+					tx.AddError(forcedErr)
+				}
+			}))
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+			require.ErrorIs(t, err, forcedErr)
+			assert.Equal(t, 0, summary["metrics"])
+			assert.Equal(t, 0, summary["breakers"])
+
+			persistedModel := any(&model.RoutingBreakerState{})
+			if testCase.metric {
+				persistedModel = &model.RoutingChannelMetric{}
+			}
+			var persistedCount int64
+			require.NoError(t, db.Model(persistedModel).
+				Where("channel_id = ? AND model_name = ?", testCase.channelID, cacheKey.Model).
+				Count(&persistedCount).Error)
+			assert.Equal(t, int64(1), persistedCount)
+			_, metricCached := routinghotcache.GetMetric(cacheKey)
+			_, breakerCached := routinghotcache.GetBreaker(cacheKey)
+			assert.False(t, metricCached)
+			assert.False(t, breakerCached)
+			assert.Zero(t, routingbreaker.RuntimeStats().Entries)
+		})
+	}
+}
+
+func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *testing.T) {
+	testCases := []struct {
+		name      string
+		channelID int
+		metric    bool
+	}{
+		{name: "metric", channelID: 1210, metric: true},
+		{name: "breaker", channelID: 1211},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.RoutingChannelBinding{},
+				&model.RoutingChannelMetric{},
+				&model.RoutingBreakerState{},
+			))
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			routingmetrics.ResetForTest()
+			routinghotcache.ResetForTest()
+			routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+				Consecutive5xxThreshold: 1,
+				BaseCooldown:            time.Second,
+				MaxCooldown:             time.Second,
+			})
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				routingmetrics.ResetForTest()
+				routinghotcache.ResetForTest()
+				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+			})
+
+			require.NoError(t, db.Create(&model.Channel{
+				Id: testCase.channelID, Name: "initial-check-error-" + testCase.name, Key: "single-key",
+			}).Error)
+			require.NoError(t, db.Create(&model.RoutingChannelBinding{
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   1,
+				UpdatedTime:   1,
+			}).Error)
+			cacheKey := routinghotcache.Key{
+				ChannelID:   testCase.channelID,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       "initial-check-error-" + testCase.name,
+				Group:       "default",
+			}
+			if testCase.metric {
+				routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					ModelName: cacheKey.Model, Group: cacheKey.Group, BucketTs: 60, RequestCount: 1,
+				}})
+				routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 99})
+			} else {
+				routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+					ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+					Model: cacheKey.Model, Group: cacheKey.Group,
+				}, routingbreaker.FailureProvider5xx)
+			}
+
+			forcedErr := errors.New("forced initial binding verification failure")
+			initialCheckStarted := make(chan struct{})
+			releaseInitialCheck := make(chan struct{})
+			released := false
+			defer func() {
+				if !released {
+					close(releaseInitialCheck)
+				}
+			}()
+			var bindingQueries atomic.Int64
+			callbackName := "test:fail_initial_flush_binding_check_" + testCase.name
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == (model.RoutingChannelBinding{}).TableName() &&
+					bindingQueries.Add(1) == 2 {
+					close(initialCheckStarted)
+					<-releaseInitialCheck
+					tx.AddError(forcedErr)
+				}
+			}))
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			type flushResult struct {
+				summary map[string]any
+				err     error
+			}
+			result := make(chan flushResult, 1)
+			go func() {
+				summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+				result <- flushResult{summary: summary, err: err}
+			}()
+			select {
+			case <-initialCheckStarted:
+			case <-time.After(time.Second):
+				require.FailNow(t, "flush did not reach the initial binding check")
+			}
+			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
+					return err
+				}
+				return tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingBreakerState{}).Error
+			}))
+			close(releaseInitialCheck)
+			released = true
+
+			flush := <-result
+			require.ErrorIs(t, flush.err, forcedErr)
+			assert.Equal(t, 0, flush.summary["metrics"])
+			assert.Equal(t, 0, flush.summary["breakers"])
+
+			persistedModel := any(&model.RoutingBreakerState{})
+			if testCase.metric {
+				persistedModel = &model.RoutingChannelMetric{}
+			}
+			var persistedCount int64
+			require.NoError(t, db.Model(persistedModel).
+				Where("channel_id = ? AND model_name = ?", testCase.channelID, cacheKey.Model).
+				Count(&persistedCount).Error)
+			assert.Zero(t, persistedCount)
+			_, metricCached := routinghotcache.GetMetric(cacheKey)
+			_, breakerCached := routinghotcache.GetBreaker(cacheKey)
+			assert.False(t, metricCached)
+			assert.False(t, breakerCached)
+			assert.Zero(t, routingbreaker.RuntimeStats().Entries)
+		})
+	}
+}
+
+func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreation(t *testing.T) {
+	testCases := []struct {
+		name      string
+		channelID int
+		metric    bool
+	}{
+		{name: "metric", channelID: 1212, metric: true},
+		{name: "breaker", channelID: 1213},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.RoutingChannelBinding{},
+				&model.RoutingChannelMetric{},
+				&model.RoutingBreakerState{},
+			))
+			previousMemoryCache := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			routingmetrics.ResetForTest()
+			routinghotcache.ResetForTest()
+			routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+				Consecutive5xxThreshold: 1,
+				BaseCooldown:            time.Second,
+				MaxCooldown:             time.Second,
+			})
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				routingmetrics.ResetForTest()
+				routinghotcache.ResetForTest()
+				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+			})
+
+			require.NoError(t, db.Create(&model.Channel{
+				Id: testCase.channelID, Name: "binding-recreated-" + testCase.name, Key: "single-key",
+			}).Error)
+			oldBinding := model.RoutingChannelBinding{
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://old-routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+				CreatedTime:   1,
+				UpdatedTime:   1,
+			}
+			require.NoError(t, db.Create(&oldBinding).Error)
+
+			cacheKeys := make([]routinghotcache.Key, 0, 3)
+			if testCase.metric {
+				metrics := make([]model.RoutingChannelMetric, 0, 3)
+				for index, modelName := range []string{"a-old-generation", "b-old-generation", "c-old-generation"} {
+					cacheKeys = append(cacheKeys, routinghotcache.Key{
+						ChannelID:   testCase.channelID,
+						APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+						Model:       modelName,
+						Group:       "default",
+					})
+					metrics = append(metrics, model.RoutingChannelMetric{
+						ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+						ModelName: modelName, Group: "default", BucketTs: int64(60 + index), RequestCount: 1,
+					})
+				}
+				routingmetrics.RequeueSnapshots(metrics)
+			} else {
+				for _, modelName := range []string{"a-old-generation", "b-old-generation", "c-old-generation"} {
+					cacheKey := routinghotcache.Key{
+						ChannelID:   testCase.channelID,
+						APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+						Model:       modelName,
+						Group:       "default",
+					}
+					cacheKeys = append(cacheKeys, cacheKey)
+					routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+						ChannelID: testCase.channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+						Model: modelName, Group: "default",
+					}, routingbreaker.FailureProvider5xx)
+				}
+			}
+
+			afterFirstPostCheck := make(chan struct{})
+			releaseFirstPostCheck := make(chan struct{})
+			released := false
+			defer func() {
+				if !released {
+					close(releaseFirstPostCheck)
+				}
+			}()
+			var bindingQueries atomic.Int64
+			callbackName := "test:block_flush_before_binding_recreation_" + testCase.name
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelBinding{}).TableName() {
+					return
+				}
+				if bindingQueries.Add(1) == 2 {
+					close(afterFirstPostCheck)
+					<-releaseFirstPostCheck
+				}
+			}))
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			type flushResult struct {
+				summary map[string]any
+				err     error
+			}
+			result := make(chan flushResult, 1)
+			go func() {
+				summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+				result <- flushResult{summary: summary, err: err}
+			}()
+
+			select {
+			case <-afterFirstPostCheck:
+			case <-time.After(time.Second):
+				require.FailNow(t, "flush did not finish the first binding post-check")
+			}
+
+			persistedModel := any(&model.RoutingBreakerState{})
+			if testCase.metric {
+				persistedModel = &model.RoutingChannelMetric{}
+			}
+			var committedCount int64
+			require.NoError(t, db.Model(persistedModel).
+				Where("channel_id = ?", testCase.channelID).
+				Count(&committedCount).Error)
+			assert.Equal(t, int64(1), committedCount)
+
+			replacementBinding := model.RoutingChannelBinding{
+				ID:            oldBinding.ID + 10_000,
+				ChannelID:     testCase.channelID,
+				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+				BaseURL:       "https://new-routing.example.com",
+				UpstreamGroup: "default",
+				Enabled:       true,
+			}
+			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Where("id = ?", oldBinding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingBreakerState{}).Error; err != nil {
+					return err
+				}
+				return tx.Create(&replacementBinding).Error
+			}))
+			close(releaseFirstPostCheck)
+			released = true
+
+			flush := <-result
+			require.NoError(t, flush.err)
+			assert.Equal(t, 0, flush.summary["metrics"])
+			assert.Equal(t, 0, flush.summary["breakers"])
+			assert.Equal(t, int64(3), bindingQueries.Load(), "the rejected channel must not query or write the third dirty item")
+
+			var currentBinding model.RoutingChannelBinding
+			require.NoError(t, db.Where("channel_id = ?", testCase.channelID).First(&currentBinding).Error)
+			assert.Equal(t, replacementBinding.ID, currentBinding.ID)
+			for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
+				var count int64
+				require.NoError(t, db.Model(table).Where("channel_id = ?", testCase.channelID).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+			for _, cacheKey := range cacheKeys {
+				_, metricCached := routinghotcache.GetMetric(cacheKey)
+				_, breakerCached := routinghotcache.GetBreaker(cacheKey)
+				assert.False(t, metricCached)
+				assert.False(t, breakerCached)
+			}
+			assert.Empty(t, routingmetrics.Snapshots())
+			assert.Empty(t, routingbreaker.DirtySnapshots())
+			assert.Zero(t, routingbreaker.RuntimeStats().Entries)
+		})
+	}
+}
+
 func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAndBreakers(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
@@ -887,6 +1873,7 @@ func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAn
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	})
 	require.NoError(t, db.Create(&model.Channel{Id: 81, Name: "single", Key: "single-key"}).Error)
+	createRoutingRuntimeBindings(t, db, 81)
 
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{
 		{ChannelID: 81, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "metric-a", Group: "default", BucketTs: 60, RequestCount: 1},
@@ -941,6 +1928,7 @@ func TestFlushRoutingRuntimeStateRequeuesMetricsWhenEligibilityLookupFails(t *te
 		{Id: 93, Name: "lookup-error", Key: "single-key"},
 		{Id: 94, Name: "unvisited-suffix", Key: "single-key"},
 	}).Error)
+	createRoutingRuntimeBindings(t, db, 91, 93, 94)
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{
 		{ChannelID: 91, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "a-supported-prefix", Group: "default", BucketTs: 60, RequestCount: 1},
 		{ChannelID: 91, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "b-supported-prefix", Group: "default", BucketTs: 60, RequestCount: 1},
@@ -1017,6 +2005,7 @@ func TestFlushRoutingRuntimeStateRequeuesBreakersWhenEligibilityLookupFails(t *t
 		{Id: 103, Name: "lookup-error", Key: "single-key"},
 		{Id: 104, Name: "unvisited-suffix", Key: "single-key"},
 	}).Error)
+	createRoutingRuntimeBindings(t, db, 101, 103, 104)
 	keys := []routingbreaker.Key{
 		{ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "a-supported-prefix", Group: "default"},
 		{ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "b-supported-prefix", Group: "default"},
@@ -1089,6 +2078,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidMetricSuffixAfterPersistenceFa
 		{Id: 41, Name: "single", Key: "single-key"},
 		{Id: 42, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 	}).Error)
+	createRoutingRuntimeBindings(t, db, 41)
 
 	const callbackName = "test:fail_second_routing_metric_create"
 	createCount := 0
@@ -1157,6 +2147,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 		{Id: 51, Name: "single", Key: "single-key"},
 		{Id: 52, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 	}).Error)
+	createRoutingRuntimeBindings(t, db, 51)
 
 	keys := []routingbreaker.Key{
 		{ChannelID: 51, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "a-valid-prefix", Group: "default"},
@@ -1168,18 +2159,18 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureProvider5xx)
 	}
 
-	const callbackName = "test:fail_second_routing_breaker_update"
-	updateCount := 0
-	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+	const callbackName = "test:fail_second_routing_breaker_upsert"
+	upsertCount := 0
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
 		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingBreakerState{}).TableName() {
 			return
 		}
-		updateCount++
-		if updateCount == 2 {
+		upsertCount++
+		if upsertCount == 2 {
 			tx.AddError(errors.New("forced breaker persistence failure"))
 		}
 	}))
-	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
 
 	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.ErrorContains(t, err, "forced breaker persistence failure")
@@ -1194,7 +2185,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 	assert.Equal(t, "d-valid-suffix", requeued[0].Key.Model)
 	routingbreaker.RequeueDirtySnapshots(requeued)
 
-	require.NoError(t, db.Callback().Update().Remove(callbackName))
+	require.NoError(t, db.Callback().Create().Remove(callbackName))
 	summary, err = flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["breakers"])
@@ -1333,6 +2324,7 @@ func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testi
 		bucketTs  = 120
 	)
 	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
+	createRoutingRuntimeBindings(t, db, channelID)
 	key := routinghotcache.Key{
 		ChannelID:   channelID,
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,

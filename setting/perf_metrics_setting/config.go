@@ -30,12 +30,11 @@ func GetSetting() PerfMetricsSetting {
 	if !config.GlobalConfig.Snapshot(configName, &setting) {
 		setting = defaultPerfMetricsSetting
 	}
-	normalize(&setting)
-	return setting
+	return Normalize(setting)
 }
 
 func UpdateSetting(setting PerfMetricsSetting) PerfMetricsSetting {
-	normalize(&setting)
+	setting = Normalize(setting)
 	config.GlobalConfig.Replace(configName, setting)
 	return GetSetting()
 }
@@ -63,7 +62,8 @@ func GetFlushIntervalMinutes() int {
 	return setting.FlushInterval
 }
 
-func normalize(setting *PerfMetricsSetting) {
+// Normalize returns a safe runtime representation of a performance metrics setting.
+func Normalize(setting PerfMetricsSetting) PerfMetricsSetting {
 	switch setting.BucketTime {
 	case "minute", "5min", "hour":
 	default:
@@ -71,8 +71,11 @@ func normalize(setting *PerfMetricsSetting) {
 	}
 	if setting.FlushInterval < 1 {
 		setting.FlushInterval = 1
+	} else if setting.FlushInterval > 1440 {
+		setting.FlushInterval = 1440
 	}
 	if setting.RetentionDays < 0 {
 		setting.RetentionDays = 0
 	}
+	return setting
 }

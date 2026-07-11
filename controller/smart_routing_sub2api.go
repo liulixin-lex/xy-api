@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/go-redis/redis/v8"
 	"golang.org/x/sync/singleflight"
 )
@@ -26,7 +26,14 @@ const (
 	routingSub2APILockTTL              = 30 * time.Second
 	routingSub2APIDefaultUnlockTimeout = 2 * time.Second
 	routingSub2APITokenTTLBuffer       = 60 * time.Second
+	routingSub2APIDefaultTokenTTL      = time.Hour
+	routingSub2APIMaxTokenTTL          = 24 * time.Hour
+	routingSub2APIRetiredTTL           = routingSub2APIMaxTokenTTL + routingSub2APILockTTL
+	routingSub2APIMaxTokenBytes        = 16 << 10
+	routingSub2APIMaxCachedJWTBytes    = 24 << 10
 	routingSub2APIDefaultMaxJWTEntries = 4_096
+	routingSub2APIDefaultMaxJWTBytes   = 16 << 20
+	routingSub2APIDefaultMaxRetired    = 4_096
 )
 
 type routingSub2APIEnvelope struct {
@@ -77,46 +84,87 @@ type routingSub2APIJWTCacheEntry struct {
 	ExpiresAt  int64
 }
 
+type routingSub2APIAuthKey struct {
+	ChannelID   int
+	Fingerprint string
+}
+
+type routingSub2APIGeneration struct {
+	Value     uint64
+	ExpiresAt int64
+}
+
+type routingSub2APIJWTActivationFence struct {
+	authKey                  routingSub2APIAuthKey
+	localGeneration          uint64
+	localRetiredExpiresAt    int64
+	hasLocalRetirement       bool
+	redisRetirementMarker    string
+	hasRedisRetirementMarker bool
+}
+
 // RoutingSub2APIJWTCacheStats reports this process's local JWT cache only.
 // Redis-backed JWT cache activity is intentionally excluded.
 type RoutingSub2APIJWTCacheStats struct {
 	Entries     int
+	Bytes       int
 	Expirations int64
 	Evictions   int64
 }
 
 var routingSub2APIJWTCache = struct {
 	sync.Mutex
-	values      map[int]routingSub2APIJWTCacheEntry
+	values      map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry
 	expirations int64
 	evictions   int64
 }{
-	values: map[int]routingSub2APIJWTCacheEntry{},
+	values: map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry{},
 }
 
 var routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
+var routingSub2APIMaxJWTBytes = routingSub2APIDefaultMaxJWTBytes
+var routingSub2APIMaxRetired = routingSub2APIDefaultMaxRetired
 var routingSub2APIUnlockTimeout = routingSub2APIDefaultUnlockTimeout
 var routingSub2APILoginCoordinator = struct {
 	sync.RWMutex
-	group      *singleflight.Group
-	generation uint64
+	group       *singleflight.Group
+	epoch       uint64
+	generations map[routingSub2APIAuthKey]routingSub2APIGeneration
+	retired     map[routingSub2APIAuthKey]int64
 }{
-	group: &singleflight.Group{},
+	group:       &singleflight.Group{},
+	generations: map[routingSub2APIAuthKey]routingSub2APIGeneration{},
+	retired:     map[routingSub2APIAuthKey]int64{},
 }
 
 func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) ([]model.RoutingCostSnapshot, error) {
-	jwt, err := routingSub2APIJWT(ctx, binding, credentials)
-	if err != nil {
-		return nil, err
+	managedJWT := strings.TrimSpace(credentials.Sub2APIToken) == ""
+	authKey := newRoutingSub2APIAuthKey(binding, credentials)
+	for attempt := 0; attempt < 2; attempt++ {
+		jwt, err := routingSub2APIJWT(ctx, binding, credentials)
+		if err != nil {
+			return nil, err
+		}
+		snapshots, managedJWTRejected, err := fetchRoutingSub2APICostSnapshotsWithJWT(ctx, binding, credentials, jwt)
+		if err == nil {
+			return snapshots, nil
+		}
+		if !managedJWT || !managedJWTRejected || attempt > 0 {
+			return nil, err
+		}
+		evictRoutingSub2APIJWT(ctx, authKey, jwt)
 	}
+	return nil, errors.New("sub2api fetch retry exhausted")
+}
 
-	if err = fetchRoutingSub2APIBalance(ctx, binding, credentials, jwt); err != nil && routingUpstreamAuthError(err) {
-		return nil, err
+func fetchRoutingSub2APICostSnapshotsWithJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) ([]model.RoutingCostSnapshot, bool, error) {
+	if err := fetchRoutingSub2APIBalance(ctx, binding, credentials, jwt); err != nil && routingUpstreamAuthError(err) {
+		return nil, strings.TrimSpace(credentials.GatewayAPIKey) == "", err
 	}
 
 	groupsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/available", jwt, nil)
 	if err != nil {
-		return nil, err
+		return nil, routingUpstreamAuthError(err), err
 	}
 	groups := parseRoutingSub2APIGroups(groupsRaw)
 	groupInfo, groupFound := groups[binding.UpstreamGroup]
@@ -127,7 +175,7 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 
 	ratesRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/rates", jwt, nil)
 	if err != nil {
-		return nil, err
+		return nil, routingUpstreamAuthError(err), err
 	}
 	if ratio, ok := parseRoutingSub2APIRates(ratesRaw)[binding.UpstreamGroup]; ok && ratio > 0 {
 		groupRatio = ratio
@@ -135,13 +183,16 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 
 	channelsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/channels/available", jwt, nil)
 	if err != nil {
-		return nil, err
+		return nil, routingUpstreamAuthError(err), err
 	}
 	channels := parseRoutingSub2APIChannels(channelsRaw)
 
 	now := common.GetTimestamp()
 	snapshots := make([]model.RoutingCostSnapshot, 0, len(channels))
-	modelNameMap := routingModelReverseMapping(binding.ChannelID)
+	modelNameMap, err := routingModelReverseMapping(ctx, binding.ChannelID)
+	if err != nil {
+		return nil, false, err
+	}
 	for _, channel := range channels {
 		if !routingSub2APIChannelServesBinding(channel, binding) {
 			continue
@@ -154,48 +205,73 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 			snapshots = append(snapshots, snapshot)
 		}
 	}
-	return snapshots, nil
+	return snapshots, false, nil
 }
 
 func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (string, error) {
 	if token := strings.TrimSpace(credentials.Sub2APIToken); token != "" {
+		if err := validateRoutingSub2APIToken(token); err != nil {
+			return "", err
+		}
 		return token, nil
 	}
-	if token, ok := getRoutingSub2APICachedJWT(ctx, binding.ChannelID); ok {
+	authKey := newRoutingSub2APIAuthKey(binding, credentials)
+	if token, ok, err, retired := readRoutingSub2APICachedJWT(ctx, authKey); err != nil {
+		return "", err
+	} else if retired {
+		return "", routingAuthErrorf("sub2api authentication identity is retired")
+	} else if ok {
 		return token, nil
 	}
 
 	routingSub2APILoginCoordinator.RLock()
 	loginGroup := routingSub2APILoginCoordinator.group
-	loginGeneration := routingSub2APILoginCoordinator.generation
-	resultChannel := loginGroup.DoChan(strconv.Itoa(binding.ChannelID), func() (any, error) {
+	loginEpoch := routingSub2APILoginCoordinator.epoch
+	loginGeneration := routingSub2APILoginCoordinator.generations[authKey].Value
+	if routingSub2APILocallyRetiredLocked(authKey, common.GetTimestamp()) {
+		routingSub2APILoginCoordinator.RUnlock()
+		return "", routingAuthErrorf("sub2api authentication identity is retired")
+	}
+	resultChannel := loginGroup.DoChan(routingSub2APISingleflightKey(authKey), func() (any, error) {
 		sharedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APILockTTL)
 		defer cancel()
 
-		if token, ok := getRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID); ok {
+		if token, ok, cacheErr, retired := readRoutingSub2APICachedJWT(sharedCtx, authKey); cacheErr != nil {
+			return "", cacheErr
+		} else if retired {
+			return "", routingAuthErrorf("sub2api authentication identity is retired")
+		} else if ok {
 			return token, nil
 		}
 
-		unlockRedis, lockErr := acquireRoutingSub2APIRedisLock(sharedCtx, binding.ChannelID)
+		unlockRedis, lockErr := acquireRoutingSub2APIRedisLock(sharedCtx, authKey)
 		if lockErr != nil {
 			return "", lockErr
 		}
 		if unlockRedis != nil {
 			defer unlockRedis()
 		}
-		if token, ok := getRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID); ok {
+		if token, ok, cacheErr, retired := readRoutingSub2APICachedJWT(sharedCtx, authKey); cacheErr != nil {
+			return "", cacheErr
+		} else if retired {
+			return "", routingAuthErrorf("sub2api authentication identity is retired")
+		} else if ok {
 			return token, nil
+		}
+		routingSub2APILoginCoordinator.RLock()
+		loginCurrent := loginEpoch == routingSub2APILoginCoordinator.epoch &&
+			loginGeneration == routingSub2APILoginCoordinator.generations[authKey].Value &&
+			!routingSub2APILocallyRetiredLocked(authKey, common.GetTimestamp())
+		routingSub2APILoginCoordinator.RUnlock()
+		if !loginCurrent {
+			return "", routingAuthErrorf("sub2api authentication identity is retired")
 		}
 
 		token, ttl, loginErr := loginRoutingSub2API(sharedCtx, binding, credentials)
 		if loginErr != nil {
 			return "", loginErr
 		}
-		routingSub2APILoginCoordinator.RLock()
-		if loginGeneration == routingSub2APILoginCoordinator.generation {
-			setRoutingSub2APICachedJWT(sharedCtx, binding.ChannelID, token, ttl)
-		}
-		routingSub2APILoginCoordinator.RUnlock()
+		setRoutingSub2APICachedJWTIfCurrent(sharedCtx, authKey, token, ttl, loginEpoch, loginGeneration)
 		return token, nil
 	})
 	routingSub2APILoginCoordinator.RUnlock()
@@ -215,11 +291,11 @@ func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding,
 	}
 }
 
-func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(), error) {
+func acquireRoutingSub2APIRedisLock(ctx context.Context, authKey routingSub2APIAuthKey) (func(), error) {
 	if !common.RedisEnabled || common.RDB == nil {
 		return nil, nil
 	}
-	lockKey := routingSub2APIRedisLockKey(channelID)
+	lockKey := routingSub2APIRedisLockKey(authKey)
 	lockOwner := common.GetRandomString(32)
 	deadline := time.Now().Add(routingSub2APILockTTL)
 	for {
@@ -229,10 +305,14 @@ func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(),
 		}
 		if acquired {
 			return func() {
-				releaseRoutingSub2APIRedisLock(channelID, lockOwner)
+				releaseRoutingSub2APIRedisLock(authKey, lockOwner)
 			}, nil
 		}
-		if _, ok := getRoutingSub2APICachedJWT(ctx, channelID); ok {
+		if _, ok, cacheErr, retired := readRoutingSub2APICachedJWT(ctx, authKey); cacheErr != nil {
+			return nil, cacheErr
+		} else if retired {
+			return nil, routingAuthErrorf("sub2api authentication identity is retired")
+		} else if ok {
 			return func() {}, nil
 		}
 		if time.Now().After(deadline) {
@@ -246,13 +326,13 @@ func acquireRoutingSub2APIRedisLock(ctx context.Context, channelID int) (func(),
 	}
 }
 
-func releaseRoutingSub2APIRedisLock(channelID int, lockOwner string) {
+func releaseRoutingSub2APIRedisLock(authKey routingSub2APIAuthKey, lockOwner string) {
 	ctx, cancel := context.WithTimeout(context.Background(), routingSub2APIUnlockTimeout)
 	defer cancel()
 
 	script := redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`)
-	if err := script.Run(ctx, common.RDB, []string{routingSub2APIRedisLockKey(channelID)}, lockOwner).Err(); err != nil {
-		common.SysError(fmt.Sprintf("sub2api login lock release failed: channel_id=%d err=%v", channelID, err))
+	if err := script.Run(ctx, common.RDB, []string{routingSub2APIRedisLockKey(authKey)}, lockOwner).Err(); err != nil {
+		common.SysError(fmt.Sprintf("sub2api login lock release failed: channel_id=%d err=%v", authKey.ChannelID, err))
 	}
 }
 
@@ -277,7 +357,7 @@ func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBindin
 		Token       string `json:"token"`
 		AccessToken string `json:"access_token"`
 		JWT         string `json:"jwt"`
-		ExpiresIn   int64  `json:"expires_in"`
+		ExpiresIn   *int64 `json:"expires_in"`
 	}
 	if err = common.Unmarshal(data, &response); err != nil {
 		var token string
@@ -296,13 +376,33 @@ func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBindin
 	if token == "" {
 		return "", 0, routingAuthErrorf("sub2api login did not return a token")
 	}
-	ttl := time.Duration(response.ExpiresIn) * time.Second
-	if ttl <= routingSub2APITokenTTLBuffer {
-		ttl = time.Hour
-	} else {
-		ttl -= routingSub2APITokenTTLBuffer
+	if err = validateRoutingSub2APIToken(token); err != nil {
+		return "", 0, err
 	}
-	return token, ttl, nil
+	return token, routingSub2APILoginCacheTTL(response.ExpiresIn), nil
+}
+
+func validateRoutingSub2APIToken(token string) error {
+	if len(token) > routingSub2APIMaxTokenBytes {
+		return routingAuthErrorf("sub2api token exceeds size limit")
+	}
+	return nil
+}
+
+func routingSub2APILoginCacheTTL(expiresIn *int64) time.Duration {
+	if expiresIn == nil {
+		return routingSub2APIDefaultTokenTTL
+	}
+	bufferSeconds := int64(routingSub2APITokenTTLBuffer / time.Second)
+	if *expiresIn <= bufferSeconds {
+		return 0
+	}
+	maxSeconds := int64(routingSub2APIMaxTokenTTL / time.Second)
+	expiresInSeconds := *expiresIn
+	if expiresInSeconds > maxSeconds {
+		expiresInSeconds = maxSeconds
+	}
+	return time.Duration(expiresInSeconds-bufferSeconds) * time.Second
 }
 
 func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, method string, path string, bearer string, body []byte) (json.RawMessage, error) {
@@ -347,7 +447,7 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 			message = "sub2api endpoint returned code != 0"
 		}
 		authFailure := routingSub2APIEnvelopeAuthFailure(envelope)
-		message = routingCleanCredentialErrorMessage(message, credentials)
+		message = routingCleanCredentialErrorMessage(message, credentials, bearer)
 		if authFailure {
 			return nil, routingAuthErrorf("%s", message)
 		}
@@ -407,15 +507,7 @@ func fetchRoutingSub2APIBalance(ctx context.Context, binding model.RoutingChanne
 		return err
 	}
 	if balance, ok := parseRoutingSub2APIBalance(raw); ok {
-		now := common.GetTimestamp()
-		routinghotcache.SetBalance(binding.ChannelID, routinghotcache.BalanceSnapshot{
-			Known:       true,
-			Balance:     balance,
-			UpdatedUnix: now,
-		})
-		if err = model.UpsertRoutingChannelBalance(binding.ChannelID, balance, now); err != nil {
-			common.SysError(fmt.Sprintf("persist routing balance failed: channel_id=%d err=%v", binding.ChannelID, err))
-		}
+		return persistRoutingBalance(ctx, binding, balance, common.GetTimestamp())
 	}
 	return nil
 }
@@ -665,55 +757,169 @@ func firstPositiveFloat(values ...float64) float64 {
 	return 0
 }
 
-func getRoutingSub2APICachedJWT(ctx context.Context, channelID int) (string, bool) {
-	if channelID <= 0 {
-		return "", false
+func getRoutingSub2APICachedJWT(ctx context.Context, authKey routingSub2APIAuthKey) (string, bool) {
+	token, ok, _, _ := readRoutingSub2APICachedJWT(ctx, authKey)
+	return token, ok
+}
+
+func readRoutingSub2APICachedJWT(ctx context.Context, authKey routingSub2APIAuthKey) (string, bool, error, bool) {
+	if authKey.ChannelID <= 0 || authKey.Fingerprint == "" {
+		return "", false, nil, false
+	}
+	routingSub2APILoginCoordinator.RLock()
+	locallyRetired := routingSub2APILocallyRetiredLocked(authKey, common.GetTimestamp())
+	routingSub2APILoginCoordinator.RUnlock()
+	if locallyRetired {
+		return "", false, nil, true
 	}
 	if common.RedisEnabled && common.RDB != nil {
-		encrypted, err := common.RDB.Get(ctx, routingSub2APIRedisJWTKey(channelID)).Result()
+		values, err := common.RDB.MGet(
+			ctx,
+			routingSub2APIRedisRetiredKey(authKey),
+			routingSub2APIRedisJWTKey(authKey),
+		).Result()
 		if err == nil {
-			token, decryptErr := common.DecryptAESGCMString(encrypted)
-			return token, decryptErr == nil && strings.TrimSpace(token) != ""
+			if len(values) != 2 {
+				return "", false, errors.New("sub2api jwt cache returned an invalid response"), false
+			}
+			if values[0] != nil {
+				routingSub2APIJWTCache.Lock()
+				if _, ok := routingSub2APIJWTCache.values[authKey]; ok {
+					delete(routingSub2APIJWTCache.values, authKey)
+					routingSub2APIJWTCache.evictions++
+				}
+				routingSub2APIJWTCache.Unlock()
+				return "", false, nil, true
+			}
+			if encrypted, ok := values[1].(string); ok {
+				if token, valid := decodeRoutingSub2APICachedJWT(encrypted); valid {
+					return token, true, nil, false
+				}
+			}
+			return "", false, nil, false
 		}
-		if err != nil && !errors.Is(err, redis.Nil) {
-			common.SysError(fmt.Sprintf("sub2api jwt cache get failed: channel_id=%d err=%v", channelID, err))
-		}
+		common.SysError(fmt.Sprintf("sub2api jwt cache get failed: channel_id=%d err=%v", authKey.ChannelID, err))
+		return "", false, fmt.Errorf("sub2api jwt cache get failed: %w", err), false
 	}
 
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
 	deleteRoutingSub2APIJWTCacheExpiredLocked(now)
-	entry, ok := routingSub2APIJWTCache.values[channelID]
+	entry, ok := routingSub2APIJWTCache.values[authKey]
+	if ok && len(entry.Ciphertext) > routingSub2APIMaxCachedJWTBytes {
+		delete(routingSub2APIJWTCache.values, authKey)
+		routingSub2APIJWTCache.evictions++
+		ok = false
+	}
 	routingSub2APIJWTCache.Unlock()
 	if !ok {
-		return "", false
+		return "", false, nil, false
 	}
-	token, err := common.DecryptAESGCMString(entry.Ciphertext)
-	return token, err == nil && strings.TrimSpace(token) != ""
+	token, ok := decodeRoutingSub2APICachedJWT(entry.Ciphertext)
+	if ok {
+		return token, true, nil, false
+	}
+	routingSub2APIJWTCache.Lock()
+	if current, exists := routingSub2APIJWTCache.values[authKey]; exists && current.Ciphertext == entry.Ciphertext {
+		delete(routingSub2APIJWTCache.values, authKey)
+		routingSub2APIJWTCache.evictions++
+	}
+	routingSub2APIJWTCache.Unlock()
+	return "", false, nil, false
 }
 
-func setRoutingSub2APICachedJWT(ctx context.Context, channelID int, token string, ttl time.Duration) {
-	if channelID <= 0 || strings.TrimSpace(token) == "" {
+func setRoutingSub2APICachedJWT(ctx context.Context, authKey routingSub2APIAuthKey, token string, ttl time.Duration) {
+	routingSub2APILoginCoordinator.RLock()
+	defer routingSub2APILoginCoordinator.RUnlock()
+	if routingSub2APILocallyRetiredLocked(authKey, common.GetTimestamp()) {
+		return
+	}
+	storeRoutingSub2APICachedJWT(ctx, authKey, token, ttl)
+}
+
+func setRoutingSub2APICachedJWTIfCurrent(ctx context.Context, authKey routingSub2APIAuthKey, token string, ttl time.Duration, epoch uint64, generation uint64) {
+	routingSub2APILoginCoordinator.RLock()
+	defer routingSub2APILoginCoordinator.RUnlock()
+	if epoch != routingSub2APILoginCoordinator.epoch || generation != routingSub2APILoginCoordinator.generations[authKey].Value {
+		return
+	}
+	if routingSub2APILocallyRetiredLocked(authKey, common.GetTimestamp()) {
+		return
+	}
+	storeRoutingSub2APICachedJWT(ctx, authKey, token, ttl)
+}
+
+func storeRoutingSub2APICachedJWT(ctx context.Context, authKey routingSub2APIAuthKey, token string, ttl time.Duration) {
+	token = strings.TrimSpace(token)
+	if authKey.ChannelID <= 0 || authKey.Fingerprint == "" || token == "" || ttl <= 0 || validateRoutingSub2APIToken(token) != nil {
+		return
+	}
+	if ttl > routingSub2APIMaxTokenTTL {
+		ttl = routingSub2APIMaxTokenTTL
+	}
+	ttlSeconds := int64(ttl / time.Second)
+	if ttlSeconds <= 0 {
 		return
 	}
 	encrypted, err := common.EncryptAESGCMString(token)
 	if err != nil {
-		common.SysError(fmt.Sprintf("sub2api jwt cache encrypt failed: channel_id=%d err=%v", channelID, err))
+		common.SysError(fmt.Sprintf("sub2api jwt cache encrypt failed: channel_id=%d err=%v", authKey.ChannelID, err))
+		return
+	}
+	if len(encrypted) > routingSub2APIMaxCachedJWTBytes {
 		return
 	}
 	if common.RedisEnabled && common.RDB != nil {
-		if err = common.RDB.Set(ctx, routingSub2APIRedisJWTKey(channelID), encrypted, ttl).Err(); err != nil {
-			common.SysError(fmt.Sprintf("sub2api jwt cache set failed: channel_id=%d err=%v", channelID, err))
+		const setUnlessRetiredScript = `
+if redis.call("EXISTS", KEYS[1]) == 1 then
+  return 0
+end
+redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+return 1`
+		written, writeErr := common.RDB.Eval(
+			ctx,
+			setUnlessRetiredScript,
+			[]string{routingSub2APIRedisRetiredKey(authKey), routingSub2APIRedisJWTKey(authKey)},
+			encrypted,
+			ttl.Milliseconds(),
+		).Int64()
+		if writeErr != nil {
+			err = writeErr
+			common.SysError(fmt.Sprintf("sub2api jwt cache set failed: channel_id=%d err=%v", authKey.ChannelID, err))
+			return
+		}
+		if written != 1 {
+			return
 		}
 	}
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
-	routingSub2APIJWTCache.values[channelID] = routingSub2APIJWTCacheEntry{
+	maxInt64 := int64(^uint64(0) >> 1)
+	expiresAt := maxInt64
+	if now <= maxInt64-ttlSeconds {
+		expiresAt = now + ttlSeconds
+	}
+	routingSub2APIJWTCache.values[authKey] = routingSub2APIJWTCacheEntry{
 		Ciphertext: encrypted,
-		ExpiresAt:  now + int64(ttl.Seconds()),
+		ExpiresAt:  expiresAt,
 	}
 	pruneRoutingSub2APIJWTCacheLocked(now, routingSub2APIMaxJWTEntries)
+}
+
+func decodeRoutingSub2APICachedJWT(encrypted string) (string, bool) {
+	if encrypted == "" || len(encrypted) > routingSub2APIMaxCachedJWTBytes {
+		return "", false
+	}
+	token, err := common.DecryptAESGCMString(encrypted)
+	if err != nil {
+		return "", false
+	}
+	token = strings.TrimSpace(token)
+	if token == "" || validateRoutingSub2APIToken(token) != nil {
+		return "", false
+	}
+	return token, true
 }
 
 func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
@@ -721,65 +927,398 @@ func pruneRoutingSub2APIJWTCacheLocked(now int64, maxEntries int) {
 	if maxEntries <= 0 {
 		maxEntries = routingSub2APIDefaultMaxJWTEntries
 	}
-	excess := len(routingSub2APIJWTCache.values) - maxEntries
-	if excess <= 0 {
+	maxBytes := routingSub2APIMaxJWTBytes
+	if maxBytes <= 0 {
+		maxBytes = routingSub2APIDefaultMaxJWTBytes
+	}
+	cacheBytes := routingSub2APIJWTCacheBytesLocked()
+	if len(routingSub2APIJWTCache.values) <= maxEntries && cacheBytes <= maxBytes {
 		return
 	}
 
 	type candidate struct {
-		channelID int
+		authKey   routingSub2APIAuthKey
 		expiresAt int64
 	}
 	candidates := make([]candidate, 0, len(routingSub2APIJWTCache.values))
-	for channelID, entry := range routingSub2APIJWTCache.values {
-		candidates = append(candidates, candidate{channelID: channelID, expiresAt: entry.ExpiresAt})
+	for authKey, entry := range routingSub2APIJWTCache.values {
+		candidates = append(candidates, candidate{authKey: authKey, expiresAt: entry.ExpiresAt})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].expiresAt == candidates[j].expiresAt {
-			return candidates[i].channelID < candidates[j].channelID
+			if candidates[i].authKey.ChannelID == candidates[j].authKey.ChannelID {
+				return candidates[i].authKey.Fingerprint < candidates[j].authKey.Fingerprint
+			}
+			return candidates[i].authKey.ChannelID < candidates[j].authKey.ChannelID
 		}
 		return candidates[i].expiresAt < candidates[j].expiresAt
 	})
-	for _, entry := range candidates[:excess] {
-		if _, ok := routingSub2APIJWTCache.values[entry.channelID]; !ok {
+	for _, candidate := range candidates {
+		if len(routingSub2APIJWTCache.values) <= maxEntries && cacheBytes <= maxBytes {
+			break
+		}
+		entry, ok := routingSub2APIJWTCache.values[candidate.authKey]
+		if !ok {
 			continue
 		}
-		delete(routingSub2APIJWTCache.values, entry.channelID)
+		delete(routingSub2APIJWTCache.values, candidate.authKey)
+		cacheBytes -= len(entry.Ciphertext)
 		routingSub2APIJWTCache.evictions++
 	}
 }
 
+func routingSub2APIJWTCacheBytesLocked() int {
+	cacheBytes := 0
+	for _, entry := range routingSub2APIJWTCache.values {
+		cacheBytes += len(entry.Ciphertext)
+	}
+	return cacheBytes
+}
+
 func deleteRoutingSub2APIJWTCacheExpiredLocked(now int64) {
-	for channelID, entry := range routingSub2APIJWTCache.values {
+	for authKey, entry := range routingSub2APIJWTCache.values {
 		if entry.ExpiresAt <= now {
-			delete(routingSub2APIJWTCache.values, channelID)
+			delete(routingSub2APIJWTCache.values, authKey)
 			routingSub2APIJWTCache.expirations++
 		}
 	}
 }
 
 // RoutingSub2APIJWTCacheRuntimeStats returns a read-only snapshot of the
-// current process's local JWT cache counters and entry count.
+// current process's local JWT cache counters, entry count, and ciphertext bytes.
 func RoutingSub2APIJWTCacheRuntimeStats() RoutingSub2APIJWTCacheStats {
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
 	return RoutingSub2APIJWTCacheStats{
 		Entries:     len(routingSub2APIJWTCache.values),
+		Bytes:       routingSub2APIJWTCacheBytesLocked(),
 		Expirations: routingSub2APIJWTCache.expirations,
 		Evictions:   routingSub2APIJWTCache.evictions,
 	}
 }
 
-func routingSub2APIRedisJWTKey(channelID int) string {
+func newRoutingSub2APIAuthKey(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) routingSub2APIAuthKey {
+	credentialFields := []string{"persisted"}
+	if binding.ID > 0 {
+		credentialFields = append(credentialFields, strconv.Itoa(binding.ID))
+		if binding.EncCredentials != nil {
+			credentialFields = append(credentialFields, *binding.EncCredentials)
+		}
+	} else {
+		credentialFields = []string{
+			"inline",
+			strings.TrimSpace(credentials.Sub2APIEmail),
+			credentials.Sub2APIPassword,
+			strings.TrimSpace(credentials.Sub2APIToken),
+		}
+	}
+	fingerprintFields := append([]string{
+		strings.TrimRight(strings.TrimSpace(binding.BaseURL), "/"),
+		strings.TrimSpace(binding.UpstreamType),
+		strconv.Itoa(binding.KeyVersion),
+	}, credentialFields...)
+
+	var fingerprintInput strings.Builder
+	for _, field := range fingerprintFields {
+		fingerprintInput.WriteString(strconv.Itoa(len(field)))
+		fingerprintInput.WriteByte(':')
+		fingerprintInput.WriteString(field)
+	}
+	return routingSub2APIAuthKey{
+		ChannelID:   binding.ChannelID,
+		Fingerprint: common.GenerateHMAC(fingerprintInput.String()),
+	}
+}
+
+func routingSub2APIRedisJWTKey(authKey routingSub2APIAuthKey) string {
+	return fmt.Sprintf("routing:sub2api:jwt:%d:%s", authKey.ChannelID, authKey.Fingerprint)
+}
+
+func routingSub2APIRedisRetiredKey(authKey routingSub2APIAuthKey) string {
+	return fmt.Sprintf("routing:sub2api:retired:%d:%s", authKey.ChannelID, authKey.Fingerprint)
+}
+
+func routingSub2APILegacyRedisJWTKey(channelID int) string {
 	return fmt.Sprintf("routing:sub2api:jwt:%d", channelID)
 }
 
-func routingSub2APIRedisLockKey(channelID int) string {
-	return fmt.Sprintf("routing:sub2api:lock:%d", channelID)
+func routingSub2APIRedisLockKey(authKey routingSub2APIAuthKey) string {
+	return fmt.Sprintf("routing:sub2api:lock:%d:%s", authKey.ChannelID, authKey.Fingerprint)
 }
 
-func routingCleanCredentialErrorMessage(message string, credentials model.RoutingCredentials) string {
-	message = common.SanitizeErrorMessage(message, routingCredentialSecrets(credentials)...)
+func routingSub2APISingleflightKey(authKey routingSub2APIAuthKey) string {
+	return fmt.Sprintf("%d:%s", authKey.ChannelID, authKey.Fingerprint)
+}
+
+func evictRoutingSub2APIJWT(ctx context.Context, authKey routingSub2APIAuthKey, rejectedToken string) {
+	rejectedToken = strings.TrimSpace(rejectedToken)
+	if authKey.ChannelID <= 0 || authKey.Fingerprint == "" || rejectedToken == "" {
+		return
+	}
+
+	redisDeleted := false
+	if common.RedisEnabled && common.RDB != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APIUnlockTimeout)
+		defer cancel()
+		encrypted, err := common.RDB.Get(cleanupCtx, routingSub2APIRedisJWTKey(authKey)).Result()
+		if err == nil {
+			cachedToken, valid := decodeRoutingSub2APICachedJWT(encrypted)
+			if valid && routingSub2APITokensEqual(cachedToken, rejectedToken) {
+				const compareAndDeleteScript = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0`
+				deleted, deleteErr := common.RDB.Eval(
+					cleanupCtx,
+					compareAndDeleteScript,
+					[]string{routingSub2APIRedisJWTKey(authKey)},
+					encrypted,
+				).Int64()
+				if deleteErr != nil {
+					common.SysError(fmt.Sprintf("sub2api jwt cache eviction failed: channel_id=%d err=%v", authKey.ChannelID, deleteErr))
+				} else {
+					redisDeleted = deleted == 1
+				}
+			}
+		} else if !errors.Is(err, redis.Nil) {
+			common.SysError(fmt.Sprintf("sub2api jwt cache eviction read failed: channel_id=%d err=%v", authKey.ChannelID, err))
+		}
+	}
+
+	routingSub2APILoginCoordinator.Lock()
+	routingSub2APIJWTCache.Lock()
+	localDeleted := false
+	if entry, ok := routingSub2APIJWTCache.values[authKey]; ok {
+		cachedToken, valid := decodeRoutingSub2APICachedJWT(entry.Ciphertext)
+		if valid && routingSub2APITokensEqual(cachedToken, rejectedToken) {
+			localDeleted = true
+		}
+	}
+	if localDeleted {
+		delete(routingSub2APIJWTCache.values, authKey)
+		routingSub2APIJWTCache.evictions++
+	}
+	routingSub2APIJWTCache.Unlock()
+	if redisDeleted || ((!common.RedisEnabled || common.RDB == nil) && localDeleted) {
+		advanceRoutingSub2APIGenerationLocked(authKey, common.GetTimestamp(), routingSub2APILockTTL)
+	}
+	routingSub2APILoginCoordinator.Unlock()
+}
+
+func invalidateRoutingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding) {
+	if binding.ChannelID <= 0 {
+		return
+	}
+	authKey := newRoutingSub2APIAuthKey(binding, model.RoutingCredentials{})
+
+	routingSub2APILoginCoordinator.Lock()
+	now := common.GetTimestamp()
+	advanceRoutingSub2APIGenerationLocked(authKey, now, routingSub2APIRetiredTTL)
+	routingSub2APILoginCoordinator.retired[authKey] = now + int64(routingSub2APIRetiredTTL/time.Second)
+	pruneRoutingSub2APILocalRetiredLocked(now)
+	routingSub2APIJWTCache.Lock()
+	for cachedKey := range routingSub2APIJWTCache.values {
+		if cachedKey.ChannelID != binding.ChannelID {
+			continue
+		}
+		delete(routingSub2APIJWTCache.values, cachedKey)
+		routingSub2APIJWTCache.evictions++
+	}
+	routingSub2APIJWTCache.Unlock()
+	routingSub2APILoginCoordinator.Unlock()
+
+	if !common.RedisEnabled || common.RDB == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APIUnlockTimeout)
+	defer cancel()
+	retiredMarker := common.GetRandomString(32)
+	const retireScript = `
+redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[1])
+return redis.call("DEL", KEYS[2], KEYS[3])`
+	if _, err := common.RDB.Eval(
+		cleanupCtx,
+		retireScript,
+		[]string{
+			routingSub2APIRedisRetiredKey(authKey),
+			routingSub2APIRedisJWTKey(authKey),
+			routingSub2APILegacyRedisJWTKey(binding.ChannelID),
+		},
+		routingSub2APIRetiredTTL.Milliseconds(),
+		retiredMarker,
+	).Result(); err != nil {
+		common.SysError(fmt.Sprintf("sub2api jwt cache invalidation failed: channel_id=%d err=%v", binding.ChannelID, err))
+	}
+}
+
+func prepareRoutingSub2APIJWTActivation(ctx context.Context, binding model.RoutingChannelBinding) (routingSub2APIJWTActivationFence, error) {
+	if binding.ChannelID <= 0 || binding.UpstreamType != model.RoutingUpstreamTypeSub2API {
+		return routingSub2APIJWTActivationFence{}, nil
+	}
+	authKey := newRoutingSub2APIAuthKey(binding, model.RoutingCredentials{})
+	fence := routingSub2APIJWTActivationFence{authKey: authKey}
+	now := common.GetTimestamp()
+	routingSub2APILoginCoordinator.RLock()
+	fence.localGeneration = routingSub2APILoginCoordinator.generations[authKey].Value
+	fence.localRetiredExpiresAt, fence.hasLocalRetirement = routingSub2APILoginCoordinator.retired[authKey]
+	fence.hasLocalRetirement = fence.hasLocalRetirement && fence.localRetiredExpiresAt > now
+	routingSub2APILoginCoordinator.RUnlock()
+
+	if !common.RedisEnabled {
+		return fence, nil
+	}
+	if common.RDB == nil {
+		return routingSub2APIJWTActivationFence{}, errors.New("sub2api auth activation cache is unavailable")
+	}
+	observeCtx, cancel := context.WithTimeout(ctx, routingSub2APIUnlockTimeout)
+	defer cancel()
+	retiredKey := routingSub2APIRedisRetiredKey(authKey)
+	retiredMarker, err := common.RDB.Get(observeCtx, retiredKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return fence, nil
+	}
+	if err != nil {
+		return routingSub2APIJWTActivationFence{}, fmt.Errorf("observe sub2api auth retirement: %w", err)
+	}
+	fence.redisRetirementMarker = retiredMarker
+	fence.hasRedisRetirementMarker = true
+	return fence, nil
+}
+
+func activateRoutingSub2APIJWT(ctx context.Context, fence routingSub2APIJWTActivationFence) {
+	if fence.authKey.ChannelID <= 0 || fence.authKey.Fingerprint == "" {
+		return
+	}
+	if fence.hasLocalRetirement {
+		routingSub2APILoginCoordinator.Lock()
+		generationUnchanged := routingSub2APILoginCoordinator.generations[fence.authKey].Value == fence.localGeneration
+		retiredExpiresAt, stillRetired := routingSub2APILoginCoordinator.retired[fence.authKey]
+		if generationUnchanged && stillRetired && retiredExpiresAt == fence.localRetiredExpiresAt {
+			delete(routingSub2APILoginCoordinator.retired, fence.authKey)
+		}
+		routingSub2APILoginCoordinator.Unlock()
+	}
+
+	if !fence.hasRedisRetirementMarker {
+		return
+	}
+	if !common.RedisEnabled || common.RDB == nil {
+		common.SysError(fmt.Sprintf("sub2api auth activation failed: channel_id=%d cache unavailable", fence.authKey.ChannelID))
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), routingSub2APIUnlockTimeout)
+	defer cancel()
+	const compareAndActivateScript = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0`
+	if err := common.RDB.Eval(
+		cleanupCtx,
+		compareAndActivateScript,
+		[]string{routingSub2APIRedisRetiredKey(fence.authKey)},
+		fence.redisRetirementMarker,
+	).Err(); err != nil {
+		common.SysError(fmt.Sprintf("sub2api auth activation failed: channel_id=%d err=%v", fence.authKey.ChannelID, err))
+	}
+}
+
+func routingSub2APILocallyRetiredLocked(authKey routingSub2APIAuthKey, now int64) bool {
+	expiresAt, ok := routingSub2APILoginCoordinator.retired[authKey]
+	return ok && expiresAt > now
+}
+
+func pruneRoutingSub2APILocalRetiredLocked(now int64) {
+	for authKey, expiresAt := range routingSub2APILoginCoordinator.retired {
+		if expiresAt <= now {
+			delete(routingSub2APILoginCoordinator.retired, authKey)
+		}
+	}
+	maxEntries := routingSub2APIMaxRetired
+	if maxEntries <= 0 {
+		maxEntries = routingSub2APIDefaultMaxRetired
+	}
+	excess := len(routingSub2APILoginCoordinator.retired) - maxEntries
+	if excess <= 0 {
+		return
+	}
+	type retiredCandidate struct {
+		authKey   routingSub2APIAuthKey
+		expiresAt int64
+	}
+	candidates := make([]retiredCandidate, 0, len(routingSub2APILoginCoordinator.retired))
+	for authKey, expiresAt := range routingSub2APILoginCoordinator.retired {
+		candidates = append(candidates, retiredCandidate{authKey: authKey, expiresAt: expiresAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].expiresAt == candidates[j].expiresAt {
+			if candidates[i].authKey.ChannelID == candidates[j].authKey.ChannelID {
+				return candidates[i].authKey.Fingerprint < candidates[j].authKey.Fingerprint
+			}
+			return candidates[i].authKey.ChannelID < candidates[j].authKey.ChannelID
+		}
+		return candidates[i].expiresAt < candidates[j].expiresAt
+	})
+	for _, candidate := range candidates[:excess] {
+		delete(routingSub2APILoginCoordinator.retired, candidate.authKey)
+	}
+}
+
+func advanceRoutingSub2APIGenerationLocked(authKey routingSub2APIAuthKey, now int64, ttl time.Duration) {
+	generation := routingSub2APILoginCoordinator.generations[authKey]
+	generation.Value++
+	expiresAt := now + int64(ttl/time.Second)
+	if expiresAt > generation.ExpiresAt {
+		generation.ExpiresAt = expiresAt
+	}
+	routingSub2APILoginCoordinator.generations[authKey] = generation
+	pruneRoutingSub2APIGenerationsLocked(now)
+}
+
+func pruneRoutingSub2APIGenerationsLocked(now int64) {
+	for authKey, generation := range routingSub2APILoginCoordinator.generations {
+		if generation.ExpiresAt <= now {
+			delete(routingSub2APILoginCoordinator.generations, authKey)
+		}
+	}
+	maxEntries := routingSub2APIMaxRetired
+	if maxEntries <= 0 {
+		maxEntries = routingSub2APIDefaultMaxRetired
+	}
+	excess := len(routingSub2APILoginCoordinator.generations) - maxEntries
+	if excess <= 0 {
+		return
+	}
+	type generationCandidate struct {
+		authKey   routingSub2APIAuthKey
+		expiresAt int64
+	}
+	candidates := make([]generationCandidate, 0, len(routingSub2APILoginCoordinator.generations))
+	for authKey, generation := range routingSub2APILoginCoordinator.generations {
+		candidates = append(candidates, generationCandidate{authKey: authKey, expiresAt: generation.ExpiresAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].expiresAt == candidates[j].expiresAt {
+			if candidates[i].authKey.ChannelID == candidates[j].authKey.ChannelID {
+				return candidates[i].authKey.Fingerprint < candidates[j].authKey.Fingerprint
+			}
+			return candidates[i].authKey.ChannelID < candidates[j].authKey.ChannelID
+		}
+		return candidates[i].expiresAt < candidates[j].expiresAt
+	})
+	for _, candidate := range candidates[:excess] {
+		delete(routingSub2APILoginCoordinator.generations, candidate.authKey)
+	}
+}
+
+func routingSub2APITokensEqual(left string, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+func routingCleanCredentialErrorMessage(message string, credentials model.RoutingCredentials, additionalSecrets ...string) string {
+	secrets := append(routingCredentialSecrets(credentials), additionalSecrets...)
+	message = common.SanitizeErrorMessage(message, secrets...)
 	if message == "" {
 		return "upstream auth failed"
 	}
@@ -799,19 +1338,28 @@ func routingCredentialSecrets(credentials model.RoutingCredentials) []string {
 func routingSub2APICachedJWTForTest(channelID int) string {
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
-	return routingSub2APIJWTCache.values[channelID].Ciphertext
+	for authKey, entry := range routingSub2APIJWTCache.values {
+		if authKey.ChannelID == channelID {
+			return entry.Ciphertext
+		}
+	}
+	return ""
 }
 
 func resetRoutingSub2APITestState() {
 	routingSub2APILoginCoordinator.Lock()
 	defer routingSub2APILoginCoordinator.Unlock()
 	routingSub2APILoginCoordinator.group = &singleflight.Group{}
-	routingSub2APILoginCoordinator.generation++
+	routingSub2APILoginCoordinator.epoch++
+	routingSub2APILoginCoordinator.generations = map[routingSub2APIAuthKey]routingSub2APIGeneration{}
+	routingSub2APILoginCoordinator.retired = map[routingSub2APIAuthKey]int64{}
 
 	routingSub2APIJWTCache.Lock()
 	defer routingSub2APIJWTCache.Unlock()
-	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{}
+	routingSub2APIJWTCache.values = map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry{}
 	routingSub2APIJWTCache.expirations = 0
 	routingSub2APIJWTCache.evictions = 0
 	routingSub2APIMaxJWTEntries = routingSub2APIDefaultMaxJWTEntries
+	routingSub2APIMaxJWTBytes = routingSub2APIDefaultMaxJWTBytes
+	routingSub2APIMaxRetired = routingSub2APIDefaultMaxRetired
 }

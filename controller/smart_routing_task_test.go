@@ -400,6 +400,430 @@ func TestRunRoutingCostSyncTaskSaturatesFailureCountAndBackoffTimestamp(t *testi
 	assert.Equal(t, maxInt64, updated.SyncBackoffUntil)
 }
 
+func TestRunRoutingCostSyncTaskUsesFailureTimeForBackoff(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"success":false}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     784,
+		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	const taskStartedAt int64 = 1_700_000_000
+	const failureObservedAt int64 = taskStartedAt + 120
+	var nowCalls atomic.Int64
+	deps := defaultRoutingCostSyncDeps()
+	deps.now = func() int64 {
+		if nowCalls.Add(1) == 1 {
+			return taskStartedAt
+		}
+		return failureObservedAt
+	}
+	deps.jitter = func(max time.Duration) time.Duration { return max }
+
+	_, err := runRoutingCostSyncTaskWithDeps(context.Background(), deps)
+	require.NoError(t, err)
+	var updated model.RoutingChannelBinding
+	require.NoError(t, db.Where("id = ?", binding.ID).First(&updated).Error)
+	assert.Equal(t, failureObservedAt+int64(time.Minute/time.Second), updated.SyncBackoffUntil)
+}
+
+func TestRunRoutingCostSyncTaskDoesNotReviveDeletedBindingSnapshots(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	pricingStarted := make(chan struct{})
+	releasePricing := make(chan struct{})
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/pricing" {
+			http.NotFound(w, r)
+			return
+		}
+		close(pricingStarted)
+		<-releasePricing
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"model_name":"gpt-stale","quota_type":0,"model_ratio":1,"completion_ratio":1}],"group_ratio":{"vip":1}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     785,
+		UpstreamType:  "test",
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	type syncResult struct {
+		summary map[string]any
+		err     error
+	}
+	result := make(chan syncResult, 1)
+	go func() {
+		summary, err := runRoutingCostSyncTaskWithDeps(context.Background(), defaultRoutingCostSyncDeps())
+		result <- syncResult{summary: summary, err: err}
+	}()
+	<-pricingStarted
+	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
+	close(releasePricing)
+
+	completed := <-result
+	require.NoError(t, completed.err)
+	assert.EqualValues(t, 1, completed.summary["stale_bindings"])
+	var snapshotCount int64
+	require.NoError(t, db.Model(&model.RoutingCostSnapshot{}).Where("channel_id = ?", binding.ChannelID).Count(&snapshotCount).Error)
+	assert.Zero(t, snapshotCount)
+	_, cached := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: binding.ChannelID, Model: "gpt-stale"})
+	assert.False(t, cached)
+}
+
+func TestRunRoutingCostSyncTaskDiscardsSnapshotsAfterBindingConfigChanges(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	pricingStarted := make(chan struct{})
+	releasePricing := make(chan struct{})
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/pricing" {
+			http.NotFound(w, r)
+			return
+		}
+		close(pricingStarted)
+		<-releasePricing
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"model_name":"gpt-old-config","quota_type":0,"model_ratio":1,"completion_ratio":1}],"group_ratio":{"vip":1}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     786,
+		UpstreamType:  "test",
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	type syncResult struct {
+		summary map[string]any
+		err     error
+	}
+	result := make(chan syncResult, 1)
+	go func() {
+		summary, err := runRoutingCostSyncTaskWithDeps(context.Background(), defaultRoutingCostSyncDeps())
+		result <- syncResult{summary: summary, err: err}
+	}()
+	<-pricingStarted
+	require.NoError(t, db.Model(&model.RoutingChannelBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+		"upstream_group": "changed",
+		"updated_time":   binding.UpdatedTime + 1,
+	}).Error)
+	close(releasePricing)
+
+	completed := <-result
+	require.NoError(t, completed.err)
+	assert.EqualValues(t, 1, completed.summary["stale_bindings"])
+	var snapshotCount int64
+	require.NoError(t, db.Model(&model.RoutingCostSnapshot{}).Where("channel_id = ?", binding.ChannelID).Count(&snapshotCount).Error)
+	assert.Zero(t, snapshotCount)
+	_, cached := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: binding.ChannelID, Model: "gpt-old-config"})
+	assert.False(t, cached)
+}
+
+func TestRunRoutingCostSyncTaskSnapshotPersistenceHonorsContext(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/pricing" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"model_name":"gpt-context","quota_type":0,"model_ratio":1,"completion_ratio":1}],"group_ratio":{"vip":1}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     787,
+		UpstreamType:  "test",
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	createStarted := make(chan struct{}, 1)
+	releaseCreate := make(chan struct{})
+	const callbackName = "test:block_routing_cost_snapshot_create"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingCostSnapshot{}).TableName() {
+			return
+		}
+		createStarted <- struct{}{}
+		select {
+		case <-tx.Statement.Context.Done():
+			tx.AddError(tx.Statement.Context.Err())
+		case <-releaseCreate:
+			tx.AddError(errors.New("routing cost snapshot create did not receive task context"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := runRoutingCostSyncTaskWithDeps(ctx, defaultRoutingCostSyncDeps())
+		result <- err
+	}()
+	<-createStarted
+	cancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		close(releaseCreate)
+		<-result
+		require.Fail(t, "routing cost snapshot persistence ignored task context")
+	}
+}
+
+func TestFetchRoutingCostSnapshotsModelMappingHonorsContext(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}))
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/pricing" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"success":true,"data":[{"model_name":"gpt-context-map","quota_type":0,"model_ratio":1,"completion_ratio":1}],"group_ratio":{"vip":1}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	queryStarted := make(chan struct{}, 1)
+	releaseQuery := make(chan struct{})
+	const callbackName = "test:block_routing_model_mapping_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "channels" {
+			return
+		}
+		queryStarted <- struct{}{}
+		select {
+		case <-tx.Statement.Context.Done():
+			tx.AddError(tx.Statement.Context.Err())
+		case <-releaseQuery:
+			tx.AddError(errors.New("routing model mapping query did not receive task context"))
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := fetchRoutingCostSnapshots(ctx, model.RoutingChannelBinding{
+			ChannelID:     788,
+			UpstreamType:  "test",
+			BaseURL:       server.URL,
+			UpstreamGroup: "vip",
+		})
+		result <- err
+	}()
+	<-queryStarted
+	cancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		close(releaseQuery)
+		<-result
+		require.Fail(t, "routing model mapping query ignored task context")
+	}
+}
+
+func TestFetchRoutingUpstreamBalanceDoesNotReviveDeletedBindingState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/user/self" {
+			http.NotFound(w, r)
+			return
+		}
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = io.WriteString(w, `{"success":true,"data":{"quota":1000000,"used_quota":0}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     789,
+		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- fetchRoutingUpstreamBalance(context.Background(), binding, model.RoutingCredentials{})
+	}()
+	<-requestStarted
+	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
+	close(releaseResponse)
+
+	require.ErrorIs(t, <-result, model.ErrRoutingBindingChanged)
+	var healthCount int64
+	require.NoError(t, db.Model(&model.RoutingChannelHealthState{}).Where("channel_id = ?", binding.ChannelID).Count(&healthCount).Error)
+	assert.Zero(t, healthCount)
+	_, cached := routinghotcache.GetBalance(binding.ChannelID)
+	assert.False(t, cached)
+}
+
+func TestFetchRoutingSub2APIBalanceDoesNotReviveDeletedBindingState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/usage" {
+			http.NotFound(w, r)
+			return
+		}
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = io.WriteString(w, `{"code":0,"data":{"balance":9.25}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     790,
+		UpstreamType:  model.RoutingUpstreamTypeSub2API,
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- fetchRoutingSub2APIBalance(
+			context.Background(),
+			binding,
+			model.RoutingCredentials{GatewayAPIKey: "gateway-token"},
+			"jwt-token",
+		)
+	}()
+	<-requestStarted
+	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
+	close(releaseResponse)
+
+	require.ErrorIs(t, <-result, model.ErrRoutingBindingChanged)
+	var healthCount int64
+	require.NoError(t, db.Model(&model.RoutingChannelHealthState{}).Where("channel_id = ?", binding.ChannelID).Count(&healthCount).Error)
+	assert.Zero(t, healthCount)
+	_, cached := routinghotcache.GetBalance(binding.ChannelID)
+	assert.False(t, cached)
+}
+
+func TestPersistRoutingBalanceDoesNotPublishSameTimestampNoop(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingChannelHealthState{}))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	for index, upstreamType := range []string{
+		model.RoutingUpstreamTypeNewAPI,
+		model.RoutingUpstreamTypeSub2API,
+	} {
+		t.Run(upstreamType, func(t *testing.T) {
+			channelID := 791 + index
+			binding := model.RoutingChannelBinding{
+				ChannelID:     channelID,
+				UpstreamType:  upstreamType,
+				BaseURL:       "https://balance.example",
+				UpstreamGroup: "vip",
+				Enabled:       true,
+			}
+			require.NoError(t, db.Create(&binding).Error)
+			const updatedTime int64 = 500
+			require.NoError(t, db.Create(&model.RoutingChannelHealthState{
+				ChannelID:          channelID,
+				BalanceKnown:       true,
+				Balance:            9.25,
+				BalanceUpdatedTime: updatedTime,
+				UpdatedTime:        updatedTime + 10,
+			}).Error)
+			routinghotcache.SetBalanceForTest(channelID, routinghotcache.BalanceSnapshot{
+				Known:       true,
+				Balance:     9.25,
+				UpdatedUnix: updatedTime,
+			})
+
+			require.NoError(t, persistRoutingBalance(context.Background(), binding, 1.25, updatedTime))
+
+			var health model.RoutingChannelHealthState
+			require.NoError(t, db.Where("channel_id = ?", channelID).First(&health).Error)
+			assert.Equal(t, 9.25, health.Balance)
+			assert.Equal(t, updatedTime, health.BalanceUpdatedTime)
+			cached, ok := routinghotcache.GetBalance(channelID)
+			require.True(t, ok)
+			assert.Equal(t, 9.25, cached.Balance)
+			assert.Equal(t, updatedTime, cached.UpdatedUnix)
+		})
+	}
+}
+
 func TestRoutingCostSyncBindingStateUpdateFailureFailsSystemTaskAndSanitizesError(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
@@ -1010,7 +1434,7 @@ func TestRoutingSub2APIRedisUnlockUsesIndependentBoundedContext(t *testing.T) {
 	t.Cleanup(func() { routingSub2APIUnlockTimeout = previousUnlockTimeout })
 
 	sharedCtx, cancelShared := context.WithCancel(context.Background())
-	unlock, err := acquireRoutingSub2APIRedisLock(sharedCtx, 890)
+	unlock, err := acquireRoutingSub2APIRedisLock(sharedCtx, routingSub2APITestAuthKey(890))
 	require.NoError(t, err)
 	require.NotNil(t, unlock)
 	cancelShared()
@@ -1237,19 +1661,19 @@ func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
 
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
-	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
-		10: {Ciphertext: "expired", ExpiresAt: now},
-		20: {Ciphertext: "oldest", ExpiresAt: now + 10},
-		30: {Ciphertext: "tied-smaller-channel", ExpiresAt: now + 20},
-		40: {Ciphertext: "tied-larger-channel", ExpiresAt: now + 20},
-		50: {Ciphertext: "newest", ExpiresAt: now + 30},
+	routingSub2APIJWTCache.values = map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry{
+		routingSub2APITestAuthKey(10): {Ciphertext: "expired", ExpiresAt: now},
+		routingSub2APITestAuthKey(20): {Ciphertext: "oldest", ExpiresAt: now + 10},
+		routingSub2APITestAuthKey(30): {Ciphertext: "tied-smaller-channel", ExpiresAt: now + 20},
+		routingSub2APITestAuthKey(40): {Ciphertext: "tied-larger-channel", ExpiresAt: now + 20},
+		routingSub2APITestAuthKey(50): {Ciphertext: "newest", ExpiresAt: now + 30},
 	}
 	pruneRoutingSub2APIJWTCacheLocked(now, 2)
-	_, hasExpired := routingSub2APIJWTCache.values[10]
-	_, hasOldest := routingSub2APIJWTCache.values[20]
-	_, hasTiedSmallerChannel := routingSub2APIJWTCache.values[30]
-	_, hasTiedLargerChannel := routingSub2APIJWTCache.values[40]
-	_, hasNewest := routingSub2APIJWTCache.values[50]
+	_, hasExpired := routingSub2APIJWTCache.values[routingSub2APITestAuthKey(10)]
+	_, hasOldest := routingSub2APIJWTCache.values[routingSub2APITestAuthKey(20)]
+	_, hasTiedSmallerChannel := routingSub2APIJWTCache.values[routingSub2APITestAuthKey(30)]
+	_, hasTiedLargerChannel := routingSub2APIJWTCache.values[routingSub2APITestAuthKey(40)]
+	_, hasNewest := routingSub2APIJWTCache.values[routingSub2APITestAuthKey(50)]
 	cacheSize := len(routingSub2APIJWTCache.values)
 	routingSub2APIJWTCache.Unlock()
 
@@ -1261,6 +1685,7 @@ func TestRoutingSub2APIJWTCachePrunesExpiredAndOldestEntries(t *testing.T) {
 	assert.Equal(t, 2, cacheSize)
 	assert.Equal(t, RoutingSub2APIJWTCacheStats{
 		Entries:     2,
+		Bytes:       25,
 		Expirations: 1,
 		Evictions:   2,
 	}, RoutingSub2APIJWTCacheRuntimeStats())
@@ -1295,15 +1720,15 @@ func TestRoutingSub2APIJWTCacheNeverExceedsLimitOnSet(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	setRoutingSub2APICachedJWT(ctx, 901, "jwt-oldest", time.Hour)
-	setRoutingSub2APICachedJWT(ctx, 902, "jwt-middle", 2*time.Hour)
-	setRoutingSub2APICachedJWT(ctx, 903, "jwt-newest", 3*time.Hour)
+	setRoutingSub2APICachedJWT(ctx, routingSub2APITestAuthKey(901), "jwt-oldest", time.Hour)
+	setRoutingSub2APICachedJWT(ctx, routingSub2APITestAuthKey(902), "jwt-middle", 2*time.Hour)
+	setRoutingSub2APICachedJWT(ctx, routingSub2APITestAuthKey(903), "jwt-newest", 3*time.Hour)
 
 	routingSub2APIJWTCache.Lock()
 	cacheSize := len(routingSub2APIJWTCache.values)
 	routingSub2APIJWTCache.Unlock()
-	latestToken, latestFound := getRoutingSub2APICachedJWT(ctx, 903)
-	_, oldestFound := getRoutingSub2APICachedJWT(ctx, 901)
+	latestToken, latestFound := getRoutingSub2APICachedJWT(ctx, routingSub2APITestAuthKey(903))
+	_, oldestFound := getRoutingSub2APICachedJWT(ctx, routingSub2APITestAuthKey(901))
 
 	assert.LessOrEqual(t, cacheSize, 2)
 	assert.True(t, latestFound)
@@ -1311,6 +1736,7 @@ func TestRoutingSub2APIJWTCacheNeverExceedsLimitOnSet(t *testing.T) {
 	assert.False(t, oldestFound)
 	assert.Equal(t, RoutingSub2APIJWTCacheStats{
 		Entries:   2,
+		Bytes:     110,
 		Evictions: 1,
 	}, RoutingSub2APIJWTCacheRuntimeStats())
 }
@@ -1330,17 +1756,18 @@ func TestRoutingSub2APIJWTCacheGetCountsExpiredEntries(t *testing.T) {
 
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
-	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
-		910: {Ciphertext: "expired", ExpiresAt: now},
-		911: {Ciphertext: "live", ExpiresAt: now + 60},
+	routingSub2APIJWTCache.values = map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry{
+		routingSub2APITestAuthKey(910): {Ciphertext: "expired", ExpiresAt: now},
+		routingSub2APITestAuthKey(911): {Ciphertext: "live", ExpiresAt: now + 60},
 	}
 	routingSub2APIJWTCache.Unlock()
 
-	_, found := getRoutingSub2APICachedJWT(context.Background(), 910)
+	_, found := getRoutingSub2APICachedJWT(context.Background(), routingSub2APITestAuthKey(910))
 
 	assert.False(t, found)
 	assert.Equal(t, RoutingSub2APIJWTCacheStats{
 		Entries:     1,
+		Bytes:       4,
 		Expirations: 1,
 	}, RoutingSub2APIJWTCacheRuntimeStats())
 }
@@ -1351,15 +1778,16 @@ func TestResetRoutingSub2APIJWTCacheClearsRuntimeStats(t *testing.T) {
 
 	now := common.GetTimestamp()
 	routingSub2APIJWTCache.Lock()
-	routingSub2APIJWTCache.values = map[int]routingSub2APIJWTCacheEntry{
-		920: {Ciphertext: "expired", ExpiresAt: now},
-		921: {Ciphertext: "oldest", ExpiresAt: now + 10},
-		922: {Ciphertext: "newest", ExpiresAt: now + 20},
+	routingSub2APIJWTCache.values = map[routingSub2APIAuthKey]routingSub2APIJWTCacheEntry{
+		routingSub2APITestAuthKey(920): {Ciphertext: "expired", ExpiresAt: now},
+		routingSub2APITestAuthKey(921): {Ciphertext: "oldest", ExpiresAt: now + 10},
+		routingSub2APITestAuthKey(922): {Ciphertext: "newest", ExpiresAt: now + 20},
 	}
 	pruneRoutingSub2APIJWTCacheLocked(now, 1)
 	routingSub2APIJWTCache.Unlock()
 	require.Equal(t, RoutingSub2APIJWTCacheStats{
 		Entries:     1,
+		Bytes:       6,
 		Expirations: 1,
 		Evictions:   1,
 	}, RoutingSub2APIJWTCacheRuntimeStats())

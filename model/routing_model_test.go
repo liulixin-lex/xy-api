@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -343,6 +345,208 @@ func TestRoutingModelContextCanceledOperationsDoNotMutateState(t *testing.T) {
 	assert.Zero(t, breakerCount)
 }
 
+func TestUpdateRoutingChannelBalanceForBindingReportsOnlyNewerWritesAsApplied(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}, &RoutingChannelHealthState{}))
+
+	binding := RoutingChannelBinding{
+		ChannelID:     1201,
+		UpstreamType:  RoutingUpstreamTypeNewAPI,
+		BaseURL:       "https://balance.example",
+		UpstreamGroup: "default",
+		Enabled:       true,
+	}
+	require.NoError(t, DB.Create(&binding).Error)
+	require.NoError(t, DB.Create(&RoutingChannelHealthState{
+		ChannelID:          binding.ChannelID,
+		BalanceKnown:       true,
+		Balance:            9.5,
+		BalanceUpdatedTime: 200,
+		UpdatedTime:        500,
+	}).Error)
+
+	applied, err := UpdateRoutingChannelBalanceForBindingContext(context.Background(), binding, 1.25, 200)
+	require.NoError(t, err)
+	assert.False(t, applied)
+
+	var health RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", binding.ChannelID).First(&health).Error)
+	assert.Equal(t, 9.5, health.Balance)
+	assert.Equal(t, int64(200), health.BalanceUpdatedTime)
+	assert.Equal(t, int64(500), health.UpdatedTime)
+
+	applied, err = UpdateRoutingChannelBalanceForBindingContext(context.Background(), binding, 10.5, 300)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	require.NoError(t, DB.Where("channel_id = ?", binding.ChannelID).First(&health).Error)
+	assert.Equal(t, 10.5, health.Balance)
+	assert.Equal(t, int64(300), health.BalanceUpdatedTime)
+	assert.Equal(t, int64(500), health.UpdatedTime)
+}
+
+func TestUpsertRoutingChannelBalanceConcurrentMissingRowKeepsNewestSQLite(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "routing-balance.db") + "?_busy_timeout=0"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingChannelHealthState{}))
+
+	const channelID = 1202
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var createCalls atomic.Int32
+	const callbackName = "test:gate_concurrent_routing_balance_creates"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		state, ok := tx.Statement.Dest.(*RoutingChannelHealthState)
+		if !ok || state.ChannelID != channelID {
+			return
+		}
+		if createCalls.Add(1) > 2 {
+			return
+		}
+		arrived <- struct{}{}
+		<-release
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	results := make(chan error, 2)
+	for _, update := range []struct {
+		balance     float64
+		updatedTime int64
+	}{
+		{balance: 4.5, updatedTime: 100},
+		{balance: 8.5, updatedTime: 200},
+	} {
+		update := update
+		go func() {
+			results <- UpsertRoutingChannelBalanceContext(context.Background(), channelID, update.balance, update.updatedTime)
+		}()
+	}
+
+	<-arrived
+	<-arrived
+	close(release)
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+
+	var health RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", channelID).First(&health).Error)
+	assert.True(t, health.BalanceKnown)
+	assert.Equal(t, 8.5, health.Balance)
+	assert.Equal(t, int64(200), health.BalanceUpdatedTime)
+}
+
+func TestFencedRoutingBreakerOlderStateUsesConflictSafeUpsert(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelBinding{}, &RoutingBreakerState{}))
+
+	const channelID = 1203
+	require.NoError(t, DB.Create(&Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
+	binding := RoutingChannelBinding{
+		ChannelID:     channelID,
+		UpstreamType:  RoutingUpstreamTypeNewAPI,
+		BaseURL:       "https://breaker.example",
+		UpstreamGroup: "default",
+		Enabled:       true,
+		CreatedTime:   100,
+		UpdatedTime:   100,
+	}
+	require.NoError(t, DB.Create(&binding).Error)
+	eligibility, err := ResolveLegacyRoutingStateEligibility(channelID, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+
+	newer := &RoutingBreakerState{
+		ChannelID: channelID, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+		Group: "default", State: RoutingBreakerStateHealthy, Reason: "newer", UpdatedTime: 300,
+	}
+	_, stateAccepted, err := eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), newer, binding.ID)
+	require.NoError(t, err)
+	require.True(t, stateAccepted)
+
+	var unsafePlainCreates atomic.Int32
+	const callbackName = "test:reject_plain_fenced_breaker_create"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (RoutingBreakerState{}).TableName() {
+			return
+		}
+		if _, conflictSafe := tx.Statement.Clauses["ON CONFLICT"]; !conflictSafe {
+			unsafePlainCreates.Add(1)
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	older := &RoutingBreakerState{
+		ChannelID: channelID, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+		Group: "default", State: RoutingBreakerStateOpen, Reason: "older", UpdatedTime: 200,
+	}
+	_, stateAccepted, err = eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), older, binding.ID)
+	require.NoError(t, err)
+	require.True(t, stateAccepted)
+	assert.Zero(t, unsafePlainCreates.Load(), "a unique-key error would abort the surrounding PostgreSQL transaction")
+
+	var persisted RoutingBreakerState
+	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
+		channelID, RoutingMetricSingleKeyIndex, "gpt-test", "default").First(&persisted).Error)
+	assert.Equal(t, RoutingBreakerStateHealthy, persisted.State)
+	assert.Equal(t, "newer", persisted.Reason)
+	assert.Equal(t, int64(300), persisted.UpdatedTime)
+}
+
+func TestFencedRoutingStateRejectsTimestampsAtOrBeforeBindingCreation(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelBinding{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+
+	const (
+		channelID   = 1204
+		createdTime = int64(630)
+	)
+	require.NoError(t, DB.Create(&Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
+	binding := RoutingChannelBinding{
+		ChannelID: channelID, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://generation.example", UpstreamGroup: "default", Enabled: true,
+		CreatedTime: createdTime, UpdatedTime: createdTime,
+	}
+	require.NoError(t, DB.Create(&binding).Error)
+	eligibility, err := ResolveLegacyRoutingStateEligibility(channelID, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+
+	bindingID, stateAccepted, err := eligibility.UpsertRoutingChannelMetricForBindingContext(context.Background(), &RoutingChannelMetric{
+		ChannelID: channelID, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "crossing-bucket",
+		Group: "default", BucketTs: 600, RequestCount: 1,
+	}, 0)
+	require.NoError(t, err)
+	assert.Equal(t, binding.ID, bindingID)
+	assert.False(t, stateAccepted)
+
+	bindingID, stateAccepted, err = eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), &RoutingBreakerState{
+		ChannelID: channelID, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "same-second-breaker",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: createdTime,
+	}, binding.ID)
+	require.NoError(t, err)
+	assert.Equal(t, binding.ID, bindingID)
+	assert.False(t, stateAccepted)
+
+	for _, table := range []any{&RoutingChannelMetric{}, &RoutingBreakerState{}} {
+		var count int64
+		require.NoError(t, DB.Model(table).Where("channel_id = ?", channelID).Count(&count).Error)
+		assert.Zero(t, count)
+	}
+}
+
 func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
@@ -518,14 +722,52 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, "https://legacy.example", migratedLegacyBinding.BaseURL)
 	assert.Equal(t, int64(1234), migratedLegacyBinding.SyncBackoffUntil)
 	assert.Zero(t, migratedLegacyBinding.SyncFailureCount)
-	require.NoError(t, DB.Model(&RoutingChannelBinding{}).
-		Where("channel_id = ?", 77).
-		Update("sync_failure_count", 3).Error)
-	require.NoError(t, DB.Where("channel_id = ?", 77).First(&migratedLegacyBinding).Error)
-	assert.Equal(t, 3, migratedLegacyBinding.SyncFailureCount)
-	require.NoError(t, DB.Model(&RoutingChannelBinding{}).
-		Where("channel_id = ?", 77).
-		Update("sync_failure_count", 0).Error)
+	nonZeroLegacyExpected := migratedLegacyBinding
+	nonZeroLegacyExpected.SyncFailureCount = 1
+	require.ErrorIs(t, UpdateRoutingCostSyncFailureContext(
+		context.Background(),
+		nonZeroLegacyExpected,
+		2,
+		2345,
+		"must not match a legacy NULL failure count",
+	), ErrRoutingBindingChanged)
+	require.NoError(t, UpdateRoutingCostSyncFailureContext(
+		context.Background(),
+		migratedLegacyBinding,
+		1,
+		2345,
+		"legacy sync failed",
+	))
+	var failedLegacyBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("channel_id = ?", 77).First(&failedLegacyBinding).Error)
+	assert.Equal(t, 1, failedLegacyBinding.SyncFailureCount)
+	assert.Equal(t, int64(2345), failedLegacyBinding.SyncBackoffUntil)
+	require.NotNil(t, failedLegacyBinding.LastSyncError)
+	assert.Equal(t, "legacy sync failed", *failedLegacyBinding.LastSyncError)
+	mismatchedFailureCount := failedLegacyBinding
+	mismatchedFailureCount.SyncFailureCount++
+	require.ErrorIs(t, UpdateRoutingCostSyncFailureContext(
+		context.Background(),
+		mismatchedFailureCount,
+		3,
+		3456,
+		"must keep non-zero failure counts strict",
+	), ErrRoutingBindingChanged)
+
+	require.NoError(t, CompleteRoutingCostSyncContext(context.Background(), failedLegacyBinding, []RoutingCostSnapshot{{
+		ChannelID:      failedLegacyBinding.ChannelID,
+		ModelName:      "legacy-sync-model",
+		BaseRatio:      1,
+		Confidence:     RoutingCostConfidenceFull,
+		SnapshotTS:     250,
+		PricingVersion: "legacy-sync-v1",
+	}}))
+	var completedLegacyBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("channel_id = ?", 77).First(&completedLegacyBinding).Error)
+	assert.Zero(t, completedLegacyBinding.SyncFailureCount)
+	assert.Zero(t, completedLegacyBinding.SyncBackoffUntil)
+	assert.Nil(t, completedLegacyBinding.LastSyncError)
+	assert.Greater(t, completedLegacyBinding.UpdatedTime, failedLegacyBinding.UpdatedTime)
 
 	var migratedLegacyMetric RoutingChannelMetric
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
@@ -634,6 +876,144 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, RoutingCostConfidenceFull, savedCostSnapshot.Confidence)
 	assert.Equal(t, int64(200), savedCostSnapshot.SnapshotTS)
 	assert.Equal(t, "v2", savedCostSnapshot.PricingVersion)
+
+	require.NoError(t, DB.Create(&RoutingChannelHealthState{
+		ChannelID:          savedBinding.ChannelID,
+		BalanceKnown:       true,
+		Balance:            12.5,
+		BalanceUpdatedTime: 250,
+		UpdatedTime:        250,
+	}).Error)
+	updatedBinding := savedBinding
+	updatedBinding.BaseURL = "https://updated.example"
+	updatedBinding.UpstreamGroup = "updated"
+	updatedBinding.Enabled = true
+	require.NoError(t, UpdateRoutingChannelBindingAndInvalidateCostContext(context.Background(), savedBinding, &updatedBinding))
+	var persistedUpdatedBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("id = ?", savedBinding.ID).First(&persistedUpdatedBinding).Error)
+	assert.Equal(t, updatedBinding.BaseURL, persistedUpdatedBinding.BaseURL)
+	assert.Equal(t, updatedBinding.UpstreamGroup, persistedUpdatedBinding.UpstreamGroup)
+	assert.True(t, persistedUpdatedBinding.Enabled)
+	assert.Greater(t, persistedUpdatedBinding.UpdatedTime, savedBinding.UpdatedTime)
+	require.NoError(t, DB.Model(&RoutingCostSnapshot{}).
+		Where("channel_id = ?", savedBinding.ChannelID).
+		Count(&costSnapshotCount).Error)
+	assert.Zero(t, costSnapshotCount)
+	var invalidatedHealth RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", savedBinding.ChannelID).First(&invalidatedHealth).Error)
+	assert.False(t, invalidatedHealth.BalanceKnown)
+	assert.Zero(t, invalidatedHealth.Balance)
+	require.ErrorIs(t, UpdateRoutingChannelBindingAndInvalidateCostContext(context.Background(), savedBinding, &updatedBinding), ErrRoutingBindingChanged)
+
+	syncBinding := RoutingChannelBinding{
+		ChannelID:        78,
+		UpstreamType:     RoutingUpstreamTypeNewAPI,
+		BaseURL:          "https://sync.example",
+		UpstreamGroup:    "vip",
+		Enabled:          true,
+		SyncFailureCount: 2,
+		SyncBackoffUntil: 321,
+	}
+	require.NoError(t, DB.Create(&syncBinding).Error)
+	require.NoError(t, CompleteRoutingCostSyncContext(context.Background(), syncBinding, []RoutingCostSnapshot{{
+		ChannelID:      syncBinding.ChannelID,
+		ModelName:      "gpt-sync",
+		BaseRatio:      1,
+		Confidence:     RoutingCostConfidenceFull,
+		SnapshotTS:     300,
+		PricingVersion: "sync-v1",
+	}}))
+	var completedBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("id = ?", syncBinding.ID).First(&completedBinding).Error)
+	assert.Zero(t, completedBinding.SyncFailureCount)
+	assert.Zero(t, completedBinding.SyncBackoffUntil)
+	assert.Nil(t, completedBinding.LastSyncError)
+	assert.Greater(t, completedBinding.UpdatedTime, syncBinding.UpdatedTime)
+	require.ErrorIs(t, CompleteRoutingCostSyncContext(context.Background(), syncBinding, []RoutingCostSnapshot{{
+		ChannelID:  syncBinding.ChannelID,
+		ModelName:  "gpt-stale-sync",
+		SnapshotTS: 400,
+	}}), ErrRoutingBindingChanged)
+	newerBalanceUpdatedTime := completedBinding.UpdatedTime + 30
+	balanceApplied, err := UpdateRoutingChannelBalanceForBindingContext(
+		context.Background(),
+		completedBinding,
+		9.25,
+		newerBalanceUpdatedTime,
+	)
+	require.NoError(t, err)
+	assert.True(t, balanceApplied)
+	var syncedHealth RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", syncBinding.ChannelID).First(&syncedHealth).Error)
+	assert.True(t, syncedHealth.BalanceKnown)
+	assert.Equal(t, 9.25, syncedHealth.Balance)
+	assert.Equal(t, newerBalanceUpdatedTime, syncedHealth.BalanceUpdatedTime)
+
+	balanceApplied, err = UpdateRoutingChannelBalanceForBindingContext(
+		context.Background(),
+		completedBinding,
+		1.25,
+		newerBalanceUpdatedTime-10,
+	)
+	require.NoError(t, err)
+	assert.False(t, balanceApplied)
+	require.NoError(t, DB.Where("channel_id = ?", syncBinding.ChannelID).First(&syncedHealth).Error)
+	assert.Equal(t, 9.25, syncedHealth.Balance)
+	assert.Equal(t, newerBalanceUpdatedTime, syncedHealth.BalanceUpdatedTime)
+	balanceApplied, err = UpdateRoutingChannelBalanceForBindingContext(
+		context.Background(),
+		completedBinding,
+		2.25,
+		newerBalanceUpdatedTime,
+	)
+	require.NoError(t, err)
+	assert.False(t, balanceApplied)
+	require.NoError(t, DB.Where("channel_id = ?", syncBinding.ChannelID).First(&syncedHealth).Error)
+	assert.Equal(t, 9.25, syncedHealth.Balance)
+	assert.Equal(t, newerBalanceUpdatedTime, syncedHealth.BalanceUpdatedTime)
+
+	authUpdatedTime := newerBalanceUpdatedTime + 100
+	require.NoError(t, DB.Model(&RoutingChannelHealthState{}).
+		Where("channel_id = ?", syncBinding.ChannelID).
+		Updates(map[string]any{
+			"auth_failure":        true,
+			"auth_failure_reason": "serving credential rejected",
+			"auth_failure_until":  authUpdatedTime + 60,
+			"updated_time":        authUpdatedTime,
+		}).Error)
+	latestBalanceUpdatedTime := newerBalanceUpdatedTime + 50
+	balanceApplied, err = UpdateRoutingChannelBalanceForBindingContext(
+		context.Background(),
+		completedBinding,
+		10.5,
+		latestBalanceUpdatedTime,
+	)
+	require.NoError(t, err)
+	assert.True(t, balanceApplied)
+	require.NoError(t, DB.Where("channel_id = ?", syncBinding.ChannelID).First(&syncedHealth).Error)
+	assert.Equal(t, 10.5, syncedHealth.Balance)
+	assert.Equal(t, latestBalanceUpdatedTime, syncedHealth.BalanceUpdatedTime)
+	assert.Equal(t, authUpdatedTime, syncedHealth.UpdatedTime)
+
+	require.NoError(t, UpdateRoutingCostSyncFailureContext(
+		context.Background(),
+		completedBinding,
+		1,
+		completedBinding.UpdatedTime+60,
+		"safe failure",
+	))
+	require.ErrorIs(t, UpdateRoutingCostSyncFailureContext(
+		context.Background(),
+		completedBinding,
+		2,
+		completedBinding.UpdatedTime+120,
+		"stale failure",
+	), ErrRoutingBindingChanged)
+	var staleSnapshotCount int64
+	require.NoError(t, DB.Model(&RoutingCostSnapshot{}).
+		Where("channel_id = ? AND model_name = ?", syncBinding.ChannelID, "gpt-stale-sync").
+		Count(&staleSnapshotCount).Error)
+	assert.Zero(t, staleSnapshotCount)
 
 	metric := &RoutingChannelMetric{
 		ChannelID:               1,
@@ -841,6 +1221,84 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.False(t, health.AuthFailure)
 	assert.True(t, health.BalanceKnown)
 	assert.Equal(t, 0.75, health.Balance)
+
+	eligibility, err := ResolveLegacyRoutingStateEligibility(1, RoutingMetricSingleKeyIndex)
+	require.NoError(t, err)
+	fencedStateTime := persistedUpdatedBinding.CreatedTime + 60
+	persistedBindingID, stateAccepted, err := eligibility.UpsertRoutingChannelMetricForBindingContext(context.Background(), &RoutingChannelMetric{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "binding-fenced-metric",
+		Group: "default", BucketTs: fencedStateTime, RequestCount: 1,
+	}, 0)
+	require.NoError(t, err)
+	assert.True(t, stateAccepted)
+	assert.Equal(t, persistedUpdatedBinding.ID, persistedBindingID)
+	persistedBindingID, stateAccepted, err = eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), &RoutingBreakerState{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "binding-fenced-breaker",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: fencedStateTime,
+	}, 0)
+	require.NoError(t, err)
+	assert.True(t, stateAccepted)
+	assert.Equal(t, persistedUpdatedBinding.ID, persistedBindingID)
+
+	require.NoError(t, DB.Delete(&RoutingChannelBinding{}, persistedUpdatedBinding.ID).Error)
+	persistedBindingID, stateAccepted, err = eligibility.UpsertRoutingChannelMetricForBindingContext(context.Background(), &RoutingChannelMetric{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "deleted-binding-metric",
+		Group: "default", BucketTs: 7100, RequestCount: 1,
+	}, 0)
+	require.NoError(t, err)
+	assert.Zero(t, persistedBindingID)
+	assert.False(t, stateAccepted)
+	persistedBindingID, stateAccepted, err = eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), &RoutingBreakerState{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "deleted-binding-breaker",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 7100,
+	}, 0)
+	require.NoError(t, err)
+	assert.Zero(t, persistedBindingID)
+	assert.False(t, stateAccepted)
+	var deletedMetricCount int64
+	require.NoError(t, DB.Model(&RoutingChannelMetric{}).
+		Where("channel_id = ? AND model_name = ?", 1, "deleted-binding-metric").
+		Count(&deletedMetricCount).Error)
+	assert.Zero(t, deletedMetricCount)
+	var deletedBreakerCount int64
+	require.NoError(t, DB.Model(&RoutingBreakerState{}).
+		Where("channel_id = ? AND model_name = ?", 1, "deleted-binding-breaker").
+		Count(&deletedBreakerCount).Error)
+	assert.Zero(t, deletedBreakerCount)
+
+	replacementBinding := RoutingChannelBinding{
+		ID:            persistedUpdatedBinding.ID + 10_000,
+		ChannelID:     persistedUpdatedBinding.ChannelID,
+		UpstreamType:  RoutingUpstreamTypeNewAPI,
+		BaseURL:       "https://replacement.example",
+		UpstreamGroup: "replacement",
+		Enabled:       true,
+	}
+	require.NoError(t, DB.Create(&replacementBinding).Error)
+	persistedBindingID, stateAccepted, err = eligibility.UpsertRoutingChannelMetricForBindingContext(context.Background(), &RoutingChannelMetric{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "recreated-binding-metric",
+		Group: "default", BucketTs: 7200, RequestCount: 1,
+	}, persistedUpdatedBinding.ID)
+	require.NoError(t, err)
+	assert.Zero(t, persistedBindingID)
+	assert.False(t, stateAccepted)
+	persistedBindingID, stateAccepted, err = eligibility.UpsertRoutingBreakerStateForBindingContext(context.Background(), &RoutingBreakerState{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "recreated-binding-breaker",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 7200,
+	}, persistedUpdatedBinding.ID)
+	require.NoError(t, err)
+	assert.Zero(t, persistedBindingID)
+	assert.False(t, stateAccepted)
+	var recreatedStateCount int64
+	require.NoError(t, DB.Model(&RoutingChannelMetric{}).
+		Where("channel_id = ? AND model_name = ?", 1, "recreated-binding-metric").
+		Count(&recreatedStateCount).Error)
+	assert.Zero(t, recreatedStateCount)
+	recreatedStateCount = 0
+	require.NoError(t, DB.Model(&RoutingBreakerState{}).
+		Where("channel_id = ? AND model_name = ?", 1, "recreated-binding-breaker").
+		Count(&recreatedStateCount).Error)
+	assert.Zero(t, recreatedStateCount)
 }
 
 func openRoutingSQLiteTestDB(t *testing.T) *gorm.DB {

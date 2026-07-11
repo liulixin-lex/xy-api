@@ -9,6 +9,56 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNormalizePerfMetricsSetting(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    PerfMetricsSetting
+		expected PerfMetricsSetting
+	}{
+		{
+			name:     "product defaults are preserved",
+			input:    productDefaultPerfMetricsSetting(),
+			expected: productDefaultPerfMetricsSetting(),
+		},
+		{
+			name: "invalid bucket and negative values use safe minimums",
+			input: PerfMetricsSetting{
+				Enabled:       false,
+				FlushInterval: -3,
+				BucketTime:    "day",
+				RetentionDays: -7,
+			},
+			expected: PerfMetricsSetting{
+				Enabled:       false,
+				FlushInterval: 1,
+				BucketTime:    "hour",
+				RetentionDays: 0,
+			},
+		},
+		{
+			name: "flush interval is capped at one day",
+			input: PerfMetricsSetting{
+				Enabled:       true,
+				FlushInterval: 2000,
+				BucketTime:    "5min",
+				RetentionDays: 30,
+			},
+			expected: PerfMetricsSetting{
+				Enabled:       true,
+				FlushInterval: 1440,
+				BucketTime:    "5min",
+				RetentionDays: 30,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, Normalize(test.input))
+		})
+	}
+}
+
 func TestGetSettingNormalizesRuntimeValues(t *testing.T) {
 	t.Cleanup(func() {
 		replacePerfMetricsSetting(t, productDefaultPerfMetricsSetting())

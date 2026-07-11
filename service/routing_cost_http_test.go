@@ -95,7 +95,10 @@ func TestRoutingCostURLValidation(t *testing.T) {
 		{name: "IPv6 loopback", rawURL: "https://[::1]/api/pricing", wantErr: true},
 		{name: "IPv4 mapped IPv6", rawURL: "https://[::ffff:8.8.8.8]/api/pricing", wantErr: true},
 		{name: "local NAT64 prefix", rawURL: "https://[64:ff9b:1::a9fe:a9fe]/api/pricing", wantErr: true},
+		{name: "dummy IPv6 prefix", rawURL: "https://[100:0:0:1::1]/api/pricing", wantErr: true},
 		{name: "6to4 prefix", rawURL: "https://[2002:a9fe:a9fe::]/api/pricing", wantErr: true},
+		{name: "segment routing SIDs", rawURL: "https://[5f00::1]/api/pricing", wantErr: true},
+		{name: "6a44 relay anycast", rawURL: "https://192.88.99.2/api/pricing", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -110,11 +113,14 @@ func TestRoutingCostURLValidation(t *testing.T) {
 	}
 }
 
-func TestRoutingCostDialerRejectsIPv6TransitionAddressWithoutDialing(t *testing.T) {
+func TestRoutingCostDialerRejectsSpecialUseAddressWithoutDialing(t *testing.T) {
 	for _, resolvedIP := range []string{
-		"::ffff:8.8.8.8",
+		"::ffff:10.0.0.1",
 		"64:ff9b:1::a9fe:a9fe",
+		"100:0:0:1::1",
 		"2002:a9fe:a9fe::",
+		"5f00::1",
+		"192.88.99.2",
 	} {
 		t.Run(resolvedIP, func(t *testing.T) {
 			var dialCount atomic.Int32
@@ -140,6 +146,50 @@ func TestRoutingCostDialerRejectsIPv6TransitionAddressWithoutDialing(t *testing.
 	}
 }
 
+func TestRoutingCostDialerUnmapsResolvedPublicIPv4BeforeDialing(t *testing.T) {
+	var dialed []string
+	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
+		resolver: routingCostStaticResolver{
+			"routing.example.com": {netip.MustParseAddr("::ffff:8.8.8.8")},
+		},
+		dialContext: func(_ context.Context, _ string, address string) (net.Conn, error) {
+			dialed = append(dialed, address)
+			clientConn, serverConn := net.Pipe()
+			serverConn.Close()
+			return clientConn, nil
+		},
+	})
+	request, err := http.NewRequest(http.MethodGet, "https://routing.example.com/api/pricing", nil)
+	require.NoError(t, err)
+
+	response, err := client.Do(request)
+	if response != nil {
+		response.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Equal(t, []string{"8.8.8.8:443"}, dialed)
+}
+
+func TestRoutingCostMalformedRedirectDoesNotExposeLocation(t *testing.T) {
+	const encodedSecret = "%73%65%63%72%65%74"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Location", "/"+encodedSecret+"/%zz")
+		w.Header().Add("Location", "https://other.example.com/"+encodedSecret)
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+
+	client, baseURL := newRoutingCostTLSTestClient(t, server, true)
+	response, err := client.Get(baseURL + "/start")
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	defer response.Body.Close()
+	assert.Equal(t, http.StatusFound, response.StatusCode)
+	assert.Empty(t, response.Header.Values("Location"))
+	assert.Equal(t, baseURL+"/start", response.Request.URL.String())
+	assert.NotContains(t, response.Request.URL.String(), encodedSecret)
+}
+
 func TestRoutingCostRedirectRejectionDoesNotExposeRejectedLocation(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "https://user:password@other.example.com/path?access_token=redirect-secret")
@@ -153,6 +203,7 @@ func TestRoutingCostRedirectRejectionDoesNotExposeRejectedLocation(t *testing.T)
 	require.NotNil(t, response)
 	defer response.Body.Close()
 	assert.Equal(t, http.StatusFound, response.StatusCode)
+	assert.Empty(t, response.Header.Values("Location"))
 	assert.Equal(t, baseURL+"/start", response.Request.URL.String())
 	for _, secret := range []string{"user", "password", "access_token", "redirect-secret", "other.example.com"} {
 		assert.NotContains(t, response.Request.URL.String(), secret)

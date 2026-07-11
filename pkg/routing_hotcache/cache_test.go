@@ -351,6 +351,115 @@ func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
 	assert.Equal(t, "open", breaker.State)
 }
 
+func TestReconcileCostConnectorSnapshotsPreservesActiveChannelsOutsideDetailLimit(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	activeCostKey := CostKey{ChannelID: 301, Model: "active"}
+	removedCostKey := CostKey{ChannelID: 302, Model: "removed"}
+	SetCostForTest(activeCostKey, CostSnapshot{Known: true, Cost: 1, UpdatedUnix: 100})
+	SetCostForTest(CostKey{ChannelID: 301, Model: "active-second-model"}, CostSnapshot{Known: true, Cost: 3, UpdatedUnix: 100})
+	SetCostForTest(removedCostKey, CostSnapshot{Known: true, Cost: 2, UpdatedUnix: 100})
+	SetBalanceForTest(301, BalanceSnapshot{Known: true, Balance: 1, UpdatedUnix: 100})
+	SetBalanceForTest(302, BalanceSnapshot{Known: true, Balance: 2, UpdatedUnix: 100})
+	cachedCostKeys, cachedBalanceChannels := CostConnectorCachedState()
+	assert.ElementsMatch(t, []CostKey{
+		activeCostKey,
+		{ChannelID: 301, Model: "active-second-model"},
+		removedCostKey,
+	}, cachedCostKeys)
+	assert.ElementsMatch(t, []int{301, 302}, cachedBalanceChannels)
+
+	ReconcileCostConnectorSnapshots(CostConnectorReconcileSnapshot{
+		CachedCostKeys: cachedCostKeys,
+		CachedCosts: []model.RoutingCostSnapshot{
+			{ChannelID: 301, ModelName: "active", GroupRatio: 1, BaseRatio: 2, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 101},
+			{ChannelID: 301, ModelName: "active-second-model", GroupRatio: 1, BaseRatio: 3, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 101},
+		},
+		CachedBalanceChannels: cachedBalanceChannels,
+		CachedHealth: []model.RoutingChannelHealthState{
+			{ChannelID: 301, BalanceKnown: true, Balance: 3, BalanceUpdatedTime: 101},
+		},
+	})
+
+	_, activeCostFound := GetCost(activeCostKey)
+	_, removedCostFound := GetCost(removedCostKey)
+	_, activeBalanceFound := GetBalance(301)
+	_, removedBalanceFound := GetBalance(302)
+	assert.True(t, activeCostFound)
+	assert.False(t, removedCostFound)
+	assert.True(t, activeBalanceFound)
+	assert.False(t, removedBalanceFound)
+}
+
+func TestReconcileCostConnectorSnapshotsRemovesMissingModelWithinActiveChannel(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	removedKey := CostKey{ChannelID: 401, Model: "removed-model"}
+	retainedKey := CostKey{ChannelID: 401, Model: "retained-model"}
+	SetCostForTest(removedKey, CostSnapshot{Known: true, Cost: 1, UpdatedUnix: 100})
+	SetCostForTest(retainedKey, CostSnapshot{Known: true, Cost: 1, UpdatedUnix: 100})
+
+	cachedCostKeys, _ := CostConnectorCachedState()
+	newKey := CostKey{ChannelID: 401, Model: "new-model"}
+	ReconcileCostConnectorSnapshots(CostConnectorReconcileSnapshot{
+		CachedCostKeys: cachedCostKeys,
+		RecentCosts: []model.RoutingCostSnapshot{
+			{ChannelID: 401, ModelName: "removed-model", GroupRatio: 1, BaseRatio: 9, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 101},
+			{ChannelID: 401, ModelName: "new-model", GroupRatio: 1, BaseRatio: 4, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 101},
+		},
+		CachedCosts: []model.RoutingCostSnapshot{
+			{ChannelID: 401, ModelName: "retained-model", GroupRatio: 1, BaseRatio: 2, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 101},
+		},
+	})
+
+	_, removedFound := GetCost(removedKey)
+	retained, retainedFound := GetCost(retainedKey)
+	newCost, newFound := GetCost(newKey)
+	assert.False(t, removedFound)
+	require.True(t, retainedFound)
+	assert.Equal(t, 2.0, retained.Cost)
+	require.True(t, newFound)
+	assert.Equal(t, 4.0, newCost.Cost)
+}
+
+func TestReconcileCostConnectorSnapshotsUpdatesCachedDetailsWithEqualTimestamp(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	costKey := CostKey{ChannelID: 402, Model: "outside-detail-limit"}
+	SetCostForTest(costKey, CostSnapshot{Known: true, Cost: 1, UpdatedUnix: 100})
+	SetBalanceForTest(402, BalanceSnapshot{Known: true, Balance: 1, UpdatedUnix: 100})
+
+	cachedCostKeys, cachedBalanceChannels := CostConnectorCachedState()
+	ReconcileCostConnectorSnapshots(CostConnectorReconcileSnapshot{
+		CachedCostKeys: cachedCostKeys,
+		CachedCosts: []model.RoutingCostSnapshot{{
+			ChannelID:  402,
+			ModelName:  "outside-detail-limit",
+			GroupRatio: 1,
+			BaseRatio:  9,
+			Confidence: model.RoutingCostConfidenceFull,
+			SnapshotTS: 100,
+		}},
+		CachedBalanceChannels: cachedBalanceChannels,
+		CachedHealth: []model.RoutingChannelHealthState{{
+			ChannelID:          402,
+			BalanceKnown:       true,
+			Balance:            9,
+			BalanceUpdatedTime: 100,
+		}},
+	})
+
+	cost, costFound := GetCost(costKey)
+	balance, balanceFound := GetBalance(402)
+	require.True(t, costFound)
+	assert.Equal(t, 9.0, cost.Cost)
+	require.True(t, balanceFound)
+	assert.Equal(t, 9.0, balance.Balance)
+}
+
 func TestHotcacheLoadSnapshotsRespectHardLimitsAndKeepNewest(t *testing.T) {
 	ResetForTest()
 	t.Cleanup(ResetForTest)

@@ -46,7 +46,10 @@ func TestSanitizeErrorMessageRedactsGenericCredentialLabels(t *testing.T) {
 		`authorization="Basic abc123"`,
 		`access_token: token-value`,
 		`refresh-token=refresh-value`,
+		`oauth_token=oauth-value`,
 		`api key: key-value`,
+		`credential=credential-value`,
+		`client_secret=client-secret-value`,
 		`password='password-value'`,
 		`passwd: passwd-value`,
 		`pwd=pwd-value`,
@@ -69,6 +72,27 @@ func TestSanitizeErrorMessageUsesLongestKnownSecretFirst(t *testing.T) {
 
 	assert.NotContains(t, got, "secret")
 	assert.NotContains(t, got, "long")
+}
+
+func TestSanitizeErrorMessageDoesNotRecursivelyExpandDuplicateSecrets(t *testing.T) {
+	got := SanitizeErrorMessage("failed with *", "*", "*", "*")
+
+	assert.Equal(t, "failed with ***", got)
+}
+
+func TestSanitizeErrorMessageRejectsOversizedMessageWithoutPartialDisclosure(t *testing.T) {
+	secret := "boundary-secret"
+	message := strings.Repeat(" ", SafeErrorWorkMaxBytes-4) + secret
+
+	got := SanitizeErrorMessage(message, secret)
+
+	assert.Equal(t, "error details omitted", got)
+}
+
+func TestSanitizeErrorMessageRejectsOversizedKnownSecret(t *testing.T) {
+	got := SanitizeErrorMessage("upstream request failed", strings.Repeat("s", SafeErrorWorkMaxBytes+1))
+
+	assert.Equal(t, "error details omitted", got)
 }
 
 func TestSanitizeErrorMessageMasksURLsAndIPs(t *testing.T) {

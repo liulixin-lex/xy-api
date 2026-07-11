@@ -329,20 +329,100 @@ func ClearChannel(channelID int) {
 	delete(cache.balances, channelID)
 }
 
+// ClearCostChannel removes only cost-connector state. Serving reliability,
+// capacity, and credential health remain scoped to their own signals.
+func ClearCostChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	for key := range cache.costs {
+		if key.ChannelID == channelID {
+			delete(cache.costs, key)
+		}
+	}
+	delete(cache.balances, channelID)
+}
+
+// CostConnectorCachedState returns bounded snapshots of the exact cached cost
+// keys and balance channels. The source maps are hard-capped by MaxCosts and
+// MaxHealth respectively.
+func CostConnectorCachedState() ([]CostKey, []int) {
+	cache.RLock()
+	defer cache.RUnlock()
+
+	costKeys := make([]CostKey, 0, len(cache.costs))
+	for key := range cache.costs {
+		costKeys = append(costKeys, key)
+	}
+	balanceChannels := make([]int, 0, len(cache.balances))
+	for channelID := range cache.balances {
+		balanceChannels = append(balanceChannels, channelID)
+	}
+	return costKeys, balanceChannels
+}
+
 func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
+	mergeCostSnapshots(cache.costs, snapshots, nil)
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
+}
+
+type CostConnectorReconcileSnapshot struct {
+	CachedCostKeys        []CostKey
+	RecentCosts           []model.RoutingCostSnapshot
+	CachedCosts           []model.RoutingCostSnapshot
+	CachedBalanceChannels []int
+	RecentHealth          []model.RoutingChannelHealthState
+	CachedHealth          []model.RoutingChannelHealthState
+}
+
+// ReconcileCostConnectorSnapshots adds recent database rows while making the
+// bounded exact lookup authoritative for keys and channels already cached.
+// Serving metrics, breakers, capacity, and authentication health remain
+// untouched.
+func ReconcileCostConnectorSnapshots(snapshot CostConnectorReconcileSnapshot) {
+	cache.Lock()
+	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+
+	cachedCostKeys := make(map[CostKey]struct{}, len(snapshot.CachedCostKeys))
+	for _, key := range snapshot.CachedCostKeys {
+		cachedCostKeys[key] = struct{}{}
+		delete(cache.costs, key)
+	}
+	mergeCostSnapshots(cache.costs, snapshot.RecentCosts, cachedCostKeys)
+	mergeCostSnapshots(cache.costs, snapshot.CachedCosts, nil)
+
+	cachedBalanceChannels := make(map[int]struct{}, len(snapshot.CachedBalanceChannels))
+	for _, channelID := range snapshot.CachedBalanceChannels {
+		cachedBalanceChannels[channelID] = struct{}{}
+		delete(cache.balances, channelID)
+	}
+	mergeBalanceSnapshots(cache.balances, snapshot.RecentHealth, cachedBalanceChannels)
+	mergeBalanceSnapshots(cache.balances, snapshot.CachedHealth, nil)
+
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
+	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
+}
+
+func mergeCostSnapshots(costs map[CostKey]CostSnapshot, snapshots []model.RoutingCostSnapshot, excluded map[CostKey]struct{}) {
 	for _, snapshot := range snapshots {
 		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" {
 			continue
 		}
 		cost := routingSnapshotCost(snapshot)
 		key := CostKey{ChannelID: snapshot.ChannelID, Model: snapshot.ModelName}
-		if existing, ok := cache.costs[key]; ok && existing.UpdatedUnix >= snapshot.SnapshotTS {
+		if _, skip := excluded[key]; skip {
 			continue
 		}
-		cache.costs[key] = CostSnapshot{
+		if existing, ok := costs[key]; ok && existing.UpdatedUnix >= snapshot.SnapshotTS {
+			continue
+		}
+		costs[key] = CostSnapshot{
 			Known:           routingSnapshotCostKnown(snapshot, cost),
 			Cost:            cost,
 			Confidence:      snapshot.Confidence,
@@ -355,7 +435,26 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 			UpdatedUnix:     snapshot.SnapshotTS,
 		}
 	}
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
+}
+
+func mergeBalanceSnapshots(balances map[int]BalanceSnapshot, snapshots []model.RoutingChannelHealthState, excluded map[int]struct{}) {
+	for _, snapshot := range snapshots {
+		if snapshot.ChannelID <= 0 || !snapshot.BalanceKnown {
+			continue
+		}
+		if _, skip := excluded[snapshot.ChannelID]; skip {
+			continue
+		}
+		incoming := BalanceSnapshot{
+			Known:       true,
+			Balance:     snapshot.Balance,
+			UpdatedUnix: snapshot.BalanceUpdatedTime,
+		}
+		if existing, ok := balances[snapshot.ChannelID]; ok && existing.UpdatedUnix >= incoming.UpdatedUnix {
+			continue
+		}
+		balances[snapshot.ChannelID] = incoming
+	}
 }
 
 func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, _ int) {

@@ -52,10 +52,13 @@ var routingCostNetworkProtection = common.SSRFProtection{
 	ApplyIPFilterForDomain: true,
 }
 
-var routingCostRejectedIPv6Prefixes = []netip.Prefix{
+var routingCostRejectedPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("192.88.99.2/32"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
 	netip.MustParsePrefix("2002::/16"),
 	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
 }
 
 var routingCostHTTPClient = newRoutingCostHTTPClient(routingCostHTTPClientOptions{})
@@ -122,7 +125,24 @@ func (t *routingCostRoundTripper) RoundTrip(request *http.Request) (*http.Respon
 	if err := validateRoutingCostURL(request.URL); err != nil {
 		return nil, err
 	}
-	return t.transport.RoundTrip(request)
+	response, err := t.transport.RoundTrip(request)
+	if err != nil || response == nil {
+		return response, err
+	}
+	switch response.StatusCode {
+	case http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		location := response.Header.Get("Location")
+		if location != "" {
+			if _, parseErr := request.URL.Parse(location); parseErr != nil {
+				response.Header.Del("Location")
+			}
+		}
+	}
+	return response, nil
 }
 
 func (t *routingCostRoundTripper) CloseIdleConnections() {
@@ -162,6 +182,7 @@ func (d *routingCostDialer) DialContext(ctx context.Context, network, address st
 		if !address.IsValid() || address.Zone() != "" {
 			return nil, errors.New("routing cost DNS resolution returned an invalid address")
 		}
+		address = address.Unmap()
 		if err = validateRoutingCostIP(host, address); err != nil {
 			return nil, err
 		}
@@ -223,11 +244,9 @@ func validateRoutingCostIP(host string, ip netip.Addr) error {
 	if !ip.IsValid() || ip.Is4In6() {
 		return errors.New("routing cost target rejected")
 	}
-	if ip.Is6() {
-		for _, prefix := range routingCostRejectedIPv6Prefixes {
-			if prefix.Contains(ip) {
-				return errors.New("routing cost target rejected")
-			}
+	for _, prefix := range routingCostRejectedPrefixes {
+		if prefix.Contains(ip) {
+			return errors.New("routing cost target rejected")
 		}
 	}
 	if err := routingCostNetworkProtection.ValidateResolvedIP(host, net.IP(ip.AsSlice())); err != nil {
@@ -277,6 +296,9 @@ func checkRoutingCostRedirect(request *http.Request, via []*http.Request) error 
 
 func rejectRoutingCostRedirect(request *http.Request) error {
 	if request != nil {
+		if request.Response != nil {
+			request.Response.Header.Del("Location")
+		}
 		request.URL = &url.URL{Scheme: "https", Host: "redacted.invalid"}
 		request.Host = ""
 		request.RequestURI = ""
