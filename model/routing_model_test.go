@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -268,6 +269,78 @@ func TestRoutingStateUpsertsPropagateEligibilityQueryErrors(t *testing.T) {
 			assert.Zero(t, persistedCount)
 		})
 	}
+}
+
+func TestRoutingModelContextCancellationStopsChannelEligibilityQuery(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}))
+	require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
+
+	queryStarted := make(chan struct{}, 1)
+	const callbackName = "test:block_routing_channel_eligibility_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "channels" {
+			return
+		}
+		queryStarted <- struct{}{}
+		<-tx.Statement.Context.Done()
+		tx.AddError(tx.Statement.Context.Err())
+	}))
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := ResolveLegacyRoutingStateEligibilityContext(ctx, 1, RoutingMetricSingleKeyIndex)
+		result <- err
+	}()
+	<-queryStarted
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+}
+
+func TestRoutingModelContextCanceledOperationsDoNotMutateState(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
+	require.NoError(t, DB.Create(&RoutingChannelMetric{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "retained",
+		Group: "default", BucketTs: 100, RequestCount: 1,
+	}).Error)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ResolveLegacyRoutingStateEligibilityContext(ctx, 1, RoutingMetricSingleKeyIndex)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, UpsertRoutingChannelMetricContext(ctx, &RoutingChannelMetric{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "canceled",
+		Group: "default", BucketTs: 100, RequestCount: 1,
+	}), context.Canceled)
+	require.ErrorIs(t, UpsertRoutingBreakerStateContext(ctx, &RoutingBreakerState{
+		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "canceled",
+		Group: "default", State: RoutingBreakerStateOpen, UpdatedTime: 100,
+	}), context.Canceled)
+	_, err = DeleteRoutingMetricsBeforeContext(ctx, 101)
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = GetRoutingBreakerStatesForHydrationPageContext(ctx, 5000, 0, 0, 0)
+	require.ErrorIs(t, err, context.Canceled)
+
+	var metrics []RoutingChannelMetric
+	require.NoError(t, DB.Order("model_name asc").Find(&metrics).Error)
+	require.Len(t, metrics, 1)
+	assert.Equal(t, "retained", metrics[0].ModelName)
+	var breakerCount int64
+	require.NoError(t, DB.Model(&RoutingBreakerState{}).Count(&breakerCount).Error)
+	assert.Zero(t, breakerCount)
 }
 
 func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {

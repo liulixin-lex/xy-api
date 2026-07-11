@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -211,17 +212,25 @@ func (RoutingChannelMetric) TableName() string {
 }
 
 func UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
+	return UpsertRoutingChannelMetricContext(context.Background(), metric)
+}
+
+func UpsertRoutingChannelMetricContext(ctx context.Context, metric *RoutingChannelMetric) error {
 	if metric == nil || metric.RequestCount == 0 {
 		return nil
 	}
-	eligibility, err := ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+	eligibility, err := ResolveLegacyRoutingStateEligibilityContext(ctx, metric.ChannelID, metric.APIKeyIndex)
 	if err != nil {
 		return err
 	}
-	return eligibility.UpsertRoutingChannelMetric(metric)
+	return eligibility.UpsertRoutingChannelMetricContext(ctx, metric)
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
+	return eligibility.UpsertRoutingChannelMetricContext(context.Background(), metric)
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricContext(ctx context.Context, metric *RoutingChannelMetric) error {
 	if metric == nil || metric.RequestCount == 0 || !eligibility.Supported() {
 		return nil
 	}
@@ -232,7 +241,7 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metr
 			metric.ChannelID, metric.APIKeyIndex,
 		)
 	}
-	return DB.Clauses(clause.OnConflict{
+	return DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "channel_id"},
 			{Name: "api_key_index"},
@@ -262,10 +271,14 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metr
 }
 
 func DeleteRoutingMetricsBefore(cutoffTs int64) (int64, error) {
+	return DeleteRoutingMetricsBeforeContext(context.Background(), cutoffTs)
+}
+
+func DeleteRoutingMetricsBeforeContext(ctx context.Context, cutoffTs int64) (int64, error) {
 	if cutoffTs <= 0 {
 		return 0, nil
 	}
-	result := DB.Where("bucket_ts < ?", cutoffTs).Delete(&RoutingChannelMetric{})
+	result := DB.WithContext(ctx).Where("bucket_ts < ?", cutoffTs).Delete(&RoutingChannelMetric{})
 	return result.RowsAffected, result.Error
 }
 
@@ -307,17 +320,25 @@ func (state *RoutingBreakerState) BeforeUpdate(_ *gorm.DB) error {
 }
 
 func UpsertRoutingBreakerState(state *RoutingBreakerState) error {
+	return UpsertRoutingBreakerStateContext(context.Background(), state)
+}
+
+func UpsertRoutingBreakerStateContext(ctx context.Context, state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" {
 		return nil
 	}
-	eligibility, err := ResolveLegacyRoutingStateEligibility(state.ChannelID, state.APIKeyIndex)
+	eligibility, err := ResolveLegacyRoutingStateEligibilityContext(ctx, state.ChannelID, state.APIKeyIndex)
 	if err != nil {
 		return err
 	}
-	return eligibility.UpsertRoutingBreakerState(state)
+	return eligibility.UpsertRoutingBreakerStateContext(ctx, state)
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state *RoutingBreakerState) error {
+	return eligibility.UpsertRoutingBreakerStateContext(context.Background(), state)
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateContext(ctx context.Context, state *RoutingBreakerState) error {
 	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" || !eligibility.Supported() {
 		return nil
 	}
@@ -344,8 +365,9 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state
 		"last_probe_at":        state.LastProbeAt,
 		"updated_time":         state.UpdatedTime,
 	}
+	db := DB.WithContext(ctx)
 	breakerKeyWhere := func() *gorm.DB {
-		return DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
+		return db.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
 			state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group)
 	}
 	versionWhere := "(semantic_version IS NULL OR semantic_version <> ? OR updated_time <= ?)"
@@ -356,7 +378,7 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state
 	if result.RowsAffected > 0 {
 		return nil
 	}
-	createErr := DB.Create(state).Error
+	createErr := db.Create(state).Error
 	if createErr == nil {
 		return nil
 	}
@@ -369,11 +391,15 @@ func GetRoutingBreakerStatesForHydration(limit int) ([]RoutingBreakerState, erro
 }
 
 func GetRoutingBreakerStatesForHydrationPage(limit int, cutoffUpdatedTime int64, beforeUpdatedTime int64, beforeID int) ([]RoutingBreakerState, error) {
+	return GetRoutingBreakerStatesForHydrationPageContext(context.Background(), limit, cutoffUpdatedTime, beforeUpdatedTime, beforeID)
+}
+
+func GetRoutingBreakerStatesForHydrationPageContext(ctx context.Context, limit int, cutoffUpdatedTime int64, beforeUpdatedTime int64, beforeID int) ([]RoutingBreakerState, error) {
 	if limit <= 0 {
 		limit = 5000
 	}
 	var states []RoutingBreakerState
-	query := DB.Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex)
+	query := DB.WithContext(ctx).Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex)
 	if cutoffUpdatedTime > 0 {
 		query = query.Where("updated_time >= ?", cutoffUpdatedTime)
 	}

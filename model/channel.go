@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -227,12 +228,24 @@ func (eligibility LegacyRoutingStateEligibility) Supported() bool {
 }
 
 func ResolveLegacyRoutingStateEligibility(channelID int, apiKeyIndex int) (LegacyRoutingStateEligibility, error) {
+	return ResolveLegacyRoutingStateEligibilityContext(context.Background(), channelID, apiKeyIndex)
+}
+
+func ResolveLegacyRoutingStateEligibilityContext(ctx context.Context, channelID int, apiKeyIndex int) (LegacyRoutingStateEligibility, error) {
 	unsupported := LegacyRoutingStateEligibility{}
 	if channelID <= 0 || apiKeyIndex != RoutingMetricSingleKeyIndex {
 		return unsupported, nil
 	}
 	memoryCacheEnabled := common.MemoryCacheEnabled
-	info, err := CacheGetChannelInfo(channelID)
+	var info *ChannelInfo
+	var err error
+	if memoryCacheEnabled {
+		info, err = CacheGetChannelInfo(channelID)
+	} else {
+		var channel Channel
+		err = DB.WithContext(ctx).Select("channel_info").First(&channel, "id = ?", channelID).Error
+		info = &channel.ChannelInfo
+	}
 	if err != nil {
 		if memoryCacheEnabled || errors.Is(err, gorm.ErrRecordNotFound) {
 			return unsupported, nil

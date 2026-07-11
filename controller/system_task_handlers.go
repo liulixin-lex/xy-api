@@ -29,17 +29,46 @@ var smartRoutingBreakerConfigMu sync.Mutex
 var smartRoutingBreakerConfigLast routingBreakerConfigIdentity
 
 type SmartRoutingRuntime struct {
-	cancel context.CancelFunc
-	wait   sync.WaitGroup
-	close  sync.Once
+	cancel       context.CancelFunc
+	wait         sync.WaitGroup
+	done         chan struct{}
+	close        sync.Once
+	finalize     sync.Once
+	finalErr     error
+	deps         smartRoutingRuntimeDeps
+	refreshStats smartRoutingWorkerStats
+	flushStats   smartRoutingWorkerStats
+	finalRuns    atomic.Int64
+	finalErrors  atomic.Int64
 }
 
 type smartRoutingRuntimeDeps struct {
 	getSetting  func() smart_routing_setting.SmartRoutingSetting
-	refresh     func(smart_routing_setting.SmartRoutingSetting)
-	flush       func(smart_routing_setting.SmartRoutingSetting)
+	refresh     func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	flush       func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	waitRefresh func(context.Context, time.Duration) bool
 	waitFlush   func(context.Context, time.Duration) bool
+	jitter      common.JitterFunc
+}
+
+type SmartRoutingRuntimeStats struct {
+	RefreshRuns              int64
+	RefreshErrors            int64
+	RefreshConsecutiveErrors int64
+	RefreshRecoveries        int64
+	FlushRuns                int64
+	FlushErrors              int64
+	FlushConsecutiveErrors   int64
+	FlushRecoveries          int64
+	FinalFlushRuns           int64
+	FinalFlushErrors         int64
+}
+
+type smartRoutingWorkerStats struct {
+	runs              atomic.Int64
+	errors            atomic.Int64
+	consecutiveErrors atomic.Int64
+	recoveries        atomic.Int64
 }
 
 type routingBreakerConfigIdentity struct {
@@ -88,64 +117,67 @@ func StartSmartRoutingRuntime(parent context.Context) *SmartRoutingRuntime {
 func defaultSmartRoutingRuntimeDeps() smartRoutingRuntimeDeps {
 	return smartRoutingRuntimeDeps{
 		getSetting: smart_routing_setting.GetSetting,
-		refresh: func(setting smart_routing_setting.SmartRoutingSetting) {
+		refresh: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
+			var err error
 			if setting.Enabled {
 				syncRoutingBreakerConfigFromSetting(setting)
-				_, _ = refreshRoutingHotcacheFromDB(setting)
+				_, err = refreshRoutingHotcacheFromDB(ctx, setting)
 			}
 			routinghotcache.Prune(common.GetTimestamp(), int64(setting.SnapshotStaleSec))
+			return err
 		},
-		flush: func(setting smart_routing_setting.SmartRoutingSetting) {
-			if !setting.Enabled {
-				return
-			}
+		flush: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
 			syncRoutingBreakerConfigFromSetting(setting)
-			_, _ = flushRoutingRuntimeState(setting)
+			_, err := flushRoutingRuntimeState(ctx, setting)
+			return err
 		},
 		waitRefresh: waitRoutingRuntime,
 		waitFlush:   waitRoutingRuntime,
+		jitter:      common.FullJitter,
 	}
 }
 
 func newSmartRoutingRuntime(parent context.Context, deps smartRoutingRuntimeDeps) *SmartRoutingRuntime {
+	if deps.waitRefresh == nil {
+		deps.waitRefresh = waitRoutingRuntime
+	}
+	if deps.waitFlush == nil {
+		deps.waitFlush = waitRoutingRuntime
+	}
 	ctx, cancel := context.WithCancel(parent)
-	runtime := &SmartRoutingRuntime{cancel: cancel}
+	runtime := &SmartRoutingRuntime{
+		cancel: cancel,
+		done:   make(chan struct{}),
+		deps:   deps,
+	}
 	runtime.wait.Add(2)
 
 	go func() {
 		defer runtime.wait.Done()
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			setting := deps.getSetting()
-			deps.refresh(setting)
-			interval := time.Duration(setting.HotcacheRefreshSec) * time.Second
+		runtime.runWorker(ctx, deps.refresh, func(smartSetting smart_routing_setting.SmartRoutingSetting) time.Duration {
+			interval := time.Duration(smartSetting.HotcacheRefreshSec) * time.Second
 			if interval <= 0 {
-				interval = 3 * time.Second
+				return 3 * time.Second
 			}
-			if !deps.waitRefresh(ctx, interval) || ctx.Err() != nil {
-				return
-			}
-		}
+			return interval
+		}, deps.waitRefresh, nil, &runtime.refreshStats)
 	}()
 
 	go func() {
 		defer runtime.wait.Done()
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			setting := deps.getSetting()
-			deps.flush(setting)
-			interval := time.Duration(setting.FlushIntervalMin) * time.Minute
+		runtime.runWorker(ctx, deps.flush, func(smartSetting smart_routing_setting.SmartRoutingSetting) time.Duration {
+			interval := time.Duration(smartSetting.FlushIntervalMin) * time.Minute
 			if interval <= 0 {
-				interval = time.Minute
+				return time.Minute
 			}
-			if !deps.waitFlush(ctx, interval) || ctx.Err() != nil {
-				return
-			}
-		}
+			return interval
+		}, deps.waitFlush, func(smartSetting smart_routing_setting.SmartRoutingSetting) bool {
+			return smartSetting.Enabled
+		}, &runtime.flushStats)
+	}()
+	go func() {
+		runtime.wait.Wait()
+		close(runtime.done)
 	}()
 
 	return runtime
@@ -153,7 +185,71 @@ func newSmartRoutingRuntime(parent context.Context, deps smartRoutingRuntimeDeps
 
 func (runtime *SmartRoutingRuntime) Close() {
 	runtime.close.Do(runtime.cancel)
-	runtime.wait.Wait()
+}
+
+func (runtime *SmartRoutingRuntime) Wait(ctx context.Context) error {
+	select {
+	case <-runtime.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	runtime.finalize.Do(func() {
+		runtime.finalRuns.Add(1)
+		runtime.finalErr = runtime.deps.flush(ctx, runtime.deps.getSetting())
+		if runtime.finalErr != nil {
+			runtime.finalErrors.Add(1)
+		}
+	})
+	return runtime.finalErr
+}
+
+func (runtime *SmartRoutingRuntime) Stats() SmartRoutingRuntimeStats {
+	return SmartRoutingRuntimeStats{
+		RefreshRuns:              runtime.refreshStats.runs.Load(),
+		RefreshErrors:            runtime.refreshStats.errors.Load(),
+		RefreshConsecutiveErrors: runtime.refreshStats.consecutiveErrors.Load(),
+		RefreshRecoveries:        runtime.refreshStats.recoveries.Load(),
+		FlushRuns:                runtime.flushStats.runs.Load(),
+		FlushErrors:              runtime.flushStats.errors.Load(),
+		FlushConsecutiveErrors:   runtime.flushStats.consecutiveErrors.Load(),
+		FlushRecoveries:          runtime.flushStats.recoveries.Load(),
+		FinalFlushRuns:           runtime.finalRuns.Load(),
+		FinalFlushErrors:         runtime.finalErrors.Load(),
+	}
+}
+
+func (runtime *SmartRoutingRuntime) runWorker(
+	ctx context.Context,
+	run func(context.Context, smart_routing_setting.SmartRoutingSetting) error,
+	interval func(smart_routing_setting.SmartRoutingSetting) time.Duration,
+	wait func(context.Context, time.Duration) bool,
+	enabled func(smart_routing_setting.SmartRoutingSetting) bool,
+	stats *smartRoutingWorkerStats,
+) {
+	for ctx.Err() == nil {
+		setting := runtime.deps.getSetting()
+		stats.runs.Add(1)
+		var err error
+		if enabled == nil || enabled(setting) {
+			err = run(ctx, setting)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		delay := interval(setting)
+		if err != nil {
+			stats.errors.Add(1)
+			failures := stats.consecutiveErrors.Add(1)
+			delay = common.CappedExponentialBackoff(int(failures), time.Second, time.Minute, runtime.deps.jitter)
+		} else if stats.consecutiveErrors.Swap(0) > 0 {
+			stats.recoveries.Add(1)
+		}
+		if !wait(ctx, delay) {
+			return
+		}
+	}
 }
 
 func waitRoutingRuntime(ctx context.Context, duration time.Duration) bool {
@@ -351,13 +447,16 @@ type routingPricingItem struct {
 	BillingExpr     string   `json:"billing_expr"`
 }
 
-func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
+func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
 	smartRoutingRuntimeStateMu.Lock()
 	defer smartRoutingRuntimeStateMu.Unlock()
 
 	summary := map[string]any{
 		"metrics":  0,
 		"breakers": 0,
+	}
+	if err := ctx.Err(); err != nil {
+		return summary, err
 	}
 	drainedMetrics := routingmetrics.DrainSnapshots()
 	eligibilityByChannel := make(map[int]model.LegacyRoutingStateEligibility)
@@ -369,7 +468,7 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 		eligibility, checked := eligibilityByChannel[metric.ChannelID]
 		if !checked {
 			var err error
-			eligibility, err = model.ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+			eligibility, err = model.ResolveLegacyRoutingStateEligibilityContext(ctx, metric.ChannelID, metric.APIKeyIndex)
 			if err != nil {
 				retryMetrics := make([]model.RoutingChannelMetric, 0, len(validMetrics)+len(drainedMetrics)-metricIndex)
 				retryMetrics = append(retryMetrics, validMetrics...)
@@ -394,9 +493,12 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 	for i := range validMetrics {
 		metric := validMetrics[i]
 		eligibility := eligibilityByChannel[metric.ChannelID]
-		if err := eligibility.UpsertRoutingChannelMetric(&metric); err != nil {
+		if err := eligibility.UpsertRoutingChannelMetricContext(ctx, &metric); err != nil {
 			routinghotcache.ApplyMetricDeltas(validMetrics[:i], setting.MetricBucketSec)
 			routingmetrics.RequeueSnapshots(validMetrics[i:])
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return summary, ctxErr
+			}
 			return summary, err
 		}
 	}
@@ -412,7 +514,7 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 		eligibility, checked := eligibilityByChannel[snapshot.Key.ChannelID]
 		if !checked {
 			var err error
-			eligibility, err = model.ResolveLegacyRoutingStateEligibility(snapshot.Key.ChannelID, snapshot.Key.APIKeyIndex)
+			eligibility, err = model.ResolveLegacyRoutingStateEligibilityContext(ctx, snapshot.Key.ChannelID, snapshot.Key.APIKeyIndex)
 			if err != nil {
 				retryBreakers := make([]routingbreaker.Snapshot, 0, len(validBreakers)+len(dirtyBreakers)-breakerIndex)
 				retryBreakers = append(retryBreakers, validBreakers...)
@@ -437,8 +539,11 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 	for i, snapshot := range validBreakers {
 		state := routingBreakerSnapshotToModel(snapshot)
 		eligibility := eligibilityByChannel[snapshot.Key.ChannelID]
-		if err := eligibility.UpsertRoutingBreakerState(&state); err != nil {
+		if err := eligibility.UpsertRoutingBreakerStateContext(ctx, &state); err != nil {
 			routingbreaker.RequeueDirtySnapshots(validBreakers[i:])
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return summary, ctxErr
+			}
 			return summary, err
 		}
 	}
@@ -455,7 +560,7 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 		if retentionDays <= now/secondsPerDay {
 			cutoffTs = now - retentionDays*secondsPerDay
 		}
-		deleted, err := model.DeleteRoutingMetricsBefore(cutoffTs)
+		deleted, err := model.DeleteRoutingMetricsBeforeContext(ctx, cutoffTs)
 		if err != nil {
 			return summary, err
 		}
@@ -465,7 +570,7 @@ func flushRoutingRuntimeState(setting smart_routing_setting.SmartRoutingSetting)
 	return summary, nil
 }
 
-func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
+func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) (map[string]any, error) {
 	smartRoutingRuntimeStateMu.Lock()
 	defer smartRoutingRuntimeStateMu.Unlock()
 
@@ -475,6 +580,9 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 		"breakers": 0,
 		"health":   0,
 	}
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
 	now := common.GetTimestamp()
 	staleSeconds := int64(setting.SnapshotStaleSec)
 	if staleSeconds <= 0 {
@@ -482,7 +590,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	}
 
 	var costs []model.RoutingCostSnapshot
-	if err := model.DB.Where("snapshot_ts >= ?", now-staleSeconds).Order("snapshot_ts desc").Limit(5000).Find(&costs).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("snapshot_ts >= ?", now-staleSeconds).Order("snapshot_ts desc").Limit(5000).Find(&costs).Error; err != nil {
 		return summary, err
 	}
 	routinghotcache.LoadCostSnapshots(costs)
@@ -498,7 +606,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	lastMetricBucketTs := int64(0)
 	lastMetricID := 0
 	for len(validMetrics) < routingSnapshotLimit {
-		query := model.DB.Where("bucket_ts >= ? AND api_key_index = ?", now-metricWindow, model.RoutingMetricSingleKeyIndex)
+		query := model.DB.WithContext(ctx).Where("bucket_ts >= ? AND api_key_index = ?", now-metricWindow, model.RoutingMetricSingleKeyIndex)
 		if lastMetricID > 0 {
 			query = query.Where("(bucket_ts < ? OR (bucket_ts = ? AND id < ?))", lastMetricBucketTs, lastMetricBucketTs, lastMetricID)
 		}
@@ -512,7 +620,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 		for _, metric := range page {
 			eligibility, checked := eligibilityByChannel[metric.ChannelID]
 			if !checked {
-				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibility(metric.ChannelID, metric.APIKeyIndex)
+				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibilityContext(ctx, metric.ChannelID, metric.APIKeyIndex)
 				if resolveErr != nil {
 					return summary, resolveErr
 				}
@@ -541,7 +649,8 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	lastBreakerUpdatedTime := int64(0)
 	lastBreakerID := 0
 	for len(validBreakerStates) < routingSnapshotLimit {
-		page, err := model.GetRoutingBreakerStatesForHydrationPage(
+		page, err := model.GetRoutingBreakerStatesForHydrationPageContext(
+			ctx,
 			routingSnapshotLimit,
 			breakerCutoffUpdatedTime,
 			lastBreakerUpdatedTime,
@@ -556,7 +665,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 		for _, state := range page {
 			eligibility, checked := eligibilityByChannel[state.ChannelID]
 			if !checked {
-				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibility(state.ChannelID, state.APIKeyIndex)
+				resolved, resolveErr := model.ResolveLegacyRoutingStateEligibilityContext(ctx, state.ChannelID, state.APIKeyIndex)
 				if resolveErr != nil {
 					return summary, resolveErr
 				}
@@ -582,7 +691,7 @@ func refreshRoutingHotcacheFromDB(setting smart_routing_setting.SmartRoutingSett
 	summary["breakers"] = len(retained)
 
 	var healthStates []model.RoutingChannelHealthState
-	if err := model.DB.Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
 		return summary, err
 	}
 	routinghotcache.LoadHealthSnapshots(healthStates, now)
@@ -604,14 +713,14 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 		"skipped_backoff": 0,
 	}
 
-	flushSummary, err := flushRoutingRuntimeState(setting)
+	flushSummary, err := flushRoutingRuntimeState(ctx, setting)
 	if err != nil {
 		return summary, err
 	}
 	summary["metrics"] = flushSummary["metrics"]
 	summary["breakers"] = flushSummary["breakers"]
 
-	refreshSummary, err := refreshRoutingHotcacheFromDB(setting)
+	refreshSummary, err := refreshRoutingHotcacheFromDB(ctx, setting)
 	if err != nil {
 		return summary, err
 	}

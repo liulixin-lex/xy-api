@@ -238,6 +238,14 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(fmt.Sprintf("server forced to shutdown: %v", err))
 	}
+
+	// Finalize in-memory runtimes after HTTP handlers drain and before the
+	// deferred database close. Keep this order when adding more runtimes.
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer finalizeCancel()
+	if err := routingRuntime.Wait(finalizeCtx); err != nil {
+		common.SysError(fmt.Sprintf("failed to finalize smart routing runtime: %v", err))
+	}
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
 		model.SaveQuotaDataCache()

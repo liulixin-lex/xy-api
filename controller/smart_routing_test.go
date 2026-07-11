@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -489,7 +490,7 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	assert.Zero(t, statsAfterClear.Entries)
 	assert.Zero(t, statsAfterClear.Dirty)
 	assert.Equal(t, statsBeforeClear.Evictions, statsAfterClear.Evictions)
-	_, err := flushRoutingRuntimeState(smart_routing_setting.GetSetting())
+	_, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	for _, table := range []any{&model.RoutingBreakerState{}, &model.RoutingChannelMetric{}} {
 		var count int64
@@ -556,7 +557,7 @@ func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 		Group:       state.Group,
 	})
 	assert.False(t, ok)
-	_, err := flushRoutingRuntimeState(smart_routing_setting.GetSetting())
+	_, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	require.NoError(t, breakerQuery.Count(&count).Error)
 	assert.Zero(t, count)

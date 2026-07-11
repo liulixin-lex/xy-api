@@ -34,13 +34,15 @@ func TestSmartRoutingRuntimeRunsAndStopsWithoutLeakingWorkers(t *testing.T) {
 				FlushIntervalMin:   1,
 			}
 		},
-		refresh: func(smart_routing_setting.SmartRoutingSetting) {
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
 			refreshCount.Add(1)
 			refreshRan <- struct{}{}
+			return nil
 		},
-		flush: func(smart_routing_setting.SmartRoutingSetting) {
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
 			flushCount.Add(1)
 			flushRan <- struct{}{}
+			return nil
 		},
 		waitRefresh: func(ctx context.Context, _ time.Duration) bool {
 			<-ctx.Done()
@@ -53,23 +55,16 @@ func TestSmartRoutingRuntimeRunsAndStopsWithoutLeakingWorkers(t *testing.T) {
 	}
 
 	runtime := newSmartRoutingRuntime(context.Background(), deps)
-	t.Cleanup(runtime.Close)
-	select {
-	case <-refreshRan:
-	case <-time.After(time.Second):
-		require.FailNow(t, "smart routing refresh worker did not run")
-	}
-	select {
-	case <-flushRan:
-	case <-time.After(time.Second):
-		require.FailNow(t, "smart routing flush worker did not run")
-	}
+	<-refreshRan
+	<-flushRan
 
 	runtime.Close()
 	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
+	require.NoError(t, runtime.Wait(context.Background()))
 
 	assert.Equal(t, int64(1), refreshCount.Load())
-	assert.Equal(t, int64(1), flushCount.Load())
+	assert.Equal(t, int64(2), flushCount.Load())
 }
 
 func TestSmartRoutingRuntimeDoesNotRunWithCanceledParent(t *testing.T) {
@@ -85,20 +80,286 @@ func TestSmartRoutingRuntimeDoesNotRunWithCanceledParent(t *testing.T) {
 				FlushIntervalMin:   1,
 			}
 		},
-		refresh: func(smart_routing_setting.SmartRoutingSetting) {
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
 			refreshCount.Add(1)
+			return nil
 		},
-		flush: func(smart_routing_setting.SmartRoutingSetting) {
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
 			flushCount.Add(1)
+			return nil
 		},
 		waitRefresh: waitRoutingRuntime,
 		waitFlush:   waitRoutingRuntime,
 	})
-	t.Cleanup(runtime.Close)
 	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
 
 	assert.Zero(t, refreshCount.Load())
-	assert.Zero(t, flushCount.Load())
+	assert.Equal(t, int64(1), flushCount.Load())
+}
+
+func TestSmartRoutingRuntimeContextCancellationStopsBlockingCallbacks(t *testing.T) {
+	refreshStarted := make(chan struct{}, 1)
+	flushStarted := make(chan struct{}, 1)
+	refreshStopped := make(chan struct{}, 1)
+	flushStopped := make(chan struct{}, 1)
+	var flushCalls atomic.Int64
+
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            true,
+				HotcacheRefreshSec: 1,
+				FlushIntervalMin:   1,
+			}
+		},
+		refresh: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			refreshStarted <- struct{}{}
+			<-ctx.Done()
+			refreshStopped <- struct{}{}
+			return ctx.Err()
+		},
+		flush: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			if flushCalls.Add(1) > 1 {
+				return nil
+			}
+			flushStarted <- struct{}{}
+			<-ctx.Done()
+			flushStopped <- struct{}{}
+			return ctx.Err()
+		},
+		waitRefresh: waitRoutingRuntime,
+		waitFlush:   waitRoutingRuntime,
+	})
+	<-refreshStarted
+	<-flushStarted
+
+	canceledWait, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	require.ErrorIs(t, runtime.Wait(canceledWait), context.Canceled)
+
+	runtime.Close()
+	runtime.Close()
+	<-refreshStopped
+	<-flushStopped
+	require.NoError(t, runtime.Wait(context.Background()))
+
+	stats := runtime.Stats()
+	assert.Zero(t, stats.RefreshErrors)
+	assert.Zero(t, stats.FlushErrors)
+	assert.Zero(t, stats.RefreshConsecutiveErrors)
+	assert.Zero(t, stats.FlushConsecutiveErrors)
+	assert.Equal(t, int64(1), stats.FinalFlushRuns)
+}
+
+func TestSmartRoutingRuntimeBackoffAndRecoveryAreIndependent(t *testing.T) {
+	refreshWaits := make(chan time.Duration)
+	flushWaits := make(chan time.Duration)
+	refreshAdvance := make(chan struct{})
+	flushAdvance := make(chan struct{})
+	var refreshAttempts atomic.Int64
+	var flushAttempts atomic.Int64
+
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            true,
+				HotcacheRefreshSec: 17,
+				FlushIntervalMin:   2,
+			}
+		},
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			if refreshAttempts.Add(1) <= 2 {
+				return errors.New("refresh failed")
+			}
+			return nil
+		},
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			if flushAttempts.Add(1) <= 2 {
+				return errors.New("flush failed")
+			}
+			return nil
+		},
+		waitRefresh: func(ctx context.Context, duration time.Duration) bool {
+			refreshWaits <- duration
+			select {
+			case <-refreshAdvance:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		},
+		waitFlush: func(ctx context.Context, duration time.Duration) bool {
+			flushWaits <- duration
+			select {
+			case <-flushAdvance:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		},
+		jitter: func(max time.Duration) time.Duration { return max },
+	})
+
+	assert.Equal(t, time.Second, <-refreshWaits)
+	assert.Equal(t, time.Second, <-flushWaits)
+	assert.Equal(t, SmartRoutingRuntimeStats{
+		RefreshRuns:              1,
+		RefreshErrors:            1,
+		RefreshConsecutiveErrors: 1,
+		FlushRuns:                1,
+		FlushErrors:              1,
+		FlushConsecutiveErrors:   1,
+	}, runtime.Stats())
+
+	refreshAdvance <- struct{}{}
+	flushAdvance <- struct{}{}
+	assert.Equal(t, 2*time.Second, <-refreshWaits)
+	assert.Equal(t, 2*time.Second, <-flushWaits)
+	assert.Equal(t, int64(2), runtime.Stats().RefreshConsecutiveErrors)
+	assert.Equal(t, int64(2), runtime.Stats().FlushConsecutiveErrors)
+
+	refreshAdvance <- struct{}{}
+	flushAdvance <- struct{}{}
+	assert.Equal(t, 17*time.Second, <-refreshWaits)
+	assert.Equal(t, 2*time.Minute, <-flushWaits)
+	assert.Equal(t, SmartRoutingRuntimeStats{
+		RefreshRuns:       3,
+		RefreshErrors:     2,
+		RefreshRecoveries: 1,
+		FlushRuns:         3,
+		FlushErrors:       2,
+		FlushRecoveries:   1,
+	}, runtime.Stats())
+
+	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
+}
+
+func TestSmartRoutingRuntimeFinalFlushReturnsErrorOnlyOnce(t *testing.T) {
+	refreshReady := make(chan struct{}, 1)
+	flushReady := make(chan struct{}, 1)
+	finalErr := errors.New("final flush failed")
+	var flushCalls atomic.Int64
+
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            false,
+				HotcacheRefreshSec: 1,
+				FlushIntervalMin:   1,
+			}
+		},
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil },
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			flushCalls.Add(1)
+			return finalErr
+		},
+		waitRefresh: func(ctx context.Context, _ time.Duration) bool {
+			refreshReady <- struct{}{}
+			<-ctx.Done()
+			return false
+		},
+		waitFlush: func(ctx context.Context, _ time.Duration) bool {
+			flushReady <- struct{}{}
+			<-ctx.Done()
+			return false
+		},
+	})
+	<-refreshReady
+	<-flushReady
+
+	runtime.Close()
+	require.ErrorIs(t, runtime.Wait(context.Background()), finalErr)
+	require.ErrorIs(t, runtime.Wait(context.Background()), finalErr)
+	assert.Equal(t, int64(1), flushCalls.Load())
+	assert.Equal(t, SmartRoutingRuntimeStats{
+		RefreshRuns:      1,
+		FlushRuns:        1,
+		FinalFlushRuns:   1,
+		FinalFlushErrors: 1,
+	}, runtime.Stats())
+}
+
+func TestSmartRoutingRuntimeFinalFlushPersistsDirtyStateWhenDisabled(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+	})
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	const channelID = 1201
+	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "final-flush", Key: "single-key"}).Error)
+	setting := smart_routing_setting.SmartRoutingSetting{
+		Enabled:            false,
+		HotcacheRefreshSec: 1,
+		MetricBucketSec:    60,
+		FlushIntervalMin:   1,
+	}
+	refreshReady := make(chan struct{}, 1)
+	flushReady := make(chan struct{}, 1)
+	deps := defaultSmartRoutingRuntimeDeps()
+	deps.getSetting = func() smart_routing_setting.SmartRoutingSetting { return setting }
+	baseFlush := deps.flush
+	var flushCalls atomic.Int64
+	deps.flush = func(ctx context.Context, current smart_routing_setting.SmartRoutingSetting) error {
+		flushCalls.Add(1)
+		return baseFlush(ctx, current)
+	}
+	deps.waitRefresh = func(ctx context.Context, _ time.Duration) bool {
+		refreshReady <- struct{}{}
+		<-ctx.Done()
+		return false
+	}
+	deps.waitFlush = func(ctx context.Context, _ time.Duration) bool {
+		flushReady <- struct{}{}
+		<-ctx.Done()
+		return false
+	}
+
+	runtime := newSmartRoutingRuntime(context.Background(), deps)
+	<-refreshReady
+	<-flushReady
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+		ChannelID:    channelID,
+		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
+		ModelName:    "final-metric",
+		Group:        "default",
+		BucketTs:     60,
+		RequestCount: 1,
+	}})
+	routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+		ChannelID:   channelID,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "final-breaker",
+		Group:       "default",
+	}, routingbreaker.FailureProvider5xx)
+
+	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
+	require.NoError(t, runtime.Wait(context.Background()))
+	assert.Equal(t, int64(1), flushCalls.Load())
+	assert.Empty(t, routingmetrics.Snapshots())
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+
+	var metric model.RoutingChannelMetric
+	require.NoError(t, db.Where("channel_id = ? AND model_name = ?", channelID, "final-metric").First(&metric).Error)
+	assert.Equal(t, int64(1), metric.RequestCount)
+	var breaker model.RoutingBreakerState
+	require.NoError(t, db.Where("channel_id = ? AND model_name = ?", channelID, "final-breaker").First(&breaker).Error)
+	assert.Equal(t, model.RoutingBreakerStateOpen, breaker.State)
 }
 
 func TestRoutingBreakerModelsToSnapshotsRejectsLegacySemanticVersion(t *testing.T) {
@@ -132,7 +393,7 @@ func TestRefreshRoutingHotcacheHydratesOnlyCurrentBreakerSemanticVersion(t *test
 		{ChannelID: 11, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: common.GetTimestamp()},
 	}).Error)
 
-	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.GetSetting())
+	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.GetSetting())
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["breakers"])
 	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
@@ -183,7 +444,7 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 	require.NoError(t, db.Create(&metrics).Error)
 	require.NoError(t, db.Create(&breakers).Error)
 
-	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec:  60,
 		SnapshotStaleSec: 300,
 	})
@@ -255,7 +516,7 @@ func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec:  60,
 		SnapshotStaleSec: 300,
 	})
@@ -315,7 +576,7 @@ func TestRefreshRoutingHotcacheDoesNotPageThroughExpiredBreakerHistory(t *testin
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	summary, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec:  60,
 		SnapshotStaleSec: 300,
 	})
@@ -359,11 +620,41 @@ func TestRefreshRoutingHotcacheReturnsEligibilityLookupErrors(t *testing.T) {
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	_, err := refreshRoutingHotcacheFromDB(smart_routing_setting.SmartRoutingSetting{
+	_, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec:  60,
 		SnapshotStaleSec: 300,
 	})
 	require.ErrorIs(t, err, forcedErr)
+}
+
+func TestRefreshRoutingHotcacheContextCancellationStopsDatabaseQuery(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+
+	queryStarted := make(chan struct{}, 1)
+	const callbackName = "test:block_refresh_routing_cost_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingCostSnapshot{}).TableName() {
+			return
+		}
+		queryStarted <- struct{}{}
+		<-tx.Statement.Context.Done()
+		tx.AddError(tx.Statement.Context.Err())
+	}))
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := refreshRoutingHotcacheFromDB(ctx, smart_routing_setting.SmartRoutingSetting{
+			MetricBucketSec:  60,
+			SnapshotStaleSec: 300,
+		})
+		result <- err
+	}()
+	<-queryStarted
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
 }
 
 func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
@@ -412,7 +703,7 @@ func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
 	}
 	routingmetrics.RequeueSnapshots(metrics)
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["metrics"])
 	assert.Equal(t, 1, summary["breakers"])
@@ -425,6 +716,65 @@ func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
 	var breakerCount int64
 	require.NoError(t, db.Model(&model.RoutingBreakerState{}).Count(&breakerCount).Error)
 	assert.Equal(t, int64(1), breakerCount)
+}
+
+func TestFlushRoutingRuntimeStateContextCancellationRequeuesDirtyState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	routingmetrics.ResetForTest()
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Second,
+		MaxCooldown:             time.Second,
+	})
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routingmetrics.ResetForTest()
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	const channelID = 1202
+	require.NoError(t, db.Create(&model.Channel{Id: channelID, Name: "cancel-flush", Key: "single-key"}).Error)
+	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{
+		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "cancel-metric",
+		Group: "default", BucketTs: 60, RequestCount: 1,
+	}})
+	routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "cancel-breaker", Group: "default",
+	}, routingbreaker.FailureProvider5xx)
+
+	createStarted := make(chan struct{}, 1)
+	const callbackName = "test:block_flush_routing_metric_create"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelMetric{}).TableName() {
+			return
+		}
+		createStarted <- struct{}{}
+		<-tx.Statement.Context.Done()
+		tx.AddError(tx.Statement.Context.Err())
+	}))
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callbackName) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := flushRoutingRuntimeState(ctx, smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+		result <- err
+	}()
+	<-createStarted
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+
+	requeuedMetrics := routingmetrics.Snapshots()
+	require.Len(t, requeuedMetrics, 1)
+	assert.Equal(t, "cancel-metric", requeuedMetrics[0].ModelName)
+	requeuedBreakers := routingbreaker.DirtySnapshots()
+	require.Len(t, requeuedBreakers, 1)
+	assert.Equal(t, "cancel-breaker", requeuedBreakers[0].Key.Model)
 }
 
 func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAndBreakers(t *testing.T) {
@@ -466,7 +816,7 @@ func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAn
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.NoError(t, err)
 	assert.Equal(t, 2, summary["metrics"])
 	assert.Equal(t, 2, summary["breakers"])
@@ -524,7 +874,7 @@ func TestFlushRoutingRuntimeStateRequeuesMetricsWhenEligibilityLookupFails(t *te
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.ErrorIs(t, err, forcedErr)
 	assert.Equal(t, 0, summary["metrics"])
 	assert.Equal(t, 3, channelQueryCount)
@@ -539,7 +889,7 @@ func TestFlushRoutingRuntimeStateRequeuesMetricsWhenEligibilityLookupFails(t *te
 	})
 
 	require.NoError(t, db.Callback().Query().Remove(callbackName))
-	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err = flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.NoError(t, err)
 	assert.Equal(t, 4, summary["metrics"])
 	assert.Empty(t, routingmetrics.Snapshots())
@@ -603,7 +953,7 @@ func TestFlushRoutingRuntimeStateRequeuesBreakersWhenEligibilityLookupFails(t *t
 	}))
 	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.ErrorIs(t, err, forcedErr)
 	assert.Equal(t, 0, summary["breakers"])
 	assert.Equal(t, 3, channelQueryCount)
@@ -619,7 +969,7 @@ func TestFlushRoutingRuntimeStateRequeuesBreakersWhenEligibilityLookupFails(t *t
 	routingbreaker.RequeueDirtySnapshots(requeued)
 
 	require.NoError(t, db.Callback().Query().Remove(callbackName))
-	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	summary, err = flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.NoError(t, err)
 	assert.Equal(t, 4, summary["breakers"])
 	assert.Empty(t, routingbreaker.DirtySnapshots())
@@ -669,7 +1019,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidMetricSuffixAfterPersistenceFa
 		{ChannelID: 41, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "d-valid-suffix", Group: "default", BucketTs: 60, RequestCount: 1},
 	})
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.ErrorContains(t, err, "forced metric persistence failure")
 	assert.Equal(t, 0, summary["metrics"])
 
@@ -686,7 +1036,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidMetricSuffixAfterPersistenceFa
 	assert.Equal(t, "d-valid-suffix", requeued[0].ModelName)
 
 	require.NoError(t, db.Callback().Create().Remove(callbackName))
-	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
+	summary, err = flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["metrics"])
 	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
@@ -740,7 +1090,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 	}))
 	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.ErrorContains(t, err, "forced breaker persistence failure")
 	assert.Equal(t, 0, summary["breakers"])
 
@@ -754,7 +1104,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 	routingbreaker.RequeueDirtySnapshots(requeued)
 
 	require.NoError(t, db.Callback().Update().Remove(callbackName))
-	summary, err = flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{})
+	summary, err = flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{})
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["breakers"])
 	require.NoError(t, db.Order("model_name asc").Find(&persisted).Error)
@@ -794,6 +1144,7 @@ func TestSmartRoutingRuntimePrunesStaleHotcacheWhenDisabled(t *testing.T) {
 
 	refreshCompleted := make(chan struct{}, 1)
 	deps := defaultSmartRoutingRuntimeDeps()
+	deps.flush = func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil }
 	deps.waitRefresh = func(ctx context.Context, _ time.Duration) bool {
 		refreshCompleted <- struct{}{}
 		<-ctx.Done()
@@ -804,17 +1155,13 @@ func TestSmartRoutingRuntimePrunesStaleHotcacheWhenDisabled(t *testing.T) {
 		return false
 	}
 	runtime := newSmartRoutingRuntime(context.Background(), deps)
-	t.Cleanup(runtime.Close)
-	select {
-	case <-refreshCompleted:
-	case <-time.After(time.Second):
-		require.FailNow(t, "smart routing runtime did not finish initial refresh")
-	}
+	<-refreshCompleted
 	_, cached := routinghotcache.GetMetric(key)
 	assert.False(t, cached)
 
 	runtime.Close()
 	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
 }
 
 func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
@@ -867,7 +1214,7 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 	require.NoError(t, db.Create(&expired).Error)
 	require.NoError(t, db.Create(&fresh).Error)
 
-	summary, err := flushRoutingRuntimeState(retentionSetting)
+	summary, err := flushRoutingRuntimeState(context.Background(), retentionSetting)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), summary["retained_metrics_deleted"])
 
@@ -925,10 +1272,10 @@ func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testi
 	setting := smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60}
 
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{firstDelta})
-	_, err := flushRoutingRuntimeState(setting)
+	_, err := flushRoutingRuntimeState(context.Background(), setting)
 	require.NoError(t, err)
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{secondDelta})
-	_, err = flushRoutingRuntimeState(setting)
+	_, err = flushRoutingRuntimeState(context.Background(), setting)
 	require.NoError(t, err)
 
 	var persisted model.RoutingChannelMetric
@@ -973,7 +1320,7 @@ func TestFlushRoutingRuntimeStateSkipsRetentionWithinThrottleWindow(t *testing.T
 	}
 	require.NoError(t, db.Create(&expired).Error)
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec: 60,
 		RetentionDays:   1,
 	})
@@ -1016,7 +1363,7 @@ func TestFlushRoutingRuntimeStateDoesNotOverflowRetentionCutoff(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&metrics).Error)
 
-	summary, err := flushRoutingRuntimeState(smart_routing_setting.SmartRoutingSetting{
+	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{
 		MetricBucketSec: 60,
 		RetentionDays:   int(^uint(0) >> 1),
 	})
