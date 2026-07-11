@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
@@ -47,6 +48,47 @@ func setupStreamTest(t *testing.T, body io.Reader) (*gin.Context, *http.Response
 	}
 
 	return c, resp, info
+}
+
+type blockingResponseWriter struct {
+	header           http.Header
+	writeStarted     chan struct{}
+	releaseWrite     chan struct{}
+	writeStartedOnce sync.Once
+	releaseOnce      sync.Once
+	mu               sync.Mutex
+	body             strings.Builder
+}
+
+func (w *blockingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingResponseWriter) WriteHeader(_ int) {}
+
+func (w *blockingResponseWriter) Write(data []byte) (int, error) {
+	w.writeStartedOnce.Do(func() {
+		close(w.writeStarted)
+	})
+	<-w.releaseWrite
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(data)
+}
+
+func (w *blockingResponseWriter) Flush() {}
+
+func (w *blockingResponseWriter) release() {
+	w.releaseOnce.Do(func() {
+		close(w.releaseWrite)
+	})
+}
+
+func (w *blockingResponseWriter) bodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
 }
 
 func buildSSEBody(n int) string {
@@ -112,6 +154,9 @@ func TestStreamScannerHandler_1000Chunks(t *testing.T) {
 	var count atomic.Int64
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 		count.Add(1)
+		if err := StringData(c, data); err != nil {
+			sr.Error(err)
+		}
 	})
 
 	assert.Equal(t, int64(numChunks), count.Load())
@@ -212,6 +257,66 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 	})
 
 	assert.Equal(t, "{\"trimmed\":true}", got)
+}
+
+func TestStreamScannerHandler_MalformedFirstChunkRemainsPreCommit(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {malformed\ndata: [DONE]\n"))}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+	initialFirstResponseTime := info.FirstResponseTime
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		var payload map[string]any
+		if err := common.UnmarshalJsonStr(data, &payload); err != nil {
+			sr.Error(err)
+			return
+		}
+		if err := StringData(c, data); err != nil {
+			sr.Error(err)
+		}
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Zero(t, info.SendResponseCount)
+	assert.False(t, info.HasSendResponse())
+	assert.Equal(t, initialFirstResponseTime, info.FirstResponseTime)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestStreamScannerHandler_WriteThenHandlerErrorRemainsCommitted(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {\"id\":1}\ndata: {malformed\ndata: [DONE]\n"))}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+
+	var pending string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if pending != "" {
+			if err := StringData(c, pending); err != nil {
+				sr.Error(err)
+				return
+			}
+		}
+		var payload map[string]any
+		if err := common.UnmarshalJsonStr(data, &payload); err != nil {
+			sr.Error(err)
+			return
+		}
+		pending = data
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.True(t, info.HasSendResponse())
+	assert.Contains(t, recorder.Body.String(), "{\"id\":1}")
 }
 
 // TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns pins the
@@ -491,6 +596,76 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	assert.False(t, info.StreamStatus.IsNormalEnd())
 }
 
+func TestStreamScannerHandler_FirstByteTimerWaitsForInFlightWriteCommit(t *testing.T) {
+	const firstByteTimeout = 30 * time.Millisecond
+
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           int(firstByteTimeout / time.Millisecond),
+		FirstByteCapMs:           int(firstByteTimeout / time.Millisecond),
+		FirstByteP95Multiplier:   1,
+	})
+	t.Cleanup(smart_routing_setting.ResetForTest)
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+
+	writer := &blockingResponseWriter{
+		header:       make(http.Header),
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+	}
+	t.Cleanup(writer.release)
+
+	c, _ := gin.CreateTestContext(writer)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: pr}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.DisablePing = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+
+	done := make(chan struct{})
+	go func() {
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+			if err := StringData(c, data); err != nil {
+				sr.Error(err)
+			}
+		})
+		close(done)
+	}()
+
+	_, err := fmt.Fprint(pw, "data: {\"id\":1}\n")
+	require.NoError(t, err)
+
+	select {
+	case <-writer.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the client write to start")
+	}
+
+	time.Sleep(3 * firstByteTimeout)
+	writer.release()
+	require.NoError(t, pw.Close())
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream handler did not return after the in-flight write completed")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.NotEqual(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Contains(t, writer.bodyString(), "{\"id\":1}")
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.True(t, info.HasSendResponse())
+}
+
 func TestStreamScannerHandler_FirstByteTimeoutStopsBeforeWritingClient(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
@@ -604,6 +779,40 @@ func TestFirstByteFailoverTimeoutUsesMetricP95WithinCap(t *testing.T) {
 		Group:       "vip",
 	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95LatencyMs: 400, P95TTFTMs: 90})
 	assert.Equal(t, 100*time.Millisecond, firstByteFailoverTimeout(info))
+}
+
+func TestFirstByteFailoverTimeoutIgnoresLegacySingleKeyMetricForMultiKey(t *testing.T) {
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           30,
+		FirstByteCapMs:           100,
+		FirstByteP95Multiplier:   2,
+	})
+	routinghotcache.SetMetricForTest(routinghotcache.Key{
+		ChannelID:   78,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "vip",
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95TTFTMs: 40})
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-test",
+		UsingGroup:      "vip",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         78,
+			ChannelIsMultiKey: true,
+		},
+	}
+
+	assert.Equal(t, 30*time.Millisecond, firstByteFailoverTimeout(info))
 }
 
 func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {

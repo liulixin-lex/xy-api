@@ -104,20 +104,53 @@ func TestShouldRetryStillRetriesBeforeAnyResponse(t *testing.T) {
 	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1))
 }
 
-func TestStreamFirstByteTimeoutErrorOnlyBeforeClientWrite(t *testing.T) {
+func TestRelayAttemptControlErrorFirstByteTimeoutUsesActualClientCommit(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
 	info := &relaycommon.RelayInfo{
+		RelayFormat:  types.RelayFormatOpenAI,
 		StreamStatus: relaycommon.NewStreamStatus(),
 	}
 	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
 
-	apiErr := streamFirstByteTimeoutError(info)
+	apiErr := relayAttemptControlError(ctx, nil, info)
 
 	require.NotNil(t, apiErr)
 	assert.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
 	assert.Equal(t, types.ErrorCodeFirstByteTimeout, apiErr.GetErrorCode())
 
 	info.SendResponseCount = 1
-	assert.Nil(t, streamFirstByteTimeoutError(info))
+	assert.NotNil(t, relayAttemptControlError(ctx, nil, info), "pre-incremented send count is not a client commit")
+	_, err := ctx.Writer.Write([]byte("committed"))
+	require.NoError(t, err)
+	assert.Nil(t, relayAttemptControlError(ctx, nil, info))
+}
+
+func TestRelayAttemptControlErrorKeepsCommittedRealtimeErrorAsClassificationEvidenceOnly(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cause := errors.New("failed to count realtime tokens")
+	attemptErr := types.NewError(cause, types.ErrorCodeCountTokenFailed)
+	committedInfo := &relaycommon.RelayInfo{
+		RelayFormat:           types.RelayFormatOpenAIRealtime,
+		ReceivedResponseCount: 1,
+		StreamStatus:          relaycommon.NewStreamStatus(),
+	}
+	committedInfo.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+
+	controlErr := relayAttemptControlError(ctx, attemptErr, committedInfo)
+	classification, success := classifyRoutingRelayAttempt(attemptErr, committedInfo)
+
+	assert.Nil(t, controlErr)
+	assert.False(t, success)
+	assert.Equal(t, routingerror.ResponsibilityGateway, classification.Responsibility)
+	assert.Equal(t, routingerror.HealthIgnore, classification.HealthEffect)
+	assert.ErrorIs(t, attemptErr, cause)
+
+	preCommitInfo := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAIRealtime}
+	assert.Same(t, attemptErr, relayAttemptControlError(ctx, attemptErr, preCommitInfo))
+	_, err := ctx.Writer.Write([]byte("non-stream response"))
+	require.NoError(t, err)
+	assert.Same(t, attemptErr, relayAttemptControlError(ctx, attemptErr, &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI}))
 }
 
 func TestShouldRetryAllowsFirstByteTimeoutBeforeClientWrite(t *testing.T) {
@@ -277,6 +310,171 @@ func TestClassifyRoutingRelayAttemptDistinguishesStreamCorruptionAndClientGone(t
 	assert.False(t, success)
 	assert.Equal(t, routingerror.ResponsibilityCaller, classification.Responsibility)
 	assert.Equal(t, routingerror.HealthIgnore, classification.HealthEffect)
+}
+
+func TestRelayAttemptControlErrorConvertsOnlyPreCommitStreamFailure(t *testing.T) {
+	tests := []struct {
+		name               string
+		configure          func(*relaycommon.RelayInfo)
+		writerCommitted    bool
+		wantErr            bool
+		wantResponsibility routingerror.Responsibility
+	}{
+		{
+			name: "scanner corruption before commit",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("scanner failed"))
+			},
+			wantErr:            true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+		{
+			name: "handler stop before commit",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errors.New("handler failed"))
+			},
+			wantErr:            true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+		{
+			name: "soft corruption before commit",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+				info.StreamStatus.RecordError("malformed first chunk")
+			},
+			wantErr:            true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+		{
+			name: "malformed chunk before first-byte timeout",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
+				info.StreamStatus.RecordError("malformed first chunk")
+			},
+			wantErr:            true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+		{
+			name: "normal completion",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+			},
+		},
+		{
+			name: "send count without writer commit",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.SendResponseCount = 1
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("write failed after counter increment"))
+			},
+			wantErr:            true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+		{
+			name: "corruption after writer commit without counters",
+			configure: func(info *relaycommon.RelayInfo) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("late scanner failure"))
+			},
+			writerCommitted:    true,
+			wantResponsibility: routingerror.ResponsibilityProvider,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			if tt.writerCommitted {
+				_, err := ctx.Writer.Write([]byte("committed"))
+				require.NoError(t, err)
+			}
+			info := &relaycommon.RelayInfo{
+				RelayFormat:  types.RelayFormatOpenAI,
+				StreamStatus: relaycommon.NewStreamStatus(),
+			}
+			tt.configure(info)
+
+			apiErr := relayAttemptControlError(ctx, nil, info)
+			if tt.wantErr {
+				require.NotNil(t, apiErr)
+				assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			} else {
+				assert.Nil(t, apiErr)
+			}
+
+			classification, success := classifyRoutingRelayAttempt(apiErr, info)
+			if tt.wantResponsibility == "" {
+				assert.True(t, success)
+				assert.Equal(t, "success", classification.Rule)
+				return
+			}
+			assert.False(t, success)
+			assert.Equal(t, tt.wantResponsibility, classification.Responsibility)
+			assert.Equal(t, routingerror.RetryNever, classification.Retryability)
+		})
+	}
+}
+
+func TestRelayAttemptControlErrorPreservesStreamEndCause(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cause := &net.DNSError{Name: "stream.example.com"}
+	info := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, cause)
+
+	apiErr := relayAttemptControlError(ctx, nil, info)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, "upstream stream failed before client commit", apiErr.Error())
+	assert.ErrorIs(t, apiErr, cause)
+}
+
+func TestRealtimeStreamOutcomesDoNotPolluteClientGoneOrCountCorruptionAsSuccess(t *testing.T) {
+	t.Run("client gone is excluded from reliability", func(t *testing.T) {
+		configureRoutingBreakerAttemptTest(t, true)
+		ctx, info := singleKeyRoutingAttemptFixture(t, 73)
+		info.RelayFormat = types.RelayFormatOpenAIRealtime
+		info.StreamStatus = relaycommon.NewStreamStatus()
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+
+		apiErr := relayAttemptControlError(ctx, nil, info)
+		classification, success := classifyRoutingRelayAttempt(apiErr, info)
+		recordRoutingAttemptEffects(ctx, info, 73, success, apiErr, classification)
+
+		assert.Nil(t, apiErr)
+		assert.False(t, success)
+		assert.Equal(t, routingerror.ResponsibilityCaller, classification.Responsibility)
+		assert.Equal(t, routingerror.HealthIgnore, classification.HealthEffect)
+		metrics := routingmetrics.Snapshots()
+		require.Len(t, metrics, 1)
+		assert.Zero(t, metrics[0].SuccessCount)
+		assert.Zero(t, metrics[0].ReliabilityRequestCount)
+		assert.Zero(t, metrics[0].ReliabilityFailureCount)
+		assert.Empty(t, routingbreaker.DirtySnapshots())
+	})
+
+	t.Run("upstream corruption is a reliability failure", func(t *testing.T) {
+		configureRoutingBreakerAttemptTest(t, true)
+		ctx, info := singleKeyRoutingAttemptFixture(t, 74)
+		info.RelayFormat = types.RelayFormatOpenAIRealtime
+		info.StreamStatus = relaycommon.NewStreamStatus()
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("upstream websocket parse failed"))
+
+		apiErr := relayAttemptControlError(ctx, nil, info)
+		classification, success := classifyRoutingRelayAttempt(apiErr, info)
+		recordRoutingAttemptEffects(ctx, info, 74, success, apiErr, classification)
+
+		require.NotNil(t, apiErr)
+		assert.False(t, success)
+		assert.Equal(t, routingerror.ResponsibilityProvider, classification.Responsibility)
+		assert.Equal(t, routingerror.HealthDegrade, classification.HealthEffect)
+		metrics := routingmetrics.Snapshots()
+		require.Len(t, metrics, 1)
+		assert.Zero(t, metrics[0].SuccessCount)
+		assert.Equal(t, int64(1), metrics[0].ReliabilityRequestCount)
+		assert.Equal(t, int64(1), metrics[0].ReliabilityFailureCount)
+		breakers := routingbreaker.DirtySnapshots()
+		require.Len(t, breakers, 1)
+		assert.Equal(t, routingbreaker.StateOpen, breakers[0].State)
+	})
 }
 
 func TestClassifyRoutingRelayAttemptMarksCSAMAsContentSafetyBeforeNormalization(t *testing.T) {

@@ -85,6 +85,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		cleanupOnce    sync.Once
 		stopOnce       sync.Once
 	)
+	var firstByteExpired bool // guarded by writeMutex
 
 	stop := func() {
 		stopOnce.Do(func() {
@@ -214,12 +215,26 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		sr := newStreamResult(info.StreamStatus)
 		for data := range dataChan {
 			sr.reset()
+			firstByteTimedOut := false
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
+				if firstByteExpired {
+					firstByteTimedOut = true
+					return
+				}
+				responseSizeBefore := c.Writer.Size()
 				ExtendWriteDeadline(c)
 				dataHandler(data, sr)
+				if c.Writer.Size() > responseSizeBefore {
+					info.SetFirstResponseTime()
+					info.ReceivedResponseCount++
+					markFirstByteSeen()
+				}
 			}()
+			if firstByteTimedOut {
+				return
+			}
 			if sr.IsStopped() {
 				return
 			}
@@ -266,10 +281,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				continue
 			}
 			if !strings.HasPrefix(data, "[DONE]") {
-				info.SetFirstResponseTime()
-				info.ReceivedResponseCount++
-				markFirstByteSeen()
-
 				select {
 				case dataChan <- data:
 				case <-ctx.Done():
@@ -301,10 +312,26 @@ waitLoop:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
 			break waitLoop
 		case <-firstByteC:
-			if !info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 {
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
-				break waitLoop
+			writeMutex.Lock()
+			select {
+			case <-firstByteSeen:
+				firstByteC = nil
+				firstByteSeen = nil
+				writeMutex.Unlock()
+				continue
+			default:
 			}
+			if c.Writer.Written() || info.HasSendResponse() || info.ReceivedResponseCount > 0 {
+				markFirstByteSeen()
+				firstByteC = nil
+				firstByteSeen = nil
+				writeMutex.Unlock()
+				continue
+			}
+			firstByteExpired = true
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
+			writeMutex.Unlock()
+			break waitLoop
 		case <-firstByteSeen:
 			if firstByteTimer != nil {
 				firstByteTimer.Stop()
@@ -441,7 +468,7 @@ func FirstByteFailoverTimeout(info *relaycommon.RelayInfo) time.Duration {
 		capMs = minMs
 	}
 	timeoutMs := minMs
-	if info.ChannelMeta != nil && info.ChannelId > 0 && info.OriginModelName != "" {
+	if info.ChannelMeta != nil && !info.ChannelIsMultiKey && info.ChannelId > 0 && info.OriginModelName != "" {
 		group := info.UsingGroup
 		if group == "" {
 			group = "default"

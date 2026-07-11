@@ -234,17 +234,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				newAPIError = relayHandler(c, relayInfo)
 			}
 		}()
-		if newAPIError == nil {
-			newAPIError = streamFirstByteTimeoutError(relayInfo)
+		attemptAPIError := newAPIError
+		controlAPIError := relayAttemptControlError(c, attemptAPIError, relayInfo)
+		classificationAPIError := attemptAPIError
+		if classificationAPIError == nil {
+			classificationAPIError = controlAPIError
 		}
-		classification, attemptSuccess := classifyRoutingRelayAttempt(newAPIError, relayInfo)
-		newAPIError = service.NormalizeViolationFeeError(newAPIError)
-		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, newAPIError, classification)
+		classification, attemptSuccess := classifyRoutingRelayAttempt(classificationAPIError, relayInfo)
+		classificationAPIError = service.NormalizeViolationFeeError(classificationAPIError)
+		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
 
-		if newAPIError == nil {
+		if controlAPIError == nil {
+			newAPIError = nil
 			relayInfo.LastError = nil
 			return
 		}
+		newAPIError = classificationAPIError
 
 		relayInfo.LastError = newAPIError
 
@@ -439,13 +444,6 @@ func cappedSecondsDuration(seconds float64, capDuration time.Duration) time.Dura
 	return time.Duration(seconds * float64(time.Second))
 }
 
-func streamFirstByteTimeoutError(relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
-	if !relayInfo.FirstByteTimedOutBeforeResponse() {
-		return nil
-	}
-	return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeFirstByteTimeout, http.StatusGatewayTimeout)
-}
-
 func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
 	if info == nil {
 		return
@@ -453,30 +451,76 @@ func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
 	info.StreamStatus = nil
 }
 
+func relayAttemptControlError(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) *types.NewAPIError {
+	isRealtime := info != nil && info.RelayFormat == types.RelayFormatOpenAIRealtime
+	isStream := info != nil && (info.IsStream || info.StreamStatus != nil || isRealtime)
+	clientCommitted := false
+	if isRealtime {
+		clientCommitted = info.ReceivedResponseCount > 0 || info.HasSendResponse()
+	} else if isStream {
+		clientCommitted = c != nil && c.Writer != nil && c.Writer.Written()
+	}
+	if clientCommitted {
+		return nil
+	}
+	if apiErr != nil {
+		return apiErr
+	}
+
+	signal := relayAttemptStreamSignal(info)
+	if signal != routingerror.SignalFirstByteTimeout && signal != routingerror.SignalStreamCorruption {
+		return nil
+	}
+
+	if signal == routingerror.SignalFirstByteTimeout {
+		return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeFirstByteTimeout, http.StatusGatewayTimeout)
+	}
+	cause := errors.New("upstream stream failed before client commit")
+	if info != nil && info.StreamStatus != nil && info.StreamStatus.EndError != nil {
+		cause = fmt.Errorf("upstream stream failed before client commit: %w", info.StreamStatus.EndError)
+	}
+	return types.NewErrorWithStatusCode(
+		cause,
+		types.ErrorCodeBadResponse,
+		http.StatusBadGateway,
+		types.ErrOptionWithHideErrMsg("upstream stream failed before client commit"),
+	)
+}
+
+func relayAttemptStreamSignal(info *relaycommon.RelayInfo) routingerror.Signal {
+	if info == nil || info.StreamStatus == nil {
+		return routingerror.SignalNone
+	}
+	status := info.StreamStatus
+	if status.EndReason == relaycommon.StreamEndReasonClientGone {
+		return routingerror.SignalClientGone
+	}
+	if status.EndReason == relaycommon.StreamEndReasonHandlerStop || status.HasErrors() {
+		return routingerror.SignalStreamCorruption
+	}
+	switch status.EndReason {
+	case relaycommon.StreamEndReasonFirstByteTimeout:
+		return routingerror.SignalFirstByteTimeout
+	case relaycommon.StreamEndReasonTimeout,
+		relaycommon.StreamEndReasonScannerErr,
+		relaycommon.StreamEndReasonPanic,
+		relaycommon.StreamEndReasonPingFail:
+		return routingerror.SignalStreamCorruption
+	default:
+		return routingerror.SignalNone
+	}
+}
+
 func classifyRoutingRelayAttempt(apiErr *types.NewAPIError, info *relaycommon.RelayInfo) (routingerror.Classification, bool) {
 	ctx := routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationRelay}
 	success := apiErr == nil
 	if apiErr != nil && service.HasCSAMViolationMarker(apiErr) {
 		ctx.Signal = routingerror.SignalContentSafety
-	} else if info != nil && info.StreamStatus != nil {
-		switch info.StreamStatus.EndReason {
-		case relaycommon.StreamEndReasonFirstByteTimeout:
-			ctx.Signal = routingerror.SignalFirstByteTimeout
-		case relaycommon.StreamEndReasonClientGone:
-			ctx.Signal = routingerror.SignalClientGone
-			success = false
-		case relaycommon.StreamEndReasonTimeout,
-			relaycommon.StreamEndReasonScannerErr,
-			relaycommon.StreamEndReasonPanic,
-			relaycommon.StreamEndReasonPingFail:
-			ctx.Signal = routingerror.SignalStreamCorruption
-			success = false
-		default:
-			if info.StreamStatus.HasErrors() {
-				ctx.Signal = routingerror.SignalStreamCorruption
-				success = false
-			}
-		}
+	} else {
+		ctx.Signal = relayAttemptStreamSignal(info)
+	}
+	if ctx.Signal != routingerror.SignalNone {
+		success = false
 	}
 	return routingerror.ClassifyAPIError(apiErr, ctx), success
 }
