@@ -152,7 +152,7 @@ func loadOrCreateBucket(key bucketKey) *bucket {
 		evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
 	}
 	for bucketCount.Load() >= int64(activeLimits.MaxBuckets) {
-		if !evictOldestBucketLocked() {
+		if !evictOldestBucketLocked(key) {
 			return nil
 		}
 	}
@@ -173,14 +173,24 @@ func evictExpiredBucketsLocked(cutoff int64) {
 	})
 }
 
-func evictOldestBucketLocked() bool {
+func evictOldestBucketLocked(incoming bucketKey) bool {
 	var oldestKey bucketKey
 	var oldestBucket *bucket
 	hotBuckets.Range(func(key any, value any) bool {
 		candidate := key.(bucketKey)
+		if candidate.bucketTs >= incoming.bucketTs {
+			return true
+		}
+		candidateBucket := value.(*bucket)
+		candidateBucket.mu.Lock()
+		draining := candidateBucket.draining
+		candidateBucket.mu.Unlock()
+		if draining {
+			return true
+		}
 		if oldestBucket == nil || bucketKeyLess(candidate, oldestKey) {
 			oldestKey = candidate
-			oldestBucket = value.(*bucket)
+			oldestBucket = candidateBucket
 		}
 		return true
 	})

@@ -54,6 +54,57 @@ func TestPerfMetricsEnforceBucketLimit(t *testing.T) {
 	}, RuntimeStats())
 }
 
+func TestPerfMetricsCapacityProtectsCurrentAndNewerBuckets(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing [2]bucketKey
+		incoming bucketKey
+	}{
+		{
+			name: "late older bucket",
+			existing: [2]bucketKey{
+				{model: "gpt-test", group: "default", bucketTs: 10},
+				{model: "gpt-test", group: "default", bucketTs: 11},
+			},
+			incoming: bucketKey{model: "gpt-test", group: "default", bucketTs: 9},
+		},
+		{
+			name: "same timestamp cardinality",
+			existing: [2]bucketKey{
+				{model: "gpt-a", group: "default", bucketTs: 10},
+				{model: "gpt-b", group: "default", bucketTs: 10},
+			},
+			incoming: bucketKey{model: "gpt-c", group: "default", bucketTs: 10},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configurePerfMetricsForTest(t, true)
+			maintenanceMu.Lock()
+			limits = Limits{MaxBuckets: 2, BucketTTL: time.Hour}
+			maintenanceMu.Unlock()
+
+			for _, key := range test.existing {
+				require.True(t, recordSample(key, Sample{Model: key.model, Group: key.group, Success: true}))
+			}
+			assert.False(t, recordSample(test.incoming, Sample{
+				Model:   test.incoming.model,
+				Group:   test.incoming.group,
+				Success: true,
+			}))
+
+			for _, key := range test.existing {
+				_, exists := hotBuckets.Load(key)
+				assert.True(t, exists)
+			}
+			_, exists := hotBuckets.Load(test.incoming)
+			assert.False(t, exists)
+			assert.Equal(t, Stats{Buckets: 2, DroppedSamples: 1}, RuntimeStats())
+		})
+	}
+}
+
 func TestPerfMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
 	configurePerfMetricsForTest(t, true)
 	maintenanceMu.Lock()
