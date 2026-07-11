@@ -263,6 +263,15 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
+	return consumeAWSResponseStream(c, info, stream, cancel)
+}
+
+type awsResponseStream interface {
+	Events() <-chan bedrockruntimeTypes.ResponseStream
+	Err() error
+}
+
+func consumeAWSResponseStream(c *gin.Context, info *relaycommon.RelayInfo, stream awsResponseStream, cancel context.CancelFunc) (*types.NewAPIError, *dto.Usage) {
 	firstByteTimeout := helper.FirstByteFailoverTimeout(info)
 	var firstByteTimer *time.Timer
 	var firstByteC <-chan time.Time
@@ -300,7 +309,12 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 			}
 		case event, ok := <-events:
 			if !ok {
-				claude.HandleStreamFinalResponse(c, info, claudeInfo)
+				if err := stream.Err(); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponseBody), claudeInfo.Usage
+				}
+				if err := claude.HandleStreamFinalResponse(c, info, claudeInfo); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponse), claudeInfo.Usage
+				}
 				return nil, claudeInfo.Usage
 			}
 			markFirstByteSeen()
@@ -310,14 +324,14 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 				info.ReceivedResponseCount++
 				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
 				if respErr != nil {
-					return respErr, nil
+					return respErr, claudeInfo.Usage
 				}
 			case *bedrockruntimeTypes.UnknownUnionMember:
 				fmt.Println("unknown tag:", v.Tag)
-				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
+				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), claudeInfo.Usage
 			default:
 				fmt.Println("union is nil or unknown type")
-				return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), nil
+				return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), claudeInfo.Usage
 			}
 		}
 	}

@@ -319,6 +319,20 @@ func TestStreamScannerHandler_WriteThenHandlerErrorRemainsCommitted(t *testing.T
 	assert.Contains(t, recorder.Body.String(), "{\"id\":1}")
 }
 
+func TestStreamScannerHandlerRecordsHandlerPanicEvenIfScannerFinishesFirst(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: {}\ndata: [DONE]\n"))
+
+	StreamScannerHandler(c, resp, info, func(_ string, _ *StreamResult) {
+		panic("handler exploded")
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	require.True(t, info.StreamStatus.HasErrors())
+	require.NotEmpty(t, info.StreamStatus.Errors)
+	assert.Contains(t, info.StreamStatus.Errors[0].Message, "handler panic")
+	assert.True(t, info.HTTPStreamHasFailure())
+}
+
 // TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns pins the
 // disconnect contract: when the client goes away, the handler must return
 // promptly (all goroutines joined, so the gin.Context can never leak into a

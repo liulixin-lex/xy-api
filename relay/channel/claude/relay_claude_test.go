@@ -1,14 +1,36 @@
 package claude
 
 import (
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type failingClaudeResponseWriter struct {
+	gin.ResponseWriter
+	err error
+}
+
+func (w *failingClaudeResponseWriter) Write(_ []byte) (int, error) {
+	return 0, w.err
+}
+
+func (w *failingClaudeResponseWriter) WriteString(_ string) (int, error) {
+	return 0, w.err
+}
 
 func commonPointer[T any](value T) *T {
 	return &value
@@ -221,6 +243,152 @@ func TestFormatClaudeResponseInfo_ContentBlockDelta(t *testing.T) {
 	if claudeInfo.ResponseText.String() != "hello" {
 		t.Errorf("ResponseText = %q, want %q", claudeInfo.ResponseText.String(), "hello")
 	}
+}
+
+func TestClaudeStreamHandlerReturnsPartialUsageAfterCommittedChunkError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	streamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = streamingTimeout
+	})
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}
+	info.OriginModelName = "claude-test"
+	info.RelayFormat = types.RelayFormatOpenAI
+	info.SetEstimatePromptTokens(11)
+
+	body := strings.Join([]string{
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}`,
+		`data: {malformed`,
+	}, "\n\n") + "\n\n"
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(body))}
+
+	usage, apiErr := ClaudeStreamHandler(c, resp, info)
+
+	require.NotNil(t, apiErr)
+	require.Error(t, apiErr.Cause())
+	assert.Contains(t, apiErr.Cause().Error(), "invalid character")
+	require.NotNil(t, usage)
+	assert.Equal(t, 11, usage.PromptTokens)
+	assert.Positive(t, usage.CompletionTokens)
+	assert.Equal(t, usage.PromptTokens+usage.CompletionTokens, usage.TotalTokens)
+	assert.Equal(t, "anthropic", usage.UsageSemantic)
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.Contains(t, recorder.Body.String(), "partial answer")
+	assert.NotContains(t, recorder.Body.String(), "[DONE]")
+}
+
+func TestClaudeStreamHandlerReturnsUsageOnDownstreamWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	writeErr := errors.New("claude downstream write failed")
+	c.Writer = &failingClaudeResponseWriter{ResponseWriter: c.Writer, err: writeErr}
+
+	oldStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.IsStream = true
+	info.DisablePing = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}
+	info.OriginModelName = "claude-test"
+	info.RelayFormat = types.RelayFormatOpenAI
+	info.SetEstimatePromptTokens(11)
+	body := `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}` + "\n\n"
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(body))}
+
+	usage, apiErr := ClaudeStreamHandler(c, resp, info)
+
+	require.NotNil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, writeErr)
+}
+
+func TestClaudeStreamHandlerDoesNotFinalizeScannerFailureBeforeCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	streamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = streamingTimeout
+	})
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.IsStream = true
+	info.DisablePing = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}
+	info.OriginModelName = "claude-test"
+	info.RelayFormat = types.RelayFormatOpenAI
+	info.SetEstimatePromptTokens(11)
+	resp := &http.Response{Body: io.NopCloser(iotest.ErrReader(errors.New("read failed")))}
+
+	usage, apiErr := ClaudeStreamHandler(c, resp, info)
+
+	require.NotNil(t, usage)
+	assert.Equal(t, 11, usage.PromptTokens)
+	assert.Equal(t, "anthropic", usage.UsageSemantic)
+	assert.Empty(t, recorder.Body.String())
+	assert.False(t, c.Writer.Written())
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.False(t, info.HasSendResponse())
+	assert.True(t, info.HTTPStreamFailedBeforeCommit(c))
+	require.NotNil(t, apiErr)
+	require.Error(t, apiErr.Cause())
+	assert.Contains(t, apiErr.Cause().Error(), "read failed")
+	assert.NotContains(t, recorder.Body.String(), "[DONE]")
+}
+
+func TestClaudeStreamHandlerDoesNotFinalizeScannerFailureAfterCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	streamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		constant.StreamingTimeout = streamingTimeout
+	})
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.IsStream = true
+	info.DisablePing = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "claude-test"}
+	info.OriginModelName = "claude-test"
+	info.RelayFormat = types.RelayFormatOpenAI
+	info.SetEstimatePromptTokens(11)
+	resp := &http.Response{Body: io.NopCloser(io.MultiReader(
+		strings.NewReader(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}`+"\n\n"),
+		iotest.ErrReader(errors.New("read failed after chunk")),
+	))}
+
+	usage, apiErr := ClaudeStreamHandler(c, resp, info)
+
+	require.NotNil(t, usage)
+	assert.Equal(t, 11, usage.PromptTokens)
+	assert.Positive(t, usage.CompletionTokens)
+	assert.Equal(t, usage.PromptTokens+usage.CompletionTokens, usage.TotalTokens)
+	assert.Equal(t, "anthropic", usage.UsageSemantic)
+	assert.True(t, c.Writer.Written())
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.True(t, info.HasSendResponse())
+	assert.Contains(t, recorder.Body.String(), "partial answer")
+	assert.NotContains(t, recorder.Body.String(), "[DONE]")
+	require.NotNil(t, apiErr)
+	require.Error(t, apiErr.Cause())
+	assert.Contains(t, apiErr.Cause().Error(), "read failed after chunk")
 }
 
 func TestBuildOpenAIStyleUsageFromClaudeUsage(t *testing.T) {

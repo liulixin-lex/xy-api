@@ -66,6 +66,9 @@ type Context struct {
 	Component Component
 	Operation Operation
 	Signal    Signal
+	// BeforeCommit is set only when the caller has verified that no response
+	// bytes were committed to the downstream client.
+	BeforeCommit bool
 }
 
 type Classification struct {
@@ -87,7 +90,11 @@ func ClassifyAPIError(apiErr *types.NewAPIError, ctx Context) Classification {
 		return result(ctx, ResponsibilityCaller, ScopeRequest, RetryNever, HealthIgnore, CapacityNone, "content_safety")
 	}
 	if ctx.Signal == SignalStreamCorruption {
-		return result(ctx, ResponsibilityProvider, ScopePoolMember, RetryNever, HealthDegrade, CapacityNone, "stream_corruption")
+		retryability := RetryNever
+		if ctx.BeforeCommit {
+			retryability = RetryBeforeCommit
+		}
+		return result(ctx, ResponsibilityProvider, ScopePoolMember, retryability, HealthDegrade, CapacityNone, "stream_corruption")
 	}
 	if apiErr == nil {
 		return result(ctx, "", ScopeRequest, RetryNever, HealthIgnore, CapacityNone, "success")

@@ -71,7 +71,10 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
 			return false
 		}
-		helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data))
+		if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return false
+		}
 		return true
 	}
 
@@ -93,7 +96,8 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		var chunk dto.ChatCompletionsStreamResponse
 		if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
 			logger.LogError(c, "failed to unmarshal chat stream response: "+err.Error())
-			sr.Error(err)
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
 			return
 		}
 
@@ -111,22 +115,24 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 	})
 
-	if streamErr != nil {
-		return nil, streamErr
-	}
-	if info.FirstByteTimedOutBeforeResponse() {
-		return nil, nil
-	}
-
 	usage := state.Usage
 	if usage == nil || usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.Usage = relayconvert.UsageFromChatUsage(usage)
 	}
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil, nil
+	}
+	if info.HTTPStreamHasFailure() {
+		return usage, openAIStreamStatusError(info)
+	}
 
 	for _, event := range relayconvert.FinalizeChatCompletionsStreamToResponses(state) {
 		if !sendEvent(event) {
-			return nil, streamErr
+			return usage, streamErr
 		}
 	}
 

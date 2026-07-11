@@ -98,48 +98,68 @@ func OpenaiImageStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp 
 	// field (real OpenAI image events keep event == type).
 	usage := &dto.Usage{}
 	var lastStreamData []byte
+	var streamErr *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		raw := common.StringToByteSlice(data)
-		lastStreamData = raw
-		if isOpenAIImageStreamErrorEvent(raw) {
-			// Record the error as a soft error; the scanner drives the final
-			// EndReason. HasErrors() flags the failure for logging/handling.
-			sr.Error(fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw)))
-		}
 		var usageResp dto.SimpleResponse
-		if err := common.Unmarshal(raw, &usageResp); err == nil {
-			normalizeOpenAIUsage(&usageResp.Usage)
-			if service.ValidUsage(&usageResp.Usage) {
-				usage = &usageResp.Usage
-			}
+		if err := common.Unmarshal(raw, &usageResp); err != nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			sr.Stop(streamErr)
+			return
 		}
-		writeOpenaiImageStreamChunk(c, raw)
+		lastStreamData = raw
+		var upstreamErr error
+		if isOpenAIImageStreamErrorEvent(raw) {
+			upstreamErr = fmt.Errorf("%s", extractOpenAIImageStreamErrorMessage(raw))
+			streamErr = types.NewError(upstreamErr, types.ErrorCodeBadResponseBody)
+		}
+		normalizeOpenAIUsage(&usageResp.Usage)
+		if service.ValidUsage(&usageResp.Usage) {
+			usage = &usageResp.Usage
+		}
+		if err := writeOpenaiImageStreamChunk(c, raw); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
+		if upstreamErr != nil {
+			sr.Stop(upstreamErr)
+			return
+		}
 	})
 
 	// StreamScannerHandler consumes the upstream [DONE]; re-emit it so the
 	// client still receives a terminal data: [DONE].
-	if info != nil && info.StreamStatus != nil && info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone {
-		helper.Done(c)
+	if info != nil && info.StreamStatus != nil &&
+		info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone && !info.HTTPStreamHasFailure() {
+		if err := helper.Done(c); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		}
 	}
 
 	applyUsagePostProcessing(info, usage, lastStreamData)
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if streamErr := openAIStreamStatusError(info); streamErr != nil {
+		return usage, streamErr
+	}
 	return usage, nil
 }
 
 // writeOpenaiImageStreamChunk rebuilds the SSE frame for an image stream chunk:
 // it emits an "event:" line derived from the JSON "type" field (when present)
 // followed by the verbatim "data:" payload, mirroring helper.ResponseChunkData.
-func writeOpenaiImageStreamChunk(c *gin.Context, data []byte) {
+func writeOpenaiImageStreamChunk(c *gin.Context, data []byte) error {
 	var payload struct {
 		Type string `json:"type"`
 	}
 	_ = common.Unmarshal(data, &payload)
 	if eventName := strings.TrimSpace(payload.Type); eventName != "" {
-		_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventName}, string(data))
-		return
+		return helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventName}, string(data))
 	}
-	_ = helper.StringData(c, string(data))
+	return helper.StringData(c, string(data))
 }
 
 // isOpenAIImageStreamErrorEvent detects upstream error chunks by JSON content

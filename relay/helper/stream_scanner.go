@@ -153,8 +153,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		gopool.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logger.LogError(c, fmt.Sprintf("ping goroutine panic: %v", r))
-					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("ping panic: %v", r))
+					panicErr := fmt.Errorf("ping panic: %v", r)
+					logger.LogError(c, "ping goroutine panic: "+panicErr.Error())
+					info.StreamStatus.RecordError(panicErr.Error())
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, panicErr)
 					stop()
 				}
 				logger.LogDebug(c, "ping goroutine exited")
@@ -181,6 +183,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					}()
 					if err != nil {
 						logger.LogError(c, "ping data error: "+err.Error())
+						info.StreamStatus.RecordError(err.Error())
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
 						return
 					}
@@ -206,8 +209,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	gopool.Go(func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.LogError(c, fmt.Sprintf("data handler goroutine panic: %v", r))
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("handler panic: %v", r))
+				panicErr := fmt.Errorf("handler panic: %v", r)
+				logger.LogError(c, "data handler goroutine panic: "+panicErr.Error())
+				info.StreamStatus.RecordError(panicErr.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, panicErr)
 			}
 			stop()
 			wg.Done()
@@ -247,8 +252,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		defer func() {
 			close(dataChan)
 			if r := recover(); r != nil {
-				logger.LogError(c, fmt.Sprintf("scanner goroutine panic: %v", r))
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("scanner panic: %v", r))
+				panicErr := fmt.Errorf("scanner panic: %v", r)
+				logger.LogError(c, "scanner goroutine panic: "+panicErr.Error())
+				info.StreamStatus.RecordError(panicErr.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, panicErr)
 			}
 			stop()
 			logger.LogDebug(c, "scanner goroutine exited")

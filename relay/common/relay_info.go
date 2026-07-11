@@ -96,6 +96,11 @@ type RelayInfo struct {
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	isFirstResponse   bool
+
+	attemptBaselineCaptured        bool
+	attemptIsStream                bool
+	attemptRequestConversionChain  []types.RelayFormat
+	attemptFinalRequestRelayFormat types.RelayFormat
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -678,6 +683,66 @@ func (info *RelayInfo) SetFirstResponseTime() {
 
 func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
+}
+
+func (info *RelayInfo) ResetStreamAttemptState() {
+	if info == nil {
+		return
+	}
+	if !info.attemptBaselineCaptured {
+		info.attemptBaselineCaptured = true
+		info.attemptIsStream = info.IsStream
+		info.attemptRequestConversionChain = append([]types.RelayFormat(nil), info.RequestConversionChain...)
+		info.attemptFinalRequestRelayFormat = info.FinalRequestRelayFormat
+	}
+	info.IsStream = info.attemptIsStream
+	info.RequestConversionChain = append([]types.RelayFormat(nil), info.attemptRequestConversionChain...)
+	info.FinalRequestRelayFormat = info.attemptFinalRequestRelayFormat
+	info.StreamStatus = nil
+	info.SendResponseCount = 0
+	info.ReceivedResponseCount = 0
+	info.FirstResponseTime = time.Time{}
+	info.isFirstResponse = true
+}
+
+// HTTPStreamClientCommitted reports whether an HTTP stream has written a
+// response to the downstream client.
+func (info *RelayInfo) HTTPStreamClientCommitted(c *gin.Context) bool {
+	if info == nil || c == nil || c.Writer == nil {
+		return false
+	}
+	return (info.IsStream || info.StreamStatus != nil) && c.Writer.Written()
+}
+
+// HTTPStreamHasFailure reports whether the stream ended abnormally, including
+// downstream disconnects and soft parsing errors recorded during an otherwise
+// normal EOF/DONE sequence.
+func (info *RelayInfo) HTTPStreamHasFailure() bool {
+	if info == nil || info.StreamStatus == nil {
+		return false
+	}
+	status := info.StreamStatus
+	if status.HasErrors() {
+		return true
+	}
+	switch status.EndReason {
+	case StreamEndReasonNone, StreamEndReasonDone, StreamEndReasonEOF:
+		return false
+	default:
+		return true
+	}
+}
+
+// HTTPStreamFailedBeforeCommit reports a provider-side stream failure that is
+// still safe to retry because nothing has been written to the client.
+func (info *RelayInfo) HTTPStreamFailedBeforeCommit(c *gin.Context) bool {
+	if info == nil || info.StreamStatus == nil || info.HTTPStreamClientCommitted(c) {
+		return false
+	}
+	if info.StreamStatus.EndReason == StreamEndReasonClientGone {
+		return false
+	}
+	return info.HTTPStreamHasFailure()
 }
 
 func (info *RelayInfo) FirstByteTimedOutBeforeResponse() bool {

@@ -240,7 +240,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if classificationAPIError == nil {
 			classificationAPIError = controlAPIError
 		}
-		classification, attemptSuccess := classifyRoutingRelayAttempt(classificationAPIError, relayInfo)
+		classification, attemptSuccess := classifyRoutingRelayAttemptWithContext(c, classificationAPIError, relayInfo)
 		classificationAPIError = service.NormalizeViolationFeeError(classificationAPIError)
 		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
 
@@ -445,10 +445,7 @@ func cappedSecondsDuration(seconds float64, capDuration time.Duration) time.Dura
 }
 
 func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
-	if info == nil {
-		return
-	}
-	info.StreamStatus = nil
+	info.ResetStreamAttemptState()
 }
 
 func relayAttemptControlError(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) *types.NewAPIError {
@@ -458,7 +455,7 @@ func relayAttemptControlError(c *gin.Context, apiErr *types.NewAPIError, info *r
 	if isRealtime {
 		clientCommitted = info.ReceivedResponseCount > 0 || info.HasSendResponse()
 	} else if isStream {
-		clientCommitted = c != nil && c.Writer != nil && c.Writer.Written()
+		clientCommitted = info.HTTPStreamClientCommitted(c)
 	}
 	if clientCommitted {
 		return nil
@@ -512,6 +509,10 @@ func relayAttemptStreamSignal(info *relaycommon.RelayInfo) routingerror.Signal {
 }
 
 func classifyRoutingRelayAttempt(apiErr *types.NewAPIError, info *relaycommon.RelayInfo) (routingerror.Classification, bool) {
+	return classifyRoutingRelayAttemptWithContext(nil, apiErr, info)
+}
+
+func classifyRoutingRelayAttemptWithContext(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) (routingerror.Classification, bool) {
 	ctx := routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationRelay}
 	success := apiErr == nil
 	if apiErr != nil && service.HasCSAMViolationMarker(apiErr) {
@@ -519,6 +520,7 @@ func classifyRoutingRelayAttempt(apiErr *types.NewAPIError, info *relaycommon.Re
 	} else {
 		ctx.Signal = relayAttemptStreamSignal(info)
 	}
+	ctx.BeforeCommit = c != nil && ctx.Signal == routingerror.SignalStreamCorruption && info.HTTPStreamFailedBeforeCommit(c)
 	if ctx.Signal != routingerror.SignalNone {
 		success = false
 	}
@@ -640,8 +642,13 @@ func shouldRetry(
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
-	if relayInfo != nil && (relayInfo.SendResponseCount > 0 || relayInfo.HasSendResponse() || relayInfo.ReceivedResponseCount > 0) {
-		return false
+	if relayInfo != nil {
+		isRealtime := relayInfo.RelayFormat == types.RelayFormatOpenAIRealtime
+		isHTTPStream := relayInfo.IsStream || relayInfo.StreamStatus != nil
+		if (isRealtime || !isHTTPStream) &&
+			(relayInfo.SendResponseCount > 0 || relayInfo.HasSendResponse() || relayInfo.ReceivedResponseCount > 0) {
+			return false
+		}
 	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
 		realtimeFirstByteTimeout := relayInfo != nil &&

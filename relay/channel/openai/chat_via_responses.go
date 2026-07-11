@@ -232,7 +232,8 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
-			sr.Error(err)
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			sr.Stop(streamErr)
 			return
 		}
 
@@ -263,17 +264,19 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 	})
 
-	if streamErr != nil {
-		return nil, streamErr
-	}
-	if info.FirstByteTimedOutBeforeResponse() {
-		return nil, nil
-	}
-
 	usage := state.Usage
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.Usage = usage
+	}
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil, nil
+	}
+	if info.HTTPStreamHasFailure() {
+		return usage, openAIStreamStatusError(info)
 	}
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil {
@@ -281,17 +284,19 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 	for _, chunk := range relayconvert.FinalizeResponsesToChatStream(state) {
 		if !sendChatChunk(chunk) {
-			return nil, streamErr
+			return usage, streamErr
 		}
 	}
 	if info.RelayFormat == types.RelayFormatOpenAI && info.ShouldIncludeUsage && usage != nil {
 		if err := helper.ObjectData(c, helper.GenerateFinalUsageResponse(responseId, state.Created, state.Model, *usage)); err != nil {
-			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return usage, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 		}
 	}
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		helper.Done(c)
+		if err := helper.Done(c); err != nil {
+			return usage, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+		}
 	}
 	return usage, nil
 }

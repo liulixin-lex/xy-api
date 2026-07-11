@@ -133,11 +133,13 @@ func TestClassifyProviderFailureWithRetryAfterHasReliabilityAndCapacityEffects(t
 
 func TestClassifyExplicitStreamSignalsWithoutAPIError(t *testing.T) {
 	corrupted := ClassifyAPIError(nil, Context{Signal: SignalStreamCorruption})
+	preCommitCorruption := ClassifyAPIError(nil, Context{Signal: SignalStreamCorruption, BeforeCommit: true})
 	clientGone := ClassifyAPIError(nil, Context{Signal: SignalClientGone})
 
 	assert.Equal(t, ResponsibilityProvider, corrupted.Responsibility)
 	assert.Equal(t, HealthDegrade, corrupted.HealthEffect)
 	assert.Equal(t, RetryNever, corrupted.Retryability)
+	assert.Equal(t, RetryBeforeCommit, preCommitCorruption.Retryability)
 	assert.Equal(t, ResponsibilityCaller, clientGone.Responsibility)
 	assert.Equal(t, HealthIgnore, clientGone.HealthEffect)
 }

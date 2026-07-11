@@ -92,6 +92,8 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 
 func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var responseText string
+	var streamErr *types.NewAPIError
+	normalEndReason := relaycommon.StreamEndReasonEOF
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
 	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
@@ -104,14 +106,35 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		if len(data) < 5 || !strings.HasPrefix(data, "data:") {
 			continue
 		}
-		data = strings.TrimPrefix(data, "data:")
+		data = strings.TrimSpace(strings.TrimPrefix(data, "data:"))
+		if data == "" {
+			continue
+		}
 		firstByteGuard.MarkReceived()
+		if data == "[DONE]" {
+			normalEndReason = relaycommon.StreamEndReasonDone
+			break
+		}
 
 		var tencentResponse TencentChatResponse
 		err := common.Unmarshal([]byte(data), &tencentResponse)
 		if err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
-			continue
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(err.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			break
+		}
+		if tencentResponse.Error.Code != 0 {
+			err := fmt.Errorf("tencent provider error %d: %s", tencentResponse.Error.Code, tencentResponse.Error.Message)
+			streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(err.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			break
 		}
 
 		response := streamResponseTencent2OpenAI(&tencentResponse)
@@ -122,22 +145,59 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 		err = helper.ObjectData(c, response)
 		if err != nil {
 			common.SysLog(err.Error())
+			streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(err.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			break
 		}
 	}
 
-	if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
-		common.SysLog("error reading stream: " + err.Error())
+	if streamErr == nil {
+		if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
+			common.SysLog("error reading stream: " + err.Error())
+			streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(err.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+			}
+		}
 	}
 
 	if firstByteGuard.TimedOutBeforeResponse() {
 		service.CloseResponseBodyGracefully(resp)
 		return &dto.Usage{}, nil
 	}
-	helper.Done(c)
 
 	service.CloseResponseBodyGracefully(resp)
+	if info.HTTPStreamFailedBeforeCommit(c) {
+		return nil, nil
+	}
 
-	return service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens()), nil
+	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.HTTPStreamHasFailure() {
+		err := info.StreamStatus.EndError
+		if err == nil {
+			err = fmt.Errorf("tencent stream ended abnormally: %s", info.StreamStatus.Summary())
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if err := helper.Done(c); err != nil {
+		if info.StreamStatus != nil {
+			info.StreamStatus.RecordError(err.Error())
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if info.StreamStatus != nil {
+		info.StreamStatus.SetEndReason(normalEndReason, nil)
+	}
+
+	return usage, nil
 }
 
 func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

@@ -1,6 +1,8 @@
 package openai
 
 import (
+	stdjson "encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
+
+type failingImageStreamWriter struct {
+	gin.ResponseWriter
+	err error
+}
+
+func (w *failingImageStreamWriter) Write(_ []byte) (int, error) {
+	return 0, w.err
+}
 
 func newImageTestContext(t *testing.T, body, contentType string, isStream bool) (*gin.Context, *httptest.ResponseRecorder, *http.Response, *relaycommon.RelayInfo) {
 	t.Helper()
@@ -153,15 +164,20 @@ func TestOpenaiImageStreamHandlerRecordsUpstreamErrorEvent(t *testing.T) {
 		`event: error`,
 		`data: {"type":"upstream_error","error":{"message":"stream error: stream ID 77; INTERNAL_ERROR; received from peer"}}`,
 		``,
+		`event: image_generation.completed`,
+		`data: {"type":"image_generation.completed","b64_json":"late"}`,
+		``,
+		`data: [DONE]`,
+		``,
 	}, "\n")
 
 	c, recorder, resp, info := newImageTestContext(t, body, "text/event-stream", true)
 
 	usage, err := OpenaiImageStreamHandler(c, info, resp)
-	require.Nil(t, err)
+	require.NotNil(t, err)
+	require.Contains(t, err.Cause().Error(), "INTERNAL_ERROR")
 	require.NotNil(t, usage)
 	require.NotNil(t, info.StreamStatus)
-	require.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
 	require.True(t, info.StreamStatus.HasErrors())
 	require.Equal(t, 1, info.StreamStatus.TotalErrorCount())
 	require.Contains(t, info.StreamStatus.Errors[0].Message, "INTERNAL_ERROR")
@@ -170,4 +186,84 @@ func TestOpenaiImageStreamHandlerRecordsUpstreamErrorEvent(t *testing.T) {
 	// is still forwarded in the data: payload (stream ID 77).
 	require.Contains(t, recorder.Body.String(), `event: upstream_error`)
 	require.Contains(t, recorder.Body.String(), `stream ID 77`)
+	require.NotContains(t, recorder.Body.String(), `"b64_json":"late"`)
+	require.NotContains(t, recorder.Body.String(), `data: [DONE]`)
+}
+
+func TestOpenaiImageStreamHandlerMalformedFirstChunkDoesNotWrite(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {malformed`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	c, recorder, resp, info := newImageTestContext(t, body, "text/event-stream", true)
+
+	usage, apiErr := OpenaiImageStreamHandler(c, info, resp)
+
+	require.NotNil(t, apiErr)
+	require.NotNil(t, usage)
+	require.NotNil(t, info.StreamStatus)
+	require.True(t, info.HTTPStreamHasFailure())
+	var syntaxErr *stdjson.SyntaxError
+	require.ErrorAs(t, apiErr, &syntaxErr)
+	require.False(t, c.Writer.Written())
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestOpenaiImageStreamHandlerReturnsUsageOnDownstreamWriteFailure(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"image_generation.partial_image\"}\n\n"
+	c, _, resp, info := newImageTestContext(t, body, "text/event-stream", true)
+	writeErr := errors.New("image downstream write failed")
+	c.Writer = &failingImageStreamWriter{ResponseWriter: c.Writer, err: writeErr}
+
+	usage, apiErr := OpenaiImageStreamHandler(c, info, resp)
+
+	require.NotNil(t, usage)
+	require.NotNil(t, apiErr)
+	require.ErrorIs(t, apiErr, writeErr)
+}
+
+func TestOpenaiImageStreamHandlerReturnsUsageWhenDoneWriteFails(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := "data: {\"type\":\"image_generation.partial_image\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
+	c, recorder, resp, info := newImageTestContext(t, body, "text/event-stream", true)
+	doneErr := errors.New("image done write failed")
+	c.Writer = &failOnMarkerWriter{
+		ResponseWriter: c.Writer,
+		marker:         []byte("[DONE]"),
+		err:            doneErr,
+	}
+
+	usage, apiErr := OpenaiImageStreamHandler(c, info, resp)
+
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.TotalTokens)
+	require.NotNil(t, apiErr)
+	require.ErrorIs(t, apiErr, doneErr)
+	require.Contains(t, recorder.Body.String(), "image_generation.partial_image")
+	require.NotContains(t, recorder.Body.String(), "[DONE]")
 }

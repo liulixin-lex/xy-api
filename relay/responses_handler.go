@@ -134,11 +134,15 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
+		finalizeHTTPStreamError(c, info, usage, strings.HasPrefix(info.OriginModelName, "gpt-4o-audio"))
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, strings.HasPrefix(info.OriginModelName, "gpt-4o-audio")) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {

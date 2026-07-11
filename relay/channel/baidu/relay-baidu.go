@@ -116,11 +116,16 @@ func embeddingResponseBaidu2OpenAI(response *BaiduEmbeddingResponse) *dto.OpenAI
 
 func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	usage := &dto.Usage{}
+	var responseText strings.Builder
+	var streamErr *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var baiduResponse BaiduChatStreamResponse
 		if err := common.Unmarshal([]byte(data), &baiduResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			}
+			sr.Stop(err)
 			return
 		}
 		if baiduResponse.Usage.TotalTokens != 0 {
@@ -128,13 +133,35 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			usage.PromptTokens = baiduResponse.Usage.PromptTokens
 			usage.CompletionTokens = baiduResponse.Usage.TotalTokens - baiduResponse.Usage.PromptTokens
 		}
+		responseText.WriteString(baiduResponse.Result)
 		response := streamResponseBaidu2OpenAI(&baiduResponse)
 		if err := helper.ObjectData(c, response); err != nil {
 			common.SysLog("error sending stream response: " + err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			}
+			sr.Stop(err)
+			return
 		}
 	})
 	service.CloseResponseBodyGracefully(resp)
+	if !info.HTTPStreamClientCommitted(c) {
+		return nil, usage
+	}
+	if !service.ValidUsage(usage) {
+		usage = service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+	if streamErr != nil {
+		return streamErr, usage
+	}
+	if info.HTTPStreamHasFailure() {
+		status := info.StreamStatus
+		err := status.EndError
+		if err == nil {
+			err = fmt.Errorf("baidu stream ended abnormally: %s", status.Summary())
+		}
+		return types.NewError(err, types.ErrorCodeBadResponse), usage
+	}
 	return nil, usage
 }
 

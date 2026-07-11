@@ -427,16 +427,26 @@ func firstByteDeadlineExceeded(ctx context.Context, err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.CancelFunc, <-chan struct{}) {
+func startPingKeepAlive(c *gin.Context, info *common.RelayInfo, pingInterval time.Duration, cancelAttempt context.CancelFunc) (context.CancelFunc, <-chan struct{}, <-chan error) {
 	pingerCtx, stopPinger := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	errChan := make(chan error, 1)
 
 	gopool.Go(func() {
 		defer close(done)
 		defer func() {
-			// 增加panic恢复处理
 			if r := recover(); r != nil {
-				logger.LogDebug(c, "SSE ping goroutine panic recovered: %v", r)
+				panicErr := fmt.Errorf("SSE ping goroutine panic: %v", r)
+				logger.LogError(c, panicErr.Error())
+				if info.StreamStatus == nil {
+					info.StreamStatus = common.NewStreamStatus()
+				}
+				info.StreamStatus.RecordError(panicErr.Error())
+				info.StreamStatus.SetEndReason(common.StreamEndReasonPanic, panicErr)
+				errChan <- panicErr
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
 			}
 			logger.LogDebug(c, "SSE ping goroutine stopped")
 		}()
@@ -466,6 +476,15 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.Can
 			case <-ticker.C:
 				if err := sendPingData(c, &pingMutex); err != nil {
 					logger.LogDebug(c, "SSE ping error, stopping goroutine: %s", err.Error())
+					if info.StreamStatus == nil {
+						info.StreamStatus = common.NewStreamStatus()
+					}
+					info.StreamStatus.RecordError(err.Error())
+					info.StreamStatus.SetEndReason(common.StreamEndReasonPingFail, err)
+					errChan <- err
+					if cancelAttempt != nil {
+						cancelAttempt()
+					}
 					return
 				}
 			// 收到退出信号
@@ -482,7 +501,7 @@ func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.Can
 		}
 	})
 
-	return stopPinger, done
+	return stopPinger, done, errChan
 }
 
 func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
@@ -533,13 +552,18 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 
 	var stopPinger context.CancelFunc
 	var pingerDone <-chan struct{}
+	var pingerErr <-chan error
+	var cancelPingAttempt context.CancelFunc
 	if info.IsStream {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()
 		if generalSettings.PingIntervalEnabled && !info.DisablePing && shouldStartPreResponseStreamPing(info) {
 			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-			stopPinger, pingerDone = startPingKeepAlive(c, pingInterval)
+			pingCtx, cancel := context.WithCancel(req.Context())
+			cancelPingAttempt = cancel
+			req = req.WithContext(pingCtx)
+			stopPinger, pingerDone, pingerErr = startPingKeepAlive(c, info, pingInterval, cancel)
 			// 使用defer确保在任何情况下都能停止ping goroutine
 			defer func() {
 				if stopPinger != nil {
@@ -547,11 +571,33 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 					<-pingerDone
 					logger.LogDebug(c, "SSE ping goroutine stopped by defer")
 				}
+				if cancelPingAttempt != nil {
+					cancelPingAttempt()
+				}
 			}()
 		}
 	}
 
 	resp, err := client.Do(req)
+	if stopPinger != nil {
+		stopPinger()
+		<-pingerDone
+		stopPinger = nil
+		if cancelPingAttempt != nil {
+			cancelPingAttempt()
+			cancelPingAttempt = nil
+		}
+	}
+	if pingerErr != nil {
+		select {
+		case err := <-pingerErr:
+			if resp != nil && resp.Body != nil {
+				service.CloseResponseBodyGracefully(resp)
+			}
+			return nil, types.NewError(err, types.ErrorCodeBadResponse)
+		default:
+		}
+	}
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
 		if firstByteTimeout > 0 && errors.Is(req.Context().Err(), context.DeadlineExceeded) {

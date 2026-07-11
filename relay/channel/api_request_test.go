@@ -1,6 +1,8 @@
 package channel
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +22,23 @@ import (
 )
 
 var smartRoutingSettingTestMu sync.Mutex
+
+type failingPingWriter struct {
+	gin.ResponseWriter
+	err error
+}
+
+func (w *failingPingWriter) Write(_ []byte) (int, error) {
+	return 0, w.err
+}
+
+type panickingPingWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *panickingPingWriter) Write(_ []byte) (int, error) {
+	panic("ping writer exploded")
+}
 
 type testWssAdaptor struct {
 	url string
@@ -77,6 +96,56 @@ func (a testWssAdaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.R
 
 func (a testWssAdaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
 	return nil, nil
+}
+
+func TestStartPingKeepAlivePropagatesFailureAndCancelsAttempt(t *testing.T) {
+	tests := []struct {
+		name       string
+		writer     func(gin.ResponseWriter) gin.ResponseWriter
+		wantReason relaycommon.StreamEndReason
+	}{
+		{
+			name: "write failure",
+			writer: func(writer gin.ResponseWriter) gin.ResponseWriter {
+				return &failingPingWriter{ResponseWriter: writer, err: errors.New("ping write failed")}
+			},
+			wantReason: relaycommon.StreamEndReasonPingFail,
+		},
+		{
+			name: "writer panic",
+			writer: func(writer gin.ResponseWriter) gin.ResponseWriter {
+				return &panickingPingWriter{ResponseWriter: writer}
+			},
+			wantReason: relaycommon.StreamEndReasonPanic,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(attemptCtx)
+			ctx.Writer = tt.writer(ctx.Writer)
+			info := &relaycommon.RelayInfo{IsStream: true}
+
+			stop, done, errChan := startPingKeepAlive(ctx, info, time.Millisecond, cancelAttempt)
+			var pingErr error
+			select {
+			case pingErr = <-errChan:
+			case <-time.After(time.Second):
+				require.Fail(t, "ping failure was not propagated")
+			}
+			stop()
+			<-done
+
+			require.Error(t, pingErr)
+			assert.ErrorIs(t, attemptCtx.Err(), context.Canceled)
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, tt.wantReason, info.StreamStatus.EndReason)
+			assert.True(t, info.StreamStatus.HasErrors())
+		})
+	}
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {

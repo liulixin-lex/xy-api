@@ -153,7 +153,7 @@ func TestRelayAttemptControlErrorKeepsCommittedRealtimeErrorAsClassificationEvid
 	assert.Same(t, attemptErr, relayAttemptControlError(ctx, attemptErr, &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAI}))
 }
 
-func TestShouldRetryAllowsFirstByteTimeoutBeforeClientWrite(t *testing.T) {
+func TestShouldRetryAllowsHTTPStreamRetryUntilWriterCommit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	apiErr := types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeBadResponseStatusCode, http.StatusGatewayTimeout)
@@ -163,8 +163,11 @@ func TestShouldRetryAllowsFirstByteTimeoutBeforeClientWrite(t *testing.T) {
 	classification := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
 	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1))
 
+	info.SendResponseCount = 1
 	info.ReceivedResponseCount = 1
-	assert.False(t, shouldRetry(ctx, info, apiErr, classification, 1))
+	info.StartTime = time.Now().Add(-time.Second)
+	info.FirstResponseTime = time.Now()
+	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1), "attempt counters are not a client commit")
 }
 
 func TestShouldRetryAllowsRealtimeFirstByteTimeoutAfterWebSocketUpgrade(t *testing.T) {
@@ -401,7 +404,7 @@ func TestRelayAttemptControlErrorConvertsOnlyPreCommitStreamFailure(t *testing.T
 				assert.Nil(t, apiErr)
 			}
 
-			classification, success := classifyRoutingRelayAttempt(apiErr, info)
+			classification, success := classifyRoutingRelayAttemptWithContext(ctx, apiErr, info)
 			if tt.wantResponsibility == "" {
 				assert.True(t, success)
 				assert.Equal(t, "success", classification.Rule)
@@ -409,7 +412,12 @@ func TestRelayAttemptControlErrorConvertsOnlyPreCommitStreamFailure(t *testing.T
 			}
 			assert.False(t, success)
 			assert.Equal(t, tt.wantResponsibility, classification.Responsibility)
-			assert.Equal(t, routingerror.RetryNever, classification.Retryability)
+			wantRetryability := routingerror.RetryBeforeCommit
+			if tt.writerCommitted {
+				wantRetryability = routingerror.RetryNever
+			}
+			assert.Equal(t, wantRetryability, classification.Retryability)
+			assert.Equal(t, !tt.writerCommitted, shouldRetry(ctx, info, apiErr, classification, 1))
 		})
 	}
 }
@@ -508,10 +516,23 @@ func TestPrepareRoutingRelayAttemptIsolatesStreamStatusPerAttempt(t *testing.T) 
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
+			start := time.Now().Add(-time.Second)
+			info := &relaycommon.RelayInfo{
+				StartTime:             start,
+				FirstResponseTime:     time.Now(),
+				SendResponseCount:     2,
+				ReceivedResponseCount: 3,
+				StreamStatus:          relaycommon.NewStreamStatus(),
+			}
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, errors.New("previous attempt timed out"))
 
 			prepareRoutingRelayAttempt(info)
+			assert.Nil(t, info.StreamStatus)
+			assert.Zero(t, info.SendResponseCount)
+			assert.Zero(t, info.ReceivedResponseCount)
+			assert.False(t, info.HasSendResponse())
+			info.SetFirstResponseTime()
+			assert.True(t, info.HasSendResponse())
 			apiErr := types.NewErrorWithStatusCode(errors.New("new attempt failed"), types.ErrorCodeBadResponseStatusCode, tt.statusCode)
 			classification, success := classifyRoutingRelayAttempt(apiErr, info)
 
@@ -522,6 +543,24 @@ func TestPrepareRoutingRelayAttemptIsolatesStreamStatusPerAttempt(t *testing.T) 
 			assert.Equal(t, tt.capacity, classification.CapacityEffect)
 		})
 	}
+}
+
+func TestPrepareRoutingRelayAttemptRestoresRequestFormatBaseline(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		RelayFormat:            types.RelayFormatOpenAI,
+		IsStream:               false,
+		RequestConversionChain: []types.RelayFormat{types.RelayFormatOpenAI},
+	}
+	prepareRoutingRelayAttempt(info)
+
+	info.IsStream = true
+	info.AppendRequestConversion(types.RelayFormatClaude)
+	info.FinalRequestRelayFormat = types.RelayFormatClaude
+	prepareRoutingRelayAttempt(info)
+
+	assert.False(t, info.IsStream)
+	assert.Equal(t, []types.RelayFormat{types.RelayFormatOpenAI}, info.RequestConversionChain)
+	assert.Empty(t, info.FinalRequestRelayFormat)
 }
 
 func TestClassifyRoutingTaskErrorKeepsContentSafety403OutOfAutoDisable(t *testing.T) {

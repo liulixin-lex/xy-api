@@ -20,6 +20,32 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func prepareImageSettlement(info *relaycommon.RelayInfo, request *dto.ImageRequest, usage any, committed bool) (any, uint) {
+	imageN := uint(1)
+	if request != nil && request.N != nil {
+		imageN = *request.N
+	}
+	if info != nil && info.PriceData.UsePrice && !info.PriceData.HasOtherRatio("n") {
+		info.PriceData.AddOtherRatio("n", float64(imageN))
+	}
+
+	usageDto, ok := usage.(*dto.Usage)
+	if !ok || usageDto == nil {
+		if !committed {
+			return usage, imageN
+		}
+		usageDto = &dto.Usage{}
+		usage = usageDto
+	}
+	if usageDto.TotalTokens == 0 {
+		usageDto.TotalTokens = 1
+	}
+	if usageDto.PromptTokens == 0 {
+		usageDto.PromptTokens = 1
+	}
+	return usage, imageN
+}
+
 func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
 
@@ -112,38 +138,21 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	}
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
+	usage, imageN := prepareImageSettlement(info, request, usage, info.HTTPStreamClientCommitted(c))
 	if newAPIError != nil {
+		finalizeHTTPStreamError(c, info, usage, false)
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {
 		return types.NewOpenAIError(fmt.Errorf("empty usage from channel response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
-	}
-
-	imageN := uint(1)
-	if request.N != nil {
-		imageN = *request.N
-	}
-
-	// n is handled via OtherRatio so it is applied exactly once in quota
-	// calculation (both price-based and ratio-based paths).
-	// Adaptors may have already set a more accurate count from the
-	// upstream response; only set the default when they haven't.
-	if info.PriceData.UsePrice { // only price model use N ratio
-		if !info.PriceData.HasOtherRatio("n") {
-			info.PriceData.AddOtherRatio("n", float64(imageN))
-		}
-	}
-
-	if usage.(*dto.Usage).TotalTokens == 0 {
-		usage.(*dto.Usage).TotalTokens = 1
-	}
-	if usage.(*dto.Usage).PromptTokens == 0 {
-		usage.(*dto.Usage).PromptTokens = 1
 	}
 
 	quality := request.Quality

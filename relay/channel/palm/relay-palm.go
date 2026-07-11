@@ -1,7 +1,7 @@
 package palm
 
 import (
-	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -51,62 +51,77 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 }
 
 func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
-	responseText := ""
-	responseId := helper.GetResponseID(c)
-	createdTime := common.GetTimestamp()
-	dataChan := make(chan string)
-	stopChan := make(chan bool)
+	defer service.CloseResponseBodyGracefully(resp)
 	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
 	defer firstByteGuard.Stop()
-	go func() {
-		responseBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			if !firstByteGuard.TimedOutBeforeResponse() {
-				common.SysLog("error reading stream response: " + err.Error())
-			}
-			stopChan <- true
-			return
-		}
-		service.CloseResponseBodyGracefully(resp)
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if len(responseBody) > 0 {
 		firstByteGuard.MarkReceived()
-		var palmResponse PaLMChatResponse
-		err = json.Unmarshal(responseBody, &palmResponse)
-		if err != nil {
-			common.SysLog("error unmarshalling stream response: " + err.Error())
-			stopChan <- true
-			return
-		}
-		fullTextResponse := streamResponsePaLM2OpenAI(&palmResponse)
-		fullTextResponse.Id = responseId
-		fullTextResponse.Created = createdTime
-		if len(palmResponse.Candidates) > 0 {
-			responseText = palmResponse.Candidates[0].Content
-		}
-		jsonResponse, err := json.Marshal(fullTextResponse)
-		if err != nil {
-			common.SysLog("error marshalling stream response: " + err.Error())
-			stopChan <- true
-			return
-		}
-		dataChan <- string(jsonResponse)
-		stopChan <- true
-	}()
-	helper.SetEventStreamHeaders(c)
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case data := <-dataChan:
-			c.Render(-1, common.CustomEvent{Data: "data: " + data})
-			return true
-		case <-stopChan:
-			if firstByteGuard.TimedOutBeforeResponse() {
-				return false
+	}
+	if firstByteGuard.TimedOutBeforeResponse() {
+		return nil, ""
+	}
+	if err != nil {
+		return palmStreamError(info, relaycommon.StreamEndReasonScannerErr, err), ""
+	}
+
+	var palmResponse PaLMChatResponse
+	if err := common.Unmarshal(responseBody, &palmResponse); err != nil {
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), ""
+	}
+	responseText := ""
+	if len(palmResponse.Candidates) > 0 {
+		responseText = palmResponse.Candidates[0].Content
+	}
+	if palmResponse.Error.Code != 0 {
+		err := fmt.Errorf("palm provider error %d (%s): %s", palmResponse.Error.Code, palmResponse.Error.Status, palmResponse.Error.Message)
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), responseText
+	}
+	if len(palmResponse.Candidates) == 0 {
+		message := palmResponse.Error.Message
+		if message == "" && len(palmResponse.Filters) > 0 {
+			message = palmResponse.Filters[0].Message
+			if message == "" {
+				message = palmResponse.Filters[0].Reason
 			}
-			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
 		}
-	})
-	service.CloseResponseBodyGracefully(resp)
+		if message == "" {
+			message = "provider returned no candidate details"
+		}
+		err := fmt.Errorf("palm provider response has no candidates: %s", message)
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), ""
+	}
+	fullTextResponse := streamResponsePaLM2OpenAI(&palmResponse)
+	fullTextResponse.Id = helper.GetResponseID(c)
+	fullTextResponse.Created = common.GetTimestamp()
+	jsonResponse, err := common.Marshal(fullTextResponse)
+	if err != nil {
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), responseText
+	}
+
+	helper.SetEventStreamHeaders(c)
+	if err := helper.StringData(c, string(jsonResponse)); err != nil {
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), responseText
+	}
+	if err := helper.Done(c); err != nil {
+		return palmStreamError(info, relaycommon.StreamEndReasonHandlerStop, err), responseText
+	}
+	if info.StreamStatus != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+	}
 	return nil, responseText
+}
+
+func palmStreamError(info *relaycommon.RelayInfo, reason relaycommon.StreamEndReason, err error) *types.NewAPIError {
+	if info != nil {
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.RecordError(err.Error())
+		info.StreamStatus.SetEndReason(reason, err)
+	}
+	return types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 }
 
 func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -116,7 +131,7 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	}
 	service.CloseResponseBodyGracefully(resp)
 	var palmResponse PaLMChatResponse
-	err = json.Unmarshal(responseBody, &palmResponse)
+	err = common.Unmarshal(responseBody, &palmResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}

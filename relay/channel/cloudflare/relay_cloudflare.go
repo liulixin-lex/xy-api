@@ -34,10 +34,12 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 	scanner.Split(bufio.ScanLines)
 	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
 	defer firstByteGuard.Stop()
+	defer service.CloseResponseBodyGracefully(resp)
 
 	helper.SetEventStreamHeaders(c)
 	id := helper.GetResponseID(c)
 	var responseText string
+	var streamErr *types.NewAPIError
 
 	for scanner.Scan() {
 		data := scanner.Text()
@@ -56,7 +58,8 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		err := common.Unmarshal([]byte(data), &response)
 		if err != nil {
 			logger.LogError(c, "error_unmarshalling_stream_response: "+err.Error())
-			continue
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			break
 		}
 		for _, choice := range response.Choices {
 			choice.Delta.Role = "assistant"
@@ -67,27 +70,35 @@ func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 		err = helper.ObjectData(c, response)
 		if err != nil {
 			logger.LogError(c, "error_rendering_stream_response: "+err.Error())
+			streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			break
 		}
 	}
 
 	if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
 		logger.LogError(c, "error_scanning_stream_response: "+err.Error())
+		if streamErr == nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
 	}
 	if firstByteGuard.TimedOutBeforeResponse() {
-		service.CloseResponseBodyGracefully(resp)
 		return nil, &dto.Usage{}
 	}
 	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	if streamErr != nil {
+		return streamErr, usage
+	}
 	if info.ShouldIncludeUsage {
 		response := helper.GenerateFinalUsageResponse(id, info.StartTime.Unix(), info.UpstreamModelName, *usage)
 		err := helper.ObjectData(c, response)
 		if err != nil {
 			logger.LogError(c, "error_rendering_final_usage_response: "+err.Error())
+			return types.NewError(err, types.ErrorCodeBadResponse), usage
 		}
 	}
-	helper.Done(c)
-
-	service.CloseResponseBodyGracefully(resp)
+	if err := helper.Done(c); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponse), usage
+	}
 
 	return nil, usage
 }

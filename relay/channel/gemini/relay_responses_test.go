@@ -167,6 +167,59 @@ func TestGeminiResponsesStreamHandlerReturnsOpenAIResponsesSSE(t *testing.T) {
 	)
 }
 
+func TestGeminiResponsesStreamHandlerReturnsUsageOnDownstreamWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	writeErr := errors.New("downstream responses write failed")
+	c.Writer = &failingGeminiResponseWriter{ResponseWriter: c.Writer, err: writeErr}
+
+	oldStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() { constant.StreamingTimeout = oldStreamingTimeout })
+
+	chunk := dto.GeminiChatResponse{
+		Candidates:    []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Role: "model", Parts: []dto.GeminiPart{{Text: "partial"}}}}},
+		UsageMetadata: dto.GeminiUsageMetadata{PromptTokenCount: 2, CandidatesTokenCount: 3, TotalTokenCount: 5},
+	}
+	chunkData, err := common.Marshal(chunk)
+	require.NoError(t, err)
+	resp := &http.Response{Body: io.NopCloser(bytes.NewReader([]byte("data: " + string(chunkData) + "\ndata: [DONE]\n")))}
+
+	usage, apiErr := GeminiResponsesStreamHandler(c, newGeminiResponsesRelayInfo(true), resp)
+
+	require.NotNil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, writeErr)
+}
+
+func TestGeminiResponsesStreamHandlerDoesNotFinalizeScannerFailureBeforeCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	oldStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 300
+	t.Cleanup(func() {
+		constant.StreamingTimeout = oldStreamingTimeout
+	})
+
+	info := newGeminiResponsesRelayInfo(true)
+	usage, apiErr := GeminiResponsesStreamHandler(c, info, &http.Response{Body: &failingReadCloser{}})
+
+	require.NotNil(t, usage)
+	assert.Empty(t, recorder.Body.String())
+	assert.False(t, c.Writer.Written())
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.False(t, info.HasSendResponse())
+	assert.True(t, info.HTTPStreamFailedBeforeCommit(c))
+	require.NotNil(t, apiErr)
+	require.Error(t, apiErr.Cause())
+	assert.Contains(t, apiErr.Cause().Error(), "read failed")
+}
+
 func newGeminiResponsesRelayInfo(isStream bool) *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{
 		IsStream:        isStream,
