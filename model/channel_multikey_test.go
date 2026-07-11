@@ -201,3 +201,36 @@ func TestChannelUpdateCleansAllOutOfRangeMultiKeyState(t *testing.T) {
 	assert.Equal(t, map[int]int64{0: 22}, channel.ChannelInfo.MultiKeyDisabledTime)
 	assert.Zero(t, channel.ChannelInfo.MultiKeyPollingIndex)
 }
+
+func TestChannelUpdateTreatsEmptyJSONArrayAsNoKeys(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+
+	channel := &Channel{
+		Id:     9202,
+		Name:   "empty multi-key array",
+		Key:    "raw-a\nraw-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-test",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeySize:           2,
+			MultiKeyStatusList:     map[int]int{0: common.ChannelStatusManuallyDisabled},
+			MultiKeyDisabledReason: map[int]string{0: "manual operation"},
+			MultiKeyDisabledTime:   map[int]int64{0: 123},
+			MultiKeyPollingIndex:   1,
+		},
+	}
+	require.NoError(t, db.Create(channel).Error)
+	channel.Key = "[]"
+
+	require.NoError(t, channel.Update())
+
+	assert.Zero(t, channel.ChannelInfo.MultiKeySize)
+	assert.Empty(t, channel.ChannelInfo.MultiKeyStatusList)
+	assert.Empty(t, channel.ChannelInfo.MultiKeyDisabledReason)
+	assert.Empty(t, channel.ChannelInfo.MultiKeyDisabledTime)
+	assert.Zero(t, channel.ChannelInfo.MultiKeyPollingIndex)
+}
