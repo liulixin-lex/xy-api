@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -407,9 +406,9 @@ func TestFlushRoutingRuntimeStateDropsInvalidLegacyRoutingState(t *testing.T) {
 			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
 			Group: "default", BucketTs: 60, RequestCount: 1,
 		})
-		routingbreaker.RecordAttempt(routingbreaker.Key{
+		routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
 			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, Model: key.modelName, Group: "default",
-		}, false, http.StatusBadGateway, 0)
+		}, routingbreaker.FailureProvider5xx)
 	}
 	routingmetrics.RequeueSnapshots(metrics)
 
@@ -453,9 +452,9 @@ func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAn
 		{ChannelID: 81, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "metric-b", Group: "default", BucketTs: 60, RequestCount: 1},
 	})
 	for _, modelName := range []string{"breaker-a", "breaker-b"} {
-		routingbreaker.RecordAttempt(routingbreaker.Key{
+		routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
 			ChannelID: 81, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: modelName, Group: "default",
-		}, false, http.StatusBadGateway, 0)
+		}, routingbreaker.FailureProvider5xx)
 	}
 
 	const callbackName = "test:count_flush_channel_eligibility_queries"
@@ -587,7 +586,7 @@ func TestFlushRoutingRuntimeStateRequeuesBreakersWhenEligibilityLookupFails(t *t
 		{ChannelID: 104, APIKeyIndex: 1, Model: "g-unvisited-positive", Group: "default"},
 	}
 	for _, key := range keys {
-		routingbreaker.RecordAttempt(key, false, http.StatusBadGateway, 0)
+		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureProvider5xx)
 	}
 
 	forcedErr := errors.New("forced breaker eligibility lookup failure")
@@ -725,7 +724,7 @@ func TestFlushRoutingRuntimeStateRequeuesOnlyValidBreakerSuffixAfterPersistenceF
 		{ChannelID: 51, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "d-valid-suffix", Group: "default"},
 	}
 	for _, key := range keys {
-		routingbreaker.RecordAttempt(key, false, http.StatusBadGateway, 0)
+		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureProvider5xx)
 	}
 
 	const callbackName = "test:fail_second_routing_breaker_update"

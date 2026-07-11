@@ -481,57 +481,30 @@ func classifyRoutingRelayAttempt(apiErr *types.NewAPIError, info *relaycommon.Re
 	return routingerror.ClassifyAPIError(apiErr, ctx), success
 }
 
-func classifyRoutingTaskChannelError(apiErr *types.NewAPIError) routingerror.Classification {
-	ctx := routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationTaskSubmit}
-	if service.HasCSAMViolationMarker(apiErr) {
-		ctx.Signal = routingerror.SignalContentSafety
+func taskErrorToAPIError(taskErr *dto.TaskError) *types.NewAPIError {
+	if taskErr == nil {
+		return nil
 	}
-	return routingerror.ClassifyAPIError(apiErr, ctx)
-}
-
-func recordRoutingTaskAttempt(c *gin.Context, relayInfo *relaycommon.RelayInfo, channelID int, taskErr *dto.TaskError) {
-	var apiErr *types.NewAPIError
-	if taskErr != nil {
-		err := taskErr.Error
+	if taskErr.Code == "" {
+		taskErr.Code = string(types.ErrorCodeBadResponseStatusCode)
+	}
+	if taskErr.StatusCode == 0 {
+		taskErr.StatusCode = http.StatusInternalServerError
+	}
+	if taskErr.Message == "" {
+		taskErr.Message = "task relay failed"
+	}
+	if taskErr.Error == nil {
+		taskErr.Error = errors.New(taskErr.Message)
+	}
+	apiErr := types.NewErrorWithStatusCode(taskErr.Error, types.ErrorCode(taskErr.Code), taskErr.StatusCode)
+	if taskErr.RetryAfterMs > 0 {
+		metadata, err := common.Marshal(map[string]int64{"retry_after_ms": taskErr.RetryAfterMs})
 		if err == nil {
-			message := taskErr.Message
-			if message == "" {
-				message = "task relay failed"
-			}
-			err = errors.New(message)
+			apiErr.Metadata = metadata
 		}
-		apiErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
 	}
-	routingmetrics.RecordAttempt(c, relayInfo, channelID, apiErr)
-	recordRoutingTaskBreakerAttempt(c, relayInfo, channelID, apiErr)
-}
-
-func recordRoutingTaskBreakerAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
-	if info == nil || info.OriginModelName == "" || info.CurrentAttemptIsMultiKey(c) {
-		return
-	}
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled {
-		return
-	}
-	syncRoutingBreakerConfigFromSetting(setting)
-	group := info.UsingGroup
-	if group == "" {
-		group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-	}
-	if group == "" {
-		group = "default"
-	}
-	statusCode := 0
-	if apiErr != nil {
-		statusCode = apiErr.StatusCode
-	}
-	routingbreaker.RecordAttempt(routingbreaker.Key{
-		ChannelID:   channelID,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       info.OriginModelName,
-		Group:       group,
-	}, apiErr == nil, statusCode, 0)
+	return apiErr
 }
 
 var upgrader = websocket.Upgrader{
@@ -856,22 +829,29 @@ func RelayTask(c *gin.Context) {
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
-		recordRoutingTaskAttempt(c, relayInfo, channel.Id, taskErr)
+		taskAPIError := taskErrorToAPIError(taskErr)
+		classificationContext := routingerror.Context{
+			Component: routingerror.ComponentServing,
+			Operation: routingerror.OperationTaskSubmit,
+		}
+		if service.HasCSAMViolationMarker(taskAPIError) {
+			classificationContext.Signal = routingerror.SignalContentSafety
+		}
+		classification := routingerror.ClassifyTaskError(taskErr, classificationContext)
+		recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
 		if taskErr == nil {
 			break
 		}
 
 		if !taskErr.LocalError {
-			apiErr := types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
-			classification := classifyRoutingTaskChannelError(apiErr)
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				apiErr,
+				taskAPIError,
 				classification)
 		}
 
-		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
+		if !shouldRetryTaskRelay(c, taskErr, classification, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
 	}
@@ -927,8 +907,11 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 	c.JSON(taskErr.StatusCode, taskErr)
 }
 
-func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
+func shouldRetryTaskRelay(c *gin.Context, taskErr *dto.TaskError, classification routingerror.Classification, retryTimes int) bool {
 	if taskErr == nil {
+		return false
+	}
+	if taskErr.LocalError {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -940,31 +923,5 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
-	if taskErr.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-	if taskErr.StatusCode == 307 {
-		return true
-	}
-	if taskErr.StatusCode/100 == 5 {
-		// 超时不重试
-		if operation_setting.IsAlwaysSkipRetryStatusCode(taskErr.StatusCode) {
-			return false
-		}
-		return true
-	}
-	if taskErr.StatusCode == http.StatusBadRequest {
-		return false
-	}
-	if taskErr.StatusCode == 408 {
-		// azure处理超时不重试
-		return false
-	}
-	if taskErr.LocalError {
-		return false
-	}
-	if taskErr.StatusCode/100 == 2 {
-		return false
-	}
-	return true
+	return classification.Retryability == routingerror.RetryBeforeCommit
 }

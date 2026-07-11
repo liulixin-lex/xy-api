@@ -3,12 +3,16 @@ package relay
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +21,35 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+type taskBillingStub struct{}
+
+func (taskBillingStub) Settle(int) error         { return nil }
+func (taskBillingStub) Refund(*gin.Context)      {}
+func (taskBillingStub) NeedsRefund() bool        { return false }
+func (taskBillingStub) GetPreConsumedQuota() int { return 0 }
+func (taskBillingStub) Reserve(int) error        { return nil }
+
+func taskSubmitTestFixture(channelType, channelID int, apiKey, baseURL, modelName string) (*gin.Context, *relaycommon.RelayInfo) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"prompt":"draw a cat","model":"`+modelName+`"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("platform", strconv.Itoa(channelType))
+	common.SetContextKey(ctx, constant.ContextKeyChannelId, channelID)
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, channelType)
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, apiKey)
+	common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, baseURL)
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	return ctx, &relaycommon.RelayInfo{
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		OriginModelName: modelName,
+		UserSetting:     dto.UserSetting{AcceptUnsetRatioModel: true},
+		Billing:         taskBillingStub{},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+}
 
 func setupResolveOriginTaskTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -195,4 +228,182 @@ func TestResolveOriginTaskSynchronizesKeySelectionError(t *testing.T) {
 	assert.True(t, taskErr.LocalError)
 	assert.Equal(t, string(types.ErrorCodeChannelNoAvailableKey), taskErr.Code)
 	assert.Equal(t, http.StatusInternalServerError, taskErr.StatusCode)
+}
+
+func TestRelayTaskSubmitMarksModelPriceFailureLocal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"prompt":"draw a cat","model":"phase0b-unpriced-task"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("platform", strconv.Itoa(constant.ChannelTypeGemini))
+	common.SetContextKey(ctx, constant.ContextKeyChannelId, 71)
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeGemini)
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, "test-key")
+	common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, "https://example.invalid")
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	info := &relaycommon.RelayInfo{
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		OriginModelName: "phase0b-unpriced-task",
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, string(types.ErrorCodeModelPriceError), taskErr.Code)
+	assert.True(t, taskErr.LocalError)
+}
+
+func TestRelayTaskSubmitPreservesRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"prompt":"draw a cat","model":"veo-3.0-generate-001"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("platform", strconv.Itoa(constant.ChannelTypeGemini))
+	common.SetContextKey(ctx, constant.ContextKeyChannelId, 72)
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeGemini)
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, "test-key")
+	common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, server.URL)
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	info := &relaycommon.RelayInfo{
+		UserGroup:       "default",
+		UsingGroup:      "default",
+		OriginModelName: "veo-3.0-generate-001",
+		Billing:         taskBillingStub{},
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, string(types.ErrorCodeBadResponseStatusCode), taskErr.Code)
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.Equal(t, int64(2000), taskErr.RetryAfterMs)
+	assert.False(t, taskErr.LocalError)
+}
+
+func TestRelayTaskSubmitMarksVertexCredentialPreparationFailureLocal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, info := taskSubmitTestFixture(
+		constant.ChannelTypeVertexAi,
+		73,
+		"not-valid-vertex-credential-json",
+		"https://example.invalid",
+		"veo-3.0-generate-001",
+	)
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, string(types.ErrorCodeDoRequestFailed), taskErr.Code)
+	assert.Equal(t, http.StatusInternalServerError, taskErr.StatusCode)
+	assert.ErrorContains(t, taskErr.Error, "failed to decode credentials")
+}
+
+func TestRelayTaskSubmitKeepsTransportFailureNonLocal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
+	ctx, info := taskSubmitTestFixture(
+		constant.ChannelTypeGemini,
+		74,
+		"test-key",
+		baseURL,
+		"veo-3.0-generate-001",
+	)
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.False(t, taskErr.LocalError)
+	assert.Equal(t, string(types.ErrorCodeDoRequestFailed), taskErr.Code)
+	assert.Equal(t, http.StatusBadGateway, taskErr.StatusCode)
+	var transportErr *types.NewAPIError
+	require.ErrorAs(t, taskErr.Error, &transportErr)
+	assert.Equal(t, types.ErrorCodeDoRequestFailed, transportErr.GetErrorCode())
+}
+
+func TestRelayTaskSubmitMarksInvalidTaskHeaderLocal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	ctx, info := taskSubmitTestFixture(
+		constant.ChannelTypeGemini,
+		77,
+		"invalid\napi-key",
+		"https://example.invalid",
+		"veo-3.0-generate-001",
+	)
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, string(types.ErrorCodeDoRequestFailed), taskErr.Code)
+	assert.Equal(t, http.StatusInternalServerError, taskErr.StatusCode)
+	assert.ErrorContains(t, taskErr.Error, "invalid header field value")
+}
+
+func TestRelayTaskSubmitMarksViduEnvelopeRejectionUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":"failed","task_id":""}`))
+	}))
+	t.Cleanup(server.Close)
+	ctx, info := taskSubmitTestFixture(
+		constant.ChannelTypeVidu,
+		75,
+		"test-key",
+		server.URL,
+		"viduq2",
+	)
+
+	_, taskErr := RelayTaskSubmit(ctx, info)
+
+	require.NotNil(t, taskErr)
+	assert.False(t, taskErr.LocalError)
+	assert.Equal(t, "task_failed", taskErr.Code)
+	assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
+}
+
+func TestRelayTaskSubmitRejectsViduSuccessWithoutTaskIDBeforeWritingResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service.InitHttpClient()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"state":"created","task_id":""}`))
+	}))
+	t.Cleanup(server.Close)
+	ctx, info := taskSubmitTestFixture(
+		constant.ChannelTypeVidu,
+		76,
+		"test-key",
+		server.URL,
+		"viduq2",
+	)
+
+	result, taskErr := RelayTaskSubmit(ctx, info)
+
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.False(t, taskErr.LocalError)
+	assert.Equal(t, "invalid_response", taskErr.Code)
+	assert.Equal(t, http.StatusInternalServerError, taskErr.StatusCode)
+	assert.False(t, ctx.Writer.Written())
+	assert.Equal(t, -1, ctx.Writer.Size())
 }

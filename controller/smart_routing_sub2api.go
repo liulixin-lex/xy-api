@@ -154,7 +154,6 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 			snapshots = append(snapshots, snapshot)
 		}
 	}
-	clearRoutingAuthFailure(binding.ChannelID)
 	return snapshots, nil
 }
 
@@ -260,7 +259,6 @@ func releaseRoutingSub2APIRedisLock(channelID int, lockOwner string) {
 func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (string, time.Duration, error) {
 	email := strings.TrimSpace(credentials.Sub2APIEmail)
 	if email == "" || credentials.Sub2APIPassword == "" {
-		markRoutingAuthFailure(binding.ChannelID)
 		return "", 0, routingAuthErrorf("sub2api email and password are required")
 	}
 	body, err := common.Marshal(map[string]string{
@@ -296,10 +294,8 @@ func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBindin
 		token = strings.TrimSpace(response.JWT)
 	}
 	if token == "" {
-		markRoutingAuthFailure(binding.ChannelID)
 		return "", 0, routingAuthErrorf("sub2api login did not return a token")
 	}
-	clearRoutingAuthFailure(binding.ChannelID)
 	ttl := time.Duration(response.ExpiresIn) * time.Second
 	if ttl <= routingSub2APITokenTTLBuffer {
 		ttl = time.Hour
@@ -332,7 +328,6 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		markRoutingAuthFailure(binding.ChannelID)
 		return nil, routingAuthErrorf("sub2api endpoint %s returned %s", path, response.Status)
 	}
 	if response.StatusCode != http.StatusOK {
@@ -351,7 +346,6 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 		authFailure := routingSub2APIEnvelopeAuthFailure(envelope)
 		message = routingCleanCredentialErrorMessage(message, credentials)
 		if authFailure {
-			markRoutingAuthFailure(binding.ChannelID)
 			return nil, routingAuthErrorf("%s", message)
 		}
 		return nil, fmt.Errorf("%s", message)

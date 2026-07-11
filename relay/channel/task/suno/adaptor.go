@@ -108,6 +108,10 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("%s", sunoResponse.Message), sunoResponse.Code, http.StatusInternalServerError)
 		return
 	}
+	if strings.TrimSpace(sunoResponse.Data) == "" {
+		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty"), "invalid_response", http.StatusInternalServerError)
+		return
+	}
 
 	// 使用公开 task_xxxx ID 替换上游 ID 返回给客户端
 	publicResponse := dto.TaskResponse[string]{

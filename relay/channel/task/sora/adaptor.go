@@ -241,10 +241,10 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	}
 
 	upstreamID := dResp.ID
-	if upstreamID == "" {
+	if strings.TrimSpace(upstreamID) == "" {
 		upstreamID = dResp.TaskID
 	}
-	if upstreamID == "" {
+	if strings.TrimSpace(upstreamID) == "" {
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty"), "invalid_response", http.StatusInternalServerError)
 		return
 	}

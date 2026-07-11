@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -177,6 +178,91 @@ func TestShouldRetryUsesClassificationBeforeStatusOverlay(t *testing.T) {
 	assert.True(t, shouldRetry(ctx, info, timeout, routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}, 1))
 }
 
+func TestTaskErrorToAPIErrorPreservesOriginalCodeCauseAndRetryAfter(t *testing.T) {
+	dnsErr := &net.DNSError{Name: "upstream.example.com"}
+	taskErr := &dto.TaskError{
+		Code:         string(types.ErrorCodeDoRequestFailed),
+		Message:      "dial failed",
+		StatusCode:   http.StatusBadGateway,
+		RetryAfterMs: 2500,
+		Error:        dnsErr,
+	}
+
+	apiErr := taskErrorToAPIError(taskErr)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusBadGateway, apiErr.SourceStatusCode())
+	var extracted *net.DNSError
+	require.ErrorAs(t, apiErr, &extracted)
+	assert.Same(t, dnsErr, extracted)
+	assert.Equal(t, 2500*time.Millisecond, retryAfterFromAPIError(apiErr, time.Minute))
+}
+
+func TestTaskErrorToAPIErrorNormalizesEmptyTaskErrorFacts(t *testing.T) {
+	taskErr := &dto.TaskError{}
+
+	apiErr := taskErrorToAPIError(taskErr)
+
+	require.NotNil(t, apiErr)
+	require.Equal(t, string(types.ErrorCodeBadResponseStatusCode), taskErr.Code)
+	require.Equal(t, http.StatusInternalServerError, taskErr.StatusCode)
+	require.Equal(t, "task relay failed", taskErr.Message)
+	require.Error(t, taskErr.Error)
+	assert.Equal(t, "task relay failed", taskErr.Error.Error())
+	assert.Equal(t, types.ErrorCodeBadResponseStatusCode, apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusInternalServerError, apiErr.SourceStatusCode())
+	assert.ErrorIs(t, apiErr, taskErr.Error)
+
+	classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationTaskSubmit,
+	})
+	assert.Equal(t, routingerror.ResponsibilityProvider, classification.Responsibility)
+	assert.Equal(t, routingerror.RetryIdempotencyRequired, classification.Retryability)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondTaskError(ctx, taskErr)
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"code":"bad_response_status_code"`)
+	assert.Contains(t, recorder.Body.String(), `"message":"task relay failed"`)
+}
+
+func TestTaskSubmitUpstreamFailuresRequireIdempotencyAndDoNotRetry(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	ctx.Request.Header.Set("Idempotency-Key", "incoming-key-is-not-stably-forwarded")
+	tests := []*dto.TaskError{
+		{Code: string(types.ErrorCodeBadResponseStatusCode), StatusCode: http.StatusTooManyRequests, Error: errors.New("rate limited")},
+		{Code: string(types.ErrorCodeBadResponseStatusCode), StatusCode: http.StatusBadGateway, Error: errors.New("bad gateway")},
+		{Code: string(types.ErrorCodeDoRequestFailed), StatusCode: http.StatusBadGateway, Error: &net.DNSError{Name: "upstream.example.com"}},
+	}
+
+	for _, taskErr := range tests {
+		classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationTaskSubmit})
+		assert.Equal(t, routingerror.RetryIdempotencyRequired, classification.Retryability)
+		assert.False(t, shouldRetryTaskRelay(ctx, taskErr, classification, 2))
+	}
+}
+
+func TestTaskLocalErrorDoesNotAffectReliabilityBreakerOrCapacity(t *testing.T) {
+	configureRoutingBreakerAttemptTest(t, true)
+	ctx, info := singleKeyRoutingAttemptFixture(t, 72)
+	taskErr := &dto.TaskError{Code: string(types.ErrorCodeModelPriceError), StatusCode: http.StatusBadRequest, LocalError: true, Error: errors.New("price missing")}
+	classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationTaskSubmit})
+
+	recordRoutingAttemptEffects(ctx, info, 72, false, taskErrorToAPIError(taskErr), classification)
+
+	snapshots := routingmetrics.Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Zero(t, snapshots[0].ReliabilityRequestCount)
+	assert.Zero(t, snapshots[0].ReliabilityFailureCount)
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	_, ok := routinghotcache.GetCapacityCooldown(routinghotcache.Key{ChannelID: 72, APIKeyIndex: -1, Model: "gpt-test", Group: "vip"})
+	assert.False(t, ok)
+}
+
 func TestClassifyRoutingRelayAttemptDistinguishesStreamCorruptionAndClientGone(t *testing.T) {
 	corrupted := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
 	corrupted.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("scanner failed"))
@@ -240,7 +326,7 @@ func TestPrepareRoutingRelayAttemptIsolatesStreamStatusPerAttempt(t *testing.T) 
 	}
 }
 
-func TestClassifyRoutingTaskChannelErrorKeepsContentSafety403OutOfAutoDisable(t *testing.T) {
+func TestClassifyRoutingTaskErrorKeepsContentSafety403OutOfAutoDisable(t *testing.T) {
 	originalEnabled := common.AutomaticDisableChannelEnabled
 	originalRanges := operation_setting.AutomaticDisableStatusCodeRanges
 	common.AutomaticDisableChannelEnabled = true
@@ -250,8 +336,13 @@ func TestClassifyRoutingTaskChannelErrorKeepsContentSafety403OutOfAutoDisable(t 
 		operation_setting.AutomaticDisableStatusCodeRanges = originalRanges
 	})
 
-	apiErr := types.NewErrorWithStatusCode(errors.New(service.CSAMViolationMarker), types.ErrorCodeBadResponseStatusCode, http.StatusForbidden)
-	classification := classifyRoutingTaskChannelError(apiErr)
+	taskErr := &dto.TaskError{Code: string(types.ErrorCodeBadResponseStatusCode), StatusCode: http.StatusForbidden, Error: errors.New(service.CSAMViolationMarker)}
+	apiErr := taskErrorToAPIError(taskErr)
+	classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationTaskSubmit,
+		Signal:    routingerror.SignalContentSafety,
+	})
 
 	assert.Equal(t, routingerror.ResponsibilityCaller, classification.Responsibility)
 	assert.Equal(t, routingerror.ScopeRequest, classification.Scope)
@@ -286,11 +377,15 @@ func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 		},
 	}
 	taskErr := &dto.TaskError{
+		Code:       string(types.ErrorCodeBadResponse),
 		StatusCode: http.StatusBadGateway,
 		Error:      errors.New("upstream failed"),
 	}
+	classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationTaskSubmit})
+	apiErr := taskErrorToAPIError(taskErr)
 
-	recordRoutingTaskAttempt(ctx, info, 31, taskErr)
+	recordRoutingAttemptEffects(ctx, info, 31, false, apiErr, classification)
+	assert.Equal(t, types.ErrorCodeBadResponse, apiErr.GetErrorCode())
 
 	metrics := routingmetrics.Snapshots()
 	require.Len(t, metrics, 1)
@@ -328,8 +423,9 @@ func TestRecordRoutingTaskAttemptIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t 
 		ChannelMeta:     &relaycommon.ChannelMeta{ChannelIsMultiKey: false},
 	}
 	taskErr := &dto.TaskError{StatusCode: http.StatusBadGateway, Error: errors.New("upstream failed")}
+	classification := routingerror.ClassifyTaskError(taskErr, routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationTaskSubmit})
 
-	recordRoutingTaskAttempt(ctx, info, 37, taskErr)
+	recordRoutingAttemptEffects(ctx, info, 37, false, taskErrorToAPIError(taskErr), classification)
 
 	assert.Empty(t, routingmetrics.Snapshots())
 	assert.Equal(t, routingmetrics.Stats{}, routingmetrics.RuntimeStats())

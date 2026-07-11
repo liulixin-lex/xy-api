@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/types"
@@ -97,6 +98,18 @@ func TestTaskErrorFromAPIErrorKeepsPublicMessageAndWrappedCause(t *testing.T) {
 	assert.True(t, taskErr.LocalError)
 	assert.Same(t, apiErr, taskErr.Error)
 	assert.ErrorIs(t, taskErr.Error, cause)
+}
+
+func TestTaskErrorFromUpstreamResponsePreservesStatusAndRetryAfter(t *testing.T) {
+	response := &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}
+	response.Header.Set("Retry-After", "2")
+
+	taskErr := TaskErrorFromUpstreamResponse(response, errors.New("rate limited"), time.Unix(100, 0))
+
+	assert.Equal(t, string(types.ErrorCodeBadResponseStatusCode), taskErr.Code)
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.Equal(t, int64(2000), taskErr.RetryAfterMs)
+	assert.False(t, taskErr.LocalError)
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {

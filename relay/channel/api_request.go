@@ -24,6 +24,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http/httpguts"
 )
 
 // applyUpstreamContentLength populates req.ContentLength when the upstream
@@ -599,6 +600,16 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
+	}
+	for name, values := range req.Header {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, fmt.Errorf("invalid header field name %q", name)
+		}
+		for _, value := range values {
+			if !httpguts.ValidHeaderFieldValue(value) {
+				return nil, fmt.Errorf("invalid header field value for %q", name)
+			}
+		}
 	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {

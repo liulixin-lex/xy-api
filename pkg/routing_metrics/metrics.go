@@ -148,14 +148,6 @@ func RuntimeStats() Stats {
 	}
 }
 
-func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
-	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
-		Component: routingerror.ComponentServing,
-		Operation: routingerror.OperationRelay,
-	})
-	RecordClassifiedAttempt(c, info, channelID, apiErr == nil, apiErr, classification)
-}
-
 func RecordClassifiedAttempt(
 	c *gin.Context,
 	info *relaycommon.RelayInfo,

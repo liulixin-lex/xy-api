@@ -290,7 +290,10 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	routinghotcache.SetMetricForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.MetricSnapshot{RequestCount: 1})
 	routinghotcache.SetAuthFailureForTest(66, routinghotcache.HealthMarker{Marked: true})
 	routinghotcache.SetBalanceForTest(66, routinghotcache.BalanceSnapshot{Known: true, Balance: 1})
-	routingbreaker.RecordAttempt(routingbreaker.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, false, http.StatusBadGateway, 0)
+	routingbreaker.RecordReliabilityFailure(
+		routingbreaker.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"},
+		routingbreaker.FailureProvider5xx,
+	)
 	statsBeforeClear := routingbreaker.RuntimeStats()
 	require.Equal(t, routingbreaker.Stats{Entries: 1, Dirty: 1}, statsBeforeClear)
 	routingmetrics.RequeueSnapshots([]model.RoutingChannelMetric{{

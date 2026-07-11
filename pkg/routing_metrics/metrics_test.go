@@ -54,6 +54,14 @@ func enableRoutingMetricsForTest(t *testing.T) {
 	configureRoutingMetricsForTest(t, true)
 }
 
+func recordTestAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationRelay,
+	})
+	RecordClassifiedAttempt(c, info, channelID, apiErr == nil, apiErr, classification)
+}
+
 func TestRoutingMetricsDoNotAllocateWhenDisabled(t *testing.T) {
 	configureRoutingMetricsForTest(t, false)
 	info := &relaycommon.RelayInfo{
@@ -64,7 +72,7 @@ func TestRoutingMetricsDoNotAllocateWhenDisabled(t *testing.T) {
 	}
 
 	release := BeginInflight(nil, info, 1)
-	RecordAttempt(nil, info, 1, nil)
+	recordTestAttempt(nil, info, 1, nil)
 	release()
 
 	assert.Empty(t, Snapshots())
@@ -387,7 +395,7 @@ func TestRoutingMetricsResetOldReleaseDoesNotAffectReplacement(t *testing.T) {
 	assert.Equal(t, Stats{}, RuntimeStats())
 }
 
-func TestRecordAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.T) {
+func TestRecordClassifiedAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -407,7 +415,7 @@ func TestRecordAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.T) {
 		},
 	}
 
-	RecordAttempt(ctx, info, 11, nil)
+	recordTestAttempt(ctx, info, 11, nil)
 
 	snapshots := Snapshots()
 	require.Len(t, snapshots, 1)
@@ -423,7 +431,7 @@ func TestRecordAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.T) {
 	assert.Equal(t, int64(1), metric.TtftCount)
 }
 
-func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
+func TestRecordClassifiedAttemptCapturesErrorStatus(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
@@ -435,9 +443,9 @@ func TestRecordAttemptClassifiesErrorStatus(t *testing.T) {
 		},
 	}
 
-	RecordAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests))
-	RecordAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad gateway"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway))
-	RecordAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad request"), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest))
+	recordTestAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests))
+	recordTestAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad gateway"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway))
+	recordTestAttempt(nil, info, 22, types.NewErrorWithStatusCode(errors.New("bad request"), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest))
 
 	snapshots := Snapshots()
 	require.Len(t, snapshots, 1)
@@ -595,7 +603,7 @@ func TestRoutingMetricsIgnoreCurrentMultiKeyAttempt(t *testing.T) {
 	perKey := InflightKey{ChannelID: 25, APIKeyIndex: 3, Model: "gpt-test", Group: "vip"}
 
 	release := BeginInflight(ctx, info, 25)
-	RecordAttempt(ctx, info, 25, nil)
+	recordTestAttempt(ctx, info, 25, nil)
 
 	assert.Empty(t, Snapshots())
 	assert.Zero(t, InflightCount(aggregate))
@@ -624,7 +632,7 @@ func TestRoutingMetricsUseOnlyMinusOneForCurrentSingleKeyAttempt(t *testing.T) {
 	perKey := InflightKey{ChannelID: 26, APIKeyIndex: 2, Model: "gpt-test", Group: "vip"}
 
 	release := BeginInflight(ctx, info, 26)
-	RecordAttempt(ctx, info, 26, nil)
+	recordTestAttempt(ctx, info, 26, nil)
 
 	assert.Equal(t, int64(1), InflightCount(aggregate))
 	assert.Zero(t, InflightCount(perKey))
@@ -638,7 +646,7 @@ func TestRoutingMetricsUseOnlyMinusOneForCurrentSingleKeyAttempt(t *testing.T) {
 	assert.Equal(t, Stats{Buckets: 1}, RuntimeStats())
 }
 
-func TestRecordAttemptCapturesRetryAfterMax(t *testing.T) {
+func TestRecordClassifiedAttemptCapturesRetryAfterMax(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	info := &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
@@ -655,15 +663,15 @@ func TestRecordAttemptCapturesRetryAfterMax(t *testing.T) {
 	secondErr := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
 	secondErr.Metadata = secondMetadata
 
-	RecordAttempt(nil, info, 23, firstErr)
-	RecordAttempt(nil, info, 23, secondErr)
+	recordTestAttempt(nil, info, 23, firstErr)
+	recordTestAttempt(nil, info, 23, secondErr)
 
 	snapshots := Snapshots()
 	require.Len(t, snapshots, 1)
 	assert.Equal(t, int64(2500), snapshots[0].RetryAfterMaxMs)
 }
 
-func TestRecordAttemptComputesLatencyAndTTFTP95(t *testing.T) {
+func TestRecordClassifiedAttemptComputesLatencyAndTTFTP95(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	now := time.Now()
 	info := &relaycommon.RelayInfo{
@@ -678,7 +686,7 @@ func TestRecordAttemptComputesLatencyAndTTFTP95(t *testing.T) {
 		start := time.Now().Add(-duration * time.Millisecond)
 		info.StartTime = start
 		info.FirstResponseTime = start.Add(duration * time.Millisecond)
-		RecordAttempt(nil, info, 27, nil)
+		recordTestAttempt(nil, info, 27, nil)
 	}
 
 	snapshots := Snapshots()
@@ -776,7 +784,7 @@ func TestDrainSnapshotsClearsInMemoryBuckets(t *testing.T) {
 		StartTime:       time.Now(),
 		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 33},
 	}
-	RecordAttempt(nil, info, 33, nil)
+	recordTestAttempt(nil, info, 33, nil)
 
 	first := DrainSnapshots()
 	require.Len(t, first, 1)
@@ -792,7 +800,7 @@ func TestRequeueSnapshotsRestoresDrainedBuckets(t *testing.T) {
 		StartTime:       time.Now(),
 		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 34},
 	}
-	RecordAttempt(nil, info, 34, nil)
+	recordTestAttempt(nil, info, 34, nil)
 	drained := DrainSnapshots()
 	require.Len(t, drained, 1)
 	require.Empty(t, Snapshots())

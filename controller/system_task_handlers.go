@@ -835,7 +835,6 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-			markRoutingAuthFailure(binding.ChannelID)
 			return routingPricingResponse{}, routingAuthErrorf("pricing endpoint returned %s", response.Status)
 		}
 		return routingPricingResponse{}, fmt.Errorf("pricing endpoint returned %s", response.Status)
@@ -846,13 +845,11 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 		return routingPricingResponse{}, err
 	}
 	if !payload.Success {
-		markRoutingAuthFailure(binding.ChannelID)
 		if payload.Message == "" {
 			payload.Message = "pricing endpoint returned success=false"
 		}
 		return routingPricingResponse{}, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
 	}
-	clearRoutingAuthFailure(binding.ChannelID)
 	return payload, nil
 }
 
@@ -887,7 +884,6 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		markRoutingAuthFailure(binding.ChannelID)
 		return routingAuthErrorf("user self endpoint returned %s", response.Status)
 	}
 	if response.StatusCode != http.StatusOK {
@@ -899,7 +895,6 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 		return err
 	}
 	if !payload.Success {
-		markRoutingAuthFailure(binding.ChannelID)
 		if payload.Message == "" {
 			payload.Message = "user self endpoint returned success=false"
 		}
@@ -913,7 +908,6 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 		UpdatedUnix: common.GetTimestamp(),
 	})
 	_ = model.UpsertRoutingChannelBalance(binding.ChannelID, balanceQuota/common.QuotaPerUnit, common.GetTimestamp())
-	clearRoutingAuthFailure(binding.ChannelID)
 	return nil
 }
 
@@ -923,24 +917,6 @@ func applyRoutingAuthHeaders(request *http.Request, binding model.RoutingChannel
 	}
 	if binding.NewAPIUserID != nil && *binding.NewAPIUserID > 0 {
 		request.Header.Set("New-Api-User", fmt.Sprintf("%d", *binding.NewAPIUserID))
-	}
-}
-
-func markRoutingAuthFailure(channelID int) {
-	until := common.GetTimestamp() + 300
-	routinghotcache.SetAuthFailure(channelID, routinghotcache.HealthMarker{
-		Marked:      true,
-		UpdatedUnix: common.GetTimestamp(),
-	})
-	if err := model.UpsertRoutingChannelAuthFailure(channelID, true, "authfail", until); err != nil {
-		common.SysError(fmt.Sprintf("persist routing auth failure failed: channel_id=%d err=%v", channelID, err))
-	}
-}
-
-func clearRoutingAuthFailure(channelID int) {
-	routinghotcache.ClearAuthFailure(channelID)
-	if err := model.ClearRoutingChannelAuthFailure(channelID, common.GetTimestamp()); err != nil {
-		common.SysError(fmt.Sprintf("clear routing auth failure failed: channel_id=%d err=%v", channelID, err))
 	}
 }
 

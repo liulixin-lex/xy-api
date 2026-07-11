@@ -139,7 +139,7 @@ func attachRetryAfterMetadata(newApiErr *types.NewAPIError, header string, now t
 	if newApiErr == nil || strings.TrimSpace(header) == "" {
 		return
 	}
-	retryAfter := parseRetryAfterHeader(header, now)
+	retryAfter := ParseRetryAfterHeader(header, now)
 	if retryAfter <= 0 {
 		return
 	}
@@ -155,7 +155,8 @@ func attachRetryAfterMetadata(newApiErr *types.NewAPIError, header string, now t
 	newApiErr.Metadata = data
 }
 
-func parseRetryAfterHeader(header string, now time.Time) time.Duration {
+// ParseRetryAfterHeader parses delta-seconds and HTTP-date Retry-After values.
+func ParseRetryAfterHeader(header string, now time.Time) time.Duration {
 	value := strings.TrimSpace(header)
 	if value == "" {
 		return 0
@@ -252,6 +253,19 @@ func TaskErrorWrapper(err error, code string, statusCode int) *dto.TaskError {
 	}
 
 	return taskError
+}
+
+// TaskErrorFromUpstreamResponse preserves upstream status and retry timing on task failures.
+func TaskErrorFromUpstreamResponse(resp *http.Response, cause error, now time.Time) *dto.TaskError {
+	if resp == nil {
+		return TaskErrorWrapperLocal(errors.New("upstream response is nil"), string(types.ErrorCodeBadResponse), http.StatusInternalServerError)
+	}
+	if cause == nil {
+		cause = fmt.Errorf("upstream task returned status %d", resp.StatusCode)
+	}
+	taskErr := TaskErrorWrapper(cause, string(types.ErrorCodeBadResponseStatusCode), resp.StatusCode)
+	taskErr.RetryAfterMs = ParseRetryAfterHeader(resp.Header.Get("Retry-After"), now).Milliseconds()
+	return taskErr
 }
 
 // TaskErrorFromAPIError 将 PreConsumeBilling 返回的 NewAPIError 转换为 TaskError。
