@@ -69,9 +69,10 @@ type Limits struct {
 }
 
 type Stats struct {
-	Buckets         int64
-	BucketEvictions int64
-	DroppedSamples  int64
+	Buckets        int64
+	DroppedSamples int64
+	EvictedBuckets int64
+	EvictedSamples int64
 }
 
 type bucketKey struct {

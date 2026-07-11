@@ -26,6 +26,7 @@ var maintenanceMu sync.Mutex
 var limits = defaultLimits
 var bucketCount atomic.Int64
 var bucketEvictionCount atomic.Int64
+var evictedSampleCount atomic.Int64
 var droppedSampleCount atomic.Int64
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
@@ -90,9 +91,10 @@ func Record(sample Sample) {
 
 func RuntimeStats() Stats {
 	return Stats{
-		Buckets:         bucketCount.Load(),
-		BucketEvictions: bucketEvictionCount.Load(),
-		DroppedSamples:  droppedSampleCount.Load(),
+		Buckets:        bucketCount.Load(),
+		DroppedSamples: droppedSampleCount.Load(),
+		EvictedBuckets: bucketEvictionCount.Load(),
+		EvictedSamples: evictedSampleCount.Load(),
 	}
 }
 
@@ -214,7 +216,7 @@ func removeBucketLocked(key bucketKey, b *bucket, eviction bool) bool {
 	bucketCount.Add(-1)
 	if eviction {
 		bucketEvictionCount.Add(1)
-		droppedSampleCount.Add(droppedSamples)
+		evictedSampleCount.Add(droppedSamples)
 	}
 	return true
 }
@@ -248,6 +250,7 @@ func resetForTest() {
 	})
 	bucketCount.Store(0)
 	bucketEvictionCount.Store(0)
+	evictedSampleCount.Store(0)
 	droppedSampleCount.Store(0)
 	limits = defaultLimits
 }

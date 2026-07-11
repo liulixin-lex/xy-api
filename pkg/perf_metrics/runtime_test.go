@@ -15,6 +15,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type observedWaitContext struct {
+	context.Context
+	checks      atomic.Int64
+	afterSecond chan struct{}
+}
+
+func (ctx *observedWaitContext) Err() error {
+	err := ctx.Context.Err()
+	if ctx.checks.Add(1) == 2 {
+		close(ctx.afterSecond)
+	}
+	return err
+}
+
 func TestRuntimeRunsMaintenanceImmediatelyAndFinalizesOnlyOnWait(t *testing.T) {
 	configurePerfMetricsForTest(t, true)
 
@@ -337,6 +351,59 @@ func TestRuntimeWaitReturnsFinalFlushErrorOnlyOnce(t *testing.T) {
 	assert.Equal(t, int64(1), persistCalls.Load())
 	assert.Equal(t, Stats{Buckets: 1}, RuntimeStats(), "failed final flush must requeue the active bucket")
 	assert.Equal(t, PerfRuntimeStats{Runs: 2, Errors: 1, ConsecutiveErrors: 1}, runtime.Stats())
+}
+
+func TestRuntimeConcurrentWaiterHonorsOwnContextDuringFinalFlush(t *testing.T) {
+	configurePerfMetricsForTest(t, true)
+	now := time.Unix(1_700_000_000, 0)
+	key := bucketKey{model: "gpt-concurrent-wait", group: "default", bucketTs: currentBucketStart(now.Unix(), "hour")}
+	require.True(t, recordSample(key, Sample{Model: key.model, Group: key.group, Success: true}))
+
+	workerWaiting := make(chan struct{})
+	persistStarted := make(chan struct{})
+	releasePersist := make(chan struct{})
+	runtime := newRuntime(context.Background(), runtimeDeps{
+		getSetting: func() perf_metrics_setting.PerfMetricsSetting {
+			return perf_metrics_setting.PerfMetricsSetting{FlushInterval: 5, BucketTime: "hour"}
+		},
+		persist: func(context.Context, *model.PerfMetric) error {
+			close(persistStarted)
+			<-releasePersist
+			return nil
+		},
+		deleteBefore: func(context.Context, int64) error { return nil },
+		wait: func(ctx context.Context, _ time.Duration) bool {
+			close(workerWaiting)
+			<-ctx.Done()
+			return false
+		},
+		now: func() time.Time { return now },
+	})
+	<-workerWaiting
+	runtime.Close()
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- runtime.Wait(context.Background()) }()
+	<-persistStarted
+
+	secondBase, cancelSecond := context.WithCancel(context.Background())
+	secondContext := &observedWaitContext{Context: secondBase, afterSecond: make(chan struct{})}
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- runtime.Wait(secondContext) }()
+	<-secondContext.afterSecond
+	cancelSecond()
+
+	select {
+	case err := <-secondResult:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		close(releasePersist)
+		require.NoError(t, <-firstResult)
+		require.Fail(t, "concurrent Wait ignored its own context")
+	}
+
+	close(releasePersist)
+	require.NoError(t, <-firstResult)
 }
 
 func TestRuntimeCanceledWaitAfterWorkerExitDoesNotConsumeFinalFlush(t *testing.T) {

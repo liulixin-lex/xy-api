@@ -146,9 +146,9 @@ func TestPerfMetricsEnforceBucketLimit(t *testing.T) {
 	}
 
 	assert.Equal(t, Stats{
-		Buckets:         2,
-		BucketEvictions: 1,
-		DroppedSamples:  1,
+		Buckets:        2,
+		EvictedBuckets: 1,
+		EvictedSamples: 1,
 	}, RuntimeStats())
 }
 
@@ -218,9 +218,9 @@ func TestPerfMetricsEvictStaleBucketsBeforeCapacity(t *testing.T) {
 	}
 
 	assert.Equal(t, Stats{
-		Buckets:         1,
-		BucketEvictions: 2,
-		DroppedSamples:  2,
+		Buckets:        1,
+		EvictedBuckets: 2,
+		EvictedSamples: 2,
 	}, RuntimeStats())
 }
 
@@ -350,6 +350,39 @@ func TestFlushFailurePreservesReservedBucketWhenCapacityIsContended(t *testing.T
 		generationMs:   200,
 	}, actual.(*bucket).snapshot())
 	assert.Equal(t, Stats{Buckets: 1, DroppedSamples: 1}, RuntimeStats(), "only the competing new sample may be dropped")
+}
+
+func TestFlushCanceledContextReturnsBeforeTakingBucketLock(t *testing.T) {
+	configurePerfMetricsForTest(t, true)
+	key := bucketKey{model: "gpt-canceled", group: "default", bucketTs: 100}
+	require.True(t, recordSample(key, Sample{Model: key.model, Group: key.group, Success: true}))
+	actual, ok := hotBuckets.Load(key)
+	require.True(t, ok)
+	bucket := actual.(*bucket)
+	bucket.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			bucket.mu.Unlock()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- flushBucketsWith(ctx, 101, false, model.UpsertPerfMetricContext)
+	}()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		bucket.mu.Unlock()
+		locked = false
+		<-result
+		require.Fail(t, "canceled flush blocked on a bucket lock")
+	}
 }
 
 func TestFlushConcurrentRecordPreservesExactPersistedAndHotTotals(t *testing.T) {

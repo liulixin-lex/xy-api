@@ -21,14 +21,15 @@ const (
 
 // Runtime owns the performance-metric maintenance lifecycle.
 type Runtime struct {
-	cancel      context.CancelFunc
-	done        chan struct{}
-	close       sync.Once
-	finalize    sync.Once
-	finalErr    error
-	deps        runtimeDeps
-	stats       runtimeStats
-	lastCleanup time.Time
+	cancel       context.CancelFunc
+	done         chan struct{}
+	finalDone    chan struct{}
+	close        sync.Once
+	finalStarted atomic.Bool
+	finalErr     error
+	deps         runtimeDeps
+	stats        runtimeStats
+	lastCleanup  time.Time
 }
 
 type runtimeDeps struct {
@@ -92,9 +93,10 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &Runtime{
-		cancel: cancel,
-		done:   make(chan struct{}),
-		deps:   deps,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		finalDone: make(chan struct{}),
+		deps:      deps,
 	}
 	go runtime.run(ctx)
 	return runtime
@@ -241,10 +243,17 @@ func (runtime *Runtime) Wait(ctx context.Context) error {
 		return err
 	}
 
-	runtime.finalize.Do(func() {
+	if runtime.finalStarted.CompareAndSwap(false, true) {
 		runtime.finalErr = runtime.runMaintenance(ctx, runtime.deps.getSetting(), true)
-	})
-	return runtime.finalErr
+		close(runtime.finalDone)
+		return runtime.finalErr
+	}
+	select {
+	case <-runtime.finalDone:
+		return runtime.finalErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Stats returns a low-cardinality snapshot of maintenance activity.

@@ -21,6 +21,9 @@ func flushBucketsWith(
 	includeActive bool,
 	persist func(context.Context, *model.PerfMetric) error,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	drainedBuckets := drainBuckets(currentBucket, includeActive)
 	var flushErrors []error
 	for index, drained := range drainedBuckets {
