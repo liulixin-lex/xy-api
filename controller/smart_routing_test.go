@@ -26,6 +26,12 @@ import (
 	"gorm.io/gorm"
 )
 
+type routingCostDoerFunc func(*http.Request) (*http.Response, error)
+
+func (do routingCostDoerFunc) Do(request *http.Request) (*http.Response, error) {
+	return do(request)
+}
+
 func TestUpdateSmartRoutingSettingsPersistenceFailureKeepsPublishedState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.Option{}))
@@ -182,13 +188,14 @@ func TestUpdateSmartRoutingSettingsDoesNotPersistEnvironmentOverrides(t *testing
 func TestBuildRoutingBindingViewMasksCredentials(t *testing.T) {
 	token := "sk-1234567890abcdef"
 	binding := model.RoutingChannelBinding{
-		ID:             10,
-		ChannelID:      20,
-		UpstreamType:   model.RoutingUpstreamTypeNewAPI,
-		BaseURL:        "https://upstream.example.com",
-		UpstreamGroup:  "vip",
-		EncCredentials: &token,
-		Enabled:        true,
+		ID:               10,
+		ChannelID:        20,
+		UpstreamType:     model.RoutingUpstreamTypeNewAPI,
+		BaseURL:          "https://upstream.example.com",
+		UpstreamGroup:    "vip",
+		EncCredentials:   &token,
+		Enabled:          true,
+		SyncFailureCount: 3,
 	}
 
 	view := buildRoutingBindingView(binding, model.RoutingCredentials{
@@ -198,6 +205,7 @@ func TestBuildRoutingBindingViewMasksCredentials(t *testing.T) {
 	})
 
 	require.Equal(t, binding.ChannelID, view.ChannelID)
+	assert.Equal(t, 3, view.SyncFailureCount)
 	assert.Equal(t, "****cdef", view.CredentialMasks.NewAPIAccessToken)
 	assert.Equal(t, "****7654", view.CredentialMasks.GatewayAPIKey)
 	assert.Equal(t, "********", view.CredentialMasks.Sub2APIPassword)
@@ -384,6 +392,68 @@ func TestLoadSmartRoutingBindingGroupsAcceptsInlineCreateBinding(t *testing.T) {
 	require.True(t, response.Success)
 	assert.Equal(t, 991, response.Data.ChannelID)
 	assert.Contains(t, response.Data.Groups, "vip")
+}
+
+func TestRoutingCostAPIErrorsDoNotExposeUpstreamSecrets(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}))
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:     992,
+		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+		BaseURL:       "https://routing.example.com",
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{
+		NewAPIAccessToken: "sk-secret",
+		Sub2APIPassword:   "pw-secret",
+	}))
+	require.NoError(t, db.Create(&binding).Error)
+	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("Authorization: Bearer sk-secret\r\nCookie: session=cookie-secret\r\npassword=pw-secret https://api.example.com/path?token=query-secret")
+	}))
+
+	tests := []struct {
+		name    string
+		handler func(*gin.Context)
+	}{
+		{name: "test binding", handler: TestSmartRoutingBinding},
+		{name: "load groups", handler: LoadSmartRoutingBindingGroups},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Params = gin.Params{{Key: "channelId", Value: "992"}}
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/smart-routing/bindings/992", nil)
+
+			tt.handler(ctx)
+
+			body := recorder.Body.String()
+			for _, secret := range []string{"sk-secret", "pw-secret", "cookie-secret", "query-secret", "api.example.com"} {
+				assert.NotContains(t, body, secret)
+			}
+			assert.NotContains(t, body, `\r`)
+			assert.NotContains(t, body, `\n`)
+			assert.Contains(t, body, "***")
+		})
+	}
+}
+
+func TestRoutingSafeErrorPreservesCancellationAndAuthClassification(t *testing.T) {
+	authErr := routingAuthErrorf("Bearer sk-secret")
+	safeAuthErr := routingSafeErrorWithCredentials(authErr, model.RoutingCredentials{NewAPIAccessToken: "sk-secret"})
+	assert.True(t, routingUpstreamAuthError(safeAuthErr))
+	assert.NotContains(t, safeAuthErr.Error(), "sk-secret")
+
+	safeCanceled := routingSafeErrorWithCredentials(context.Canceled, model.RoutingCredentials{})
+	assert.ErrorIs(t, safeCanceled, context.Canceled)
 }
 
 func TestLoadSmartRoutingBindingGroupsRequiresSensitiveWriteForInlineCredentials(t *testing.T) {

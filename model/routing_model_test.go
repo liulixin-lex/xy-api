@@ -393,6 +393,27 @@ type routingChannelMetricBeforeReliability struct {
 	SuccessCount int64
 }
 
+type routingChannelBindingBeforeSyncFailureCount struct {
+	ID               int    `gorm:"primaryKey"`
+	ChannelID        int    `gorm:"uniqueIndex;not null"`
+	UpstreamType     string `gorm:"type:varchar(32);not null"`
+	BaseURL          string `gorm:"type:varchar(512);not null"`
+	UpstreamGroup    string `gorm:"type:varchar(128);not null"`
+	ServesClaudeCode bool
+	EncCredentials   *string `gorm:"type:text"`
+	KeyVersion       int
+	NewAPIUserID     *int
+	Enabled          bool
+	SyncBackoffUntil int64   `gorm:"bigint"`
+	LastSyncError    *string `gorm:"type:text"`
+	CreatedTime      int64   `gorm:"bigint"`
+	UpdatedTime      int64   `gorm:"bigint"`
+}
+
+func (routingChannelBindingBeforeSyncFailureCount) TableName() string {
+	return "routing_channel_bindings"
+}
+
 func (routingChannelMetricBeforeReliability) TableName() string {
 	return "routing_channel_metrics"
 }
@@ -428,7 +449,22 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, DB.AutoMigrate(&routingChannelMetricBeforeReliability{}, &routingBreakerStateBeforeSemanticVersion{}))
+	require.NoError(t, DB.AutoMigrate(
+		&routingChannelBindingBeforeSyncFailureCount{},
+		&routingChannelMetricBeforeReliability{},
+		&routingBreakerStateBeforeSemanticVersion{},
+	))
+	legacyBinding := routingChannelBindingBeforeSyncFailureCount{
+		ChannelID:        77,
+		UpstreamType:     RoutingUpstreamTypeNewAPI,
+		BaseURL:          "https://legacy.example",
+		UpstreamGroup:    "legacy",
+		Enabled:          true,
+		SyncBackoffUntil: 1234,
+		CreatedTime:      100,
+		UpdatedTime:      200,
+	}
+	require.NoError(t, DB.Create(&legacyBinding).Error)
 	legacyMetric := routingChannelMetricBeforeReliability{
 		ChannelID:    91,
 		APIKeyIndex:  RoutingMetricSingleKeyIndex,
@@ -475,6 +511,21 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "ReliabilityFailureCount"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "Err529"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingBreakerState{}, "SemanticVersion"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingChannelBinding{}, "SyncFailureCount"))
+
+	var migratedLegacyBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("channel_id = ?", 77).First(&migratedLegacyBinding).Error)
+	assert.Equal(t, "https://legacy.example", migratedLegacyBinding.BaseURL)
+	assert.Equal(t, int64(1234), migratedLegacyBinding.SyncBackoffUntil)
+	assert.Zero(t, migratedLegacyBinding.SyncFailureCount)
+	require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+		Where("channel_id = ?", 77).
+		Update("sync_failure_count", 3).Error)
+	require.NoError(t, DB.Where("channel_id = ?", 77).First(&migratedLegacyBinding).Error)
+	assert.Equal(t, 3, migratedLegacyBinding.SyncFailureCount)
+	require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+		Where("channel_id = ?", 77).
+		Update("sync_failure_count", 0).Error)
 
 	var migratedLegacyMetric RoutingChannelMetric
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",

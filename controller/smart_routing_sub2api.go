@@ -282,7 +282,7 @@ func loginRoutingSub2API(ctx context.Context, binding model.RoutingChannelBindin
 	if err = common.Unmarshal(data, &response); err != nil {
 		var token string
 		if strErr := common.Unmarshal(data, &token); strErr != nil {
-			return "", 0, err
+			return "", 0, errors.New("invalid sub2api login response")
 		}
 		response.Token = token
 	}
@@ -339,7 +339,7 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 	}
 	var envelope routingSub2APIEnvelope
 	if err = common.Unmarshal(bodyBytes, &envelope); err != nil {
-		return nil, err
+		return nil, errors.New("invalid sub2api response")
 	}
 	if (envelope.Success != nil && !*envelope.Success) || envelope.Code != 0 {
 		message := envelope.Message
@@ -779,20 +779,21 @@ func routingSub2APIRedisLockKey(channelID int) string {
 }
 
 func routingCleanCredentialErrorMessage(message string, credentials model.RoutingCredentials) string {
-	message = routingCleanUpstreamErrorMessage(message)
-	for _, secret := range []string{
+	message = common.SanitizeErrorMessage(message, routingCredentialSecrets(credentials)...)
+	if message == "" {
+		return "upstream auth failed"
+	}
+	return message
+}
+
+func routingCredentialSecrets(credentials model.RoutingCredentials) []string {
+	return []string{
 		credentials.NewAPIAccessToken,
 		credentials.GatewayAPIKey,
 		credentials.Sub2APIEmail,
 		credentials.Sub2APIPassword,
 		credentials.Sub2APIToken,
-	} {
-		secret = strings.TrimSpace(secret)
-		if secret != "" {
-			message = strings.ReplaceAll(message, secret, "***")
-		}
 	}
-	return message
 }
 
 func routingSub2APICachedJWTForTest(channelID int) string {

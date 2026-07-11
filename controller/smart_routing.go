@@ -58,6 +58,7 @@ type routingBindingView struct {
 	ServesClaudeCode bool                   `json:"serves_claude_code"`
 	NewAPIUserID     *int                   `json:"new_api_user_id,omitempty"`
 	Enabled          bool                   `json:"enabled"`
+	SyncFailureCount int                    `json:"sync_failure_count"`
 	SyncBackoffUntil int64                  `json:"sync_backoff_until"`
 	LastSyncError    *string                `json:"last_sync_error,omitempty"`
 	CredentialMasks  routingCredentialMasks `json:"credential_masks"`
@@ -106,7 +107,7 @@ func ListSmartRoutingBindings(c *gin.Context) {
 		view, err := routingBindingViewWithStoredCredentials(binding)
 		if err != nil {
 			view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-			view.CredentialError = err.Error()
+			view.CredentialError = common.SanitizeErrorMessage(err.Error())
 		}
 		views = append(views, view)
 	}
@@ -121,7 +122,7 @@ func GetSmartRoutingBinding(c *gin.Context) {
 	view, err := routingBindingViewWithStoredCredentials(*binding)
 	if err != nil {
 		view = buildRoutingBindingView(*binding, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -150,7 +151,7 @@ func CreateSmartRoutingBinding(c *gin.Context) {
 	view, err := routingBindingViewWithStoredCredentials(binding)
 	if err != nil {
 		view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -194,7 +195,7 @@ func UpdateSmartRoutingBinding(c *gin.Context) {
 	view, err := routingBindingViewWithStoredCredentials(updated)
 	if err != nil {
 		view = buildRoutingBindingView(updated, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -369,6 +370,7 @@ func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials mo
 		ServesClaudeCode: binding.ServesClaudeCode,
 		NewAPIUserID:     binding.NewAPIUserID,
 		Enabled:          binding.Enabled,
+		SyncFailureCount: binding.SyncFailureCount,
 		SyncBackoffUntil: binding.SyncBackoffUntil,
 		LastSyncError:    binding.LastSyncError,
 		CredentialMasks: routingCredentialMasks{

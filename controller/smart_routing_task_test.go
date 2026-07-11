@@ -3,6 +3,7 @@ package controller
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,8 +11,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -21,6 +24,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type blockingRoutingSub2APIEvalHook struct {
@@ -291,6 +295,163 @@ func TestRunRoutingCostSyncTaskSkipsBindingsStillInBackoff(t *testing.T) {
 	assert.EqualValues(t, 1, summary["skipped_backoff"])
 }
 
+func TestRunRoutingCostSyncTaskPersistsFailureBackoffAndClearsOnSuccess(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+
+	var succeed atomic.Bool
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !succeed.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"success":false}`)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/user/self":
+			_, _ = io.WriteString(w, `{"success":true,"data":{"quota":1000000,"used_quota":0}}`)
+		case "/api/pricing":
+			_, _ = io.WriteString(w, `{"success":true,"data":[],"group_ratio":{}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	binding := model.RoutingChannelBinding{
+		ChannelID:        781,
+		UpstreamType:     model.RoutingUpstreamTypeNewAPI,
+		BaseURL:          server.URL,
+		UpstreamGroup:    "vip",
+		Enabled:          true,
+		SyncFailureCount: 2,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	var nowUnix atomic.Int64
+	nowUnix.Store(1_700_000_000)
+	deps := defaultRoutingCostSyncDeps()
+	deps.now = nowUnix.Load
+	deps.jitter = func(max time.Duration) time.Duration { return max }
+
+	summary, err := runRoutingCostSyncTaskWithDeps(context.Background(), deps)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, summary["errors"])
+	var failed model.RoutingChannelBinding
+	require.NoError(t, db.Where("channel_id = ?", binding.ChannelID).First(&failed).Error)
+	assert.Equal(t, 3, failed.SyncFailureCount)
+	assert.Equal(t, nowUnix.Load()+int64((4*time.Minute)/time.Second), failed.SyncBackoffUntil)
+	require.NotNil(t, failed.LastSyncError)
+
+	succeed.Store(true)
+	nowUnix.Store(failed.SyncBackoffUntil + 1)
+	summary, err = runRoutingCostSyncTaskWithDeps(context.Background(), deps)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, summary["errors"])
+	var recovered model.RoutingChannelBinding
+	require.NoError(t, db.Where("channel_id = ?", binding.ChannelID).First(&recovered).Error)
+	assert.Zero(t, recovered.SyncFailureCount)
+	assert.Zero(t, recovered.SyncBackoffUntil)
+	assert.Nil(t, recovered.LastSyncError)
+}
+
+func TestRunRoutingCostSyncTaskSaturatesFailureCountAndBackoffTimestamp(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"success":false}`)
+	}))
+	t.Cleanup(server.Close)
+
+	maxInt := int(^uint(0) >> 1)
+	maxInt64 := int64(^uint64(0) >> 1)
+	binding := model.RoutingChannelBinding{
+		ChannelID:        782,
+		UpstreamType:     model.RoutingUpstreamTypeNewAPI,
+		BaseURL:          server.URL,
+		UpstreamGroup:    "vip",
+		Enabled:          true,
+		SyncFailureCount: maxInt,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+	deps := defaultRoutingCostSyncDeps()
+	deps.now = func() int64 { return maxInt64 - 10 }
+	deps.jitter = func(max time.Duration) time.Duration { return max }
+
+	_, err := runRoutingCostSyncTaskWithDeps(context.Background(), deps)
+	require.NoError(t, err)
+	var updated model.RoutingChannelBinding
+	require.NoError(t, db.Where("channel_id = ?", binding.ChannelID).First(&updated).Error)
+	assert.Equal(t, maxInt, updated.SyncFailureCount)
+	assert.Equal(t, maxInt64, updated.SyncBackoffUntil)
+}
+
+func TestRoutingCostSyncBindingStateUpdateFailureFailsSystemTaskAndSanitizesError(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.SystemTask{},
+		&model.SystemTaskLock{},
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"success":false}`)
+	}))
+	t.Cleanup(server.Close)
+	require.NoError(t, db.Create(&model.RoutingChannelBinding{
+		ChannelID:     783,
+		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
+		BaseURL:       server.URL,
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}).Error)
+
+	forcedErr := errors.New("forced Authorization: Bearer sk-secret\nstate update failure")
+	callbackName := "test:fail_routing_binding_state_update"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "routing_channel_bindings" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() { _ = db.Callback().Update().Remove(callbackName) })
+
+	task, err := model.CreateSystemTask(model.SystemTaskTypeRoutingCostSync, nil, nil)
+	require.NoError(t, err)
+	const runnerID = "routing-cost-test-runner"
+	claimed, ok, err := model.ClaimSystemTask(task.ID, task.Type, runnerID, common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	(routingCostSyncHandler{}).Run(context.Background(), claimed, runnerID)
+
+	finished, err := model.GetSystemTaskByTaskID(task.TaskID)
+	require.NoError(t, err)
+	require.NotNil(t, finished)
+	assert.Equal(t, model.SystemTaskStatusFailed, finished.Status)
+	assert.NotContains(t, finished.Error, "sk-secret")
+	assert.NotContains(t, finished.Error, "\n")
+	assert.NotContains(t, finished.Result, "sk-secret")
+}
+
 func TestRunRoutingCostSyncTaskLoadsPersistedBreakerStatesIntoHotcache(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
@@ -478,9 +639,14 @@ func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
+	responseBody, err := common.Marshal(map[string]any{
+		"success": false,
+		"message": "bad token secret-token\r\nCookie: session=cookie-secret\r\n" + strings.Repeat("尾", common.SafeErrorMaxRunes+100),
+	})
+	require.NoError(t, err)
 	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"success":false,"message":"bad token secret-token"}`)
+		_, _ = w.Write(responseBody)
 	}))
 	t.Cleanup(server.Close)
 
@@ -508,6 +674,10 @@ func TestRunRoutingCostSyncTaskMasksNewAPISuccessFalseMessage(t *testing.T) {
 	require.NoError(t, db.Where("channel_id = ?", 779).First(&updated).Error)
 	require.NotNil(t, updated.LastSyncError)
 	assert.NotContains(t, *updated.LastSyncError, "secret-token")
+	assert.NotContains(t, *updated.LastSyncError, "cookie-secret")
+	assert.NotContains(t, *updated.LastSyncError, "\r")
+	assert.NotContains(t, *updated.LastSyncError, "\n")
+	assert.LessOrEqual(t, utf8.RuneCountInString(*updated.LastSyncError), common.SafeErrorMaxRunes)
 	assert.Contains(t, *updated.LastSyncError, "***")
 }
 
@@ -1473,4 +1643,38 @@ func TestRoutingSub2APIRequestDecodesGzipJSON(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"ok":true}`, string(raw))
+}
+
+func TestRoutingCostMalformedJSONErrorsDoNotEchoUpstreamLiterals(t *testing.T) {
+	longNumber := strings.Repeat("9", 2048)
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/pricing":
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":[{"quota_type":%s}]}`, longNumber)
+		case "/api/test":
+			_, _ = fmt.Fprintf(w, `{"code":%s,"data":{}}`, longNumber)
+		case "/api/v1/auth/login":
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"token":"token","expires_in":%s}}`, longNumber)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	binding := model.RoutingChannelBinding{ChannelID: 993, BaseURL: server.URL, UpstreamGroup: "vip"}
+
+	_, pricingErr := fetchRoutingPricingPayload(context.Background(), binding)
+	require.Error(t, pricingErr)
+	assert.NotContains(t, pricingErr.Error(), strings.Repeat("9", 64))
+
+	_, sub2APIErr := routingSub2APIRequest(context.Background(), binding, model.RoutingCredentials{}, http.MethodGet, "/api/test", "", nil)
+	require.Error(t, sub2APIErr)
+	assert.NotContains(t, sub2APIErr.Error(), strings.Repeat("9", 64))
+
+	_, _, loginErr := loginRoutingSub2API(context.Background(), binding, model.RoutingCredentials{
+		Sub2APIEmail:    "admin@example.com",
+		Sub2APIPassword: "password",
+	})
+	require.Error(t, loginErr)
+	assert.NotContains(t, loginErr.Error(), strings.Repeat("9", 64))
 }

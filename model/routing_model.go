@@ -63,6 +63,7 @@ type RoutingChannelBinding struct {
 	KeyVersion       int     `json:"key_version"`
 	NewAPIUserID     *int    `json:"new_api_user_id"`
 	Enabled          bool    `json:"enabled"`
+	SyncFailureCount int     `json:"sync_failure_count"`
 	SyncBackoffUntil int64   `json:"sync_backoff_until" gorm:"bigint"`
 	LastSyncError    *string `json:"last_sync_error" gorm:"type:text"`
 	CreatedTime      int64   `json:"created_time" gorm:"bigint"`

@@ -245,13 +245,13 @@ func main() {
 	// deferred database close. Keep this order when adding more runtimes.
 	perfFinalizeCtx, perfFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := perfRuntime.Wait(perfFinalizeCtx); err != nil {
-		common.SysError("failed to finalize performance metrics runtime: " + common.MaskSensitiveInfo(err.Error()))
+		common.SysError("failed to finalize performance metrics runtime: " + common.SanitizeErrorMessage(err.Error()))
 	}
 	perfFinalizeCancel()
 
 	routingFinalizeCtx, routingFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := routingRuntime.Wait(routingFinalizeCtx); err != nil {
-		common.SysError("failed to finalize smart routing runtime: " + common.MaskSensitiveInfo(err.Error()))
+		common.SysError("failed to finalize smart routing runtime: " + common.SanitizeErrorMessage(err.Error()))
 	}
 	routingFinalizeCancel()
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)

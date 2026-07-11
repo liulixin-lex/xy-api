@@ -33,6 +33,18 @@ type routingCostDoer interface {
 
 var routingCostHTTPDoer routingCostDoer = service.GetRoutingCostHTTPClient()
 
+type routingCostSyncDeps struct {
+	now    func() int64
+	jitter common.JitterFunc
+}
+
+func defaultRoutingCostSyncDeps() routingCostSyncDeps {
+	return routingCostSyncDeps{
+		now:    common.GetTimestamp,
+		jitter: common.FullJitter,
+	}
+}
+
 type SmartRoutingRuntime struct {
 	cancel       context.CancelFunc
 	wait         sync.WaitGroup
@@ -715,6 +727,17 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 }
 
 func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
+	return runRoutingCostSyncTaskWithDeps(ctx, defaultRoutingCostSyncDeps())
+}
+
+func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDeps) (map[string]any, error) {
+	defaults := defaultRoutingCostSyncDeps()
+	if deps.now == nil {
+		deps.now = defaults.now
+	}
+	if deps.jitter == nil {
+		deps.jitter = defaults.jitter
+	}
 	setting := smart_routing_setting.GetSetting()
 	syncRoutingBreakerConfigFromSetting(setting)
 
@@ -742,10 +765,10 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 	summary["loaded_breakers"] = refreshSummary["breakers"]
 
 	var bindings []model.RoutingChannelBinding
-	if err := model.DB.Where("enabled = ?", true).Order("channel_id asc").Find(&bindings).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("enabled = ?", true).Order("channel_id asc").Find(&bindings).Error; err != nil {
 		return summary, err
 	}
-	now := common.GetTimestamp()
+	now := deps.now()
 	eligibleBindings := make([]model.RoutingChannelBinding, 0, len(bindings))
 	skippedBackoff := 0
 	for _, binding := range bindings {
@@ -770,13 +793,45 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 				return summary, ctx.Err()
 			}
 			syncErrors++
-			message := err.Error()
-			_ = model.DB.Model(&model.RoutingChannelBinding{}).
+			failureCount := binding.SyncFailureCount
+			if failureCount < 0 {
+				failureCount = 0
+			}
+			maxInt := int(^uint(0) >> 1)
+			if failureCount < maxInt {
+				failureCount++
+			}
+			delay := common.CappedExponentialBackoff(failureCount, time.Minute, time.Hour, deps.jitter)
+			delaySeconds := int64(delay / time.Second)
+			if delay%time.Second != 0 {
+				delaySeconds++
+			}
+			if delaySeconds <= 0 {
+				delaySeconds = 1
+			}
+			backoffUntil := now
+			maxInt64 := int64(^uint64(0) >> 1)
+			if delaySeconds > 0 {
+				if now > maxInt64-delaySeconds {
+					backoffUntil = maxInt64
+				} else {
+					backoffUntil = now + delaySeconds
+				}
+			}
+			credentials, _ := binding.GetCredentials()
+			message := common.SanitizeErrorMessage(err.Error(), routingCredentialSecrets(credentials)...)
+			if message == "" {
+				message = "routing cost sync failed"
+			}
+			if updateErr := model.DB.WithContext(ctx).Model(&model.RoutingChannelBinding{}).
 				Where("id = ?", binding.ID).
 				Updates(map[string]any{
 					"last_sync_error":    &message,
-					"sync_backoff_until": common.GetTimestamp() + 60,
-				}).Error
+					"sync_failure_count": failureCount,
+					"sync_backoff_until": backoffUntil,
+				}).Error; updateErr != nil {
+				return summary, fmt.Errorf("persist routing cost sync failure state: %w", updateErr)
+			}
 			continue
 		}
 		for i := range snapshots {
@@ -790,12 +845,15 @@ func runRoutingCostSyncTask(ctx context.Context) (map[string]any, error) {
 			return summary, err
 		}
 		routinghotcache.LoadCostSnapshots(snapshots)
-		_ = model.DB.Model(&model.RoutingChannelBinding{}).
+		if updateErr := model.DB.WithContext(ctx).Model(&model.RoutingChannelBinding{}).
 			Where("id = ?", binding.ID).
 			Updates(map[string]any{
 				"last_sync_error":    nil,
+				"sync_failure_count": 0,
 				"sync_backoff_until": 0,
-			}).Error
+			}).Error; updateErr != nil {
+			return summary, fmt.Errorf("clear routing cost sync failure state: %w", updateErr)
+		}
 	}
 	summary["snapshots"] = syncedSnapshots
 	summary["errors"] = syncErrors
@@ -909,11 +967,16 @@ func routingModelReverseMapping(channelID int) map[string]string {
 	return reverse
 }
 
-func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChannelBinding) (routingPricingResponse, error) {
+func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChannelBinding) (_ routingPricingResponse, err error) {
 	credentials, err := binding.GetCredentials()
 	if err != nil {
-		return routingPricingResponse{}, err
+		return routingPricingResponse{}, routingSafeErrorWithCredentials(err, model.RoutingCredentials{})
 	}
+	defer func() {
+		if err != nil {
+			err = routingSafeErrorWithCredentials(err, credentials)
+		}
+	}()
 	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
 		snapshots, err := fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
 		if err != nil {
@@ -969,7 +1032,7 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 	}
 	var payload routingPricingResponse
 	if err = common.Unmarshal(body, &payload); err != nil {
-		return routingPricingResponse{}, err
+		return routingPricingResponse{}, errors.New("invalid routing pricing response")
 	}
 	if !payload.Success {
 		if payload.Message == "" {
@@ -997,6 +1060,26 @@ func routingUpstreamAuthError(err error) bool {
 	return errors.As(err, &authErr)
 }
 
+type routingSafeError struct {
+	cause   error
+	message string
+}
+
+func (err routingSafeError) Error() string { return err.message }
+
+func (err routingSafeError) Unwrap() error { return err.cause }
+
+func routingSafeErrorWithCredentials(err error, credentials model.RoutingCredentials) error {
+	if err == nil {
+		return nil
+	}
+	message := common.SanitizeErrorMessage(err.Error(), routingCredentialSecrets(credentials)...)
+	if message == "" {
+		message = "routing upstream request failed"
+	}
+	return routingSafeError{cause: err, message: message}
+}
+
 func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/user/self", nil)
 	if err != nil {
@@ -1022,7 +1105,7 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 	}
 	var payload routingUserSelfResponse
 	if err = common.Unmarshal(body, &payload); err != nil {
-		return err
+		return errors.New("invalid routing user response")
 	}
 	if !payload.Success {
 		if payload.Message == "" {
@@ -1051,7 +1134,7 @@ func applyRoutingAuthHeaders(request *http.Request, binding model.RoutingChannel
 }
 
 func routingCleanUpstreamErrorMessage(message string) string {
-	message = strings.TrimSpace(common.MaskSensitiveInfo(message))
+	message = common.SanitizeErrorMessage(message)
 	if message == "" {
 		return "upstream auth failed"
 	}
@@ -1196,9 +1279,9 @@ func (routingAgentHandler) Run(ctx context.Context, task *model.SystemTask, runn
 func finishSystemTaskHandler(task *model.SystemTask, runnerID string, status model.SystemTaskStatus, result any, runErr error) {
 	errorMessage := ""
 	if runErr != nil {
-		errorMessage = runErr.Error()
+		errorMessage = common.SanitizeErrorMessage(runErr.Error())
 	}
 	if err := model.FinishSystemTask(task.TaskID, runnerID, status, result, errorMessage); err != nil {
-		common.SysLog(fmt.Sprintf("system task %s failed to persist result: %v", task.TaskID, err))
+		common.SysLog(fmt.Sprintf("system task %s failed to persist result: %s", task.TaskID, common.SanitizeErrorMessage(err.Error())))
 	}
 }
