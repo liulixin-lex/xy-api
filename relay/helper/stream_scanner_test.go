@@ -646,7 +646,7 @@ func TestStreamScannerHandler_FirstByteTimerWaitsForInFlightWriteCommit(t *testi
 	select {
 	case <-writer.writeStarted:
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for the client write to start")
+		require.FailNow(t, "timed out waiting for the client write to start")
 	}
 
 	time.Sleep(3 * firstByteTimeout)
@@ -656,7 +656,7 @@ func TestStreamScannerHandler_FirstByteTimerWaitsForInFlightWriteCommit(t *testi
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("stream handler did not return after the in-flight write completed")
+		require.FailNow(t, "stream handler did not return after the in-flight write completed")
 	}
 
 	require.NotNil(t, info.StreamStatus)
