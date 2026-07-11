@@ -76,9 +76,8 @@ func UpdateSmartRoutingSettings(c *gin.Context) {
 		common.ApiErrorMsg(c, "invalid smart routing settings")
 		return
 	}
-	updated := smart_routing_setting.UpdateSetting(request)
-	syncRoutingBreakerConfigFromSetting(updated)
-	values, err := config.ConfigToMap(updated)
+	normalized := smart_routing_setting.Normalize(request)
+	values, err := config.ConfigToMap(normalized)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -91,7 +90,9 @@ func UpdateSmartRoutingSettings(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, updated)
+	effective := smart_routing_setting.GetSetting()
+	syncRoutingBreakerConfigFromSetting(effective)
+	common.ApiSuccess(c, effective)
 }
 
 func ListSmartRoutingBindings(c *gin.Context) {

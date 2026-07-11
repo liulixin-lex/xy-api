@@ -2,7 +2,9 @@ package controller
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,12 +16,167 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestUpdateSmartRoutingSettingsPersistenceFailureKeepsPublishedState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	smart_routing_setting.ResetForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+	t.Setenv("SMART_ROUTING_ENABLED", "invalid")
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeObserve)
+	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "invalid")
+
+	oldSetting := smart_routing_setting.GetSetting()
+	oldSetting.Consecutive5xx = 8
+	oldSetting = smart_routing_setting.UpdateSetting(oldSetting)
+	routingbreaker.ResetDefaultForTest(routingBreakerConfigFromSetting(oldSetting))
+
+	oldValues, err := config.ConfigToMap(oldSetting)
+	require.NoError(t, err)
+	oldOptions := make(map[string]string, len(oldValues))
+	for key, value := range oldValues {
+		oldOptions["smart_routing_setting."+key] = value
+	}
+	common.OptionMapRWMutex.Lock()
+	previousOptionMap := maps.Clone(common.OptionMap)
+	common.OptionMap = maps.Clone(oldOptions)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	forcedErr := errors.New("forced option write failure")
+	optionTable := db.NamingStrategy.TableName("Option")
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(
+		"test:fail_smart_routing_option_create",
+		func(tx *gorm.DB) {
+			if tx.Statement.Schema != nil && tx.Statement.Schema.Table == optionTable {
+				tx.AddError(forcedErr)
+			}
+		},
+	))
+
+	request := oldSetting
+	request.Mode = smart_routing_setting.ModeBalanced
+	request.Consecutive5xx = 1
+	body, err := common.Marshal(request)
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/settings", bytes.NewReader(body))
+
+	UpdateSmartRoutingSettings(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	assert.Equal(t, oldSetting, smart_routing_setting.GetSetting())
+	common.OptionMapRWMutex.RLock()
+	currentOptions := maps.Clone(common.OptionMap)
+	common.OptionMapRWMutex.RUnlock()
+	assert.Equal(t, oldOptions, currentOptions)
+
+	breakerSnapshot := routingbreaker.RecordReliabilityFailure(routingbreaker.Key{
+		ChannelID:   991,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "default",
+	}, routingbreaker.FailureProvider5xx)
+	assert.Equal(t, routingbreaker.StateHealthy, breakerSnapshot.State)
+}
+
+func TestUpdateSmartRoutingSettingsDoesNotPersistEnvironmentOverrides(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		smart_routing_setting.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+
+	t.Setenv("SMART_ROUTING_ENABLED", "invalid")
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeObserve)
+	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "invalid")
+	request := smart_routing_setting.GetSetting()
+	request.Enabled = false
+	request.Mode = smart_routing_setting.ModeBalanced
+	request.AgentEnabled = false
+	request.WeightAvailability = 2
+	request.WeightLatency = 1
+	request.WeightThroughput = 1
+	request.WeightCost = 0
+
+	t.Setenv("SMART_ROUTING_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeEnterpriseSLO)
+	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
+
+	common.OptionMapRWMutex.Lock()
+	previousOptionMap := maps.Clone(common.OptionMap)
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	body, err := common.Marshal(request)
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/settings", bytes.NewReader(body))
+
+	UpdateSmartRoutingSettings(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool                                      `json:"success"`
+		Data    smart_routing_setting.SmartRoutingSetting `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success)
+	assert.True(t, response.Data.Enabled)
+	assert.Equal(t, smart_routing_setting.ModeEnterpriseSLO, response.Data.Mode)
+	assert.True(t, response.Data.AgentEnabled)
+
+	expectedPersisted := map[string]string{
+		"smart_routing_setting.enabled":             "false",
+		"smart_routing_setting.mode":                smart_routing_setting.ModeBalanced,
+		"smart_routing_setting.agent_enabled":       "false",
+		"smart_routing_setting.weight_availability": "0.5",
+		"smart_routing_setting.weight_latency":      "0.25",
+		"smart_routing_setting.weight_throughput":   "0.25",
+		"smart_routing_setting.weight_cost":         "0",
+	}
+	for key, expected := range expectedPersisted {
+		var option model.Option
+		require.NoError(t, db.First(&option, "key = ?", key).Error)
+		assert.Equal(t, expected, option.Value, key)
+	}
+	common.OptionMapRWMutex.RLock()
+	for key, expected := range expectedPersisted {
+		assert.Equal(t, expected, common.OptionMap[key], key)
+	}
+	common.OptionMapRWMutex.RUnlock()
+}
 
 func TestBuildRoutingBindingViewMasksCredentials(t *testing.T) {
 	token := "sk-1234567890abcdef"

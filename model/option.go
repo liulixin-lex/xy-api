@@ -221,10 +221,9 @@ func UpdateOption(key string, value string) error {
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
-// transaction, then dispatches them through updateOptionMap in one pass. If
-// any DB write fails the whole transaction rolls back and no in-memory state
-// is touched — safe for callers that must commit a set of related options
-// atomically (e.g. payment gateway binding).
+// transaction, then publishes OptionMap in one batch and each registered
+// config namespace in one grouped update. If any DB write fails the whole
+// transaction rolls back and no in-memory state is touched.
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
@@ -245,7 +244,38 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
+
+	configValues := make(map[string]map[string]string)
 	for k, v := range values {
+		parts := strings.SplitN(k, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if configValues[parts[0]] == nil {
+			configValues[parts[0]] = make(map[string]string)
+		}
+		configValues[parts[0]][parts[1]] = v
+	}
+
+	handledConfigs := make(map[string]struct{}, len(configValues))
+	common.OptionMapRWMutex.Lock()
+	for k, v := range values {
+		common.OptionMap[k] = v
+	}
+	for configName, configMap := range configValues {
+		if handleConfigUpdates(configName, configMap) {
+			handledConfigs[configName] = struct{}{}
+		}
+	}
+	common.OptionMapRWMutex.Unlock()
+
+	for k, v := range values {
+		parts := strings.SplitN(k, ".", 2)
+		if len(parts) == 2 {
+			if _, handled := handledConfigs[parts[0]]; handled {
+				continue
+			}
+		}
 		if err := updateOptionMap(k, v); err != nil {
 			return err
 		}
@@ -585,13 +615,10 @@ func handleConfigUpdate(key, value string) bool {
 	if len(parts) != 2 {
 		return false // 不是分层配置
 	}
+	return handleConfigUpdates(parts[0], map[string]string{parts[1]: value})
+}
 
-	configName := parts[0]
-	configKey := parts[1]
-
-	configMap := map[string]string{
-		configKey: value,
-	}
+func handleConfigUpdates(configName string, configMap map[string]string) bool {
 	found, err := config.GlobalConfig.UpdateFromMap(configName, configMap)
 	if !found {
 		return false // 未注册的配置

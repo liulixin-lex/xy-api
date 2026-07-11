@@ -114,9 +114,15 @@ func GetSetting() SmartRoutingSetting {
 	return setting
 }
 
-func UpdateSetting(setting SmartRoutingSetting) SmartRoutingSetting {
+// Normalize returns a normalized copy without reading environment overrides
+// or publishing it to the global config snapshot.
+func Normalize(setting SmartRoutingSetting) SmartRoutingSetting {
 	normalize(&setting)
-	config.GlobalConfig.Replace(configName, setting)
+	return setting
+}
+
+func UpdateSetting(setting SmartRoutingSetting) SmartRoutingSetting {
+	config.GlobalConfig.Replace(configName, Normalize(setting))
 	return GetSetting()
 }
 

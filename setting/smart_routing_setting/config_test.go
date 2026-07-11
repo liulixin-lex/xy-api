@@ -6,8 +6,45 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	t.Setenv("SMART_ROUTING_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_MODE", ModeEnterpriseSLO)
+	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
+
+	var before SmartRoutingSetting
+	require.True(t, config.GlobalConfig.Snapshot(configName, &before))
+
+	normalized := Normalize(SmartRoutingSetting{
+		Enabled:            false,
+		Mode:               ModeBalanced,
+		WeightAvailability: 2,
+		WeightLatency:      1,
+		WeightThroughput:   1,
+		WeightCost:         0,
+		TopK:               0,
+		AgentEnabled:       false,
+	})
+
+	assert.False(t, normalized.Enabled)
+	assert.Equal(t, ModeBalanced, normalized.Mode)
+	assert.False(t, normalized.AgentEnabled)
+	assert.Equal(t, 1, normalized.TopK)
+	assert.InDelta(t, 0.5, normalized.WeightAvailability, 0.000001)
+	assert.InDelta(t, 0.25, normalized.WeightLatency, 0.000001)
+	assert.InDelta(t, 0.25, normalized.WeightThroughput, 0.000001)
+	assert.Zero(t, normalized.WeightCost)
+
+	var after SmartRoutingSetting
+	require.True(t, config.GlobalConfig.Snapshot(configName, &after))
+	assert.Equal(t, before, after)
+}
 
 func TestGetSettingDefaultsAndNormalizesWeights(t *testing.T) {
 	ResetForTest()
