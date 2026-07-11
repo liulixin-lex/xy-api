@@ -9,7 +9,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	"github.com/QuantumNous/new-api/service"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -21,11 +23,13 @@ import (
 func TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	smart_routing_setting.ResetForTest()
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled = previousMemoryCache
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 		smart_routing_setting.ResetForTest()
 	})
@@ -49,6 +53,12 @@ func TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly(t *testi
 			UpdatedUnixMilli:       now.UnixMilli(),
 		})
 	}
+	breakerKey := routingbreaker.Key{ChannelID: 9201, APIKeyIndex: 1, Model: "gpt-test", Group: "vip"}
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key:       breakerKey,
+		State:     routingbreaker.StateHalfOpen,
+		UpdatedAt: now,
+	}})
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "vip")
@@ -72,6 +82,13 @@ func TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly(t *testi
 	_, hasLease := common.GetContextKey(ctx, constant.ContextKeyRoutingHalfOpenLeases)
 	assert.False(t, hasProbe)
 	assert.False(t, hasLease)
+
+	service.ReleaseRoutingHalfOpenProbe(ctx, channel.Id, "gpt-test", "vip")
+	snapshot, acquired := routingbreaker.AcquireDefaultHalfOpenProbe(breakerKey, 1)
+	require.True(t, acquired)
+	assert.Equal(t, 1, snapshot.HalfOpenInflight)
+	snapshot = routingbreaker.ReleaseDefaultHalfOpenProbe(breakerKey)
+	assert.Zero(t, snapshot.HalfOpenInflight)
 }
 
 func TestSetupContextForSelectedChannelResetsSingleKeyMetadata(t *testing.T) {
