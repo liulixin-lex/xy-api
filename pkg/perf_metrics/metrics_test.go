@@ -123,7 +123,7 @@ func TestRecordRelaySampleUsesLocalStoreWithoutRedis(t *testing.T) {
 	assert.Equal(t, "default", beforeFlush.Groups[0].Group)
 	assert.Equal(t, float64(100), beforeFlush.Groups[0].SuccessRate)
 
-	flushCompletedBucketsWith(activeKey.bucketTs+1, model.UpsertPerfMetric)
+	require.NoError(t, flushBucketsWith(context.Background(), activeKey.bucketTs+1, false, model.UpsertPerfMetricContext))
 	assert.Equal(t, Stats{}, RuntimeStats())
 	afterFlush, err := Query(QueryParams{Model: info.OriginModelName, Hours: 1})
 	require.NoError(t, err)
@@ -239,10 +239,10 @@ func TestFlushCompletedBucketRemovesItImmediately(t *testing.T) {
 	}))
 
 	var persisted model.PerfMetric
-	flushCompletedBucketsWith(101, func(metric *model.PerfMetric) error {
+	require.NoError(t, flushBucketsWith(context.Background(), 101, false, func(_ context.Context, metric *model.PerfMetric) error {
 		persisted = *metric
 		return nil
-	})
+	}))
 
 	assert.Equal(t, model.PerfMetric{
 		ModelName:      key.model,
@@ -277,13 +277,13 @@ func TestFlushFailureRequeuesCompleteBucket(t *testing.T) {
 
 	persistStarted := make(chan struct{})
 	releasePersist := make(chan struct{})
-	flushDone := make(chan struct{})
+	persistErr := errors.New("database unavailable")
+	flushErr := make(chan error, 1)
 	go func() {
-		defer close(flushDone)
-		flushCompletedBucketsWith(101, func(*model.PerfMetric) error {
+		flushErr <- flushBucketsWith(context.Background(), 101, false, func(context.Context, *model.PerfMetric) error {
 			close(persistStarted)
 			<-releasePersist
-			return errors.New("database unavailable")
+			return persistErr
 		})
 	}()
 	<-persistStarted
@@ -296,7 +296,7 @@ func TestFlushFailureRequeuesCompleteBucket(t *testing.T) {
 		GenerationMs: 100,
 	}))
 	close(releasePersist)
-	<-flushDone
+	require.ErrorIs(t, <-flushErr, persistErr)
 
 	actual, exists := hotBuckets.Load(key)
 	require.True(t, exists)
@@ -310,6 +310,46 @@ func TestFlushFailureRequeuesCompleteBucket(t *testing.T) {
 		generationMs:   300,
 	}, actual.(*bucket).snapshot())
 	assert.Equal(t, Stats{Buckets: 1}, RuntimeStats())
+}
+
+func TestFlushFailurePreservesReservedBucketWhenCapacityIsContended(t *testing.T) {
+	configurePerfMetricsForTest(t, true)
+	maintenanceMu.Lock()
+	limits = Limits{MaxBuckets: 1, BucketTTL: time.Hour}
+	maintenanceMu.Unlock()
+
+	oldKey := bucketKey{model: "gpt-old", group: "default", bucketTs: 100}
+	require.True(t, recordSample(oldKey, Sample{
+		Model:        oldKey.model,
+		Group:        oldKey.group,
+		LatencyMs:    250,
+		TtftMs:       50,
+		HasTtft:      true,
+		Success:      true,
+		OutputTokens: 40,
+		GenerationMs: 200,
+	}))
+
+	persistErr := errors.New("database unavailable")
+	err := flushBucketsWith(context.Background(), 101, false, func(context.Context, *model.PerfMetric) error {
+		newKey := bucketKey{model: "gpt-new", group: "default", bucketTs: 200}
+		assert.False(t, recordSample(newKey, Sample{Model: newKey.model, Group: newKey.group, Success: true}))
+		return persistErr
+	})
+
+	require.ErrorIs(t, err, persistErr)
+	actual, exists := hotBuckets.Load(oldKey)
+	require.True(t, exists)
+	assert.Equal(t, counters{
+		requestCount:   1,
+		successCount:   1,
+		totalLatencyMs: 250,
+		ttftSumMs:      50,
+		ttftCount:      1,
+		outputTokens:   40,
+		generationMs:   200,
+	}, actual.(*bucket).snapshot())
+	assert.Equal(t, Stats{Buckets: 1, DroppedSamples: 1}, RuntimeStats(), "only the competing new sample may be dropped")
 }
 
 func TestFlushConcurrentRecordPreservesExactPersistedAndHotTotals(t *testing.T) {
@@ -328,11 +368,10 @@ func TestFlushConcurrentRecordPreservesExactPersistedAndHotTotals(t *testing.T) 
 
 	persistStarted := make(chan struct{})
 	releasePersist := make(chan struct{})
-	flushDone := make(chan struct{})
+	flushErr := make(chan error, 1)
 	var persisted model.PerfMetric
 	go func() {
-		defer close(flushDone)
-		flushCompletedBucketsWith(101, func(metric *model.PerfMetric) error {
+		flushErr <- flushBucketsWith(context.Background(), 101, false, func(_ context.Context, metric *model.PerfMetric) error {
 			persisted = *metric
 			close(persistStarted)
 			<-releasePersist
@@ -354,7 +393,7 @@ func TestFlushConcurrentRecordPreservesExactPersistedAndHotTotals(t *testing.T) 
 	}()
 	require.True(t, <-recorded)
 	close(releasePersist)
-	<-flushDone
+	require.NoError(t, <-flushErr)
 
 	actual, exists := hotBuckets.Load(key)
 	require.True(t, exists)
@@ -403,10 +442,10 @@ func TestDisabledMetricsDoNotAllocateButMaintainExistingBuckets(t *testing.T) {
 		return false
 	})
 	persisted := 0
-	runMaintenanceWith(setting, existingKey.bucketTs+1, func(*model.PerfMetric) error {
+	require.NoError(t, flushBucketsWith(context.Background(), existingKey.bucketTs+1, false, func(context.Context, *model.PerfMetric) error {
 		persisted++
 		return nil
-	})
+	}))
 
 	assert.Equal(t, 1, persisted)
 	assert.Equal(t, Stats{}, RuntimeStats())

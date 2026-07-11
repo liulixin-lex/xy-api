@@ -1,6 +1,7 @@
 package perfmetrics
 
 import (
+	"context"
 	"math"
 	"sort"
 	"sync"
@@ -31,8 +32,10 @@ var droppedSampleCount atomic.Int64
 // hiding fields or making response-only privacy hardening changes.
 const seriesSchema = "dbcd0a3c01b55203"
 
-func Init() {
-	go flushLoop()
+// Init starts a runtime with a background parent for compatibility. New
+// lifecycle-aware callers should use Start and retain the returned Runtime.
+func Init() *Runtime {
+	return Start(context.Background())
 }
 
 func RecordRelaySample(info *relaycommon.RelayInfo, success bool, outputTokens int64) {
@@ -99,12 +102,6 @@ func recordSample(key bucketKey, sample Sample) bool {
 	})
 }
 
-func recordCounters(key bucketKey, value counters) bool {
-	return withWritableBucket(key, value.requestCount, func(b *bucket) {
-		b.addCountersLocked(value)
-	})
-}
-
 func withWritableBucket(key bucketKey, droppedSamples int64, write func(*bucket)) bool {
 	for {
 		actual, ok := hotBuckets.Load(key)
@@ -119,8 +116,14 @@ func withWritableBucket(key bucketKey, droppedSamples int64, write func(*bucket)
 		b := actual.(*bucket)
 		b.mu.Lock()
 		if b.draining {
-			b.mu.Unlock()
-			continue
+			// A bucket being flushed remains in the map as its reserved capacity
+			// slot. It stays writable for same-key samples; a detached bucket was
+			// removed and must be retried against the current map entry.
+			current, ok := hotBuckets.Load(key)
+			if !ok || current != b {
+				b.mu.Unlock()
+				continue
+			}
 		}
 		write(b)
 		b.mu.Unlock()
@@ -197,6 +200,10 @@ func evictOldestBucketLocked(incoming bucketKey) bool {
 
 func removeBucketLocked(key bucketKey, b *bucket, eviction bool) bool {
 	b.mu.Lock()
+	if eviction && b.draining {
+		b.mu.Unlock()
+		return false
+	}
 	b.draining = true
 	droppedSamples := b.counters.requestCount
 	deleted := hotBuckets.CompareAndDelete(key, b)
