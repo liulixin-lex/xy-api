@@ -26,6 +26,7 @@ type MetricSnapshot struct {
 	ReliabilityRequestCount int64
 	ReliabilityFailureCount int64
 	P95LatencyMs            float64
+	P95TTFTMs               float64
 	TPS                     float64
 	Inflight                int64
 }
@@ -64,6 +65,7 @@ type Settings struct {
 	NowUnix            int64
 	NowUnixMilli       int64
 	RandomSeed         int64
+	PreferTTFT         bool
 }
 
 type Weights struct {

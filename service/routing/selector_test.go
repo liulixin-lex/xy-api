@@ -80,6 +80,58 @@ func TestRankCandidatesNormalizesWeights(t *testing.T) {
 	assert.InDelta(t, 0.5, decision.Weights.Cost, 0.000001)
 }
 
+func TestSelectRankedFromCandidatesUsesTTFTOnlyWhenPreferred(t *testing.T) {
+	candidates := []Candidate{
+		testCandidate(1, 1, 900, 10, nil, nil),
+		testCandidate(2, 1, 200, 10, nil, nil),
+	}
+	candidates[0].Metric.P95TTFTMs = 100
+	candidates[1].Metric.P95TTFTMs = 500
+
+	streaming := SelectRankedFromCandidates(candidates, Settings{
+		WeightLatency: 1,
+		TopK:          1,
+		PreferTTFT:    true,
+	})
+	nonStreaming := SelectRankedFromCandidates(candidates, Settings{
+		WeightLatency: 1,
+		TopK:          1,
+	})
+
+	require.NotNil(t, streaming.Selected)
+	require.NotNil(t, nonStreaming.Selected)
+	assert.Equal(t, 1, streaming.Selected.Channel.Id)
+	assert.Equal(t, 2, nonStreaming.Selected.Channel.Id)
+}
+
+func TestSelectRankedFromCandidatesFallsBackToTotalLatencyForInvalidTTFT(t *testing.T) {
+	for _, ttft := range []struct {
+		name  string
+		value float64
+	}{
+		{name: "missing"},
+		{name: "nan", value: math.NaN()},
+	} {
+		t.Run(ttft.name, func(t *testing.T) {
+			candidates := []Candidate{
+				testCandidate(1, 1, 900, 10, nil, nil),
+				testCandidate(2, 1, 200, 10, nil, nil),
+			}
+			candidates[0].Metric.P95TTFTMs = ttft.value
+			candidates[1].Metric.P95TTFTMs = ttft.value
+
+			decision := SelectRankedFromCandidates(candidates, Settings{
+				WeightLatency: 1,
+				TopK:          1,
+				PreferTTFT:    true,
+			})
+
+			require.NotNil(t, decision.Selected)
+			assert.Equal(t, 2, decision.Selected.Channel.Id)
+		})
+	}
+}
+
 func TestRankCandidatesTreatsStaleCostsAsUnknown(t *testing.T) {
 	settings := Settings{
 		WeightAvailability: 1,

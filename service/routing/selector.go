@@ -211,7 +211,7 @@ func collectScoreBounds(candidates []candidateHealth, settings Settings) scoreBo
 	}
 	for _, item := range candidates {
 		if item.candidate.Metric != nil {
-			latency := item.candidate.Metric.P95LatencyMs
+			latency := candidateLatencyMs(item.candidate.Metric, settings)
 			if finitePositive(latency) {
 				bounds.hasLatency = true
 				if latency < bounds.minLatency {
@@ -244,7 +244,7 @@ func collectScoreBounds(candidates []candidateHealth, settings Settings) scoreBo
 
 func scoreCandidate(item candidateHealth, bounds scoreBounds, weights Weights, settings Settings) RankedCandidate {
 	availability := availabilityScore(item.candidate.Metric, settings.MinVolume)
-	latency := latencyScore(item.candidate.Metric, bounds)
+	latency := latencyScore(item.candidate.Metric, bounds, settings)
 	throughput := throughputScore(item.candidate.Metric, bounds)
 	cost, knownCost := costScore(item.candidate.Cost, bounds, settings)
 
@@ -326,17 +326,28 @@ func belowAvailabilityFloor(metric *MetricSnapshot, settings Settings) bool {
 	return availabilityScore(metric, 0) < floor
 }
 
-func latencyScore(metric *MetricSnapshot, bounds scoreBounds) float64 {
+func candidateLatencyMs(metric *MetricSnapshot, settings Settings) float64 {
+	if metric == nil {
+		return 0
+	}
+	if settings.PreferTTFT && finitePositive(metric.P95TTFTMs) {
+		return metric.P95TTFTMs
+	}
+	return metric.P95LatencyMs
+}
+
+func latencyScore(metric *MetricSnapshot, bounds scoreBounds, settings Settings) float64 {
 	if !bounds.hasLatency {
 		return 1
 	}
-	if metric == nil || !finitePositive(metric.P95LatencyMs) {
+	latency := candidateLatencyMs(metric, settings)
+	if !finitePositive(latency) {
 		return 0
 	}
 	if almostEqual(bounds.minLatency, bounds.maxLatency) {
 		return 1
 	}
-	return clamp01((bounds.maxLatency - metric.P95LatencyMs) / (bounds.maxLatency - bounds.minLatency))
+	return clamp01((bounds.maxLatency - latency) / (bounds.maxLatency - bounds.minLatency))
 }
 
 func throughputScore(metric *MetricSnapshot, bounds scoreBounds) float64 {
