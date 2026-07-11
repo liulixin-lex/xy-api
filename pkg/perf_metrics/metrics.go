@@ -1,15 +1,12 @@
 package perfmetrics
 
 import (
-	"context"
-	"fmt"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
@@ -85,9 +82,7 @@ func Record(sample Sample) {
 		group:    sample.Group,
 		bucketTs: bucketStart(time.Now().Unix()),
 	}
-	if recordSample(key, sample) {
-		recordRedis(key, sample)
-	}
+	recordSample(key, sample)
 }
 
 func RuntimeStats() Stats {
@@ -149,7 +144,7 @@ func loadOrCreateBucket(key bucketKey) *bucket {
 	}
 	const minBucketTimestamp int64 = -1 << 63
 	if key.bucketTs >= minBucketTimestamp+ttlSeconds {
-		evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
+		evictStaleBucketsLocked(key.bucketTs - ttlSeconds)
 	}
 	for bucketCount.Load() >= int64(activeLimits.MaxBuckets) {
 		if !evictOldestBucketLocked(key) {
@@ -163,7 +158,7 @@ func loadOrCreateBucket(key bucketKey) *bucket {
 	return b
 }
 
-func evictExpiredBucketsLocked(cutoff int64) {
+func evictStaleBucketsLocked(cutoff int64) {
 	hotBuckets.Range(func(key any, value any) bool {
 		k := key.(bucketKey)
 		if k.bucketTs <= cutoff {
@@ -549,54 +544,4 @@ func avgTps(value counters) float64 {
 		return 0
 	}
 	return float64(value.outputTokens) / (float64(value.generationMs) / 1000)
-}
-
-func recordRedis(key bucketKey, sample Sample) {
-	if !common.RedisEnabled || common.RDB == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	redisKey := redisBucketKey(key)
-	pipe := common.RDB.TxPipeline()
-	pipe.HIncrBy(ctx, redisKey, "req", 1)
-	if sample.Success {
-		pipe.HIncrBy(ctx, redisKey, "ok", 1)
-	}
-	if sample.LatencyMs > 0 {
-		pipe.HIncrBy(ctx, redisKey, "lat", sample.LatencyMs)
-	}
-	if sample.HasTtft && sample.TtftMs >= 0 {
-		pipe.HIncrBy(ctx, redisKey, "ttft", sample.TtftMs)
-		pipe.HIncrBy(ctx, redisKey, "ttft_n", 1)
-	}
-	if sample.OutputTokens > 0 && sample.GenerationMs > 0 {
-		pipe.HIncrBy(ctx, redisKey, "out", sample.OutputTokens)
-		pipe.HIncrBy(ctx, redisKey, "gen_ms", sample.GenerationMs)
-	}
-	pipe.Expire(ctx, redisKey, time.Hour)
-	_, _ = pipe.Exec(ctx)
-}
-
-func mergeRedisActiveBuckets(merged map[bucketKey]counters, params QueryParams, startTs int64, endTs int64) {
-	if !common.RedisEnabled || common.RDB == nil || params.Model == "" || params.Group == "" {
-		return
-	}
-	active := bucketStart(time.Now().Unix())
-	if active < startTs || active > endTs {
-		return
-	}
-	key := bucketKey{model: params.Model, group: params.Group, bucketTs: active}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	values, err := common.RDB.HGetAll(ctx, redisBucketKey(key)).Result()
-	if err != nil || len(values) == 0 {
-		return
-	}
-	mergeCounters(merged, key, redisCounters(values))
-}
-
-func redisBucketKey(key bucketKey) string {
-	return fmt.Sprintf("perf:%s:%s:%d", key.model, key.group, key.bucketTs)
 }

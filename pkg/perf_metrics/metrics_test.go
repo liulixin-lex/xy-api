@@ -1,16 +1,46 @@
 package perfmetrics
 
 import (
+	"context"
 	"errors"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	appcore "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 
+	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+type rejectingRedisHook struct {
+	commandCount atomic.Int64
+}
+
+func (h *rejectingRedisHook) BeforeProcess(ctx context.Context, _ redis.Cmder) (context.Context, error) {
+	h.commandCount.Add(1)
+	return ctx, errors.New("unexpected Redis command")
+}
+
+func (*rejectingRedisHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (h *rejectingRedisHook) BeforeProcessPipeline(ctx context.Context, commands []redis.Cmder) (context.Context, error) {
+	h.commandCount.Add(int64(len(commands)))
+	return ctx, errors.New("unexpected Redis pipeline")
+}
+
+func (*rejectingRedisHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
 
 func configurePerfMetricsForTest(t *testing.T, enabled bool) {
 	t.Helper()
@@ -31,6 +61,74 @@ func configurePerfMetricsForTest(t *testing.T, enabled bool) {
 		maintenanceMu.Unlock()
 		perf_metrics_setting.UpdateSetting(previousSetting)
 	})
+}
+
+func TestRecordRelaySampleUsesLocalStoreWithoutRedis(t *testing.T) {
+	configurePerfMetricsForTest(t, true)
+
+	db, err := gorm.Open(sqlite.Open("file:perf_metrics_local_store?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.PerfMetric{}))
+	previousDB := model.DB
+	model.DB = db
+
+	hook := &rejectingRedisHook{}
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: "unused:0",
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unexpected Redis network access")
+		},
+		MaxRetries: -1,
+	})
+	redisClient.AddHook(hook)
+	previousRedisEnabled := appcore.RedisEnabled
+	previousRDB := appcore.RDB
+	appcore.RedisEnabled = true
+	appcore.RDB = redisClient
+	t.Cleanup(func() {
+		appcore.RedisEnabled = previousRedisEnabled
+		appcore.RDB = previousRDB
+		_ = redisClient.Close()
+		model.DB = previousDB
+		sqlDB, sqlErr := db.DB()
+		if sqlErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-local",
+		UsingGroup:      "default",
+		StartTime:       time.Now().Add(-time.Second),
+		RetryIndex:      2,
+	}
+	RecordRelaySample(info, true, 40)
+
+	assert.Zero(t, hook.commandCount.Load())
+	require.Equal(t, Stats{Buckets: 1}, RuntimeStats())
+	var activeKey bucketKey
+	var activeCounters counters
+	hotBuckets.Range(func(key, value any) bool {
+		activeKey = key.(bucketKey)
+		activeCounters = value.(*bucket).snapshot()
+		return false
+	})
+	assert.Equal(t, int64(1), activeCounters.requestCount, "one logical request must remain one sample after retries")
+	assert.Equal(t, int64(1), activeCounters.successCount)
+	assert.Equal(t, int64(40), activeCounters.outputTokens)
+
+	beforeFlush, err := Query(QueryParams{Model: info.OriginModelName, Hours: 1})
+	require.NoError(t, err)
+	require.Len(t, beforeFlush.Groups, 1)
+	assert.Equal(t, "default", beforeFlush.Groups[0].Group)
+	assert.Equal(t, float64(100), beforeFlush.Groups[0].SuccessRate)
+
+	flushCompletedBucketsWith(activeKey.bucketTs+1, model.UpsertPerfMetric)
+	assert.Equal(t, Stats{}, RuntimeStats())
+	afterFlush, err := Query(QueryParams{Model: info.OriginModelName, Hours: 1})
+	require.NoError(t, err)
+	assert.Equal(t, beforeFlush, afterFlush)
+	assert.Zero(t, hook.commandCount.Load())
 }
 
 func TestPerfMetricsEnforceBucketLimit(t *testing.T) {
@@ -105,7 +203,7 @@ func TestPerfMetricsCapacityProtectsCurrentAndNewerBuckets(t *testing.T) {
 	}
 }
 
-func TestPerfMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
+func TestPerfMetricsEvictStaleBucketsBeforeCapacity(t *testing.T) {
 	configurePerfMetricsForTest(t, true)
 	maintenanceMu.Lock()
 	limits = Limits{MaxBuckets: 3, BucketTTL: 2 * time.Second}

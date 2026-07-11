@@ -7,7 +7,9 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +19,14 @@ import (
 
 func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing.T) {
 	truncate(t)
+	previousPerfSetting := perf_metrics_setting.GetSetting()
+	perfSetting := previousPerfSetting
+	perfSetting.Enabled = true
+	perf_metrics_setting.UpdateSetting(perfSetting)
+	t.Cleanup(func() {
+		perf_metrics_setting.UpdateSetting(previousPerfSetting)
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.PerfMetric{}))
 	seedUser(t, 9921, 100000)
 	seedToken(t, 9922, 9921, "wss-token", 100000)
 	seedChannel(t, 9923)
@@ -60,6 +70,11 @@ func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing
 	var logCount int64
 	require.NoError(t, model.DB.Model(&model.Log{}).Count(&logCount).Error)
 	assert.Equal(t, int64(1), logCount)
+	result, err := perfmetrics.Query(perfmetrics.QueryParams{Model: info.OriginModelName, Hours: 1})
+	require.NoError(t, err)
+	require.Len(t, result.Groups, 1)
+	assert.Equal(t, "default", result.Groups[0].Group)
+	assert.Equal(t, float64(100), result.Groups[0].SuccessRate)
 }
 
 func TestPostWssConsumeQuotaMissingUsageRetainsReservedQuotaAndRecordsConsumption(t *testing.T) {
