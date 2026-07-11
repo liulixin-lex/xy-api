@@ -133,7 +133,7 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 	multiAggregate := routinghotcache.Key{ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	multiPositive := routinghotcache.Key{ChannelID: 142, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
 
-	routinghotcache.SetMetricForTest(singleAggregate, routinghotcache.MetricSnapshot{RequestCount: 11, ReliabilityRequestCount: 10, ReliabilityFailureCount: 1})
+	routinghotcache.SetMetricForTest(singleAggregate, routinghotcache.MetricSnapshot{RequestCount: 11, ReliabilityRequestCount: 10, ReliabilityFailureCount: 1, P95TTFTMs: 123})
 	routinghotcache.SetMetricForTest(singlePositive, routinghotcache.MetricSnapshot{RequestCount: 99, ReliabilityRequestCount: 99, ReliabilityFailureCount: 99})
 	routinghotcache.SetBreakerForTest(singleAggregate, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateDegraded, UpdatedUnix: now.Unix()})
 	routinghotcache.SetBreakerForTest(singlePositive, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateOpen, UpdatedUnix: now.Unix()})
@@ -170,6 +170,7 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 	single := byChannelID[141]
 	require.NotNil(t, single.Metric)
 	assert.Equal(t, int64(11), single.Metric.RequestCount)
+	assert.Equal(t, 123.0, single.Metric.P95TTFTMs)
 	require.NotNil(t, single.Breaker)
 	assert.Equal(t, routingselector.BreakerStateDegraded, single.Breaker.State)
 	require.NotNil(t, single.Capacity)
@@ -189,6 +190,30 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 		if candidate.Channel.Id == 142 {
 			assert.Nil(t, candidate.Capacity)
 		}
+	}
+}
+
+func TestRoutingSelectorSettingsPrefersTTFTOnlyForStreamingContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	streamCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(streamCtx, constant.ContextKeyIsStream, true)
+	nonStreamCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(nonStreamCtx, constant.ContextKeyIsStream, false)
+
+	tests := []struct {
+		name string
+		ctx  *gin.Context
+		want bool
+	}{
+		{name: "stream", ctx: streamCtx, want: true},
+		{name: "non-stream", ctx: nonStreamCtx, want: false},
+		{name: "nil context", ctx: nil, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			settings := routingSelectorSettings(smart_routing_setting.SmartRoutingSetting{}, test.ctx)
+			assert.Equal(t, test.want, settings.PreferTTFT)
+		})
 	}
 }
 

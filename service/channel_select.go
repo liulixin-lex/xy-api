@@ -292,7 +292,7 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		return nil, nil
 	}
 
-	selectorSettings := routingSelectorSettings(setting)
+	selectorSettings := routingSelectorSettings(setting, param.Ctx)
 	for len(filtered) > 0 {
 		decision := routingselector.SelectRankedFromCandidates(filtered, selectorSettings)
 		if param.Ctx != nil {
@@ -516,6 +516,7 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 					ReliabilityRequestCount: metric.ReliabilityRequestCount,
 					ReliabilityFailureCount: metric.ReliabilityFailureCount,
 					P95LatencyMs:            metric.P95LatencyMs,
+					P95TTFTMs:               metric.P95TTFTMs,
 					TPS:                     metric.TPS,
 				}
 			}
@@ -643,7 +644,7 @@ func smartRoutingMemoKey(group string, modelName string, requestPath string) str
 	return group + "\x00" + modelName + "\x00" + requestPath
 }
 
-func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting) routingselector.Settings {
+func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting, c *gin.Context) routingselector.Settings {
 	now := time.Now()
 	return routingselector.Settings{
 		WeightAvailability: setting.WeightAvailability,
@@ -659,6 +660,7 @@ func routingSelectorSettings(setting smart_routing_setting.SmartRoutingSetting) 
 		NowUnix:            now.Unix(),
 		NowUnixMilli:       now.UnixMilli(),
 		RandomSeed:         now.UnixNano(),
+		PreferTTFT:         c != nil && common.GetContextKeyBool(c, constant.ContextKeyIsStream),
 	}
 }
 
@@ -767,7 +769,7 @@ func admissibleAffinityChannelForSmartGroup(c *gin.Context, preferredID int, mod
 	if len(filtered) == 0 {
 		return nil, false
 	}
-	selectorSettings := routingSelectorSettings(setting)
+	selectorSettings := routingSelectorSettings(setting, c)
 	decision := routingselector.RankCandidates(filtered, selectorSettings)
 	if c != nil {
 		common.SetContextKey(c, constant.ContextKeyRoutingLastDecision, decision)

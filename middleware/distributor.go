@@ -170,6 +170,10 @@ func setRoutingPromptCostProxy(c *gin.Context) {
 	if err != nil || len(body) == 0 || !gjson.ValidBytes(body) {
 		return
 	}
+	stream := gjson.GetBytes(body, "stream")
+	if stream.Exists() {
+		common.SetContextKey(c, constant.ContextKeyIsStream, stream.Bool())
+	}
 	proxy := len(body) / 4
 	if proxy < 1 {
 		proxy = 1

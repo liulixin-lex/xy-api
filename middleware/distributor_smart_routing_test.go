@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,4 +106,49 @@ func TestSetupContextForSelectedChannelResetsSingleKeyMetadata(t *testing.T) {
 	assert.Equal(t, "single-key", common.GetContextKeyString(ctx, constant.ContextKeyChannelKey))
 	assert.False(t, common.GetContextKeyBool(ctx, constant.ContextKeyChannelIsMultiKey))
 	assert.Equal(t, model.RoutingMetricSingleKeyIndex, common.GetContextKeyInt(ctx, constant.ContextKeyChannelMultiKeyIndex))
+}
+
+func TestSetRoutingPromptCostProxyCapturesStreamWithoutConsumingJSONBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name       string
+		body       string
+		wantExists bool
+		wantStream bool
+	}{
+		{name: "true", body: `{"model":"gpt-test","stream":true}`, wantExists: true, wantStream: true},
+		{name: "false", body: `{"model":"gpt-test","stream":false}`, wantExists: true, wantStream: false},
+		{name: "absent", body: `{"model":"gpt-test"}`, wantExists: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			t.Cleanup(func() {
+				common.CleanupBodyStorage(ctx)
+			})
+
+			setRoutingPromptCostProxy(ctx)
+
+			stream, exists := common.GetContextKey(ctx, constant.ContextKeyIsStream)
+			assert.Equal(t, test.wantExists, exists)
+			if test.wantExists {
+				assert.Equal(t, test.wantStream, stream)
+			}
+
+			var replayed struct {
+				Model  string `json:"model"`
+				Stream *bool  `json:"stream"`
+			}
+			require.NoError(t, common.UnmarshalBodyReusable(ctx, &replayed))
+			assert.Equal(t, "gpt-test", replayed.Model)
+			if test.wantExists {
+				require.NotNil(t, replayed.Stream)
+				assert.Equal(t, test.wantStream, *replayed.Stream)
+			} else {
+				assert.Nil(t, replayed.Stream)
+			}
+		})
+	}
 }
