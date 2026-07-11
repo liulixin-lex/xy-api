@@ -92,7 +92,7 @@ func TestRoutingMetricsEnforceBucketLimitAndEvictOldest(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
+		}, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -172,7 +172,7 @@ func TestRoutingMetricsEvictOldestUsesStableTieBreakOrder(t *testing.T) {
 			maintenanceMu.Unlock()
 
 			for _, key := range test.keys {
-				recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
+				recordBucket(key, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 			}
 
 			snapshots := Snapshots()
@@ -206,7 +206,7 @@ func TestRoutingMetricsEvictExpiredBucketsBeforeCapacity(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
+		}, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -228,7 +228,7 @@ func TestRoutingMetricsBucketTTLDoesNotExpirePartialSecond(t *testing.T) {
 			modelName:   "gpt-test",
 			group:       "default",
 			bucketTs:    bucketTs,
-		}, 1, 0, false, 1, true, nil, routingerror.Classification{})
+		}, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 	}
 
 	snapshots := Snapshots()
@@ -285,7 +285,7 @@ func TestRoutingMetricsNormalizeNonPositiveLimits(t *testing.T) {
 	}
 	inflightKey := InflightKey{ChannelID: 1, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 
-	recordBucket(metricKey, 1, 0, false, 1, true, nil, routingerror.Classification{})
+	recordBucket(metricKey, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 	release := BeginInflight(nil, info, 1)
 
 	require.Len(t, Snapshots(), 1)
@@ -429,6 +429,51 @@ func TestRecordClassifiedAttemptNormalizesSingleKeyAndCapturesTiming(t *testing.
 	assert.GreaterOrEqual(t, metric.TotalLatencyMs, int64(1900))
 	assert.Equal(t, int64(300), metric.TtftSumMs)
 	assert.Equal(t, int64(1), metric.TtftCount)
+}
+
+func TestRecordClassifiedAttemptCapturesOutputTokensAndGenerationDuration(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		StartTime:       time.Now().Add(-10 * time.Second),
+		IsStream:        true,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 28},
+	}
+	info.ResetStreamAttemptState()
+	attemptStart := info.RoutingAttemptStartTime()
+	info.FirstResponseTime = attemptStart.Add(500 * time.Millisecond)
+	info.ObserveRoutingOutputTokens(150)
+	time.Sleep(550 * time.Millisecond)
+
+	recordTestAttempt(nil, info, 28, nil)
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(150), snapshots[0].OutputTokens)
+	assert.Less(t, snapshots[0].TotalLatencyMs, int64(2000))
+	assert.Less(t, snapshots[0].TtftP95Ms, int64(1000))
+	assert.Greater(t, snapshots[0].GenerationMs, int64(0))
+}
+
+func TestRecordClassifiedAttemptDoesNotAddGenerationWithoutOutputTokens(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	info := &relaycommon.RelayInfo{
+		UsingGroup:      "default",
+		OriginModelName: "gpt-test",
+		StartTime:       time.Now().Add(-10 * time.Second),
+		IsStream:        true,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 29},
+	}
+	info.ResetStreamAttemptState()
+	time.Sleep(10 * time.Millisecond)
+
+	recordTestAttempt(nil, info, 29, nil)
+
+	snapshots := Snapshots()
+	require.Len(t, snapshots, 1)
+	assert.Zero(t, snapshots[0].OutputTokens)
+	assert.Zero(t, snapshots[0].GenerationMs)
 }
 
 func TestRecordClassifiedAttemptCapturesErrorStatus(t *testing.T) {
@@ -730,7 +775,7 @@ func TestRoutingMetricsConcurrentDrainAndRecordPreserveAttempts(t *testing.T) {
 		group:       "default",
 		bucketTs:    1,
 	}
-	recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
+	recordBucket(key, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 	value, ok := buckets.Load(key)
 	require.True(t, ok)
 	b := value.(*bucket)
@@ -752,7 +797,7 @@ func TestRoutingMetricsConcurrentDrainAndRecordPreserveAttempts(t *testing.T) {
 		defer wg.Done()
 		ready <- struct{}{}
 		<-start
-		recordBucket(key, 1, 0, false, 1, true, nil, routingerror.Classification{})
+		recordBucket(key, 1, 0, false, 1, 0, true, nil, routingerror.Classification{})
 		recordResult <- struct{}{}
 	}()
 	<-ready

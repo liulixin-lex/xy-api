@@ -163,19 +163,23 @@ func RecordClassifiedAttempt(
 		return
 	}
 	now := time.Now()
+	attemptStart := info.RoutingAttemptStartTime()
+	if attemptStart.IsZero() {
+		attemptStart = now
+	}
 	key, ok := attemptBucketKey(c, info, channelID, now)
 	if !ok {
 		return
 	}
 
-	latencyMs := now.Sub(info.StartTime).Milliseconds()
+	latencyMs := now.Sub(attemptStart).Milliseconds()
 	if latencyMs < 0 {
 		latencyMs = 0
 	}
 	ttftMs := int64(0)
 	hasTtft := info.IsStream && info.HasSendResponse()
 	if hasTtft {
-		ttftMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+		ttftMs = info.FirstResponseTime.Sub(attemptStart).Milliseconds()
 		if ttftMs < 0 {
 			ttftMs = 0
 		}
@@ -188,7 +192,8 @@ func RecordClassifiedAttempt(
 		}
 	}
 
-	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
+	outputTokens := info.RoutingOutputTokens()
+	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 }
 
 func Snapshots() []model.RoutingChannelMetric {
@@ -284,12 +289,13 @@ func recordBucket(
 	ttftMs int64,
 	hasTtft bool,
 	generationMs int64,
+	outputTokens int64,
 	success bool,
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
 ) {
 	withWritableBucket(key, func(b *bucket) {
-		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
+		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 	})
 }
 
@@ -527,13 +533,14 @@ func (b *bucket) add(
 	ttftMs int64,
 	hasTtft bool,
 	generationMs int64,
+	outputTokens int64,
 	success bool,
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
 ) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, success, apiErr, classification)
+	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 }
 
 func (b *bucket) addLocked(
@@ -541,6 +548,7 @@ func (b *bucket) addLocked(
 	ttftMs int64,
 	hasTtft bool,
 	generationMs int64,
+	outputTokens int64,
 	success bool,
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
@@ -563,7 +571,10 @@ func (b *bucket) addLocked(
 		b.ttftCount++
 		b.ttftSamples = appendBoundedSample(b.ttftSamples, ttftMs)
 	}
-	b.generationMs += generationMs
+	if outputTokens > 0 && generationMs > 0 {
+		b.outputTokens += outputTokens
+		b.generationMs += generationMs
+	}
 
 	statusCode := 0
 	if apiErr != nil {
