@@ -2721,3 +2721,27 @@ deffc0d6 docs: plan phase 0b routing semantics
 - `go test -race ./relay ./relay/channel/openai ./controller -run 'Test(WssHelperSettlesOnlyCommittedRealtimeErrors|OpenaiRealtimeHandlerErrorIncludesCommittedPendingUsage|RelayAttemptControlError|RealtimeStreamOutcomes)' -count=1`：exit 0；已提交 Realtime 计费、pending usage 与 Controller outcome 路径无 race report。
 
 Race 总命令因此如实记录为非零，而不是 PASS；新增 Multi-Key、Task Submit 与 task adaptor 路径的定向 race 验证均通过。
+
+## Phase 0B 普通 HTTP 流补充验证（2026-07-11）
+
+### 范围与实现结论
+
+- 补充基准：`ed4cb8f1`；代码提交：`3136539d`（`fix: preserve committed http stream accounting`）；分支：`feat/channel-routing-v2`。
+- 普通 HTTP 流现在以真实 `c.Writer.Written()` 判断 client commit：pre-commit 解析、scanner、首字节或写入失败可安全重试；committed failure 禁止跨渠道重试并使用已获得的 partial usage 结算。
+- committed 流缺失有效 usage 时保留预扣额度并记录完整消费；图片流结算先应用请求 `n`，显式 usage 优先，缺失 usage 时使用可审计的最小计费信息或本地文本估算。
+- 每次 retry attempt 会恢复 `IsStream`、请求转换链、最终 relay format、响应计数、首响应状态和 `StreamStatus`，避免前一渠道污染后一渠道。
+- `common.CustomEvent`、SSE helper、Claude/OpenAI/Gemini 转换链、最终 usage 与 `[DONE]` 均传播底层写错误；首个 parse/scanner/ping/downstream write/provider error 后停止读取和最终化，并保留原始 cause。
+- 已覆盖 OpenAI（Chat、Responses、Image、TTS）、Claude、Gemini（OpenAI/Responses/native）、AWS Bedrock、Baidu、Cloudflare、Cohere、Coze、Dify、Ollama、PaLM、Tencent、xAI、Xunfei、Zhipu。AWS 额外检查 SDK `stream.Err()`；预响应 ping failure/panic 会标记 `StreamStatus` 并取消当前 attempt。
+- 最终 blocker-only 复审结论为 `READY`，无剩余 Critical/Important。本会话未连接生产、未部署、未执行生产迁移，也未修改前端。
+
+### 新鲜验证记录
+
+- `go test ./... -count=1`：exit 0，全部通过。
+- 扩展 `go vet`（common、routing、service、relay/helper、全部相关 channel、controller、model）：exit 0。
+- 普通 HTTP 流新增/修改路径的定向 `go test -race`：exit 0；覆盖 retry/attempt reset、HTTP stream billing、SSE helper、OpenAI/Claude/Gemini/AWS 及上述 legacy provider stream handlers。
+- 完整 race 仍不记为 PASS：可复现的非零项来自既有全局 `logger.logCount`、并行测试调用 `gin.SetMode`、以及既有 service task polling 共享对象；触发 race 的具体代码行与 `ed4cb8f1` 基线相同，并非本提交新增。本提交新增路径均由定向 race 命令验证通过。
+- `git diff --cached --check`：exit 0。
+- `git diff ed4cb8f1 -- '*.go' | rg '^\+.*json\.(Marshal|Unmarshal|NewDecoder|NewEncoder)'`：exit 1、无输出。
+- `git diff ed4cb8f1 -- '*_test.go' | rg '^\+.*\bt\.(Fatal|Fatalf|FailNow)\b'`：exit 1、无输出。
+- `git diff ed4cb8f1 -- . | rg '^-' | rg -i 'QuantumNous|new-api'`：exit 1、无输出。
+- `git diff --name-only ed4cb8f1 -- web/default web/classic`：exit 0、无输出。
