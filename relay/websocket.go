@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -14,8 +15,10 @@ import (
 
 func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	return wssHelperWithAdaptor(c, info, GetAdaptor(info.ApiType))
+}
 
-	adaptor := GetAdaptor(info.ApiType)
+func wssHelperWithAdaptor(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor) (newAPIError *types.NewAPIError) {
 	if adaptor == nil {
 		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
@@ -37,6 +40,10 @@ func WssHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.
 
 	usage, newAPIError := adaptor.DoResponse(c, nil, info)
 	if newAPIError != nil {
+		realtimeUsage, ok := usage.(*dto.RealtimeUsage)
+		if ok && realtimeUsage != nil && (info.ReceivedResponseCount > 0 || info.HasSendResponse()) {
+			service.PostWssConsumeQuota(c, info, info.UpstreamModelName, realtimeUsage, "")
+		}
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
