@@ -8,7 +8,7 @@ import (
 // JitterFunc selects a delay within a backoff ceiling.
 type JitterFunc func(time.Duration) time.Duration
 
-// FullJitter returns a random delay in the inclusive range [0, max].
+// FullJitter returns a random delay between zero and max.
 func FullJitter(max time.Duration) time.Duration {
 	if max <= 0 {
 		return 0

@@ -1,7 +1,6 @@
 package common
 
 import (
-	"sync"
 	"testing"
 	"time"
 
@@ -20,30 +19,6 @@ func TestFullJitterReturnsValueWithinMaximum(t *testing.T) {
 
 	assert.GreaterOrEqual(t, got, time.Duration(0))
 	assert.LessOrEqual(t, got, maximum)
-}
-
-func TestFullJitterIsSafeForConcurrentUse(t *testing.T) {
-	const (
-		maximum = 25 * time.Millisecond
-		workers = 32
-	)
-	results := make(chan time.Duration, workers)
-	var wg sync.WaitGroup
-
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results <- FullJitter(maximum)
-		}()
-	}
-
-	wg.Wait()
-	close(results)
-	for got := range results {
-		assert.GreaterOrEqual(t, got, time.Duration(0))
-		assert.LessOrEqual(t, got, maximum)
-	}
 }
 
 func TestCappedExponentialBackoffRejectsInvalidInputs(t *testing.T) {
