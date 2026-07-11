@@ -1769,38 +1769,15 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		keys := channel.GetKeys()
-		var remainingKeys []string
-		var newStatusList = make(map[int]int)
-		var newDisabledTime = make(map[int]int64)
-		var newDisabledReason = make(map[int]string)
-
-		newIndex := 0
-		for i, key := range keys {
+		oldKeys := channel.GetKeys()
+		remainingKeys := make([]string, 0, len(oldKeys))
+		for i, key := range oldKeys {
 			// 跳过要删除的密钥
 			if i == keyIndex {
 				continue
 			}
 
 			remainingKeys = append(remainingKeys, key)
-
-			// 保留其他密钥的状态信息，重新索引
-			if channel.ChannelInfo.MultiKeyStatusList != nil {
-				if status, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists && status != 1 {
-					newStatusList[newIndex] = status
-				}
-			}
-			if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-				if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
-					newDisabledTime[newIndex] = t
-				}
-			}
-			if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-				if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
-					newDisabledReason[newIndex] = r
-				}
-			}
-			newIndex++
 		}
 
 		if len(remainingKeys) == 0 {
@@ -1813,10 +1790,7 @@ func ManageMultiKeys(c *gin.Context) {
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.RemapMultiKeyState(oldKeys, remainingKeys)
 
 		err = channel.Update()
 		if err != nil {
@@ -1832,15 +1806,11 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 
 	case "delete_disabled_keys":
-		keys := channel.GetKeys()
-		var remainingKeys []string
+		oldKeys := channel.GetKeys()
+		remainingKeys := make([]string, 0, len(oldKeys))
 		var deletedCount int
-		var newStatusList = make(map[int]int)
-		var newDisabledTime = make(map[int]int64)
-		var newDisabledReason = make(map[int]string)
 
-		newIndex := 0
-		for i, key := range keys {
+		for i, key := range oldKeys {
 			status := 1 // default enabled
 			if channel.ChannelInfo.MultiKeyStatusList != nil {
 				if s, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists {
@@ -1853,21 +1823,6 @@ func ManageMultiKeys(c *gin.Context) {
 				deletedCount++
 			} else {
 				remainingKeys = append(remainingKeys, key)
-				// 保留非自动禁用密钥的状态信息，重新索引
-				if status != 1 {
-					newStatusList[newIndex] = status
-					if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-						if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
-							newDisabledTime[newIndex] = t
-						}
-					}
-					if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-						if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
-							newDisabledReason[newIndex] = r
-						}
-					}
-				}
-				newIndex++
 			}
 		}
 
@@ -1878,13 +1833,17 @@ func ManageMultiKeys(c *gin.Context) {
 			})
 			return
 		}
+		if len(remainingKeys) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "不能删除最后一个密钥",
+			})
+			return
+		}
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.RemapMultiKeyState(oldKeys, remainingKeys)
 
 		err = channel.Update()
 		if err != nil {
