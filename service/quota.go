@@ -153,6 +153,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	if usageMissing {
 		usage = &dto.RealtimeUsage{}
 	}
+	relayInfo.ObserveRoutingOutputTokens(int64(usage.OutputTokens))
 
 	var (
 		tieredResult *billingexpr.TieredResult
@@ -295,6 +296,7 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
+	relayInfo.ObserveRoutingOutputTokens(int64(usage.CompletionTokens))
 
 	var tieredUsedVars map[string]bool
 	if snap := relayInfo.TieredBillingSnapshot; snap != nil {

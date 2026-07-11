@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -86,16 +87,18 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
-	TokenId           int
-	TokenKey          string
-	TokenGroup        string
-	UserId            int
-	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
-	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
-	StartTime         time.Time
-	FirstResponseTime time.Time
-	isFirstResponse   bool
+	TokenId                 int
+	TokenKey                string
+	TokenGroup              string
+	UserId                  int
+	UsingGroup              string // 使用的分组，当auto跨分组重试时，会变动
+	UserGroup               string // 用户所在分组
+	TokenUnlimited          bool
+	StartTime               time.Time
+	FirstResponseTime       time.Time
+	isFirstResponse         bool
+	routingAttemptStartTime time.Time
+	routingOutputTokens     atomic.Int64
 
 	attemptBaselineCaptured        bool
 	attemptIsStream                bool
@@ -685,10 +688,41 @@ func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
 }
 
+func (info *RelayInfo) ObserveRoutingOutputTokens(tokens int64) {
+	if info == nil || tokens <= 0 {
+		return
+	}
+	for {
+		current := info.routingOutputTokens.Load()
+		if tokens <= current || info.routingOutputTokens.CompareAndSwap(current, tokens) {
+			return
+		}
+	}
+}
+
+func (info *RelayInfo) RoutingOutputTokens() int64 {
+	if info == nil {
+		return 0
+	}
+	return info.routingOutputTokens.Load()
+}
+
+func (info *RelayInfo) RoutingAttemptStartTime() time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	if !info.routingAttemptStartTime.IsZero() {
+		return info.routingAttemptStartTime
+	}
+	return info.StartTime
+}
+
 func (info *RelayInfo) ResetStreamAttemptState() {
 	if info == nil {
 		return
 	}
+	info.routingAttemptStartTime = time.Now()
+	info.routingOutputTokens.Store(0)
 	if !info.attemptBaselineCaptured {
 		info.attemptBaselineCaptured = true
 		info.attemptIsStream = info.IsStream

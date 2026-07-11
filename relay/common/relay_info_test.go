@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -13,6 +14,26 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRelayInfoRoutingOutputTokensAreAttemptScoped(t *testing.T) {
+	logicalStart := time.Now().Add(-time.Hour)
+	info := &RelayInfo{StartTime: logicalStart}
+
+	assert.Equal(t, logicalStart, info.RoutingAttemptStartTime())
+	info.ObserveRoutingOutputTokens(12)
+	info.ObserveRoutingOutputTokens(8)
+	info.ObserveRoutingOutputTokens(-1)
+	assert.Equal(t, int64(12), info.RoutingOutputTokens())
+
+	info.ResetStreamAttemptState()
+	assert.Zero(t, info.RoutingOutputTokens())
+	assert.True(t, info.RoutingAttemptStartTime().After(logicalStart))
+
+	info.ObserveRoutingOutputTokens(7)
+	assert.Equal(t, int64(7), info.RoutingOutputTokens())
+	info.ResetStreamAttemptState()
+	assert.Zero(t, info.RoutingOutputTokens())
+}
 
 func TestCurrentAttemptIsMultiKeyPrefersContextOverStaleChannelMeta(t *testing.T) {
 	gin.SetMode(gin.TestMode)

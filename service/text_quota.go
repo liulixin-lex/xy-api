@@ -344,6 +344,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+	relayInfo.ObserveRoutingOutputTokens(int64(summary.CompletionTokens))
 	if originUsage == nil {
 		summary.Quota = relayInfo.FinalPreConsumedQuota
 		if relayInfo.Billing != nil {
