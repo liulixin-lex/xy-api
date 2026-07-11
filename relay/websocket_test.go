@@ -10,13 +10,16 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type wssResponseAdaptor struct {
@@ -62,6 +65,16 @@ func (s *wssBillingSpy) Reserve(_ int) error {
 }
 
 func TestWssHelperSettlesOnlyCommittedRealtimeErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}))
+	mainDB := model.DB
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = mainDB
+	})
+
 	logConsumeEnabled := common.LogConsumeEnabled
 	common.LogConsumeEnabled = false
 	t.Cleanup(func() {
@@ -72,17 +85,26 @@ func TestWssHelperSettlesOnlyCommittedRealtimeErrors(t *testing.T) {
 	tests := []struct {
 		name                  string
 		receivedResponseCount int
+		usage                 any
 		wantSettledQuotas     []int
 		wantNeedsRefund       bool
 	}{
 		{
 			name:                  "committed response settles returned usage once",
 			receivedResponseCount: 1,
+			usage:                 &dto.RealtimeUsage{},
 			wantSettledQuotas:     []int{0},
 			wantNeedsRefund:       false,
 		},
 		{
+			name:                  "committed response with missing usage keeps reserved quota",
+			receivedResponseCount: 1,
+			wantSettledQuotas:     []int{10},
+			wantNeedsRefund:       false,
+		},
+		{
 			name:              "pre-commit error remains refundable",
+			usage:             &dto.RealtimeUsage{},
 			wantNeedsRefund:   true,
 			wantSettledQuotas: nil,
 		},
@@ -103,7 +125,7 @@ func TestWssHelperSettlesOnlyCommittedRealtimeErrors(t *testing.T) {
 				IsStream:              true,
 			}
 			adaptor := &wssResponseAdaptor{
-				usage:       &dto.RealtimeUsage{},
+				usage:       tt.usage,
 				responseErr: responseErr,
 			}
 

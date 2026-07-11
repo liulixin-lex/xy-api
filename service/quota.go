@@ -149,15 +149,26 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
+	usageMissing := usage == nil
+	if usageMissing {
+		usage = &dto.RealtimeUsage{}
+	}
 
-	var tieredResult *billingexpr.TieredResult
-	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
-		P:   float64(usage.InputTokens),
-		C:   float64(usage.OutputTokens),
-		Len: float64(usage.InputTokens),
-	})
-	if tieredOk {
-		tieredResult = tieredRes
+	var (
+		tieredResult *billingexpr.TieredResult
+		tieredOk     bool
+		tieredQuota  int
+	)
+	if !usageMissing {
+		var tieredRes *billingexpr.TieredResult
+		tieredOk, tieredQuota, tieredRes = TryTieredSettle(relayInfo, billingexpr.TokenParams{
+			P:   float64(usage.InputTokens),
+			C:   float64(usage.OutputTokens),
+			Len: float64(usage.InputTokens),
+		})
+		if tieredOk {
+			tieredResult = tieredRes
+		}
 	}
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
@@ -192,10 +203,17 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		GroupRatio: groupRatio,
 	}
 
-	quota, clamp := calculateAudioQuota(quotaInfo)
-	noteQuotaClamp(relayInfo, clamp)
-	if tieredOk {
-		quota = tieredQuota
+	quota := relayInfo.FinalPreConsumedQuota
+	if relayInfo.Billing != nil {
+		quota = relayInfo.Billing.GetPreConsumedQuota()
+	}
+	if !usageMissing {
+		calculatedQuota, clamp := calculateAudioQuota(quotaInfo)
+		noteQuotaClamp(relayInfo, clamp)
+		quota = calculatedQuota
+		if tieredOk {
+			quota = tieredQuota
+		}
 	}
 
 	totalTokens := usage.TotalTokens
@@ -208,7 +226,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	}
 
 	// record all the consume log even if quota is 0
-	if totalTokens == 0 {
+	if totalTokens == 0 && !usageMissing {
 		// in this case, must be some error happened
 		// we cannot just return, because we may have to return the pre-consumed quota
 		quota = 0
@@ -218,6 +236,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	} else {
 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		if usageMissing {
+			logContent += "（已提交的 Realtime 响应缺少 usage，按预扣额度结算）"
+			logger.LogError(ctx, fmt.Sprintf("committed realtime response missing usage, settling reserved quota %d for userId %d, channelId %d, tokenId %d, model %s",
+				quota, relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, modelName))
+		}
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {

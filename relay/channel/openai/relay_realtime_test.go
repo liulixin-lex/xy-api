@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type realtimeBillingSpy struct {
+	reservedQuotas []int
+}
+
+func (s *realtimeBillingSpy) Settle(_ int) error { return nil }
+
+func (s *realtimeBillingSpy) Refund(_ *gin.Context) {}
+
+func (s *realtimeBillingSpy) NeedsRefund() bool { return false }
+
+func (s *realtimeBillingSpy) GetPreConsumedQuota() int { return 0 }
+
+func (s *realtimeBillingSpy) Reserve(quota int) error {
+	s.reservedQuotas = append(s.reservedQuotas, quota)
+	return nil
+}
 
 func TestRealtimeFirstByteStateTimeoutWaitsForSuccessfulForward(t *testing.T) {
 	state := &realtimeFirstByteState{}
@@ -464,6 +482,99 @@ func TestOpenaiRealtimeHandlerMalformedUpstreamMessageIsPreCommitCorruption(t *t
 		assert.False(t, result.hasSentResponse)
 	case <-time.After(time.Second):
 		require.Fail(t, "realtime handler did not return after malformed upstream message")
+	}
+}
+
+func TestOpenaiRealtimeHandlerErrorIncludesCommittedPendingUsage(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	transcript := "pending usage"
+	committedMessage, err := common.Marshal(dto.RealtimeEvent{
+		Type:  dto.RealtimeEventResponseAudioTranscriptionDelta,
+		Delta: transcript,
+	})
+	require.NoError(t, err)
+	invalidAudioMessage, err := common.Marshal(dto.RealtimeEvent{
+		Type:  dto.RealtimeEventResponseAudioDelta,
+		Delta: "not-base64",
+	})
+	require.NoError(t, err)
+
+	targetRelease := make(chan struct{})
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage, committedMessage))
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage, invalidAudioMessage))
+		<-targetRelease
+	}))
+	t.Cleanup(func() {
+		close(targetRelease)
+		targetServer.Close()
+	})
+
+	targetConn, _, err := websocket.DefaultDialer.Dial("ws"+targetServer.URL[len("http"):], nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = targetConn.Close() })
+
+	type handlerResult struct {
+		err                   *types.NewAPIError
+		usage                 *dto.RealtimeUsage
+		receivedResponseCount int
+		reservedQuotas        []int
+	}
+	resultCh := make(chan handlerResult, 1)
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientConn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer clientConn.Close()
+
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = r
+		info := relaycommon.GenRelayInfoWs(c, clientConn)
+		info.TargetWs = targetConn
+		info.OriginModelName = "gpt-realtime"
+		info.UsingGroup = "default"
+		info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 23, UpstreamModelName: "test-model"}
+		billing := &realtimeBillingSpy{}
+		info.Billing = billing
+
+		apiErr, usage := OpenaiRealtimeHandler(c, info)
+		resultCh <- handlerResult{
+			err:                   apiErr,
+			usage:                 usage,
+			receivedResponseCount: info.ReceivedResponseCount,
+			reservedQuotas:        append([]int(nil), billing.reservedQuotas...),
+		}
+	}))
+	t.Cleanup(clientServer.Close)
+
+	clientConn, _, err := websocket.DefaultDialer.Dial("ws"+clientServer.URL[len("http"):], nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientConn.Close() })
+
+	_, gotMessage, err := clientConn.ReadMessage()
+	require.NoError(t, err)
+	assert.JSONEq(t, string(committedMessage), string(gotMessage))
+
+	select {
+	case result := <-resultCh:
+		require.NotNil(t, result.err)
+		assert.Contains(t, result.err.Cause().Error(), "error counting audio token")
+		assert.Equal(t, 1, result.receivedResponseCount)
+		require.NotNil(t, result.usage)
+		expectedTextTokens := service.EstimateTokenByModel("test-model", transcript)
+		assert.Equal(t, expectedTextTokens, result.usage.TotalTokens)
+		assert.Equal(t, expectedTextTokens, result.usage.OutputTokens)
+		assert.Equal(t, expectedTextTokens, result.usage.OutputTokenDetails.TextTokens)
+		assert.Len(t, result.reservedQuotas, 1)
+	case <-time.After(time.Second):
+		require.Fail(t, "realtime handler did not return after committed usage error")
 	}
 }
 

@@ -250,6 +250,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						usage.OutputTokenDetails.AudioTokens += realtimeUsage.OutputTokenDetails.AudioTokens
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
 						err := preConsumeUsage(c, info, usage, sumUsage)
+						usage = &dto.RealtimeUsage{}
+						localUsage = &dto.RealtimeUsage{}
 						if err != nil {
 							relayErr := fmt.Errorf("error consume usage: %w", err)
 							errChan <- realtimeRelayError{
@@ -262,10 +264,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 							}
 							return
 						}
-						// 本次计费完成，清除
-						usage = &dto.RealtimeUsage{}
-
-						localUsage = &dto.RealtimeUsage{}
 					} else {
 						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if err != nil {
@@ -287,6 +285,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						localUsage.InputTokenDetails.TextTokens += textToken
 						localUsage.InputTokenDetails.AudioTokens += audioToken
 						err = preConsumeUsage(c, info, localUsage, sumUsage)
+						localUsage = &dto.RealtimeUsage{}
 						if err != nil {
 							relayErr := fmt.Errorf("error consume usage: %w", err)
 							errChan <- realtimeRelayError{
@@ -299,8 +298,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 							}
 							return
 						}
-						// 本次计费完成，清除
-						localUsage = &dto.RealtimeUsage{}
 						// print now usage
 					}
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming sumUsage: %v", sumUsage))
@@ -422,6 +419,15 @@ waitLoop:
 	}
 
 	cleanupAttempt()
+	if handlerErr == nil || firstByteState.hasCommitted() {
+		if usage.TotalTokens != 0 {
+			_ = preConsumeUsage(c, info, usage, sumUsage)
+		}
+
+		if localUsage.TotalTokens != 0 {
+			_ = preConsumeUsage(c, info, localUsage, sumUsage)
+		}
+	}
 	if handlerErr != nil {
 		replayMu.Lock()
 		info.RealtimeReplayMessages = cloneRealtimeMessages(replayBuffer)
@@ -429,14 +435,6 @@ waitLoop:
 		return handlerErr, sumUsage
 	}
 	info.RealtimeReplayMessages = nil
-
-	if usage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, usage, sumUsage)
-	}
-
-	if localUsage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, localUsage, sumUsage)
-	}
 
 	// check usage total tokens, if 0, use local usage
 

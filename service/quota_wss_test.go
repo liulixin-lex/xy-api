@@ -59,3 +59,53 @@ func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing
 	require.NoError(t, model.DB.Model(&model.Log{}).Count(&logCount).Error)
 	assert.Equal(t, int64(1), logCount)
 }
+
+func TestPostWssConsumeQuotaMissingUsageRetainsReservedQuotaAndRecordsConsumption(t *testing.T) {
+	truncate(t)
+	seedUser(t, 9931, 100000)
+	seedToken(t, 9932, 9931, "wss-missing-usage", 100000)
+	seedChannel(t, 9933)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		UserId:          9931,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 9933},
+		TokenId:         9932,
+		TokenKey:        "wss-missing-usage",
+		UsingGroup:      "default",
+		UserGroup:       "default",
+		OriginModelName: "gpt-realtime",
+		StartTime:       time.Now(),
+		IsStream:        true,
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
+	}
+
+	require.Nil(t, PreConsumeBilling(ctx, 250, info))
+	assert.Equal(t, 99750, getUserQuota(t, 9931))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9932))
+
+	require.NotPanics(t, func() {
+		PostWssConsumeQuota(ctx, info, info.OriginModelName, nil, "")
+	})
+
+	assert.False(t, info.Billing.NeedsRefund())
+	assert.Equal(t, 99750, getUserQuota(t, 9931))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9932))
+
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 9931).First(&user).Error)
+	assert.Equal(t, 250, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", 9933).First(&channel).Error)
+	assert.Equal(t, int64(250), channel.UsedQuota)
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, int64(1), countLogs(t))
+	assert.Equal(t, 250, log.Quota)
+	assert.Zero(t, log.PromptTokens)
+	assert.Zero(t, log.CompletionTokens)
+	assert.Contains(t, log.Content, "缺少 usage")
+}

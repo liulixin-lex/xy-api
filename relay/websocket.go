@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -40,8 +41,12 @@ func wssHelperWithAdaptor(c *gin.Context, info *relaycommon.RelayInfo, adaptor c
 
 	usage, newAPIError := adaptor.DoResponse(c, nil, info)
 	if newAPIError != nil {
-		realtimeUsage, ok := usage.(*dto.RealtimeUsage)
-		if ok && realtimeUsage != nil && (info.ReceivedResponseCount > 0 || info.HasSendResponse()) {
+		if info.ReceivedResponseCount > 0 || info.HasSendResponse() {
+			realtimeUsage, ok := usage.(*dto.RealtimeUsage)
+			if !ok || realtimeUsage == nil {
+				logger.LogError(c, fmt.Sprintf("committed realtime request returned invalid usage type %T", usage))
+				realtimeUsage = nil
+			}
 			service.PostWssConsumeQuota(c, info, info.UpstreamModelName, realtimeUsage, "")
 		}
 		// reset status code 重置状态码
