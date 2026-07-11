@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -964,8 +963,12 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 		return routingPricingResponse{}, fmt.Errorf("pricing endpoint returned %s", response.Status)
 	}
 
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
 	var payload routingPricingResponse
-	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &payload); err != nil {
+	if err = common.Unmarshal(body, &payload); err != nil {
 		return routingPricingResponse{}, err
 	}
 	if !payload.Success {
@@ -1013,8 +1016,12 @@ func fetchRoutingUpstreamBalance(ctx context.Context, binding model.RoutingChann
 		return fmt.Errorf("user self endpoint returned %s", response.Status)
 	}
 
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return err
+	}
 	var payload routingUserSelfResponse
-	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &payload); err != nil {
+	if err = common.Unmarshal(body, &payload); err != nil {
 		return err
 	}
 	if !payload.Success {

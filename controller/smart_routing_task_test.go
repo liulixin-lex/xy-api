@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -33,6 +34,7 @@ func newRoutingCostTLSServerForTest(t *testing.T, handler http.Handler) *httptes
 	transport, ok := client.Transport.(*http.Transport)
 	require.True(t, ok)
 	transport = transport.Clone()
+	transport.DisableCompression = true
 	serverAddress := server.Listener.Addr().String()
 	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		dialer := &net.Dialer{Timeout: time.Second}
@@ -979,6 +981,7 @@ func TestRoutingSub2APIJWTResetRetiresInFlightLogin(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 
 		loginMu.Lock()
 		loginCount++
@@ -1411,4 +1414,63 @@ func TestRoutingSub2APIRequestReturnsTypedAuthErrorsWithoutMarkingServingHealth(
 			assert.Zero(t, marked)
 		})
 	}
+}
+
+func TestRoutingCostEndpointsRejectNonJSONContentType(t *testing.T) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.URL.Path {
+		case "/api/pricing":
+			_, _ = io.WriteString(w, `{"success":true,"data":[],"group_ratio":{}}`)
+		case "/api/user/self":
+			_, _ = io.WriteString(w, `{"success":false,"message":"not JSON"}`)
+		case "/api/test":
+			_, _ = io.WriteString(w, `{"code":0,"success":true,"data":{"ok":true}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	binding := model.RoutingChannelBinding{ChannelID: 990, BaseURL: server.URL, UpstreamGroup: "default"}
+
+	_, err := fetchRoutingPricingPayload(context.Background(), binding)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Content-Type")
+
+	err = fetchRoutingUpstreamBalance(context.Background(), binding, model.RoutingCredentials{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Content-Type")
+
+	_, err = routingSub2APIRequest(context.Background(), binding, model.RoutingCredentials{}, http.MethodGet, "/api/test", "", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Content-Type")
+}
+
+func TestRoutingSub2APIRequestDecodesGzipJSON(t *testing.T) {
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		writer := gzip.NewWriter(w)
+		if _, err := io.WriteString(writer, `{"code":0,"success":true,"data":{"ok":true}}`); err != nil {
+			t.Errorf("write gzip response: %v", err)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			t.Errorf("close gzip response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	raw, err := routingSub2APIRequest(
+		context.Background(),
+		model.RoutingChannelBinding{ChannelID: 991, BaseURL: server.URL},
+		model.RoutingCredentials{},
+		http.MethodGet,
+		"/api/test",
+		"",
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"ok":true}`, string(raw))
 }

@@ -333,8 +333,12 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 		return nil, fmt.Errorf("sub2api endpoint %s returned %s", path, response.Status)
 	}
 
+	bodyBytes, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return nil, err
+	}
 	var envelope routingSub2APIEnvelope
-	if err = common.DecodeJson(io.LimitReader(response.Body, maxRatioConfigBytes), &envelope); err != nil {
+	if err = common.Unmarshal(bodyBytes, &envelope); err != nil {
 		return nil, err
 	}
 	if (envelope.Success != nil && !*envelope.Success) || envelope.Code != 0 {
