@@ -31,6 +31,15 @@ type Key struct {
 	Group       string
 }
 
+func (key Key) HotcacheKey() routinghotcache.Key {
+	return routinghotcache.Key{
+		ChannelID:   key.ChannelID,
+		APIKeyIndex: key.APIKeyIndex,
+		Model:       key.Model,
+		Group:       key.Group,
+	}
+}
+
 type Config struct {
 	Consecutive5xxThreshold int
 	FailureRateThreshold    float64

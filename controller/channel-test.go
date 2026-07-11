@@ -935,9 +935,10 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		shouldBanChannel := false
 		newAPIError := result.newAPIError
+		classification, _ := classifyRoutingRelayAttempt(newAPIError, nil)
 		// request error disables the channel
 		if newAPIError != nil {
-			shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+			shouldBanChannel = service.ShouldDisableChannel(newAPIError, classification)
 		}
 
 		// 当错误检查通过，才检查响应时间
@@ -945,7 +946,8 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 			if milliseconds > disableThreshold {
 				err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
 				newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
-				shouldBanChannel = true
+				classification, _ = classifyRoutingRelayAttempt(newAPIError, nil)
+				shouldBanChannel = service.ShouldDisableChannel(newAPIError, classification)
 			}
 		}
 
@@ -957,7 +959,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		// disable channel
 		if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, classification)
 			summary.Disabled++
 		}
 
