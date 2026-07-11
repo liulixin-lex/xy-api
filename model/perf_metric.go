@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"time"
 
 	"gorm.io/gorm"
@@ -27,10 +28,14 @@ func (PerfMetric) TableName() string {
 }
 
 func UpsertPerfMetric(metric *PerfMetric) error {
+	return UpsertPerfMetricContext(context.Background(), metric)
+}
+
+func UpsertPerfMetricContext(ctx context.Context, metric *PerfMetric) error {
 	if metric == nil || metric.RequestCount == 0 {
 		return nil
 	}
-	return DB.Clauses(clause.OnConflict{
+	err := DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "model_name"},
 			{Name: "group"},
@@ -46,6 +51,10 @@ func UpsertPerfMetric(metric *PerfMetric) error {
 			"generation_ms":    gorm.Expr("perf_metrics.generation_ms + ?", metric.GenerationMs),
 		}),
 	}).Create(metric).Error
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func GetPerfMetrics(modelName string, group string, startTs int64, endTs int64) ([]PerfMetric, error) {
@@ -116,10 +125,18 @@ func GetPerfMetricsSummaryBucketsAll(startTs int64, endTs int64, groups []string
 }
 
 func DeletePerfMetricsBefore(cutoffTs int64) error {
+	return DeletePerfMetricsBeforeContext(context.Background(), cutoffTs)
+}
+
+func DeletePerfMetricsBeforeContext(ctx context.Context, cutoffTs int64) error {
 	if cutoffTs <= 0 {
 		return nil
 	}
-	return DB.Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error
+	err := DB.WithContext(ctx).Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func PerfMetricStartTime(hours int) int64 {
