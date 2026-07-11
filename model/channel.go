@@ -442,14 +442,22 @@ func (channel *Channel) GetAutoBan() bool {
 }
 
 func (channel *Channel) Save() error {
-	return DB.Save(channel).Error
+	err := DB.Save(channel).Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func (channel *Channel) SaveWithoutKey() error {
 	if channel.Id == 0 {
 		return errors.New("channel ID is 0")
 	}
-	return DB.Omit("key").Save(channel).Error
+	err := DB.Omit("key").Save(channel).Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
@@ -548,7 +556,11 @@ func BatchInsertChannels(channels []Channel) error {
 			}
 		}
 	}
-	return tx.Commit().Error
+	err := tx.Commit().Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func BatchDeleteChannels(ids []int) error {
@@ -570,7 +582,11 @@ func BatchDeleteChannels(ids []int) error {
 			return err
 		}
 	}
-	return tx.Commit().Error
+	err := tx.Commit().Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -619,6 +635,7 @@ func (channel *Channel) Insert() error {
 		return err
 	}
 	err = channel.AddAbilities(nil)
+	NotifyRoutingTopologyChanged()
 	return err
 }
 
@@ -667,6 +684,7 @@ func (channel *Channel) Update() error {
 	}
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
 	err = channel.UpdateAbilities(nil)
+	NotifyRoutingTopologyChanged()
 	return err
 }
 
@@ -697,6 +715,7 @@ func (channel *Channel) Delete() error {
 		return err
 	}
 	err = channel.DeleteAbilities()
+	NotifyRoutingTopologyChanged()
 	return err
 }
 
@@ -884,6 +903,9 @@ func EnableChannelByTag(tag string) error {
 		return err
 	}
 	err = UpdateAbilityStatusByTag(tag, true)
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
 	return err
 }
 
@@ -893,6 +915,9 @@ func DisableChannelByTag(tag string) error {
 		return err
 	}
 	err = UpdateAbilityStatusByTag(tag, false)
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
 	return err
 }
 
@@ -949,6 +974,7 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 			return err
 		}
 	}
+	NotifyRoutingTopologyChanged()
 	return nil
 }
 
@@ -969,11 +995,17 @@ func updateChannelUsedQuota(id int, quota int) {
 
 func DeleteChannelByStatus(status int64) (int64, error) {
 	result := DB.Where("status = ?", status).Delete(&Channel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		NotifyRoutingTopologyChanged()
+	}
 	return result.RowsAffected, result.Error
 }
 
 func DeleteDisabledChannel() (int64, error) {
 	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		NotifyRoutingTopologyChanged()
+	}
 	return result.RowsAffected, result.Error
 }
 

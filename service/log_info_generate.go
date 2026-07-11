@@ -99,6 +99,15 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 		adminInfo["is_multi_key"] = true
 		adminInfo["multi_key_index"] = common.GetContextKeyInt(ctx, constant.ContextKeyChannelMultiKeyIndex)
 	}
+	if poolID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingPoolID); poolID > 0 {
+		routingSnapshotRevision, _ := common.GetContextKeyType[uint64](ctx, constant.ContextKeyRoutingSnapshotRevision)
+		adminInfo["routing_snapshot_revision"] = routingSnapshotRevision
+		adminInfo["routing_pool_id"] = poolID
+		adminInfo["routing_member_id"] = common.GetContextKeyInt(ctx, constant.ContextKeyRoutingMemberID)
+		if credentialID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID); credentialID > 0 {
+			adminInfo["routing_credential_id"] = credentialID
+		}
+	}
 
 	isLocalCountTokens := common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)
 	if isLocalCountTokens {

@@ -163,6 +163,15 @@ func StartSmartRoutingRuntime(parent context.Context) *SmartRoutingRuntime {
 	return newSmartRoutingRuntime(parent, defaultSmartRoutingRuntimeDeps())
 }
 
+func BootstrapSmartRoutingHotcacheContext(ctx context.Context) error {
+	setting := smart_routing_setting.GetSetting()
+	if !setting.Enabled {
+		return nil
+	}
+	_, err := refreshRoutingHotcacheFromDB(ctx, setting)
+	return err
+}
+
 func defaultSmartRoutingRuntimeDeps() smartRoutingRuntimeDeps {
 	return smartRoutingRuntimeDeps{
 		getSetting: smart_routing_setting.GetSetting,

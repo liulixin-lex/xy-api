@@ -92,36 +92,33 @@ var inflightKeyCount atomic.Int64
 var bucketEvictionCount atomic.Int64
 var inflightDropCount atomic.Int64
 
+func noopInflightRelease() {}
+
 func BeginInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID int) func() {
-	if info.CurrentAttemptIsMultiKey(c) {
-		return func() {}
-	}
 	if !smart_routing_setting.Enabled() {
-		return func() {}
+		return noopInflightRelease
 	}
-	key, ok := inflightKey(c, info, channelID)
-	if !ok {
-		return func() {}
+	releases := make([]func(), 0, 2)
+	if release := beginStableInflight(c, info, channelID); release != nil {
+		releases = append(releases, release)
 	}
-	keys := []InflightKey{key}
-	trackedKeys := make([]InflightKey, 0, len(keys))
-	trackedCounters := make([]*inflightCounter, 0, len(keys))
-	for _, item := range keys {
-		counter, acquired := acquireInflightCounter(item)
-		if !acquired {
-			continue
+	if !info.CurrentAttemptIsMultiKey(c) {
+		if key, ok := inflightKey(c, info, channelID); ok {
+			if counter, acquired := acquireInflightCounter(key); acquired {
+				releases = append(releases, func() {
+					releaseInflightCounter(key, counter)
+				})
+			}
 		}
-		trackedKeys = append(trackedKeys, item)
-		trackedCounters = append(trackedCounters, counter)
 	}
-	if len(trackedKeys) == 0 {
-		return func() {}
+	if len(releases) == 0 {
+		return noopInflightRelease
 	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			for i, item := range trackedKeys {
-				releaseInflightCounter(item, trackedCounters[i])
+			for _, release := range releases {
+				release()
 			}
 		})
 	}
@@ -156,10 +153,11 @@ func RecordClassifiedAttempt(
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
 ) {
-	if info.CurrentAttemptIsMultiKey(c) {
+	if !smart_routing_setting.Enabled() {
 		return
 	}
-	if !smart_routing_setting.Enabled() {
+	if info == nil {
+		recordStableClassifiedAttempt(c, info, channelID, time.Now(), 0, 0, false, 0, 0, success, apiErr, classification)
 		return
 	}
 	now := info.RoutingAttemptEndTime()
@@ -169,10 +167,6 @@ func RecordClassifiedAttempt(
 	attemptStart := info.RoutingAttemptStartTime()
 	if attemptStart.IsZero() {
 		attemptStart = now
-	}
-	key, ok := attemptBucketKey(c, info, channelID, now)
-	if !ok {
-		return
 	}
 
 	latencyMs := now.Sub(attemptStart).Milliseconds()
@@ -196,6 +190,28 @@ func RecordClassifiedAttempt(
 	}
 
 	outputTokens := info.RoutingOutputTokens()
+	recordStableClassifiedAttempt(
+		c,
+		info,
+		channelID,
+		now,
+		latencyMs,
+		ttftMs,
+		hasTtft,
+		generationMs,
+		outputTokens,
+		success,
+		apiErr,
+		classification,
+	)
+	if info.CurrentAttemptIsMultiKey(c) {
+		return
+	}
+
+	key, ok := attemptBucketKey(c, info, channelID, now)
+	if !ok {
+		return
+	}
 	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 }
 
@@ -249,11 +265,17 @@ func RequeueSnapshots(snapshots []model.RoutingChannelMetric) {
 }
 
 func ClearChannel(channelID int) {
+	ClearLegacyChannel(channelID)
+}
+
+// ClearLegacyChannel removes only the index-based compatibility state. Stable
+// member/credential deltas have an independent persistence lifecycle and must
+// not be discarded when a legacy cost binding changes.
+func ClearLegacyChannel(channelID int) {
 	if channelID <= 0 {
 		return
 	}
 	maintenanceMu.Lock()
-	defer maintenanceMu.Unlock()
 	buckets.Range(func(key any, value any) bool {
 		if k, ok := key.(bucketKey); ok && k.channelID == channelID {
 			removeBucketLocked(k, value.(*bucket), false)
@@ -266,11 +288,18 @@ func ClearChannel(channelID int) {
 		}
 		return true
 	})
+	maintenanceMu.Unlock()
+}
+
+func ClearStableChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	clearStableChannel(channelID)
 }
 
 func ResetForTest() {
 	maintenanceMu.Lock()
-	defer maintenanceMu.Unlock()
 	buckets.Range(func(key any, value any) bool {
 		removeBucketLocked(key.(bucketKey), value.(*bucket), false)
 		return true
@@ -284,6 +313,8 @@ func ResetForTest() {
 	bucketEvictionCount.Store(0)
 	inflightDropCount.Store(0)
 	limits = defaultLimits
+	maintenanceMu.Unlock()
+	resetStableForTest()
 }
 
 func recordBucket(

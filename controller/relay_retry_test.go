@@ -682,10 +682,15 @@ func TestRecordRoutingTaskAttemptCapturesMetricsAndBreaker(t *testing.T) {
 	assert.Equal(t, "5xx", breakers[0].Reason)
 }
 
-func TestRecordRoutingTaskAttemptIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t *testing.T) {
+func TestRecordRoutingTaskAttemptWritesStableMultiKeyWithoutLegacyState(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, "selected-key")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 9)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingMemberID, 91)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCredentialID, 911)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingSnapshotRevision, uint64(3))
 	configureRoutingBreakerAttemptTest(t, true)
 	routingSetting := smart_routing_setting.GetSetting()
 	routingSetting.Enabled = true
@@ -708,6 +713,11 @@ func TestRecordRoutingTaskAttemptIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t 
 
 	assert.Empty(t, routingmetrics.Snapshots())
 	assert.Equal(t, routingmetrics.Stats{}, routingmetrics.RuntimeStats())
+	stable := routingmetrics.StableSnapshots()
+	require.Len(t, stable, 1)
+	assert.Equal(t, 91, stable[0].PoolMemberID)
+	assert.Equal(t, 911, stable[0].CredentialID)
+	assert.Equal(t, int64(1), stable[0].FailureCount)
 	assert.Empty(t, routingbreaker.DirtySnapshots())
 	assert.Equal(t, routingbreaker.Stats{}, routingbreaker.RuntimeStats())
 }

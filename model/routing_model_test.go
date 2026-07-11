@@ -578,9 +578,15 @@ func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {
 }
 
 var routingMigrationModels = []interface{}{
+	&RoutingTopologyMetadata{},
+	&RoutingPool{},
+	&RoutingPoolMember{},
+	&RoutingCredentialRef{},
+	&RoutingDecisionAudit{},
 	&RoutingChannelBinding{},
 	&RoutingCostSnapshot{},
 	&RoutingChannelMetric{},
+	&RoutingMetricRollup{},
 	&RoutingBreakerState{},
 	&RoutingChannelHealthState{},
 	&RoutingAgentRecommendation{},
@@ -704,9 +710,14 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	t.Cleanup(func() { _ = db.Migrator().DropTable(&Channel{}) })
 	require.NoError(t, DB.AutoMigrate(&Channel{}))
 	require.NoError(t, DB.Create(&[]Channel{
-		{Id: 1, Name: "single-one", Key: "single-key-one"},
-		{Id: 91, Name: "single-ninety-one", Key: "single-key-ninety-one"},
+		{Id: 1, Name: "single-one", Key: "single-key-one", Group: "default"},
+		{Id: 91, Name: "single-ninety-one", Key: "single-key-ninety-one", Group: "legacy"},
+		{
+			Id: 92, Name: "multi-ninety-two", Key: "key-a\nkey-b", Group: "default,vip",
+			ChannelInfo: ChannelInfo{IsMultiKey: true},
+		},
 	}).Error)
+	runRoutingTopologyReconcileContract(t)
 
 	for _, model := range routingMigrationModels {
 		require.True(t, DB.Migrator().HasTable(model))
@@ -716,6 +727,18 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingChannelMetric{}, "Err529"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingBreakerState{}, "SemanticVersion"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingChannelBinding{}, "SyncFailureCount"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "GroupKey"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ModelKey"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "RequestKey"))
+	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{
+		{DecisionID: "case-upper", RequestID: "Request-X", PoolID: 1, GroupName: "VIP", ModelName: "Model-X", SnapshotRevision: 1, CreatedTime: 1},
+		{DecisionID: "case-lower", RequestID: "request-x", PoolID: 2, GroupName: "vip", ModelName: "model-x", SnapshotRevision: 1, CreatedTime: 1},
+	}))
+	var exactDecision RoutingDecisionAudit
+	require.NoError(t, DB.Where("group_key = ? AND model_key = ? AND request_key = ?",
+		RoutingDecisionGroupKey("VIP"), RoutingDecisionModelKey("Model-X"), RoutingDecisionRequestKey("Request-X"),
+	).First(&exactDecision).Error)
+	assert.Equal(t, "case-upper", exactDecision.DecisionID)
 
 	var migratedLegacyBinding RoutingChannelBinding
 	require.NoError(t, DB.Where("channel_id = ?", 77).First(&migratedLegacyBinding).Error)
@@ -1299,6 +1322,79 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		Where("channel_id = ? AND model_name = ?", 1, "recreated-binding-breaker").
 		Count(&recreatedStateCount).Error)
 	assert.Zero(t, recreatedStateCount)
+}
+
+func runRoutingTopologyReconcileContract(t *testing.T) {
+	t.Helper()
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-external-contract-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	first, err := ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 3, first.ActivePools)
+	assert.Equal(t, 4, first.ActiveMembers)
+	assert.Equal(t, 4, first.ActiveCredentials)
+
+	pools := loadRoutingPoolsForTest(t)
+	defaultPool := pools["default"]
+	vipPool := pools["vip"]
+	require.NotZero(t, defaultPool.ID)
+	require.NotZero(t, vipPool.ID)
+
+	members := loadRoutingMembersForTest(t)
+	defaultMember := members[routingMemberTestKey{poolID: defaultPool.ID, channelID: 92}]
+	vipMember := members[routingMemberTestKey{poolID: vipPool.ID, channelID: 92}]
+	require.True(t, defaultMember.Active)
+	require.True(t, vipMember.Active)
+
+	credentials := loadRoutingCredentialsForTest(t, 92)
+	keyAID := credentials["key-a"].ID
+	keyBID := credentials["key-b"].ID
+	require.NotZero(t, keyAID)
+	require.NotZero(t, keyBID)
+
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", 92).Updates(map[string]any{
+		"group": "vip",
+		"key":   "key-b\nkey-a",
+	}).Error)
+	second, err := ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 3, second.ActivePools)
+	assert.Equal(t, 3, second.ActiveMembers)
+	assert.Equal(t, 4, second.ActiveCredentials)
+
+	members = loadRoutingMembersForTest(t)
+	assert.False(t, members[routingMemberTestKey{poolID: defaultPool.ID, channelID: 92}].Active)
+	assert.Equal(t, vipMember.ID, members[routingMemberTestKey{poolID: vipPool.ID, channelID: 92}].ID)
+
+	credentials = loadRoutingCredentialsForTest(t, 92)
+	assert.Equal(t, keyAID, credentials["key-a"].ID)
+	assert.Equal(t, keyBID, credentials["key-b"].ID)
+	assert.Equal(t, 1, credentials["key-a"].LastSeenIndex)
+	assert.Equal(t, 0, credentials["key-b"].LastSeenIndex)
+
+	before := routingTopologyIdentitySnapshotForTest(t)
+	_, err = ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, before, routingTopologyIdentitySnapshotForTest(t))
+
+	require.NoError(t, DB.Create(&Channel{
+		Id: 93, Name: "case-sensitive-groups", Key: "case-key", Group: "VIP,vip",
+	}).Error)
+	_, err = ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	pools = loadRoutingPoolsForTest(t)
+	upperPool := pools["VIP"]
+	lowerPool := pools["vip"]
+	require.NotZero(t, upperPool.ID)
+	require.NotZero(t, lowerPool.ID)
+	assert.NotEqual(t, upperPool.ID, lowerPool.ID)
+	members = loadRoutingMembersForTest(t)
+	assert.True(t, members[routingMemberTestKey{poolID: upperPool.ID, channelID: 93}].Active)
+	assert.True(t, members[routingMemberTestKey{poolID: lowerPool.ID, channelID: 93}].Active)
 }
 
 func openRoutingSQLiteTestDB(t *testing.T) *gorm.DB {

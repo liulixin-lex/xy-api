@@ -278,10 +278,13 @@ func recordRoutingAttemptEffects(
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
 ) {
-	if info == nil || info.OriginModelName == "" || info.CurrentAttemptIsMultiKey(c) {
+	if info == nil || info.OriginModelName == "" {
 		return
 	}
 	routingmetrics.RecordClassifiedAttempt(c, info, channelID, success, apiErr, classification)
+	if info.CurrentAttemptIsMultiKey(c) {
+		return
+	}
 	if !smart_routing_setting.Enabled() {
 		return
 	}
@@ -882,7 +885,11 @@ func RelayTask(c *gin.Context) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
-		result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
+		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
+		func() {
+			defer releaseInflight()
+			result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
+		}()
 		taskAPIError := taskErrorToAPIError(taskErr)
 		classificationContext := routingerror.Context{
 			Component: routingerror.ComponentServing,

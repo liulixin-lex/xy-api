@@ -16,6 +16,7 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -102,10 +103,30 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 		if handled {
 			return channel, selectGroup, nil
 		}
-	} else if shouldObserveSmartRouting(smartSetting) {
-		recordSmartRoutingDecision(param, smartSetting)
+	}
+	if shouldObserveSmartRouting(smartSetting) {
+		retryIndex := param.GetRetry()
+		channel, group, err := cacheGetRandomSatisfiedChannelLegacy(param)
+		if err == nil {
+			RecordChannelRoutingObserveSelection(param, group, channel, retryIndex)
+		}
+		return channel, group, err
 	}
 	return cacheGetRandomSatisfiedChannelLegacy(param)
+}
+
+func RecordChannelRoutingObserveSelection(param *RetryParam, actualGroup string, actual *model.Channel, retryIndex int) {
+	setting := smart_routing_setting.GetSetting()
+	if param == nil || !shouldObserveSmartRouting(setting) {
+		return
+	}
+	if param.Ctx != nil {
+		common.SetContextKey(param.Ctx, constant.ContextKeyRoutingObserveDecision, nil)
+	}
+	if actual != nil && actualGroup != "" && actualGroup != "auto" {
+		_, _ = selectSmartChannelForGroup(param, actualGroup, setting, false)
+	}
+	recordChannelRoutingObserveAudit(param, actualGroup, actual, retryIndex)
 }
 
 func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, string, error) {
@@ -213,6 +234,9 @@ func recordSmartRoutingDecision(param *RetryParam, setting smart_routing_setting
 	if param == nil {
 		return
 	}
+	if param.Ctx != nil {
+		common.SetContextKey(param.Ctx, constant.ContextKeyRoutingObserveDecision, nil)
+	}
 	if param.TokenGroup == "auto" {
 		userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 		for _, group := range GetUserAutoGroup(userGroup) {
@@ -297,6 +321,13 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		decision := routingselector.SelectRankedFromCandidates(filtered, selectorSettings)
 		if param.Ctx != nil {
 			common.SetContextKey(param.Ctx, constant.ContextKeyRoutingLastDecision, decision)
+			if !reserveHalfOpen {
+				common.SetContextKey(param.Ctx, constant.ContextKeyRoutingObserveDecision, smartRoutingObserveEvaluation{
+					Group:      group,
+					Candidates: append([]routingselector.Candidate(nil), filtered...),
+					Decision:   decision,
+				})
+			}
 		}
 		if decision.Selected == nil || decision.Selected.Channel == nil {
 			return nil, nil
@@ -314,6 +345,139 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		filtered = next
 	}
 	return nil, nil
+}
+
+type smartRoutingObserveEvaluation struct {
+	Group      string
+	Candidates []routingselector.Candidate
+	Decision   routingselector.Decision
+}
+
+func recordChannelRoutingObserveAudit(param *RetryParam, actualGroup string, actual *model.Channel, retryIndex int) {
+	if param == nil || param.Ctx == nil {
+		return
+	}
+	evaluation, ok := common.GetContextKeyType[smartRoutingObserveEvaluation](param.Ctx, constant.ContextKeyRoutingObserveDecision)
+	if !ok || evaluation.Group == "" || evaluation.Group != actualGroup {
+		return
+	}
+	channelIDs := make([]int, 0, len(evaluation.Candidates)+2)
+	for _, candidate := range evaluation.Candidates {
+		if candidate.Channel != nil {
+			channelIDs = append(channelIDs, candidate.Channel.Id)
+		}
+	}
+	if actual != nil {
+		channelIDs = append(channelIDs, actual.Id)
+	}
+	if evaluation.Decision.Selected != nil && evaluation.Decision.Selected.Channel != nil {
+		channelIDs = append(channelIDs, evaluation.Decision.Selected.Channel.Id)
+	}
+	identitySnapshot, identityKnown := channelrouting.ResolveDecisionIdentities(evaluation.Group, channelIDs)
+	if !identityKnown {
+		_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+			GroupName: evaluation.Group, ModelName: param.ModelName,
+		})
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing observe audit dropped: %v", err))
+		return
+	}
+
+	rankedByChannel := make(map[int]routingselector.RankedCandidate, len(evaluation.Decision.Ranked))
+	for _, ranked := range evaluation.Decision.Ranked {
+		if ranked.Channel != nil {
+			rankedByChannel[ranked.Channel.Id] = ranked
+		}
+	}
+	candidates := make([]channelrouting.DecisionCandidate, 0, len(evaluation.Candidates))
+	nowUnix := time.Now().Unix()
+	nowUnixMilli := time.Now().UnixMilli()
+	for _, candidate := range evaluation.Candidates {
+		if candidate.Channel == nil {
+			continue
+		}
+		channelID := candidate.Channel.Id
+		memberID := identitySnapshot.MemberIDs[channelID]
+		if memberID <= 0 {
+			_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+				GroupName: evaluation.Group, ModelName: param.ModelName,
+			})
+			logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing observe audit dropped: %v", err))
+			return
+		}
+		view := channelrouting.DecisionCandidate{
+			PoolMemberID: memberID,
+			ChannelID:    channelID,
+		}
+		if ranked, eligible := rankedByChannel[channelID]; eligible {
+			view.Eligible = true
+			view.Score = ranked.Score
+			view.Availability = ranked.Availability
+			view.Latency = ranked.Latency
+			view.Throughput = ranked.Throughput
+			view.CostScore = ranked.CostScore
+			view.CostKnown = ranked.CostKnown
+			view.Degraded = ranked.Degraded
+			view.Open = ranked.Open
+			view.Inflight = ranked.Inflight
+		} else {
+			view.ExclusionReason = routingObserveExclusionReason(candidate, nowUnix, nowUnixMilli)
+		}
+		candidates = append(candidates, view)
+	}
+
+	actualChannelID := 0
+	if actual != nil {
+		actualChannelID = actual.Id
+		if identitySnapshot.MemberIDs[actualChannelID] <= 0 {
+			_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+				GroupName: evaluation.Group, ModelName: param.ModelName,
+			})
+			logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing observe audit dropped: %v", err))
+			return
+		}
+	}
+	observedChannelID := 0
+	if evaluation.Decision.Selected != nil && evaluation.Decision.Selected.Channel != nil {
+		observedChannelID = evaluation.Decision.Selected.Channel.Id
+	}
+	_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+		RequestID:         common.GetContextKeyString(param.Ctx, common.RequestIdKey),
+		PoolID:            identitySnapshot.PoolID,
+		GroupName:         evaluation.Group,
+		ModelName:         param.ModelName,
+		SnapshotRevision:  identitySnapshot.SnapshotRevision,
+		AlgorithmVersion:  channelrouting.DecisionAlgorithmObserveV1,
+		RetryIndex:        retryIndex,
+		IsStream:          common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+		ActualChannelID:   actualChannelID,
+		ObservedChannelID: observedChannelID,
+		FilteredOpen:      evaluation.Decision.FilteredOpen,
+		FilteredCapacity:  evaluation.Decision.FilteredCapacity,
+		BreakerBypassed:   evaluation.Decision.BreakerBypassed,
+		Candidates:        candidates,
+	})
+	if err != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing observe audit dropped: %v", err))
+	}
+}
+
+func routingObserveExclusionReason(candidate routingselector.Candidate, nowUnix int64, nowUnixMilli int64) string {
+	if candidate.Capacity != nil && candidate.Capacity.CooldownUntilUnixMilli > nowUnixMilli {
+		return "capacity_cooldown"
+	}
+	if candidate.Breaker != nil {
+		state := strings.ToLower(strings.TrimSpace(candidate.Breaker.State))
+		if candidate.Breaker.Reason == routingselector.BreakerReasonAuthFail {
+			return "credential_unavailable"
+		}
+		if candidate.Breaker.Reason == routingselector.BreakerReasonBalance {
+			return "balance_unavailable"
+		}
+		if state == routingselector.BreakerStateOpen && (candidate.Breaker.CooldownUntilUnix == 0 || candidate.Breaker.CooldownUntilUnix > nowUnix) {
+			return "reliability_breaker_open"
+		}
+	}
+	return "selector_filtered"
 }
 
 func acquireRoutingHalfOpenProbe(c *gin.Context, candidate *routingselector.RankedCandidate, modelName string, group string, maxProbes int, nowUnix int64) bool {
@@ -493,6 +657,8 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 	if err != nil || len(channels) == 0 {
 		return nil, err
 	}
+	routingSetting := smart_routing_setting.GetSetting()
+	useObserveSnapshot := shouldObserveSmartRouting(routingSetting)
 	candidates := make([]routingselector.Candidate, 0, len(channels))
 	for _, channel := range channels {
 		if channel == nil {
@@ -508,16 +674,29 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 		if cost, ok := routinghotcache.GetCost(cacheKey.CostKey()); ok {
 			candidate.Cost = routingCostForRequest(param.Ctx, cost)
 		}
+		if observation, _, ok := channelrouting.ResolveObserveModelSnapshot(group, channel.Id, param.ModelName); useObserveSnapshot && ok && observation.MetricKnown {
+			candidate.Metric = &routingselector.MetricSnapshot{
+				RequestCount:            observation.RequestCount,
+				SuccessCount:            observation.SuccessCount,
+				ReliabilityRequestCount: observation.ReliabilityRequestCount,
+				ReliabilityFailureCount: observation.ReliabilityFailureCount,
+				P95LatencyMs:            observation.P95LatencyMs,
+				P95TTFTMs:               observation.P95TTFTMs,
+				TPS:                     observation.OutputTokensPerSecond,
+			}
+		}
 		if !channel.ChannelInfo.IsMultiKey {
-			if metric, ok := routinghotcache.GetMetric(cacheKey); ok {
-				candidate.Metric = &routingselector.MetricSnapshot{
-					RequestCount:            metric.RequestCount,
-					SuccessCount:            metric.SuccessCount,
-					ReliabilityRequestCount: metric.ReliabilityRequestCount,
-					ReliabilityFailureCount: metric.ReliabilityFailureCount,
-					P95LatencyMs:            metric.P95LatencyMs,
-					P95TTFTMs:               metric.P95TTFTMs,
-					TPS:                     metric.TPS,
+			if candidate.Metric == nil {
+				if metric, ok := routinghotcache.GetMetric(cacheKey); ok {
+					candidate.Metric = &routingselector.MetricSnapshot{
+						RequestCount:            metric.RequestCount,
+						SuccessCount:            metric.SuccessCount,
+						ReliabilityRequestCount: metric.ReliabilityRequestCount,
+						ReliabilityFailureCount: metric.ReliabilityFailureCount,
+						P95LatencyMs:            metric.P95LatencyMs,
+						P95TTFTMs:               metric.P95TTFTMs,
+						TPS:                     metric.TPS,
+					}
 				}
 			}
 			candidate.Capacity = routingCapacityForKey(cacheKey)
@@ -542,7 +721,7 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				}
 			}
 		}
-		applyRoutingHealthMarkers(&candidate, channel.Id, smart_routing_setting.GetSetting())
+		applyRoutingHealthMarkers(&candidate, channel.Id, routingSetting)
 		candidates = append(candidates, candidate)
 	}
 

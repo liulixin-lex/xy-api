@@ -28,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/router"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	_ "github.com/QuantumNous/new-api/setting/performance_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -145,8 +146,17 @@ func main() {
 	// (DB-lease dedup across masters + run history), then start the runner that
 	// schedules and executes them. Master-only execution and the UpdateTask
 	// switch are enforced inside the runner and each handler's Enabled().
+	routingBootstrapCtx, routingBootstrapCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := controller.BootstrapSmartRoutingHotcacheContext(routingBootstrapCtx); err != nil {
+		common.SysError("failed to bootstrap routing hot cache: " + common.SanitizeErrorMessage(err.Error()))
+	}
+	if err := channelrouting.BootstrapContext(routingBootstrapCtx); err != nil {
+		common.SysError("failed to bootstrap channel routing snapshot: " + common.SanitizeErrorMessage(err.Error()))
+	}
+	routingBootstrapCancel()
 	perfRuntime := perfmetrics.Start(context.Background())
 	routingRuntime := controller.StartSmartRoutingRuntime(context.Background())
+	channelRoutingRuntime := channelrouting.Start(context.Background())
 	controller.RegisterScheduledSystemTasks()
 	service.StartSystemTaskRunner()
 
@@ -232,6 +242,7 @@ func main() {
 	common.SysLog(fmt.Sprintf("received signal: %v, shutting down...", sig))
 	perfRuntime.Close()
 	routingRuntime.Close()
+	channelRoutingRuntime.Close()
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
@@ -254,6 +265,12 @@ func main() {
 		common.SysError("failed to finalize smart routing runtime: " + common.SanitizeErrorMessage(err.Error()))
 	}
 	routingFinalizeCancel()
+
+	channelRoutingFinalizeCtx, channelRoutingFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := channelRoutingRuntime.Wait(channelRoutingFinalizeCtx); err != nil {
+		common.SysError("failed to finalize channel routing observe runtime: " + common.SanitizeErrorMessage(err.Error()))
+	}
+	channelRoutingFinalizeCancel()
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
 		model.SaveQuotaDataCache()

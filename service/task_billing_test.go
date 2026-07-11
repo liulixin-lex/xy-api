@@ -11,7 +11,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
@@ -48,8 +50,15 @@ func TestMain(m *testing.M) {
 		&model.Ability{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.RoutingTopologyMetadata{},
+		&model.RoutingPool{},
+		&model.RoutingPoolMember{},
+		&model.RoutingCredentialRef{},
+		&model.RoutingDecisionAudit{},
+		&model.RoutingChannelBinding{},
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},
+		&model.RoutingMetricRollup{},
 		&model.RoutingBreakerState{},
 		&model.RoutingChannelHealthState{},
 		&model.SystemTask{},
@@ -67,6 +76,9 @@ func TestMain(m *testing.M) {
 
 func truncate(t *testing.T) {
 	t.Helper()
+	channelrouting.ResetDecisionAuditsForTest()
+	channelrouting.ResetSnapshotForTest()
+	routingmetrics.ResetForTest()
 	t.Cleanup(func() {
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
@@ -76,12 +88,21 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM abilities")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
+		model.DB.Exec("DELETE FROM routing_decision_audits")
+		model.DB.Exec("DELETE FROM routing_topology_metadata")
+		model.DB.Exec("DELETE FROM routing_credential_refs")
+		model.DB.Exec("DELETE FROM routing_pool_members")
+		model.DB.Exec("DELETE FROM routing_pools")
 		model.DB.Exec("DELETE FROM routing_cost_snapshots")
 		model.DB.Exec("DELETE FROM routing_channel_metrics")
+		model.DB.Exec("DELETE FROM routing_metric_rollups")
 		model.DB.Exec("DELETE FROM routing_breaker_states")
 		model.DB.Exec("DELETE FROM routing_channel_health_states")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		channelrouting.ResetDecisionAuditsForTest()
+		channelrouting.ResetSnapshotForTest()
+		routingmetrics.ResetForTest()
 	})
 }
 

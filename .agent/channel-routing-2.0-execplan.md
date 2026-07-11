@@ -22,10 +22,10 @@
 - 主仓库：`/opt/xy-api`
 - 专用工作树：`/root/.config/superpowers/worktrees/xy-api/feat-channel-routing-v2`
 - 分支：`feat/channel-routing-v2`
-- 当前 HEAD：`d7b3b3e2`（Phase 0C 实现完成）
-- 基线：`main` / `origin/main` = `e868614b`
-- 工作树仅有本台账目录 `.agent/` 尚待强制纳入版本控制。
-- 该分支相对 main 修改 130 个文件，约 `20235 insertions / 2022 deletions`；正式前端尚无差异。
+- 当前 HEAD：`bcb6602b`（Gate 1 已提交）；Gate 2 已完成验证，等待单独提交。
+- 开发基线位于专用分支 `feat/channel-routing-v2`，不在 `/opt/xy-api` 的 main 工作树直接开发。
+- `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
+- 正式 `web/default` 前端尚未开始；必须等 Phase 2 DTO/API/权限语义稳定后进入。
 - 旧并行 Task 4 工作树仍存在，但不作为当前实现真源。
 
 ## Progress
@@ -35,8 +35,8 @@
 - [x] Phase 0A：配置并发安全、有界 metrics/breaker/hot cache/JWT、可取消 SmartRoutingRuntime、Retention。
 - [x] Phase 0B：错误证据与分类、Reliability/Capacity 分离、Multi-Key 安全降级、提交边界与流式计费闭环。
 - [x] Phase 0C：真实 Output Token、独立 attempt latency/generation duration 与 TTFT 接线；渠道级 TPS 改为真实 Token/s；重试 attempt 遥测隔离。
-- [ ] Phase 0D：统一/收敛 `routing_metrics` 与 `perf_metrics` 生命周期语义；修复设置竞态、无界桶、永久 Worker、退避/Jitter/可观测边界；完成 Gate 1 总审计。
-- [ ] Phase 1 Observe：Pool、Member、稳定 Credential ID、统一有界遥测、兼容迁移、只读 API、新选择器仅审计。
+- [x] Phase 0D：统一/收敛 `routing_metrics` 与 `perf_metrics` 生命周期语义；修复设置竞态、无界桶、永久 Worker、退避/Jitter/可观测边界；完成 Gate 1 总审计。
+- [x] Phase 1 Observe：Pool、Member、稳定 Credential ID、统一有界遥测、兼容迁移、只读 API、新选择器仅审计。
 - [ ] Phase 2 Shadow：双算、差异审计、决策重放、Revision/Outbox/Redis Stream、增量聚合、成本快照、多实例降级。
 - [ ] Phase 3 Canary：确定性灰度、自动回滚、容量预留、慢启动、故障注入；Hedging 保持关闭。
 - [ ] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、兼容改名。
@@ -50,19 +50,19 @@
 | ID | Requirement | Current evidence | Status / next evidence |
 | --- | --- | --- | --- |
 | CR-0.1 | 关闭态不分配，所有缓存/Map/锁有 TTL、容量、统计 | Phase 0A 计划、`pkg/routing_*`、Sub2API JWT 测试 | PASS（后续统一遥测仍需复核） |
-| CR-0.2 | 设置并发安全，Worker 可取消、可等待，Retention 生效 | Phase 0A 计划、`setting/config`、`SmartRoutingRuntime` | PARTIAL：`perf_metrics_setting`、最终 flush、Context DB 调用、退避/Jitter 尚未纳入 |
+| CR-0.2 | 设置并发安全，Worker 可取消、可等待，Retention 生效 | Gate 1 提交 `bcb6602b`、Runtime/Race/Retention 测试 | PASS |
 | CR-0.3 | 错误责任/作用域/重试/健康/容量分类正确 | Phase 0B 计划、`pkg/routing_error`、Controller/Task tests | PASS |
 | CR-0.4 | 429/529 与 Reliability Breaker 分离 | `pkg/routing_hotcache/capacity.go`、Phase 0B tests | PASS |
 | CR-0.5 | Multi-Key 不写聚合状态，稳定身份上线前安全降级 | Phase 0B tests | PASS；Phase 1 用 Credential ID 替代降级 |
 | CR-0.6 | 真实 Output Token、TTFT、Token/s | `8f43ee5a..d7b3b3e2`；结算边界同步 usage、attempt end、routing bucket、Hot Cache、Selector 与 stream hint 测试 | PASS |
 | CR-0.7 | Cost Connector 与 Serving health 分离 | Phase 0B Task 9 tests | PASS |
-| CR-1 | Pool/Member/Credential/Observe/三库迁移/只读 API | 尚无 v2 模型/API | PENDING |
+| CR-1 | Pool/Member/Credential/Observe/三库迁移/只读 API | Phase 1 模型、stable rollup、不可变快照、审计、v2 API、三库与 Race 证据 | PASS（Gate 2） |
 | CR-2 | Shadow、Revision、Outbox、Redis Stream、重放、正确可合并分布 | 尚无实现 | PENDING |
 | CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | 尚无实现 | PENDING |
 | CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 尚无 v2 实现 | PENDING |
 | CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | 尚无实现 | PENDING |
 | CR-FE | 七页渠道路由工作区、六语言、SSE/A11y/响应式/视觉 | `web/default` 相对 main 无差异 | PENDING |
-| CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径仍在；新路径尚无 | PARTIAL |
+| CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/配置保留，Observe 双算不改变实际 legacy 渠道 | PASS（正式改名提示留 Gate 5/7） |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 现有成本连接器未满足完整威胁模型 | PENDING |
 | CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | Phase 0B 修复提交边界；v2 成本审计尚无 | PARTIAL |
 | CR-GIT | PR、同步 main、合入、镜像构建 | 尚未执行 | PENDING |
@@ -70,10 +70,11 @@
 ## Plan of Work
 
 1. [完成] Phase 0C：结算层真实 usage 与 attempt end、retry reset、渠道 bucket、真实 Token/s、流式 TTFT 评分及旧选择点 stream hint。
-2. [当前] 为 Phase 0D 写计划并执行：审计并收敛 `pkg/perf_metrics` 的无界 Map、永久 `time.Sleep` worker、未锁设置和重复采样；补退避/Jitter、生命周期与 Gate 1 验证。
-3. 每个后续 Phase 单独写 plan，严格依赖前一 Gate 的稳定 DTO/API/迁移契约；先后端 Observe/Shadow，再正式前端。
-4. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
-5. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
+2. [完成] Phase 0D / Gate 1：有界状态、正确分类、容量分离、真实 TTFT/Token/s、Worker 生命周期、安全与最终 flush。
+3. [完成] Phase 1 / Gate 2：稳定身份、stable telemetry + rollup、不可变快照、Observe 审计、只读 v2 API、三库与并发验证。
+4. [当前] Phase 2 / Gate 3：可合并分布、Shadow 双算/重放、Revision/Activation/Outbox、Redis Stream、node sequence 幂等与增量聚合。
+5. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
+6. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
 
 ## Validation and Acceptance
 
@@ -106,6 +107,14 @@
 - 前端：typecheck、lint、format、i18n、关键测试、build、E2E、Axe、键盘、明暗主题、320/768/1440 视觉检查。
 - 最终独立审查：无未解决 P0/P1；`git diff --check`、敏感信息、临时文件、生成物、无关依赖与受保护标识审计。
 
+### Gate 2 fresh evidence（2026-07-12）
+
+- `go test ./... -count=1`、`go vet ./...`、`go build ./...`：exit 0。
+- `go test -race ./model ./service/channelrouting ./pkg/routing_metrics -count=1`：exit 0。
+- MySQL 5.7 / PostgreSQL 15 串行真实契约：模型迁移、模型/分组大小写隔离、stable rollup、active/retired credential、keyless、live merge、decision 精确 hash filter：PASS；临时容器已删除。
+- 全仓 Race 仍复现既有 `service/task_polling`/`logger` 竞态；本阶段相关包定向 Race 通过。
+- 独立 blocker review：无未解决 P0/P1。Phase 2 接管模糊提交去重、DDSketch/HDR 与 DB 聚合热点。
+
 ## Surprises & Discoveries
 
 - 旧会话只完成 Phase 0A/0B；最后的“已完成”只指 Phase 0B 收尾，不是完整渠道路由 2.0。
@@ -115,11 +124,10 @@
 - Phase 0C 初版把 `atomic.Int64` 内嵌进可按值复制的 `RelayInfo`，`go vet` 报 copylocks；改用结构体首部对齐的原始 `int64` + `sync/atomic` 后，同时满足值复制与 386 对齐。
 - 仅在 Controller 返回后取结束时间会把结算/日志数据库耗时混入 generation duration；最终改为在 Text/Audio/Realtime usage 入口、数据库操作之前同步捕获 attempt end。
 - 普通 relay loop 已重置 attempt，但 Task submit retry loop 原先遗漏；Phase 0C 将每次真实 Task submit 包装为先 reset 再提交，并用连续两次本地失败保护。
-- `pkg/perf_metrics` 已有正确的 Token/s 公式，但使用独立的 model+group 遥测、永久 `time.Sleep` worker、直接读取可变设置和无硬上限 `sync.Map`；不能把它当作 Gate 1 已完成证据。
-- `SmartRoutingRuntime` 的 refresh/flush callback 当前吞掉错误、固定周期无退避/Jitter，DB 操作不接收 Context，Shutdown 前没有最终 flush。
-- 成本连接器仍允许任意 HTTP/HTTPS 目标并使用默认重定向，尚无 DNS pinning、逐跳校验、TLS/Content-Type/大小策略；属于 Gate 1 后半段安全阻断项。
-- 设置更新当前先替换内存再持久化，DB 写失败会留下仅本节点生效的新设置；需在 Phase 0D 加回滚/原子性测试，Revision/ETag 的完整治理留给 Phase 2。
-- 渠道删除与 `channelPollingLocks` 仍有生命周期/孤儿状态风险；需在 Gate 1 审计中决定最小兼容清理边界。
+- Gate 1 已把 `pkg/perf_metrics`、Smart Routing Runtime、成本连接器出站安全、设置回滚和最终 flush 的上述问题收口；这些条目保留为历史发现，不再是当前阻塞。
+- Gate 2 发现 MySQL 默认 CI collation 会折叠 `VIP`/`vip` 与 `Model-X`/`model-x`；Pool、Rollup 和 Decision 过滤统一改用原始文本 SHA-256 稳定键。
+- Stable additive upsert 在“数据库已提交但客户端收到错误”的模糊提交场景仍可能重复计数；Phase 2 必须引入 `node_id + sequence` 幂等协议。
+- 近期 Rollup 的 DB `GROUP BY` 在高流量下是可预见热点；Phase 2 使用增量聚合与可合并分布替代持续全窗扫描。
 - Phase 0B 的完整 race 记录包含既有 logger、task polling 和并行 `gin.SetMode` 竞态；新增路径定向 race 通过。最终 Gate 需要重新判断这些基线竞态是否仍阻止仓库级完整 race 声明。
 
 ## Decision Log
@@ -142,4 +150,4 @@
 
 ## Outcomes & Retrospective
 
-Phase 0C 已完成并有新鲜验证；完整目标仍进行中。下一恢复点是 Phase 0D 第一个设置快照切片，完成 Gate 1 前不得进入 Phase 1。
+Gate 2 已完成并有新鲜三库、Race、Vet、Build 与全仓测试证据；完整目标仍进行中。下一恢复点是 Phase 2 Shadow 的可合并分布与 node sequence/outbox 基础切片。

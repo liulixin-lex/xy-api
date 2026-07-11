@@ -79,6 +79,26 @@ func TestCurrentAttemptIsMultiKeyPrefersContextOverStaleChannelMeta(t *testing.T
 	assert.False(t, (*RelayInfo)(nil).CurrentAttemptIsMultiKey(nil))
 }
 
+func TestInitChannelMetaCopiesStableRoutingIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyChannelId, 41)
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingSnapshotRevision, uint64(17))
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 7)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingMemberID, 11)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCredentialID, 13)
+
+	info := &RelayInfo{}
+	info.InitChannelMeta(ctx)
+
+	require.NotNil(t, info.ChannelMeta)
+	assert.Equal(t, uint64(17), info.ChannelMeta.RoutingSnapshotRevision)
+	assert.Equal(t, 7, info.ChannelMeta.RoutingPoolID)
+	assert.Equal(t, 11, info.ChannelMeta.RoutingMemberID)
+	assert.Equal(t, 13, info.ChannelMeta.RoutingCredentialID)
+}
+
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {
 	info := &RelayInfo{
 		RelayFormat:             types.RelayFormatOpenAI,

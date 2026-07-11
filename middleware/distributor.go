@@ -17,7 +17,9 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -109,6 +111,10 @@ func Distribute() func(c *gin.Context) {
 						selectGroup = affinityGroup
 						affinityUsable = true
 						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
+						service.RecordChannelRoutingObserveSelection(&service.RetryParam{
+							Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
+							RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+						}, affinityGroup, preferred, 0)
 					}
 					if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
@@ -471,6 +477,13 @@ func getTaskOriginModelName(c *gin.Context) string {
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, uint64(0))
+	common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -506,6 +519,24 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if routingGroup == "auto" {
+		if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
+			routingGroup = selectedGroup
+		}
+	}
+	if smart_routing_setting.Enabled() {
+		if identity, ok := channelrouting.ResolveIdentity(
+			routingGroup,
+			channel.Id,
+			key,
+		); ok {
+			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
+			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
+		}
+	}
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
 
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)

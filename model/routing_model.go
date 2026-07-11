@@ -33,6 +33,7 @@ const (
 
 var (
 	ErrCredentialSecretUnstable              = errors.New("routing credential secret is not persistent")
+	ErrCredentialSecretMismatch              = errors.New("routing credential secret does not match topology metadata")
 	ErrCredentialKeyMismatch                 = errors.New("routing credential key mismatch")
 	ErrLegacyRoutingStateEligibilityMismatch = errors.New("legacy routing state eligibility does not match record")
 	ErrRoutingBindingChanged                 = errors.New("routing channel binding changed during sync")

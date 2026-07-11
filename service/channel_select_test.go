@@ -16,6 +16,7 @@ import (
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -363,8 +364,12 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	smart_routing_setting.ResetForTest()
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-observe-audit-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled = previousMemoryCache
+		common.CryptoSecret = previousSecret
 		routinghotcache.ResetForTest()
 		smart_routing_setting.ResetForTest()
 	})
@@ -372,11 +377,15 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	highPriority := int64(100)
 	lowPriority := int64(1)
 	weight := uint(10)
-	require.NoError(t, model.DB.Create(&model.Channel{Id: 201, Name: "legacy-priority", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &highPriority, Weight: &weight}).Error)
-	require.NoError(t, model.DB.Create(&model.Channel{Id: 202, Name: "smart-score", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &lowPriority, Weight: &weight}).Error)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 201, Name: "legacy-priority", Key: "key-201", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &highPriority, Weight: &weight}).Error)
+	require.NoError(t, model.DB.Create(&model.Channel{Id: 202, Name: "smart-score", Key: "key-202", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &lowPriority, Weight: &weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 201, Enabled: true, Priority: &highPriority, Weight: weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 202, Enabled: true, Priority: &lowPriority, Weight: weight}).Error)
 	model.InitChannelCache()
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
 
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
 		ChannelID:   202,
@@ -409,6 +418,93 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	require.True(t, ok)
 	require.NotNil(t, decision.Selected)
 	assert.NotEmpty(t, decision.Ranked)
+
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+	var audits []model.RoutingDecisionAudit
+	require.NoError(t, model.DB.Find(&audits).Error)
+	require.Len(t, audits, 1)
+	assert.Equal(t, 201, audits[0].ActualChannelID)
+	assert.Equal(t, decision.Selected.Channel.Id, audits[0].ObservedChannelID)
+	assert.NotZero(t, audits[0].PoolID)
+	assert.NotZero(t, audits[0].SnapshotRevision)
+}
+
+func TestObserveCandidatesUseStableMultiKeyTelemetryWithoutLegacyAggregate(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.Exec("DELETE FROM routing_topology_metadata").Error)
+	routinghotcache.ResetForTest()
+	routingmetrics.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true, Mode: smart_routing_setting.ModeObserve, MinVolume: 1,
+	})
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-observe-multikey-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		common.CryptoSecret = previousSecret
+		routinghotcache.ResetForTest()
+		routingmetrics.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id: 203, Name: "multi-observe", Key: "key-a\nkey-b", Status: common.ChannelStatusEnabled,
+		Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight,
+		ChannelInfo: model.ChannelInfo{IsMultiKey: true},
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{
+		Group: "default", Model: "gpt-test", ChannelId: 203, Enabled: true, Priority: &priority, Weight: weight,
+	}).Error)
+	model.InitChannelCache()
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	first, err := channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	member := first.Pools[0].Members[0]
+	require.Len(t, member.CredentialIDs, 2)
+	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
+		PoolID: member.PoolID, PoolMemberID: member.ID, CredentialID: member.CredentialIDs[0], ChannelID: 203,
+		Model: "gpt-test", BucketTs: time.Now().Unix(), LastSnapshotRevision: first.Revision,
+		RequestCount: 10, SuccessCount: 9, FailureCount: 1,
+		ReliabilityRequestCount: 10, ReliabilityFailureCount: 1,
+		OutputTokens: 500, GenerationMs: 2000,
+	}})
+	routinghotcache.SetMetricForTest(routinghotcache.Key{
+		ChannelID: 203, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+	}, routinghotcache.MetricSnapshot{RequestCount: 999, SuccessCount: 999, TPS: 999})
+	_, err = channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	candidates, err := smartRoutingCandidatesForGroup(&RetryParam{
+		Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0),
+	}, "default")
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.NotNil(t, candidates[0].Metric)
+	assert.Equal(t, int64(10), candidates[0].Metric.RequestCount)
+	assert.Equal(t, int64(9), candidates[0].Metric.SuccessCount)
+	assert.Equal(t, float64(250), candidates[0].Metric.TPS)
+	assert.Nil(t, candidates[0].Breaker)
+	assert.Nil(t, candidates[0].Capacity)
+
+	balancedSetting := smart_routing_setting.GetSetting()
+	balancedSetting.Mode = smart_routing_setting.ModeBalanced
+	smart_routing_setting.UpdateSetting(balancedSetting)
+	balancedCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	balancedCandidates, err := smartRoutingCandidatesForGroup(&RetryParam{
+		Ctx: balancedCtx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0),
+	}, "default")
+	require.NoError(t, err)
+	require.Len(t, balancedCandidates, 1)
+	assert.Nil(t, balancedCandidates[0].Metric)
 }
 
 func TestCacheGetRandomSatisfiedChannelDoesNotFallbackWhenSmartSafetyFiltersEmptyPool(t *testing.T) {
@@ -748,6 +844,39 @@ func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
 	assert.Zero(t, cached.HalfOpenInflight)
 	_, ok = common.GetContextKeyType[map[int]routingbreaker.Key](ctx, constant.ContextKeyRoutingHalfOpenProbes)
 	assert.False(t, ok)
+}
+
+func TestRecordSmartRoutingDecisionClearsStaleEvaluationWhenNoCandidates(t *testing.T) {
+	truncate(t)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingObserveDecision, smartRoutingObserveEvaluation{
+		Group: "stale-group",
+	})
+
+	recordSmartRoutingDecision(&RetryParam{
+		Ctx: ctx, TokenGroup: "auto", ModelName: "gpt-test", Retry: common.GetPointer(0),
+	}, smart_routing_setting.SmartRoutingSetting{Enabled: true, Mode: smart_routing_setting.ModeObserve})
+
+	_, ok := common.GetContextKeyType[smartRoutingObserveEvaluation](ctx, constant.ContextKeyRoutingObserveDecision)
+	assert.False(t, ok)
+}
+
+func TestObserveAuditRejectsEvaluationFromDifferentPool(t *testing.T) {
+	channelrouting.ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { channelrouting.ResetDecisionAuditsForTest() })
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingObserveDecision, smartRoutingObserveEvaluation{
+		Group: "pool-a",
+		Decision: routingselector.Decision{
+			Selected: &routingselector.RankedCandidate{Channel: &model.Channel{Id: 1}},
+		},
+	})
+
+	recordChannelRoutingObserveAudit(&RetryParam{
+		Ctx: ctx, ModelName: "gpt-test", Retry: common.GetPointer(0),
+	}, "pool-b", &model.Channel{Id: 2}, 0)
+
+	assert.Zero(t, channelrouting.DecisionAuditsStats().Entries)
 }
 
 func TestAffinityAdmissibleIgnoresLegacyAuthFailureAndStillFiltersLowBalance(t *testing.T) {
