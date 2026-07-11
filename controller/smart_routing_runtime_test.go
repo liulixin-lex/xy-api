@@ -152,6 +152,40 @@ func TestSmartRoutingRuntimeContextCancellationStopsBlockingCallbacks(t *testing
 	assert.Equal(t, int64(1), stats.FinalFlushRuns)
 }
 
+func TestSmartRoutingRuntimeCanceledWaitAfterWorkersStopDoesNotConsumeFinalFlush(t *testing.T) {
+	var flushCalls atomic.Int64
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            false,
+				HotcacheRefreshSec: 1,
+				FlushIntervalMin:   1,
+			}
+		},
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil },
+		flush: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			flushCalls.Add(1)
+			return ctx.Err()
+		},
+		waitRefresh: waitRoutingRuntime,
+		waitFlush:   waitRoutingRuntime,
+	})
+	runtime.Close()
+	<-runtime.done
+
+	canceledWait, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	for range 16 {
+		require.ErrorIs(t, runtime.Wait(canceledWait), context.Canceled)
+	}
+	assert.Zero(t, flushCalls.Load())
+	assert.Zero(t, runtime.Stats().FinalFlushRuns)
+
+	require.NoError(t, runtime.Wait(context.Background()))
+	assert.Equal(t, int64(1), flushCalls.Load())
+	assert.Equal(t, int64(1), runtime.Stats().FinalFlushRuns)
+}
+
 func TestSmartRoutingRuntimeBackoffAndRecoveryAreIndependent(t *testing.T) {
 	refreshWaits := make(chan time.Duration)
 	flushWaits := make(chan time.Duration)
@@ -236,6 +270,64 @@ func TestSmartRoutingRuntimeBackoffAndRecoveryAreIndependent(t *testing.T) {
 	require.NoError(t, runtime.Wait(context.Background()))
 }
 
+func TestSmartRoutingRuntimeDisabledFlushDoesNotCountRunOrRecovery(t *testing.T) {
+	var enabled atomic.Bool
+	enabled.Store(true)
+	flushWaits := make(chan time.Duration)
+	flushAdvance := make(chan struct{})
+	var flushCalls atomic.Int64
+
+	runtime := newSmartRoutingRuntime(context.Background(), smartRoutingRuntimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled:            enabled.Load(),
+				HotcacheRefreshSec: 1,
+				FlushIntervalMin:   2,
+			}
+		},
+		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil },
+		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			if flushCalls.Add(1) == 1 {
+				return errors.New("flush failed")
+			}
+			return nil
+		},
+		waitRefresh: waitRoutingRuntime,
+		waitFlush: func(ctx context.Context, duration time.Duration) bool {
+			select {
+			case flushWaits <- duration:
+			case <-ctx.Done():
+				return false
+			}
+			select {
+			case <-flushAdvance:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		},
+		jitter: func(max time.Duration) time.Duration { return max },
+	})
+
+	assert.Equal(t, time.Second, <-flushWaits)
+	stats := runtime.Stats()
+	assert.Equal(t, int64(1), stats.FlushRuns)
+	assert.Equal(t, int64(1), stats.FlushErrors)
+	assert.Equal(t, int64(1), stats.FlushConsecutiveErrors)
+
+	enabled.Store(false)
+	flushAdvance <- struct{}{}
+	assert.Equal(t, 2*time.Minute, <-flushWaits)
+	assert.Equal(t, int64(1), flushCalls.Load())
+	assert.Equal(t, int64(1), runtime.Stats().FlushRuns)
+	assert.Equal(t, int64(1), runtime.Stats().FlushConsecutiveErrors)
+	assert.Zero(t, runtime.Stats().FlushRecoveries)
+
+	runtime.Close()
+	require.NoError(t, runtime.Wait(context.Background()))
+	assert.Equal(t, int64(2), flushCalls.Load(), "disabled routing still performs the one final flush")
+}
+
 func TestSmartRoutingRuntimeFinalFlushReturnsErrorOnlyOnce(t *testing.T) {
 	refreshReady := make(chan struct{}, 1)
 	flushReady := make(chan struct{}, 1)
@@ -275,7 +367,6 @@ func TestSmartRoutingRuntimeFinalFlushReturnsErrorOnlyOnce(t *testing.T) {
 	assert.Equal(t, int64(1), flushCalls.Load())
 	assert.Equal(t, SmartRoutingRuntimeStats{
 		RefreshRuns:      1,
-		FlushRuns:        1,
 		FinalFlushRuns:   1,
 		FinalFlushErrors: 1,
 	}, runtime.Stats())

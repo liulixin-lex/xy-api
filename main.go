@@ -145,6 +145,7 @@ func main() {
 	// (DB-lease dedup across masters + run history), then start the runner that
 	// schedules and executes them. Master-only execution and the UpdateTask
 	// switch are enforced inside the runner and each handler's Enabled().
+	perfRuntime := perfmetrics.Start(context.Background())
 	routingRuntime := controller.StartSmartRoutingRuntime(context.Background())
 	controller.RegisterScheduledSystemTasks()
 	service.StartSystemTaskRunner()
@@ -229,6 +230,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	common.SysLog(fmt.Sprintf("received signal: %v, shutting down...", sig))
+	perfRuntime.Close()
 	routingRuntime.Close()
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
@@ -241,11 +243,17 @@ func main() {
 
 	// Finalize in-memory runtimes after HTTP handlers drain and before the
 	// deferred database close. Keep this order when adding more runtimes.
-	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer finalizeCancel()
-	if err := routingRuntime.Wait(finalizeCtx); err != nil {
-		common.SysError(fmt.Sprintf("failed to finalize smart routing runtime: %v", err))
+	perfFinalizeCtx, perfFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := perfRuntime.Wait(perfFinalizeCtx); err != nil {
+		common.SysError("failed to finalize performance metrics runtime: " + common.MaskSensitiveInfo(err.Error()))
 	}
+	perfFinalizeCancel()
+
+	routingFinalizeCtx, routingFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := routingRuntime.Wait(routingFinalizeCtx); err != nil {
+		common.SysError("failed to finalize smart routing runtime: " + common.MaskSensitiveInfo(err.Error()))
+	}
+	routingFinalizeCancel()
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {
 		model.SaveQuotaDataCache()
@@ -353,8 +361,6 @@ func InitResources() error {
 	if err != nil {
 		return err
 	}
-
-	perfmetrics.Init()
 
 	// 启动系统监控
 	common.StartSystemMonitor()

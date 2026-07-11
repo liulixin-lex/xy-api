@@ -194,10 +194,16 @@ func (runtime *SmartRoutingRuntime) Close() {
 }
 
 func (runtime *SmartRoutingRuntime) Wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-runtime.done:
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	runtime.finalize.Do(func() {
@@ -235,11 +241,15 @@ func (runtime *SmartRoutingRuntime) runWorker(
 ) {
 	for ctx.Err() == nil {
 		setting := runtime.deps.getSetting()
-		stats.runs.Add(1)
-		var err error
-		if enabled == nil || enabled(setting) {
-			err = run(ctx, setting)
+		if enabled != nil && !enabled(setting) {
+			if !wait(ctx, interval(setting)) {
+				return
+			}
+			continue
 		}
+
+		stats.runs.Add(1)
+		err := run(ctx, setting)
 		if ctx.Err() != nil {
 			return
 		}
