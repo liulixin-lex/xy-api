@@ -15,56 +15,75 @@ func flushLoop() {
 		interval := perf_metrics_setting.GetFlushIntervalMinutes()
 		time.Sleep(time.Duration(interval) * time.Minute)
 		setting := perf_metrics_setting.GetSetting()
-		if !setting.Enabled {
-			continue
-		}
-		flushCompletedBuckets()
-		cleanupExpiredMetrics(setting.RetentionDays)
+		runMaintenanceWith(setting, bucketStart(time.Now().Unix()), model.UpsertPerfMetric)
 	}
 }
 
 func flushCompletedBuckets() {
-	currentBucket := bucketStart(time.Now().Unix())
+	flushCompletedBucketsWith(bucketStart(time.Now().Unix()), model.UpsertPerfMetric)
+}
+
+func runMaintenanceWith(setting perf_metrics_setting.PerfMetricsSetting, currentBucket int64, persist func(*model.PerfMetric) error) {
+	flushCompletedBucketsWith(currentBucket, persist)
+	cleanupExpiredMetrics(setting.RetentionDays)
+}
+
+type drainedBucket struct {
+	key      bucketKey
+	counters counters
+}
+
+func flushCompletedBucketsWith(currentBucket int64, persist func(*model.PerfMetric) error) {
+	drainedBuckets := drainCompletedBuckets(currentBucket)
+	for _, drained := range drainedBuckets {
+		k := drained.key
+		value := drained.counters
+		err := persist(&model.PerfMetric{
+			ModelName:      k.model,
+			Group:          k.group,
+			BucketTs:       k.bucketTs,
+			RequestCount:   value.requestCount,
+			SuccessCount:   value.successCount,
+			TotalLatencyMs: value.totalLatencyMs,
+			TtftSumMs:      value.ttftSumMs,
+			TtftCount:      value.ttftCount,
+			OutputTokens:   value.outputTokens,
+			GenerationMs:   value.generationMs,
+		})
+		if err == nil {
+			continue
+		}
+		recordCounters(k, value)
+		common.SysError(fmt.Sprintf("failed to flush perf metric bucket model=%s group=%s bucket=%d: %s", k.model, k.group, k.bucketTs, err.Error()))
+	}
+}
+
+func drainCompletedBuckets(currentBucket int64) []drainedBucket {
+	drainedBuckets := make([]drainedBucket, 0)
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
 	hotBuckets.Range(func(key, value any) bool {
 		k := key.(bucketKey)
 		if k.bucketTs >= currentBucket {
 			return true
 		}
 
-		bucket := value.(*atomicBucket)
-		drained := bucket.drain()
-		if drained.requestCount == 0 {
-			deleteOldEmptyBucket(k, key)
+		bucket := value.(*bucket)
+		bucket.mu.Lock()
+		bucket.draining = true
+		drained := bucket.counters
+		deleted := hotBuckets.CompareAndDelete(key, value)
+		bucket.mu.Unlock()
+		if !deleted {
 			return true
 		}
-
-		err := model.UpsertPerfMetric(&model.PerfMetric{
-			ModelName:      k.model,
-			Group:          k.group,
-			BucketTs:       k.bucketTs,
-			RequestCount:   drained.requestCount,
-			SuccessCount:   drained.successCount,
-			TotalLatencyMs: drained.totalLatencyMs,
-			TtftSumMs:      drained.ttftSumMs,
-			TtftCount:      drained.ttftCount,
-			OutputTokens:   drained.outputTokens,
-			GenerationMs:   drained.generationMs,
-		})
-		if err != nil {
-			bucket.addCounters(drained)
-			common.SysError(fmt.Sprintf("failed to flush perf metric bucket model=%s group=%s bucket=%d: %s", k.model, k.group, k.bucketTs, err.Error()))
-			return true
+		bucketCount.Add(-1)
+		if drained.requestCount > 0 {
+			drainedBuckets = append(drainedBuckets, drainedBucket{key: k, counters: drained})
 		}
-
-		deleteOldEmptyBucket(k, key)
 		return true
 	})
-}
-
-func deleteOldEmptyBucket(k bucketKey, rawKey any) {
-	if k.bucketTs < bucketStart(time.Now().Add(-24*time.Hour).Unix()) {
-		hotBuckets.Delete(rawKey)
-	}
+	return drainedBuckets
 }
 
 func cleanupExpiredMetrics(retentionDays int) {

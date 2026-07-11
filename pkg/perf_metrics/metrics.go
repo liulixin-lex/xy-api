@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,7 +15,20 @@ import (
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 )
 
+var defaultLimits = Limits{
+	MaxBuckets: 20_000,
+	BucketTTL:  24 * time.Hour,
+}
+
 var hotBuckets sync.Map
+
+// maintenanceMu serializes bucket creation/removal and limit changes. When a
+// bucket lock is also needed, maintenanceMu must be acquired first.
+var maintenanceMu sync.Mutex
+var limits = defaultLimits
+var bucketCount atomic.Int64
+var bucketEvictionCount atomic.Int64
+var droppedSampleCount atomic.Int64
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
@@ -71,9 +85,159 @@ func Record(sample Sample) {
 		group:    sample.Group,
 		bucketTs: bucketStart(time.Now().Unix()),
 	}
-	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
-	actual.(*atomicBucket).add(sample)
-	recordRedis(key, sample)
+	if recordSample(key, sample) {
+		recordRedis(key, sample)
+	}
+}
+
+func RuntimeStats() Stats {
+	return Stats{
+		Buckets:         bucketCount.Load(),
+		BucketEvictions: bucketEvictionCount.Load(),
+		DroppedSamples:  droppedSampleCount.Load(),
+	}
+}
+
+func recordSample(key bucketKey, sample Sample) bool {
+	return withWritableBucket(key, 1, func(b *bucket) {
+		b.addLocked(sample)
+	})
+}
+
+func recordCounters(key bucketKey, value counters) bool {
+	return withWritableBucket(key, value.requestCount, func(b *bucket) {
+		b.addCountersLocked(value)
+	})
+}
+
+func withWritableBucket(key bucketKey, droppedSamples int64, write func(*bucket)) bool {
+	for {
+		actual, ok := hotBuckets.Load(key)
+		if !ok {
+			created := loadOrCreateBucket(key)
+			if created == nil {
+				droppedSampleCount.Add(droppedSamples)
+				return false
+			}
+			actual = created
+		}
+		b := actual.(*bucket)
+		b.mu.Lock()
+		if b.draining {
+			b.mu.Unlock()
+			continue
+		}
+		write(b)
+		b.mu.Unlock()
+		return true
+	}
+}
+
+func loadOrCreateBucket(key bucketKey) *bucket {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+
+	if actual, ok := hotBuckets.Load(key); ok {
+		return actual.(*bucket)
+	}
+
+	activeLimits := normalizedLimits(limits)
+	limits = activeLimits
+	ttlSeconds := int64(activeLimits.BucketTTL / time.Second)
+	if activeLimits.BucketTTL%time.Second != 0 {
+		ttlSeconds++
+	}
+	const minBucketTimestamp int64 = -1 << 63
+	if key.bucketTs >= minBucketTimestamp+ttlSeconds {
+		evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
+	}
+	for bucketCount.Load() >= int64(activeLimits.MaxBuckets) {
+		if !evictOldestBucketLocked() {
+			return nil
+		}
+	}
+
+	b := &bucket{}
+	hotBuckets.Store(key, b)
+	bucketCount.Add(1)
+	return b
+}
+
+func evictExpiredBucketsLocked(cutoff int64) {
+	hotBuckets.Range(func(key any, value any) bool {
+		k := key.(bucketKey)
+		if k.bucketTs <= cutoff {
+			removeBucketLocked(k, value.(*bucket), true)
+		}
+		return true
+	})
+}
+
+func evictOldestBucketLocked() bool {
+	var oldestKey bucketKey
+	var oldestBucket *bucket
+	hotBuckets.Range(func(key any, value any) bool {
+		candidate := key.(bucketKey)
+		if oldestBucket == nil || bucketKeyLess(candidate, oldestKey) {
+			oldestKey = candidate
+			oldestBucket = value.(*bucket)
+		}
+		return true
+	})
+	if oldestBucket == nil {
+		return false
+	}
+	return removeBucketLocked(oldestKey, oldestBucket, true)
+}
+
+func removeBucketLocked(key bucketKey, b *bucket, eviction bool) bool {
+	b.mu.Lock()
+	b.draining = true
+	droppedSamples := b.counters.requestCount
+	deleted := hotBuckets.CompareAndDelete(key, b)
+	b.mu.Unlock()
+	if !deleted {
+		return false
+	}
+	bucketCount.Add(-1)
+	if eviction {
+		bucketEvictionCount.Add(1)
+		droppedSampleCount.Add(droppedSamples)
+	}
+	return true
+}
+
+func bucketKeyLess(left bucketKey, right bucketKey) bool {
+	if left.bucketTs != right.bucketTs {
+		return left.bucketTs < right.bucketTs
+	}
+	if left.model != right.model {
+		return left.model < right.model
+	}
+	return left.group < right.group
+}
+
+func normalizedLimits(value Limits) Limits {
+	if value.MaxBuckets <= 0 {
+		value.MaxBuckets = defaultLimits.MaxBuckets
+	}
+	if value.BucketTTL <= 0 {
+		value.BucketTTL = defaultLimits.BucketTTL
+	}
+	return value
+}
+
+func resetForTest() {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+	hotBuckets.Range(func(key any, value any) bool {
+		removeBucketLocked(key.(bucketKey), value.(*bucket), false)
+		return true
+	})
+	bucketCount.Store(0)
+	bucketEvictionCount.Store(0)
+	droppedSampleCount.Store(0)
+	limits = defaultLimits
 }
 
 func Query(params QueryParams) (QueryResult, error) {
@@ -115,7 +279,7 @@ func Query(params QueryParams) (QueryResult, error) {
 		if params.Group != "" && k.group != params.Group {
 			return true
 		}
-		mergeCounters(merged, k, value.(*atomicBucket).snapshot())
+		mergeCounters(merged, k, value.(*bucket).snapshot())
 		return true
 	})
 
@@ -162,7 +326,7 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 				return true
 			}
 		}
-		snap := value.(*atomicBucket).snapshot()
+		snap := value.(*bucket).snapshot()
 		if snap.requestCount == 0 {
 			return true
 		}
