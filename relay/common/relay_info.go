@@ -87,6 +87,7 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
+	routingOutputTokens     int64
 	TokenId                 int
 	TokenKey                string
 	TokenGroup              string
@@ -98,7 +99,6 @@ type RelayInfo struct {
 	FirstResponseTime       time.Time
 	isFirstResponse         bool
 	routingAttemptStartTime time.Time
-	routingOutputTokens     int64
 
 	attemptBaselineCaptured        bool
 	attemptIsStream                bool
