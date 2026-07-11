@@ -27,6 +27,8 @@ type MetricSnapshot struct {
 	ReliabilityFailureCount int64
 	P95LatencyMs            float64
 	P95TTFTMs               float64
+	OutputTokens            int64
+	GenerationMs            int64
 	TPS                     float64
 	UpdatedUnix             int64
 }
@@ -356,10 +358,7 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 }
 
-func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds int) {
-	if bucketSeconds <= 0 {
-		bucketSeconds = 60
-	}
+func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, _ int) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
@@ -382,15 +381,12 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, bucketSeconds i
 				continue
 			}
 		}
-		cache.metrics[key] = metricSnapshotFromModel(snapshot, bucketSeconds)
+		cache.metrics[key] = metricSnapshotFromModel(snapshot)
 	}
 	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 }
 
-func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, bucketSeconds int) {
-	if bucketSeconds <= 0 {
-		bucketSeconds = 60
-	}
+func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, _ int) {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.limits = normalizedLimits(cache.limits)
@@ -405,7 +401,7 @@ func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, bucketSeconds int) {
 			Model:       delta.ModelName,
 			Group:       delta.Group,
 		}
-		incoming := metricSnapshotFromModel(delta, bucketSeconds)
+		incoming := metricSnapshotFromModel(delta)
 		existing, ok := cache.metrics[key]
 		if !ok || existing.UpdatedUnix < delta.BucketTs {
 			cache.metrics[key] = incoming
@@ -418,19 +414,21 @@ func ApplyMetricDeltas(deltas []model.RoutingChannelMetric, bucketSeconds int) {
 		existing.SuccessCount += delta.SuccessCount
 		existing.ReliabilityRequestCount += delta.ReliabilityRequestCount
 		existing.ReliabilityFailureCount += delta.ReliabilityFailureCount
+		existing.OutputTokens += delta.OutputTokens
+		existing.GenerationMs += delta.GenerationMs
 		if incoming.P95LatencyMs > existing.P95LatencyMs {
 			existing.P95LatencyMs = incoming.P95LatencyMs
 		}
 		if incoming.P95TTFTMs > existing.P95TTFTMs {
 			existing.P95TTFTMs = incoming.P95TTFTMs
 		}
-		existing.TPS = float64(existing.RequestCount) / float64(bucketSeconds)
+		existing.TPS = tokenThroughput(existing.OutputTokens, existing.GenerationMs)
 		cache.metrics[key] = existing
 	}
 	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
 }
 
-func metricSnapshotFromModel(snapshot model.RoutingChannelMetric, bucketSeconds int) MetricSnapshot {
+func metricSnapshotFromModel(snapshot model.RoutingChannelMetric) MetricSnapshot {
 	latencyMs := float64(snapshot.LatencyP95Ms)
 	if latencyMs <= 0 {
 		latencyMs = float64(snapshot.TotalLatencyMs) / float64(snapshot.RequestCount)
@@ -446,9 +444,18 @@ func metricSnapshotFromModel(snapshot model.RoutingChannelMetric, bucketSeconds 
 		ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
 		P95LatencyMs:            latencyMs,
 		P95TTFTMs:               ttftMs,
-		TPS:                     float64(snapshot.RequestCount) / float64(bucketSeconds),
+		OutputTokens:            snapshot.OutputTokens,
+		GenerationMs:            snapshot.GenerationMs,
+		TPS:                     tokenThroughput(snapshot.OutputTokens, snapshot.GenerationMs),
 		UpdatedUnix:             snapshot.BucketTs,
 	}
+}
+
+func tokenThroughput(outputTokens int64, generationMs int64) float64 {
+	if outputTokens <= 0 || generationMs <= 0 {
+		return 0
+	}
+	return float64(outputTokens) / (float64(generationMs) / 1000)
 }
 
 func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {

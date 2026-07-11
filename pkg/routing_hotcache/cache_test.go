@@ -202,6 +202,8 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 		LatencyP95Ms:            750,
 		TtftCount:               4,
 		TtftP95Ms:               120,
+		OutputTokens:            120,
+		GenerationMs:            2000,
 	}}, 60)
 
 	metric, ok := GetMetric(Key{ChannelID: 77, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"})
@@ -212,8 +214,62 @@ func TestLoadMetricSnapshotsBuildsSelectorMetric(t *testing.T) {
 	assert.Equal(t, int64(1), metric.ReliabilityFailureCount)
 	assert.Equal(t, 750.0, metric.P95LatencyMs)
 	assert.Equal(t, 120.0, metric.P95TTFTMs)
-	assert.InDelta(t, 4.0/60.0, metric.TPS, 0.000001)
+	assert.Equal(t, int64(120), metric.OutputTokens)
+	assert.Equal(t, int64(2000), metric.GenerationMs)
+	assert.Equal(t, 60.0, metric.TPS)
 	assert.Equal(t, int64(120), metric.UpdatedUnix)
+}
+
+func TestApplyMetricDeltasRecomputesTPSFromSameBucketTotals(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	key := Key{ChannelID: 79, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	ApplyMetricDeltas([]model.RoutingChannelMetric{
+		{ChannelID: 79, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", BucketTs: 120, RequestCount: 1, OutputTokens: 100, GenerationMs: 1000},
+		{ChannelID: 79, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "default", BucketTs: 120, RequestCount: 1, OutputTokens: 50, GenerationMs: 500},
+	}, 60)
+
+	metric, ok := GetMetric(key)
+	require.True(t, ok)
+	assert.Equal(t, int64(150), metric.OutputTokens)
+	assert.Equal(t, int64(1500), metric.GenerationMs)
+	assert.Equal(t, 100.0, metric.TPS)
+}
+
+func TestLoadMetricSnapshotsUsesZeroTPSForNonPositiveThroughputInputs(t *testing.T) {
+	testCases := []struct {
+		name         string
+		outputTokens int64
+		generationMs int64
+	}{
+		{name: "zero output tokens", outputTokens: 0, generationMs: 2000},
+		{name: "zero generation time", outputTokens: 120, generationMs: 0},
+		{name: "negative output tokens", outputTokens: -1, generationMs: 2000},
+		{name: "negative generation time", outputTokens: 120, generationMs: -1},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ResetForTest()
+			key := Key{ChannelID: 80 + index, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+			LoadMetricSnapshots([]model.RoutingChannelMetric{{
+				ChannelID:    key.ChannelID,
+				APIKeyIndex:  key.APIKeyIndex,
+				ModelName:    key.Model,
+				Group:        key.Group,
+				BucketTs:     120,
+				RequestCount: 1,
+				OutputTokens: testCase.outputTokens,
+				GenerationMs: testCase.generationMs,
+			}}, 60)
+
+			metric, ok := GetMetric(key)
+			require.True(t, ok)
+			assert.Equal(t, 0.0, metric.TPS)
+		})
+	}
+	ResetForTest()
 }
 
 func TestLoadMetricAndBreakerSnapshotsRejectPositiveAPIKeyIndexes(t *testing.T) {
