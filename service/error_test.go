@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -17,6 +18,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type errorReadCloser struct {
+	err    error
+	closed bool
+}
+
+func (reader *errorReadCloser) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func (reader *errorReadCloser) Close() error {
+	reader.closed = true
+	return nil
+}
 
 func TestResetStatusCode(t *testing.T) {
 	t.Parallel()
@@ -110,6 +125,36 @@ func TestTaskErrorFromUpstreamResponsePreservesStatusAndRetryAfter(t *testing.T)
 	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
 	assert.Equal(t, int64(2000), taskErr.RetryAfterMs)
 	assert.False(t, taskErr.LocalError)
+}
+
+func TestParseRetryAfterHeaderSaturatesHugeDeltaSeconds(t *testing.T) {
+	duration := ParseRetryAfterHeader("1e20", time.Unix(100, 0))
+
+	assert.Equal(t, time.Duration(1<<63-1), duration)
+}
+
+func TestRelayErrorHandlerReadFailurePreservesCauseAndClosesBody(t *testing.T) {
+	cause := &net.DNSError{Name: "upstream.example.com", Err: "response interrupted"}
+	body := &errorReadCloser{err: cause}
+	response := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{"Retry-After": []string{"3"}},
+		Body:       body,
+	}
+
+	apiErr := RelayErrorHandler(context.Background(), response, false)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, body.closed)
+	assert.Equal(t, types.ErrorCodeReadResponseBodyFailed, apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.SourceStatusCode())
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.Same(t, cause, apiErr.Cause())
+	assert.ErrorIs(t, apiErr, cause)
+	assert.Equal(t, "failed to read upstream response body", apiErr.Error())
+	var metadata map[string]int64
+	require.NoError(t, common.Unmarshal(apiErr.Metadata, &metadata))
+	assert.Equal(t, int64(3000), metadata["retry_after_ms"])
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {

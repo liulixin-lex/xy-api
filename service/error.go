@@ -87,15 +87,21 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	retryAfterHeader := resp.Header.Get("Retry-After")
+	defer CloseResponseBodyGracefully(resp)
 	defer func() {
 		attachRetryAfterMetadata(newApiErr, retryAfterHeader, time.Now())
 	}()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		newApiErr = types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeReadResponseBodyFailed,
+			resp.StatusCode,
+			types.ErrOptionWithHideErrMsg("failed to read upstream response body"),
+		)
 		return
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
@@ -164,6 +170,10 @@ func ParseRetryAfterHeader(header string, now time.Time) time.Duration {
 	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
 		if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
 			return 0
+		}
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds >= float64(maxDuration)/float64(time.Second) {
+			return maxDuration
 		}
 		return time.Duration(seconds * float64(time.Second))
 	}

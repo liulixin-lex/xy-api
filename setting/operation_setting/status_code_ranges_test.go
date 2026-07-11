@@ -74,8 +74,12 @@ func TestShouldRetryByStatusCode(t *testing.T) {
 	require.False(t, ShouldRetryByStatusCode(200))
 }
 
-func TestShouldRetryByStatusCode_DefaultAllowsClassificationApprovedStatuses(t *testing.T) {
+func TestShouldRetryByStatusCode_DefaultExcludes1xxAnd3xx(t *testing.T) {
+	require.False(t, ShouldRetryByStatusCode(100))
+	require.False(t, ShouldRetryByStatusCode(199))
 	require.False(t, ShouldRetryByStatusCode(200))
+	require.False(t, ShouldRetryByStatusCode(300))
+	require.False(t, ShouldRetryByStatusCode(399))
 	require.True(t, ShouldRetryByStatusCode(400))
 	require.True(t, ShouldRetryByStatusCode(401))
 	require.False(t, ShouldRetryByStatusCode(408))

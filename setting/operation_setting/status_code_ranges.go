@@ -20,10 +20,8 @@ var AutomaticDisableStatusCodeRanges = []StatusCodeRange{
 }
 
 // Classification decides whether retry is safe. These ranges only provide the
-// operator-controlled status overlay for classification-approved attempts.
+// operator-controlled 4xx/5xx status overlay for classification-approved attempts.
 var AutomaticRetryStatusCodeRanges = []StatusCodeRange{
-	{Start: 100, End: 199},
-	{Start: 300, End: 399},
 	{Start: 400, End: 523},
 	{Start: 525, End: 599},
 }
