@@ -2648,8 +2648,8 @@ git commit -m "docs: record phase 0b routing verification"
 
 ### 范围与审计结论
 
-- 基准提交：`6cc7abfa`；代码与治理验证范围：`6cc7abfa..1bae9a0e`；分支：`feat/channel-routing-v2`。
-- Task 1–10 已逐项对照实现与测试审计。错误证据、单次分类扇出、Reliability denominator、Capacity Cooldown、Breaker semantic version、Relay/Task retry、Cost Connector health、Single-Key/Multi-Key 隔离、raw Key operational 重排与 origin task context 均符合本计划边界。
+- 基准提交：`6cc7abfa`；最终代码 HEAD：`5f9cf112`；代码与治理验证范围：`6cc7abfa..5f9cf112`；分支：`feat/channel-routing-v2`。其后仅允许提交本验证文档。
+- Task 1–10 已逐项对照实现与测试审计。错误证据、单次分类扇出、Reliability denominator、Capacity Cooldown、Breaker semantic version、Relay/Task retry、Cost Connector health、Single-Key/Multi-Key 隔离、raw Key operational 重排与 origin task context 均符合本计划边界；补充审查确认 Multi-Key 删除重映射、已提交 Stream/Realtime outcome 分类及 Realtime 计费收尾完整。
 - 10 个 task adaptor 均在成功响应写入前拒绝空白 upstream task ID；Gemini、Vertex 均先校验 `name` 再编码本地 task ID。
 - 未引入 Credential ID/hash/HMAC、Capacity DB/Redis lease、Token Bucket/AIMD、公平份额或前端功能改动；未扩大主动选路流量。
 - 计划内兼容 schema 列（Reliability、Err529、Breaker semantic version）已实现并通过 SQLite 契约测试；MySQL、PostgreSQL 因对应 DSN 未设置而 SKIP。本会话未连接生产、未部署，也未对生产执行 DDL/迁移。
@@ -2657,6 +2657,13 @@ git commit -m "docs: record phase 0b routing verification"
 ### 提交记录
 
 ```text
+5f9cf112 fix: preserve committed realtime accounting
+367e692c test: use testify fatal assertions
+6d920bbd fix: settle committed realtime usage
+6130c776 fix: classify committed stream outcomes
+0b4d7584 fix: preserve retry error evidence
+a207e91f fix: remap multi-key state on deletion
+8f57c67b docs: record phase 0b routing verification
 1bae9a0e test: cover multi-key routing isolation
 b5d0c86e fix: isolate task and connector health
 1569d884 fix: route classified relay outcomes
@@ -2674,13 +2681,15 @@ a1e33f83 fix: preserve routing error evidence
 deffc0d6 docs: plan phase 0b routing semantics
 ```
 
-其中 `1bae9a0e` 为独立治理提交：恢复受保护 import，并用 Multi-Key half-open probe 回归断言证明 middleware Setup 不消费 Breaker 状态。
+其中 `1bae9a0e` 为独立治理提交：恢复受保护 import，并用 Multi-Key half-open probe 回归断言证明 middleware Setup 不消费 Breaker 状态。`8f57c67b` 为首轮验证记录；其后的代码提交来自最终 blocker-only 复审，分别补齐删除路径 raw-Key 重映射、retry 错误证据、已提交流式 outcome 分类与 Realtime 完整计费/审计闭环。
 
 ### 最终命令与退出状态
 
 - `gofmt -w types/error.go types/error_test.go dto/task.go pkg/routing_error/classifier.go pkg/routing_error/classifier_test.go model/routing_model.go model/routing_model_test.go model/channel.go model/channel_cache.go model/channel_multikey_test.go pkg/routing_metrics/metrics.go pkg/routing_metrics/metrics_test.go pkg/routing_hotcache/cache.go pkg/routing_hotcache/cache_test.go pkg/routing_hotcache/capacity.go pkg/routing_hotcache/capacity_test.go pkg/routing_breaker/breaker.go pkg/routing_breaker/breaker_test.go service/error.go service/error_test.go service/channel.go service/channel_test.go service/violation_fee.go service/violation_fee_test.go service/channel_select.go service/channel_select_test.go service/routing/types.go service/routing/selector.go service/routing/selector_test.go setting/operation_setting/status_code_ranges.go setting/operation_setting/status_code_ranges_test.go middleware/distributor.go middleware/distributor_smart_routing_test.go relay/common/relay_info.go relay/common/relay_info_test.go relay/relay_task.go relay/relay_task_test.go relay/channel/api_request.go relay/channel/task/ali/adaptor.go relay/channel/task/doubao/adaptor.go relay/channel/task/hailuo/adaptor.go relay/channel/task/jimeng/adaptor.go relay/channel/task/kling/adaptor.go relay/channel/task/sora/adaptor.go relay/channel/task/suno/adaptor.go relay/channel/task/vidu/adaptor.go controller/relay.go controller/relay_retry_test.go controller/channel.go controller/channel-test.go controller/channel_multikey_update_test.go controller/system_task_handlers.go controller/smart_routing_runtime_test.go controller/smart_routing_sub2api.go controller/smart_routing_task_test.go controller/smart_routing_test.go`：exit 0；随后无代码 diff。
-- `go vet ./types ./dto ./pkg/routing_error ./pkg/routing_metrics ./pkg/routing_hotcache ./pkg/routing_breaker ./service/routing ./service ./setting/operation_setting ./middleware ./relay/common ./relay ./relay/channel ./relay/channel/task/... ./controller ./model`：exit 0。
+- `go vet ./types ./dto ./pkg/routing_error ./pkg/routing_metrics ./pkg/routing_hotcache ./pkg/routing_breaker ./service/routing ./service ./setting/operation_setting ./middleware ./relay/common ./relay ./relay/channel ./relay/channel/openai ./relay/channel/task/... ./controller ./model`：exit 0。
 - `go test ./... -count=1`：exit 0，全部通过。
+- `go test ./relay ./relay/channel/openai ./controller ./service -count=1`：exit 0，Realtime、Controller 与计费集成路径通过。
+- `go test -race ./relay ./relay/channel/openai ./service -run 'Test(WssHelperSettlesOnlyCommittedRealtimeErrors|OpenaiRealtimeHandlerErrorIncludesCommittedPendingUsage|PostWssConsumeQuotaMissingUsageRetainsReservedQuotaAndRecordsConsumption)' -count=1`：exit 0，无 race report。
 - `bun run typecheck`（`web/default`）：exit 0。
 - `bun run build`（`web/default`）：exit 0，`built in 31.5s`。
 - `go test ./model -run 'TestRoutingModels(AutoMigrateAndMetricUpsert|ExternalDatabaseCompatibility)' -count=1 -v`：exit 0；SQLite PASS；MySQL SKIP（未设置 `ROUTING_TEST_MYSQL_DSN`）；PostgreSQL SKIP（未设置 `ROUTING_TEST_POSTGRES_DSN`）。
@@ -2695,7 +2704,7 @@ deffc0d6 docs: plan phase 0b routing semantics
 - `git diff --name-only 6cc7abfa..HEAD -- web/default web/classic`：exit 0、无输出；无 frontend diff。
 - 部署/显式迁移路径审计 `git diff --name-only 6cc7abfa..HEAD | rg -i '(^|/)(deploy|deployment|migrations?|terraform|ansible|helm|k8s|docker-compose|compose)(/|\.|$)'`：exit 1、无输出。
 - `git diff --check`：exit 0。
-- `git status --short`：exit 0；更新本文档前工作树为空。
+- `git status --short`：exit 0；本次更新本文档前工作树为空。
 - `git log --oneline 6cc7abfa..HEAD`：exit 0，提交序列如上。
 
 ### Race 结果与基线归属
@@ -2709,5 +2718,6 @@ deffc0d6 docs: plan phase 0b routing semantics
 - `git diff --exit-code 6cc7abfa..HEAD -- logger/logger.go model/task.go service/task_polling.go service/task_polling_test.go relay/channel/api_request_test.go`：exit 0，证明上述 race 源文件与基准完全一致。
 - `go test -race ./middleware -run '^TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly$' -count=1`：exit 0。
 - `go test -race ./relay -run '^Test(RelayTaskSubmit|ResolveOriginTask)' -count=1`：exit 0。
+- `go test -race ./relay ./relay/channel/openai ./controller -run 'Test(WssHelperSettlesOnlyCommittedRealtimeErrors|OpenaiRealtimeHandlerErrorIncludesCommittedPendingUsage|RelayAttemptControlError|RealtimeStreamOutcomes)' -count=1`：exit 0；已提交 Realtime 计费、pending usage 与 Controller outcome 路径无 race report。
 
 Race 总命令因此如实记录为非零，而不是 PASS；新增 Multi-Key、Task Submit 与 task adaptor 路径的定向 race 验证均通过。
