@@ -443,17 +443,16 @@ func TestRecordClassifiedAttemptCapturesOutputTokensAndGenerationDuration(t *tes
 	info.ResetStreamAttemptState()
 	attemptStart := info.RoutingAttemptStartTime()
 	info.FirstResponseTime = attemptStart.Add(500 * time.Millisecond)
-	info.ObserveRoutingOutputTokens(150)
-	time.Sleep(550 * time.Millisecond)
+	info.ObserveRoutingOutputTokensAt(150, attemptStart.Add(1500*time.Millisecond))
 
 	recordTestAttempt(nil, info, 28, nil)
 
 	snapshots := Snapshots()
 	require.Len(t, snapshots, 1)
 	assert.Equal(t, int64(150), snapshots[0].OutputTokens)
-	assert.Less(t, snapshots[0].TotalLatencyMs, int64(2000))
-	assert.Less(t, snapshots[0].TtftP95Ms, int64(1000))
-	assert.Greater(t, snapshots[0].GenerationMs, int64(0))
+	assert.Equal(t, int64(1500), snapshots[0].TotalLatencyMs)
+	assert.Equal(t, int64(500), snapshots[0].TtftP95Ms)
+	assert.Equal(t, int64(1000), snapshots[0].GenerationMs)
 }
 
 func TestRecordClassifiedAttemptDoesNotAddGenerationWithoutOutputTokens(t *testing.T) {
@@ -466,7 +465,9 @@ func TestRecordClassifiedAttemptDoesNotAddGenerationWithoutOutputTokens(t *testi
 		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 29},
 	}
 	info.ResetStreamAttemptState()
-	time.Sleep(10 * time.Millisecond)
+	attemptStart := info.RoutingAttemptStartTime()
+	info.FirstResponseTime = attemptStart.Add(500 * time.Millisecond)
+	info.ObserveRoutingOutputTokensAt(0, attemptStart.Add(1500*time.Millisecond))
 
 	recordTestAttempt(nil, info, 29, nil)
 
@@ -474,6 +475,8 @@ func TestRecordClassifiedAttemptDoesNotAddGenerationWithoutOutputTokens(t *testi
 	require.Len(t, snapshots, 1)
 	assert.Zero(t, snapshots[0].OutputTokens)
 	assert.Zero(t, snapshots[0].GenerationMs)
+	assert.Equal(t, int64(1500), snapshots[0].TotalLatencyMs)
+	assert.Equal(t, int64(500), snapshots[0].TtftP95Ms)
 }
 
 func TestRecordClassifiedAttemptCapturesErrorStatus(t *testing.T) {
@@ -837,17 +840,23 @@ func TestDrainSnapshotsClearsInMemoryBuckets(t *testing.T) {
 	assert.Empty(t, Snapshots())
 }
 
-func TestRequeueSnapshotsRestoresDrainedBuckets(t *testing.T) {
+func TestDrainAndRequeuePreserveTokenThroughputPairs(t *testing.T) {
 	enableRoutingMetricsForTest(t)
-	info := &relaycommon.RelayInfo{
-		UsingGroup:      "default",
-		OriginModelName: "gpt-test",
-		StartTime:       time.Now(),
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 34},
+	key := bucketKey{
+		channelID:   34,
+		apiKeyIndex: model.RoutingMetricSingleKeyIndex,
+		modelName:   "gpt-test",
+		group:       "default",
+		bucketTs:    1,
 	}
-	recordTestAttempt(nil, info, 34, nil)
+	recordBucket(key, 100, 0, false, 1000, 0, true, nil, routingerror.Classification{})
+	recordBucket(key, 100, 0, false, 0, 150, true, nil, routingerror.Classification{})
+	recordBucket(key, 100, 0, false, 1000, 150, true, nil, routingerror.Classification{})
+
 	drained := DrainSnapshots()
 	require.Len(t, drained, 1)
+	assert.Equal(t, int64(150), drained[0].OutputTokens)
+	assert.Equal(t, int64(1000), drained[0].GenerationMs)
 	require.Empty(t, Snapshots())
 
 	RequeueSnapshots(drained)
@@ -858,6 +867,8 @@ func TestRequeueSnapshotsRestoresDrainedBuckets(t *testing.T) {
 	assert.Equal(t, drained[0].ModelName, snapshots[0].ModelName)
 	assert.Equal(t, drained[0].RequestCount, snapshots[0].RequestCount)
 	assert.Equal(t, drained[0].SuccessCount, snapshots[0].SuccessCount)
+	assert.Equal(t, drained[0].OutputTokens, snapshots[0].OutputTokens)
+	assert.Equal(t, drained[0].GenerationMs, snapshots[0].GenerationMs)
 }
 
 func TestDrainAndRequeuePreserveReliabilityCounters(t *testing.T) {

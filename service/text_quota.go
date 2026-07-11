@@ -334,7 +334,13 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
+	observedAt := time.Now()
 	originUsage := usage
+	outputTokens := int64(0)
+	if originUsage != nil {
+		outputTokens = int64(originUsage.CompletionTokens)
+	}
+	relayInfo.ObserveRoutingOutputTokensAt(outputTokens, observedAt)
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")
 	}
@@ -344,7 +350,6 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
-	relayInfo.ObserveRoutingOutputTokens(int64(summary.CompletionTokens))
 	if originUsage == nil {
 		summary.Quota = relayInfo.FinalPreConsumedQuota
 		if relayInfo.Billing != nil {

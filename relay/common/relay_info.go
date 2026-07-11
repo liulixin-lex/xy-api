@@ -87,18 +87,19 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
-	routingOutputTokens     int64
-	TokenId                 int
-	TokenKey                string
-	TokenGroup              string
-	UserId                  int
-	UsingGroup              string // 使用的分组，当auto跨分组重试时，会变动
-	UserGroup               string // 用户所在分组
-	TokenUnlimited          bool
-	StartTime               time.Time
-	FirstResponseTime       time.Time
-	isFirstResponse         bool
-	routingAttemptStartTime time.Time
+	routingOutputTokens         int64
+	routingAttemptDurationNanos int64
+	TokenId                     int
+	TokenKey                    string
+	TokenGroup                  string
+	UserId                      int
+	UsingGroup                  string // 使用的分组，当auto跨分组重试时，会变动
+	UserGroup                   string // 用户所在分组
+	TokenUnlimited              bool
+	StartTime                   time.Time
+	FirstResponseTime           time.Time
+	isFirstResponse             bool
+	routingAttemptStartTime     time.Time
 
 	attemptBaselineCaptured        bool
 	attemptIsStream                bool
@@ -689,12 +690,37 @@ func (info *RelayInfo) HasSendResponse() bool {
 }
 
 func (info *RelayInfo) ObserveRoutingOutputTokens(tokens int64) {
-	if info == nil || tokens <= 0 {
+	info.ObserveRoutingOutputTokensAt(tokens, time.Now())
+}
+
+func (info *RelayInfo) ObserveRoutingOutputTokensAt(tokens int64, observedAt time.Time) {
+	if info == nil || tokens < 0 {
+		return
+	}
+	attemptStart := info.RoutingAttemptStartTime()
+	if attemptStart.IsZero() {
 		return
 	}
 	for {
 		current := atomic.LoadInt64(&info.routingOutputTokens)
-		if tokens <= current || atomic.CompareAndSwapInt64(&info.routingOutputTokens, current, tokens) {
+		if tokens < current {
+			return
+		}
+		if tokens == current || atomic.CompareAndSwapInt64(&info.routingOutputTokens, current, tokens) {
+			break
+		}
+	}
+
+	durationNanos := int64(observedAt.Sub(attemptStart))
+	if durationNanos <= 0 {
+		return
+	}
+	for {
+		if tokens < atomic.LoadInt64(&info.routingOutputTokens) {
+			return
+		}
+		current := atomic.LoadInt64(&info.routingAttemptDurationNanos)
+		if durationNanos <= current || atomic.CompareAndSwapInt64(&info.routingAttemptDurationNanos, current, durationNanos) {
 			return
 		}
 	}
@@ -717,12 +743,25 @@ func (info *RelayInfo) RoutingAttemptStartTime() time.Time {
 	return info.StartTime
 }
 
+func (info *RelayInfo) RoutingAttemptEndTime() time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	attemptStart := info.RoutingAttemptStartTime()
+	durationNanos := atomic.LoadInt64(&info.routingAttemptDurationNanos)
+	if attemptStart.IsZero() || durationNanos <= 0 {
+		return time.Time{}
+	}
+	return attemptStart.Add(time.Duration(durationNanos))
+}
+
 func (info *RelayInfo) ResetStreamAttemptState() {
 	if info == nil {
 		return
 	}
 	info.routingAttemptStartTime = time.Now()
 	atomic.StoreInt64(&info.routingOutputTokens, 0)
+	atomic.StoreInt64(&info.routingAttemptDurationNanos, 0)
 	if !info.attemptBaselineCaptured {
 		info.attemptBaselineCaptured = true
 		info.attemptIsStream = info.IsStream

@@ -162,7 +162,10 @@ func RecordClassifiedAttempt(
 	if !smart_routing_setting.Enabled() {
 		return
 	}
-	now := time.Now()
+	now := info.RoutingAttemptEndTime()
+	if now.IsZero() {
+		now = time.Now()
+	}
 	attemptStart := info.RoutingAttemptStartTime()
 	if attemptStart.IsZero() {
 		attemptStart = now
@@ -177,7 +180,7 @@ func RecordClassifiedAttempt(
 		latencyMs = 0
 	}
 	ttftMs := int64(0)
-	hasTtft := info.IsStream && info.HasSendResponse()
+	hasTtft := info.IsStream && info.FirstResponseTime.After(attemptStart)
 	if hasTtft {
 		ttftMs = info.FirstResponseTime.Sub(attemptStart).Milliseconds()
 		if ttftMs < 0 {

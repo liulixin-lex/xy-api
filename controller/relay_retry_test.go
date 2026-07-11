@@ -563,6 +563,48 @@ func TestPrepareRoutingRelayAttemptRestoresRequestFormatBaseline(t *testing.T) {
 	assert.Empty(t, info.FinalRequestRelayFormat)
 }
 
+func TestSubmitRoutingTaskAttemptResetsTelemetryBeforeEverySubmit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/invalid-task-platform", strings.NewReader(`{}`))
+	requestStart := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	info := &relaycommon.RelayInfo{
+		StartTime:         requestStart,
+		FirstResponseTime: requestStart.Add(time.Second),
+		IsStream:          true,
+		TaskRelayInfo:     &relaycommon.TaskRelayInfo{},
+	}
+	info.ObserveRoutingOutputTokensAt(11, requestStart.Add(2*time.Second))
+
+	result, taskErr := submitRoutingTaskAttempt(ctx, info)
+
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.LocalError)
+	assert.True(t, info.FirstResponseTime.IsZero())
+	assert.True(t, info.RoutingAttemptEndTime().IsZero())
+	assert.Zero(t, info.RoutingOutputTokens())
+
+	attemptStart := info.RoutingAttemptStartTime()
+	info.FirstResponseTime = attemptStart.Add(100 * time.Millisecond)
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.SendResponseCount = 2
+	info.ReceivedResponseCount = 3
+	info.ObserveRoutingOutputTokensAt(7, attemptStart.Add(time.Second))
+
+	result, taskErr = submitRoutingTaskAttempt(ctx, info)
+
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.LocalError)
+	assert.True(t, info.FirstResponseTime.IsZero())
+	assert.Nil(t, info.StreamStatus)
+	assert.Zero(t, info.SendResponseCount)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.True(t, info.RoutingAttemptEndTime().IsZero())
+	assert.Zero(t, info.RoutingOutputTokens())
+}
+
 func TestClassifyRoutingTaskErrorKeepsContentSafety403OutOfAutoDisable(t *testing.T) {
 	originalEnabled := common.AutomaticDisableChannelEnabled
 	originalRanges := operation_setting.AutomaticDisableStatusCodeRanges

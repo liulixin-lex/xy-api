@@ -15,24 +15,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRelayInfoRoutingOutputTokensAreAttemptScoped(t *testing.T) {
-	logicalStart := time.Now().Add(-time.Hour)
+func TestRelayInfoRoutingObservationTracksMonotonicTokensAndAttemptEnd(t *testing.T) {
+	attemptStart := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	info := &RelayInfo{StartTime: attemptStart}
+
+	info.ObserveRoutingOutputTokensAt(0, attemptStart.Add(500*time.Millisecond))
+	assert.Zero(t, info.RoutingOutputTokens())
+	assert.Equal(t, attemptStart.Add(500*time.Millisecond), info.RoutingAttemptEndTime())
+
+	info.ObserveRoutingOutputTokensAt(12, attemptStart.Add(1200*time.Millisecond))
+	info.ObserveRoutingOutputTokensAt(8, attemptStart.Add(2*time.Second))
+	info.ObserveRoutingOutputTokensAt(12, attemptStart.Add(1500*time.Millisecond))
+	info.ObserveRoutingOutputTokensAt(15, attemptStart.Add(1400*time.Millisecond))
+	info.ObserveRoutingOutputTokensAt(-1, attemptStart.Add(3*time.Second))
+
+	assert.Equal(t, int64(15), info.RoutingOutputTokens())
+	assert.Equal(t, attemptStart.Add(1500*time.Millisecond), info.RoutingAttemptEndTime())
+}
+
+func TestRelayInfoRoutingObservationIsAttemptScoped(t *testing.T) {
+	logicalStart := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
 	info := &RelayInfo{StartTime: logicalStart}
-
-	assert.Equal(t, logicalStart, info.RoutingAttemptStartTime())
-	info.ObserveRoutingOutputTokens(12)
-	info.ObserveRoutingOutputTokens(8)
-	info.ObserveRoutingOutputTokens(-1)
-	assert.Equal(t, int64(12), info.RoutingOutputTokens())
+	info.ObserveRoutingOutputTokensAt(12, logicalStart.Add(time.Second))
 
 	info.ResetStreamAttemptState()
+	attemptStart := info.RoutingAttemptStartTime()
 	assert.Zero(t, info.RoutingOutputTokens())
-	assert.True(t, info.RoutingAttemptStartTime().After(logicalStart))
+	assert.True(t, info.RoutingAttemptEndTime().IsZero())
 
-	info.ObserveRoutingOutputTokens(7)
+	info.ObserveRoutingOutputTokensAt(7, attemptStart.Add(700*time.Millisecond))
 	assert.Equal(t, int64(7), info.RoutingOutputTokens())
+	assert.Equal(t, attemptStart.Add(700*time.Millisecond), info.RoutingAttemptEndTime())
+
 	info.ResetStreamAttemptState()
 	assert.Zero(t, info.RoutingOutputTokens())
+	assert.True(t, info.RoutingAttemptEndTime().IsZero())
 }
 
 func TestCurrentAttemptIsMultiKeyPrefersContextOverStaleChannelMeta(t *testing.T) {

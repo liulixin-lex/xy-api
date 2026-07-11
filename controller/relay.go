@@ -448,6 +448,11 @@ func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
 	info.ResetStreamAttemptState()
 }
 
+func submitRoutingTaskAttempt(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+	prepareRoutingRelayAttempt(info)
+	return relay.RelayTaskSubmit(c, info)
+}
+
 func relayAttemptControlError(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) *types.NewAPIError {
 	isRealtime := info != nil && info.RelayFormat == types.RelayFormatOpenAIRealtime
 	isStream := info != nil && (info.IsStream || info.StreamStatus != nil || isRealtime)
@@ -879,7 +884,7 @@ func RelayTask(c *gin.Context) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
-		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
+		result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
 		taskAPIError := taskErrorToAPIError(taskErr)
 		classificationContext := routingerror.Context{
 			Component: routingerror.ComponentServing,
