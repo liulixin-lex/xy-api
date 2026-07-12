@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/bits"
 	"strings"
@@ -16,7 +17,8 @@ import (
 )
 
 const (
-	RoutingCanaryEvaluationSchemaVersion = 1
+	RoutingCanaryEvaluationSchemaVersion     = 1
+	routingCanaryEvaluationWindowUniqueIndex = "uidx_routing_canary_window_v2"
 
 	RoutingCanaryEvaluationStatusPassed       RoutingCanaryEvaluationStatus = "passed"
 	RoutingCanaryEvaluationStatusBreached     RoutingCanaryEvaluationStatus = "breached"
@@ -26,11 +28,39 @@ const (
 )
 
 var (
-	ErrRoutingCanaryEvaluationInvalid   = errors.New("invalid routing canary evaluation")
-	ErrRoutingCanaryEvaluationImmutable = errors.New("routing canary evaluation is immutable")
+	ErrRoutingCanaryEvaluationInvalid        = errors.New("invalid routing canary evaluation")
+	ErrRoutingCanaryEvaluationImmutable      = errors.New("routing canary evaluation is immutable")
+	ErrRoutingCanaryEvaluationWindowConflict = errors.New("routing canary evaluation window has duplicate rows")
 )
 
 type RoutingCanaryEvaluationStatus string
+
+type RoutingCanaryEvaluationWindowConflictError struct {
+	RolloutKey    string
+	PoolID        int
+	WindowStartMs int64
+	WindowEndMs   int64
+	Count         int64
+}
+
+func (err *RoutingCanaryEvaluationWindowConflictError) Error() string {
+	if err == nil {
+		return ErrRoutingCanaryEvaluationWindowConflict.Error()
+	}
+	return fmt.Sprintf(
+		"%s: rollout_key=%s pool_id=%d window_start_ms=%d window_end_ms=%d count=%d",
+		ErrRoutingCanaryEvaluationWindowConflict,
+		err.RolloutKey,
+		err.PoolID,
+		err.WindowStartMs,
+		err.WindowEndMs,
+		err.Count,
+	)
+}
+
+func (err *RoutingCanaryEvaluationWindowConflictError) Unwrap() error {
+	return ErrRoutingCanaryEvaluationWindowConflict
+}
 
 type RoutingCanaryCohortMetrics struct {
 	RequestCount        int64   `json:"request_count"`
@@ -72,10 +102,10 @@ type RoutingCanaryEvaluation struct {
 	CreateToken                        string                        `json:"-" gorm:"type:char(32);not null"`
 	PolicyRevision                     int64                         `json:"policy_revision" gorm:"bigint;index;not null"`
 	ActivationID                       int64                         `json:"activation_id" gorm:"bigint;index;not null"`
-	PoolID                             int                           `json:"pool_id" gorm:"index;uniqueIndex:idx_routing_canary_evaluation_window,priority:2;not null"`
-	RolloutKey                         string                        `json:"rollout_key" gorm:"type:char(64);index;uniqueIndex:idx_routing_canary_evaluation_window,priority:1;not null"`
-	WindowStartMs                      int64                         `json:"window_start_ms" gorm:"bigint;index;uniqueIndex:idx_routing_canary_evaluation_window,priority:3;not null"`
-	WindowEndMs                        int64                         `json:"window_end_ms" gorm:"bigint;index;uniqueIndex:idx_routing_canary_evaluation_window,priority:4;not null"`
+	PoolID                             int                           `json:"pool_id" gorm:"index;uniqueIndex:uidx_routing_canary_window_v2,priority:2;not null"`
+	RolloutKey                         string                        `json:"rollout_key" gorm:"type:char(64);index;uniqueIndex:uidx_routing_canary_window_v2,priority:1;not null"`
+	WindowStartMs                      int64                         `json:"window_start_ms" gorm:"bigint;index;uniqueIndex:uidx_routing_canary_window_v2,priority:3;not null"`
+	WindowEndMs                        int64                         `json:"window_end_ms" gorm:"bigint;index;uniqueIndex:uidx_routing_canary_window_v2,priority:4;not null"`
 	ControlRequestCount                int64                         `json:"control_request_count" gorm:"bigint;not null"`
 	ControlSuccessCount                int64                         `json:"control_success_count" gorm:"bigint;not null"`
 	ControlTTFTSampleCount             int64                         `json:"control_ttft_sample_count" gorm:"bigint;not null"`
@@ -117,6 +147,34 @@ func (*RoutingCanaryEvaluation) BeforeUpdate(*gorm.DB) error {
 
 func (*RoutingCanaryEvaluation) BeforeDelete(*gorm.DB) error {
 	return ErrRoutingCanaryEvaluationImmutable
+}
+
+func prepareRoutingCanaryEvaluationWindowUniqueIndex(db *gorm.DB) error {
+	if db == nil {
+		return ErrRoutingCanaryEvaluationInvalid
+	}
+	if !db.Migrator().HasTable(&RoutingCanaryEvaluation{}) ||
+		db.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex) {
+		return nil
+	}
+
+	var conflict RoutingCanaryEvaluationWindowConflictError
+	err := db.Model(&RoutingCanaryEvaluation{}).
+		Select(
+			"rollout_key, pool_id, window_start_ms, window_end_ms, COUNT(*) AS count",
+		).
+		Group("rollout_key, pool_id, window_start_ms, window_end_ms").
+		Having("COUNT(*) > ?", 1).
+		Order("rollout_key asc, pool_id asc, window_start_ms asc, window_end_ms asc").
+		Limit(1).
+		Scan(&conflict).Error
+	if err != nil {
+		return err
+	}
+	if conflict.Count > 1 {
+		return &conflict
+	}
+	return nil
 }
 
 func CreateRoutingCanaryEvaluationContext(

@@ -754,7 +754,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "ControlExpectedCostTotal"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "CanaryP95TTFTMilliseconds"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "RetryAmplificationRatioBasisPoints"))
-	require.True(t, DB.Migrator().HasIndex(&RoutingCanaryEvaluation{}, "idx_routing_canary_evaluation_window"))
+	require.True(t, DB.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "IdempotencyHash"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "CreateToken"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "ClaimToken"))

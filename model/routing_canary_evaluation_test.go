@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"strings"
@@ -83,6 +84,113 @@ func TestRoutingCanaryEvaluationExternalDatabaseCompatibility(t *testing.T) {
 			runRoutingCanaryEvaluationContract(t, db, test.dbType)
 		})
 	}
+}
+
+func TestRoutingCanaryEvaluationWindowUniqueIndexUpgrade(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	runRoutingCanaryEvaluationWindowUniqueIndexUpgradeContract(t, db, common.DatabaseTypeSQLite)
+}
+
+func TestRoutingCanaryEvaluationWindowUniqueIndexUpgradeExternalDatabaseCompatibility(t *testing.T) {
+	tests := []struct {
+		name   string
+		envKey string
+		dbType common.DatabaseType
+	}{
+		{name: "mysql", envKey: "ROUTING_TEST_MYSQL_DSN", dbType: common.DatabaseTypeMySQL},
+		{name: "postgres", envKey: "ROUTING_TEST_POSTGRES_DSN", dbType: common.DatabaseTypePostgreSQL},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := os.Getenv(test.envKey)
+			if dsn == "" {
+				t.Skipf("%s is not set", test.envKey)
+			}
+			db := openRoutingExternalTestDB(t, test.dbType, dsn)
+			runRoutingCanaryEvaluationWindowUniqueIndexUpgradeContract(t, db, test.dbType)
+		})
+	}
+}
+
+func TestRoutingCanaryEvaluationWindowUniqueIndexPreflightRejectsHistoricalDuplicates(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	prepareLegacyRoutingCanaryEvaluationWindowIndex(t, db)
+
+	firstSpec := routingCanaryEvaluationSpecForTest()
+	secondSpec := firstSpec
+	secondSpec.Canary.AttemptCount++
+	secondSpec.Canary.RetryCount++
+	for index, spec := range []RoutingCanaryEvaluationSpec{firstSpec, secondSpec} {
+		normalized, evaluationHash, err := normalizeRoutingCanaryEvaluationSpec(spec)
+		require.NoError(t, err)
+		row := routingCanaryEvaluationFromSpec(normalized)
+		row.EvaluationHash = evaluationHash
+		row.CreateToken = strings.Repeat(string(rune('a'+index)), 32)
+		row.CreatedTimeMs = int64(index + 1)
+		require.NoError(t, db.Create(&row).Error)
+	}
+
+	err := prepareRoutingCanaryEvaluationWindowUniqueIndex(db)
+	assert.ErrorIs(t, err, ErrRoutingCanaryEvaluationWindowConflict)
+	var conflict *RoutingCanaryEvaluationWindowConflictError
+	require.True(t, errors.As(err, &conflict))
+	assert.Equal(t, firstSpec.RolloutKey, conflict.RolloutKey)
+	assert.Equal(t, firstSpec.PoolID, conflict.PoolID)
+	assert.Equal(t, firstSpec.WindowStartMs, conflict.WindowStartMs)
+	assert.Equal(t, firstSpec.WindowEndMs, conflict.WindowEndMs)
+	assert.Equal(t, int64(2), conflict.Count)
+	assert.False(t, db.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
+}
+
+func runRoutingCanaryEvaluationWindowUniqueIndexUpgradeContract(
+	t *testing.T,
+	db *gorm.DB,
+	dbType common.DatabaseType,
+) {
+	t.Helper()
+	withRoutingTestDB(t, db, dbType)
+	prepareLegacyRoutingCanaryEvaluationWindowIndex(t, db)
+	require.True(t, db.Migrator().HasIndex(&RoutingCanaryEvaluation{}, "idx_routing_canary_evaluation_window"))
+	require.False(t, db.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
+
+	require.NoError(t, prepareRoutingCanaryEvaluationWindowUniqueIndex(db))
+	require.NoError(t, db.AutoMigrate(&RoutingCanaryEvaluation{}))
+	require.True(t, db.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
+
+	firstSpec := routingCanaryEvaluationSpecForTest()
+	first, created, err := CreateRoutingCanaryEvaluationContext(context.Background(), firstSpec)
+	require.NoError(t, err)
+	require.True(t, created)
+	secondSpec := firstSpec
+	secondSpec.Canary.AttemptCount++
+	secondSpec.Canary.RetryCount++
+	second, created, err := CreateRoutingCanaryEvaluationContext(context.Background(), secondSpec)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, first.EvaluationHash, second.EvaluationHash)
+	var count int64
+	require.NoError(t, db.Model(&RoutingCanaryEvaluation{}).Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+}
+
+func prepareLegacyRoutingCanaryEvaluationWindowIndex(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&RoutingCanaryEvaluation{}))
+	require.NoError(t, db.Migrator().DropIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
+	require.NoError(t, db.AutoMigrate(&routingCanaryEvaluationLegacyWindowIndex{}))
+}
+
+type routingCanaryEvaluationLegacyWindowIndex struct {
+	RolloutKey    string `gorm:"type:char(64);index:idx_routing_canary_evaluation_window,priority:1"`
+	PoolID        int    `gorm:"index:idx_routing_canary_evaluation_window,priority:2"`
+	WindowStartMs int64  `gorm:"bigint;index:idx_routing_canary_evaluation_window,priority:3"`
+	WindowEndMs   int64  `gorm:"bigint;index:idx_routing_canary_evaluation_window,priority:4"`
+}
+
+func (routingCanaryEvaluationLegacyWindowIndex) TableName() string {
+	return "routing_canary_evaluations"
 }
 
 func runRoutingCanaryEvaluationContract(t *testing.T, db *gorm.DB, dbType common.DatabaseType) {
