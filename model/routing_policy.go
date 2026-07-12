@@ -817,138 +817,194 @@ func publishNormalizedRoutingPolicyRevisionContext(
 		return RoutingPolicyPublishResult{}, err
 	}
 
+	changedPoolIDs := make([]int, len(document.Pools))
+	for index := range document.Pools {
+		changedPoolIDs[index] = document.Pools[index].PoolID
+	}
 	now := common.GetTimestamp()
 	var result RoutingPolicyPublishResult
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		head, err := ensureRoutingPolicyHeadTx(tx)
-		if err != nil {
-			return err
-		}
-		if head.CurrentRevision != expectedRevision {
-			return newRoutingPolicyRevisionConflict(expectedRevision, head)
-		}
-		if err := validateRoutingPolicyPoolIdentitiesTx(tx, document); err != nil {
-			return err
-		}
-		if err := validateRoutingPolicyMemberIdentitiesTx(tx, document); err != nil {
-			return err
-		}
-
-		nextRevision := expectedRevision + 1
-		cas := tx.Model(&RoutingPolicyHead{}).
-			Where("id = ? AND current_revision = ?", routingPolicyHeadID, expectedRevision).
-			Updates(map[string]any{
-				"current_revision": nextRevision,
-				"current_hash":     contentHash,
-				"current_stage":    activationSpec.Stage,
-				"updated_time":     now,
-			})
-		if cas.Error != nil {
-			return cas.Error
-		}
-		if cas.RowsAffected != 1 {
-			var actual RoutingPolicyHead
-			if err := tx.Where("id = ?", routingPolicyHeadID).First(&actual).Error; err != nil {
-				return err
-			}
-			return newRoutingPolicyRevisionConflict(expectedRevision, actual)
-		}
-
-		revision := RoutingPolicyRevision{
-			Revision:           nextRevision,
-			ParentRevision:     expectedRevision,
-			RollbackOfRevision: rollbackOfRevision,
-			SchemaVersion:      document.SchemaVersion,
-			ContentHash:        contentHash,
-			PoolCount:          len(document.Pools),
-			MemberCount:        routingPolicyDocumentMemberCount(document),
-			ActorID:            activationSpec.ActorID,
-			Reason:             activationSpec.Reason,
-			CreatedTime:        now,
-		}
-		if err := tx.Create(&revision).Error; err != nil {
-			return err
-		}
-
-		poolRows, memberRows, err := routingPolicyRevisionRows(nextRevision, document)
-		if err != nil {
-			return err
-		}
-		if len(poolRows) > 0 {
-			if err := createRoutingPolicyRowsInBatches(tx, poolRows, routingPolicyPoolInsertBatch, routingPolicyPoolRowEncodedSize); err != nil {
-				return err
-			}
-		}
-		if len(memberRows) > 0 {
-			if err := createRoutingPolicyRowsInBatches(tx, memberRows, routingPolicyMemberInsertBatch, routingPolicyMemberRowEncodedSize); err != nil {
-				return err
-			}
-		}
-
-		activation := RoutingPolicyActivation{
-			Revision:           nextRevision,
-			PreviousRevision:   expectedRevision,
-			RollbackOfRevision: rollbackOfRevision,
-			Stage:              activationSpec.Stage,
-			TrafficBasisPoints: activationSpec.TrafficBasisPoints,
-			ActorID:            activationSpec.ActorID,
-			Reason:             activationSpec.Reason,
-			CreatedTime:        now,
-		}
-		if err := tx.Create(&activation).Error; err != nil {
-			return err
-		}
-
-		eventID := fmt.Sprintf("routing-policy-revision:%020d", nextRevision)
-		changedPoolIDs := make([]int, len(document.Pools))
-		for index := range document.Pools {
-			changedPoolIDs[index] = document.Pools[index].PoolID
-		}
-		event := RoutingConfigEvent{
-			SchemaVersion:      RoutingPolicySchemaVersion,
-			EventID:            eventID,
-			Revision:           nextRevision,
-			PreviousRevision:   expectedRevision,
-			ActivationID:       activation.ID,
-			DeploymentStage:    activation.Stage,
-			TrafficBasisPoints: activation.TrafficBasisPoints,
-			ContentHash:        contentHash,
-			ChangedPoolIDs:     changedPoolIDs,
-			RollbackOfRevision: rollbackOfRevision,
-			CreatedTime:        now,
-		}
-		payload, err := common.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if len(payload) > routingConfigOutboxPayloadMaxBytes {
-			return ErrRoutingPolicyInvalid
-		}
-		outbox := RoutingConfigOutbox{
-			EventID:     eventID,
-			Revision:    nextRevision,
-			EventType:   RoutingConfigEventPolicyRevision,
-			PayloadJSON: string(payload),
-			PayloadHash: routingPolicyHash(payload),
-			CreatedTime: now,
-		}
-		if err := tx.Create(&outbox).Error; err != nil {
-			return err
-		}
-
-		finalize := tx.Model(&RoutingPolicyHead{}).
-			Where("id = ? AND current_revision = ? AND current_hash = ?", routingPolicyHeadID, nextRevision, contentHash).
-			Update("current_activation_id", activation.ID)
-		if finalize.Error != nil {
-			return finalize.Error
-		}
-		if finalize.RowsAffected != 1 {
-			return ErrRoutingPolicyRevisionConflict
-		}
-		result = RoutingPolicyPublishResult{Revision: revision, Activation: activation, Outbox: outbox}
-		return nil
+		var err error
+		result, err = publishNormalizedRoutingPolicyRevisionTx(
+			ctx,
+			tx,
+			expectedRevision,
+			rollbackOfRevision,
+			document,
+			contentHash,
+			activationSpec,
+			changedPoolIDs,
+			now,
+		)
+		return err
 	})
 	return result, err
+}
+
+func publishNormalizedRoutingPolicyRevisionTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	expectedRevision int64,
+	rollbackOfRevision int64,
+	document RoutingPolicyDocument,
+	contentHash string,
+	activationSpec RoutingPolicyActivationSpec,
+	changedPoolIDs []int,
+	now int64,
+) (RoutingPolicyPublishResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tx == nil {
+		return RoutingPolicyPublishResult{}, errRoutingPolicyDatabaseNil
+	}
+	if expectedRevision < 0 || expectedRevision == math.MaxInt64 || rollbackOfRevision < 0 ||
+		activationSpec.Validate() != nil || len(contentHash) != 64 || now <= 0 {
+		return RoutingPolicyPublishResult{}, ErrRoutingPolicyInvalid
+	}
+	if err := ValidateRoutingPolicyActivationDocument(document, activationSpec); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+
+	poolIDs := make(map[int]struct{}, len(document.Pools))
+	for index := range document.Pools {
+		poolIDs[document.Pools[index].PoolID] = struct{}{}
+	}
+	changedPoolIDs = append([]int(nil), changedPoolIDs...)
+	sort.Ints(changedPoolIDs)
+	for index := range changedPoolIDs {
+		if _, exists := poolIDs[changedPoolIDs[index]]; !exists ||
+			(index > 0 && changedPoolIDs[index] == changedPoolIDs[index-1]) {
+			return RoutingPolicyPublishResult{}, ErrRoutingPolicyInvalid
+		}
+	}
+
+	tx = tx.WithContext(ctx)
+	head, err := ensureRoutingPolicyHeadTx(tx)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if head.CurrentRevision != expectedRevision {
+		return RoutingPolicyPublishResult{}, newRoutingPolicyRevisionConflict(expectedRevision, head)
+	}
+	if err := validateRoutingPolicyPoolIdentitiesTx(tx, document); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if err := validateRoutingPolicyMemberIdentitiesTx(tx, document); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+
+	nextRevision := expectedRevision + 1
+	cas := tx.Model(&RoutingPolicyHead{}).
+		Where("id = ? AND current_revision = ?", routingPolicyHeadID, expectedRevision).
+		Updates(map[string]any{
+			"current_revision": nextRevision,
+			"current_hash":     contentHash,
+			"current_stage":    activationSpec.Stage,
+			"updated_time":     now,
+		})
+	if cas.Error != nil {
+		return RoutingPolicyPublishResult{}, cas.Error
+	}
+	if cas.RowsAffected != 1 {
+		var actual RoutingPolicyHead
+		if err := tx.Where("id = ?", routingPolicyHeadID).First(&actual).Error; err != nil {
+			return RoutingPolicyPublishResult{}, err
+		}
+		return RoutingPolicyPublishResult{}, newRoutingPolicyRevisionConflict(expectedRevision, actual)
+	}
+
+	revision := RoutingPolicyRevision{
+		Revision:           nextRevision,
+		ParentRevision:     expectedRevision,
+		RollbackOfRevision: rollbackOfRevision,
+		SchemaVersion:      document.SchemaVersion,
+		ContentHash:        contentHash,
+		PoolCount:          len(document.Pools),
+		MemberCount:        routingPolicyDocumentMemberCount(document),
+		ActorID:            activationSpec.ActorID,
+		Reason:             activationSpec.Reason,
+		CreatedTime:        now,
+	}
+	if err := tx.Create(&revision).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+
+	poolRows, memberRows, err := routingPolicyRevisionRows(nextRevision, document)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if len(poolRows) > 0 {
+		if err := createRoutingPolicyRowsInBatches(tx, poolRows, routingPolicyPoolInsertBatch, routingPolicyPoolRowEncodedSize); err != nil {
+			return RoutingPolicyPublishResult{}, err
+		}
+	}
+	if len(memberRows) > 0 {
+		if err := createRoutingPolicyRowsInBatches(tx, memberRows, routingPolicyMemberInsertBatch, routingPolicyMemberRowEncodedSize); err != nil {
+			return RoutingPolicyPublishResult{}, err
+		}
+	}
+
+	activation := RoutingPolicyActivation{
+		Revision:           nextRevision,
+		PreviousRevision:   expectedRevision,
+		RollbackOfRevision: rollbackOfRevision,
+		Stage:              activationSpec.Stage,
+		TrafficBasisPoints: activationSpec.TrafficBasisPoints,
+		ActorID:            activationSpec.ActorID,
+		Reason:             activationSpec.Reason,
+		CreatedTime:        now,
+	}
+	if err := tx.Create(&activation).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+
+	eventID := fmt.Sprintf("routing-policy-revision:%020d", nextRevision)
+	event := RoutingConfigEvent{
+		SchemaVersion:      RoutingPolicySchemaVersion,
+		EventID:            eventID,
+		Revision:           nextRevision,
+		PreviousRevision:   expectedRevision,
+		ActivationID:       activation.ID,
+		DeploymentStage:    activation.Stage,
+		TrafficBasisPoints: activation.TrafficBasisPoints,
+		ContentHash:        contentHash,
+		ChangedPoolIDs:     changedPoolIDs,
+		RollbackOfRevision: rollbackOfRevision,
+		CreatedTime:        now,
+	}
+	payload, err := common.Marshal(event)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if len(payload) > routingConfigOutboxPayloadMaxBytes {
+		return RoutingPolicyPublishResult{}, ErrRoutingPolicyInvalid
+	}
+	outbox := RoutingConfigOutbox{
+		EventID:     eventID,
+		Revision:    nextRevision,
+		EventType:   RoutingConfigEventPolicyRevision,
+		PayloadJSON: string(payload),
+		PayloadHash: routingPolicyHash(payload),
+		CreatedTime: now,
+	}
+	if err := tx.Create(&outbox).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+
+	finalize := tx.Model(&RoutingPolicyHead{}).
+		Where("id = ? AND current_revision = ? AND current_hash = ?", routingPolicyHeadID, nextRevision, contentHash).
+		Update("current_activation_id", activation.ID)
+	if finalize.Error != nil {
+		return RoutingPolicyPublishResult{}, finalize.Error
+	}
+	if finalize.RowsAffected != 1 {
+		return RoutingPolicyPublishResult{}, ErrRoutingPolicyRevisionConflict
+	}
+	return RoutingPolicyPublishResult{Revision: revision, Activation: activation, Outbox: outbox}, nil
 }
 
 func ensureRoutingPolicyHeadTx(tx *gorm.DB) (RoutingPolicyHead, error) {

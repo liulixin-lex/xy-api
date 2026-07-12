@@ -591,6 +591,8 @@ var routingMigrationModels = []interface{}{
 	&RoutingConfigOutbox{},
 	&RoutingRuntimeCheckpoint{},
 	&RoutingControlLease{},
+	&RoutingCanaryEvaluation{},
+	&RoutingOperation{},
 	&RoutingUpstreamAccount{},
 	&RoutingCostSnapshotVersion{},
 	&RoutingChannelBinding{},
@@ -747,6 +749,16 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "SelectedMemberID"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ReservationMode"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ExclusionSummaryJSON"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "EvaluationHash"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "CreateToken"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "ControlExpectedCostTotal"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "CanaryP95TTFTMilliseconds"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "RetryAmplificationRatioBasisPoints"))
+	require.True(t, DB.Migrator().HasIndex(&RoutingCanaryEvaluation{}, "idx_routing_canary_evaluation_window"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "IdempotencyHash"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "CreateToken"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "ClaimToken"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "ResultOutboxID"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCostSnapshot{}, "ModelKey"))
 	require.True(t, DB.Migrator().HasIndex(&RoutingCostSnapshot{}, "idx_routing_cost_channel_model_key"))
 	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{

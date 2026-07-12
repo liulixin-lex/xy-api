@@ -757,6 +757,8 @@ func migrateRoutingPolicyModelsForTest(db *gorm.DB) error {
 		&RoutingPolicyActivation{},
 		&RoutingConfigOutbox{},
 		&RoutingRuntimeCheckpoint{},
+		&RoutingCanaryEvaluation{},
+		&RoutingOperation{},
 	)
 }
 
