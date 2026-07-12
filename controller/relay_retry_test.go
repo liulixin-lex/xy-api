@@ -87,6 +87,40 @@ func TestCommitRoutingCapacityAttemptFailsClosedBeforeUpstream(t *testing.T) {
 	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
 }
 
+func TestCommitRoutingCapacityAttemptReleasesCommittedReservationWhenOutcomeRegistrationFails(t *testing.T) {
+	tracker, err := channelrouting.NewCapacityTracker(channelrouting.CapacityConfig{
+		MaxEntries: 4,
+		IdleTTL:    time.Hour,
+		Shards:     1,
+	})
+	require.NoError(t, err)
+	key := channelrouting.CapacityKey{PoolID: 1, MemberID: 2, Model: "gpt-test"}
+	reservation, err := tracker.TryReserve(key, channelrouting.Demand{Inflight: 1}, channelrouting.Limit{Inflight: 1})
+	require.NoError(t, err)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	gate := channelrouting.CanaryGate{
+		PoolID: 1, ActivationID: 2, PolicyRevision: 3, TrafficBasisPoints: 100,
+		InCanary: true, RolloutKey: channelrouting.RolloutKey(strings.Repeat("a", 64)),
+	}
+	require.NoError(t, service.PrepareChannelRoutingCanarySelection(ctx, service.ChannelRoutingCanarySelection{
+		Gate: gate, WindowSeconds: 60, LatenessSeconds: 5,
+	}))
+	require.NoError(t, service.MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, service.SetRoutingCapacityReservation(ctx, reservation))
+
+	apiErr := commitRoutingCapacityAttempt(ctx)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	snapshot, ok := tracker.Snapshot(key)
+	require.True(t, ok)
+	assert.Zero(t, snapshot.PendingReservations)
+	assert.Zero(t, snapshot.CommittedReservations)
+	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
+	require.NoError(t, service.FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, time.Now()))
+}
+
 func resetRoutingBreakerConfigIdentityForTest() {
 	smartRoutingBreakerConfigMu.Lock()
 	smartRoutingBreakerConfigLast = routingBreakerConfigIdentity{}

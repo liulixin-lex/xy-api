@@ -130,6 +130,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
+	var (
+		canaryOutcomeKnown          bool
+		canaryOutcomeSuccess        bool
+		canaryOutcomeClassification routingerror.Classification
+	)
+	defer func() {
+		success := newAPIError == nil
+		if canaryOutcomeKnown {
+			success = canaryOutcomeSuccess
+		} else if newAPIError != nil {
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
+		}
+		finishRoutingCanaryOutcome(c, relayInfo, canaryOutcomeClassification, success)
+	}()
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
@@ -202,6 +216,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
 			break
 		}
 
@@ -216,12 +231,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			} else {
 				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			newAPIError = capacityErr
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
 			break
 		}
 
@@ -248,6 +265,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			classificationAPIError = controlAPIError
 		}
 		classification, attemptSuccess := classifyRoutingRelayAttemptWithContext(c, classificationAPIError, relayInfo)
+		canaryOutcomeKnown = true
+		canaryOutcomeSuccess = attemptSuccess
+		canaryOutcomeClassification = classification
 		classificationAPIError = service.NormalizeViolationFeeError(classificationAPIError)
 		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
 
@@ -466,7 +486,37 @@ func commitRoutingCapacityAttempt(c *gin.Context) *types.NewAPIError {
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
+	if err := service.MarkChannelRoutingCanaryAttemptStarted(c); err != nil {
+		releaseErr := service.ReleaseRoutingCapacityReservation(c)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("channel routing canary attempt registration failed: %w", errors.Join(err, releaseErr)),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 	return nil
+}
+
+func finishRoutingCanaryOutcome(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	classification routingerror.Classification,
+	success bool,
+) {
+	include := success || classification.Responsibility != routingerror.ResponsibilityCaller
+	clientTTFTMilliseconds := int64(0)
+	if success && info != nil && !info.StartTime.IsZero() && info.FirstResponseTime.After(info.StartTime) {
+		clientTTFTMilliseconds = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+		if clientTTFTMilliseconds < 0 {
+			clientTTFTMilliseconds = 0
+		}
+	}
+	if err := service.FinishChannelRoutingCanaryOutcome(
+		c, include, success, false, clientTTFTMilliseconds, time.Now(),
+	); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing canary outcome dropped: %v", err))
+	}
 }
 
 func cancelRoutingCapacityReservation(c *gin.Context) {
@@ -870,6 +920,24 @@ func RelayTask(c *gin.Context) {
 
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
+	var (
+		canaryOutcomeKnown          bool
+		canaryOutcomeSuccess        bool
+		canaryOutcomeClassification routingerror.Classification
+	)
+	defer func() {
+		if !canaryOutcomeKnown && taskErr != nil {
+			canaryOutcomeClassification = routingerror.ClassifyTaskError(taskErr, routingerror.Context{
+				Component: routingerror.ComponentServing,
+				Operation: routingerror.OperationTaskSubmit,
+			})
+		}
+		success := taskErr == nil
+		if canaryOutcomeKnown {
+			success = canaryOutcomeSuccess
+		}
+		finishRoutingCanaryOutcome(c, relayInfo, canaryOutcomeClassification, success)
+	}()
 	defer func() {
 		if taskErr != nil && relayInfo.Billing != nil {
 			relayInfo.Billing.Refund(c)
@@ -939,6 +1007,9 @@ func RelayTask(c *gin.Context) {
 			classificationContext.Signal = routingerror.SignalContentSafety
 		}
 		classification := routingerror.ClassifyTaskError(taskErr, classificationContext)
+		canaryOutcomeKnown = true
+		canaryOutcomeSuccess = taskErr == nil
+		canaryOutcomeClassification = classification
 		recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
 		if taskErr == nil {
 			break

@@ -58,6 +58,7 @@ const (
 	ContextKeyRoutingSelectedIdentity ContextKey = "routing_selected_identity"
 	ContextKeyRoutingCapacityReserve  ContextKey = "routing_capacity_reservation"
 	ContextKeyRoutingSessionSet       ContextKey = "routing_session_set"
+	ContextKeyRoutingCanaryOutcome    ContextKey = "routing_canary_outcome"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"

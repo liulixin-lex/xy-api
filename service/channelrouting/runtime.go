@@ -207,7 +207,8 @@ func defaultRuntimeDeps() runtimeDeps {
 func flushLocalRoutingWritesContext(ctx context.Context) error {
 	_, telemetryErr := FlushStableTelemetryContext(ctx)
 	_, auditErr := flushDecisionAuditBatchesContext(ctx, decisionAuditFlushMaxBatches)
-	return errors.Join(telemetryErr, auditErr)
+	_, canaryErr := FlushCanaryOutcomeCheckpointsContext(ctx)
+	return errors.Join(telemetryErr, auditErr, canaryErr)
 }
 
 func flushDecisionAuditBatchesContext(ctx context.Context, maxBatches int) (int, error) {
