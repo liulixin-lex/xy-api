@@ -398,6 +398,39 @@ func TestPreparedBalancedRetainsCandidatesThatRecoverAfterCompile(t *testing.T) 
 	assert.Equal(t, 2, recoveredSoft.SelectedChannelID)
 }
 
+func TestPreparedBalancedUsesRequestCostOverrideForBudgetAndSelection(t *testing.T) {
+	settings := balancedSettingsForTest()
+	settings.Weights = Weights{Availability: 0.1, Latency: 0.1, Throughput: 0.1, Cost: 0.7}
+	settings.CostTarget = 1
+	settings.CostBudget = 2
+	settings.RequireKnownCost = true
+
+	first := balancedCandidateForTest(1, 100, 20, 0, 1)
+	second := balancedCandidateForTest(2, 100, 20, 0, 1)
+	prepared, err := PrepareBalanced([]BalancedCandidate{first, second}, settings)
+	require.NoError(t, err)
+
+	decision, err := prepared.Select(BalancedRequest{
+		RandomSeed: 1,
+		RuntimeByChannelID: map[int]BalancedRuntimeState{
+			1: {Cost: &CostSnapshot{Known: true, Cost: 4, UpdatedUnix: settings.NowUnix}},
+			2: {Cost: &CostSnapshot{Known: true, Cost: 0.5, UpdatedUnix: settings.NowUnix}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, decision.SelectedChannelID)
+
+	unknown, err := prepared.Select(BalancedRequest{
+		RandomSeed: 1,
+		RuntimeByChannelID: map[int]BalancedRuntimeState{
+			1: {Cost: &CostSnapshot{Known: false, UpdatedUnix: settings.NowUnix}},
+			2: {Cost: &CostSnapshot{Known: false, UpdatedUnix: settings.NowUnix}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Zero(t, unknown.SelectedChannelID)
+}
+
 func TestPreparedBalancedFallsBackAcrossSoftStateAndBusinessTiersAtRuntime(t *testing.T) {
 	settings := balancedSettingsForTest()
 	settings.AllowSoftFailureFallback = true

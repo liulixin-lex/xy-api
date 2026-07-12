@@ -138,6 +138,7 @@ type BalancedRuntimeState struct {
 	CooldownUntilUnixMilli *int64
 	SlowStartFactor        *float64
 	Breaker                *BreakerSnapshot
+	Cost                   *CostSnapshot
 	Admission              BalancedRuntimeAdmission
 }
 
@@ -424,6 +425,7 @@ type balancedEffectiveRuntimeState struct {
 type balancedRuntimeEvaluation struct {
 	state             balancedEffectiveRuntimeState
 	breaker           *BreakerSnapshot
+	cost              *CostSnapshot
 	slowStartFactor   float64
 	baseUtilityScore  float64
 	costUtility       float64
@@ -457,6 +459,7 @@ func (prepared *PreparedBalancedPool) runtimeEvaluation(
 	admission := BalancedRuntimeAdmissionInherit
 	var slowStartOverride *float64
 	var breakerOverride *BreakerSnapshot
+	var costOverride *CostSnapshot
 	if current, exists := request.RuntimeByChannelID[channelID]; exists {
 		if current.HasCapacityUtilization || current.CapacityUtilization != 0 {
 			state.capacityUtilization = current.CapacityUtilization
@@ -473,6 +476,7 @@ func (prepared *PreparedBalancedPool) runtimeEvaluation(
 		}
 		slowStartOverride = current.SlowStartFactor
 		breakerOverride = current.Breaker
+		costOverride = current.Cost
 	}
 	evaluation.state = state
 	if admission == BalancedRuntimeAdmissionBlocked {
@@ -489,7 +493,7 @@ func (prepared *PreparedBalancedPool) runtimeEvaluation(
 		return BalancedExclusionCapacityExhausted
 	}
 	planOverride := admission != BalancedRuntimeAdmissionInherit ||
-		slowStartOverride != nil || breakerOverride != nil
+		slowStartOverride != nil || breakerOverride != nil || costOverride != nil
 	breakerTransitioned := index < len(prepared.breakerTransitionByIndex) &&
 		prepared.breakerTransitionByIndex[index] > 0 &&
 		nowUnixMilli/1_000 >= prepared.breakerTransitionByIndex[index]
@@ -581,12 +585,27 @@ func (prepared *PreparedBalancedPool) runtimeEvaluation(
 	evaluation.baseUtilityScore = candidate.BaseUtilityScore
 	evaluation.costUtility = candidate.CostUtility
 	evaluation.costKnown = candidate.CostKnown
-	if costExpired {
-		if prepared.settings.RequireKnownCost {
+	evaluation.cost = candidate.Candidate.Candidate.Cost
+	currentCost := candidate.Candidate.Candidate.Cost
+	if costOverride != nil {
+		currentCost = costOverride
+		evaluation.cost = costOverride
+	}
+	if costOverride != nil || costExpired {
+		costSettings := prepared.settings
+		costSettings.NowUnix = nowUnixMilli / 1_000
+		costKnown := balancedCostKnown(currentCost, costSettings)
+		if prepared.settings.RequireKnownCost && !costKnown {
 			return BalancedExclusionCostUnknown
 		}
-		evaluation.costKnown = false
+		if costKnown && prepared.settings.CostBudget > 0 && currentCost.Cost > prepared.settings.CostBudget {
+			return BalancedExclusionCostBudget
+		}
+		evaluation.costKnown = costKnown
 		evaluation.costUtility = prepared.settings.UnknownCostUtility
+		if costKnown {
+			evaluation.costUtility = balancedLowerIsBetterUtility(currentCost.Cost, prepared.settings.CostTarget)
+		}
 		geometric := balancedGeometricUtility(
 			prepared.normalizedWeights,
 			candidate.AvailabilityUtility,
@@ -625,6 +644,12 @@ func (prepared *PreparedBalancedPool) runtimeCandidate(
 	}
 	candidate := prepared.ranked[index]
 	candidate.Candidate.Candidate.Breaker = evaluation.breaker
+	if evaluation.cost == nil {
+		candidate.Candidate.Candidate.Cost = nil
+	} else {
+		cost := *evaluation.cost
+		candidate.Candidate.Candidate.Cost = &cost
+	}
 	candidate.Candidate.SlowStartFactor = evaluation.slowStartFactor
 	candidate.Candidate.CapacityUtilization = evaluation.state.capacityUtilization
 	candidate.Candidate.QueueDelayMs = evaluation.state.queueDelayMs
@@ -695,7 +720,8 @@ func (prepared *PreparedBalancedPool) validateRequest(request BalancedRequest) e
 			!balancedFiniteNonNegative(state.CapacityUtilization) || !balancedFiniteNonNegative(state.QueueDelayMs) ||
 			state.Inflight < 0 || (state.CooldownUntilUnixMilli != nil && *state.CooldownUntilUnixMilli < 0) ||
 			(state.SlowStartFactor != nil && !balancedUnitInterval(*state.SlowStartFactor, true)) ||
-			!balancedRuntimeAdmissionValid(state.Admission) || !balancedBreakerSnapshotValid(state.Breaker) {
+			!balancedRuntimeAdmissionValid(state.Admission) || !balancedBreakerSnapshotValid(state.Breaker) ||
+			!balancedCostSnapshotValid(state.Cost) {
 			return ErrBalancedCandidateInvalid
 		}
 	}
@@ -714,11 +740,16 @@ func (prepared *PreparedBalancedPool) requiresDynamicReplan(request BalancedRequ
 		return true
 	}
 	for _, state := range request.RuntimeByChannelID {
-		if state.Admission != BalancedRuntimeAdmissionInherit || state.SlowStartFactor != nil || state.Breaker != nil {
+		if state.Admission != BalancedRuntimeAdmissionInherit || state.SlowStartFactor != nil ||
+			state.Breaker != nil || state.Cost != nil {
 			return true
 		}
 	}
 	return false
+}
+
+func balancedCostSnapshotValid(cost *CostSnapshot) bool {
+	return cost == nil || (cost.UpdatedUnix >= 0 && (!cost.Known || balancedFiniteNonNegative(cost.Cost)))
 }
 
 type balancedDynamicStage struct {

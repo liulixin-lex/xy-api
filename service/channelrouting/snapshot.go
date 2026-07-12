@@ -18,6 +18,7 @@ import (
 	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"gorm.io/gorm"
@@ -112,6 +113,7 @@ type PoolSnapshot struct {
 	DeploymentStage  string                    `json:"deployment_stage"`
 	PolicyProfile    string                    `json:"policy_profile"`
 	SelectorPolicy   PoolSelectorPolicy        `json:"selector_policy"`
+	BalancedPolicy   BalancedPoolPolicy        `json:"balanced_policy"`
 	CanaryPolicy     model.RoutingCanaryPolicy `json:"canary_policy"`
 	MemberCount      int                       `json:"member_count"`
 	MembersTruncated bool                      `json:"members_truncated"`
@@ -229,6 +231,7 @@ type runtimeSnapshot struct {
 	channelByID              map[int]ChannelSnapshot
 	poolIndexByID            map[int]int
 	memberIndexesByPoolModel map[poolModelKey][]int
+	preparedBalancedPools    map[balancedPoolModelKey]*routingselector.PreparedBalancedPool
 	poolSummaries            []PoolSnapshotSummary
 	telemetrySummary         TelemetryAggregate
 }
@@ -604,6 +607,7 @@ func buildSnapshotWithinTransaction(
 	memberCredentialIDs := make(map[int][]int, revision.MemberCount)
 	policyPoolByID := make(map[int]model.RoutingPolicyPoolContent, len(document.Pools))
 	selectorPolicyByPoolID := make(map[int]PoolSelectorPolicy, len(document.Pools))
+	balancedPolicyByPoolID := make(map[int]BalancedPoolPolicy, len(document.Pools))
 	canaryPolicyByPoolID := make(map[int]model.RoutingCanaryPolicy, len(document.Pools))
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
@@ -611,12 +615,17 @@ func buildSnapshotWithinTransaction(
 		if err != nil {
 			return nil, fmt.Errorf("invalid routing selector policy for pool %d: %w", pool.PoolID, err)
 		}
+		balancedPolicy, err := resolveBalancedPoolPolicy(pool.PolicyProfile, pool.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid balanced routing policy for pool %d: %w", pool.PoolID, err)
+		}
 		canaryPolicy, err := model.ResolveRoutingCanaryPolicy(pool.Policy)
 		if err != nil {
 			return nil, fmt.Errorf("invalid routing canary policy for pool %d: %w", pool.PoolID, err)
 		}
 		policyPoolByID[pool.PoolID] = pool
 		selectorPolicyByPoolID[pool.PoolID] = selectorPolicy
+		balancedPolicyByPoolID[pool.PoolID] = balancedPolicy
 		canaryPolicyByPoolID[pool.PoolID] = canaryPolicy
 		pools = append(pools, model.RoutingPool{
 			ID:          pool.PoolID,
@@ -1109,6 +1118,7 @@ metricPages:
 			DeploymentStage: policyPool.DeploymentStage,
 			PolicyProfile:   policyPool.PolicyProfile,
 			SelectorPolicy:  selectorPolicyByPoolID[pool.ID],
+			BalancedPolicy:  balancedPolicyByPoolID[pool.ID],
 			CanaryPolicy:    canaryPolicyByPoolID[pool.ID],
 			MemberCount:     len(membersByPool[pool.ID]),
 			Members:         make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
@@ -1233,7 +1243,7 @@ metricPages:
 		poolSummaries[index] = summarizePoolSnapshot(poolViews[index])
 	}
 
-	return &runtimeSnapshot{
+	snapshot := &runtimeSnapshot{
 		view:                     view,
 		poolByGroup:              poolByGroup,
 		memberByPoolChannel:      memberByPoolChannel,
@@ -1242,9 +1252,14 @@ metricPages:
 		channelByID:              channelViewByID,
 		poolIndexByID:            poolIndexByID,
 		memberIndexesByPoolModel: memberIndexesByPoolModel,
+		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
 		poolSummaries:            poolSummaries,
 		telemetrySummary:         telemetryAggregate(view),
-	}, ctx.Err()
+	}
+	if err := snapshot.compileBalancedPools(); err != nil {
+		return nil, err
+	}
+	return snapshot, ctx.Err()
 }
 
 func aggregateRoutingMetricTTFTP95(
@@ -1812,6 +1827,7 @@ func SetSnapshotForTest(view SnapshotView) {
 		channelByID:              make(map[int]ChannelSnapshot, len(cloned.Channels)),
 		poolIndexByID:            make(map[int]int, len(cloned.Pools)),
 		memberIndexesByPoolModel: make(map[poolModelKey][]int),
+		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
 		poolSummaries:            make([]PoolSnapshotSummary, len(cloned.Pools)),
 	}
 	for index := range cloned.Channels {
@@ -1840,6 +1856,7 @@ func SetSnapshotForTest(view SnapshotView) {
 		}
 	}
 	snapshot.telemetrySummary = telemetryAggregate(snapshot.view)
+	_ = snapshot.compileBalancedPools()
 	snapshotPublishMu.Lock()
 	currentSnapshot.Store(snapshot)
 	snapshotPublishMu.Unlock()
