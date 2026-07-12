@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -18,7 +19,10 @@ import (
 )
 
 type routingAttemptGuard struct {
+	mu          sync.Mutex
+	policy      channelrouting.AttemptPolicy
 	coordinator *channelrouting.AttemptCoordinator
+	bypass      bool
 }
 
 func newRoutingAttemptGuard(c *gin.Context, info *relaycommon.RelayInfo) *routingAttemptGuard {
@@ -40,32 +44,60 @@ func newRoutingAttemptGuard(c *gin.Context, info *relaycommon.RelayInfo) *routin
 		requestContext = c.Request.Context()
 	}
 	baselineCost := routingAttemptCostUnits(info)
-	return &routingAttemptGuard{coordinator: channelrouting.NewAttemptCoordinator(channelrouting.AttemptPolicy{
+	return &routingAttemptGuard{policy: channelrouting.AttemptPolicy{
 		MaxAttempts:          maxRetries + 1,
 		Deadline:             channelrouting.AttemptDeadline(requestContext, now, time.Duration(setting.FailoverDeadlineMs)*time.Millisecond),
 		ExtraCostBudgetUnits: channelrouting.AttemptExtraCostBudget(baselineCost, setting.RetryExtraCostMultiplier),
 		RetryTokenCapacity:   setting.RetryTokenCapacity,
 		RetryTokenRefill:     setting.RetryTokenRefillPerSec,
-	})}
+	}}
 }
 
 func (guard *routingAttemptGuard) Begin(c *gin.Context, info *relaycommon.RelayInfo) (*channelrouting.AttemptLease, error) {
-	if guard == nil || guard.coordinator == nil {
+	if guard == nil {
 		return nil, nil
 	}
 	poolID := 0
 	if c != nil {
 		poolID = common.GetContextKeyInt(c, constant.ContextKeyRoutingPoolID)
 	}
-	return guard.coordinator.BeginAttempt(channelrouting.AttemptInput{
+	guard.mu.Lock()
+	if guard.bypass {
+		guard.mu.Unlock()
+		return nil, nil
+	}
+	if poolID <= 0 {
+		coordinator := guard.coordinator
+		guard.coordinator = nil
+		guard.bypass = true
+		guard.mu.Unlock()
+		if coordinator != nil {
+			coordinator.Complete()
+		}
+		return nil, nil
+	}
+	if guard.coordinator == nil {
+		guard.coordinator = channelrouting.NewAttemptCoordinator(guard.policy)
+	}
+	coordinator := guard.coordinator
+	guard.mu.Unlock()
+	return coordinator.BeginAttempt(channelrouting.AttemptInput{
 		PoolID:             poolID,
 		EstimatedCostUnits: routingAttemptCostUnits(info),
 	})
 }
 
 func (guard *routingAttemptGuard) Complete() {
-	if guard != nil && guard.coordinator != nil {
-		guard.coordinator.Complete()
+	if guard == nil {
+		return
+	}
+	guard.mu.Lock()
+	coordinator := guard.coordinator
+	guard.coordinator = nil
+	guard.bypass = true
+	guard.mu.Unlock()
+	if coordinator != nil {
+		coordinator.Complete()
 	}
 }
 

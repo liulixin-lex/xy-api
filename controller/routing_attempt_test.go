@@ -74,6 +74,57 @@ func TestRoutingAttemptGuardStopsAfterClientCommit(t *testing.T) {
 	assert.ErrorIs(t, err, channelrouting.ErrAttemptClientCommitted)
 }
 
+func TestRoutingAttemptGuardPreservesLegacyRetryPath(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	setting := smart_routing_setting.GetSetting()
+	setting.Enabled = true
+	setting.Mode = smart_routing_setting.ModeBalanced
+	smart_routing_setting.UpdateSetting(setting)
+	ctx := routingAttemptContextForTest()
+	info := &relaycommon.RelayInfo{}
+	guard := newRoutingAttemptGuard(ctx, info)
+	require.NotNil(t, guard)
+	defer guard.Complete()
+
+	first, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	assert.Nil(t, first)
+	second, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	assert.Nil(t, second)
+}
+
+func TestRoutingAttemptGuardBypassesRemainderAfterV2FallsBackToLegacy(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	setting := smart_routing_setting.GetSetting()
+	setting.Enabled = true
+	setting.Mode = smart_routing_setting.ModeBalanced
+	setting.MaxSwitches = 2
+	smart_routing_setting.UpdateSetting(setting)
+	ctx := routingAttemptContextForTest()
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 7)
+	info := &relaycommon.RelayInfo{}
+	guard := newRoutingAttemptGuard(ctx, info)
+	require.NotNil(t, guard)
+	defer guard.Complete()
+
+	first, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	first.Finish()
+
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 0)
+	legacy, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	assert.Nil(t, legacy)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 8)
+	later, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	assert.Nil(t, later)
+}
+
 func TestRoutingAttemptGuardsShareBoundedPoolRetryBudget(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(smart_routing_setting.ResetForTest)
