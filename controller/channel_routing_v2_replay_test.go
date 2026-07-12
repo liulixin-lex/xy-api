@@ -229,8 +229,10 @@ func enqueueControllerCanaryReplayAudit(t *testing.T) string {
 	require.NoError(t, err)
 	require.True(t, gate.InCanary)
 	admission := channelrouting.CapacityAdmission{
-		Mode:   channelrouting.CapacityModeLocalSoft,
-		Key:    channelrouting.CapacityKey{PoolID: poolID, MemberID: 11, Model: profile.ModelName},
+		Mode: channelrouting.CapacityModeLocalSoft,
+		Key: channelrouting.CapacityKey{
+			PolicyRevision: policyRevision, PoolID: poolID, MemberID: 11, Model: profile.ModelName,
+		},
 		Demand: channelrouting.Demand{RPM: 1, InputTPM: 100, OutputTPM: 20, Inflight: 1},
 		Limit:  channelrouting.Limit{RPM: 10, InputTPM: 1_000, OutputTPM: 200, Inflight: 4},
 	}

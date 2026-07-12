@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,35 +24,26 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	channelrouting.ResetDecisionAuditsForTest()
 	smart_routing_setting.ResetForTest()
 	previousMemoryCache := common.MemoryCacheEnabled
-	previousCapacity := channelRoutingCanaryCapacity
-	previousSlowStart := channelRoutingCanarySlowStart
-	previousLimit := channelRoutingCanaryLimit
+	previousRuntime := channelRoutingCanaryRuntime
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled = previousMemoryCache
-		channelRoutingCanaryCapacity = previousCapacity
-		channelRoutingCanarySlowStart = previousSlowStart
-		channelRoutingCanaryLimit = previousLimit
+		channelRoutingCanaryRuntime = previousRuntime
 		channelrouting.ResetSnapshotForTest()
 		channelrouting.ResetDecisionAuditsForTest()
 		smart_routing_setting.ResetForTest()
 	})
 
 	var err error
-	channelRoutingCanaryCapacity, err = channelrouting.NewCapacityTracker(channelrouting.CapacityConfig{
-		MaxEntries: 16,
-		IdleTTL:    time.Hour,
-		Shards:     4,
-	})
+	channelRoutingCanaryRuntime, err = newChannelRoutingCanaryRuntimeManager(nil)
 	require.NoError(t, err)
-	channelRoutingCanarySlowStart, err = channelrouting.NewSlowStartTracker(channelrouting.SlowStartPolicy{
-		MinimumFactor: 0.5,
-		RampDuration:  time.Minute,
-		StateTTL:      time.Hour,
-		MaxEntries:    16,
-	}, nil)
-	require.NoError(t, err)
-	channelRoutingCanaryLimit = channelrouting.Limit{RPM: 10, InputTPM: 100, OutputTPM: 100, Inflight: 1}
+	canaryPolicy := model.DefaultRoutingCanaryPolicy()
+	canaryPolicy.Capacity = model.RoutingCanaryCapacityPolicy{
+		Mode: model.RoutingCanaryCapacityModeLocalSoft, RPM: 10, InputTPM: 100, OutputTPM: 100, Inflight: 1,
+	}
+	canaryPolicy.SlowStart.MinimumFactor = 0.5
+	canaryPolicy.SlowStart.RampSeconds = 60
+	canaryPolicy.SlowStart.StateTTLSeconds = 3_600
 
 	priority := int64(10)
 	weight := uint(10)
@@ -66,16 +58,17 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 		}).Error)
 	}
 	model.InitChannelCache()
-	channelrouting.SetSnapshotForTest(channelRoutingCanarySnapshotForTest(11, 401, []int{101, 102}))
+	view := channelRoutingCanarySnapshotForTest(11, 401, []int{101, 102})
+	view.Pools[0].CanaryPolicy = canaryPolicy
+	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true,
 		Mode:    smart_routing_setting.ModeObserve,
 	})
 
-	held, err := channelRoutingCanaryCapacity.TryReserve(
+	held, err := channelRoutingCanaryRuntime.tryReserve(11, canaryPolicy,
 		channelrouting.CapacityKey{PoolID: 29, MemberID: 1, Model: "gpt-test"},
 		channelrouting.Demand{Inflight: 1},
-		channelRoutingCanaryLimit,
 	)
 	require.NoError(t, err)
 	require.NoError(t, held.Commit())
@@ -118,7 +111,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	assert.Equal(t, string(channelrouting.CapacityModeLocalSoft), audit.ReservationMode)
 	assert.Equal(t, int64(10), audit.ReservationInputTPM)
 	assert.Equal(t, int64(20), audit.ReservationOutputTPM)
-	assert.Equal(t, channelRoutingCanaryLimit.Inflight, audit.ReservationLimitInflight)
+	assert.Equal(t, canaryPolicy.Capacity.Inflight, audit.ReservationLimitInflight)
 	var exclusionSummary model.RoutingDecisionExclusionSummary
 	require.NoError(t, common.UnmarshalJsonStr(audit.ExclusionSummaryJSON, &exclusionSummary))
 	assert.Equal(t, audit.CandidateCount-audit.EligibleCount, exclusionSummary.ExcludedCount)
@@ -200,7 +193,7 @@ func TestChannelRoutingCanaryAffinityAndAutoGroupsSharePinnedSnapshot(t *testing
 	view := channelRoutingCanarySnapshotForTest(31, 601, []int{301})
 	view.Pools = append(view.Pools, channelrouting.PoolSnapshot{
 		ID: 30, GroupName: "secondary", DeploymentStage: model.RoutingDeploymentStageCanary,
-		SelectorPolicy: view.Pools[0].SelectorPolicy,
+		SelectorPolicy: view.Pools[0].SelectorPolicy, CanaryPolicy: view.Pools[0].CanaryPolicy,
 		Members: []channelrouting.PoolMemberSnapshot{{
 			ID: 3, PoolID: 30, ChannelID: 302, PhysicalStatus: common.ChannelStatusEnabled,
 			LegacyPriority: 10, LegacyWeight: 10, CredentialIDs: []int{3_002},
@@ -242,6 +235,7 @@ func channelRoutingCanarySnapshotForTest(revision uint64, activationID int64, ch
 		Pools: []channelrouting.PoolSnapshot{{
 			ID: 29, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageCanary,
 			PolicyProfile: model.RoutingPolicyProfileBalanced,
+			CanaryPolicy:  model.DefaultRoutingCanaryPolicy(),
 			SelectorPolicy: channelrouting.PoolSelectorPolicy{
 				WeightAvailability: 1, AvailabilityFloor: 0.95, MinVolume: 50,
 				TopK: 1, MaxEjectedPct: 50, HalfOpenProbes: 1, SnapshotStaleSec: 1_800,
@@ -250,4 +244,69 @@ func channelRoutingCanarySnapshotForTest(revision uint64, activationID int64, ch
 		}},
 		Channels: channels,
 	}
+}
+
+func TestChannelRoutingCanaryRuntimeSeparatesCapacityByPolicyRevision(t *testing.T) {
+	manager, err := newChannelRoutingCanaryRuntimeManager(nil)
+	require.NoError(t, err)
+	policy := model.DefaultRoutingCanaryPolicy()
+	policy.Capacity.Inflight = 1
+	key := channelrouting.CapacityKey{PoolID: 29, MemberID: 1, Model: "gpt-test"}
+	demand := channelrouting.Demand{Inflight: 1}
+
+	first, err := manager.tryReserve(11, policy, key, demand)
+	require.NoError(t, err)
+	require.NoError(t, first.Commit())
+	_, err = manager.tryReserve(11, policy, key, demand)
+	assert.ErrorIs(t, err, channelrouting.ErrCapacityExhausted)
+
+	second, err := manager.tryReserve(12, policy, key, demand)
+	require.NoError(t, err)
+	require.NoError(t, second.Cancel())
+	require.NoError(t, first.Release())
+}
+
+func TestChannelRoutingCanaryRuntimeSlowStartsColdNodeNewMemberAndRevision(t *testing.T) {
+	clock := &channelRoutingCanaryTestClock{now: time.Unix(1_000, 0)}
+	manager, err := newChannelRoutingCanaryRuntimeManager(clock)
+	require.NoError(t, err)
+	policy := model.DefaultRoutingCanaryPolicy()
+	policy.SlowStart.MinimumFactor = 0.20
+	policy.SlowStart.RampSeconds = 100
+	policy.SlowStart.StateTTLSeconds = 1_000
+	firstKey := channelrouting.SlowStartKey{PoolID: 29, MemberID: 1, Model: "gpt-test"}
+
+	factor, err := manager.slowStartFactor(11, policy, firstKey)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.20, factor, 1e-9)
+	clock.Advance(100 * time.Second)
+	factor, err = manager.slowStartFactor(11, policy, firstKey)
+	require.NoError(t, err)
+	assert.Equal(t, 1.0, factor)
+
+	newMember := channelrouting.SlowStartKey{PoolID: 29, MemberID: 2, Model: "gpt-test"}
+	factor, err = manager.slowStartFactor(11, policy, newMember)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.20, factor, 1e-9, "a member first observed after the node is warm must still ramp")
+
+	factor, err = manager.slowStartFactor(12, policy, firstKey)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.20, factor, 1e-9, "a new policy revision must not inherit incompatible slow-start state")
+}
+
+type channelRoutingCanaryTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *channelRoutingCanaryTestClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *channelRoutingCanaryTestClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(duration)
+	clock.mu.Unlock()
 }

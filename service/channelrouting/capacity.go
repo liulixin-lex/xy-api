@@ -42,9 +42,10 @@ func (wallClock) Now() time.Time {
 }
 
 type CapacityKey struct {
-	PoolID   int    `json:"pool_id"`
-	MemberID int    `json:"member_id"`
-	Model    string `json:"model"`
+	PolicyRevision uint64 `json:"policy_revision,omitempty"`
+	PoolID         int    `json:"pool_id"`
+	MemberID       int    `json:"member_id"`
+	Model          string `json:"model"`
 }
 
 type Demand struct {
@@ -585,6 +586,7 @@ func (tracker *CapacityTracker) shardFor(key CapacityKey) *capacityShard {
 	}
 	mix(uint64(key.PoolID))
 	mix(uint64(key.MemberID))
+	mix(key.PolicyRevision)
 	for index := 0; index < len(key.Model); index++ {
 		hash ^= uint64(key.Model[index])
 		hash *= 1099511628211
@@ -688,6 +690,9 @@ func decayCapacityDebt(debt int64, limit int64, remainder uint64, elapsed time.D
 }
 
 func lessCapacityKey(left CapacityKey, right CapacityKey) bool {
+	if left.PolicyRevision != right.PolicyRevision {
+		return left.PolicyRevision < right.PolicyRevision
+	}
 	if left.PoolID != right.PoolID {
 		return left.PoolID < right.PoolID
 	}

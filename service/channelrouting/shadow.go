@@ -913,7 +913,10 @@ func validCanaryDecisionAudit(audit model.RoutingDecisionAudit, result ShadowRep
 	}
 	admission := CapacityAdmission{
 		Mode: CapacityMode(audit.ReservationMode),
-		Key:  CapacityKey{PoolID: audit.PoolID, MemberID: audit.SelectedMemberID, Model: audit.ModelName},
+		Key: CapacityKey{
+			PolicyRevision: uint64(audit.SnapshotRevision), PoolID: audit.PoolID,
+			MemberID: audit.SelectedMemberID, Model: audit.ModelName,
+		},
 		Demand: Demand{
 			RPM: audit.ReservationRPM, InputTPM: audit.ReservationInputTPM,
 			OutputTPM: audit.ReservationOutputTPM, Inflight: audit.ReservationInflight,

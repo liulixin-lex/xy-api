@@ -18,7 +18,9 @@ func TestRequestRoutingSessionPinsOneSnapshotAndConcretePool(t *testing.T) {
 	_, err := NewRequestRoutingSession("request", "default")
 	assert.ErrorIs(t, err, ErrRoutingSessionUnavailable)
 
-	SetSnapshotForTest(canarySessionSnapshotForTest(11, 3, 401, 29, 101))
+	firstView := canarySessionSnapshotForTest(11, 3, 401, 29, 101)
+	firstView.Pools[0].CanaryPolicy.Capacity.RPM = 321
+	SetSnapshotForTest(firstView)
 	for _, groupName := range []string{"", " ", "auto", "AUTO"} {
 		_, err = NewRequestRoutingSession("request", groupName)
 		assert.ErrorIs(t, err, ErrRoutingSessionGroupRequired)
@@ -31,8 +33,13 @@ func TestRequestRoutingSessionPinsOneSnapshotAndConcretePool(t *testing.T) {
 	assert.Equal(t, uint64(11), session.SnapshotRevision())
 	assert.Equal(t, uint64(3), session.RuntimeGeneration())
 	assert.Equal(t, 29, session.PoolID())
+	pinnedPolicy, err := session.CanaryPolicy()
+	require.NoError(t, err)
+	assert.Equal(t, int64(321), pinnedPolicy.Capacity.RPM)
 
-	SetSnapshotForTest(canarySessionSnapshotForTest(12, 4, 402, 29, 201))
+	secondView := canarySessionSnapshotForTest(12, 4, 402, 29, 201)
+	secondView.Pools[0].CanaryPolicy.Capacity.RPM = 654
+	SetSnapshotForTest(secondView)
 	plan, active, err := session.Plan(RequestRoutingPlanInput{ModelName: "gpt-test"})
 	require.NoError(t, err)
 	require.True(t, active)
@@ -41,10 +48,16 @@ func TestRequestRoutingSessionPinsOneSnapshotAndConcretePool(t *testing.T) {
 	assert.Equal(t, uint64(3), plan.Replay.RuntimeGeneration)
 	assert.Equal(t, 101, plan.Result.SelectedChannelID)
 	assert.Equal(t, Identity{SnapshotRevision: 11, PoolID: 29, MemberID: 11, CredentialID: 1_001}, plan.SelectedIdentity)
+	pinnedPolicy, err = session.CanaryPolicy()
+	require.NoError(t, err)
+	assert.Equal(t, int64(321), pinnedPolicy.Capacity.RPM)
 
 	newSession, err := NewRequestRoutingSession("cohort-0005", "default")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(12), newSession.SnapshotRevision())
+	newPolicy, err := newSession.CanaryPolicy()
+	require.NoError(t, err)
+	assert.Equal(t, int64(654), newPolicy.Capacity.RPM)
 	newPlan, active, err := newSession.Plan(RequestRoutingPlanInput{ModelName: "gpt-test"})
 	require.NoError(t, err)
 	require.True(t, active)
@@ -58,6 +71,7 @@ func TestRequestRoutingSessionSetPinsOneSnapshotAcrossConcreteGroups(t *testing.
 	view.Pools = append(view.Pools, PoolSnapshot{
 		ID: 42, GroupName: "secondary", DeploymentStage: model.RoutingDeploymentStageCanary,
 		SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
+		CanaryPolicy:   model.DefaultRoutingCanaryPolicy(),
 		Members: []PoolMemberSnapshot{{
 			ID: 22, PoolID: 42, ChannelID: 302, PhysicalStatus: common.ChannelStatusEnabled,
 			LegacyPriority: 10, LegacyWeight: 10, CredentialIDs: []int{2_002},
@@ -273,6 +287,7 @@ func canarySessionSnapshotForTest(revision uint64, generation uint64, activation
 		Pools: []PoolSnapshot{{
 			ID: poolID, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageCanary,
 			SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
+			CanaryPolicy:   model.DefaultRoutingCanaryPolicy(),
 			Members: []PoolMemberSnapshot{{
 				ID: 11, PoolID: poolID, ChannelID: channelID, PhysicalStatus: common.ChannelStatusEnabled,
 				LegacyPriority: 10, LegacyWeight: 10, CredentialIDs: []int{1_001},

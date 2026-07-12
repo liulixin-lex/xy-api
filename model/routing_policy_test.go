@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -408,10 +409,24 @@ func TestRoutingPolicyCanaryConfigurationFailsClosedForKnownFields(t *testing.T)
 		valid      bool
 	}{
 		{name: "hedging explicitly disabled", policyJSON: `{"canary":{"hedging_enabled":false}}`, valid: true},
-		{name: "unknown top level and canary fields remain compatible", policyJSON: `{"future":1,"canary":{"future_mode":"observe","hedging_enabled":false}}`, valid: true},
+		{name: "unknown fields remain compatible", policyJSON: `{"future":1,"canary":{"future_mode":"observe","capacity":{"future_limit":2},"hedging_enabled":false}}`, valid: true},
+		{name: "known overrides are valid", policyJSON: `{"canary":{"max_concurrent_attempts":1,"capacity":{"mode":"local_soft","rpm":1,"input_tpm":1,"output_tpm":1,"inflight":1},"slow_start":{"minimum_factor":0.01,"ramp_seconds":30,"state_ttl_seconds":30},"evaluation":{"window_seconds":60,"evaluation_interval_seconds":10,"checkpoint_lateness_seconds":5,"min_canary_requests":10,"min_control_requests":10,"min_ttft_samples":10,"min_node_coverage_basis_points":1,"max_p95_ttft_ratio_basis_points":10000,"max_cost_ratio_basis_points":10000,"max_retry_amplification_ratio_basis_points":10000,"consecutive_breach_windows":1}}}`, valid: true},
 		{name: "hedging enabled", policyJSON: `{"canary":{"hedging_enabled":true}}`},
 		{name: "hedging string is not a boolean", policyJSON: `{"canary":{"hedging_enabled":"false"}}`},
 		{name: "hedging null is not a boolean", policyJSON: `{"canary":{"hedging_enabled":null}}`},
+		{name: "concurrent attempts cannot enable hedging", policyJSON: `{"canary":{"max_concurrent_attempts":2}}`},
+		{name: "concurrent attempts rejects string", policyJSON: `{"canary":{"max_concurrent_attempts":"1"}}`},
+		{name: "capacity must be an object", policyJSON: `{"canary":{"capacity":[]}}`},
+		{name: "capacity mode is fixed", policyJSON: `{"canary":{"capacity":{"mode":"strict"}}}`},
+		{name: "capacity rejects zero", policyJSON: `{"canary":{"capacity":{"rpm":0}}}`},
+		{name: "capacity rejects overflow", policyJSON: `{"canary":{"capacity":{"input_tpm":9223372036854775808}}}`},
+		{name: "slow start rejects wrong type", policyJSON: `{"canary":{"slow_start":{"minimum_factor":"0.1"}}}`},
+		{name: "slow start rejects out of range", policyJSON: `{"canary":{"slow_start":{"minimum_factor":0.9}}}`},
+		{name: "slow start ttl covers ramp", policyJSON: `{"canary":{"slow_start":{"ramp_seconds":300,"state_ttl_seconds":299}}}`},
+		{name: "evaluation must be an object", policyJSON: `{"canary":{"evaluation":false}}`},
+		{name: "evaluation interval divides window", policyJSON: `{"canary":{"evaluation":{"window_seconds":300,"evaluation_interval_seconds":40}}}`},
+		{name: "evaluation rejects null", policyJSON: `{"canary":{"evaluation":{"min_canary_requests":null}}}`},
+		{name: "evaluation rejects ratio below one", policyJSON: `{"canary":{"evaluation":{"max_cost_ratio_basis_points":9999}}}`},
 		{name: "canary must be an object", policyJSON: `{"canary":[]}`},
 	}
 
@@ -429,6 +444,47 @@ func TestRoutingPolicyCanaryConfigurationFailsClosedForKnownFields(t *testing.T)
 			assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
 		})
 	}
+}
+
+func TestResolveRoutingCanaryPolicyAppliesStableDefaultsAndOverrides(t *testing.T) {
+	policy, err := ResolveRoutingCanaryPolicy(json.RawMessage(`{
+		"future_top_level": true,
+		"canary": {
+			"future_canary": "kept",
+			"capacity": {"rpm": 1200, "future_capacity": 3},
+			"slow_start": {"minimum_factor": 0.25, "ramp_seconds": 600},
+			"evaluation": {
+				"auto_rollback_enabled": false,
+				"window_seconds": 600,
+				"evaluation_interval_seconds": 60,
+				"max_success_rate_drop_basis_points": 350
+			}
+		}
+	}`))
+	require.NoError(t, err)
+	assert.False(t, policy.HedgingEnabled)
+	assert.Equal(t, 1, policy.MaxConcurrentAttempts)
+	assert.Equal(t, int64(1200), policy.Capacity.RPM)
+	assert.Equal(t, int64(1_000_000), policy.Capacity.InputTPM)
+	assert.Equal(t, 0.25, policy.SlowStart.MinimumFactor)
+	assert.Equal(t, 600, policy.SlowStart.RampSeconds)
+	assert.Equal(t, 24*60*60, policy.SlowStart.StateTTLSeconds)
+	assert.False(t, policy.Evaluation.AutoRollbackEnabled)
+	assert.True(t, policy.Evaluation.RollbackOnTelemetryGap)
+	assert.Equal(t, 600, policy.Evaluation.WindowSeconds)
+	assert.Equal(t, 60, policy.Evaluation.EvaluationIntervalSeconds)
+	assert.Equal(t, 350, policy.Evaluation.MaxSuccessRateDropBasisPoints)
+}
+
+func TestNormalizeRoutingCanaryPolicyRejectsNonFiniteFactor(t *testing.T) {
+	policy := DefaultRoutingCanaryPolicy()
+	policy.SlowStart.MinimumFactor = math.NaN()
+	_, err := NormalizeRoutingCanaryPolicy(policy)
+	assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
+
+	policy.SlowStart.MinimumFactor = math.Inf(1)
+	_, err = NormalizeRoutingCanaryPolicy(policy)
+	assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
 }
 
 func TestRoutingPolicyAllowsLargePoolAndRejectsTopologyLimit(t *testing.T) {

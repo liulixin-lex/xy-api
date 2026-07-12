@@ -145,6 +145,21 @@ func (session *RequestRoutingSession) PoolID() int {
 	return session.snapshot.view.Pools[session.poolIndex].ID
 }
 
+func (session *RequestRoutingSession) CanaryPolicy() (model.RoutingCanaryPolicy, error) {
+	if session == nil || session.snapshot == nil || session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {
+		return model.RoutingCanaryPolicy{}, ErrRoutingSessionInvalid
+	}
+	pool := session.snapshot.view.Pools[session.poolIndex]
+	if pool.ID <= 0 || pool.GroupName != session.groupName {
+		return model.RoutingCanaryPolicy{}, ErrRoutingSessionInvalid
+	}
+	policy, err := model.NormalizeRoutingCanaryPolicy(pool.CanaryPolicy)
+	if err != nil {
+		return model.RoutingCanaryPolicy{}, ErrRoutingSessionInvalid
+	}
+	return policy, nil
+}
+
 func (session *RequestRoutingSession) IdentityForChannel(channelID int) (Identity, bool) {
 	if session == nil || session.snapshot == nil || channelID <= 0 ||
 		session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {

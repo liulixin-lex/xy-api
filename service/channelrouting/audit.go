@@ -366,6 +366,7 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 	admission := *input.CapacityAdmission
 	if admission.Mode != CapacityModeLocalSoft || admission.Key.PoolID != input.PoolID ||
 		admission.Key.MemberID != identity.MemberID || admission.Key.Model != input.ModelName ||
+		admission.Key.PolicyRevision != input.SnapshotRevision ||
 		!validDemand(admission.Demand) || !validLimit(admission.Limit) ||
 		!limitCoversDemand(admission.Limit, admission.Demand) || exceedsLimit(admission.Demand, admission.Limit) {
 		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid

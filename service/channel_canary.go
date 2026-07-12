@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,43 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
-
-const (
-	channelRoutingCanaryMaxEntries = 100_000
-	channelRoutingCanaryShards     = 64
-)
-
-var (
-	channelRoutingCanaryCapacity  *channelrouting.CapacityTracker
-	channelRoutingCanarySlowStart *channelrouting.SlowStartTracker
-	channelRoutingCanaryLimit     = channelrouting.Limit{
-		RPM:       600,
-		InputTPM:  1_000_000,
-		OutputTPM: 250_000,
-		Inflight:  32,
-	}
-)
-
-func init() {
-	var err error
-	channelRoutingCanaryCapacity, err = channelrouting.NewCapacityTracker(channelrouting.CapacityConfig{
-		MaxEntries: channelRoutingCanaryMaxEntries,
-		IdleTTL:    15 * time.Minute,
-		Shards:     channelRoutingCanaryShards,
-	})
-	if err != nil {
-		panic(err)
-	}
-	channelRoutingCanarySlowStart, err = channelrouting.NewSlowStartTracker(channelrouting.SlowStartPolicy{
-		MinimumFactor: 0.10,
-		RampDuration:  5 * time.Minute,
-		StateTTL:      24 * time.Hour,
-		MaxEntries:    channelRoutingCanaryMaxEntries,
-	}, nil)
-	if err != nil {
-		panic(err)
-	}
-}
 
 func cacheGetChannelRoutingCanary(
 	param *RetryParam,
@@ -168,6 +130,10 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	if err != nil {
 		return nil, true, true, err
 	}
+	canaryPolicy, err := session.CanaryPolicy()
+	if err != nil {
+		return nil, true, true, err
+	}
 
 	allowedChannels, err := model.GetRankedSatisfiedChannels(group, param.ModelName, param.RequestPath)
 	if err != nil {
@@ -201,7 +167,9 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			AllowedChannelIDs:          allowedIDs,
 			ExcludedChannelIDs:         excludedIDs,
 			CapacityExcludedChannelIDs: capacityExcluded,
-			SlowStartFactor:            channelRoutingCanarySlowStart.Factor,
+			SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
+				return channelRoutingCanaryRuntime.slowStartFactor(gate.PolicyRevision, canaryPolicy, key)
+			},
 		})
 		if planErr != nil {
 			return nil, true, true, planErr
@@ -223,11 +191,11 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			OutputTPM: int64(max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)),
 			Inflight:  1,
 		}
-		reservation, reserveErr := channelRoutingCanaryCapacity.TryReserve(channelrouting.CapacityKey{
+		reservation, reserveErr := channelRoutingCanaryRuntime.tryReserve(gate.PolicyRevision, canaryPolicy, channelrouting.CapacityKey{
 			PoolID:   plan.SelectedIdentity.PoolID,
 			MemberID: plan.SelectedIdentity.MemberID,
 			Model:    param.ModelName,
-		}, demand, channelRoutingCanaryLimit)
+		}, demand)
 		if reserveErr != nil {
 			if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
 				errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {

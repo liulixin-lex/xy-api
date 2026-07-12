@@ -155,7 +155,13 @@ func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides
 		"availability_floor": 0.99,
 		"min_volume": 7,
 		"top_k": 1,
-		"snapshot_stale_sec": 90
+		"snapshot_stale_sec": 90,
+		"canary": {
+			"capacity": {"rpm": 321, "inflight": 7, "future_limit": 1},
+			"slow_start": {"minimum_factor": 0.2, "ramp_seconds": 600},
+			"evaluation": {"window_seconds": 600, "evaluation_interval_seconds": 60},
+			"future_mode": "compatible"
+		}
 	}`)
 	_, err = model.PublishRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision, document, model.RoutingPolicyActivationSpec{
 		Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "shadow_test",
@@ -173,6 +179,12 @@ func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides
 	assert.Equal(t, 7, pool.SelectorPolicy.MinVolume)
 	assert.Equal(t, 1, pool.SelectorPolicy.TopK)
 	assert.Equal(t, 90, pool.SelectorPolicy.SnapshotStaleSec)
+	assert.Equal(t, int64(321), pool.CanaryPolicy.Capacity.RPM)
+	assert.Equal(t, int64(7), pool.CanaryPolicy.Capacity.Inflight)
+	assert.InDelta(t, 0.2, pool.CanaryPolicy.SlowStart.MinimumFactor, 1e-9)
+	assert.Equal(t, 600, pool.CanaryPolicy.SlowStart.RampSeconds)
+	assert.Equal(t, 600, pool.CanaryPolicy.Evaluation.WindowSeconds)
+	assert.Equal(t, 60, pool.CanaryPolicy.Evaluation.EvaluationIntervalSeconds)
 }
 
 func TestSnapshotBindsCurrentActivationMetadata(t *testing.T) {

@@ -104,16 +104,17 @@ type SnapshotView struct {
 }
 
 type PoolSnapshot struct {
-	ID               int                  `json:"id"`
-	GroupName        string               `json:"group_name"`
-	DisplayName      string               `json:"display_name"`
-	Source           string               `json:"source"`
-	DeploymentStage  string               `json:"deployment_stage"`
-	PolicyProfile    string               `json:"policy_profile"`
-	SelectorPolicy   PoolSelectorPolicy   `json:"selector_policy"`
-	MemberCount      int                  `json:"member_count"`
-	MembersTruncated bool                 `json:"members_truncated"`
-	Members          []PoolMemberSnapshot `json:"members"`
+	ID               int                       `json:"id"`
+	GroupName        string                    `json:"group_name"`
+	DisplayName      string                    `json:"display_name"`
+	Source           string                    `json:"source"`
+	DeploymentStage  string                    `json:"deployment_stage"`
+	PolicyProfile    string                    `json:"policy_profile"`
+	SelectorPolicy   PoolSelectorPolicy        `json:"selector_policy"`
+	CanaryPolicy     model.RoutingCanaryPolicy `json:"canary_policy"`
+	MemberCount      int                       `json:"member_count"`
+	MembersTruncated bool                      `json:"members_truncated"`
+	Members          []PoolMemberSnapshot      `json:"members"`
 }
 
 type PoolMemberSnapshot struct {
@@ -602,14 +603,20 @@ func buildSnapshotWithinTransaction(
 	memberCredentialIDs := make(map[int][]int, revision.MemberCount)
 	policyPoolByID := make(map[int]model.RoutingPolicyPoolContent, len(document.Pools))
 	selectorPolicyByPoolID := make(map[int]PoolSelectorPolicy, len(document.Pools))
+	canaryPolicyByPoolID := make(map[int]model.RoutingCanaryPolicy, len(document.Pools))
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
 		selectorPolicy, err := resolvePoolSelectorPolicy(pool.PolicyProfile, pool.Policy)
 		if err != nil {
 			return nil, fmt.Errorf("invalid routing selector policy for pool %d: %w", pool.PoolID, err)
 		}
+		canaryPolicy, err := model.ResolveRoutingCanaryPolicy(pool.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid routing canary policy for pool %d: %w", pool.PoolID, err)
+		}
 		policyPoolByID[pool.PoolID] = pool
 		selectorPolicyByPoolID[pool.PoolID] = selectorPolicy
+		canaryPolicyByPoolID[pool.PoolID] = canaryPolicy
 		pools = append(pools, model.RoutingPool{
 			ID:          pool.PoolID,
 			GroupName:   pool.GroupName,
@@ -1101,6 +1108,7 @@ metricPages:
 			DeploymentStage: policyPool.DeploymentStage,
 			PolicyProfile:   policyPool.PolicyProfile,
 			SelectorPolicy:  selectorPolicyByPoolID[pool.ID],
+			CanaryPolicy:    canaryPolicyByPoolID[pool.ID],
 			MemberCount:     len(membersByPool[pool.ID]),
 			Members:         make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
 		}

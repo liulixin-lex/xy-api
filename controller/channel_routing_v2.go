@@ -632,7 +632,10 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 	if record.ReservationMode != "" {
 		capacityAdmission = &channelrouting.CapacityAdmission{
 			Mode: channelrouting.CapacityMode(record.ReservationMode),
-			Key:  channelrouting.CapacityKey{PoolID: record.PoolID, MemberID: record.SelectedMemberID, Model: record.ModelName},
+			Key: channelrouting.CapacityKey{
+				PolicyRevision: uint64(record.SnapshotRevision), PoolID: record.PoolID,
+				MemberID: record.SelectedMemberID, Model: record.ModelName,
+			},
 			Demand: channelrouting.Demand{
 				RPM: record.ReservationRPM, InputTPM: record.ReservationInputTPM,
 				OutputTPM: record.ReservationOutputTPM, Inflight: record.ReservationInflight,

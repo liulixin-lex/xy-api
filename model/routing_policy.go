@@ -1199,31 +1199,8 @@ func normalizeRoutingPolicyJSONObject(value json.RawMessage) (json.RawMessage, e
 }
 
 func validateRoutingPolicyCanaryConfiguration(policy json.RawMessage) error {
-	var object map[string]json.RawMessage
-	if err := common.Unmarshal(policy, &object); err != nil || object == nil {
-		return ErrRoutingPolicyInvalid
-	}
-	canaryJSON, exists := object["canary"]
-	if !exists {
-		return nil
-	}
-	var canary map[string]json.RawMessage
-	if err := common.Unmarshal(canaryJSON, &canary); err != nil || canary == nil {
-		return ErrRoutingPolicyInvalid
-	}
-	hedgingJSON, exists := canary["hedging_enabled"]
-	if !exists {
-		return nil
-	}
-	var hedgingValue any
-	if err := common.Unmarshal(hedgingJSON, &hedgingValue); err != nil {
-		return ErrRoutingPolicyInvalid
-	}
-	hedgingEnabled, valid := hedgingValue.(bool)
-	if !valid || hedgingEnabled {
-		return ErrRoutingPolicyInvalid
-	}
-	return nil
+	_, err := ResolveRoutingCanaryPolicy(policy)
+	return err
 }
 
 func ValidateRoutingPolicyActivationDocument(document RoutingPolicyDocument, activation RoutingPolicyActivationSpec) error {

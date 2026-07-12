@@ -345,7 +345,10 @@ func TestCanaryDecisionAuditReplaysExactly(t *testing.T) {
 	tracker, err := NewCapacityTracker(CapacityConfig{MaxEntries: 4, IdleTTL: time.Hour, Shards: 1})
 	require.NoError(t, err)
 	reservation, err := tracker.TryReserve(
-		CapacityKey{PoolID: plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: "gpt-test"},
+		CapacityKey{
+			PolicyRevision: plan.Replay.PolicyRevision, PoolID: plan.SelectedIdentity.PoolID,
+			MemberID: plan.SelectedIdentity.MemberID, Model: "gpt-test",
+		},
 		Demand{RPM: 1, InputTPM: 10, OutputTPM: 5, Inflight: 1},
 		Limit{RPM: 10, InputTPM: 100, OutputTPM: 50, Inflight: 2},
 	)

@@ -281,6 +281,26 @@ func TestCapacityTrackerRejectsInvalidInputsAndActiveLimitChanges(t *testing.T) 
 	assert.Equal(t, int64(1), tracker.Stats().Drops)
 }
 
+func TestCapacityTrackerSeparatesPolicyRevisions(t *testing.T) {
+	clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
+	tracker := newCapacityTrackerForTest(t, clock, 4, time.Minute)
+	base := CapacityKey{PoolID: 1, MemberID: 11, Model: "gpt-4o"}
+	demand := Demand{Inflight: 1}
+
+	firstKey := base
+	firstKey.PolicyRevision = 11
+	first, err := tracker.TryReserve(firstKey, demand, Limit{Inflight: 1})
+	require.NoError(t, err)
+	require.NoError(t, first.Commit())
+
+	secondKey := base
+	secondKey.PolicyRevision = 12
+	second, err := tracker.TryReserve(secondKey, demand, Limit{Inflight: 2})
+	require.NoError(t, err, "a new policy revision must not conflict with active reservations from its predecessor")
+	require.NoError(t, second.Cancel())
+	require.NoError(t, first.Release())
+}
+
 func TestCapacityTrackerEvictsOnlyIdleEntriesAndExpiresThem(t *testing.T) {
 	clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
 	tracker := newCapacityTrackerForTest(t, clock, 2, time.Minute)
