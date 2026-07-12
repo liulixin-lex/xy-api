@@ -35,7 +35,7 @@ func TestCanaryWindowFlushesOneAbsoluteCheckpointForBothCohorts(t *testing.T) {
 	}))
 	require.NoError(t, aggregator.Record(CanaryLogicalOutcome{
 		Identity: identity, Cohort: model.RoutingDecisionCohortCanary, CompletedAt: clock.Now(),
-		Success: false, RoutingFailure: true, Attempts: 2, CostKnown: true,
+		Success: false, Attempts: 2, CostKnown: true,
 		ExpectedPlatformCostNanoUSD: 250,
 	}))
 
@@ -56,7 +56,7 @@ func TestCanaryWindowFlushesOneAbsoluteCheckpointForBothCohorts(t *testing.T) {
 	assert.Equal(t, int64(1), payload.Control.TTFTSampleCount)
 	assert.Equal(t, int64(1), payload.Canary.LogicalRequests)
 	assert.Equal(t, int64(1), payload.Canary.Failures)
-	assert.Equal(t, int64(1), payload.Canary.RoutingFailures)
+	assert.Zero(t, payload.Canary.RoutingFailures)
 	assert.Equal(t, int64(2), payload.Canary.Attempts)
 	assert.Equal(t, int64(250), payload.Canary.ExpectedPlatformCostNanoUSD)
 	sketch, err := routingdistribution.DecodeDurationSketch(
@@ -202,6 +202,15 @@ func TestCanaryWindowRejectsInvalidOutcomeAndTamperedCheckpoint(t *testing.T) {
 		CompletedAt: clock.Now(), Success: true, Attempts: 1,
 	})
 	assert.ErrorIs(t, err, ErrCanaryWindowInvalid, "TTL shorter than window plus lateness must be rejected")
+	validTTL, err := NewCanaryWindowAggregator(CanaryWindowAggregatorConfig{
+		MaxEntries: 2, Shards: 1, TTL: 2 * time.Hour, Clock: clock,
+	})
+	require.NoError(t, err)
+	err = validTTL.Record(CanaryLogicalOutcome{
+		Identity: identity, Cohort: model.RoutingDecisionCohortCanary,
+		CompletedAt: clock.Now(), RoutingFailure: true, Attempts: 1,
+	})
+	assert.ErrorIs(t, err, ErrCanaryWindowInvalid, "routing failures must not contain an upstream attempt")
 
 	payload := CanaryCohortWindowCheckpoint{
 		SchemaVersion: canaryCohortWindowSchemaVersion,

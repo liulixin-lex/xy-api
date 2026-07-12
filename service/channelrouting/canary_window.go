@@ -635,6 +635,7 @@ func validCanaryLogicalOutcome(outcome CanaryLogicalOutcome) bool {
 	if !validCanaryWindowIdentity(identity) || outcome.CompletedAt.IsZero() ||
 		(outcome.Cohort != model.RoutingDecisionCohortControl && outcome.Cohort != model.RoutingDecisionCohortCanary) ||
 		outcome.Attempts < 0 || (!outcome.RoutingFailure && outcome.Attempts == 0) ||
+		(outcome.RoutingFailure && outcome.Attempts != 0) ||
 		outcome.ExpectedPlatformCostNanoUSD < 0 || (!outcome.CostKnown && outcome.ExpectedPlatformCostNanoUSD != 0) ||
 		outcome.ClientTTFTMilliseconds < 0 || (outcome.Success && outcome.RoutingFailure) {
 		return false

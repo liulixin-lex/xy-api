@@ -94,7 +94,7 @@ func PrepareChannelRoutingCanarySelection(c *gin.Context, selection ChannelRouti
 	state.mu.Unlock()
 
 	if previous != nil {
-		return recordChannelRoutingCanaryOutcomeUnit(previous, false, true, 0, time.Now())
+		return recordChannelRoutingCanaryOutcomeUnit(previous, false, previous.attempts == 0, 0, time.Now())
 	}
 	return nil
 }

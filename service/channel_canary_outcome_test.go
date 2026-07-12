@@ -80,53 +80,72 @@ func TestChannelRoutingCanaryOutcomeTracksAttemptsCostAndClientTTFT(t *testing.T
 	assert.Equal(t, int64(1), payload.Canary.TTFTSampleCount)
 }
 
-func TestChannelRoutingCanaryOutcomeCrossPoolClosesPriorUnitAsFailure(t *testing.T) {
-	truncate(t)
-	clock := &canaryOutcomeTestClock{now: time.Now().Truncate(time.Second)}
-	aggregator, err := channelrouting.NewCanaryWindowAggregator(channelrouting.CanaryWindowAggregatorConfig{
-		MaxEntries: 8, Shards: 4, TTL: 2 * time.Hour, Clock: clock,
-	})
-	require.NoError(t, err)
-	channelrouting.ResetCanaryWindowAggregatorForTest(aggregator)
-	t.Cleanup(func() { channelrouting.ResetCanaryWindowAggregatorForTest() })
-	require.NoError(t, model.DB.AutoMigrate(&model.RoutingRuntimeCheckpoint{}))
+func TestChannelRoutingCanaryOutcomeCrossUnitPreservesAttemptAndRoutingFailureSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		crossRollout       bool
+		startAttempt       bool
+		wantAttempts       int64
+		wantRoutingFailure int64
+	}{
+		{name: "cross pool after attempt", startAttempt: true, wantAttempts: 1},
+		{name: "cross rollout after attempt", crossRollout: true, startAttempt: true, wantAttempts: 1},
+		{name: "cross pool before attempt", wantRoutingFailure: 1},
+		{name: "cross rollout before attempt", crossRollout: true, wantRoutingFailure: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			truncate(t)
+			clock := &canaryOutcomeTestClock{now: time.Now().Truncate(time.Second)}
+			aggregator, err := channelrouting.NewCanaryWindowAggregator(channelrouting.CanaryWindowAggregatorConfig{
+				MaxEntries: 4, Shards: 2, TTL: 2 * time.Hour, Clock: clock,
+			})
+			require.NoError(t, err)
+			channelrouting.ResetCanaryWindowAggregatorForTest(aggregator)
+			t.Cleanup(func() { channelrouting.ResetCanaryWindowAggregatorForTest() })
+			require.NoError(t, model.DB.AutoMigrate(&model.RoutingRuntimeCheckpoint{}))
 
-	firstGate := channelrouting.CanaryGate{
-		PoolID: 29, ActivationID: 401, PolicyRevision: 11, TrafficBasisPoints: 100,
-		Bucket: 0, InCanary: true, RolloutKey: channelrouting.RolloutKey(strings.Repeat("a", 64)),
-	}
-	secondGate := firstGate
-	secondGate.PoolID = 30
-	secondGate.RolloutKey = channelrouting.RolloutKey(strings.Repeat("b", 64))
-	ctx, _ := gin.CreateTestContext(nil)
-	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
-		Gate: firstGate, WindowSeconds: 60, LatenessSeconds: 5,
-	}))
-	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
-	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
-	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
-		Gate: secondGate, WindowSeconds: 60, LatenessSeconds: 5,
-	}))
-	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
-	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
-	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 80, clock.Now()))
+			firstGate := channelrouting.CanaryGate{
+				PoolID: 29, ActivationID: 401, PolicyRevision: 11, TrafficBasisPoints: 100,
+				Bucket: 0, InCanary: true, RolloutKey: channelrouting.RolloutKey(strings.Repeat("a", 64)),
+			}
+			secondGate := firstGate
+			secondGate.RolloutKey = channelrouting.RolloutKey(strings.Repeat("b", 64))
+			if test.crossRollout {
+				secondGate.ActivationID++
+				secondGate.PolicyRevision++
+			} else {
+				secondGate.PoolID++
+			}
 
-	clock.Advance(2 * time.Minute)
-	flushed, err := channelrouting.FlushCanaryOutcomeCheckpointsContext(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, 2, flushed)
-	var checkpoints []model.RoutingRuntimeCheckpoint
-	require.NoError(t, model.DB.Where("checkpoint_kind = ?", channelrouting.CanaryCohortWindowCheckpointKind).Find(&checkpoints).Error)
-	require.Len(t, checkpoints, 2)
-	byPool := make(map[int]channelrouting.CanaryCohortWindowCheckpoint, 2)
-	for index := range checkpoints {
-		payload, decodeErr := channelrouting.DecodeCanaryCohortWindowCheckpoint(checkpoints[index])
-		require.NoError(t, decodeErr)
-		byPool[payload.PoolID] = payload
+			ctx, _ := gin.CreateTestContext(nil)
+			require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
+				Gate: firstGate, WindowSeconds: 60, LatenessSeconds: 5,
+			}))
+			if test.startAttempt {
+				require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+				require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
+			}
+			require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
+				Gate: secondGate, WindowSeconds: 60, LatenessSeconds: 5,
+			}))
+			require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, clock.Now()))
+
+			clock.Advance(2 * time.Minute)
+			flushed, err := channelrouting.FlushCanaryOutcomeCheckpointsContext(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, 1, flushed)
+			var checkpoint model.RoutingRuntimeCheckpoint
+			require.NoError(t, model.DB.Where(
+				"checkpoint_kind = ?", channelrouting.CanaryCohortWindowCheckpointKind,
+			).First(&checkpoint).Error)
+			payload, err := channelrouting.DecodeCanaryCohortWindowCheckpoint(checkpoint)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), payload.Canary.LogicalRequests)
+			assert.Equal(t, int64(1), payload.Canary.Failures)
+			assert.Equal(t, test.wantAttempts, payload.Canary.Attempts)
+			assert.Equal(t, test.wantRoutingFailure, payload.Canary.RoutingFailures)
+		})
 	}
-	assert.Equal(t, int64(1), byPool[29].Canary.Failures)
-	assert.Equal(t, int64(1), byPool[29].Canary.RoutingFailures)
-	assert.Equal(t, int64(1), byPool[30].Canary.Successes)
 }
 
 func TestChannelRoutingCanaryOutcomeIgnoresCallerOwnedResult(t *testing.T) {
