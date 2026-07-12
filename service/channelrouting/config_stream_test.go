@@ -159,10 +159,16 @@ func TestRoutingConfigColdNodeAcceptsDatabaseRevisionAheadOfStreamEvent(t *testi
 	refreshRoutingConfigSnapshot = func(context.Context) (SnapshotView, error) {
 		refreshCalls++
 		metadataAvailable = true
-		return SnapshotView{Revision: 5, PolicyHash: policyHash}, nil
+		return SnapshotView{
+			Revision: 5, PolicyHash: policyHash, ActivationID: 71,
+			ActivationStage: model.RoutingDeploymentStageCanary, TrafficBasisPoints: 250,
+		}, nil
 	}
 	loadRoutingConfigSnapshotMetadata = func() (SnapshotMetadata, bool) {
-		return SnapshotMetadata{Revision: 5, PolicyHash: policyHash}, metadataAvailable
+		return SnapshotMetadata{
+			Revision: 5, PolicyHash: policyHash, ActivationID: 71,
+			ActivationStage: model.RoutingDeploymentStageCanary, TrafficBasisPoints: 250,
+		}, metadataAvailable
 	}
 	stub := &routingConfigRedisStub{readMessages: []redis.XMessage{message}}
 	withRoutingConfigRedis(t, stub)
@@ -181,10 +187,16 @@ func TestRoutingConfigColdNodeAcceptsDatabaseRevisionAheadOfStreamEvent(t *testi
 	require.NoError(t, err)
 	assert.Equal(t, int64(5), checkpoint.PolicyRevision)
 	var payload struct {
-		PolicyHash string `json:"policy_hash"`
+		PolicyHash         string `json:"policy_hash"`
+		ActivationID       int64  `json:"activation_id"`
+		ActivationStage    string `json:"activation_stage"`
+		TrafficBasisPoints int    `json:"traffic_basis_points"`
 	}
 	require.NoError(t, checkpoint.DecodePayload(&payload))
 	assert.Equal(t, policyHash, payload.PolicyHash)
+	assert.Equal(t, int64(71), payload.ActivationID)
+	assert.Equal(t, model.RoutingDeploymentStageCanary, payload.ActivationStage)
+	assert.Equal(t, 250, payload.TrafficBasisPoints)
 }
 
 func TestRoutingConfigRejectsCorruptEventAndAdvancesPastPoisonMessage(t *testing.T) {

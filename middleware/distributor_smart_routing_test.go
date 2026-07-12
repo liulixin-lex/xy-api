@@ -209,6 +209,39 @@ func TestSetupContextForSelectedChannelPublishesStableRoutingIdentity(t *testing
 	assert.Zero(t, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID))
 }
 
+func TestSetupContextForSelectedChannelPreservesPinnedRoutingIdentity(t *testing.T) {
+	db := openDistributorRoutingIdentityDB(t)
+	withDistributorRoutingIdentityState(t, db)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 9210, Name: "pinned-identity-channel", Key: "stable-key", Group: "vip", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	currentIdentity, ok := channelrouting.ResolveIdentity("vip", 9210, "stable-key")
+	require.True(t, ok)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "vip")
+	service.SetSelectedRoutingIdentity(ctx, service.SelectedRoutingIdentity{
+		ChannelID:        9210,
+		SnapshotRevision: currentIdentity.SnapshotRevision + 10,
+		PoolID:           currentIdentity.PoolID,
+		MemberID:         currentIdentity.MemberID,
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: false})
+	errResult := SetupContextForSelectedChannel(ctx, &model.Channel{
+		Id: 9210, Name: "pinned-identity-channel", Key: "stable-key",
+	}, "gpt-test")
+
+	require.Nil(t, errResult)
+	assert.Equal(t, currentIdentity.SnapshotRevision+10, routingSnapshotRevisionFromContext(t, ctx))
+	assert.Equal(t, currentIdentity.PoolID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingPoolID))
+	assert.Equal(t, currentIdentity.MemberID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingMemberID))
+	assert.Equal(t, currentIdentity.CredentialID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID))
+}
+
 func openDistributorRoutingIdentityDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

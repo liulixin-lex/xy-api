@@ -129,6 +129,79 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 	}
 }
 
+func TestSyncLegacyRoutingPolicyNormalizesHistoricalNonCanaryTraffic(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 904, Name: "normalize-traffic", Group: "default", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	initial, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(
+		"UPDATE routing_policy_activations SET traffic_basis_points = 250 WHERE id = ?",
+		initial.CurrentActivationID,
+	).Error)
+
+	healed, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, initial.CurrentRevision+1, healed.CurrentRevision)
+	var activation model.RoutingPolicyActivation
+	require.NoError(t, db.Where("id = ?", healed.CurrentActivationID).First(&activation).Error)
+	assert.Equal(t, model.RoutingDeploymentStageObserve, activation.Stage)
+	assert.Zero(t, activation.TrafficBasisPoints)
+	assert.Equal(t, legacyRoutingPolicyNormalizeActivationReason, activation.Reason)
+}
+
+func TestSyncLegacyRoutingPolicySafelyDowngradesHistoricalInvalidCanary(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 905, Name: "downgrade-canary", Group: "default", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	initial, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, initial.CurrentRevision)
+	require.NoError(t, err)
+	document.Pools[0].DeploymentStage = model.RoutingDeploymentStageCanary
+	canary, err := model.PublishRoutingPolicyRevisionDBContext(
+		context.Background(),
+		db,
+		initial.CurrentRevision,
+		document,
+		model.RoutingPolicyActivationSpec{
+			Stage:              model.RoutingDeploymentStageCanary,
+			TrafficBasisPoints: 100,
+			ActorID:            7,
+			Reason:             "historical_canary",
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(
+		"UPDATE routing_policy_activations SET traffic_basis_points = 0 WHERE id = ?",
+		canary.Activation.ID,
+	).Error)
+
+	healed, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, canary.Revision.Revision+1, healed.CurrentRevision)
+	var activation model.RoutingPolicyActivation
+	require.NoError(t, db.Where("id = ?", healed.CurrentActivationID).First(&activation).Error)
+	assert.Equal(t, model.RoutingDeploymentStageShadow, activation.Stage)
+	assert.Zero(t, activation.TrafficBasisPoints)
+	assert.Equal(t, legacyRoutingPolicyCanarySafetyDowngradeReason, activation.Reason)
+	healedDocument, healedRevision, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, healed.CurrentRevision)
+	require.NoError(t, err)
+	require.Len(t, healedDocument.Pools, 1)
+	assert.Equal(t, model.RoutingDeploymentStageShadow, healedDocument.Pools[0].DeploymentStage)
+	assert.Equal(t, legacyRoutingPolicyCanarySafetyDowngradeReason, healedRevision.Reason)
+}
+
 func TestPolicySyncAndSnapshotUseProvidedDatabase(t *testing.T) {
 	target := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, target)

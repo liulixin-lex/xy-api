@@ -241,9 +241,13 @@ func initializeRoutingConfigCursorContext(ctx context.Context, client routingCon
 	}
 	view := SnapshotView{}
 	metadata, available := loadRoutingConfigSnapshotMetadata()
-	if available && int64(metadata.Revision) == head.CurrentRevision && metadata.PolicyHash == head.CurrentHash {
+	if available && int64(metadata.Revision) == head.CurrentRevision && metadata.PolicyHash == head.CurrentHash &&
+		metadata.ActivationID == head.CurrentActivationID && metadata.ActivationStage == head.CurrentStage {
 		view.Revision = metadata.Revision
 		view.PolicyHash = metadata.PolicyHash
+		view.ActivationID = metadata.ActivationID
+		view.ActivationStage = metadata.ActivationStage
+		view.TrafficBasisPoints = metadata.TrafficBasisPoints
 	} else if head.CurrentRevision > 0 || head.CurrentHash != "" {
 		view, err = refreshRoutingConfigSnapshot(ctx)
 		if err != nil {
@@ -339,8 +343,14 @@ func persistRoutingConfigCheckpointContext(ctx context.Context, cursor string, r
 	sequence := routingConfigState.nextSequence()
 	now := common.GetTimestamp()
 	policyHash := ""
+	activationID := int64(0)
+	activationStage := ""
+	trafficBasisPoints := 0
 	if metadata, ok := loadRoutingConfigSnapshotMetadata(); ok && int64(metadata.Revision) == revision {
 		policyHash = metadata.PolicyHash
+		activationID = metadata.ActivationID
+		activationStage = metadata.ActivationStage
+		trafficBasisPoints = metadata.TrafficBasisPoints
 	}
 	checkpoint, err := model.NewRoutingRuntimeCheckpoint(
 		NodeEpochID(),
@@ -348,7 +358,13 @@ func persistRoutingConfigCheckpointContext(ctx context.Context, cursor string, r
 		RoutingConfigCheckpointScope,
 		revision,
 		sequence,
-		map[string]any{"cursor": cursor, "policy_hash": policyHash},
+		map[string]any{
+			"cursor":               cursor,
+			"policy_hash":          policyHash,
+			"activation_id":        activationID,
+			"activation_stage":     activationStage,
+			"traffic_basis_points": trafficBasisPoints,
+		},
 		now,
 		now+int64(routingConfigCheckpointTTL/time.Second),
 	)

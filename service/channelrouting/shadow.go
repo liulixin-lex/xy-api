@@ -20,6 +20,7 @@ import (
 
 const (
 	DecisionAlgorithmShadowV1  = "channel-routing-shadow-v1"
+	DecisionAlgorithmCanaryV1  = model.RoutingDecisionAlgorithmCanaryV1
 	MaxShadowCandidates        = model.RoutingPolicyMaxMembersPerPool
 	shadowReplaySchemaVersion  = 1
 	shadowProfileSchemaVersion = 1
@@ -131,14 +132,17 @@ type ShadowCapacityInput struct {
 }
 
 type ShadowCandidateInput struct {
-	PoolMemberID int                  `json:"pool_member_id"`
-	ChannelID    int                  `json:"channel_id"`
-	Priority     int64                `json:"priority"`
-	Weight       uint                 `json:"weight"`
-	Metric       *ShadowMetricInput   `json:"metric,omitempty"`
-	Cost         *ShadowCostInput     `json:"cost,omitempty"`
-	Breaker      *ShadowBreakerInput  `json:"breaker,omitempty"`
-	Capacity     *ShadowCapacityInput `json:"capacity,omitempty"`
+	PoolMemberID           int                  `json:"pool_member_id"`
+	ChannelID              int                  `json:"channel_id"`
+	CredentialID           int                  `json:"credential_id,omitempty"`
+	Priority               int64                `json:"priority"`
+	Weight                 uint                 `json:"weight"`
+	Metric                 *ShadowMetricInput   `json:"metric,omitempty"`
+	Cost                   *ShadowCostInput     `json:"cost,omitempty"`
+	Breaker                *ShadowBreakerInput  `json:"breaker,omitempty"`
+	Capacity               *ShadowCapacityInput `json:"capacity,omitempty"`
+	SlowStartFactor        float64              `json:"slow_start_factor,omitempty"`
+	RequestExclusionReason string               `json:"request_exclusion_reason,omitempty"`
 }
 
 type ShadowReplayInput struct {
@@ -155,15 +159,16 @@ type ShadowReplayInput struct {
 }
 
 type ShadowReplayResult struct {
-	SelectedChannelID int                 `json:"selected_channel_id"`
-	SelectedMemberID  int                 `json:"selected_member_id"`
-	SelectedCost      float64             `json:"selected_cost"`
-	SelectedCostKnown bool                `json:"selected_cost_known"`
-	FilteredOpen      int                 `json:"filtered_open"`
-	FilteredCapacity  int                 `json:"filtered_capacity"`
-	BreakerBypassed   bool                `json:"breaker_bypassed"`
-	Ranked            []DecisionCandidate `json:"ranked"`
-	Candidates        []DecisionCandidate `json:"candidates"`
+	SelectedChannelID    int                 `json:"selected_channel_id"`
+	SelectedMemberID     int                 `json:"selected_member_id"`
+	SelectedCredentialID int                 `json:"selected_credential_id"`
+	SelectedCost         float64             `json:"selected_cost"`
+	SelectedCostKnown    bool                `json:"selected_cost_known"`
+	FilteredOpen         int                 `json:"filtered_open"`
+	FilteredCapacity     int                 `json:"filtered_capacity"`
+	BreakerBypassed      bool                `json:"breaker_bypassed"`
+	Ranked               []DecisionCandidate `json:"ranked"`
+	Candidates           []DecisionCandidate `json:"candidates"`
 }
 
 func NewRequestProfile(
@@ -213,13 +218,17 @@ func (profile RequestProfile) Hash() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func DeriveShadowSeed(requestID string, policyRevision uint64, retryIndex int) (int64, error) {
+func DeriveDecisionSeed(requestID string, policyRevision uint64, retryIndex int) (int64, error) {
 	if !validShadowText(requestID, 64) || strings.TrimSpace(requestID) == "" || policyRevision == 0 || retryIndex < 0 {
 		return 0, ErrShadowReplayInvalid
 	}
 	payload := fmt.Sprintf("channel-routing-shadow-seed:v1\x00%s\x00%d\x00%d", requestID, policyRevision, retryIndex)
 	sum := sha256.Sum256([]byte(payload))
 	return int64(binary.BigEndian.Uint64(sum[:8])), nil
+}
+
+func DeriveShadowSeed(requestID string, policyRevision uint64, retryIndex int) (int64, error) {
+	return DeriveDecisionSeed(requestID, policyRevision, retryIndex)
 }
 
 // CaptureShadowReplayRequest reads one immutable runtime snapshot and derives
@@ -257,7 +266,7 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 	if err != nil {
 		return ShadowReplayInput{}, true, err
 	}
-	seed, err := DeriveShadowSeed(request.RequestID, snapshot.view.Revision, request.RetryIndex)
+	seed, err := DeriveDecisionSeed(request.RequestID, snapshot.view.Revision, request.RetryIndex)
 	if err != nil {
 		return ShadowReplayInput{}, true, err
 	}
@@ -436,9 +445,52 @@ func BuildShadowReplayInput(
 	settings routingselector.Settings,
 	candidates []ShadowCandidateInput,
 ) (ShadowReplayInput, error) {
+	return buildDecisionReplayInput(
+		DecisionAlgorithmShadowV1,
+		poolID,
+		policyRevision,
+		runtimeGeneration,
+		policyHash,
+		profile,
+		settings,
+		candidates,
+	)
+}
+
+func BuildCanaryReplayInput(
+	poolID int,
+	policyRevision uint64,
+	runtimeGeneration uint64,
+	policyHash string,
+	profile RequestProfile,
+	settings routingselector.Settings,
+	candidates []ShadowCandidateInput,
+) (ShadowReplayInput, error) {
+	return buildDecisionReplayInput(
+		DecisionAlgorithmCanaryV1,
+		poolID,
+		policyRevision,
+		runtimeGeneration,
+		policyHash,
+		profile,
+		settings,
+		candidates,
+	)
+}
+
+func buildDecisionReplayInput(
+	algorithmVersion string,
+	poolID int,
+	policyRevision uint64,
+	runtimeGeneration uint64,
+	policyHash string,
+	profile RequestProfile,
+	settings routingselector.Settings,
+	candidates []ShadowCandidateInput,
+) (ShadowReplayInput, error) {
 	input := ShadowReplayInput{
 		SchemaVersion:     shadowReplaySchemaVersion,
-		AlgorithmVersion:  DecisionAlgorithmShadowV1,
+		AlgorithmVersion:  algorithmVersion,
 		PoolID:            poolID,
 		PolicyRevision:    policyRevision,
 		RuntimeGeneration: runtimeGeneration,
@@ -474,6 +526,9 @@ func shadowCandidateFromSnapshot(
 		ChannelID:    member.ChannelID,
 		Priority:     member.LegacyPriority,
 		Weight:       uint(member.LegacyWeight),
+	}
+	if len(member.CredentialIDs) == 1 {
+		candidate.CredentialID = member.CredentialIDs[0]
 	}
 	if observation.MetricKnown || observation.Inflight > 0 {
 		candidate.Metric = &ShadowMetricInput{
@@ -614,19 +669,31 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 	if err := input.Validate(); err != nil {
 		return ShadowReplayResult{}, err
 	}
-	if input.AlgorithmVersion != DecisionAlgorithmShadowV1 {
+	if !supportedDecisionAlgorithm(input.AlgorithmVersion) {
 		return ShadowReplayResult{}, ErrShadowReplayAlgorithm
 	}
 
 	candidates := make([]routingselector.Candidate, 0, len(input.Candidates))
 	memberByChannel := make(map[int]int, len(input.Candidates))
+	credentialByChannel := make(map[int]int, len(input.Candidates))
 	costByChannel := make(map[int]ShadowCostInput, len(input.Candidates))
 	for index := range input.Candidates {
 		candidate := input.Candidates[index]
+		memberByChannel[candidate.ChannelID] = candidate.PoolMemberID
+		credentialByChannel[candidate.ChannelID] = candidate.CredentialID
+		if candidate.Cost != nil {
+			costByChannel[candidate.ChannelID] = *candidate.Cost
+		}
+		if candidate.RequestExclusionReason != "" {
+			continue
+		}
 		priority := candidate.Priority
 		weight := candidate.Weight
 		selectorCandidate := routingselector.Candidate{
 			Channel: &model.Channel{Id: candidate.ChannelID, Priority: &priority, Weight: &weight},
+		}
+		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 {
+			selectorCandidate.ScoreMultiplier = candidate.SlowStartFactor
 		}
 		if candidate.Metric != nil {
 			selectorCandidate.Metric = &routingselector.MetricSnapshot{
@@ -644,7 +711,6 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 			selectorCandidate.Cost = &routingselector.CostSnapshot{
 				Known: candidate.Cost.Known, Cost: candidate.Cost.Cost, UpdatedUnix: candidate.Cost.UpdatedUnix,
 			}
-			costByChannel[candidate.ChannelID] = *candidate.Cost
 		}
 		if candidate.Breaker != nil {
 			selectorCandidate.Breaker = &routingselector.BreakerSnapshot{
@@ -662,7 +728,6 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 			}
 		}
 		candidates = append(candidates, selectorCandidate)
-		memberByChannel[candidate.ChannelID] = candidate.PoolMemberID
 	}
 
 	decision := routingselector.SelectRankedFromCandidates(candidates, input.Settings.selectorSettings())
@@ -708,6 +773,7 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 	if decision.Selected != nil && decision.Selected.Channel != nil {
 		result.SelectedChannelID = decision.Selected.Channel.Id
 		result.SelectedMemberID = memberByChannel[result.SelectedChannelID]
+		result.SelectedCredentialID = credentialByChannel[result.SelectedChannelID]
 		if cost, ok := costByChannel[result.SelectedChannelID]; ok && shadowCostKnown(&cost, input.Settings) {
 			result.SelectedCostKnown = true
 			result.SelectedCost = cost.Cost
@@ -744,7 +810,7 @@ func ClassifyShadowDifference(actualChannelID int, replay ShadowReplayResult) st
 
 func ReplayDecisionAudit(audit model.RoutingDecisionAudit) (ShadowReplayResult, error) {
 	if !audit.Replayable || audit.PoolID <= 0 || audit.SnapshotRevision <= 0 ||
-		audit.RuntimeGeneration <= 0 || audit.AlgorithmVersion != DecisionAlgorithmShadowV1 {
+		audit.RuntimeGeneration <= 0 || !supportedDecisionAlgorithm(audit.AlgorithmVersion) {
 		return ShadowReplayResult{}, ErrShadowReplayAudit
 	}
 	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
@@ -761,7 +827,7 @@ func ReplayDecisionAudit(audit model.RoutingDecisionAudit) (ShadowReplayResult, 
 	if err := input.Validate(); err != nil {
 		return ShadowReplayResult{}, err
 	}
-	expectedSeed, err := DeriveShadowSeed(audit.RequestID, uint64(audit.SnapshotRevision), audit.RetryIndex)
+	expectedSeed, err := DeriveDecisionSeed(audit.RequestID, uint64(audit.SnapshotRevision), audit.RetryIndex)
 	if err != nil || input.PoolID != audit.PoolID || input.PolicyRevision != uint64(audit.SnapshotRevision) ||
 		input.RuntimeGeneration != uint64(audit.RuntimeGeneration) || input.PolicyHash != audit.PolicyHash ||
 		input.SnapshotHash != audit.SnapshotHash || input.AlgorithmVersion != audit.AlgorithmVersion ||
@@ -799,6 +865,15 @@ func ReplayDecisionAudit(audit model.RoutingDecisionAudit) (ShadowReplayResult, 
 		audit.ObservedMatchesActual != (result.SelectedChannelID > 0 && result.SelectedChannelID == audit.ActualChannelID) {
 		return ShadowReplayResult{}, ErrShadowReplayAudit
 	}
+	if audit.ExclusionSummaryJSON != "" {
+		expectedSummary, summaryErr := marshalDecisionExclusionSummary(result.Candidates)
+		if summaryErr != nil || string(expectedSummary) != audit.ExclusionSummaryJSON {
+			return ShadowReplayResult{}, ErrShadowReplayAudit
+		}
+	}
+	if audit.AlgorithmVersion == DecisionAlgorithmCanaryV1 && !validCanaryDecisionAudit(audit, result) {
+		return ShadowReplayResult{}, ErrShadowReplayAudit
+	}
 	var stored struct {
 		Truncated  bool                `json:"truncated"`
 		Candidates []DecisionCandidate `json:"candidates"`
@@ -815,7 +890,48 @@ func ReplayDecisionAudit(audit model.RoutingDecisionAudit) (ShadowReplayResult, 
 	return result, nil
 }
 
+func validCanaryDecisionAudit(audit model.RoutingDecisionAudit, result ShadowReplayResult) bool {
+	gate, err := EvaluateCanaryGate(
+		audit.PoolID,
+		audit.ActivationID,
+		uint64(audit.SnapshotRevision),
+		audit.RequestID,
+		audit.TrafficBasisPoints,
+	)
+	if err != nil || audit.ActivationStage != model.RoutingDeploymentStageCanary ||
+		audit.CanaryBucket != gate.Bucket || audit.RolloutKey != string(gate.RolloutKey) ||
+		audit.Cohort != model.RoutingDecisionCohortCanary || !gate.InCanary || audit.ExclusionSummaryJSON == "" ||
+		audit.ActualChannelID != result.SelectedChannelID || audit.ObservedChannelID != result.SelectedChannelID ||
+		audit.SelectedMemberID != result.SelectedMemberID || audit.SelectedCredentialID != result.SelectedCredentialID {
+		return false
+	}
+	if result.SelectedChannelID <= 0 {
+		return audit.SelectedMemberID == 0 && audit.SelectedCredentialID == 0 &&
+			audit.ReservationMode == "" && audit.ReservationRPM == 0 && audit.ReservationInputTPM == 0 &&
+			audit.ReservationOutputTPM == 0 && audit.ReservationInflight == 0 && audit.ReservationLimitRPM == 0 &&
+			audit.ReservationLimitInputTPM == 0 && audit.ReservationLimitOutputTPM == 0 && audit.ReservationLimitInflight == 0
+	}
+	admission := CapacityAdmission{
+		Mode: CapacityMode(audit.ReservationMode),
+		Key:  CapacityKey{PoolID: audit.PoolID, MemberID: audit.SelectedMemberID, Model: audit.ModelName},
+		Demand: Demand{
+			RPM: audit.ReservationRPM, InputTPM: audit.ReservationInputTPM,
+			OutputTPM: audit.ReservationOutputTPM, Inflight: audit.ReservationInflight,
+		},
+		Limit: Limit{
+			RPM: audit.ReservationLimitRPM, InputTPM: audit.ReservationLimitInputTPM,
+			OutputTPM: audit.ReservationLimitOutputTPM, Inflight: audit.ReservationLimitInflight,
+		},
+	}
+	return admission.Mode == CapacityModeLocalSoft && validCapacityKey(admission.Key) && validDemand(admission.Demand) &&
+		validLimit(admission.Limit) && limitCoversDemand(admission.Limit, admission.Demand) &&
+		!exceedsLimit(admission.Demand, admission.Limit)
+}
+
 func shadowExclusionReason(candidate ShadowCandidateInput, settings ShadowSelectorSettings) string {
+	if candidate.RequestExclusionReason != "" {
+		return candidate.RequestExclusionReason
+	}
 	if candidate.Capacity != nil && candidate.Capacity.CooldownUntilUnixMilli > settings.NowUnixMilli {
 		return "capacity_cooldown"
 	}
@@ -862,7 +978,7 @@ func shadowCostKnown(cost *ShadowCostInput, settings ShadowSelectorSettings) boo
 }
 
 func (input ShadowReplayInput) validateWithoutHash() error {
-	if input.SchemaVersion != shadowReplaySchemaVersion || input.AlgorithmVersion != DecisionAlgorithmShadowV1 ||
+	if input.SchemaVersion != shadowReplaySchemaVersion || !supportedDecisionAlgorithm(input.AlgorithmVersion) ||
 		input.PoolID <= 0 || input.PolicyRevision == 0 || input.RuntimeGeneration == 0 || !validShadowHash(input.PolicyHash) ||
 		len(input.Candidates) > MaxShadowCandidates || input.Profile.Validate() != nil ||
 		input.Settings.NowUnix <= 0 || input.Settings.NowUnixMilli <= 0 || !validShadowSettings(input.Settings) {
@@ -920,6 +1036,12 @@ func (input ShadowReplayInput) computeHash() (string, error) {
 }
 
 func validShadowCandidate(candidate ShadowCandidateInput) bool {
+	if candidate.CredentialID < 0 || !finiteShadowNumber(candidate.SlowStartFactor) ||
+		candidate.SlowStartFactor < 0 || candidate.SlowStartFactor > 1 ||
+		!validShadowText(candidate.RequestExclusionReason, MaxDecisionReasonRunes) ||
+		(candidate.RequestExclusionReason != "" && strings.TrimSpace(candidate.RequestExclusionReason) != candidate.RequestExclusionReason) {
+		return false
+	}
 	if candidate.Metric != nil {
 		values := []int64{
 			candidate.Metric.RequestCount, candidate.Metric.SuccessCount,
@@ -948,6 +1070,10 @@ func validShadowCandidate(candidate ShadowCandidateInput) bool {
 	}
 	return candidate.Capacity == nil || (candidate.Capacity.SourceStatusCode >= 0 &&
 		candidate.Capacity.CooldownUntilUnixMilli >= 0 && candidate.Capacity.UpdatedUnixMilli >= 0)
+}
+
+func supportedDecisionAlgorithm(algorithmVersion string) bool {
+	return algorithmVersion == DecisionAlgorithmShadowV1 || algorithmVersion == DecisionAlgorithmCanaryV1
 }
 
 func shadowSettingsFromSelector(settings routingselector.Settings) ShadowSelectorSettings {

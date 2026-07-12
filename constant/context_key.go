@@ -55,6 +55,9 @@ const (
 	ContextKeyRoutingHalfOpenLeases   ContextKey = "routing_half_open_leases"
 	ContextKeyRoutingPromptProxy      ContextKey = "routing_prompt_proxy"
 	ContextKeyRoutingEstimatedOutput  ContextKey = "routing_estimated_output"
+	ContextKeyRoutingSelectedIdentity ContextKey = "routing_selected_identity"
+	ContextKeyRoutingCapacityReserve  ContextKey = "routing_capacity_reservation"
+	ContextKeyRoutingSessionSet       ContextKey = "routing_session_set"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"

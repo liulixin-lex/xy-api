@@ -13,11 +13,12 @@ const (
 )
 
 type Candidate struct {
-	Channel  *model.Channel
-	Metric   *MetricSnapshot
-	Cost     *CostSnapshot
-	Breaker  *BreakerSnapshot
-	Capacity *CapacityCooldownSnapshot
+	Channel         *model.Channel
+	Metric          *MetricSnapshot
+	Cost            *CostSnapshot
+	Breaker         *BreakerSnapshot
+	Capacity        *CapacityCooldownSnapshot
+	ScoreMultiplier float64
 }
 
 type MetricSnapshot struct {
@@ -96,6 +97,7 @@ type RankedCandidate struct {
 	Degraded        bool
 	Open            bool
 	Inflight        int64
+	ScoreMultiplier float64
 	originalIndex   int
 	healthSortOrder int
 }

@@ -56,6 +56,63 @@ func TestShadowSeedAndProfileHashAreStableAndScoped(t *testing.T) {
 	assert.Equal(t, seed, same)
 	assert.NotEqual(t, seed, retry)
 	assert.NotEqual(t, seed, revision)
+	decisionSeed, err := DeriveDecisionSeed("request-1", 9, 0)
+	require.NoError(t, err)
+	assert.Equal(t, seed, decisionSeed, "the generalized seed must preserve existing shadow replay")
+}
+
+func TestCanaryReplayAppliesSlowStartAndRequestExclusions(t *testing.T) {
+	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 0, 0)
+	require.NoError(t, err)
+	seed, err := DeriveDecisionSeed("canary-replay", 7, 0)
+	require.NoError(t, err)
+	input, err := BuildCanaryReplayInput(5, 7, 3, strings.Repeat("c", 64), profile, routingselector.Settings{
+		WeightAvailability: 1,
+		AvailabilityFloor:  0,
+		MinVolume:          0,
+		TopK:               1,
+		MaxEjectedPct:      50,
+		HalfOpenProbes:     1,
+		SnapshotStaleSec:   1_800,
+		NowUnix:            1_000,
+		NowUnixMilli:       1_000_000,
+		RandomSeed:         seed,
+	}, []ShadowCandidateInput{
+		{PoolMemberID: 11, ChannelID: 101, Priority: 10, Weight: 10, SlowStartFactor: 0.25},
+		{PoolMemberID: 12, ChannelID: 102, Priority: 100, Weight: 100, RequestExclusionReason: ExclusionReasonRequestFailed},
+		{PoolMemberID: 13, ChannelID: 103, Priority: 10, Weight: 10, SlowStartFactor: 1},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAlgorithmCanaryV1, input.AlgorithmVersion)
+
+	replay, err := RunShadowReplay(input)
+	require.NoError(t, err)
+	require.Len(t, replay.Ranked, 2)
+	assert.Equal(t, 103, replay.SelectedChannelID)
+	rankedByChannel := make(map[int]DecisionCandidate, len(replay.Ranked))
+	for _, candidate := range replay.Ranked {
+		rankedByChannel[candidate.ChannelID] = candidate
+	}
+	assert.InDelta(t, rankedByChannel[103].Score*0.25, rankedByChannel[101].Score, 0.000001)
+	for _, candidate := range replay.Candidates {
+		if candidate.ChannelID == 102 {
+			assert.False(t, candidate.Eligible)
+			assert.Equal(t, ExclusionReasonRequestFailed, candidate.ExclusionReason)
+		}
+	}
+}
+
+func TestShadowReplayJSONOmitsCanaryFieldsForLegacyHashCompatibility(t *testing.T) {
+	input := shadowReplayInputForTest(t)
+	encoded, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "slow_start_factor")
+	assert.NotContains(t, string(encoded), "request_exclusion_reason")
+
+	var decoded ShadowReplayInput
+	require.NoError(t, common.Unmarshal(encoded, &decoded))
+	require.NoError(t, decoded.Validate())
+	assert.Equal(t, input.SnapshotHash, decoded.SnapshotHash)
 }
 
 func TestClassifyShadowDifference(t *testing.T) {
@@ -265,6 +322,86 @@ func TestShadowDecisionAuditReplaysExactlyAndRejectsTampering(t *testing.T) {
 	tamperedReplay.ReplayInputJSON = string(encoded)
 	_, err = ReplayDecisionAudit(tamperedReplay)
 	assert.ErrorIs(t, err, ErrShadowReplayHash)
+}
+
+func TestCanaryDecisionAuditReplaysExactly(t *testing.T) {
+	ResetSnapshotForTest()
+	ResetDecisionAuditsForTest(4)
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		ResetDecisionAuditsForTest()
+	})
+	SetSnapshotForTest(canarySessionSnapshotForTest(11, 3, 401, 29, 101))
+	session, err := NewRequestRoutingSession("cohort-0005", "default")
+	require.NoError(t, err)
+	plan, active, err := session.Plan(RequestRoutingPlanInput{
+		RequestPath: "/v1/chat/completions",
+		ModelName:   "gpt-test",
+		RetryIndex:  1,
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	require.True(t, plan.Gate.InCanary)
+	tracker, err := NewCapacityTracker(CapacityConfig{MaxEntries: 4, IdleTTL: time.Hour, Shards: 1})
+	require.NoError(t, err)
+	reservation, err := tracker.TryReserve(
+		CapacityKey{PoolID: plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: "gpt-test"},
+		Demand{RPM: 1, InputTPM: 10, OutputTPM: 5, Inflight: 1},
+		Limit{RPM: 10, InputTPM: 100, OutputTPM: 50, Inflight: 2},
+	)
+	require.NoError(t, err)
+	admission := reservation.Admission()
+
+	_, err = EnqueueDecision(DecisionInput{
+		RequestID:         "cohort-0005",
+		PoolID:            plan.Replay.PoolID,
+		GroupName:         plan.Replay.Profile.GroupName,
+		ModelName:         plan.Replay.Profile.ModelName,
+		SnapshotRevision:  plan.Replay.PolicyRevision,
+		AlgorithmVersion:  DecisionAlgorithmCanaryV1,
+		RetryIndex:        plan.Replay.Profile.RetryIndex,
+		ActualChannelID:   plan.Result.SelectedChannelID,
+		ObservedChannelID: plan.Result.SelectedChannelID,
+		FilteredOpen:      plan.Result.FilteredOpen,
+		FilteredCapacity:  plan.Result.FilteredCapacity,
+		BreakerBypassed:   plan.Result.BreakerBypassed,
+		Candidates:        plan.Result.Candidates,
+		ReplayInput:       &plan.Replay,
+		DifferenceType:    ClassifyShadowDifference(plan.Result.SelectedChannelID, plan.Result),
+		Gate:              &plan.Gate,
+		SelectedIdentity:  plan.SelectedIdentity,
+		CapacityAdmission: &admission,
+	})
+	require.NoError(t, err)
+	audits := decisionBuffer.drain(1)
+	require.Len(t, audits, 1)
+	assert.Equal(t, DecisionAlgorithmCanaryV1, audits[0].AlgorithmVersion)
+	assert.Equal(t, plan.Gate.ActivationID, audits[0].ActivationID)
+	assert.Equal(t, string(plan.Gate.RolloutKey), audits[0].RolloutKey)
+	assert.Equal(t, model.RoutingDecisionCohortCanary, audits[0].Cohort)
+	assert.Equal(t, plan.SelectedIdentity.MemberID, audits[0].SelectedMemberID)
+	assert.Equal(t, string(CapacityModeLocalSoft), audits[0].ReservationMode)
+
+	replayed, err := ReplayDecisionAudit(audits[0])
+	require.NoError(t, err)
+	assert.Equal(t, plan.Result, replayed)
+
+	tamperedGate := audits[0]
+	tamperedGate.CanaryBucket++
+	_, err = ReplayDecisionAudit(tamperedGate)
+	assert.ErrorIs(t, err, ErrShadowReplayAudit)
+	tamperedMember := audits[0]
+	tamperedMember.SelectedMemberID++
+	_, err = ReplayDecisionAudit(tamperedMember)
+	assert.ErrorIs(t, err, ErrShadowReplayAudit)
+	tamperedCredential := audits[0]
+	tamperedCredential.SelectedCredentialID++
+	_, err = ReplayDecisionAudit(tamperedCredential)
+	assert.ErrorIs(t, err, ErrShadowReplayAudit)
+	tamperedAdmission := audits[0]
+	tamperedAdmission.ReservationLimitInflight = 0
+	_, err = ReplayDecisionAudit(tamperedAdmission)
+	assert.ErrorIs(t, err, ErrShadowReplayAudit)
 }
 
 func shadowReplayInputForTest(t *testing.T) ShadowReplayInput {

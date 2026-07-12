@@ -319,6 +319,47 @@ func TestChannelRoutingDecisionFiltersAreCaseExact(t *testing.T) {
 	assert.NotContains(t, recorder.Body.String(), lowerID)
 }
 
+func TestChannelRoutingDecisionAPIExposesAndFiltersCanaryMetadata(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	decisionID := enqueueControllerCanaryReplayAudit(t)
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, flushed)
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, db.Where("decision_id = ?", decisionID).First(&audit).Error)
+
+	target := "/api/channel-routing/v2/decisions?activation_id=401&cohort=canary&rollout_key=" + audit.RolloutKey
+	listRecorder := httptest.NewRecorder()
+	listContext, _ := gin.CreateTestContext(listRecorder)
+	listContext.Request = httptest.NewRequest(http.MethodGet, target, nil)
+	ListChannelRoutingDecisions(listContext)
+	assert.Equal(t, http.StatusOK, listRecorder.Code)
+	body := listRecorder.Body.String()
+	assert.Contains(t, body, decisionID)
+	assert.Contains(t, body, `"activation_id":401`)
+	assert.Contains(t, body, `"cohort":"canary"`)
+	assert.Contains(t, body, `"selected_identity":{"snapshot_revision":7,"pool_id":29,"member_id":11,"credential_id":1001,"channel_id":101}`)
+	assert.Contains(t, body, `"capacity_admission":{"mode":"local_soft"`)
+	assert.Contains(t, body, `"exclusion_summary":{"excluded_count":0,"reasons":[]}`)
+	assert.NotContains(t, body, "exclusion_summary_json")
+
+	detailRecorder := httptest.NewRecorder()
+	detailContext, _ := gin.CreateTestContext(detailRecorder)
+	detailContext.Params = gin.Params{{Key: "id", Value: decisionID}}
+	detailContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/decisions/"+decisionID, nil)
+	GetChannelRoutingDecision(detailContext)
+	assert.Equal(t, http.StatusOK, detailRecorder.Code)
+	assert.Contains(t, detailRecorder.Body.String(), `"rollout_key":"`+audit.RolloutKey+`"`)
+
+	filteredRecorder := httptest.NewRecorder()
+	filteredContext, _ := gin.CreateTestContext(filteredRecorder)
+	filteredContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/decisions?cohort=control", nil)
+	ListChannelRoutingDecisions(filteredContext)
+	assert.Equal(t, http.StatusOK, filteredRecorder.Code)
+	assert.NotContains(t, filteredRecorder.Body.String(), decisionID)
+}
+
 func TestChannelRoutingSnapshotAPIsReturnServiceUnavailableWhileInitializing(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)

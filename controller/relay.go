@@ -208,6 +208,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
@@ -218,10 +219,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			newAPIError = capacityErr
+			break
+		}
 
 		prepareRoutingRelayAttempt(relayInfo)
 		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
 		func() {
+			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -449,6 +456,31 @@ func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
 	info.ResetStreamAttemptState()
 }
 
+func commitRoutingCapacityAttempt(c *gin.Context) *types.NewAPIError {
+	if err := service.CommitRoutingCapacityReservation(c); err != nil {
+		cancelRoutingCapacityReservation(c)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("channel routing capacity reservation commit failed: %w", err),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	return nil
+}
+
+func cancelRoutingCapacityReservation(c *gin.Context) {
+	if err := service.CancelRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation cancel failed: %v", err))
+	}
+}
+
+func releaseRoutingCapacityReservation(c *gin.Context) {
+	if err := service.ReleaseRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation release failed: %v", err))
+	}
+}
+
 func submitRoutingTaskAttempt(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 	prepareRoutingRelayAttempt(info)
 	return relay.RelayTaskSubmit(c, info)
@@ -629,6 +661,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 	if newAPIError != nil {
+		cancelRoutingCapacityReservation(c)
 		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, info.OriginModelName, selectGroup)
 		return nil, newAPIError
 	}
@@ -875,6 +908,7 @@ func RelayTask(c *gin.Context) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
 				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusRequestEntityTooLarge)
@@ -884,9 +918,15 @@ func RelayTask(c *gin.Context) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			taskErr = service.TaskErrorWrapperLocal(capacityErr.Err, "routing_capacity_commit_failed", http.StatusServiceUnavailable)
+			break
+		}
 
 		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
 		func() {
+			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
 			result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
 		}()

@@ -95,6 +95,9 @@ func (p *RetryParam) ResetRetryNextTry() {
 //	         分组B, 优先级1
 func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
 	smartSetting := smart_routing_setting.GetSetting()
+	if channel, selectGroup, handled, err := cacheGetChannelRoutingCanary(param, smartSetting); handled {
+		return channel, selectGroup, err
+	}
 	if shouldActivateSmartRouting(smartSetting) {
 		channel, selectGroup, handled, err := cacheGetSmartSatisfiedChannel(param, smartSetting)
 		if err != nil {

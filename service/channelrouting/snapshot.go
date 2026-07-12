@@ -26,6 +26,7 @@ import (
 var (
 	ErrSnapshotLimitExceeded    = errors.New("channel routing snapshot limit exceeded")
 	ErrSnapshotPolicyReference  = errors.New("channel routing snapshot policy reference is invalid")
+	ErrSnapshotActivation       = errors.New("channel routing snapshot activation is invalid")
 	ErrSnapshotRevisionRollback = errors.New("channel routing snapshot revision cannot move backwards")
 	ErrSnapshotRevisionConflict = errors.New("channel routing snapshot revision hash conflict")
 )
@@ -90,6 +91,9 @@ type SnapshotView struct {
 	Revision              uint64            `json:"revision"`
 	RuntimeGeneration     uint64            `json:"runtime_generation"`
 	PolicyHash            string            `json:"policy_hash"`
+	ActivationID          int64             `json:"activation_id"`
+	ActivationStage       string            `json:"activation_stage"`
+	TrafficBasisPoints    int               `json:"traffic_basis_points"`
 	BuiltAtUnix           int64             `json:"built_at"`
 	BuildDurationMs       int64             `json:"build_duration_ms"`
 	AggregateP95TTFTMs    float64           `json:"aggregate_p95_ttft_ms"`
@@ -215,15 +219,16 @@ type Identity struct {
 }
 
 type runtimeSnapshot struct {
-	view                    SnapshotView
-	poolByGroup             map[string]int
-	memberByPoolChannel     map[poolChannelKey]int
-	credentialByFingerprint map[credentialFingerprintKey]int
-	modelByMemberModel      map[memberModelKey]ModelSnapshot
-	channelByID             map[int]ChannelSnapshot
-	poolIndexByID           map[int]int
-	poolSummaries           []PoolSnapshotSummary
-	telemetrySummary        TelemetryAggregate
+	view                     SnapshotView
+	poolByGroup              map[string]int
+	memberByPoolChannel      map[poolChannelKey]int
+	credentialByFingerprint  map[credentialFingerprintKey]int
+	modelByMemberModel       map[memberModelKey]ModelSnapshot
+	channelByID              map[int]ChannelSnapshot
+	poolIndexByID            map[int]int
+	memberIndexesByPoolModel map[poolModelKey][]int
+	poolSummaries            []PoolSnapshotSummary
+	telemetrySummary         TelemetryAggregate
 }
 
 type poolChannelKey struct {
@@ -239,6 +244,11 @@ type credentialFingerprintKey struct {
 type memberModelKey struct {
 	memberID int
 	model    string
+}
+
+type poolModelKey struct {
+	poolID int
+	model  string
 }
 
 type stableMetricKey struct {
@@ -348,8 +358,13 @@ func publishRuntimeSnapshot(snapshot *runtimeSnapshot) (SnapshotView, error) {
 		if snapshot.view.Revision < current.view.Revision {
 			return SnapshotView{}, ErrSnapshotRevisionRollback
 		}
-		if snapshot.view.Revision == current.view.Revision && snapshot.view.PolicyHash != current.view.PolicyHash {
-			return SnapshotView{}, ErrSnapshotRevisionConflict
+		if snapshot.view.Revision == current.view.Revision {
+			if snapshot.view.PolicyHash != current.view.PolicyHash ||
+				snapshot.view.ActivationID != current.view.ActivationID ||
+				snapshot.view.ActivationStage != current.view.ActivationStage ||
+				snapshot.view.TrafficBasisPoints != current.view.TrafficBasisPoints {
+				return SnapshotView{}, ErrSnapshotRevisionConflict
+			}
 		}
 	}
 	snapshot.view.RuntimeGeneration = snapshotRuntimeGeneration.Add(1)
@@ -466,11 +481,47 @@ func buildSnapshotContext(ctx context.Context, db *gorm.DB, limits SnapshotLimit
 		if revision.ContentHash != head.CurrentHash {
 			return model.ErrRoutingPolicyContentCorrupt
 		}
+		if head.CurrentActivationID <= 0 {
+			return fmt.Errorf("%w: policy head has no current activation", ErrSnapshotActivation)
+		}
+		var activation model.RoutingPolicyActivation
+		if err := tx.WithContext(ctx).Where("id = ?", head.CurrentActivationID).First(&activation).Error; err != nil {
+			return fmt.Errorf("%w: load current activation %d: %w", ErrSnapshotActivation, head.CurrentActivationID, err)
+		}
+		if err := validateSnapshotActivation(head, revision, activation, document); err != nil {
+			return err
+		}
 		var buildErr error
-		snapshot, buildErr = buildSnapshotWithinTransaction(ctx, tx, limits, document, revision, liveRollups)
+		snapshot, buildErr = buildSnapshotWithinTransaction(ctx, tx, limits, document, revision, activation, liveRollups)
 		return buildErr
 	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	return snapshot, err
+}
+
+func validateSnapshotActivation(
+	head model.RoutingPolicyHead,
+	revision model.RoutingPolicyRevision,
+	activation model.RoutingPolicyActivation,
+	document model.RoutingPolicyDocument,
+) error {
+	if revision.Revision != head.CurrentRevision || activation.ID != head.CurrentActivationID ||
+		activation.Revision != revision.Revision || activation.PreviousRevision != revision.ParentRevision ||
+		activation.RollbackOfRevision != revision.RollbackOfRevision || activation.Stage != head.CurrentStage {
+		return fmt.Errorf("%w: head, revision, and activation identities do not match", ErrSnapshotActivation)
+	}
+	activationSpec := model.RoutingPolicyActivationSpec{
+		Stage:              activation.Stage,
+		TrafficBasisPoints: activation.TrafficBasisPoints,
+		ActorID:            activation.ActorID,
+		Reason:             activation.Reason,
+	}
+	if err := activationSpec.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrSnapshotActivation, err)
+	}
+	if err := model.ValidateRoutingPolicyActivationDocument(document, activationSpec); err != nil {
+		return fmt.Errorf("%w: pool stage conflicts with activation stage %q", ErrSnapshotActivation, activation.Stage)
+	}
+	return nil
 }
 
 func validateSnapshotPolicyReferences(
@@ -541,6 +592,7 @@ func buildSnapshotWithinTransaction(
 	limits SnapshotLimits,
 	document model.RoutingPolicyDocument,
 	revision model.RoutingPolicyRevision,
+	activation model.RoutingPolicyActivation,
 	liveRollups []routingmetrics.StableSnapshot,
 ) (*runtimeSnapshot, error) {
 	started := time.Now()
@@ -1029,6 +1081,7 @@ metricPages:
 
 	poolViews := make([]PoolSnapshot, 0, len(pools))
 	modelByMemberModel := make(map[memberModelKey]ModelSnapshot, min(limits.MaxTotalModelSnapshots, len(members)*4))
+	memberIndexesByPoolModel := make(map[poolModelKey][]int, min(limits.MaxTotalModelSnapshots, len(members)*4))
 	membersWithTelemetry := 0
 	modelSnapshotCount := 0
 	unknownFailedAttempts := int64(0)
@@ -1052,6 +1105,7 @@ metricPages:
 			Members:         make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
 		}
 		for _, member := range membersByPool[pool.ID] {
+			memberIndex := len(poolView.Members)
 			channel := channelByID[member.ChannelID]
 			memberAssociatedChannels[channel.Id] = struct{}{}
 			if credentialRequiredByChannel[channel.Id] {
@@ -1095,6 +1149,8 @@ metricPages:
 				}
 				memberView.Models = append(memberView.Models, modelView)
 				modelByMemberModel[memberModelKey{memberID: member.ID, model: modelName}] = modelView
+				key := poolModelKey{poolID: pool.ID, model: modelName}
+				memberIndexesByPoolModel[key] = append(memberIndexesByPoolModel[key], memberIndex)
 				modelSnapshotCount++
 			}
 			if memberView.TelemetryKnown {
@@ -1149,6 +1205,9 @@ metricPages:
 	view := SnapshotView{
 		Revision:              uint64(revision.Revision),
 		PolicyHash:            revision.ContentHash,
+		ActivationID:          activation.ID,
+		ActivationStage:       activation.Stage,
+		TrafficBasisPoints:    activation.TrafficBasisPoints,
 		BuiltAtUnix:           common.GetTimestamp(),
 		BuildDurationMs:       time.Since(started).Milliseconds(),
 		AggregateP95TTFTMs:    aggregateP95TTFTMs,
@@ -1165,15 +1224,16 @@ metricPages:
 	}
 
 	return &runtimeSnapshot{
-		view:                    view,
-		poolByGroup:             poolByGroup,
-		memberByPoolChannel:     memberByPoolChannel,
-		credentialByFingerprint: credentialByFingerprint,
-		modelByMemberModel:      modelByMemberModel,
-		channelByID:             channelViewByID,
-		poolIndexByID:           poolIndexByID,
-		poolSummaries:           poolSummaries,
-		telemetrySummary:        telemetryAggregate(view),
+		view:                     view,
+		poolByGroup:              poolByGroup,
+		memberByPoolChannel:      memberByPoolChannel,
+		credentialByFingerprint:  credentialByFingerprint,
+		modelByMemberModel:       modelByMemberModel,
+		channelByID:              channelViewByID,
+		poolIndexByID:            poolIndexByID,
+		memberIndexesByPoolModel: memberIndexesByPoolModel,
+		poolSummaries:            poolSummaries,
+		telemetrySummary:         telemetryAggregate(view),
 	}, ctx.Err()
 }
 
@@ -1734,14 +1794,15 @@ func ResetSnapshotForTest() {
 func SetSnapshotForTest(view SnapshotView) {
 	cloned := cloneSnapshotView(view)
 	snapshot := &runtimeSnapshot{
-		view:                    cloned,
-		poolByGroup:             make(map[string]int, len(cloned.Pools)),
-		memberByPoolChannel:     make(map[poolChannelKey]int),
-		credentialByFingerprint: make(map[credentialFingerprintKey]int),
-		modelByMemberModel:      make(map[memberModelKey]ModelSnapshot),
-		channelByID:             make(map[int]ChannelSnapshot, len(cloned.Channels)),
-		poolIndexByID:           make(map[int]int, len(cloned.Pools)),
-		poolSummaries:           make([]PoolSnapshotSummary, len(cloned.Pools)),
+		view:                     cloned,
+		poolByGroup:              make(map[string]int, len(cloned.Pools)),
+		memberByPoolChannel:      make(map[poolChannelKey]int),
+		credentialByFingerprint:  make(map[credentialFingerprintKey]int),
+		modelByMemberModel:       make(map[memberModelKey]ModelSnapshot),
+		channelByID:              make(map[int]ChannelSnapshot, len(cloned.Channels)),
+		poolIndexByID:            make(map[int]int, len(cloned.Pools)),
+		memberIndexesByPoolModel: make(map[poolModelKey][]int),
+		poolSummaries:            make([]PoolSnapshotSummary, len(cloned.Pools)),
 	}
 	for index := range cloned.Channels {
 		channel := cloned.Channels[index]
@@ -1763,6 +1824,8 @@ func SetSnapshotForTest(view SnapshotView) {
 			for modelIndex := range member.Models {
 				observation := member.Models[modelIndex]
 				snapshot.modelByMemberModel[memberModelKey{memberID: member.ID, model: observation.ModelName}] = observation
+				key := poolModelKey{poolID: pool.ID, model: observation.ModelName}
+				snapshot.memberIndexesByPoolModel[key] = append(snapshot.memberIndexesByPoolModel[key], memberIndex)
 			}
 		}
 	}

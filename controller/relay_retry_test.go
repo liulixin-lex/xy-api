@@ -20,6 +20,7 @@ import (
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -58,6 +59,32 @@ func configureRoutingBreakerAttemptTest(t *testing.T, enabled bool) {
 		routinghotcache.ResetForTest()
 		resetRoutingBreakerConfigIdentityForTest()
 	})
+}
+
+func TestCommitRoutingCapacityAttemptFailsClosedBeforeUpstream(t *testing.T) {
+	tracker, err := channelrouting.NewCapacityTracker(channelrouting.CapacityConfig{
+		MaxEntries: 4,
+		IdleTTL:    time.Hour,
+		Shards:     1,
+	})
+	require.NoError(t, err)
+	key := channelrouting.CapacityKey{PoolID: 1, MemberID: 2, Model: "gpt-test"}
+	reservation, err := tracker.TryReserve(key, channelrouting.Demand{Inflight: 1}, channelrouting.Limit{Inflight: 1})
+	require.NoError(t, err)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	require.NoError(t, service.SetRoutingCapacityReservation(ctx, reservation))
+	require.NoError(t, reservation.Cancel())
+
+	apiErr := commitRoutingCapacityAttempt(ctx)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.True(t, types.IsSkipRetryError(apiErr))
+	snapshot, ok := tracker.Snapshot(key)
+	require.True(t, ok)
+	assert.Zero(t, snapshot.PendingReservations)
+	assert.Zero(t, snapshot.CommittedReservations)
+	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
 }
 
 func resetRoutingBreakerConfigIdentityForTest() {

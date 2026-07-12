@@ -80,6 +80,26 @@ func TestRankCandidatesNormalizesWeights(t *testing.T) {
 	assert.InDelta(t, 0.5, decision.Weights.Cost, 0.000001)
 }
 
+func TestRankCandidatesAppliesBoundedScoreMultiplierWithoutChangingLegacyCandidates(t *testing.T) {
+	legacy := testCandidate(1, 1, 100, 10, nil, nil)
+	warming := testCandidate(2, 1, 100, 10, nil, nil)
+	warming.ScoreMultiplier = 0.2
+	invalid := testCandidate(3, 1, 100, 10, nil, nil)
+	invalid.ScoreMultiplier = math.Inf(1)
+
+	decision := RankCandidates([]Candidate{warming, legacy, invalid}, Settings{
+		WeightAvailability: 1,
+		MinVolume:          1,
+	})
+
+	require.Len(t, decision.Ranked, 3)
+	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+	assert.InDelta(t, 1, rankedByID(t, decision, 1).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, 0.2, rankedByID(t, decision, 2).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, 1, rankedByID(t, decision, 3).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, rankedByID(t, decision, 1).Score*0.2, rankedByID(t, decision, 2).Score, 0.000001)
+}
+
 func TestSelectRankedFromCandidatesUsesTTFTOnlyWhenPreferred(t *testing.T) {
 	candidates := []Candidate{
 		testCandidate(1, 1, 900, 10, nil, nil),

@@ -175,6 +175,209 @@ func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides
 	assert.Equal(t, 90, pool.SelectorPolicy.SnapshotStaleSec)
 }
 
+func TestSnapshotBindsCurrentActivationMetadata(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+
+	published, err := model.PublishRoutingPolicyRevisionDBContext(
+		context.Background(),
+		db,
+		0,
+		snapshotPolicyDocumentForStages(model.RoutingDeploymentStageCanary),
+		model.RoutingPolicyActivationSpec{
+			Stage:              model.RoutingDeploymentStageCanary,
+			TrafficBasisPoints: 250,
+			ActorID:            7,
+			Reason:             "activation_snapshot",
+		},
+	)
+	require.NoError(t, err)
+
+	snapshot, err := buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+	require.NoError(t, err)
+	view := snapshot.view
+	assert.Equal(t, published.Activation.ID, view.ActivationID)
+	assert.Equal(t, model.RoutingDeploymentStageCanary, view.ActivationStage)
+	assert.Equal(t, 250, view.TrafficBasisPoints)
+	require.Len(t, view.Pools, 1)
+	assert.Equal(t, model.RoutingDeploymentStageCanary, view.Pools[0].DeploymentStage)
+
+	metadata := snapshotMetadata(view)
+	assert.Equal(t, view.ActivationID, metadata.ActivationID)
+	assert.Equal(t, view.ActivationStage, metadata.ActivationStage)
+	assert.Equal(t, view.TrafficBasisPoints, metadata.TrafficBasisPoints)
+}
+
+func TestSnapshotFailsClosedForCorruptCurrentActivation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, db *gorm.DB, published model.RoutingPolicyPublishResult)
+	}{
+		{
+			name: "head has no activation",
+			mutate: func(t *testing.T, db *gorm.DB, _ model.RoutingPolicyPublishResult) {
+				require.NoError(t, db.Exec("UPDATE routing_policy_heads SET current_activation_id = 0 WHERE id = 1").Error)
+			},
+		},
+		{
+			name: "activation belongs to another revision",
+			mutate: func(t *testing.T, db *gorm.DB, published model.RoutingPolicyPublishResult) {
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_activations SET revision = ? WHERE id = ?",
+					published.Revision.Revision+1,
+					published.Activation.ID,
+				).Error)
+			},
+		},
+		{
+			name: "activation stage differs from head",
+			mutate: func(t *testing.T, db *gorm.DB, published model.RoutingPolicyPublishResult) {
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_activations SET stage = ? WHERE id = ?",
+					model.RoutingDeploymentStageShadow,
+					published.Activation.ID,
+				).Error)
+			},
+		},
+		{
+			name: "activation traffic violates canary bounds",
+			mutate: func(t *testing.T, db *gorm.DB, published model.RoutingPolicyPublishResult) {
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_activations SET traffic_basis_points = 501 WHERE id = ?",
+					published.Activation.ID,
+				).Error)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openSnapshotTestDB(t)
+			withSnapshotTestDB(t, db)
+			withSnapshotSecret(t)
+			published, err := model.PublishRoutingPolicyRevisionDBContext(
+				context.Background(),
+				db,
+				0,
+				snapshotPolicyDocumentForStages(model.RoutingDeploymentStageCanary),
+				model.RoutingPolicyActivationSpec{
+					Stage:              model.RoutingDeploymentStageCanary,
+					TrafficBasisPoints: 250,
+					ActorID:            7,
+				},
+			)
+			require.NoError(t, err)
+			test.mutate(t, db, published)
+
+			_, err = buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+			assert.ErrorIs(t, err, ErrSnapshotActivation)
+		})
+	}
+}
+
+func TestSnapshotFailsClosedForPoolActivationStageConflict(t *testing.T) {
+	tests := []struct {
+		name          string
+		activation    string
+		basis         int
+		pools         []string
+		publishedPool string
+		valid         bool
+	}{
+		{name: "observe pool under observe activation", activation: model.RoutingDeploymentStageObserve, pools: []string{model.RoutingDeploymentStageObserve}, valid: true},
+		{name: "observe and shadow pools under shadow activation", activation: model.RoutingDeploymentStageShadow, pools: []string{model.RoutingDeploymentStageObserve, model.RoutingDeploymentStageShadow}, valid: true},
+		{name: "shadow and canary pools under canary activation", activation: model.RoutingDeploymentStageCanary, basis: 250, pools: []string{model.RoutingDeploymentStageShadow, model.RoutingDeploymentStageCanary}, valid: true},
+		{name: "shadow activation cannot contain canary pool", activation: model.RoutingDeploymentStageShadow, pools: []string{model.RoutingDeploymentStageCanary}, publishedPool: model.RoutingDeploymentStageShadow},
+		{name: "canary activation cannot contain active pool", activation: model.RoutingDeploymentStageCanary, basis: 250, pools: []string{model.RoutingDeploymentStageActive}, publishedPool: model.RoutingDeploymentStageCanary},
+		{name: "active activation cannot retain canary pool without canary traffic", activation: model.RoutingDeploymentStageActive, pools: []string{model.RoutingDeploymentStageCanary}, publishedPool: model.RoutingDeploymentStageActive},
+		{name: "active activation can contain lower non-canary stages", activation: model.RoutingDeploymentStageActive, pools: []string{model.RoutingDeploymentStageObserve, model.RoutingDeploymentStageShadow, model.RoutingDeploymentStageActive}, valid: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openSnapshotTestDB(t)
+			withSnapshotTestDB(t, db)
+			withSnapshotSecret(t)
+			document := snapshotPolicyDocumentForStages(test.pools...)
+			if !test.valid {
+				document.Pools[0].DeploymentStage = test.publishedPool
+			}
+			published, err := model.PublishRoutingPolicyRevisionDBContext(
+				context.Background(),
+				db,
+				0,
+				document,
+				model.RoutingPolicyActivationSpec{Stage: test.activation, TrafficBasisPoints: test.basis, ActorID: 7},
+			)
+			require.NoError(t, err)
+			if !test.valid {
+				document.Pools[0].DeploymentStage = test.pools[0]
+				_, contentHash, normalizeErr := model.NormalizeRoutingPolicyDocument(document)
+				require.NoError(t, normalizeErr)
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_pool_revisions SET deployment_stage = ? WHERE revision = ? AND pool_id = ?",
+					test.pools[0],
+					published.Revision.Revision,
+					document.Pools[0].PoolID,
+				).Error)
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_revisions SET content_hash = ? WHERE revision = ?",
+					contentHash,
+					published.Revision.Revision,
+				).Error)
+				require.NoError(t, db.Exec(
+					"UPDATE routing_policy_heads SET current_hash = ? WHERE id = 1",
+					contentHash,
+				).Error)
+			}
+
+			_, err = buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, ErrSnapshotActivation)
+		})
+	}
+}
+
+func TestSnapshotPrecomputesDeterministicPoolModelMemberIndexes(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 410, Name: "shared-a", Group: "alpha,beta", Models: "common,alpha-only"},
+		{Id: 411, Name: "alpha-b", Group: "alpha", Models: "common,alpha-only"},
+		{Id: 412, Name: "beta-b", Group: "beta", Models: "common,beta-only"},
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+
+	snapshot, err := buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+	require.NoError(t, err)
+	for _, pool := range snapshot.view.Pools {
+		indexes := snapshot.memberIndexesByPoolModel[poolModelKey{poolID: pool.ID, model: "common"}]
+		require.Len(t, indexes, 2)
+		assert.Less(t, indexes[0], indexes[1])
+		for _, memberIndex := range indexes {
+			require.Less(t, memberIndex, len(pool.Members))
+			member := pool.Members[memberIndex]
+			assert.Equal(t, pool.ID, member.PoolID)
+			assert.Contains(t, []int{410, 411, 412}, member.ChannelID)
+		}
+	}
+
+	indexedMembers := 0
+	for _, indexes := range snapshot.memberIndexesByPoolModel {
+		indexedMembers += len(indexes)
+	}
+	assert.Equal(t, snapshot.view.Stats.ModelSnapshotCount, indexedMembers)
+	assert.LessOrEqual(t, indexedMembers, DefaultSnapshotLimits.MaxTotalModelSnapshots)
+}
+
 func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback(t *testing.T) {
 	db := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, db)
@@ -1007,6 +1210,23 @@ func openSnapshotTestDB(t *testing.T) *gorm.DB {
 		&model.RoutingMetricRollup{},
 	))
 	return db
+}
+
+func snapshotPolicyDocumentForStages(stages ...string) model.RoutingPolicyDocument {
+	document := model.RoutingPolicyDocument{
+		SchemaVersion: model.RoutingPolicySchemaVersion,
+		Pools:         make([]model.RoutingPolicyPoolContent, len(stages)),
+	}
+	for index, stage := range stages {
+		document.Pools[index] = model.RoutingPolicyPoolContent{
+			PoolID:          8_000 + index,
+			GroupName:       "activation-" + stage + "-" + string(rune('a'+index)),
+			DisplayName:     "Activation " + stage,
+			DeploymentStage: stage,
+			PolicyProfile:   model.RoutingPolicyProfileBalanced,
+		}
+	}
+	return document
 }
 
 func openSnapshotExternalTestDB(t *testing.T, dbType common.DatabaseType, dsn string) *gorm.DB {

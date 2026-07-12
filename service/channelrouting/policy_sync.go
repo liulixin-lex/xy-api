@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	legacyRoutingPolicySyncReason         = "legacy_topology_sync"
-	legacyRoutingPolicyPreserveSyncReason = "legacy_topology_sync_preserving_policy"
-	legacyRoutingPolicyMaxPublishAttempts = 3
+	legacyRoutingPolicySyncReason                  = "legacy_topology_sync"
+	legacyRoutingPolicyPreserveSyncReason          = "legacy_topology_sync_preserving_policy"
+	legacyRoutingPolicyNormalizeActivationReason   = "legacy_topology_sync_normalizing_activation"
+	legacyRoutingPolicyCanarySafetyDowngradeReason = "legacy_topology_sync_canary_safety_downgrade"
+	legacyRoutingPolicyMaxPublishAttempts          = 3
 )
 
 func SyncLegacyRoutingPolicyContext(ctx context.Context) (model.RoutingPolicyHead, error) {
@@ -55,30 +57,48 @@ func syncLegacyRoutingPolicyDBContext(ctx context.Context, db *gorm.DB) (model.R
 			if err != nil {
 				return err
 			}
-			_, contentHash, err := model.NormalizeRoutingPolicyDocument(document)
-			if err != nil {
-				return err
-			}
-			if head.CurrentRevision > 0 && head.CurrentHash == contentHash {
-				synchronized = head
-				return nil
-			}
 
 			stage := head.CurrentStage
 			if stage == "" {
 				stage = model.RoutingDeploymentStageObserve
 			}
 			trafficBasisPoints := 0
+			var currentActivation model.RoutingPolicyActivation
 			if head.CurrentActivationID > 0 {
-				var activation model.RoutingPolicyActivation
-				if err := tx.WithContext(ctx).Where("id = ?", head.CurrentActivationID).First(&activation).Error; err != nil {
+				if err := tx.WithContext(ctx).Where("id = ?", head.CurrentActivationID).First(&currentActivation).Error; err != nil {
 					return err
 				}
-				trafficBasisPoints = activation.TrafficBasisPoints
 			}
 			reason := legacyRoutingPolicySyncReason
 			if preservePolicy {
 				reason = legacyRoutingPolicyPreserveSyncReason
+			}
+			if stage == model.RoutingDeploymentStageCanary {
+				if currentActivation.TrafficBasisPoints >= model.RoutingPolicyCanaryMinBasisPoints &&
+					currentActivation.TrafficBasisPoints <= model.RoutingPolicyCanaryMaxBasisPoints {
+					trafficBasisPoints = currentActivation.TrafficBasisPoints
+				} else {
+					stage = model.RoutingDeploymentStageShadow
+					for index := range document.Pools {
+						if document.Pools[index].DeploymentStage == model.RoutingDeploymentStageCanary {
+							document.Pools[index].DeploymentStage = model.RoutingDeploymentStageShadow
+						}
+					}
+					reason = legacyRoutingPolicyCanarySafetyDowngradeReason
+				}
+			} else if currentActivation.TrafficBasisPoints != 0 {
+				reason = legacyRoutingPolicyNormalizeActivationReason
+			}
+			_, contentHash, err := model.NormalizeRoutingPolicyDocument(document)
+			if err != nil {
+				return err
+			}
+			activationCurrent := head.CurrentRevision > 0 && currentActivation.ID == head.CurrentActivationID &&
+				currentActivation.Revision == head.CurrentRevision && currentActivation.Stage == stage &&
+				currentActivation.TrafficBasisPoints == trafficBasisPoints
+			if head.CurrentRevision > 0 && head.CurrentHash == contentHash && activationCurrent {
+				synchronized = head
+				return nil
 			}
 			published, err := model.PublishRoutingPolicyRevisionDBContext(ctx, tx, head.CurrentRevision, document, model.RoutingPolicyActivationSpec{
 				Stage:              stage,

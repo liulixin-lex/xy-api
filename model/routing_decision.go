@@ -16,14 +16,30 @@ import (
 )
 
 const (
-	RoutingDecisionAuditMaxBatch       = 500
-	RoutingDecisionReplayChunkMaxBytes = 48 << 10
-	RoutingDecisionReplayMaxChunks     = 256
-	RoutingDecisionReplayMaxBytes      = RoutingDecisionReplayChunkMaxBytes * RoutingDecisionReplayMaxChunks
-	routingDecisionRetentionBatchSize  = 500
-	routingDecisionDBBatchMaxBytes     = 1 << 20
-	routingDecisionDBRowOverheadBytes  = 2 << 10
+	RoutingDecisionAuditMaxBatch        = 500
+	RoutingDecisionReplayChunkMaxBytes  = 48 << 10
+	RoutingDecisionReplayMaxChunks      = 256
+	RoutingDecisionReplayMaxBytes       = RoutingDecisionReplayChunkMaxBytes * RoutingDecisionReplayMaxChunks
+	RoutingDecisionExclusionMaxReasons  = 32
+	RoutingDecisionExclusionMaxBytes    = 8 << 10
+	RoutingDecisionAlgorithmCanaryV1    = "channel-routing-canary-v1"
+	RoutingDecisionCohortControl        = "control"
+	RoutingDecisionCohortCanary         = "canary"
+	RoutingDecisionReservationLocalSoft = "local_soft"
+	routingDecisionRetentionBatchSize   = 500
+	routingDecisionDBBatchMaxBytes      = 1 << 20
+	routingDecisionDBRowOverheadBytes   = 2 << 10
 )
+
+type RoutingDecisionExclusionCount struct {
+	Reason string `json:"reason"`
+	Count  int    `json:"count"`
+}
+
+type RoutingDecisionExclusionSummary struct {
+	ExcludedCount int                             `json:"excluded_count"`
+	Reasons       []RoutingDecisionExclusionCount `json:"reasons"`
+}
 
 var (
 	ErrRoutingDecisionAuditInvalid    = errors.New("invalid routing decision audit")
@@ -34,47 +50,65 @@ var (
 )
 
 type RoutingDecisionAudit struct {
-	ID                    int                          `json:"id" gorm:"primaryKey"`
-	DecisionID            string                       `json:"decision_id" gorm:"type:varchar(64);uniqueIndex;not null"`
-	RequestID             string                       `json:"request_id" gorm:"type:varchar(64);index"`
-	RequestKey            string                       `json:"-" gorm:"type:char(64);index"`
-	PoolID                int                          `json:"pool_id" gorm:"index"`
-	GroupName             string                       `json:"group_name" gorm:"type:varchar(64);index"`
-	GroupKey              string                       `json:"-" gorm:"type:char(64);index"`
-	ModelName             string                       `json:"model_name" gorm:"type:varchar(128);index"`
-	ModelKey              string                       `json:"-" gorm:"type:char(64);index"`
-	SnapshotRevision      int64                        `json:"snapshot_revision" gorm:"bigint;index"`
-	RuntimeGeneration     int64                        `json:"runtime_generation" gorm:"bigint;index"`
-	PolicyHash            string                       `json:"policy_hash" gorm:"type:char(64);index"`
-	SnapshotHash          string                       `json:"snapshot_hash" gorm:"type:char(64);index"`
-	ProfileHash           string                       `json:"profile_hash" gorm:"type:char(64);index"`
-	AlgorithmVersion      string                       `json:"algorithm_version" gorm:"type:varchar(64);index"`
-	Seed                  int64                        `json:"seed" gorm:"bigint"`
-	RetryIndex            int                          `json:"retry_index"`
-	IsStream              bool                         `json:"is_stream"`
-	ActualChannelID       int                          `json:"actual_channel_id" gorm:"index"`
-	ObservedChannelID     int                          `json:"observed_channel_id" gorm:"index"`
-	CandidateCount        int                          `json:"candidate_count"`
-	EligibleCount         int                          `json:"eligible_count"`
-	FilteredOpen          int                          `json:"filtered_open"`
-	FilteredCapacity      int                          `json:"filtered_capacity"`
-	BreakerBypassed       bool                         `json:"breaker_bypassed"`
-	ObservedMatchesActual bool                         `json:"observed_matches_actual" gorm:"index"`
-	DifferenceType        string                       `json:"difference_type" gorm:"type:varchar(64);index"`
-	ActualCostKnown       bool                         `json:"actual_cost_known"`
-	ActualExpectedCost    float64                      `json:"actual_expected_cost"`
-	ObservedCostKnown     bool                         `json:"observed_cost_known"`
-	ObservedExpectedCost  float64                      `json:"observed_expected_cost"`
-	ExpectedCostDelta     float64                      `json:"expected_cost_delta"`
-	Replayable            bool                         `json:"replayable" gorm:"index"`
-	RequestProfileJSON    string                       `json:"-" gorm:"type:text"`
-	ReplayInputJSON       string                       `json:"-" gorm:"type:text"`
-	ReplayInputHash       string                       `json:"-" gorm:"type:char(64)"`
-	ReplayInputBytes      int                          `json:"-"`
-	ReplayChunkCount      int                          `json:"-"`
-	ReplayChunks          []RoutingDecisionReplayChunk `json:"-" gorm:"-"`
-	CandidatesJSON        string                       `json:"-" gorm:"type:text"`
-	CreatedTime           int64                        `json:"created_time" gorm:"bigint;index"`
+	ID                        int                          `json:"id" gorm:"primaryKey"`
+	DecisionID                string                       `json:"decision_id" gorm:"type:varchar(64);uniqueIndex;not null"`
+	RequestID                 string                       `json:"request_id" gorm:"type:varchar(64);index"`
+	RequestKey                string                       `json:"-" gorm:"type:char(64);index"`
+	PoolID                    int                          `json:"pool_id" gorm:"index"`
+	GroupName                 string                       `json:"group_name" gorm:"type:varchar(64);index"`
+	GroupKey                  string                       `json:"-" gorm:"type:char(64);index"`
+	ModelName                 string                       `json:"model_name" gorm:"type:varchar(128);index"`
+	ModelKey                  string                       `json:"-" gorm:"type:char(64);index"`
+	SnapshotRevision          int64                        `json:"snapshot_revision" gorm:"bigint;index"`
+	RuntimeGeneration         int64                        `json:"runtime_generation" gorm:"bigint;index"`
+	ActivationID              int64                        `json:"activation_id" gorm:"bigint;index"`
+	ActivationStage           string                       `json:"activation_stage" gorm:"type:varchar(16);index"`
+	TrafficBasisPoints        int                          `json:"traffic_basis_points"`
+	CanaryBucket              int                          `json:"canary_bucket"`
+	RolloutKey                string                       `json:"rollout_key" gorm:"type:char(64);index"`
+	Cohort                    string                       `json:"cohort" gorm:"type:varchar(16);index"`
+	PolicyHash                string                       `json:"policy_hash" gorm:"type:char(64);index"`
+	SnapshotHash              string                       `json:"snapshot_hash" gorm:"type:char(64);index"`
+	ProfileHash               string                       `json:"profile_hash" gorm:"type:char(64);index"`
+	AlgorithmVersion          string                       `json:"algorithm_version" gorm:"type:varchar(64);index"`
+	Seed                      int64                        `json:"seed" gorm:"bigint"`
+	RetryIndex                int                          `json:"retry_index"`
+	IsStream                  bool                         `json:"is_stream"`
+	ActualChannelID           int                          `json:"actual_channel_id" gorm:"index"`
+	ObservedChannelID         int                          `json:"observed_channel_id" gorm:"index"`
+	SelectedMemberID          int                          `json:"selected_member_id" gorm:"index"`
+	SelectedCredentialID      int                          `json:"selected_credential_id" gorm:"index"`
+	ReservationMode           string                       `json:"reservation_mode" gorm:"type:varchar(16);index"`
+	ReservationRPM            int64                        `json:"reservation_rpm" gorm:"bigint"`
+	ReservationInputTPM       int64                        `json:"reservation_input_tpm" gorm:"bigint"`
+	ReservationOutputTPM      int64                        `json:"reservation_output_tpm" gorm:"bigint"`
+	ReservationInflight       int64                        `json:"reservation_inflight" gorm:"bigint"`
+	ReservationLimitRPM       int64                        `json:"reservation_limit_rpm" gorm:"bigint"`
+	ReservationLimitInputTPM  int64                        `json:"reservation_limit_input_tpm" gorm:"bigint"`
+	ReservationLimitOutputTPM int64                        `json:"reservation_limit_output_tpm" gorm:"bigint"`
+	ReservationLimitInflight  int64                        `json:"reservation_limit_inflight" gorm:"bigint"`
+	CandidateCount            int                          `json:"candidate_count"`
+	EligibleCount             int                          `json:"eligible_count"`
+	FilteredOpen              int                          `json:"filtered_open"`
+	FilteredCapacity          int                          `json:"filtered_capacity"`
+	BreakerBypassed           bool                         `json:"breaker_bypassed"`
+	ObservedMatchesActual     bool                         `json:"observed_matches_actual" gorm:"index"`
+	DifferenceType            string                       `json:"difference_type" gorm:"type:varchar(64);index"`
+	ActualCostKnown           bool                         `json:"actual_cost_known"`
+	ActualExpectedCost        float64                      `json:"actual_expected_cost"`
+	ObservedCostKnown         bool                         `json:"observed_cost_known"`
+	ObservedExpectedCost      float64                      `json:"observed_expected_cost"`
+	ExpectedCostDelta         float64                      `json:"expected_cost_delta"`
+	Replayable                bool                         `json:"replayable" gorm:"index"`
+	RequestProfileJSON        string                       `json:"-" gorm:"type:text"`
+	ReplayInputJSON           string                       `json:"-" gorm:"type:text"`
+	ReplayInputHash           string                       `json:"-" gorm:"type:char(64)"`
+	ReplayInputBytes          int                          `json:"-"`
+	ReplayChunkCount          int                          `json:"-"`
+	ReplayChunks              []RoutingDecisionReplayChunk `json:"-" gorm:"-"`
+	CandidatesJSON            string                       `json:"-" gorm:"type:text"`
+	ExclusionSummaryJSON      string                       `json:"-" gorm:"type:text"`
+	CreatedTime               int64                        `json:"created_time" gorm:"bigint;index"`
 }
 
 func (RoutingDecisionAudit) TableName() string {
@@ -263,8 +297,9 @@ func routingDecisionAuditApproxBytes(audit RoutingDecisionAudit) int {
 		len(audit.DecisionID) + len(audit.RequestID) + len(audit.RequestKey) +
 		len(audit.GroupName) + len(audit.GroupKey) + len(audit.ModelName) + len(audit.ModelKey) +
 		len(audit.PolicyHash) + len(audit.SnapshotHash) + len(audit.ProfileHash) +
-		len(audit.AlgorithmVersion) + len(audit.DifferenceType) +
-		len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) + len(audit.CandidatesJSON)
+		len(audit.AlgorithmVersion) + len(audit.DifferenceType) + len(audit.ActivationStage) +
+		len(audit.RolloutKey) + len(audit.Cohort) + len(audit.ReservationMode) +
+		len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) + len(audit.CandidatesJSON) + len(audit.ExclusionSummaryJSON)
 }
 
 func routingDecisionReplayChunkApproxBytes(chunk RoutingDecisionReplayChunk) int {
@@ -344,6 +379,7 @@ func validRoutingDecisionAudit(audit *RoutingDecisionAudit) bool {
 		}
 	}
 	if !utf8.ValidString(audit.CandidatesJSON) || len(audit.CandidatesJSON) > 60<<10 ||
+		!validRoutingDecisionCanaryMetadata(audit) || !validRoutingDecisionExclusionSummary(audit.ExclusionSummaryJSON) ||
 		!validRoutingDecisionCost(audit.ActualCostKnown, audit.ActualExpectedCost) ||
 		!validRoutingDecisionCost(audit.ObservedCostKnown, audit.ObservedExpectedCost) ||
 		math.IsNaN(audit.ExpectedCostDelta) || math.IsInf(audit.ExpectedCostDelta, 0) {
@@ -373,6 +409,96 @@ func validRoutingDecisionAudit(audit *RoutingDecisionAudit) bool {
 	}
 	_, err := joinRoutingDecisionReplayChunks(*audit, audit.ReplayChunks)
 	return err == nil
+}
+
+func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
+	if audit == nil {
+		return false
+	}
+	hasCanaryMetadata := audit.ActivationID != 0 || audit.ActivationStage != "" || audit.TrafficBasisPoints != 0 ||
+		audit.CanaryBucket != 0 || audit.RolloutKey != "" || audit.Cohort != ""
+	hasSelectedIdentity := audit.SelectedMemberID != 0 || audit.SelectedCredentialID != 0
+	hasReservation := audit.ReservationMode != "" || audit.ReservationRPM != 0 || audit.ReservationInputTPM != 0 ||
+		audit.ReservationOutputTPM != 0 || audit.ReservationInflight != 0 || audit.ReservationLimitRPM != 0 ||
+		audit.ReservationLimitInputTPM != 0 || audit.ReservationLimitOutputTPM != 0 || audit.ReservationLimitInflight != 0
+	if !hasCanaryMetadata {
+		return !hasSelectedIdentity && !hasReservation
+	}
+	if audit.AlgorithmVersion != RoutingDecisionAlgorithmCanaryV1 || audit.ActivationID <= 0 ||
+		audit.ActivationStage != RoutingDeploymentStageCanary ||
+		audit.TrafficBasisPoints < RoutingPolicyCanaryMinBasisPoints ||
+		audit.TrafficBasisPoints > RoutingPolicyCanaryMaxBasisPoints || audit.CanaryBucket < 0 ||
+		audit.CanaryBucket >= 10_000 || !validRoutingDecisionHash(audit.RolloutKey) ||
+		audit.RolloutKey != strings.ToLower(audit.RolloutKey) || audit.SelectedMemberID < 0 ||
+		audit.SelectedCredentialID < 0 || (audit.SelectedCredentialID > 0 && audit.SelectedMemberID == 0) {
+		return false
+	}
+	inCanary := audit.CanaryBucket < audit.TrafficBasisPoints
+	if (inCanary && audit.Cohort != RoutingDecisionCohortCanary) ||
+		(!inCanary && audit.Cohort != RoutingDecisionCohortControl) {
+		return false
+	}
+	if audit.ObservedChannelID > 0 {
+		if audit.SelectedMemberID <= 0 || audit.ActualChannelID != audit.ObservedChannelID {
+			return false
+		}
+	} else if hasSelectedIdentity || hasReservation || audit.ActualChannelID != 0 {
+		return false
+	}
+	if audit.Cohort == RoutingDecisionCohortControl {
+		return !audit.Replayable && !hasReservation
+	}
+	if !audit.Replayable {
+		return false
+	}
+	if audit.ObservedChannelID == 0 {
+		return !hasReservation
+	}
+	return validRoutingDecisionReservation(audit)
+}
+
+func validRoutingDecisionReservation(audit *RoutingDecisionAudit) bool {
+	if audit == nil || audit.ReservationMode != RoutingDecisionReservationLocalSoft {
+		return false
+	}
+	demand := [4]int64{audit.ReservationRPM, audit.ReservationInputTPM, audit.ReservationOutputTPM, audit.ReservationInflight}
+	limit := [4]int64{audit.ReservationLimitRPM, audit.ReservationLimitInputTPM, audit.ReservationLimitOutputTPM, audit.ReservationLimitInflight}
+	demandKnown := false
+	limitKnown := false
+	for index := range demand {
+		if demand[index] < 0 || limit[index] < 0 || (demand[index] > 0 && limit[index] <= 0) || demand[index] > limit[index] {
+			return false
+		}
+		demandKnown = demandKnown || demand[index] > 0
+		limitKnown = limitKnown || limit[index] > 0
+	}
+	return demandKnown && limitKnown
+}
+
+func validRoutingDecisionExclusionSummary(value string) bool {
+	if value == "" {
+		return true
+	}
+	if !utf8.ValidString(value) || len(value) > RoutingDecisionExclusionMaxBytes {
+		return false
+	}
+	var summary RoutingDecisionExclusionSummary
+	if common.UnmarshalJsonStr(value, &summary) != nil || summary.ExcludedCount < 0 ||
+		len(summary.Reasons) > RoutingDecisionExclusionMaxReasons {
+		return false
+	}
+	total := 0
+	previous := ""
+	for index := range summary.Reasons {
+		item := summary.Reasons[index]
+		if item.Count <= 0 || item.Reason == "" || !utf8.ValidString(item.Reason) ||
+			utf8.RuneCountInString(item.Reason) > 128 || (index > 0 && item.Reason <= previous) {
+			return false
+		}
+		total += item.Count
+		previous = item.Reason
+	}
+	return total == summary.ExcludedCount && (summary.ExcludedCount == 0) == (len(summary.Reasons) == 0)
 }
 
 func joinRoutingDecisionReplayChunks(audit RoutingDecisionAudit, chunks []RoutingDecisionReplayChunk) (string, error) {

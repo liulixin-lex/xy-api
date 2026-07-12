@@ -137,6 +137,41 @@ func TestEnqueueDecisionSanitizesNonFiniteScoresAndCapsCandidates(t *testing.T) 
 	assert.Zero(t, payload.Candidates[0].Score)
 }
 
+func TestEnqueueDecisionSummarizesExclusionsBeforeCandidateTruncation(t *testing.T) {
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	candidates := make([]DecisionCandidate, MaxDecisionCandidates+3)
+	for index := range candidates {
+		candidates[index] = DecisionCandidate{PoolMemberID: index + 1, ChannelID: index + 1, Eligible: true}
+	}
+	candidates[MaxDecisionCandidates].Eligible = false
+	candidates[MaxDecisionCandidates].ExclusionReason = ExclusionReasonRequestFailed
+	candidates[MaxDecisionCandidates+1].Eligible = false
+	candidates[MaxDecisionCandidates+1].ExclusionReason = ExclusionReasonRequestFailed
+	candidates[MaxDecisionCandidates+2].Eligible = false
+	candidates[MaxDecisionCandidates+2].ExclusionReason = ExclusionReasonLocalCapacity
+
+	_, err := EnqueueDecision(DecisionInput{
+		PoolID: 1, SnapshotRevision: 1, GroupName: "default", ModelName: "gpt-test", Candidates: candidates,
+	})
+	require.NoError(t, err)
+	audits := decisionBuffer.drain(1)
+	require.Len(t, audits, 1)
+	assert.Equal(t, len(candidates), audits[0].CandidateCount)
+	assert.Equal(t, MaxDecisionCandidates, audits[0].EligibleCount)
+	var summary model.RoutingDecisionExclusionSummary
+	require.NoError(t, common.UnmarshalJsonStr(audits[0].ExclusionSummaryJSON, &summary))
+	assert.Equal(t, model.RoutingDecisionExclusionSummary{
+		ExcludedCount: 3,
+		Reasons: []model.RoutingDecisionExclusionCount{
+			{Reason: ExclusionReasonLocalCapacity, Count: 1},
+			{Reason: ExclusionReasonRequestFailed, Count: 2},
+		},
+	}, summary)
+	assert.NotContains(t, audits[0].CandidatesJSON, ExclusionReasonRequestFailed)
+}
+
 func TestDecisionAuditPayloadFitsCrossDatabaseTextColumn(t *testing.T) {
 	ResetDecisionAuditsForTest(2)
 	t.Cleanup(func() { ResetDecisionAuditsForTest() })

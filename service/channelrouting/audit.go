@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,23 @@ type DecisionInput struct {
 	ActualExpectedCost   float64
 	ObservedCostKnown    bool
 	ObservedExpectedCost float64
+	Gate                 *CanaryGate
+	SelectedIdentity     Identity
+	CapacityAdmission    *CapacityAdmission
+}
+
+type decisionCanaryAuditFields struct {
+	activationID         int64
+	activationStage      string
+	trafficBasisPoints   int
+	canaryBucket         int
+	rolloutKey           string
+	cohort               string
+	selectedMemberID     int
+	selectedCredentialID int
+	reservationMode      string
+	reservationDemand    Demand
+	reservationLimit     Limit
 }
 
 type DecisionBufferStats struct {
@@ -108,23 +126,32 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		decisionBuffer.markUnknownIdentityDrop()
 		return "", ErrDecisionIdentityUnknown
 	}
+	algorithmVersion := input.AlgorithmVersion
+	if algorithmVersion == "" {
+		algorithmVersion = DecisionAlgorithmObserveV1
+	}
+	algorithmVersion = truncateDecisionText(algorithmVersion, 64)
+	input.AlgorithmVersion = algorithmVersion
+	input.Candidates = append([]DecisionCandidate(nil), input.Candidates...)
 	originalCandidateCount := len(input.Candidates)
 	originalEligibleCount := 0
-	for _, candidate := range input.Candidates {
-		if candidate.Eligible {
-			originalEligibleCount++
-		}
-	}
-	if len(input.Candidates) > MaxDecisionCandidates {
-		input.Candidates = input.Candidates[:MaxDecisionCandidates]
-		input.CandidatesTruncated = true
-	}
 	for index := range input.Candidates {
 		if input.Candidates[index].PoolMemberID <= 0 {
 			decisionBuffer.markUnknownIdentityDrop()
 			return "", ErrDecisionIdentityUnknown
 		}
 		sanitizeDecisionCandidate(&input.Candidates[index])
+		if input.Candidates[index].Eligible {
+			originalEligibleCount++
+		}
+	}
+	exclusionSummaryJSON, err := marshalDecisionExclusionSummary(input.Candidates)
+	if err != nil {
+		return "", err
+	}
+	if len(input.Candidates) > MaxDecisionCandidates {
+		input.Candidates = input.Candidates[:MaxDecisionCandidates]
+		input.CandidatesTruncated = true
 	}
 	candidatesJSON, err := common.Marshal(struct {
 		Truncated  bool                `json:"truncated"`
@@ -140,11 +167,6 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		return "", ErrDecisionAuditTooLarge
 	}
 
-	algorithmVersion := input.AlgorithmVersion
-	if algorithmVersion == "" {
-		algorithmVersion = DecisionAlgorithmObserveV1
-	}
-	algorithmVersion = truncateDecisionText(algorithmVersion, 64)
 	decisionID := common.GetUUID()
 	createdTime := common.GetTimestamp()
 	requestProfileJSON := ""
@@ -163,7 +185,7 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 			return "", err
 		}
 		profile := input.ReplayInput.Profile
-		expectedSeed, err := DeriveShadowSeed(input.RequestID, input.SnapshotRevision, input.RetryIndex)
+		expectedSeed, err := DeriveDecisionSeed(input.RequestID, input.SnapshotRevision, input.RetryIndex)
 		if err != nil || input.PoolID != input.ReplayInput.PoolID || input.SnapshotRevision != input.ReplayInput.PolicyRevision ||
 			input.AlgorithmVersion != input.ReplayInput.AlgorithmVersion || input.ReplayInput.Settings.RandomSeed != expectedSeed ||
 			input.GroupName != profile.GroupName ||
@@ -202,6 +224,10 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		runtimeGeneration = snapshotRevisionInt64(input.ReplayInput.RuntimeGeneration)
 		seed = input.ReplayInput.Settings.RandomSeed
 	}
+	canaryFields, err := decisionCanaryFieldsFromInput(input, replayable)
+	if err != nil {
+		return "", err
+	}
 	input.DifferenceType = truncateDecisionText(input.DifferenceType, 64)
 	if !input.ActualCostKnown || !finiteDecisionNumber(input.ActualExpectedCost) || input.ActualExpectedCost < 0 {
 		input.ActualCostKnown = false
@@ -216,45 +242,178 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		expectedCostDelta = input.ObservedExpectedCost - input.ActualExpectedCost
 	}
 	decisionBuffer.enqueue(model.RoutingDecisionAudit{
-		DecisionID:            decisionID,
-		RequestID:             truncateDecisionText(input.RequestID, 64),
-		PoolID:                input.PoolID,
-		GroupName:             input.GroupName,
-		ModelName:             input.ModelName,
-		SnapshotRevision:      snapshotRevisionInt64(input.SnapshotRevision),
-		RuntimeGeneration:     runtimeGeneration,
-		PolicyHash:            policyHash,
-		SnapshotHash:          snapshotHash,
-		ProfileHash:           profileHash,
-		AlgorithmVersion:      algorithmVersion,
-		Seed:                  seed,
-		RetryIndex:            input.RetryIndex,
-		IsStream:              input.IsStream,
-		ActualChannelID:       input.ActualChannelID,
-		ObservedChannelID:     input.ObservedChannelID,
-		CandidateCount:        originalCandidateCount,
-		EligibleCount:         originalEligibleCount,
-		FilteredOpen:          input.FilteredOpen,
-		FilteredCapacity:      input.FilteredCapacity,
-		BreakerBypassed:       input.BreakerBypassed,
-		ObservedMatchesActual: input.ObservedChannelID > 0 && input.ObservedChannelID == input.ActualChannelID,
-		DifferenceType:        input.DifferenceType,
-		ActualCostKnown:       input.ActualCostKnown,
-		ActualExpectedCost:    input.ActualExpectedCost,
-		ObservedCostKnown:     input.ObservedCostKnown,
-		ObservedExpectedCost:  input.ObservedExpectedCost,
-		ExpectedCostDelta:     expectedCostDelta,
-		Replayable:            replayable,
-		RequestProfileJSON:    requestProfileJSON,
-		ReplayInputJSON:       replayInputJSON,
-		ReplayInputHash:       replayInputHash,
-		ReplayInputBytes:      replayInputBytes,
-		ReplayChunkCount:      len(replayChunks),
-		ReplayChunks:          replayChunks,
-		CandidatesJSON:        string(candidatesJSON),
-		CreatedTime:           createdTime,
+		DecisionID:                decisionID,
+		RequestID:                 truncateDecisionText(input.RequestID, 64),
+		PoolID:                    input.PoolID,
+		GroupName:                 input.GroupName,
+		ModelName:                 input.ModelName,
+		SnapshotRevision:          snapshotRevisionInt64(input.SnapshotRevision),
+		RuntimeGeneration:         runtimeGeneration,
+		ActivationID:              canaryFields.activationID,
+		ActivationStage:           canaryFields.activationStage,
+		TrafficBasisPoints:        canaryFields.trafficBasisPoints,
+		CanaryBucket:              canaryFields.canaryBucket,
+		RolloutKey:                canaryFields.rolloutKey,
+		Cohort:                    canaryFields.cohort,
+		PolicyHash:                policyHash,
+		SnapshotHash:              snapshotHash,
+		ProfileHash:               profileHash,
+		AlgorithmVersion:          algorithmVersion,
+		Seed:                      seed,
+		RetryIndex:                input.RetryIndex,
+		IsStream:                  input.IsStream,
+		ActualChannelID:           input.ActualChannelID,
+		ObservedChannelID:         input.ObservedChannelID,
+		SelectedMemberID:          canaryFields.selectedMemberID,
+		SelectedCredentialID:      canaryFields.selectedCredentialID,
+		ReservationMode:           canaryFields.reservationMode,
+		ReservationRPM:            canaryFields.reservationDemand.RPM,
+		ReservationInputTPM:       canaryFields.reservationDemand.InputTPM,
+		ReservationOutputTPM:      canaryFields.reservationDemand.OutputTPM,
+		ReservationInflight:       canaryFields.reservationDemand.Inflight,
+		ReservationLimitRPM:       canaryFields.reservationLimit.RPM,
+		ReservationLimitInputTPM:  canaryFields.reservationLimit.InputTPM,
+		ReservationLimitOutputTPM: canaryFields.reservationLimit.OutputTPM,
+		ReservationLimitInflight:  canaryFields.reservationLimit.Inflight,
+		CandidateCount:            originalCandidateCount,
+		EligibleCount:             originalEligibleCount,
+		FilteredOpen:              input.FilteredOpen,
+		FilteredCapacity:          input.FilteredCapacity,
+		BreakerBypassed:           input.BreakerBypassed,
+		ObservedMatchesActual:     input.ObservedChannelID > 0 && input.ObservedChannelID == input.ActualChannelID,
+		DifferenceType:            input.DifferenceType,
+		ActualCostKnown:           input.ActualCostKnown,
+		ActualExpectedCost:        input.ActualExpectedCost,
+		ObservedCostKnown:         input.ObservedCostKnown,
+		ObservedExpectedCost:      input.ObservedExpectedCost,
+		ExpectedCostDelta:         expectedCostDelta,
+		Replayable:                replayable,
+		RequestProfileJSON:        requestProfileJSON,
+		ReplayInputJSON:           replayInputJSON,
+		ReplayInputHash:           replayInputHash,
+		ReplayInputBytes:          replayInputBytes,
+		ReplayChunkCount:          len(replayChunks),
+		ReplayChunks:              replayChunks,
+		CandidatesJSON:            string(candidatesJSON),
+		ExclusionSummaryJSON:      string(exclusionSummaryJSON),
+		CreatedTime:               createdTime,
 	})
 	return decisionID, nil
+}
+
+func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisionCanaryAuditFields, error) {
+	if input.Gate == nil {
+		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
+			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+		}
+		return decisionCanaryAuditFields{}, nil
+	}
+	gate := *input.Gate
+	expectedGate, err := EvaluateCanaryGate(
+		input.PoolID,
+		gate.ActivationID,
+		input.SnapshotRevision,
+		input.RequestID,
+		gate.TrafficBasisPoints,
+	)
+	if err != nil || gate != expectedGate || input.AlgorithmVersion != DecisionAlgorithmCanaryV1 ||
+		gate.PoolID != input.PoolID || gate.PolicyRevision != input.SnapshotRevision {
+		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+	}
+	fields := decisionCanaryAuditFields{
+		activationID: gate.ActivationID, activationStage: model.RoutingDeploymentStageCanary,
+		trafficBasisPoints: gate.TrafficBasisPoints, canaryBucket: gate.Bucket, rolloutKey: string(gate.RolloutKey),
+		cohort: model.RoutingDecisionCohortControl,
+	}
+	if gate.InCanary {
+		fields.cohort = model.RoutingDecisionCohortCanary
+		if !replayable {
+			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+		}
+	} else if replayable || input.CapacityAdmission != nil {
+		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+	}
+	if input.ObservedChannelID <= 0 {
+		if input.ActualChannelID != 0 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
+			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+		}
+		return fields, nil
+	}
+	identity := input.SelectedIdentity
+	if input.ActualChannelID != input.ObservedChannelID || identity.SnapshotRevision != input.SnapshotRevision ||
+		identity.PoolID != input.PoolID || identity.MemberID <= 0 || identity.CredentialID < 0 {
+		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+	}
+	if gate.InCanary {
+		matched := false
+		for index := range input.ReplayInput.Candidates {
+			candidate := input.ReplayInput.Candidates[index]
+			if candidate.ChannelID == input.ObservedChannelID && candidate.PoolMemberID == identity.MemberID &&
+				candidate.CredentialID == identity.CredentialID {
+				matched = true
+				break
+			}
+		}
+		if !matched || input.CapacityAdmission == nil {
+			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+		}
+	}
+	fields.selectedMemberID = identity.MemberID
+	fields.selectedCredentialID = identity.CredentialID
+	if input.CapacityAdmission == nil {
+		return fields, nil
+	}
+	admission := *input.CapacityAdmission
+	if admission.Mode != CapacityModeLocalSoft || admission.Key.PoolID != input.PoolID ||
+		admission.Key.MemberID != identity.MemberID || admission.Key.Model != input.ModelName ||
+		!validDemand(admission.Demand) || !validLimit(admission.Limit) ||
+		!limitCoversDemand(admission.Limit, admission.Demand) || exceedsLimit(admission.Demand, admission.Limit) {
+		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
+	}
+	fields.reservationMode = string(admission.Mode)
+	fields.reservationDemand = admission.Demand
+	fields.reservationLimit = admission.Limit
+	return fields, nil
+}
+
+func marshalDecisionExclusionSummary(candidates []DecisionCandidate) ([]byte, error) {
+	counts := make(map[string]int)
+	excludedCount := 0
+	for index := range candidates {
+		candidate := candidates[index]
+		if candidate.Eligible {
+			continue
+		}
+		reason := candidate.ExclusionReason
+		if reason == "" {
+			reason = "unspecified"
+		}
+		counts[reason]++
+		excludedCount++
+	}
+	if len(counts) > model.RoutingDecisionExclusionMaxReasons {
+		return nil, ErrDecisionAuditTooLarge
+	}
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	summary := model.RoutingDecisionExclusionSummary{
+		ExcludedCount: excludedCount,
+		Reasons:       make([]model.RoutingDecisionExclusionCount, 0, len(reasons)),
+	}
+	for _, reason := range reasons {
+		summary.Reasons = append(summary.Reasons, model.RoutingDecisionExclusionCount{Reason: reason, Count: counts[reason]})
+	}
+	encoded, err := common.Marshal(summary)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > model.RoutingDecisionExclusionMaxBytes {
+		return nil, ErrDecisionAuditTooLarge
+	}
+	return encoded, nil
 }
 
 func FlushDecisionAuditsContext(ctx context.Context) (int, error) {
@@ -573,7 +732,9 @@ func (buffer *auditBuffer) expireLocked(cutoff int64) {
 func decisionAuditSize(audit model.RoutingDecisionAudit) int64 {
 	size := int64(len(audit.DecisionID) + len(audit.RequestID) + len(audit.GroupName) + len(audit.ModelName) +
 		len(audit.AlgorithmVersion) + len(audit.PolicyHash) + len(audit.SnapshotHash) + len(audit.ProfileHash) +
-		len(audit.DifferenceType) + len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) + len(audit.CandidatesJSON) + 256)
+		len(audit.DifferenceType) + len(audit.ActivationStage) + len(audit.RolloutKey) + len(audit.Cohort) +
+		len(audit.ReservationMode) + len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) +
+		len(audit.CandidatesJSON) + len(audit.ExclusionSummaryJSON) + 512)
 	for index := range audit.ReplayChunks {
 		size += int64(len(audit.ReplayChunks[index].Payload) + len(audit.ReplayChunks[index].PayloadHash) + 256)
 	}

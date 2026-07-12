@@ -72,6 +72,36 @@ func TestCreateRoutingDecisionAuditsUsesExactCrossDatabaseFilterKeys(t *testing.
 	assert.Equal(t, int64(2), count)
 }
 
+func TestCreateRoutingDecisionAuditsValidatesCanaryMetadataAndLegacyRows(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingDecisionAudit{}))
+
+	summary := `{"excluded_count":1,"reasons":[{"reason":"request_failed","count":1}]}`
+	control := RoutingDecisionAudit{
+		DecisionID: "control", RequestID: "request-control", PoolID: 7, GroupName: "default",
+		ModelName: "gpt-test", SnapshotRevision: 11, AlgorithmVersion: "channel-routing-canary-v1",
+		ActivationID: 401, ActivationStage: RoutingDeploymentStageCanary, TrafficBasisPoints: 100,
+		CanaryBucket: 221, RolloutKey: strings.Repeat("a", 64), Cohort: RoutingDecisionCohortControl,
+		CandidatesJSON: `{"candidates":[]}`, ExclusionSummaryJSON: summary, CreatedTime: 10,
+	}
+	legacy := RoutingDecisionAudit{
+		DecisionID: "legacy", PoolID: 7, GroupName: "default", ModelName: "gpt-test",
+		SnapshotRevision: 10, CandidatesJSON: `{"candidates":[]}`, CreatedTime: 9,
+	}
+	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{control, legacy}))
+
+	partial := legacy
+	partial.DecisionID = "partial"
+	partial.ActivationID = 1
+	require.ErrorIs(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{partial}), ErrRoutingDecisionAuditInvalid)
+
+	invalidCohort := control
+	invalidCohort.DecisionID = "invalid-cohort"
+	invalidCohort.Cohort = RoutingDecisionCohortCanary
+	require.ErrorIs(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{invalidCohort}), ErrRoutingDecisionAuditInvalid)
+}
+
 func TestCreateRoutingDecisionAuditsSplitsLargeRowsByEncodedByteBudget(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)

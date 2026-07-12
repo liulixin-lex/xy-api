@@ -634,26 +634,31 @@ func TestRefreshSnapshotIfNeededReturnsLightweightMetadataForCurrentRevision(t *
 	now := common.GetTimestamp()
 	policyHash := strings.Repeat("a", 64)
 	require.NoError(t, db.Create(&model.RoutingPolicyHead{
-		ID:              1,
-		CurrentRevision: 7,
-		CurrentHash:     policyHash,
-		CurrentStage:    model.RoutingDeploymentStageShadow,
-		CreatedTime:     now,
-		UpdatedTime:     now,
+		ID:                  1,
+		CurrentRevision:     7,
+		CurrentActivationID: 11,
+		CurrentHash:         policyHash,
+		CurrentStage:        model.RoutingDeploymentStageShadow,
+		CreatedTime:         now,
+		UpdatedTime:         now,
 	}).Error)
 	SetSnapshotForTest(SnapshotView{
-		Revision:    7,
-		PolicyHash:  policyHash,
-		BuiltAtUnix: now,
-		Pools:       []PoolSnapshot{{ID: 1, Members: []PoolMemberSnapshot{{ID: 1}}}},
-		Channels:    []ChannelSnapshot{{ID: 1, CredentialIDs: []int{1}}},
-		Stats:       SnapshotStats{PoolCount: 1, MemberCount: 1, ChannelCount: 1},
+		Revision:        7,
+		PolicyHash:      policyHash,
+		ActivationID:    11,
+		ActivationStage: model.RoutingDeploymentStageShadow,
+		BuiltAtUnix:     now,
+		Pools:           []PoolSnapshot{{ID: 1, Members: []PoolMemberSnapshot{{ID: 1}}}},
+		Channels:        []ChannelSnapshot{{ID: 1, CredentialIDs: []int{1}}},
+		Stats:           SnapshotStats{PoolCount: 1, MemberCount: 1, ChannelCount: 1},
 	})
 
 	metadata, err := refreshSnapshotIfNeededContext(context.Background(), false)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(7), metadata.Revision)
 	assert.Equal(t, policyHash, metadata.PolicyHash)
+	assert.Equal(t, int64(11), metadata.ActivationID)
+	assert.Equal(t, model.RoutingDeploymentStageShadow, metadata.ActivationStage)
 	assert.Equal(t, 1, metadata.Stats.MemberCount)
 }
 

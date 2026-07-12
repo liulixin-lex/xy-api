@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"math"
 	"net/http"
@@ -88,39 +89,62 @@ type channelRoutingDecisionCandidates struct {
 	Candidates []channelrouting.DecisionCandidate `json:"candidates"`
 }
 
+type channelRoutingDecisionGate struct {
+	ActivationID       int64                     `json:"activation_id"`
+	ActivationStage    string                    `json:"activation_stage"`
+	PolicyRevision     int64                     `json:"policy_revision"`
+	TrafficBasisPoints int                       `json:"traffic_basis_points"`
+	Bucket             int                       `json:"bucket"`
+	InCanary           bool                      `json:"in_canary"`
+	RolloutKey         channelrouting.RolloutKey `json:"rollout_key"`
+}
+
+type channelRoutingDecisionIdentity struct {
+	SnapshotRevision int64 `json:"snapshot_revision"`
+	PoolID           int   `json:"pool_id"`
+	MemberID         int   `json:"member_id"`
+	CredentialID     int   `json:"credential_id"`
+	ChannelID        int   `json:"channel_id"`
+}
+
 type channelRoutingDecisionView struct {
-	ID                    int                              `json:"id"`
-	DecisionID            string                           `json:"decision_id"`
-	RequestID             string                           `json:"request_id"`
-	PoolID                int                              `json:"pool_id"`
-	GroupName             string                           `json:"group_name"`
-	ModelName             string                           `json:"model_name"`
-	SnapshotRevision      int64                            `json:"snapshot_revision"`
-	RuntimeGeneration     int64                            `json:"runtime_generation"`
-	PolicyHash            string                           `json:"policy_hash,omitempty"`
-	SnapshotHash          string                           `json:"snapshot_hash,omitempty"`
-	ProfileHash           string                           `json:"profile_hash,omitempty"`
-	AlgorithmVersion      string                           `json:"algorithm_version"`
-	Seed                  int64                            `json:"seed"`
-	RetryIndex            int                              `json:"retry_index"`
-	IsStream              bool                             `json:"is_stream"`
-	ActualChannelID       int                              `json:"actual_channel_id"`
-	ObservedChannelID     int                              `json:"observed_channel_id"`
-	CandidateCount        int                              `json:"candidate_count"`
-	EligibleCount         int                              `json:"eligible_count"`
-	FilteredOpen          int                              `json:"filtered_open"`
-	FilteredCapacity      int                              `json:"filtered_capacity"`
-	BreakerBypassed       bool                             `json:"breaker_bypassed"`
-	ObservedMatchesActual bool                             `json:"observed_matches_actual"`
-	DifferenceType        string                           `json:"difference_type,omitempty"`
-	ActualCostKnown       bool                             `json:"actual_cost_known"`
-	ActualExpectedCost    float64                          `json:"actual_expected_cost"`
-	ObservedCostKnown     bool                             `json:"observed_cost_known"`
-	ObservedExpectedCost  float64                          `json:"observed_expected_cost"`
-	ExpectedCostDelta     float64                          `json:"expected_cost_delta"`
-	Replayable            bool                             `json:"replayable"`
-	Candidates            channelRoutingDecisionCandidates `json:"candidate_set"`
-	CreatedTime           int64                            `json:"created_time"`
+	ID                    int                                   `json:"id"`
+	DecisionID            string                                `json:"decision_id"`
+	RequestID             string                                `json:"request_id"`
+	PoolID                int                                   `json:"pool_id"`
+	GroupName             string                                `json:"group_name"`
+	ModelName             string                                `json:"model_name"`
+	SnapshotRevision      int64                                 `json:"snapshot_revision"`
+	RuntimeGeneration     int64                                 `json:"runtime_generation"`
+	PolicyHash            string                                `json:"policy_hash,omitempty"`
+	SnapshotHash          string                                `json:"snapshot_hash,omitempty"`
+	ProfileHash           string                                `json:"profile_hash,omitempty"`
+	AlgorithmVersion      string                                `json:"algorithm_version"`
+	Seed                  int64                                 `json:"seed"`
+	RetryIndex            int                                   `json:"retry_index"`
+	IsStream              bool                                  `json:"is_stream"`
+	ActualChannelID       int                                   `json:"actual_channel_id"`
+	ObservedChannelID     int                                   `json:"observed_channel_id"`
+	CandidateCount        int                                   `json:"candidate_count"`
+	EligibleCount         int                                   `json:"eligible_count"`
+	FilteredOpen          int                                   `json:"filtered_open"`
+	FilteredCapacity      int                                   `json:"filtered_capacity"`
+	BreakerBypassed       bool                                  `json:"breaker_bypassed"`
+	ObservedMatchesActual bool                                  `json:"observed_matches_actual"`
+	DifferenceType        string                                `json:"difference_type,omitempty"`
+	ActualCostKnown       bool                                  `json:"actual_cost_known"`
+	ActualExpectedCost    float64                               `json:"actual_expected_cost"`
+	ObservedCostKnown     bool                                  `json:"observed_cost_known"`
+	ObservedExpectedCost  float64                               `json:"observed_expected_cost"`
+	ExpectedCostDelta     float64                               `json:"expected_cost_delta"`
+	Replayable            bool                                  `json:"replayable"`
+	Gate                  *channelRoutingDecisionGate           `json:"gate,omitempty"`
+	Cohort                string                                `json:"cohort,omitempty"`
+	SelectedIdentity      *channelRoutingDecisionIdentity       `json:"selected_identity,omitempty"`
+	CapacityAdmission     *channelrouting.CapacityAdmission     `json:"capacity_admission,omitempty"`
+	ExclusionSummary      model.RoutingDecisionExclusionSummary `json:"exclusion_summary"`
+	Candidates            channelRoutingDecisionCandidates      `json:"candidate_set"`
+	CreatedTime           int64                                 `json:"created_time"`
 }
 
 func GetChannelRoutingOverview(c *gin.Context) {
@@ -510,6 +534,29 @@ func ListChannelRoutingDecisions(c *gin.Context) {
 		}
 		query = query.Where("observed_matches_actual = ?", value)
 	}
+	if rawActivationID := strings.TrimSpace(c.Query("activation_id")); rawActivationID != "" {
+		activationID, err := strconv.ParseInt(rawActivationID, 10, 64)
+		if err != nil || activationID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision activation filter"})
+			return
+		}
+		query = query.Where("activation_id = ?", activationID)
+	}
+	if rolloutKey := strings.TrimSpace(c.Query("rollout_key")); rolloutKey != "" {
+		_, err := hex.DecodeString(rolloutKey)
+		if err != nil || len(rolloutKey) != 64 || rolloutKey != strings.ToLower(rolloutKey) {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision rollout filter"})
+			return
+		}
+		query = query.Where("rollout_key = ?", rolloutKey)
+	}
+	if cohort := strings.TrimSpace(c.Query("cohort")); cohort != "" {
+		if cohort != model.RoutingDecisionCohortControl && cohort != model.RoutingDecisionCohortCanary {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision cohort filter"})
+			return
+		}
+		query = query.Where("cohort = ?", cohort)
+	}
 	var records []model.RoutingDecisionAudit
 	if err := query.Order("id desc").Limit(limit + 1).Find(&records).Error; err != nil {
 		common.ApiErrorMsg(c, "failed to load channel routing decisions")
@@ -561,6 +608,41 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 	if err := common.UnmarshalJsonStr(record.CandidatesJSON, &payload); err != nil {
 		payload = channelRoutingDecisionCandidates{Truncated: true, Candidates: []channelrouting.DecisionCandidate{}}
 	}
+	exclusionSummary := model.RoutingDecisionExclusionSummary{Reasons: []model.RoutingDecisionExclusionCount{}}
+	if record.ExclusionSummaryJSON != "" && common.UnmarshalJsonStr(record.ExclusionSummaryJSON, &exclusionSummary) != nil {
+		exclusionSummary = model.RoutingDecisionExclusionSummary{Reasons: []model.RoutingDecisionExclusionCount{}}
+	}
+	var gate *channelRoutingDecisionGate
+	if record.Cohort != "" {
+		gate = &channelRoutingDecisionGate{
+			ActivationID: record.ActivationID, ActivationStage: record.ActivationStage,
+			PolicyRevision: record.SnapshotRevision, TrafficBasisPoints: record.TrafficBasisPoints,
+			Bucket: record.CanaryBucket, InCanary: record.Cohort == model.RoutingDecisionCohortCanary,
+			RolloutKey: channelrouting.RolloutKey(record.RolloutKey),
+		}
+	}
+	var selectedIdentity *channelRoutingDecisionIdentity
+	if record.SelectedMemberID > 0 {
+		selectedIdentity = &channelRoutingDecisionIdentity{
+			SnapshotRevision: record.SnapshotRevision, PoolID: record.PoolID, MemberID: record.SelectedMemberID,
+			CredentialID: record.SelectedCredentialID, ChannelID: record.ObservedChannelID,
+		}
+	}
+	var capacityAdmission *channelrouting.CapacityAdmission
+	if record.ReservationMode != "" {
+		capacityAdmission = &channelrouting.CapacityAdmission{
+			Mode: channelrouting.CapacityMode(record.ReservationMode),
+			Key:  channelrouting.CapacityKey{PoolID: record.PoolID, MemberID: record.SelectedMemberID, Model: record.ModelName},
+			Demand: channelrouting.Demand{
+				RPM: record.ReservationRPM, InputTPM: record.ReservationInputTPM,
+				OutputTPM: record.ReservationOutputTPM, Inflight: record.ReservationInflight,
+			},
+			Limit: channelrouting.Limit{
+				RPM: record.ReservationLimitRPM, InputTPM: record.ReservationLimitInputTPM,
+				OutputTPM: record.ReservationLimitOutputTPM, Inflight: record.ReservationLimitInflight,
+			},
+		}
+	}
 	return channelRoutingDecisionView{
 		ID:                    record.ID,
 		DecisionID:            record.DecisionID,
@@ -592,6 +674,11 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 		ObservedExpectedCost:  record.ObservedExpectedCost,
 		ExpectedCostDelta:     record.ExpectedCostDelta,
 		Replayable:            record.Replayable,
+		Gate:                  gate,
+		Cohort:                record.Cohort,
+		SelectedIdentity:      selectedIdentity,
+		CapacityAdmission:     capacityAdmission,
+		ExclusionSummary:      exclusionSummary,
 		Candidates:            payload,
 		CreatedTime:           record.CreatedTime,
 	}

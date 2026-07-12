@@ -314,6 +314,123 @@ func TestRoutingPolicySupportsEmptyRevisionAndRejectsNonPositiveCredentialIDs(t 
 	}
 }
 
+func TestRoutingPolicyActivationTrafficContract(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage string
+		basis int
+		valid bool
+	}{
+		{name: "observe without traffic", stage: RoutingDeploymentStageObserve, basis: 0, valid: true},
+		{name: "shadow without traffic", stage: RoutingDeploymentStageShadow, basis: 0, valid: true},
+		{name: "active without traffic", stage: RoutingDeploymentStageActive, basis: 0, valid: true},
+		{name: "canary one percent", stage: RoutingDeploymentStageCanary, basis: 100, valid: true},
+		{name: "canary five percent", stage: RoutingDeploymentStageCanary, basis: 500, valid: true},
+		{name: "canary below one percent", stage: RoutingDeploymentStageCanary, basis: 99},
+		{name: "canary above five percent", stage: RoutingDeploymentStageCanary, basis: 501},
+		{name: "canary without traffic", stage: RoutingDeploymentStageCanary, basis: 0},
+		{name: "observe with traffic", stage: RoutingDeploymentStageObserve, basis: 100},
+		{name: "shadow with traffic", stage: RoutingDeploymentStageShadow, basis: 100},
+		{name: "active with traffic", stage: RoutingDeploymentStageActive, basis: 100},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openRoutingSQLiteTestDB(t)
+			withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+			require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+			require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+
+			document := routingPolicyDocumentForTest(10)
+			document.Pools[0].DeploymentStage = test.stage
+			_, err := PublishRoutingPolicyRevisionContext(
+				context.Background(),
+				0,
+				document,
+				RoutingPolicyActivationSpec{Stage: test.stage, TrafficBasisPoints: test.basis, ActorID: 100},
+			)
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
+			assertRoutingPolicyRowCounts(t, 0, 0, 0, 0, 0)
+		})
+	}
+}
+
+func TestRoutingPolicyRejectsPoolActivationStageConflict(t *testing.T) {
+	tests := []struct {
+		name       string
+		activation string
+		basis      int
+		pools      []string
+		valid      bool
+	}{
+		{name: "observe", activation: RoutingDeploymentStageObserve, pools: []string{RoutingDeploymentStageObserve}, valid: true},
+		{name: "shadow with observe pool", activation: RoutingDeploymentStageShadow, pools: []string{RoutingDeploymentStageObserve, RoutingDeploymentStageShadow}, valid: true},
+		{name: "canary with lower pools", activation: RoutingDeploymentStageCanary, basis: 250, pools: []string{RoutingDeploymentStageObserve, RoutingDeploymentStageShadow, RoutingDeploymentStageCanary}, valid: true},
+		{name: "active with lower non-canary pools", activation: RoutingDeploymentStageActive, pools: []string{RoutingDeploymentStageObserve, RoutingDeploymentStageShadow, RoutingDeploymentStageActive}, valid: true},
+		{name: "observe cannot activate shadow", activation: RoutingDeploymentStageObserve, pools: []string{RoutingDeploymentStageShadow}},
+		{name: "shadow cannot activate canary", activation: RoutingDeploymentStageShadow, pools: []string{RoutingDeploymentStageCanary}},
+		{name: "canary cannot activate active", activation: RoutingDeploymentStageCanary, basis: 250, pools: []string{RoutingDeploymentStageActive}},
+		{name: "active cannot retain canary", activation: RoutingDeploymentStageActive, pools: []string{RoutingDeploymentStageCanary}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openRoutingSQLiteTestDB(t)
+			withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+			require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+			require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+			document := routingPolicyDocumentWithStagesForTest(test.pools...)
+
+			_, err := PublishRoutingPolicyRevisionContext(
+				context.Background(),
+				0,
+				document,
+				RoutingPolicyActivationSpec{Stage: test.activation, TrafficBasisPoints: test.basis, ActorID: 100},
+			)
+			if test.valid {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
+			assertRoutingPolicyRowCounts(t, 0, 0, 0, 0, 0)
+		})
+	}
+}
+
+func TestRoutingPolicyCanaryConfigurationFailsClosedForKnownFields(t *testing.T) {
+	tests := []struct {
+		name       string
+		policyJSON string
+		valid      bool
+	}{
+		{name: "hedging explicitly disabled", policyJSON: `{"canary":{"hedging_enabled":false}}`, valid: true},
+		{name: "unknown top level and canary fields remain compatible", policyJSON: `{"future":1,"canary":{"future_mode":"observe","hedging_enabled":false}}`, valid: true},
+		{name: "hedging enabled", policyJSON: `{"canary":{"hedging_enabled":true}}`},
+		{name: "hedging string is not a boolean", policyJSON: `{"canary":{"hedging_enabled":"false"}}`},
+		{name: "hedging null is not a boolean", policyJSON: `{"canary":{"hedging_enabled":null}}`},
+		{name: "canary must be an object", policyJSON: `{"canary":[]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := routingPolicyDocumentForTest(10)
+			document.Pools[0].Policy = json.RawMessage(test.policyJSON)
+			normalized, _, err := NormalizeRoutingPolicyDocument(document)
+			if test.valid {
+				require.NoError(t, err)
+				require.Len(t, normalized.Pools, 1)
+				assert.JSONEq(t, test.policyJSON, string(normalized.Pools[0].Policy))
+				return
+			}
+			assert.ErrorIs(t, err, ErrRoutingPolicyInvalid)
+		})
+	}
+}
+
 func TestRoutingPolicyAllowsLargePoolAndRejectsTopologyLimit(t *testing.T) {
 	large := routingPolicyDocumentForTest(10)
 	large.Pools[0].Members = make([]RoutingPolicyMemberContent, 65)
@@ -556,6 +673,23 @@ func routingPolicyDocumentForTest(weight int64) RoutingPolicyDocument {
 			}},
 		}},
 	}
+}
+
+func routingPolicyDocumentWithStagesForTest(stages ...string) RoutingPolicyDocument {
+	document := RoutingPolicyDocument{
+		SchemaVersion: RoutingPolicySchemaVersion,
+		Pools:         make([]RoutingPolicyPoolContent, len(stages)),
+	}
+	for index, stage := range stages {
+		document.Pools[index] = RoutingPolicyPoolContent{
+			PoolID:          index + 1,
+			GroupName:       fmt.Sprintf("stage-%d", index),
+			DisplayName:     fmt.Sprintf("Stage %d", index),
+			DeploymentStage: stage,
+			PolicyProfile:   RoutingPolicyProfileBalanced,
+		}
+	}
+	return document
 }
 
 func migrateRoutingPolicyModelsForTest(db *gorm.DB) error {

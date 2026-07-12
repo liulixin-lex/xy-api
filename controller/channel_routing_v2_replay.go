@@ -31,6 +31,7 @@ type channelRoutingReplayView struct {
 	ReplayedChannelID int                               `json:"replayed_channel_id"`
 	DifferenceType    string                            `json:"difference_type"`
 	AuditVerified     bool                              `json:"audit_verified"`
+	GateVerified      bool                              `json:"gate_verified"`
 	Result            channelrouting.ShadowReplayResult `json:"result"`
 }
 
@@ -54,7 +55,8 @@ func ReplayChannelRoutingDecision(c *gin.Context) {
 		writeChannelRoutingReplayError(c, http.StatusUnprocessableEntity, "decision_not_replayable", "channel routing decision is not replayable")
 		return
 	}
-	if audit.AlgorithmVersion != channelrouting.DecisionAlgorithmShadowV1 {
+	if audit.AlgorithmVersion != channelrouting.DecisionAlgorithmShadowV1 &&
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmCanaryV1 {
 		writeChannelRoutingReplayError(c, http.StatusUnprocessableEntity, "replay_algorithm_unsupported", "channel routing replay algorithm is not supported")
 		return
 	}
@@ -85,6 +87,7 @@ func ReplayChannelRoutingDecision(c *gin.Context) {
 		ReplayedChannelID: result.SelectedChannelID,
 		DifferenceType:    channelrouting.ClassifyShadowDifference(audit.ActualChannelID, result),
 		AuditVerified:     true,
+		GateVerified:      audit.AlgorithmVersion == channelrouting.DecisionAlgorithmCanaryV1,
 		Result:            result,
 	})
 }

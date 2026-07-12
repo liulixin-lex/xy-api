@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
@@ -106,17 +107,25 @@ func Distribute() func(c *gin.Context) {
 
 				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
 					affinityUsable := false
+					affinityBypassedForCanary := false
 					if preferred, affinityGroup, ok := service.GetAdmissibleAffinityChannel(c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path); ok {
-						channel = preferred
-						selectGroup = affinityGroup
-						affinityUsable = true
-						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
-						service.RecordChannelRoutingObserveSelection(&service.RetryParam{
-							Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
-							RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
-						}, affinityGroup, preferred, 0)
+						bypassAffinity, gateErr := service.ShouldBypassChannelRoutingAffinity(c, affinityGroup)
+						if gateErr != nil {
+							logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
+						}
+						affinityBypassedForCanary = bypassAffinity
+						if !bypassAffinity {
+							channel = preferred
+							selectGroup = affinityGroup
+							affinityUsable = true
+							service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
+							service.RecordChannelRoutingObserveSelection(&service.RetryParam{
+								Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
+								RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+							}, affinityGroup, preferred, 0)
+						}
 					}
-					if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
+					if !affinityUsable && !affinityBypassedForCanary && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
 					}
 				}
@@ -153,14 +162,22 @@ func Distribute() func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		if channel != nil {
 			if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+				cleanupRoutingCapacityReservation(c)
 				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 				return
 			}
 		}
 		c.Next()
+		cleanupRoutingCapacityReservation(c)
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
+	}
+}
+
+func cleanupRoutingCapacityReservation(c *gin.Context) {
+	if err := service.CancelRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation cleanup failed: %v", err))
 	}
 }
 
@@ -525,12 +542,17 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 			routingGroup = selectedGroup
 		}
 	}
-	if smart_routing_setting.Enabled() {
-		if identity, ok := channelrouting.ResolveIdentity(
-			routingGroup,
-			channel.Id,
-			key,
-		); ok {
+	if selected, ok := service.GetSelectedRoutingIdentity(c, channel.Id); ok {
+		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selected.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selected.PoolID)
+		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selected.MemberID)
+		if identity, resolved := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); resolved &&
+			identity.PoolID == selected.PoolID && identity.MemberID == selected.MemberID {
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
+		}
+		service.ClearSelectedRoutingIdentity(c)
+	} else if smart_routing_setting.Enabled() {
+		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
 			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
 			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
 			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)

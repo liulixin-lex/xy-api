@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	RoutingPolicySchemaVersion     = 1
-	RoutingPolicyMaxMembersPerPool = 4_096
+	RoutingPolicySchemaVersion        = 1
+	RoutingPolicyMaxMembersPerPool    = 4_096
+	RoutingPolicyCanaryMinBasisPoints = 100
+	RoutingPolicyCanaryMaxBasisPoints = 500
 
 	RoutingDeploymentStageObserve = "observe"
 	RoutingDeploymentStageShadow  = "shadow"
@@ -271,6 +273,13 @@ type RoutingPolicyActivationSpec struct {
 	TrafficBasisPoints int    `json:"traffic_basis_points"`
 	ActorID            int    `json:"actor_id"`
 	Reason             string `json:"reason"`
+}
+
+func (spec RoutingPolicyActivationSpec) Validate() error {
+	if !validRoutingPolicyActivationSpec(spec) {
+		return ErrRoutingPolicyInvalid
+	}
+	return nil
 }
 
 type RoutingPolicyPublishResult struct {
@@ -798,8 +807,11 @@ func publishNormalizedRoutingPolicyRevisionContext(
 		return RoutingPolicyPublishResult{}, errRoutingPolicyDatabaseNil
 	}
 	if expectedRevision < 0 || expectedRevision == math.MaxInt64 || rollbackOfRevision < 0 ||
-		!validRoutingPolicyActivationSpec(activationSpec) || len(contentHash) != 64 {
+		activationSpec.Validate() != nil || len(contentHash) != 64 {
 		return RoutingPolicyPublishResult{}, ErrRoutingPolicyInvalid
+	}
+	if err := ValidateRoutingPolicyActivationDocument(document, activationSpec); err != nil {
+		return RoutingPolicyPublishResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return RoutingPolicyPublishResult{}, err
@@ -1019,6 +1031,9 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 		if err != nil {
 			return RoutingPolicyDocument{}, "", err
 		}
+		if err := validateRoutingPolicyCanaryConfiguration(policy); err != nil {
+			return RoutingPolicyDocument{}, "", err
+		}
 		pool.Policy = policy
 		pool.Members = append([]RoutingPolicyMemberContent(nil), pool.Members...)
 		if len(pool.Members) > RoutingPolicyMaxMembersPerPool {
@@ -1183,6 +1198,60 @@ func normalizeRoutingPolicyJSONObject(value json.RawMessage) (json.RawMessage, e
 	return json.RawMessage(canonical), nil
 }
 
+func validateRoutingPolicyCanaryConfiguration(policy json.RawMessage) error {
+	var object map[string]json.RawMessage
+	if err := common.Unmarshal(policy, &object); err != nil || object == nil {
+		return ErrRoutingPolicyInvalid
+	}
+	canaryJSON, exists := object["canary"]
+	if !exists {
+		return nil
+	}
+	var canary map[string]json.RawMessage
+	if err := common.Unmarshal(canaryJSON, &canary); err != nil || canary == nil {
+		return ErrRoutingPolicyInvalid
+	}
+	hedgingJSON, exists := canary["hedging_enabled"]
+	if !exists {
+		return nil
+	}
+	var hedgingValue any
+	if err := common.Unmarshal(hedgingJSON, &hedgingValue); err != nil {
+		return ErrRoutingPolicyInvalid
+	}
+	hedgingEnabled, valid := hedgingValue.(bool)
+	if !valid || hedgingEnabled {
+		return ErrRoutingPolicyInvalid
+	}
+	return nil
+}
+
+func ValidateRoutingPolicyActivationDocument(document RoutingPolicyDocument, activation RoutingPolicyActivationSpec) error {
+	if err := activation.Validate(); err != nil {
+		return err
+	}
+	for index := range document.Pools {
+		poolStage := document.Pools[index].DeploymentStage
+		valid := false
+		switch activation.Stage {
+		case RoutingDeploymentStageObserve:
+			valid = poolStage == RoutingDeploymentStageObserve
+		case RoutingDeploymentStageShadow:
+			valid = poolStage == RoutingDeploymentStageObserve || poolStage == RoutingDeploymentStageShadow
+		case RoutingDeploymentStageCanary:
+			valid = poolStage == RoutingDeploymentStageObserve || poolStage == RoutingDeploymentStageShadow ||
+				poolStage == RoutingDeploymentStageCanary
+		case RoutingDeploymentStageActive:
+			valid = poolStage == RoutingDeploymentStageObserve || poolStage == RoutingDeploymentStageShadow ||
+				poolStage == RoutingDeploymentStageActive
+		}
+		if !valid {
+			return ErrRoutingPolicyInvalid
+		}
+	}
+	return nil
+}
+
 func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) ([]RoutingPolicyPoolRevision, []RoutingPolicyMemberRevision, error) {
 	poolRows := make([]RoutingPolicyPoolRevision, 0, len(document.Pools))
 	memberRows := make([]RoutingPolicyMemberRevision, 0, routingPolicyDocumentMemberCount(document))
@@ -1265,8 +1334,15 @@ func routingPolicyDocumentMemberCount(document RoutingPolicyDocument) int {
 }
 
 func validRoutingPolicyActivationSpec(spec RoutingPolicyActivationSpec) bool {
-	return validRoutingDeploymentStage(spec.Stage) && spec.TrafficBasisPoints >= 0 && spec.TrafficBasisPoints <= 10_000 &&
-		spec.ActorID >= 0 && validRoutingPolicyText(spec.Reason, routingPolicyReasonMaxRunes)
+	if !validRoutingDeploymentStage(spec.Stage) || spec.ActorID < 0 ||
+		!validRoutingPolicyText(spec.Reason, routingPolicyReasonMaxRunes) {
+		return false
+	}
+	if spec.Stage == RoutingDeploymentStageCanary {
+		return spec.TrafficBasisPoints >= RoutingPolicyCanaryMinBasisPoints &&
+			spec.TrafficBasisPoints <= RoutingPolicyCanaryMaxBasisPoints
+	}
+	return spec.TrafficBasisPoints == 0
 }
 
 func validRoutingDeploymentStage(stage string) bool {

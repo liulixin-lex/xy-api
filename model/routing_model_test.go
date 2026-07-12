@@ -741,6 +741,12 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "GroupKey"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ModelKey"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "RequestKey"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ActivationID"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "RolloutKey"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "Cohort"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "SelectedMemberID"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ReservationMode"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ExclusionSummaryJSON"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCostSnapshot{}, "ModelKey"))
 	require.True(t, DB.Migrator().HasIndex(&RoutingCostSnapshot{}, "idx_routing_cost_channel_model_key"))
 	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{

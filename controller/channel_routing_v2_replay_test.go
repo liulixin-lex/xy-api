@@ -75,6 +75,27 @@ func TestReplayChannelRoutingDecisionVerifiesAuditAndDistinguishesFailureModes(t
 	}
 }
 
+func TestReplayChannelRoutingCanaryDecisionVerifiesGateAndMetadata(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	decisionID := enqueueControllerCanaryReplayAudit(t)
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, flushed)
+
+	valid := performControllerReplayRequest(decisionID)
+	assert.Equal(t, http.StatusOK, valid.Code)
+	assert.Contains(t, valid.Body.String(), `"algorithm_version":"`+channelrouting.DecisionAlgorithmCanaryV1+`"`)
+	assert.Contains(t, valid.Body.String(), `"gate_verified":true`)
+	assert.Contains(t, valid.Body.String(), `"stored_channel_id":101`)
+
+	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).
+		Where("decision_id = ?", decisionID).Update("canary_bucket", 999).Error)
+	tampered := performControllerReplayRequest(decisionID)
+	assert.Equal(t, http.StatusConflict, tampered.Code)
+	assert.Contains(t, tampered.Body.String(), `"code":"replay_integrity_failed"`)
+}
+
 func TestSimulateChannelRoutingGroupUsesStrictBoundedRequestSchema(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
@@ -176,6 +197,55 @@ func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) st
 		ActualExpectedCost:   actualCost,
 		ObservedCostKnown:    replay.SelectedCostKnown,
 		ObservedExpectedCost: replay.SelectedCost,
+	})
+	require.NoError(t, err)
+	return decisionID
+}
+
+func enqueueControllerCanaryReplayAudit(t *testing.T) string {
+	t.Helper()
+	const (
+		poolID         = 29
+		policyRevision = 7
+		requestID      = "cohort-0005"
+	)
+	profile, err := channelrouting.NewRequestProfile(
+		"/v1/chat/completions", "group-29", "gpt-test", false, 0, 100, 20,
+	)
+	require.NoError(t, err)
+	seed, err := channelrouting.DeriveDecisionSeed(requestID, policyRevision, 0)
+	require.NoError(t, err)
+	input, err := channelrouting.BuildCanaryReplayInput(poolID, policyRevision, 3, strings.Repeat("c", 64), profile, routingselector.Settings{
+		WeightAvailability: 1, TopK: 1, MaxEjectedPct: 50, HalfOpenProbes: 1,
+		SnapshotStaleSec: 1_800, NowUnix: 1_000, NowUnixMilli: 1_000_000, RandomSeed: seed,
+	}, []channelrouting.ShadowCandidateInput{{
+		PoolMemberID: 11, ChannelID: 101, CredentialID: 1_001,
+		Priority: 10, Weight: 10, SlowStartFactor: 1,
+	}})
+	require.NoError(t, err)
+	replay, err := channelrouting.RunShadowReplay(input)
+	require.NoError(t, err)
+	gate, err := channelrouting.EvaluateCanaryGate(poolID, 401, policyRevision, requestID, 100)
+	require.NoError(t, err)
+	require.True(t, gate.InCanary)
+	admission := channelrouting.CapacityAdmission{
+		Mode:   channelrouting.CapacityModeLocalSoft,
+		Key:    channelrouting.CapacityKey{PoolID: poolID, MemberID: 11, Model: profile.ModelName},
+		Demand: channelrouting.Demand{RPM: 1, InputTPM: 100, OutputTPM: 20, Inflight: 1},
+		Limit:  channelrouting.Limit{RPM: 10, InputTPM: 1_000, OutputTPM: 200, Inflight: 4},
+	}
+	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+		RequestID: requestID, PoolID: poolID, GroupName: profile.GroupName, ModelName: profile.ModelName,
+		SnapshotRevision: policyRevision, AlgorithmVersion: channelrouting.DecisionAlgorithmCanaryV1,
+		ActualChannelID: replay.SelectedChannelID, ObservedChannelID: replay.SelectedChannelID,
+		FilteredOpen: replay.FilteredOpen, FilteredCapacity: replay.FilteredCapacity,
+		BreakerBypassed: replay.BreakerBypassed, Candidates: replay.Candidates, ReplayInput: &input,
+		DifferenceType: channelrouting.ClassifyShadowDifference(replay.SelectedChannelID, replay),
+		Gate:           &gate,
+		SelectedIdentity: channelrouting.Identity{
+			SnapshotRevision: policyRevision, PoolID: poolID, MemberID: 11, CredentialID: 1_001,
+		},
+		CapacityAdmission: &admission,
 	})
 	require.NoError(t, err)
 	return decisionID

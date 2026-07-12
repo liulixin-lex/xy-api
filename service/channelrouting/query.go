@@ -9,13 +9,16 @@ import (
 )
 
 type SnapshotMetadata struct {
-	Revision          uint64        `json:"revision"`
-	RuntimeGeneration uint64        `json:"runtime_generation"`
-	PolicyHash        string        `json:"policy_hash"`
-	NodeEpochID       string        `json:"node_epoch_id"`
-	BuiltAtUnix       int64         `json:"built_at"`
-	BuildDurationMs   int64         `json:"build_duration_ms"`
-	Stats             SnapshotStats `json:"stats"`
+	Revision           uint64        `json:"revision"`
+	RuntimeGeneration  uint64        `json:"runtime_generation"`
+	PolicyHash         string        `json:"policy_hash"`
+	ActivationID       int64         `json:"activation_id"`
+	ActivationStage    string        `json:"activation_stage"`
+	TrafficBasisPoints int           `json:"traffic_basis_points"`
+	NodeEpochID        string        `json:"node_epoch_id"`
+	BuiltAtUnix        int64         `json:"built_at"`
+	BuildDurationMs    int64         `json:"build_duration_ms"`
+	Stats              SnapshotStats `json:"stats"`
 }
 
 type TelemetryAggregate struct {
@@ -72,13 +75,16 @@ func snapshotMetadata(view SnapshotView) SnapshotMetadata {
 		stats.UnknownClassificationRate = &value
 	}
 	return SnapshotMetadata{
-		Revision:          view.Revision,
-		RuntimeGeneration: view.RuntimeGeneration,
-		PolicyHash:        view.PolicyHash,
-		NodeEpochID:       NodeEpochID(),
-		BuiltAtUnix:       view.BuiltAtUnix,
-		BuildDurationMs:   view.BuildDurationMs,
-		Stats:             stats,
+		Revision:           view.Revision,
+		RuntimeGeneration:  view.RuntimeGeneration,
+		PolicyHash:         view.PolicyHash,
+		ActivationID:       view.ActivationID,
+		ActivationStage:    view.ActivationStage,
+		TrafficBasisPoints: view.TrafficBasisPoints,
+		NodeEpochID:        NodeEpochID(),
+		BuiltAtUnix:        view.BuiltAtUnix,
+		BuildDurationMs:    view.BuildDurationMs,
+		Stats:              stats,
 	}
 }
 
@@ -96,6 +102,26 @@ func CurrentSnapshotSummary() (SnapshotMetadata, TelemetryAggregate, bool) {
 		return SnapshotMetadata{}, TelemetryAggregate{}, false
 	}
 	return snapshotMetadata(snapshot.view), snapshot.telemetrySummary, true
+}
+
+func CurrentPoolDeploymentStage(groupName string) (string, bool) {
+	snapshot := currentSnapshot.Load()
+	if snapshot == nil || groupName == "" {
+		return "", false
+	}
+	poolID, exists := snapshot.poolByGroup[groupName]
+	if !exists {
+		return "", false
+	}
+	poolIndex, exists := snapshot.poolIndexByID[poolID]
+	if !exists || poolIndex < 0 || poolIndex >= len(snapshot.view.Pools) {
+		return "", false
+	}
+	pool := snapshot.view.Pools[poolIndex]
+	if pool.ID != poolID || pool.GroupName != groupName {
+		return "", false
+	}
+	return pool.DeploymentStage, true
 }
 
 func ListPoolSnapshotSummaries(search string, offset int, limit int) ([]PoolSnapshotSummary, int, SnapshotMetadata, bool) {

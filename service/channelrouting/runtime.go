@@ -285,7 +285,9 @@ func refreshSnapshotIfNeededContext(ctx context.Context, force bool) (SnapshotMe
 		if int64(current.Revision) > head.CurrentRevision {
 			return SnapshotMetadata{}, ErrSnapshotRevisionRollback
 		}
-		if int64(current.Revision) == head.CurrentRevision && current.PolicyHash != head.CurrentHash {
+		if int64(current.Revision) == head.CurrentRevision &&
+			(current.PolicyHash != head.CurrentHash || current.ActivationID != head.CurrentActivationID ||
+				current.ActivationStage != head.CurrentStage) {
 			return SnapshotMetadata{}, ErrSnapshotRevisionConflict
 		}
 		age := time.Since(time.Unix(current.BuiltAtUnix, 0))
@@ -293,6 +295,7 @@ func refreshSnapshotIfNeededContext(ctx context.Context, force bool) (SnapshotMe
 			age = 0
 		}
 		if !force && int64(current.Revision) == head.CurrentRevision && current.PolicyHash == head.CurrentHash &&
+			current.ActivationID == head.CurrentActivationID && current.ActivationStage == head.CurrentStage &&
 			age < observeSnapshotFallback {
 			return current, nil
 		}

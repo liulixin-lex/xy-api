@@ -248,7 +248,8 @@ func scoreCandidate(item candidateHealth, bounds scoreBounds, weights Weights, s
 	throughput := throughputScore(item.candidate.Metric, bounds)
 	cost, knownCost := costScore(item.candidate.Cost, bounds, settings)
 
-	score, healthOrder := weightedScore(weights, availability, latency, throughput, cost, knownCost), 0
+	scoreMultiplier := candidateScoreMultiplier(item.candidate.ScoreMultiplier)
+	score, healthOrder := weightedScore(weights, availability, latency, throughput, cost, knownCost)*scoreMultiplier, 0
 	if item.degraded {
 		score *= degradedScoreMultiplier
 		healthOrder = 1
@@ -266,9 +267,20 @@ func scoreCandidate(item candidateHealth, bounds scoreBounds, weights Weights, s
 		Degraded:        item.degraded,
 		Open:            item.open,
 		Inflight:        inflightCount(item.candidate.Metric),
+		ScoreMultiplier: scoreMultiplier,
 		originalIndex:   item.index,
 		healthSortOrder: healthOrder,
 	}
+}
+
+func candidateScoreMultiplier(value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 1
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
 }
 
 func inflightCount(metric *MetricSnapshot) int64 {
