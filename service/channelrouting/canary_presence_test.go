@@ -96,6 +96,9 @@ func TestCanaryEvaluatorUsesPresenceHeartbeatsAcrossZeroTrafficWindows(t *testin
 	policy.Evaluation.ConsecutiveBreachWindows = 2
 	view.Pools[0].CanaryPolicy = policy
 	currentSnapshot.Store(&runtimeSnapshot{view: view})
+	rolloutKey, err := CanaryRolloutKey(29, view.ActivationID, view.Revision, view.TrafficBasisPoints)
+	require.NoError(t, err)
+	defaultCanaryEvaluationSchedule.markCompleted(rolloutKey, base.UnixMilli())
 
 	setting := smart_routing_setting.SmartRoutingSetting{Enabled: true}
 	require.NoError(t, persistRoutingCanaryNodePresenceAtContext(context.Background(), clock.Now()))

@@ -18,13 +18,14 @@ import (
 )
 
 const (
-	routingCanaryEvaluatorLeaseName = "routing-v2-canary-evaluator"
-	routingCanaryOperationLeaseName = "routing-v2-canary-operations"
-	canaryControlLeaseTTL           = 2 * time.Minute
-	canaryOperationClaimTTL         = time.Minute
-	canaryEvaluatorSettleDelay      = 5 * time.Second
-	canaryEvaluatorMaxNodes         = 4_096
-	canaryEvaluatorPageSize         = model.RoutingRuntimeCheckpointMaxPageSize
+	routingCanaryEvaluatorLeaseName  = "routing-v2-canary-evaluator"
+	routingCanaryOperationLeaseName  = "routing-v2-canary-operations"
+	canaryControlLeaseTTL            = 2 * time.Minute
+	canaryOperationClaimTTL          = time.Minute
+	canaryEvaluatorSettleDelay       = 5 * time.Second
+	canaryEvaluatorMaxCatchUpWindows = 10
+	canaryEvaluatorMaxNodes          = 4_096
+	canaryEvaluatorPageSize          = model.RoutingRuntimeCheckpointMaxPageSize
 )
 
 var ErrCanaryControlInvalid = errors.New("invalid channel routing canary control state")
@@ -124,16 +125,15 @@ func evaluateRoutingCanarySweepContext(
 	defaultCanaryEvaluationSchedule.prune(targets)
 	pending := make([]pendingCanaryEvaluation, 0, len(targets))
 	for index := range targets {
-		windowStartMs, windowEndMs, exists, windowErr := canaryEvaluationWindow(targets[index], now)
+		windows, windowErr := pendingCanaryEvaluationWindows(
+			targets[index],
+			now,
+			defaultCanaryEvaluationSchedule.completedWindowEnd(targets[index].RolloutKey),
+		)
 		if windowErr != nil {
 			return windowErr
 		}
-		if !exists || defaultCanaryEvaluationSchedule.completed(targets[index].RolloutKey, windowEndMs) {
-			continue
-		}
-		pending = append(pending, pendingCanaryEvaluation{
-			target: targets[index], windowStartMs: windowStartMs, windowEndMs: windowEndMs,
-		})
+		pending = append(pending, windows...)
 	}
 	if len(pending) == 0 {
 		return nil
@@ -152,7 +152,14 @@ func evaluateRoutingCanarySweepContext(
 		if activeErr != nil {
 			return activeErr
 		}
-		if err := evaluateRoutingCanaryTargetContext(ctx, pending[index].target, activeNodes, now); err != nil {
+		if err := evaluateRoutingCanaryTargetContext(
+			ctx,
+			pending[index].target,
+			activeNodes,
+			pending[index].windowStartMs,
+			pending[index].windowEndMs,
+			now,
+		); err != nil {
 			return err
 		}
 		defaultCanaryEvaluationSchedule.markCompleted(pending[index].target.RolloutKey, pending[index].windowEndMs)
@@ -205,6 +212,67 @@ func currentCanaryEvaluationTargets() ([]canaryEvaluationTarget, error) {
 	return targets, nil
 }
 
+func pendingCanaryEvaluationWindows(
+	target canaryEvaluationTarget,
+	now time.Time,
+	completedWindowEndMs int64,
+) ([]pendingCanaryEvaluation, error) {
+	latestWindowStartMs, latestWindowEndMs, exists, err := canaryEvaluationWindow(target, now)
+	if err != nil || !exists {
+		return nil, err
+	}
+	if completedWindowEndMs >= latestWindowEndMs {
+		return nil, nil
+	}
+	windowMs := latestWindowEndMs - latestWindowStartMs
+	catchUpWindows := target.Policy.ConsecutiveBreachWindows
+	if windowMs <= 0 || catchUpWindows < 1 || catchUpWindows > canaryEvaluatorMaxCatchUpWindows ||
+		target.ActivationCreatedMs <= 0 {
+		return nil, ErrCanaryControlInvalid
+	}
+	lookbackMs := int64(catchUpWindows-1) * windowMs
+	if lookbackMs < 0 || latestWindowEndMs <= lookbackMs {
+		return nil, ErrCanaryControlInvalid
+	}
+	firstWindowEndMs := latestWindowEndMs - lookbackMs
+
+	activationWindowStartMs := target.ActivationCreatedMs / windowMs * windowMs
+	if activationWindowStartMs > math.MaxInt64-windowMs {
+		return nil, ErrCanaryControlInvalid
+	}
+	firstActivationWindowEndMs := activationWindowStartMs + windowMs
+	if firstWindowEndMs < firstActivationWindowEndMs {
+		firstWindowEndMs = firstActivationWindowEndMs
+	}
+	if completedWindowEndMs > 0 {
+		if completedWindowEndMs%windowMs != 0 || completedWindowEndMs > math.MaxInt64-windowMs {
+			return nil, ErrCanaryControlInvalid
+		}
+		nextWindowEndMs := completedWindowEndMs + windowMs
+		if firstWindowEndMs < nextWindowEndMs {
+			firstWindowEndMs = nextWindowEndMs
+		}
+	}
+	if firstWindowEndMs > latestWindowEndMs {
+		return nil, nil
+	}
+
+	windowCount := int((latestWindowEndMs-firstWindowEndMs)/windowMs) + 1
+	if windowCount < 1 || windowCount > canaryEvaluatorMaxCatchUpWindows {
+		return nil, ErrCanaryControlInvalid
+	}
+	windows := make([]pendingCanaryEvaluation, 0, windowCount)
+	for index := 0; index < windowCount; index++ {
+		windowEndMs := firstWindowEndMs + int64(index)*windowMs
+		windows = append(windows, pendingCanaryEvaluation{
+			target:        target,
+			windowStartMs: windowEndMs - windowMs,
+			windowEndMs:   windowEndMs,
+		})
+	}
+	return windows, nil
+}
+
 func activeCanaryNodeIDsForWindow(
 	checkpoints []model.RoutingRuntimeCheckpoint,
 	windowStartMs int64,
@@ -232,14 +300,18 @@ func evaluateRoutingCanaryTargetContext(
 	ctx context.Context,
 	target canaryEvaluationTarget,
 	activeNodes map[string]struct{},
+	windowStartMs int64,
+	windowEndMs int64,
 	now time.Time,
 ) error {
-	windowStartMs, windowEndMs, exists, err := canaryEvaluationWindow(target, now)
-	if err != nil {
+	windowMs := int64(target.Policy.WindowSeconds) * 1_000
+	_, latestWindowEndMs, exists, err := canaryEvaluationWindow(target, now)
+	if err != nil || !exists {
 		return err
 	}
-	if !exists {
-		return nil
+	if windowMs <= 0 || windowStartMs <= 0 || windowEndMs-windowStartMs != windowMs ||
+		windowEndMs%windowMs != 0 || windowEndMs > latestWindowEndMs {
+		return ErrCanaryControlInvalid
 	}
 
 	evaluation, err := model.GetRoutingCanaryEvaluationWindowContext(
@@ -769,14 +841,14 @@ func (schedule *canaryEvaluationSchedule) prune(targets []canaryEvaluationTarget
 	schedule.mu.Unlock()
 }
 
-func (schedule *canaryEvaluationSchedule) completed(rolloutKey RolloutKey, windowEndMs int64) bool {
-	if schedule == nil || rolloutKey == "" || windowEndMs <= 0 {
-		return false
+func (schedule *canaryEvaluationSchedule) completedWindowEnd(rolloutKey RolloutKey) int64 {
+	if schedule == nil || rolloutKey == "" {
+		return 0
 	}
 	schedule.mu.Lock()
-	completed := schedule.completedWindow[rolloutKey] >= windowEndMs
+	completedWindowEndMs := schedule.completedWindow[rolloutKey]
 	schedule.mu.Unlock()
-	return completed
+	return completedWindowEndMs
 }
 
 func (schedule *canaryEvaluationSchedule) markCompleted(rolloutKey RolloutKey, windowEndMs int64) {

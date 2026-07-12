@@ -117,6 +117,40 @@ func TestBuildRoutingCanaryEvaluationSpecCountsRetriesAfterRoutingFailures(t *te
 	assert.Equal(t, "retry amplification breached", spec.Reason)
 }
 
+func TestPendingCanaryEvaluationWindowsBoundsCatchUpAndPreservesOrder(t *testing.T) {
+	latestWindowEnd := time.Unix(1_700_000_100, 0)
+	now := latestWindowEnd.Add(11 * time.Second)
+	target := canaryEvaluationTargetForTest(latestWindowEnd.Add(-time.Hour).UnixMilli())
+	target.Policy.WindowSeconds = 60
+	target.Policy.CheckpointLatenessSeconds = 5
+	target.Policy.ConsecutiveBreachWindows = canaryEvaluatorMaxCatchUpWindows
+
+	windows, err := pendingCanaryEvaluationWindows(target, now, 0)
+	require.NoError(t, err)
+	require.Len(t, windows, canaryEvaluatorMaxCatchUpWindows)
+	for index := range windows {
+		wantEndMs := latestWindowEnd.Add(
+			time.Duration(index-canaryEvaluatorMaxCatchUpWindows+1) * time.Minute,
+		).UnixMilli()
+		assert.Equal(t, wantEndMs-int64(time.Minute/time.Millisecond), windows[index].windowStartMs)
+		assert.Equal(t, wantEndMs, windows[index].windowEndMs)
+	}
+
+	resumed, err := pendingCanaryEvaluationWindows(target, now, windows[7].windowEndMs)
+	require.NoError(t, err)
+	require.Len(t, resumed, 2)
+	assert.Equal(t, windows[8].windowEndMs, resumed[0].windowEndMs)
+	assert.Equal(t, windows[9].windowEndMs, resumed[1].windowEndMs)
+
+	completed, err := pendingCanaryEvaluationWindows(target, now, windows[9].windowEndMs)
+	require.NoError(t, err)
+	assert.Empty(t, completed)
+
+	target.Policy.ConsecutiveBreachWindows = canaryEvaluatorMaxCatchUpWindows + 1
+	_, err = pendingCanaryEvaluationWindows(target, now, 0)
+	assert.ErrorIs(t, err, ErrCanaryControlInvalid)
+}
+
 func TestCanaryEvaluatorAggregatesActiveNodesWithoutTreatingMissingDataAsPassing(t *testing.T) {
 	for _, test := range []struct {
 		name             string
@@ -133,6 +167,102 @@ func TestCanaryEvaluatorAggregatesActiveNodesWithoutTreatingMissingDataAsPassing
 			assert.Equal(t, test.wantNodeCoverage, evaluation.NodeCoverageBasisPoints)
 		})
 	}
+}
+
+func TestCanaryEvaluatorCatchesUpClosedWindowsAndTriggersRollbackWithoutDelay(t *testing.T) {
+	ResetSnapshotForTest()
+	ResetCanaryControlForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	t.Cleanup(ResetCanaryControlForTest)
+	db := openCanaryWindowTestDB(t, false)
+	withCanaryWindowTestDB(t, db)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingRuntimeCheckpoint{}, &model.RoutingCanaryEvaluation{}, &model.RoutingOperation{},
+	))
+
+	latestWindowEnd := time.Unix(1_700_000_100, 0)
+	firstWindowStart := latestWindowEnd.Add(-2 * time.Minute)
+	now := latestWindowEnd.Add(11 * time.Second)
+	policy := model.DefaultRoutingCanaryPolicy()
+	policy.Evaluation.WindowSeconds = 60
+	policy.Evaluation.EvaluationIntervalSeconds = 10
+	policy.Evaluation.CheckpointLatenessSeconds = 5
+	policy.Evaluation.RolloutGraceSeconds = 0
+	policy.Evaluation.MinCanaryRequests = 10
+	policy.Evaluation.MinControlRequests = 10
+	policy.Evaluation.MinTTFTSamples = 10
+	policy.Evaluation.ConsecutiveBreachWindows = 2
+
+	view := SnapshotView{
+		Revision:              11,
+		PolicyHash:            strings.Repeat("b", 64),
+		ActivationID:          401,
+		ActivationStage:       model.RoutingDeploymentStageCanary,
+		TrafficBasisPoints:    100,
+		ActivationCreatedTime: firstWindowStart.Add(-time.Hour).Unix(),
+		Pools: []PoolSnapshot{{
+			ID: 29, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageCanary,
+			CanaryPolicy: policy,
+		}},
+	}
+	currentSnapshot.Store(&runtimeSnapshot{view: view})
+	rolloutKey, err := CanaryRolloutKey(29, view.ActivationID, view.Revision, view.TrafficBasisPoints)
+	require.NoError(t, err)
+
+	presenceIdentity, err := canaryNodePresenceIdentityFromView(view)
+	require.NoError(t, err)
+	presence, err := newCanaryNodePresenceCheckpoint("node-a", presenceIdentity, 1, firstWindowStart.Add(10*time.Second))
+	require.NoError(t, err)
+	_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), presence)
+	require.NoError(t, err)
+	presence, err = newCanaryNodePresenceCheckpoint("node-a", presenceIdentity, 2, now)
+	require.NoError(t, err)
+	_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), presence)
+	require.NoError(t, err)
+
+	stats := canaryWindowAggregateForEvaluatorFixture(t)
+	stats.Canary.Attempts = 20
+	for windowStart := firstWindowStart; windowStart.Before(latestWindowEnd); windowStart = windowStart.Add(time.Minute) {
+		windowEnd := windowStart.Add(time.Minute)
+		payload := CanaryCohortWindowCheckpoint{
+			SchemaVersion: canaryCohortWindowSchemaVersion,
+			PoolID:        29, ActivationID: view.ActivationID, PolicyRevision: view.Revision,
+			TrafficBasisPoints: view.TrafficBasisPoints, RolloutKey: rolloutKey,
+			WindowSeconds: 60, WindowStartUnixMs: windowStart.UnixMilli(), WindowEndUnixMs: windowEnd.UnixMilli(),
+			Control: canaryWindowStatsForTest(t, stats.Control),
+			Canary:  canaryWindowStatsForTest(t, stats.Canary),
+		}
+		checkpoint, checkpointErr := model.NewRoutingRuntimeCheckpoint(
+			"node-a", CanaryCohortWindowCheckpointKind, CanaryWindowCheckpointScope(payload),
+			int64(view.Revision), 1, payload, windowEnd.Unix(), now.Add(time.Hour).Unix(),
+		)
+		require.NoError(t, checkpointErr)
+		_, checkpointErr = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), checkpoint)
+		require.NoError(t, checkpointErr)
+	}
+
+	setting := smart_routing_setting.SmartRoutingSetting{Enabled: true}
+	require.NoError(t, evaluateRoutingCanarySweepContext(context.Background(), setting, now))
+
+	var evaluations []model.RoutingCanaryEvaluation
+	require.NoError(t, db.Order("window_end_ms asc").Find(&evaluations).Error)
+	require.Len(t, evaluations, 2)
+	for index := range evaluations {
+		assert.Equal(t, firstWindowStart.Add(time.Duration(index+1)*time.Minute).UnixMilli(), evaluations[index].WindowEndMs)
+		assert.Equal(t, 10_000, evaluations[index].NodeCoverageBasisPoints)
+		assert.Equal(t, model.RoutingCanaryEvaluationStatusBreached, evaluations[index].Status)
+	}
+
+	var operation model.RoutingOperation
+	require.NoError(t, db.First(&operation).Error)
+	assert.Equal(t, evaluations[1].EvaluationHash, operation.EvaluationHash)
+
+	ResetCanaryControlForTest()
+	require.NoError(t, evaluateRoutingCanarySweepContext(context.Background(), setting, now))
+	var evaluationCount int64
+	require.NoError(t, db.Model(&model.RoutingCanaryEvaluation{}).Count(&evaluationCount).Error)
+	assert.Equal(t, int64(2), evaluationCount)
+	assertRoutingOperationCount(t, db, 1)
 }
 
 func TestCanaryRollbackOperationRequiresAdjacentBreachWindows(t *testing.T) {
@@ -314,6 +444,7 @@ func runCanaryEvaluatorFixture(t *testing.T, reportNodeB bool) model.RoutingCana
 	currentSnapshot.Store(&runtimeSnapshot{view: view})
 	rolloutKey, err := CanaryRolloutKey(29, view.ActivationID, view.Revision, view.TrafficBasisPoints)
 	require.NoError(t, err)
+	defaultCanaryEvaluationSchedule.markCompleted(rolloutKey, windowStart.UnixMilli())
 
 	presenceIdentity, err := canaryNodePresenceIdentityFromView(view)
 	require.NoError(t, err)
