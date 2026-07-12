@@ -17,6 +17,7 @@ func TestChannelRoutingV2RoutesUseExplicitPermissions(t *testing.T) {
 		"/groups/:id":             http.MethodGet,
 		"/channels":               http.MethodGet,
 		"/costs":                  http.MethodGet,
+		"/probes":                 http.MethodGet,
 		"/decisions":              http.MethodGet,
 		"/decisions/:id":          http.MethodGet,
 		"/decisions/:id/replay":   http.MethodPost,

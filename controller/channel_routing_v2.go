@@ -490,6 +490,59 @@ func ListChannelRoutingCosts(c *gin.Context) {
 	})
 }
 
+func ListChannelRoutingProbes(c *gin.Context) {
+	limit := parseChannelRoutingLimit(c, 50)
+	poolID, err := parseOptionalChannelRoutingInt(c.Query("pool_id"))
+	if err != nil || (poolID != nil && *poolID <= 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing probe pool filter"})
+		return
+	}
+	channelID, err := parseOptionalChannelRoutingInt(c.Query("channel_id"))
+	if err != nil || (channelID != nil && *channelID <= 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing probe channel filter"})
+		return
+	}
+	beforeID, err := parseOptionalChannelRoutingInt(c.Query("cursor"))
+	if err != nil || (beforeID != nil && *beforeID <= 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing probe cursor"})
+		return
+	}
+	outcome := strings.TrimSpace(c.Query("outcome"))
+	switch outcome {
+	case "", model.RoutingProbeOutcomeSuccess, model.RoutingProbeOutcomeFailure, model.RoutingProbeOutcomeTimeout,
+		model.RoutingProbeOutcomeCanceled, model.RoutingProbeOutcomeLocalError:
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing probe outcome"})
+		return
+	}
+	filter := model.RoutingProbeResultFilter{
+		Outcome: outcome,
+		Limit:   limit,
+	}
+	if poolID != nil {
+		filter.PoolID = *poolID
+	}
+	if channelID != nil {
+		filter.ChannelID = *channelID
+	}
+	if beforeID != nil {
+		filter.BeforeID = *beforeID
+	}
+	results, err := model.ListRoutingProbeResultsContext(c.Request.Context(), filter)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	nextCursor := ""
+	if len(results) == limit {
+		nextCursor = strconv.Itoa(results[len(results)-1].ID)
+	}
+	common.ApiSuccess(c, gin.H{
+		"items":       results,
+		"next_cursor": nextCursor,
+	})
+}
+
 func ListChannelRoutingDecisions(c *gin.Context) {
 	limit := parseChannelRoutingLimit(c, 50)
 	cursor := 0

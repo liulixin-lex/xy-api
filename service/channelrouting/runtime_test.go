@@ -115,6 +115,63 @@ func TestRuntimeDisabledStateDoesNotInvokeCallbacks(t *testing.T) {
 	assert.Zero(t, runtime.Stats().Flush.Runs)
 }
 
+func TestRuntimeActiveProbeRequiresItsFeatureSwitch(t *testing.T) {
+	var runs atomic.Int64
+	runtime := &Runtime{deps: runtimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled: true, Mode: smart_routing_setting.ModeBalanced, ActiveProbeEnabled: false,
+			}
+		},
+		wait: func(context.Context, time.Duration) bool { return false },
+	}}
+	runtime.runWorker(
+		context.Background(),
+		func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			runs.Add(1)
+			return nil
+		},
+		activeProbePollInterval,
+		&runtime.activeProbeStats,
+	)
+	assert.Zero(t, runs.Load())
+}
+
+func TestRuntimeCloseCancelsActiveProbe(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	runtime := newRuntime(context.Background(), runtimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{
+				Enabled: true, Mode: smart_routing_setting.ModeBalanced, ActiveProbeEnabled: true,
+				ActiveProbeOpenSec: 10,
+			}
+		},
+		activeProbe: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return ctx.Err()
+		},
+		wait: waitRuntime,
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active probe worker did not start")
+	}
+	runtime.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, runtime.Wait(ctx))
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("active probe worker was not canceled")
+	}
+	assert.Equal(t, int64(1), runtime.Stats().ActiveProbe.Runs)
+}
+
 func TestRuntimeFailureUsesBackoffAndExposesSanitizedState(t *testing.T) {
 	waits := make(chan time.Duration, 2)
 	runtime := newRuntime(context.Background(), runtimeDeps{

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"strings"
 	"unicode/utf8"
 
 	"gorm.io/gorm"
@@ -153,4 +154,51 @@ func finishRoutingControlLeaseContext(
 
 func validRoutingControlLeaseText(value string, maxRunes int) bool {
 	return value != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= maxRunes
+}
+
+func DeleteRoutingControlLeasesByPrefixBeforeContext(
+	ctx context.Context,
+	prefix string,
+	cutoffUpdatedMs int64,
+	nowMs int64,
+	batchSize int,
+) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validRoutingControlLeaseText(prefix, 48) || strings.ContainsAny(prefix, "%_") || cutoffUpdatedMs <= 0 || nowMs <= 0 {
+		return 0, ErrRoutingControlLeaseInvalid
+	}
+	if batchSize < 1 {
+		batchSize = 100
+	}
+	if batchSize > 1_000 {
+		batchSize = 1_000
+	}
+	deleted := int64(0)
+	for {
+		var names []string
+		if err := DB.WithContext(ctx).Model(&RoutingControlLease{}).
+			Where("lease_name LIKE ? AND lease_until_ms <= ? AND updated_time_ms < ?", prefix+"%", nowMs, cutoffUpdatedMs).
+			Order("lease_name ASC").Limit(batchSize).
+			Pluck("lease_name", &names).Error; err != nil {
+			return deleted, err
+		}
+		if len(names) == 0 {
+			return deleted, nil
+		}
+		result := DB.WithContext(ctx).
+			Where("lease_name IN ? AND lease_name LIKE ? AND lease_until_ms <= ? AND updated_time_ms < ?", names, prefix+"%", nowMs, cutoffUpdatedMs).
+			Delete(&RoutingControlLease{})
+		deleted += result.RowsAffected
+		if result.Error != nil {
+			return deleted, result.Error
+		}
+		if len(names) < batchSize {
+			return deleted, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+	}
 }

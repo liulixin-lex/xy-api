@@ -28,6 +28,7 @@ var channelRoutingReadRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/groups/:id", permission: authz.ChannelRead, handler: controller.GetChannelRoutingGroup},
 	{method: http.MethodGet, path: "/channels", permission: authz.ChannelRead, handler: controller.ListChannelRoutingChannels},
 	{method: http.MethodGet, path: "/costs", permission: authz.ChannelRead, handler: controller.ListChannelRoutingCosts},
+	{method: http.MethodGet, path: "/probes", permission: authz.ChannelRead, handler: controller.ListChannelRoutingProbes},
 	{method: http.MethodGet, path: "/decisions", permission: authz.ChannelRead, handler: controller.ListChannelRoutingDecisions},
 	{method: http.MethodGet, path: "/decisions/:id", permission: authz.ChannelRead, handler: controller.GetChannelRoutingDecision},
 	{method: http.MethodPost, path: "/decisions/:id/replay", permission: authz.ChannelRead, handler: controller.ReplayChannelRoutingDecision},

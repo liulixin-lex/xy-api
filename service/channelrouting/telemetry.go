@@ -128,7 +128,9 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 	if retentionDays > maxRetentionDays {
 		retentionDays = maxRetentionDays
 	}
-	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
+	now := time.Now()
+	cutoffTime := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
+	cutoff := cutoffTime.Unix()
 	rollupsDeleted, err := model.DeleteRoutingMetricRollupsBeforeContext(ctx, cutoff)
 	if err != nil {
 		return rollupsDeleted, err
@@ -141,21 +143,31 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 	if err != nil {
 		return rollupsDeleted + auditsDeleted + costVersionsDeleted, err
 	}
+	probeResultsDeleted, err := model.DeleteRoutingProbeResultsBeforeContext(ctx, cutoffTime.UnixMilli())
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted, err
+	}
+	probeLeasesDeleted, err := model.DeleteRoutingControlLeasesByPrefixBeforeContext(
+		ctx, activeProbeLeasePrefix, cutoffTime.UnixMilli(), now.UnixMilli(), 500,
+	)
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted, err
+	}
 	receiptRetentionDays := retentionDays + 1
 	if receiptRetentionDays < retentionDays || receiptRetentionDays > maxRetentionDays {
 		receiptRetentionDays = maxRetentionDays
 	}
-	receiptCutoff := time.Now().Add(-time.Duration(receiptRetentionDays) * 24 * time.Hour).UnixMilli()
+	receiptCutoff := now.Add(-time.Duration(receiptRetentionDays) * 24 * time.Hour).UnixMilli()
 	receiptsDeleted, err := model.DeleteRoutingTelemetryReceiptsBeforeContext(ctx, receiptCutoff)
 	if err != nil {
-		return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted, err
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted, err
 	}
 	outboxDeleted, err := model.DeletePublishedRoutingConfigOutboxBeforeContext(ctx, cutoff)
 	if err != nil {
-		return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted + outboxDeleted, err
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted, err
 	}
-	checkpointsDeleted, err := model.DeleteExpiredRoutingRuntimeCheckpointsContext(ctx, time.Now().Unix())
-	return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted + outboxDeleted + checkpointsDeleted, err
+	checkpointsDeleted, err := model.DeleteExpiredRoutingRuntimeCheckpointsContext(ctx, now.Unix())
+	return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted + checkpointsDeleted, err
 }
 
 func lockRoutingTelemetry(ctx context.Context) error {

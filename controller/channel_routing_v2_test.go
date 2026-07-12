@@ -431,6 +431,8 @@ func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
 		{name: "channel status", target: "/api/channel-routing/v2/channels?status=unknown", handler: ListChannelRoutingChannels},
 		{name: "channel type", target: "/api/channel-routing/v2/channels?type=unknown", handler: ListChannelRoutingChannels},
 		{name: "cost known", target: "/api/channel-routing/v2/costs?known=unknown", handler: ListChannelRoutingCosts},
+		{name: "probe cursor", target: "/api/channel-routing/v2/probes?cursor=-1", handler: ListChannelRoutingProbes},
+		{name: "probe outcome", target: "/api/channel-routing/v2/probes?outcome=unknown", handler: ListChannelRoutingProbes},
 		{name: "group search length", target: "/api/channel-routing/v2/groups?search=" + strings.Repeat("x", 257), handler: ListChannelRoutingGroups},
 	}
 	for _, test := range tests {
@@ -445,6 +447,37 @@ func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, recorder.Code)
 		})
 	}
+}
+
+func TestListChannelRoutingProbesFiltersAndPaginates(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	for index, outcome := range []string{model.RoutingProbeOutcomeSuccess, model.RoutingProbeOutcomeFailure} {
+		repeated := strings.Repeat(strconv.Itoa(index+1), 64)
+		require.NoError(t, db.Create(&model.RoutingProbeResult{
+			ProbeID: repeated, TargetKey: repeated, ProbeType: model.RoutingProbeTypeServing,
+			SnapshotRevision: 1, PoolID: 10, MemberID: index + 1, ChannelID: 20 + index,
+			GroupName: "default", ModelName: "gpt-test", EndpointHost: "api.example.test",
+			BreakerState: model.RoutingBreakerStateHealthy, Outcome: outcome,
+			StartedTimeMs: int64(index + 1), FinishedTimeMs: int64(index + 1),
+			LeaseFencingToken: int64(index + 1), NodeEpochID: "node-test", CreatedTime: int64(index + 1),
+		}).Error)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/channel-routing/v2/probes?pool_id=10&outcome=failure&limit=1",
+		nil,
+	)
+	ListChannelRoutingProbes(ctx)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"outcome":"failure"`)
+	assert.NotContains(t, body, `"outcome":"success"`)
+	assert.Contains(t, body, `"next_cursor":"2"`)
 }
 
 func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
@@ -471,6 +504,7 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingTelemetryReceipt{},
 		&model.RoutingUpstreamAccount{},
 		&model.RoutingCostSnapshotVersion{},
+		&model.RoutingProbeResult{},
 	))
 	return db
 }

@@ -39,7 +39,7 @@
 - [x] Phase 1 Observe：Pool、Member、稳定 Credential ID、统一有界遥测、兼容迁移、只读 API、新选择器仅审计。
 - [x] Phase 2 Shadow：双算、差异审计、决策重放、Revision/Outbox/Redis Stream、增量聚合、成本快照、多实例降级。
 - [ ] Phase 3 Canary：确定性灰度、自动回滚、容量预留、慢启动、故障注入；Hedging 保持关闭。
-- [ ] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、兼容改名。
+- [ ] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、兼容改名。主动探测与提交前串行故障转移切片已实现并验证，Balanced 热路径与治理仍在继续。
 - [ ] Phase 5 Enterprise SLO：严格容量租约、多区域、独立 RBAC、双人审批、Error Budget Burn、审计导出、预算 Hedging。
 - [ ] Gate 7 前端：七个深链页面、单 SSE、完整状态、六语言、A11y、响应式、明暗主题与视觉验证。
 - [ ] 最终验证：三数据库、Redis/多节点、race/vet/build、故障注入、benchmark/soak、前端测试/E2E/Axe/视觉与独立 P0/P1 审查。
@@ -73,7 +73,7 @@
 2. [完成] Phase 0D / Gate 1：有界状态、正确分类、容量分离、真实 TTFT/Token/s、Worker 生命周期、安全与最终 flush。
 3. [完成] Phase 1 / Gate 2：稳定身份、stable telemetry + rollup、不可变快照、Observe 审计、只读 v2 API、三库与并发验证。
 4. [完成] Phase 2 / Gate 3：可合并分布、Shadow 双算/重放、Revision/Activation/Outbox、Redis Stream、node sequence 幂等与增量聚合。
-5. [当前] Phase 3 / Gate 4：确定性 Canary、请求级固定快照、软容量预留、慢启动、结果窗口和自动回滚。
+5. [当前] Phase 3 / Gate 4 收口与 Phase 4 / Gate 5 并行推进：Canary P1 审查继续；Balanced 主动探测和提交前串行故障转移已完成切片验证，继续接入正式热路径与策略治理。
 6. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
 7. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
 
@@ -150,6 +150,16 @@
 - 独立 P0/P1 审查发现并修复：成本观测历史无界增长、普通 Policy Head 检查深拷贝完整快照；修复后跨库与 Race 复验通过。
 - 全仓首次复跑发现 Middleware fixture 缺少 Policy 迁移，已补齐完整 Policy 控制面模型并通过全仓复跑。
 - `git diff --check`、JSON wrapper、敏感信息、临时容器/测试库清理审计：PASS。
+
+### Phase 4 active probe / pre-commit failover slice（2026-07-12）
+
+- Attempt Coordinator 已接入 Relay/Task：单逻辑请求最多一个并发 attempt，Hedging 硬关闭，约束尝试数、总切换 Deadline、额外成本与 Pool 级有界 Retry Token Bucket；首次发送前拒绝会返回明确终止错误，客户端提交后不再切换。
+- Active Probe 仅在 Balanced/Enterprise 且显式开启时运行；Open/Half-open 优先、Degraded 次之、Healthy 最后，同层确定性轮换；总并发、Per-host、目标数、Token/成本、租约与本机调度状态均有界，关闭开关会停止排队任务。
+- Probe 使用真实渠道测试链但限制输出，不写生产消费日志/路由遥测；过期目标发送前拒绝，Multi-key 使用隔离副本且不推进生产轮询游标，不写聚合 Breaker；结果具备 CAS/Fencing、幂等 ID、分页 API 与保留期清理。
+- `go test ./controller ./model ./router ./service ./service/channelrouting ./pkg/routing_error ./setting/smart_routing_setting -count=1`：exit 0。
+- `go test -race` 定向覆盖 Attempt、Probe、Runtime、Controller、Model：exit 0；相关包 `go vet`：exit 0。
+- MySQL 5.7 与 PostgreSQL 15 隔离容器实跑 Probe/完整 Routing migration contract：PASS；临时容器已删除。
+- `go test ./... -count=1`：除根包因工作树缺少 `web/classic/dist` embed 生成物而 setup failed 外，其余所有包 PASS；最终 Gate 在生成前端 dist 后复跑。
 
 ## Surprises & Discoveries
 

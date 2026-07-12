@@ -53,6 +53,7 @@ const (
 	OperationRelay      Operation = "relay"
 	OperationTaskSubmit Operation = "task_submit"
 	OperationTaskPoll   Operation = "task_poll"
+	OperationProbe      Operation = "probe"
 	OperationSync       Operation = "sync"
 
 	SignalNone             Signal = ""

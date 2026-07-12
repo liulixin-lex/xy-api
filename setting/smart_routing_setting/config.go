@@ -1,6 +1,7 @@
 package smart_routing_setting
 
 import (
+	"math"
 	"os"
 	"strconv"
 
@@ -40,6 +41,10 @@ type SmartRoutingSetting struct {
 	MaxEjectedPct            int     `json:"max_ejected_pct"`
 	HalfOpenProbes           int     `json:"half_open_probes"`
 	MaxSwitches              int     `json:"max_switches"`
+	RetryTokenCapacity       int     `json:"retry_token_capacity"`
+	RetryTokenRefillPerSec   float64 `json:"retry_token_refill_per_sec"`
+	FailoverDeadlineMs       int     `json:"failover_deadline_ms"`
+	RetryExtraCostMultiplier float64 `json:"retry_extra_cost_multiplier"`
 	BackoffBaseMs5xx         int     `json:"backoff_base_ms_5xx"`
 	BackoffBaseMs429         int     `json:"backoff_base_ms_429"`
 	BackoffCapMs             int     `json:"backoff_cap_ms"`
@@ -55,6 +60,16 @@ type SmartRoutingSetting struct {
 	MetricBucketSec          int     `json:"metric_bucket_sec"`
 	FlushIntervalMin         int     `json:"flush_interval_min"`
 	RetentionDays            int     `json:"retention_days"`
+	ActiveProbeEnabled       bool    `json:"active_probe_enabled"`
+	ActiveProbeHealthySec    int     `json:"active_probe_healthy_sec"`
+	ActiveProbeDegradedSec   int     `json:"active_probe_degraded_sec"`
+	ActiveProbeOpenSec       int     `json:"active_probe_open_sec"`
+	ActiveProbeTimeoutMs     int     `json:"active_probe_timeout_ms"`
+	ActiveProbeMaxTargets    int     `json:"active_probe_max_targets"`
+	ActiveProbeConcurrency   int     `json:"active_probe_concurrency"`
+	ActiveProbePerHost       int     `json:"active_probe_per_host"`
+	ActiveProbeTokenBudget   int     `json:"active_probe_token_budget"`
+	ActiveProbeCostBudgetUSD float64 `json:"active_probe_cost_budget_usd"`
 	AgentEnabled             bool    `json:"agent_enabled"`
 	AgentAutoApply           bool    `json:"agent_auto_apply"`
 	AgentModel               string  `json:"agent_model"`
@@ -77,6 +92,10 @@ var defaultSmartRoutingSetting = SmartRoutingSetting{
 	MaxEjectedPct:            50,
 	HalfOpenProbes:           1,
 	MaxSwitches:              2,
+	RetryTokenCapacity:       100,
+	RetryTokenRefillPerSec:   10,
+	FailoverDeadlineMs:       120_000,
+	RetryExtraCostMultiplier: 2,
 	BackoffBaseMs5xx:         50,
 	BackoffBaseMs429:         1000,
 	BackoffCapMs:             20000,
@@ -92,6 +111,16 @@ var defaultSmartRoutingSetting = SmartRoutingSetting{
 	MetricBucketSec:          60,
 	FlushIntervalMin:         1,
 	RetentionDays:            7,
+	ActiveProbeEnabled:       false,
+	ActiveProbeHealthySec:    900,
+	ActiveProbeDegradedSec:   120,
+	ActiveProbeOpenSec:       30,
+	ActiveProbeTimeoutMs:     15_000,
+	ActiveProbeMaxTargets:    128,
+	ActiveProbeConcurrency:   4,
+	ActiveProbePerHost:       1,
+	ActiveProbeTokenBudget:   4_096,
+	ActiveProbeCostBudgetUSD: 0.25,
 	AgentEnabled:             false,
 	AgentAutoApply:           false,
 	AgentModel:               "claude-opus-4-8",
@@ -213,6 +242,30 @@ func normalize(setting *SmartRoutingSetting) {
 	if setting.MaxSwitches < 0 {
 		setting.MaxSwitches = 0
 	}
+	if setting.RetryTokenCapacity < 1 {
+		setting.RetryTokenCapacity = defaultSmartRoutingSetting.RetryTokenCapacity
+	}
+	if setting.RetryTokenCapacity > 1_000_000 {
+		setting.RetryTokenCapacity = 1_000_000
+	}
+	if setting.RetryTokenRefillPerSec <= 0 || math.IsNaN(setting.RetryTokenRefillPerSec) || math.IsInf(setting.RetryTokenRefillPerSec, 0) {
+		setting.RetryTokenRefillPerSec = defaultSmartRoutingSetting.RetryTokenRefillPerSec
+	}
+	if setting.RetryTokenRefillPerSec > 1_000_000 {
+		setting.RetryTokenRefillPerSec = 1_000_000
+	}
+	if setting.FailoverDeadlineMs < 1 {
+		setting.FailoverDeadlineMs = defaultSmartRoutingSetting.FailoverDeadlineMs
+	}
+	if setting.FailoverDeadlineMs > 600_000 {
+		setting.FailoverDeadlineMs = 600_000
+	}
+	if setting.RetryExtraCostMultiplier <= 0 || math.IsNaN(setting.RetryExtraCostMultiplier) || math.IsInf(setting.RetryExtraCostMultiplier, 0) {
+		setting.RetryExtraCostMultiplier = defaultSmartRoutingSetting.RetryExtraCostMultiplier
+	}
+	if setting.RetryExtraCostMultiplier > 16 {
+		setting.RetryExtraCostMultiplier = 16
+	}
 	if setting.BackoffBaseMs5xx < 1 {
 		setting.BackoffBaseMs5xx = defaultSmartRoutingSetting.BackoffBaseMs5xx
 	}
@@ -251,6 +304,66 @@ func normalize(setting *SmartRoutingSetting) {
 	}
 	if setting.RetentionDays < 1 {
 		setting.RetentionDays = defaultSmartRoutingSetting.RetentionDays
+	}
+	if setting.ActiveProbeHealthySec < 1 {
+		setting.ActiveProbeHealthySec = defaultSmartRoutingSetting.ActiveProbeHealthySec
+	}
+	if setting.ActiveProbeHealthySec > 86_400 {
+		setting.ActiveProbeHealthySec = 86_400
+	}
+	if setting.ActiveProbeDegradedSec < 1 {
+		setting.ActiveProbeDegradedSec = defaultSmartRoutingSetting.ActiveProbeDegradedSec
+	}
+	if setting.ActiveProbeDegradedSec > 86_400 {
+		setting.ActiveProbeDegradedSec = 86_400
+	}
+	if setting.ActiveProbeOpenSec < 1 {
+		setting.ActiveProbeOpenSec = defaultSmartRoutingSetting.ActiveProbeOpenSec
+	}
+	if setting.ActiveProbeOpenSec > 86_400 {
+		setting.ActiveProbeOpenSec = 86_400
+	}
+	if setting.ActiveProbeDegradedSec > setting.ActiveProbeHealthySec {
+		setting.ActiveProbeDegradedSec = setting.ActiveProbeHealthySec
+	}
+	if setting.ActiveProbeOpenSec > setting.ActiveProbeDegradedSec {
+		setting.ActiveProbeOpenSec = setting.ActiveProbeDegradedSec
+	}
+	if setting.ActiveProbeTimeoutMs < 1 {
+		setting.ActiveProbeTimeoutMs = defaultSmartRoutingSetting.ActiveProbeTimeoutMs
+	}
+	if setting.ActiveProbeTimeoutMs > 120_000 {
+		setting.ActiveProbeTimeoutMs = 120_000
+	}
+	if setting.ActiveProbeMaxTargets < 1 {
+		setting.ActiveProbeMaxTargets = defaultSmartRoutingSetting.ActiveProbeMaxTargets
+	}
+	if setting.ActiveProbeMaxTargets > 4_096 {
+		setting.ActiveProbeMaxTargets = 4_096
+	}
+	if setting.ActiveProbeConcurrency < 1 {
+		setting.ActiveProbeConcurrency = defaultSmartRoutingSetting.ActiveProbeConcurrency
+	}
+	if setting.ActiveProbeConcurrency > 64 {
+		setting.ActiveProbeConcurrency = 64
+	}
+	if setting.ActiveProbePerHost < 1 {
+		setting.ActiveProbePerHost = defaultSmartRoutingSetting.ActiveProbePerHost
+	}
+	if setting.ActiveProbePerHost > setting.ActiveProbeConcurrency {
+		setting.ActiveProbePerHost = setting.ActiveProbeConcurrency
+	}
+	if setting.ActiveProbeTokenBudget < 1 {
+		setting.ActiveProbeTokenBudget = defaultSmartRoutingSetting.ActiveProbeTokenBudget
+	}
+	if setting.ActiveProbeTokenBudget > 1_000_000_000 {
+		setting.ActiveProbeTokenBudget = 1_000_000_000
+	}
+	if setting.ActiveProbeCostBudgetUSD <= 0 || math.IsNaN(setting.ActiveProbeCostBudgetUSD) || math.IsInf(setting.ActiveProbeCostBudgetUSD, 0) {
+		setting.ActiveProbeCostBudgetUSD = defaultSmartRoutingSetting.ActiveProbeCostBudgetUSD
+	}
+	if setting.ActiveProbeCostBudgetUSD > 1_000 {
+		setting.ActiveProbeCostBudgetUSD = 1_000
 	}
 }
 

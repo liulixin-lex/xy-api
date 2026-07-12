@@ -46,6 +46,38 @@ func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
 	assert.Equal(t, before, after)
 }
 
+func TestNormalizeBoundsFailoverAndProbeBudgets(t *testing.T) {
+	normalized := Normalize(SmartRoutingSetting{
+		RetryTokenCapacity:       -1,
+		RetryTokenRefillPerSec:   math.NaN(),
+		FailoverDeadlineMs:       0,
+		RetryExtraCostMultiplier: math.Inf(1),
+		ActiveProbeHealthySec:    30,
+		ActiveProbeDegradedSec:   60,
+		ActiveProbeOpenSec:       90,
+		ActiveProbeTimeoutMs:     0,
+		ActiveProbeMaxTargets:    10_000,
+		ActiveProbeConcurrency:   100,
+		ActiveProbePerHost:       100,
+		ActiveProbeTokenBudget:   0,
+		ActiveProbeCostBudgetUSD: math.NaN(),
+	})
+
+	assert.Equal(t, 100, normalized.RetryTokenCapacity)
+	assert.Equal(t, 10.0, normalized.RetryTokenRefillPerSec)
+	assert.Equal(t, 120_000, normalized.FailoverDeadlineMs)
+	assert.Equal(t, 2.0, normalized.RetryExtraCostMultiplier)
+	assert.Equal(t, 30, normalized.ActiveProbeHealthySec)
+	assert.Equal(t, 30, normalized.ActiveProbeDegradedSec)
+	assert.Equal(t, 30, normalized.ActiveProbeOpenSec)
+	assert.Equal(t, 15_000, normalized.ActiveProbeTimeoutMs)
+	assert.Equal(t, 4_096, normalized.ActiveProbeMaxTargets)
+	assert.Equal(t, 64, normalized.ActiveProbeConcurrency)
+	assert.Equal(t, 64, normalized.ActiveProbePerHost)
+	assert.Equal(t, 4_096, normalized.ActiveProbeTokenBudget)
+	assert.Equal(t, 0.25, normalized.ActiveProbeCostBudgetUSD)
+}
+
 func TestGetSettingDefaultsAndNormalizesWeights(t *testing.T) {
 	ResetForTest()
 

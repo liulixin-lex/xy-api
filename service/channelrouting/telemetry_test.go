@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +235,7 @@ func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingMetricRollup{}, &model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}, &model.RoutingTelemetryReceipt{},
 		&model.RoutingConfigOutbox{}, &model.RoutingRuntimeCheckpoint{}, &model.RoutingCostSnapshotVersion{},
+		&model.RoutingProbeResult{}, &model.RoutingControlLease{},
 	))
 	withSnapshotTestDB(t, db)
 
@@ -266,10 +268,19 @@ func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 		Freshness: model.RoutingCostFreshnessUnknown, SourceSyncStatus: model.RoutingUpstreamSyncStatusUnknown,
 		CreatedTime: 1,
 	}).Error)
+	require.NoError(t, db.Create(&model.RoutingProbeResult{
+		ProbeID: strings.Repeat("a", 64), TargetKey: strings.Repeat("b", 64), ProbeType: model.RoutingProbeTypeServing,
+		SnapshotRevision: 1, PoolID: 1, MemberID: 1, ChannelID: 1, GroupName: "default", ModelName: "old",
+		EndpointHost: "old.example", BreakerState: model.RoutingBreakerStateHealthy, Outcome: model.RoutingProbeOutcomeSuccess,
+		StartedTimeMs: 1, FinishedTimeMs: 1, LeaseFencingToken: 1, NodeEpochID: "old-node", CreatedTime: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingControlLease{
+		LeaseName: activeProbeLeasePrefix + "old", LeaseUntilMs: 0, LastCompletedMs: 1, UpdatedTimeMs: 1,
+	}).Error)
 
 	deleted, err := DeleteExpiredRoutingHistoryContext(context.Background(), 1)
 	require.NoError(t, err)
-	assert.Equal(t, int64(6), deleted)
+	assert.Equal(t, int64(8), deleted)
 }
 
 func enableStableTelemetryTest(t *testing.T) {

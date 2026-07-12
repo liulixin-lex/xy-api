@@ -592,6 +592,7 @@ var routingMigrationModels = []interface{}{
 	&RoutingConfigOutbox{},
 	&RoutingRuntimeCheckpoint{},
 	&RoutingControlLease{},
+	&RoutingProbeResult{},
 	&RoutingCanaryEvaluation{},
 	&RoutingOperation{},
 	&RoutingUpstreamAccount{},

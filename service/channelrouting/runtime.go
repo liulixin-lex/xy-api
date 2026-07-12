@@ -57,7 +57,10 @@ type RuntimeStats struct {
 	CanaryNodePresence        RuntimeWorkerStats             `json:"canary_node_presence"`
 	CanaryEvaluator           RuntimeWorkerStats             `json:"canary_evaluator"`
 	CanaryOperations          RuntimeWorkerStats             `json:"canary_operations"`
+	ActiveProbe               RuntimeWorkerStats             `json:"active_probe"`
 	Retention                 RuntimeWorkerStats             `json:"retention"`
+	Probe                     ActiveProbeStats               `json:"probe"`
+	RetryBudget               RetryTokenBudgetStats          `json:"retry_budget"`
 	Audit                     DecisionBufferStats            `json:"audit"`
 	Telemetry                 routingmetrics.StableStats     `json:"telemetry"`
 	TelemetryTransport        RoutingTelemetryTransportStats `json:"telemetry_transport"`
@@ -87,6 +90,7 @@ type Runtime struct {
 	canaryPresenceStats  runtimeWorkerState
 	canaryEvaluateStats  runtimeWorkerState
 	canaryOperationStats runtimeWorkerState
+	activeProbeStats     runtimeWorkerState
 	retentionStats       runtimeWorkerState
 
 	lastRetentionUnix atomic.Int64
@@ -126,6 +130,8 @@ type runtimeDeps struct {
 	heartbeatCanary  func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	evaluateCanary   func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	executeCanary    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	activeProbe      func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	probeStats       func() ActiveProbeStats
 	retention        func(context.Context, int) (int64, error)
 	topologyChanges  <-chan struct{}
 	wait             func(context.Context, time.Duration) bool
@@ -155,6 +161,7 @@ func CurrentRuntimeStats() RuntimeStats {
 			Telemetry:          routingmetrics.StableRuntimeStats(),
 			TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
 			ConfigStream:       RoutingConfigStreamRuntimeStats(),
+			RetryBudget:        DefaultRetryTokenBudgetStats(),
 			NodeEpochID:        NodeEpochID(),
 		}
 	}
@@ -162,6 +169,7 @@ func CurrentRuntimeStats() RuntimeStats {
 }
 
 func defaultRuntimeDeps() runtimeDeps {
+	probeScheduler := NewActiveProbeScheduler()
 	return runtimeDeps{
 		getSetting: smart_routing_setting.GetSetting,
 		refresh: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
@@ -212,6 +220,8 @@ func defaultRuntimeDeps() runtimeDeps {
 		heartbeatCanary: persistRoutingCanaryNodePresenceContext,
 		evaluateCanary:  evaluateRoutingCanaryControlContext,
 		executeCanary:   executeRoutingCanaryOperationContext,
+		activeProbe:     probeScheduler.RunCycle,
+		probeStats:      probeScheduler.Stats,
 		retention:       DeleteExpiredRoutingHistoryContext,
 		topologyChanges: model.RoutingTopologyChanges(),
 		wait:            waitRuntime,
@@ -378,6 +388,9 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.executeCanary != nil {
 		workerCount++
 	}
+	if deps.activeProbe != nil {
+		workerCount++
+	}
 	if deps.retention != nil {
 		workerCount++
 	}
@@ -430,6 +443,12 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 		go func() {
 			defer runtime.wait.Done()
 			runtime.runWorker(ctx, deps.executeCanary, canaryOperationInterval, &runtime.canaryOperationStats)
+		}()
+	}
+	if deps.activeProbe != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.activeProbe, activeProbePollInterval, &runtime.activeProbeStats)
 		}()
 	}
 	if deps.retention != nil {
@@ -490,12 +509,17 @@ func (runtime *Runtime) Stats() RuntimeStats {
 		CanaryNodePresence: runtime.canaryPresenceStats.snapshot(),
 		CanaryEvaluator:    runtime.canaryEvaluateStats.snapshot(),
 		CanaryOperations:   runtime.canaryOperationStats.snapshot(),
+		ActiveProbe:        runtime.activeProbeStats.snapshot(),
 		Retention:          runtime.retentionStats.snapshot(),
+		RetryBudget:        DefaultRetryTokenBudgetStats(),
 		Audit:              DecisionAuditsStats(),
 		Telemetry:          routingmetrics.StableRuntimeStats(),
 		TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
 		ConfigStream:       RoutingConfigStreamRuntimeStats(),
 		NodeEpochID:        NodeEpochID(),
+	}
+	if runtime.deps.probeStats != nil {
+		stats.Probe = runtime.deps.probeStats()
 	}
 	if snapshot := currentSnapshot.Load(); snapshot != nil {
 		stats.SnapshotRevision = snapshot.view.Revision
@@ -518,8 +542,12 @@ func (runtime *Runtime) runWorker(
 			return
 		}
 		setting := runtime.deps.getSetting()
-		drainWhileDisabled := !setting.Enabled && runtime.shouldDrainWhileDisabled(state)
-		if (!setting.Enabled && !drainWhileDisabled) || run == nil {
+		workerEnabled := setting.Enabled
+		if state == &runtime.activeProbeStats {
+			workerEnabled = activeProbeEnabled(setting)
+		}
+		drainWhileDisabled := !workerEnabled && runtime.shouldDrainWhileDisabled(state)
+		if (!workerEnabled && !drainWhileDisabled) || run == nil {
 			consecutiveFailures = 0
 			state.consecutiveFailures.Store(0)
 			if !runtime.waitNext(ctx, observeDisabledPoll, state) {
@@ -745,6 +773,17 @@ func canaryControlInterval(smart_routing_setting.SmartRoutingSetting) time.Durat
 
 func canaryNodePresenceInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
 	return canaryNodePresencePollInterval
+}
+
+func activeProbePollInterval(setting smart_routing_setting.SmartRoutingSetting) time.Duration {
+	interval := time.Duration(setting.ActiveProbeOpenSec) * time.Second / 4
+	if interval < time.Second {
+		return time.Second
+	}
+	if interval > 30*time.Second {
+		return 30 * time.Second
+	}
+	return interval
 }
 
 func canaryOperationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {

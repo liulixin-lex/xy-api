@@ -44,6 +44,15 @@ func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
 	require.Equal(t, "stream", result.MatchedTier)
 }
 
+func TestSettleTestQuotaPreservesLegacyRoundingOrder(t *testing.T) {
+	quota, result := settleTestQuota(&relaycommon.RelayInfo{}, types.PriceData{
+		ModelRatio: 1.4, CompletionRatio: 0.6,
+	}, &dto.Usage{PromptTokens: 1, CompletionTokens: 1})
+
+	require.Equal(t, 3, quota)
+	require.Nil(t, result)
+}
+
 func TestBuildTestLogOtherInjectsTieredInfo(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())

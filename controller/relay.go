@@ -209,6 +209,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	attemptGuard := newRoutingAttemptGuard(c, relayInfo)
+	defer attemptGuard.Complete()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -220,9 +222,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
+		attemptLease, attemptErr := attemptGuard.Begin(c, relayInfo)
+		if attemptErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			logger.LogWarn(c, fmt.Sprintf("channel routing retry budget rejected attempt: %v", attemptErr))
+			if newAPIError == nil {
+				newAPIError = routingAttemptRejectionError(attemptErr)
+			}
+			break
+		}
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			attemptLease.Finish()
 			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
@@ -236,6 +249,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			attemptLease.Finish()
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			newAPIError = capacityErr
 			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
@@ -243,6 +257,21 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		prepareRoutingRelayAttempt(relayInfo)
+		if attemptLease != nil {
+			if markErr := attemptLease.MarkSent(); markErr != nil {
+				attemptLease.Finish()
+				releaseRoutingCapacityReservation(c)
+				finishRoutingCanaryAttempt(c)
+				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+				newAPIError = types.NewErrorWithStatusCode(
+					fmt.Errorf("channel routing attempt state transition failed: %w", markErr),
+					types.ErrorCodeGetChannelFailed,
+					http.StatusServiceUnavailable,
+					types.ErrOptionWithSkipRetry(),
+				)
+				break
+			}
+		}
 		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
 		func() {
 			defer releaseRoutingCapacityReservation(c)
@@ -261,6 +290,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}()
 		attemptAPIError := newAPIError
 		controlAPIError := relayAttemptControlError(c, attemptAPIError, relayInfo)
+		if attemptLease != nil && routingAttemptClientCommitted(c, relayInfo) {
+			_ = attemptLease.MarkClientCommitted()
+		}
+		attemptLease.Finish()
 		classificationAPIError := attemptAPIError
 		if classificationAPIError == nil {
 			classificationAPIError = controlAPIError
@@ -959,6 +992,8 @@ func RelayTask(c *gin.Context) {
 		RequestPath: c.Request.URL.Path,
 		Retry:       common.GetPointer(0),
 	}
+	attemptGuard := newRoutingAttemptGuard(c, relayInfo)
+	defer attemptGuard.Complete()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		var channel *model.Channel
@@ -981,9 +1016,21 @@ func RelayTask(c *gin.Context) {
 			}
 		}
 
+		attemptLease, attemptErr := attemptGuard.Begin(c, relayInfo)
+		if attemptErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			logger.LogWarn(c, fmt.Sprintf("channel routing retry budget rejected task attempt: %v", attemptErr))
+			if taskErr == nil {
+				apiErr := routingAttemptRejectionError(attemptErr)
+				taskErr = service.TaskErrorWrapperLocal(apiErr.Err, "routing_attempt_rejected", apiErr.StatusCode)
+			}
+			break
+		}
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			attemptLease.Finish()
 			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
@@ -995,11 +1042,22 @@ func RelayTask(c *gin.Context) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			attemptLease.Finish()
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			taskErr = service.TaskErrorWrapperLocal(capacityErr.Err, "routing_capacity_commit_failed", http.StatusServiceUnavailable)
 			break
 		}
 
+		if attemptLease != nil {
+			if markErr := attemptLease.MarkSent(); markErr != nil {
+				attemptLease.Finish()
+				releaseRoutingCapacityReservation(c)
+				finishRoutingCanaryAttempt(c)
+				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+				taskErr = service.TaskErrorWrapperLocal(markErr, "routing_attempt_state_failed", http.StatusServiceUnavailable)
+				break
+			}
+		}
 		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
 		func() {
 			defer releaseRoutingCapacityReservation(c)
@@ -1016,6 +1074,10 @@ func RelayTask(c *gin.Context) {
 			classificationContext.Signal = routingerror.SignalContentSafety
 		}
 		classification := routingerror.ClassifyTaskError(taskErr, classificationContext)
+		if attemptLease != nil && (taskErr == nil || classification.Retryability == routingerror.RetryIdempotencyRequired) {
+			_ = attemptLease.MarkClientCommitted()
+		}
+		attemptLease.Finish()
 		canaryOutcomeKnown = true
 		canaryOutcomeSuccess = taskErr == nil
 		canaryOutcomeClassification = classification
