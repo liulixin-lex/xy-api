@@ -34,6 +34,11 @@ type BaseNavItem = {
    * `useSidebarView`). Route-level guards still enforce access independently.
    */
   requiredRole?: number
+  /** Explicit backend capability required to show this item. */
+  requiredPermission?: {
+    resource: string
+    action: string
+  }
 }
 
 /**

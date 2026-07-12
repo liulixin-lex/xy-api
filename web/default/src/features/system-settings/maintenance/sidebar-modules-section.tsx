@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useEffect, useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+
 import {
   Form,
   FormControl,
@@ -27,6 +28,7 @@ import {
   FormLabel,
 } from '@/components/ui/form'
 import { Switch } from '@/components/ui/switch'
+
 import {
   SettingsControlChildren,
   SettingsForm,
@@ -51,7 +53,9 @@ type SidebarModulesSectionProps = {
 type SidebarFormValues = SidebarModulesAdminConfig
 
 const toTitleCase = (value: string) =>
-  value.replaceAll(/[_-]+/g, ' ').replaceAll(/\b\w/g, (char) => char.toUpperCase())
+  value
+    .replaceAll(/[_-]+/g, ' ')
+    .replaceAll(/\b\w/g, (char) => char.toUpperCase())
 
 export function SidebarModulesSection({
   config,
@@ -130,9 +134,11 @@ export function SidebarModulesSection({
         title: t('Channels'),
         description: t('Configure upstream providers and routing.'),
       },
-      smart_routing: {
-        title: t('Smart Routing'),
-        description: t('Tune dynamic provider selection and health breakers.'),
+      channel_routing: {
+        title: t('Channel Routing'),
+        description: t(
+          'Operate routing pools, health, costs, and policy changes.'
+        ),
       },
       models: {
         title: t('Models'),

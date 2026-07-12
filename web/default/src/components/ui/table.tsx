@@ -19,13 +19,25 @@ For commercial licensing, please contact support@quantumnous.com
 'use client'
 
 import * as React from 'react'
+
 import { cn } from '@/lib/utils'
 
-function Table({ className, ...props }: React.ComponentProps<'table'>) {
+type TableProps = React.ComponentProps<'table'> & {
+  scrollAreaLabel?: string
+}
+
+function Table({ className, scrollAreaLabel, ...props }: TableProps) {
   return (
     <div
       data-slot='table-container'
-      className='relative w-full overflow-x-auto overflow-y-hidden'
+      role={scrollAreaLabel ? 'region' : undefined}
+      aria-label={scrollAreaLabel}
+      tabIndex={scrollAreaLabel ? 0 : undefined}
+      className={cn(
+        'relative w-full overflow-x-auto overflow-y-hidden',
+        scrollAreaLabel &&
+          'focus-visible:ring-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:outline-none'
+      )}
     >
       <table
         data-slot='table'
