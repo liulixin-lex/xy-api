@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
@@ -54,6 +56,7 @@ type ActiveProbeTarget struct {
 	EndpointHost         string
 	BreakerState         string
 	BreakerCooldownUntil int64
+	AuthFailure          bool
 	MultiKey             bool
 	Interval             time.Duration
 	EstimatedTokens      int64
@@ -66,6 +69,7 @@ type ActiveProbeExecution struct {
 	Err              error
 	LocalError       bool
 	Classification   routingerror.Classification
+	RetryAfterMs     int64
 	PromptTokens     int64
 	CompletionTokens int64
 	CostNanoUSD      int64
@@ -89,6 +93,7 @@ type ActiveProbeStats struct {
 	LocalErrors         int64 `json:"local_errors"`
 	PersistenceErrors   int64 `json:"persistence_errors"`
 	CompletionErrors    int64 `json:"completion_errors"`
+	EffectErrors        int64 `json:"effect_errors"`
 	ReservedTokens      int64 `json:"reserved_tokens"`
 	ReservedCostNanoUSD int64 `json:"reserved_cost_nano_usd"`
 	Inflight            int64 `json:"inflight"`
@@ -111,6 +116,7 @@ type activeProbeAtomicStats struct {
 	localErrors         atomic.Int64
 	persistenceErrors   atomic.Int64
 	completionErrors    atomic.Int64
+	effectErrors        atomic.Int64
 	reservedTokens      atomic.Int64
 	reservedCostNanoUSD atomic.Int64
 	inflight            atomic.Int64
@@ -305,6 +311,7 @@ func (scheduler *ActiveProbeScheduler) Stats() ActiveProbeStats {
 		LocalErrors:         scheduler.stats.localErrors.Load(),
 		PersistenceErrors:   scheduler.stats.persistenceErrors.Load(),
 		CompletionErrors:    scheduler.stats.completionErrors.Load(),
+		EffectErrors:        scheduler.stats.effectErrors.Load(),
 		ReservedTokens:      scheduler.stats.reservedTokens.Load(),
 		ReservedCostNanoUSD: scheduler.stats.reservedCostNanoUSD.Load(),
 		Inflight:            scheduler.stats.inflight.Load(),
@@ -392,7 +399,14 @@ func (scheduler *ActiveProbeScheduler) runTarget(
 		scheduler.setNextDue(target.TargetKey, now.Add(activeProbeScheduleRetry))
 		return completeErr
 	}
-	applyActiveProbeBreakerOutcome(target, execution, result.Outcome)
+	effectCtx, effectCancel := context.WithTimeout(ctx, 5*time.Second)
+	effectErr := applyActiveProbeBreakerOutcome(effectCtx, setting, target, execution, result.Outcome, finished)
+	effectCancel()
+	if effectErr != nil {
+		scheduler.stats.effectErrors.Add(1)
+		scheduler.setNextDue(target.TargetKey, now.Add(activeProbeScheduleRetry))
+		return effectErr
+	}
 	scheduler.setNextDue(target.TargetKey, now.Add(target.Interval))
 	return nil
 }
@@ -557,6 +571,7 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 					EndpointHost:         activeProbeEndpointHost(channel.Endpoint, member.ChannelID),
 					BreakerState:         breakerState,
 					BreakerCooldownUntil: observation.BreakerCooldownUntil,
+					AuthFailure:          channel.AuthFailure,
 					MultiKey:             member.MultiKey,
 					Interval:             activeProbeTargetInterval(setting, breakerState),
 					EstimatedTokens:      activeProbeEstimatedTokens,
@@ -656,9 +671,23 @@ func activeProbeResult(
 	}
 }
 
-func applyActiveProbeBreakerOutcome(target ActiveProbeTarget, execution ActiveProbeExecution, outcome string) {
+func applyActiveProbeBreakerOutcome(
+	ctx context.Context,
+	setting smart_routing_setting.SmartRoutingSetting,
+	target ActiveProbeTarget,
+	execution ActiveProbeExecution,
+	outcome string,
+	now time.Time,
+) error {
 	if target.MultiKey || target.ChannelID <= 0 || target.ModelName == "" || target.GroupName == "" {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	setting = smart_routing_setting.Normalize(setting)
+	if now.IsZero() {
+		now = time.Now()
 	}
 	key := routingbreaker.Key{
 		ChannelID:   target.ChannelID,
@@ -667,27 +696,69 @@ func applyActiveProbeBreakerOutcome(target ActiveProbeTarget, execution ActivePr
 		Group:       target.GroupName,
 	}
 	if outcome == model.RoutingProbeOutcomeSuccess {
+		routinghotcache.ClearCapacityCooldown(key.HotcacheKey())
+		_, cachedAuthFailure := routinghotcache.GetAuthFailure(target.ChannelID)
+		if target.AuthFailure || cachedAuthFailure {
+			if err := model.ClearRoutingChannelAuthFailureContext(ctx, target.ChannelID, now.Unix()); err != nil {
+				return err
+			}
+			routinghotcache.ClearAuthFailure(target.ChannelID)
+		}
 		if target.BreakerState == model.RoutingBreakerStateOpen || target.BreakerState == model.RoutingBreakerStateHalfOpen ||
 			target.BreakerState == model.RoutingBreakerStateDegraded {
 			routingbreaker.RecordReliabilitySuccess(key)
 		}
-		return
+		return nil
+	}
+
+	if execution.StatusCode == http.StatusUnauthorized || execution.StatusCode == http.StatusForbidden {
+		nowUnix := now.Unix()
+		staleSeconds := int64(setting.SnapshotStaleSec)
+		until := int64(math.MaxInt64)
+		if staleSeconds <= math.MaxInt64-nowUnix {
+			until = nowUnix + staleSeconds
+		}
+		reason := "active_probe_http_" + strconv.Itoa(execution.StatusCode)
+		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix})
+		return model.UpsertRoutingChannelAuthFailureContext(ctx, target.ChannelID, true, reason, until)
+	}
+
+	if execution.Classification.CapacityEffect == routingerror.CapacityCooldown {
+		maxCooldownSeconds := int64(setting.MaxCooldownSec)
+		maximumDurationSeconds := int64(math.MaxInt64) / int64(time.Second)
+		if maxCooldownSeconds > maximumDurationSeconds {
+			maxCooldownSeconds = maximumDurationSeconds
+		}
+		maxCooldown := time.Duration(maxCooldownSeconds) * time.Second
+		baseCooldownMilliseconds := int64(setting.BackoffBaseMs429)
+		maximumDurationMilliseconds := int64(math.MaxInt64) / int64(time.Millisecond)
+		if baseCooldownMilliseconds > maximumDurationMilliseconds {
+			baseCooldownMilliseconds = maximumDurationMilliseconds
+		}
+		baseCooldown := time.Duration(baseCooldownMilliseconds) * time.Millisecond
+		retryAfterMs := min(max(execution.RetryAfterMs, 0), maxCooldown.Milliseconds())
+		retryAfter := time.Duration(retryAfterMs) * time.Millisecond
+		routinghotcache.RecordCapacityCooldown(
+			key.HotcacheKey(), execution.StatusCode, retryAfter, baseCooldown, maxCooldown, now,
+		)
 	}
 	if outcome == model.RoutingProbeOutcomeTimeout {
 		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureNetwork)
-		return
+		return nil
 	}
 	if outcome != model.RoutingProbeOutcomeFailure {
-		return
+		return nil
 	}
 	if execution.Classification.HealthEffect != routingerror.HealthDegrade && execution.Classification.HealthEffect != routingerror.HealthOpen {
-		return
+		return nil
 	}
-	kind := routingbreaker.FailureNetwork
-	if execution.Classification.Responsibility == routingerror.ResponsibilityProvider {
-		kind = routingbreaker.FailureProvider5xx
+	switch execution.Classification.Responsibility {
+	case routingerror.ResponsibilityProvider:
+		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureProvider5xx)
+	case routingerror.ResponsibilityNetwork:
+		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureNetwork)
 	}
-	routingbreaker.RecordReliabilityFailure(key, kind)
+	return nil
 }
 
 func activeProbeEnabled(setting smart_routing_setting.SmartRoutingSetting) bool {

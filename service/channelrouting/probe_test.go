@@ -454,7 +454,9 @@ func TestActiveProbeBreakerUsesPersistedOutcomeBoundary(t *testing.T) {
 	target.ModelName = "gpt-test"
 	target.BreakerState = model.RoutingBreakerStateDegraded
 
-	applyActiveProbeBreakerOutcome(target, ActiveProbeExecution{}, model.RoutingProbeOutcomeTimeout)
+	require.NoError(t, applyActiveProbeBreakerOutcome(
+		context.Background(), activeProbeSettingForTest(), target, ActiveProbeExecution{}, model.RoutingProbeOutcomeTimeout, now,
+	))
 	snapshots := routingbreaker.DirtySnapshots()
 	require.Len(t, snapshots, 1)
 	assert.Equal(t, 1, snapshots[0].ConsecutiveFailures)

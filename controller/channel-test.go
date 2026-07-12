@@ -44,6 +44,7 @@ type testResult struct {
 	usage            *dto.Usage
 	quota            int
 	sourceStatusCode int
+	retryAfterMs     int64
 }
 
 type channelTestOptions struct {
@@ -479,6 +480,7 @@ func testChannelWithOptions(
 		httpResp = resp.(*http.Response)
 		upstreamStatusCode = httpResp.StatusCode
 		if httpResp.StatusCode != http.StatusOK {
+			retryAfterMs := service.ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), time.Now()).Milliseconds()
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			if options.logDetails {
 				common.SysError(fmt.Sprintf(
@@ -497,6 +499,7 @@ func testChannelWithOptions(
 				localErr:         err,
 				newAPIError:      types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
 				sourceStatusCode: httpResp.StatusCode,
+				retryAfterMs:     max(retryAfterMs, 0),
 			}
 		}
 	}
@@ -575,33 +578,33 @@ func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting
 	_, identity, current := channelrouting.ResolveObserveModelSnapshot(target.GroupName, target.ChannelID, target.ModelName)
 	if !current || identity.SnapshotRevision != target.SnapshotRevision || identity.PoolID != target.PoolID || identity.MemberID != target.MemberID {
 		apiErr := types.NewError(errors.New("channel routing active probe target is stale"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
 	channel, err := model.GetChannelById(target.ChannelID, true)
 	if err != nil {
 		apiErr := types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
 	if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey != target.MultiKey {
 		apiErr := types.NewError(errors.New("channel routing active probe target is no longer enabled"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
 	if !target.MultiKey {
 		resolved, ok := channelrouting.ResolveIdentity(target.GroupName, target.ChannelID, channel.Key)
 		if !ok || resolved.SnapshotRevision != target.SnapshotRevision || resolved.CredentialID != target.CredentialID {
 			apiErr := types.NewError(errors.New("channel routing active probe credential is stale"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-			return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+			return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 		}
 	}
 	channel, err = activeProbeChannelCopy(channel)
 	if err != nil {
 		apiErr := types.NewError(err, types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
 	testUserID, err := resolveChannelTestUserID(nil)
 	if err != nil {
 		apiErr := types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, true)
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
 	result := testChannelWithOptions(ctx, channel, testUserID, target.ModelName, "", false, channelTestOptions{
 		recordConsumption: false,
@@ -616,7 +619,7 @@ func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting
 	if apiErr != nil && result.sourceStatusCode > 0 {
 		apiErr = types.NewErrorWithStatusCode(apiErr.Cause(), apiErr.GetErrorCode(), result.sourceStatusCode)
 	}
-	return channelRoutingProbeExecution(apiErr, result.sourceStatusCode, result.usage, result.quota, false)
+	return channelRoutingProbeExecution(apiErr, result.sourceStatusCode, result.usage, result.quota, result.retryAfterMs, false)
 }
 
 func activeProbeChannelCopy(channel *model.Channel) (*model.Channel, error) {
@@ -656,6 +659,7 @@ func channelRoutingProbeExecution(
 	statusCode int,
 	usage *dto.Usage,
 	quota int,
+	retryAfterMs int64,
 	localError bool,
 ) channelrouting.ActiveProbeExecution {
 	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
@@ -671,7 +675,11 @@ func channelRoutingProbeExecution(
 		StatusCode:     statusCode,
 		LocalError:     localError,
 		Classification: classification,
+		RetryAfterMs:   max(retryAfterMs, 0),
 		CostNanoUSD:    channelTestQuotaNanoUSD(quota),
+	}
+	if result.RetryAfterMs > 0 {
+		result.Classification.CapacityEffect = routingerror.CapacityCooldown
 	}
 	if apiErr != nil {
 		result.Err = apiErr.Cause()

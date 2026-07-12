@@ -760,14 +760,21 @@ func (state *RoutingChannelHealthState) BeforeUpdate(_ *gorm.DB) error {
 }
 
 func UpsertRoutingChannelAuthFailure(channelID int, marked bool, reason string, until int64) error {
+	return UpsertRoutingChannelAuthFailureContext(context.Background(), channelID, marked, reason, until)
+}
+
+func UpsertRoutingChannelAuthFailureContext(ctx context.Context, channelID int, marked bool, reason string, until int64) error {
 	if channelID <= 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	now := common.GetTimestamp()
 	if until <= 0 {
 		until = now
 	}
-	return DB.Clauses(clause.OnConflict{
+	return DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "channel_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"auth_failure":        marked,
@@ -785,13 +792,20 @@ func UpsertRoutingChannelAuthFailure(channelID int, marked bool, reason string, 
 }
 
 func ClearRoutingChannelAuthFailure(channelID int, updatedTime int64) error {
+	return ClearRoutingChannelAuthFailureContext(context.Background(), channelID, updatedTime)
+}
+
+func ClearRoutingChannelAuthFailureContext(ctx context.Context, channelID int, updatedTime int64) error {
 	if channelID <= 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if updatedTime <= 0 {
 		updatedTime = common.GetTimestamp()
 	}
-	return DB.Clauses(clause.OnConflict{
+	return DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "channel_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"auth_failure":        false,

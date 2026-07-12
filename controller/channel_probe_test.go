@@ -68,7 +68,7 @@ func TestChannelRoutingProbeExecutionClassifiesOperationalFailures(t *testing.T)
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result := channelRoutingProbeExecution(test.apiErr, test.statusCode, nil, 0, false)
+			result := channelRoutingProbeExecution(test.apiErr, test.statusCode, nil, 0, 0, false)
 			assert.Equal(t, test.responsibility, result.Classification.Responsibility)
 			assert.Equal(t, test.scope, result.Classification.Scope)
 			assert.Equal(t, test.health, result.Classification.HealthEffect)
@@ -84,7 +84,7 @@ func TestChannelRoutingProbeExecutionReportsUsageWithoutProductionSettlement(t *
 	common.QuotaPerUnit = 500_000
 	t.Cleanup(func() { common.QuotaPerUnit = previousQuotaPerUnit })
 
-	result := channelRoutingProbeExecution(nil, http.StatusOK, &dto.Usage{PromptTokens: 3, CompletionTokens: 5}, 500_000, false)
+	result := channelRoutingProbeExecution(nil, http.StatusOK, &dto.Usage{PromptTokens: 3, CompletionTokens: 5}, 500_000, 0, false)
 	assert.NoError(t, result.Err)
 	assert.Equal(t, http.StatusOK, result.StatusCode)
 	assert.Equal(t, int64(3), result.PromptTokens)
@@ -92,6 +92,17 @@ func TestChannelRoutingProbeExecutionReportsUsageWithoutProductionSettlement(t *
 	assert.Equal(t, int64(1_000_000_000), result.CostNanoUSD)
 	assert.False(t, result.LocalError)
 	assert.Equal(t, routingerror.HealthIgnore, result.Classification.HealthEffect)
+
+	retryAfter := channelRoutingProbeExecution(
+		types.NewErrorWithStatusCode(errors.New("temporarily unavailable"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable),
+		http.StatusServiceUnavailable,
+		nil,
+		0,
+		2_500,
+		false,
+	)
+	assert.Equal(t, int64(2_500), retryAfter.RetryAfterMs)
+	assert.Equal(t, routingerror.CapacityCooldown, retryAfter.Classification.CapacityEffect)
 
 	assert.Equal(t, int64(math.MaxInt64), channelTestQuotaNanoUSD(math.MaxInt))
 }
