@@ -270,6 +270,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		canaryOutcomeClassification = classification
 		classificationAPIError = service.NormalizeViolationFeeError(classificationAPIError)
 		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 
 		if controlAPIError == nil {
 			newAPIError = nil
@@ -1011,6 +1012,7 @@ func RelayTask(c *gin.Context) {
 		canaryOutcomeSuccess = taskErr == nil
 		canaryOutcomeClassification = classification
 		recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 		if taskErr == nil {
 			break
 		}

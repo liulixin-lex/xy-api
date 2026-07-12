@@ -435,6 +435,18 @@ func classifyBreaker(breaker *BreakerSnapshot, settings Settings) (bool, bool, b
 	}
 }
 
+func BreakerNeedsHalfOpenProbe(breaker *BreakerSnapshot, settings Settings) bool {
+	if breaker == nil || breakerStale(breaker, settings) {
+		return false
+	}
+	state := strings.ToLower(strings.TrimSpace(breaker.State))
+	if state == BreakerStateHalfOpen {
+		return true
+	}
+	return state == BreakerStateOpen && settings.NowUnix > 0 && breaker.CooldownUntilUnix > 0 &&
+		settings.NowUnix >= breaker.CooldownUntilUnix
+}
+
 func breakerStale(breaker *BreakerSnapshot, settings Settings) bool {
 	if breaker.UpdatedUnix <= 0 || settings.NowUnix <= 0 || settings.SnapshotStaleSec <= 0 {
 		return false

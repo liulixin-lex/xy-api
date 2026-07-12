@@ -104,47 +104,106 @@ func (manager *channelRoutingCanaryRuntimeManager) slowStartFactor(
 	manager.slowStartMu.Lock()
 	defer manager.slowStartMu.Unlock()
 	manager.pruneSlowStartsLocked(now)
-
-	runtimeKey := channelRoutingCanaryRuntimeKey{PolicyRevision: policyRevision, PoolID: key.PoolID}
-	runtime := manager.slowStarts[runtimeKey]
-	if runtime == nil {
-		if len(manager.slowStarts) >= channelRoutingCanaryMaxSlowStartRuntimes {
-			manager.evictOldestSlowStartLocked(runtimeKey)
-		}
-		tracker, trackerErr := channelrouting.NewSlowStartTracker(channelrouting.SlowStartPolicy{
-			MinimumFactor: normalized.SlowStart.MinimumFactor,
-			RampDuration:  time.Duration(normalized.SlowStart.RampSeconds) * time.Second,
-			StateTTL:      time.Duration(normalized.SlowStart.StateTTLSeconds) * time.Second,
-			MaxEntries:    channelRoutingCanaryMaxEntries,
-		}, manager.clock)
-		if trackerErr != nil {
-			return 0, trackerErr
-		}
-		runtime = &channelRoutingCanarySlowStartRuntime{
-			policy:   normalized.SlowStart,
-			tracker:  tracker,
-			seen:     make(map[channelrouting.SlowStartKey]struct{}),
-			lastUsed: now,
-		}
-		manager.slowStarts[runtimeKey] = runtime
-	} else if runtime.policy != normalized.SlowStart {
-		return 0, channelrouting.ErrSlowStartInvalidPolicy
+	runtimeKey, runtime, err := manager.slowStartRuntimeLocked(policyRevision, normalized, key.PoolID, now)
+	if err != nil {
+		return 0, err
 	}
-
-	runtime.lastUsed = now
-	if _, exists := runtime.seen[key]; !exists {
-		if manager.slowStartEntries >= channelRoutingCanaryMaxEntries {
-			manager.evictOldestSlowStartLocked(runtimeKey)
-		}
-		if manager.slowStartEntries >= channelRoutingCanaryMaxEntries {
-			return 0, errChannelRoutingCanaryRuntimeFull
-		}
-		runtime.seen[key] = struct{}{}
-		manager.slowStartEntries++
+	newKey, err := manager.registerSlowStartKeyLocked(runtimeKey, runtime, key)
+	if err != nil {
+		return 0, err
+	}
+	if newKey {
 		state, startErr := runtime.tracker.StartNew(key)
 		return state.Factor, startErr
 	}
 	return runtime.tracker.Factor(key)
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) startRecovery(
+	policyRevision uint64,
+	policy model.RoutingCanaryPolicy,
+	key channelrouting.SlowStartKey,
+) error {
+	if manager == nil || policyRevision == 0 || key.PoolID <= 0 {
+		return channelrouting.ErrSlowStartInvalidKey
+	}
+	normalized, err := model.NormalizeRoutingCanaryPolicy(policy)
+	if err != nil {
+		return channelrouting.ErrSlowStartInvalidPolicy
+	}
+	now := manager.now()
+	manager.slowStartMu.Lock()
+	defer manager.slowStartMu.Unlock()
+	manager.pruneSlowStartsLocked(now)
+	runtimeKey, runtime, err := manager.slowStartRuntimeLocked(policyRevision, normalized, key.PoolID, now)
+	if err != nil {
+		return err
+	}
+	if _, err := manager.registerSlowStartKeyLocked(runtimeKey, runtime, key); err != nil {
+		return err
+	}
+	_, err = runtime.tracker.StartRecovery(key)
+	return err
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) slowStartRuntimeLocked(
+	policyRevision uint64,
+	policy model.RoutingCanaryPolicy,
+	poolID int,
+	now time.Time,
+) (channelRoutingCanaryRuntimeKey, *channelRoutingCanarySlowStartRuntime, error) {
+	runtimeKey := channelRoutingCanaryRuntimeKey{PolicyRevision: policyRevision, PoolID: poolID}
+	runtime := manager.slowStarts[runtimeKey]
+	if runtime != nil {
+		if runtime.policy != policy.SlowStart {
+			return runtimeKey, nil, channelrouting.ErrSlowStartInvalidPolicy
+		}
+		runtime.lastUsed = now
+		return runtimeKey, runtime, nil
+	}
+	if len(manager.slowStarts) >= channelRoutingCanaryMaxSlowStartRuntimes {
+		manager.evictOldestSlowStartLocked(runtimeKey)
+	}
+	if len(manager.slowStarts) >= channelRoutingCanaryMaxSlowStartRuntimes {
+		return runtimeKey, nil, errChannelRoutingCanaryRuntimeFull
+	}
+	tracker, err := channelrouting.NewSlowStartTracker(channelrouting.SlowStartPolicy{
+		MinimumFactor: policy.SlowStart.MinimumFactor,
+		RampDuration:  time.Duration(policy.SlowStart.RampSeconds) * time.Second,
+		StateTTL:      time.Duration(policy.SlowStart.StateTTLSeconds) * time.Second,
+		MaxEntries:    channelRoutingCanaryMaxEntries,
+	}, manager.clock)
+	if err != nil {
+		return runtimeKey, nil, err
+	}
+	runtime = &channelRoutingCanarySlowStartRuntime{
+		policy: policy.SlowStart, tracker: tracker,
+		seen: make(map[channelrouting.SlowStartKey]struct{}), lastUsed: now,
+	}
+	manager.slowStarts[runtimeKey] = runtime
+	return runtimeKey, runtime, nil
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) registerSlowStartKeyLocked(
+	runtimeKey channelRoutingCanaryRuntimeKey,
+	runtime *channelRoutingCanarySlowStartRuntime,
+	key channelrouting.SlowStartKey,
+) (bool, error) {
+	if runtime == nil || runtime.tracker == nil {
+		return false, channelrouting.ErrSlowStartInvalidPolicy
+	}
+	if _, exists := runtime.seen[key]; exists {
+		return false, nil
+	}
+	if manager.slowStartEntries >= channelRoutingCanaryMaxEntries {
+		manager.evictOldestSlowStartLocked(runtimeKey)
+	}
+	if manager.slowStartEntries >= channelRoutingCanaryMaxEntries {
+		return false, errChannelRoutingCanaryRuntimeFull
+	}
+	runtime.seen[key] = struct{}{}
+	manager.slowStartEntries++
+	return true, nil
 }
 
 func (manager *channelRoutingCanaryRuntimeManager) now() time.Time {

@@ -551,6 +551,27 @@ func TestRankCandidatesDoesNotModifyOriginalChannelPointer(t *testing.T) {
 	assert.Equal(t, beforeBreaker, *breaker)
 }
 
+func TestBreakerNeedsHalfOpenProbeMatchesSelectorFreshnessAndCooldown(t *testing.T) {
+	settings := Settings{NowUnix: 1_000, SnapshotStaleSec: 300, HalfOpenProbes: 1}
+	tests := []struct {
+		name    string
+		breaker *BreakerSnapshot
+		want    bool
+	}{
+		{name: "fresh half open", breaker: &BreakerSnapshot{State: BreakerStateHalfOpen, UpdatedUnix: 900}, want: true},
+		{name: "stale half open", breaker: &BreakerSnapshot{State: BreakerStateHalfOpen, UpdatedUnix: 600}},
+		{name: "open cooldown elapsed", breaker: &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 1_000, UpdatedUnix: 900}, want: true},
+		{name: "open still cooling", breaker: &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 1_001, UpdatedUnix: 900}},
+		{name: "healthy", breaker: &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 900}},
+		{name: "missing"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, BreakerNeedsHalfOpenProbe(test.breaker, settings))
+		})
+	}
+}
+
 func testCandidate(id int, availability float64, p95LatencyMs float64, tps float64, cost *CostSnapshot, breaker *BreakerSnapshot) Candidate {
 	requests := int64(100)
 	successes := int64(math.Round(availability * float64(requests)))

@@ -397,7 +397,9 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		if decision.Selected == nil || decision.Selected.Channel == nil {
 			return nil, nil
 		}
-		if !reserveHalfOpen || acquireRoutingHalfOpenProbe(param.Ctx, decision.Selected, param.ModelName, group, selectorSettings.HalfOpenProbes, selectorSettings.NowUnix) {
+		if !reserveHalfOpen || acquireRoutingHalfOpenProbe(
+			param.Ctx, decision.Selected, param.ModelName, group, selectorSettings,
+		) {
 			return decision.Selected.Channel, nil
 		}
 		selectedID := decision.Selected.Channel.Id
@@ -545,7 +547,13 @@ func routingObserveExclusionReason(candidate routingselector.Candidate, nowUnix 
 	return "selector_filtered"
 }
 
-func acquireRoutingHalfOpenProbe(c *gin.Context, candidate *routingselector.RankedCandidate, modelName string, group string, maxProbes int, nowUnix int64) bool {
+func acquireRoutingHalfOpenProbe(
+	c *gin.Context,
+	candidate *routingselector.RankedCandidate,
+	modelName string,
+	group string,
+	settings routingselector.Settings,
+) bool {
 	if candidate == nil || candidate.Channel == nil || candidate.Candidate.Breaker == nil {
 		return true
 	}
@@ -555,29 +563,37 @@ func acquireRoutingHalfOpenProbe(c *gin.Context, candidate *routingselector.Rank
 		Model:       modelName,
 		Group:       group,
 	}
-	return acquireRoutingHalfOpenProbeForKey(c, key, candidate.Candidate.Breaker, maxProbes, nowUnix)
+	acquired, _ := acquireRoutingHalfOpenProbeForKey(c, key, candidate.Candidate.Breaker, settings, false)
+	return acquired
 }
 
-func acquireRoutingHalfOpenProbeForKey(c *gin.Context, key routingbreaker.Key, breaker *routingselector.BreakerSnapshot, maxProbes int, nowUnix int64) bool {
-	if breaker == nil {
-		return true
-	}
-	state := strings.ToLower(strings.TrimSpace(breaker.State))
-	needsProbe := state == routingselector.BreakerStateHalfOpen
-	if state == routingselector.BreakerStateOpen && breaker.CooldownUntilUnix > 0 && nowUnix >= breaker.CooldownUntilUnix {
-		needsProbe = true
-	}
-	if !needsProbe {
-		return true
+var errRoutingHalfOpenProbeCoordinator = errors.New("routing half-open probe coordinator unavailable")
+
+func acquireRoutingHalfOpenProbeForKey(
+	c *gin.Context,
+	key routingbreaker.Key,
+	breaker *routingselector.BreakerSnapshot,
+	settings routingselector.Settings,
+	failClosedOnRedisError bool,
+) (bool, error) {
+	if !routingselector.BreakerNeedsHalfOpenProbe(breaker, settings) {
+		return true, nil
 	}
 	if routingHalfOpenProbeHeld(c, key) {
-		return true
+		return true, nil
 	}
-	redisKey, redisOwner, redisAcquired, redisAvailable := acquireRoutingHalfOpenRedisLease(key)
-	if redisAvailable && !redisAcquired {
-		return false
+	redisKey, redisOwner, redisAcquired, redisErr := acquireRoutingHalfOpenRedisLease(key)
+	if redisErr != nil {
+		if failClosedOnRedisError {
+			return false, fmt.Errorf("%w: %v", errRoutingHalfOpenProbeCoordinator, redisErr)
+		}
+		redisKey = ""
+		redisOwner = ""
 	}
-	_, ok := routingbreaker.AcquireDefaultHalfOpenProbe(key, maxProbes)
+	if redisErr == nil && redisKey != "" && !redisAcquired {
+		return false, nil
+	}
+	_, ok := routingbreaker.AcquireDefaultHalfOpenProbe(key, settings.HalfOpenProbes)
 	if !ok {
 		releaseRoutingHalfOpenRedisLease(redisKey, redisOwner)
 	}
@@ -597,7 +613,7 @@ func acquireRoutingHalfOpenProbeForKey(c *gin.Context, key routingbreaker.Key, b
 			common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenLeases, leases)
 		}
 	}
-	return ok
+	return ok, nil
 }
 
 func routingHalfOpenProbeHeld(c *gin.Context, key routingbreaker.Key) bool {
@@ -617,9 +633,12 @@ type routingHalfOpenRedisLease struct {
 	Owner string
 }
 
-func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, bool, bool) {
-	if !common.RedisEnabled || common.RDB == nil {
-		return "", "", false, false
+func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, bool, error) {
+	if !common.RedisEnabled {
+		return "", "", false, nil
+	}
+	if common.RDB == nil {
+		return "", "", false, errors.New("routing half-open Redis client is unavailable")
 	}
 	redisKey := fmt.Sprintf("routing:halfopen:%d:%d:%s:%s", key.ChannelID, key.APIKeyIndex, key.Model, key.Group)
 	owner := common.GetRandomString(32)
@@ -627,9 +646,9 @@ func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, b
 	defer cancel()
 	acquired, err := common.RDB.SetNX(ctx, redisKey, owner, 30*time.Second).Result()
 	if err != nil {
-		return "", "", false, false
+		return redisKey, owner, false, err
 	}
-	return redisKey, owner, acquired, true
+	return redisKey, owner, acquired, nil
 }
 
 func releaseRoutingHalfOpenRedisLease(redisKey string, owner string) {
@@ -1023,7 +1042,9 @@ func admissibleAffinityChannelForSmartGroup(c *gin.Context, preferredID int, mod
 		if ranked.Channel == nil || ranked.Channel.Id != preferredID {
 			continue
 		}
-		if !acquireRoutingHalfOpenProbe(c, ranked, modelName, group, selectorSettings.HalfOpenProbes, selectorSettings.NowUnix) {
+		if !acquireRoutingHalfOpenProbe(
+			c, ranked, modelName, group, selectorSettings,
+		) {
 			return nil, false
 		}
 		return ranked.Channel, true

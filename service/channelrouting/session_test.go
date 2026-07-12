@@ -181,7 +181,7 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 		{
 			ID: 15, PoolID: 29, ChannelID: 105, PhysicalStatus: common.ChannelStatusEnabled,
 			LegacyPriority: 100, LegacyWeight: 100, CredentialIDs: []int{1_006},
-			Models: []ModelSnapshot{{ModelName: "other-model"}},
+			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
 		},
 	}
 	view.Pools = append(view.Pools, PoolSnapshot{
@@ -209,6 +209,7 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 		ModelName:                  "gpt-test",
 		AllowedChannelIDs:          []int{101, 102, 103, 104, 105},
 		CapacityExcludedChannelIDs: []int{103},
+		ProbeExcludedChannelIDs:    []int{105},
 		ExcludedChannelIDs: []int{
 			102,
 		},
@@ -221,12 +222,13 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	require.True(t, active)
 	require.True(t, plan.Gate.InCanary)
 	assert.Equal(t, DecisionAlgorithmCanaryV1, plan.Replay.AlgorithmVersion)
-	require.Len(t, plan.Replay.Candidates, 4, "only the target pool/model index may feed the plan")
+	require.Len(t, plan.Replay.Candidates, 5, "only the target pool/model index may feed the plan")
 	assert.Equal(t, []SlowStartKey{{PoolID: 29, MemberID: 11, Model: "gpt-test"}}, slowStartKeys)
 	assert.Equal(t, 0.25, plan.Replay.Candidates[0].SlowStartFactor)
 	assert.Equal(t, ExclusionReasonRequestFailed, plan.Replay.Candidates[1].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonLocalCapacity, plan.Replay.Candidates[2].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonMultiKeyUnsupported, plan.Replay.Candidates[3].RequestExclusionReason)
+	assert.Equal(t, ExclusionReasonHalfOpenProbe, plan.Replay.Candidates[4].RequestExclusionReason)
 
 	assert.Equal(t, 101, plan.Result.SelectedChannelID)
 	assert.Equal(t, Identity{SnapshotRevision: 11, PoolID: 29, MemberID: 11, CredentialID: 1_001}, plan.SelectedIdentity)
@@ -240,10 +242,10 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	assert.False(t, candidates[103].Eligible)
 	assert.Equal(t, ExclusionReasonLocalCapacity, candidates[103].ExclusionReason)
 	assert.False(t, candidates[104].Eligible)
+	assert.False(t, candidates[105].Eligible)
+	assert.Equal(t, ExclusionReasonHalfOpenProbe, candidates[105].ExclusionReason)
 	_, crossedPool := candidates[999]
 	assert.False(t, crossedPool)
-	_, wrongModel := candidates[105]
-	assert.False(t, wrongModel)
 }
 
 func TestRequestRoutingSessionPlanRejectsInvalidBoundedInputs(t *testing.T) {
@@ -254,6 +256,10 @@ func TestRequestRoutingSessionPlanRejectsInvalidBoundedInputs(t *testing.T) {
 	require.NoError(t, err)
 
 	_, active, err := session.Plan(RequestRoutingPlanInput{ModelName: "gpt-test", AllowedChannelIDs: []int{0}})
+	assert.True(t, active)
+	assert.ErrorIs(t, err, ErrRoutingSessionInvalid)
+
+	_, active, err = session.Plan(RequestRoutingPlanInput{ModelName: "gpt-test", ProbeExcludedChannelIDs: []int{0}})
 	assert.True(t, active)
 	assert.ErrorIs(t, err, ErrRoutingSessionInvalid)
 

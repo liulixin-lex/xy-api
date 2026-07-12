@@ -9,7 +9,9 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	"github.com/QuantumNous/new-api/service/channelrouting"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 	globalsetting "github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -165,6 +167,8 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	}
 	sort.Ints(excludedIDs)
 	capacityExcluded := make([]int, 0, len(allowedIDs))
+	probeExcluded := make([]int, 0, len(allowedIDs))
+	var lastProbeErr error
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, planActive, planErr := session.Plan(channelrouting.RequestRoutingPlanInput{
 			RequestPath:                param.RequestPath,
@@ -176,6 +180,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			AllowedChannelIDs:          allowedIDs,
 			ExcludedChannelIDs:         excludedIDs,
 			CapacityExcludedChannelIDs: capacityExcluded,
+			ProbeExcludedChannelIDs:    probeExcluded,
 			SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
 				return channelRoutingCanaryRuntime.slowStartFactor(gate.PolicyRevision, canaryPolicy, key)
 			},
@@ -187,11 +192,54 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			return nil, true, true, channelrouting.ErrRoutingSessionInvalid
 		}
 		if plan.Result.SelectedChannelID <= 0 {
+			enqueueChannelRoutingCanaryDecision(param, group, plan, nil)
+			if lastProbeErr != nil {
+				return nil, true, true, fmt.Errorf("channel routing half-open probe admission failed: %w", lastProbeErr)
+			}
 			return nil, true, true, nil
 		}
 		selected := channelByID[plan.Result.SelectedChannelID]
 		if selected == nil || plan.SelectedIdentity.MemberID <= 0 || plan.SelectedIdentity.PoolID != gate.PoolID {
 			return nil, true, true, channelrouting.ErrRoutingSessionInvalid
+		}
+		var selectedCandidate *channelrouting.ShadowCandidateInput
+		for candidateIndex := range plan.Replay.Candidates {
+			candidate := &plan.Replay.Candidates[candidateIndex]
+			if candidate.ChannelID == selected.Id {
+				selectedCandidate = candidate
+				break
+			}
+		}
+		if selectedCandidate == nil || selectedCandidate.PoolMemberID != plan.SelectedIdentity.MemberID {
+			return nil, true, true, channelrouting.ErrRoutingSessionInvalid
+		}
+		var selectedBreaker *routingselector.BreakerSnapshot
+		if selectedCandidate.Breaker != nil {
+			selectedBreaker = &routingselector.BreakerSnapshot{
+				State: selectedCandidate.Breaker.State, Reason: selectedCandidate.Breaker.Reason,
+				CooldownUntilUnix: selectedCandidate.Breaker.CooldownUntilUnix,
+				HalfOpenInflight:  selectedCandidate.Breaker.HalfOpenInflight,
+				UpdatedUnix:       selectedCandidate.Breaker.UpdatedUnix,
+			}
+		}
+		probeSettings := routingselector.Settings{
+			HalfOpenProbes: plan.Replay.Settings.HalfOpenProbes, NowUnix: plan.Replay.Settings.NowUnix,
+			SnapshotStaleSec: plan.Replay.Settings.SnapshotStaleSec,
+		}
+		probeKey := routingbreaker.Key{
+			ChannelID: selected.Id, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model: param.ModelName, Group: group,
+		}
+		probeAcquired, probeErr := acquireRoutingHalfOpenProbeForKey(
+			param.Ctx, probeKey, selectedBreaker, probeSettings, true,
+		)
+		if !probeAcquired {
+			probeExcluded = append(probeExcluded, selected.Id)
+			if probeErr != nil {
+				lastProbeErr = probeErr
+				logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing canary half-open probe unavailable: %v", probeErr))
+			}
+			continue
 		}
 
 		demand := channelrouting.Demand{
@@ -206,6 +254,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			Model:    param.ModelName,
 		}, demand)
 		if reserveErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 			if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
 				errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {
 				capacityExcluded = append(capacityExcluded, selected.Id)
@@ -215,8 +264,9 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		}
 		admission := reservation.Admission()
 		if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
-			_ = reservation.Cancel()
-			return nil, true, true, err
+			cancelErr := reservation.Cancel()
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, true, errors.Join(err, cancelErr)
 		}
 		if err := PrepareChannelRoutingCanarySelection(param.Ctx, ChannelRoutingCanarySelection{
 			Gate:              gate,
@@ -226,7 +276,17 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			ExpectedCostKnown: plan.Result.SelectedCostKnown,
 		}); err != nil {
 			cancelErr := CancelRoutingCapacityReservation(param.Ctx)
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 			return nil, true, true, errors.Join(err, cancelErr)
+		}
+		if routingselector.BreakerNeedsHalfOpenProbe(selectedBreaker, probeSettings) {
+			if err := channelRoutingCanaryRuntime.startRecovery(gate.PolicyRevision, canaryPolicy, channelrouting.SlowStartKey{
+				PoolID: gate.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: param.ModelName,
+			}); err != nil {
+				cancelErr := CancelRoutingCapacityReservation(param.Ctx)
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				return nil, true, true, errors.Join(err, cancelErr)
+			}
 		}
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
 			ChannelID:        selected.Id,
@@ -234,7 +294,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			PoolID:           plan.SelectedIdentity.PoolID,
 			MemberID:         plan.SelectedIdentity.MemberID,
 		})
-		enqueueChannelRoutingCanaryDecision(param, group, plan, admission)
+		enqueueChannelRoutingCanaryDecision(param, group, plan, &admission)
 		return selected, true, true, nil
 	}
 	return nil, true, true, nil
@@ -294,11 +354,75 @@ func ShouldBypassChannelRoutingAffinity(c *gin.Context, group string) (bool, err
 	return active && gate.InCanary, nil
 }
 
+func GetAdmissibleAffinityChannelWithRoutingGate(
+	c *gin.Context,
+	preferredID int,
+	modelName string,
+	usingGroup string,
+	requestPath string,
+) (*model.Channel, string, bool, error) {
+	setting := smart_routing_setting.GetSetting()
+	if c == nil || preferredID <= 0 || modelName == "" || usingGroup == "" ||
+		!setting.Enabled || !common.MemoryCacheEnabled {
+		channel, group, _ := GetAdmissibleAffinityChannel(c, preferredID, modelName, usingGroup, requestPath)
+		return channel, group, false, nil
+	}
+
+	groups := []string{usingGroup}
+	if usingGroup == "auto" {
+		userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+		groups = GetUserAutoGroup(userGroup)
+	}
+	for _, group := range groups {
+		allowedChannels, err := model.GetRankedSatisfiedChannels(group, modelName, requestPath)
+		if err != nil {
+			return nil, group, true, err
+		}
+		preferredAllowed := false
+		for _, channel := range allowedChannels {
+			if channel != nil && channel.Id == preferredID {
+				preferredAllowed = true
+				break
+			}
+		}
+		if !preferredAllowed {
+			continue
+		}
+
+		bypass, err := ShouldBypassChannelRoutingAffinity(c, group)
+		if err != nil {
+			return nil, group, true, err
+		}
+		if bypass {
+			return nil, group, true, nil
+		}
+
+		var preferred *model.Channel
+		if shouldActivateSmartRouting(setting) {
+			preferred, preferredAllowed = admissibleAffinityChannelForSmartGroup(
+				c, preferredID, modelName, group, requestPath, setting,
+			)
+		} else {
+			preferred, _, preferredAllowed = admissibleAffinityChannelLegacy(
+				c, preferredID, modelName, group, requestPath,
+			)
+		}
+		if !preferredAllowed {
+			continue
+		}
+		if usingGroup == "auto" {
+			common.SetContextKey(c, constant.ContextKeyAutoGroup, group)
+		}
+		return preferred, group, false, nil
+	}
+	return nil, "", false, nil
+}
+
 func enqueueChannelRoutingCanaryDecision(
 	param *RetryParam,
 	group string,
 	plan channelrouting.RequestRoutingPlan,
-	admission channelrouting.CapacityAdmission,
+	admission *channelrouting.CapacityAdmission,
 ) {
 	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(plan.Replay, plan.Result.SelectedChannelID)
 	_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
@@ -324,7 +448,7 @@ func enqueueChannelRoutingCanaryDecision(
 		ObservedExpectedCost: plan.Result.SelectedCost,
 		Gate:                 &plan.Gate,
 		SelectedIdentity:     plan.SelectedIdentity,
-		CapacityAdmission:    &admission,
+		CapacityAdmission:    admission,
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing canary audit dropped: %v", err))

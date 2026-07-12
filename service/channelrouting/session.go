@@ -23,6 +23,7 @@ const (
 	ExclusionReasonRequestFailed        = "request_failed"
 	ExclusionReasonChannelNotAllowed    = "channel_not_allowed"
 	ExclusionReasonLocalCapacity        = "local_capacity_exhausted"
+	ExclusionReasonHalfOpenProbe        = "half_open_probe_unavailable"
 	ExclusionReasonMultiKeyUnsupported  = "multi_key_unsupported"
 	ExclusionReasonSlowStartUnavailable = "slow_start_unavailable"
 )
@@ -56,6 +57,7 @@ type RequestRoutingPlanInput struct {
 	AllowedChannelIDs          []int
 	ExcludedChannelIDs         []int
 	CapacityExcludedChannelIDs []int
+	ProbeExcludedChannelIDs    []int
 	SlowStartFactor            func(SlowStartKey) (float64, error)
 }
 
@@ -305,6 +307,10 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
+	probeExcludedChannels, _, err := routingSessionChannelSet(input.ProbeExcludedChannelIDs)
+	if err != nil {
+		return RequestRoutingPlan{}, true, err
+	}
 	seed, err := DeriveDecisionSeed(session.requestID, snapshot.view.Revision, input.RetryIndex)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
@@ -343,6 +349,8 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		switch {
 		case routingSessionChannelContains(excludedChannels, member.ChannelID):
 			candidate.RequestExclusionReason = ExclusionReasonRequestFailed
+		case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
+			candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
 		case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
 			candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
 		case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):

@@ -108,22 +108,22 @@ func Distribute() func(c *gin.Context) {
 				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
 					affinityUsable := false
 					affinityBypassedForCanary := false
-					if preferred, affinityGroup, ok := service.GetAdmissibleAffinityChannel(c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path); ok {
-						bypassAffinity, gateErr := service.ShouldBypassChannelRoutingAffinity(c, affinityGroup)
-						if gateErr != nil {
-							logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
-						}
-						affinityBypassedForCanary = bypassAffinity
-						if !bypassAffinity {
-							channel = preferred
-							selectGroup = affinityGroup
-							affinityUsable = true
-							service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
-							service.RecordChannelRoutingObserveSelection(&service.RetryParam{
-								Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
-								RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
-							}, affinityGroup, preferred, 0)
-						}
+					preferred, affinityGroup, bypassAffinity, gateErr := service.GetAdmissibleAffinityChannelWithRoutingGate(
+						c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path,
+					)
+					if gateErr != nil {
+						logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
+					}
+					affinityBypassedForCanary = bypassAffinity
+					if preferred != nil {
+						channel = preferred
+						selectGroup = affinityGroup
+						affinityUsable = true
+						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
+						service.RecordChannelRoutingObserveSelection(&service.RetryParam{
+							Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
+							RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+						}, affinityGroup, preferred, 0)
 					}
 					if !affinityUsable && !affinityBypassedForCanary && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
