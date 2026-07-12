@@ -588,6 +588,7 @@ var routingMigrationModels = []interface{}{
 	&RoutingPolicyPoolRevision{},
 	&RoutingPolicyMemberRevision{},
 	&RoutingPolicyActivation{},
+	&RoutingPolicyDraft{},
 	&RoutingConfigOutbox{},
 	&RoutingRuntimeCheckpoint{},
 	&RoutingControlLease{},
@@ -755,6 +756,9 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "CanaryP95TTFTMilliseconds"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "RetryAmplificationRatioBasisPoints"))
 	require.True(t, DB.Migrator().HasIndex(&RoutingCanaryEvaluation{}, routingCanaryEvaluationWindowUniqueIndex))
+	require.True(t, DB.Migrator().HasColumn(&RoutingPolicyDraft{}, "DocumentHash"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingPolicyDraft{}, "ValidatedHeadRevision"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingPolicyDraft{}, "PublishedRevision"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "IdempotencyHash"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "CreateToken"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingOperation{}, "ClaimToken"))
