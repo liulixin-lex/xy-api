@@ -34,10 +34,11 @@ type SimulationSelectorOverrides struct {
 }
 
 type HistoricalSimulationOptions struct {
-	PoolID   int
-	Cursor   int
-	Limit    int
-	Selector SimulationSelectorOverrides
+	PoolID         int
+	Cursor         int
+	Limit          int
+	Selector       SimulationSelectorOverrides
+	BalancedPolicy *BalancedPoolPolicy
 }
 
 type HistoricalSimulationSample struct {
@@ -55,6 +56,7 @@ type HistoricalSimulationSample struct {
 	SimulatedExpectedCost float64 `json:"simulated_expected_cost"`
 	ExpectedCostDelta     float64 `json:"expected_cost_delta"`
 	CounterfactualHash    string  `json:"counterfactual_hash"`
+	SimulatedAlgorithm    string  `json:"simulated_algorithm"`
 }
 
 type HistoricalSimulationSkip struct {
@@ -79,19 +81,29 @@ type HistoricalSimulationResult struct {
 	SkipReasons            map[string]int               `json:"skip_reasons"`
 	Samples                []HistoricalSimulationSample `json:"samples"`
 	Skipped                []HistoricalSimulationSkip   `json:"skipped"`
+	SimulatedAlgorithm     string                       `json:"simulated_algorithm"`
 }
 
 func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOptions) (HistoricalSimulationResult, error) {
 	result := HistoricalSimulationResult{
-		PoolID:      options.PoolID,
-		Cursor:      options.Cursor,
-		Limit:       options.Limit,
-		SkipReasons: make(map[string]int),
-		Samples:     []HistoricalSimulationSample{},
-		Skipped:     []HistoricalSimulationSkip{},
+		PoolID:             options.PoolID,
+		Cursor:             options.Cursor,
+		Limit:              options.Limit,
+		SkipReasons:        make(map[string]int),
+		Samples:            []HistoricalSimulationSample{},
+		Skipped:            []HistoricalSimulationSkip{},
+		SimulatedAlgorithm: DecisionAlgorithmShadowV1,
 	}
 	if err := validateHistoricalSimulationOptions(options); err != nil {
 		return result, err
+	}
+	if options.BalancedPolicy != nil {
+		normalized, err := normalizeBalancedPoolPolicy(*options.BalancedPolicy)
+		if err != nil {
+			return result, ErrSimulationInvalidOptions
+		}
+		options.BalancedPolicy = &normalized
+		result.SimulatedAlgorithm = DecisionAlgorithmBalancedV1
 	}
 
 	query := model.DB.WithContext(ctx).
@@ -113,40 +125,9 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 
 	for index := range audits {
 		audit := audits[index]
-		if audit.AlgorithmVersion != DecisionAlgorithmShadowV1 {
-			result.addSkip(audit.DecisionID, "unsupported_algorithm")
-			continue
-		}
-		baseline, err := ReplayDecisionAudit(audit)
+		baseline, simulated, counterfactualHash, err := simulateHistoricalDecision(ctx, audit, options)
 		if err != nil {
 			result.addSkip(audit.DecisionID, simulationSkipReason(err))
-			continue
-		}
-
-		replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
-		if err != nil {
-			result.addSkip(audit.DecisionID, "invalid_replay")
-			continue
-		}
-		var input ShadowReplayInput
-		if err := common.UnmarshalJsonStr(replayInputJSON, &input); err != nil {
-			result.addSkip(audit.DecisionID, "invalid_replay")
-			continue
-		}
-		applySimulationSelectorOverrides(&input.Settings, options.Selector)
-		if !validShadowSettings(input.Settings) {
-			return result, ErrSimulationInvalidOptions
-		}
-		input.SnapshotHash = ""
-		counterfactualHash, err := input.computeHash()
-		if err != nil {
-			result.addSkip(audit.DecisionID, "counterfactual_failed")
-			continue
-		}
-		input.SnapshotHash = counterfactualHash
-		simulated, err := RunShadowReplay(input)
-		if err != nil {
-			result.addSkip(audit.DecisionID, "counterfactual_failed")
 			continue
 		}
 
@@ -155,15 +136,16 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 			CreatedTime:           audit.CreatedTime,
 			AlgorithmVersion:      audit.AlgorithmVersion,
 			ActualChannelID:       audit.ActualChannelID,
-			BaselineChannelID:     baseline.SelectedChannelID,
-			SimulatedChannelID:    simulated.SelectedChannelID,
-			MatchesActual:         simulated.SelectedChannelID > 0 && simulated.SelectedChannelID == audit.ActualChannelID,
-			SelectionChanged:      simulated.SelectedChannelID != baseline.SelectedChannelID,
-			BaselineCostKnown:     baseline.SelectedCostKnown,
-			BaselineExpectedCost:  baseline.SelectedCost,
-			SimulatedCostKnown:    simulated.SelectedCostKnown,
-			SimulatedExpectedCost: simulated.SelectedCost,
+			BaselineChannelID:     baseline.channelID,
+			SimulatedChannelID:    simulated.channelID,
+			MatchesActual:         simulated.channelID > 0 && simulated.channelID == audit.ActualChannelID,
+			SelectionChanged:      simulated.channelID != baseline.channelID,
+			BaselineCostKnown:     baseline.costKnown,
+			BaselineExpectedCost:  baseline.cost,
+			SimulatedCostKnown:    simulated.costKnown,
+			SimulatedExpectedCost: simulated.cost,
 			CounterfactualHash:    counterfactualHash,
+			SimulatedAlgorithm:    result.SimulatedAlgorithm,
 		}
 		if sample.BaselineCostKnown && sample.SimulatedCostKnown {
 			delta := sample.SimulatedExpectedCost - sample.BaselineExpectedCost
@@ -201,6 +183,11 @@ func validateHistoricalSimulationOptions(options HistoricalSimulationOptions) er
 	if options.PoolID <= 0 || options.Cursor < 0 || options.Limit < 1 || options.Limit > MaxSimulationLimit {
 		return ErrSimulationInvalidOptions
 	}
+	if options.BalancedPolicy != nil {
+		if _, err := normalizeBalancedPoolPolicy(*options.BalancedPolicy); err != nil || simulationSelectorOverridesPresent(options.Selector) {
+			return ErrSimulationInvalidOptions
+		}
+	}
 	for _, value := range []*float64{
 		options.Selector.WeightAvailability,
 		options.Selector.WeightLatency,
@@ -237,6 +224,171 @@ func validateHistoricalSimulationOptions(options HistoricalSimulationOptions) er
 		return ErrSimulationInvalidOptions
 	}
 	return nil
+}
+
+type historicalSimulationDecision struct {
+	channelID int
+	cost      float64
+	costKnown bool
+}
+
+func simulateHistoricalDecision(
+	ctx context.Context,
+	audit model.RoutingDecisionAudit,
+	options HistoricalSimulationOptions,
+) (historicalSimulationDecision, historicalSimulationDecision, string, error) {
+	if options.BalancedPolicy != nil {
+		return simulateBalancedHistoricalDecision(ctx, audit, *options.BalancedPolicy)
+	}
+	if audit.AlgorithmVersion != DecisionAlgorithmShadowV1 {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayAlgorithm
+	}
+	baseline, err := ReplayDecisionAudit(audit)
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+	}
+	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayInvalid
+	}
+	var input ShadowReplayInput
+	if common.UnmarshalJsonStr(replayInputJSON, &input) != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayInvalid
+	}
+	applySimulationSelectorOverrides(&input.Settings, options.Selector)
+	if !validShadowSettings(input.Settings) {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrSimulationInvalidOptions
+	}
+	input.SnapshotHash = ""
+	counterfactualHash, err := input.computeHash()
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+	}
+	input.SnapshotHash = counterfactualHash
+	simulated, err := RunShadowReplay(input)
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+	}
+	return historicalSimulationDecision{
+			channelID: baseline.SelectedChannelID, cost: baseline.SelectedCost, costKnown: baseline.SelectedCostKnown,
+		}, historicalSimulationDecision{
+			channelID: simulated.SelectedChannelID, cost: simulated.SelectedCost, costKnown: simulated.SelectedCostKnown,
+		}, counterfactualHash, nil
+}
+
+func simulateBalancedHistoricalDecision(
+	ctx context.Context,
+	audit model.RoutingDecisionAudit,
+	policy BalancedPoolPolicy,
+) (historicalSimulationDecision, historicalSimulationDecision, string, error) {
+	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrBalancedReplayInvalid
+	}
+	var baseline historicalSimulationDecision
+	var input BalancedReplayInput
+	switch audit.AlgorithmVersion {
+	case DecisionAlgorithmBalancedV1:
+		baselineResult, replayErr := ReplayBalancedDecisionAudit(audit)
+		if replayErr != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", replayErr
+		}
+		if common.UnmarshalJsonStr(replayInputJSON, &input) != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrBalancedReplayInvalid
+		}
+		baseline = historicalSimulationDecision{
+			channelID: baselineResult.SelectedChannelID,
+			cost:      baselineResult.SelectedCost, costKnown: baselineResult.SelectedCostKnown,
+		}
+	case DecisionAlgorithmShadowV1, DecisionAlgorithmCanaryV1:
+		baselineResult, replayErr := ReplayDecisionAudit(audit)
+		if replayErr != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", replayErr
+		}
+		var shadowInput ShadowReplayInput
+		if common.UnmarshalJsonStr(replayInputJSON, &shadowInput) != nil || shadowInput.Validate() != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayInvalid
+		}
+		input, err = balancedReplayInputFromShadow(shadowInput, policy)
+		if err != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+		}
+		baseline = historicalSimulationDecision{
+			channelID: baselineResult.SelectedChannelID,
+			cost:      baselineResult.SelectedCost, costKnown: baselineResult.SelectedCostKnown,
+		}
+	default:
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayAlgorithm
+	}
+	input.Settings.Policy = policy
+	input.SnapshotHash = ""
+	counterfactualHash, err := input.computeHash()
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+	}
+	input.SnapshotHash = counterfactualHash
+	simulated, err := RunBalancedReplay(input)
+	if err != nil {
+		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+	}
+	return baseline, historicalSimulationDecision{
+		channelID: simulated.SelectedChannelID,
+		cost:      simulated.SelectedCost,
+		costKnown: simulated.SelectedCostKnown,
+	}, counterfactualHash, nil
+}
+
+func balancedReplayInputFromShadow(input ShadowReplayInput, policy BalancedPoolPolicy) (BalancedReplayInput, error) {
+	candidates := make([]BalancedReplayCandidate, 0, len(input.Candidates))
+	for index := range input.Candidates {
+		source := input.Candidates[index]
+		confidence := 0.50
+		explorationEligible := true
+		if source.Metric != nil {
+			confidence = 1
+			explorationEligible = source.Metric.ReliabilityRequestCount < int64(policy.MinVolume)
+			if explorationEligible {
+				confidence = 0.75
+			}
+		}
+		slowStartFactor := source.SlowStartFactor
+		if input.AlgorithmVersion == DecisionAlgorithmShadowV1 && slowStartFactor == 0 {
+			slowStartFactor = 1
+		}
+		metricUpdatedUnix := int64(0)
+		if source.Metric != nil {
+			metricUpdatedUnix = input.Settings.NowUnix
+		}
+		candidates = append(candidates, BalancedReplayCandidate{
+			PoolMemberID: source.PoolMemberID, ChannelID: source.ChannelID, CredentialID: source.CredentialID,
+			BusinessTier: source.Priority, TargetWeight: float64(source.Weight), Confidence: confidence,
+			Freshness: 1, SlowStartFactor: slowStartFactor, MetricUpdatedUnix: metricUpdatedUnix,
+			ExplorationEligible: explorationEligible, HardExclusionReason: source.RequestExclusionReason,
+			Metric: source.Metric, Cost: source.Cost, Breaker: source.Breaker, Capacity: source.Capacity,
+		})
+	}
+	return buildBalancedReplayInput(
+		input.PoolID,
+		input.PolicyRevision,
+		input.RuntimeGeneration,
+		input.PolicyHash,
+		input.Profile,
+		BalancedReplaySettings{
+			Policy: policy, PreparedAtUnix: input.Settings.NowUnix,
+			PreparedAtUnixMilli: input.Settings.NowUnixMilli, RequestNowUnixMilli: input.Settings.NowUnixMilli,
+			RandomSeed: input.Settings.RandomSeed, PreferTTFT: input.Settings.PreferTTFT,
+		},
+		candidates,
+		nil,
+		nil,
+	)
+}
+
+func simulationSelectorOverridesPresent(overrides SimulationSelectorOverrides) bool {
+	return overrides.WeightAvailability != nil || overrides.WeightLatency != nil ||
+		overrides.WeightThroughput != nil || overrides.WeightCost != nil ||
+		overrides.AvailabilityFloor != nil || overrides.MinVolume != nil || overrides.TopK != nil ||
+		overrides.MaxEjectedPct != nil || overrides.HalfOpenProbes != nil || overrides.SnapshotStaleSec != nil
 }
 
 func applySimulationSelectorOverrides(settings *ShadowSelectorSettings, overrides SimulationSelectorOverrides) {
@@ -282,6 +434,12 @@ func simulationSkipReason(err error) string {
 		return "audit_mismatch"
 	case errors.Is(err, ErrShadowReplayInvalid):
 		return "invalid_replay"
+	case errors.Is(err, ErrBalancedReplayHash):
+		return "hash_mismatch"
+	case errors.Is(err, ErrBalancedReplayInvalid):
+		return "invalid_replay"
+	case errors.Is(err, ErrSimulationInvalidOptions):
+		return "invalid_options"
 	default:
 		return "replay_failed"
 	}

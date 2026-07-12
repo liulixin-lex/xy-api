@@ -136,6 +136,45 @@ func TestRunHistoricalSimulationRejectsUnsafeSelectorWindows(t *testing.T) {
 	}
 }
 
+func TestRunHistoricalSimulationReplaysBalancedDraftPolicyAgainstShadowHistory(t *testing.T) {
+	openHistoricalSimulationTestDB(t)
+	enqueueHistoricalSimulationAudit(t, 5, "balanced-policy-simulation")
+	flushed, err := FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, flushed)
+	policy, err := resolveBalancedPoolPolicy(model.RoutingPolicyProfileBalanced, []byte(`{
+		"weight_availability": 0,
+		"weight_latency": 0,
+		"weight_throughput": 0,
+		"weight_cost": 1,
+		"availability_floor": 0,
+		"exploration_basis_points": 0,
+		"protection_band_basis_points": 0
+	}`))
+	require.NoError(t, err)
+
+	result, err := RunHistoricalSimulation(context.Background(), HistoricalSimulationOptions{
+		PoolID: 5, Limit: 10, BalancedPolicy: &policy,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAlgorithmBalancedV1, result.SimulatedAlgorithm)
+	assert.Equal(t, 1, result.ScannedSamples)
+	assert.Equal(t, 1, result.EvaluatedSamples)
+	require.Len(t, result.Samples, 1)
+	sample := result.Samples[0]
+	assert.Equal(t, DecisionAlgorithmShadowV1, sample.AlgorithmVersion)
+	assert.Equal(t, DecisionAlgorithmBalancedV1, sample.SimulatedAlgorithm)
+	assert.Equal(t, 101, sample.BaselineChannelID)
+	assert.Equal(t, 102, sample.SimulatedChannelID)
+	assert.True(t, sample.SelectionChanged)
+	assert.True(t, sample.BaselineCostKnown)
+	assert.True(t, sample.SimulatedCostKnown)
+	assert.InDelta(t, 10.0, sample.BaselineExpectedCost, 1e-12)
+	assert.InDelta(t, 1.0, sample.SimulatedExpectedCost, 1e-12)
+	assert.InDelta(t, -9.0, sample.ExpectedCostDelta, 1e-12)
+	assert.Len(t, sample.CounterfactualHash, 64)
+}
+
 func enqueueHistoricalSimulationAudit(t *testing.T, poolID int, requestID string) string {
 	t.Helper()
 	profile, err := NewRequestProfile("/v1/chat/completions", "group-"+strconv.Itoa(poolID), "gpt-test", false, 0, 1_000, 200)

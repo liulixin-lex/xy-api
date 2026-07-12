@@ -535,6 +535,7 @@ func (prepared *PreparedBalancedPool) runtimeEvaluation(
 		if full {
 			candidate := &prepared.ranked[index]
 			evaluation.breaker = candidate.Candidate.Candidate.Breaker
+			evaluation.cost = candidate.Candidate.Candidate.Cost
 			evaluation.baseUtilityScore = candidate.BaseUtilityScore
 			evaluation.costUtility = candidate.CostUtility
 		}

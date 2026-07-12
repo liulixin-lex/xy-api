@@ -431,6 +431,20 @@ func TestPreparedBalancedUsesRequestCostOverrideForBudgetAndSelection(t *testing
 	assert.Zero(t, unknown.SelectedChannelID)
 }
 
+func TestPreparedBalancedSelectDetailedMaterializesSnapshotCost(t *testing.T) {
+	settings := balancedSettingsForTest()
+	candidate := balancedCandidateForTest(1, 100, 20, 0, 0.25)
+	prepared, err := PrepareBalanced([]BalancedCandidate{candidate}, settings)
+	require.NoError(t, err)
+
+	decision, err := prepared.SelectDetailed(BalancedRequest{RandomSeed: 1})
+	require.NoError(t, err)
+	require.NotNil(t, decision.Selected)
+	require.NotNil(t, decision.Selected.Candidate.Candidate.Cost)
+	assert.True(t, decision.Selected.CostKnown)
+	assert.InDelta(t, 0.25, decision.Selected.Candidate.Candidate.Cost.Cost, 1e-12)
+}
+
 func TestPreparedBalancedFallsBackAcrossSoftStateAndBusinessTiersAtRuntime(t *testing.T) {
 	settings := balancedSettingsForTest()
 	settings.AllowSoftFailureFallback = true
