@@ -557,9 +557,13 @@ func buildRoutingCanaryEvaluationSpec(
 func canaryCohortEvaluationMetrics(
 	aggregate canaryCohortAggregate,
 ) (model.RoutingCanaryCohortMetrics, float64, error) {
-	if aggregate.LogicalRequests < aggregate.RoutingFailures ||
-		aggregate.Attempts < aggregate.LogicalRequests-aggregate.RoutingFailures ||
+	if aggregate.LogicalRequests < 0 || aggregate.RoutingFailures < 0 ||
+		aggregate.LogicalRequests < aggregate.RoutingFailures ||
 		aggregate.TTFT == nil || aggregate.TTFT.Count() != aggregate.TTFTSampleCount {
+		return model.RoutingCanaryCohortMetrics{}, 0, ErrCanaryControlInvalid
+	}
+	attemptedRequests := aggregate.LogicalRequests - aggregate.RoutingFailures
+	if aggregate.Attempts < attemptedRequests {
 		return model.RoutingCanaryCohortMetrics{}, 0, ErrCanaryControlInvalid
 	}
 	p95 := float64(0)
@@ -570,10 +574,7 @@ func canaryCohortEvaluationMetrics(
 		}
 		p95 = quantile.ValueMilliseconds
 	}
-	retries := aggregate.Attempts - aggregate.LogicalRequests
-	if retries < 0 {
-		retries = 0
-	}
+	retries := aggregate.Attempts - attemptedRequests
 	metrics := model.RoutingCanaryCohortMetrics{
 		RequestCount:        aggregate.LogicalRequests,
 		SuccessCount:        aggregate.Successes,

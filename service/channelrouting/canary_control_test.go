@@ -91,6 +91,32 @@ func TestBuildRoutingCanaryEvaluationSpecAppliesSafetyGates(t *testing.T) {
 	}
 }
 
+func TestBuildRoutingCanaryEvaluationSpecCountsRetriesAfterRoutingFailures(t *testing.T) {
+	windowStartMs := int64(1_700_000_000_000)
+	windowEndMs := windowStartMs + int64(5*time.Minute/time.Millisecond)
+	target := canaryEvaluationTargetForTest(windowStartMs - int64(time.Hour/time.Millisecond))
+	target.Policy.MinCostCoverageBasisPoints = 0
+	target.Policy.HardMinSuccessRateBasisPoints = 0
+	target.Policy.MaxSuccessRateDropBasisPoints = 5_000
+	aggregate := canaryWindowAggregateForTest(t)
+	aggregate.Control.Attempts = 1_100
+	aggregate.Canary.Successes = 50
+	aggregate.Canary.Failures = 50
+	aggregate.Canary.RoutingFailures = 50
+	aggregate.Canary.Attempts = 70
+	aggregate.Canary.CostKnownRequests = 50
+	aggregate.Canary.ExpectedPlatformCostNanoUSD = 50_000_000
+	aggregate.Canary.TTFTSampleCount = 50
+	aggregate.Canary.TTFT = durationSketchForTest(t, 50, 100)
+
+	spec, err := buildRoutingCanaryEvaluationSpec(target, aggregate, windowStartMs, windowEndMs)
+	require.NoError(t, err)
+	assert.Equal(t, int64(20), spec.Canary.RetryCount)
+	assert.Equal(t, int64(20_000), spec.RetryAmplificationRatioBasisPoints)
+	assert.Equal(t, model.RoutingCanaryEvaluationStatusBreached, spec.Status)
+	assert.Equal(t, "retry amplification breached", spec.Reason)
+}
+
 func TestCanaryEvaluatorAggregatesActiveNodesWithoutTreatingMissingDataAsPassing(t *testing.T) {
 	for _, test := range []struct {
 		name             string
