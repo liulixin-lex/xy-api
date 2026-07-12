@@ -94,6 +94,7 @@ type SnapshotView struct {
 	ActivationID          int64             `json:"activation_id"`
 	ActivationStage       string            `json:"activation_stage"`
 	TrafficBasisPoints    int               `json:"traffic_basis_points"`
+	ActivationCreatedTime int64             `json:"activation_created_time"`
 	BuiltAtUnix           int64             `json:"built_at"`
 	BuildDurationMs       int64             `json:"build_duration_ms"`
 	AggregateP95TTFTMs    float64           `json:"aggregate_p95_ttft_ms"`
@@ -1216,6 +1217,7 @@ metricPages:
 		ActivationID:          activation.ID,
 		ActivationStage:       activation.Stage,
 		TrafficBasisPoints:    activation.TrafficBasisPoints,
+		ActivationCreatedTime: activation.CreatedTime,
 		BuiltAtUnix:           common.GetTimestamp(),
 		BuildDurationMs:       time.Since(started).Milliseconds(),
 		AggregateP95TTFTMs:    aggregateP95TTFTMs,

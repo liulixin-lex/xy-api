@@ -72,10 +72,10 @@ type RoutingCanaryEvaluation struct {
 	CreateToken                        string                        `json:"-" gorm:"type:char(32);not null"`
 	PolicyRevision                     int64                         `json:"policy_revision" gorm:"bigint;index;not null"`
 	ActivationID                       int64                         `json:"activation_id" gorm:"bigint;index;not null"`
-	PoolID                             int                           `json:"pool_id" gorm:"index;index:idx_routing_canary_evaluation_window,priority:2;not null"`
-	RolloutKey                         string                        `json:"rollout_key" gorm:"type:char(64);index;index:idx_routing_canary_evaluation_window,priority:1;not null"`
-	WindowStartMs                      int64                         `json:"window_start_ms" gorm:"bigint;index;index:idx_routing_canary_evaluation_window,priority:3;not null"`
-	WindowEndMs                        int64                         `json:"window_end_ms" gorm:"bigint;index;index:idx_routing_canary_evaluation_window,priority:4;not null"`
+	PoolID                             int                           `json:"pool_id" gorm:"index;uniqueIndex:idx_routing_canary_evaluation_window,priority:2;not null"`
+	RolloutKey                         string                        `json:"rollout_key" gorm:"type:char(64);index;uniqueIndex:idx_routing_canary_evaluation_window,priority:1;not null"`
+	WindowStartMs                      int64                         `json:"window_start_ms" gorm:"bigint;index;uniqueIndex:idx_routing_canary_evaluation_window,priority:3;not null"`
+	WindowEndMs                        int64                         `json:"window_end_ms" gorm:"bigint;index;uniqueIndex:idx_routing_canary_evaluation_window,priority:4;not null"`
 	ControlRequestCount                int64                         `json:"control_request_count" gorm:"bigint;not null"`
 	ControlSuccessCount                int64                         `json:"control_success_count" gorm:"bigint;not null"`
 	ControlTTFTSampleCount             int64                         `json:"control_ttft_sample_count" gorm:"bigint;not null"`
@@ -143,7 +143,12 @@ func CreateRoutingCanaryEvaluationContext(
 	evaluation.CreateToken = createToken
 	evaluation.CreatedTimeMs = time.Now().UnixMilli()
 	created := DB.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "evaluation_hash"}},
+		Columns: []clause.Column{
+			{Name: "rollout_key"},
+			{Name: "pool_id"},
+			{Name: "window_start_ms"},
+			{Name: "window_end_ms"},
+		},
 		DoNothing: true,
 	}).Create(&evaluation)
 	if created.Error != nil {
@@ -151,15 +156,85 @@ func CreateRoutingCanaryEvaluationContext(
 	}
 
 	var stored RoutingCanaryEvaluation
-	if err := DB.WithContext(ctx).Where("evaluation_hash = ?", evaluationHash).First(&stored).Error; err != nil {
+	if err := DB.WithContext(ctx).
+		Where("rollout_key = ? AND pool_id = ? AND window_start_ms = ? AND window_end_ms = ?",
+			normalized.RolloutKey, normalized.PoolID, normalized.WindowStartMs, normalized.WindowEndMs,
+		).
+		First(&stored).Error; err != nil {
 		return RoutingCanaryEvaluation{}, false, err
 	}
-	storedSpec := stored.Spec()
-	_, storedHash, err := normalizeRoutingCanaryEvaluationSpec(storedSpec)
-	if err != nil || storedHash != stored.EvaluationHash || !validRoutingPersistenceToken(stored.CreateToken) {
+	if err := validateStoredRoutingCanaryEvaluation(stored); err != nil {
 		return RoutingCanaryEvaluation{}, false, ErrRoutingCanaryEvaluationInvalid
 	}
 	return stored, stored.CreateToken == createToken, nil
+}
+
+func GetRoutingCanaryEvaluationWindowContext(
+	ctx context.Context,
+	rolloutKey string,
+	poolID int,
+	windowStartMs int64,
+	windowEndMs int64,
+) (RoutingCanaryEvaluation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rolloutKey = strings.ToLower(strings.TrimSpace(rolloutKey))
+	if !validRoutingHash(rolloutKey) || poolID <= 0 || windowStartMs <= 0 || windowEndMs <= windowStartMs {
+		return RoutingCanaryEvaluation{}, ErrRoutingCanaryEvaluationInvalid
+	}
+	var evaluation RoutingCanaryEvaluation
+	err := DB.WithContext(ctx).
+		Where("rollout_key = ? AND pool_id = ? AND window_start_ms = ? AND window_end_ms = ?",
+			rolloutKey, poolID, windowStartMs, windowEndMs,
+		).
+		First(&evaluation).Error
+	if err == nil {
+		err = validateStoredRoutingCanaryEvaluation(evaluation)
+	}
+	return evaluation, err
+}
+
+func ListRoutingCanaryEvaluationsBeforeContext(
+	ctx context.Context,
+	rolloutKey string,
+	poolID int,
+	beforeWindowEndMs int64,
+	limit int,
+) ([]RoutingCanaryEvaluation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rolloutKey = strings.ToLower(strings.TrimSpace(rolloutKey))
+	if !validRoutingHash(rolloutKey) || poolID <= 0 || beforeWindowEndMs <= 0 || limit <= 0 || limit > 10 {
+		return nil, ErrRoutingCanaryEvaluationInvalid
+	}
+	evaluations := make([]RoutingCanaryEvaluation, 0, limit)
+	err := DB.WithContext(ctx).
+		Where("rollout_key = ? AND pool_id = ? AND window_end_ms < ?", rolloutKey, poolID, beforeWindowEndMs).
+		Order("window_end_ms desc").
+		Order("id desc").
+		Limit(limit).
+		Find(&evaluations).Error
+	if err == nil {
+		for index := range evaluations {
+			if validateErr := validateStoredRoutingCanaryEvaluation(evaluations[index]); validateErr != nil {
+				return nil, validateErr
+			}
+		}
+	}
+	return evaluations, err
+}
+
+func validateStoredRoutingCanaryEvaluation(evaluation RoutingCanaryEvaluation) error {
+	if evaluation.ID <= 0 || evaluation.CreatedTimeMs <= 0 || !validRoutingPersistenceToken(evaluation.CreateToken) {
+		return ErrRoutingCanaryEvaluationInvalid
+	}
+	_, storedHash, err := normalizeRoutingCanaryEvaluationSpec(evaluation.Spec())
+	if err != nil || storedHash != evaluation.EvaluationHash {
+		return ErrRoutingCanaryEvaluationInvalid
+	}
+	return nil
 }
 
 func (evaluation RoutingCanaryEvaluation) Spec() RoutingCanaryEvaluationSpec {

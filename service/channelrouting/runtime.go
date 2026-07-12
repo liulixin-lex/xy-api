@@ -29,6 +29,8 @@ const (
 	decisionAuditFlushMaxBatches = 16
 	observeFinalFlushMaxAttempts = 4
 	observeFinalFlushRetryBase   = 50 * time.Millisecond
+	canaryControlPollInterval    = 10 * time.Second
+	canaryOperationPollInterval  = time.Second
 )
 
 const routingLegacyReconcileLeaseName = "routing-v2-legacy-reconcile"
@@ -52,6 +54,8 @@ type RuntimeStats struct {
 	TelemetryStream           RuntimeWorkerStats             `json:"telemetry_stream"`
 	ConfigPublisher           RuntimeWorkerStats             `json:"config_publisher"`
 	ConfigConsumer            RuntimeWorkerStats             `json:"config_consumer"`
+	CanaryEvaluator           RuntimeWorkerStats             `json:"canary_evaluator"`
+	CanaryOperations          RuntimeWorkerStats             `json:"canary_operations"`
 	Retention                 RuntimeWorkerStats             `json:"retention"`
 	Audit                     DecisionBufferStats            `json:"audit"`
 	Telemetry                 routingmetrics.StableStats     `json:"telemetry"`
@@ -73,13 +77,15 @@ type Runtime struct {
 	wakeRefresh   bool
 	topologyDirty atomic.Bool
 
-	refreshStats       runtimeWorkerState
-	flushStats         runtimeWorkerState
-	localDrainStats    runtimeWorkerState
-	streamStats        runtimeWorkerState
-	configPublishStats runtimeWorkerState
-	configConsumeStats runtimeWorkerState
-	retentionStats     runtimeWorkerState
+	refreshStats         runtimeWorkerState
+	flushStats           runtimeWorkerState
+	localDrainStats      runtimeWorkerState
+	streamStats          runtimeWorkerState
+	configPublishStats   runtimeWorkerState
+	configConsumeStats   runtimeWorkerState
+	canaryEvaluateStats  runtimeWorkerState
+	canaryOperationStats runtimeWorkerState
+	retentionStats       runtimeWorkerState
 
 	lastRetentionUnix atomic.Int64
 	finalOnce         sync.Once
@@ -103,6 +109,7 @@ type pendingRoutingWriteStats struct {
 	audits           int
 	stableBuckets    int64
 	pendingEnvelopes int
+	canaryWindows    int
 }
 
 type runtimeDeps struct {
@@ -114,6 +121,8 @@ type runtimeDeps struct {
 	consumeTelemetry func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	publishConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	consumeConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	evaluateCanary   func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	executeCanary    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	retention        func(context.Context, int) (int64, error)
 	topologyChanges  <-chan struct{}
 	wait             func(context.Context, time.Duration) bool
@@ -159,10 +168,10 @@ func defaultRuntimeDeps() runtimeDeps {
 			return refreshTopologySnapshotContext(ctx, false)
 		},
 		flush: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
-			return flushLocalRoutingWritesContext(ctx)
+			return flushLocalRoutingWritesContext(ctx, setting.Enabled)
 		},
-		drainLocal: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
-			return flushLocalRoutingWritesContext(ctx)
+		drainLocal: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
+			return flushLocalRoutingWritesContext(ctx, setting.Enabled)
 		},
 		consumeTelemetry: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
 			if !common.RedisEnabled || common.RDB == nil {
@@ -197,6 +206,8 @@ func defaultRuntimeDeps() runtimeDeps {
 			_, err := ConsumeRoutingConfigOnceContext(ctx)
 			return err
 		},
+		evaluateCanary:  evaluateRoutingCanaryControlContext,
+		executeCanary:   executeRoutingCanaryOperationContext,
 		retention:       DeleteExpiredRoutingHistoryContext,
 		topologyChanges: model.RoutingTopologyChanges(),
 		wait:            waitRuntime,
@@ -204,11 +215,15 @@ func defaultRuntimeDeps() runtimeDeps {
 	}
 }
 
-func flushLocalRoutingWritesContext(ctx context.Context) error {
+func flushLocalRoutingWritesContext(ctx context.Context, ensureCanaryWindows bool) error {
 	_, telemetryErr := FlushStableTelemetryContext(ctx)
 	_, auditErr := flushDecisionAuditBatchesContext(ctx, decisionAuditFlushMaxBatches)
+	var ensureCanaryErr error
+	if ensureCanaryWindows {
+		ensureCanaryErr = ensureCurrentCanaryOutcomeWindows(defaultCanaryWindowAggregator)
+	}
 	_, canaryErr := FlushCanaryOutcomeCheckpointsContext(ctx)
-	return errors.Join(telemetryErr, auditErr, canaryErr)
+	return errors.Join(telemetryErr, auditErr, ensureCanaryErr, canaryErr)
 }
 
 func flushDecisionAuditBatchesContext(ctx context.Context, maxBatches int) (int, error) {
@@ -350,6 +365,12 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.consumeConfig != nil {
 		workerCount++
 	}
+	if deps.evaluateCanary != nil {
+		workerCount++
+	}
+	if deps.executeCanary != nil {
+		workerCount++
+	}
 	if deps.retention != nil {
 		workerCount++
 	}
@@ -384,6 +405,18 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 		go func() {
 			defer runtime.wait.Done()
 			runtime.runWorker(ctx, deps.consumeConfig, observeStreamInterval, &runtime.configConsumeStats)
+		}()
+	}
+	if deps.evaluateCanary != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.evaluateCanary, canaryControlInterval, &runtime.canaryEvaluateStats)
+		}()
+	}
+	if deps.executeCanary != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.executeCanary, canaryOperationInterval, &runtime.canaryOperationStats)
 		}()
 	}
 	if deps.retention != nil {
@@ -441,6 +474,8 @@ func (runtime *Runtime) Stats() RuntimeStats {
 		TelemetryStream:    runtime.streamStats.snapshot(),
 		ConfigPublisher:    runtime.configPublishStats.snapshot(),
 		ConfigConsumer:     runtime.configConsumeStats.snapshot(),
+		CanaryEvaluator:    runtime.canaryEvaluateStats.snapshot(),
+		CanaryOperations:   runtime.canaryOperationStats.snapshot(),
 		Retention:          runtime.retentionStats.snapshot(),
 		Audit:              DecisionAuditsStats(),
 		Telemetry:          routingmetrics.StableRuntimeStats(),
@@ -627,17 +662,19 @@ func pendingRoutingWrites() pendingRoutingWriteStats {
 		audits:           DecisionAuditsStats().Entries,
 		stableBuckets:    routingmetrics.StableRuntimeStats().Buckets,
 		pendingEnvelopes: RoutingTelemetryTransportRuntimeStats().PendingEnvelopes,
+		canaryWindows:    CurrentCanaryWindowStats().Entries,
 	}
 }
 
 func (stats pendingRoutingWriteStats) hasWrites() bool {
-	return stats.audits > 0 || stats.stableBuckets > 0 || stats.pendingEnvelopes > 0
+	return stats.audits > 0 || stats.stableBuckets > 0 || stats.pendingEnvelopes > 0 || stats.canaryWindows > 0
 }
 
 func (stats pendingRoutingWriteStats) lessThan(previous pendingRoutingWriteStats) bool {
 	return stats.audits < previous.audits ||
 		stats.stableBuckets < previous.stableBuckets ||
-		stats.pendingEnvelopes < previous.pendingEnvelopes
+		stats.pendingEnvelopes < previous.pendingEnvelopes ||
+		stats.canaryWindows < previous.canaryWindows
 }
 
 func (state *runtimeWorkerState) snapshot() RuntimeWorkerStats {
@@ -686,6 +723,14 @@ func observeLocalDrainInterval(smart_routing_setting.SmartRoutingSetting) time.D
 		return observeLocalDrainRedis
 	}
 	return observeLocalDrainFallback
+}
+
+func canaryControlInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return canaryControlPollInterval
+}
+
+func canaryOperationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return canaryOperationPollInterval
 }
 
 func observeRetentionInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {

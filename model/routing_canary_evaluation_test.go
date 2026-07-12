@@ -36,8 +36,13 @@ func TestRoutingCanaryEvaluationConcurrentCreateHasOneRow(t *testing.T) {
 		go func(index int) {
 			defer wait.Done()
 			<-start
+			spec := routingCanaryEvaluationSpecForTest()
+			if index > 0 {
+				spec.Canary.AttemptCount++
+				spec.Canary.RetryCount++
+			}
 			results[index], created[index], errs[index] = CreateRoutingCanaryEvaluationContext(
-				context.Background(), routingCanaryEvaluationSpecForTest(),
+				context.Background(), spec,
 			)
 		}(index)
 	}
@@ -108,6 +113,14 @@ func runRoutingCanaryEvaluationContract(t *testing.T, db *gorm.DB, dbType common
 	changed := spec
 	changed.Canary.AttemptCount++
 	changed.Canary.RetryCount++
+	firstWriterWins, created, err := CreateRoutingCanaryEvaluationContext(context.Background(), changed)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.ID, firstWriterWins.ID)
+	assert.Equal(t, first.EvaluationHash, firstWriterWins.EvaluationHash)
+
+	changed.WindowStartMs = spec.WindowEndMs
+	changed.WindowEndMs = changed.WindowStartMs + (spec.WindowEndMs - spec.WindowStartMs)
 	second, created, err := CreateRoutingCanaryEvaluationContext(context.Background(), changed)
 	require.NoError(t, err)
 	assert.True(t, created)
@@ -116,6 +129,19 @@ func runRoutingCanaryEvaluationContract(t *testing.T, db *gorm.DB, dbType common
 	var count int64
 	require.NoError(t, db.Model(&RoutingCanaryEvaluation{}).Count(&count).Error)
 	assert.Equal(t, int64(2), count)
+
+	loaded, err := GetRoutingCanaryEvaluationWindowContext(
+		context.Background(), spec.RolloutKey, spec.PoolID, spec.WindowStartMs, spec.WindowEndMs,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, first.ID, loaded.ID)
+	previous, err := ListRoutingCanaryEvaluationsBeforeContext(
+		context.Background(), spec.RolloutKey, spec.PoolID, second.WindowEndMs+1, 2,
+	)
+	require.NoError(t, err)
+	require.Len(t, previous, 2)
+	assert.Equal(t, second.ID, previous[0].ID)
+	assert.Equal(t, first.ID, previous[1].ID)
 
 	invalidSpecs := []RoutingCanaryEvaluationSpec{spec, spec, spec, spec}
 	invalidSpecs[0].CanarySuccessRateBasisPoints++
@@ -133,6 +159,14 @@ func runRoutingCanaryEvaluationContract(t *testing.T, db *gorm.DB, dbType common
 	assert.ErrorIs(t, err, ErrRoutingCanaryEvaluationImmutable)
 	err = db.Where("id = ?", first.ID).Delete(&RoutingCanaryEvaluation{}).Error
 	assert.ErrorIs(t, err, ErrRoutingCanaryEvaluationImmutable)
+
+	require.NoError(t, db.Exec(
+		"UPDATE routing_canary_evaluations SET reason = ? WHERE id = ?", "raw tamper", first.ID,
+	).Error)
+	_, err = GetRoutingCanaryEvaluationWindowContext(
+		context.Background(), spec.RolloutKey, spec.PoolID, spec.WindowStartMs, spec.WindowEndMs,
+	)
+	assert.ErrorIs(t, err, ErrRoutingCanaryEvaluationInvalid)
 }
 
 func routingCanaryEvaluationSpecForTest() RoutingCanaryEvaluationSpec {

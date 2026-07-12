@@ -9,16 +9,17 @@ import (
 )
 
 type SnapshotMetadata struct {
-	Revision           uint64        `json:"revision"`
-	RuntimeGeneration  uint64        `json:"runtime_generation"`
-	PolicyHash         string        `json:"policy_hash"`
-	ActivationID       int64         `json:"activation_id"`
-	ActivationStage    string        `json:"activation_stage"`
-	TrafficBasisPoints int           `json:"traffic_basis_points"`
-	NodeEpochID        string        `json:"node_epoch_id"`
-	BuiltAtUnix        int64         `json:"built_at"`
-	BuildDurationMs    int64         `json:"build_duration_ms"`
-	Stats              SnapshotStats `json:"stats"`
+	Revision              uint64        `json:"revision"`
+	RuntimeGeneration     uint64        `json:"runtime_generation"`
+	PolicyHash            string        `json:"policy_hash"`
+	ActivationID          int64         `json:"activation_id"`
+	ActivationStage       string        `json:"activation_stage"`
+	TrafficBasisPoints    int           `json:"traffic_basis_points"`
+	ActivationCreatedTime int64         `json:"activation_created_time"`
+	NodeEpochID           string        `json:"node_epoch_id"`
+	BuiltAtUnix           int64         `json:"built_at"`
+	BuildDurationMs       int64         `json:"build_duration_ms"`
+	Stats                 SnapshotStats `json:"stats"`
 }
 
 type TelemetryAggregate struct {
@@ -75,16 +76,17 @@ func snapshotMetadata(view SnapshotView) SnapshotMetadata {
 		stats.UnknownClassificationRate = &value
 	}
 	return SnapshotMetadata{
-		Revision:           view.Revision,
-		RuntimeGeneration:  view.RuntimeGeneration,
-		PolicyHash:         view.PolicyHash,
-		ActivationID:       view.ActivationID,
-		ActivationStage:    view.ActivationStage,
-		TrafficBasisPoints: view.TrafficBasisPoints,
-		NodeEpochID:        NodeEpochID(),
-		BuiltAtUnix:        view.BuiltAtUnix,
-		BuildDurationMs:    view.BuildDurationMs,
-		Stats:              stats,
+		Revision:              view.Revision,
+		RuntimeGeneration:     view.RuntimeGeneration,
+		PolicyHash:            view.PolicyHash,
+		ActivationID:          view.ActivationID,
+		ActivationStage:       view.ActivationStage,
+		TrafficBasisPoints:    view.TrafficBasisPoints,
+		ActivationCreatedTime: view.ActivationCreatedTime,
+		NodeEpochID:           NodeEpochID(),
+		BuiltAtUnix:           view.BuiltAtUnix,
+		BuildDurationMs:       view.BuildDurationMs,
+		Stats:                 stats,
 	}
 }
 

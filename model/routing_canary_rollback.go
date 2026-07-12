@@ -101,6 +101,9 @@ func AutoRollbackRoutingCanaryPoolContext(
 			}
 			return err
 		}
+		if err := validateStoredRoutingCanaryEvaluation(evaluation); err != nil {
+			return ErrRoutingCanaryAutoRollbackInvalid
+		}
 		if evaluation.PolicyRevision != request.ExpectedRevision ||
 			evaluation.ActivationID != request.ExpectedActivationID || evaluation.PoolID != request.PoolID ||
 			evaluation.Status != RoutingCanaryEvaluationStatusBreached {

@@ -21,7 +21,7 @@ const (
 	defaultCanaryWindowMaxEntries    = 8_192
 	defaultCanaryWindowShards        = 32
 	defaultCanaryWindowTTL           = 2 * time.Hour
-	defaultCanaryWindowFlushLimit    = 100
+	defaultCanaryWindowFlushLimit    = 1_024
 	canaryWindowScopeMaxBytes        = 512
 )
 
@@ -151,6 +151,20 @@ type canaryCohortAccumulator struct {
 	ttft                        *routingdistribution.DurationSketch
 }
 
+func newCanaryWindowEntry(
+	identity CanaryWindowIdentity,
+	windowStartMs int64,
+	windowEndMs int64,
+	now time.Time,
+) *canaryWindowEntry {
+	return &canaryWindowEntry{
+		identity: identity, windowStartMs: windowStartMs, windowEndMs: windowEndMs,
+		control:   canaryCohortAccumulator{ttft: routingdistribution.NewDurationSketch()},
+		canary:    canaryCohortAccumulator{ttft: routingdistribution.NewDurationSketch()},
+		updatedAt: now,
+	}
+}
+
 var defaultCanaryWindowAggregator = func() *CanaryWindowAggregator {
 	aggregator, err := NewCanaryWindowAggregator(CanaryWindowAggregatorConfig{
 		MaxEntries: defaultCanaryWindowMaxEntries,
@@ -179,6 +193,75 @@ func NewCanaryWindowAggregator(config CanaryWindowAggregatorConfig) (*CanaryWind
 
 func RecordCanaryLogicalOutcome(outcome CanaryLogicalOutcome) error {
 	return defaultCanaryWindowAggregator.Record(outcome)
+}
+
+func (aggregator *CanaryWindowAggregator) Ensure(identity CanaryWindowIdentity, observedAt time.Time) error {
+	if aggregator == nil || !validCanaryWindowIdentity(identity) || observedAt.IsZero() {
+		return ErrCanaryWindowInvalid
+	}
+	windowLifetime := time.Duration(identity.WindowSeconds+identity.LatenessSeconds) * time.Second
+	if windowLifetime <= 0 || windowLifetime > aggregator.config.TTL {
+		return ErrCanaryWindowInvalid
+	}
+	windowMs := int64(identity.WindowSeconds) * int64(time.Second/time.Millisecond)
+	observedMs := observedAt.UnixMilli()
+	if observedMs <= 0 || windowMs <= 0 {
+		return ErrCanaryWindowInvalid
+	}
+	windowStartMs := observedMs / windowMs * windowMs
+	if windowStartMs > math.MaxInt64-windowMs {
+		return ErrCanaryWindowInvalid
+	}
+	key := canaryWindowKey{
+		PoolID: identity.PoolID, ActivationID: identity.ActivationID,
+		PolicyRevision: identity.PolicyRevision, RolloutKey: identity.RolloutKey,
+		WindowStartMs: windowStartMs,
+	}
+	now := aggregator.config.Clock.Now()
+	freezeAt := time.UnixMilli(windowStartMs + windowMs).Add(time.Duration(identity.LatenessSeconds) * time.Second)
+	if !now.Before(freezeAt) {
+		return ErrCanaryWindowClosed
+	}
+	shard := aggregator.shardFor(key)
+	shard.mu.Lock()
+	entry := shard.entries[key]
+	if entry != nil {
+		valid := entry.identity == identity && entry.frozen == nil
+		shard.mu.Unlock()
+		if !valid {
+			return ErrCanaryWindowClosed
+		}
+		return nil
+	}
+	shard.mu.Unlock()
+
+	aggregator.admissionMu.Lock()
+	defer aggregator.admissionMu.Unlock()
+	aggregator.pruneExpiredLocked(now)
+	shard = aggregator.shardFor(key)
+	shard.mu.Lock()
+	entry = shard.entries[key]
+	if entry != nil {
+		valid := entry.identity == identity && entry.frozen == nil
+		shard.mu.Unlock()
+		if !valid {
+			return ErrCanaryWindowClosed
+		}
+		return nil
+	}
+	shard.mu.Unlock()
+	if aggregator.entries.Load() >= int64(aggregator.config.MaxEntries) && !aggregator.evictOldestLocked() {
+		aggregator.entryDrops.Add(1)
+		return ErrCanaryWindowEntriesFull
+	}
+	entry = newCanaryWindowEntry(identity, windowStartMs, windowStartMs+windowMs, now)
+	shard.mu.Lock()
+	if shard.entries[key] == nil {
+		shard.entries[key] = entry
+		aggregator.entries.Add(1)
+	}
+	shard.mu.Unlock()
+	return nil
 }
 
 func CanaryCostNanoUSD(costUSD float64) (int64, bool) {
@@ -242,12 +325,7 @@ func (aggregator *CanaryWindowAggregator) Record(outcome CanaryLogicalOutcome) e
 		aggregator.entryDrops.Add(1)
 		return ErrCanaryWindowEntriesFull
 	}
-	entry = &canaryWindowEntry{
-		identity: outcome.Identity, windowStartMs: windowStartMs, windowEndMs: windowStartMs + windowMs,
-		control:   canaryCohortAccumulator{ttft: routingdistribution.NewDurationSketch()},
-		canary:    canaryCohortAccumulator{ttft: routingdistribution.NewDurationSketch()},
-		updatedAt: now,
-	}
+	entry = newCanaryWindowEntry(outcome.Identity, windowStartMs, windowStartMs+windowMs, now)
 	shard.mu.Lock()
 	if existing := shard.entries[key]; existing != nil {
 		entry = existing
@@ -332,11 +410,51 @@ func addCanaryOutcome(
 }
 
 func FlushCanaryOutcomeCheckpointsContext(ctx context.Context) (int, error) {
-	return defaultCanaryWindowAggregator.FlushContext(ctx, defaultCanaryWindowFlushLimit)
+	limit := min(defaultCanaryWindowFlushLimit, defaultCanaryWindowAggregator.config.MaxEntries)
+	return defaultCanaryWindowAggregator.FlushContext(ctx, limit)
+}
+
+func ensureCurrentCanaryOutcomeWindows(aggregator *CanaryWindowAggregator) error {
+	if aggregator == nil {
+		return ErrCanaryWindowInvalid
+	}
+	snapshot := currentSnapshot.Load()
+	if snapshot == nil || snapshot.view.ActivationStage != model.RoutingDeploymentStageCanary ||
+		snapshot.view.ActivationID <= 0 || snapshot.view.Revision == 0 {
+		return nil
+	}
+	now := aggregator.config.Clock.Now()
+	for index := range snapshot.view.Pools {
+		pool := snapshot.view.Pools[index]
+		if pool.DeploymentStage != model.RoutingDeploymentStageCanary {
+			continue
+		}
+		rolloutKey, err := CanaryRolloutKey(
+			pool.ID,
+			snapshot.view.ActivationID,
+			snapshot.view.Revision,
+			snapshot.view.TrafficBasisPoints,
+		)
+		if err != nil {
+			return err
+		}
+		if err := aggregator.Ensure(CanaryWindowIdentity{
+			PoolID:             pool.ID,
+			ActivationID:       snapshot.view.ActivationID,
+			PolicyRevision:     snapshot.view.Revision,
+			TrafficBasisPoints: snapshot.view.TrafficBasisPoints,
+			RolloutKey:         rolloutKey,
+			WindowSeconds:      pool.CanaryPolicy.Evaluation.WindowSeconds,
+			LatenessSeconds:    pool.CanaryPolicy.Evaluation.CheckpointLatenessSeconds,
+		}, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (aggregator *CanaryWindowAggregator) FlushContext(ctx context.Context, limit int) (int, error) {
-	if aggregator == nil || limit <= 0 || limit > model.RoutingRuntimeCheckpointMaxPageSize {
+	if aggregator == nil || limit <= 0 || limit > aggregator.config.MaxEntries {
 		return 0, ErrCanaryWindowInvalid
 	}
 	if ctx == nil {
@@ -497,7 +615,8 @@ func validFrozenCanaryCohort(stats CanaryCohortWindowStats) bool {
 	if stats.Successes > stats.LogicalRequests || stats.Failures > stats.LogicalRequests ||
 		stats.Successes > math.MaxInt64-stats.Failures || stats.Successes+stats.Failures != stats.LogicalRequests ||
 		stats.RoutingFailures > stats.Failures ||
-		stats.CostKnownRequests > stats.LogicalRequests || stats.Attempts < stats.Successes ||
+		stats.CostKnownRequests > stats.LogicalRequests ||
+		stats.Attempts < stats.LogicalRequests-stats.RoutingFailures ||
 		stats.TTFTSampleCount > stats.Successes {
 		return false
 	}
@@ -513,11 +632,7 @@ func validFrozenCanaryCohort(stats CanaryCohortWindowStats) bool {
 
 func validCanaryLogicalOutcome(outcome CanaryLogicalOutcome) bool {
 	identity := outcome.Identity
-	if identity.PoolID <= 0 || identity.ActivationID <= 0 || identity.PolicyRevision == 0 ||
-		identity.TrafficBasisPoints < model.RoutingPolicyCanaryMinBasisPoints ||
-		identity.TrafficBasisPoints > model.RoutingPolicyCanaryMaxBasisPoints ||
-		!validShadowHash(string(identity.RolloutKey)) || identity.WindowSeconds < 1 || identity.WindowSeconds > 3_600 ||
-		identity.LatenessSeconds < 0 || identity.LatenessSeconds > 3_600 || outcome.CompletedAt.IsZero() ||
+	if !validCanaryWindowIdentity(identity) || outcome.CompletedAt.IsZero() ||
 		(outcome.Cohort != model.RoutingDecisionCohortControl && outcome.Cohort != model.RoutingDecisionCohortCanary) ||
 		outcome.Attempts < 0 || (!outcome.RoutingFailure && outcome.Attempts == 0) ||
 		outcome.ExpectedPlatformCostNanoUSD < 0 || (!outcome.CostKnown && outcome.ExpectedPlatformCostNanoUSD != 0) ||
@@ -525,6 +640,14 @@ func validCanaryLogicalOutcome(outcome CanaryLogicalOutcome) bool {
 		return false
 	}
 	return true
+}
+
+func validCanaryWindowIdentity(identity CanaryWindowIdentity) bool {
+	return identity.PoolID > 0 && identity.ActivationID > 0 && identity.PolicyRevision > 0 &&
+		identity.TrafficBasisPoints >= model.RoutingPolicyCanaryMinBasisPoints &&
+		identity.TrafficBasisPoints <= model.RoutingPolicyCanaryMaxBasisPoints &&
+		validShadowHash(string(identity.RolloutKey)) && identity.WindowSeconds >= 1 && identity.WindowSeconds <= 3_600 &&
+		identity.LatenessSeconds >= 0 && identity.LatenessSeconds <= 3_600
 }
 
 func (aggregator *CanaryWindowAggregator) Stats() CanaryWindowStats {

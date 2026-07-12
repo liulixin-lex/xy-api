@@ -103,6 +103,33 @@ func TestCanaryWindowDatabaseFailureRetainsFrozenPayloadForIdempotentRetry(t *te
 	assert.Equal(t, int64(1), count)
 }
 
+func TestCanaryWindowEnsurePersistsZeroTrafficNodeCheckpoint(t *testing.T) {
+	clock := &routingTestClock{now: time.Unix(1_700_000_010, 0)}
+	aggregator, err := NewCanaryWindowAggregator(CanaryWindowAggregatorConfig{
+		MaxEntries: 4, Shards: 2, TTL: 2 * time.Hour, Clock: clock,
+	})
+	require.NoError(t, err)
+	db := openCanaryWindowTestDB(t, true)
+	withCanaryWindowTestDB(t, db)
+
+	identity := canaryWindowIdentityForTest()
+	require.NoError(t, aggregator.Ensure(identity, clock.Now()))
+	require.NoError(t, aggregator.Ensure(identity, clock.Now()))
+	assert.Equal(t, 1, aggregator.Stats().Entries)
+
+	clock.Advance(2 * time.Minute)
+	flushed, err := aggregator.FlushContext(context.Background(), 4)
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+
+	var stored model.RoutingRuntimeCheckpoint
+	require.NoError(t, db.Where("checkpoint_kind = ?", CanaryCohortWindowCheckpointKind).First(&stored).Error)
+	payload, err := DecodeCanaryCohortWindowCheckpoint(stored)
+	require.NoError(t, err)
+	assert.Zero(t, payload.Control.LogicalRequests)
+	assert.Zero(t, payload.Canary.LogicalRequests)
+}
+
 func TestCanaryCostNanoUSDRejectsNonFiniteNegativeAndInt64Boundary(t *testing.T) {
 	for _, cost := range []float64{
 		math.NaN(), math.Inf(1), math.Inf(-1), -0.01, float64(math.MaxInt64) / 1_000_000_000,

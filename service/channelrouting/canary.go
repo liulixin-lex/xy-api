@@ -51,6 +51,35 @@ func EvaluateCanaryGate(
 	bucketSum := bucketHash.Sum(nil)
 	bucket := int(binary.BigEndian.Uint64(bucketSum[:8]) % canaryBucketCount)
 
+	rolloutKey, err := CanaryRolloutKey(poolID, activationID, policyRevision, trafficBasisPoints)
+	if err != nil {
+		return CanaryGate{}, err
+	}
+
+	return CanaryGate{
+		PoolID:             poolID,
+		ActivationID:       activationID,
+		PolicyRevision:     policyRevision,
+		TrafficBasisPoints: trafficBasisPoints,
+		Bucket:             bucket,
+		InCanary:           bucket < trafficBasisPoints,
+		RolloutKey:         rolloutKey,
+	}, nil
+}
+
+func CanaryRolloutKey(
+	poolID int,
+	activationID int64,
+	policyRevision uint64,
+	trafficBasisPoints int,
+) (RolloutKey, error) {
+	if poolID <= 0 || activationID <= 0 || policyRevision == 0 ||
+		trafficBasisPoints < model.RoutingPolicyCanaryMinBasisPoints ||
+		trafficBasisPoints > model.RoutingPolicyCanaryMaxBasisPoints {
+		return "", ErrCanaryGateInvalid
+	}
+
+	var encoded [8]byte
 	rolloutHash := sha256.New()
 	_, _ = rolloutHash.Write([]byte(canaryRolloutDomain))
 	binary.BigEndian.PutUint64(encoded[:], uint64(poolID))
@@ -62,14 +91,5 @@ func EvaluateCanaryGate(
 	binary.BigEndian.PutUint64(encoded[:], uint64(trafficBasisPoints))
 	_, _ = rolloutHash.Write(encoded[:])
 	rolloutSum := rolloutHash.Sum(nil)
-
-	return CanaryGate{
-		PoolID:             poolID,
-		ActivationID:       activationID,
-		PolicyRevision:     policyRevision,
-		TrafficBasisPoints: trafficBasisPoints,
-		Bucket:             bucket,
-		InCanary:           bucket < trafficBasisPoints,
-		RolloutKey:         RolloutKey(hex.EncodeToString(rolloutSum)),
-	}, nil
+	return RolloutKey(hex.EncodeToString(rolloutSum)), nil
 }
