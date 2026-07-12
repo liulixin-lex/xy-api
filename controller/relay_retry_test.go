@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -118,6 +119,7 @@ func TestCommitRoutingCapacityAttemptReleasesCommittedReservationWhenOutcomeRegi
 	assert.Zero(t, snapshot.PendingReservations)
 	assert.Zero(t, snapshot.CommittedReservations)
 	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
+	require.NoError(t, service.FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, service.FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, time.Now()))
 }
 
@@ -273,6 +275,65 @@ func TestShouldRetryUsesClassificationBeforeStatusOverlay(t *testing.T) {
 
 	assert.False(t, shouldRetry(ctx, info, caller, routingerror.Classification{Retryability: routingerror.RetryNever}, 1))
 	assert.True(t, shouldRetry(ctx, info, timeout, routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}, 1))
+}
+
+func TestCanaryFaultInjectionMatrixRetriesOnlyBeforeClientCommit(t *testing.T) {
+	tests := []struct {
+		name           string
+		apiErr         *types.NewAPIError
+		responsibility routingerror.Responsibility
+		scope          routingerror.Scope
+	}{
+		{
+			name: "dns", apiErr: types.NewError(
+				&net.DNSError{Name: "upstream.example.com", IsTemporary: true}, types.ErrorCodeDoRequestFailed,
+			),
+			responsibility: routingerror.ResponsibilityNetwork, scope: routingerror.ScopeEndpoint,
+		},
+		{
+			name: "tls", apiErr: types.NewError(
+				x509.UnknownAuthorityError{Cert: &x509.Certificate{}}, types.ErrorCodeDoRequestFailed,
+			),
+			responsibility: routingerror.ResponsibilityNetwork, scope: routingerror.ScopeEndpoint,
+		},
+		{name: "401", apiErr: types.NewErrorWithStatusCode(errors.New("unauthorized"), types.ErrorCodeBadResponseStatusCode, 401), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
+		{name: "403", apiErr: types.NewErrorWithStatusCode(errors.New("forbidden"), types.ErrorCodeBadResponseStatusCode, 403), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
+		{name: "402", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, 402), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
+		{name: "429", apiErr: types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, 429), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
+		{name: "529", apiErr: types.NewErrorWithStatusCode(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, 529), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
+		{name: "5xx", apiErr: types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, 500), responsibility: routingerror.ResponsibilityProvider, scope: routingerror.ScopePoolMember},
+		{name: "first byte timeout", apiErr: types.NewErrorWithStatusCode(errors.New("first byte timeout"), types.ErrorCodeFirstByteTimeout, 504), responsibility: routingerror.ResponsibilityNetwork, scope: routingerror.ScopeEndpoint},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{}
+			classification, success := classifyRoutingRelayAttemptWithContext(ctx, test.apiErr, info)
+			assert.False(t, success)
+			assert.Equal(t, test.responsibility, classification.Responsibility)
+			assert.Equal(t, test.scope, classification.Scope)
+			assert.Equal(t, routingerror.RetryBeforeCommit, classification.Retryability)
+			assert.True(t, shouldRetry(ctx, info, test.apiErr, classification, 1))
+		})
+	}
+
+	t.Run("stream failure after client commit", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		_, err := ctx.Writer.Write([]byte("committed"))
+		require.NoError(t, err)
+		info := &relaycommon.RelayInfo{IsStream: true, StreamStatus: relaycommon.NewStreamStatus()}
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errors.New("late stream failure"))
+
+		apiErr := relayAttemptControlError(ctx, nil, info)
+		assert.Nil(t, apiErr)
+		classification, success := classifyRoutingRelayAttemptWithContext(ctx, apiErr, info)
+		assert.False(t, success)
+		assert.Equal(t, routingerror.ResponsibilityProvider, classification.Responsibility)
+		assert.Equal(t, routingerror.RetryNever, classification.Retryability)
+		assert.False(t, shouldRetry(ctx, info, apiErr, classification, 1))
+	})
 }
 
 func TestTaskErrorToAPIErrorPreservesOriginalCodeCauseAndRetryAfter(t *testing.T) {

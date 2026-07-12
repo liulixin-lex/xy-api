@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -54,11 +55,13 @@ func TestChannelRoutingCanaryOutcomeTracksAttemptsCostAndClientTTFT(t *testing.T
 		ExpectedCostKnown: true, ExpectedCostUSD: 0.000001,
 	}))
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
 		Gate: gate, WindowSeconds: 60, LatenessSeconds: 5,
 		ExpectedCostKnown: true, ExpectedCostUSD: 0.000002,
 	}))
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 125, clock.Now()))
 
 	clock.Advance(2 * time.Minute)
@@ -100,10 +103,12 @@ func TestChannelRoutingCanaryOutcomeCrossPoolClosesPriorUnitAsFailure(t *testing
 		Gate: firstGate, WindowSeconds: 60, LatenessSeconds: 5,
 	}))
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, ChannelRoutingCanarySelection{
 		Gate: secondGate, WindowSeconds: 60, LatenessSeconds: 5,
 	}))
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 80, clock.Now()))
 
 	clock.Advance(2 * time.Minute)
@@ -141,6 +146,7 @@ func TestChannelRoutingCanaryOutcomeIgnoresCallerOwnedResult(t *testing.T) {
 		Gate: gate, WindowSeconds: 60, LatenessSeconds: 5,
 	}))
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, clock.Now()))
 	assert.Zero(t, aggregator.Stats().Recorded)
 	_, exists := common.GetContextKeyType[*channelRoutingCanaryOutcomeContext](ctx, constant.ContextKeyRoutingCanaryOutcome)
@@ -180,4 +186,45 @@ func TestChannelRoutingCanaryOutcomeMarksZeroAttemptFailureAsRoutingFailure(t *t
 	assert.Equal(t, int64(1), payload.Canary.Failures)
 	assert.Equal(t, int64(1), payload.Canary.RoutingFailures)
 	assert.Zero(t, payload.Canary.Attempts)
+}
+
+func TestChannelRoutingCanaryOutcomeRejectsOverlappingUpstreamAttempts(t *testing.T) {
+	gate := channelrouting.CanaryGate{
+		PoolID: 29, ActivationID: 401, PolicyRevision: 11, TrafficBasisPoints: 100,
+		Bucket: 0, InCanary: true, RolloutKey: channelrouting.RolloutKey(strings.Repeat("a", 64)),
+	}
+	ctx, _ := gin.CreateTestContext(nil)
+	selection := ChannelRoutingCanarySelection{Gate: gate, WindowSeconds: 60, LatenessSeconds: 5}
+	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, selection))
+	start := make(chan struct{})
+	errs := make([]error, 2)
+	var wait sync.WaitGroup
+	wait.Add(len(errs))
+	for index := range errs {
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			errs[index] = MarkChannelRoutingCanaryAttemptStarted(ctx)
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	succeeded := 0
+	rejected := 0
+	for _, err := range errs {
+		if err == nil {
+			succeeded++
+		} else if errors.Is(err, ErrChannelRoutingCanaryOutcomeInvalid) {
+			rejected++
+		}
+	}
+	assert.Equal(t, 1, succeeded)
+	assert.Equal(t, 1, rejected)
+	assert.ErrorIs(t, PrepareChannelRoutingCanarySelection(ctx, selection), ErrChannelRoutingCanaryOutcomeInvalid)
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
+
+	require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, selection))
+	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, time.Now()))
 }

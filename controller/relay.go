@@ -247,6 +247,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		func() {
 			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
+			defer finishRoutingCanaryAttempt(c)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				newAPIError = relay.WssHelper(c, relayInfo)
@@ -517,6 +518,12 @@ func finishRoutingCanaryOutcome(
 		c, include, success, false, clientTTFTMilliseconds, time.Now(),
 	); err != nil {
 		logger.LogWarn(c, fmt.Sprintf("channel routing canary outcome dropped: %v", err))
+	}
+}
+
+func finishRoutingCanaryAttempt(c *gin.Context) {
+	if err := service.FinishChannelRoutingCanaryAttempt(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing canary attempt release failed: %v", err))
 	}
 }
 
@@ -997,6 +1004,7 @@ func RelayTask(c *gin.Context) {
 		func() {
 			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
+			defer finishRoutingCanaryAttempt(c)
 			result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
 		}()
 		taskAPIError := taskErrorToAPIError(taskErr)

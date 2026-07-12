@@ -25,8 +25,9 @@ type ChannelRoutingCanarySelection struct {
 }
 
 type channelRoutingCanaryOutcomeContext struct {
-	mu      sync.Mutex
-	current *channelRoutingCanaryOutcomeUnit
+	mu            sync.Mutex
+	current       *channelRoutingCanaryOutcomeUnit
+	activeAttempt bool
 }
 
 type channelRoutingCanaryOutcomeUnit struct {
@@ -74,6 +75,10 @@ func PrepareChannelRoutingCanarySelection(c *gin.Context, selection ChannelRouti
 
 	var previous *channelRoutingCanaryOutcomeUnit
 	state.mu.Lock()
+	if state.activeAttempt {
+		state.mu.Unlock()
+		return ErrChannelRoutingCanaryOutcomeInvalid
+	}
 	if state.current != nil && (state.current.identity != identity || state.current.cohort != cohort) {
 		previous = state.current
 		state.current = nil
@@ -105,7 +110,7 @@ func MarkChannelRoutingCanaryAttemptStarted(c *gin.Context) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	unit := state.current
-	if unit == nil || !unit.hasPendingSelection || unit.attempts == math.MaxInt64 {
+	if unit == nil || state.activeAttempt || !unit.hasPendingSelection || unit.attempts == math.MaxInt64 {
 		return ErrChannelRoutingCanaryOutcomeInvalid
 	}
 	unit.attempts++
@@ -123,6 +128,24 @@ func MarkChannelRoutingCanaryAttemptStarted(c *gin.Context) error {
 	unit.pendingCostKnown = false
 	unit.pendingCostNanoUSD = 0
 	unit.hasPendingSelection = false
+	state.activeAttempt = true
+	return nil
+}
+
+func FinishChannelRoutingCanaryAttempt(c *gin.Context) error {
+	if c == nil {
+		return nil
+	}
+	state, ok := common.GetContextKeyType[*channelRoutingCanaryOutcomeContext](c, constant.ContextKeyRoutingCanaryOutcome)
+	if !ok || state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.activeAttempt {
+		return ErrChannelRoutingCanaryOutcomeInvalid
+	}
+	state.activeAttempt = false
 	return nil
 }
 
@@ -144,8 +167,13 @@ func FinishChannelRoutingCanaryOutcome(
 	state.mu.Lock()
 	unit := state.current
 	state.current = nil
+	activeAttempt := state.activeAttempt
+	state.activeAttempt = false
 	state.mu.Unlock()
 	common.SetContextKey(c, constant.ContextKeyRoutingCanaryOutcome, nil)
+	if activeAttempt {
+		return ErrChannelRoutingCanaryOutcomeInvalid
+	}
 	if unit == nil || !include {
 		return nil
 	}

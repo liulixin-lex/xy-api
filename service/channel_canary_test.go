@@ -207,6 +207,7 @@ func TestChannelRoutingCanaryControlCohortPreservesLegacyWithoutReservation(t *t
 	_, reserved := routingCapacityReservationFromContext(ctx)
 	assert.False(t, reserved)
 	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
 	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 80, clock.Now()))
 	clock.Advance(2 * time.Minute)
 	flushed, err := channelrouting.FlushCanaryOutcomeCheckpointsContext(context.Background())
