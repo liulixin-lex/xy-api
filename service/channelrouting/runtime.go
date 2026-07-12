@@ -54,6 +54,7 @@ type RuntimeStats struct {
 	TelemetryStream           RuntimeWorkerStats             `json:"telemetry_stream"`
 	ConfigPublisher           RuntimeWorkerStats             `json:"config_publisher"`
 	ConfigConsumer            RuntimeWorkerStats             `json:"config_consumer"`
+	CanaryNodePresence        RuntimeWorkerStats             `json:"canary_node_presence"`
 	CanaryEvaluator           RuntimeWorkerStats             `json:"canary_evaluator"`
 	CanaryOperations          RuntimeWorkerStats             `json:"canary_operations"`
 	Retention                 RuntimeWorkerStats             `json:"retention"`
@@ -83,6 +84,7 @@ type Runtime struct {
 	streamStats          runtimeWorkerState
 	configPublishStats   runtimeWorkerState
 	configConsumeStats   runtimeWorkerState
+	canaryPresenceStats  runtimeWorkerState
 	canaryEvaluateStats  runtimeWorkerState
 	canaryOperationStats runtimeWorkerState
 	retentionStats       runtimeWorkerState
@@ -121,6 +123,7 @@ type runtimeDeps struct {
 	consumeTelemetry func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	publishConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	consumeConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	heartbeatCanary  func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	evaluateCanary   func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	executeCanary    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	retention        func(context.Context, int) (int64, error)
@@ -206,6 +209,7 @@ func defaultRuntimeDeps() runtimeDeps {
 			_, err := ConsumeRoutingConfigOnceContext(ctx)
 			return err
 		},
+		heartbeatCanary: persistRoutingCanaryNodePresenceContext,
 		evaluateCanary:  evaluateRoutingCanaryControlContext,
 		executeCanary:   executeRoutingCanaryOperationContext,
 		retention:       DeleteExpiredRoutingHistoryContext,
@@ -365,6 +369,9 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.consumeConfig != nil {
 		workerCount++
 	}
+	if deps.heartbeatCanary != nil {
+		workerCount++
+	}
 	if deps.evaluateCanary != nil {
 		workerCount++
 	}
@@ -405,6 +412,12 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 		go func() {
 			defer runtime.wait.Done()
 			runtime.runWorker(ctx, deps.consumeConfig, observeStreamInterval, &runtime.configConsumeStats)
+		}()
+	}
+	if deps.heartbeatCanary != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.heartbeatCanary, canaryNodePresenceInterval, &runtime.canaryPresenceStats)
 		}()
 	}
 	if deps.evaluateCanary != nil {
@@ -474,6 +487,7 @@ func (runtime *Runtime) Stats() RuntimeStats {
 		TelemetryStream:    runtime.streamStats.snapshot(),
 		ConfigPublisher:    runtime.configPublishStats.snapshot(),
 		ConfigConsumer:     runtime.configConsumeStats.snapshot(),
+		CanaryNodePresence: runtime.canaryPresenceStats.snapshot(),
 		CanaryEvaluator:    runtime.canaryEvaluateStats.snapshot(),
 		CanaryOperations:   runtime.canaryOperationStats.snapshot(),
 		Retention:          runtime.retentionStats.snapshot(),
@@ -727,6 +741,10 @@ func observeLocalDrainInterval(smart_routing_setting.SmartRoutingSetting) time.D
 
 func canaryControlInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
 	return canaryControlPollInterval
+}
+
+func canaryNodePresenceInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return canaryNodePresencePollInterval
 }
 
 func canaryOperationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {

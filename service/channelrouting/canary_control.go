@@ -108,7 +108,7 @@ func evaluateRoutingCanaryControlContext(
 
 func evaluateRoutingCanarySweepContext(
 	ctx context.Context,
-	setting smart_routing_setting.SmartRoutingSetting,
+	_ smart_routing_setting.SmartRoutingSetting,
 	now time.Time,
 ) error {
 	if ctx == nil {
@@ -138,14 +138,13 @@ func evaluateRoutingCanarySweepContext(
 	if len(pending) == 0 {
 		return nil
 	}
-	nodeCheckpoints, err := loadCanaryNodeCheckpointsContext(ctx, pending[0].target, now)
+	nodeCheckpoints, err := loadCanaryNodePresenceCheckpointsContext(ctx, pending[0].target, now)
 	if err != nil {
 		return err
 	}
 	for index := range pending {
 		activeNodes, activeErr := activeCanaryNodeIDsForWindow(
 			nodeCheckpoints,
-			setting,
 			pending[index].windowStartMs,
 			pending[index].windowEndMs,
 			now,
@@ -206,47 +205,8 @@ func currentCanaryEvaluationTargets() ([]canaryEvaluationTarget, error) {
 	return targets, nil
 }
 
-func loadCanaryNodeCheckpointsContext(
-	ctx context.Context,
-	target canaryEvaluationTarget,
-	now time.Time,
-) ([]model.RoutingRuntimeCheckpoint, error) {
-	nowUnix := now.Unix()
-	checkpoints, err := listCanaryCheckpointsContext(
-		ctx,
-		RoutingConfigCheckpointKind,
-		RoutingConfigCheckpointScope,
-		nowUnix,
-	)
-	if err != nil {
-		return nil, err
-	}
-	matching := make([]model.RoutingRuntimeCheckpoint, 0, len(checkpoints))
-	for index := range checkpoints {
-		checkpoint := checkpoints[index]
-		if checkpoint.PolicyRevision != target.PolicyRevision || checkpoint.ObservedTime <= 0 ||
-			checkpoint.ObservedTime > nowUnix {
-			continue
-		}
-		var payload struct {
-			PolicyHash         string `json:"policy_hash"`
-			ActivationID       int64  `json:"activation_id"`
-			ActivationStage    string `json:"activation_stage"`
-			TrafficBasisPoints int    `json:"traffic_basis_points"`
-		}
-		if checkpoint.DecodePayload(&payload) != nil || payload.PolicyHash != target.PolicyHash ||
-			payload.ActivationID != target.ActivationID || payload.ActivationStage != model.RoutingDeploymentStageCanary ||
-			payload.TrafficBasisPoints != target.TrafficBasisPoints {
-			continue
-		}
-		matching = append(matching, checkpoint)
-	}
-	return matching, nil
-}
-
 func activeCanaryNodeIDsForWindow(
 	checkpoints []model.RoutingRuntimeCheckpoint,
-	setting smart_routing_setting.SmartRoutingSetting,
 	windowStartMs int64,
 	windowEndMs int64,
 	now time.Time,
@@ -254,24 +214,13 @@ func activeCanaryNodeIDsForWindow(
 	if windowStartMs <= 0 || windowEndMs <= windowStartMs || now.IsZero() {
 		return nil, ErrCanaryControlInvalid
 	}
-	refreshSeconds := int64(setting.HotcacheRefreshSec)
-	if refreshSeconds < int64(observeRefreshMinimum/time.Second) {
-		refreshSeconds = int64(observeRefreshMinimum / time.Second)
-	}
-	if refreshSeconds > math.MaxInt64/3 {
-		return nil, ErrCanaryControlInvalid
-	}
-	staleAfter := refreshSeconds * 3
-	windowStartUnix := windowStartMs / 1_000
-	oldestPresence := int64(0)
-	if windowStartUnix > staleAfter {
-		oldestPresence = windowStartUnix - staleAfter
-	}
+	windowEndUnix := windowEndMs / 1_000
 	nowUnix := now.Unix()
 	nodes := make(map[string]struct{}, len(checkpoints))
 	for index := range checkpoints {
 		checkpoint := checkpoints[index]
-		if checkpoint.ObservedTime < oldestPresence || checkpoint.ObservedTime > nowUnix {
+		if checkpoint.CreatedTime <= 0 || checkpoint.CreatedTime > windowEndUnix ||
+			checkpoint.ObservedTime <= 0 || checkpoint.ObservedTime > nowUnix {
 			continue
 		}
 		nodes[checkpoint.NodeID] = struct{}{}

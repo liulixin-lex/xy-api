@@ -141,12 +141,17 @@ func TestCanaryRollbackOperationRequiresAdjacentBreachWindows(t *testing.T) {
 	assertRoutingOperationCount(t, db, 1)
 }
 
-func TestRuntimeUsesOneFixedWorkerForEvaluationAndOperations(t *testing.T) {
+func TestRuntimeUsesOneFixedWorkerForCanaryControl(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	events := make(chan string, 2)
+	events := make(chan string, 3)
 	runtime := newRuntime(ctx, runtimeDeps{
 		getSetting: func() smart_routing_setting.SmartRoutingSetting {
 			return smart_routing_setting.SmartRoutingSetting{Enabled: true}
+		},
+		heartbeatCanary: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			events <- "presence"
+			<-ctx.Done()
+			return ctx.Err()
 		},
 		evaluateCanary: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
 			events <- "evaluate"
@@ -164,11 +169,12 @@ func TestRuntimeUsesOneFixedWorkerForEvaluationAndOperations(t *testing.T) {
 	seen := map[string]int{}
 	seen[<-events]++
 	seen[<-events]++
+	seen[<-events]++
 	cancel()
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer waitCancel()
 	require.NoError(t, runtime.Wait(waitCtx))
-	assert.Equal(t, map[string]int{"evaluate": 1, "operate": 1}, seen)
+	assert.Equal(t, map[string]int{"evaluate": 1, "operate": 1, "presence": 1}, seen)
 }
 
 func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
@@ -283,23 +289,21 @@ func runCanaryEvaluatorFixture(t *testing.T, reportNodeB bool) model.RoutingCana
 	rolloutKey, err := CanaryRolloutKey(29, view.ActivationID, view.Revision, view.TrafficBasisPoints)
 	require.NoError(t, err)
 
+	presenceIdentity, err := canaryNodePresenceIdentityFromView(view)
+	require.NoError(t, err)
 	for _, nodeID := range []string{"node-a", "node-b"} {
-		observedAt := now
-		if nodeID == "node-b" {
-			observedAt = windowStart.Add(10 * time.Second)
-		}
-		checkpoint, checkpointErr := model.NewRoutingRuntimeCheckpoint(
-			nodeID, RoutingConfigCheckpointKind, RoutingConfigCheckpointScope,
-			int64(view.Revision), 1,
-			map[string]any{
-				"policy_hash": view.PolicyHash, "activation_id": view.ActivationID,
-				"activation_stage": view.ActivationStage, "traffic_basis_points": view.TrafficBasisPoints,
-			},
-			observedAt.Unix(), now.Add(time.Hour).Unix(),
+		checkpoint, checkpointErr := newCanaryNodePresenceCheckpoint(
+			nodeID, presenceIdentity, 1, windowStart.Add(10*time.Second),
 		)
 		require.NoError(t, checkpointErr)
 		_, checkpointErr = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), checkpoint)
 		require.NoError(t, checkpointErr)
+		if nodeID == "node-a" {
+			checkpoint, checkpointErr = newCanaryNodePresenceCheckpoint(nodeID, presenceIdentity, 2, now)
+			require.NoError(t, checkpointErr)
+			_, checkpointErr = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), checkpoint)
+			require.NoError(t, checkpointErr)
+		}
 	}
 
 	stats := canaryWindowAggregateForEvaluatorFixture(t)
