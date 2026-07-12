@@ -31,6 +31,70 @@ func TestRoutingCanaryAutoRollbackLastCanaryChangesActivationToShadow(t *testing
 	)
 }
 
+func TestRoutingCanaryAutoRollbackBatchesBreachedPoolsFromSameRevision(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	fixture := newRoutingCanaryRollbackFixture(
+		t, db, common.DatabaseTypeSQLite,
+		[]string{RoutingDeploymentStageCanary, RoutingDeploymentStageCanary, RoutingDeploymentStageCanary},
+	)
+	secondOperation := createRoutingCanaryRollbackOperationForPool(
+		t,
+		fixture,
+		fixture.document.Pools[1].PoolID,
+		"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	)
+
+	result, err := AutoRollbackRoutingCanaryPoolContext(context.Background(), RoutingCanaryAutoRollbackRequest{
+		Operation:            fixture.claimed,
+		Lease:                fixture.lease,
+		ExpectedRevision:     fixture.published.Revision.Revision,
+		ExpectedActivationID: fixture.published.Activation.ID,
+		PoolID:               fixture.targetPoolID,
+		NowMs:                20_001,
+	})
+	require.NoError(t, err)
+	assert.False(t, result.Superseded)
+
+	rolledBack, _, err := LoadRoutingPolicyRevisionContext(context.Background(), result.Publish.Revision.Revision)
+	require.NoError(t, err)
+	wantDocument := cloneRoutingPolicyDocumentForTest(t, fixture.document)
+	wantDocument.Pools[0].DeploymentStage = RoutingDeploymentStageShadow
+	wantDocument.Pools[1].DeploymentStage = RoutingDeploymentStageShadow
+	assert.Equal(t, wantDocument, rolledBack)
+	assert.Equal(t, RoutingDeploymentStageCanary, result.Publish.Activation.Stage)
+	assert.Equal(t, 250, result.Publish.Activation.TrafficBasisPoints)
+
+	var event RoutingConfigEvent
+	require.NoError(t, result.Publish.Outbox.DecodePayload(&event))
+	assert.Equal(t, []int{fixture.document.Pools[0].PoolID, fixture.document.Pools[1].PoolID}, event.ChangedPoolIDs)
+
+	var operations []RoutingOperation
+	require.NoError(t, DB.Where(
+		"expected_revision = ? AND expected_activation_id = ?",
+		fixture.published.Revision.Revision,
+		fixture.published.Activation.ID,
+	).Order("id asc").Find(&operations).Error)
+	require.Len(t, operations, 2)
+	for index := range operations {
+		assert.Equal(t, RoutingOperationStatusSucceeded, operations[index].Status)
+		assert.Equal(t, result.Publish.Revision.Revision, operations[index].ResultRevision)
+		assert.Equal(t, result.Publish.Activation.ID, operations[index].ResultActivationID)
+		assert.Equal(t, result.Publish.Outbox.ID, operations[index].ResultOutboxID)
+	}
+	assert.Equal(t, secondOperation.ID, operations[1].ID)
+
+	_, err = AutoRollbackRoutingCanaryPoolContext(context.Background(), RoutingCanaryAutoRollbackRequest{
+		Operation:            fixture.claimed,
+		Lease:                fixture.lease,
+		ExpectedRevision:     fixture.published.Revision.Revision,
+		ExpectedActivationID: fixture.published.Activation.ID,
+		PoolID:               fixture.targetPoolID,
+		NowMs:                20_002,
+	})
+	assert.ErrorIs(t, err, ErrRoutingOperationClaimLost)
+	assertRoutingPolicyRowCounts(t, 2, 6, 6, 2, 2)
+}
+
 func TestRoutingCanaryAutoRollbackExternalDatabaseCompatibility(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -121,6 +185,12 @@ func TestRoutingCanaryAutoRollbackSupersedesChangedHead(t *testing.T) {
 		t, db, common.DatabaseTypeSQLite,
 		[]string{RoutingDeploymentStageCanary, RoutingDeploymentStageCanary},
 	)
+	createRoutingCanaryRollbackOperationForPool(
+		t,
+		fixture,
+		fixture.document.Pools[1].PoolID,
+		"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	)
 
 	changed := cloneRoutingPolicyDocumentForTest(t, fixture.document)
 	changed.Pools[1].Members[0].Weight++
@@ -147,6 +217,17 @@ func TestRoutingCanaryAutoRollbackSupersedesChangedHead(t *testing.T) {
 	assert.True(t, result.Superseded)
 	assert.Equal(t, RoutingOperationStatusSuperseded, result.Operation.Status)
 	assert.Zero(t, result.Publish.Revision.Revision)
+	var operations []RoutingOperation
+	require.NoError(t, DB.Where(
+		"expected_revision = ? AND expected_activation_id = ?",
+		fixture.published.Revision.Revision,
+		fixture.published.Activation.ID,
+	).Order("id asc").Find(&operations).Error)
+	require.Len(t, operations, 2)
+	for index := range operations {
+		assert.Equal(t, RoutingOperationStatusSuperseded, operations[index].Status)
+		assert.Equal(t, "routing policy head or activation changed", operations[index].LastError)
+	}
 
 	head, err := GetRoutingPolicyHeadContext(context.Background())
 	require.NoError(t, err)
@@ -354,6 +435,33 @@ func newRoutingCanaryRollbackFixture(
 	return routingCanaryRollbackFixture{
 		document: document, published: published, lease: lease, claimed: *claimed, targetPoolID: targetPoolID,
 	}
+}
+
+func createRoutingCanaryRollbackOperationForPool(
+	t *testing.T,
+	fixture routingCanaryRollbackFixture,
+	poolID int,
+	rolloutKey string,
+) RoutingOperation {
+	t.Helper()
+	evaluationSpec := routingCanaryEvaluationSpecForTest()
+	evaluationSpec.PolicyRevision = fixture.published.Revision.Revision
+	evaluationSpec.ActivationID = fixture.published.Activation.ID
+	evaluationSpec.PoolID = poolID
+	evaluationSpec.RolloutKey = rolloutKey
+	evaluation, _, err := CreateRoutingCanaryEvaluationContext(context.Background(), evaluationSpec)
+	require.NoError(t, err)
+	operation, _, err := CreateRoutingOperationContext(context.Background(), RoutingOperationSpec{
+		Type:                 RoutingOperationTypeCanaryAutoRollback,
+		EvaluationHash:       evaluation.EvaluationHash,
+		PoolID:               poolID,
+		ExpectedRevision:     fixture.published.Revision.Revision,
+		ExpectedActivationID: fixture.published.Activation.ID,
+		ActorID:              0,
+		Reason:               evaluation.Reason,
+	})
+	require.NoError(t, err)
+	return operation
 }
 
 func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument {

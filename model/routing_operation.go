@@ -193,6 +193,31 @@ func ClaimRoutingOperationContext(
 	return &claimed, nil
 }
 
+func HasRunnableRoutingOperationContext(
+	ctx context.Context,
+	operationType string,
+	nowMs int64,
+) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validRoutingOperationType(operationType) || nowMs <= 0 {
+		return false, ErrRoutingOperationInvalid
+	}
+	eligible := "((status = ? AND next_retry_ms <= ?) OR (status = ? AND claim_until_ms <= ?))"
+	var operation RoutingOperation
+	err := DB.WithContext(ctx).
+		Select("id").
+		Where("operation_type = ?", operationType).
+		Where(eligible, RoutingOperationStatusPending, nowMs, RoutingOperationStatusRunning, nowMs).
+		Order("id asc").
+		First(&operation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func RetryRoutingOperationContext(
 	ctx context.Context,
 	id int64,

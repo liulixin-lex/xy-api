@@ -10,6 +10,8 @@ import (
 
 var ErrRoutingCanaryAutoRollbackInvalid = errors.New("invalid routing canary auto rollback")
 
+const routingCanaryRollbackQueryBatch = 200
+
 type RoutingCanaryAutoRollbackRequest struct {
 	Operation            RoutingOperation    `json:"operation"`
 	Lease                RoutingControlLease `json:"lease"`
@@ -115,10 +117,12 @@ func AutoRollbackRoutingCanaryPoolContext(
 			return err
 		}
 		if head.CurrentRevision != request.ExpectedRevision || head.CurrentActivationID != request.ExpectedActivationID {
-			completed, err := finishRoutingOperationTx(
+			completed, err := finishRoutingCanaryRollbackOperationGroupTx(
 				ctx,
 				tx,
-				operation,
+				request.ExpectedRevision,
+				request.ExpectedActivationID,
+				operation.ID,
 				request.NowMs,
 				RoutingOperationStatusSuperseded,
 				"routing policy head or activation changed",
@@ -137,10 +141,12 @@ func AutoRollbackRoutingCanaryPoolContext(
 			return err
 		}
 		if head.CurrentHash != revision.ContentHash || head.CurrentHash == "" {
-			completed, err := finishRoutingOperationTx(
+			completed, err := finishRoutingCanaryRollbackOperationGroupTx(
 				ctx,
 				tx,
-				operation,
+				request.ExpectedRevision,
+				request.ExpectedActivationID,
+				operation.ID,
 				request.NowMs,
 				RoutingOperationStatusSuperseded,
 				"routing policy head hash changed",
@@ -165,12 +171,26 @@ func AutoRollbackRoutingCanaryPoolContext(
 			activation.TrafficBasisPoints > RoutingPolicyCanaryMaxBasisPoints {
 			return ErrRoutingPolicyContentCorrupt
 		}
+		rollbackPoolIDs, err := routingCanaryRollbackPoolIDsTx(
+			ctx,
+			tx,
+			request.ExpectedRevision,
+			request.ExpectedActivationID,
+			request.PoolID,
+		)
+		if err != nil {
+			return err
+		}
+		rollbackPoolSet := make(map[int]struct{}, len(rollbackPoolIDs))
+		for index := range rollbackPoolIDs {
+			rollbackPoolSet[rollbackPoolIDs[index]] = struct{}{}
+		}
 
 		rollbackDocument := RoutingPolicyDocument{
 			SchemaVersion: document.SchemaVersion,
 			Pools:         make([]RoutingPolicyPoolContent, len(document.Pools)),
 		}
-		targetFound := false
+		targetsFound := 0
 		remainingCanary := false
 		for poolIndex := range document.Pools {
 			pool := document.Pools[poolIndex]
@@ -184,18 +204,18 @@ func AutoRollbackRoutingCanaryPoolContext(
 				copiedMember.Overrides = append(member.Overrides[:0:0], member.Overrides...)
 				copiedPool.Members[memberIndex] = copiedMember
 			}
-			if copiedPool.PoolID == request.PoolID {
+			if _, targeted := rollbackPoolSet[copiedPool.PoolID]; targeted {
 				if copiedPool.DeploymentStage != RoutingDeploymentStageCanary {
 					return ErrRoutingCanaryAutoRollbackInvalid
 				}
 				copiedPool.DeploymentStage = RoutingDeploymentStageShadow
-				targetFound = true
+				targetsFound++
 			} else if copiedPool.DeploymentStage == RoutingDeploymentStageCanary {
 				remainingCanary = true
 			}
 			rollbackDocument.Pools[poolIndex] = copiedPool
 		}
-		if !targetFound {
+		if targetsFound != len(rollbackPoolIDs) {
 			return ErrRoutingCanaryAutoRollbackInvalid
 		}
 
@@ -224,16 +244,18 @@ func AutoRollbackRoutingCanaryPoolContext(
 			normalized,
 			contentHash,
 			activationSpec,
-			[]int{request.PoolID},
+			rollbackPoolIDs,
 			request.NowMs/1_000,
 		)
 		if err != nil {
 			return err
 		}
-		completed, err := finishRoutingOperationTx(
+		completed, err := finishRoutingCanaryRollbackOperationGroupTx(
 			ctx,
 			tx,
-			operation,
+			request.ExpectedRevision,
+			request.ExpectedActivationID,
+			operation.ID,
 			request.NowMs,
 			RoutingOperationStatusSucceeded,
 			"",
@@ -252,4 +274,175 @@ func AutoRollbackRoutingCanaryPoolContext(
 		return RoutingCanaryAutoRollbackResult{}, err
 	}
 	return result, nil
+}
+
+func routingCanaryRollbackPoolIDsTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	expectedRevision int64,
+	expectedActivationID int64,
+	claimedPoolID int,
+) ([]int, error) {
+	if tx == nil || expectedRevision <= 0 || expectedActivationID <= 0 || claimedPoolID <= 0 {
+		return nil, ErrRoutingCanaryAutoRollbackInvalid
+	}
+	type candidate struct {
+		PoolID      int   `gorm:"column:pool_id"`
+		OperationID int64 `gorm:"column:operation_id"`
+	}
+	nonterminalStatuses := []RoutingOperationStatus{
+		RoutingOperationStatusPending,
+		RoutingOperationStatusRunning,
+	}
+	candidates := make([]candidate, 0)
+	err := tx.WithContext(ctx).Model(&RoutingOperation{}).
+		Select("pool_id, MIN(id) AS operation_id").
+		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
+			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,
+		).
+		Where("status IN ?", nonterminalStatuses).
+		Group("pool_id").
+		Order("pool_id asc").
+		Limit(routingTopologyMaxPools + 1).
+		Scan(&candidates).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 || len(candidates) > routingTopologyMaxPools {
+		return nil, ErrRoutingCanaryAutoRollbackInvalid
+	}
+
+	operationByID := make(map[int64]RoutingOperation, len(candidates))
+	for start := 0; start < len(candidates); start += routingCanaryRollbackQueryBatch {
+		end := min(start+routingCanaryRollbackQueryBatch, len(candidates))
+		ids := make([]int64, 0, end-start)
+		for index := start; index < end; index++ {
+			ids = append(ids, candidates[index].OperationID)
+		}
+		var operations []RoutingOperation
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("id IN ?", ids).Find(&operations).Error; err != nil {
+			return nil, err
+		}
+		if len(operations) != len(ids) {
+			return nil, ErrRoutingCanaryAutoRollbackInvalid
+		}
+		for index := range operations {
+			operationByID[operations[index].ID] = operations[index]
+		}
+	}
+
+	evaluationHashes := make([]string, 0, len(candidates))
+	for index := range candidates {
+		operation, exists := operationByID[candidates[index].OperationID]
+		if !exists || operation.PoolID != candidates[index].PoolID ||
+			operation.OperationType != RoutingOperationTypeCanaryAutoRollback ||
+			operation.ExpectedRevision != expectedRevision || operation.ExpectedActivationID != expectedActivationID ||
+			(operation.Status != RoutingOperationStatusPending && operation.Status != RoutingOperationStatusRunning) ||
+			!validRoutingPersistenceToken(operation.CreateToken) || operation.CreatedTimeMs <= 0 {
+			return nil, ErrRoutingCanaryAutoRollbackInvalid
+		}
+		normalized, idempotencyHash, normalizeErr := normalizeRoutingOperationSpec(RoutingOperationSpec{
+			Type:                 operation.OperationType,
+			EvaluationHash:       operation.EvaluationHash,
+			PoolID:               operation.PoolID,
+			ExpectedRevision:     operation.ExpectedRevision,
+			ExpectedActivationID: operation.ExpectedActivationID,
+			ActorID:              operation.ActorID,
+			Reason:               operation.Reason,
+		})
+		if normalizeErr != nil || idempotencyHash != operation.IdempotencyHash || normalized.Reason != operation.Reason {
+			return nil, ErrRoutingCanaryAutoRollbackInvalid
+		}
+		evaluationHashes = append(evaluationHashes, operation.EvaluationHash)
+	}
+
+	evaluationByHash := make(map[string]RoutingCanaryEvaluation, len(evaluationHashes))
+	for start := 0; start < len(evaluationHashes); start += routingCanaryRollbackQueryBatch {
+		end := min(start+routingCanaryRollbackQueryBatch, len(evaluationHashes))
+		var evaluations []RoutingCanaryEvaluation
+		if err := tx.WithContext(ctx).
+			Where("evaluation_hash IN ?", evaluationHashes[start:end]).
+			Find(&evaluations).Error; err != nil {
+			return nil, err
+		}
+		for index := range evaluations {
+			if err := validateStoredRoutingCanaryEvaluation(evaluations[index]); err != nil {
+				return nil, ErrRoutingCanaryAutoRollbackInvalid
+			}
+			evaluationByHash[evaluations[index].EvaluationHash] = evaluations[index]
+		}
+	}
+
+	poolIDs := make([]int, 0, len(candidates))
+	claimedPoolFound := false
+	for index := range candidates {
+		operation := operationByID[candidates[index].OperationID]
+		evaluation, exists := evaluationByHash[operation.EvaluationHash]
+		if !exists || evaluation.PolicyRevision != expectedRevision ||
+			evaluation.ActivationID != expectedActivationID || evaluation.PoolID != operation.PoolID ||
+			evaluation.Status != RoutingCanaryEvaluationStatusBreached {
+			return nil, ErrRoutingCanaryAutoRollbackInvalid
+		}
+		poolIDs = append(poolIDs, operation.PoolID)
+		claimedPoolFound = claimedPoolFound || operation.PoolID == claimedPoolID
+	}
+	if !claimedPoolFound {
+		return nil, ErrRoutingCanaryAutoRollbackInvalid
+	}
+	return poolIDs, nil
+}
+
+func finishRoutingCanaryRollbackOperationGroupTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	expectedRevision int64,
+	expectedActivationID int64,
+	claimedOperationID int64,
+	nowMs int64,
+	status RoutingOperationStatus,
+	lastError string,
+	result RoutingOperationResult,
+) (RoutingOperation, error) {
+	if tx == nil || expectedRevision <= 0 || expectedActivationID <= 0 || claimedOperationID <= 0 || nowMs <= 0 ||
+		!validRoutingOperationTerminalState(status, lastError, result) {
+		return RoutingOperation{}, ErrRoutingCanaryAutoRollbackInvalid
+	}
+	nonterminalStatuses := []RoutingOperationStatus{
+		RoutingOperationStatusPending,
+		RoutingOperationStatusRunning,
+	}
+	query := tx.WithContext(ctx).Model(&RoutingOperation{}).
+		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
+			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,
+		).
+		Where("status IN ?", nonterminalStatuses)
+	var operationCount int64
+	if err := query.Count(&operationCount).Error; err != nil {
+		return RoutingOperation{}, err
+	}
+	if operationCount <= 0 {
+		return RoutingOperation{}, ErrRoutingOperationClaimLost
+	}
+	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
+		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
+			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,
+		).
+		Where("status IN ?", nonterminalStatuses).
+		Updates(routingOperationTerminalUpdates(status, lastError, result, nowMs))
+	if updated.Error != nil {
+		return RoutingOperation{}, updated.Error
+	}
+	if updated.RowsAffected != operationCount {
+		return RoutingOperation{}, ErrRoutingOperationClaimLost
+	}
+	var claimed RoutingOperation
+	if err := tx.WithContext(ctx).Where("id = ?", claimedOperationID).First(&claimed).Error; err != nil {
+		return RoutingOperation{}, err
+	}
+	if claimed.Status != status || claimed.LastError != lastError ||
+		claimed.ResultRevision != result.Revision || claimed.ResultActivationID != result.ActivationID ||
+		claimed.ResultOutboxID != result.OutboxID || claimed.CompletedTimeMs != nowMs {
+		return RoutingOperation{}, ErrRoutingCanaryAutoRollbackInvalid
+	}
+	return claimed, nil
 }

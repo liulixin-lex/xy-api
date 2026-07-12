@@ -739,7 +739,7 @@ func executeRoutingCanaryOperationContext(
 	_ smart_routing_setting.SmartRoutingSetting,
 ) error {
 	now := time.Now()
-	lease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
+	operationLease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
 		ctx,
 		routingCanaryOperationLeaseName,
 		NodeEpochID(),
@@ -751,6 +751,29 @@ func executeRoutingCanaryOperationContext(
 	if err != nil || !acquired {
 		return err
 	}
+	hasRunnableOperation, err := model.HasRunnableRoutingOperationContext(
+		ctx,
+		model.RoutingOperationTypeCanaryAutoRollback,
+		now.UnixMilli(),
+	)
+	if err != nil || !hasRunnableOperation {
+		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		return errors.Join(err, releaseErr)
+	}
+	// Freeze evaluator writes while the rollback transaction snapshots every breached pool in this rollout.
+	evaluatorLease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
+		ctx,
+		routingCanaryEvaluatorLeaseName,
+		NodeEpochID(),
+		now.UnixMilli(),
+		int64(canaryControlLeaseTTL/time.Millisecond),
+		0,
+		true,
+	)
+	if err != nil || !acquired {
+		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		return errors.Join(err, releaseErr)
+	}
 	operation, err := model.ClaimRoutingOperationContext(
 		ctx,
 		model.RoutingOperationTypeCanaryAutoRollback,
@@ -758,28 +781,34 @@ func executeRoutingCanaryOperationContext(
 		int64(canaryOperationClaimTTL/time.Millisecond),
 	)
 	if err != nil {
-		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, lease, time.Now().UnixMilli())
-		return errors.Join(err, releaseErr)
+		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		return errors.Join(err, operationReleaseErr, evaluatorReleaseErr)
 	}
 	if operation == nil {
-		return model.ReleaseRoutingControlLeaseContext(ctx, lease, time.Now().UnixMilli())
+		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		return errors.Join(operationReleaseErr, evaluatorReleaseErr)
 	}
 
 	_, operationErr := model.AutoRollbackRoutingCanaryPoolContext(ctx, model.RoutingCanaryAutoRollbackRequest{
 		Operation:            *operation,
-		Lease:                lease,
+		Lease:                evaluatorLease,
 		ExpectedRevision:     operation.ExpectedRevision,
 		ExpectedActivationID: operation.ExpectedActivationID,
 		PoolID:               operation.PoolID,
 		NowMs:                time.Now().UnixMilli(),
 	})
 	if operationErr == nil {
-		return model.CompleteRoutingControlLeaseContext(ctx, lease, time.Now().UnixMilli())
+		operationCompleteErr := model.CompleteRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		return errors.Join(operationCompleteErr, evaluatorReleaseErr)
 	}
 
 	transitionErr := transitionFailedCanaryOperationContext(ctx, *operation, operationErr, time.Now())
-	releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, lease, time.Now().UnixMilli())
-	return errors.Join(operationErr, transitionErr, releaseErr)
+	operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+	evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+	return errors.Join(operationErr, transitionErr, operationReleaseErr, evaluatorReleaseErr)
 }
 
 func transitionFailedCanaryOperationContext(

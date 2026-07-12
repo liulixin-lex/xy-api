@@ -140,6 +140,11 @@ func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
 
 	operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
 	require.NoError(t, err)
+	runnable, err := HasRunnableRoutingOperationContext(
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000,
+	)
+	require.NoError(t, err)
+	assert.True(t, runnable)
 	claimed, err := ClaimRoutingOperationContext(
 		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000, 200,
 	)
@@ -149,6 +154,11 @@ func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
 		context.Background(), operation.ID, claimed.ClaimToken, 1_050, 1_100, errors.New("transient"),
 	))
 
+	runnable, err = HasRunnableRoutingOperationContext(
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_099,
+	)
+	require.NoError(t, err)
+	assert.False(t, runnable)
 	notDue, err := ClaimRoutingOperationContext(
 		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_099, 100,
 	)
@@ -163,6 +173,11 @@ func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
 	require.NoError(t, FailRoutingOperationContext(
 		context.Background(), due.ID, due.ClaimToken, 1_150, errors.New("permanent"),
 	))
+	runnable, err = HasRunnableRoutingOperationContext(
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, 2_000,
+	)
+	require.NoError(t, err)
+	assert.False(t, runnable)
 
 	var failed RoutingOperation
 	require.NoError(t, db.First(&failed, due.ID).Error)

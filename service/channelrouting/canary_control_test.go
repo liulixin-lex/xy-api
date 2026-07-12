@@ -388,10 +388,24 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ensureCanaryRollbackOperationContext(context.Background(), target, evaluation))
 
+	blockedAtMs := time.Now().UnixMilli()
+	evaluatorLease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
+		context.Background(), routingCanaryEvaluatorLeaseName, "other-node", blockedAtMs,
+		int64(time.Minute/time.Millisecond), 0, true,
+	)
+	require.NoError(t, err)
+	require.True(t, acquired)
 	require.NoError(t, executeRoutingCanaryOperationContext(
 		context.Background(), smart_routing_setting.SmartRoutingSetting{Enabled: true},
 	))
 	var operation model.RoutingOperation
+	require.NoError(t, db.First(&operation).Error)
+	assert.Equal(t, model.RoutingOperationStatusPending, operation.Status)
+	require.NoError(t, model.ReleaseRoutingControlLeaseContext(context.Background(), evaluatorLease, time.Now().UnixMilli()))
+
+	require.NoError(t, executeRoutingCanaryOperationContext(
+		context.Background(), smart_routing_setting.SmartRoutingSetting{Enabled: true},
+	))
 	require.NoError(t, db.First(&operation).Error)
 	assert.Equal(t, model.RoutingOperationStatusSucceeded, operation.Status)
 	head, err := model.GetRoutingPolicyHeadContext(context.Background())
