@@ -89,7 +89,6 @@ func evaluateRoutingCanaryControlContext(
 		ctx,
 		routingCanaryEvaluatorLeaseName,
 		NodeEpochID(),
-		now.UnixMilli(),
 		int64(canaryControlLeaseTTL/time.Millisecond),
 		int64(canaryControlPollInterval/time.Millisecond),
 		false,
@@ -99,12 +98,11 @@ func evaluateRoutingCanaryControlContext(
 	}
 
 	evaluateErr := evaluateRoutingCanarySweepContext(ctx, setting, now)
-	finishedAt := time.Now().UnixMilli()
 	if evaluateErr != nil {
-		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, lease, finishedAt)
+		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, lease)
 		return errors.Join(evaluateErr, releaseErr)
 	}
-	return model.CompleteRoutingControlLeaseContext(ctx, lease, finishedAt)
+	return model.CompleteRoutingControlLeaseContext(ctx, lease)
 }
 
 func evaluateRoutingCanarySweepContext(
@@ -763,7 +761,6 @@ func executeRoutingCanaryOperationContext(
 		ctx,
 		routingCanaryOperationLeaseName,
 		NodeEpochID(),
-		now.UnixMilli(),
 		int64(canaryControlLeaseTTL/time.Millisecond),
 		0,
 		false,
@@ -777,7 +774,7 @@ func executeRoutingCanaryOperationContext(
 		now.UnixMilli(),
 	)
 	if err != nil || !hasRunnableOperation {
-		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease)
 		return errors.Join(err, releaseErr)
 	}
 	// Freeze evaluator writes while the rollback transaction snapshots every breached pool in this rollout.
@@ -785,13 +782,12 @@ func executeRoutingCanaryOperationContext(
 		ctx,
 		routingCanaryEvaluatorLeaseName,
 		NodeEpochID(),
-		now.UnixMilli(),
 		int64(canaryControlLeaseTTL/time.Millisecond),
 		0,
 		true,
 	)
 	if err != nil || !acquired {
-		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
+		releaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease)
 		return errors.Join(err, releaseErr)
 	}
 	operation, err := model.ClaimRoutingOperationContext(
@@ -801,13 +797,13 @@ func executeRoutingCanaryOperationContext(
 		int64(canaryOperationClaimTTL/time.Millisecond),
 	)
 	if err != nil {
-		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
-		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease)
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease)
 		return errors.Join(err, operationReleaseErr, evaluatorReleaseErr)
 	}
 	if operation == nil {
-		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
-		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease)
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease)
 		return errors.Join(operationReleaseErr, evaluatorReleaseErr)
 	}
 
@@ -820,14 +816,14 @@ func executeRoutingCanaryOperationContext(
 		NowMs:                time.Now().UnixMilli(),
 	})
 	if operationErr == nil {
-		operationCompleteErr := model.CompleteRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
-		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+		operationCompleteErr := model.CompleteRoutingControlLeaseContext(ctx, operationLease)
+		evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease)
 		return errors.Join(operationCompleteErr, evaluatorReleaseErr)
 	}
 
 	transitionErr := transitionFailedCanaryOperationContext(ctx, *operation, operationErr, time.Now())
-	operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease, time.Now().UnixMilli())
-	evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease, time.Now().UnixMilli())
+	operationReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, operationLease)
+	evaluatorReleaseErr := model.ReleaseRoutingControlLeaseContext(ctx, evaluatorLease)
 	return errors.Join(operationErr, transitionErr, operationReleaseErr, evaluatorReleaseErr)
 }
 

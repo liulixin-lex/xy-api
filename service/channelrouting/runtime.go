@@ -54,14 +54,20 @@ type RuntimeStats struct {
 	TelemetryStream           RuntimeWorkerStats             `json:"telemetry_stream"`
 	ConfigPublisher           RuntimeWorkerStats             `json:"config_publisher"`
 	ConfigConsumer            RuntimeWorkerStats             `json:"config_consumer"`
+	EventStream               RuntimeWorkerStats             `json:"event_stream"`
 	CanaryNodePresence        RuntimeWorkerStats             `json:"canary_node_presence"`
 	CanaryEvaluator           RuntimeWorkerStats             `json:"canary_evaluator"`
 	CanaryOperations          RuntimeWorkerStats             `json:"canary_operations"`
 	ActiveProbe               RuntimeWorkerStats             `json:"active_probe"`
+	ActiveProbeOperations     RuntimeWorkerStats             `json:"active_probe_operations"`
+	ErrorBudget               RuntimeWorkerStats             `json:"error_budget"`
+	BreakerReset              RuntimeWorkerStats             `json:"breaker_reset"`
 	Retention                 RuntimeWorkerStats             `json:"retention"`
 	Probe                     ActiveProbeStats               `json:"probe"`
 	RetryBudget               RetryTokenBudgetStats          `json:"retry_budget"`
 	Audit                     DecisionBufferStats            `json:"audit"`
+	HedgeRuntime              HedgeRuntimeStats              `json:"hedge_runtime"`
+	HedgeAudit                HedgeAttemptAuditStats         `json:"hedge_audit"`
 	Telemetry                 routingmetrics.StableStats     `json:"telemetry"`
 	TelemetryTransport        RoutingTelemetryTransportStats `json:"telemetry_transport"`
 	ConfigStream              RoutingConfigStreamStats       `json:"config_stream"`
@@ -70,6 +76,8 @@ type RuntimeStats struct {
 	SnapshotPolicyHash        string                         `json:"snapshot_policy_hash"`
 	SnapshotBuiltAt           int64                          `json:"snapshot_built_at"`
 	NodeEpochID               string                         `json:"node_epoch_id"`
+	StableNodeID              string                         `json:"stable_node_id,omitempty"`
+	EndpointQuorumEligible    bool                           `json:"endpoint_quorum_eligible"`
 }
 
 type Runtime struct {
@@ -87,10 +95,14 @@ type Runtime struct {
 	streamStats          runtimeWorkerState
 	configPublishStats   runtimeWorkerState
 	configConsumeStats   runtimeWorkerState
+	eventStreamStats     runtimeWorkerState
 	canaryPresenceStats  runtimeWorkerState
 	canaryEvaluateStats  runtimeWorkerState
 	canaryOperationStats runtimeWorkerState
 	activeProbeStats     runtimeWorkerState
+	activeProbeOpStats   runtimeWorkerState
+	errorBudgetStats     runtimeWorkerState
+	breakerResetStats    runtimeWorkerState
 	retentionStats       runtimeWorkerState
 
 	lastRetentionUnix atomic.Int64
@@ -113,6 +125,7 @@ type runtimeWorkerState struct {
 
 type pendingRoutingWriteStats struct {
 	audits           int
+	hedgeAudits      int
 	stableBuckets    int64
 	pendingEnvelopes int
 	canaryWindows    int
@@ -127,12 +140,17 @@ type runtimeDeps struct {
 	consumeTelemetry func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	publishConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	consumeConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	consumeEvents    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	heartbeatCanary  func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	evaluateCanary   func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	executeCanary    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	activeProbe      func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	executeProbeOps  func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	evaluateBudgets  func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	breakerReset     func(context.Context, smart_routing_setting.SmartRoutingSetting) error
 	probeStats       func() ActiveProbeStats
 	retention        func(context.Context, int) (int64, error)
+	hedgeRetention   func(context.Context, int) (int64, error)
 	topologyChanges  <-chan struct{}
 	wait             func(context.Context, time.Duration) bool
 	jitter           common.JitterFunc
@@ -150,19 +168,34 @@ func BootstrapContext(ctx context.Context) error {
 	if !smart_routing_setting.Enabled() {
 		return nil
 	}
-	return refreshTopologySnapshotContext(ctx, false)
+	if err := refreshTopologySnapshotContext(ctx, false); err != nil {
+		return err
+	}
+	if err := RefreshSharedEndpointBreakersContext(ctx); err != nil {
+		return err
+	}
+	return SyncRoutingBreakerResetStateContext(ctx)
 }
 
 func CurrentRuntimeStats() RuntimeStats {
 	runtime := activeRuntime.Load()
 	if runtime == nil {
+		setting := smart_routing_setting.GetSetting()
+		stableNodeID, quorumEligible := StableNodeID()
 		return RuntimeStats{
-			Audit:              DecisionAuditsStats(),
-			Telemetry:          routingmetrics.StableRuntimeStats(),
-			TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
-			ConfigStream:       RoutingConfigStreamRuntimeStats(),
-			RetryBudget:        DefaultRetryTokenBudgetStats(),
-			NodeEpochID:        NodeEpochID(),
+			Audit: DecisionAuditsStats(),
+			HedgeRuntime: DefaultHedgeRuntimeStats(
+				setting.HedgeMaxConcurrent, setting.HedgeMaxBufferedBytes,
+				time.Duration(setting.HedgeRatioWindowSec)*time.Second, setting.HedgeMaxExtraBasisPoints,
+			),
+			HedgeAudit:             HedgeAttemptAuditsStats(),
+			Telemetry:              routingmetrics.StableRuntimeStats(),
+			TelemetryTransport:     RoutingTelemetryTransportRuntimeStats(),
+			ConfigStream:           RoutingConfigStreamRuntimeStats(),
+			RetryBudget:            DefaultRetryTokenBudgetStats(),
+			NodeEpochID:            NodeEpochID(),
+			StableNodeID:           stableNodeID,
+			EndpointQuorumEligible: quorumEligible,
 		}
 	}
 	return runtime.Stats()
@@ -217,12 +250,28 @@ func defaultRuntimeDeps() runtimeDeps {
 			_, err := ConsumeRoutingConfigOnceContext(ctx)
 			return err
 		},
+		consumeEvents: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			if !common.RedisEnabled || common.RDB == nil {
+				if !waitRuntime(ctx, observeDisabledPoll) {
+					return ctx.Err()
+				}
+				return nil
+			}
+			_, err := ConsumeRoutingEventsOnceContext(ctx)
+			return err
+		},
 		heartbeatCanary: persistRoutingCanaryNodePresenceContext,
 		evaluateCanary:  evaluateRoutingCanaryControlContext,
 		executeCanary:   executeRoutingCanaryOperationContext,
 		activeProbe:     probeScheduler.RunCycle,
+		executeProbeOps: RunActiveProbeOperationCycleContext,
+		evaluateBudgets: RunEnterpriseErrorBudgetCycleContext,
+		breakerReset: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			return RunBreakerResetControlCycleContext(ctx)
+		},
 		probeStats:      probeScheduler.Stats,
 		retention:       DeleteExpiredRoutingHistoryContext,
+		hedgeRetention:  DeleteExpiredRoutingHedgeAttemptAuditsContext,
 		topologyChanges: model.RoutingTopologyChanges(),
 		wait:            waitRuntime,
 		jitter:          common.FullJitter,
@@ -231,13 +280,15 @@ func defaultRuntimeDeps() runtimeDeps {
 
 func flushLocalRoutingWritesContext(ctx context.Context, ensureCanaryWindows bool) error {
 	_, telemetryErr := FlushStableTelemetryContext(ctx)
+	endpointErr := FlushAndRefreshSharedEndpointBreakersContext(ctx, smart_routing_setting.GetSetting())
 	_, auditErr := flushDecisionAuditBatchesContext(ctx, decisionAuditFlushMaxBatches)
+	_, hedgeAuditErr := FlushHedgeAttemptAuditsContext(ctx)
 	var ensureCanaryErr error
 	if ensureCanaryWindows {
 		ensureCanaryErr = ensureCurrentCanaryOutcomeWindows(defaultCanaryWindowAggregator)
 	}
 	_, canaryErr := FlushCanaryOutcomeCheckpointsContext(ctx)
-	return errors.Join(telemetryErr, auditErr, ensureCanaryErr, canaryErr)
+	return errors.Join(telemetryErr, endpointErr, auditErr, hedgeAuditErr, ensureCanaryErr, canaryErr)
 }
 
 func flushDecisionAuditBatchesContext(ctx context.Context, maxBatches int) (int, error) {
@@ -267,12 +318,10 @@ func refreshTopologySnapshotContext(ctx context.Context, forceReconcile bool) er
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, observeRefreshTimeout)
 	defer cancel()
-	nowMs := time.Now().UnixMilli()
 	lease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
 		refreshCtx,
 		routingLegacyReconcileLeaseName,
 		NodeEpochID(),
-		nowMs,
 		int64(routingLegacyLeaseTTL/time.Millisecond),
 		int64(routingLegacyMinInterval/time.Millisecond),
 		forceReconcile,
@@ -284,12 +333,12 @@ func refreshTopologySnapshotContext(ctx context.Context, forceReconcile bool) er
 		if _, err := model.ReconcileLegacyRoutingTopologyContext(refreshCtx); err != nil {
 			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer finishCancel()
-			releaseErr := model.ReleaseRoutingControlLeaseContext(finishCtx, lease, time.Now().UnixMilli())
+			releaseErr := model.ReleaseRoutingControlLeaseContext(finishCtx, lease)
 			return errors.Join(err, releaseErr)
 		}
 		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer finishCancel()
-		if err := model.CompleteRoutingControlLeaseContext(finishCtx, lease, time.Now().UnixMilli()); err != nil {
+		if err := model.CompleteRoutingControlLeaseContext(finishCtx, lease); err != nil {
 			return err
 		}
 	} else if forceReconcile {
@@ -379,6 +428,9 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.consumeConfig != nil {
 		workerCount++
 	}
+	if deps.consumeEvents != nil {
+		workerCount++
+	}
 	if deps.heartbeatCanary != nil {
 		workerCount++
 	}
@@ -391,7 +443,16 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.activeProbe != nil {
 		workerCount++
 	}
-	if deps.retention != nil {
+	if deps.executeProbeOps != nil {
+		workerCount++
+	}
+	if deps.evaluateBudgets != nil {
+		workerCount++
+	}
+	if deps.breakerReset != nil {
+		workerCount++
+	}
+	if deps.retention != nil || deps.hedgeRetention != nil {
 		workerCount++
 	}
 	runtime.wait.Add(workerCount)
@@ -427,6 +488,12 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 			runtime.runWorker(ctx, deps.consumeConfig, observeStreamInterval, &runtime.configConsumeStats)
 		}()
 	}
+	if deps.consumeEvents != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.consumeEvents, observeStreamInterval, &runtime.eventStreamStats)
+		}()
+	}
 	if deps.heartbeatCanary != nil {
 		go func() {
 			defer runtime.wait.Done()
@@ -451,11 +518,29 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 			runtime.runWorker(ctx, deps.activeProbe, activeProbePollInterval, &runtime.activeProbeStats)
 		}()
 	}
-	if deps.retention != nil {
+	if deps.executeProbeOps != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.executeProbeOps, activeProbeOperationInterval, &runtime.activeProbeOpStats)
+		}()
+	}
+	if deps.evaluateBudgets != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.evaluateBudgets, errorBudgetEvaluationInterval, &runtime.errorBudgetStats)
+		}()
+	}
+	if deps.breakerReset != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.breakerReset, breakerResetControlInterval, &runtime.breakerResetStats)
+		}()
+	}
+	if deps.retention != nil || deps.hedgeRetention != nil {
 		go func() {
 			defer runtime.wait.Done()
 			runtime.runWorker(ctx, func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
-				return runtime.runRetention(ctx, setting.RetentionDays)
+				return runtime.runRetention(ctx, setting.RetentionDays, setting.HedgeAuditRetentionDays)
 			}, observeRetentionInterval, &runtime.retentionStats)
 		}()
 	}
@@ -499,25 +584,39 @@ func (runtime *Runtime) Stats() RuntimeStats {
 	if runtime == nil {
 		return RuntimeStats{}
 	}
+	setting := smart_routing_setting.GetSetting()
+	if runtime.deps.getSetting != nil {
+		setting = runtime.deps.getSetting()
+	}
 	stats := RuntimeStats{
-		Refresh:            runtime.refreshStats.snapshot(),
-		Flush:              runtime.flushStats.snapshot(),
-		LocalDrain:         runtime.localDrainStats.snapshot(),
-		TelemetryStream:    runtime.streamStats.snapshot(),
-		ConfigPublisher:    runtime.configPublishStats.snapshot(),
-		ConfigConsumer:     runtime.configConsumeStats.snapshot(),
-		CanaryNodePresence: runtime.canaryPresenceStats.snapshot(),
-		CanaryEvaluator:    runtime.canaryEvaluateStats.snapshot(),
-		CanaryOperations:   runtime.canaryOperationStats.snapshot(),
-		ActiveProbe:        runtime.activeProbeStats.snapshot(),
-		Retention:          runtime.retentionStats.snapshot(),
-		RetryBudget:        DefaultRetryTokenBudgetStats(),
-		Audit:              DecisionAuditsStats(),
+		Refresh:               runtime.refreshStats.snapshot(),
+		Flush:                 runtime.flushStats.snapshot(),
+		LocalDrain:            runtime.localDrainStats.snapshot(),
+		TelemetryStream:       runtime.streamStats.snapshot(),
+		ConfigPublisher:       runtime.configPublishStats.snapshot(),
+		ConfigConsumer:        runtime.configConsumeStats.snapshot(),
+		EventStream:           runtime.eventStreamStats.snapshot(),
+		CanaryNodePresence:    runtime.canaryPresenceStats.snapshot(),
+		CanaryEvaluator:       runtime.canaryEvaluateStats.snapshot(),
+		CanaryOperations:      runtime.canaryOperationStats.snapshot(),
+		ActiveProbe:           runtime.activeProbeStats.snapshot(),
+		ActiveProbeOperations: runtime.activeProbeOpStats.snapshot(),
+		ErrorBudget:           runtime.errorBudgetStats.snapshot(),
+		BreakerReset:          runtime.breakerResetStats.snapshot(),
+		Retention:             runtime.retentionStats.snapshot(),
+		RetryBudget:           DefaultRetryTokenBudgetStats(),
+		Audit:                 DecisionAuditsStats(),
+		HedgeRuntime: DefaultHedgeRuntimeStats(
+			setting.HedgeMaxConcurrent, setting.HedgeMaxBufferedBytes,
+			time.Duration(setting.HedgeRatioWindowSec)*time.Second, setting.HedgeMaxExtraBasisPoints,
+		),
+		HedgeAudit:         HedgeAttemptAuditsStats(),
 		Telemetry:          routingmetrics.StableRuntimeStats(),
 		TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
 		ConfigStream:       RoutingConfigStreamRuntimeStats(),
 		NodeEpochID:        NodeEpochID(),
 	}
+	stats.StableNodeID, stats.EndpointQuorumEligible = StableNodeID()
 	if runtime.deps.probeStats != nil {
 		stats.Probe = runtime.deps.probeStats()
 	}
@@ -545,6 +644,9 @@ func (runtime *Runtime) runWorker(
 		workerEnabled := setting.Enabled
 		if state == &runtime.activeProbeStats {
 			workerEnabled = activeProbeEnabled(setting)
+		} else if state == &runtime.eventStreamStats || state == &runtime.errorBudgetStats ||
+			state == &runtime.breakerResetStats || state == &runtime.activeProbeOpStats {
+			workerEnabled = true
 		}
 		drainWhileDisabled := !workerEnabled && runtime.shouldDrainWhileDisabled(state)
 		if (!workerEnabled && !drainWhileDisabled) || run == nil {
@@ -622,8 +724,8 @@ func (runtime *Runtime) waitNext(ctx context.Context, duration time.Duration, st
 	}
 }
 
-func (runtime *Runtime) runRetention(ctx context.Context, retentionDays int) error {
-	if retentionDays < 1 {
+func (runtime *Runtime) runRetention(ctx context.Context, retentionDays int, hedgeRetentionDays int) error {
+	if retentionDays < 1 && hedgeRetentionDays < 1 {
 		return nil
 	}
 	now := common.GetTimestamp()
@@ -631,9 +733,19 @@ func (runtime *Runtime) runRetention(ctx context.Context, retentionDays int) err
 	if last > 0 && now-last < int64((6*time.Hour)/time.Second) {
 		return nil
 	}
-	retentionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if _, err := runtime.deps.retention(retentionCtx, retentionDays); err != nil {
+	var retentionErr error
+	if retentionDays > 0 && runtime.deps.retention != nil {
+		retentionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, retentionErr = runtime.deps.retention(retentionCtx, retentionDays)
+		cancel()
+	}
+	var hedgeRetentionErr error
+	if hedgeRetentionDays > 0 && runtime.deps.hedgeRetention != nil {
+		hedgeRetentionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, hedgeRetentionErr = runtime.deps.hedgeRetention(hedgeRetentionCtx, hedgeRetentionDays)
+		cancel()
+	}
+	if err := errors.Join(retentionErr, hedgeRetentionErr); err != nil {
 		return err
 	}
 	runtime.lastRetentionUnix.Store(common.GetTimestamp())
@@ -702,6 +814,7 @@ func hasPendingRoutingWrites() bool {
 func pendingRoutingWrites() pendingRoutingWriteStats {
 	return pendingRoutingWriteStats{
 		audits:           DecisionAuditsStats().Entries,
+		hedgeAudits:      HedgeAttemptAuditsStats().Entries,
 		stableBuckets:    routingmetrics.StableRuntimeStats().Buckets,
 		pendingEnvelopes: RoutingTelemetryTransportRuntimeStats().PendingEnvelopes,
 		canaryWindows:    CurrentCanaryWindowStats().Entries,
@@ -709,11 +822,12 @@ func pendingRoutingWrites() pendingRoutingWriteStats {
 }
 
 func (stats pendingRoutingWriteStats) hasWrites() bool {
-	return stats.audits > 0 || stats.stableBuckets > 0 || stats.pendingEnvelopes > 0 || stats.canaryWindows > 0
+	return stats.audits > 0 || stats.hedgeAudits > 0 || stats.stableBuckets > 0 || stats.pendingEnvelopes > 0 || stats.canaryWindows > 0
 }
 
 func (stats pendingRoutingWriteStats) lessThan(previous pendingRoutingWriteStats) bool {
 	return stats.audits < previous.audits ||
+		stats.hedgeAudits < previous.hedgeAudits ||
 		stats.stableBuckets < previous.stableBuckets ||
 		stats.pendingEnvelopes < previous.pendingEnvelopes ||
 		stats.canaryWindows < previous.canaryWindows
@@ -786,8 +900,20 @@ func activeProbePollInterval(setting smart_routing_setting.SmartRoutingSetting) 
 	return interval
 }
 
+func activeProbeOperationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return time.Second
+}
+
+func errorBudgetEvaluationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return errorBudgetEvaluationPeriod
+}
+
 func canaryOperationInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
 	return canaryOperationPollInterval
+}
+
+func breakerResetControlInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return time.Second
 }
 
 func observeRetentionInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {

@@ -17,6 +17,7 @@ func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
 	t.Setenv("SMART_ROUTING_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_MODE", ModeEnterpriseSLO)
 	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "true")
 
 	var before SmartRoutingSetting
 	require.True(t, config.GlobalConfig.Snapshot(configName, &before))
@@ -30,11 +31,13 @@ func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
 		WeightCost:         0,
 		TopK:               0,
 		AgentEnabled:       false,
+		HedgeEnabled:       false,
 	})
 
 	assert.False(t, normalized.Enabled)
 	assert.Equal(t, ModeBalanced, normalized.Mode)
 	assert.False(t, normalized.AgentEnabled)
+	assert.False(t, normalized.HedgeEnabled)
 	assert.Equal(t, 1, normalized.TopK)
 	assert.InDelta(t, 0.5, normalized.WeightAvailability, 0.000001)
 	assert.InDelta(t, 0.25, normalized.WeightLatency, 0.000001)
@@ -61,6 +64,12 @@ func TestNormalizeBoundsFailoverAndProbeBudgets(t *testing.T) {
 		ActiveProbePerHost:       100,
 		ActiveProbeTokenBudget:   0,
 		ActiveProbeCostBudgetUSD: math.NaN(),
+		HedgeMaxConcurrent:       1_000,
+		HedgeMaxResponseBytes:    1,
+		HedgeMaxBufferedBytes:    1 << 40,
+		HedgeRatioWindowSec:      10_000,
+		HedgeMaxExtraBasisPoints: 20_000,
+		HedgeAuditRetentionDays:  1_000,
 	})
 
 	assert.Equal(t, 100, normalized.RetryTokenCapacity)
@@ -76,6 +85,12 @@ func TestNormalizeBoundsFailoverAndProbeBudgets(t *testing.T) {
 	assert.Equal(t, 64, normalized.ActiveProbePerHost)
 	assert.Equal(t, 4_096, normalized.ActiveProbeTokenBudget)
 	assert.Equal(t, 0.25, normalized.ActiveProbeCostBudgetUSD)
+	assert.Equal(t, 128, normalized.HedgeMaxConcurrent)
+	assert.Equal(t, 4<<20, normalized.HedgeMaxResponseBytes)
+	assert.Equal(t, int64(1<<30), normalized.HedgeMaxBufferedBytes)
+	assert.Equal(t, 3_600, normalized.HedgeRatioWindowSec)
+	assert.Equal(t, 10_000, normalized.HedgeMaxExtraBasisPoints)
+	assert.Equal(t, 365, normalized.HedgeAuditRetentionDays)
 }
 
 func TestGetSettingDefaultsAndNormalizesWeights(t *testing.T) {
@@ -89,6 +104,12 @@ func TestGetSettingDefaultsAndNormalizesWeights(t *testing.T) {
 	assert.Equal(t, 50, setting.FailureRatePct)
 	assert.Equal(t, 3000, setting.FirstByteMinMs)
 	assert.Equal(t, 12000, setting.FirstByteCapMs)
+	assert.False(t, setting.HedgeEnabled)
+	assert.Equal(t, 8, setting.HedgeMaxConcurrent)
+	assert.Equal(t, 4<<20, setting.HedgeMaxResponseBytes)
+	assert.Equal(t, int64(64<<20), setting.HedgeMaxBufferedBytes)
+	assert.Equal(t, 60, setting.HedgeRatioWindowSec)
+	assert.Equal(t, 500, setting.HedgeMaxExtraBasisPoints)
 	assert.InDelta(t, 1.0, setting.WeightAvailability+setting.WeightLatency+setting.WeightThroughput+setting.WeightCost, 0.000001)
 }
 
@@ -97,21 +118,25 @@ func TestGetSettingAppliesEnvOverridesEveryRead(t *testing.T) {
 	t.Setenv("SMART_ROUTING_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_MODE", ModeBalanced)
 	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "true")
 
 	setting := GetSetting()
 
 	assert.True(t, setting.Enabled)
 	assert.Equal(t, ModeBalanced, setting.Mode)
 	assert.True(t, setting.AgentEnabled)
+	assert.True(t, setting.HedgeEnabled)
 
 	t.Setenv("SMART_ROUTING_ENABLED", "false")
 	t.Setenv("SMART_ROUTING_MODE", "invalid")
 	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "false")
+	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "false")
 
 	setting = GetSetting()
 	assert.False(t, setting.Enabled)
 	assert.Equal(t, ModeObserve, setting.Mode)
 	assert.False(t, setting.AgentEnabled)
+	assert.False(t, setting.HedgeEnabled)
 }
 
 func TestUpdateSettingNormalizesAndStoresValues(t *testing.T) {

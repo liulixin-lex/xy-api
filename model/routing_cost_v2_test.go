@@ -62,6 +62,28 @@ func TestRoutingCostV2MigrationAndCaseSensitiveModels(t *testing.T) {
 		}).
 		Count(&latestCount).Error)
 	assert.Equal(t, int64(2), latestCount)
+	var latest RoutingCostSnapshot
+	require.NoError(t, DB.Where("channel_id = ? AND model_key = ?", upper.ChannelID, RoutingCostModelKey("Model-X")).First(&latest).Error)
+	assert.Equal(t, account.ID, latest.AccountID)
+}
+
+func TestNormalizeRoutingActualCostProfileAllowsClaudeCacheOutsideInputTokens(t *testing.T) {
+	profile, err := normalizeRoutingActualCostProfile(
+		RoutingNormalizedPricing{BillingExpression: "p * 1 + c * 2 + cr * 0.1 + cc * 1.25"},
+		RoutingCostRequestProfile{ActualUsage: &RoutingCostActualUsage{
+			PromptTokens: 100, CompletionTokens: 10, CacheReadTokens: 300, CacheWriteTokens: 50,
+			ClaudeUsageSemantic: true,
+		}},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), profile.PromptTokens)
+	assert.Equal(t, int64(10), profile.ExpectedCompletionTokens)
+	require.NotNil(t, profile.actualTokenParams)
+	assert.Equal(t, float64(450), profile.actualTokenParams.Len)
+	assert.Equal(t, float64(100), profile.actualTokenParams.P)
+	assert.Equal(t, float64(300), profile.actualTokenParams.CR)
+	assert.Equal(t, float64(50), profile.actualTokenParams.CC)
 }
 
 func TestRoutingCostV2MigrationAcceptsRowsWithoutContentHash(t *testing.T) {
@@ -437,16 +459,141 @@ func TestRoutingCostEstimateDefinesExpectedWorstAndEffectivePlatformCost(t *test
 
 	require.NoError(t, err)
 	assert.True(t, estimate.Known)
+	assert.True(t, estimate.ExpectedKnown)
+	assert.True(t, estimate.WorstCaseKnown)
+	assert.True(t, estimate.ExpectedEffectiveKnown)
 	assert.InDelta(t, 0.014, estimate.ExpectedCost, 1e-12)
 	assert.InDelta(t, 0.096, estimate.WorstCaseCost, 1e-12)
 	assert.InDelta(t, 0.028, estimate.ExpectedEffectiveCost, 1e-12)
 	assert.Equal(t, "USD", estimate.Currency)
+	assert.Equal(t, "expression", estimate.Unit)
+	assert.InDelta(t, estimate.ExpectedCost, estimate.ExpectedBreakdown.Expression, 1e-12)
 
 	expired, err := EstimateRoutingCostSnapshot(version, pricing, profile, version.ExpiresTime)
 	require.NoError(t, err)
 	assert.False(t, expired.Known)
 	assert.Zero(t, expired.ExpectedCost)
 	assert.Zero(t, expired.FreshnessScore)
+}
+
+func TestRoutingCostEstimateUsesConservativeMaximumPromptOnlyForWorstCase(t *testing.T) {
+	observed := common.GetTimestamp()
+	inputRate := 2.0
+	outputRate := 10.0
+	estimate, err := EstimateRoutingCostSnapshot(
+		RoutingCostSnapshotVersion{
+			Confidence: RoutingCostConfidenceExact, ConfidenceScore: 1,
+			Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+			ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+		},
+		RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+		},
+		RoutingCostRequestProfile{
+			PromptTokens: 100, MaximumPromptTokens: 400,
+			ExpectedCompletionTokens: 10, MaximumCompletionTokens: 20,
+			MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+			MaximumCompletionKnown: true, CacheTokensKnown: true,
+			MediaDimensionsKnown: true, RequestInputKnown: true,
+		},
+		observed,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, estimate.ExpectedKnown)
+	assert.True(t, estimate.WorstCaseKnown)
+	assert.InDelta(t, 0.0003, estimate.ExpectedCost, 1e-12)
+	assert.InDelta(t, 0.001, estimate.WorstCaseCost, 1e-12)
+	assert.InDelta(t, 0.0008, estimate.WorstCaseSingleBreakdown.Input, 1e-12)
+}
+
+func TestRoutingCostEstimateFailsClosedForUnknownRequestDimensions(t *testing.T) {
+	observed := common.GetTimestamp()
+	version := RoutingCostSnapshotVersion{
+		Confidence: RoutingCostConfidenceExact, ConfidenceScore: 1,
+		Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+		ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3600,
+	}
+	inputRate := 2.0
+	outputRate := 10.0
+	baseProfile := RoutingCostRequestProfile{
+		PromptTokens: 1_000, ExpectedCompletionTokens: 500, MaximumCompletionTokens: 1_000,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true, MediaDimensionsKnown: true,
+		RequestInputKnown: true,
+	}
+
+	t.Run("remote input keeps expected proxy but closes worst", func(t *testing.T) {
+		profile := baseProfile
+		profile.InputTokensKnown = false
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.True(t, estimate.ExpectedKnown)
+		assert.False(t, estimate.WorstCaseKnown)
+		assert.InDelta(t, 0.6, estimate.ConfidenceScore, 1e-12)
+	})
+
+	tests := []struct {
+		name    string
+		pricing RoutingNormalizedPricing
+		mutate  func(*RoutingCostRequestProfile)
+	}{
+		{
+			name: "cache", pricing: RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+				BillingExpression: `tier("cache", p * 2 + c * 10 + cr * 0.2)`,
+			}, mutate: func(profile *RoutingCostRequestProfile) { profile.CacheTokensKnown = false },
+		},
+		{
+			name: "media", pricing: RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD", ImageInputCostPerMillion: &inputRate,
+			}, mutate: func(profile *RoutingCostRequestProfile) { profile.MediaDimensionsKnown = false },
+		},
+		{
+			name: "request expression", pricing: RoutingNormalizedPricing{
+				QuotaType: 1, BillingMode: "tiered_expr", Currency: "USD",
+				BillingExpression: `header("x-priority") == "fast" ? tier("fast", 2) : tier("base", 1)`,
+			}, mutate: func(profile *RoutingCostRequestProfile) { profile.RequestInputKnown = false },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := baseProfile
+			test.mutate(&profile)
+			estimate, err := EstimateRoutingCostSnapshot(version, test.pricing, profile, observed)
+			require.NoError(t, err)
+			assert.False(t, estimate.ExpectedKnown)
+			assert.False(t, estimate.WorstCaseKnown)
+			assert.Zero(t, estimate.ExpectedCost)
+			assert.Zero(t, estimate.WorstCaseCost)
+		})
+	}
+}
+
+func TestRoutingCostLatestMaterializesVersionPricingAndMaskedAccount(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+	account := createRoutingUpstreamAccountForTest(t)
+	write := routingCostVersionWriteForTest(account.ID, "gpt-materialized", 0.5)
+
+	result, err := WriteRoutingCostSnapshotVersionContext(context.Background(), write)
+	require.NoError(t, err)
+	assert.Equal(t, result.Version.PricingHash, result.Latest.PricingHash)
+	assert.Equal(t, write.UpstreamGroup, result.Latest.UpstreamGroup)
+	assert.Equal(t, write.UpstreamModel, result.Latest.UpstreamModel)
+	assert.Equal(t, account.AccountKey, result.Latest.AccountKeyHash)
+	assert.Equal(t, account.MaskedIdentity, result.Latest.AccountMaskedID)
+	assert.NotEmpty(t, result.Latest.PricingJSON)
+	pricing, known, err := DecodeRoutingCostSnapshotPricing(result.Latest)
+	require.NoError(t, err)
+	assert.True(t, known)
+	assert.Equal(t, "USD", pricing.Currency)
+	assert.Equal(t, "mixed", pricing.Unit)
 }
 
 func TestRoutingCostV2ExternalDatabaseCompatibility(t *testing.T) {

@@ -307,12 +307,15 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 }
 
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("upstream request context is unavailable")
+	}
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", fullRequestURL)
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -337,12 +340,15 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 }
 
 func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("upstream request context is unavailable")
+	}
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	logger.LogDebug(c, "fullRequestURL: %s", fullRequestURL)
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -369,6 +375,9 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 }
 
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("upstream request context is unavailable")
+	}
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
@@ -521,10 +530,131 @@ func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
 	return nil
 }
 
+type upstreamFirstByteGuard struct {
+	once   sync.Once
+	timer  *time.Timer
+	cancel context.CancelCauseFunc
+	status *common.StreamStatus
+	seen   bool
+}
+
+func newUpstreamFirstByteGuard(
+	timeout time.Duration,
+	cancel context.CancelCauseFunc,
+	status *common.StreamStatus,
+) *upstreamFirstByteGuard {
+	guard := &upstreamFirstByteGuard{cancel: cancel, status: status}
+	guard.timer = time.AfterFunc(timeout, func() {
+		guard.once.Do(func() {
+			guard.status.SetEndReason(common.StreamEndReasonFirstByteTimeout, context.DeadlineExceeded)
+			guard.cancel(context.DeadlineExceeded)
+		})
+	})
+	return guard
+}
+
+func (guard *upstreamFirstByteGuard) observeFirstByte() bool {
+	if guard == nil {
+		return true
+	}
+	guard.once.Do(func() {
+		guard.seen = true
+		if guard.timer != nil {
+			guard.timer.Stop()
+		}
+	})
+	return guard.seen
+}
+
+func (guard *upstreamFirstByteGuard) finishWithoutFirstByte() {
+	if guard == nil {
+		return
+	}
+	guard.once.Do(func() {
+		if guard.timer != nil {
+			guard.timer.Stop()
+		}
+	})
+}
+
+type upstreamAttemptResponseBody struct {
+	io.ReadCloser
+	firstByte *upstreamFirstByteGuard
+	cancel    context.CancelCauseFunc
+	// SSE comments, event names, and blank lines are transport noise rather
+	// than the first usable model event. The scanner marks a business event.
+	businessEventRequired bool
+	finish                sync.Once
+}
+
+// RoutingFirstByteGuarded lets the stream scanner reuse the transport-level
+// deadline instead of starting a second first-byte budget after headers arrive.
+func (body *upstreamAttemptResponseBody) RoutingFirstByteGuarded() bool {
+	return body != nil && body.firstByte != nil
+}
+
+// RoutingMarkFirstByte atomically races the first valid SSE event against the
+// absolute transport deadline. False means the timeout already won and the
+// caller must not commit the event to the downstream client.
+func (body *upstreamAttemptResponseBody) RoutingMarkFirstByte() bool {
+	return body == nil || body.firstByte.observeFirstByte()
+}
+
+func (body *upstreamAttemptResponseBody) Read(buffer []byte) (int, error) {
+	read, err := body.ReadCloser.Read(buffer)
+	if read > 0 && !body.businessEventRequired && !body.firstByte.observeFirstByte() {
+		return 0, context.DeadlineExceeded
+	}
+	if err != nil {
+		body.finishAttempt()
+	}
+	return read, err
+}
+
+func (body *upstreamAttemptResponseBody) Close() error {
+	err := body.ReadCloser.Close()
+	body.finishAttempt()
+	return err
+}
+
+func (body *upstreamAttemptResponseBody) finishAttempt() {
+	if body == nil {
+		return
+	}
+	body.finish.Do(func() {
+		if body.businessEventRequired {
+			body.firstByte.finishWithoutFirstByte()
+		} else {
+			body.firstByte.observeFirstByte()
+		}
+		if body.cancel != nil {
+			body.cancel(context.Canceled)
+		}
+	})
+}
+
 func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	return doRequest(c, req, info)
 }
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("upstream request context is unavailable")
+	}
+	if req == nil {
+		return nil, errors.New("upstream request is nil")
+	}
+	if info == nil {
+		return nil, errors.New("relay info is nil")
+	}
+	if info.ChannelMeta == nil {
+		return nil, errors.New("relay channel metadata is nil")
+	}
+	// SetRoutingStrictCapacityReservation and future attempt orchestration may
+	// replace the inbound request context after the upstream request was built.
+	// Bind at the final send boundary so lease loss, client disconnects, and
+	// loser cancellation always reach http.Client.Do.
+	req = req.WithContext(c.Request.Context())
+
 	var client *http.Client
 	var err error
 	if info.ChannelSetting.Proxy != "" {
@@ -540,41 +670,48 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	if info.IsStream {
 		firstByteTimeout = helper.FirstByteFailoverTimeout(info)
 	}
-	var cancelFirstByte context.CancelFunc
-	if firstByteTimeout > 0 && req != nil {
-		reqCtx, cancel := context.WithTimeout(req.Context(), firstByteTimeout)
-		cancelFirstByte = cancel
+	var attemptCancel context.CancelCauseFunc
+	var firstByteGuard *upstreamFirstByteGuard
+	if firstByteTimeout > 0 {
+		reqCtx, cancel := context.WithCancelCause(req.Context())
+		attemptCancel = cancel
 		req = req.WithContext(reqCtx)
-	}
-	if cancelFirstByte != nil {
-		defer cancelFirstByte()
+		if info.StreamStatus == nil {
+			info.StreamStatus = common.NewStreamStatus()
+		}
+		firstByteGuard = newUpstreamFirstByteGuard(firstByteTimeout, cancel, info.StreamStatus)
 	}
 
 	var stopPinger context.CancelFunc
 	var pingerDone <-chan struct{}
 	var pingerErr <-chan error
-	var cancelPingAttempt context.CancelFunc
+	defer func() {
+		if stopPinger != nil {
+			stopPinger()
+			<-pingerDone
+			logger.LogDebug(c, "SSE ping goroutine stopped by defer")
+		}
+		if firstByteGuard != nil {
+			firstByteGuard.observeFirstByte()
+		}
+		if attemptCancel != nil {
+			attemptCancel(context.Canceled)
+		}
+	}()
 	if info.IsStream {
 		helper.SetEventStreamHeaders(c)
 		// 处理流式请求的 ping 保活
 		generalSettings := operation_setting.GetGeneralSetting()
 		if generalSettings.PingIntervalEnabled && !info.DisablePing && shouldStartPreResponseStreamPing(info) {
 			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-			pingCtx, cancel := context.WithCancel(req.Context())
-			cancelPingAttempt = cancel
-			req = req.WithContext(pingCtx)
-			stopPinger, pingerDone, pingerErr = startPingKeepAlive(c, info, pingInterval, cancel)
-			// 使用defer确保在任何情况下都能停止ping goroutine
-			defer func() {
-				if stopPinger != nil {
-					stopPinger()
-					<-pingerDone
-					logger.LogDebug(c, "SSE ping goroutine stopped by defer")
-				}
-				if cancelPingAttempt != nil {
-					cancelPingAttempt()
-				}
-			}()
+			if attemptCancel == nil {
+				attemptCtx, cancel := context.WithCancelCause(req.Context())
+				attemptCancel = cancel
+				req = req.WithContext(attemptCtx)
+			}
+			stopPinger, pingerDone, pingerErr = startPingKeepAlive(c, info, pingInterval, func() {
+				attemptCancel(errors.New("pre-response stream ping failed"))
+			})
 		}
 	}
 
@@ -583,10 +720,6 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		stopPinger()
 		<-pingerDone
 		stopPinger = nil
-		if cancelPingAttempt != nil {
-			cancelPingAttempt()
-			cancelPingAttempt = nil
-		}
 	}
 	if pingerErr != nil {
 		select {
@@ -600,7 +733,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 	if err != nil {
 		logger.LogError(c, "do request failed: "+err.Error())
-		if firstByteTimeout > 0 && errors.Is(req.Context().Err(), context.DeadlineExceeded) {
+		if firstByteTimeout > 0 && errors.Is(context.Cause(req.Context()), context.DeadlineExceeded) {
 			if info.StreamStatus == nil {
 				info.StreamStatus = common.NewStreamStatus()
 			}
@@ -612,13 +745,31 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	if resp == nil {
 		return nil, errors.New("resp is nil")
 	}
+	if attemptCancel != nil && resp.Body != nil {
+		businessEventRequired := strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+		if !businessEventRequired && (resp.Body == http.NoBody || resp.ContentLength == 0) {
+			firstByteGuard.observeFirstByte()
+		}
+		resp.Body = &upstreamAttemptResponseBody{
+			ReadCloser:            resp.Body,
+			firstByte:             firstByteGuard,
+			cancel:                attemptCancel,
+			businessEventRequired: businessEventRequired,
+		}
+		firstByteGuard = nil
+		attemptCancel = nil
+	}
 
 	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
 		c.Set(common2.UpstreamRequestIdKey, upID)
 	}
 
-	_ = req.Body.Close()
-	_ = c.Request.Body.Close()
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	if c.Request.Body != nil {
+		_ = c.Request.Body.Close()
+	}
 	return resp, nil
 }
 
@@ -630,11 +781,14 @@ func shouldStartPreResponseStreamPing(info *common.RelayInfo) bool {
 }
 
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("upstream request context is unavailable")
+	}
 	fullRequestURL, err := a.BuildRequestURL(info)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}

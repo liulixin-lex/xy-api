@@ -124,6 +124,29 @@ func TestApplyChannelTestMaxOutputTokensKeepsProbeRequestBounded(t *testing.T) {
 	assert.Equal(t, uint(12), *responses.MaxOutputTokens)
 }
 
+func TestChannelRoutingActiveProbeAllowsOnlyLowCostRelayFormats(t *testing.T) {
+	for _, relayFormat := range []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatOpenAIResponses,
+		types.RelayFormatOpenAIResponsesCompaction,
+		types.RelayFormatClaude,
+		types.RelayFormatGemini,
+		types.RelayFormatRerank,
+		types.RelayFormatEmbedding,
+	} {
+		assert.True(t, channelRoutingProbeRelayFormatAllowed(relayFormat), relayFormat)
+	}
+	for _, relayFormat := range []types.RelayFormat{
+		types.RelayFormatOpenAIImage,
+		types.RelayFormatOpenAIAudio,
+		types.RelayFormatOpenAIRealtime,
+		types.RelayFormatTask,
+		types.RelayFormatMjProxy,
+	} {
+		assert.False(t, channelRoutingProbeRelayFormatAllowed(relayFormat), relayFormat)
+	}
+}
+
 func TestChannelRoutingActiveProbeRejectsStaleTargetBeforeDatabaseLookup(t *testing.T) {
 	channelrouting.ResetSnapshotForTest()
 	t.Cleanup(channelrouting.ResetSnapshotForTest)

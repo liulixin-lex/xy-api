@@ -206,6 +206,9 @@ func ConsumeRoutingConfigOnceContext(ctx context.Context) (int, error) {
 			if metadata, ok := loadRoutingConfigSnapshotMetadata(); ok {
 				checkpointRevision = int64(metadata.Revision)
 			}
+			_, _ = publishLocalRoutingEvent(RoutingEventTypePolicyApplied, uint64(checkpointRevision), map[string]any{
+				"event_revision": event.Revision, "local_revision": checkpointRevision,
+			})
 			if err := persistRoutingConfigCheckpointContext(ctx, message.ID, checkpointRevision); err != nil {
 				routingConfigState.markCheckpointFailure(err)
 			}

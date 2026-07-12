@@ -153,6 +153,31 @@ func TestStableMetricsContextIdentityOverridesRelayInfoAndClearsStaleIdentity(t 
 	assert.Equal(t, int64(1), StableRuntimeStats().IdentityDrops)
 }
 
+func TestStableMetricsSeparatesSnapshotRevisionsWithinBucket(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	ctx := stableTestContext(304, 3, 34, 334, 21, true, "selected")
+	info := stableTestRelayInfo(304, "gpt-revision-boundary")
+	recordTestAttempt(ctx, info, 304, nil)
+
+	common.SetContextKey(ctx, constant.ContextKeyRoutingSnapshotRevision, uint64(22))
+	recordTestAttempt(ctx, info, 304, nil)
+
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 2)
+	assert.Equal(t, []uint64{21, 22}, []uint64{
+		snapshots[0].LastSnapshotRevision,
+		snapshots[1].LastSnapshotRevision,
+	})
+	assert.Equal(t, int64(1), snapshots[0].RequestCount)
+	assert.Equal(t, int64(1), snapshots[1].RequestCount)
+	assert.Equal(t, int64(2), StableRuntimeStats().Buckets)
+
+	drained := DrainStableSnapshots()
+	require.Len(t, drained, 2)
+	RequeueStableSnapshots(drained)
+	assert.Equal(t, drained, StableSnapshots())
+}
+
 func TestStableMetricsCredentialAndModelIdentityRules(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 
@@ -252,8 +277,8 @@ func TestStableMetricsDrainAndRequeueMergeOnlyAdditiveData(t *testing.T) {
 		RetryAfterCount: 1, RetryAfterTotalMs: 1000,
 	}
 	second := StableSnapshot{
-		PoolID: 2, PoolMemberID: 61, CredentialID: 601, ChannelID: 602,
-		Model: "gpt-merge", BucketTs: 60, LastSnapshotRevision: 13,
+		PoolID: 1, PoolMemberID: 61, CredentialID: 601, ChannelID: 601,
+		Model: "gpt-merge", BucketTs: 60, LastSnapshotRevision: 12,
 		RequestCount: 3, SuccessCount: 2, FailureCount: 1,
 		ReliabilityRequestCount: 2, ReliabilityFailureCount: 1,
 		TotalLatencyMs: 700, TtftSumMs: 120, TtftCount: 2,
@@ -264,9 +289,9 @@ func TestStableMetricsDrainAndRequeueMergeOnlyAdditiveData(t *testing.T) {
 
 	merged := StableSnapshots()
 	require.Len(t, merged, 1)
-	assert.Equal(t, 2, merged[0].PoolID)
-	assert.Equal(t, 602, merged[0].ChannelID)
-	assert.Equal(t, uint64(13), merged[0].LastSnapshotRevision)
+	assert.Equal(t, 1, merged[0].PoolID)
+	assert.Equal(t, 601, merged[0].ChannelID)
+	assert.Equal(t, uint64(12), merged[0].LastSnapshotRevision)
 	assert.Equal(t, int64(5), merged[0].RequestCount)
 	assert.Equal(t, int64(3), merged[0].SuccessCount)
 	assert.Equal(t, int64(2), merged[0].FailureCount)
@@ -324,7 +349,7 @@ func TestStableMetricsRecordDrainAndRequeueMergeableDistributions(t *testing.T) 
 	require.NoError(t, err)
 	drained = append(drained, StableSnapshot{
 		PoolID: 6, PoolMemberID: 61, CredentialID: 601, ChannelID: 611,
-		Model: "gpt-distribution", BucketTs: drained[0].BucketTs, LastSnapshotRevision: 13,
+		Model: "gpt-distribution", BucketTs: drained[0].BucketTs, LastSnapshotRevision: 12,
 		RequestCount: 19, SuccessCount: 19, ReliabilityRequestCount: 19, TotalLatencyMs: 19_000,
 		SketchCodecVersion: routingdistribution.SketchCodecVersion,
 		LatencySampleCount: 19, LatencySketch: secondLatencyBytes,

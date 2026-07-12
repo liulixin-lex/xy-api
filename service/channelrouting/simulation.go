@@ -7,11 +7,12 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 )
 
 const (
 	DefaultSimulationLimit = 50
-	MaxSimulationLimit     = 100
+	MaxSimulationLimit     = 50
 
 	maxSimulationMinVolume        = 10_000_000
 	maxSimulationHalfOpenProbes   = 1_000
@@ -39,6 +40,8 @@ type HistoricalSimulationOptions struct {
 	Limit          int
 	Selector       SimulationSelectorOverrides
 	BalancedPolicy *BalancedPoolPolicy
+	BalancedPool   *model.RoutingPolicyPoolContent
+	PolicyHash     string
 }
 
 type HistoricalSimulationSample struct {
@@ -65,26 +68,41 @@ type HistoricalSimulationSkip struct {
 }
 
 type HistoricalSimulationResult struct {
-	PoolID                 int                          `json:"pool_id"`
-	Cursor                 int                          `json:"cursor"`
-	NextCursor             int                          `json:"next_cursor"`
-	Limit                  int                          `json:"limit"`
-	ScannedSamples         int                          `json:"scanned_samples"`
-	EvaluatedSamples       int                          `json:"evaluated_samples"`
-	ActualMatchCount       int                          `json:"actual_match_count"`
-	ActualMatchRate        *float64                     `json:"actual_match_rate,omitempty"`
-	SelectionChangedCount  int                          `json:"selection_changed_count"`
-	SelectionChangeRate    *float64                     `json:"selection_change_rate,omitempty"`
-	CostKnownSamples       int                          `json:"cost_known_samples"`
-	TotalExpectedCostDelta float64                      `json:"total_expected_cost_delta"`
-	AverageCostDelta       *float64                     `json:"average_expected_cost_delta,omitempty"`
-	SkipReasons            map[string]int               `json:"skip_reasons"`
-	Samples                []HistoricalSimulationSample `json:"samples"`
-	Skipped                []HistoricalSimulationSkip   `json:"skipped"`
-	SimulatedAlgorithm     string                       `json:"simulated_algorithm"`
+	PoolID                 int                             `json:"pool_id"`
+	Cursor                 int                             `json:"cursor"`
+	NextCursor             int                             `json:"next_cursor"`
+	Limit                  int                             `json:"limit"`
+	ScannedSamples         int                             `json:"scanned_samples"`
+	EvaluatedSamples       int                             `json:"evaluated_samples"`
+	ActualMatchCount       int                             `json:"actual_match_count"`
+	ActualMatchRate        *float64                        `json:"actual_match_rate,omitempty"`
+	SelectionChangedCount  int                             `json:"selection_changed_count"`
+	SelectionChangeRate    *float64                        `json:"selection_change_rate,omitempty"`
+	CostKnownSamples       int                             `json:"cost_known_samples"`
+	TotalExpectedCostDelta float64                         `json:"total_expected_cost_delta"`
+	AverageCostDelta       *float64                        `json:"average_expected_cost_delta,omitempty"`
+	SkipReasons            map[string]int                  `json:"skip_reasons"`
+	Samples                []HistoricalSimulationSample    `json:"samples"`
+	Skipped                []HistoricalSimulationSkip      `json:"skipped"`
+	SimulatedAlgorithm     string                          `json:"simulated_algorithm"`
+	Risk                   *PolicySimulationRiskAssessment `json:"risk,omitempty"`
+
+	riskSLOKnownSamples         int
+	riskSuccessRateDeltaTotal   float64
+	riskLatencyDeltaTotal       float64
+	riskLatencyMetric           string
+	riskLatencyMetricMixed      bool
+	riskCapacityKnownSamples    int
+	riskCapacityExceededSamples int
+	riskMaxCapacityUtilization  float64
+	riskCapacityLimit           float64
+	riskCapacityLimitKnown      bool
 }
 
 func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOptions) (HistoricalSimulationResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	result := HistoricalSimulationResult{
 		PoolID:             options.PoolID,
 		Cursor:             options.Cursor,
@@ -94,8 +112,15 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 		Skipped:            []HistoricalSimulationSkip{},
 		SimulatedAlgorithm: DecisionAlgorithmShadowV1,
 	}
-	if err := validateHistoricalSimulationOptions(options); err != nil {
+	if err := ValidateHistoricalSimulationOptions(options); err != nil {
 		return result, err
+	}
+	if options.BalancedPool != nil {
+		policy, err := resolveBalancedPoolPolicy(options.BalancedPool.PolicyProfile, options.BalancedPool.Policy)
+		if err != nil {
+			return result, ErrSimulationInvalidOptions
+		}
+		options.BalancedPolicy = &policy
 	}
 	if options.BalancedPolicy != nil {
 		normalized, err := normalizeBalancedPoolPolicy(*options.BalancedPolicy)
@@ -104,6 +129,8 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 		}
 		options.BalancedPolicy = &normalized
 		result.SimulatedAlgorithm = DecisionAlgorithmBalancedV1
+		result.riskCapacityLimit = normalized.MaxCapacityUtilization
+		result.riskCapacityLimitKnown = true
 	}
 
 	query := model.DB.WithContext(ctx).
@@ -162,6 +189,7 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 		if sample.SelectionChanged {
 			result.SelectionChangedCount++
 		}
+		result.addRiskEvidence(baseline, simulated)
 		result.Samples = append(result.Samples, sample)
 		result.EvaluatedSamples++
 	}
@@ -179,9 +207,21 @@ func RunHistoricalSimulation(ctx context.Context, options HistoricalSimulationOp
 	return result, nil
 }
 
-func validateHistoricalSimulationOptions(options HistoricalSimulationOptions) error {
+func ValidateHistoricalSimulationOptions(options HistoricalSimulationOptions) error {
 	if options.PoolID <= 0 || options.Cursor < 0 || options.Limit < 1 || options.Limit > MaxSimulationLimit {
 		return ErrSimulationInvalidOptions
+	}
+	if options.PolicyHash != "" && !validShadowHash(options.PolicyHash) {
+		return ErrSimulationInvalidOptions
+	}
+	if options.BalancedPool != nil {
+		if options.BalancedPool.PoolID != options.PoolID || options.BalancedPool.PolicyProfile == "" ||
+			simulationSelectorOverridesPresent(options.Selector) {
+			return ErrSimulationInvalidOptions
+		}
+		if _, err := resolveBalancedPoolPolicy(options.BalancedPool.PolicyProfile, options.BalancedPool.Policy); err != nil {
+			return ErrSimulationInvalidOptions
+		}
 	}
 	if options.BalancedPolicy != nil {
 		if _, err := normalizeBalancedPoolPolicy(*options.BalancedPolicy); err != nil || simulationSelectorOverridesPresent(options.Selector) {
@@ -226,10 +266,71 @@ func validateHistoricalSimulationOptions(options HistoricalSimulationOptions) er
 	return nil
 }
 
+func RunPolicyDocumentSimulation(
+	ctx context.Context,
+	document model.RoutingPolicyDocument,
+	poolID int,
+	cursor int,
+	limit int,
+) (HistoricalSimulationResult, error) {
+	return RunPolicyDocumentSimulationAgainstBase(
+		ctx,
+		model.RoutingPolicyDocument{SchemaVersion: model.RoutingPolicySchemaVersion, Pools: []model.RoutingPolicyPoolContent{}},
+		document,
+		poolID,
+		cursor,
+		limit,
+	)
+}
+
+func RunPolicyDocumentSimulationAgainstBase(
+	ctx context.Context,
+	baseDocument model.RoutingPolicyDocument,
+	draftDocument model.RoutingPolicyDocument,
+	poolID int,
+	cursor int,
+	limit int,
+) (HistoricalSimulationResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	normalizedBase, _, err := model.NormalizeRoutingPolicyDocument(baseDocument)
+	if err != nil {
+		return HistoricalSimulationResult{}, ErrSimulationInvalidOptions
+	}
+	normalizedDraft, documentHash, err := model.NormalizeRoutingPolicyDocument(draftDocument)
+	if err != nil {
+		return HistoricalSimulationResult{}, ErrSimulationInvalidOptions
+	}
+	for index := range normalizedDraft.Pools {
+		if normalizedDraft.Pools[index].PoolID != poolID {
+			continue
+		}
+		pool := normalizedDraft.Pools[index]
+		result, simulationErr := RunHistoricalSimulation(ctx, HistoricalSimulationOptions{
+			PoolID: poolID, Cursor: cursor, Limit: limit, BalancedPool: &pool, PolicyHash: documentHash,
+		})
+		if simulationErr != nil {
+			return result, simulationErr
+		}
+		assessment := assessPolicySimulationRisk(ctx, normalizedBase, normalizedDraft, poolID, result)
+		result.Risk = &assessment
+		return result, nil
+	}
+	return HistoricalSimulationResult{}, ErrSimulationInvalidOptions
+}
+
 type historicalSimulationDecision struct {
-	channelID int
-	cost      float64
-	costKnown bool
+	channelID           int
+	cost                float64
+	costKnown           bool
+	successRate         float64
+	successRateKnown    bool
+	latencyMs           float64
+	latencyKnown        bool
+	latencyMetric       string
+	capacityUtilization float64
+	capacityKnown       bool
 }
 
 func simulateHistoricalDecision(
@@ -238,7 +339,9 @@ func simulateHistoricalDecision(
 	options HistoricalSimulationOptions,
 ) (historicalSimulationDecision, historicalSimulationDecision, string, error) {
 	if options.BalancedPolicy != nil {
-		return simulateBalancedHistoricalDecision(ctx, audit, *options.BalancedPolicy)
+		return simulateBalancedHistoricalDecision(
+			ctx, audit, *options.BalancedPolicy, options.BalancedPool, options.PolicyHash,
+		)
 	}
 	if audit.AlgorithmVersion != DecisionAlgorithmShadowV1 {
 		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayAlgorithm
@@ -269,17 +372,22 @@ func simulateHistoricalDecision(
 	if err != nil {
 		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
 	}
-	return historicalSimulationDecision{
-			channelID: baseline.SelectedChannelID, cost: baseline.SelectedCost, costKnown: baseline.SelectedCostKnown,
-		}, historicalSimulationDecision{
-			channelID: simulated.SelectedChannelID, cost: simulated.SelectedCost, costKnown: simulated.SelectedCostKnown,
-		}, counterfactualHash, nil
+	baselineDecision := historicalSimulationDecision{
+		channelID: baseline.SelectedChannelID, cost: baseline.SelectedCost, costKnown: baseline.SelectedCostKnown,
+	}
+	simulatedDecision := historicalSimulationDecision{
+		channelID: simulated.SelectedChannelID, cost: simulated.SelectedCost, costKnown: simulated.SelectedCostKnown,
+	}
+	return attachShadowSimulationEvidence(baselineDecision, input),
+		attachShadowSimulationEvidence(simulatedDecision, input), counterfactualHash, nil
 }
 
 func simulateBalancedHistoricalDecision(
 	ctx context.Context,
 	audit model.RoutingDecisionAudit,
 	policy BalancedPoolPolicy,
+	pool *model.RoutingPolicyPoolContent,
+	policyHash string,
 ) (historicalSimulationDecision, historicalSimulationDecision, string, error) {
 	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
 	if err != nil {
@@ -320,6 +428,16 @@ func simulateBalancedHistoricalDecision(
 	default:
 		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayAlgorithm
 	}
+	baseline = attachBalancedSimulationEvidence(baseline, input)
+	if pool != nil {
+		input, err = applyBalancedSimulationPool(input, *pool)
+		if err != nil {
+			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
+		}
+	}
+	if policyHash != "" {
+		input.PolicyHash = policyHash
+	}
 	input.Settings.Policy = policy
 	input.SnapshotHash = ""
 	counterfactualHash, err := input.computeHash()
@@ -331,11 +449,79 @@ func simulateBalancedHistoricalDecision(
 	if err != nil {
 		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", err
 	}
-	return baseline, historicalSimulationDecision{
+	simulatedDecision := historicalSimulationDecision{
 		channelID: simulated.SelectedChannelID,
 		cost:      simulated.SelectedCost,
 		costKnown: simulated.SelectedCostKnown,
-	}, counterfactualHash, nil
+	}
+	return baseline, attachBalancedSimulationEvidence(simulatedDecision, input), counterfactualHash, nil
+}
+
+func applyBalancedSimulationPool(
+	input BalancedReplayInput,
+	pool model.RoutingPolicyPoolContent,
+) (BalancedReplayInput, error) {
+	if pool.PoolID != input.PoolID {
+		return BalancedReplayInput{}, ErrSimulationInvalidOptions
+	}
+	historicalByMember := make(map[int]BalancedReplayCandidate, len(input.Candidates))
+	for index := range input.Candidates {
+		candidate := input.Candidates[index]
+		historicalByMember[candidate.PoolMemberID] = candidate
+	}
+	memberByChannel := make(map[int]int, len(pool.Members))
+	candidates := make([]BalancedReplayCandidate, 0, len(pool.Members))
+	for index := range pool.Members {
+		member := pool.Members[index]
+		if !member.Enabled {
+			continue
+		}
+		candidate, exists := historicalByMember[member.MemberID]
+		if exists && candidate.ChannelID != member.ChannelID {
+			return BalancedReplayInput{}, ErrSimulationInvalidOptions
+		}
+		if !exists {
+			candidate = BalancedReplayCandidate{
+				PoolMemberID: member.MemberID, ChannelID: member.ChannelID,
+				Confidence: 0.50, Freshness: 0.50, SlowStartFactor: 1, ExplorationEligible: true,
+			}
+		}
+		candidate.BusinessTier = member.Priority
+		candidate.TargetWeight = float64(member.Weight)
+		candidate.CredentialID = 0
+		if len(member.CredentialIDs) == 1 {
+			candidate.CredentialID = member.CredentialIDs[0]
+		}
+		if len(member.CredentialIDs) > 1 {
+			candidate.HardExclusionReason = routingselector.BalancedExclusionCredentialUnavailable
+		}
+		candidates = append(candidates, candidate)
+		memberByChannel[member.ChannelID] = member.MemberID
+	}
+	runtimeStates := make([]BalancedReplayRuntimeState, 0, len(input.RuntimeStates))
+	for index := range input.RuntimeStates {
+		state := input.RuntimeStates[index]
+		if _, exists := memberByChannel[state.ChannelID]; exists {
+			runtimeStates = append(runtimeStates, state)
+		}
+	}
+	excludedChannelIDs := make([]int, 0, len(input.ExcludedChannelIDs))
+	for _, channelID := range input.ExcludedChannelIDs {
+		if _, exists := memberByChannel[channelID]; exists {
+			excludedChannelIDs = append(excludedChannelIDs, channelID)
+		}
+	}
+	return buildBalancedReplayInput(
+		input.PoolID,
+		input.PolicyRevision,
+		input.RuntimeGeneration,
+		input.PolicyHash,
+		input.Profile,
+		input.Settings,
+		candidates,
+		runtimeStates,
+		excludedChannelIDs,
+	)
 }
 
 func balancedReplayInputFromShadow(input ShadowReplayInput, policy BalancedPoolPolicy) (BalancedReplayInput, error) {

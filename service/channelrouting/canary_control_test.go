@@ -337,6 +337,7 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	db := openCanaryWindowTestDB(t, false)
 	withCanaryWindowTestDB(t, db)
 	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
 		&model.RoutingPolicyHead{},
 		&model.RoutingPolicyRevision{},
 		&model.RoutingPolicyPoolRevision{},
@@ -347,6 +348,9 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 		&model.RoutingCanaryEvaluation{},
 		&model.RoutingOperation{},
 	))
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 201, Name: "canary-rollback", Models: "gpt-test",
+	}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	document := model.RoutingPolicyDocument{
 		SchemaVersion: model.RoutingPolicySchemaVersion,
@@ -388,9 +392,8 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ensureCanaryRollbackOperationContext(context.Background(), target, evaluation))
 
-	blockedAtMs := time.Now().UnixMilli()
 	evaluatorLease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
-		context.Background(), routingCanaryEvaluatorLeaseName, "other-node", blockedAtMs,
+		context.Background(), routingCanaryEvaluatorLeaseName, "other-node",
 		int64(time.Minute/time.Millisecond), 0, true,
 	)
 	require.NoError(t, err)
@@ -401,7 +404,7 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	var operation model.RoutingOperation
 	require.NoError(t, db.First(&operation).Error)
 	assert.Equal(t, model.RoutingOperationStatusPending, operation.Status)
-	require.NoError(t, model.ReleaseRoutingControlLeaseContext(context.Background(), evaluatorLease, time.Now().UnixMilli()))
+	require.NoError(t, model.ReleaseRoutingControlLeaseContext(context.Background(), evaluatorLease))
 
 	require.NoError(t, executeRoutingCanaryOperationContext(
 		context.Background(), smart_routing_setting.SmartRoutingSetting{Enabled: true},

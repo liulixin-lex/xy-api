@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
@@ -389,6 +390,181 @@ func RollbackRoutingPolicyRevisionContext(
 	return RollbackRoutingPolicyRevisionDBContext(ctx, DB, expectedRevision, sourceRevision, activation)
 }
 
+func RollbackRoutingPolicyRevisionWithOperationContext(
+	ctx context.Context,
+	expectedRevision int64,
+	sourceRevision int64,
+	activation RoutingPolicyActivationSpec,
+) (RoutingPolicyPublishResult, RoutingOperation, error) {
+	return rollbackRoutingPolicyRevisionWithOperationContext(
+		ctx, expectedRevision, sourceRevision, activation, RoutingOperationRequestIdentity{},
+	)
+}
+
+func RollbackRoutingPolicyRevisionWithOperationRequestContext(
+	ctx context.Context,
+	expectedRevision int64,
+	sourceRevision int64,
+	activation RoutingPolicyActivationSpec,
+	requestIdentity RoutingOperationRequestIdentity,
+) (RoutingPolicyPublishResult, RoutingOperation, error) {
+	if !validRoutingOperationRequestIdentity(requestIdentity) {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, ErrRoutingOperationInvalid
+	}
+	return rollbackRoutingPolicyRevisionWithOperationContext(
+		ctx, expectedRevision, sourceRevision, activation, requestIdentity,
+	)
+}
+
+func rollbackRoutingPolicyRevisionWithOperationContext(
+	ctx context.Context,
+	expectedRevision int64,
+	sourceRevision int64,
+	activation RoutingPolicyActivationSpec,
+	requestIdentity RoutingOperationRequestIdentity,
+) (RoutingPolicyPublishResult, RoutingOperation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sourceRevision <= 0 || sourceRevision >= expectedRevision || activation.Validate() != nil {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, ErrRoutingPolicyInvalid
+	}
+	document, source, err := LoadRoutingPolicyRevisionContext(ctx, sourceRevision)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
+	}
+	evaluationHash, err := routingPolicyRollbackOperationHash(expectedRevision, source, activation)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
+	}
+	changedPoolIDs := make([]int, len(document.Pools))
+	for index := range document.Pools {
+		changedPoolIDs[index] = document.Pools[index].PoolID
+	}
+	var published RoutingPolicyPublishResult
+	var operation RoutingOperation
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		head, headErr := ensureRoutingPolicyHeadTx(tx.WithContext(ctx))
+		if headErr != nil {
+			return headErr
+		}
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", routingPolicyHeadID).First(&head).Error; err != nil {
+			return err
+		}
+		if requestIdentity != (RoutingOperationRequestIdentity{}) {
+			existing, found, replayErr := getRoutingOperationByRequestIdentityDB(ctx, tx, requestIdentity)
+			if replayErr != nil {
+				return replayErr
+			}
+			if found {
+				if existing.OperationType != RoutingOperationTypePolicyRollback ||
+					existing.SubjectType != RoutingOperationSubjectPolicyRevision || existing.SubjectID != sourceRevision ||
+					existing.ActorID != activation.ActorID || existing.Status != RoutingOperationStatusSucceeded {
+					return ErrRoutingOperationIdempotencyConflict
+				}
+				published, replayErr = routingPolicyPublishResultForOperationTx(ctx, tx, existing)
+				if replayErr != nil {
+					return replayErr
+				}
+				operation = existing
+				return nil
+			}
+		}
+		if head.CurrentRevision != expectedRevision {
+			return newRoutingPolicyRevisionConflict(expectedRevision, head)
+		}
+		if routingPolicyPublishRequiresApproval(document, activation) {
+			if _, err := requireRoutingPolicyRollbackApprovalQuorumDBContext(
+				ctx, tx, head, source, activation, RoutingPolicyRequiredApprovals,
+			); err != nil {
+				return err
+			}
+		}
+		published, err = publishNormalizedRoutingPolicyRevisionTx(
+			ctx, tx, expectedRevision, sourceRevision, document, source.ContentHash,
+			activation, changedPoolIDs, common.GetTimestamp(),
+		)
+		if err != nil {
+			return err
+		}
+		operation, _, err = createSucceededRoutingOperationTx(
+			ctx,
+			tx,
+			RoutingOperationSpec{
+				Type: RoutingOperationTypePolicyRollback, EvaluationHash: evaluationHash,
+				SubjectType: RoutingOperationSubjectPolicyRevision, SubjectID: sourceRevision,
+				ExpectedRevision: expectedRevision, ExpectedActivationID: head.CurrentActivationID,
+				ActorID: activation.ActorID, Reason: activation.Reason,
+				RequestKeyHash: requestIdentity.KeyHash, RequestPayloadHash: requestIdentity.PayloadHash,
+			},
+			RoutingOperationResult{
+				Revision:     published.Revision.Revision,
+				ActivationID: published.Activation.ID,
+				OutboxID:     published.Outbox.ID,
+			},
+			struct {
+				SourceRevision int64 `json:"source_revision"`
+			}{SourceRevision: sourceRevision},
+			time.Now().UnixMilli(),
+		)
+		return err
+	})
+	if err != nil {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
+	}
+	return published, operation, nil
+}
+
+func routingPolicyPublishResultForOperationTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	operation RoutingOperation,
+) (RoutingPolicyPublishResult, error) {
+	if tx == nil || operation.Status != RoutingOperationStatusSucceeded ||
+		operation.ResultRevision <= 0 || operation.ResultActivationID <= 0 || operation.ResultOutboxID <= 0 {
+		return RoutingPolicyPublishResult{}, ErrRoutingOperationCorrupt
+	}
+	var result RoutingPolicyPublishResult
+	if err := tx.WithContext(ctx).Where("revision = ?", operation.ResultRevision).First(&result.Revision).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if err := tx.WithContext(ctx).Where("id = ?", operation.ResultActivationID).First(&result.Activation).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if err := tx.WithContext(ctx).Where("id = ?", operation.ResultOutboxID).First(&result.Outbox).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if result.Activation.Revision != result.Revision.Revision || result.Outbox.Revision != result.Revision.Revision {
+		return RoutingPolicyPublishResult{}, ErrRoutingOperationCorrupt
+	}
+	return result, nil
+}
+
+func routingPolicyRollbackOperationHash(
+	expectedRevision int64,
+	source RoutingPolicyRevision,
+	activation RoutingPolicyActivationSpec,
+) (string, error) {
+	payload, err := common.Marshal(struct {
+		SchemaVersion      int    `json:"schema_version"`
+		ExpectedRevision   int64  `json:"expected_revision"`
+		SourceRevision     int64  `json:"source_revision"`
+		SourceContentHash  string `json:"source_content_hash"`
+		Stage              string `json:"stage"`
+		TrafficBasisPoints int    `json:"traffic_basis_points"`
+		ActorID            int    `json:"actor_id"`
+		Reason             string `json:"reason"`
+	}{
+		SchemaVersion: 1, ExpectedRevision: expectedRevision, SourceRevision: source.Revision,
+		SourceContentHash: source.ContentHash, Stage: activation.Stage,
+		TrafficBasisPoints: activation.TrafficBasisPoints, ActorID: activation.ActorID, Reason: activation.Reason,
+	})
+	if err != nil {
+		return "", err
+	}
+	return routingPolicyHash(payload), nil
+}
+
 func RollbackRoutingPolicyRevisionDBContext(
 	ctx context.Context,
 	db *gorm.DB,
@@ -396,22 +572,49 @@ func RollbackRoutingPolicyRevisionDBContext(
 	sourceRevision int64,
 	activation RoutingPolicyActivationSpec,
 ) (RoutingPolicyPublishResult, error) {
-	if sourceRevision <= 0 || sourceRevision >= expectedRevision {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if db == nil {
+		return RoutingPolicyPublishResult{}, errRoutingPolicyDatabaseNil
+	}
+	if sourceRevision <= 0 || sourceRevision >= expectedRevision || activation.Validate() != nil {
 		return RoutingPolicyPublishResult{}, ErrRoutingPolicyInvalid
 	}
-	document, revision, err := LoadRoutingPolicyRevisionDBContext(ctx, db, sourceRevision)
-	if err != nil {
-		return RoutingPolicyPublishResult{}, err
-	}
-	return publishNormalizedRoutingPolicyRevisionContext(
-		ctx,
-		db,
-		expectedRevision,
-		sourceRevision,
-		document,
-		revision.ContentHash,
-		activation,
-	)
+	var result RoutingPolicyPublishResult
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		head, err := ensureRoutingPolicyHeadTx(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", routingPolicyHeadID).First(&head).Error; err != nil {
+			return err
+		}
+		if head.CurrentRevision != expectedRevision {
+			return newRoutingPolicyRevisionConflict(expectedRevision, head)
+		}
+		document, target, err := LoadRoutingPolicyRevisionDBContext(ctx, tx, sourceRevision)
+		if err != nil {
+			return err
+		}
+		if routingPolicyPublishRequiresApproval(document, activation) {
+			if _, err := requireRoutingPolicyRollbackApprovalQuorumDBContext(
+				ctx, tx, head, target, activation, RoutingPolicyRequiredApprovals,
+			); err != nil {
+				return err
+			}
+		}
+		changedPoolIDs := make([]int, len(document.Pools))
+		for index := range document.Pools {
+			changedPoolIDs[index] = document.Pools[index].PoolID
+		}
+		result, err = publishNormalizedRoutingPolicyRevisionTx(
+			ctx, tx, expectedRevision, sourceRevision, document, target.ContentHash,
+			activation, changedPoolIDs, common.GetTimestamp(),
+		)
+		return err
+	})
+	return result, err
 }
 
 func LoadRoutingPolicyRevisionContext(ctx context.Context, revisionNumber int64) (RoutingPolicyDocument, RoutingPolicyRevision, error) {
@@ -887,6 +1090,9 @@ func publishNormalizedRoutingPolicyRevisionTx(
 	if err != nil {
 		return RoutingPolicyPublishResult{}, err
 	}
+	if err := lockForUpdate(tx).Where("id = ?", routingPolicyHeadID).First(&head).Error; err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
 	if head.CurrentRevision != expectedRevision {
 		return RoutingPolicyPublishResult{}, newRoutingPolicyRevisionConflict(expectedRevision, head)
 	}
@@ -894,6 +1100,9 @@ func publishNormalizedRoutingPolicyRevisionTx(
 		return RoutingPolicyPublishResult{}, err
 	}
 	if err := validateRoutingPolicyMemberIdentitiesTx(tx, document); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	if err := validateRoutingPolicyLiveReferencesTx(tx, document); err != nil {
 		return RoutingPolicyPublishResult{}, err
 	}
 

@@ -21,6 +21,7 @@ func TestRoutingConfigRealRedisBroadcastsToIndependentNodeCursors(t *testing.T) 
 	client := routingRedisIntegrationClient(t)
 	db := routingRedisIntegrationDB(t)
 	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
 		&model.RoutingPolicyHead{},
 		&model.RoutingPolicyRevision{},
 		&model.RoutingPolicyPoolRevision{},
@@ -29,6 +30,7 @@ func TestRoutingConfigRealRedisBroadcastsToIndependentNodeCursors(t *testing.T) 
 		&model.RoutingConfigOutbox{},
 		&model.RoutingRuntimeCheckpoint{},
 	))
+	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	published, err := model.PublishRoutingPolicyRevisionContext(
 		context.Background(),
@@ -88,6 +90,78 @@ func TestRoutingConfigRealRedisBroadcastsToIndependentNodeCursors(t *testing.T) 
 		assert.Equal(t, second.Revision.Revision, RoutingConfigStreamRuntimeStats().LastAppliedRevision)
 	}
 	assert.Equal(t, 4, refreshCalls)
+}
+
+func TestRoutingEventsRealRedisPropagateAcrossThreeIndependentNodes(t *testing.T) {
+	client := routingRedisIntegrationClient(t)
+	nodeEpochs := []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"cccccccccccccccccccccccccccccccc",
+	}
+	hubs := []*routingEventHub{
+		newRoutingEventHub(16),
+		newRoutingEventHub(16),
+		newRoutingEventHub(16),
+	}
+	states := []*routingEventTransportState{
+		newRoutingEventTransportState(),
+		newRoutingEventTransportState(),
+		newRoutingEventTransportState(),
+	}
+	for index := range states {
+		require.NoError(t, initializeRoutingEventTransportContext(context.Background(), states[index], client))
+		assert.Equal(t, "0-0", states[index].snapshot().Cursor)
+	}
+
+	first, err := hubs[0].publish(
+		RoutingEventTypePolicyPublished, 11, []byte(`{"revision":11}`), time.Now(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, broadcastRoutingEventContext(
+		context.Background(), states[0], client, nodeEpochs[0], first,
+	))
+	for index := range states {
+		processed, consumeErr := consumeRoutingEventsOnceContext(
+			context.Background(), hubs[index], states[index], client, nodeEpochs[index],
+		)
+		require.NoError(t, consumeErr)
+		assert.Equal(t, 1, processed)
+	}
+	assert.Equal(t, 1, hubs[0].stats().Buffered)
+	assert.Equal(t, 1, hubs[1].stats().Buffered)
+	assert.Equal(t, 1, hubs[2].stats().Buffered)
+	assert.Equal(t, uint64(1), states[0].snapshot().IgnoredOwn)
+	assert.Equal(t, uint64(1), states[1].snapshot().Consumed)
+	assert.Equal(t, uint64(1), states[2].snapshot().Consumed)
+
+	second, err := hubs[1].publish(
+		RoutingEventTypeCostSyncCompleted, 11, []byte(`{"status":"succeeded"}`), time.Now(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, broadcastRoutingEventContext(
+		context.Background(), states[1], client, nodeEpochs[1], second,
+	))
+	for index := range states {
+		processed, consumeErr := consumeRoutingEventsOnceContext(
+			context.Background(), hubs[index], states[index], client, nodeEpochs[index],
+		)
+		require.NoError(t, consumeErr)
+		assert.Equal(t, 1, processed)
+		assert.NotEqual(t, "0-0", states[index].snapshot().Cursor)
+	}
+	assert.Equal(t, 2, hubs[0].stats().Buffered)
+	assert.Equal(t, 2, hubs[1].stats().Buffered)
+	assert.Equal(t, 2, hubs[2].stats().Buffered)
+	assert.Equal(t, uint64(1), states[1].snapshot().IgnoredOwn)
+	assert.Equal(t, uint64(2), states[2].snapshot().Consumed)
+
+	replay, _, cancel, err := hubs[2].subscribe(0, 4, true)
+	require.NoError(t, err)
+	defer cancel()
+	require.Len(t, replay.Events, 2)
+	assert.Equal(t, RoutingEventTypePolicyPublished, replay.Events[0].Type)
+	assert.Equal(t, RoutingEventTypeCostSyncCompleted, replay.Events[1].Type)
 }
 
 func TestRoutingTelemetryRealRedisCommitBeforeAckRedeliveryIsIdempotent(t *testing.T) {

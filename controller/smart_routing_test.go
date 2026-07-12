@@ -18,6 +18,7 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -763,12 +764,19 @@ func TestDeleteSmartRoutingBindingCanceledRequestDoesNotMutateState(t *testing.T
 
 func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingBreakerState{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingBreakerState{}, &model.RoutingOperation{}, &model.RoutingBreakerResetCommand{},
+		&model.RoutingBreakerResetTombstone{}, &model.RoutingBreakerResetOutbox{},
+		&model.RoutingEndpointEvidence{}, &model.RoutingEndpointSharedState{},
+		&model.RoutingPolicyHead{}, &model.RoutingPolicyPoolRevision{}, &model.RoutingPolicyMemberRevision{},
+	))
 	routinghotcache.ResetForTest()
 	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	channelrouting.ResetSnapshotForTest()
 	t.Cleanup(func() {
 		routinghotcache.ResetForTest()
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+		channelrouting.ResetSnapshotForTest()
 	})
 
 	state := model.RoutingBreakerState{
@@ -783,6 +791,16 @@ func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 		EjectionCount:       1,
 	}
 	require.NoError(t, db.Create(&state).Error)
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 1, ActivationID: 1,
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 11, GroupName: state.Group, Members: []channelrouting.PoolMemberSnapshot{{
+				ID: 22, PoolID: 11, ChannelID: state.ChannelID,
+				Models: []channelrouting.ModelSnapshot{{ModelName: state.ModelName}},
+			}},
+		}},
+	})
+	seedChannelRoutingBreakerPolicy(t, db, 11, 22, state.ChannelID, state.Group, 1, 1)
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key: routingbreaker.Key{
 			ChannelID:   state.ChannelID,
@@ -807,20 +825,57 @@ func TestResetSmartRoutingBreakerClearsStoredAndHotcacheState(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/breakers/1/reset", nil)
 	router.ServeHTTP(recorder, request)
 
-	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, http.StatusAccepted, recorder.Code)
+	firstIdempotencyKey := recorder.Header().Get("Idempotency-Key")
+	assert.Contains(t, firstIdempotencyKey, "legacy-breaker-reset-1-0-")
+	replayRecorder := httptest.NewRecorder()
+	replayRequest := httptest.NewRequest(http.MethodPost, "/breakers/1/reset", nil)
+	router.ServeHTTP(replayRecorder, replayRequest)
+	require.Equal(t, http.StatusOK, replayRecorder.Code)
+	assert.Equal(t, firstIdempotencyKey, replayRecorder.Header().Get("Idempotency-Key"))
+	var operationCount int64
+	require.NoError(t, db.Model(&model.RoutingOperation{}).Count(&operationCount).Error)
+	assert.Equal(t, int64(1), operationCount)
+	require.NoError(t, channelrouting.RunBreakerResetControlCycleContext(context.Background()))
 	var count int64
 	breakerQuery := db.Model(&model.RoutingBreakerState{}).Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND `group` = ?", state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group)
 	require.NoError(t, breakerQuery.Count(&count).Error)
 	assert.Zero(t, count)
-	_, ok := routinghotcache.GetBreaker(routinghotcache.Key{
+	resetSnapshot, ok := routinghotcache.GetBreaker(routinghotcache.Key{
 		ChannelID:   state.ChannelID,
 		APIKeyIndex: state.APIKeyIndex,
 		Model:       state.ModelName,
 		Group:       state.Group,
 	})
-	assert.False(t, ok)
-	_, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.GetSetting())
-	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, model.RoutingBreakerStateHealthy, resetSnapshot.State)
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	require.NoError(t, breakerQuery.Count(&count).Error)
+	assert.Zero(t, count)
+
+	completedReplay := httptest.NewRecorder()
+	router.ServeHTTP(completedReplay, httptest.NewRequest(http.MethodPost, "/breakers/1/reset", nil))
+	require.Equal(t, http.StatusOK, completedReplay.Code)
+	assert.Equal(t, firstIdempotencyKey, completedReplay.Header().Get("Idempotency-Key"))
+	assert.Contains(t, completedReplay.Body.String(), `"status":"succeeded"`)
+
+	reusedState := model.RoutingBreakerState{
+		ChannelID: state.ChannelID, APIKeyIndex: state.APIKeyIndex,
+		ModelName: state.ModelName, Group: state.Group, ResetGeneration: 1,
+		State: model.RoutingBreakerStateOpen, Reason: "5xx",
+		SemanticVersion: model.RoutingBreakerSemanticVersion, ConsecutiveFailures: 1,
+	}
+	require.NoError(t, db.Create(&reusedState).Error)
+	require.Equal(t, state.ID, reusedState.ID, "SQLite may reuse the deleted highest row ID")
+	reusedRecorder := httptest.NewRecorder()
+	router.ServeHTTP(reusedRecorder, httptest.NewRequest(http.MethodPost, "/breakers/1/reset", nil))
+	require.Equal(t, http.StatusAccepted, reusedRecorder.Code, reusedRecorder.Body.String())
+	reusedIdempotencyKey := reusedRecorder.Header().Get("Idempotency-Key")
+	assert.Contains(t, reusedIdempotencyKey, "legacy-breaker-reset-1-1-")
+	assert.NotEqual(t, firstIdempotencyKey, reusedIdempotencyKey)
+	require.NoError(t, db.Model(&model.RoutingOperation{}).Count(&operationCount).Error)
+	assert.Equal(t, int64(2), operationCount)
+	require.NoError(t, channelrouting.RunBreakerResetControlCycleContext(context.Background()))
 	require.NoError(t, breakerQuery.Count(&count).Error)
 	assert.Zero(t, count)
 }

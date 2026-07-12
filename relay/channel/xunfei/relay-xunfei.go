@@ -134,7 +134,7 @@ func buildXunfeiAuthUrl(hostUrl string, apiKey, apiSecret string) string {
 
 func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, endChan, closeUpstream, err := xunfeiMakeRequest(info, textRequest, domain, authUrl, appId)
+	dataChan, endChan, closeUpstream, err := xunfeiMakeRequest(c.Request.Context(), info, textRequest, domain, authUrl, appId)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
@@ -150,6 +150,9 @@ func relayXunfeiStream(c *gin.Context, info *relaycommon.RelayInfo, dataChan cha
 	var responseText strings.Builder
 	for {
 		select {
+		case <-c.Request.Context().Done():
+			cause := context.Cause(c.Request.Context())
+			return xunfeiStreamUsage(c, info, usage, responseText.String()), xunfeiStreamError(info, relaycommon.StreamEndReasonHandlerStop, cause)
 		case xunfeiResponse := <-dataChan:
 			firstByteGuard.MarkReceived()
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
@@ -167,6 +170,10 @@ func relayXunfeiStream(c *gin.Context, info *relaycommon.RelayInfo, dataChan cha
 				return xunfeiStreamUsage(c, info, usage, responseText.String()), xunfeiStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 			}
 		case end := <-endChan:
+			if c.Request.Context().Err() != nil {
+				cause := context.Cause(c.Request.Context())
+				return xunfeiStreamUsage(c, info, usage, responseText.String()), xunfeiStreamError(info, relaycommon.StreamEndReasonHandlerStop, cause)
+			}
 			if end.Received {
 				firstByteGuard.MarkReceived()
 			}
@@ -208,16 +215,19 @@ func xunfeiStreamError(info *relaycommon.RelayInfo, reason relaycommon.StreamEnd
 
 func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	dataChan, endChan, _, err := xunfeiMakeRequest(nil, textRequest, domain, authUrl, appId)
+	dataChan, endChan, closeUpstream, err := xunfeiMakeRequest(c.Request.Context(), nil, textRequest, domain, authUrl, appId)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
+	defer closeUpstream.Close()
 	var usage dto.Usage
 	var content string
 	var xunfeiResponse XunfeiChatResponse
 	stop := false
 	for !stop {
 		select {
+		case <-c.Request.Context().Done():
+			return &usage, types.NewError(context.Cause(c.Request.Context()), types.ErrorCodeDoRequestFailed)
 		case xunfeiResponse = <-dataChan:
 			if len(xunfeiResponse.Payload.Choices.Text) == 0 {
 				continue
@@ -226,7 +236,13 @@ func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId s
 			usage.PromptTokens += xunfeiResponse.Payload.Usage.Text.PromptTokens
 			usage.CompletionTokens += xunfeiResponse.Payload.Usage.Text.CompletionTokens
 			usage.TotalTokens += xunfeiResponse.Payload.Usage.Text.TotalTokens
-		case <-endChan:
+		case end := <-endChan:
+			if c.Request.Context().Err() != nil {
+				return &usage, types.NewError(context.Cause(c.Request.Context()), types.ErrorCodeDoRequestFailed)
+			}
+			if end.Err != nil {
+				return &usage, types.NewError(end.Err, types.ErrorCodeBadResponseBody)
+			}
 			stop = true
 		}
 	}
@@ -249,11 +265,14 @@ func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId s
 	return &usage, nil
 }
 
-func xunfeiMakeRequest(info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (chan XunfeiChatResponse, chan xunfeiStreamEnd, xunfeiCloseFunc, error) {
+func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authUrl, appId string) (chan XunfeiChatResponse, chan xunfeiStreamEnd, xunfeiCloseFunc, error) {
 	d := websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
 	}
-	dialCtx := context.Background()
+	if ctx == nil {
+		return nil, nil, nil, errors.New("xunfei request context is unavailable")
+	}
+	dialCtx := ctx
 	cancelDial := func() {}
 	if firstByteTimeout := helper.FirstByteFailoverTimeout(info); firstByteTimeout > 0 {
 		var cancel context.CancelFunc
@@ -299,6 +318,13 @@ func xunfeiMakeRequest(info *relaycommon.RelayInfo, textRequest dto.GeneralOpenA
 		})
 		return closeErr
 	})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = closeUpstream.Close()
+		case <-streamDone:
+		}
+	}()
 	go func() {
 		defer conn.Close()
 		end := xunfeiStreamEnd{}

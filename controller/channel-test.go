@@ -52,6 +52,7 @@ type channelTestOptions struct {
 	logDetails        bool
 	maxOutputTokens   uint
 	groupName         string
+	probeLowCostOnly  bool
 }
 
 func init() {
@@ -264,6 +265,13 @@ func testChannelWithOptions(
 		}
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/responses/compact") {
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
+		}
+	}
+	if options.probeLowCostOnly && !channelRoutingProbeRelayFormatAllowed(relayFormat) {
+		err := fmt.Errorf("relay format %s is not eligible for low-cost active probes", relayFormat)
+		return testResult{
+			context: c, localErr: err,
+			newAPIError: types.NewError(err, types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry()),
 		}
 	}
 
@@ -575,26 +583,10 @@ func testChannelWithOptions(
 }
 
 func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting.ActiveProbeTarget) channelrouting.ActiveProbeExecution {
-	_, identity, current := channelrouting.ResolveObserveModelSnapshot(target.GroupName, target.ChannelID, target.ModelName)
-	if !current || identity.SnapshotRevision != target.SnapshotRevision || identity.PoolID != target.PoolID || identity.MemberID != target.MemberID {
-		apiErr := types.NewError(errors.New("channel routing active probe target is stale"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
-	}
-	channel, err := model.GetChannelById(target.ChannelID, true)
+	channel, err := currentChannelRoutingActiveProbeTarget(target)
 	if err != nil {
 		apiErr := types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
-	}
-	if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey != target.MultiKey {
-		apiErr := types.NewError(errors.New("channel routing active probe target is no longer enabled"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
-	}
-	if !target.MultiKey {
-		resolved, ok := channelrouting.ResolveIdentity(target.GroupName, target.ChannelID, channel.Key)
-		if !ok || resolved.SnapshotRevision != target.SnapshotRevision || resolved.CredentialID != target.CredentialID {
-			apiErr := types.NewError(errors.New("channel routing active probe credential is stale"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-			return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
-		}
 	}
 	channel, err = activeProbeChannelCopy(channel)
 	if err != nil {
@@ -611,7 +603,12 @@ func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting
 		logDetails:        false,
 		maxOutputTokens:   16,
 		groupName:         target.GroupName,
+		probeLowCostOnly:  true,
 	})
+	if _, validateErr := currentChannelRoutingActiveProbeTarget(target); validateErr != nil {
+		apiErr := types.NewError(validateErr, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		return channelRoutingProbeExecution(apiErr, 0, result.usage, result.quota, 0, true)
+	}
 	apiErr := result.newAPIError
 	if apiErr == nil && result.localErr != nil {
 		apiErr = types.NewError(result.localErr, types.ErrorCodeBadResponse)
@@ -620,6 +617,45 @@ func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting
 		apiErr = types.NewErrorWithStatusCode(apiErr.Cause(), apiErr.GetErrorCode(), result.sourceStatusCode)
 	}
 	return channelRoutingProbeExecution(apiErr, result.sourceStatusCode, result.usage, result.quota, result.retryAfterMs, false)
+}
+
+func currentChannelRoutingActiveProbeTarget(target channelrouting.ActiveProbeTarget) (*model.Channel, error) {
+	_, identity, current := channelrouting.ResolveObserveModelSnapshot(target.GroupName, target.ChannelID, target.ModelName)
+	if !current || identity.SnapshotRevision != target.SnapshotRevision || identity.PoolID != target.PoolID || identity.MemberID != target.MemberID {
+		return nil, channelrouting.ErrActiveProbeTargetStale
+	}
+	channel, err := model.GetChannelById(target.ChannelID, true)
+	if err != nil {
+		return nil, err
+	}
+	if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey != target.MultiKey ||
+		channelrouting.EndpointHost(channel.GetBaseURL(), channel.Id) != target.EndpointHost ||
+		channelrouting.EndpointAuthority(channel.GetBaseURL(), channel.Id) != target.EndpointAuthority ||
+		channelrouting.RoutingRegion() != target.Region {
+		return nil, channelrouting.ErrActiveProbeTargetStale
+	}
+	if !target.MultiKey {
+		resolved, ok := channelrouting.ResolveIdentity(target.GroupName, target.ChannelID, channel.Key)
+		if !ok || resolved.SnapshotRevision != target.SnapshotRevision || resolved.CredentialID != target.CredentialID {
+			return nil, channelrouting.ErrActiveProbeTargetStale
+		}
+	}
+	return channel, nil
+}
+
+func channelRoutingProbeRelayFormatAllowed(relayFormat types.RelayFormat) bool {
+	switch relayFormat {
+	case types.RelayFormatOpenAI,
+		types.RelayFormatOpenAIResponses,
+		types.RelayFormatOpenAIResponsesCompaction,
+		types.RelayFormatClaude,
+		types.RelayFormatGemini,
+		types.RelayFormatRerank,
+		types.RelayFormatEmbedding:
+		return true
+	default:
+		return false
+	}
 }
 
 func activeProbeChannelCopy(channel *model.Channel) (*model.Channel, error) {

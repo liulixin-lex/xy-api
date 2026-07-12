@@ -108,6 +108,61 @@ func TestRoutingCostSyncHandlerUsesSmartRoutingSetting(t *testing.T) {
 	assert.Equal(t, 7*time.Minute, handler.Interval())
 }
 
+func TestRoutingCostSyncExecutionStateReflectsAccountOutcome(t *testing.T) {
+	tests := []struct {
+		name    string
+		summary map[string]any
+		state   string
+		failed  bool
+	}{
+		{
+			name: "no bindings",
+			summary: map[string]any{
+				"bindings": 0, "accounts": 0, "successful_accounts": 0,
+				"errors": 0, "partial_accounts": 0, "stale_bindings": 0,
+			},
+			state: model.RoutingCostSyncExecutionStateCompleted,
+		},
+		{
+			name: "all accounts failed",
+			summary: map[string]any{
+				"bindings": 2, "accounts": 2, "successful_accounts": 0,
+				"errors": 2, "partial_accounts": 0, "stale_bindings": 0,
+			},
+			state:  model.RoutingCostSyncExecutionStateFailed,
+			failed: true,
+		},
+		{
+			name: "partial success",
+			summary: map[string]any{
+				"bindings": 2, "accounts": 2, "successful_accounts": 1,
+				"errors": 1, "partial_accounts": 1, "stale_bindings": 0,
+			},
+			state: model.RoutingCostSyncExecutionStatePartial,
+		},
+		{
+			name: "all accounts succeeded",
+			summary: map[string]any{
+				"bindings": 2, "accounts": 2, "successful_accounts": 2,
+				"errors": 0, "partial_accounts": 0, "stale_bindings": 0,
+			},
+			state: model.RoutingCostSyncExecutionStateCompleted,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, err := routingCostSyncExecutionState(test.summary)
+			if test.failed {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, test.state, state)
+		})
+	}
+}
+
 func TestRoutingAgentHandlerRequiresAgentEnabled(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	handler := routingAgentHandler{}
@@ -186,6 +241,7 @@ func TestRunRoutingCostSyncTaskFetchesNewAPIPricingSnapshots(t *testing.T) {
 	assert.Equal(t, 1, requests["/api/pricing"])
 	assert.EqualValues(t, 1, summary["bindings"])
 	assert.EqualValues(t, 2, summary["snapshots"])
+	assert.EqualValues(t, 1, summary["successful_accounts"])
 
 	var snapshots []model.RoutingCostSnapshot
 	require.NoError(t, db.Order("model_name asc").Find(&snapshots).Error)
@@ -267,6 +323,7 @@ func TestRunRoutingCostSyncTaskAggregatesNewAPIBindingsByUpstreamAccount(t *test
 	assert.Equal(t, 1, requests["/api/pricing"])
 	assert.EqualValues(t, 1, summary["accounts"])
 	assert.EqualValues(t, 2, summary["snapshots"])
+	assert.EqualValues(t, 1, summary["successful_accounts"])
 	var accounts []model.RoutingUpstreamAccount
 	require.NoError(t, db.Find(&accounts).Error)
 	require.Len(t, accounts, 1)
@@ -329,6 +386,7 @@ func TestRunRoutingCostSyncTaskIsolatesInvalidGroupPricingWithinSharedAccount(t 
 	assert.Equal(t, 1, requests)
 	assert.EqualValues(t, 1, summary["snapshots"])
 	assert.EqualValues(t, 1, summary["errors"])
+	assert.EqualValues(t, 1, summary["successful_accounts"])
 	assert.EqualValues(t, 1, summary["partial_accounts"])
 	var snapshots []model.RoutingCostSnapshot
 	require.NoError(t, db.Find(&snapshots).Error)
@@ -423,6 +481,7 @@ func TestRunRoutingCostSyncTaskDoesNotMarkServingAuthFailureOnUnauthorizedUpstre
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, summary["bindings"])
 	assert.EqualValues(t, 1, summary["errors"])
+	assert.EqualValues(t, 0, summary["successful_accounts"])
 	_, cached := routinghotcache.GetAuthFailure(778)
 	assert.False(t, cached)
 	var marked int64
@@ -661,7 +720,14 @@ func TestRunRoutingCostSyncTaskDoesNotReviveDeletedBindingSnapshots(t *testing.T
 		summary, err := runRoutingCostSyncTaskWithDeps(context.Background(), defaultRoutingCostSyncDeps())
 		result <- syncResult{summary: summary, err: err}
 	}()
-	<-pricingStarted
+	require.Eventually(t, func() bool {
+		select {
+		case <-pricingStarted:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
 	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
 	close(releasePricing)
 
@@ -719,7 +785,14 @@ func TestRunRoutingCostSyncTaskDiscardsSnapshotsAfterBindingConfigChanges(t *tes
 		summary, err := runRoutingCostSyncTaskWithDeps(context.Background(), defaultRoutingCostSyncDeps())
 		result <- syncResult{summary: summary, err: err}
 	}()
-	<-pricingStarted
+	require.Eventually(t, func() bool {
+		select {
+		case <-pricingStarted:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
 	require.NoError(t, db.Model(&model.RoutingChannelBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
 		"upstream_group": "changed",
 		"updated_time":   binding.UpdatedTime + 1,
@@ -1002,6 +1075,7 @@ func TestRoutingCostSyncBindingStateUpdateFailureFailsSystemTaskAndSanitizesErro
 	require.NoError(t, db.AutoMigrate(
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.RoutingOperation{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},

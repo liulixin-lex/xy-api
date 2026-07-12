@@ -17,27 +17,39 @@ type BalancedRoutingPlanInput struct {
 }
 
 type BalancedRoutingPlan struct {
-	AlgorithmVersion  string                           `json:"algorithm_version"`
-	PoolID            int                              `json:"pool_id"`
-	PolicyRevision    uint64                           `json:"policy_revision"`
-	RuntimeGeneration uint64                           `json:"runtime_generation"`
-	ActivationID      int64                            `json:"activation_id"`
-	PolicyHash        string                           `json:"policy_hash"`
-	Profile           RequestProfile                   `json:"profile"`
-	Policy            BalancedPoolPolicy               `json:"policy"`
-	SelectedChannelID int                              `json:"selected_channel_id"`
-	SelectedIdentity  Identity                         `json:"selected_identity"`
-	SelectedCost      float64                          `json:"selected_cost"`
-	SelectedCostKnown bool                             `json:"selected_cost_known"`
-	SelectedBreaker   *routingselector.BreakerSnapshot `json:"selected_breaker,omitempty"`
-	SampledChannelIDs []int                            `json:"sampled_channel_ids"`
-	AffinityUsed      bool                             `json:"affinity_used"`
-	ExplorationUsed   bool                             `json:"exploration_used"`
-	SoftFallback      bool                             `json:"soft_fallback"`
-	FilteredOpen      int                              `json:"filtered_open"`
-	FilteredCapacity  int                              `json:"filtered_capacity"`
-	Candidates        []DecisionCandidate              `json:"candidates"`
-	Replay            BalancedReplayInput              `json:"replay"`
+	AlgorithmVersion           string                           `json:"algorithm_version"`
+	PoolID                     int                              `json:"pool_id"`
+	PolicyRevision             uint64                           `json:"policy_revision"`
+	RuntimeGeneration          uint64                           `json:"runtime_generation"`
+	ActivationID               int64                            `json:"activation_id"`
+	PolicyHash                 string                           `json:"policy_hash"`
+	Profile                    RequestProfile                   `json:"profile"`
+	Policy                     BalancedPoolPolicy               `json:"policy"`
+	SelectedChannelID          int                              `json:"selected_channel_id"`
+	SelectedIdentity           Identity                         `json:"selected_identity"`
+	SelectedCost               float64                          `json:"selected_cost"`
+	SelectedCostKnown          bool                             `json:"selected_cost_known"`
+	SelectedWorstCaseCost      float64                          `json:"selected_worst_case_cost,omitempty"`
+	SelectedWorstCaseKnown     bool                             `json:"selected_worst_case_known,omitempty"`
+	SelectedEffectiveCost      float64                          `json:"selected_effective_cost,omitempty"`
+	SelectedEffectiveKnown     bool                             `json:"selected_effective_known,omitempty"`
+	SelectedCostCurrency       string                           `json:"selected_cost_currency,omitempty"`
+	SelectedCostUnit           string                           `json:"selected_cost_unit,omitempty"`
+	SelectedCostPricingHash    string                           `json:"selected_cost_pricing_hash,omitempty"`
+	SelectedCostPricingVersion string                           `json:"selected_cost_pricing_version,omitempty"`
+	SelectedCostEstimate       *ShadowCostInput                 `json:"selected_cost_estimate,omitempty"`
+	SelectedBreaker            *routingselector.BreakerSnapshot `json:"selected_breaker,omitempty"`
+	SelectedBreakerScope       string                           `json:"selected_breaker_scope,omitempty"`
+	SelectedEndpointAuthority  string                           `json:"selected_endpoint_authority,omitempty"`
+	SelectedRegion             string                           `json:"selected_region,omitempty"`
+	SampledChannelIDs          []int                            `json:"sampled_channel_ids"`
+	AffinityUsed               bool                             `json:"affinity_used"`
+	ExplorationUsed            bool                             `json:"exploration_used"`
+	SoftFallback               bool                             `json:"soft_fallback"`
+	FilteredOpen               int                              `json:"filtered_open"`
+	FilteredCapacity           int                              `json:"filtered_capacity"`
+	Candidates                 []DecisionCandidate              `json:"candidates"`
+	Replay                     BalancedReplayInput              `json:"replay"`
 }
 
 func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInput) (BalancedRoutingPlan, bool, error) {
@@ -71,6 +83,7 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
 	}
+	profile = attachRoutingCostProfile(profile, input.CostProfile, session.planningTime.Unix())
 	seed, err := DeriveDecisionSeed(session.requestID, snapshot.view.Revision, input.RetryIndex)
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
@@ -103,7 +116,12 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	}
 	requestExcluded := make(map[int]struct{})
 	identities := make(map[int]Identity, len(pool.Members))
+	endpointBreakerByChannelID := make(map[int]struct {
+		authority string
+		region    string
+	}, len(pool.Members))
 	replayCandidates := make([]BalancedReplayCandidate, 0, len(pool.Members))
+	costByChannelID := make(map[int]ShadowCostInput, len(pool.Members))
 	preparedAt := time.Unix(snapshot.view.BuiltAtUnix, 0)
 	preparedSettings := pool.BalancedPolicy.settings(preparedAt, 1, 0, profile.IsStream)
 	preparedProfile := profile
@@ -134,6 +152,19 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		}
 		replayCandidates = append(replayCandidates, balancedReplayCandidateFromRouting(member, preparedCandidate))
 		state := runtimeByChannelID[member.ChannelID]
+		endpointBreaker, authority, region := endpointBreakerForChannel(channel, session.planningTime, pool.BalancedPolicy.SnapshotStaleSec)
+		baseBreaker := preparedCandidate.Candidate.Breaker
+		if state.Breaker != nil {
+			baseBreaker, _ = mergeRoutingBreaker(baseBreaker, state.Breaker)
+		}
+		var endpointSelected bool
+		state.Breaker, endpointSelected = mergeRoutingBreaker(baseBreaker, endpointBreaker)
+		if endpointSelected {
+			endpointBreakerByChannelID[member.ChannelID] = struct {
+				authority string
+				region    string
+			}{authority: authority, region: region}
+		}
 		cost, costErr := shadowExpectedCost(observation, profile)
 		if costErr != nil {
 			return BalancedRoutingPlan{}, true, costErr
@@ -143,6 +174,7 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 			state.Cost.Known = cost.Known
 			state.Cost.Cost = cost.Cost
 			state.Cost.UpdatedUnix = cost.UpdatedUnix
+			costByChannelID[member.ChannelID] = *cost
 		}
 		if input.SlowStartFactor != nil {
 			factor, factorErr := session.slowStartFactor(SlowStartKey{
@@ -228,6 +260,18 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		Candidates:        append([]DecisionCandidate(nil), replayResult.Candidates...),
 		Replay:            replay,
 	}
+	if selectedCost, exists := costByChannelID[decision.SelectedChannelID]; exists {
+		selectedCostCopy := selectedCost
+		plan.SelectedCostEstimate = &selectedCostCopy
+		plan.SelectedWorstCaseCost = selectedCost.WorstCaseCost
+		plan.SelectedWorstCaseKnown = selectedCost.WorstCaseKnown
+		plan.SelectedEffectiveCost = selectedCost.EffectiveCost
+		plan.SelectedEffectiveKnown = selectedCost.EffectiveKnown
+		plan.SelectedCostCurrency = selectedCost.Currency
+		plan.SelectedCostUnit = selectedCost.Unit
+		plan.SelectedCostPricingHash = selectedCost.PricingHash
+		plan.SelectedCostPricingVersion = selectedCost.PricingVersion
+	}
 	if decision.SelectedChannelID <= 0 {
 		return plan, true, nil
 	}
@@ -236,6 +280,11 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
 	plan.SelectedIdentity = identity
+	if endpoint, endpointSelected := endpointBreakerByChannelID[decision.SelectedChannelID]; endpointSelected {
+		plan.SelectedBreakerScope = BreakerScopeEndpoint
+		plan.SelectedEndpointAuthority = endpoint.authority
+		plan.SelectedRegion = endpoint.region
+	}
 	selectedState := runtimeByChannelID[decision.SelectedChannelID]
 	if selectedState.Breaker != nil {
 		breaker := *selectedState.Breaker

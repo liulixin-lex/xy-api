@@ -1,9 +1,11 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -13,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	globalsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
@@ -141,6 +144,9 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 	if policyRevision == 0 {
 		return nil, true, channelrouting.ErrRoutingSessionInvalid
 	}
+	promptTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)
+	completionTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)
+	capacityInput, capacityOutput := routingCapacityTokenEstimate(param.Ctx)
 	capacityExcluded := make([]int, 0, len(allowedIDs))
 	probeExcluded := make([]int, 0, len(allowedIDs))
 	var lastProbeErr error
@@ -151,8 +157,9 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 				ModelName:                  param.ModelName,
 				IsStream:                   common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 				RetryIndex:                 param.GetRetry(),
-				PromptTokenEstimate:        max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
-				CompletionTokenEstimate:    max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+				PromptTokenEstimate:        promptTokens,
+				CompletionTokenEstimate:    completionTokens,
+				CostProfile:                routingCostRequestProfile(param.Ctx),
 				AllowedChannelIDs:          allowedIDs,
 				ExcludedChannelIDs:         excludedIDs,
 				CapacityExcludedChannelIDs: capacityExcluded,
@@ -180,6 +187,17 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		if selected == nil || plan.SelectedIdentity.MemberID <= 0 || plan.SelectedIdentity.PoolID != plan.PoolID {
 			return nil, true, channelrouting.ErrRoutingSessionInvalid
 		}
+		capacityModelName := param.ModelName
+		if strings.HasSuffix(capacityModelName, ratio_setting.CompactModelSuffix) {
+			capacityModelName = strings.TrimSuffix(capacityModelName, ratio_setting.CompactModelSuffix)
+		}
+		upstreamModelName, _, mappingErr := model.ResolveChannelModelMapping(selected.GetModelMapping(), capacityModelName)
+		if mappingErr != nil {
+			return nil, true, fmt.Errorf("channel routing upstream model mapping failed: %w", mappingErr)
+		}
+		if strings.TrimSpace(upstreamModelName) == "" {
+			return nil, true, errors.New("channel routing upstream model mapping is empty")
+		}
 		probeSettings := routingselector.Settings{
 			HalfOpenProbes:   plan.Policy.HalfOpenProbes,
 			NowUnix:          common.GetTimestamp(),
@@ -188,6 +206,9 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		probeKey := routingbreaker.Key{
 			ChannelID: selected.Id, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 			Model: param.ModelName, Group: group,
+		}
+		if plan.SelectedBreakerScope == channelrouting.BreakerScopeEndpoint {
+			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
 		}
 		probeAcquired, probeErr := acquireRoutingHalfOpenProbeForKey(
 			param.Ctx, probeKey, plan.SelectedBreaker, probeSettings, true,
@@ -200,34 +221,125 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			}
 			continue
 		}
+		localInputDemand, demandErr := capacityInput.Demand(capacityPolicy.Capacity.InputTPM)
+		if demandErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, fmt.Errorf("channel routing input capacity estimate failed: %w", demandErr)
+		}
+		localOutputDemand, demandErr := capacityOutput.Demand(capacityPolicy.Capacity.OutputTPM)
+		if demandErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, fmt.Errorf("channel routing output capacity estimate failed: %w", demandErr)
+		}
 		demand := channelrouting.Demand{
 			RPM:       1,
-			InputTPM:  int64(max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)),
-			OutputTPM: int64(max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)),
+			InputTPM:  localInputDemand,
+			OutputTPM: localOutputDemand,
 			Inflight:  1,
 		}
-		reservation, reserveErr := channelRoutingCanaryRuntime.tryReserve(
-			plan.PolicyRevision, capacityPolicy,
-			channelrouting.CapacityKey{PoolID: plan.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: param.ModelName},
-			demand,
+		strictCost, strictCostKnown, costErr := routingStrictCapacityCost(
+			session, selected.Id, param, capacityInput, capacityOutput,
 		)
-		if reserveErr != nil {
+		if costErr != nil {
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
-			if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
-				errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {
+			return nil, true, fmt.Errorf("channel routing strict capacity cost failed: %w", costErr)
+		}
+		strictRequest, strict, strictErr := session.StrictCapacityRequest(
+			plan.SelectedIdentity, param.ModelName, upstreamModelName,
+			capacityInput, capacityOutput,
+			strictCost, strictCostKnown,
+		)
+		if strictErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			if errors.Is(strictErr, channelrouting.ErrStrictCapacityExhausted) ||
+				errors.Is(strictErr, channelrouting.ErrEnterpriseCapacityCostUnknown) {
 				capacityExcluded = append(capacityExcluded, selected.Id)
 				continue
 			}
-			return nil, true, fmt.Errorf("channel routing capacity admission failed: %w", reserveErr)
+			return nil, true, fmt.Errorf("channel routing strict capacity plan failed: %w", strictErr)
 		}
-		admission := reservation.Admission()
-		if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
-			cancelErr := reservation.Cancel()
+		var strictRequestForAdaptive *channelrouting.StrictCapacityRequest
+		if strict {
+			strictRequestForAdaptive = &strictRequest
+		}
+		adaptiveLease, adaptiveErr := reserveRoutingAdaptiveConcurrency(
+			plan.PolicyRevision,
+			capacityPolicy,
+			plan.SelectedIdentity,
+			selected.Id,
+			param.ModelName,
+			upstreamModelName,
+			strictRequestForAdaptive,
+		)
+		if adaptiveErr != nil {
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
-			return nil, true, errors.Join(err, cancelErr)
+			if errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyExhausted) ||
+				errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyConflict) {
+				capacityExcluded = append(capacityExcluded, selected.Id)
+				continue
+			}
+			return nil, true, fmt.Errorf("channel routing adaptive concurrency admission failed: %w", adaptiveErr)
+		}
+		var admission channelrouting.CapacityAdmission
+		if strict {
+			reserveContext := context.Background()
+			if param.Ctx.Request != nil {
+				reserveContext = param.Ctx.Request.Context()
+			}
+			reservation, reserveErr := channelrouting.DefaultStrictCapacityCoordinator().TryReserve(reserveContext, strictRequest)
+			if reserveErr != nil {
+				_ = adaptiveLease.Release()
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				if errors.Is(reserveErr, channelrouting.ErrStrictCapacityExhausted) {
+					capacityExcluded = append(capacityExcluded, selected.Id)
+					continue
+				}
+				return nil, true, fmt.Errorf("channel routing strict capacity admission failed: %w", reserveErr)
+			}
+			admission, reserveErr = channelrouting.CapacityAdmissionFromStrict(
+				plan.SelectedIdentity, param.ModelName, reservation.Admission(),
+			)
+			if reserveErr == nil {
+				reserveErr = SetRoutingStrictCapacityReservation(param.Ctx, reservation)
+			}
+			if reserveErr != nil {
+				cancelErr := reservation.Cancel(context.Background())
+				adaptiveErr = adaptiveLease.Release()
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				return nil, true, errors.Join(reserveErr, cancelErr, adaptiveErr)
+			}
+		} else {
+			reservation, reserveErr := channelRoutingCanaryRuntime.tryReserve(
+				plan.PolicyRevision, capacityPolicy,
+				channelrouting.CapacityKey{PoolID: plan.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: param.ModelName},
+				demand,
+			)
+			if reserveErr != nil {
+				_ = adaptiveLease.Release()
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
+					errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {
+					capacityExcluded = append(capacityExcluded, selected.Id)
+					continue
+				}
+				return nil, true, fmt.Errorf("channel routing capacity admission failed: %w", reserveErr)
+			}
+			admission = reservation.Admission()
+			if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
+				cancelErr := reservation.Cancel()
+				adaptiveErr = adaptiveLease.Release()
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				return nil, true, errors.Join(err, cancelErr, adaptiveErr)
+			}
+		}
+		if err := AttachRoutingAdaptiveConcurrency(param.Ctx, adaptiveLease); err != nil {
+			cancelErr := CancelRoutingCapacityReservation(param.Ctx)
+			adaptiveErr = adaptiveLease.Release()
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, errors.Join(err, cancelErr, adaptiveErr)
 		}
 		if routingselector.BreakerNeedsHalfOpenProbe(plan.SelectedBreaker, probeSettings) {
-			if err := channelRoutingCanaryRuntime.startRecovery(plan.PolicyRevision, capacityPolicy, channelrouting.SlowStartKey{
+			if err := prepareRoutingSlowStartProbe(param.Ctx, selected.Id, plan.PolicyRevision, capacityPolicy, channelrouting.SlowStartKey{
 				PoolID: plan.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: param.ModelName,
 			}); err != nil {
 				cancelErr := CancelRoutingCapacityReservation(param.Ctx)
@@ -280,7 +392,7 @@ func enqueueChannelRoutingBalancedDecision(
 	if plan.SelectedChannelID > 0 {
 		differenceType = "active_selected"
 	}
-	_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
 		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
 		PoolID:               plan.PoolID,
 		GroupName:            group,
@@ -300,11 +412,16 @@ func enqueueChannelRoutingBalancedDecision(
 		ActualExpectedCost:   plan.SelectedCost,
 		ObservedCostKnown:    plan.SelectedCostKnown,
 		ObservedExpectedCost: plan.SelectedCost,
+		ActualCostEstimate:   plan.SelectedCostEstimate,
+		ObservedCostEstimate: plan.SelectedCostEstimate,
 		SelectedIdentity:     plan.SelectedIdentity,
 		CapacityAdmission:    admission,
 		ActivationID:         plan.ActivationID,
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing balanced audit dropped: %v", err))
+		return
 	}
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmBalancedV1)
 }

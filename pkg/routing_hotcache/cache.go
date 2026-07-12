@@ -9,10 +9,13 @@ import (
 )
 
 type Key struct {
-	ChannelID   int
-	APIKeyIndex int
-	Model       string
-	Group       string
+	ChannelID         int
+	APIKeyIndex       int
+	Model             string
+	Group             string
+	Scope             string
+	EndpointAuthority string
+	Region            string
 }
 
 type CostKey struct {
@@ -34,16 +37,41 @@ type MetricSnapshot struct {
 }
 
 type CostSnapshot struct {
-	Known           bool
-	Cost            float64
-	Confidence      string
-	QuotaType       int
-	GroupRatio      float64
-	BaseRatio       float64
-	CompletionRatio float64
-	ModelPrice      float64
-	BillingMode     string
-	UpdatedUnix     int64
+	AccountID           int
+	Known               bool
+	Cost                float64
+	Confidence          string
+	QuotaType           int
+	GroupRatio          float64
+	BaseRatio           float64
+	CompletionRatio     float64
+	ModelPrice          float64
+	BillingMode         string
+	UpdatedUnix         int64
+	PricingKnown        bool
+	Pricing             model.RoutingNormalizedPricing
+	PricingHash         string
+	PricingVersion      string
+	UpstreamGroup       string
+	UpstreamModel       string
+	ObservedTime        int64
+	EffectiveTime       int64
+	ExpiresTime         int64
+	VersionConfidence   string
+	ConfidenceScore     float64
+	Freshness           string
+	FreshnessScore      float64
+	SourceSyncStatus    string
+	SourceSyncError     string
+	AccountSourceType   string
+	AccountKeyHash      string
+	AccountMaskedID     string
+	AccountStatus       string
+	AccountBalanceKnown bool
+	AccountBalance      float64
+	AccountBalanceAt    int64
+	AccountSyncStatus   string
+	AccountSyncError    string
 }
 
 type BreakerSnapshot struct {
@@ -52,6 +80,23 @@ type BreakerSnapshot struct {
 	CooldownUntilUnix int64
 	HalfOpenInflight  int64
 	UpdatedUnix       int64
+}
+
+type SharedEndpointBreakerSnapshot struct {
+	State               string
+	Reason              string
+	CooldownUntilUnix   int64
+	UpdatedUnix         int64
+	ExpiresUnix         int64
+	EvidenceCount       int64
+	NetworkFailureCount int64
+	NodeCount           int
+	FailureNodeCount    int
+}
+
+type SharedEndpointBreakerEntry struct {
+	Key      Key
+	Snapshot SharedEndpointBreakerSnapshot
 }
 
 type HealthMarker struct {
@@ -69,6 +114,7 @@ type Limits struct {
 	MaxMetrics           int
 	MaxCosts             int
 	MaxBreakers          int
+	MaxSharedEndpoints   int
 	MaxHealth            int
 	MaxCapacityCooldowns int
 }
@@ -77,6 +123,7 @@ type Stats struct {
 	Metrics           int
 	Costs             int
 	Breakers          int
+	SharedEndpoints   int
 	CapacityCooldowns int
 	AuthFailures      int
 	Balances          int
@@ -87,6 +134,7 @@ var defaultLimits = Limits{
 	MaxMetrics:           20_000,
 	MaxCosts:             10_000,
 	MaxBreakers:          20_000,
+	MaxSharedEndpoints:   20_000,
 	MaxHealth:            10_000,
 	MaxCapacityCooldowns: 20_000,
 }
@@ -96,6 +144,7 @@ var cache = struct {
 	metrics           map[Key]MetricSnapshot
 	costs             map[CostKey]CostSnapshot
 	breakers          map[Key]BreakerSnapshot
+	sharedEndpoints   map[Key]SharedEndpointBreakerSnapshot
 	capacityCooldowns map[Key]CapacityCooldownSnapshot
 	authFailures      map[int]HealthMarker
 	balances          map[int]BalanceSnapshot
@@ -105,6 +154,7 @@ var cache = struct {
 	metrics:           map[Key]MetricSnapshot{},
 	costs:             map[CostKey]CostSnapshot{},
 	breakers:          map[Key]BreakerSnapshot{},
+	sharedEndpoints:   map[Key]SharedEndpointBreakerSnapshot{},
 	capacityCooldowns: map[Key]CapacityCooldownSnapshot{},
 	authFailures:      map[int]HealthMarker{},
 	balances:          map[int]BalanceSnapshot{},
@@ -136,6 +186,41 @@ func GetBreaker(key Key) (BreakerSnapshot, bool) {
 	return snapshot, ok
 }
 
+func GetSharedEndpointBreaker(key Key) (SharedEndpointBreakerSnapshot, bool) {
+	cache.RLock()
+	defer cache.RUnlock()
+	snapshot, ok := cache.sharedEndpoints[key]
+	return snapshot, ok
+}
+
+func ListSharedEndpointBreakers() []SharedEndpointBreakerEntry {
+	cache.RLock()
+	defer cache.RUnlock()
+	entries := make([]SharedEndpointBreakerEntry, 0, len(cache.sharedEndpoints))
+	for key, snapshot := range cache.sharedEndpoints {
+		entries = append(entries, SharedEndpointBreakerEntry{Key: key, Snapshot: snapshot})
+	}
+	sort.Slice(entries, func(i, j int) bool { return keyLess(entries[i].Key, entries[j].Key) })
+	return entries
+}
+
+func ListLocalEndpointBreakers() []SharedEndpointBreakerEntry {
+	cache.RLock()
+	defer cache.RUnlock()
+	entries := make([]SharedEndpointBreakerEntry, 0)
+	for key, snapshot := range cache.breakers {
+		if key.Scope != "endpoint" || key.EndpointAuthority == "" || key.Region == "" {
+			continue
+		}
+		entries = append(entries, SharedEndpointBreakerEntry{Key: key, Snapshot: SharedEndpointBreakerSnapshot{
+			State: snapshot.State, Reason: snapshot.Reason, CooldownUntilUnix: snapshot.CooldownUntilUnix,
+			UpdatedUnix: snapshot.UpdatedUnix,
+		}})
+	}
+	sort.Slice(entries, func(i, j int) bool { return keyLess(entries[i].Key, entries[j].Key) })
+	return entries
+}
+
 func GetAuthFailure(channelID int) (HealthMarker, bool) {
 	cache.RLock()
 	defer cache.RUnlock()
@@ -157,6 +242,7 @@ func RuntimeStats() Stats {
 		Metrics:           len(cache.metrics),
 		Costs:             len(cache.costs),
 		Breakers:          len(cache.breakers),
+		SharedEndpoints:   len(cache.sharedEndpoints),
 		CapacityCooldowns: len(cache.capacityCooldowns),
 		AuthFailures:      len(cache.authFailures),
 		Balances:          len(cache.balances),
@@ -189,6 +275,12 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 				deleted++
 			}
 		}
+		for key, snapshot := range cache.sharedEndpoints {
+			if snapshot.ExpiresUnix <= nowUnix || (snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff) {
+				delete(cache.sharedEndpoints, key)
+				deleted++
+			}
+		}
 		for channelID, marker := range cache.authFailures {
 			if marker.UpdatedUnix > 0 && marker.UpdatedUnix < cutoff {
 				delete(cache.authFailures, channelID)
@@ -214,6 +306,7 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 	deleted += trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess)
 	deleted += trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess)
+	deleted += trimBoundedMap(cache.sharedEndpoints, cache.limits.MaxSharedEndpoints, sharedEndpointUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.capacityCooldowns, cache.limits.MaxCapacityCooldowns, capacityUpdatedUnixMilli, keyLess)
 	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess)
 	deleted += trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess)
@@ -261,6 +354,32 @@ func ClearBreaker(key Key) {
 	cache.Lock()
 	defer cache.Unlock()
 	delete(cache.breakers, key)
+}
+
+func ClearSharedEndpointBreaker(key Key) {
+	cache.Lock()
+	defer cache.Unlock()
+	delete(cache.sharedEndpoints, key)
+}
+
+// ReplaceSharedEndpointBreakers atomically replaces the database-backed
+// regional view. Local breaker entries remain untouched.
+func ReplaceSharedEndpointBreakers(entries []SharedEndpointBreakerEntry) {
+	cache.Lock()
+	defer cache.Unlock()
+	next := make(map[Key]SharedEndpointBreakerSnapshot, len(entries))
+	for _, entry := range entries {
+		key := entry.Key
+		snapshot := entry.Snapshot
+		if key.Scope != "endpoint" || key.EndpointAuthority == "" || key.Region == "" ||
+			snapshot.State == "" || snapshot.UpdatedUnix <= 0 || snapshot.ExpiresUnix <= snapshot.UpdatedUnix {
+			continue
+		}
+		next[key] = snapshot
+	}
+	cache.limits = normalizedLimits(cache.limits)
+	cache.evictions += int64(trimBoundedMap(next, cache.limits.MaxSharedEndpoints, sharedEndpointUpdatedUnix, keyLess))
+	cache.sharedEndpoints = next
 }
 
 func SetAuthFailureForTest(channelID int, marker HealthMarker) {
@@ -419,20 +538,49 @@ func mergeCostSnapshots(costs map[CostKey]CostSnapshot, snapshots []model.Routin
 		if _, skip := excluded[key]; skip {
 			continue
 		}
-		if existing, ok := costs[key]; ok && existing.UpdatedUnix >= snapshot.SnapshotTS {
-			continue
+		if existing, ok := costs[key]; ok {
+			if existing.UpdatedUnix > snapshot.SnapshotTS ||
+				(existing.UpdatedUnix == snapshot.SnapshotTS && existing.AccountID > 0 && snapshot.AccountID == 0) {
+				continue
+			}
 		}
+		pricing, pricingKnown, _ := model.DecodeRoutingCostSnapshotPricing(snapshot)
 		costs[key] = CostSnapshot{
-			Known:           routingSnapshotCostKnown(snapshot, cost),
-			Cost:            cost,
-			Confidence:      snapshot.Confidence,
-			QuotaType:       snapshot.QuotaType,
-			GroupRatio:      snapshot.GroupRatio,
-			BaseRatio:       snapshot.BaseRatio,
-			CompletionRatio: snapshot.CompletionRatio,
-			ModelPrice:      snapshot.ModelPrice,
-			BillingMode:     snapshot.BillingMode,
-			UpdatedUnix:     snapshot.SnapshotTS,
+			AccountID:           snapshot.AccountID,
+			Known:               routingSnapshotCostKnown(snapshot, cost),
+			Cost:                cost,
+			Confidence:          snapshot.Confidence,
+			QuotaType:           snapshot.QuotaType,
+			GroupRatio:          snapshot.GroupRatio,
+			BaseRatio:           snapshot.BaseRatio,
+			CompletionRatio:     snapshot.CompletionRatio,
+			ModelPrice:          snapshot.ModelPrice,
+			BillingMode:         snapshot.BillingMode,
+			UpdatedUnix:         snapshot.SnapshotTS,
+			PricingKnown:        pricingKnown,
+			Pricing:             pricing,
+			PricingHash:         snapshot.PricingHash,
+			PricingVersion:      snapshot.PricingVersion,
+			UpstreamGroup:       snapshot.UpstreamGroup,
+			UpstreamModel:       snapshot.UpstreamModel,
+			ObservedTime:        snapshot.ObservedTime,
+			EffectiveTime:       snapshot.EffectiveTime,
+			ExpiresTime:         snapshot.ExpiresTime,
+			VersionConfidence:   snapshot.VersionConfidence,
+			ConfidenceScore:     snapshot.ConfidenceScore,
+			Freshness:           snapshot.Freshness,
+			FreshnessScore:      snapshot.FreshnessScore,
+			SourceSyncStatus:    snapshot.SourceSyncStatus,
+			SourceSyncError:     snapshot.SourceSyncError,
+			AccountSourceType:   snapshot.AccountSourceType,
+			AccountKeyHash:      snapshot.AccountKeyHash,
+			AccountMaskedID:     snapshot.AccountMaskedID,
+			AccountStatus:       snapshot.AccountStatus,
+			AccountBalanceKnown: snapshot.AccountBalanceKnown,
+			AccountBalance:      snapshot.AccountBalance,
+			AccountBalanceAt:    snapshot.AccountBalanceAt,
+			AccountSyncStatus:   snapshot.AccountSyncStatus,
+			AccountSyncError:    snapshot.AccountSyncError,
 		}
 	}
 }
@@ -645,6 +793,9 @@ func normalizedLimits(value Limits) Limits {
 	if value.MaxBreakers <= 0 {
 		value.MaxBreakers = defaultLimits.MaxBreakers
 	}
+	if value.MaxSharedEndpoints <= 0 {
+		value.MaxSharedEndpoints = defaultLimits.MaxSharedEndpoints
+	}
 	if value.MaxHealth <= 0 {
 		value.MaxHealth = defaultLimits.MaxHealth
 	}
@@ -711,6 +862,10 @@ func breakerUpdatedUnix(snapshot BreakerSnapshot) int64 {
 	return snapshot.UpdatedUnix
 }
 
+func sharedEndpointUpdatedUnix(snapshot SharedEndpointBreakerSnapshot) int64 {
+	return snapshot.UpdatedUnix
+}
+
 func capacityUpdatedUnixMilli(snapshot CapacityCooldownSnapshot) int64 {
 	return snapshot.UpdatedUnixMilli
 }
@@ -724,6 +879,15 @@ func balanceUpdatedUnix(snapshot BalanceSnapshot) int64 {
 }
 
 func keyLess(left Key, right Key) bool {
+	if left.Scope != right.Scope {
+		return left.Scope < right.Scope
+	}
+	if left.EndpointAuthority != right.EndpointAuthority {
+		return left.EndpointAuthority < right.EndpointAuthority
+	}
+	if left.Region != right.Region {
+		return left.Region < right.Region
+	}
 	if left.ChannelID != right.ChannelID {
 		return left.ChannelID < right.ChannelID
 	}
@@ -753,6 +917,7 @@ func ResetForTest() {
 	cache.metrics = map[Key]MetricSnapshot{}
 	cache.costs = map[CostKey]CostSnapshot{}
 	cache.breakers = map[Key]BreakerSnapshot{}
+	cache.sharedEndpoints = map[Key]SharedEndpointBreakerSnapshot{}
 	cache.capacityCooldowns = map[Key]CapacityCooldownSnapshot{}
 	cache.authFailures = map[int]HealthMarker{}
 	cache.balances = map[int]BalanceSnapshot{}

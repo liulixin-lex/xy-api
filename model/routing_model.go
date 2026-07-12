@@ -141,21 +141,44 @@ func (binding *RoutingChannelBinding) GetCredentials() (RoutingCredentials, erro
 }
 
 type RoutingCostSnapshot struct {
-	ID              int     `json:"id" gorm:"primaryKey"`
-	ChannelID       int     `json:"channel_id" gorm:"uniqueIndex:idx_routing_cost_channel_model_key,priority:1;index"`
-	ModelName       string  `json:"model_name" gorm:"type:varchar(128);index"`
-	ModelKey        *string `json:"-" gorm:"type:char(64);uniqueIndex:idx_routing_cost_channel_model_key,priority:2"`
-	QuotaType       int     `json:"quota_type"`
-	GroupRatio      float64 `json:"group_ratio"`
-	BaseRatio       float64 `json:"base_ratio"`
-	CompletionRatio float64 `json:"completion_ratio"`
-	ModelPrice      float64 `json:"model_price"`
-	BillingMode     string  `json:"billing_mode" gorm:"type:varchar(32)"`
-	TiersJSON       *string `json:"tiers_json" gorm:"type:text"`
-	ExtrasJSON      *string `json:"extras_json" gorm:"type:text"`
-	Confidence      string  `json:"confidence" gorm:"type:varchar(32)"`
-	SnapshotTS      int64   `json:"snapshot_ts" gorm:"bigint;index"`
-	PricingVersion  string  `json:"pricing_version" gorm:"type:varchar(128)"`
+	ID                  int     `json:"id" gorm:"primaryKey"`
+	AccountID           int     `json:"account_id,omitempty" gorm:"index"`
+	ChannelID           int     `json:"channel_id" gorm:"uniqueIndex:idx_routing_cost_channel_model_key,priority:1;index"`
+	ModelName           string  `json:"model_name" gorm:"type:varchar(128);index"`
+	ModelKey            *string `json:"-" gorm:"type:char(64);uniqueIndex:idx_routing_cost_channel_model_key,priority:2"`
+	QuotaType           int     `json:"quota_type"`
+	GroupRatio          float64 `json:"group_ratio"`
+	BaseRatio           float64 `json:"base_ratio"`
+	CompletionRatio     float64 `json:"completion_ratio"`
+	ModelPrice          float64 `json:"model_price"`
+	BillingMode         string  `json:"billing_mode" gorm:"type:varchar(32)"`
+	TiersJSON           *string `json:"tiers_json" gorm:"type:text"`
+	ExtrasJSON          *string `json:"extras_json" gorm:"type:text"`
+	Confidence          string  `json:"confidence" gorm:"type:varchar(32)"`
+	SnapshotTS          int64   `json:"snapshot_ts" gorm:"bigint;index"`
+	PricingVersion      string  `json:"pricing_version" gorm:"type:varchar(128)"`
+	PricingHash         string  `json:"pricing_hash,omitempty" gorm:"type:char(64);index"`
+	PricingJSON         *string `json:"-" gorm:"type:text"`
+	UpstreamGroup       string  `json:"upstream_group,omitempty" gorm:"type:varchar(128)"`
+	UpstreamModel       string  `json:"upstream_model,omitempty" gorm:"type:varchar(128)"`
+	ObservedTime        int64   `json:"observed_time,omitempty" gorm:"bigint;index"`
+	EffectiveTime       int64   `json:"effective_time,omitempty" gorm:"bigint;index"`
+	ExpiresTime         int64   `json:"expires_time,omitempty" gorm:"bigint;index"`
+	VersionConfidence   string  `json:"version_confidence,omitempty" gorm:"type:varchar(32);index"`
+	ConfidenceScore     float64 `json:"confidence_score,omitempty"`
+	Freshness           string  `json:"freshness,omitempty" gorm:"type:varchar(32);index"`
+	FreshnessScore      float64 `json:"freshness_score,omitempty"`
+	SourceSyncStatus    string  `json:"source_sync_status,omitempty" gorm:"type:varchar(32);index"`
+	SourceSyncError     string  `json:"source_sync_error,omitempty" gorm:"type:text"`
+	AccountSourceType   string  `json:"account_source_type,omitempty" gorm:"type:varchar(32);index"`
+	AccountKeyHash      string  `json:"-" gorm:"type:char(64);index"`
+	AccountMaskedID     string  `json:"account_masked_identity,omitempty" gorm:"type:varchar(256)"`
+	AccountStatus       string  `json:"account_status,omitempty" gorm:"type:varchar(32);index"`
+	AccountBalanceKnown bool    `json:"account_balance_known,omitempty"`
+	AccountBalance      float64 `json:"account_balance,omitempty"`
+	AccountBalanceAt    int64   `json:"account_balance_updated_at,omitempty" gorm:"bigint"`
+	AccountSyncStatus   string  `json:"account_last_sync_status,omitempty" gorm:"type:varchar(32);index"`
+	AccountSyncError    string  `json:"account_last_sync_error,omitempty" gorm:"type:text"`
 }
 
 func (RoutingCostSnapshot) TableName() string {
@@ -176,25 +199,42 @@ func UpsertRoutingCostSnapshotContext(ctx context.Context, snapshot *RoutingCost
 func upsertRoutingCostSnapshot(db *gorm.DB, snapshot *RoutingCostSnapshot) error {
 	modelKey := RoutingCostModelKey(snapshot.ModelName)
 	snapshot.ModelKey = &modelKey
+	assignments := map[string]interface{}{
+		"model_name":         snapshot.ModelName,
+		"quota_type":         snapshot.QuotaType,
+		"group_ratio":        snapshot.GroupRatio,
+		"base_ratio":         snapshot.BaseRatio,
+		"completion_ratio":   snapshot.CompletionRatio,
+		"model_price":        snapshot.ModelPrice,
+		"billing_mode":       snapshot.BillingMode,
+		"tiers_json":         snapshot.TiersJSON,
+		"extras_json":        snapshot.ExtrasJSON,
+		"confidence":         snapshot.Confidence,
+		"snapshot_ts":        snapshot.SnapshotTS,
+		"pricing_version":    snapshot.PricingVersion,
+		"pricing_hash":       "",
+		"pricing_json":       nil,
+		"upstream_group":     "",
+		"upstream_model":     "",
+		"observed_time":      0,
+		"effective_time":     0,
+		"expires_time":       0,
+		"version_confidence": "",
+		"confidence_score":   0,
+		"freshness":          "",
+		"freshness_score":    0,
+		"source_sync_status": "",
+		"source_sync_error":  "",
+	}
+	if snapshot.AccountID > 0 {
+		assignments["account_id"] = snapshot.AccountID
+	}
 	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "channel_id"},
 			{Name: "model_key"},
 		},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"model_name":       snapshot.ModelName,
-			"quota_type":       snapshot.QuotaType,
-			"group_ratio":      snapshot.GroupRatio,
-			"base_ratio":       snapshot.BaseRatio,
-			"completion_ratio": snapshot.CompletionRatio,
-			"model_price":      snapshot.ModelPrice,
-			"billing_mode":     snapshot.BillingMode,
-			"tiers_json":       snapshot.TiersJSON,
-			"extras_json":      snapshot.ExtrasJSON,
-			"confidence":       snapshot.Confidence,
-			"snapshot_ts":      snapshot.SnapshotTS,
-			"pricing_version":  snapshot.PricingVersion,
-		}),
+		DoUpdates: clause.Assignments(assignments),
 	}).Create(snapshot).Error
 }
 
@@ -517,6 +557,7 @@ type RoutingBreakerState struct {
 	ModelName           string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_breaker_key,priority:3"`
 	Group               string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_breaker_key,priority:4"`
 	SemanticVersion     int    `json:"semantic_version" gorm:"index"`
+	ResetGeneration     int64  `json:"reset_generation" gorm:"bigint;index;default:0;not null"`
 	State               string `json:"state" gorm:"type:varchar(32);index"`
 	Reason              string `json:"reason" gorm:"type:varchar(64);index"`
 	ConsecutiveFailures int64  `json:"consecutive_failures"`
@@ -597,8 +638,39 @@ func (eligibility LegacyRoutingStateEligibility) upsertRoutingBreakerState(db *g
 			state.ChannelID, state.APIKeyIndex,
 		)
 	}
+	if state.ResetGeneration < 0 {
+		return ErrRoutingBreakerResetInvalid
+	}
+	writeCtx := context.Background()
+	if db.Statement != nil && db.Statement.Context != nil {
+		writeCtx = db.Statement.Context
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		nowMs, err := routingErrorBudgetDatabaseNowMs(tx)
+		if err != nil {
+			return err
+		}
+		targetKey, err := routingBreakerResetMemberTargetKey(
+			state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group,
+		)
+		if err != nil {
+			return err
+		}
+		fence, err := lockRoutingBreakerResetFenceTx(writeCtx, tx, targetKey, nowMs)
+		if err != nil {
+			return err
+		}
+		if state.ResetGeneration < fence.Generation {
+			return nil
+		}
+		return eligibility.upsertRoutingBreakerStateLocked(tx, state)
+	})
+}
+
+func (eligibility LegacyRoutingStateEligibility) upsertRoutingBreakerStateLocked(db *gorm.DB, state *RoutingBreakerState) error {
 	state.SemanticVersion = RoutingBreakerSemanticVersion
 	updateColumns := []string{
+		"reset_generation",
 		"state",
 		"reason",
 		"consecutive_failures",
@@ -774,20 +846,90 @@ func UpsertRoutingChannelAuthFailureContext(ctx context.Context, channelID int, 
 	if until <= 0 {
 		until = now
 	}
-	return DB.WithContext(ctx).Clauses(clause.OnConflict{
+	return upsertRoutingChannelAuthFailureDB(DB.WithContext(ctx), channelID, marked, reason, until, now)
+}
+
+func ApplyRoutingChannelProbeAuthStateContext(
+	ctx context.Context,
+	channelID int,
+	credentialID int,
+	marked bool,
+	reason string,
+	until int64,
+) (bool, error) {
+	if channelID <= 0 || credentialID <= 0 {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	applied := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "key", "status", "channel_info").Where("id = ?", channelID).First(&channel).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey || channel.Key == "" {
+			return nil
+		}
+		var credential RoutingCredentialRef
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND channel_id = ? AND active = ?", credentialID, channelID, true).
+			First(&credential).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		fingerprint, err := RoutingCredentialFingerprint(channelID, channel.Key)
+		if err != nil {
+			return err
+		}
+		if credential.Fingerprint != fingerprint || credential.FingerprintVersion != RoutingCredentialFingerprintVersion {
+			return nil
+		}
+		now := common.GetTimestamp()
+		if !marked {
+			reason = ""
+			until = 0
+		} else if until <= 0 {
+			until = now
+		}
+		if err := upsertRoutingChannelAuthFailureDB(tx.WithContext(ctx), channelID, marked, reason, until, now); err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	})
+	return applied, err
+}
+
+func upsertRoutingChannelAuthFailureDB(
+	db *gorm.DB,
+	channelID int,
+	marked bool,
+	reason string,
+	until int64,
+	updatedTime int64,
+) error {
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "channel_id"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"auth_failure":        marked,
 			"auth_failure_reason": reason,
 			"auth_failure_until":  until,
-			"updated_time":        now,
+			"updated_time":        updatedTime,
 		}),
 	}).Create(&RoutingChannelHealthState{
 		ChannelID:         channelID,
 		AuthFailure:       marked,
 		AuthFailureReason: reason,
 		AuthFailureUntil:  until,
-		UpdatedTime:       now,
+		UpdatedTime:       updatedTime,
 	}).Error
 }
 

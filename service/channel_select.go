@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -151,6 +152,7 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 		RetryIndex:              retryIndex,
 		PromptTokenEstimate:     max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
 		CompletionTokenEstimate: max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+		CostProfile:             routingCostRequestProfile(param.Ctx),
 	})
 	if !active {
 		return false
@@ -169,6 +171,8 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 		actualChannelID = actual.Id
 	}
 	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(replayInput, actualChannelID)
+	actualCostEstimate, _ := channelrouting.ShadowCostEstimateForChannel(replayInput, actualChannelID)
+	observedCostEstimate, _ := channelrouting.ShadowCostEstimateForChannel(replayInput, replay.SelectedChannelID)
 	_, err = channelrouting.EnqueueDecision(channelrouting.DecisionInput{
 		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
 		PoolID:               replayInput.PoolID,
@@ -190,6 +194,8 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 		ActualExpectedCost:   actualCost,
 		ObservedCostKnown:    replay.SelectedCostKnown,
 		ObservedExpectedCost: replay.SelectedCost,
+		ActualCostEstimate:   actualCostEstimate,
+		ObservedCostEstimate: observedCostEstimate,
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing shadow audit dropped: %v", err))
@@ -644,6 +650,10 @@ func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, b
 		return "", "", false, errors.New("routing half-open Redis client is unavailable")
 	}
 	redisKey := fmt.Sprintf("routing:halfopen:%d:%d:%s:%s", key.ChannelID, key.APIKeyIndex, key.Model, key.Group)
+	if key.IsEndpointScoped() {
+		digest := sha256.Sum256([]byte(string(key.Scope) + "\x00" + key.EndpointAuthority + "\x00" + key.Region))
+		redisKey = fmt.Sprintf("routing:halfopen:endpoint:%x", digest[:])
+	}
 	owner := common.GetRandomString(32)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -667,6 +677,7 @@ func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string
 	if channelID <= 0 || c == nil {
 		return
 	}
+	clearRoutingSlowStartProbe(c, channelID)
 	probes, ok := common.GetContextKeyType[map[routingbreaker.Key]struct{}](c, constant.ContextKeyRoutingHalfOpenProbes)
 	if !ok {
 		return
@@ -674,7 +685,7 @@ func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string
 	leases, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
 	released := false
 	for key := range probes {
-		if key.ChannelID != channelID {
+		if key.ChannelID != channelID && !key.IsEndpointScoped() {
 			continue
 		}
 		delete(probes, key)
@@ -696,6 +707,7 @@ func ReleaseAllRoutingHalfOpenProbes(c *gin.Context) {
 	if c == nil {
 		return
 	}
+	clearRoutingSlowStartProbe(c, 0)
 	probes, ok := common.GetContextKeyType[map[routingbreaker.Key]struct{}](c, constant.ContextKeyRoutingHalfOpenProbes)
 	if !ok || len(probes) == 0 {
 		return

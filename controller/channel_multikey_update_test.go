@@ -27,6 +27,7 @@ func setupMultiKeyUpdateControllerTestDB(t *testing.T) *gorm.DB {
 	previousMemoryCacheEnabled := common.MemoryCacheEnabled
 
 	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
 	t.Cleanup(func() {
 		model.DB = previousDB
 		model.LOG_DB = previousLogDB

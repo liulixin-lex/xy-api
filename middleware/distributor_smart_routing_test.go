@@ -339,3 +339,207 @@ func TestSetRoutingPromptCostProxyCapturesStreamWithoutConsumingJSONBody(t *test
 		})
 	}
 }
+
+func TestSetRoutingPromptCostProxySeparatesCostAndCapacityEstimates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := `{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"max_tokens":128}`
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	t.Cleanup(func() { common.CleanupBodyStorage(ctx) })
+
+	setRoutingPromptCostProxy(ctx)
+
+	promptProxy := max(len(body)/4, 1)
+	assert.Equal(t, promptProxy, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingPromptProxy))
+	assert.Equal(t, min(promptProxy+promptProxy/2, 512), common.GetContextKeyInt(ctx, constant.ContextKeyRoutingEstimatedOutput))
+	assert.Equal(t, len(body), common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCapacityInput))
+	assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityInputKnown))
+	assert.Equal(t, 128, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCapacityOutput))
+	assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityOutputKnown))
+	profile, ok := common.GetContextKeyType[*model.RoutingCostRequestProfile](ctx, constant.ContextKeyRoutingCostProfile)
+	require.True(t, ok)
+	require.NotNil(t, profile)
+	assert.Equal(t, int64(promptProxy), profile.PromptTokens)
+	assert.Equal(t, int64(len(body)), profile.MaximumPromptTokens)
+	inputRate := 1.0
+	now := time.Now().Unix()
+	cost, err := model.EstimateRoutingCostSnapshot(
+		model.RoutingCostSnapshotVersion{
+			Confidence: model.RoutingCostConfidenceExact, ConfidenceScore: 1,
+			Freshness: model.RoutingCostFreshnessFresh, FreshnessScore: 1,
+			ObservedTime: now, EffectiveTime: now, ExpiresTime: now + 3_600,
+		},
+		model.RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+			InputCostPerMillion: &inputRate,
+		},
+		*profile,
+		now,
+	)
+	require.NoError(t, err)
+	assert.True(t, cost.WorstCaseKnown)
+	assert.InDelta(t, float64(len(body))/1_000_000, cost.WorstCaseSingleBreakdown.Input, 1e-12)
+}
+
+func TestMiddlewareCostProfileKeepsHedgeDependencyChecksFailClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	channelrouting.ResetSnapshotForTest()
+	t.Cleanup(channelrouting.ResetSnapshotForTest)
+	body := `{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"max_tokens":64}`
+	now := time.Now().Unix()
+	inputRate := 2.0
+	outputRate := 10.0
+	cacheRate := 0.2
+	imageRate := 3.0
+	tests := []struct {
+		name    string
+		pricing model.RoutingNormalizedPricing
+		mutate  func(*model.RoutingCostRequestProfile)
+		known   bool
+	}{
+		{
+			name: "ordinary token pricing",
+			pricing: model.RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+				InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			},
+			known: true,
+		},
+		{
+			name: "unknown cache dependency",
+			pricing: model.RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+				InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+				CacheReadCostPerMillion: &cacheRate,
+			},
+		},
+		{
+			name: "unknown media dependency",
+			pricing: model.RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+				InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+				ImageInputCostPerMillion: &imageRate,
+			},
+			mutate: func(profile *model.RoutingCostRequestProfile) {
+				profile.MediaDimensionsKnown = false
+			},
+		},
+		{
+			name: "unknown request dependency",
+			pricing: model.RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD", Unit: "expression",
+				BillingExpression: `header("x-priority") == "fast" ? tier("fast", p * 4 + c * 20) : tier("base", p * 2 + c * 10)`,
+			},
+			mutate: func(profile *model.RoutingCostRequestProfile) {
+				profile.RequestInputKnown = false
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			t.Cleanup(func() { common.CleanupBodyStorage(ctx) })
+			setRoutingPromptCostProxy(ctx)
+			common.SetContextKey(ctx, common.RequestIdKey, "middleware-hedge-cost-profile")
+			common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			profile, ok := common.GetContextKeyType[*model.RoutingCostRequestProfile](ctx, constant.ContextKeyRoutingCostProfile)
+			require.True(t, ok)
+			require.NotNil(t, profile)
+			if test.mutate != nil {
+				test.mutate(profile)
+			}
+			channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+				Revision: 1, PolicyHash: strings.Repeat("a", 64), ActivationID: 1,
+				ActivationStage: model.RoutingDeploymentStageActive,
+				Pools: []channelrouting.PoolSnapshot{{
+					ID: 29, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
+					Members: []channelrouting.PoolMemberSnapshot{{
+						ID: 11, PoolID: 29, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
+						LegacyPriority: 10, LegacyWeight: 10, CredentialIDs: []int{1_001},
+						Models: []channelrouting.ModelSnapshot{{
+							ModelName: "gpt-test", CostPricing: &test.pricing,
+							CostPricingHash: strings.Repeat("b", 64), CostPricingVersion: "middleware-v1",
+							CostObservedTime: now, CostEffectiveTime: now, CostExpiresTime: now + 3_600,
+							CostVersionConfidence: model.RoutingCostConfidenceExact, CostConfidenceScore: 1,
+							CostFreshness: model.RoutingCostFreshnessFresh, CostFreshnessScore: 1,
+							CostSourceSyncStatus:  model.RoutingUpstreamSyncStatusSuccess,
+							CostAccountSourceType: model.RoutingUpstreamTypeNewAPI,
+							CostAccountKeyHash:    strings.Repeat("c", 64),
+						}},
+					}},
+				}},
+				Channels: []channelrouting.ChannelSnapshot{{ID: 101, Status: common.ChannelStatusEnabled}},
+			})
+
+			estimate, known, err := service.ChannelRoutingHedgeCostEstimate(
+				ctx, 101, "gpt-test", "/v1/chat/completions", 0,
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.known, known)
+			if test.known {
+				assert.True(t, estimate.WorstCaseKnown)
+				assert.InDelta(t, float64(len(body))*inputRate/1_000_000, estimate.WorstSingleBreakdown.Input, 1e-12)
+				assert.Less(t, estimate.Cost, estimate.WorstCaseCost)
+			}
+		})
+	}
+}
+
+func TestSetRoutingPromptCostProxyAltSSEAndRealtimeCapacitySemantics(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Run("multipart media token dimensions are not applicable", func(t *testing.T) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("form-data"))
+		ctx.Request.Header.Set("Content-Type", "multipart/form-data; boundary=test")
+
+		setRoutingPromptCostProxy(ctx)
+
+		inputState, inputExists := common.GetContextKey(ctx, constant.ContextKeyRoutingCapacityInputState)
+		outputState, outputExists := common.GetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputState)
+		require.True(t, inputExists)
+		require.True(t, outputExists)
+		assert.Equal(t, channelrouting.CapacityDimensionNotApplicable, inputState)
+		assert.Equal(t, channelrouting.CapacityDimensionNotApplicable, outputState)
+		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityInputKnown))
+		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityOutputKnown))
+		assert.Zero(t, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCapacityInput))
+		assert.Zero(t, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCapacityOutput))
+	})
+
+	t.Run("gemini alt sse wins", func(t *testing.T) {
+		body := `{"contents":[{"parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":32}}`
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-test:generateContent?alt=sse", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		t.Cleanup(func() { common.CleanupBodyStorage(ctx) })
+
+		setRoutingPromptCostProxy(ctx)
+
+		stream, exists := common.GetContextKey(ctx, constant.ContextKeyIsStream)
+		require.True(t, exists)
+		assert.Equal(t, true, stream)
+	})
+
+	t.Run("realtime is capacity unknown", func(t *testing.T) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model=gpt-realtime", nil)
+
+		setRoutingPromptCostProxy(ctx)
+
+		_, promptProxyExists := common.GetContextKey(ctx, constant.ContextKeyRoutingPromptProxy)
+		assert.False(t, promptProxyExists)
+		_, capacityInputExists := common.GetContextKey(ctx, constant.ContextKeyRoutingCapacityInput)
+		assert.True(t, capacityInputExists)
+		assert.False(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityInputKnown))
+		assert.False(t, common.GetContextKeyBool(ctx, constant.ContextKeyRoutingCapacityOutputKnown))
+		inputState, _ := common.GetContextKey(ctx, constant.ContextKeyRoutingCapacityInputState)
+		outputState, _ := common.GetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputState)
+		assert.Equal(t, channelrouting.CapacityDimensionApplicableUnknown, inputState)
+		assert.Equal(t, channelrouting.CapacityDimensionApplicableUnknown, outputState)
+		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyIsStream))
+	})
+}

@@ -128,7 +128,11 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 	if retentionDays > maxRetentionDays {
 		retentionDays = maxRetentionDays
 	}
-	now := time.Now()
+	databaseNowMs, err := model.RoutingDatabaseNowMsContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	now := time.UnixMilli(databaseNowMs)
 	cutoffTime := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
 	cutoff := cutoffTime.Unix()
 	rollupsDeleted, err := model.DeleteRoutingMetricRollupsBeforeContext(ctx, cutoff)
@@ -166,8 +170,93 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 	if err != nil {
 		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted, err
 	}
+	resetOutboxDeleted, err := model.DeletePublishedRoutingBreakerResetOutboxBeforeContext(ctx, cutoffTime.UnixMilli())
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted + resetOutboxDeleted, err
+	}
 	checkpointsDeleted, err := model.DeleteExpiredRoutingRuntimeCheckpointsContext(ctx, now.Unix())
-	return rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted + checkpointsDeleted, err
+	deleted := rollupsDeleted + auditsDeleted + costVersionsDeleted + probeResultsDeleted + probeLeasesDeleted + receiptsDeleted + outboxDeleted + resetOutboxDeleted + checkpointsDeleted
+	if err != nil {
+		return deleted, err
+	}
+	endpointDeleted, err := DeleteExpiredRoutingEndpointHistoryContext(ctx, retentionDays)
+	deleted += endpointDeleted
+	if err != nil {
+		return deleted, err
+	}
+	errorBudgetDeleted, err := model.DeleteRoutingErrorBudgetHistoryBeforeContext(ctx, cutoffTime.UnixMilli())
+	deleted += errorBudgetDeleted
+	if err != nil {
+		return deleted, err
+	}
+	canaryEvaluationsDeleted, err := deleteExpiredRoutingCanaryEvaluationsContext(ctx, cutoffTime.UnixMilli())
+	deleted += canaryEvaluationsDeleted
+	if err != nil {
+		return deleted, err
+	}
+	for batch := 0; batch < 20; batch++ {
+		exportsDeleted, deleteErr := model.DeleteExpiredRoutingAuditExportsContext(ctx, now.UnixMilli(), 500)
+		deleted += exportsDeleted
+		if deleteErr != nil {
+			return deleted, deleteErr
+		}
+		if exportsDeleted < 500 {
+			break
+		}
+	}
+	for batch := 0; batch < 20; batch++ {
+		operationsDeleted, deleteErr := model.DeleteCompletedRoutingOperationsBeforeContext(
+			ctx, cutoffTime.UnixMilli(), now.UnixMilli(), 500,
+		)
+		deleted += operationsDeleted
+		if deleteErr != nil {
+			return deleted, deleteErr
+		}
+		if operationsDeleted < 500 {
+			break
+		}
+	}
+	for batch := 0; batch < 20; batch++ {
+		approvalsDeleted, deleteErr := model.DeleteStaleRoutingPolicyApprovalsContext(
+			ctx, cutoffTime.UnixMilli(), 500,
+		)
+		deleted += approvalsDeleted
+		if deleteErr != nil {
+			return deleted, deleteErr
+		}
+		if approvalsDeleted < 500 {
+			break
+		}
+	}
+	for batch := 0; batch < 20; batch++ {
+		approvalsDeleted, deleteErr := model.DeleteStaleRoutingPolicyRollbackApprovalsContext(
+			ctx, cutoffTime.UnixMilli(), 500,
+		)
+		deleted += approvalsDeleted
+		if deleteErr != nil {
+			return deleted, deleteErr
+		}
+		if approvalsDeleted < 500 {
+			break
+		}
+	}
+	for batch := 0; batch < 20; batch++ {
+		commandsDeleted, deleteErr := model.DeleteCompletedRoutingBreakerResetCommandsBeforeContext(
+			ctx, cutoffTime.UnixMilli(), 500,
+		)
+		deleted += commandsDeleted
+		if deleteErr != nil {
+			return deleted, deleteErr
+		}
+		if commandsDeleted < 500 {
+			break
+		}
+	}
+	return deleted, nil
+}
+
+func deleteExpiredRoutingCanaryEvaluationsContext(ctx context.Context, cutoffMs int64) (int64, error) {
+	return model.DeleteRoutingCanaryEvaluationsBeforeContext(ctx, cutoffMs)
 }
 
 func lockRoutingTelemetry(ctx context.Context) error {

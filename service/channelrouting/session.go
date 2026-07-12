@@ -53,6 +53,7 @@ type RequestRoutingPlanInput struct {
 	RetryIndex              int
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
+	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
 	// A nil allowed list means unrestricted. A non-nil empty list fails closed.
 	AllowedChannelIDs          []int
 	ExcludedChannelIDs         []int
@@ -68,13 +69,17 @@ type RequestRoutingCostInput struct {
 	RetryIndex              int
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
+	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
 }
 
 type RequestRoutingPlan struct {
-	Gate             CanaryGate         `json:"gate"`
-	Replay           ShadowReplayInput  `json:"replay"`
-	Result           ShadowReplayResult `json:"result"`
-	SelectedIdentity Identity           `json:"selected_identity"`
+	Gate                      CanaryGate         `json:"gate"`
+	Replay                    ShadowReplayInput  `json:"replay"`
+	Result                    ShadowReplayResult `json:"result"`
+	SelectedIdentity          Identity           `json:"selected_identity"`
+	SelectedBreakerScope      string             `json:"selected_breaker_scope,omitempty"`
+	SelectedEndpointAuthority string             `json:"selected_endpoint_authority,omitempty"`
+	SelectedRegion            string             `json:"selected_region,omitempty"`
 }
 
 func NewRequestRoutingSession(requestID string, groupName string) (*RequestRoutingSession, error) {
@@ -199,17 +204,39 @@ func (session *RequestRoutingSession) ExpectedCostForChannel(
 	channelID int,
 	input RequestRoutingCostInput,
 ) (float64, bool, error) {
+	estimate, available, err := session.CostEstimateForChannel(channelID, input)
+	if err != nil || !available || !estimate.Known {
+		return 0, false, err
+	}
+	return estimate.Cost, true, nil
+}
+
+func (session *RequestRoutingSession) WorstCaseCostForChannel(
+	channelID int,
+	input RequestRoutingCostInput,
+) (float64, bool, error) {
+	estimate, available, err := session.CostEstimateForChannel(channelID, input)
+	if err != nil || !available || !estimate.WorstCaseKnown {
+		return 0, false, err
+	}
+	return estimate.WorstCaseCost, true, nil
+}
+
+func (session *RequestRoutingSession) CostEstimateForChannel(
+	channelID int,
+	input RequestRoutingCostInput,
+) (ShadowCostInput, bool, error) {
 	if session == nil || session.snapshot == nil || channelID <= 0 ||
 		session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {
-		return 0, false, ErrRoutingSessionInvalid
+		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
 	pool := &session.snapshot.view.Pools[session.poolIndex]
 	if pool.ID <= 0 || pool.GroupName != session.groupName || session.planningTime.IsZero() {
-		return 0, false, ErrRoutingSessionInvalid
+		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
 	memberID, exists := session.snapshot.memberByPoolChannel[poolChannelKey{PoolID: pool.ID, ChannelID: channelID}]
 	if !exists || memberID <= 0 {
-		return 0, false, ErrRoutingSessionInvalid
+		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
 	profile, err := NewRequestProfile(
 		input.RequestPath,
@@ -221,24 +248,25 @@ func (session *RequestRoutingSession) ExpectedCostForChannel(
 		input.CompletionTokenEstimate,
 	)
 	if err != nil {
-		return 0, false, ErrRoutingSessionInvalid
+		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
+	profile = attachRoutingCostProfile(profile, input.CostProfile, session.planningTime.Unix())
 	observation, exists := session.snapshot.modelByMemberModel[memberModelKey{memberID: memberID, model: profile.ModelName}]
 	if !exists {
-		return 0, false, nil
+		return ShadowCostInput{}, false, nil
 	}
 	cost, err := shadowExpectedCost(observation, profile)
 	if err != nil {
-		return 0, false, ErrRoutingSessionInvalid
+		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
 	settings := ShadowSelectorSettings{
 		NowUnix:          session.planningTime.Unix(),
 		SnapshotStaleSec: pool.SelectorPolicy.SnapshotStaleSec,
 	}
-	if cost == nil || !shadowCostKnown(cost, settings) {
-		return 0, false, nil
+	if cost == nil || shadowCostStale(cost, settings) {
+		return ShadowCostInput{}, false, nil
 	}
-	return cost.Cost, true, nil
+	return *cost, true, nil
 }
 
 func (session *RequestRoutingSession) Gate() (CanaryGate, bool, error) {
@@ -295,6 +323,7 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
+	profile = attachRoutingCostProfile(profile, input.CostProfile, session.planningTime.Unix())
 	allowedChannels, allowedRestricted, err := routingSessionChannelSet(input.AllowedChannelIDs)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
@@ -325,7 +354,12 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		return RequestRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
 	candidates := make([]ShadowCandidateInput, 0, len(memberIndexes))
+	costEstimates := make(map[int]ShadowCostInput, len(memberIndexes))
 	identities := make(map[int]Identity, len(memberIndexes))
+	endpointBreakerByMemberID := make(map[int]struct {
+		authority string
+		region    string
+	}, len(memberIndexes))
 	for _, memberIndex := range memberIndexes {
 		if memberIndex < 0 || memberIndex >= len(pool.Members) {
 			return RequestRoutingPlan{}, true, ErrRoutingSessionInvalid
@@ -342,9 +376,21 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		if !exists || channel.Status != common.ChannelStatusEnabled {
 			continue
 		}
-		candidate, candidateErr := shadowCandidateFromSnapshot(*pool, member, observation, channel, profile, settings)
+		candidate, costEstimate, candidateErr := shadowCandidateFromSnapshot(*pool, member, observation, channel, profile, settings)
 		if candidateErr != nil {
 			return RequestRoutingPlan{}, true, candidateErr
+		}
+		if costEstimate != nil {
+			costEstimates[member.ChannelID] = *costEstimate
+		}
+		endpointBreaker, authority, region := endpointBreakerForChannel(channel, now, settings.SnapshotStaleSec)
+		var endpointSelected bool
+		candidate.Breaker, endpointSelected = mergeShadowBreaker(candidate.Breaker, endpointBreaker)
+		if endpointSelected {
+			endpointBreakerByMemberID[member.ID] = struct {
+				authority string
+				region    string
+			}{authority: authority, region: region}
 		}
 		switch {
 		case routingSessionChannelContains(excludedChannels, member.ChannelID):
@@ -390,6 +436,7 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
+	replay.costEstimates = costEstimates
 	result, err := RunShadowReplay(replay)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
@@ -402,6 +449,11 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 			return RequestRoutingPlan{}, true, ErrRoutingSessionInvalid
 		}
 		plan.SelectedIdentity = identity
+		if endpoint, endpointSelected := endpointBreakerByMemberID[result.SelectedMemberID]; endpointSelected {
+			plan.SelectedBreakerScope = BreakerScopeEndpoint
+			plan.SelectedEndpointAuthority = endpoint.authority
+			plan.SelectedRegion = endpoint.region
+		}
 	}
 	return plan, true, nil
 }
@@ -428,6 +480,29 @@ func (session *RequestRoutingSession) slowStartFactor(
 	}
 	session.slowStartMu.Unlock()
 	return factor, nil
+}
+
+func attachRoutingCostProfile(
+	profile RequestProfile,
+	costProfile *model.RoutingCostRequestProfile,
+	atUnix int64,
+) RequestProfile {
+	profile.costAtUnix = atUnix
+	if costProfile == nil {
+		return profile
+	}
+	cloned := *costProfile
+	if len(costProfile.Request.Body) > 0 {
+		cloned.Request.Body = append([]byte(nil), costProfile.Request.Body...)
+	}
+	if len(costProfile.Request.Headers) > 0 {
+		cloned.Request.Headers = make(map[string]string, len(costProfile.Request.Headers))
+		for key, value := range costProfile.Request.Headers {
+			cloned.Request.Headers[key] = value
+		}
+	}
+	profile.costProfile = &cloned
+	return profile
 }
 
 func routingSessionChannelSet(channelIDs []int) (map[int]struct{}, bool, error) {

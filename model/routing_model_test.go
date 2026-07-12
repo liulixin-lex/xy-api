@@ -142,7 +142,7 @@ func TestRoutingPersistenceAcceptsOnlySingleKeyMinusOne(t *testing.T) {
 			common.MemoryCacheEnabled = false
 			t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
 
-			require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+			require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingBreakerResetFence{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
 			require.NoError(t, DB.Create(&Channel{Id: 1001, Name: "single", Key: "single-key"}).Error)
 			require.NoError(t, DB.Create(&Channel{Id: 1002, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: ChannelInfo{IsMultiKey: true}}).Error)
 
@@ -234,7 +234,7 @@ func TestRoutingStateUpsertsPropagateEligibilityQueryErrors(t *testing.T) {
 		},
 		{
 			name:   "breaker",
-			models: []interface{}{&Channel{}, &RoutingBreakerState{}},
+			models: []interface{}{&Channel{}, &RoutingBreakerResetFence{}, &RoutingBreakerState{}},
 			upsert: func() error {
 				return UpsertRoutingBreakerState(&RoutingBreakerState{
 					ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
@@ -311,7 +311,7 @@ func TestRoutingModelContextCanceledOperationsDoNotMutateState(t *testing.T) {
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingBreakerResetFence{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
 	require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
 	require.NoError(t, DB.Create(&RoutingChannelMetric{
 		ChannelID: 1, APIKeyIndex: RoutingMetricSingleKeyIndex, ModelName: "retained",
@@ -448,7 +448,7 @@ func TestFencedRoutingBreakerOlderStateUsesConflictSafeUpsert(t *testing.T) {
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelBinding{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingBreakerResetFence{}, &RoutingChannelBinding{}, &RoutingBreakerState{}))
 
 	const channelID = 1203
 	require.NoError(t, DB.Create(&Channel{Id: channelID, Name: "single", Key: "single-key"}).Error)
@@ -508,7 +508,7 @@ func TestFencedRoutingStateRejectsTimestampsAtOrBeforeBindingCreation(t *testing
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelBinding{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingBreakerResetFence{}, &RoutingChannelBinding{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
 
 	const (
 		channelID   = 1204
@@ -553,7 +553,7 @@ func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() { common.MemoryCacheEnabled = previousMemoryCache })
-	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &RoutingBreakerResetFence{}, &RoutingChannelMetric{}, &RoutingBreakerState{}))
 	require.NoError(t, DB.Create(&Channel{Id: 1, Name: "single", Key: "single-key"}).Error)
 
 	eligibility, err := ResolveLegacyRoutingStateEligibility(1, RoutingMetricSingleKeyIndex)
@@ -578,6 +578,7 @@ func TestLegacyRoutingStateEligibilityRejectsMismatchedRecords(t *testing.T) {
 }
 
 var routingMigrationModels = []interface{}{
+	&RoutingSchemaVersion{},
 	&RoutingTopologyMetadata{},
 	&RoutingPool{},
 	&RoutingPoolMember{},
@@ -589,12 +590,25 @@ var routingMigrationModels = []interface{}{
 	&RoutingPolicyMemberRevision{},
 	&RoutingPolicyActivation{},
 	&RoutingPolicyDraft{},
+	&RoutingPolicyApproval{},
+	&RoutingPolicyRollbackApproval{},
 	&RoutingConfigOutbox{},
 	&RoutingRuntimeCheckpoint{},
 	&RoutingControlLease{},
 	&RoutingProbeResult{},
+	&RoutingEndpointEvidence{},
+	&RoutingEndpointSharedState{},
 	&RoutingCanaryEvaluation{},
 	&RoutingOperation{},
+	&RoutingBreakerResetCommand{},
+	&RoutingBreakerResetFence{},
+	&RoutingBreakerResetTombstone{},
+	&RoutingBreakerResetOutbox{},
+	&RoutingAuditExport{},
+	&RoutingAuditExportChunk{},
+	&RoutingHedgeAttemptAudit{},
+	&SystemTask{},
+	&SystemTaskLock{},
 	&RoutingUpstreamAccount{},
 	&RoutingCostSnapshotVersion{},
 	&RoutingChannelBinding{},
@@ -606,6 +620,14 @@ var routingMigrationModels = []interface{}{
 	&RoutingChannelHealthState{},
 	&RoutingAgentRecommendation{},
 }
+
+var routingExternalCleanupModels = append([]interface{}{
+	&RoutingErrorBudgetCursor{},
+	&RoutingErrorBudgetHistory{},
+	&RoutingErrorBudgetState{},
+	&routingPolicyApprovalUserForTest{},
+	&CasbinRule{},
+}, routingMigrationModels...)
 
 type routingChannelMetricBeforeReliability struct {
 	ID           int    `gorm:"primaryKey"`
@@ -750,6 +772,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "Cohort"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "SelectedMemberID"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ReservationMode"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ReservationResourceModel"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ExclusionSummaryJSON"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "EvaluationHash"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCanaryEvaluation{}, "CreateToken"))
@@ -1473,16 +1496,17 @@ func openRoutingExternalTestDB(t *testing.T, dbType common.DatabaseType, dsn str
 	if db.Migrator().HasTable(&Channel{}) {
 		t.Skip("refusing to run against external database because channels already exists")
 	}
-	for _, model := range routingMigrationModels {
+	for _, model := range routingExternalCleanupModels {
 		if db.Migrator().HasTable(model) {
 			t.Skipf("refusing to run against external database because %s already exists", model.(interface{ TableName() string }).TableName())
 		}
 	}
 
 	t.Cleanup(func() {
-		for index := len(routingMigrationModels) - 1; index >= 0; index-- {
-			_ = db.Migrator().DropTable(routingMigrationModels[index])
+		for index := len(routingExternalCleanupModels) - 1; index >= 0; index-- {
+			_ = db.Migrator().DropTable(routingExternalCleanupModels[index])
 		}
+		_ = db.Migrator().DropTable(&Channel{})
 	})
 
 	return db

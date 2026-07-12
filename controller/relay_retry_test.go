@@ -233,7 +233,7 @@ func TestShouldRetryAllowsHTTPStreamRetryUntilWriterCommit(t *testing.T) {
 	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1), "attempt counters are not a client commit")
 }
 
-func TestShouldRetryAllowsRealtimeFirstByteTimeoutAfterWebSocketUpgrade(t *testing.T) {
+func TestShouldRetryBlocksRealtimeFirstByteTimeoutAfterWebSocketUpgrade(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -247,7 +247,7 @@ func TestShouldRetryAllowsRealtimeFirstByteTimeoutAfterWebSocketUpgrade(t *testi
 	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, nil)
 
 	classification := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
-	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1))
+	assert.False(t, shouldRetry(ctx, info, apiErr, classification, 1))
 }
 
 func TestShouldRetryBlocksFirstByteTimeoutAfterHTTPWriterWritten(t *testing.T) {
@@ -852,11 +852,18 @@ func singleKeyRoutingAttemptFixture(t *testing.T, channelID int) (*gin.Context, 
 	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, false)
 	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
 	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "vip")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointHost, "api.example.test")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointAuthority, "https://api.example.test:443")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRegion, "us-east-1")
 	return ctx, &relaycommon.RelayInfo{
 		UsingGroup:      "vip",
 		OriginModelName: "gpt-test",
 		StartTime:       time.Now(),
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: channelID, ChannelIsMultiKey: false},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: channelID, ChannelIsMultiKey: false,
+			RoutingEndpointHost: "api.example.test", RoutingEndpointAuthority: "https://api.example.test:443",
+			RoutingRegion: "us-east-1",
+		},
 	}
 }
 
@@ -867,17 +874,20 @@ func TestRecordRoutingAttemptEffectsMatrix(t *testing.T) {
 		responseStatus    int
 		retryAfterMs      int64
 		responsibility    routingerror.Responsibility
+		scope             routingerror.Scope
 		health            routingerror.HealthEffect
 		capacity          routingerror.CapacityEffect
 		wantReliability   bool
 		wantCapacity      bool
 		wantBreakerReason string
+		wantEndpointState string
 	}{
-		{name: "402 is capacity only", sourceStatus: 402, responseStatus: 402, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true},
-		{name: "mapped 429 is capacity only", sourceStatus: 429, responseStatus: 503, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true},
-		{name: "529 is capacity only", sourceStatus: 529, responseStatus: 529, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true},
-		{name: "502 is reliability only", sourceStatus: 502, responseStatus: 502, responsibility: routingerror.ResponsibilityProvider, health: routingerror.HealthDegrade, capacity: routingerror.CapacityNone, wantReliability: true, wantBreakerReason: "5xx"},
-		{name: "503 retry after has both effects", sourceStatus: 503, responseStatus: 503, retryAfterMs: 2500, responsibility: routingerror.ResponsibilityProvider, health: routingerror.HealthDegrade, capacity: routingerror.CapacityCooldown, wantReliability: true, wantCapacity: true, wantBreakerReason: "5xx"},
+		{name: "402 is capacity only", sourceStatus: 402, responseStatus: 402, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "mapped 429 is capacity only", sourceStatus: 429, responseStatus: 503, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "529 is capacity only", sourceStatus: 529, responseStatus: 529, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "502 is reliability only", sourceStatus: 502, responseStatus: 502, responsibility: routingerror.ResponsibilityProvider, health: routingerror.HealthDegrade, capacity: routingerror.CapacityNone, wantReliability: true, wantBreakerReason: "5xx", wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "503 retry after has both effects", sourceStatus: 503, responseStatus: 503, retryAfterMs: 2500, responsibility: routingerror.ResponsibilityProvider, health: routingerror.HealthDegrade, capacity: routingerror.CapacityCooldown, wantReliability: true, wantCapacity: true, wantBreakerReason: "5xx", wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "network endpoint does not poison member", sourceStatus: 504, responseStatus: 504, responsibility: routingerror.ResponsibilityNetwork, scope: routingerror.ScopeEndpoint, health: routingerror.HealthDegrade, capacity: routingerror.CapacityNone, wantEndpointState: string(routingbreaker.StateOpen)},
 		{name: "caller 400 has neither effect", sourceStatus: 400, responseStatus: 400, responsibility: routingerror.ResponsibilityCaller, health: routingerror.HealthIgnore, capacity: routingerror.CapacityNone},
 	}
 
@@ -894,6 +904,7 @@ func TestRecordRoutingAttemptEffectsMatrix(t *testing.T) {
 			}
 			classification := routingerror.Classification{
 				Responsibility: tt.responsibility,
+				Scope:          tt.scope,
 				HealthEffect:   tt.health,
 				CapacityEffect: tt.capacity,
 				Component:      routingerror.ComponentServing,
@@ -915,6 +926,13 @@ func TestRecordRoutingAttemptEffectsMatrix(t *testing.T) {
 			assert.Equal(t, tt.wantReliability, hasBreaker)
 			if tt.wantBreakerReason != "" && hasBreaker {
 				assert.Equal(t, tt.wantBreakerReason, breaker.Reason)
+			}
+			endpoint, hasEndpoint := routinghotcache.GetBreaker(
+				routingbreaker.NewEndpointKey("https://api.example.test:443", "us-east-1").HotcacheKey(),
+			)
+			assert.Equal(t, tt.wantEndpointState != "", hasEndpoint)
+			if hasEndpoint {
+				assert.Equal(t, tt.wantEndpointState, endpoint.State)
 			}
 			metrics := routingmetrics.Snapshots()
 			require.Len(t, metrics, 1)
@@ -1037,6 +1055,39 @@ func TestRecordRoutingAttemptEffectsUsesSmartRoutingBreakerSettings(t *testing.T
 	cached, ok := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 33, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	require.True(t, ok)
 	assert.Equal(t, string(routingbreaker.StateOpen), cached.State)
+}
+
+func TestRecordRoutingAttemptEffectsPublishesBreakerOpenAndRecoveryEvents(t *testing.T) {
+	configureRoutingBreakerAttemptTest(t, true)
+	channelrouting.ResetRoutingEventsForTest()
+	t.Cleanup(channelrouting.ResetRoutingEventsForTest)
+	ctx, info := singleKeyRoutingAttemptFixture(t, 34)
+	apiErr := types.NewErrorWithStatusCode(
+		errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, http.StatusBadGateway,
+	)
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component: routingerror.ComponentServing, Operation: routingerror.OperationRelay,
+	})
+
+	recordRoutingAttemptEffects(ctx, info, 34, false, apiErr, classification)
+	key := routingbreaker.Key{
+		ChannelID: 34, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model: "gpt-test", Group: "vip",
+	}
+	routingbreaker.ResetDefaultForTest(routingBreakerConfigFromSetting(smart_routing_setting.GetSetting()))
+	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
+		Key: key, State: routingbreaker.StateHalfOpen, UpdatedAt: time.Now(),
+	}})
+	recordRoutingAttemptEffects(ctx, info, 34, true, nil, routingerror.Classification{})
+
+	events := channelrouting.RecentRoutingEvents(
+		10, channelrouting.RoutingEventTypeBreakerOpened, channelrouting.RoutingEventTypeBreakerRecovered,
+	)
+	require.Len(t, events, 2)
+	assert.Equal(t, channelrouting.RoutingEventTypeBreakerRecovered, events[0].Type)
+	assert.Equal(t, channelrouting.RoutingEventTypeBreakerOpened, events[1].Type)
+	assert.Contains(t, string(events[0].PayloadJSON), `"channel_id":34`)
+	assert.Contains(t, string(events[0].PayloadJSON), `"current_state":"healthy"`)
 }
 
 func TestRelayInvalidRequestReleasesReservedHalfOpenProbe(t *testing.T) {

@@ -23,9 +23,11 @@ import (
 func TestRoutingConfigOutboxPublishesStreamEventAndMarksRow(t *testing.T) {
 	db := openRoutingConfigTestDB(t)
 	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
 		&model.RoutingPolicyHead{}, &model.RoutingPolicyRevision{}, &model.RoutingPolicyPoolRevision{},
 		&model.RoutingPolicyMemberRevision{}, &model.RoutingPolicyActivation{}, &model.RoutingConfigOutbox{},
 	))
+	require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "config-stream", Models: "gpt-test"}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	published, err := model.PublishRoutingPolicyRevisionContext(
 		context.Background(),

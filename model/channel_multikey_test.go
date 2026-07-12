@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -160,7 +161,7 @@ func TestEnablingMultiKeyClearsOperationalMetadata(t *testing.T) {
 func TestChannelUpdateCleansAllOutOfRangeMultiKeyState(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
-	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}, &RoutingChannelHealthState{}))
 
 	channel := &Channel{
 		Id:     9201,
@@ -205,7 +206,7 @@ func TestChannelUpdateCleansAllOutOfRangeMultiKeyState(t *testing.T) {
 func TestChannelUpdateTreatsEmptyJSONArrayAsNoKeys(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
-	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}))
+	require.NoError(t, db.AutoMigrate(&Channel{}, &Ability{}, &RoutingChannelHealthState{}))
 
 	channel := &Channel{
 		Id:     9202,
@@ -233,4 +234,49 @@ func TestChannelUpdateTreatsEmptyJSONArrayAsNoKeys(t *testing.T) {
 	assert.Empty(t, channel.ChannelInfo.MultiKeyDisabledReason)
 	assert.Empty(t, channel.ChannelInfo.MultiKeyDisabledTime)
 	assert.Zero(t, channel.ChannelInfo.MultiKeyPollingIndex)
+}
+
+func TestChannelCredentialUpdateClearsPersistedRoutingAuthFailure(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-channel-credential-rotation-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+	require.NoError(t, db.AutoMigrate(
+		&Channel{}, &Ability{}, &RoutingCredentialRef{}, &RoutingChannelHealthState{},
+	))
+
+	channel := &Channel{
+		Id: 9301, Name: "credential rotation", Key: "old-key", Status: common.ChannelStatusEnabled,
+		Models: "gpt-test", Group: "default",
+	}
+	require.NoError(t, db.Create(channel).Error)
+	fingerprint, err := RoutingCredentialFingerprint(channel.Id, channel.Key)
+	require.NoError(t, err)
+	credential := RoutingCredentialRef{
+		ChannelID: channel.Id, Fingerprint: fingerprint,
+		FingerprintVersion: RoutingCredentialFingerprintVersion, Active: true,
+	}
+	require.NoError(t, db.Create(&credential).Error)
+	require.NoError(t, db.Create(&RoutingChannelHealthState{
+		ChannelID: channel.Id, AuthFailure: true, AuthFailureReason: "old credential rejected", AuthFailureUntil: 9_999,
+	}).Error)
+
+	channel.Key = "new-key"
+	require.NoError(t, channel.Update())
+
+	var health RoutingChannelHealthState
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).First(&health).Error)
+	assert.False(t, health.AuthFailure)
+	assert.Empty(t, health.AuthFailureReason)
+	assert.Zero(t, health.AuthFailureUntil)
+
+	applied, err := ApplyRoutingChannelProbeAuthStateContext(
+		context.Background(), channel.Id, credential.ID, true, "late old credential", 20_000,
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).First(&health).Error)
+	assert.False(t, health.AuthFailure)
 }

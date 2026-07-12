@@ -1,6 +1,8 @@
 package model
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -26,6 +28,12 @@ var commonFalseVal string
 
 var logKeyCol string
 var logGroupCol string
+
+const (
+	routingV2AlphaDrainedEnv         = "ROUTING_V2_ALPHA_DRAINED"
+	routingSchemaReadyWaitSecondsEnv = "ROUTING_SCHEMA_READY_WAIT_SECONDS"
+	routingSchemaReadyWaitDefault    = 60
+)
 
 func initCol() {
 	// init common column names
@@ -205,7 +213,7 @@ func InitDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
-			return nil
+			return waitRoutingV2SchemaReady(DB)
 		}
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
@@ -261,6 +269,9 @@ func InitLogDB() (err error) {
 }
 
 func migrateDB() error {
+	if err := invalidateRoutingV2SchemaVersion(DB); err != nil {
+		return err
+	}
 	// Migrate price_amount column from float/double to decimal for existing tables
 	migrateSubscriptionPlanPriceAmount()
 	// Migrate model_limits column from varchar to text for existing tables
@@ -301,6 +312,7 @@ func migrateDB() error {
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
+		&RoutingSchemaVersion{},
 		&RoutingTopologyMetadata{},
 		&RoutingPool{},
 		&RoutingPoolMember{},
@@ -313,18 +325,28 @@ func migrateDB() error {
 		&RoutingPolicyMemberRevision{},
 		&RoutingPolicyActivation{},
 		&RoutingPolicyDraft{},
+		&RoutingPolicyApproval{},
+		&RoutingPolicyRollbackApproval{},
 		&RoutingConfigOutbox{},
 		&RoutingRuntimeCheckpoint{},
 		&RoutingControlLease{},
 		&RoutingProbeResult{},
+		&RoutingEndpointEvidence{},
+		&RoutingEndpointSharedState{},
 		&RoutingCanaryEvaluation{},
 		&RoutingOperation{},
+		&RoutingBreakerResetCommand{},
+		&RoutingBreakerResetFence{},
+		&RoutingBreakerResetTombstone{},
+		&RoutingBreakerResetOutbox{},
+		&RoutingAuditExport{},
+		&RoutingAuditExportChunk{},
+		&RoutingHedgeAttemptAudit{},
 		&RoutingUpstreamAccount{},
 		&RoutingCostSnapshotVersion{},
 		&RoutingChannelBinding{},
 		&RoutingCostSnapshot{},
 		&RoutingChannelMetric{},
-		&RoutingMetricRollup{},
 		&RoutingTelemetryReceipt{},
 		&RoutingBreakerState{},
 		&RoutingChannelHealthState{},
@@ -336,6 +358,12 @@ func migrateDB() error {
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
+		return err
+	}
+	if err := ensureRoutingOperationRequestKeyUniqueIndex(DB); err != nil {
 		return err
 	}
 	if err := EnsureRoutingPolicyHead(); err != nil {
@@ -353,10 +381,13 @@ func migrateDB() error {
 			return err
 		}
 	}
-	return nil
+	return publishRoutingV2SchemaVersion(DB)
 }
 
 func migrateDBFast() error {
+	if err := invalidateRoutingV2SchemaVersion(DB); err != nil {
+		return err
+	}
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
 		return err
 	}
@@ -396,6 +427,7 @@ func migrateDBFast() error {
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
 		{&PerfMetric{}, "PerfMetric"},
+		{&RoutingSchemaVersion{}, "RoutingSchemaVersion"},
 		{&RoutingTopologyMetadata{}, "RoutingTopologyMetadata"},
 		{&RoutingPool{}, "RoutingPool"},
 		{&RoutingPoolMember{}, "RoutingPoolMember"},
@@ -408,18 +440,28 @@ func migrateDBFast() error {
 		{&RoutingPolicyMemberRevision{}, "RoutingPolicyMemberRevision"},
 		{&RoutingPolicyActivation{}, "RoutingPolicyActivation"},
 		{&RoutingPolicyDraft{}, "RoutingPolicyDraft"},
+		{&RoutingPolicyApproval{}, "RoutingPolicyApproval"},
+		{&RoutingPolicyRollbackApproval{}, "RoutingPolicyRollbackApproval"},
 		{&RoutingConfigOutbox{}, "RoutingConfigOutbox"},
 		{&RoutingRuntimeCheckpoint{}, "RoutingRuntimeCheckpoint"},
 		{&RoutingControlLease{}, "RoutingControlLease"},
 		{&RoutingProbeResult{}, "RoutingProbeResult"},
+		{&RoutingEndpointEvidence{}, "RoutingEndpointEvidence"},
+		{&RoutingEndpointSharedState{}, "RoutingEndpointSharedState"},
 		{&RoutingCanaryEvaluation{}, "RoutingCanaryEvaluation"},
 		{&RoutingOperation{}, "RoutingOperation"},
+		{&RoutingBreakerResetCommand{}, "RoutingBreakerResetCommand"},
+		{&RoutingBreakerResetFence{}, "RoutingBreakerResetFence"},
+		{&RoutingBreakerResetTombstone{}, "RoutingBreakerResetTombstone"},
+		{&RoutingBreakerResetOutbox{}, "RoutingBreakerResetOutbox"},
+		{&RoutingAuditExport{}, "RoutingAuditExport"},
+		{&RoutingAuditExportChunk{}, "RoutingAuditExportChunk"},
+		{&RoutingHedgeAttemptAudit{}, "RoutingHedgeAttemptAudit"},
 		{&RoutingUpstreamAccount{}, "RoutingUpstreamAccount"},
 		{&RoutingCostSnapshotVersion{}, "RoutingCostSnapshotVersion"},
 		{&RoutingChannelBinding{}, "RoutingChannelBinding"},
 		{&RoutingCostSnapshot{}, "RoutingCostSnapshot"},
 		{&RoutingChannelMetric{}, "RoutingChannelMetric"},
-		{&RoutingMetricRollup{}, "RoutingMetricRollup"},
 		{&RoutingTelemetryReceipt{}, "RoutingTelemetryReceipt"},
 		{&RoutingBreakerState{}, "RoutingBreakerState"},
 		{&RoutingChannelHealthState{}, "RoutingChannelHealthState"},
@@ -451,6 +493,12 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
+		return err
+	}
+	if err := ensureRoutingOperationRequestKeyUniqueIndex(DB); err != nil {
+		return err
+	}
 	if err := EnsureRoutingPolicyHead(); err != nil {
 		return err
 	}
@@ -466,8 +514,49 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := publishRoutingV2SchemaVersion(DB); err != nil {
+		return err
+	}
 	common.SysLog("database migrated")
 	return nil
+}
+
+func migrateRoutingV2DedicatedSchemas(db *gorm.DB) error {
+	alphaV2Drained := common.GetEnvOrDefaultBool(routingV2AlphaDrainedEnv, false)
+	rollupOptions := RoutingMetricRollupMigrationOptions{AlphaV2Drained: alphaV2Drained}
+	if err := MigrateRoutingMetricRollupRevisionKeyWithOptions(db, rollupOptions); err != nil {
+		return routingV2MigrationError("routing metric rollup", err)
+	}
+	errorBudgetOptions := RoutingErrorBudgetMigrationOptions{AlphaV2Drained: alphaV2Drained}
+	if err := MigrateRoutingErrorBudgetModelsWithOptions(db, errorBudgetOptions); err != nil {
+		return routingV2MigrationError("routing error budget", err)
+	}
+	if err := MigrateRoutingPolicyApprovalIntentIndexes(db); err != nil {
+		return routingV2MigrationError("routing policy approval indexes", err)
+	}
+	return nil
+}
+
+func waitRoutingV2SchemaReady(db *gorm.DB) error {
+	waitSeconds := common.GetEnvOrDefault(routingSchemaReadyWaitSecondsEnv, routingSchemaReadyWaitDefault)
+	if waitSeconds < 0 {
+		return fmt.Errorf("%s must be non-negative", routingSchemaReadyWaitSecondsEnv)
+	}
+	if err := WaitRoutingV2SchemaReady(context.Background(), db, time.Duration(waitSeconds)*time.Second); err != nil {
+		return fmt.Errorf("wait for channel routing v2 schema version %s: %w", routingV2SchemaVersion, err)
+	}
+	return nil
+}
+
+func routingV2MigrationError(component string, err error) error {
+	if errors.Is(err, ErrRoutingMetricRollupAlphaDrainRequired) ||
+		errors.Is(err, ErrRoutingErrorBudgetAlphaDrainRequired) {
+		return fmt.Errorf(
+			"migrate %s: %w; stop all pre-v3 routing alpha nodes, drain Redis telemetry stream routing:v2:telemetry, then set %s=true",
+			component, err, routingV2AlphaDrainedEnv,
+		)
+	}
+	return fmt.Errorf("migrate %s: %w", component, err)
 }
 
 func migrateLOGDB() error {

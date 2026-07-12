@@ -30,6 +30,45 @@ var (
 
 type CapacityMode string
 
+type CapacityDimensionState string
+
+const (
+	CapacityDimensionNotApplicable     CapacityDimensionState = "not_applicable"
+	CapacityDimensionBoundedKnown      CapacityDimensionState = "bounded_known"
+	CapacityDimensionApplicableUnknown CapacityDimensionState = "applicable_unknown"
+)
+
+type CapacityDimensionEstimate struct {
+	State  CapacityDimensionState `json:"state"`
+	Tokens int                    `json:"tokens"`
+}
+
+func (estimate CapacityDimensionEstimate) Known() bool {
+	return estimate.State == CapacityDimensionNotApplicable || estimate.State == CapacityDimensionBoundedKnown
+}
+
+func (estimate CapacityDimensionEstimate) Demand(upperBound int64) (int64, error) {
+	if estimate.Tokens < 0 || upperBound < 0 {
+		return 0, ErrCapacityInvalidInput
+	}
+	switch estimate.State {
+	case CapacityDimensionNotApplicable:
+		if estimate.Tokens != 0 {
+			return 0, ErrCapacityInvalidInput
+		}
+		return 0, nil
+	case CapacityDimensionBoundedKnown:
+		return int64(estimate.Tokens), nil
+	case CapacityDimensionApplicableUnknown:
+		if estimate.Tokens != 0 {
+			return 0, ErrCapacityInvalidInput
+		}
+		return upperBound, nil
+	default:
+		return 0, ErrCapacityInvalidInput
+	}
+}
+
 // Clock keeps capacity and slow-start state deterministic in tests and replay.
 type Clock interface {
 	Now() time.Time
@@ -63,10 +102,11 @@ type Limit struct {
 }
 
 type CapacityAdmission struct {
-	Mode   CapacityMode `json:"mode"`
-	Key    CapacityKey  `json:"key"`
-	Demand Demand       `json:"demand"`
-	Limit  Limit        `json:"limit"`
+	Mode   CapacityMode             `json:"mode"`
+	Key    CapacityKey              `json:"key"`
+	Demand Demand                   `json:"demand"`
+	Limit  Limit                    `json:"limit"`
+	Strict *StrictCapacityAdmission `json:"strict,omitempty"`
 }
 
 type CapacityConfig struct {
@@ -115,6 +155,9 @@ type capacityShard struct {
 
 type capacityEntry struct {
 	limit                 Limit
+	desiredLimit          Limit
+	mixedLimit            bool
+	policyRevision        uint64
 	pending               Demand
 	committed             Demand
 	rateRemainder         capacityRateRemainder
@@ -157,7 +200,7 @@ func (reservation *Reservation) Admission() CapacityAdmission {
 		return CapacityAdmission{}
 	}
 	return CapacityAdmission{
-		Mode: CapacityModeLocalSoft, Key: reservation.key, Demand: reservation.demand, Limit: reservation.limit,
+		Mode: CapacityModeLocalSoft, Key: reservation.Key, Demand: reservation.demand, Limit: reservation.limit,
 	}
 }
 
@@ -186,6 +229,8 @@ func (tracker *CapacityTracker) TryReserve(key CapacityKey, demand Demand, limit
 		tracker.drops.Add(1)
 		return nil, ErrCapacityExhausted
 	}
+	admissionKey := key
+	key.PolicyRevision = 0
 	now := tracker.config.Clock.Now()
 	shard := tracker.shardFor(key)
 
@@ -195,13 +240,13 @@ func (tracker *CapacityTracker) TryReserve(key CapacityKey, demand Demand, limit
 		tracker.applyRateDecayLocked(entry, now)
 	}
 	if found && !tracker.expiredIdle(entry, now) {
-		reservation, err := tracker.reserveLocked(entry, key, demand, limit, now)
+		reservation, err := tracker.reserveLocked(entry, key, admissionKey, demand, limit, now)
 		shard.mu.Unlock()
 		return reservation, err
 	}
 	shard.mu.Unlock()
 
-	return tracker.reserveWithAdmission(key, demand, limit, now)
+	return tracker.reserveWithAdmission(key, admissionKey, demand, limit, now)
 }
 
 func (tracker *CapacityTracker) Stats() CapacityStats {
@@ -225,6 +270,8 @@ func (tracker *CapacityTracker) Snapshot(key CapacityKey) (CapacitySnapshot, boo
 	if !validCapacityKey(key) {
 		return CapacitySnapshot{}, false
 	}
+	requestedKey := key
+	key.PolicyRevision = 0
 	tracker.admissionMu.Lock()
 	defer tracker.admissionMu.Unlock()
 
@@ -243,7 +290,7 @@ func (tracker *CapacityTracker) Snapshot(key CapacityKey) (CapacitySnapshot, boo
 	}
 	return CapacitySnapshot{
 		Mode:                  CapacityModeLocalSoft,
-		Key:                   key,
+		Key:                   requestedKey,
 		Limit:                 entry.limit,
 		Pending:               entry.pending,
 		Committed:             entry.committed,
@@ -315,6 +362,7 @@ func (reservation *Reservation) Release() error {
 
 func (tracker *CapacityTracker) reserveWithAdmission(
 	key CapacityKey,
+	admissionKey CapacityKey,
 	demand Demand,
 	limit Limit,
 	now time.Time,
@@ -326,7 +374,7 @@ func (tracker *CapacityTracker) reserveWithAdmission(
 	shard := tracker.shardFor(key)
 	shard.mu.Lock()
 	if entry, ok := shard.entries[key]; ok {
-		reservation, err := tracker.reserveLocked(entry, key, demand, limit, now)
+		reservation, err := tracker.reserveLocked(entry, key, admissionKey, demand, limit, now)
 		shard.mu.Unlock()
 		return reservation, err
 	}
@@ -338,10 +386,13 @@ func (tracker *CapacityTracker) reserveWithAdmission(
 	}
 
 	shard.mu.Lock()
-	entry := &capacityEntry{limit: limit, rateUpdatedAt: now, updatedAt: now}
+	entry := &capacityEntry{
+		limit: limit, desiredLimit: limit, policyRevision: admissionKey.PolicyRevision,
+		rateUpdatedAt: now, updatedAt: now,
+	}
 	shard.entries[key] = entry
 	tracker.entries.Add(1)
-	reservation, err := tracker.reserveLocked(entry, key, demand, limit, now)
+	reservation, err := tracker.reserveLocked(entry, key, admissionKey, demand, limit, now)
 	if err != nil {
 		delete(shard.entries, key)
 		tracker.entries.Add(-1)
@@ -353,18 +404,37 @@ func (tracker *CapacityTracker) reserveWithAdmission(
 func (tracker *CapacityTracker) reserveLocked(
 	entry *capacityEntry,
 	key CapacityKey,
+	admissionKey CapacityKey,
 	demand Demand,
 	limit Limit,
 	now time.Time,
 ) (*Reservation, error) {
 	tracker.applyRateDecayLocked(entry, now)
 	active := !entry.idle()
-	if active && entry.limit != limit {
-		tracker.drops.Add(1)
-		return nil, ErrCapacityLimitConflict
-	}
-	if !active {
-		entry.limit = limit
+	switch {
+	case admissionKey.PolicyRevision < entry.policyRevision:
+		// A stale pinned request may continue under the newer, already-applied limit,
+		// but it must never restore an older limit.
+	case admissionKey.PolicyRevision == entry.policyRevision:
+		if active && entry.desiredLimit != limit {
+			tracker.drops.Add(1)
+			return nil, ErrCapacityLimitConflict
+		}
+		if !active {
+			entry.desiredLimit = limit
+			entry.limit = limit
+			entry.mixedLimit = false
+		}
+	case admissionKey.PolicyRevision > entry.policyRevision:
+		entry.desiredLimit = limit
+		if active {
+			entry.limit = conservativeCapacityLimit(entry.limit, limit)
+			entry.mixedLimit = entry.limit != entry.desiredLimit
+		} else {
+			entry.limit = limit
+			entry.mixedLimit = false
+		}
+		entry.policyRevision = admissionKey.PolicyRevision
 	}
 
 	used, ok := addDemand(entry.pending, entry.committed)
@@ -377,7 +447,7 @@ func (tracker *CapacityTracker) reserveLocked(
 		tracker.drops.Add(1)
 		return nil, ErrCapacityOverflow
 	}
-	if exceedsLimit(next, limit) {
+	if exceedsLimit(next, entry.limit) {
 		tracker.drops.Add(1)
 		return nil, ErrCapacityExhausted
 	}
@@ -392,14 +462,32 @@ func (tracker *CapacityTracker) reserveLocked(
 	tracker.pending.Add(1)
 	return &Reservation{
 		Mode:    CapacityModeLocalSoft,
-		Key:     key,
+		Key:     admissionKey,
 		Demand:  demand,
 		tracker: tracker,
 		key:     key,
 		demand:  demand,
-		limit:   limit,
+		limit:   entry.limit,
 		state:   capacityReservationPending,
 	}, nil
+}
+
+func conservativeCapacityLimit(left Limit, right Limit) Limit {
+	minimumBound := func(a int64, b int64) int64 {
+		if a == 0 {
+			return b
+		}
+		if b == 0 {
+			return a
+		}
+		return min(a, b)
+	}
+	return Limit{
+		RPM:       minimumBound(left.RPM, right.RPM),
+		InputTPM:  minimumBound(left.InputTPM, right.InputTPM),
+		OutputTPM: minimumBound(left.OutputTPM, right.OutputTPM),
+		Inflight:  minimumBound(left.Inflight, right.Inflight),
+	}
 }
 
 func (tracker *CapacityTracker) commit(key CapacityKey, demand Demand) error {

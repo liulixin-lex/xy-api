@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func TestPublishRoutingPolicyRevisionConcurrentCASHasSingleWinner(t *testing.T) {
@@ -128,7 +130,7 @@ func TestRoutingPolicyRollbackCreatesHigherImmutableRevision(t *testing.T) {
 		Update("weight", 999).Error
 	require.ErrorIs(t, err, ErrRoutingPolicyHistoryImmutable)
 
-	rollback, err := RollbackRoutingPolicyRevisionContext(
+	rollback, operation, err := RollbackRoutingPolicyRevisionWithOperationContext(
 		context.Background(),
 		second.Revision.Revision,
 		first.Revision.Revision,
@@ -138,6 +140,9 @@ func TestRoutingPolicyRollbackCreatesHigherImmutableRevision(t *testing.T) {
 	assert.Equal(t, int64(3), rollback.Revision.Revision)
 	assert.Equal(t, first.Revision.Revision, rollback.Revision.RollbackOfRevision)
 	assert.Equal(t, first.Revision.ContentHash, rollback.Revision.ContentHash)
+	assert.Equal(t, RoutingOperationTypePolicyRollback, operation.OperationType)
+	assert.Equal(t, first.Revision.Revision, operation.SubjectID)
+	assert.Equal(t, rollback.Revision.Revision, operation.ResultRevision)
 
 	firstDocument, _, err := LoadRoutingPolicyRevisionContext(context.Background(), first.Revision.Revision)
 	require.NoError(t, err)
@@ -544,6 +549,7 @@ func TestRoutingPolicyLargeJSONUsesByteBoundedInsertBatches(t *testing.T) {
 			}},
 		}
 	}
+	require.NoError(t, seedRoutingPolicyLiveReferencesForTest(db, document))
 
 	poolBatches := 0
 	memberBatches := 0
@@ -749,18 +755,105 @@ func routingPolicyDocumentWithStagesForTest(stages ...string) RoutingPolicyDocum
 }
 
 func migrateRoutingPolicyModelsForTest(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
+		&routingPolicyApprovalUserForTest{},
+		&CasbinRule{},
+		&Channel{},
+		&RoutingCredentialRef{},
 		&RoutingPolicyHead{},
 		&RoutingPolicyRevision{},
 		&RoutingPolicyPoolRevision{},
 		&RoutingPolicyMemberRevision{},
 		&RoutingPolicyActivation{},
 		&RoutingPolicyDraft{},
+		&RoutingPolicyApproval{},
+		&RoutingPolicyRollbackApproval{},
 		&RoutingConfigOutbox{},
 		&RoutingRuntimeCheckpoint{},
 		&RoutingCanaryEvaluation{},
 		&RoutingOperation{},
-	)
+	); err != nil {
+		return err
+	}
+	actors := []routingPolicyApprovalUserForTest{
+		{Id: 10, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 11, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 12, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 13, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+	}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&actors).Error; err != nil {
+		return err
+	}
+	rules := make([]CasbinRule, 0, len(actors))
+	for _, actor := range actors {
+		rules = append(rules, CasbinRule{
+			Ptype: "p",
+			V0:    fmt.Sprintf("user:%d", actor.Id),
+			V1:    "channel_routing",
+			V2:    "deploy",
+			V3:    "allow",
+		})
+	}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&rules).Error; err != nil {
+		return err
+	}
+	return seedRoutingPolicyLiveReferencesForTest(db, routingPolicyDocumentForTest(1))
+}
+
+type routingPolicyApprovalUserForTest struct {
+	Id        int `gorm:"primaryKey"`
+	Role      int
+	Status    int
+	DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+func (routingPolicyApprovalUserForTest) TableName() string {
+	return "users"
+}
+
+func seedRoutingPolicyLiveReferencesForTest(db *gorm.DB, documents ...RoutingPolicyDocument) error {
+	channels := make(map[int]Channel)
+	credentials := make(map[int]RoutingCredentialRef)
+	for documentIndex := range documents {
+		document := documents[documentIndex]
+		for poolIndex := range document.Pools {
+			for memberIndex := range document.Pools[poolIndex].Members {
+				member := document.Pools[poolIndex].Members[memberIndex]
+				mapping := `{}`
+				channels[member.ChannelID] = Channel{
+					Id: member.ChannelID, Name: fmt.Sprintf("routing-policy-%d", member.ChannelID),
+					Models: "gpt-test", ModelMapping: &mapping,
+				}
+				for _, credentialID := range member.CredentialIDs {
+					credentials[credentialID] = RoutingCredentialRef{
+						ID: credentialID, ChannelID: member.ChannelID,
+						Fingerprint: fmt.Sprintf("%064x", credentialID), Active: true,
+					}
+				}
+			}
+		}
+	}
+	channelRows := make([]Channel, 0, len(channels))
+	for _, channel := range channels {
+		channelRows = append(channelRows, channel)
+	}
+	sort.Slice(channelRows, func(i, j int) bool { return channelRows[i].Id < channelRows[j].Id })
+	if len(channelRows) > 0 {
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&channelRows).Error; err != nil {
+			return err
+		}
+	}
+	credentialRows := make([]RoutingCredentialRef, 0, len(credentials))
+	for _, credential := range credentials {
+		credentialRows = append(credentialRows, credential)
+	}
+	sort.Slice(credentialRows, func(i, j int) bool { return credentialRows[i].ID < credentialRows[j].ID })
+	if len(credentialRows) > 0 {
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&credentialRows).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func assertRoutingPolicyRowCounts(t *testing.T, revisions, pools, members, activations, outbox int64) {

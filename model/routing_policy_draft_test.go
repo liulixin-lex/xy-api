@@ -114,6 +114,46 @@ func TestRoutingPolicyDraftPublishFailureRollsBackRevisionAndDraft(t *testing.T)
 	assertRoutingPolicyRowCounts(t, 1, 1, 1, 1, 1)
 }
 
+func TestRoutingPolicyDraftPublishPersistsOperationAtomically(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+	base, err := PublishRoutingPolicyRevisionContext(
+		context.Background(), 0, routingPolicyDocumentForTest(100),
+		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
+	)
+	require.NoError(t, err)
+	draft, err := CreateRoutingPolicyDraftContext(
+		context.Background(), base.Revision.Revision, routingPolicyDocumentForTest(200), 2,
+	)
+	require.NoError(t, err)
+	draft, err = ValidateRoutingPolicyDraftContext(context.Background(), draft.ID, draft.Version, draft.ETag, 2)
+	require.NoError(t, err)
+	activation := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 2, Reason: "publish"}
+	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 10)
+	require.NoError(t, err)
+	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 11)
+	require.NoError(t, err)
+
+	publishedDraft, published, operation, err := PublishRoutingPolicyDraftWithOperationContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag,
+		activation,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingPolicyDraftStatusPublished, publishedDraft.Status)
+	assert.Equal(t, RoutingOperationTypePolicyPublish, operation.OperationType)
+	assert.Equal(t, RoutingOperationSubjectPolicyDraft, operation.SubjectType)
+	assert.Equal(t, draft.ID, operation.SubjectID)
+	assert.Equal(t, RoutingOperationStatusSucceeded, operation.Status)
+	assert.Equal(t, published.Revision.Revision, operation.ResultRevision)
+	assert.Equal(t, published.Activation.ID, operation.ResultActivationID)
+	assert.Equal(t, published.Outbox.ID, operation.ResultOutboxID)
+	payload, err := operation.ResultPayload()
+	require.NoError(t, err)
+	assert.Contains(t, string(payload), `"draft_id":`)
+}
+
 func TestRoutingPolicyDraftDetectsStoredDocumentTampering(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)

@@ -23,38 +23,38 @@ var (
 )
 
 type BalancedReplayCandidate struct {
-	PoolMemberID        int                  `json:"pool_member_id"`
-	ChannelID           int                  `json:"channel_id"`
-	CredentialID        int                  `json:"credential_id,omitempty"`
-	BusinessTier        int64                `json:"business_tier"`
-	TargetWeight        float64              `json:"target_weight"`
-	Confidence          float64              `json:"confidence"`
-	Freshness           float64              `json:"freshness"`
-	SlowStartFactor     float64              `json:"slow_start_factor"`
-	CapacityUtilization float64              `json:"capacity_utilization"`
-	QueueDelayMs        float64              `json:"queue_delay_ms"`
-	MetricUpdatedUnix   int64                `json:"metric_updated_unix"`
-	ExplorationEligible bool                 `json:"exploration_eligible"`
-	HardExclusionReason string               `json:"hard_exclusion_reason,omitempty"`
-	Metric              *ShadowMetricInput   `json:"metric,omitempty"`
-	Cost                *ShadowCostInput     `json:"cost,omitempty"`
-	Breaker             *ShadowBreakerInput  `json:"breaker,omitempty"`
-	Capacity            *ShadowCapacityInput `json:"capacity,omitempty"`
+	PoolMemberID        int                    `json:"pool_member_id"`
+	ChannelID           int                    `json:"channel_id"`
+	CredentialID        int                    `json:"credential_id,omitempty"`
+	BusinessTier        int64                  `json:"business_tier"`
+	TargetWeight        float64                `json:"target_weight"`
+	Confidence          float64                `json:"confidence"`
+	Freshness           float64                `json:"freshness"`
+	SlowStartFactor     float64                `json:"slow_start_factor"`
+	CapacityUtilization float64                `json:"capacity_utilization"`
+	QueueDelayMs        float64                `json:"queue_delay_ms"`
+	MetricUpdatedUnix   int64                  `json:"metric_updated_unix"`
+	ExplorationEligible bool                   `json:"exploration_eligible"`
+	HardExclusionReason string                 `json:"hard_exclusion_reason,omitempty"`
+	Metric              *ShadowMetricInput     `json:"metric,omitempty"`
+	Cost                *ShadowReplayCostInput `json:"cost,omitempty"`
+	Breaker             *ShadowBreakerInput    `json:"breaker,omitempty"`
+	Capacity            *ShadowCapacityInput   `json:"capacity,omitempty"`
 }
 
 type BalancedReplayRuntimeState struct {
-	ChannelID              int                 `json:"channel_id"`
-	CapacityUtilization    float64             `json:"capacity_utilization"`
-	QueueDelayMs           float64             `json:"queue_delay_ms"`
-	Inflight               int64               `json:"inflight"`
-	HasCapacityUtilization bool                `json:"has_capacity_utilization"`
-	HasQueueDelay          bool                `json:"has_queue_delay"`
-	HasInflight            bool                `json:"has_inflight"`
-	CooldownUntilUnixMilli *int64              `json:"cooldown_until_unix_milli,omitempty"`
-	SlowStartFactor        *float64            `json:"slow_start_factor,omitempty"`
-	Breaker                *ShadowBreakerInput `json:"breaker,omitempty"`
-	Cost                   *ShadowCostInput    `json:"cost,omitempty"`
-	Admission              string              `json:"admission,omitempty"`
+	ChannelID              int                    `json:"channel_id"`
+	CapacityUtilization    float64                `json:"capacity_utilization"`
+	QueueDelayMs           float64                `json:"queue_delay_ms"`
+	Inflight               int64                  `json:"inflight"`
+	HasCapacityUtilization bool                   `json:"has_capacity_utilization"`
+	HasQueueDelay          bool                   `json:"has_queue_delay"`
+	HasInflight            bool                   `json:"has_inflight"`
+	CooldownUntilUnixMilli *int64                 `json:"cooldown_until_unix_milli,omitempty"`
+	SlowStartFactor        *float64               `json:"slow_start_factor,omitempty"`
+	Breaker                *ShadowBreakerInput    `json:"breaker,omitempty"`
+	Cost                   *ShadowReplayCostInput `json:"cost,omitempty"`
+	Admission              string                 `json:"admission,omitempty"`
 }
 
 type BalancedReplaySettings struct {
@@ -155,12 +155,19 @@ func runBalancedReplayValidated(input BalancedReplayInput) (BalancedReplayResult
 }
 
 func ReplayBalancedDecisionAudit(audit model.RoutingDecisionAudit) (BalancedReplayResult, error) {
+	return ReplayBalancedDecisionAuditContext(context.Background(), audit)
+}
+
+func ReplayBalancedDecisionAuditContext(ctx context.Context, audit model.RoutingDecisionAudit) (BalancedReplayResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !audit.Replayable || audit.AlgorithmVersion != DecisionAlgorithmBalancedV1 || audit.PoolID <= 0 ||
 		audit.SnapshotRevision <= 0 || audit.RuntimeGeneration <= 0 || audit.ActivationID <= 0 ||
 		audit.ActivationStage != model.RoutingDeploymentStageActive {
 		return BalancedReplayResult{}, ErrBalancedReplayInvalid
 	}
-	replayJSON, err := model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
+	replayJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
 	if err != nil {
 		if errors.Is(err, model.ErrRoutingDecisionReplayIntegrity) {
 			return BalancedReplayResult{}, ErrBalancedReplayHash
@@ -397,7 +404,7 @@ func validBalancedReplayCandidate(candidate BalancedReplayCandidate) bool {
 		!finiteShadowNumber(candidate.QueueDelayMs) || candidate.QueueDelayMs < 0 ||
 		candidate.MetricUpdatedUnix < 0 || !validShadowText(candidate.HardExclusionReason, MaxDecisionReasonRunes) ||
 		len(candidate.HardExclusionReason) > MaxDecisionReasonRunes ||
-		!validBalancedReplayMetric(candidate.Metric) || !validBalancedReplayCost(candidate.Cost) ||
+		!validBalancedReplayMetric(candidate.Metric) || !validShadowReplayCost(candidate.Cost) ||
 		!validBalancedReplayBreaker(candidate.Breaker) || !validBalancedReplayCapacity(candidate.Capacity) {
 		return false
 	}
@@ -409,7 +416,7 @@ func validBalancedReplayRuntimeState(state BalancedReplayRuntimeState) bool {
 		!finiteShadowNumber(state.QueueDelayMs) || state.QueueDelayMs < 0 || state.Inflight < 0 ||
 		(state.CooldownUntilUnixMilli != nil && *state.CooldownUntilUnixMilli < 0) ||
 		(state.SlowStartFactor != nil && !balancedReplayUnitInterval(*state.SlowStartFactor)) ||
-		!validBalancedReplayBreaker(state.Breaker) || !validBalancedReplayCost(state.Cost) {
+		!validBalancedReplayBreaker(state.Breaker) || !validShadowReplayCost(state.Cost) {
 		return false
 	}
 	switch routingselector.BalancedRuntimeAdmission(state.Admission) {
@@ -437,7 +444,20 @@ func validBalancedReplayMetric(metric *ShadowMetricInput) bool {
 }
 
 func validBalancedReplayCost(cost *ShadowCostInput) bool {
-	return cost == nil || (finiteShadowNumber(cost.Cost) && cost.Cost >= 0 && cost.UpdatedUnix >= 0)
+	return cost == nil || (finiteShadowNumber(cost.Cost) && cost.Cost >= 0 &&
+		finiteShadowNumber(cost.WorstCaseCost) && cost.WorstCaseCost >= 0 &&
+		finiteShadowNumber(cost.EffectiveCost) && cost.EffectiveCost >= 0 &&
+		finiteShadowNumber(cost.ConfidenceScore) && cost.ConfidenceScore >= 0 && cost.ConfidenceScore <= 1 &&
+		finiteShadowNumber(cost.FreshnessScore) && cost.FreshnessScore >= 0 && cost.FreshnessScore <= 1 &&
+		validRoutingCostBreakdown(cost.ExpectedBreakdown) && validRoutingCostBreakdown(cost.WorstSingleBreakdown) &&
+		cost.ObservedTime >= 0 && cost.EffectiveTime >= 0 && cost.ExpiresTime >= 0 && cost.UpdatedUnix >= 0 &&
+		validShadowText(cost.Currency, 8) && validShadowText(cost.Unit, 32) &&
+		validShadowText(cost.PricingBasis, 32) &&
+		validShadowText(cost.PricingVersion, 128) && validShadowText(cost.VersionConfidence, 32) &&
+		validShadowText(cost.Freshness, 32) && validShadowText(cost.SourceSyncStatus, 32) &&
+		validShadowText(cost.AccountSourceType, 32) &&
+		(cost.PricingHash == "" || validShadowHash(cost.PricingHash)) &&
+		(cost.AccountKeyHash == "" || validShadowHash(cost.AccountKeyHash)))
 }
 
 func validBalancedReplayBreaker(breaker *ShadowBreakerInput) bool {
@@ -568,7 +588,7 @@ func balancedReplayCandidateFromRouting(
 		}
 	}
 	if cost := candidate.Candidate.Cost; cost != nil {
-		result.Cost = &ShadowCostInput{Known: cost.Known, Cost: cost.Cost, UpdatedUnix: cost.UpdatedUnix}
+		result.Cost = &ShadowReplayCostInput{Known: cost.Known, Cost: cost.Cost, UpdatedUnix: cost.UpdatedUnix}
 	}
 	if breaker := candidate.Candidate.Breaker; breaker != nil {
 		result.Breaker = &ShadowBreakerInput{
@@ -602,7 +622,7 @@ func balancedReplayRuntimeFromRouting(channelID int, state routingselector.Balan
 		}
 	}
 	if state.Cost != nil {
-		result.Cost = &ShadowCostInput{Known: state.Cost.Known, Cost: state.Cost.Cost, UpdatedUnix: state.Cost.UpdatedUnix}
+		result.Cost = &ShadowReplayCostInput{Known: state.Cost.Known, Cost: state.Cost.Cost, UpdatedUnix: state.Cost.UpdatedUnix}
 	}
 	return result
 }

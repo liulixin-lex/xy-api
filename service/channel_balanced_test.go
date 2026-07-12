@@ -73,6 +73,10 @@ func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy
 	ctx, _ := gin.CreateTestContext(nil)
 	common.SetContextKey(ctx, common.RequestIdKey, "balanced-active-request")
 	common.SetContextKey(ctx, constant.ContextKeyRoutingPromptProxy, int(common.QuotaPerUnit))
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInput, int(common.QuotaPerUnit))
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInputKnown, true)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutput, 0)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputKnown, true)
 	preferred, group, bypass, err := GetAdmissibleAffinityChannelWithRoutingGate(
 		ctx, 101, "gpt-test", "default", "/v1/chat/completions",
 	)

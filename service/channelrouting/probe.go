@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 )
 
@@ -32,12 +32,13 @@ const (
 	activeProbeMaximumJitter      = 5 * time.Second
 	activeProbeScheduleRetry      = 5 * time.Second
 	activeProbeTargetRotation     = time.Minute
-	activeProbeUnknownCostNanoUSD = int64(10_000_000)
+	activeProbeUnknownCostNanoUSD = int64(math.MaxInt64)
 	activeProbeEstimatedTokens    = int64(32)
 )
 
 var (
 	ErrActiveProbeExecutorUnavailable = errors.New("channel routing active probe executor is unavailable")
+	ErrActiveProbeTargetStale         = errors.New("channel routing active probe target is stale")
 	activeProbeExecutorRegistry       struct {
 		sync.RWMutex
 		executor ActiveProbeExecutor
@@ -54,6 +55,9 @@ type ActiveProbeTarget struct {
 	GroupName            string
 	ModelName            string
 	EndpointHost         string
+	EndpointAuthority    string
+	Region               string
+	BreakerScope         string
 	BreakerState         string
 	BreakerCooldownUntil int64
 	AuthFailure          bool
@@ -136,6 +140,7 @@ type activeProbeDeps struct {
 	enabled   func() bool
 	targets   func(smart_routing_setting.SmartRoutingSetting, time.Time) []ActiveProbeTarget
 	executor  func() ActiveProbeExecutor
+	validate  func(ActiveProbeTarget) error
 	acquire   func(context.Context, ActiveProbeTarget, int64, int64, int64) (model.RoutingControlLease, bool, error)
 	persist   func(context.Context, model.RoutingControlLease, model.RoutingProbeResult) error
 	complete  func(context.Context, model.RoutingControlLease, int64) error
@@ -375,6 +380,25 @@ func (scheduler *ActiveProbeScheduler) runTarget(
 	scheduler.stats.inflight.Add(-1)
 	cancel()
 	scheduler.stats.executed.Add(1)
+	targetStale := false
+	if scheduler.deps.validate != nil {
+		if validateErr := scheduler.deps.validate(target); validateErr != nil {
+			targetStale = true
+			execution = ActiveProbeExecution{
+				Err:        validateErr,
+				LocalError: true,
+				Classification: routingerror.Classification{
+					Responsibility: routingerror.ResponsibilityConfig,
+					Scope:          routingerror.ScopeRequest,
+					Retryability:   routingerror.RetryBeforeCommit,
+					HealthEffect:   routingerror.HealthIgnore,
+					CapacityEffect: routingerror.CapacityNone,
+					Component:      routingerror.ComponentServing,
+					Rule:           "active_probe_target_stale",
+				},
+			}
+		}
+	}
 
 	result := activeProbeResult(target, lease, execution, started, finished, probeContextErr, ctx.Err())
 	scheduler.recordOutcome(result.Outcome)
@@ -398,6 +422,16 @@ func (scheduler *ActiveProbeScheduler) runTarget(
 		scheduler.stats.completionErrors.Add(1)
 		scheduler.setNextDue(target.TargetKey, now.Add(activeProbeScheduleRetry))
 		return completeErr
+	}
+	if targetStale {
+		scheduler.setNextDue(target.TargetKey, now.Add(activeProbeScheduleRetry))
+		return nil
+	}
+	if scheduler.deps.validate != nil {
+		if validateErr := scheduler.deps.validate(target); validateErr != nil {
+			scheduler.setNextDue(target.TargetKey, now.Add(activeProbeScheduleRetry))
+			return nil
+		}
 	}
 	effectCtx, effectCancel := context.WithTimeout(ctx, 5*time.Second)
 	effectErr := applyActiveProbeBreakerOutcome(effectCtx, setting, target, execution, result.Outcome, finished)
@@ -499,17 +533,22 @@ func defaultActiveProbeDeps() activeProbeDeps {
 			defer activeProbeExecutorRegistry.RUnlock()
 			return activeProbeExecutorRegistry.executor
 		},
+		validate: validateActiveProbeTarget,
 		acquire: func(ctx context.Context, target ActiveProbeTarget, nowMs int64, ttlMs int64, minimumIntervalMs int64) (model.RoutingControlLease, bool, error) {
 			return model.TryAcquireRoutingControlLeaseContext(
-				ctx, activeProbeLeaseName(target.TargetKey), NodeEpochID(), nowMs, ttlMs, minimumIntervalMs, false,
+				ctx, activeProbeLeaseName(target.TargetKey), NodeEpochID(), ttlMs, minimumIntervalMs, false,
 			)
 		},
 		persist: func(ctx context.Context, lease model.RoutingControlLease, result model.RoutingProbeResult) error {
 			_, _, err := model.CreateRoutingProbeResultContext(ctx, lease, result)
 			return err
 		},
-		complete: model.CompleteRoutingControlLeaseContext,
-		release:  model.ReleaseRoutingControlLeaseContext,
+		complete: func(ctx context.Context, lease model.RoutingControlLease, _ int64) error {
+			return model.CompleteRoutingControlLeaseContext(ctx, lease)
+		},
+		release: func(ctx context.Context, lease model.RoutingControlLease, _ int64) error {
+			return model.ReleaseRoutingControlLeaseContext(ctx, lease)
+		},
 		waitUntil: func(ctx context.Context, due time.Time) bool {
 			delay := time.Until(due)
 			if delay <= 0 {
@@ -525,6 +564,45 @@ func defaultActiveProbeDeps() activeProbeDeps {
 			}
 		},
 	}
+}
+
+func validateActiveProbeTarget(target ActiveProbeTarget) error {
+	snapshot := currentSnapshot.Load()
+	if snapshot == nil || snapshot.view.Revision != target.SnapshotRevision ||
+		target.PoolID <= 0 || target.MemberID <= 0 || target.ChannelID <= 0 ||
+		target.GroupName == "" || target.ModelName == "" {
+		return ErrActiveProbeTargetStale
+	}
+	poolID, exists := snapshot.poolByGroup[target.GroupName]
+	if !exists || poolID != target.PoolID ||
+		snapshot.memberByPoolChannel[poolChannelKey{PoolID: poolID, ChannelID: target.ChannelID}] != target.MemberID {
+		return ErrActiveProbeTargetStale
+	}
+	if _, exists := snapshot.modelByMemberModel[memberModelKey{memberID: target.MemberID, model: target.ModelName}]; !exists {
+		return ErrActiveProbeTargetStale
+	}
+	channel, exists := snapshot.channelByID[target.ChannelID]
+	if !exists || channel.Status != common.ChannelStatusEnabled || channel.MultiKey != target.MultiKey ||
+		EndpointHost(channel.Endpoint, channel.ID) != target.EndpointHost ||
+		EndpointAuthority(channel.Endpoint, channel.ID) != target.EndpointAuthority ||
+		RoutingRegion() != target.Region {
+		return ErrActiveProbeTargetStale
+	}
+	if target.MultiKey {
+		if target.CredentialID != 0 {
+			return ErrActiveProbeTargetStale
+		}
+		return nil
+	}
+	if target.CredentialID <= 0 {
+		return ErrActiveProbeTargetStale
+	}
+	for _, credentialID := range channel.CredentialIDs {
+		if credentialID == target.CredentialID {
+			return nil
+		}
+	}
+	return ErrActiveProbeTargetStale
 }
 
 func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting, now time.Time) []ActiveProbeTarget {
@@ -560,6 +638,23 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 				if breakerState == "" {
 					breakerState = model.RoutingBreakerStateHealthy
 				}
+				breakerCooldownUntil := observation.BreakerCooldownUntil
+				breakerScope := "member"
+				endpointBreaker, endpointAuthority, region := endpointBreakerForChannel(
+					channel, now, setting.SnapshotStaleSec,
+				)
+				memberBreaker := &routingselector.BreakerSnapshot{
+					State: breakerState, CooldownUntilUnix: observation.BreakerCooldownUntil,
+					UpdatedUnix: observation.BreakerUpdatedUnix,
+				}
+				mergedBreaker, endpointSelected := mergeRoutingBreaker(memberBreaker, endpointBreaker)
+				if mergedBreaker != nil {
+					breakerState = mergedBreaker.State
+					breakerCooldownUntil = mergedBreaker.CooldownUntilUnix
+				}
+				if endpointSelected {
+					breakerScope = BreakerScopeEndpoint
+				}
 				target := ActiveProbeTarget{
 					SnapshotRevision:     snapshot.view.Revision,
 					PoolID:               pool.ID,
@@ -568,9 +663,12 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 					CredentialID:         credentialID,
 					GroupName:            pool.GroupName,
 					ModelName:            observation.ModelName,
-					EndpointHost:         activeProbeEndpointHost(channel.Endpoint, member.ChannelID),
+					EndpointHost:         EndpointHost(channel.Endpoint, member.ChannelID),
+					EndpointAuthority:    endpointAuthority,
+					Region:               region,
+					BreakerScope:         breakerScope,
 					BreakerState:         breakerState,
-					BreakerCooldownUntil: observation.BreakerCooldownUntil,
+					BreakerCooldownUntil: breakerCooldownUntil,
 					AuthFailure:          channel.AuthFailure,
 					MultiKey:             member.MultiKey,
 					Interval:             activeProbeTargetInterval(setting, breakerState),
@@ -615,11 +713,11 @@ func activeProbeResult(
 	if execution.Err != nil {
 		outcome = model.RoutingProbeOutcomeFailure
 	}
-	if execution.LocalError {
-		outcome = model.RoutingProbeOutcomeLocalError
-	}
 	if errors.Is(probeContextErr, context.DeadlineExceeded) || errors.Is(execution.Err, context.DeadlineExceeded) {
 		outcome = model.RoutingProbeOutcomeTimeout
+	}
+	if execution.LocalError {
+		outcome = model.RoutingProbeOutcomeLocalError
 	}
 	if parentContextErr != nil || errors.Is(probeContextErr, context.Canceled) || errors.Is(execution.Err, context.Canceled) {
 		outcome = model.RoutingProbeOutcomeCanceled
@@ -648,6 +746,11 @@ func activeProbeResult(
 		GroupName:          target.GroupName,
 		ModelName:          target.ModelName,
 		EndpointHost:       target.EndpointHost,
+		EndpointAuthority:  target.EndpointAuthority,
+		Region:             target.Region,
+		BreakerScope:       target.BreakerScope,
+		EvidenceCount:      1,
+		NodeCount:          1,
 		BreakerState:       target.BreakerState,
 		Outcome:            outcome,
 		Responsibility:     string(classification.Responsibility),
@@ -679,7 +782,8 @@ func applyActiveProbeBreakerOutcome(
 	outcome string,
 	now time.Time,
 ) error {
-	if target.MultiKey || target.ChannelID <= 0 || target.ModelName == "" || target.GroupName == "" {
+	if target.ChannelID <= 0 || target.ModelName == "" || target.GroupName == "" ||
+		target.EndpointAuthority == "" || target.Region == "" {
 		return nil
 	}
 	if ctx == nil {
@@ -689,6 +793,29 @@ func applyActiveProbeBreakerOutcome(
 	if now.IsZero() {
 		now = time.Now()
 	}
+	if outcome == model.RoutingProbeOutcomeLocalError || outcome == model.RoutingProbeOutcomeCanceled {
+		return nil
+	}
+	endpointKey := routingbreaker.NewEndpointKey(target.EndpointAuthority, target.Region)
+	networkFailure := outcome == model.RoutingProbeOutcomeTimeout ||
+		(outcome == model.RoutingProbeOutcomeFailure &&
+			execution.Classification.Responsibility == routingerror.ResponsibilityNetwork &&
+			execution.Classification.Scope == routingerror.ScopeEndpoint &&
+			(execution.Classification.HealthEffect == routingerror.HealthDegrade ||
+				execution.Classification.HealthEffect == routingerror.HealthOpen))
+	endpointReachable := outcome == model.RoutingProbeOutcomeSuccess ||
+		(execution.StatusCode > 0 && execution.Classification.Responsibility != routingerror.ResponsibilityNetwork) ||
+		execution.Classification.Responsibility == routingerror.ResponsibilityProvider ||
+		execution.Classification.Responsibility == routingerror.ResponsibilityCapacity ||
+		execution.Classification.Responsibility == routingerror.ResponsibilityCredential
+	if networkFailure {
+		routingbreaker.RecordReliabilityFailure(endpointKey, routingbreaker.FailureNetwork)
+	} else if endpointReachable {
+		routingbreaker.RecordReliabilitySuccess(endpointKey)
+	}
+	if target.MultiKey {
+		return nil
+	}
 	key := routingbreaker.Key{
 		ChannelID:   target.ChannelID,
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
@@ -696,14 +823,20 @@ func applyActiveProbeBreakerOutcome(
 		Group:       target.GroupName,
 	}
 	if outcome == model.RoutingProbeOutcomeSuccess {
-		routinghotcache.ClearCapacityCooldown(key.HotcacheKey())
 		_, cachedAuthFailure := routinghotcache.GetAuthFailure(target.ChannelID)
 		if target.AuthFailure || cachedAuthFailure {
-			if err := model.ClearRoutingChannelAuthFailureContext(ctx, target.ChannelID, now.Unix()); err != nil {
+			applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
+				ctx, target.ChannelID, target.CredentialID, false, "", now.Unix(),
+			)
+			if err != nil {
 				return err
+			}
+			if !applied {
+				return nil
 			}
 			routinghotcache.ClearAuthFailure(target.ChannelID)
 		}
+		routinghotcache.ClearCapacityCooldown(key.HotcacheKey())
 		if target.BreakerState == model.RoutingBreakerStateOpen || target.BreakerState == model.RoutingBreakerStateHalfOpen ||
 			target.BreakerState == model.RoutingBreakerStateDegraded {
 			routingbreaker.RecordReliabilitySuccess(key)
@@ -719,8 +852,14 @@ func applyActiveProbeBreakerOutcome(
 			until = nowUnix + staleSeconds
 		}
 		reason := "active_probe_http_" + strconv.Itoa(execution.StatusCode)
+		applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
+			ctx, target.ChannelID, target.CredentialID, true, reason, until,
+		)
+		if err != nil || !applied {
+			return err
+		}
 		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix})
-		return model.UpsertRoutingChannelAuthFailureContext(ctx, target.ChannelID, true, reason, until)
+		return nil
 	}
 
 	if execution.Classification.CapacityEffect == routingerror.CapacityCooldown {
@@ -743,7 +882,6 @@ func applyActiveProbeBreakerOutcome(
 		)
 	}
 	if outcome == model.RoutingProbeOutcomeTimeout {
-		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureNetwork)
 		return nil
 	}
 	if outcome != model.RoutingProbeOutcomeFailure {
@@ -755,8 +893,6 @@ func applyActiveProbeBreakerOutcome(
 	switch execution.Classification.Responsibility {
 	case routingerror.ResponsibilityProvider:
 		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureProvider5xx)
-	case routingerror.ResponsibilityNetwork:
-		routingbreaker.RecordReliabilityFailure(key, routingbreaker.FailureNetwork)
 	}
 	return nil
 }
@@ -775,16 +911,6 @@ func activeProbeTargetInterval(setting smart_routing_setting.SmartRoutingSetting
 	default:
 		return time.Duration(setting.ActiveProbeHealthySec) * time.Second
 	}
-}
-
-func activeProbeEndpointHost(endpoint string, channelID int) string {
-	endpoint = strings.TrimSpace(endpoint)
-	if parsed, err := url.Parse(endpoint); err == nil {
-		if host := strings.ToLower(strings.TrimSpace(parsed.Hostname())); host != "" {
-			return truncateActiveProbeText(host, 255)
-		}
-	}
-	return "channel-" + strconv.Itoa(channelID)
 }
 
 func activeProbeEstimatedCostNanoUSD(observation ModelSnapshot) int64 {
@@ -816,7 +942,8 @@ func activeProbeCostBudgetNanoUSD(costUSD float64) int64 {
 
 func activeProbeTargetKey(target ActiveProbeTarget) string {
 	payload := fmt.Sprintf(
-		"routing-probe-target:v1\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s",
+		"routing-probe-target:v3\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		target.SnapshotRevision,
 		target.PoolID,
 		target.MemberID,
 		target.ChannelID,
@@ -824,6 +951,8 @@ func activeProbeTargetKey(target ActiveProbeTarget) string {
 		target.GroupName,
 		target.ModelName,
 		target.EndpointHost,
+		target.EndpointAuthority,
+		target.Region,
 	)
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])

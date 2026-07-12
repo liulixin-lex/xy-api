@@ -118,6 +118,7 @@ type PoolSnapshot struct {
 	MemberCount      int                       `json:"member_count"`
 	MembersTruncated bool                      `json:"members_truncated"`
 	Members          []PoolMemberSnapshot      `json:"members"`
+	enterprisePolicy EnterprisePoolPolicy
 }
 
 type PoolMemberSnapshot struct {
@@ -137,82 +138,109 @@ type PoolMemberSnapshot struct {
 	ModelsTruncated      bool            `json:"models_truncated"`
 	Models               []ModelSnapshot `json:"models"`
 	TelemetryKnown       bool            `json:"telemetry_known"`
+	enterprisePolicy     enterpriseMemberPolicy
 }
 
 type ModelSnapshot struct {
-	ModelName                   string  `json:"model_name"`
-	MetricKnown                 bool    `json:"metric_known"`
-	MetricSource                string  `json:"metric_source,omitempty"`
-	RequestCount                int64   `json:"request_count"`
-	SuccessCount                int64   `json:"success_count"`
-	FailureCount                int64   `json:"failure_count"`
-	UnknownClassificationCount  int64   `json:"unknown_classification_count"`
-	ReliabilityRequestCount     int64   `json:"reliability_request_count"`
-	ReliabilityFailureCount     int64   `json:"reliability_failure_count"`
-	AverageLatencyMs            float64 `json:"average_latency_ms"`
-	AverageTTFTMs               float64 `json:"average_ttft_ms"`
-	P50LatencyMs                float64 `json:"p50_latency_ms"`
-	P95LatencyMs                float64 `json:"p95_latency_ms"`
-	P99LatencyMs                float64 `json:"p99_latency_ms"`
-	P50TTFTMs                   float64 `json:"p50_ttft_ms"`
-	P95TTFTMs                   float64 `json:"p95_ttft_ms"`
-	P99TTFTMs                   float64 `json:"p99_ttft_ms"`
-	P95LatencyKnown             bool    `json:"p95_latency_known"`
-	P95TTFTKnown                bool    `json:"p95_ttft_known"`
-	LatencyDistributionKnown    bool    `json:"latency_distribution_known"`
-	TTFTDistributionKnown       bool    `json:"ttft_distribution_known"`
-	LatencyDistributionCoverage float64 `json:"latency_distribution_coverage"`
-	TTFTDistributionCoverage    float64 `json:"ttft_distribution_coverage"`
-	OutputTokens                int64   `json:"output_tokens"`
-	GenerationMs                int64   `json:"generation_ms"`
-	OutputTokensPerSecond       float64 `json:"output_tokens_per_second"`
-	Err4xx                      int64   `json:"err_4xx"`
-	Err5xx                      int64   `json:"err_5xx"`
-	Err429                      int64   `json:"err_429"`
-	Err529                      int64   `json:"err_529"`
-	AverageRetryAfterMs         float64 `json:"average_retry_after_ms"`
-	MetricUpdatedUnix           int64   `json:"metric_updated_at"`
-	Inflight                    int64   `json:"inflight"`
-	BreakerKnown                bool    `json:"breaker_known"`
-	BreakerState                string  `json:"breaker_state"`
-	BreakerReason               string  `json:"breaker_reason"`
-	BreakerCooldownUntil        int64   `json:"breaker_cooldown_until"`
-	BreakerHalfOpenInflight     int64   `json:"breaker_half_open_inflight"`
-	BreakerUpdatedUnix          int64   `json:"breaker_updated_at"`
-	CapacityLimited             bool    `json:"capacity_limited"`
-	CapacityStatusCode          int     `json:"capacity_status_code"`
-	CapacityCooldownUntilMs     int64   `json:"capacity_cooldown_until_ms"`
-	CapacityUpdatedUnixMilli    int64   `json:"capacity_updated_at_ms"`
-	CostKnown                   bool    `json:"cost_known"`
-	Cost                        float64 `json:"cost"`
-	CostConfidence              string  `json:"cost_confidence"`
-	CostUpdatedUnix             int64   `json:"cost_updated_at"`
-	CostQuotaType               int     `json:"cost_quota_type"`
-	CostGroupRatio              float64 `json:"cost_group_ratio"`
-	CostBaseRatio               float64 `json:"cost_base_ratio"`
-	CostCompletionRatio         float64 `json:"cost_completion_ratio"`
-	CostModelPrice              float64 `json:"cost_model_price"`
-	CostBillingMode             string  `json:"cost_billing_mode"`
+	ModelName                   string                          `json:"model_name"`
+	MetricKnown                 bool                            `json:"metric_known"`
+	MetricSource                string                          `json:"metric_source,omitempty"`
+	RequestCount                int64                           `json:"request_count"`
+	SuccessCount                int64                           `json:"success_count"`
+	FailureCount                int64                           `json:"failure_count"`
+	UnknownClassificationCount  int64                           `json:"unknown_classification_count"`
+	ReliabilityRequestCount     int64                           `json:"reliability_request_count"`
+	ReliabilityFailureCount     int64                           `json:"reliability_failure_count"`
+	AverageLatencyMs            float64                         `json:"average_latency_ms"`
+	AverageTTFTMs               float64                         `json:"average_ttft_ms"`
+	P50LatencyMs                float64                         `json:"p50_latency_ms"`
+	P95LatencyMs                float64                         `json:"p95_latency_ms"`
+	P99LatencyMs                float64                         `json:"p99_latency_ms"`
+	P50TTFTMs                   float64                         `json:"p50_ttft_ms"`
+	P95TTFTMs                   float64                         `json:"p95_ttft_ms"`
+	P99TTFTMs                   float64                         `json:"p99_ttft_ms"`
+	P95LatencyKnown             bool                            `json:"p95_latency_known"`
+	P95TTFTKnown                bool                            `json:"p95_ttft_known"`
+	LatencyDistributionKnown    bool                            `json:"latency_distribution_known"`
+	TTFTDistributionKnown       bool                            `json:"ttft_distribution_known"`
+	LatencyDistributionCoverage float64                         `json:"latency_distribution_coverage"`
+	TTFTDistributionCoverage    float64                         `json:"ttft_distribution_coverage"`
+	OutputTokens                int64                           `json:"output_tokens"`
+	GenerationMs                int64                           `json:"generation_ms"`
+	OutputTokensPerSecond       float64                         `json:"output_tokens_per_second"`
+	Err4xx                      int64                           `json:"err_4xx"`
+	Err5xx                      int64                           `json:"err_5xx"`
+	Err429                      int64                           `json:"err_429"`
+	Err529                      int64                           `json:"err_529"`
+	AverageRetryAfterMs         float64                         `json:"average_retry_after_ms"`
+	MetricUpdatedUnix           int64                           `json:"metric_updated_at"`
+	Inflight                    int64                           `json:"inflight"`
+	BreakerKnown                bool                            `json:"breaker_known"`
+	BreakerState                string                          `json:"breaker_state"`
+	BreakerReason               string                          `json:"breaker_reason"`
+	BreakerCooldownUntil        int64                           `json:"breaker_cooldown_until"`
+	BreakerHalfOpenInflight     int64                           `json:"breaker_half_open_inflight"`
+	BreakerUpdatedUnix          int64                           `json:"breaker_updated_at"`
+	CapacityLimited             bool                            `json:"capacity_limited"`
+	CapacityStatusCode          int                             `json:"capacity_status_code"`
+	CapacityCooldownUntilMs     int64                           `json:"capacity_cooldown_until_ms"`
+	CapacityUpdatedUnixMilli    int64                           `json:"capacity_updated_at_ms"`
+	CostKnown                   bool                            `json:"cost_known"`
+	Cost                        float64                         `json:"cost"`
+	CostConfidence              string                          `json:"cost_confidence"`
+	CostUpdatedUnix             int64                           `json:"cost_updated_at"`
+	CostQuotaType               int                             `json:"cost_quota_type"`
+	CostGroupRatio              float64                         `json:"cost_group_ratio"`
+	CostBaseRatio               float64                         `json:"cost_base_ratio"`
+	CostCompletionRatio         float64                         `json:"cost_completion_ratio"`
+	CostModelPrice              float64                         `json:"cost_model_price"`
+	CostBillingMode             string                          `json:"cost_billing_mode"`
+	CostPricing                 *model.RoutingNormalizedPricing `json:"-"`
+	CostPricingHash             string                          `json:"cost_pricing_hash,omitempty"`
+	CostPricingVersion          string                          `json:"cost_pricing_version,omitempty"`
+	CostUpstreamGroup           string                          `json:"cost_upstream_group,omitempty"`
+	CostUpstreamModel           string                          `json:"cost_upstream_model,omitempty"`
+	CostObservedTime            int64                           `json:"cost_observed_time,omitempty"`
+	CostEffectiveTime           int64                           `json:"cost_effective_time,omitempty"`
+	CostExpiresTime             int64                           `json:"cost_expires_time,omitempty"`
+	CostVersionConfidence       string                          `json:"cost_version_confidence,omitempty"`
+	CostConfidenceScore         float64                         `json:"cost_confidence_score,omitempty"`
+	CostFreshness               string                          `json:"cost_freshness,omitempty"`
+	CostFreshnessScore          float64                         `json:"cost_freshness_score,omitempty"`
+	CostSourceSyncStatus        string                          `json:"cost_source_sync_status,omitempty"`
+	CostSourceSyncError         string                          `json:"cost_source_sync_error,omitempty"`
+	CostAccountSourceType       string                          `json:"cost_account_source_type,omitempty"`
+	CostAccountKeyHash          string                          `json:"-"`
+	CostAccountMaskedID         string                          `json:"cost_account_masked_identity,omitempty"`
+	CostAccountStatus           string                          `json:"cost_account_status,omitempty"`
+	CostAccountBalanceKnown     bool                            `json:"cost_account_balance_known,omitempty"`
+	CostAccountBalance          float64                         `json:"cost_account_balance,omitempty"`
+	CostAccountBalanceUpdatedAt int64                           `json:"cost_account_balance_updated_at,omitempty"`
+	CostAccountSyncStatus       string                          `json:"cost_account_sync_status,omitempty"`
+	CostAccountSyncError        string                          `json:"cost_account_sync_error,omitempty"`
+	upstreamAccountID           int
 	ttftCount                   int64
 }
 
 type ChannelSnapshot struct {
-	ID                   int     `json:"id"`
-	Name                 string  `json:"name"`
-	Type                 int     `json:"type"`
-	Status               int     `json:"status"`
-	Endpoint             string  `json:"endpoint,omitempty"`
-	MultiKey             bool    `json:"multi_key"`
-	CredentialIDs        []int   `json:"credential_ids"`
-	AuthFailure          bool    `json:"auth_failure"`
-	AuthFailureUpdatedAt int64   `json:"auth_failure_updated_at"`
-	BalanceKnown         bool    `json:"balance_known"`
-	Balance              float64 `json:"balance"`
-	BalanceUpdatedAt     int64   `json:"balance_updated_at"`
-	CostConnectorEnabled bool    `json:"cost_connector_enabled"`
-	CostSyncFailures     int     `json:"cost_sync_failures"`
-	CostSyncBackoffUntil int64   `json:"cost_sync_backoff_until"`
-	CostSyncError        string  `json:"cost_sync_error,omitempty"`
+	ID                   int      `json:"id"`
+	Name                 string   `json:"name"`
+	Type                 int      `json:"type"`
+	Status               int      `json:"status"`
+	Endpoint             string   `json:"endpoint,omitempty"`
+	ModelMapping         string   `json:"-"`
+	ModelNames           []string `json:"-"`
+	MultiKey             bool     `json:"multi_key"`
+	CredentialIDs        []int    `json:"credential_ids"`
+	AuthFailure          bool     `json:"auth_failure"`
+	AuthFailureUpdatedAt int64    `json:"auth_failure_updated_at"`
+	BalanceKnown         bool     `json:"balance_known"`
+	Balance              float64  `json:"balance"`
+	BalanceUpdatedAt     int64    `json:"balance_updated_at"`
+	CostConnectorEnabled bool     `json:"cost_connector_enabled"`
+	CostSyncFailures     int      `json:"cost_sync_failures"`
+	CostSyncBackoffUntil int64    `json:"cost_sync_backoff_until"`
+	CostSyncError        string   `json:"cost_sync_error,omitempty"`
 }
 
 type Identity struct {
@@ -232,6 +260,7 @@ type runtimeSnapshot struct {
 	poolIndexByID            map[int]int
 	memberIndexesByPoolModel map[poolModelKey][]int
 	preparedBalancedPools    map[balancedPoolModelKey]*routingselector.PreparedBalancedPool
+	strictCapacityPlans      map[memberModelKey]strictCapacityPlan
 	poolSummaries            []PoolSnapshotSummary
 	telemetrySummary         TelemetryAggregate
 }
@@ -609,6 +638,8 @@ func buildSnapshotWithinTransaction(
 	selectorPolicyByPoolID := make(map[int]PoolSelectorPolicy, len(document.Pools))
 	balancedPolicyByPoolID := make(map[int]BalancedPoolPolicy, len(document.Pools))
 	canaryPolicyByPoolID := make(map[int]model.RoutingCanaryPolicy, len(document.Pools))
+	enterprisePolicyByPoolID := make(map[int]EnterprisePoolPolicy, len(document.Pools))
+	enterpriseMemberPolicyByID := make(map[int]enterpriseMemberPolicy, revision.MemberCount)
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
 		selectorPolicy, err := resolvePoolSelectorPolicy(pool.PolicyProfile, pool.Policy)
@@ -623,10 +654,15 @@ func buildSnapshotWithinTransaction(
 		if err != nil {
 			return nil, fmt.Errorf("invalid routing canary policy for pool %d: %w", pool.PoolID, err)
 		}
+		enterprisePolicy, err := resolveEnterprisePoolPolicy(pool.PolicyProfile, pool.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid enterprise routing policy for pool %d: %w", pool.PoolID, err)
+		}
 		policyPoolByID[pool.PoolID] = pool
 		selectorPolicyByPoolID[pool.PoolID] = selectorPolicy
 		balancedPolicyByPoolID[pool.PoolID] = balancedPolicy
 		canaryPolicyByPoolID[pool.PoolID] = canaryPolicy
+		enterprisePolicyByPoolID[pool.PoolID] = enterprisePolicy
 		pools = append(pools, model.RoutingPool{
 			ID:          pool.PoolID,
 			GroupName:   pool.GroupName,
@@ -636,6 +672,11 @@ func buildSnapshotWithinTransaction(
 		})
 		for memberIndex := range pool.Members {
 			member := pool.Members[memberIndex]
+			enterpriseMemberPolicy, err := resolveEnterpriseMemberPolicy(pool.PolicyProfile, member.Overrides, enterprisePolicy)
+			if err != nil {
+				return nil, fmt.Errorf("invalid enterprise routing override for member %d: %w", member.MemberID, err)
+			}
+			enterpriseMemberPolicyByID[member.MemberID] = enterpriseMemberPolicy
 			if !member.Enabled {
 				continue
 			}
@@ -1040,6 +1081,8 @@ metricPages:
 			Type:          channel.Type,
 			Status:        channel.Status,
 			Endpoint:      safeEndpoint(channel.BaseURL),
+			ModelMapping:  channel.GetModelMapping(),
+			ModelNames:    append([]string(nil), modelNamesByChannel[channel.Id]...),
 			MultiKey:      channel.ChannelInfo.IsMultiKey,
 			CredentialIDs: append([]int(nil), credentialsByChannel[channel.Id]...),
 		}
@@ -1111,17 +1154,18 @@ metricPages:
 	for _, pool := range pools {
 		policyPool := policyPoolByID[pool.ID]
 		poolView := PoolSnapshot{
-			ID:              pool.ID,
-			GroupName:       pool.GroupName,
-			DisplayName:     pool.DisplayName,
-			Source:          pool.Source,
-			DeploymentStage: policyPool.DeploymentStage,
-			PolicyProfile:   policyPool.PolicyProfile,
-			SelectorPolicy:  selectorPolicyByPoolID[pool.ID],
-			BalancedPolicy:  balancedPolicyByPoolID[pool.ID],
-			CanaryPolicy:    canaryPolicyByPoolID[pool.ID],
-			MemberCount:     len(membersByPool[pool.ID]),
-			Members:         make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
+			ID:               pool.ID,
+			GroupName:        pool.GroupName,
+			DisplayName:      pool.DisplayName,
+			Source:           pool.Source,
+			DeploymentStage:  policyPool.DeploymentStage,
+			PolicyProfile:    policyPool.PolicyProfile,
+			SelectorPolicy:   selectorPolicyByPoolID[pool.ID],
+			BalancedPolicy:   balancedPolicyByPoolID[pool.ID],
+			CanaryPolicy:     canaryPolicyByPoolID[pool.ID],
+			enterprisePolicy: enterprisePolicyByPoolID[pool.ID],
+			MemberCount:      len(membersByPool[pool.ID]),
+			Members:          make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
 		}
 		for _, member := range membersByPool[pool.ID] {
 			memberIndex := len(poolView.Members)
@@ -1135,19 +1179,20 @@ metricPages:
 				channelsWithCredentials[channel.Id] = struct{}{}
 			}
 			memberView := PoolMemberSnapshot{
-				ID:              member.ID,
-				PoolID:          member.PoolID,
-				ChannelID:       member.ChannelID,
-				ChannelName:     channel.Name,
-				ChannelType:     channel.Type,
-				PhysicalStatus:  channel.Status,
-				LegacyPriority:  member.LegacyPriority,
-				LegacyWeight:    member.LegacyWeight,
-				MultiKey:        channel.ChannelInfo.IsMultiKey,
-				CredentialCount: len(credentialIDs),
-				CredentialIDs:   credentialIDs,
-				ModelCount:      len(modelNamesByChannel[channel.Id]),
-				Models:          make([]ModelSnapshot, 0, len(modelNamesByChannel[channel.Id])),
+				ID:               member.ID,
+				PoolID:           member.PoolID,
+				ChannelID:        member.ChannelID,
+				ChannelName:      channel.Name,
+				ChannelType:      channel.Type,
+				PhysicalStatus:   channel.Status,
+				LegacyPriority:   member.LegacyPriority,
+				LegacyWeight:     member.LegacyWeight,
+				MultiKey:         channel.ChannelInfo.IsMultiKey,
+				CredentialCount:  len(credentialIDs),
+				CredentialIDs:    credentialIDs,
+				ModelCount:       len(modelNamesByChannel[channel.Id]),
+				Models:           make([]ModelSnapshot, 0, len(modelNamesByChannel[channel.Id])),
+				enterprisePolicy: enterpriseMemberPolicyByID[member.ID],
 			}
 			for _, modelName := range modelNamesByChannel[channel.Id] {
 				if modelSnapshotCount >= limits.MaxTotalModelSnapshots {
@@ -1253,8 +1298,12 @@ metricPages:
 		poolIndexByID:            poolIndexByID,
 		memberIndexesByPoolModel: memberIndexesByPoolModel,
 		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
+		strictCapacityPlans:      make(map[memberModelKey]strictCapacityPlan),
 		poolSummaries:            poolSummaries,
 		telemetrySummary:         telemetryAggregate(view),
+	}
+	if err := snapshot.compileStrictCapacityPlans(); err != nil {
+		return nil, err
 	}
 	if err := snapshot.compileBalancedPools(); err != nil {
 		return nil, err
@@ -1419,6 +1468,7 @@ func snapshotModel(
 		}
 	}
 	if cost, ok := routinghotcache.GetCost(key.CostKey()); ok {
+		view.upstreamAccountID = cost.AccountID
 		view.CostKnown = cost.Known && finiteNonNegative(cost.Cost)
 		if view.CostKnown {
 			view.Cost = cost.Cost
@@ -1433,6 +1483,32 @@ func snapshotModel(
 		view.CostCompletionRatio = cost.CompletionRatio
 		view.CostModelPrice = cost.ModelPrice
 		view.CostBillingMode = cost.BillingMode
+		if cost.PricingKnown {
+			pricing := cost.Pricing
+			view.CostPricing = &pricing
+		}
+		view.CostPricingHash = cost.PricingHash
+		view.CostPricingVersion = cost.PricingVersion
+		view.CostUpstreamGroup = cost.UpstreamGroup
+		view.CostUpstreamModel = cost.UpstreamModel
+		view.CostObservedTime = cost.ObservedTime
+		view.CostEffectiveTime = cost.EffectiveTime
+		view.CostExpiresTime = cost.ExpiresTime
+		view.CostVersionConfidence = cost.VersionConfidence
+		view.CostConfidenceScore = cost.ConfidenceScore
+		view.CostFreshness = cost.Freshness
+		view.CostFreshnessScore = cost.FreshnessScore
+		view.CostSourceSyncStatus = cost.SourceSyncStatus
+		view.CostSourceSyncError = cost.SourceSyncError
+		view.CostAccountSourceType = cost.AccountSourceType
+		view.CostAccountKeyHash = cost.AccountKeyHash
+		view.CostAccountMaskedID = cost.AccountMaskedID
+		view.CostAccountStatus = cost.AccountStatus
+		view.CostAccountBalanceKnown = cost.AccountBalanceKnown
+		view.CostAccountBalance = cost.AccountBalance
+		view.CostAccountBalanceUpdatedAt = cost.AccountBalanceAt
+		view.CostAccountSyncStatus = cost.AccountSyncStatus
+		view.CostAccountSyncError = cost.AccountSyncError
 	}
 	return view, invalidValues
 }
@@ -1795,6 +1871,7 @@ func cloneSnapshotView(source SnapshotView) SnapshotView {
 	result.Channels = append([]ChannelSnapshot(nil), source.Channels...)
 	for index := range result.Channels {
 		result.Channels[index].CredentialIDs = append([]int(nil), source.Channels[index].CredentialIDs...)
+		result.Channels[index].ModelNames = append([]string(nil), source.Channels[index].ModelNames...)
 	}
 	result.Pools = append([]PoolSnapshot(nil), source.Pools...)
 	for poolIndex := range result.Pools {
@@ -1828,6 +1905,7 @@ func SetSnapshotForTest(view SnapshotView) {
 		poolIndexByID:            make(map[int]int, len(cloned.Pools)),
 		memberIndexesByPoolModel: make(map[poolModelKey][]int),
 		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
+		strictCapacityPlans:      make(map[memberModelKey]strictCapacityPlan),
 		poolSummaries:            make([]PoolSnapshotSummary, len(cloned.Pools)),
 	}
 	for index := range cloned.Channels {
@@ -1856,6 +1934,7 @@ func SetSnapshotForTest(view SnapshotView) {
 		}
 	}
 	snapshot.telemetrySummary = telemetryAggregate(snapshot.view)
+	_ = snapshot.compileStrictCapacityPlans()
 	_ = snapshot.compileBalancedPools()
 	snapshotPublishMu.Lock()
 	currentSnapshot.Store(snapshot)

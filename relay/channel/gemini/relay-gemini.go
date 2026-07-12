@@ -1712,7 +1712,10 @@ type GeminiModelsResponse struct {
 	NextPageToken string            `json:"nextPageToken"`
 }
 
-func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
+func FetchGeminiModels(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+	if ctx == nil {
+		return nil, errors.New("gemini model discovery context is unavailable")
+	}
 	client, err := service.GetHttpClientWithProxy(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP客户端失败: %v", err)
@@ -1728,8 +1731,8 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			url = fmt.Sprintf("%s?pageToken=%s", url, nextPageToken)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		request, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		pageCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		request, err := http.NewRequestWithContext(pageCtx, http.MethodGet, url, nil)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("创建请求失败: %v", err)
@@ -1740,7 +1743,7 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 		response, err := client.Do(request)
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("请求失败: %v", err)
+			return nil, fmt.Errorf("请求失败: %w", err)
 		}
 
 		if response.StatusCode != http.StatusOK {
@@ -1754,7 +1757,7 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 		response.Body.Close()
 		cancel()
 		if err != nil {
-			return nil, fmt.Errorf("读取响应失败: %v", err)
+			return nil, fmt.Errorf("读取响应失败: %w", err)
 		}
 
 		var modelsResponse GeminiModelsResponse

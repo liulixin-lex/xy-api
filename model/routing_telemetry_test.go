@@ -120,7 +120,6 @@ func TestRoutingTelemetryMergesDuplicateItemsAndDistributionsBeforeApply(t *test
 	setupRoutingTelemetrySQLite(t)
 	first := telemetryRollup(t, 1, 100, 100)
 	second := telemetryRollup(t, 1, 100, 1_000)
-	second.LastSnapshotRevision = 2
 	batch := telemetryBatch("node-a", 1, "duplicate-items", first, second)
 
 	result, err := ApplyRoutingTelemetryBatchContext(context.Background(), batch)
@@ -132,7 +131,7 @@ func TestRoutingTelemetryMergesDuplicateItemsAndDistributionsBeforeApply(t *test
 	assert.Equal(t, int64(2), saved.RequestCount)
 	assert.Equal(t, int64(2), saved.LatencySampleCount)
 	assert.Equal(t, int64(1_100), saved.TotalLatencyMs)
-	assert.Equal(t, int64(2), saved.LastSnapshotRevision)
+	assert.Equal(t, int64(1), saved.LastSnapshotRevision)
 	sketch, err := routingdistribution.DecodeDurationSketch(saved.LatencySketch, saved.SketchCodecVersion)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), sketch.Count())
@@ -144,6 +143,28 @@ func TestRoutingTelemetryMergesDuplicateItemsAndDistributionsBeforeApply(t *test
 	var receipt RoutingTelemetryReceipt
 	require.NoError(t, DB.First(&receipt).Error)
 	assert.Equal(t, 2, receipt.ItemCount, "receipt records the original envelope item count")
+}
+
+func TestRoutingTelemetryKeepsSnapshotRevisionsSeparateWithinBatch(t *testing.T) {
+	setupRoutingTelemetrySQLite(t)
+	first := telemetryRollup(t, 1, 100, 100)
+	second := telemetryRollup(t, 1, 100, 1_000)
+	second.LastSnapshotRevision = 2
+	batch := telemetryBatch("node-a", 1, "revision-isolated-items", second, first)
+
+	result, err := ApplyRoutingTelemetryBatchContext(context.Background(), batch)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingTelemetryApplyResult{AppliedItems: 2}, result)
+
+	var saved []RoutingMetricRollup
+	require.NoError(t, DB.Order("last_snapshot_revision asc").Find(&saved).Error)
+	require.Len(t, saved, 2)
+	assert.Equal(t, int64(1), saved[0].LastSnapshotRevision)
+	assert.Equal(t, int64(100), saved[0].TotalLatencyMs)
+	assert.Equal(t, int64(2), saved[1].LastSnapshotRevision)
+	assert.Equal(t, int64(1_000), saved[1].TotalLatencyMs)
+	assert.Equal(t, int64(1), saved[0].RequestCount)
+	assert.Equal(t, int64(1), saved[1].RequestCount)
 }
 
 func TestRoutingTelemetryRollsBackReceiptAndAllRollupsOnApplyFailure(t *testing.T) {

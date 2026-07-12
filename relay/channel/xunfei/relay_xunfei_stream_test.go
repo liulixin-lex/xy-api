@@ -2,6 +2,7 @@ package xunfei
 
 import (
 	"bytes"
+	"context"
 	stdjson "encoding/json"
 	"errors"
 	"net/http"
@@ -113,7 +114,7 @@ func TestXunfeiStreamPreservesMalformedFrameCause(t *testing.T) {
 
 	ctx, recorder, info := newXunfeiStreamTestContext(t)
 	authURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	dataChan, stopChan, closeUpstream, err := xunfeiMakeRequest(info, dto.GeneralOpenAIRequest{}, "general", authURL, "app")
+	dataChan, stopChan, closeUpstream, err := xunfeiMakeRequest(ctx.Request.Context(), info, dto.GeneralOpenAIRequest{}, "general", authURL, "app")
 	require.NoError(t, err)
 
 	usage, apiErr := relayXunfeiStream(ctx, info, dataChan, stopChan, closeUpstream)
@@ -161,6 +162,22 @@ func TestXunfeiStreamReturnsUsageWhenDoneWriteFails(t *testing.T) {
 	assert.NotContains(t, recorder.Body.String(), "[DONE]")
 }
 
+func TestXunfeiStreamRequestCancellationWinsOverUpstreamStop(t *testing.T) {
+	ctx, recorder, info := newXunfeiStreamTestContext(t)
+	requestCtx, cancel := context.WithCancel(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	endChan := make(chan xunfeiStreamEnd, 1)
+	endChan <- xunfeiStreamEnd{}
+	cancel()
+
+	usage, apiErr := relayXunfeiStream(ctx, info, make(chan XunfeiChatResponse), endChan, func() error { return nil })
+
+	require.NotNil(t, usage)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, context.Canceled)
+	assert.NotContains(t, recorder.Body.String(), "[DONE]")
+}
+
 func TestXunfeiMakeRequestCloseSignalsStop(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +192,7 @@ func TestXunfeiMakeRequestCloseSignalsStop(t *testing.T) {
 	defer server.Close()
 
 	authURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	_, endChan, closeUpstream, err := xunfeiMakeRequest(&relaycommon.RelayInfo{}, dto.GeneralOpenAIRequest{}, "general", authURL, "app")
+	_, endChan, closeUpstream, err := xunfeiMakeRequest(context.Background(), &relaycommon.RelayInfo{}, dto.GeneralOpenAIRequest{}, "general", authURL, "app")
 	require.NoError(t, err)
 	require.NoError(t, closeUpstream.Close())
 
@@ -183,5 +200,51 @@ func TestXunfeiMakeRequestCloseSignalsStop(t *testing.T) {
 	case <-endChan:
 	case <-time.After(time.Second):
 		require.Fail(t, "xunfei stream producer did not signal stop after close")
+	}
+}
+
+func TestXunfeiMakeRequestClosesConnectedUpstreamOnRequestCancel(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	requestReceived := make(chan struct{})
+	connectionClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		close(requestReceived)
+		if _, _, err := conn.ReadMessage(); err != nil {
+			close(connectionClosed)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	authURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	_, endChan, closeUpstream, err := xunfeiMakeRequest(ctx, &relaycommon.RelayInfo{}, dto.GeneralOpenAIRequest{}, "general", authURL, "app")
+	require.NoError(t, err)
+	defer closeUpstream.Close()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		require.Fail(t, "xunfei upstream did not receive the request")
+	}
+	cancel()
+
+	select {
+	case <-connectionClosed:
+	case <-time.After(time.Second):
+		require.Fail(t, "xunfei upstream connection stayed open after request cancellation")
+	}
+	select {
+	case <-endChan:
+	case <-time.After(time.Second):
+		require.Fail(t, "xunfei stream producer did not stop after request cancellation")
 	}
 }

@@ -74,6 +74,8 @@ type DecisionInput struct {
 	ActualExpectedCost   float64
 	ObservedCostKnown    bool
 	ObservedExpectedCost float64
+	ActualCostEstimate   *ShadowCostInput
+	ObservedCostEstimate *ShadowCostInput
 	Gate                 *CanaryGate
 	SelectedIdentity     Identity
 	CapacityAdmission    *CapacityAdmission
@@ -81,17 +83,26 @@ type DecisionInput struct {
 }
 
 type decisionCanaryAuditFields struct {
-	activationID         int64
-	activationStage      string
-	trafficBasisPoints   int
-	canaryBucket         int
-	rolloutKey           string
-	cohort               string
-	selectedMemberID     int
-	selectedCredentialID int
-	reservationMode      string
-	reservationDemand    Demand
-	reservationLimit     Limit
+	activationID                    int64
+	activationStage                 string
+	trafficBasisPoints              int
+	canaryBucket                    int
+	rolloutKey                      string
+	cohort                          string
+	selectedMemberID                int
+	selectedCredentialID            int
+	reservationMode                 string
+	reservationDemand               Demand
+	reservationLimit                Limit
+	reservationAccountID            int
+	reservationResourceCredentialID int
+	reservationResourceModel        string
+	reservationTotalTPM             int64
+	reservationCostNanoUSD          int64
+	reservationLimitTotalTPM        int64
+	reservationLimitCostNanoUSD     int64
+	reservationLeaseExpiresMs       int64
+	reservationPoolSharesJSON       string
 }
 
 type DecisionBufferStats struct {
@@ -266,66 +277,85 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		input.ObservedCostKnown = false
 		input.ObservedExpectedCost = 0
 	}
+	actualCostEstimateJSON, err := routingDecisionCostEstimateJSON(input.ActualCostEstimate)
+	if err != nil {
+		return "", err
+	}
+	observedCostEstimateJSON, err := routingDecisionCostEstimateJSON(input.ObservedCostEstimate)
+	if err != nil {
+		return "", err
+	}
 	expectedCostDelta := 0.0
 	if input.ActualCostKnown && input.ObservedCostKnown {
 		expectedCostDelta = input.ObservedExpectedCost - input.ActualExpectedCost
 	}
 	decisionBuffer.enqueue(model.RoutingDecisionAudit{
-		DecisionID:                decisionID,
-		RequestID:                 truncateDecisionText(input.RequestID, 64),
-		PoolID:                    input.PoolID,
-		GroupName:                 input.GroupName,
-		ModelName:                 input.ModelName,
-		SnapshotRevision:          snapshotRevisionInt64(input.SnapshotRevision),
-		RuntimeGeneration:         runtimeGeneration,
-		ActivationID:              canaryFields.activationID,
-		ActivationStage:           canaryFields.activationStage,
-		TrafficBasisPoints:        canaryFields.trafficBasisPoints,
-		CanaryBucket:              canaryFields.canaryBucket,
-		RolloutKey:                canaryFields.rolloutKey,
-		Cohort:                    canaryFields.cohort,
-		PolicyHash:                policyHash,
-		SnapshotHash:              snapshotHash,
-		ProfileHash:               profileHash,
-		AlgorithmVersion:          algorithmVersion,
-		Seed:                      seed,
-		RetryIndex:                input.RetryIndex,
-		IsStream:                  input.IsStream,
-		ActualChannelID:           input.ActualChannelID,
-		ObservedChannelID:         input.ObservedChannelID,
-		SelectedMemberID:          canaryFields.selectedMemberID,
-		SelectedCredentialID:      canaryFields.selectedCredentialID,
-		ReservationMode:           canaryFields.reservationMode,
-		ReservationRPM:            canaryFields.reservationDemand.RPM,
-		ReservationInputTPM:       canaryFields.reservationDemand.InputTPM,
-		ReservationOutputTPM:      canaryFields.reservationDemand.OutputTPM,
-		ReservationInflight:       canaryFields.reservationDemand.Inflight,
-		ReservationLimitRPM:       canaryFields.reservationLimit.RPM,
-		ReservationLimitInputTPM:  canaryFields.reservationLimit.InputTPM,
-		ReservationLimitOutputTPM: canaryFields.reservationLimit.OutputTPM,
-		ReservationLimitInflight:  canaryFields.reservationLimit.Inflight,
-		CandidateCount:            originalCandidateCount,
-		EligibleCount:             originalEligibleCount,
-		FilteredOpen:              input.FilteredOpen,
-		FilteredCapacity:          input.FilteredCapacity,
-		BreakerBypassed:           input.BreakerBypassed,
-		ObservedMatchesActual:     input.ObservedChannelID > 0 && input.ObservedChannelID == input.ActualChannelID,
-		DifferenceType:            input.DifferenceType,
-		ActualCostKnown:           input.ActualCostKnown,
-		ActualExpectedCost:        input.ActualExpectedCost,
-		ObservedCostKnown:         input.ObservedCostKnown,
-		ObservedExpectedCost:      input.ObservedExpectedCost,
-		ExpectedCostDelta:         expectedCostDelta,
-		Replayable:                replayable,
-		RequestProfileJSON:        requestProfileJSON,
-		ReplayInputJSON:           replayInputJSON,
-		ReplayInputHash:           replayInputHash,
-		ReplayInputBytes:          replayInputBytes,
-		ReplayChunkCount:          len(replayChunks),
-		ReplayChunks:              replayChunks,
-		CandidatesJSON:            string(candidatesJSON),
-		ExclusionSummaryJSON:      string(exclusionSummaryJSON),
-		CreatedTime:               createdTime,
+		DecisionID:                      decisionID,
+		RequestID:                       truncateDecisionText(input.RequestID, 64),
+		PoolID:                          input.PoolID,
+		GroupName:                       input.GroupName,
+		ModelName:                       input.ModelName,
+		SnapshotRevision:                snapshotRevisionInt64(input.SnapshotRevision),
+		RuntimeGeneration:               runtimeGeneration,
+		ActivationID:                    canaryFields.activationID,
+		ActivationStage:                 canaryFields.activationStage,
+		TrafficBasisPoints:              canaryFields.trafficBasisPoints,
+		CanaryBucket:                    canaryFields.canaryBucket,
+		RolloutKey:                      canaryFields.rolloutKey,
+		Cohort:                          canaryFields.cohort,
+		PolicyHash:                      policyHash,
+		SnapshotHash:                    snapshotHash,
+		ProfileHash:                     profileHash,
+		AlgorithmVersion:                algorithmVersion,
+		Seed:                            seed,
+		RetryIndex:                      input.RetryIndex,
+		IsStream:                        input.IsStream,
+		ActualChannelID:                 input.ActualChannelID,
+		ObservedChannelID:               input.ObservedChannelID,
+		SelectedMemberID:                canaryFields.selectedMemberID,
+		SelectedCredentialID:            canaryFields.selectedCredentialID,
+		ReservationMode:                 canaryFields.reservationMode,
+		ReservationRPM:                  canaryFields.reservationDemand.RPM,
+		ReservationInputTPM:             canaryFields.reservationDemand.InputTPM,
+		ReservationOutputTPM:            canaryFields.reservationDemand.OutputTPM,
+		ReservationInflight:             canaryFields.reservationDemand.Inflight,
+		ReservationLimitRPM:             canaryFields.reservationLimit.RPM,
+		ReservationLimitInputTPM:        canaryFields.reservationLimit.InputTPM,
+		ReservationLimitOutputTPM:       canaryFields.reservationLimit.OutputTPM,
+		ReservationLimitInflight:        canaryFields.reservationLimit.Inflight,
+		ReservationAccountID:            canaryFields.reservationAccountID,
+		ReservationResourceCredentialID: canaryFields.reservationResourceCredentialID,
+		ReservationResourceModel:        canaryFields.reservationResourceModel,
+		ReservationTotalTPM:             canaryFields.reservationTotalTPM,
+		ReservationCostNanoUSD:          canaryFields.reservationCostNanoUSD,
+		ReservationLimitTotalTPM:        canaryFields.reservationLimitTotalTPM,
+		ReservationLimitCostNanoUSD:     canaryFields.reservationLimitCostNanoUSD,
+		ReservationLeaseExpiresMs:       canaryFields.reservationLeaseExpiresMs,
+		ReservationPoolSharesJSON:       canaryFields.reservationPoolSharesJSON,
+		CandidateCount:                  originalCandidateCount,
+		EligibleCount:                   originalEligibleCount,
+		FilteredOpen:                    input.FilteredOpen,
+		FilteredCapacity:                input.FilteredCapacity,
+		BreakerBypassed:                 input.BreakerBypassed,
+		ObservedMatchesActual:           input.ObservedChannelID > 0 && input.ObservedChannelID == input.ActualChannelID,
+		DifferenceType:                  input.DifferenceType,
+		ActualCostKnown:                 input.ActualCostKnown,
+		ActualExpectedCost:              input.ActualExpectedCost,
+		ObservedCostKnown:               input.ObservedCostKnown,
+		ObservedExpectedCost:            input.ObservedExpectedCost,
+		ExpectedCostDelta:               expectedCostDelta,
+		ActualCostEstimateJSON:          actualCostEstimateJSON,
+		ObservedCostEstimateJSON:        observedCostEstimateJSON,
+		Replayable:                      replayable,
+		RequestProfileJSON:              requestProfileJSON,
+		ReplayInputJSON:                 replayInputJSON,
+		ReplayInputHash:                 replayInputHash,
+		ReplayInputBytes:                replayInputBytes,
+		ReplayChunkCount:                len(replayChunks),
+		ReplayChunks:                    replayChunks,
+		CandidatesJSON:                  string(candidatesJSON),
+		ExclusionSummaryJSON:            string(exclusionSummaryJSON),
+		CreatedTime:                     createdTime,
 	})
 	return decisionID, nil
 }
@@ -364,7 +394,7 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
 			}
 			admission := *input.CapacityAdmission
-			if admission.Mode != CapacityModeLocalSoft || admission.Key.PoolID != input.PoolID ||
+			if admission.Key.PoolID != input.PoolID ||
 				admission.Key.MemberID != identity.MemberID || admission.Key.Model != input.ModelName ||
 				admission.Key.PolicyRevision != input.SnapshotRevision || !validDemand(admission.Demand) ||
 				!validLimit(admission.Limit) || !limitCoversDemand(admission.Limit, admission.Demand) ||
@@ -376,6 +406,38 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 			fields.reservationMode = string(admission.Mode)
 			fields.reservationDemand = admission.Demand
 			fields.reservationLimit = admission.Limit
+			switch admission.Mode {
+			case CapacityModeLocalSoft:
+				if admission.Strict != nil {
+					return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+				}
+			case CapacityModeRedisStrict, CapacityModeRedisBlock:
+				strict := admission.Strict
+				if strict == nil || strict.Mode != admission.Mode || strict.PoolID != input.PoolID ||
+					strict.PolicyRevision != input.SnapshotRevision || strings.TrimSpace(strict.Key.Model) == "" ||
+					strict.Demand.RPM != admission.Demand.RPM || strict.Demand.InputTPM != admission.Demand.InputTPM ||
+					strict.Demand.OutputTPM != admission.Demand.OutputTPM || strict.Demand.Inflight != admission.Demand.Inflight ||
+					strict.Limit.RPM != admission.Limit.RPM || strict.Limit.InputTPM != admission.Limit.InputTPM ||
+					strict.Limit.OutputTPM != admission.Limit.OutputTPM || strict.Limit.Inflight != admission.Limit.Inflight ||
+					(strict.Key.AccountID <= 0 && strict.Key.CredentialID <= 0) || strict.LeaseExpiresMs <= 0 {
+					return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+				}
+				poolSharesJSON, err := common.Marshal(strict.PoolShares)
+				if err != nil || len(poolSharesJSON) == 0 || len(poolSharesJSON) > 8<<10 {
+					return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+				}
+				fields.reservationAccountID = strict.Key.AccountID
+				fields.reservationResourceCredentialID = strict.Key.CredentialID
+				fields.reservationResourceModel = strict.Key.Model
+				fields.reservationTotalTPM = strict.Demand.TotalTPM
+				fields.reservationCostNanoUSD = strict.Demand.CostNanoUSD
+				fields.reservationLimitTotalTPM = strict.Limit.TotalTPM
+				fields.reservationLimitCostNanoUSD = strict.Limit.CostNanoUSD
+				fields.reservationLeaseExpiresMs = strict.LeaseExpiresMs
+				fields.reservationPoolSharesJSON = string(poolSharesJSON)
+			default:
+				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+			}
 			return fields, nil
 		}
 		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
@@ -439,7 +501,7 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 		return fields, nil
 	}
 	admission := *input.CapacityAdmission
-	if admission.Mode != CapacityModeLocalSoft || admission.Key.PoolID != input.PoolID ||
+	if admission.Mode != CapacityModeLocalSoft || admission.Strict != nil || admission.Key.PoolID != input.PoolID ||
 		admission.Key.MemberID != identity.MemberID || admission.Key.Model != input.ModelName ||
 		admission.Key.PolicyRevision != input.SnapshotRevision ||
 		!validDemand(admission.Demand) || !validLimit(admission.Limit) ||
@@ -809,10 +871,25 @@ func decisionAuditSize(audit model.RoutingDecisionAudit) int64 {
 	size := int64(len(audit.DecisionID) + len(audit.RequestID) + len(audit.GroupName) + len(audit.ModelName) +
 		len(audit.AlgorithmVersion) + len(audit.PolicyHash) + len(audit.SnapshotHash) + len(audit.ProfileHash) +
 		len(audit.DifferenceType) + len(audit.ActivationStage) + len(audit.RolloutKey) + len(audit.Cohort) +
-		len(audit.ReservationMode) + len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) +
+		len(audit.ReservationMode) + len(audit.ActualCostEstimateJSON) + len(audit.ObservedCostEstimateJSON) +
+		len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) +
 		len(audit.CandidatesJSON) + len(audit.ExclusionSummaryJSON) + 512)
 	for index := range audit.ReplayChunks {
 		size += int64(len(audit.ReplayChunks[index].Payload) + len(audit.ReplayChunks[index].PayloadHash) + 256)
 	}
 	return size
+}
+
+func routingDecisionCostEstimateJSON(cost *ShadowCostInput) (string, error) {
+	if cost == nil {
+		return "", nil
+	}
+	if !validBalancedReplayCost(cost) {
+		return "", model.ErrRoutingDecisionAuditInvalid
+	}
+	encoded, err := common.Marshal(cost)
+	if err != nil || len(encoded) > 32<<10 {
+		return "", ErrDecisionAuditTooLarge
+	}
+	return string(encoded), nil
 }

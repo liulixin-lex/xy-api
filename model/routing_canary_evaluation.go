@@ -19,6 +19,7 @@ import (
 const (
 	RoutingCanaryEvaluationSchemaVersion     = 1
 	routingCanaryEvaluationWindowUniqueIndex = "uidx_routing_canary_window_v2"
+	routingCanaryEvaluationRetentionBatch    = 500
 
 	RoutingCanaryEvaluationStatusPassed       RoutingCanaryEvaluationStatus = "passed"
 	RoutingCanaryEvaluationStatusBreached     RoutingCanaryEvaluationStatus = "breached"
@@ -282,6 +283,73 @@ func ListRoutingCanaryEvaluationsBeforeContext(
 		}
 	}
 	return evaluations, err
+}
+
+func DeleteRoutingCanaryEvaluationsBeforeContext(
+	ctx context.Context,
+	cutoffMs int64,
+) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cutoffMs <= 0 {
+		return 0, nil
+	}
+	var deleted int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		selected := 0
+		err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var head RoutingPolicyHead
+			if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", routingPolicyHeadID).First(&head).Error; err != nil {
+				return err
+			}
+			if head.CurrentRevision < 0 || head.CurrentActivationID < 0 ||
+				(head.CurrentRevision == 0 && head.CurrentActivationID != 0) ||
+				(head.CurrentRevision > 0 && (head.CurrentActivationID <= 0 || !validRoutingDeploymentStage(head.CurrentStage))) {
+				return ErrRoutingCanaryEvaluationInvalid
+			}
+
+			query := tx.WithContext(ctx).Model(&RoutingCanaryEvaluation{}).
+				Where("created_time_ms < ?", cutoffMs)
+			if head.CurrentStage == RoutingDeploymentStageCanary {
+				query = query.Not(
+					"policy_revision = ? AND activation_id = ?",
+					head.CurrentRevision,
+					head.CurrentActivationID,
+				)
+			}
+			var ids []int64
+			if err := query.Order("id ASC").Limit(routingCanaryEvaluationRetentionBatch).Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			selected = len(ids)
+			if selected == 0 {
+				return nil
+			}
+
+			deleteQuery := tx.WithContext(ctx).Session(&gorm.Session{SkipHooks: true}).
+				Where("id IN ? AND created_time_ms < ?", ids, cutoffMs)
+			if head.CurrentStage == RoutingDeploymentStageCanary {
+				deleteQuery = deleteQuery.Not(
+					"policy_revision = ? AND activation_id = ?",
+					head.CurrentRevision,
+					head.CurrentActivationID,
+				)
+			}
+			result := deleteQuery.Delete(&RoutingCanaryEvaluation{})
+			deleted += result.RowsAffected
+			return result.Error
+		})
+		if err != nil {
+			return deleted, err
+		}
+		if selected < routingCanaryEvaluationRetentionBatch {
+			return deleted, nil
+		}
+	}
 }
 
 func validateStoredRoutingCanaryEvaluation(evaluation RoutingCanaryEvaluation) error {

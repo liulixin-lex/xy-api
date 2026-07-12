@@ -3,19 +3,25 @@ package channel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -410,6 +416,322 @@ func TestDoRequestUsesFirstByteTimeoutBeforeResponseHeaders(t *testing.T) {
 	assert.Empty(t, recorder.Body.String())
 }
 
+func TestDoRequestKeepsStreamAliveAfterResponseHeadersUntilFirstBodyByte(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           100,
+		FirstByteCapMs:           100,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(30 * time.Millisecond)
+		_, _ = w.Write([]byte("data: ready\n\n"))
+	}))
+	t.Cleanup(server.Close)
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 127},
+	}
+
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "data: ready\n\n", string(body))
+	assert.NotEqual(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+}
+
+func TestDoRequestTimesOutFirstBodyByteAfterResponseHeaders(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           20,
+		FirstByteCapMs:           20,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte("data: late\n\n"))
+	}))
+	t.Cleanup(server.Close)
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 128},
+	}
+
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	_, readErr := io.ReadAll(resp.Body)
+	require.Error(t, readErr)
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+}
+
+func TestDoRequestFirstByteDeadlineIsNotRestartedByProductionScanner(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           40,
+		FirstByteCapMs:           40,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousStreamingTimeout }()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte("data: late\n\n"))
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 129},
+	}
+
+	start := time.Now()
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	helper.StreamScannerHandler(ctx, resp, info, func(data string, result *helper.StreamResult) {
+		result.Error(errors.New("late data must not reach the production scanner handler"))
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(start), 120*time.Millisecond)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestDoRequestSSEKeepaliveDoesNotSatisfyFirstBusinessEventDeadline(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           50,
+		FirstByteCapMs:           50,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousStreamingTimeout }()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(10 * time.Millisecond)
+		_, _ = w.Write([]byte(": keepalive\n\nevent: ping\n\n"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 130},
+	}
+
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	helper.StreamScannerHandler(ctx, resp, info, func(data string, result *helper.StreamResult) {
+		result.Error(fmt.Errorf("transport-only SSE frame reached business handler: %s", data))
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestDoRequestDroppedDataFrameDoesNotSatisfyFirstBusinessEventDeadline(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           50,
+		FirstByteCapMs:           50,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousStreamingTimeout }()
+	service.InitHttpClient()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\"}\n\n"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 131},
+	}
+
+	start := time.Now()
+	resp, err := doRequest(ctx, req, info)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	helper.StreamScannerHandler(ctx, resp, info, func(data string, result *helper.StreamResult) {
+		if strings.Contains(data, `"content"`) {
+			if writeErr := helper.StringData(ctx, data); writeErr != nil {
+				result.Error(writeErr)
+			}
+		}
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(start), 150*time.Millisecond)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestDoRequestSSEEndBeforeBusinessEventRemainsPreCommitFailure(t *testing.T) {
+	smartRoutingSettingTestMu.Lock()
+	defer smartRoutingSettingTestMu.Unlock()
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           200,
+		FirstByteCapMs:           200,
+		FirstByteP95Multiplier:   1,
+	})
+	defer smart_routing_setting.ResetForTest()
+	previousStreamingTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousStreamingTimeout }()
+	service.InitHttpClient()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "zero length response"},
+		{name: "done only", body: "data: [DONE]\n\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if test.body == "" {
+					w.Header().Set("Content-Length", "0")
+				}
+				w.WriteHeader(http.StatusOK)
+				if test.body != "" {
+					_, _ = io.WriteString(w, test.body)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{
+				IsStream: true, OriginModelName: "gpt-test", UsingGroup: "default",
+				ChannelMeta: &relaycommon.ChannelMeta{ChannelId: 132},
+			}
+
+			resp, err := doRequest(ctx, req, info)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			marker, ok := resp.Body.(interface{ RoutingMarkFirstByte() bool })
+			require.True(t, ok)
+			helper.StreamScannerHandler(ctx, resp, info, func(data string, result *helper.StreamResult) {
+				result.Stop(fmt.Errorf("empty SSE response reached business handler: %s", data))
+			})
+
+			require.NotNil(t, info.StreamStatus)
+			assert.Equal(t, relaycommon.StreamEndReasonScannerErr, info.StreamStatus.EndReason)
+			assert.ErrorContains(t, info.StreamStatus.EndError, "before the first business event")
+			assert.False(t, marker.RoutingMarkFirstByte())
+			assert.Zero(t, info.SendResponseCount)
+			assert.Zero(t, info.ReceivedResponseCount)
+			assert.Empty(t, recorder.Body.String())
+		})
+	}
+}
+
 func TestDoRequestDoesNotUseFirstByteTimeoutForNonStream(t *testing.T) {
 	smartRoutingSettingTestMu.Lock()
 	defer smartRoutingSettingTestMu.Unlock()
@@ -450,6 +772,84 @@ func TestDoRequestDoesNotUseFirstByteTimeoutForNonStream(t *testing.T) {
 	require.NotNil(t, resp)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestDoRequestCancelsBlockedUpstreamWhenStrictCapacityRenewalFails(t *testing.T) {
+	service.InitHttpClient()
+	upstreamStarted := make(chan struct{}, 1)
+	upstreamCanceled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamStarted <- struct{}{}
+		<-r.Context().Done()
+		upstreamCanceled <- struct{}{}
+	}))
+	t.Cleanup(server.Close)
+
+	coordinator := channelrouting.NewStrictCapacityCoordinator(&requestCancelStrictCapacityRedis{})
+	reservation, err := coordinator.TryReserve(context.Background(), channelrouting.StrictCapacityRequest{
+		Key:            channelrouting.StrictCapacityKey{AccountID: 9001, CredentialID: 9002, Model: "cancel-test"},
+		PoolID:         1,
+		PolicyRevision: 1,
+		Demand:         channelrouting.StrictCapacityDemand{RPM: 1, Inflight: 1},
+		Limit:          channelrouting.StrictCapacityLimit{RPM: 10, Inflight: 1},
+		PoolShares: []channelrouting.StrictCapacityPoolShare{
+			{PoolID: 1, GuaranteedBasisPoints: 10_000, MaximumBasisPoints: 10_000},
+		},
+		LeaseTTL: time.Second,
+	})
+	require.NoError(t, err)
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	require.NoError(t, service.SetRoutingStrictCapacityReservation(ctx, reservation))
+	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
+	t.Cleanup(func() { _ = service.ReleaseRoutingCapacityReservation(ctx) })
+
+	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	result := make(chan error, 1)
+	go func() {
+		_, requestErr := doRequest(ctx, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+		result <- requestErr
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		require.Fail(t, "upstream request did not start")
+	}
+	select {
+	case requestErr := <-result:
+		require.Error(t, requestErr)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "upstream request did not stop after strict-capacity renewal failure")
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		require.Fail(t, "upstream server did not observe request cancellation")
+	}
+	assert.ErrorIs(t, context.Cause(ctx.Request.Context()), channelrouting.ErrStrictCapacityUnavailable)
+}
+
+type requestCancelStrictCapacityRedis struct{}
+
+func (*requestCancelStrictCapacityRedis) Eval(
+	_ context.Context,
+	script string,
+	_ []string,
+	args ...interface{},
+) *redis.Cmd {
+	if strings.Contains(script, "strict_capacity_reserve_v2") {
+		now := time.Now().UnixMilli()
+		lease, _ := args[1].(int64)
+		return redis.NewCmdResult([]interface{}{int64(1), now, now + lease}, nil)
+	}
+	if strings.Contains(script, "current_expires") {
+		return redis.NewCmdResult(nil, errors.New("redis unavailable"))
+	}
+	return redis.NewCmdResult(int64(1), nil)
 }
 
 func TestDoWssRequestUsesFirstByteTimeoutBeforeUpstreamHandshake(t *testing.T) {

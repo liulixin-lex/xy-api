@@ -3,15 +3,18 @@ package controller
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -20,26 +23,39 @@ import (
 )
 
 type channelRoutingOverview struct {
-	APIVersion            string                      `json:"api_version"`
-	Enabled               bool                        `json:"enabled"`
-	LegacyMode            string                      `json:"legacy_mode"`
-	DeploymentStage       string                      `json:"deployment_stage"`
-	ControlPlaneAvailable bool                        `json:"control_plane_available"`
-	ControlPlaneRevision  int64                       `json:"control_plane_revision"`
-	RevisionLag           int64                       `json:"revision_lag"`
-	RevisionAhead         int64                       `json:"revision_ahead"`
-	PropagationStatus     string                      `json:"propagation_status"`
-	SnapshotAvailable     bool                        `json:"snapshot_available"`
-	SnapshotRevision      uint64                      `json:"snapshot_revision"`
-	RuntimeGeneration     uint64                      `json:"runtime_generation"`
-	PolicyHash            string                      `json:"policy_hash"`
-	NodeEpochID           string                      `json:"node_epoch_id"`
-	SnapshotBuiltAt       int64                       `json:"snapshot_built_at"`
-	SnapshotAgeSec        int64                       `json:"snapshot_age_sec"`
-	SnapshotStale         bool                        `json:"snapshot_stale"`
-	Telemetry             channelRoutingTelemetryView `json:"telemetry"`
-	Topology              channelRoutingTopologyView  `json:"topology"`
-	Runtime               channelrouting.RuntimeStats `json:"runtime"`
+	APIVersion              string                                  `json:"api_version"`
+	Enabled                 bool                                    `json:"enabled"`
+	LegacyMode              string                                  `json:"legacy_mode"`
+	DeploymentStage         string                                  `json:"deployment_stage"`
+	ControlPlaneAvailable   bool                                    `json:"control_plane_available"`
+	ControlPlaneRevision    int64                                   `json:"control_plane_revision"`
+	RevisionLag             int64                                   `json:"revision_lag"`
+	RevisionAhead           int64                                   `json:"revision_ahead"`
+	PropagationStatus       string                                  `json:"propagation_status"`
+	SnapshotAvailable       bool                                    `json:"snapshot_available"`
+	SnapshotRevision        uint64                                  `json:"snapshot_revision"`
+	RuntimeGeneration       uint64                                  `json:"runtime_generation"`
+	PolicyHash              string                                  `json:"policy_hash"`
+	NodeEpochID             string                                  `json:"node_epoch_id"`
+	SnapshotBuiltAt         int64                                   `json:"snapshot_built_at"`
+	SnapshotAgeSec          int64                                   `json:"snapshot_age_sec"`
+	SnapshotStale           bool                                    `json:"snapshot_stale"`
+	Telemetry               channelRoutingTelemetryView             `json:"telemetry"`
+	Topology                channelRoutingTopologyView              `json:"topology"`
+	Runtime                 channelrouting.RuntimeStats             `json:"runtime"`
+	Events                  channelrouting.RoutingEventStats        `json:"events"`
+	AdaptiveConcurrency     channelrouting.AdaptiveConcurrencyStats `json:"adaptive_concurrency"`
+	StrictCapacity          channelrouting.StrictCapacityStats      `json:"strict_capacity"`
+	AttemptMetricsAvailable bool                                    `json:"attempt_metrics_available"`
+	AttemptMetricsDegraded  bool                                    `json:"attempt_metrics_degraded"`
+	AttemptMetricsCoverage  float64                                 `json:"attempt_metrics_coverage"`
+	AttemptMetricsPipeline  channelrouting.HedgeAttemptAuditStats   `json:"attempt_metrics_pipeline"`
+	AttemptMetrics          model.RoutingAttemptWindowMetrics       `json:"attempt_metrics"`
+	RiskGroupsAvailable     bool                                    `json:"risk_groups_available"`
+	RiskGroupsTruncated     bool                                    `json:"risk_groups_truncated"`
+	RiskGroups              []channelrouting.PoolSnapshotSummary    `json:"risk_groups"`
+	RecentEventsAvailable   bool                                    `json:"recent_events_available"`
+	RecentEvents            []channelRoutingEventEnvelope           `json:"recent_events"`
 }
 
 type channelRoutingNodeView struct {
@@ -108,60 +124,111 @@ type channelRoutingDecisionIdentity struct {
 }
 
 type channelRoutingDecisionView struct {
-	ID                    int                                   `json:"id"`
-	DecisionID            string                                `json:"decision_id"`
-	RequestID             string                                `json:"request_id"`
-	PoolID                int                                   `json:"pool_id"`
-	GroupName             string                                `json:"group_name"`
-	ModelName             string                                `json:"model_name"`
-	SnapshotRevision      int64                                 `json:"snapshot_revision"`
-	RuntimeGeneration     int64                                 `json:"runtime_generation"`
-	PolicyHash            string                                `json:"policy_hash,omitempty"`
-	SnapshotHash          string                                `json:"snapshot_hash,omitempty"`
-	ProfileHash           string                                `json:"profile_hash,omitempty"`
-	AlgorithmVersion      string                                `json:"algorithm_version"`
-	Seed                  int64                                 `json:"seed"`
-	RetryIndex            int                                   `json:"retry_index"`
-	IsStream              bool                                  `json:"is_stream"`
-	ActualChannelID       int                                   `json:"actual_channel_id"`
-	ObservedChannelID     int                                   `json:"observed_channel_id"`
-	CandidateCount        int                                   `json:"candidate_count"`
-	EligibleCount         int                                   `json:"eligible_count"`
-	FilteredOpen          int                                   `json:"filtered_open"`
-	FilteredCapacity      int                                   `json:"filtered_capacity"`
-	BreakerBypassed       bool                                  `json:"breaker_bypassed"`
-	ObservedMatchesActual bool                                  `json:"observed_matches_actual"`
-	DifferenceType        string                                `json:"difference_type,omitempty"`
-	ActualCostKnown       bool                                  `json:"actual_cost_known"`
-	ActualExpectedCost    float64                               `json:"actual_expected_cost"`
-	ObservedCostKnown     bool                                  `json:"observed_cost_known"`
-	ObservedExpectedCost  float64                               `json:"observed_expected_cost"`
-	ExpectedCostDelta     float64                               `json:"expected_cost_delta"`
-	Replayable            bool                                  `json:"replayable"`
-	Gate                  *channelRoutingDecisionGate           `json:"gate,omitempty"`
-	Cohort                string                                `json:"cohort,omitempty"`
-	SelectedIdentity      *channelRoutingDecisionIdentity       `json:"selected_identity,omitempty"`
-	CapacityAdmission     *channelrouting.CapacityAdmission     `json:"capacity_admission,omitempty"`
-	ExclusionSummary      model.RoutingDecisionExclusionSummary `json:"exclusion_summary"`
-	Candidates            channelRoutingDecisionCandidates      `json:"candidate_set"`
-	CreatedTime           int64                                 `json:"created_time"`
+	ID                    int                                     `json:"id"`
+	DecisionID            string                                  `json:"decision_id"`
+	RequestID             string                                  `json:"request_id"`
+	PoolID                int                                     `json:"pool_id"`
+	GroupName             string                                  `json:"group_name"`
+	ModelName             string                                  `json:"model_name"`
+	SnapshotRevision      int64                                   `json:"snapshot_revision"`
+	RuntimeGeneration     int64                                   `json:"runtime_generation"`
+	PolicyHash            string                                  `json:"policy_hash,omitempty"`
+	SnapshotHash          string                                  `json:"snapshot_hash,omitempty"`
+	ProfileHash           string                                  `json:"profile_hash,omitempty"`
+	AlgorithmVersion      string                                  `json:"algorithm_version"`
+	Seed                  int64                                   `json:"seed"`
+	RetryIndex            int                                     `json:"retry_index"`
+	IsStream              bool                                    `json:"is_stream"`
+	ActualChannelID       int                                     `json:"actual_channel_id"`
+	ObservedChannelID     int                                     `json:"observed_channel_id"`
+	CandidateCount        int                                     `json:"candidate_count"`
+	EligibleCount         int                                     `json:"eligible_count"`
+	FilteredOpen          int                                     `json:"filtered_open"`
+	FilteredCapacity      int                                     `json:"filtered_capacity"`
+	BreakerBypassed       bool                                    `json:"breaker_bypassed"`
+	ObservedMatchesActual bool                                    `json:"observed_matches_actual"`
+	DifferenceType        string                                  `json:"difference_type,omitempty"`
+	ActualCostKnown       bool                                    `json:"actual_cost_known"`
+	ActualExpectedCost    float64                                 `json:"actual_expected_cost"`
+	ObservedCostKnown     bool                                    `json:"observed_cost_known"`
+	ObservedExpectedCost  float64                                 `json:"observed_expected_cost"`
+	ExpectedCostDelta     float64                                 `json:"expected_cost_delta"`
+	ActualCostEstimate    *channelrouting.ShadowCostInput         `json:"actual_cost_estimate,omitempty"`
+	ObservedCostEstimate  *channelrouting.ShadowCostInput         `json:"observed_cost_estimate,omitempty"`
+	Replayable            bool                                    `json:"replayable"`
+	Gate                  *channelRoutingDecisionGate             `json:"gate,omitempty"`
+	Cohort                string                                  `json:"cohort,omitempty"`
+	SelectedIdentity      *channelRoutingDecisionIdentity         `json:"selected_identity,omitempty"`
+	CapacityAdmission     *channelrouting.CapacityAdmission       `json:"capacity_admission,omitempty"`
+	ExclusionSummary      model.RoutingDecisionExclusionSummary   `json:"exclusion_summary"`
+	Candidates            channelRoutingDecisionCandidates        `json:"candidate_set"`
+	AttemptTimeline       *model.RoutingHedgeDecisionAuditSummary `json:"attempt_timeline,omitempty"`
+	Hedge                 *model.RoutingHedgeDecisionAuditSummary `json:"hedge,omitempty"`
+	CreatedTime           int64                                   `json:"created_time"`
 }
 
 func GetChannelRoutingOverview(c *gin.Context) {
+	const (
+		riskGroupLimit   = 10
+		recentEventLimit = 20
+	)
 	setting := smart_routing_setting.GetSetting()
+	nowMs := time.Now().UnixMilli()
+	metricsFromMs := nowMs - (24 * time.Hour).Milliseconds()
+	runtimeStats := channelrouting.CurrentRuntimeStats()
+	auditStats := runtimeStats.HedgeAudit
+	auditAvailable, auditDegraded, auditCoverage := channelRoutingAttemptMetricsPipelineHealth(auditStats, metricsFromMs)
 	overview := channelRoutingOverview{
-		APIVersion:      "v2",
-		Enabled:         setting.Enabled,
-		LegacyMode:      setting.Mode,
-		DeploymentStage: channelRoutingDeploymentStage(setting.Mode),
-		NodeEpochID:     channelrouting.NodeEpochID(),
-		Runtime:         channelrouting.CurrentRuntimeStats(),
+		APIVersion:             "v2",
+		Enabled:                setting.Enabled,
+		LegacyMode:             setting.Mode,
+		DeploymentStage:        channelRoutingDeploymentStage(setting.Mode),
+		NodeEpochID:            channelrouting.NodeEpochID(),
+		Runtime:                runtimeStats,
+		Events:                 channelrouting.CurrentRoutingEventStats(),
+		AdaptiveConcurrency:    service.RoutingAdaptiveConcurrencyStats(),
+		StrictCapacity:         channelrouting.DefaultStrictCapacityStats(),
+		AttemptMetricsDegraded: auditDegraded,
+		AttemptMetricsCoverage: auditCoverage,
+		AttemptMetricsPipeline: auditStats,
+		AttemptMetrics: model.RoutingAttemptWindowMetrics{
+			FromTimeMs: metricsFromMs,
+			ToTimeMs:   nowMs,
+		},
+		RiskGroups:            []channelrouting.PoolSnapshotSummary{},
+		RecentEventsAvailable: true,
+		RecentEvents:          []channelRoutingEventEnvelope{},
 		Telemetry: channelRoutingTelemetryView{
 			Status:        "unavailable",
 			Reason:        "snapshot_initializing",
 			P95TTFTStatus: "no_samples",
 		},
 		PropagationStatus: "initializing",
+	}
+	if model.DB != nil {
+		metrics, err := model.GetRoutingAttemptWindowMetricsContext(c.Request.Context(), metricsFromMs, nowMs)
+		if err == nil {
+			overview.AttemptMetrics = metrics
+			overview.AttemptMetricsAvailable = auditAvailable
+		}
+	}
+	for _, event := range channelrouting.RecentRoutingEvents(
+		recentEventLimit,
+		channelrouting.RoutingEventTypeBreakerOpened,
+		channelrouting.RoutingEventTypeBreakerRecovered,
+		channelrouting.RoutingEventTypeCostSyncCompleted,
+		channelrouting.RoutingEventTypePolicyPublished,
+		channelrouting.RoutingEventTypePolicyRolledBack,
+	) {
+		overview.RecentEvents = append(overview.RecentEvents, channelRoutingEventEnvelope{
+			ID:            formatChannelRoutingEventCursor(overview.NodeEpochID, event.ID),
+			Sequence:      event.ID,
+			NodeEpochID:   overview.NodeEpochID,
+			Type:          event.Type,
+			Revision:      event.Revision,
+			CreatedTimeMs: event.CreatedTimeMs,
+			Payload:       append(json.RawMessage(nil), event.PayloadJSON...),
+		})
 	}
 	head, controlPlaneAvailable := channelRoutingPolicyHeadState(c.Request.Context())
 	overview.ControlPlaneAvailable = controlPlaneAvailable
@@ -177,6 +244,14 @@ func GetChannelRoutingOverview(c *gin.Context) {
 	if !ok {
 		common.ApiSuccess(c, overview)
 		return
+	}
+	if riskGroups, _, riskOK := channelrouting.ListRiskPoolSnapshotSummaries(riskGroupLimit + 1); riskOK {
+		if len(riskGroups) > riskGroupLimit {
+			riskGroups = riskGroups[:riskGroupLimit]
+			overview.RiskGroupsTruncated = true
+		}
+		overview.RiskGroups = riskGroups
+		overview.RiskGroupsAvailable = true
 	}
 
 	now := common.GetTimestamp()
@@ -251,6 +326,19 @@ func GetChannelRoutingOverview(c *gin.Context) {
 		}
 	}
 	common.ApiSuccess(c, overview)
+}
+
+func channelRoutingAttemptMetricsPipelineHealth(
+	stats channelrouting.HedgeAttemptAuditStats,
+	metricsFromMs int64,
+) (bool, bool, float64) {
+	coverage := 1.0
+	if total := stats.Persisted + int64(stats.Entries) + stats.Rejected; total > 0 {
+		coverage = float64(stats.Persisted) / float64(total)
+	}
+	available := stats.LastRejectedMs == 0 || stats.LastRejectedMs < metricsFromMs
+	degraded := stats.Entries > 0 && stats.ConsecutivePersistFailures > 0
+	return available, degraded, coverage
 }
 
 func ListChannelRoutingNodes(c *gin.Context) {
@@ -382,6 +470,12 @@ func GetChannelRoutingGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing credential limit"})
 		return
 	}
+	if !channelRoutingGroupNestedBudgetValid(pageSize, modelLimit, credentialLimit) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false, "message": "channel routing group response exceeds nested item budget",
+		})
+		return
+	}
 	pool, metadata, found := channelrouting.GetPoolSnapshotPage(
 		id,
 		channelRoutingPageOffset(page, pageSize),
@@ -407,16 +501,60 @@ func GetChannelRoutingGroup(c *gin.Context) {
 		nextPage = page + 1
 	}
 	common.ApiSuccess(c, gin.H{
-		"group":             pool,
-		"summary":           summary,
-		"page":              page,
-		"page_size":         pageSize,
-		"next_page":         nextPage,
-		"model_limit":       modelLimit,
-		"credential_limit":  credentialLimit,
-		"snapshot_revision": metadata.Revision,
-		"snapshot_built_at": metadata.BuiltAtUnix,
+		"group":              pool,
+		"summary":            summary,
+		"page":               page,
+		"page_size":          pageSize,
+		"next_page":          nextPage,
+		"model_limit":        modelLimit,
+		"credential_limit":   credentialLimit,
+		"nested_item_budget": channelRoutingGroupNestedItemBudget,
+		"snapshot_revision":  metadata.Revision,
+		"snapshot_built_at":  metadata.BuiltAtUnix,
 	})
+}
+
+func GetChannelRoutingGroupErrorBudget(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing group id"})
+		return
+	}
+	pool, metadata, found := channelrouting.GetPoolSnapshot(id)
+	if !found {
+		if _, available := channelrouting.CurrentSnapshotMetadata(); !available {
+			writeChannelRoutingSnapshotInitializing(c)
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "channel routing group not found"})
+		return
+	}
+	if pool.PolicyProfile != model.RoutingPolicyProfileEnterpriseSLO {
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false, "code": "error_budget_not_enabled",
+			"message": "error budget burn evaluation requires an enterprise SLO policy",
+		})
+		return
+	}
+	current, err := channelrouting.EvaluateErrorBudgetBurnContext(
+		c.Request.Context(), id, pool.BalancedPolicy.AvailabilityTarget, time.Now(),
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "failed to evaluate channel routing error budget"})
+		return
+	}
+	response := gin.H{
+		"current": current, "snapshot_revision": metadata.Revision,
+		"snapshot_built_at": metadata.BuiltAtUnix,
+	}
+	persisted, err := channelrouting.GetErrorBudgetStateContext(c.Request.Context(), id)
+	if err == nil {
+		response["persisted"] = persisted
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "failed to load channel routing error budget state"})
+		return
+	}
+	common.ApiSuccess(c, response)
 }
 
 func ListChannelRoutingChannels(c *gin.Context) {
@@ -435,7 +573,7 @@ func ListChannelRoutingChannels(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel type filter"})
 		return
 	}
-	items, total, metadata, ok := channelrouting.ListChannelSnapshots(
+	items, total, metadata, ok := channelrouting.ListChannelSnapshotSummaries(
 		c.Query("search"),
 		status,
 		channelType,
@@ -456,6 +594,41 @@ func ListChannelRoutingChannels(c *gin.Context) {
 	})
 }
 
+func ListChannelRoutingEndpoints(c *gin.Context) {
+	page, pageSize := parseChannelRoutingPage(c)
+	search := strings.ToLower(strings.TrimSpace(c.Query("search")))
+	region := strings.ToLower(strings.TrimSpace(c.Query("region")))
+	if !utf8.ValidString(search) || len([]rune(search)) > 320 ||
+		!utf8.ValidString(region) || len([]rune(region)) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing endpoint filter"})
+		return
+	}
+	all := channelrouting.ListEndpointBreakerViews()
+	filtered := make([]channelrouting.EndpointBreakerView, 0, len(all))
+	for _, item := range all {
+		if region != "" && item.Region != region {
+			continue
+		}
+		if search != "" && !strings.Contains(strings.ToLower(item.EndpointAuthority+" "+item.Region), search) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	offset := channelRoutingPageOffset(page, pageSize)
+	start := min(offset, len(filtered))
+	end := min(start+pageSize, len(filtered))
+	stableNodeID, quorumEligible := channelrouting.StableNodeID()
+	common.ApiSuccess(c, gin.H{
+		"items":                    filtered[start:end],
+		"total":                    len(filtered),
+		"page":                     page,
+		"page_size":                pageSize,
+		"region":                   channelrouting.RoutingRegion(),
+		"stable_node_id":           stableNodeID,
+		"endpoint_quorum_eligible": quorumEligible,
+	})
+}
+
 func ListChannelRoutingCosts(c *gin.Context) {
 	page, pageSize := parseChannelRoutingPage(c)
 	groupFilter := strings.TrimSpace(c.Query("group"))
@@ -469,7 +642,7 @@ func ListChannelRoutingCosts(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing cost filter"})
 		return
 	}
-	items, total, metadata, ok := channelrouting.ListCostSnapshots(
+	items, total, metadata, ok := channelrouting.ListCostSnapshotSummaries(
 		groupFilter,
 		modelFilter,
 		known,
@@ -554,30 +727,27 @@ func ListChannelRoutingDecisions(c *gin.Context) {
 		}
 		cursor = parsedCursor
 	}
-	query := model.DB.WithContext(c.Request.Context()).Model(&model.RoutingDecisionAudit{})
-	if cursor > 0 {
-		query = query.Where("id < ?", cursor)
-	}
+	filter := model.RoutingDecisionAuditSummaryFilter{BeforeID: cursor, Limit: limit}
 	if group := strings.TrimSpace(c.Query("group")); group != "" {
 		if !utf8.ValidString(group) || len([]rune(group)) > 64 {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "channel routing decision group filter exceeds limit"})
 			return
 		}
-		query = query.Where("group_key = ?", model.RoutingDecisionGroupKey(group))
+		filter.GroupKey = model.RoutingDecisionGroupKey(group)
 	}
 	if modelName := strings.TrimSpace(c.Query("model")); modelName != "" {
 		if !utf8.ValidString(modelName) || len([]rune(modelName)) > 128 {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "channel routing decision model filter exceeds limit"})
 			return
 		}
-		query = query.Where("model_key = ?", model.RoutingDecisionModelKey(modelName))
+		filter.ModelKey = model.RoutingDecisionModelKey(modelName)
 	}
 	if requestID := strings.TrimSpace(c.Query("request_id")); requestID != "" {
 		if !utf8.ValidString(requestID) || len([]rune(requestID)) > 64 {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "channel routing decision request filter exceeds limit"})
 			return
 		}
-		query = query.Where("request_key = ?", model.RoutingDecisionRequestKey(requestID))
+		filter.RequestKey = model.RoutingDecisionRequestKey(requestID)
 	}
 	if matched := strings.TrimSpace(c.Query("matched")); matched != "" {
 		value, err := strconv.ParseBool(matched)
@@ -585,7 +755,15 @@ func ListChannelRoutingDecisions(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision match filter"})
 			return
 		}
-		query = query.Where("observed_matches_actual = ?", value)
+		filter.ObservedMatchesActual = &value
+	}
+	if replayable := strings.TrimSpace(c.Query("replayable")); replayable != "" {
+		value, err := strconv.ParseBool(replayable)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision replayable filter"})
+			return
+		}
+		filter.Replayable = &value
 	}
 	if rawActivationID := strings.TrimSpace(c.Query("activation_id")); rawActivationID != "" {
 		activationID, err := strconv.ParseInt(rawActivationID, 10, 64)
@@ -593,7 +771,7 @@ func ListChannelRoutingDecisions(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision activation filter"})
 			return
 		}
-		query = query.Where("activation_id = ?", activationID)
+		filter.ActivationID = activationID
 	}
 	if rolloutKey := strings.TrimSpace(c.Query("rollout_key")); rolloutKey != "" {
 		_, err := hex.DecodeString(rolloutKey)
@@ -601,28 +779,35 @@ func ListChannelRoutingDecisions(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision rollout filter"})
 			return
 		}
-		query = query.Where("rollout_key = ?", rolloutKey)
+		filter.RolloutKey = rolloutKey
 	}
 	if cohort := strings.TrimSpace(c.Query("cohort")); cohort != "" {
 		if cohort != model.RoutingDecisionCohortControl && cohort != model.RoutingDecisionCohortCanary {
 			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision cohort filter"})
 			return
 		}
-		query = query.Where("cohort = ?", cohort)
+		filter.Cohort = cohort
 	}
-	var records []model.RoutingDecisionAudit
-	if err := query.Order("id desc").Limit(limit + 1).Find(&records).Error; err != nil {
+	fromTime, err := parseChannelRoutingDecisionTime(c.Query("from_time"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision start time"})
+		return
+	}
+	toTime, err := parseChannelRoutingDecisionTime(c.Query("to_time"))
+	if err != nil || (fromTime > 0 && toTime > 0 && fromTime > toTime) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid channel routing decision end time"})
+		return
+	}
+	filter.FromTime = fromTime
+	filter.ToTime = toTime
+	items, hasMore, err := model.ListRoutingDecisionAuditSummariesContext(c.Request.Context(), filter)
+	if err != nil {
 		common.ApiErrorMsg(c, "failed to load channel routing decisions")
 		return
 	}
 	nextCursor := 0
-	if len(records) > limit {
-		records = records[:limit]
-		nextCursor = records[len(records)-1].ID
-	}
-	items := make([]channelRoutingDecisionView, 0, len(records))
-	for _, record := range records {
-		items = append(items, buildChannelRoutingDecisionView(record))
+	if hasMore && len(items) > 0 {
+		nextCursor = items[len(items)-1].ID
 	}
 	common.ApiSuccess(c, gin.H{
 		"items":       items,
@@ -646,7 +831,17 @@ func GetChannelRoutingDecision(c *gin.Context) {
 		common.ApiErrorMsg(c, "failed to load channel routing decision")
 		return
 	}
-	common.ApiSuccess(c, buildChannelRoutingDecisionView(record))
+	hedge, err := model.GetRoutingHedgeDecisionAuditContext(c.Request.Context(), record.DecisionID, record.RequestID)
+	if err != nil {
+		common.ApiErrorMsg(c, "failed to load channel routing hedge timeline")
+		return
+	}
+	view := buildChannelRoutingDecisionView(record)
+	if hedge.AttemptCount > 0 {
+		view.AttemptTimeline = &hedge
+		view.Hedge = &hedge
+	}
+	common.ApiSuccess(c, view)
 }
 
 func writeChannelRoutingSnapshotInitializing(c *gin.Context) {
@@ -664,6 +859,20 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 	exclusionSummary := model.RoutingDecisionExclusionSummary{Reasons: []model.RoutingDecisionExclusionCount{}}
 	if record.ExclusionSummaryJSON != "" && common.UnmarshalJsonStr(record.ExclusionSummaryJSON, &exclusionSummary) != nil {
 		exclusionSummary = model.RoutingDecisionExclusionSummary{Reasons: []model.RoutingDecisionExclusionCount{}}
+	}
+	var actualCostEstimate *channelrouting.ShadowCostInput
+	if record.ActualCostEstimateJSON != "" {
+		decoded := &channelrouting.ShadowCostInput{}
+		if common.UnmarshalJsonStr(record.ActualCostEstimateJSON, decoded) == nil {
+			actualCostEstimate = decoded
+		}
+	}
+	var observedCostEstimate *channelrouting.ShadowCostInput
+	if record.ObservedCostEstimateJSON != "" {
+		decoded := &channelrouting.ShadowCostInput{}
+		if common.UnmarshalJsonStr(record.ObservedCostEstimateJSON, decoded) == nil {
+			observedCostEstimate = decoded
+		}
 	}
 	var gate *channelRoutingDecisionGate
 	if record.Cohort != "" {
@@ -698,6 +907,39 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 				OutputTPM: record.ReservationLimitOutputTPM, Inflight: record.ReservationLimitInflight,
 			},
 		}
+		if record.ReservationMode == model.RoutingDecisionReservationRedisStrict ||
+			record.ReservationMode == model.RoutingDecisionReservationRedisBlock {
+			resourceModel := record.ReservationResourceModel
+			if resourceModel == "" {
+				resourceModel = record.ModelName
+			}
+			var shares []channelrouting.StrictCapacityPoolShare
+			if common.UnmarshalJsonStr(record.ReservationPoolSharesJSON, &shares) == nil {
+				mode := channelrouting.CapacityMode(record.ReservationMode)
+				capacityAdmission.Strict = &channelrouting.StrictCapacityAdmission{
+					Mode: mode,
+					Key: channelrouting.StrictCapacityKey{
+						AccountID:    record.ReservationAccountID,
+						CredentialID: record.ReservationResourceCredentialID,
+						Model:        resourceModel,
+					},
+					PoolID: record.PoolID, PolicyRevision: uint64(record.SnapshotRevision),
+					Demand: channelrouting.StrictCapacityDemand{
+						RPM: record.ReservationRPM, InputTPM: record.ReservationInputTPM,
+						OutputTPM: record.ReservationOutputTPM, TotalTPM: record.ReservationTotalTPM,
+						Inflight: record.ReservationInflight, CostNanoUSD: record.ReservationCostNanoUSD,
+					},
+					Limit: channelrouting.StrictCapacityLimit{
+						RPM: record.ReservationLimitRPM, InputTPM: record.ReservationLimitInputTPM,
+						OutputTPM: record.ReservationLimitOutputTPM, TotalTPM: record.ReservationLimitTotalTPM,
+						Inflight:    record.ReservationLimitInflight,
+						CostNanoUSD: record.ReservationLimitCostNanoUSD,
+					},
+					PoolShares: shares, LeaseExpiresMs: record.ReservationLeaseExpiresMs,
+					BlockLease: mode == channelrouting.CapacityModeRedisBlock,
+				}
+			}
+		}
 	}
 	return channelRoutingDecisionView{
 		ID:                    record.ID,
@@ -729,6 +971,8 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 		ObservedCostKnown:     record.ObservedCostKnown,
 		ObservedExpectedCost:  record.ObservedExpectedCost,
 		ExpectedCostDelta:     record.ExpectedCostDelta,
+		ActualCostEstimate:    actualCostEstimate,
+		ObservedCostEstimate:  observedCostEstimate,
 		Replayable:            record.Replayable,
 		Gate:                  gate,
 		Cohort:                record.Cohort,

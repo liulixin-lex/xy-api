@@ -129,24 +129,29 @@ func (*RoutingCostSnapshotVersion) BeforeDelete(*gorm.DB) error {
 }
 
 type RoutingNormalizedPricing struct {
-	QuotaType                 int             `json:"quota_type"`
-	BillingMode               string          `json:"billing_mode"`
-	Currency                  string          `json:"currency"`
-	GroupRatio                *float64        `json:"group_ratio"`
-	BaseRatio                 *float64        `json:"base_ratio"`
-	CompletionRatio           *float64        `json:"completion_ratio"`
-	ModelPrice                *float64        `json:"model_price"`
-	InputCostPerMillion       *float64        `json:"input_cost_per_million"`
-	OutputCostPerMillion      *float64        `json:"output_cost_per_million"`
-	CacheReadCostPerMillion   *float64        `json:"cache_read_cost_per_million"`
-	CacheWriteCostPerMillion  *float64        `json:"cache_write_cost_per_million"`
-	ImageCost                 *float64        `json:"image_cost"`
-	AudioInputCostPerMillion  *float64        `json:"audio_input_cost_per_million"`
-	AudioOutputCostPerMillion *float64        `json:"audio_output_cost_per_million"`
-	PerRequestCost            *float64        `json:"per_request_cost"`
-	BillingExpression         string          `json:"billing_expression"`
-	Tiers                     json.RawMessage `json:"tiers"`
-	Extras                    json.RawMessage `json:"extras"`
+	QuotaType                  int             `json:"quota_type"`
+	BillingMode                string          `json:"billing_mode"`
+	Currency                   string          `json:"currency"`
+	Unit                       string          `json:"unit"`
+	GroupRatio                 *float64        `json:"group_ratio"`
+	BaseRatio                  *float64        `json:"base_ratio"`
+	CompletionRatio            *float64        `json:"completion_ratio"`
+	ModelPrice                 *float64        `json:"model_price"`
+	InputCostPerMillion        *float64        `json:"input_cost_per_million"`
+	OutputCostPerMillion       *float64        `json:"output_cost_per_million"`
+	CacheReadCostPerMillion    *float64        `json:"cache_read_cost_per_million"`
+	CacheWriteCostPerMillion   *float64        `json:"cache_write_cost_per_million"`
+	CacheWrite1hCostPerMillion *float64        `json:"cache_write_1h_cost_per_million"`
+	ImageInputCostPerMillion   *float64        `json:"image_input_cost_per_million"`
+	ImageOutputCostPerMillion  *float64        `json:"image_output_cost_per_million"`
+	ImageCost                  *float64        `json:"image_cost"`
+	PerImageCost               *float64        `json:"per_image_cost"`
+	AudioInputCostPerMillion   *float64        `json:"audio_input_cost_per_million"`
+	AudioOutputCostPerMillion  *float64        `json:"audio_output_cost_per_million"`
+	PerRequestCost             *float64        `json:"per_request_cost"`
+	BillingExpression          string          `json:"billing_expression"`
+	Tiers                      json.RawMessage `json:"tiers"`
+	Extras                     json.RawMessage `json:"extras"`
 }
 
 // RoutingCostRequestProfile describes one logical request for platform-cost
@@ -155,6 +160,7 @@ type RoutingNormalizedPricing struct {
 // values never participate in user quota or settlement.
 type RoutingCostRequestProfile struct {
 	PromptTokens             int64
+	MaximumPromptTokens      int64
 	ExpectedCompletionTokens int64
 	MaximumCompletionTokens  int64
 	CacheReadTokens          int64
@@ -169,17 +175,60 @@ type RoutingCostRequestProfile struct {
 	RetryProbability         float64
 	HedgeProbability         float64
 	HedgeAllowed             bool
-	Request                  billingexpr.RequestInput
+	KnowledgeSpecified       bool
+	InputTokensKnown         bool
+	MaximumCompletionKnown   bool
+	CacheTokensKnown         bool
+	MediaDimensionsKnown     bool
+	RequestInputKnown        bool
+	Request                  billingexpr.RequestInput `json:"-"`
+	ActualUsage              *RoutingCostActualUsage  `json:"-"`
+	actualTokenParams        *billingexpr.TokenParams
+}
+
+type RoutingCostActualUsage struct {
+	PromptTokens            int64
+	CompletionTokens        int64
+	CacheReadTokens         int64
+	CacheWriteTokens        int64
+	CacheWriteOneHourTokens int64
+	ImageInputTokens        int64
+	ImageOutputTokens       int64
+	AudioInputTokens        int64
+	AudioOutputTokens       int64
+	ClaudeUsageSemantic     bool
+}
+
+type RoutingCostBreakdown struct {
+	Input        float64 `json:"input"`
+	Output       float64 `json:"output"`
+	CacheRead    float64 `json:"cache_read"`
+	CacheWrite   float64 `json:"cache_write"`
+	CacheWrite1h float64 `json:"cache_write_1h"`
+	ImageInput   float64 `json:"image_input"`
+	ImageOutput  float64 `json:"image_output"`
+	ImageUnits   float64 `json:"image_units"`
+	AudioInput   float64 `json:"audio_input"`
+	AudioOutput  float64 `json:"audio_output"`
+	PerRequest   float64 `json:"per_request"`
+	Expression   float64 `json:"expression"`
+	Total        float64 `json:"total"`
 }
 
 type RoutingCostEstimate struct {
-	Known                 bool    `json:"known"`
-	ExpectedCost          float64 `json:"expected_cost"`
-	WorstCaseCost         float64 `json:"worst_case_cost"`
-	ExpectedEffectiveCost float64 `json:"expected_effective_cost"`
-	Currency              string  `json:"currency"`
-	ConfidenceScore       float64 `json:"confidence_score"`
-	FreshnessScore        float64 `json:"freshness_score"`
+	Known                    bool                 `json:"known"`
+	ExpectedKnown            bool                 `json:"expected_known"`
+	WorstCaseKnown           bool                 `json:"worst_case_known"`
+	ExpectedEffectiveKnown   bool                 `json:"expected_effective_known"`
+	ExpectedCost             float64              `json:"expected_cost"`
+	WorstCaseCost            float64              `json:"worst_case_cost"`
+	ExpectedEffectiveCost    float64              `json:"expected_effective_cost"`
+	Currency                 string               `json:"currency"`
+	Unit                     string               `json:"unit"`
+	ConfidenceScore          float64              `json:"confidence_score"`
+	FreshnessScore           float64              `json:"freshness_score"`
+	ExpectedBreakdown        RoutingCostBreakdown `json:"expected_breakdown"`
+	WorstCaseSingleBreakdown RoutingCostBreakdown `json:"worst_case_single_breakdown"`
 }
 
 type RoutingCostSnapshotVersionWrite struct {
@@ -286,6 +335,21 @@ func upsertRoutingUpstreamAccount(db *gorm.DB, spec RoutingUpstreamAccountSpec) 
 	if err := db.Where("account_key = ?", account.AccountKey).First(&account).Error; err != nil {
 		return RoutingUpstreamAccount{}, err
 	}
+	if db.Migrator().HasTable(&RoutingCostSnapshot{}) {
+		if err := db.Model(&RoutingCostSnapshot{}).Where("account_id = ?", account.ID).Updates(map[string]any{
+			"account_source_type":   account.SourceType,
+			"account_key_hash":      account.AccountKey,
+			"account_masked_id":     account.MaskedIdentity,
+			"account_status":        account.Status,
+			"account_balance_known": account.BalanceKnown,
+			"account_balance":       account.Balance,
+			"account_balance_at":    account.BalanceUpdatedAt,
+			"account_sync_status":   account.LastSyncStatus,
+			"account_sync_error":    account.LastSyncError,
+		}).Error; err != nil {
+			return RoutingUpstreamAccount{}, err
+		}
+	}
 	return account, nil
 }
 
@@ -388,7 +452,7 @@ func writeRoutingCostSnapshotVersion(tx *gorm.DB, write RoutingCostSnapshotVersi
 	now := common.GetTimestamp()
 	latest := RoutingCostSnapshot{}
 	if normalized.EffectiveTime <= now {
-		latest = routingCostLatestSnapshot(normalized, pricingJSON)
+		latest = routingCostLatestSnapshot(normalized, pricingJSON, version, account)
 		if err := upsertRoutingCostLatestV2(tx, &latest); err != nil {
 			return RoutingCostSnapshotVersionWriteResult{}, err
 		}
@@ -579,6 +643,25 @@ func LoadRoutingCostSnapshotVersionContext(ctx context.Context, pricingHash stri
 	return version, normalized, nil
 }
 
+func DecodeRoutingCostSnapshotPricing(snapshot RoutingCostSnapshot) (RoutingNormalizedPricing, bool, error) {
+	encoded := snapshot.PricingJSON
+	if encoded == nil || strings.TrimSpace(*encoded) == "" {
+		encoded = snapshot.ExtrasJSON
+	}
+	if encoded == nil || strings.TrimSpace(*encoded) == "" {
+		return RoutingNormalizedPricing{}, false, nil
+	}
+	var pricing RoutingNormalizedPricing
+	if err := common.UnmarshalJsonStr(*encoded, &pricing); err != nil {
+		return RoutingNormalizedPricing{}, false, ErrRoutingCostVersionCorrupt
+	}
+	normalized, _, err := normalizeRoutingNormalizedPricing(pricing)
+	if err != nil {
+		return RoutingNormalizedPricing{}, false, ErrRoutingCostVersionCorrupt
+	}
+	return normalized, routingNormalizedPricingHasKnownCost(normalized), nil
+}
+
 func backfillRoutingCostSnapshotContentHash(db *gorm.DB, versionID int64, contentHash string) error {
 	if db == nil || versionID <= 0 || len(contentHash) != sha256.Size*2 {
 		return ErrRoutingCostV2Invalid
@@ -636,15 +719,25 @@ func EstimateRoutingCostSnapshot(
 	if atUnix <= 0 {
 		atUnix = common.GetTimestamp()
 	}
-	if err := validateRoutingCostRequestProfile(profile); err != nil {
-		return RoutingCostEstimate{}, err
-	}
 	pricing, _, err := normalizeRoutingNormalizedPricing(pricing)
 	if err != nil {
 		return RoutingCostEstimate{}, err
 	}
+	if profile.ActualUsage != nil {
+		profile, err = normalizeRoutingActualCostProfile(pricing, profile)
+		if err != nil {
+			return RoutingCostEstimate{}, err
+		}
+	}
+	if profile.MaximumPromptTokens == 0 {
+		profile.MaximumPromptTokens = profile.PromptTokens
+	}
+	if err := validateRoutingCostRequestProfile(profile); err != nil {
+		return RoutingCostEstimate{}, err
+	}
 	estimate := RoutingCostEstimate{
 		Currency:        pricing.Currency,
+		Unit:            pricing.Unit,
 		ConfidenceScore: version.ConfidenceScore,
 		FreshnessScore:  routingCostFreshnessAt(version, atUnix),
 	}
@@ -654,17 +747,36 @@ func EstimateRoutingCostSnapshot(
 		return estimate, nil
 	}
 
-	expected, err := routingCostSingleAttempt(pricing, profile, profile.ExpectedCompletionTokens)
-	if err != nil {
-		return RoutingCostEstimate{}, err
+	dependencies := routingCostPricingDependencies(pricing)
+	expectedKnown := true
+	worstKnown := true
+	if profile.KnowledgeSpecified {
+		if dependencies.request && !profile.RequestInputKnown ||
+			dependencies.cache && !profile.CacheTokensKnown ||
+			dependencies.media && !profile.MediaDimensionsKnown {
+			expectedKnown = false
+			worstKnown = false
+		}
+		if dependencies.input && !profile.InputTokensKnown {
+			worstKnown = false
+			if profile.PromptTokens == 0 {
+				expectedKnown = false
+			}
+			estimate.ConfidenceScore *= 0.6
+		}
+		if dependencies.output && !profile.MaximumCompletionKnown {
+			worstKnown = false
+		}
 	}
-	maximumCompletion := profile.MaximumCompletionTokens
-	if maximumCompletion < profile.ExpectedCompletionTokens {
-		maximumCompletion = profile.ExpectedCompletionTokens
-	}
-	worstSingle, err := routingCostSingleAttempt(pricing, profile, maximumCompletion)
-	if err != nil {
-		return RoutingCostEstimate{}, err
+	if expectedKnown {
+		expected, breakdown, err := routingCostSingleAttempt(pricing, profile, profile.ExpectedCompletionTokens)
+		if err != nil {
+			return RoutingCostEstimate{}, err
+		}
+		estimate.ExpectedKnown = true
+		estimate.ExpectedEffectiveKnown = true
+		estimate.ExpectedCost = expected
+		estimate.ExpectedBreakdown = breakdown
 	}
 
 	maxAttempts := profile.MaxAttempts
@@ -683,10 +795,25 @@ func EstimateRoutingCostSnapshot(
 		worstAttemptCount++
 	}
 
-	estimate.Known = true
-	estimate.ExpectedCost = expected
-	estimate.WorstCaseCost = worstSingle * float64(worstAttemptCount)
-	estimate.ExpectedEffectiveCost = expected * expectedAttemptFactor
+	if estimate.ExpectedKnown {
+		estimate.ExpectedEffectiveCost = estimate.ExpectedCost * expectedAttemptFactor
+	}
+	if worstKnown {
+		maximumCompletion := profile.MaximumCompletionTokens
+		if maximumCompletion < profile.ExpectedCompletionTokens {
+			maximumCompletion = profile.ExpectedCompletionTokens
+		}
+		worstProfile := profile
+		worstProfile.PromptTokens = profile.MaximumPromptTokens
+		worstSingle, breakdown, err := routingCostSingleAttempt(pricing, worstProfile, maximumCompletion)
+		if err != nil {
+			return RoutingCostEstimate{}, err
+		}
+		estimate.WorstCaseKnown = true
+		estimate.WorstCaseCost = worstSingle * float64(worstAttemptCount)
+		estimate.WorstCaseSingleBreakdown = breakdown
+	}
+	estimate.Known = estimate.ExpectedKnown
 	if !routingCostFinite(estimate.ExpectedCost) || !routingCostFinite(estimate.WorstCaseCost) ||
 		!routingCostFinite(estimate.ExpectedEffectiveCost) || estimate.ExpectedCost < 0 ||
 		estimate.WorstCaseCost < 0 || estimate.ExpectedEffectiveCost < 0 {
@@ -698,6 +825,7 @@ func EstimateRoutingCostSnapshot(
 func validateRoutingCostRequestProfile(profile RoutingCostRequestProfile) error {
 	values := []int64{
 		profile.PromptTokens,
+		profile.MaximumPromptTokens,
 		profile.ExpectedCompletionTokens,
 		profile.MaximumCompletionTokens,
 		profile.CacheReadTokens,
@@ -713,6 +841,9 @@ func validateRoutingCostRequestProfile(profile RoutingCostRequestProfile) error 
 		if value < 0 || value > maxCostDimension {
 			return ErrRoutingCostV2Invalid
 		}
+	}
+	if profile.InputTokensKnown && profile.MaximumPromptTokens < profile.PromptTokens {
+		return ErrRoutingCostV2Invalid
 	}
 	if profile.MaxAttempts < 0 || profile.MaxAttempts > 16 ||
 		!routingCostFinite(profile.RetryProbability) || profile.RetryProbability < 0 || profile.RetryProbability > 1 ||
@@ -735,7 +866,11 @@ func routingCostFreshnessAt(version RoutingCostSnapshotVersion, atUnix int64) fl
 	return math.Max(0, math.Min(version.FreshnessScore, version.FreshnessScore*remaining/window))
 }
 
-func routingCostSingleAttempt(pricing RoutingNormalizedPricing, profile RoutingCostRequestProfile, completionTokens int64) (float64, error) {
+func routingCostSingleAttempt(
+	pricing RoutingNormalizedPricing,
+	profile RoutingCostRequestProfile,
+	completionTokens int64,
+) (float64, RoutingCostBreakdown, error) {
 	groupRatio := routingCostPointerValue(pricing.GroupRatio)
 	if groupRatio <= 0 {
 		groupRatio = 1
@@ -745,7 +880,7 @@ func routingCostSingleAttempt(pricing RoutingNormalizedPricing, profile RoutingC
 		expression = routingCostTierExpression(pricing.Tiers)
 	}
 	if expression != "" {
-		raw, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{
+		params := billingexpr.TokenParams{
 			P:    float64(profile.PromptTokens),
 			C:    float64(completionTokens),
 			Len:  float64(profile.PromptTokens + profile.CacheReadTokens + profile.CacheWriteTokens + profile.CacheWriteOneHourTokens),
@@ -756,11 +891,16 @@ func routingCostSingleAttempt(pricing RoutingNormalizedPricing, profile RoutingC
 			ImgO: float64(profile.ImageOutputTokens),
 			AI:   float64(profile.AudioInputTokens),
 			AO:   float64(profile.AudioOutputTokens),
-		}, profile.Request)
-		if err != nil || !routingCostFinite(raw) || raw < 0 {
-			return 0, ErrRoutingCostV2Invalid
 		}
-		return raw / 1_000_000 * groupRatio, nil
+		if profile.actualTokenParams != nil {
+			params = *profile.actualTokenParams
+		}
+		raw, _, err := billingexpr.RunExprWithRequest(expression, params, profile.Request)
+		if err != nil || !routingCostFinite(raw) || raw < 0 {
+			return 0, RoutingCostBreakdown{}, ErrRoutingCostV2Invalid
+		}
+		cost := raw / 1_000_000 * groupRatio
+		return cost, RoutingCostBreakdown{Expression: cost, Total: cost}, nil
 	}
 
 	inputRate := routingCostPointerValue(pricing.InputCostPerMillion)
@@ -782,6 +922,18 @@ func routingCostSingleAttempt(pricing RoutingNormalizedPricing, profile RoutingC
 	if cacheWriteRate == 0 {
 		cacheWriteRate = inputRate
 	}
+	cacheWriteOneHourRate := routingCostPointerValue(pricing.CacheWrite1hCostPerMillion)
+	if cacheWriteOneHourRate == 0 {
+		cacheWriteOneHourRate = cacheWriteRate
+	}
+	imageInputRate := routingCostPointerValue(pricing.ImageInputCostPerMillion)
+	if imageInputRate == 0 {
+		imageInputRate = inputRate
+	}
+	imageOutputRate := routingCostPointerValue(pricing.ImageOutputCostPerMillion)
+	if imageOutputRate == 0 {
+		imageOutputRate = outputRate
+	}
 	audioInputRate := routingCostPointerValue(pricing.AudioInputCostPerMillion)
 	if audioInputRate == 0 {
 		audioInputRate = inputRate
@@ -791,15 +943,196 @@ func routingCostSingleAttempt(pricing RoutingNormalizedPricing, profile RoutingC
 		audioOutputRate = outputRate
 	}
 
-	tokenCost := float64(profile.PromptTokens)*inputRate +
-		float64(completionTokens)*outputRate +
-		float64(profile.CacheReadTokens)*cacheReadRate +
-		float64(profile.CacheWriteTokens+profile.CacheWriteOneHourTokens)*cacheWriteRate +
-		float64(profile.AudioInputTokens)*audioInputRate +
-		float64(profile.AudioOutputTokens)*audioOutputRate
-	cost := tokenCost/1_000_000 + profile.ImageUnits*routingCostPointerValue(pricing.ImageCost) +
-		routingCostPointerValue(pricing.PerRequestCost)
-	return cost * groupRatio, nil
+	perImageRate := routingCostPointerValue(pricing.PerImageCost)
+	if perImageRate == 0 {
+		perImageRate = routingCostPointerValue(pricing.ImageCost)
+	}
+	breakdown := RoutingCostBreakdown{
+		Input:        float64(profile.PromptTokens) * inputRate / 1_000_000,
+		Output:       float64(completionTokens) * outputRate / 1_000_000,
+		CacheRead:    float64(profile.CacheReadTokens) * cacheReadRate / 1_000_000,
+		CacheWrite:   float64(profile.CacheWriteTokens) * cacheWriteRate / 1_000_000,
+		CacheWrite1h: float64(profile.CacheWriteOneHourTokens) * cacheWriteOneHourRate / 1_000_000,
+		ImageInput:   float64(profile.ImageInputTokens) * imageInputRate / 1_000_000,
+		ImageOutput:  float64(profile.ImageOutputTokens) * imageOutputRate / 1_000_000,
+		ImageUnits:   profile.ImageUnits * perImageRate,
+		AudioInput:   float64(profile.AudioInputTokens) * audioInputRate / 1_000_000,
+		AudioOutput:  float64(profile.AudioOutputTokens) * audioOutputRate / 1_000_000,
+		PerRequest:   routingCostPointerValue(pricing.PerRequestCost),
+	}
+	breakdown = scaleRoutingCostBreakdown(breakdown, groupRatio)
+	return breakdown.Total, breakdown, nil
+}
+
+func normalizeRoutingActualCostProfile(
+	pricing RoutingNormalizedPricing,
+	profile RoutingCostRequestProfile,
+) (RoutingCostRequestProfile, error) {
+	usage := profile.ActualUsage
+	if usage == nil {
+		return profile, nil
+	}
+	values := []int64{
+		usage.PromptTokens, usage.CompletionTokens, usage.CacheReadTokens,
+		usage.CacheWriteTokens, usage.CacheWriteOneHourTokens,
+		usage.ImageInputTokens, usage.ImageOutputTokens,
+		usage.AudioInputTokens, usage.AudioOutputTokens,
+	}
+	const maxCostDimension = int64(1_000_000_000_000)
+	for _, value := range values {
+		if value < 0 || value > maxCostDimension {
+			return RoutingCostRequestProfile{}, ErrRoutingCostV2Invalid
+		}
+	}
+	if (!usage.ClaudeUsageSemantic && (usage.CacheReadTokens > usage.PromptTokens ||
+		usage.CacheWriteTokens > usage.PromptTokens || usage.CacheWriteOneHourTokens > usage.PromptTokens)) ||
+		usage.ImageInputTokens > usage.PromptTokens ||
+		usage.AudioInputTokens > usage.PromptTokens || usage.ImageOutputTokens > usage.CompletionTokens ||
+		usage.AudioOutputTokens > usage.CompletionTokens {
+		return RoutingCostRequestProfile{}, ErrRoutingCostV2Invalid
+	}
+
+	expression := strings.TrimSpace(pricing.BillingExpression)
+	if expression == "" {
+		expression = routingCostTierExpression(pricing.Tiers)
+	}
+	promptTokens := usage.PromptTokens
+	completionTokens := usage.CompletionTokens
+	if expression != "" {
+		usedVars := billingexpr.UsedVars(expression)
+		params := billingexpr.TokenParams{
+			P: float64(promptTokens), C: float64(completionTokens),
+			CR: float64(usage.CacheReadTokens), CC: float64(usage.CacheWriteTokens),
+			CC1h: float64(usage.CacheWriteOneHourTokens), Img: float64(usage.ImageInputTokens),
+			ImgO: float64(usage.ImageOutputTokens), AI: float64(usage.AudioInputTokens),
+			AO: float64(usage.AudioOutputTokens), Len: float64(promptTokens),
+		}
+		if usage.ClaudeUsageSemantic {
+			if promptTokens > maxCostDimension-usage.CacheReadTokens ||
+				promptTokens+usage.CacheReadTokens > maxCostDimension-usage.CacheWriteTokens ||
+				promptTokens+usage.CacheReadTokens+usage.CacheWriteTokens > maxCostDimension-usage.CacheWriteOneHourTokens {
+				return RoutingCostRequestProfile{}, ErrRoutingCostV2Invalid
+			}
+			params.Len = float64(promptTokens + usage.CacheReadTokens + usage.CacheWriteTokens + usage.CacheWriteOneHourTokens)
+		} else {
+			if usedVars["cr"] {
+				params.P -= params.CR
+			}
+			if usedVars["cc"] {
+				params.P -= params.CC
+			}
+			if usedVars["cc1h"] {
+				params.P -= params.CC1h
+			}
+			if usedVars["img"] {
+				params.P -= params.Img
+			}
+			if usedVars["ai"] {
+				params.P -= params.AI
+			}
+			if usedVars["img_o"] {
+				params.C -= params.ImgO
+			}
+			if usedVars["ao"] {
+				params.C -= params.AO
+			}
+			params.P = math.Max(params.P, 0)
+			params.C = math.Max(params.C, 0)
+		}
+		promptTokens = int64(params.P)
+		completionTokens = int64(params.C)
+		profile.actualTokenParams = &params
+	} else if !usage.ClaudeUsageSemantic {
+		inputSubcategories := usage.CacheReadTokens + usage.CacheWriteTokens + usage.CacheWriteOneHourTokens +
+			usage.ImageInputTokens + usage.AudioInputTokens
+		outputSubcategories := usage.ImageOutputTokens + usage.AudioOutputTokens
+		if inputSubcategories > promptTokens || outputSubcategories > completionTokens {
+			return RoutingCostRequestProfile{}, ErrRoutingCostV2Invalid
+		}
+		promptTokens -= inputSubcategories
+		completionTokens -= outputSubcategories
+	}
+
+	profile.PromptTokens = promptTokens
+	profile.MaximumPromptTokens = promptTokens
+	profile.ExpectedCompletionTokens = completionTokens
+	profile.MaximumCompletionTokens = completionTokens
+	profile.CacheReadTokens = usage.CacheReadTokens
+	profile.CacheWriteTokens = usage.CacheWriteTokens
+	profile.CacheWriteOneHourTokens = usage.CacheWriteOneHourTokens
+	profile.ImageInputTokens = usage.ImageInputTokens
+	profile.ImageOutputTokens = usage.ImageOutputTokens
+	profile.AudioInputTokens = usage.AudioInputTokens
+	profile.AudioOutputTokens = usage.AudioOutputTokens
+	profile.MaxAttempts = 1
+	profile.RetryProbability = 0
+	profile.HedgeProbability = 0
+	profile.HedgeAllowed = false
+	profile.KnowledgeSpecified = true
+	profile.InputTokensKnown = true
+	profile.MaximumCompletionKnown = true
+	profile.CacheTokensKnown = true
+	profile.MediaDimensionsKnown = true
+	profile.RequestInputKnown = true
+	return profile, nil
+}
+
+type routingCostDependencies struct {
+	input   bool
+	output  bool
+	cache   bool
+	media   bool
+	request bool
+}
+
+func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCostDependencies {
+	expression := strings.TrimSpace(pricing.BillingExpression)
+	if expression == "" {
+		expression = routingCostTierExpression(pricing.Tiers)
+	}
+	if expression != "" {
+		used := billingexpr.UsedVars(expression)
+		return routingCostDependencies{
+			input:   used["p"] || used["len"],
+			output:  used["c"],
+			cache:   used["cr"] || used["cc"] || used["cc1h"],
+			media:   used["img"] || used["img_o"] || used["ai"] || used["ao"],
+			request: used["header"] || used["param"],
+		}
+	}
+	inputRateKnown := routingCostPointerValue(pricing.InputCostPerMillion) > 0 ||
+		routingCostPointerValue(pricing.BaseRatio) > 0
+	return routingCostDependencies{
+		input:  inputRateKnown,
+		output: routingCostPointerValue(pricing.OutputCostPerMillion) > 0 || inputRateKnown,
+		cache: routingCostPointerValue(pricing.CacheReadCostPerMillion) > 0 ||
+			routingCostPointerValue(pricing.CacheWriteCostPerMillion) > 0 ||
+			routingCostPointerValue(pricing.CacheWrite1hCostPerMillion) > 0,
+		media: routingCostPointerValue(pricing.ImageInputCostPerMillion) > 0 ||
+			routingCostPointerValue(pricing.ImageOutputCostPerMillion) > 0 ||
+			routingCostPointerValue(pricing.PerImageCost) > 0 || routingCostPointerValue(pricing.ImageCost) > 0 ||
+			routingCostPointerValue(pricing.AudioInputCostPerMillion) > 0 ||
+			routingCostPointerValue(pricing.AudioOutputCostPerMillion) > 0,
+	}
+}
+
+func scaleRoutingCostBreakdown(breakdown RoutingCostBreakdown, ratio float64) RoutingCostBreakdown {
+	breakdown.Input *= ratio
+	breakdown.Output *= ratio
+	breakdown.CacheRead *= ratio
+	breakdown.CacheWrite *= ratio
+	breakdown.CacheWrite1h *= ratio
+	breakdown.ImageInput *= ratio
+	breakdown.ImageOutput *= ratio
+	breakdown.ImageUnits *= ratio
+	breakdown.AudioInput *= ratio
+	breakdown.AudioOutput *= ratio
+	breakdown.PerRequest *= ratio
+	breakdown.Expression *= ratio
+	breakdown.Total = breakdown.Input + breakdown.Output + breakdown.CacheRead + breakdown.CacheWrite +
+		breakdown.CacheWrite1h + breakdown.ImageInput + breakdown.ImageOutput + breakdown.ImageUnits +
+		breakdown.AudioInput + breakdown.AudioOutput + breakdown.PerRequest + breakdown.Expression
+	return breakdown
 }
 
 func routingCostTierExpression(tiers json.RawMessage) string {
@@ -877,18 +1210,41 @@ func upsertRoutingCostLatestV2(tx *gorm.DB, snapshot *RoutingCostSnapshot) error
 	update := tx.Model(&RoutingCostSnapshot{}).
 		Where("channel_id = ? AND model_key = ? AND snapshot_ts <= ?", snapshot.ChannelID, modelKey, snapshot.SnapshotTS).
 		Updates(map[string]any{
-			"model_name":       snapshot.ModelName,
-			"quota_type":       snapshot.QuotaType,
-			"group_ratio":      snapshot.GroupRatio,
-			"base_ratio":       snapshot.BaseRatio,
-			"completion_ratio": snapshot.CompletionRatio,
-			"model_price":      snapshot.ModelPrice,
-			"billing_mode":     snapshot.BillingMode,
-			"tiers_json":       snapshot.TiersJSON,
-			"extras_json":      snapshot.ExtrasJSON,
-			"confidence":       snapshot.Confidence,
-			"snapshot_ts":      snapshot.SnapshotTS,
-			"pricing_version":  snapshot.PricingVersion,
+			"account_id":            snapshot.AccountID,
+			"model_name":            snapshot.ModelName,
+			"quota_type":            snapshot.QuotaType,
+			"group_ratio":           snapshot.GroupRatio,
+			"base_ratio":            snapshot.BaseRatio,
+			"completion_ratio":      snapshot.CompletionRatio,
+			"model_price":           snapshot.ModelPrice,
+			"billing_mode":          snapshot.BillingMode,
+			"tiers_json":            snapshot.TiersJSON,
+			"extras_json":           snapshot.ExtrasJSON,
+			"confidence":            snapshot.Confidence,
+			"snapshot_ts":           snapshot.SnapshotTS,
+			"pricing_version":       snapshot.PricingVersion,
+			"pricing_hash":          snapshot.PricingHash,
+			"pricing_json":          snapshot.PricingJSON,
+			"upstream_group":        snapshot.UpstreamGroup,
+			"upstream_model":        snapshot.UpstreamModel,
+			"observed_time":         snapshot.ObservedTime,
+			"effective_time":        snapshot.EffectiveTime,
+			"expires_time":          snapshot.ExpiresTime,
+			"version_confidence":    snapshot.VersionConfidence,
+			"confidence_score":      snapshot.ConfidenceScore,
+			"freshness":             snapshot.Freshness,
+			"freshness_score":       snapshot.FreshnessScore,
+			"source_sync_status":    snapshot.SourceSyncStatus,
+			"source_sync_error":     snapshot.SourceSyncError,
+			"account_source_type":   snapshot.AccountSourceType,
+			"account_key_hash":      snapshot.AccountKeyHash,
+			"account_masked_id":     snapshot.AccountMaskedID,
+			"account_status":        snapshot.AccountStatus,
+			"account_balance_known": snapshot.AccountBalanceKnown,
+			"account_balance":       snapshot.AccountBalance,
+			"account_balance_at":    snapshot.AccountBalanceAt,
+			"account_sync_status":   snapshot.AccountSyncStatus,
+			"account_sync_error":    snapshot.AccountSyncError,
 		})
 	if update.Error != nil {
 		return update.Error
@@ -951,12 +1307,35 @@ func normalizeRoutingCostSnapshotVersionWrite(
 func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (RoutingNormalizedPricing, []byte, error) {
 	pricing.BillingMode = strings.TrimSpace(pricing.BillingMode)
 	pricing.Currency = strings.ToUpper(strings.TrimSpace(pricing.Currency))
+	pricing.Unit = strings.ToLower(strings.TrimSpace(pricing.Unit))
 	pricing.BillingExpression = strings.TrimSpace(pricing.BillingExpression)
 	if pricing.Currency == "" {
 		pricing.Currency = "USD"
 	}
+	if pricing.PerImageCost == nil && pricing.ImageCost != nil {
+		value := *pricing.ImageCost
+		pricing.PerImageCost = &value
+	}
+	if pricing.ImageCost == nil && pricing.PerImageCost != nil {
+		value := *pricing.PerImageCost
+		pricing.ImageCost = &value
+	}
+	if pricing.ImageCost != nil && pricing.PerImageCost != nil && *pricing.ImageCost != *pricing.PerImageCost {
+		return RoutingNormalizedPricing{}, nil, ErrRoutingCostV2Invalid
+	}
+	if pricing.Unit == "" {
+		switch {
+		case pricing.BillingExpression != "" || len(strings.TrimSpace(string(pricing.Tiers))) > 0:
+			pricing.Unit = "expression"
+		case strings.EqualFold(pricing.BillingMode, "per_request"):
+			pricing.Unit = "request"
+		default:
+			pricing.Unit = "mixed"
+		}
+	}
 	if pricing.QuotaType < 0 || pricing.QuotaType > 1 || !validRoutingCostText(pricing.BillingMode, 32) || pricing.BillingMode == "" ||
-		!validRoutingCostText(pricing.Currency, 8) || !validRoutingCostText(pricing.BillingExpression, 16_384) {
+		!validRoutingCostText(pricing.Currency, 8) || !validRoutingCostUnit(pricing.Unit) ||
+		!validRoutingCostText(pricing.BillingExpression, 16_384) {
 		return RoutingNormalizedPricing{}, nil, ErrRoutingCostV2Invalid
 	}
 	values := []*float64{
@@ -968,7 +1347,11 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 		pricing.OutputCostPerMillion,
 		pricing.CacheReadCostPerMillion,
 		pricing.CacheWriteCostPerMillion,
+		pricing.CacheWrite1hCostPerMillion,
+		pricing.ImageInputCostPerMillion,
+		pricing.ImageOutputCostPerMillion,
 		pricing.ImageCost,
+		pricing.PerImageCost,
 		pricing.AudioInputCostPerMillion,
 		pricing.AudioOutputCostPerMillion,
 		pricing.PerRequestCost,
@@ -1117,7 +1500,12 @@ func routingCostContentHash(account RoutingUpstreamAccount, write RoutingCostSna
 	return routingCostHash(encoded), nil
 }
 
-func routingCostLatestSnapshot(write RoutingCostSnapshotVersionWrite, pricingJSON []byte) RoutingCostSnapshot {
+func routingCostLatestSnapshot(
+	write RoutingCostSnapshotVersionWrite,
+	pricingJSON []byte,
+	version RoutingCostSnapshotVersion,
+	account RoutingUpstreamAccount,
+) RoutingCostSnapshot {
 	pricing := write.Pricing
 	modelKey := RoutingCostModelKey(write.LocalModel)
 	tiersJSON := string(pricing.Tiers)
@@ -1133,20 +1521,43 @@ func routingCostLatestSnapshot(write RoutingCostSnapshotVersionWrite, pricingJSO
 		confidence = RoutingCostConfidenceFull
 	}
 	return RoutingCostSnapshot{
-		ChannelID:       write.ChannelID,
-		ModelName:       write.LocalModel,
-		ModelKey:        &modelKey,
-		QuotaType:       pricing.QuotaType,
-		GroupRatio:      routingCostPointerValue(pricing.GroupRatio),
-		BaseRatio:       routingCostPointerValue(pricing.BaseRatio),
-		CompletionRatio: routingCostPointerValue(pricing.CompletionRatio),
-		ModelPrice:      modelPrice,
-		BillingMode:     pricing.BillingMode,
-		TiersJSON:       &tiersJSON,
-		ExtrasJSON:      &extrasJSON,
-		Confidence:      confidence,
-		SnapshotTS:      write.ObservedTime,
-		PricingVersion:  write.PricingVersion,
+		AccountID:           write.AccountID,
+		ChannelID:           write.ChannelID,
+		ModelName:           write.LocalModel,
+		ModelKey:            &modelKey,
+		QuotaType:           pricing.QuotaType,
+		GroupRatio:          routingCostPointerValue(pricing.GroupRatio),
+		BaseRatio:           routingCostPointerValue(pricing.BaseRatio),
+		CompletionRatio:     routingCostPointerValue(pricing.CompletionRatio),
+		ModelPrice:          modelPrice,
+		BillingMode:         pricing.BillingMode,
+		TiersJSON:           &tiersJSON,
+		ExtrasJSON:          &extrasJSON,
+		Confidence:          confidence,
+		SnapshotTS:          write.ObservedTime,
+		PricingVersion:      write.PricingVersion,
+		PricingHash:         version.PricingHash,
+		PricingJSON:         &extrasJSON,
+		UpstreamGroup:       write.UpstreamGroup,
+		UpstreamModel:       write.UpstreamModel,
+		ObservedTime:        write.ObservedTime,
+		EffectiveTime:       write.EffectiveTime,
+		ExpiresTime:         write.ExpiresTime,
+		VersionConfidence:   write.Confidence,
+		ConfidenceScore:     write.ConfidenceScore,
+		Freshness:           write.Freshness,
+		FreshnessScore:      write.FreshnessScore,
+		SourceSyncStatus:    write.SourceSyncStatus,
+		SourceSyncError:     write.SourceSyncError,
+		AccountSourceType:   account.SourceType,
+		AccountKeyHash:      account.AccountKey,
+		AccountMaskedID:     account.MaskedIdentity,
+		AccountStatus:       account.Status,
+		AccountBalanceKnown: account.BalanceKnown,
+		AccountBalance:      account.Balance,
+		AccountBalanceAt:    account.BalanceUpdatedAt,
+		AccountSyncStatus:   account.LastSyncStatus,
+		AccountSyncError:    account.LastSyncError,
 	}
 }
 
@@ -1174,7 +1585,11 @@ func routingNormalizedPricingHasKnownCost(pricing RoutingNormalizedPricing) bool
 		pricing.OutputCostPerMillion,
 		pricing.CacheReadCostPerMillion,
 		pricing.CacheWriteCostPerMillion,
+		pricing.CacheWrite1hCostPerMillion,
+		pricing.ImageInputCostPerMillion,
+		pricing.ImageOutputCostPerMillion,
 		pricing.ImageCost,
+		pricing.PerImageCost,
 		pricing.AudioInputCostPerMillion,
 		pricing.AudioOutputCostPerMillion,
 		pricing.PerRequestCost,
@@ -1335,6 +1750,15 @@ func validRoutingCostFreshness(freshness string) bool {
 	switch freshness {
 	case RoutingCostFreshnessFresh, RoutingCostFreshnessStale,
 		RoutingCostFreshnessExpired, RoutingCostFreshnessUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRoutingCostUnit(unit string) bool {
+	switch unit {
+	case "million_tokens", "request", "image", "mixed", "expression":
 		return true
 	default:
 		return false

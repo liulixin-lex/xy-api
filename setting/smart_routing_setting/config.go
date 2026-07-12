@@ -52,6 +52,13 @@ type SmartRoutingSetting struct {
 	FirstByteMinMs           int     `json:"first_byte_min_ms"`
 	FirstByteCapMs           int     `json:"first_byte_cap_ms"`
 	FirstByteP95Multiplier   float64 `json:"first_byte_p95_multiplier"`
+	HedgeEnabled             bool    `json:"hedge_enabled"`
+	HedgeMaxConcurrent       int     `json:"hedge_max_concurrent"`
+	HedgeMaxResponseBytes    int     `json:"hedge_max_response_bytes"`
+	HedgeMaxBufferedBytes    int64   `json:"hedge_max_buffered_bytes"`
+	HedgeRatioWindowSec      int     `json:"hedge_ratio_window_sec"`
+	HedgeMaxExtraBasisPoints int     `json:"hedge_max_extra_basis_points"`
+	HedgeAuditRetentionDays  int     `json:"hedge_audit_retention_days"`
 	SnapshotLiveSec          int     `json:"snapshot_live_sec"`
 	SnapshotStaleSec         int     `json:"snapshot_stale_sec"`
 	BalanceMarginUSD         float64 `json:"balance_margin_usd"`
@@ -103,6 +110,13 @@ var defaultSmartRoutingSetting = SmartRoutingSetting{
 	FirstByteMinMs:           3000,
 	FirstByteCapMs:           12000,
 	FirstByteP95Multiplier:   2.0,
+	HedgeEnabled:             false,
+	HedgeMaxConcurrent:       8,
+	HedgeMaxResponseBytes:    4 << 20,
+	HedgeMaxBufferedBytes:    64 << 20,
+	HedgeRatioWindowSec:      60,
+	HedgeMaxExtraBasisPoints: 500,
+	HedgeAuditRetentionDays:  30,
 	SnapshotLiveSec:          300,
 	SnapshotStaleSec:         1800,
 	BalanceMarginUSD:         1.0,
@@ -179,6 +193,11 @@ func applyEnvOverrides(setting *SmartRoutingSetting) {
 	if value, ok := os.LookupEnv("SMART_ROUTING_AGENT_ENABLED"); ok {
 		if parsed, err := strconv.ParseBool(value); err == nil {
 			setting.AgentEnabled = parsed
+		}
+	}
+	if value, ok := os.LookupEnv("SMART_ROUTING_HEDGE_ENABLED"); ok {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			setting.HedgeEnabled = parsed
 		}
 	}
 }
@@ -283,6 +302,43 @@ func normalize(setting *SmartRoutingSetting) {
 	}
 	if setting.FirstByteP95Multiplier <= 0 {
 		setting.FirstByteP95Multiplier = defaultSmartRoutingSetting.FirstByteP95Multiplier
+	}
+	if setting.HedgeMaxConcurrent < 1 {
+		setting.HedgeMaxConcurrent = defaultSmartRoutingSetting.HedgeMaxConcurrent
+	}
+	if setting.HedgeMaxConcurrent > 128 {
+		setting.HedgeMaxConcurrent = 128
+	}
+	if setting.HedgeMaxResponseBytes < 64<<10 {
+		setting.HedgeMaxResponseBytes = defaultSmartRoutingSetting.HedgeMaxResponseBytes
+	}
+	if setting.HedgeMaxResponseBytes > 64<<20 {
+		setting.HedgeMaxResponseBytes = 64 << 20
+	}
+	minimumHedgeBufferedBytes := int64(setting.HedgeMaxResponseBytes) * 2
+	if setting.HedgeMaxBufferedBytes < minimumHedgeBufferedBytes {
+		setting.HedgeMaxBufferedBytes = max(defaultSmartRoutingSetting.HedgeMaxBufferedBytes, minimumHedgeBufferedBytes)
+	}
+	if setting.HedgeMaxBufferedBytes > 1<<30 {
+		setting.HedgeMaxBufferedBytes = 1 << 30
+	}
+	if setting.HedgeRatioWindowSec < 1 {
+		setting.HedgeRatioWindowSec = defaultSmartRoutingSetting.HedgeRatioWindowSec
+	}
+	if setting.HedgeRatioWindowSec > 3_600 {
+		setting.HedgeRatioWindowSec = 3_600
+	}
+	if setting.HedgeMaxExtraBasisPoints < 1 {
+		setting.HedgeMaxExtraBasisPoints = defaultSmartRoutingSetting.HedgeMaxExtraBasisPoints
+	}
+	if setting.HedgeMaxExtraBasisPoints > 10_000 {
+		setting.HedgeMaxExtraBasisPoints = 10_000
+	}
+	if setting.HedgeAuditRetentionDays < 1 {
+		setting.HedgeAuditRetentionDays = defaultSmartRoutingSetting.HedgeAuditRetentionDays
+	}
+	if setting.HedgeAuditRetentionDays > 365 {
+		setting.HedgeAuditRetentionDays = 365
 	}
 	if setting.SnapshotLiveSec < 1 {
 		setting.SnapshotLiveSec = defaultSmartRoutingSetting.SnapshotLiveSec

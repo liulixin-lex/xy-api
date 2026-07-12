@@ -47,7 +47,7 @@ func runRoutingProbeResultContract(t *testing.T, db *gorm.DB, dbType common.Data
 	require.NoError(t, db.Where("probe_id IN ?", []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}).Delete(&RoutingProbeResult{}).Error)
 
 	lease, acquired, err := TryAcquireRoutingControlLeaseContext(
-		context.Background(), "routing-probe-test-a", "node-a", 1_000, 1_000, 0, false,
+		context.Background(), "routing-probe-test-a", "node-a", 1_000, 0, false,
 	)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -64,6 +64,11 @@ func runRoutingProbeResultContract(t *testing.T, db *gorm.DB, dbType common.Data
 		GroupName:         "default",
 		ModelName:         "gpt-test",
 		EndpointHost:      "api.example.test",
+		EndpointAuthority: "https://api.example.test:443",
+		Region:            "us-east-1",
+		BreakerScope:      "member",
+		EvidenceCount:     1,
+		NodeCount:         1,
 		BreakerState:      RoutingBreakerStateHealthy,
 		Outcome:           RoutingProbeOutcomeSuccess,
 		PromptTokens:      1,
@@ -100,9 +105,9 @@ func runRoutingProbeResultContract(t *testing.T, db *gorm.DB, dbType common.Data
 	_, err = ListRoutingProbeResultsContext(context.Background(), RoutingProbeResultFilter{Outcome: "unknown"})
 	assert.ErrorIs(t, err, ErrRoutingProbeResultInvalid)
 
-	require.NoError(t, CompleteRoutingControlLeaseContext(context.Background(), lease, 1_101))
+	require.NoError(t, CompleteRoutingControlLeaseContext(context.Background(), lease))
 	newLease, acquired, err := TryAcquireRoutingControlLeaseContext(
-		context.Background(), "routing-probe-test-a", "node-b", 1_102, 1_000, 0, true,
+		context.Background(), "routing-probe-test-a", "node-b", 1_000, 0, true,
 	)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -110,7 +115,11 @@ func runRoutingProbeResultContract(t *testing.T, db *gorm.DB, dbType common.Data
 	stale.ProbeID = strings.Repeat("b", 64)
 	_, _, err = CreateRoutingProbeResultContext(context.Background(), lease, stale)
 	assert.ErrorIs(t, err, ErrRoutingControlLeaseLost)
-	require.NoError(t, CompleteRoutingControlLeaseContext(context.Background(), newLease, 1_103))
+	require.NoError(t, CompleteRoutingControlLeaseContext(context.Background(), newLease))
+	require.NoError(t, db.Create(&RoutingControlLease{
+		LeaseName: "routing-probe-test-old", HolderID: "", LeaseToken: "",
+		LeaseUntilMs: 0, FencingToken: 1, UpdatedTimeMs: 1_000,
+	}).Error)
 	require.NoError(t, db.Create(&RoutingControlLease{
 		LeaseName: "routing-probe-test-fresh", HolderID: "node-fresh", LeaseToken: strings.Repeat("f", 32),
 		LeaseUntilMs: 1_000, FencingToken: 1, UpdatedTimeMs: 2_000,

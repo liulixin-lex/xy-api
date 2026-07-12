@@ -2,12 +2,15 @@ package helper
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -35,6 +38,8 @@ const (
 	streamWriteTimeout = 30 * time.Second
 )
 
+var errStreamEndedBeforeBusinessEvent = errors.New("upstream stream ended before the first business event")
+
 func getScannerBufferSize() int {
 	if constant.StreamScannerMaxBufferMB > 0 {
 		return constant.StreamScannerMaxBufferMB << 20
@@ -58,14 +63,103 @@ func ExtendWriteDeadline(c *gin.Context) {
 	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 }
 
+type streamEventBufferWriter struct {
+	gin.ResponseWriter
+	buffer      bytes.Buffer
+	status      int
+	wroteHeader bool
+}
+
+func (writer *streamEventBufferWriter) WriteHeader(status int) {
+	if writer.wroteHeader {
+		return
+	}
+	writer.status = status
+	writer.wroteHeader = true
+}
+
+func (writer *streamEventBufferWriter) WriteHeaderNow() {
+	if !writer.wroteHeader {
+		writer.WriteHeader(http.StatusOK)
+	}
+}
+
+func (writer *streamEventBufferWriter) Write(data []byte) (int, error) {
+	writer.WriteHeaderNow()
+	return writer.buffer.Write(data)
+}
+
+func (writer *streamEventBufferWriter) WriteString(data string) (int, error) {
+	writer.WriteHeaderNow()
+	return writer.buffer.WriteString(data)
+}
+
+func (writer *streamEventBufferWriter) Flush() {}
+
+func (writer *streamEventBufferWriter) Status() int {
+	if writer.wroteHeader {
+		return writer.status
+	}
+	return writer.ResponseWriter.Status()
+}
+
+func (writer *streamEventBufferWriter) Size() int {
+	size := writer.ResponseWriter.Size()
+	if size < 0 {
+		size = 0
+	}
+	return size + writer.buffer.Len()
+}
+
+func (writer *streamEventBufferWriter) Written() bool {
+	return writer.wroteHeader || writer.buffer.Len() > 0 || writer.ResponseWriter.Written()
+}
+
+func (writer *streamEventBufferWriter) commit() (int, error) {
+	if writer.wroteHeader && !writer.ResponseWriter.Written() {
+		writer.ResponseWriter.WriteHeader(writer.status)
+	}
+	if writer.buffer.Len() == 0 {
+		return 0, nil
+	}
+	written, err := writer.ResponseWriter.Write(writer.buffer.Bytes())
+	if err != nil {
+		return written, err
+	}
+	if written != writer.buffer.Len() {
+		return written, io.ErrShortWrite
+	}
+	return written, nil
+}
+
+func recordStreamEndedBeforeBusinessEvent(info *relaycommon.RelayInfo) {
+	if info == nil || info.StreamStatus == nil {
+		return
+	}
+	info.StreamStatus.RecordError(errStreamEndedBeforeBusinessEvent.Error())
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, errStreamEndedBeforeBusinessEvent)
+}
+
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
 
-	if resp == nil || dataHandler == nil {
+	if resp == nil || info == nil || dataHandler == nil {
 		return
 	}
 
-	// 无条件新建 StreamStatus
-	info.StreamStatus = relaycommon.NewStreamStatus()
+	// doRequest owns the first-byte deadline when its response body exposes the
+	// guarded marker. Reuse the same status so a timeout remains visible to the
+	// retry controller and do not restart the budget after response headers.
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	transportFirstByteGuarded := false
+	var transportFirstByteMarker interface{ RoutingMarkFirstByte() bool }
+	if guarded, ok := resp.Body.(interface{ RoutingFirstByteGuarded() bool }); ok {
+		transportFirstByteGuarded = guarded.RoutingFirstByteGuarded()
+	}
+	if marker, ok := resp.Body.(interface{ RoutingMarkFirstByte() bool }); ok {
+		transportFirstByteMarker = marker
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -80,6 +174,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		firstByteC     <-chan time.Time
 		firstByteSeen  = make(chan struct{})
 		firstByteOnce  sync.Once
+		businessSeen   atomic.Bool
 		writeMutex     sync.Mutex     // Mutex to protect concurrent writes
 		wg             sync.WaitGroup // 用于等待所有 goroutine 退出
 		cleanupOnce    sync.Once
@@ -103,7 +198,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	if pingEnabled {
 		pingTicker = time.NewTicker(pingInterval)
 	}
-	firstByteTimeout := firstByteFailoverTimeout(info)
+	firstByteTimeout := time.Duration(0)
+	if !transportFirstByteGuarded {
+		firstByteTimeout = firstByteFailoverTimeout(info)
+	}
 	if firstByteTimeout > 0 {
 		firstByteTimer = time.NewTimer(firstByteTimeout)
 		firstByteC = firstByteTimer.C
@@ -204,6 +302,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}
 
 	dataChan := make(chan string, 10)
+	var scannerTerminalReason relaycommon.StreamEndReason
+	var scannerTerminalErr error
 
 	wg.Add(1)
 	gopool.Go(func() {
@@ -228,21 +328,67 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					firstByteTimedOut = true
 					return
 				}
-				responseSizeBefore := c.Writer.Size()
+				originalWriter := c.Writer
+				bufferedWriter := &streamEventBufferWriter{ResponseWriter: originalWriter}
+				sendResponseCountBefore := info.SendResponseCount
+				c.Writer = bufferedWriter
+				func() {
+					defer func() { c.Writer = originalWriter }()
+					dataHandler(data, sr)
+				}()
+				if bufferedWriter.buffer.Len() == 0 {
+					info.SendResponseCount = sendResponseCountBefore
+					return
+				}
+				if transportFirstByteMarker != nil && !transportFirstByteMarker.RoutingMarkFirstByte() {
+					info.SendResponseCount = sendResponseCountBefore
+					firstByteExpired = true
+					firstByteTimedOut = true
+					return
+				}
 				ExtendWriteDeadline(c)
-				dataHandler(data, sr)
-				if c.Writer.Size() > responseSizeBefore {
+				written, err := bufferedWriter.commit()
+				if written > 0 {
+					businessSeen.Store(true)
 					info.SetFirstResponseTime()
 					info.ReceivedResponseCount++
 					markFirstByteSeen()
+				}
+				if err != nil {
+					if written == 0 {
+						info.SendResponseCount = sendResponseCountBefore
+					}
+					sr.Stop(err)
+					return
 				}
 			}()
 			if firstByteTimedOut {
 				return
 			}
+			if sr.IsDone() {
+				if businessSeen.Load() {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+				} else {
+					recordStreamEndedBeforeBusinessEvent(info)
+				}
+				return
+			}
 			if sr.IsStopped() {
 				return
 			}
+		}
+		switch scannerTerminalReason {
+		case relaycommon.StreamEndReasonDone, relaycommon.StreamEndReasonEOF:
+			if businessSeen.Load() {
+				info.StreamStatus.SetEndReason(scannerTerminalReason, nil)
+			} else {
+				recordStreamEndedBeforeBusinessEvent(info)
+			}
+		case relaycommon.StreamEndReasonScannerErr:
+			if scannerTerminalErr != nil {
+				logger.LogError(c, "scanner error: "+scannerTerminalErr.Error())
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, scannerTerminalErr)
 		}
 	})
 
@@ -296,7 +442,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					return
 				}
 			} else {
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+				scannerTerminalReason = relaycommon.StreamEndReasonDone
 				logger.LogDebug(c, "received [DONE], stopping scanner")
 				return
 			}
@@ -304,11 +450,12 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
-				logger.LogError(c, "scanner error: "+err.Error())
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+				scannerTerminalReason = relaycommon.StreamEndReasonScannerErr
+				scannerTerminalErr = err
+				return
 			}
 		}
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+		scannerTerminalReason = relaycommon.StreamEndReasonEOF
 	})
 
 	// 主循环等待完成或超时
@@ -328,7 +475,7 @@ waitLoop:
 				continue
 			default:
 			}
-			if c.Writer.Written() || info.HasSendResponse() || info.ReceivedResponseCount > 0 {
+			if businessSeen.Load() {
 				markFirstByteSeen()
 				firstByteC = nil
 				firstByteSeen = nil

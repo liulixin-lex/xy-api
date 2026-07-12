@@ -303,8 +303,10 @@ func TestRoutingCanaryAutoRollbackRejectsStaleFencingLeaseWithoutMutation(t *tes
 		t, db, common.DatabaseTypeSQLite,
 		[]string{RoutingDeploymentStageCanary},
 	)
+	require.NoError(t, db.Model(&RoutingControlLease{}).
+		Where("lease_name = ?", fixture.lease.LeaseName).Update("lease_until_ms", 0).Error)
 	newer, acquired, err := TryAcquireRoutingControlLeaseContext(
-		context.Background(), fixture.lease.LeaseName, "node-b", 30_001, 10_000, 0, true,
+		context.Background(), fixture.lease.LeaseName, "node-b", 10_000, 0, true,
 	)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -390,6 +392,7 @@ func newRoutingCanaryRollbackFixture(
 	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
 
 	document := routingCanaryRollbackDocumentForTest(stages)
+	require.NoError(t, seedRoutingPolicyLiveReferencesForTest(db, document))
 	published, err := PublishRoutingPolicyRevisionContext(
 		context.Background(), 0, document,
 		RoutingPolicyActivationSpec{
@@ -427,7 +430,7 @@ func newRoutingCanaryRollbackFixture(
 	assert.Equal(t, operation.ID, claimed.ID)
 
 	lease, acquired, err := TryAcquireRoutingControlLeaseContext(
-		context.Background(), "canary-auto-rollback", "node-a", 20_000, 10_000, 0, true,
+		context.Background(), "canary-auto-rollback", "node-a", 10_000, 0, true,
 	)
 	require.NoError(t, err)
 	require.True(t, acquired)
@@ -502,6 +505,8 @@ func cloneRoutingPolicyDocumentForTest(t *testing.T, document RoutingPolicyDocum
 
 func migrateRoutingCanaryRollbackModelsForTest(db *gorm.DB) error {
 	return db.AutoMigrate(
+		&Channel{},
+		&RoutingCredentialRef{},
 		&RoutingPolicyHead{},
 		&RoutingPolicyRevision{},
 		&RoutingPolicyPoolRevision{},

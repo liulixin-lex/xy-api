@@ -93,6 +93,8 @@ func TestChannelRoutingV2ReadAPIsExposeSnapshotWithoutSecrets(t *testing.T) {
 	ListChannelRoutingChannels(channelsContext)
 	assert.Equal(t, http.StatusOK, channelsRecorder.Code)
 	assert.Contains(t, channelsRecorder.Body.String(), `"endpoint":"https://provider.example"`)
+	assert.Contains(t, channelsRecorder.Body.String(), `"region":"default"`)
+	assert.Contains(t, channelsRecorder.Body.String(), `"models":["gpt-test"]`)
 	assert.NotContains(t, channelsRecorder.Body.String(), "api_key")
 
 	costsRecorder := httptest.NewRecorder()
@@ -203,6 +205,114 @@ func TestChannelRoutingOverviewReportsAheadAndHashConflict(t *testing.T) {
 	}
 }
 
+func TestChannelRoutingOverviewKeepsPendingAttemptMetricsAvailableWithPartialCoverage(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	reservation, err := channelrouting.ReserveUpstreamAttemptAudit(channelRoutingOverviewAttemptSpec("pending"))
+	require.NoError(t, err)
+	require.NotNil(t, reservation)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/overview", nil)
+	GetChannelRoutingOverview(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"attempt_metrics_available":true`)
+	assert.Contains(t, body, `"attempt_metrics_degraded":false`)
+	assert.Contains(t, body, `"attempt_metrics_coverage":0`)
+	assert.Contains(t, body, `"entries":1`)
+}
+
+func TestChannelRoutingOverviewMarksRejectedAttemptMetricsUnavailable(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	channelrouting.ResetHedgeAttemptAuditsForTest(1)
+	_, err := channelrouting.ReserveUpstreamAttemptAudit(channelRoutingOverviewAttemptSpec("accepted"))
+	require.NoError(t, err)
+	_, err = channelrouting.ReserveUpstreamAttemptAudit(channelRoutingOverviewAttemptSpec("rejected"))
+	require.ErrorIs(t, err, channelrouting.ErrHedgeAuditBufferFull)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/overview", nil)
+	GetChannelRoutingOverview(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"attempt_metrics_available":false`)
+	assert.Contains(t, body, `"attempt_metrics_degraded":false`)
+	assert.Contains(t, body, `"rejected":1`)
+}
+
+func TestChannelRoutingAttemptMetricsPipelineHealthSeparatesLagFailureAndLoss(t *testing.T) {
+	const metricsFromMs = int64(1_000)
+	tests := []struct {
+		name          string
+		stats         channelrouting.HedgeAttemptAuditStats
+		wantAvailable bool
+		wantDegraded  bool
+		wantCoverage  float64
+	}{
+		{
+			name:          "pending only is healthy lag",
+			stats:         channelrouting.HedgeAttemptAuditStats{Persisted: 9, Entries: 1},
+			wantAvailable: true,
+			wantCoverage:  0.9,
+		},
+		{
+			name: "pending persistence failure is degraded",
+			stats: channelrouting.HedgeAttemptAuditStats{
+				Persisted: 8, Entries: 2, PersistFailures: 1, ConsecutivePersistFailures: 1,
+			},
+			wantAvailable: true,
+			wantDegraded:  true, wantCoverage: 0.8,
+		},
+		{
+			name: "historical failure with pending work has recovered",
+			stats: channelrouting.HedgeAttemptAuditStats{
+				Persisted: 8, Entries: 2, PersistFailures: 1,
+			},
+			wantAvailable: true,
+			wantCoverage:  0.8,
+		},
+		{
+			name: "rejection inside metrics window is unavailable",
+			stats: channelrouting.HedgeAttemptAuditStats{
+				Persisted: 9, Rejected: 1, LastRejectedMs: metricsFromMs,
+			},
+			wantCoverage: 0.9,
+		},
+		{
+			name: "rejection before metrics window recovers availability",
+			stats: channelrouting.HedgeAttemptAuditStats{
+				Persisted: 9, Rejected: 1, LastRejectedMs: metricsFromMs - 1,
+			},
+			wantAvailable: true,
+			wantCoverage:  0.9,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			available, degraded, coverage := channelRoutingAttemptMetricsPipelineHealth(test.stats, metricsFromMs)
+			assert.Equal(t, test.wantAvailable, available)
+			assert.Equal(t, test.wantDegraded, degraded)
+			assert.InDelta(t, test.wantCoverage, coverage, 1e-12)
+		})
+	}
+}
+
+func channelRoutingOverviewAttemptSpec(requestID string) model.RoutingHedgeAttemptStartSpec {
+	return model.RoutingHedgeAttemptStartSpec{
+		RequestID: requestID, NodeEpochID: "0123456789abcdef0123456789abcdef",
+		PolicyRevision: 1, AlgorithmVersion: channelrouting.DecisionAlgorithmBalancedV1,
+		PoolID: 1, MemberID: 1, ChannelID: 1, CredentialID: 1, ModelName: "gpt-test",
+		ExecutionMode: model.RoutingAttemptExecutionSerial, Role: model.RoutingAttemptRoleSerial,
+		EndpointAuthority: "https://api.example.test", Region: "default", StartedTimeMs: 1_000,
+	}
+}
+
 func TestChannelRoutingNodesExposePerNodeRevisionLagAndStatus(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
@@ -285,6 +395,8 @@ func TestChannelRoutingDecisionAPIsUseBoundedCursorPagination(t *testing.T) {
 	assert.NotContains(t, listRecorder.Body.String(), firstID)
 	assert.Contains(t, listRecorder.Body.String(), `"next_cursor":`)
 	assert.NotContains(t, listRecorder.Body.String(), "candidates_json")
+	assert.NotContains(t, listRecorder.Body.String(), `"candidate_set"`)
+	assert.NotContains(t, listRecorder.Body.String(), `"actual_cost_estimate"`)
 
 	detailRecorder := httptest.NewRecorder()
 	detailContext, _ := gin.CreateTestContext(detailRecorder)
@@ -294,6 +406,139 @@ func TestChannelRoutingDecisionAPIsUseBoundedCursorPagination(t *testing.T) {
 	assert.Equal(t, http.StatusOK, detailRecorder.Code)
 	assert.Contains(t, detailRecorder.Body.String(), firstID)
 	assert.Contains(t, detailRecorder.Body.String(), `"channel_id":2`)
+}
+
+func TestChannelRoutingDecisionDetailAggregatesAttemptTimelineAcrossDecisionIDs(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	const (
+		requestID       = "logical-request-timeline"
+		primaryDecision = "decision-primary-hedge"
+		retryDecision   = "decision-serial-retry"
+	)
+	require.NoError(t, db.Create(&model.RoutingDecisionAudit{
+		DecisionID: primaryDecision, RequestID: requestID,
+		RequestKey: model.RoutingDecisionRequestKey(requestID),
+		PoolID:     1, GroupName: "vip", GroupKey: model.RoutingDecisionGroupKey("vip"),
+		ModelName: "gpt-test", ModelKey: model.RoutingDecisionModelKey("gpt-test"),
+		CandidatesJSON: `{"candidates":[]}`, CreatedTime: 1_000,
+	}).Error)
+
+	attempts := []struct {
+		decisionID   string
+		execution    string
+		role         string
+		attemptIndex int
+		memberID     int
+		channelID    int
+		startedMs    int64
+		completion   model.RoutingHedgeAttemptCompleteSpec
+	}{
+		{
+			decisionID: primaryDecision, execution: model.RoutingAttemptExecutionHedge,
+			role: model.RoutingHedgeAttemptRolePrimary, memberID: 11, channelID: 101, startedMs: 1_000,
+			completion: model.RoutingHedgeAttemptCompleteSpec{
+				Result: model.RoutingHedgeAttemptResultUpstreamError, HTTPStatus: 502,
+				UpstreamSent: true, WillRetry: true, CompletedTimeMs: 1_050,
+			},
+		},
+		{
+			decisionID: primaryDecision, execution: model.RoutingAttemptExecutionHedge,
+			role: model.RoutingHedgeAttemptRoleSecondary, memberID: 12, channelID: 102, startedMs: 1_010,
+			completion: model.RoutingHedgeAttemptCompleteSpec{
+				Result:       model.RoutingHedgeAttemptResultHedgeLost,
+				UpstreamSent: true, CompletedTimeMs: 1_060,
+			},
+		},
+		{
+			decisionID: retryDecision, execution: model.RoutingAttemptExecutionSerial,
+			role: model.RoutingAttemptRoleSerial, attemptIndex: 1, memberID: 13, channelID: 103, startedMs: 1_100,
+			completion: model.RoutingHedgeAttemptCompleteSpec{
+				Result: model.RoutingHedgeAttemptResultSuccess, Winner: true, HTTPStatus: 200,
+				UpstreamSent: true, ClientCommitted: true, FinalAttempt: true, CompletedTimeMs: 1_150,
+			},
+		},
+	}
+	for _, attempt := range attempts {
+		audit, err := model.StartRoutingHedgeAttemptAuditContext(context.Background(), model.RoutingHedgeAttemptStartSpec{
+			DecisionID: attempt.decisionID, RequestID: requestID,
+			NodeEpochID:    "0123456789abcdef0123456789abcdef",
+			PolicyRevision: 1, AlgorithmVersion: channelrouting.DecisionAlgorithmBalancedV1,
+			PoolID: 1, MemberID: attempt.memberID, ChannelID: attempt.channelID,
+			CredentialID: attempt.channelID, ModelName: "gpt-test",
+			ExecutionMode: attempt.execution, AttemptIndex: attempt.attemptIndex, Role: attempt.role,
+			EndpointAuthority: "https://api.example.test", Region: "default", StartedTimeMs: attempt.startedMs,
+		})
+		require.NoError(t, err)
+		_, err = model.CompleteRoutingHedgeAttemptAuditContext(context.Background(), audit.ID, attempt.completion)
+		require.NoError(t, err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: primaryDecision}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/decisions/"+primaryDecision, nil)
+	GetChannelRoutingDecision(ctx)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool                       `json:"success"`
+		Data    channelRoutingDecisionView `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success)
+	require.NotNil(t, response.Data.AttemptTimeline)
+	require.NotNil(t, response.Data.Hedge)
+	assert.Equal(t, 3, response.Data.AttemptTimeline.AttemptCount)
+	require.Len(t, response.Data.AttemptTimeline.Attempts, 3)
+	assert.Equal(t, model.RoutingAttemptExecutionHedge, response.Data.AttemptTimeline.Attempts[0].ExecutionMode)
+	assert.Equal(t, model.RoutingHedgeAttemptRolePrimary, response.Data.AttemptTimeline.Attempts[0].Role)
+	assert.Equal(t, model.RoutingHedgeAttemptRoleSecondary, response.Data.AttemptTimeline.Attempts[1].Role)
+	assert.Equal(t, model.RoutingAttemptExecutionSerial, response.Data.AttemptTimeline.Attempts[2].ExecutionMode)
+	assert.Equal(t, 103, response.Data.AttemptTimeline.FinalChannelID)
+	assert.Equal(t, model.RoutingHedgeAttemptResultSuccess, response.Data.AttemptTimeline.FinalResult)
+	assert.Equal(t, response.Data.AttemptTimeline, response.Data.Hedge)
+}
+
+func TestChannelRoutingDecisionViewDecodesVersionedCostEstimate(t *testing.T) {
+	estimate := channelrouting.ShadowCostInput{
+		Known: true, Cost: 0.003, WorstCaseKnown: true, WorstCaseCost: 0.012,
+		EffectiveKnown: true, EffectiveCost: 0.004, Currency: "USD", Unit: "mixed",
+		PricingBasis: "token", PricingHash: strings.Repeat("a", 64), PricingVersion: "upstream-v3",
+		VersionConfidence: model.RoutingCostConfidenceExact, Freshness: model.RoutingCostFreshnessFresh,
+		ConfidenceScore: 0.95, FreshnessScore: 0.9,
+		ExpectedBreakdown:    model.RoutingCostBreakdown{Input: 0.001, Output: 0.002, Total: 0.003},
+		WorstSingleBreakdown: model.RoutingCostBreakdown{Input: 0.002, Output: 0.004, Total: 0.006},
+		UpdatedUnix:          1_700_000_000,
+	}
+	encoded, err := common.Marshal(estimate)
+	require.NoError(t, err)
+	view := buildChannelRoutingDecisionView(model.RoutingDecisionAudit{
+		DecisionID: "cost-estimate", CandidatesJSON: `{"candidates":[]}`,
+		ActualCostEstimateJSON: string(encoded), ObservedCostEstimateJSON: string(encoded),
+	})
+
+	require.NotNil(t, view.ActualCostEstimate)
+	require.NotNil(t, view.ObservedCostEstimate)
+	assert.Equal(t, estimate.PricingHash, view.ActualCostEstimate.PricingHash)
+	assert.Equal(t, estimate.WorstCaseCost, view.ActualCostEstimate.WorstCaseCost)
+	assert.Equal(t, estimate.ExpectedBreakdown, view.ActualCostEstimate.ExpectedBreakdown)
+	assert.Equal(t, estimate, *view.ObservedCostEstimate)
+}
+
+func TestChannelRoutingDecisionViewRestoresRedisBlockLeaseMarker(t *testing.T) {
+	view := buildChannelRoutingDecisionView(model.RoutingDecisionAudit{
+		DecisionID: "redis-block-view", CandidatesJSON: `{"candidates":[]}`,
+		SnapshotRevision: 7, PoolID: 3, SelectedMemberID: 31,
+		ReservationMode:                 model.RoutingDecisionReservationRedisBlock,
+		ReservationResourceCredentialID: 91, ReservationResourceModel: "upstream-gpt",
+		ReservationPoolSharesJSON: `[{"pool_id":3,"guaranteed_basis_points":10000,"maximum_basis_points":10000}]`,
+		ReservationInflight:       1, ReservationLimitInflight: 10, ReservationLeaseExpiresMs: 5_000,
+	})
+
+	require.NotNil(t, view.CapacityAdmission)
+	require.NotNil(t, view.CapacityAdmission.Strict)
+	assert.Equal(t, channelrouting.CapacityModeRedisBlock, view.CapacityAdmission.Strict.Mode)
+	assert.True(t, view.CapacityAdmission.Strict.BlockLease)
 }
 
 func TestChannelRoutingDecisionFiltersAreCaseExact(t *testing.T) {
@@ -339,9 +584,11 @@ func TestChannelRoutingDecisionAPIExposesAndFiltersCanaryMetadata(t *testing.T) 
 	assert.Contains(t, body, decisionID)
 	assert.Contains(t, body, `"activation_id":401`)
 	assert.Contains(t, body, `"cohort":"canary"`)
-	assert.Contains(t, body, `"selected_identity":{"snapshot_revision":7,"pool_id":29,"member_id":11,"credential_id":1001,"channel_id":101}`)
-	assert.Contains(t, body, `"capacity_admission":{"mode":"local_soft"`)
-	assert.Contains(t, body, `"exclusion_summary":{"excluded_count":0,"reasons":[]}`)
+	assert.Contains(t, body, `"selected_member_id":11`)
+	assert.Contains(t, body, `"selected_credential_id":1001`)
+	assert.NotContains(t, body, `"selected_identity"`)
+	assert.NotContains(t, body, `"capacity_admission"`)
+	assert.NotContains(t, body, `"exclusion_summary"`)
 	assert.NotContains(t, body, "exclusion_summary_json")
 
 	detailRecorder := httptest.NewRecorder()
@@ -351,6 +598,9 @@ func TestChannelRoutingDecisionAPIExposesAndFiltersCanaryMetadata(t *testing.T) 
 	GetChannelRoutingDecision(detailContext)
 	assert.Equal(t, http.StatusOK, detailRecorder.Code)
 	assert.Contains(t, detailRecorder.Body.String(), `"rollout_key":"`+audit.RolloutKey+`"`)
+	assert.Contains(t, detailRecorder.Body.String(), `"selected_identity":{"snapshot_revision":7,"pool_id":29,"member_id":11,"credential_id":1001,"channel_id":101}`)
+	assert.Contains(t, detailRecorder.Body.String(), `"capacity_admission":{"mode":"local_soft"`)
+	assert.Contains(t, detailRecorder.Body.String(), `"exclusion_summary":{"excluded_count":0,"reasons":[]}`)
 
 	filteredRecorder := httptest.NewRecorder()
 	filteredContext, _ := gin.CreateTestContext(filteredRecorder)
@@ -358,6 +608,52 @@ func TestChannelRoutingDecisionAPIExposesAndFiltersCanaryMetadata(t *testing.T) 
 	ListChannelRoutingDecisions(filteredContext)
 	assert.Equal(t, http.StatusOK, filteredRecorder.Code)
 	assert.NotContains(t, filteredRecorder.Body.String(), decisionID)
+}
+
+func TestChannelRoutingDecisionHedgeTimelineIsDetailOnlyAndNamesFinalRoute(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	decision := model.RoutingDecisionAudit{
+		DecisionID: "decision-hedge-detail", RequestID: "request-hedge-detail",
+		PoolID: 9, GroupName: "default", ModelName: "gpt-test", ActualChannelID: 7,
+		AlgorithmVersion: "balanced-v1", CreatedTime: 100,
+	}
+	require.NoError(t, db.Create(&decision).Error)
+	require.NoError(t, db.Create(&[]model.RoutingHedgeAttemptAudit{
+		{
+			AttemptKey: strings.Repeat("e", 64), DecisionID: decision.DecisionID,
+			Role: model.RoutingHedgeAttemptRolePrimary, State: model.RoutingHedgeAttemptStateCompleted,
+			Result: model.RoutingHedgeAttemptResultHedgeLost, MemberID: 71, ChannelID: 7, Region: "default",
+			StartedTimeMs: 100_000, CompletedTimeMs: 100_020,
+		},
+		{
+			AttemptKey: strings.Repeat("f", 64), DecisionID: decision.DecisionID,
+			Role: model.RoutingHedgeAttemptRoleSecondary, State: model.RoutingHedgeAttemptStateCompleted,
+			Result: model.RoutingHedgeAttemptResultSuccess, Winner: true,
+			MemberID: 72, ChannelID: 8, Region: "default", StartedTimeMs: 100_010, CompletedTimeMs: 100_030,
+		},
+	}).Error)
+
+	listRecorder := httptest.NewRecorder()
+	listContext, _ := gin.CreateTestContext(listRecorder)
+	listContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/decisions", nil)
+	ListChannelRoutingDecisions(listContext)
+	require.Equal(t, http.StatusOK, listRecorder.Code)
+	assert.NotContains(t, listRecorder.Body.String(), `"hedge"`)
+
+	detailRecorder := httptest.NewRecorder()
+	detailContext, _ := gin.CreateTestContext(detailRecorder)
+	detailContext.Params = gin.Params{{Key: "id", Value: decision.DecisionID}}
+	detailContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/decisions/"+decision.DecisionID, nil)
+	GetChannelRoutingDecision(detailContext)
+	require.Equal(t, http.StatusOK, detailRecorder.Code)
+	body := detailRecorder.Body.String()
+	assert.Contains(t, body, `"actual_channel_id":7`)
+	assert.Contains(t, body, `"winner_role":"secondary"`)
+	assert.Contains(t, body, `"final_member_id":72`)
+	assert.Contains(t, body, `"final_channel_id":8`)
+	assert.NotContains(t, body, "request_key")
+	assert.NotContains(t, body, "credential_reference")
 }
 
 func TestChannelRoutingSnapshotAPIsReturnServiceUnavailableWhileInitializing(t *testing.T) {
@@ -415,6 +711,69 @@ func TestChannelRoutingGroupDetailUsesBoundedNestedPagination(t *testing.T) {
 	assert.Contains(t, body, `"credential_count":2`)
 	assert.Contains(t, body, `"credentials_truncated":true`)
 	assert.Contains(t, body, `"next_page":3`)
+	assert.Contains(t, body, `"nested_item_budget":2000`)
+}
+
+func TestChannelRoutingGroupDetailRejectsExcessiveNestedResponseBudget(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/channel-routing/v2/groups/1?page_size=100&model_limit=100&credential_limit=100",
+		nil,
+	)
+
+	GetChannelRoutingGroup(ctx)
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "nested item budget")
+}
+
+func TestChannelRoutingDecisionSummarySupportsTimeWindowDeepLinks(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.Create(&[]model.RoutingDecisionAudit{
+		{DecisionID: "decision-before-window", GroupName: "default", ModelName: "gpt-test", CreatedTime: 100},
+		{DecisionID: "decision-in-window", GroupName: "default", ModelName: "gpt-test", CreatedTime: 200},
+		{DecisionID: "decision-after-window", GroupName: "default", ModelName: "gpt-test", CreatedTime: 300},
+	}).Error)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodGet, "/api/channel-routing/v2/decisions?from_time=150&to_time=250", nil,
+	)
+	ListChannelRoutingDecisions(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), "decision-in-window")
+	assert.NotContains(t, recorder.Body.String(), "decision-before-window")
+	assert.NotContains(t, recorder.Body.String(), "decision-after-window")
+}
+
+func TestChannelRoutingReplayProfilesReturnLatestDecisionPerModelAndStream(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.Create(&[]model.RoutingDecisionAudit{
+		{DecisionID: "profile-old", PoolID: 7, ModelName: "gpt-a", ModelKey: model.RoutingDecisionModelKey("gpt-a"), Replayable: true, CreatedTime: 100},
+		{DecisionID: "profile-new", PoolID: 7, ModelName: "gpt-a", ModelKey: model.RoutingDecisionModelKey("gpt-a"), Replayable: true, CreatedTime: 200},
+		{DecisionID: "profile-stream", PoolID: 7, ModelName: "gpt-a", ModelKey: model.RoutingDecisionModelKey("gpt-a"), IsStream: true, Replayable: true, CreatedTime: 300},
+		{DecisionID: "profile-ignored", PoolID: 7, ModelName: "gpt-b", ModelKey: model.RoutingDecisionModelKey("gpt-b"), CreatedTime: 400},
+	}).Error)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "7"}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/groups/7/replay-profiles", nil)
+	ListChannelRoutingGroupReplayProfiles(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	body := recorder.Body.String()
+	assert.Contains(t, body, "profile-new")
+	assert.Contains(t, body, "profile-stream")
+	assert.NotContains(t, body, "profile-old")
+	assert.NotContains(t, body, "profile-ignored")
 }
 
 func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
@@ -426,6 +785,8 @@ func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
 		params  gin.Params
 	}{
 		{name: "decision cursor", target: "/api/channel-routing/v2/decisions?cursor=not-a-number", handler: ListChannelRoutingDecisions},
+		{name: "decision time", target: "/api/channel-routing/v2/decisions?from_time=200&to_time=100", handler: ListChannelRoutingDecisions},
+		{name: "decision replayable", target: "/api/channel-routing/v2/decisions?replayable=unknown", handler: ListChannelRoutingDecisions},
 		{name: "node cursor", target: "/api/channel-routing/v2/nodes?cursor=not-a-cursor", handler: ListChannelRoutingNodes},
 		{name: "group model limit", target: "/api/channel-routing/v2/groups/1?model_limit=101", handler: GetChannelRoutingGroup, params: gin.Params{{Key: "id", Value: "1"}}},
 		{name: "channel status", target: "/api/channel-routing/v2/channels?status=unknown", handler: ListChannelRoutingChannels},
@@ -458,6 +819,8 @@ func TestListChannelRoutingProbesFiltersAndPaginates(t *testing.T) {
 			ProbeID: repeated, TargetKey: repeated, ProbeType: model.RoutingProbeTypeServing,
 			SnapshotRevision: 1, PoolID: 10, MemberID: index + 1, ChannelID: 20 + index,
 			GroupName: "default", ModelName: "gpt-test", EndpointHost: "api.example.test",
+			EndpointAuthority: "https://api.example.test:443", Region: "default",
+			BreakerScope: "member", EvidenceCount: 1, NodeCount: 1,
 			BreakerState: model.RoutingBreakerStateHealthy, Outcome: outcome,
 			StartedTimeMs: int64(index + 1), FinishedTimeMs: int64(index + 1),
 			LeaseFencingToken: int64(index + 1), NodeEpochID: "node-test", CreatedTime: int64(index + 1),
@@ -485,6 +848,8 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
+		&channelRoutingPermissionUserForTest{},
+		&model.CasbinRule{},
 		&model.Channel{},
 		&model.RoutingTopologyMetadata{},
 		&model.RoutingPool{},
@@ -496,17 +861,51 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingPolicyMemberRevision{},
 		&model.RoutingPolicyActivation{},
 		&model.RoutingPolicyDraft{},
+		&model.RoutingPolicyApproval{},
+		&model.RoutingPolicyRollbackApproval{},
 		&model.RoutingConfigOutbox{},
 		&model.RoutingRuntimeCheckpoint{},
+		&model.RoutingOperation{},
+		&model.RoutingBreakerResetCommand{},
+		&model.RoutingBreakerResetFence{},
+		&model.RoutingBreakerResetTombstone{},
+		&model.RoutingBreakerResetOutbox{},
+		&model.RoutingBreakerState{},
+		&model.RoutingEndpointEvidence{},
+		&model.RoutingEndpointSharedState{},
+		&model.RoutingAuditExport{},
+		&model.RoutingAuditExportChunk{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingDecisionAudit{},
+		&model.RoutingHedgeAttemptAudit{},
 		&model.RoutingMetricRollup{},
 		&model.RoutingTelemetryReceipt{},
 		&model.RoutingUpstreamAccount{},
 		&model.RoutingCostSnapshotVersion{},
 		&model.RoutingProbeResult{},
+		&model.SystemTask{},
+		&model.SystemTaskLock{},
 	))
+	require.NoError(t, db.Create(&[]channelRoutingPermissionUserForTest{
+		{Id: 10, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 11, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+	}).Error)
+	require.NoError(t, db.Create(&[]model.CasbinRule{
+		{Ptype: "p", V0: "user:10", V1: "channel_routing", V2: "deploy", V3: "allow"},
+		{Ptype: "p", V0: "user:11", V1: "channel_routing", V2: "deploy", V3: "allow"},
+	}).Error)
 	return db
+}
+
+type channelRoutingPermissionUserForTest struct {
+	Id        int `gorm:"primaryKey"`
+	Role      int
+	Status    int
+	DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+func (channelRoutingPermissionUserForTest) TableName() string {
+	return "users"
 }
 
 func withChannelRoutingControllerState(t *testing.T, db *gorm.DB) {
@@ -525,6 +924,7 @@ func withChannelRoutingControllerState(t *testing.T, db *gorm.DB) {
 	routingmetrics.ResetForTest()
 	channelrouting.ResetSnapshotForTest()
 	channelrouting.ResetDecisionAuditsForTest()
+	channelrouting.ResetHedgeAttemptAuditsForTest()
 	smart_routing_setting.ResetForTest()
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true, Mode: smart_routing_setting.ModeObserve, SnapshotStaleSec: 300,
@@ -538,6 +938,7 @@ func withChannelRoutingControllerState(t *testing.T, db *gorm.DB) {
 		routingmetrics.ResetForTest()
 		channelrouting.ResetSnapshotForTest()
 		channelrouting.ResetDecisionAuditsForTest()
+		channelrouting.ResetHedgeAttemptAuditsForTest()
 		smart_routing_setting.ResetForTest()
 	})
 }

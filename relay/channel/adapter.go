@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"io"
 	"net/http"
 
@@ -74,8 +75,10 @@ type TaskAdaptor interface {
 
 	// ── Polling ──────────────────────────────────────────────────────
 
-	FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error)
-	ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error)
+	// ctx owns the complete poll lifecycle, including auth refreshes and any
+	// secondary lookups performed while parsing a successful result.
+	FetchTask(ctx context.Context, baseUrl, key string, body map[string]any, proxy string) (*http.Response, error)
+	ParseTaskResult(ctx context.Context, respBody []byte) (*relaycommon.TaskInfo, error)
 }
 
 type OpenAIVideoConverter interface {

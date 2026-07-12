@@ -22,6 +22,7 @@ import (
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"gorm.io/gorm"
@@ -490,12 +491,98 @@ func (routingCostSyncHandler) Interval() time.Duration {
 func (routingCostSyncHandler) NewPayload() any { return nil }
 
 func (routingCostSyncHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	summary, err := runRoutingCostSyncTask(ctx)
-	if err != nil {
-		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
+	const operationLease = time.Minute
+	nowMs := time.Now().UnixMilli()
+	if err := model.ClaimRoutingCostSyncOperationsContext(
+		ctx, task.TaskID, runnerID, nowMs, int64(operationLease/time.Millisecond),
+	); err != nil {
+		message := common.SanitizeErrorMessage(err.Error())
+		if message == "" {
+			message = "cost sync operation claim failed"
+		}
+		if _, finishErr := model.FinishRoutingCostSyncTaskContext(
+			ctx, task.TaskID, runnerID, model.SystemTaskStatusFailed, nil, message, time.Now().UnixMilli(),
+		); finishErr != nil {
+			common.SysLog(fmt.Sprintf("system task %s failed to persist claim failure: %s", task.TaskID, common.SanitizeErrorMessage(finishErr.Error())))
+		}
 		return
 	}
-	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	stopHeartbeat := make(chan struct{})
+	heartbeatResult := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(operationLease / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				heartbeatResult <- nil
+				return
+			case <-runCtx.Done():
+				heartbeatResult <- runCtx.Err()
+				return
+			case <-ticker.C:
+				err := model.RenewRoutingCostSyncOperationsContext(
+					runCtx, task.TaskID, runnerID, time.Now().UnixMilli(), int64(operationLease/time.Millisecond),
+				)
+				if err != nil {
+					heartbeatResult <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	summary, runErr := runRoutingCostSyncTask(runCtx)
+	close(stopHeartbeat)
+	heartbeatErr := <-heartbeatResult
+	cancel()
+	if runErr == nil && heartbeatErr != nil {
+		runErr = heartbeatErr
+	}
+	executionState := model.RoutingCostSyncExecutionStateFailed
+	if runErr == nil {
+		executionState, runErr = routingCostSyncExecutionState(summary)
+	}
+	summary["execution_state"] = executionState
+	status := model.SystemTaskStatusSucceeded
+	errorMessage := ""
+	if runErr != nil {
+		status = model.SystemTaskStatusFailed
+		errorMessage = common.SanitizeErrorMessage(runErr.Error())
+		if errorMessage == "" {
+			errorMessage = "cost sync task failed"
+		}
+	}
+	operationCount, finishErr := model.FinishRoutingCostSyncTaskContext(
+		ctx, task.TaskID, runnerID, status, summary, errorMessage, time.Now().UnixMilli(),
+	)
+	if finishErr != nil {
+		common.SysLog(fmt.Sprintf("system task %s failed to persist result: %s", task.TaskID, common.SanitizeErrorMessage(finishErr.Error())))
+		return
+	}
+	publishChannelRoutingControlEvent(channelrouting.RoutingEventTypeCostSyncCompleted, 0, map[string]any{
+		"system_task_id": task.TaskID, "status": status, "operation_count": operationCount,
+	})
+}
+
+func routingCostSyncExecutionState(summary map[string]any) (string, error) {
+	bindingCount, _ := summary["bindings"].(int)
+	accountCount, _ := summary["accounts"].(int)
+	successfulAccounts, _ := summary["successful_accounts"].(int)
+	syncErrors, _ := summary["errors"].(int)
+	partialAccounts, _ := summary["partial_accounts"].(int)
+	staleBindings, _ := summary["stale_bindings"].(int)
+	hasAnomaly := syncErrors > 0 || partialAccounts > 0 || staleBindings > 0
+	if (accountCount > 0 || bindingCount > 0) && successfulAccounts == 0 && hasAnomaly {
+		return model.RoutingCostSyncExecutionStateFailed, errors.New("cost sync failed for all eligible upstream accounts")
+	}
+	if successfulAccounts > 0 && (successfulAccounts < accountCount || hasAnomaly) {
+		return model.RoutingCostSyncExecutionStatePartial, nil
+	}
+	return model.RoutingCostSyncExecutionStateCompleted, nil
 }
 
 type routingPricingResponse struct {
@@ -838,17 +925,32 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		retentionIntervalSeconds int64 = 6 * 60 * 60
 		secondsPerDay            int64 = 24 * 60 * 60
 	)
-	if setting.RetentionDays > 0 && now-smartRoutingRetentionLast.Load() >= retentionIntervalSeconds {
-		cutoffTs := int64(0)
-		retentionDays := int64(setting.RetentionDays)
-		if retentionDays <= now/secondsPerDay {
-			cutoffTs = now - retentionDays*secondsPerDay
+	if (setting.RetentionDays > 0 || setting.HedgeAuditRetentionDays > 0) &&
+		now-smartRoutingRetentionLast.Load() >= retentionIntervalSeconds {
+		if setting.RetentionDays > 0 {
+			cutoffTs := int64(0)
+			retentionDays := int64(setting.RetentionDays)
+			if retentionDays <= now/secondsPerDay {
+				cutoffTs = now - retentionDays*secondsPerDay
+			}
+			deleted, err := model.DeleteRoutingMetricsBeforeContext(ctx, cutoffTs)
+			if err != nil {
+				return summary, err
+			}
+			summary["retained_metrics_deleted"] = deleted
 		}
-		deleted, err := model.DeleteRoutingMetricsBeforeContext(ctx, cutoffTs)
-		if err != nil {
-			return summary, err
+		if setting.HedgeAuditRetentionDays > 0 {
+			cutoffMs := int64(0)
+			retentionDays := int64(setting.HedgeAuditRetentionDays)
+			if retentionDays <= now/secondsPerDay {
+				cutoffMs = (now - retentionDays*secondsPerDay) * 1_000
+			}
+			deleted, err := model.DeleteRoutingHedgeAttemptAuditsBeforeContext(ctx, cutoffMs)
+			if err != nil {
+				return summary, err
+			}
+			summary["retained_hedge_audits_deleted"] = deleted
 		}
-		summary["retained_metrics_deleted"] = deleted
 		smartRoutingRetentionLast.Store(now)
 	}
 	return summary, nil
@@ -1093,17 +1195,18 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	syncRoutingBreakerConfigFromSetting(setting)
 
 	summary := map[string]any{
-		"bindings":         0,
-		"accounts":         0,
-		"snapshots":        0,
-		"versions_created": 0,
-		"metrics":          0,
-		"breakers":         0,
-		"loaded_breakers":  0,
-		"errors":           0,
-		"partial_accounts": 0,
-		"skipped_backoff":  0,
-		"stale_bindings":   0,
+		"bindings":            0,
+		"accounts":            0,
+		"snapshots":           0,
+		"versions_created":    0,
+		"metrics":             0,
+		"breakers":            0,
+		"loaded_breakers":     0,
+		"errors":              0,
+		"successful_accounts": 0,
+		"partial_accounts":    0,
+		"skipped_backoff":     0,
+		"stale_bindings":      0,
 	}
 
 	flushSummary, err := flushRoutingRuntimeState(ctx, setting)
@@ -1185,6 +1288,7 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	}
 	sort.Strings(accountKeys)
 	summary["accounts"] = len(accountKeys)
+	successfulAccounts := 0
 	partialAccounts := 0
 	for _, accountKey := range accountKeys {
 		group := accountGroups[accountKey]
@@ -1223,6 +1327,7 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 		if payload.SyncStatus == model.RoutingUpstreamSyncStatusPartial {
 			partialAccounts++
 		}
+		accountSucceeded := false
 		accountMappingPartial := false
 		accountMappingError := ""
 
@@ -1287,6 +1392,7 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 				return summary, fmt.Errorf("persist routing cost versions: %w", persistErr)
 			}
 			syncedSnapshots += len(writes)
+			accountSucceeded = true
 			for _, version := range persisted.Versions {
 				if version.Created {
 					createdVersions++
@@ -1309,10 +1415,14 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 				return summary, fmt.Errorf("persist routing upstream account partial status: %w", err)
 			}
 		}
+		if accountSucceeded {
+			successfulAccounts++
+		}
 	}
 	summary["snapshots"] = syncedSnapshots
 	summary["versions_created"] = createdVersions
 	summary["errors"] = syncErrors
+	summary["successful_accounts"] = successfulAccounts
 	summary["stale_bindings"] = staleBindings
 	summary["partial_accounts"] = partialAccounts
 	return summary, nil
@@ -1674,6 +1784,9 @@ func routingNewAPINormalizedPricing(
 	if item.CreateCacheRatio != nil && inputCostPerMillion > 0 {
 		pricing.CacheWriteCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.CreateCacheRatio)
 	}
+	if item.ImageRatio != nil && inputCostPerMillion > 0 {
+		pricing.ImageInputCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.ImageRatio)
+	}
 	if item.AudioRatio != nil && inputCostPerMillion > 0 {
 		pricing.AudioInputCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.AudioRatio)
 	}
@@ -1855,6 +1968,7 @@ func routingSub2APINormalizedPricing(
 	}
 	if imageCost > 0 {
 		pricing.ImageCost = routingCostFloatPointer(imageCost)
+		pricing.PerImageCost = routingCostFloatPointer(imageCost)
 	}
 	extras := map[string]float64{}
 	if outputCost > 0 {
@@ -2271,6 +2385,7 @@ func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.Routi
 		ModelName:           snapshot.Key.Model,
 		Group:               snapshot.Key.Group,
 		SemanticVersion:     model.RoutingBreakerSemanticVersion,
+		ResetGeneration:     snapshot.ResetGeneration,
 		State:               string(snapshot.State),
 		Reason:              snapshot.Reason,
 		ConsecutiveFailures: int64(snapshot.ConsecutiveFailures),
@@ -2309,6 +2424,7 @@ func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routi
 				Group:       state.Group,
 			},
 			State:               routingbreaker.State(state.State),
+			ResetGeneration:     state.ResetGeneration,
 			Reason:              state.Reason,
 			ConsecutiveFailures: int(state.ConsecutiveFailures),
 			Consecutive5xx:      int(state.Consecutive5xx),

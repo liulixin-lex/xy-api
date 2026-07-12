@@ -182,7 +182,27 @@ func cleanupRoutingCapacityReservation(c *gin.Context) {
 }
 
 func setRoutingPromptCostProxy(c *gin.Context) {
-	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+	if c == nil || c.Request == nil {
+		return
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
+		estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, nil)
+		setRoutingCapacityEstimate(c, estimate)
+		common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+			c.Request.URL.Path, nil, c.Request.Header, estimate, 0, 0,
+		))
+		common.SetContextKey(c, constant.ContextKeyIsStream, true)
+		return
+	}
+	if !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+		estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, nil)
+		setRoutingCapacityEstimate(c, estimate)
+		common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+			c.Request.URL.Path, nil, c.Request.Header, estimate, 0, 0,
+		))
+		if estimate.StreamKnown {
+			common.SetContextKey(c, constant.ContextKeyIsStream, estimate.Stream)
+		}
 		return
 	}
 	storage, err := common.GetBodyStorage(c)
@@ -193,32 +213,41 @@ func setRoutingPromptCostProxy(c *gin.Context) {
 	if err != nil || len(body) == 0 || !gjson.ValidBytes(body) {
 		return
 	}
-	stream := gjson.GetBytes(body, "stream")
-	if stream.Exists() {
-		common.SetContextKey(c, constant.ContextKeyIsStream, stream.Bool())
-	}
-	proxy := len(body) / 4
-	if proxy < 1 {
-		proxy = 1
-	}
-	common.SetContextKey(c, constant.ContextKeyRoutingPromptProxy, proxy)
-	outputCap := proxy + proxy/2
-	if outputCap < 1 {
-		outputCap = 1
-	}
-	if outputCap > 512 {
-		outputCap = 512
-	}
+	estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, body)
+	promptProxy := max(len(body)/4, 1)
+	common.SetContextKey(c, constant.ContextKeyRoutingPromptProxy, promptProxy)
+	outputProxy := min(promptProxy+promptProxy/2, 512)
 	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
 		value := gjson.GetBytes(body, field)
 		if value.Exists() && value.Num > 0 {
-			if value.Num < float64(outputCap) {
-				outputCap = int(value.Num)
-			}
+			outputProxy = min(outputProxy, int(value.Num))
 			break
 		}
 	}
-	common.SetContextKey(c, constant.ContextKeyRoutingEstimatedOutput, outputCap)
+	common.SetContextKey(c, constant.ContextKeyRoutingEstimatedOutput, max(outputProxy, 1))
+	setRoutingCapacityEstimate(c, estimate)
+	common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+		c.Request.URL.Path,
+		body,
+		c.Request.Header,
+		estimate,
+		promptProxy,
+		max(outputProxy, 1),
+	))
+	if c.Query("alt") == "sse" {
+		common.SetContextKey(c, constant.ContextKeyIsStream, true)
+	} else if estimate.StreamKnown {
+		common.SetContextKey(c, constant.ContextKeyIsStream, estimate.Stream)
+	}
+}
+
+func setRoutingCapacityEstimate(c *gin.Context, estimate routingCapacityTokenEstimate) {
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInput, estimate.Input.Tokens)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInputKnown, estimate.Input.Known())
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInputState, estimate.Input.State)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutput, estimate.Output.Tokens)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutputKnown, estimate.Output.Known())
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutputState, estimate.Output.State)
 }
 
 // channelSupportsRequestPath reports whether a channel can serve the request path.
@@ -559,7 +588,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
 		}
 	}
-	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
+	channelBaseURL := channel.GetBaseURL()
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channelBaseURL)
+	common.SetContextKey(c, constant.ContextKeyRoutingEndpointHost, channelrouting.EndpointHost(channelBaseURL, channel.Id))
+	common.SetContextKey(c, constant.ContextKeyRoutingEndpointAuthority, channelrouting.EndpointAuthority(channelBaseURL, channel.Id))
+	common.SetContextKey(c, constant.ContextKeyRoutingRegion, channelrouting.RoutingRegion())
 
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
 

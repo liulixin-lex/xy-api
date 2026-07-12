@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -52,6 +53,47 @@ func TestRelayInfoRoutingObservationIsAttemptScoped(t *testing.T) {
 	assert.True(t, info.RoutingAttemptEndTime().IsZero())
 }
 
+func TestRelayInfoRoutingAttemptUsageIsNormalizedAndResetPerAttempt(t *testing.T) {
+	info := &RelayInfo{}
+	info.ObserveRoutingAttemptUsage(&dto.Usage{
+		PromptTokens: 100, CompletionTokens: 25, PromptCacheHitTokens: 20,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens: 15, CachedCreationTokens: 7, ImageTokens: 3, AudioTokens: 4,
+		},
+		CompletionTokenDetails:      dto.OutputTokenDetails{ImageTokens: 2, AudioTokens: 1},
+		ClaudeCacheCreation1hTokens: 5,
+		UsageSemantic:               "anthropic",
+	})
+
+	usage, known := info.RoutingAttemptUsageSnapshot()
+	require.True(t, known)
+	assert.Equal(t, int64(100), usage.PromptTokens)
+	assert.Equal(t, int64(25), usage.CompletionTokens)
+	assert.Equal(t, int64(20), usage.CacheReadTokens)
+	assert.Zero(t, usage.CacheWriteTokens, "one-hour cache creation remains a distinct billing dimension")
+	assert.Equal(t, int64(5), usage.CacheWrite1hTokens)
+	assert.Equal(t, int64(3), usage.ImageInputTokens)
+	assert.Equal(t, int64(2), usage.ImageOutputTokens)
+	assert.True(t, usage.ClaudeSemantic)
+
+	info.ResetStreamAttemptState()
+	_, known = info.RoutingAttemptUsageSnapshot()
+	assert.False(t, known)
+
+	info.ObserveRoutingRealtimeUsage(&dto.RealtimeUsage{
+		InputTokens: 12, OutputTokens: 8,
+		InputTokenDetails:  dto.InputTokenDetails{CachedTokens: 4, AudioTokens: 3},
+		OutputTokenDetails: dto.OutputTokenDetails{AudioTokens: 2},
+	})
+	usage, known = info.RoutingAttemptUsageSnapshot()
+	require.True(t, known)
+	assert.Equal(t, int64(12), usage.PromptTokens)
+	assert.Equal(t, int64(8), usage.CompletionTokens)
+	assert.Equal(t, int64(4), usage.CacheReadTokens)
+	assert.Equal(t, int64(3), usage.AudioInputTokens)
+	assert.Equal(t, int64(2), usage.AudioOutputTokens)
+}
+
 func TestCurrentAttemptIsMultiKeyPrefersContextOverStaleChannelMeta(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -88,6 +130,9 @@ func TestInitChannelMetaCopiesStableRoutingIdentity(t *testing.T) {
 	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 7)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingMemberID, 11)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCredentialID, 13)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointHost, "api.example.test")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointAuthority, "https://api.example.test:443")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRegion, "us-east-1")
 
 	info := &RelayInfo{}
 	info.InitChannelMeta(ctx)
@@ -97,6 +142,9 @@ func TestInitChannelMetaCopiesStableRoutingIdentity(t *testing.T) {
 	assert.Equal(t, 7, info.ChannelMeta.RoutingPoolID)
 	assert.Equal(t, 11, info.ChannelMeta.RoutingMemberID)
 	assert.Equal(t, 13, info.ChannelMeta.RoutingCredentialID)
+	assert.Equal(t, "api.example.test", info.ChannelMeta.RoutingEndpointHost)
+	assert.Equal(t, "https://api.example.test:443", info.ChannelMeta.RoutingEndpointAuthority)
+	assert.Equal(t, "us-east-1", info.ChannelMeta.RoutingRegion)
 }
 
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {

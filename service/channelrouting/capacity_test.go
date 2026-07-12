@@ -41,6 +41,50 @@ func newCapacityTrackerForTest(t *testing.T, clock Clock, maxEntries int, idleTT
 	return tracker
 }
 
+func TestCapacityDimensionEstimatePreservesZeroAndUnknownSemantics(t *testing.T) {
+	tests := []struct {
+		name     string
+		estimate CapacityDimensionEstimate
+		limit    int64
+		want     int64
+		known    bool
+	}{
+		{
+			name:     "not applicable is known zero",
+			estimate: CapacityDimensionEstimate{State: CapacityDimensionNotApplicable},
+			limit:    1_000, want: 0, known: true,
+		},
+		{
+			name:     "bounded explicit zero stays zero",
+			estimate: CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown},
+			limit:    1_000, want: 0, known: true,
+		},
+		{
+			name:     "bounded positive value stays bounded",
+			estimate: CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown, Tokens: 125},
+			limit:    1_000, want: 125, known: true,
+		},
+		{
+			name:     "applicable unknown reserves the conservative bound",
+			estimate: CapacityDimensionEstimate{State: CapacityDimensionApplicableUnknown},
+			limit:    1_000, want: 1_000, known: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			demand, err := test.estimate.Demand(test.limit)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, demand)
+			assert.Equal(t, test.known, test.estimate.Known())
+		})
+	}
+
+	_, err := (CapacityDimensionEstimate{
+		State: CapacityDimensionNotApplicable, Tokens: 1,
+	}).Demand(1_000)
+	assert.ErrorIs(t, err, ErrCapacityInvalidInput)
+}
+
 func TestCapacityReservationLifecycleIsExactAndIdempotent(t *testing.T) {
 	clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
 	tracker := newCapacityTrackerForTest(t, clock, 8, time.Minute)
@@ -281,7 +325,7 @@ func TestCapacityTrackerRejectsInvalidInputsAndActiveLimitChanges(t *testing.T) 
 	assert.Equal(t, int64(1), tracker.Stats().Drops)
 }
 
-func TestCapacityTrackerSeparatesPolicyRevisions(t *testing.T) {
+func TestCapacityTrackerSharesLimitsAcrossPolicyRevisions(t *testing.T) {
 	clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
 	tracker := newCapacityTrackerForTest(t, clock, 4, time.Minute)
 	base := CapacityKey{PoolID: 1, MemberID: 11, Model: "gpt-4o"}
@@ -295,10 +339,105 @@ func TestCapacityTrackerSeparatesPolicyRevisions(t *testing.T) {
 
 	secondKey := base
 	secondKey.PolicyRevision = 12
-	second, err := tracker.TryReserve(secondKey, demand, Limit{Inflight: 2})
-	require.NoError(t, err, "a new policy revision must not conflict with active reservations from its predecessor")
-	require.NoError(t, second.Cancel())
+	_, err = tracker.TryReserve(secondKey, demand, Limit{Inflight: 2})
+	assert.ErrorIs(t, err, ErrCapacityExhausted,
+		"a new policy revision must not allocate a second capacity budget for the same resource")
 	require.NoError(t, first.Release())
+
+	second, err := tracker.TryReserve(secondKey, demand, Limit{Inflight: 2})
+	require.NoError(t, err)
+	require.NoError(t, second.Cancel())
+}
+
+func TestCapacityTrackerInterleavedOldRevisionCannotRestoreNewerLimit(t *testing.T) {
+	clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
+	tracker := newCapacityTrackerForTest(t, clock, 4, time.Minute)
+	base := CapacityKey{PoolID: 1, MemberID: 11, Model: "gpt-4o"}
+	demand := Demand{Inflight: 1}
+	revisionOne := base
+	revisionOne.PolicyRevision = 1
+	revisionTwo := base
+	revisionTwo.PolicyRevision = 2
+
+	first, err := tracker.TryReserve(revisionOne, demand, Limit{Inflight: 100})
+	require.NoError(t, err)
+	second, err := tracker.TryReserve(revisionTwo, demand, Limit{Inflight: 50})
+	require.NoError(t, err)
+	stale, err := tracker.TryReserve(revisionOne, demand, Limit{Inflight: 100})
+	require.NoError(t, err, "a pinned old revision may share the conservative newer limit")
+	assert.Equal(t, int64(50), stale.Admission().Limit.Inflight)
+	require.NoError(t, first.Cancel())
+	require.NoError(t, second.Cancel())
+	require.NoError(t, stale.Cancel())
+
+	idleStale, err := tracker.TryReserve(revisionOne, demand, Limit{Inflight: 100})
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), idleStale.Admission().Limit.Inflight,
+		"draining must not let a stale revision restore its old limit")
+	require.NoError(t, idleStale.Cancel())
+
+	revisionThree := base
+	revisionThree.PolicyRevision = 3
+	newer, err := tracker.TryReserve(revisionThree, demand, Limit{Inflight: 80})
+	require.NoError(t, err)
+	assert.Equal(t, int64(80), newer.Admission().Limit.Inflight,
+		"a higher revision may deliberately adopt a relaxed limit after drain")
+	require.NoError(t, newer.Cancel())
+}
+
+func TestCapacityTrackerAdoptsLatestRevisionLimitAfterTransitionDrains(t *testing.T) {
+	tests := []struct {
+		name       string
+		oldLimit   Limit
+		newLimit   Limit
+		transition Limit
+	}{
+		{
+			name:       "relaxed limit",
+			oldLimit:   Limit{RPM: 100, InputTPM: 1_000, OutputTPM: 400, Inflight: 10},
+			newLimit:   Limit{RPM: 200, InputTPM: 2_000, OutputTPM: 800, Inflight: 20},
+			transition: Limit{RPM: 100, InputTPM: 1_000, OutputTPM: 400, Inflight: 10},
+		},
+		{
+			name:       "tightened limit",
+			oldLimit:   Limit{RPM: 100, InputTPM: 1_000, OutputTPM: 400, Inflight: 10},
+			newLimit:   Limit{RPM: 50, InputTPM: 500, OutputTPM: 200, Inflight: 5},
+			transition: Limit{RPM: 50, InputTPM: 500, OutputTPM: 200, Inflight: 5},
+		},
+		{
+			name:       "mixed multidimensional limit",
+			oldLimit:   Limit{RPM: 100, InputTPM: 1_000, OutputTPM: 400, Inflight: 10},
+			newLimit:   Limit{RPM: 200, InputTPM: 500, OutputTPM: 0, Inflight: 20},
+			transition: Limit{RPM: 100, InputTPM: 500, OutputTPM: 400, Inflight: 10},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := &routingTestClock{now: time.Unix(1_700_000_000, 0)}
+			tracker := newCapacityTrackerForTest(t, clock, 4, time.Minute)
+			base := CapacityKey{PoolID: 1, MemberID: 11, Model: "gpt-4o"}
+			revisionOne := base
+			revisionOne.PolicyRevision = 1
+			revisionTwo := base
+			revisionTwo.PolicyRevision = 2
+			demand := Demand{Inflight: 1}
+
+			oldReservation, err := tracker.TryReserve(revisionOne, demand, test.oldLimit)
+			require.NoError(t, err)
+			transitionReservation, err := tracker.TryReserve(revisionTwo, demand, test.newLimit)
+			require.NoError(t, err)
+			assert.Equal(t, test.transition, transitionReservation.Admission().Limit)
+
+			require.NoError(t, oldReservation.Cancel())
+			require.NoError(t, transitionReservation.Cancel())
+
+			settledReservation, err := tracker.TryReserve(revisionTwo, demand, test.newLimit)
+			require.NoError(t, err,
+				"the latest revision must converge from its conservative transition limit after drain")
+			assert.Equal(t, test.newLimit, settledReservation.Admission().Limit)
+			require.NoError(t, settledReservation.Cancel())
+		})
+	}
 }
 
 func TestCapacityTrackerEvictsOnlyIdleEntriesAndExpiresThem(t *testing.T) {

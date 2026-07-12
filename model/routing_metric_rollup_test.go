@@ -3,16 +3,22 @@ package model
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -47,8 +53,85 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	t.Helper()
 
 	withRoutingTestDB(t, db, dbType)
-	require.NoError(t, DB.AutoMigrate(&RoutingMetricRollup{}))
-	require.NoError(t, DB.AutoMigrate(&RoutingMetricRollup{}))
+	prepareLegacyRoutingMetricRollupIndex(t, DB)
+	legacyRows := []RoutingMetricRollup{
+		{
+			MemberID: 91, CredentialID: 901, ModelName: "legacy-v1",
+			ModelKey: routingMetricRollupModelKey("legacy-v1"), BucketTs: 91,
+			ChannelID: 901, PoolID: 9001, SchemaVersion: 1, LastSnapshotRevision: 5,
+			RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+		},
+		{
+			MemberID: 92, CredentialID: 902, ModelName: "legacy-v2",
+			ModelKey: routingMetricRollupModelKey("legacy-v2"), BucketTs: 92,
+			ChannelID: 902, PoolID: 9002, SchemaVersion: 2, LastSnapshotRevision: 6,
+			RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+		},
+	}
+	require.NoError(t, DB.Create(&legacyRows).Error)
+	require.NoError(t, MigrateRoutingMetricRollupRevisionKeyWithOptions(DB, RoutingMetricRollupMigrationOptions{
+		AlphaV2Drained: true,
+	}))
+	require.NoError(t, MigrateRoutingMetricRollupRevisionKey(DB))
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(DB, routingMetricRollupUniqueIndex)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.True(t, unique)
+	assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
+	_, _, exists, err = routingMetricRollupIndexDefinition(DB, routingMetricRollupLegacyUniqueIndex)
+	require.NoError(t, err)
+	assert.False(t, exists)
+	assert.False(t, DB.Migrator().HasIndex(&routingMetricRollupRevisionGuard{}, routingMetricRollupRevisionGuardIndex))
+	for _, legacy := range legacyRows {
+		var preserved RoutingMetricRollup
+		require.NoError(t, DB.First(&preserved, legacy.ID).Error)
+		assert.Equal(t, legacy.SchemaVersion, preserved.SchemaVersion)
+		assert.Equal(t, legacy.LastSnapshotRevision, preserved.LastSnapshotRevision)
+		assert.Equal(t, legacy.RequestCount, preserved.RequestCount)
+		assert.Equal(t, legacy.ReliabilityRequestCount, preserved.ReliabilityRequestCount)
+	}
+
+	for _, legacy := range legacyRows {
+		incoming := legacy
+		incoming.ID = 0
+		incoming.SchemaVersion = RoutingMetricRollupSchemaVersion
+		incoming.RequestCount = 1
+		incoming.SuccessCount = 1
+		incoming.ReliabilityRequestCount = 1
+		require.NoError(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{incoming}))
+
+		var preserved RoutingMetricRollup
+		require.NoError(t, DB.First(&preserved, legacy.ID).Error)
+		assert.Equal(t, legacy.SchemaVersion, preserved.SchemaVersion)
+		assert.Equal(t, legacy.LastSnapshotRevision, preserved.LastSnapshotRevision)
+		assert.Equal(t, int64(2), preserved.RequestCount)
+
+		isolated := incoming
+		isolated.LastSnapshotRevision++
+		require.NoError(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{isolated}))
+		history, historyErr := GetRoutingMetricRollupsContext(
+			context.Background(), legacy.MemberID, legacy.CredentialID, legacy.ModelName, legacy.BucketTs, legacy.BucketTs,
+		)
+		require.NoError(t, historyErr)
+		require.Len(t, history, 2)
+		assert.Equal(t, legacy.LastSnapshotRevision, history[0].LastSnapshotRevision)
+		assert.Equal(t, legacy.LastSnapshotRevision+1, history[1].LastSnapshotRevision)
+		exact, exactErr := GetRoutingMetricRollupsForSnapshotRevisionContext(
+			context.Background(), legacy.MemberID, legacy.CredentialID, legacy.ModelName,
+			legacy.LastSnapshotRevision, legacy.BucketTs, legacy.BucketTs,
+		)
+		require.NoError(t, exactErr)
+		assert.Empty(t, exact)
+		exact, exactErr = GetRoutingMetricRollupsForSnapshotRevisionContext(
+			context.Background(), legacy.MemberID, legacy.CredentialID, legacy.ModelName,
+			legacy.LastSnapshotRevision+1, legacy.BucketTs, legacy.BucketTs,
+		)
+		require.NoError(t, exactErr)
+		require.Len(t, exact, 1)
+		assert.Equal(t, RoutingMetricRollupSchemaVersion, exact[0].SchemaVersion)
+	}
+	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&RoutingMetricRollup{}).Error)
+
 	assert.True(t, DB.Migrator().HasTable(&RoutingMetricRollup{}))
 	assert.True(t, DB.Migrator().HasColumn(&RoutingMetricRollup{}, "UnknownCount"))
 	assert.True(t, DB.Migrator().HasColumn(&RoutingMetricRollup{}, "RetryAfterTotalMs"))
@@ -61,7 +144,7 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 
 	first := RoutingMetricRollup{
 		MemberID: 2, CredentialID: 3, ModelName: "model-z", BucketTs: 200,
-		ChannelID: 20, PoolID: 200, SchemaVersion: 2, LastSnapshotRevision: 9,
+		ChannelID: 20, PoolID: 200, SchemaVersion: RoutingMetricRollupSchemaVersion, LastSnapshotRevision: 9,
 		RequestCount: 2, SuccessCount: 1, FailureCount: 1, ReliabilityRequestCount: 2,
 		TotalLatencyMs: 100, TtftSumMs: 20, TtftCount: 1,
 		OutputTokens: 10, GenerationMs: 80, Err4xx: 1,
@@ -98,8 +181,8 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	assert.Equal(t, int64(2), lowerWindow[0].RequestCount)
 
 	additive := first
-	additive.SchemaVersion = 1
-	additive.LastSnapshotRevision = 7
+	additive.SchemaVersion = RoutingMetricRollupSchemaVersion
+	additive.LastSnapshotRevision = first.LastSnapshotRevision
 	additive.RequestCount = 10
 	additive.SuccessCount = 0
 	additive.FailureCount = 9
@@ -126,10 +209,10 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 
 	var saved RoutingMetricRollup
 	require.NoError(t, DB.Where(
-		"member_id = ? AND credential_id = ? AND model_name = ? AND bucket_ts = ?",
-		first.MemberID, first.CredentialID, first.ModelName, first.BucketTs,
+		"member_id = ? AND credential_id = ? AND model_name = ? AND bucket_ts = ? AND last_snapshot_revision = ?",
+		first.MemberID, first.CredentialID, first.ModelName, first.BucketTs, first.LastSnapshotRevision,
 	).First(&saved).Error)
-	assert.Equal(t, 2, saved.SchemaVersion)
+	assert.Equal(t, RoutingMetricRollupSchemaVersion, saved.SchemaVersion)
 	assert.Equal(t, int64(9), saved.LastSnapshotRevision)
 	assert.Equal(t, int64(12), saved.RequestCount)
 	assert.Equal(t, int64(1), saved.SuccessCount)
@@ -166,10 +249,26 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	require.True(t, ttftP95.Known)
 	assert.InDelta(t, routingMetricDurationQuantile(t, 0.95, 20, 30, 40), ttftP95.ValueMilliseconds, 0.000001)
 
+	revisionTen := RoutingMetricRollup{
+		MemberID: first.MemberID, CredentialID: first.CredentialID,
+		ModelName: first.ModelName, BucketTs: first.BucketTs,
+		ChannelID: first.ChannelID, PoolID: first.PoolID,
+		SchemaVersion: RoutingMetricRollupSchemaVersion, LastSnapshotRevision: 10,
+		RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+	}
+	require.NoError(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{revisionTen}))
 	window, err := GetRoutingMetricRollupsContext(context.Background(), 2, 3, "model-z", 100, 250)
 	require.NoError(t, err)
-	require.Len(t, window, 1)
+	require.Len(t, window, 2)
 	assert.Equal(t, saved.ID, window[0].ID)
+	assert.Equal(t, int64(9), window[0].LastSnapshotRevision)
+	assert.Equal(t, int64(10), window[1].LastSnapshotRevision)
+	exactRevision, err := GetRoutingMetricRollupsForSnapshotRevisionContext(
+		context.Background(), 2, 3, "model-z", 9, 100, 250,
+	)
+	require.NoError(t, err)
+	require.Len(t, exactRevision, 1)
+	assert.Equal(t, saved.ID, exactRevision[0].ID)
 	keylessWindow, err := GetRoutingMetricRollupsContext(context.Background(), 3, 0, keyless.ModelName, 0, 500)
 	require.NoError(t, err)
 	require.Len(t, keylessWindow, 1)
@@ -186,6 +285,9 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	tooLarge := make([]RoutingMetricRollup, RoutingMetricRollupMaxBatch+1)
 	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), tooLarge), ErrRoutingMetricRollupBatchTooLarge)
 	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{first, first}), ErrRoutingMetricRollupDuplicateKey)
+	distinctRevisions, err := normalizeRoutingMetricRollups([]RoutingMetricRollup{first, revisionTen})
+	require.NoError(t, err)
+	require.Len(t, distinctRevisions, 2)
 	invalid := first
 	invalid.RequestCount = -1
 	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{invalid}), ErrRoutingMetricRollupInvalid)
@@ -197,6 +299,9 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{invalid}), ErrRoutingMetricRollupInvalid)
 	invalid = first
 	invalid.LatencySketch = []byte("not-a-sketch")
+	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{invalid}), ErrRoutingMetricRollupInvalid)
+	invalid = first
+	invalid.LastSnapshotRevision = 0
 	assert.ErrorIs(t, UpsertRoutingMetricRollupsContext(context.Background(), []RoutingMetricRollup{invalid}), ErrRoutingMetricRollupInvalid)
 
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&RoutingMetricRollup{}).Error)
@@ -221,6 +326,269 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	require.NoError(t, DB.Order("bucket_ts asc").Find(&retained).Error)
 	require.Len(t, retained, 1)
 	assert.Equal(t, int64(100_000), retained[0].BucketTs)
+}
+
+type routingMetricRollupLegacyIndex struct {
+	MemberID     int    `gorm:"uniqueIndex:idx_routing_metric_rollup_key,priority:1"`
+	CredentialID int    `gorm:"uniqueIndex:idx_routing_metric_rollup_key,priority:2"`
+	ModelKey     string `gorm:"type:char(64);uniqueIndex:idx_routing_metric_rollup_key,priority:3"`
+	BucketTs     int64  `gorm:"bigint;uniqueIndex:idx_routing_metric_rollup_key,priority:4"`
+}
+
+func (routingMetricRollupLegacyIndex) TableName() string {
+	return "routing_metric_rollups"
+}
+
+type routingMetricRollupV3LegacyNameIndex struct {
+	MemberID             int    `gorm:"uniqueIndex:idx_routing_metric_rollup_key,priority:1"`
+	CredentialID         int    `gorm:"uniqueIndex:idx_routing_metric_rollup_key,priority:2"`
+	ModelKey             string `gorm:"type:char(64);uniqueIndex:idx_routing_metric_rollup_key,priority:3"`
+	BucketTs             int64  `gorm:"bigint;uniqueIndex:idx_routing_metric_rollup_key,priority:4"`
+	LastSnapshotRevision int64  `gorm:"bigint;uniqueIndex:idx_routing_metric_rollup_key,priority:5"`
+}
+
+func (routingMetricRollupV3LegacyNameIndex) TableName() string {
+	return "routing_metric_rollups"
+}
+
+func prepareLegacyRoutingMetricRollupIndex(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&RoutingMetricRollup{}))
+	if db.Migrator().HasIndex(&routingMetricRollupRevisionGuard{}, routingMetricRollupRevisionGuardIndex) {
+		require.NoError(t, db.Migrator().DropIndex(&routingMetricRollupRevisionGuard{}, routingMetricRollupRevisionGuardIndex))
+	}
+	if db.Migrator().HasIndex(&RoutingMetricRollup{}, routingMetricRollupUniqueIndex) {
+		require.NoError(t, db.Migrator().DropIndex(&RoutingMetricRollup{}, routingMetricRollupUniqueIndex))
+	}
+	if db.Migrator().HasIndex(&routingMetricRollupLegacyIndex{}, routingMetricRollupLegacyUniqueIndex) {
+		require.NoError(t, db.Migrator().DropIndex(&routingMetricRollupLegacyIndex{}, routingMetricRollupLegacyUniqueIndex))
+	}
+	require.NoError(t, db.Migrator().CreateIndex(&routingMetricRollupLegacyIndex{}, routingMetricRollupLegacyUniqueIndex))
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.True(t, unique)
+	assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts"}, columns)
+}
+
+func TestRoutingMetricRollupMigrationAcceptsExistingFiveColumnIndex(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	prepareLegacyRoutingMetricRollupIndex(t, db)
+	require.NoError(t, db.Migrator().DropIndex(&routingMetricRollupLegacyIndex{}, routingMetricRollupLegacyUniqueIndex))
+	require.NoError(t, db.Migrator().CreateIndex(&routingMetricRollupV3LegacyNameIndex{}, routingMetricRollupLegacyUniqueIndex))
+
+	require.NoError(t, MigrateRoutingMetricRollupRevisionKey(db))
+	ready, err := RoutingMetricRollupRevisionKeySchemaReady(db)
+	require.NoError(t, err)
+	assert.True(t, ready)
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+	require.NoError(t, err)
+	if exists {
+		assert.True(t, unique)
+		assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
+	}
+	columns, unique, exists, err = routingMetricRollupIndexDefinition(db, routingMetricRollupUniqueIndex)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.True(t, unique)
+	assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
+}
+
+func TestRoutingMetricRollupMigrationResumesFromEveryPhase(t *testing.T) {
+	tests := []struct {
+		name         string
+		expand       bool
+		contract     bool
+		initialReady bool
+	}{
+		{name: "legacy only"},
+		{name: "expanded before legacy drop", expand: true},
+		{name: "contracted before final verification", expand: true, contract: true, initialReady: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openRoutingSQLiteTestDB(t)
+			prepareLegacyRoutingMetricRollupIndex(t, db)
+			if test.expand {
+				require.NoError(t, db.Migrator().CreateIndex(&RoutingMetricRollup{}, routingMetricRollupUniqueIndex))
+			}
+			if test.contract {
+				require.NoError(t, db.Migrator().DropIndex(&RoutingMetricRollup{}, routingMetricRollupLegacyUniqueIndex))
+			}
+
+			ready, err := RoutingMetricRollupRevisionKeySchemaReady(db)
+			require.NoError(t, err)
+			assert.Equal(t, test.initialReady, ready)
+			if test.initialReady {
+				require.NoError(t, WaitRoutingMetricRollupRevisionKeySchemaReady(context.Background(), db, 0))
+			} else {
+				assert.ErrorIs(t, WaitRoutingMetricRollupRevisionKeySchemaReady(context.Background(), db, 0), ErrRoutingMetricRollupSchemaNotReady)
+			}
+
+			if !test.contract {
+				assert.ErrorIs(t, MigrateRoutingMetricRollupRevisionKey(db), ErrRoutingMetricRollupAlphaDrainRequired)
+				columns, unique, exists, indexErr := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+				require.NoError(t, indexErr)
+				assert.True(t, exists)
+				assert.True(t, unique)
+				assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts"}, columns)
+				columns, unique, exists, indexErr = routingMetricRollupIndexDefinition(db, routingMetricRollupUniqueIndex)
+				require.NoError(t, indexErr)
+				assert.True(t, exists)
+				assert.True(t, unique)
+				assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
+			}
+			require.NoError(t, MigrateRoutingMetricRollupRevisionKeyWithOptions(db, RoutingMetricRollupMigrationOptions{
+				AlphaV2Drained: true,
+			}))
+			require.NoError(t, MigrateRoutingMetricRollupRevisionKey(db))
+			ready, err = RoutingMetricRollupRevisionKeySchemaReady(db)
+			require.NoError(t, err)
+			assert.True(t, ready)
+			require.NoError(t, WaitRoutingMetricRollupRevisionKeySchemaReady(context.Background(), db, 0))
+		})
+	}
+}
+
+func TestRoutingMetricRollupMigrationHonorsCanceledContext(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	prepareLegacyRoutingMetricRollupIndex(t, db)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, MigrateRoutingMetricRollupRevisionKeyContext(ctx, db), context.Canceled)
+	assert.ErrorIs(t, WaitRoutingMetricRollupRevisionKeySchemaReady(ctx, db, time.Second), context.Canceled)
+}
+
+func TestRoutingMetricRollupConcurrentMigrationSQLite(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "clean install"
+		if legacy {
+			name = "legacy finalize"
+		}
+		t.Run(name, func(t *testing.T) {
+			dsn := fmt.Sprintf(
+				"file:%s?_busy_timeout=5000&_journal_mode=WAL",
+				filepath.ToSlash(filepath.Join(t.TempDir(), "routing-rollup.db")),
+			)
+			first := openRoutingMetricRollupSQLiteConnection(t, dsn)
+			second := openRoutingMetricRollupSQLiteConnection(t, dsn)
+			runRoutingMetricRollupConcurrentMigrationContract(t, first, second, legacy)
+		})
+	}
+}
+
+func TestRoutingMetricRollupConcurrentMigrationExternalCompatibility(t *testing.T) {
+	tests := []struct {
+		name   string
+		envKey string
+		dbType common.DatabaseType
+	}{
+		{name: "mysql", envKey: "ROUTING_TEST_MYSQL_DSN", dbType: common.DatabaseTypeMySQL},
+		{name: "postgres", envKey: "ROUTING_TEST_POSTGRES_DSN", dbType: common.DatabaseTypePostgreSQL},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := os.Getenv(test.envKey)
+			if dsn == "" {
+				t.Skipf("%s is not set", test.envKey)
+			}
+			first := openRoutingExternalTestDB(t, test.dbType, dsn)
+			second := openRoutingMetricRollupExternalConnection(t, test.dbType, dsn)
+			t.Run("clean install", func(t *testing.T) {
+				runRoutingMetricRollupConcurrentMigrationContract(t, first, second, false)
+			})
+			require.NoError(t, first.Migrator().DropTable(&RoutingMetricRollup{}))
+			t.Run("legacy finalize", func(t *testing.T) {
+				runRoutingMetricRollupConcurrentMigrationContract(t, first, second, true)
+			})
+		})
+	}
+}
+
+func runRoutingMetricRollupConcurrentMigrationContract(t *testing.T, first *gorm.DB, second *gorm.DB, legacy bool) {
+	t.Helper()
+	if legacy {
+		prepareLegacyRoutingMetricRollupIndex(t, first)
+	}
+	ready, err := RoutingMetricRollupRevisionKeySchemaReady(second)
+	require.NoError(t, err)
+	assert.False(t, ready)
+
+	start := make(chan struct{})
+	errorsByConnection := make(chan error, 2)
+	var workers sync.WaitGroup
+	for _, db := range []*gorm.DB{first, second} {
+		workers.Add(1)
+		go func(connection *gorm.DB) {
+			defer workers.Done()
+			<-start
+			options := RoutingMetricRollupMigrationOptions{}
+			if legacy {
+				options.AlphaV2Drained = true
+			}
+			errorsByConnection <- MigrateRoutingMetricRollupRevisionKeyWithOptions(
+				connection,
+				options,
+			)
+		}(db)
+	}
+	close(start)
+	workers.Wait()
+	close(errorsByConnection)
+	for err := range errorsByConnection {
+		require.NoError(t, err)
+	}
+
+	for _, db := range []*gorm.DB{first, second} {
+		ready, err = RoutingMetricRollupRevisionKeySchemaReady(db)
+		require.NoError(t, err)
+		assert.True(t, ready)
+		require.NoError(t, WaitRoutingMetricRollupRevisionKeySchemaReady(context.Background(), db, 0))
+		require.NoError(t, MigrateRoutingMetricRollupRevisionKey(db))
+	}
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(first, routingMetricRollupUniqueIndex)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.True(t, unique)
+	assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
+	_, _, exists, err = routingMetricRollupIndexDefinition(first, routingMetricRollupLegacyUniqueIndex)
+	require.NoError(t, err)
+	assert.False(t, exists)
+}
+
+func openRoutingMetricRollupSQLiteConnection(t *testing.T, dsn string) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	return db
+}
+
+func openRoutingMetricRollupExternalConnection(t *testing.T, dbType common.DatabaseType, dsn string) *gorm.DB {
+	t.Helper()
+	var (
+		db  *gorm.DB
+		err error
+	)
+	switch dbType {
+	case common.DatabaseTypeMySQL:
+		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	case common.DatabaseTypePostgreSQL:
+		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	default:
+		t.Fatalf("unsupported external routing test database type %q", dbType)
+	}
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Ping())
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	return db
 }
 
 func routingMetricDurationSketch(t *testing.T, values ...int64) []byte {
@@ -248,11 +616,12 @@ func routingMetricDurationQuantile(t *testing.T, quantile float64, values ...int
 func TestNormalizeRoutingMetricRollupsSortsUniqueLockKeys(t *testing.T) {
 	now := time.Unix(10_000, 0)
 	rollups := []RoutingMetricRollup{
-		{MemberID: 2, CredentialID: 2, ModelName: "model-b", BucketTs: 20, ChannelID: 2, PoolID: 1, RequestCount: 1},
-		{MemberID: 1, CredentialID: 2, ModelName: "model-b", BucketTs: 30, ChannelID: 1, PoolID: 1, RequestCount: 1},
-		{MemberID: 1, CredentialID: 1, ModelName: "model-z", BucketTs: 30, ChannelID: 1, PoolID: 1, RequestCount: 1},
-		{MemberID: 1, CredentialID: 1, ModelName: "model-a", BucketTs: 40, ChannelID: 1, PoolID: 1, RequestCount: 1},
-		{MemberID: 1, CredentialID: 1, ModelName: "model-a", BucketTs: 10, ChannelID: 1, PoolID: 1, RequestCount: 1},
+		{MemberID: 2, CredentialID: 2, ModelName: "model-b", BucketTs: 20, ChannelID: 2, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1},
+		{MemberID: 1, CredentialID: 2, ModelName: "model-b", BucketTs: 30, ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1},
+		{MemberID: 1, CredentialID: 1, ModelName: "model-z", BucketTs: 30, ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1},
+		{MemberID: 1, CredentialID: 1, ModelName: "model-a", BucketTs: 40, ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1},
+		{MemberID: 1, CredentialID: 1, ModelName: "model-a", BucketTs: 10, ChannelID: 1, PoolID: 1, LastSnapshotRevision: 2, RequestCount: 1},
+		{MemberID: 1, CredentialID: 1, ModelName: "model-a", BucketTs: 10, ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1},
 	}
 
 	normalized, err := normalizeRoutingMetricRollupsAt(rollups, now)
@@ -265,23 +634,24 @@ func TestNormalizeRoutingMetricRollupsSortsUniqueLockKeys(t *testing.T) {
 			left.MemberID < right.MemberID ||
 				(left.MemberID == right.MemberID && left.CredentialID < right.CredentialID) ||
 				(left.MemberID == right.MemberID && left.CredentialID == right.CredentialID && left.ModelKey < right.ModelKey) ||
-				(left.MemberID == right.MemberID && left.CredentialID == right.CredentialID && left.ModelKey == right.ModelKey && left.BucketTs < right.BucketTs),
+				(left.MemberID == right.MemberID && left.CredentialID == right.CredentialID && left.ModelKey == right.ModelKey && left.BucketTs < right.BucketTs) ||
+				(left.MemberID == right.MemberID && left.CredentialID == right.CredentialID && left.ModelKey == right.ModelKey && left.BucketTs == right.BucketTs && left.LastSnapshotRevision < right.LastSnapshotRevision),
 		)
 	}
-	modelABuckets := make([]int64, 0, 2)
+	modelAKeys := make([][2]int64, 0, 3)
 	for index := range normalized {
 		if normalized[index].MemberID == 1 && normalized[index].CredentialID == 1 && normalized[index].ModelName == "model-a" {
-			modelABuckets = append(modelABuckets, normalized[index].BucketTs)
+			modelAKeys = append(modelAKeys, [2]int64{normalized[index].BucketTs, normalized[index].LastSnapshotRevision})
 		}
 	}
-	assert.Equal(t, []int64{10, 40}, modelABuckets)
+	assert.Equal(t, [][2]int64{{10, 1}, {10, 2}, {40, 1}}, modelAKeys)
 }
 
 func TestNormalizeRoutingMetricRollupsRejectsFutureBucketAndAcceptsHistory(t *testing.T) {
 	now := time.Unix(100_000, 0)
 	rollup := RoutingMetricRollup{
 		MemberID: 1, CredentialID: 1, ModelName: "model-time", BucketTs: 1,
-		ChannelID: 1, PoolID: 1, RequestCount: 1,
+		ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1,
 	}
 	_, err := normalizeRoutingMetricRollupsAt([]RoutingMetricRollup{rollup}, now)
 	require.NoError(t, err)
@@ -295,7 +665,7 @@ func TestNormalizeRoutingMetricRollupsRejectsUnknownSchemaAndImpossibleCounters(
 	base := RoutingMetricRollup{
 		MemberID: 1, CredentialID: 1, ModelName: "model-invariants", BucketTs: 1,
 		ChannelID: 1, PoolID: 1, SchemaVersion: RoutingMetricRollupSchemaVersion,
-		RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+		LastSnapshotRevision: 1, RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
 	}
 	tests := []struct {
 		name   string
@@ -349,6 +719,9 @@ func TestNormalizeRoutingMetricRollupsRejectsUnknownSchemaAndImpossibleCounters(
 	legacy := base
 	legacy.SchemaVersion = 1
 	_, err := normalizeRoutingMetricRollups([]RoutingMetricRollup{legacy})
+	require.NoError(t, err)
+	legacy.SchemaVersion = 2
+	_, err = normalizeRoutingMetricRollups([]RoutingMetricRollup{legacy})
 	require.NoError(t, err)
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	globalsetting "github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
@@ -175,6 +177,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	sort.Ints(excludedIDs)
 	capacityExcluded := make([]int, 0, len(allowedIDs))
 	probeExcluded := make([]int, 0, len(allowedIDs))
+	capacityInput, capacityOutput := routingCapacityTokenEstimate(param.Ctx)
 	var lastProbeErr error
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, planActive, planErr := session.Plan(channelrouting.RequestRoutingPlanInput{
@@ -184,6 +187,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			RetryIndex:                 param.GetRetry(),
 			PromptTokenEstimate:        max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
 			CompletionTokenEstimate:    max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+			CostProfile:                routingCostRequestProfile(param.Ctx),
 			AllowedChannelIDs:          allowedIDs,
 			ExcludedChannelIDs:         excludedIDs,
 			CapacityExcludedChannelIDs: capacityExcluded,
@@ -208,6 +212,17 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		selected := channelByID[plan.Result.SelectedChannelID]
 		if selected == nil || plan.SelectedIdentity.MemberID <= 0 || plan.SelectedIdentity.PoolID != gate.PoolID {
 			return nil, true, true, channelrouting.ErrRoutingSessionInvalid
+		}
+		capacityModelName := param.ModelName
+		if strings.HasSuffix(capacityModelName, ratio_setting.CompactModelSuffix) {
+			capacityModelName = strings.TrimSuffix(capacityModelName, ratio_setting.CompactModelSuffix)
+		}
+		upstreamModelName, _, mappingErr := model.ResolveChannelModelMapping(selected.GetModelMapping(), capacityModelName)
+		if mappingErr != nil {
+			return nil, true, true, fmt.Errorf("channel routing upstream model mapping failed: %w", mappingErr)
+		}
+		if strings.TrimSpace(upstreamModelName) == "" {
+			return nil, true, true, errors.New("channel routing upstream model mapping is empty")
 		}
 		var selectedCandidate *channelrouting.ShadowCandidateInput
 		for candidateIndex := range plan.Replay.Candidates {
@@ -237,6 +252,9 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			ChannelID: selected.Id, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 			Model: param.ModelName, Group: group,
 		}
+		if plan.SelectedBreakerScope == channelrouting.BreakerScopeEndpoint {
+			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
+		}
 		probeAcquired, probeErr := acquireRoutingHalfOpenProbeForKey(
 			param.Ctx, probeKey, selectedBreaker, probeSettings, true,
 		)
@@ -249,11 +267,39 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			continue
 		}
 
+		inputDemand, demandErr := capacityInput.Demand(canaryPolicy.Capacity.InputTPM)
+		if demandErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, true, fmt.Errorf("channel routing input capacity estimate failed: %w", demandErr)
+		}
+		outputDemand, demandErr := capacityOutput.Demand(canaryPolicy.Capacity.OutputTPM)
+		if demandErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, true, fmt.Errorf("channel routing output capacity estimate failed: %w", demandErr)
+		}
 		demand := channelrouting.Demand{
 			RPM:       1,
-			InputTPM:  int64(max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)),
-			OutputTPM: int64(max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)),
+			InputTPM:  inputDemand,
+			OutputTPM: outputDemand,
 			Inflight:  1,
+		}
+		adaptiveLease, adaptiveErr := reserveRoutingAdaptiveConcurrency(
+			gate.PolicyRevision,
+			canaryPolicy,
+			plan.SelectedIdentity,
+			selected.Id,
+			param.ModelName,
+			upstreamModelName,
+			nil,
+		)
+		if adaptiveErr != nil {
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			if errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyExhausted) ||
+				errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyConflict) {
+				capacityExcluded = append(capacityExcluded, selected.Id)
+				continue
+			}
+			return nil, true, true, fmt.Errorf("channel routing adaptive concurrency admission failed: %w", adaptiveErr)
 		}
 		reservation, reserveErr := channelRoutingCanaryRuntime.tryReserve(gate.PolicyRevision, canaryPolicy, channelrouting.CapacityKey{
 			PoolID:   plan.SelectedIdentity.PoolID,
@@ -261,6 +307,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			Model:    param.ModelName,
 		}, demand)
 		if reserveErr != nil {
+			_ = adaptiveLease.Release()
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 			if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
 				errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {
@@ -272,8 +319,15 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		admission := reservation.Admission()
 		if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
 			cancelErr := reservation.Cancel()
+			adaptiveErr = adaptiveLease.Release()
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
-			return nil, true, true, errors.Join(err, cancelErr)
+			return nil, true, true, errors.Join(err, cancelErr, adaptiveErr)
+		}
+		if err := AttachRoutingAdaptiveConcurrency(param.Ctx, adaptiveLease); err != nil {
+			cancelErr := CancelRoutingCapacityReservation(param.Ctx)
+			adaptiveErr = adaptiveLease.Release()
+			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+			return nil, true, true, errors.Join(err, cancelErr, adaptiveErr)
 		}
 		if err := PrepareChannelRoutingCanarySelection(param.Ctx, ChannelRoutingCanarySelection{
 			Gate:              gate,
@@ -287,7 +341,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			return nil, true, true, errors.Join(err, cancelErr)
 		}
 		if routingselector.BreakerNeedsHalfOpenProbe(selectedBreaker, probeSettings) {
-			if err := channelRoutingCanaryRuntime.startRecovery(gate.PolicyRevision, canaryPolicy, channelrouting.SlowStartKey{
+			if err := prepareRoutingSlowStartProbe(param.Ctx, selected.Id, gate.PolicyRevision, canaryPolicy, channelrouting.SlowStartKey{
 				PoolID: gate.PoolID, MemberID: plan.SelectedIdentity.MemberID, Model: param.ModelName,
 			}); err != nil {
 				cancelErr := CancelRoutingCapacityReservation(param.Ctx)
@@ -439,7 +493,8 @@ func enqueueChannelRoutingCanaryDecision(
 	admission *channelrouting.CapacityAdmission,
 ) {
 	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(plan.Replay, plan.Result.SelectedChannelID)
-	_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+	selectedCostEstimate, _ := channelrouting.ShadowCostEstimateForChannel(plan.Replay, plan.Result.SelectedChannelID)
+	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
 		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
 		PoolID:               plan.Gate.PoolID,
 		GroupName:            group,
@@ -460,13 +515,18 @@ func enqueueChannelRoutingCanaryDecision(
 		ActualExpectedCost:   actualCost,
 		ObservedCostKnown:    plan.Result.SelectedCostKnown,
 		ObservedExpectedCost: plan.Result.SelectedCost,
+		ActualCostEstimate:   selectedCostEstimate,
+		ObservedCostEstimate: selectedCostEstimate,
 		Gate:                 &plan.Gate,
 		SelectedIdentity:     plan.SelectedIdentity,
 		CapacityAdmission:    admission,
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing canary audit dropped: %v", err))
+		return
 	}
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmCanaryV1)
 }
 
 func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selected *model.Channel) error {
@@ -530,7 +590,7 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 	}); err != nil {
 		return err
 	}
-	_, err = channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
 		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
 		PoolID:               gate.PoolID,
 		GroupName:            group,
@@ -552,6 +612,9 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing control audit dropped: %v", err))
+		return nil
 	}
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmCanaryV1)
 	return nil
 }

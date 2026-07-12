@@ -5,8 +5,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/channelrouting"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -14,6 +18,7 @@ const (
 	channelRoutingCanaryShards               = 64
 	channelRoutingCanaryMaxSlowStartRuntimes = 4_096
 	channelRoutingCanaryCapacityIdleTTL      = 15 * time.Minute
+	channelRoutingAdaptiveIdleTTL            = 30 * time.Minute
 )
 
 var errChannelRoutingCanaryRuntimeFull = errors.New("channel routing canary runtime capacity reached")
@@ -30,8 +35,16 @@ type channelRoutingCanarySlowStartRuntime struct {
 	lastUsed time.Time
 }
 
+type channelRoutingSlowStartProbe struct {
+	ChannelID      int
+	PolicyRevision uint64
+	Policy         model.RoutingCanaryPolicy
+	Key            channelrouting.SlowStartKey
+}
+
 type channelRoutingCanaryRuntimeManager struct {
 	capacity *channelrouting.CapacityTracker
+	adaptive *channelrouting.AdaptiveConcurrencyController
 	clock    channelrouting.Clock
 
 	slowStartMu      sync.Mutex
@@ -59,11 +72,86 @@ func newChannelRoutingCanaryRuntimeManager(clock channelrouting.Clock) (*channel
 	if err != nil {
 		return nil, err
 	}
+	adaptive, err := channelrouting.NewAdaptiveConcurrencyController(channelrouting.AdaptiveConcurrencyConfig{
+		MaxEntries: channelRoutingCanaryMaxEntries,
+		IdleTTL:    channelRoutingAdaptiveIdleTTL,
+		Shards:     channelRoutingCanaryShards,
+		Clock:      clock,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &channelRoutingCanaryRuntimeManager{
 		capacity:   capacity,
+		adaptive:   adaptive,
 		clock:      clock,
 		slowStarts: make(map[channelRoutingCanaryRuntimeKey]*channelRoutingCanarySlowStartRuntime),
 	}, nil
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) tryAcquireAdaptiveConcurrency(
+	policyRevision uint64,
+	policy model.RoutingCanaryPolicy,
+	identity channelrouting.Identity,
+	channelID int,
+	modelName string,
+	upstreamModelName string,
+	strictRequest *channelrouting.StrictCapacityRequest,
+) (*channelrouting.AdaptiveConcurrencyLeaseSet, error) {
+	if manager == nil || manager.adaptive == nil || policyRevision == 0 ||
+		identity.SnapshotRevision != policyRevision || identity.PoolID <= 0 || identity.MemberID <= 0 ||
+		channelID <= 0 || modelName == "" {
+		return nil, channelrouting.ErrAdaptiveConcurrencyInvalid
+	}
+	normalized, err := model.NormalizeRoutingCanaryPolicy(policy)
+	if err != nil || normalized.Capacity.Inflight <= 0 {
+		return nil, channelrouting.ErrAdaptiveConcurrencyInvalid
+	}
+	targets := []channelrouting.AdaptiveConcurrencyTarget{{
+		Key: channelrouting.AdaptiveConcurrencyKey{
+			PolicyRevision: policyRevision,
+			Scope:          channelrouting.AdaptiveConcurrencyScopeMemberModel,
+			PoolID:         identity.PoolID,
+			MemberID:       identity.MemberID,
+			Model:          modelName,
+		},
+		Policy: channelrouting.DefaultAdaptiveConcurrencyPolicy(normalized.Capacity.Inflight),
+	}}
+	sharedMaximum := normalized.Capacity.Inflight
+	sharedKey := channelrouting.AdaptiveConcurrencyKey{
+		PolicyRevision: policyRevision,
+		Scope:          channelrouting.AdaptiveConcurrencyScopeSharedResource,
+		ChannelID:      channelID,
+		CredentialID:   identity.CredentialID,
+		Model:          upstreamModelName,
+	}
+	if strictRequest != nil {
+		sharedMaximum = strictRequest.Limit.Inflight
+		sharedKey.ChannelID = 0
+		sharedKey.AccountID = strictRequest.Key.AccountID
+		sharedKey.CredentialID = strictRequest.Key.CredentialID
+		sharedKey.Model = strictRequest.Key.Model
+	}
+	if sharedKey.Model == "" {
+		sharedKey.Model = modelName
+	}
+	if sharedMaximum <= 0 {
+		return nil, channelrouting.ErrAdaptiveConcurrencyInvalid
+	}
+	targets = append(targets, channelrouting.AdaptiveConcurrencyTarget{
+		Key: sharedKey, Policy: channelrouting.DefaultAdaptiveConcurrencyPolicy(sharedMaximum),
+	})
+	return manager.adaptive.TryAcquire(targets)
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) observeAdaptiveConcurrency(
+	targets []channelrouting.AdaptiveConcurrencyTarget,
+	signal channelrouting.AdaptiveConcurrencySignal,
+) {
+	if manager == nil || manager.adaptive == nil || len(targets) == 0 {
+		return
+	}
+	manager.adaptive.Observe(targets, signal)
 }
 
 func (manager *channelRoutingCanaryRuntimeManager) tryReserve(
@@ -144,6 +232,89 @@ func (manager *channelRoutingCanaryRuntimeManager) startRecovery(
 	}
 	_, err = runtime.tracker.StartRecovery(key)
 	return err
+}
+
+func (manager *channelRoutingCanaryRuntimeManager) observeSlowStartProbe(
+	policyRevision uint64,
+	policy model.RoutingCanaryPolicy,
+	key channelrouting.SlowStartKey,
+	healthy bool,
+	hardFailure bool,
+) error {
+	if manager == nil || policyRevision == 0 || key.PoolID <= 0 || (!healthy && !hardFailure) {
+		if !healthy && !hardFailure {
+			return nil
+		}
+		return channelrouting.ErrSlowStartInvalidKey
+	}
+	normalized, err := model.NormalizeRoutingCanaryPolicy(policy)
+	if err != nil {
+		return channelrouting.ErrSlowStartInvalidPolicy
+	}
+	now := manager.now()
+	manager.slowStartMu.Lock()
+	defer manager.slowStartMu.Unlock()
+	manager.pruneSlowStartsLocked(now)
+	runtimeKey, runtime, err := manager.slowStartRuntimeLocked(policyRevision, normalized, key.PoolID, now)
+	if err != nil {
+		return err
+	}
+	if _, err := manager.registerSlowStartKeyLocked(runtimeKey, runtime, key); err != nil {
+		return err
+	}
+	if hardFailure {
+		_, err = runtime.tracker.MarkHardFailure(key)
+		return err
+	}
+	if _, exists := runtime.tracker.State(key); !exists {
+		_, err = runtime.tracker.StartRecovery(key)
+		return err
+	}
+	_, err = runtime.tracker.MarkHealthy(key)
+	return err
+}
+
+func prepareRoutingSlowStartProbe(
+	c *gin.Context,
+	channelID int,
+	policyRevision uint64,
+	policy model.RoutingCanaryPolicy,
+	key channelrouting.SlowStartKey,
+) error {
+	if c == nil || channelID <= 0 || policyRevision == 0 || key.PoolID <= 0 || key.MemberID <= 0 || key.Model == "" {
+		return channelrouting.ErrSlowStartInvalidKey
+	}
+	if _, err := model.NormalizeRoutingCanaryPolicy(policy); err != nil {
+		return channelrouting.ErrSlowStartInvalidPolicy
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingSlowStartProbe, channelRoutingSlowStartProbe{
+		ChannelID: channelID, PolicyRevision: policyRevision, Policy: policy, Key: key,
+	})
+	return nil
+}
+
+func ObserveRoutingSlowStartProbe(c *gin.Context, healthy bool, hardFailure bool) error {
+	if c == nil {
+		return nil
+	}
+	probe, ok := common.GetContextKeyType[channelRoutingSlowStartProbe](c, constant.ContextKeyRoutingSlowStartProbe)
+	if !ok {
+		return nil
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingSlowStartProbe, nil)
+	return channelRoutingCanaryRuntime.observeSlowStartProbe(
+		probe.PolicyRevision, probe.Policy, probe.Key, healthy, hardFailure,
+	)
+}
+
+func clearRoutingSlowStartProbe(c *gin.Context, channelID int) {
+	if c == nil {
+		return
+	}
+	probe, ok := common.GetContextKeyType[channelRoutingSlowStartProbe](c, constant.ContextKeyRoutingSlowStartProbe)
+	if ok && (channelID <= 0 || probe.ChannelID == channelID) {
+		common.SetContextKey(c, constant.ContextKeyRoutingSlowStartProbe, nil)
+	}
 }
 
 func (manager *channelRoutingCanaryRuntimeManager) slowStartRuntimeLocked(

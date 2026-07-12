@@ -19,10 +19,17 @@ import (
 )
 
 const (
-	RoutingMetricRollupSchemaVersion     = 2
+	RoutingMetricRollupSchemaVersion     = 3
 	RoutingMetricRollupMaxBatch          = 500
 	RoutingMetricRollupDefaultQueryLimit = 1_000
 	RoutingMetricRollupMaxQueryLimit     = 200_000
+
+	routingMetricRollupLegacyUniqueIndex    = "idx_routing_metric_rollup_key"
+	routingMetricRollupUniqueIndex          = "idx_routing_metric_rollup_revision_key"
+	routingMetricRollupRevisionGuardIndex   = "idx_routing_metric_rollup_revision_guard"
+	routingMetricRollupMigrationMaxAttempts = 20
+	routingMetricRollupMigrationRetryDelay  = 50 * time.Millisecond
+	routingMetricRollupSchemaPollInterval   = 50 * time.Millisecond
 
 	routingMetricRollupRetentionBatchSize = 500
 	routingMetricRollupModelNameMaxRunes  = 128
@@ -35,26 +42,36 @@ const (
 )
 
 var (
-	ErrRoutingMetricRollupBatchTooLarge = errors.New("routing metric rollup batch exceeds limit")
-	ErrRoutingMetricRollupDuplicateKey  = errors.New("routing metric rollup batch contains duplicate key")
-	ErrRoutingMetricRollupInvalid       = errors.New("invalid routing metric rollup")
-	ErrRoutingMetricRollupQueryTooLarge = errors.New("routing metric rollup query exceeds limit")
-	ErrRoutingMetricRollupOverflow      = errors.New("routing metric rollup counter overflow")
+	ErrRoutingMetricRollupBatchTooLarge      = errors.New("routing metric rollup batch exceeds limit")
+	ErrRoutingMetricRollupDuplicateKey       = errors.New("routing metric rollup batch contains duplicate key")
+	ErrRoutingMetricRollupInvalid            = errors.New("invalid routing metric rollup")
+	ErrRoutingMetricRollupQueryTooLarge      = errors.New("routing metric rollup query exceeds limit")
+	ErrRoutingMetricRollupOverflow           = errors.New("routing metric rollup counter overflow")
+	ErrRoutingMetricRollupSchemaNotReady     = errors.New("routing metric rollup revision-key schema is not ready")
+	ErrRoutingMetricRollupAlphaDrainRequired = errors.New("routing metric rollup alpha-v2 writers and telemetry must be drained")
 )
+
+type RoutingMetricRollupMigrationOptions struct {
+	// AlphaV2Drained must only be set after old writers have stopped and their
+	// telemetry backlog has been fully drained.
+	AlphaV2Drained bool
+}
 
 // RoutingMetricRollup stores mergeable counters keyed by stable routing identities.
 // Percentiles are intentionally excluded because scalar percentiles are not mergeable.
 type RoutingMetricRollup struct {
-	ID                   int    `json:"id" gorm:"primaryKey"`
-	MemberID             int    `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_key,priority:1;index"`
-	CredentialID         int    `json:"credential_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_key,priority:2;index"`
-	ModelName            string `json:"model_name" gorm:"type:varchar(128);not null;index"`
-	ModelKey             string `json:"-" gorm:"type:char(64);not null;uniqueIndex:idx_routing_metric_rollup_key,priority:3"`
-	BucketTs             int64  `json:"bucket_ts" gorm:"bigint;not null;uniqueIndex:idx_routing_metric_rollup_key,priority:4;index:idx_routing_metric_rollup_bucket_ts"`
-	ChannelID            int    `json:"channel_id" gorm:"not null;index"`
-	PoolID               int    `json:"pool_id" gorm:"not null;index"`
-	SchemaVersion        int    `json:"schema_version" gorm:"not null"`
-	LastSnapshotRevision int64  `json:"last_snapshot_revision" gorm:"bigint;not null;index"`
+	ID            int    `json:"id" gorm:"primaryKey"`
+	MemberID      int    `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:1;index"`
+	CredentialID  int    `json:"credential_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:2;index"`
+	ModelName     string `json:"model_name" gorm:"type:varchar(128);not null;index"`
+	ModelKey      string `json:"-" gorm:"type:char(64);not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:3"`
+	BucketTs      int64  `json:"bucket_ts" gorm:"bigint;not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:4;index:idx_routing_metric_rollup_bucket_ts"`
+	ChannelID     int    `json:"channel_id" gorm:"not null;index"`
+	PoolID        int    `json:"pool_id" gorm:"not null;index"`
+	SchemaVersion int    `json:"schema_version" gorm:"not null"`
+	// LastSnapshotRevision keeps its legacy column/API name, but schema v3 treats
+	// it as the exact snapshot revision and the fifth physical rollup key.
+	LastSnapshotRevision int64  `json:"last_snapshot_revision" gorm:"bigint;not null;index;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:5"`
 	SketchCodecVersion   int    `json:"sketch_codec_version"`
 	LatencySampleCount   int64  `json:"latency_sample_count"`
 	LatencySketch        []byte `json:"latency_sketch"`
@@ -80,8 +97,555 @@ type RoutingMetricRollup struct {
 	RetryAfterTotalMs       int64 `json:"retry_after_total_ms" gorm:"not null"`
 }
 
+type RoutingMetricReliabilityAggregate struct {
+	RequestCount int64 `json:"request_count"`
+	FailureCount int64 `json:"failure_count"`
+}
+
+func AggregateRoutingMetricReliabilityContext(
+	ctx context.Context,
+	poolID int,
+	fromUnix int64,
+	toUnix int64,
+) (RoutingMetricReliabilityAggregate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if poolID <= 0 || fromUnix < 0 || toUnix <= fromUnix {
+		return RoutingMetricReliabilityAggregate{}, ErrRoutingMetricRollupInvalid
+	}
+	var aggregate RoutingMetricReliabilityAggregate
+	err := DB.WithContext(ctx).Model(&RoutingMetricRollup{}).
+		Select(
+			"COALESCE(SUM(reliability_request_count), 0) AS request_count, "+
+				"COALESCE(SUM(reliability_failure_count), 0) AS failure_count",
+		).
+		Where("pool_id = ? AND bucket_ts >= ? AND bucket_ts < ?", poolID, fromUnix, toUnix).
+		Scan(&aggregate).Error
+	if err != nil {
+		return RoutingMetricReliabilityAggregate{}, err
+	}
+	if aggregate.RequestCount < 0 || aggregate.FailureCount < 0 || aggregate.FailureCount > aggregate.RequestCount {
+		return RoutingMetricReliabilityAggregate{}, ErrRoutingMetricRollupInvalid
+	}
+	return aggregate, nil
+}
+
 func (RoutingMetricRollup) TableName() string {
 	return "routing_metric_rollups"
+}
+
+type routingMetricRollupRevisionGuard struct {
+	MemberID             int    `gorm:"uniqueIndex:idx_routing_metric_rollup_revision_guard,priority:1"`
+	CredentialID         int    `gorm:"uniqueIndex:idx_routing_metric_rollup_revision_guard,priority:2"`
+	ModelKey             string `gorm:"type:char(64);uniqueIndex:idx_routing_metric_rollup_revision_guard,priority:3"`
+	BucketTs             int64  `gorm:"bigint;uniqueIndex:idx_routing_metric_rollup_revision_guard,priority:4"`
+	LastSnapshotRevision int64  `gorm:"bigint;uniqueIndex:idx_routing_metric_rollup_revision_guard,priority:5"`
+}
+
+func (routingMetricRollupRevisionGuard) TableName() string {
+	return "routing_metric_rollups"
+}
+
+// MigrateRoutingMetricRollupRevisionKey finalizes the legacy four-column
+// identity as the schema-v3 revision-isolated identity. The v3 index has a new
+// physical name so concurrent masters can expand before any of them contracts
+// the legacy index. Every failed DDL operation is followed by a state read;
+// another master completing that phase therefore counts as success.
+//
+// PostgreSQL and SQLite writers compiled against the four-column ON CONFLICT
+// target cannot coexist with the finalized index. The caller must first stop or
+// upgrade those alpha writers and drain their telemetry queue. This helper does
+// not rewrite legacy rows or claim mixed v1/v2 buckets are revision-isolated.
+// The central migration path should call it after the rollout gate described
+// above. Interrupted runs are safe to resume and completed runs are idempotent.
+func MigrateRoutingMetricRollupRevisionKey(db *gorm.DB) error {
+	return MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
+		context.Background(), db, RoutingMetricRollupMigrationOptions{},
+	)
+}
+
+func MigrateRoutingMetricRollupRevisionKeyContext(ctx context.Context, db *gorm.DB) error {
+	return MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
+		ctx, db, RoutingMetricRollupMigrationOptions{},
+	)
+}
+
+func MigrateRoutingMetricRollupRevisionKeyWithOptions(
+	db *gorm.DB,
+	options RoutingMetricRollupMigrationOptions,
+) error {
+	return MigrateRoutingMetricRollupRevisionKeyContextWithOptions(context.Background(), db, options)
+}
+
+func MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
+	ctx context.Context,
+	db *gorm.DB,
+	options RoutingMetricRollupMigrationOptions,
+) error {
+	if db == nil || db.Dialector == nil {
+		return ErrRoutingMetricRollupInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db = db.WithContext(ctx)
+	desiredColumns := []string{
+		"member_id",
+		"credential_id",
+		"model_key",
+		"bucket_ts",
+		"last_snapshot_revision",
+	}
+	legacyColumns := desiredColumns[:len(desiredColumns)-1]
+
+	var lastErr error
+	var (
+		legacyIndexColumns []string
+		legacyIndexUnique  bool
+		legacyIndexExists  bool
+		err                error
+	)
+	for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+		legacyIndexColumns, legacyIndexUnique, legacyIndexExists, err = routingMetricRollupIndexDefinition(
+			db, routingMetricRollupLegacyUniqueIndex,
+		)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("inspect legacy routing metric rollup index: %w", lastErr)
+	}
+	legacyIndexIsV2 := legacyIndexExists && legacyIndexUnique &&
+		routingMetricRollupIndexColumnsEqual(legacyIndexColumns, legacyColumns)
+	if legacyIndexExists && !legacyIndexIsV2 &&
+		(!legacyIndexUnique || !routingMetricRollupIndexColumnsEqual(legacyIndexColumns, desiredColumns)) {
+		return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupLegacyUniqueIndex)
+	}
+
+	columnsReady := false
+	for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+		columnsReady, err = routingMetricRollupRevisionKeyColumnsReady(db)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("inspect routing metric rollup columns: %w", lastErr)
+	}
+	if legacyIndexIsV2 && !columnsReady && !options.AlphaV2Drained {
+		return ErrRoutingMetricRollupAlphaDrainRequired
+	}
+	if !legacyIndexIsV2 || !columnsReady {
+		columnsReady = false
+		for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+			migrationErr := db.AutoMigrate(&RoutingMetricRollup{})
+			var readErr error
+			columnsReady, readErr = routingMetricRollupRevisionKeyColumnsReady(db)
+			if columnsReady {
+				break
+			}
+			if readErr != nil {
+				lastErr = readErr
+			} else if migrationErr != nil {
+				lastErr = migrationErr
+			} else {
+				lastErr = ErrRoutingMetricRollupSchemaNotReady
+			}
+			if migrationErr != nil && !isRetryableRoutingMetricMigrationError(migrationErr) && readErr == nil {
+				return fmt.Errorf("migrate routing metric rollup columns: %w", migrationErr)
+			}
+			if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+				return err
+			}
+		}
+	}
+	if !columnsReady {
+		return fmt.Errorf("migrate routing metric rollup columns: %w", lastErr)
+	}
+
+	indexReady := false
+	for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+		columns, unique, exists, readErr := routingMetricRollupIndexDefinition(db, routingMetricRollupUniqueIndex)
+		if readErr == nil && exists && unique && routingMetricRollupIndexColumnsEqual(columns, desiredColumns) {
+			indexReady = true
+			break
+		}
+		if readErr == nil && exists {
+			return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupUniqueIndex)
+		}
+
+		migrationErr := readErr
+		if readErr == nil {
+			migrationErr = db.Migrator().CreateIndex(&RoutingMetricRollup{}, routingMetricRollupUniqueIndex)
+		}
+		columns, unique, exists, readErr = routingMetricRollupIndexDefinition(db, routingMetricRollupUniqueIndex)
+		if readErr == nil && exists && unique && routingMetricRollupIndexColumnsEqual(columns, desiredColumns) {
+			indexReady = true
+			break
+		}
+		if readErr == nil && exists {
+			return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupUniqueIndex)
+		}
+		if readErr != nil {
+			lastErr = readErr
+		} else if migrationErr != nil {
+			lastErr = migrationErr
+		} else {
+			lastErr = ErrRoutingMetricRollupSchemaNotReady
+		}
+		if migrationErr != nil && !isRetryableRoutingMetricMigrationError(migrationErr) && readErr == nil {
+			return fmt.Errorf("create revision-isolated routing metric rollup index: %w", migrationErr)
+		}
+		if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	if !indexReady {
+		return fmt.Errorf("create revision-isolated routing metric rollup index: %w", lastErr)
+	}
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+	if err != nil {
+		return err
+	}
+	if exists && unique && routingMetricRollupIndexColumnsEqual(columns, legacyColumns) && !options.AlphaV2Drained {
+		return ErrRoutingMetricRollupAlphaDrainRequired
+	}
+
+	legacyRemoved := false
+	for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+		columns, unique, exists, readErr := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+		if readErr == nil && (!exists || unique && routingMetricRollupIndexColumnsEqual(columns, desiredColumns)) {
+			legacyRemoved = true
+			break
+		}
+		if readErr == nil && (!unique || !routingMetricRollupIndexColumnsEqual(columns, legacyColumns)) {
+			return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupLegacyUniqueIndex)
+		}
+
+		migrationErr := readErr
+		if readErr == nil {
+			migrationErr = db.Migrator().DropIndex(&RoutingMetricRollup{}, routingMetricRollupLegacyUniqueIndex)
+		}
+		columns, unique, exists, readErr = routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+		if readErr == nil && (!exists || unique && routingMetricRollupIndexColumnsEqual(columns, desiredColumns)) {
+			legacyRemoved = true
+			break
+		}
+		if readErr == nil && exists && (!unique || !routingMetricRollupIndexColumnsEqual(columns, legacyColumns)) {
+			return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupLegacyUniqueIndex)
+		}
+		if readErr != nil {
+			lastErr = readErr
+		} else if migrationErr != nil {
+			lastErr = migrationErr
+		} else {
+			lastErr = ErrRoutingMetricRollupSchemaNotReady
+		}
+		if migrationErr != nil && !isRetryableRoutingMetricMigrationError(migrationErr) && readErr == nil {
+			return fmt.Errorf("drop legacy routing metric rollup index: %w", migrationErr)
+		}
+		if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	if !legacyRemoved {
+		return fmt.Errorf("drop legacy routing metric rollup index: %w", lastErr)
+	}
+
+	for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
+		ready, readErr := RoutingMetricRollupRevisionKeySchemaReady(db)
+		if ready {
+			return nil
+		}
+		if readErr != nil {
+			lastErr = readErr
+		} else {
+			lastErr = ErrRoutingMetricRollupSchemaNotReady
+		}
+		if err := waitRoutingMetricRollupMigrationRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("verify routing metric rollup revision-key schema: %w", lastErr)
+}
+
+// RoutingMetricRollupRevisionKeySchemaReady reports whether v3 writers can use
+// the exact five-column conflict target. It fails closed while a legacy
+// four-column index is still present.
+func RoutingMetricRollupRevisionKeySchemaReady(db *gorm.DB) (bool, error) {
+	if db == nil || db.Dialector == nil {
+		return false, ErrRoutingMetricRollupInvalid
+	}
+	columnsReady, err := routingMetricRollupRevisionKeyColumnsReady(db)
+	if err != nil || !columnsReady {
+		return false, err
+	}
+	desiredColumns := []string{
+		"member_id",
+		"credential_id",
+		"model_key",
+		"bucket_ts",
+		"last_snapshot_revision",
+	}
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(db, routingMetricRollupUniqueIndex)
+	if err != nil {
+		return false, err
+	}
+	if !exists || !unique || !routingMetricRollupIndexColumnsEqual(columns, desiredColumns) {
+		return false, nil
+	}
+	columns, unique, exists, err = routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return true, nil
+	}
+	if unique && routingMetricRollupIndexColumnsEqual(columns, desiredColumns) {
+		return true, nil
+	}
+	legacyColumns := desiredColumns[:len(desiredColumns)-1]
+	if unique && routingMetricRollupIndexColumnsEqual(columns, legacyColumns) {
+		return false, nil
+	}
+	return false, fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupLegacyUniqueIndex)
+}
+
+// WaitRoutingMetricRollupRevisionKeySchemaReady gives non-migrating nodes a
+// bounded startup gate while the elected/default master converges the schema.
+func WaitRoutingMetricRollupRevisionKeySchemaReady(
+	ctx context.Context,
+	db *gorm.DB,
+	maxWait time.Duration,
+) error {
+	if db == nil || db.Dialector == nil || maxWait < 0 {
+		return ErrRoutingMetricRollupInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	var lastErr error
+	for {
+		ready, err := RoutingMetricRollupRevisionKeySchemaReady(db.WithContext(ctx))
+		if ready {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if maxWait == 0 {
+			if lastErr != nil {
+				return fmt.Errorf("%w: %v", ErrRoutingMetricRollupSchemaNotReady, lastErr)
+			}
+			return ErrRoutingMetricRollupSchemaNotReady
+		}
+
+		poll := time.NewTimer(routingMetricRollupSchemaPollInterval)
+		select {
+		case <-ctx.Done():
+			if !poll.Stop() {
+				<-poll.C
+			}
+			return ctx.Err()
+		case <-deadline.C:
+			if !poll.Stop() {
+				<-poll.C
+			}
+			if lastErr != nil {
+				return fmt.Errorf("%w: %v", ErrRoutingMetricRollupSchemaNotReady, lastErr)
+			}
+			return ErrRoutingMetricRollupSchemaNotReady
+		case <-poll.C:
+		}
+	}
+}
+
+func routingMetricRollupRevisionKeyColumnsReady(db *gorm.DB) (bool, error) {
+	if !db.Migrator().HasTable(&RoutingMetricRollup{}) {
+		return false, nil
+	}
+	columnTypes, err := db.Migrator().ColumnTypes(&RoutingMetricRollup{})
+	if err != nil {
+		return false, err
+	}
+	columns := make(map[string]struct{}, len(columnTypes))
+	for _, columnType := range columnTypes {
+		columns[strings.ToLower(columnType.Name())] = struct{}{}
+	}
+	for _, column := range []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"} {
+		if _, exists := columns[column]; !exists {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func waitRoutingMetricRollupMigrationRetry(ctx context.Context, attempt int) error {
+	if attempt >= routingMetricRollupMigrationMaxAttempts-1 {
+		return nil
+	}
+	delay := time.Duration(attempt+1) * routingMetricRollupMigrationRetryDelay
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isRetryableRoutingMetricMigrationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRetryableRoutingMetricTransactionError(err) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"already exists",
+		"duplicate column",
+		"duplicate key name",
+		"error 1050",
+		"error 1060",
+		"error 1061",
+		"sqlstate 42p07",
+		"sqlstate 42701",
+		"no such index",
+		"does not exist",
+		"can't drop",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func routingMetricRollupIndexDefinition(db *gorm.DB, indexName string) ([]string, bool, bool, error) {
+	switch db.Dialector.Name() {
+	case "sqlite":
+		var indexes []struct {
+			Name   string `gorm:"column:name"`
+			Unique int    `gorm:"column:unique"`
+		}
+		if err := db.Raw("PRAGMA index_list('routing_metric_rollups')").Scan(&indexes).Error; err != nil {
+			return nil, false, false, err
+		}
+		for _, index := range indexes {
+			if index.Name != indexName {
+				continue
+			}
+			if indexName != routingMetricRollupLegacyUniqueIndex && indexName != routingMetricRollupUniqueIndex && indexName != routingMetricRollupRevisionGuardIndex {
+				return nil, false, false, errors.New("unsupported routing metric rollup index")
+			}
+			var columns []struct {
+				Sequence int    `gorm:"column:seqno"`
+				Name     string `gorm:"column:name"`
+			}
+			query := "PRAGMA index_info('" + indexName + "')"
+			if err := db.Raw(query).Scan(&columns).Error; err != nil {
+				return nil, false, false, err
+			}
+			sort.Slice(columns, func(left int, right int) bool {
+				return columns[left].Sequence < columns[right].Sequence
+			})
+			names := make([]string, 0, len(columns))
+			for _, column := range columns {
+				names = append(names, column.Name)
+			}
+			return names, index.Unique == 1, true, nil
+		}
+		return nil, false, false, nil
+	case "mysql":
+		var rows []struct {
+			ColumnName string `gorm:"column:column_name"`
+			NonUnique  int    `gorm:"column:non_unique"`
+		}
+		if err := db.Raw(
+			"SELECT COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique "+
+				"FROM information_schema.STATISTICS "+
+				"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? "+
+				"ORDER BY SEQ_IN_INDEX",
+			"routing_metric_rollups", indexName,
+		).Scan(&rows).Error; err != nil {
+			return nil, false, false, err
+		}
+		if len(rows) == 0 {
+			return nil, false, false, nil
+		}
+		names := make([]string, 0, len(rows))
+		unique := true
+		for _, row := range rows {
+			names = append(names, row.ColumnName)
+			unique = unique && row.NonUnique == 0
+		}
+		return names, unique, true, nil
+	case "postgres":
+		var rows []struct {
+			ColumnName string `gorm:"column:column_name"`
+			IsUnique   bool   `gorm:"column:is_unique"`
+		}
+		if err := db.Raw(
+			"SELECT pg_get_indexdef(index_meta.indexrelid, position.number, TRUE) AS column_name, "+
+				"index_meta.indisunique AS is_unique "+
+				"FROM pg_catalog.pg_index AS index_meta "+
+				"JOIN pg_catalog.pg_class AS index_table ON index_table.oid = index_meta.indexrelid "+
+				"JOIN pg_catalog.pg_class AS data_table ON data_table.oid = index_meta.indrelid "+
+				"JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = data_table.relnamespace "+
+				"JOIN LATERAL generate_series(1, index_meta.indnatts::integer) AS position(number) ON TRUE "+
+				"WHERE namespace.nspname = current_schema() AND data_table.relname = ? AND index_table.relname = ? "+
+				"ORDER BY position.number",
+			"routing_metric_rollups", indexName,
+		).Scan(&rows).Error; err != nil {
+			return nil, false, false, err
+		}
+		if len(rows) == 0 {
+			return nil, false, false, nil
+		}
+		names := make([]string, 0, len(rows))
+		unique := true
+		for _, row := range rows {
+			names = append(names, row.ColumnName)
+			unique = unique && row.IsUnique
+		}
+		return names, unique, true, nil
+	default:
+		return nil, false, false, fmt.Errorf("unsupported routing metric rollup database %q", db.Dialector.Name())
+	}
+}
+
+func routingMetricRollupIndexColumnsEqual(actual []string, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range expected {
+		actualColumn := strings.Trim(strings.TrimSpace(actual[index]), "`\"")
+		if !strings.EqualFold(actualColumn, expected[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 func UpsertRoutingMetricRollups(rollups []RoutingMetricRollup) error {
@@ -173,10 +737,11 @@ func normalizeRoutingMetricRollupsAt(rollups []RoutingMetricRollup, now time.Tim
 	}
 	normalized := append([]RoutingMetricRollup(nil), rollups...)
 	type rollupKey struct {
-		memberID     int
-		credentialID int
-		modelKey     string
-		bucketTs     int64
+		memberID         int
+		credentialID     int
+		modelKey         string
+		bucketTs         int64
+		snapshotRevision int64
 	}
 	seen := make(map[rollupKey]struct{}, len(normalized))
 	for index := range normalized {
@@ -192,10 +757,11 @@ func normalizeRoutingMetricRollupsAt(rollups []RoutingMetricRollup, now time.Tim
 			return nil, fmt.Errorf("%w at index %d: %v", ErrRoutingMetricRollupInvalid, index, err)
 		}
 		key := rollupKey{
-			memberID:     rollup.MemberID,
-			credentialID: rollup.CredentialID,
-			modelKey:     rollup.ModelKey,
-			bucketTs:     rollup.BucketTs,
+			memberID:         rollup.MemberID,
+			credentialID:     rollup.CredentialID,
+			modelKey:         rollup.ModelKey,
+			bucketTs:         rollup.BucketTs,
+			snapshotRevision: rollup.LastSnapshotRevision,
 		}
 		if _, exists := seen[key]; exists {
 			return nil, fmt.Errorf("%w at index %d", ErrRoutingMetricRollupDuplicateKey, index)
@@ -219,7 +785,10 @@ func sortRoutingMetricRollupsByKey(rollups []RoutingMetricRollup) {
 		if left.ModelKey != right.ModelKey {
 			return left.ModelKey < right.ModelKey
 		}
-		return left.BucketTs < right.BucketTs
+		if left.BucketTs != right.BucketTs {
+			return left.BucketTs < right.BucketTs
+		}
+		return left.LastSnapshotRevision < right.LastSnapshotRevision
 	})
 }
 
@@ -236,8 +805,8 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			BucketTs:             rollup.BucketTs,
 			ChannelID:            rollup.ChannelID,
 			PoolID:               rollup.PoolID,
-			SchemaVersion:        1,
-			LastSnapshotRevision: 0,
+			SchemaVersion:        rollup.SchemaVersion,
+			LastSnapshotRevision: rollup.LastSnapshotRevision,
 		})
 	}
 	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{
@@ -246,6 +815,7 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			{Name: "credential_id"},
 			{Name: "model_key"},
 			{Name: "bucket_ts"},
+			{Name: "last_snapshot_revision"},
 		},
 		DoNothing: true,
 	}).CreateInBatches(&placeholders, RoutingMetricRollupMaxBatch).Error; err != nil {
@@ -256,8 +826,9 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 		incoming := &rollups[index]
 		var current RoutingMetricRollup
 		if err := lockForUpdate(tx.WithContext(ctx)).Where(
-			"member_id = ? AND credential_id = ? AND model_key = ? AND bucket_ts = ?",
+			"member_id = ? AND credential_id = ? AND model_key = ? AND bucket_ts = ? AND last_snapshot_revision = ?",
 			incoming.MemberID, incoming.CredentialID, incoming.ModelKey, incoming.BucketTs,
+			incoming.LastSnapshotRevision,
 		).First(&current).Error; err != nil {
 			return err
 		}
@@ -268,7 +839,6 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			"channel_id":                current.ChannelID,
 			"pool_id":                   current.PoolID,
 			"schema_version":            current.SchemaVersion,
-			"last_snapshot_revision":    current.LastSnapshotRevision,
 			"sketch_codec_version":      current.SketchCodecVersion,
 			"latency_sample_count":      current.LatencySampleCount,
 			"latency_sketch":            current.LatencySketch,
@@ -299,6 +869,9 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 }
 
 func mergeRoutingMetricRollup(current *RoutingMetricRollup, incoming *RoutingMetricRollup) error {
+	if current.LastSnapshotRevision != incoming.LastSnapshotRevision {
+		return fmt.Errorf("%w: snapshot revision mismatch", ErrRoutingMetricRollupInvalid)
+	}
 	codecVersion := current.SketchCodecVersion
 	if codecVersion == 0 {
 		codecVersion = incoming.SketchCodecVersion
@@ -368,8 +941,15 @@ func mergeRoutingMetricRollup(current *RoutingMetricRollup, incoming *RoutingMet
 
 	current.ChannelID = incoming.ChannelID
 	current.PoolID = incoming.PoolID
-	current.SchemaVersion = max(current.SchemaVersion, incoming.SchemaVersion)
-	current.LastSnapshotRevision = max(current.LastSnapshotRevision, incoming.LastSnapshotRevision)
+	if current.SchemaVersion < RoutingMetricRollupSchemaVersion || incoming.SchemaVersion < RoutingMetricRollupSchemaVersion {
+		if current.SchemaVersion >= RoutingMetricRollupSchemaVersion {
+			current.SchemaVersion = incoming.SchemaVersion
+		} else if incoming.SchemaVersion < RoutingMetricRollupSchemaVersion {
+			current.SchemaVersion = max(current.SchemaVersion, incoming.SchemaVersion)
+		}
+	} else {
+		current.SchemaVersion = RoutingMetricRollupSchemaVersion
+	}
 	current.SketchCodecVersion = codecVersion
 	current.LatencySampleCount = latencyCount
 	current.LatencySketch = latencySketch
@@ -438,6 +1018,46 @@ func GetRoutingMetricRollupsContext(
 		Where("member_id = ? AND credential_id = ? AND model_key = ? AND bucket_ts >= ? AND bucket_ts <= ?",
 			memberID, credentialID, routingMetricRollupModelKey(modelName), startTs, endTs).
 		Order("bucket_ts asc").
+		Order("last_snapshot_revision asc").
+		Order("id asc").
+		Limit(RoutingMetricRollupMaxQueryLimit).
+		Find(&rollups).Error
+	if err != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return rollups, err
+}
+
+// GetRoutingMetricRollupsForSnapshotRevisionContext returns only schema-v3
+// buckets whose physical key carries the requested exact snapshot revision.
+// Legacy v1/v2 rows remain available through GetRoutingMetricRollupsContext but
+// are intentionally excluded from revision-isolated reads.
+func GetRoutingMetricRollupsForSnapshotRevisionContext(
+	ctx context.Context,
+	memberID int,
+	credentialID int,
+	modelName string,
+	snapshotRevision int64,
+	startTs int64,
+	endTs int64,
+) ([]RoutingMetricRollup, error) {
+	if memberID <= 0 || credentialID < 0 || !validRoutingMetricRollupModelName(modelName) ||
+		snapshotRevision <= 0 || startTs < 0 || endTs < startTs {
+		return nil, ErrRoutingMetricRollupInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var rollups []RoutingMetricRollup
+	err := DB.WithContext(ctx).
+		Where(
+			"member_id = ? AND credential_id = ? AND model_key = ? AND last_snapshot_revision = ? "+
+				"AND schema_version = ? AND bucket_ts >= ? AND bucket_ts <= ?",
+			memberID, credentialID, routingMetricRollupModelKey(modelName), snapshotRevision,
+			RoutingMetricRollupSchemaVersion, startTs, endTs,
+		).
+		Order("bucket_ts asc").
 		Order("id asc").
 		Limit(RoutingMetricRollupMaxQueryLimit).
 		Find(&rollups).Error
@@ -468,6 +1088,7 @@ func GetRoutingMetricRollupsSinceContext(ctx context.Context, cutoffTs int64, li
 		Order("credential_id asc").
 		Order("model_name asc").
 		Order("bucket_ts asc").
+		Order("last_snapshot_revision asc").
 		Order("id asc").
 		Limit(limit).
 		Find(&rollups).Error
@@ -526,9 +1147,12 @@ func validateRoutingMetricRollup(rollup *RoutingMetricRollup) error {
 		return errors.New("model key does not match model name")
 	}
 	if rollup.BucketTs < 0 ||
-		(rollup.SchemaVersion != 1 && rollup.SchemaVersion != RoutingMetricRollupSchemaVersion) ||
+		(rollup.SchemaVersion != 1 && rollup.SchemaVersion != 2 && rollup.SchemaVersion != RoutingMetricRollupSchemaVersion) ||
 		rollup.LastSnapshotRevision < 0 {
 		return errors.New("bucket, schema version, or snapshot revision is invalid")
+	}
+	if rollup.SchemaVersion == RoutingMetricRollupSchemaVersion && rollup.LastSnapshotRevision == 0 {
+		return errors.New("schema v3 requires an exact positive snapshot revision")
 	}
 	for _, counter := range []int64{
 		rollup.RequestCount,

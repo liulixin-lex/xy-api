@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
@@ -125,6 +126,7 @@ func TestReplayChannelRoutingBalancedDecisionVerifiesActiveMetadata(t *testing.T
 func TestSimulateChannelRoutingGroupUsesStrictBoundedRequestSchema(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
+	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	for index := 0; index < 3; index++ {
 		enqueueControllerReplayAudit(t, 5, "controller-simulation-"+strconv.Itoa(index))
 	}
@@ -138,6 +140,7 @@ func TestSimulateChannelRoutingGroupUsesStrictBoundedRequestSchema(t *testing.T)
 	assert.Contains(t, valid.Body.String(), `"selection_changed_count":2`)
 	assert.Contains(t, valid.Body.String(), `"cost_known_samples":2`)
 	assert.Contains(t, valid.Body.String(), `"next_cursor":`)
+	assert.Contains(t, valid.Body.String(), `"type":"historical_simulation"`)
 	assert.NotContains(t, valid.Body.String(), "replay_input_json")
 	assert.NotContains(t, valid.Body.String(), "request_profile")
 	assert.NotContains(t, valid.Body.String(), "/v1/chat/completions")
@@ -190,12 +193,12 @@ func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) st
 		{
 			PoolMemberID: 11, ChannelID: 101, Priority: 10, Weight: 10,
 			Metric: &channelrouting.ShadowMetricInput{RequestCount: 100, SuccessCount: 100, ReliabilityRequestCount: 100, P95LatencyMs: 300, OutputTokensPerSecond: 50},
-			Cost:   &channelrouting.ShadowCostInput{Known: true, Cost: 10, UpdatedUnix: 990},
+			Cost:   &channelrouting.ShadowReplayCostInput{Known: true, Cost: 10, UpdatedUnix: 990},
 		},
 		{
 			PoolMemberID: 12, ChannelID: 102, Priority: 10, Weight: 10,
 			Metric: &channelrouting.ShadowMetricInput{RequestCount: 100, SuccessCount: 80, ReliabilityRequestCount: 100, ReliabilityFailureCount: 20, P95LatencyMs: 250, OutputTokensPerSecond: 60},
-			Cost:   &channelrouting.ShadowCostInput{Known: true, Cost: 1, UpdatedUnix: 990},
+			Cost:   &channelrouting.ShadowReplayCostInput{Known: true, Cost: 1, UpdatedUnix: 990},
 		},
 	})
 	require.NoError(t, err)
@@ -359,7 +362,9 @@ func performControllerSimulationRequest(poolID string, body string) *httptest.Re
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "id", Value: poolID}}
+	common.SetContextKey(ctx, constant.ContextKeyUserId, 7)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel-routing/v2/groups/"+poolID+"/simulations", bytes.NewBufferString(body))
+	ctx.Request.Header.Set("Idempotency-Key", "historical-simulation-key-0001")
 	SimulateChannelRoutingGroup(ctx)
 	return recorder
 }

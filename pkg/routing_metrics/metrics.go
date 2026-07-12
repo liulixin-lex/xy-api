@@ -190,6 +190,7 @@ func RecordClassifiedAttempt(
 	}
 
 	outputTokens := info.RoutingOutputTokens()
+	recordEndpointClassifiedAttempt(c, info, now, latencyMs, ttftMs, hasTtft, success, apiErr, classification)
 	recordStableClassifiedAttempt(
 		c,
 		info,
@@ -315,6 +316,7 @@ func ResetForTest() {
 	limits = defaultLimits
 	maintenanceMu.Unlock()
 	resetStableForTest()
+	resetEndpointMetricsForTest()
 }
 
 func recordBucket(
@@ -592,7 +594,7 @@ func (b *bucket) addLocked(
 		b.successCount++
 		b.reliabilityRequestCount++
 	} else if (classification.Responsibility == routingerror.ResponsibilityProvider ||
-		classification.Responsibility == routingerror.ResponsibilityNetwork) &&
+		(classification.Responsibility == routingerror.ResponsibilityNetwork && classification.Scope != routingerror.ScopeEndpoint)) &&
 		(classification.HealthEffect == routingerror.HealthDegrade ||
 			classification.HealthEffect == routingerror.HealthOpen) {
 		b.reliabilityRequestCount++

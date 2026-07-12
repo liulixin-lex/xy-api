@@ -137,6 +137,26 @@ func TestRuntimeActiveProbeRequiresItsFeatureSwitch(t *testing.T) {
 	assert.Zero(t, runs.Load())
 }
 
+func TestRuntimeActiveProbeOperationsDrainWhileRoutingIsDisabled(t *testing.T) {
+	var runs atomic.Int64
+	runtime := &Runtime{deps: runtimeDeps{
+		getSetting: func() smart_routing_setting.SmartRoutingSetting {
+			return smart_routing_setting.SmartRoutingSetting{Enabled: false, ActiveProbeEnabled: false}
+		},
+		wait: func(context.Context, time.Duration) bool { return false },
+	}}
+	runtime.runWorker(
+		context.Background(),
+		func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			runs.Add(1)
+			return nil
+		},
+		activeProbeOperationInterval,
+		&runtime.activeProbeOpStats,
+	)
+	assert.Equal(t, int64(1), runs.Load())
+}
+
 func TestRuntimeCloseCancelsActiveProbe(t *testing.T) {
 	started := make(chan struct{})
 	canceled := make(chan struct{})
@@ -609,13 +629,35 @@ func TestRuntimeRetentionFailureRemainsImmediatelyRetryable(t *testing.T) {
 		},
 	}}
 
-	require.Error(t, runtime.runRetention(context.Background(), 7))
+	require.Error(t, runtime.runRetention(context.Background(), 7, 0))
 	assert.Zero(t, runtime.lastRetentionUnix.Load())
-	require.NoError(t, runtime.runRetention(context.Background(), 7))
+	require.NoError(t, runtime.runRetention(context.Background(), 7, 0))
 	assert.Equal(t, int64(2), calls.Load())
 	assert.Positive(t, runtime.lastRetentionUnix.Load())
-	require.NoError(t, runtime.runRetention(context.Background(), 7))
+	require.NoError(t, runtime.runRetention(context.Background(), 7, 0))
 	assert.Equal(t, int64(2), calls.Load())
+}
+
+func TestRuntimeHedgeRetentionUsesIndependentBoundedContext(t *testing.T) {
+	var ordinaryDone <-chan struct{}
+	runtime := &Runtime{deps: runtimeDeps{
+		retention: func(ctx context.Context, _ int) (int64, error) {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			ordinaryDone = ctx.Done()
+			return 1, nil
+		},
+		hedgeRetention: func(ctx context.Context, _ int) (int64, error) {
+			_, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			assert.NotEqual(t, ordinaryDone, ctx.Done())
+			assert.NoError(t, ctx.Err())
+			return 1, nil
+		},
+	}}
+
+	require.NoError(t, runtime.runRetention(context.Background(), 7, 30))
+	assert.Positive(t, runtime.lastRetentionUnix.Load())
 }
 
 func TestRuntimeTopologyChangeWakesRefreshWithoutBlockingPublisher(t *testing.T) {

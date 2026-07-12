@@ -23,7 +23,7 @@ func TestDeleteRoutingDecisionAuditsBeforeContextUsesRecoverableBatches(t *testi
 			DecisionID: fmt.Sprintf("old-%d", index), GroupName: "default", ModelName: "gpt-test", CreatedTime: 10,
 		}
 	}
-	require.NoError(t, DB.CreateInBatches(old, RoutingDecisionAuditMaxBatch).Error)
+	require.NoError(t, DB.CreateInBatches(old, routingDecisionDBBatchRowLimit(&RoutingDecisionAudit{})).Error)
 	require.NoError(t, DB.Create(&RoutingDecisionReplayChunk{
 		DecisionID: "old-0", ChunkIndex: 0, ChunkCount: 1, PayloadBytes: 2,
 		PayloadHash: fmt.Sprintf("%064x", 1), Payload: `{}`, CreatedTime: 10,
@@ -133,5 +133,35 @@ func TestCreateRoutingDecisionAuditsSplitsLargeRowsByEncodedByteBudget(t *testin
 	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), audits))
 	var count int64
 	require.NoError(t, db.Model(&RoutingDecisionAudit{}).Count(&count).Error)
+	assert.Equal(t, int64(len(audits)), count)
+}
+
+func TestCreateRoutingDecisionAuditsSplitsSmallRowsByDatabaseBindBudget(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingDecisionAudit{}))
+
+	audits := make([]RoutingDecisionAudit, RoutingDecisionAuditMaxBatch)
+	for index := range audits {
+		audits[index] = RoutingDecisionAudit{
+			DecisionID:       fmt.Sprintf("bind-budget-%03d", index),
+			PoolID:           1,
+			GroupName:        "default",
+			ModelName:        "gpt-test",
+			SnapshotRevision: 1,
+			CreatedTime:      10,
+		}
+	}
+	batches, err := splitRoutingDecisionAuditDBBatches(audits)
+	require.NoError(t, err)
+	assert.Greater(t, len(batches), 1)
+	rowLimit := routingDecisionDBBatchRowLimit(&RoutingDecisionAudit{})
+	for _, batch := range batches {
+		assert.LessOrEqual(t, len(batch), rowLimit)
+	}
+
+	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), audits))
+	var count int64
+	require.NoError(t, DB.Model(&RoutingDecisionAudit{}).Count(&count).Error)
 	assert.Equal(t, int64(len(audits)), count)
 }

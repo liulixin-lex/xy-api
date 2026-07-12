@@ -9,12 +9,14 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -364,26 +366,141 @@ func ResetSmartRoutingBreaker(c *gin.Context) {
 		common.ApiErrorMsg(c, "invalid breaker id")
 		return
 	}
+	legacyRequest := c.GetHeader("Idempotency-Key") == ""
 	var state model.RoutingBreakerState
-	if err = model.DB.Where("id = ?", id).First(&state).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+	var resolved channelrouting.BreakerResetResolvedTarget
+	if legacyRequest {
+		if err = model.DB.WithContext(c.Request.Context()).Where("id = ?", id).First(&state).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				operation, command, replayErr := model.GetLatestLegacyRoutingBreakerResetContext(c.Request.Context(), id)
+				if replayErr != nil {
+					if errors.Is(replayErr, gorm.ErrRecordNotFound) {
+						c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+						return
+					}
+					writeChannelRoutingBreakerResetError(c, replayErr)
+					return
+				}
+				key := legacyBreakerResetIdempotencyKey(id, command.LegacyGeneration, command.TargetKey)
+				if key == "" {
+					writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+					return
+				}
+				view, viewErr := channelRoutingOperationViewFromModel(operation)
+				if viewErr != nil {
+					writeChannelRoutingBreakerResetError(c, viewErr)
+					return
+				}
+				c.Header("Idempotency-Key", key)
+				common.ApiSuccess(c, view)
+				return
+			}
+			common.ApiError(c, err)
 			return
 		}
-		common.ApiError(c, err)
+		if state.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		resolved, err = channelrouting.ResolveLegacyMemberBreakerResetTarget(
+			state.ChannelID, state.ModelName, state.Group,
+		)
+		if err != nil {
+			writeChannelRoutingBreakerResetError(c, err)
+			return
+		}
+		targetKey, targetErr := model.RoutingBreakerResetTargetKey(resolved.Target)
+		if targetErr != nil {
+			writeChannelRoutingBreakerResetError(c, targetErr)
+			return
+		}
+		key := legacyBreakerResetIdempotencyKey(id, state.ResetGeneration, targetKey)
+		if key == "" {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		c.Request.Header.Set("Idempotency-Key", key)
+	}
+	identity, ok := requireChannelRoutingOperationIdempotency(c, model.RoutingOperationTypeBreakerReset, struct {
+		LegacyBreakerID int `json:"legacy_breaker_id"`
+	}{LegacyBreakerID: id})
+	if !ok {
 		return
 	}
-	if err = model.DB.Delete(&model.RoutingBreakerState{}, id).Error; err != nil {
-		common.ApiError(c, err)
+	operation, lookupErr := model.GetRoutingOperationByRequestIdentityContext(c.Request.Context(), identity)
+	if lookupErr == nil {
+		if operation.OperationType != model.RoutingOperationTypeBreakerReset {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingOperationIdempotencyConflict)
+			return
+		}
+		view, viewErr := channelRoutingOperationViewFromModel(operation)
+		if viewErr != nil {
+			writeChannelRoutingBreakerResetError(c, viewErr)
+			return
+		}
+		common.ApiSuccess(c, view)
 		return
 	}
-	routingbreaker.ClearDefaultKey(routingbreaker.Key{
-		ChannelID:   state.ChannelID,
-		APIKeyIndex: state.APIKeyIndex,
-		Model:       state.ModelName,
-		Group:       state.Group,
-	})
-	common.ApiSuccess(c, nil)
+	if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		writeChannelRoutingBreakerResetError(c, lookupErr)
+		return
+	}
+	if !legacyRequest {
+		if err = model.DB.WithContext(c.Request.Context()).Where("id = ?", id).First(&state).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+				return
+			}
+			common.ApiError(c, err)
+			return
+		}
+		if state.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		resolved, err = channelrouting.ResolveLegacyMemberBreakerResetTarget(
+			state.ChannelID, state.ModelName, state.Group,
+		)
+		if err != nil {
+			writeChannelRoutingBreakerResetError(c, err)
+			return
+		}
+	}
+	spec := model.RoutingOperationSpec{
+		Type: model.RoutingOperationTypeBreakerReset, EvaluationHash: identity.PayloadHash,
+		SubjectType: model.RoutingOperationSubjectMemberBreaker,
+		SubjectID:   int64(resolved.Target.MemberID), PoolID: resolved.Target.PoolID,
+		ExpectedRevision: resolved.ExpectedRevision, ExpectedActivationID: resolved.ExpectedActivationID,
+		ActorID: common.GetContextKeyInt(c, constant.ContextKeyUserId), Reason: "legacy manual breaker reset",
+		RequestKeyHash: identity.KeyHash, RequestPayloadHash: identity.PayloadHash,
+	}
+	if legacyRequest {
+		operation, _, err = model.CreateLegacyRoutingBreakerResetOperationContext(
+			c.Request.Context(), spec, resolved.Target, id, state.ResetGeneration,
+		)
+	} else {
+		operation, _, err = model.CreateRoutingBreakerResetOperationContext(
+			c.Request.Context(), spec, resolved.Target,
+		)
+	}
+	if err != nil {
+		writeChannelRoutingBreakerResetError(c, err)
+		return
+	}
+	view, err := channelRoutingOperationViewFromModel(operation)
+	if err != nil {
+		writeChannelRoutingBreakerResetError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"success": true, "message": "", "data": view})
+}
+
+func legacyBreakerResetIdempotencyKey(breakerID int, generation int64, targetKey string) string {
+	if breakerID <= 0 || generation < 0 || len(targetKey) != 64 {
+		return ""
+	}
+	return "legacy-breaker-reset-" + strconv.Itoa(breakerID) + "-" +
+		strconv.FormatInt(generation, 10) + "-" + targetKey
 }
 
 func EnqueueSmartRoutingSync(c *gin.Context) {

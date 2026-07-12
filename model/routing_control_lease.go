@@ -36,7 +36,6 @@ func TryAcquireRoutingControlLeaseContext(
 	ctx context.Context,
 	leaseName string,
 	holderID string,
-	nowMs int64,
 	ttlMs int64,
 	minimumIntervalMs int64,
 	force bool,
@@ -45,7 +44,7 @@ func TryAcquireRoutingControlLeaseContext(
 		ctx = context.Background()
 	}
 	if !validRoutingControlLeaseText(leaseName, 64) || !validRoutingControlLeaseText(holderID, 128) ||
-		nowMs <= 0 || ttlMs <= 0 || nowMs > math.MaxInt64-ttlMs || minimumIntervalMs < 0 {
+		ttlMs <= 0 || minimumIntervalMs < 0 {
 		return RoutingControlLease{}, false, ErrRoutingControlLeaseInvalid
 	}
 	var acquired RoutingControlLease
@@ -61,6 +60,13 @@ func TryAcquireRoutingControlLeaseContext(
 		var current RoutingControlLease
 		if err := lockForUpdate(tx.WithContext(ctx)).Where("lease_name = ?", leaseName).First(&current).Error; err != nil {
 			return err
+		}
+		nowMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if nowMs > math.MaxInt64-ttlMs {
+			return ErrRoutingControlLeaseInvalid
 		}
 		if current.LeaseUntilMs > nowMs {
 			acquired = current
@@ -85,7 +91,7 @@ func TryAcquireRoutingControlLeaseContext(
 		}
 		leaseToken := hex.EncodeToString(token[:])
 		result := tx.WithContext(ctx).Model(&RoutingControlLease{}).
-			Where("lease_name = ? AND lease_until_ms <= ?", leaseName, nowMs).
+			Where("lease_name = ? AND lease_until_ms <= ? AND fencing_token = ?", leaseName, nowMs, current.FencingToken).
 			Updates(map[string]any{
 				"holder_id":       holderID,
 				"lease_token":     leaseToken,
@@ -108,48 +114,117 @@ func TryAcquireRoutingControlLeaseContext(
 	return acquired, acquiredOK, err
 }
 
-func CompleteRoutingControlLeaseContext(ctx context.Context, lease RoutingControlLease, completedAtMs int64) error {
-	return finishRoutingControlLeaseContext(ctx, lease, completedAtMs, true)
+func RenewRoutingControlLeaseContext(
+	ctx context.Context,
+	lease RoutingControlLease,
+	ttlMs int64,
+) (RoutingControlLease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validRoutingControlLeaseText(lease.LeaseName, 64) || !validRoutingControlLeaseText(lease.HolderID, 128) ||
+		len(lease.LeaseToken) != 32 || lease.FencingToken <= 0 || ttlMs <= 0 {
+		return RoutingControlLease{}, ErrRoutingControlLeaseInvalid
+	}
+	var renewed RoutingControlLease
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current RoutingControlLease
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("lease_name = ?", lease.LeaseName).First(&current).Error; err != nil {
+			return err
+		}
+		nowMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if current.HolderID != lease.HolderID || current.LeaseToken != lease.LeaseToken ||
+			current.FencingToken != lease.FencingToken || current.LeaseUntilMs <= nowMs {
+			return ErrRoutingControlLeaseLost
+		}
+		if nowMs > math.MaxInt64-ttlMs {
+			return ErrRoutingControlLeaseInvalid
+		}
+		leaseUntilMs := nowMs + ttlMs
+		result := tx.WithContext(ctx).Model(&RoutingControlLease{}).
+			Where("lease_name = ? AND holder_id = ? AND lease_token = ? AND fencing_token = ? AND lease_until_ms > ?",
+				lease.LeaseName, lease.HolderID, lease.LeaseToken, lease.FencingToken, nowMs,
+			).
+			Updates(map[string]any{"lease_until_ms": leaseUntilMs, "updated_time_ms": nowMs})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrRoutingControlLeaseLost
+		}
+		commitNowMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if leaseUntilMs <= commitNowMs {
+			return ErrRoutingControlLeaseLost
+		}
+		current.LeaseUntilMs = leaseUntilMs
+		current.UpdatedTimeMs = nowMs
+		renewed = current
+		return nil
+	})
+	return renewed, err
 }
 
-func ReleaseRoutingControlLeaseContext(ctx context.Context, lease RoutingControlLease, releasedAtMs int64) error {
-	return finishRoutingControlLeaseContext(ctx, lease, releasedAtMs, false)
+func CompleteRoutingControlLeaseContext(ctx context.Context, lease RoutingControlLease) error {
+	return finishRoutingControlLeaseContext(ctx, lease, true)
+}
+
+func ReleaseRoutingControlLeaseContext(ctx context.Context, lease RoutingControlLease) error {
+	return finishRoutingControlLeaseContext(ctx, lease, false)
 }
 
 func finishRoutingControlLeaseContext(
 	ctx context.Context,
 	lease RoutingControlLease,
-	finishedAtMs int64,
 	completed bool,
 ) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if !validRoutingControlLeaseText(lease.LeaseName, 64) || !validRoutingControlLeaseText(lease.HolderID, 128) ||
-		len(lease.LeaseToken) != 32 || finishedAtMs <= 0 {
+		len(lease.LeaseToken) != 32 || lease.FencingToken <= 0 {
 		return ErrRoutingControlLeaseInvalid
 	}
-	updates := map[string]any{
-		"holder_id":       "",
-		"lease_token":     "",
-		"lease_until_ms":  0,
-		"updated_time_ms": finishedAtMs,
-	}
-	if completed {
-		updates["last_completed_ms"] = finishedAtMs
-	}
-	result := DB.WithContext(ctx).Model(&RoutingControlLease{}).
-		Where("lease_name = ? AND holder_id = ? AND lease_token = ? AND fencing_token = ?",
-			lease.LeaseName, lease.HolderID, lease.LeaseToken, lease.FencingToken,
-		).
-		Updates(updates)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return ErrRoutingControlLeaseLost
-	}
-	return nil
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current RoutingControlLease
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("lease_name = ?", lease.LeaseName).First(&current).Error; err != nil {
+			return err
+		}
+		finishedAtMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if current.HolderID != lease.HolderID || current.LeaseToken != lease.LeaseToken ||
+			current.FencingToken != lease.FencingToken || (completed && current.LeaseUntilMs <= finishedAtMs) {
+			return ErrRoutingControlLeaseLost
+		}
+		updates := map[string]any{
+			"holder_id":       "",
+			"lease_token":     "",
+			"lease_until_ms":  0,
+			"updated_time_ms": finishedAtMs,
+		}
+		if completed {
+			updates["last_completed_ms"] = finishedAtMs
+		}
+		result := tx.WithContext(ctx).Model(&RoutingControlLease{}).
+			Where("lease_name = ? AND holder_id = ? AND lease_token = ? AND fencing_token = ?",
+				lease.LeaseName, lease.HolderID, lease.LeaseToken, lease.FencingToken,
+			).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrRoutingControlLeaseLost
+		}
+		return nil
+	})
 }
 
 func validRoutingControlLeaseText(value string, maxRunes int) bool {

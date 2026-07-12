@@ -65,6 +65,61 @@ func TestRoutingCanaryEvaluationConcurrentCreateHasOneRow(t *testing.T) {
 	assert.Equal(t, int64(1), count)
 }
 
+func TestRoutingCanaryEvaluationRetentionPreservesOnlyActiveRollout(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&RoutingPolicyHead{}, &RoutingCanaryEvaluation{}))
+	require.NoError(t, db.Create(&RoutingPolicyHead{
+		ID: 1, CurrentRevision: 11, CurrentActivationID: 401,
+		CurrentHash: strings.Repeat("f", 64), CurrentStage: RoutingDeploymentStageCanary,
+		CreatedTime: 1, UpdatedTime: 1,
+	}).Error)
+
+	activeRollout := strings.Repeat("a", 64)
+	rows := []RoutingCanaryEvaluation{
+		{
+			EvaluationHash: strings.Repeat("1", 64), CreateToken: strings.Repeat("1", 32),
+			PolicyRevision: 11, ActivationID: 401, PoolID: 1, RolloutKey: activeRollout,
+			WindowStartMs: 1, WindowEndMs: 2, Status: RoutingCanaryEvaluationStatusPassed,
+			Reason: "active rollout", CreatedTimeMs: 10,
+		},
+		{
+			EvaluationHash: strings.Repeat("2", 64), CreateToken: strings.Repeat("2", 32),
+			PolicyRevision: 10, ActivationID: 400, PoolID: 2, RolloutKey: strings.Repeat("b", 64),
+			WindowStartMs: 1, WindowEndMs: 2, Status: RoutingCanaryEvaluationStatusPassed,
+			Reason: "expired rollout", CreatedTimeMs: 10,
+		},
+		{
+			EvaluationHash: strings.Repeat("3", 64), CreateToken: strings.Repeat("3", 32),
+			PolicyRevision: 10, ActivationID: 400, PoolID: 3, RolloutKey: strings.Repeat("c", 64),
+			WindowStartMs: 1, WindowEndMs: 2, Status: RoutingCanaryEvaluationStatusPassed,
+			Reason: "recent rollout", CreatedTimeMs: 1_000,
+		},
+	}
+	require.NoError(t, db.Create(&rows).Error)
+	assert.ErrorIs(t, db.Delete(&rows[0]).Error, ErrRoutingCanaryEvaluationImmutable)
+
+	deleted, err := DeleteRoutingCanaryEvaluationsBeforeContext(context.Background(), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	var remaining []RoutingCanaryEvaluation
+	require.NoError(t, db.Order("id ASC").Find(&remaining).Error)
+	require.Len(t, remaining, 2)
+	assert.Equal(t, rows[0].ID, remaining[0].ID)
+	assert.Equal(t, rows[2].ID, remaining[1].ID)
+
+	require.NoError(t, db.Model(&RoutingPolicyHead{}).Where("id = ?", 1).Updates(map[string]any{
+		"current_revision": 12, "current_activation_id": 402, "current_stage": RoutingDeploymentStageActive,
+	}).Error)
+	deleted, err = DeleteRoutingCanaryEvaluationsBeforeContext(context.Background(), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	remaining = nil
+	require.NoError(t, db.Order("id ASC").Find(&remaining).Error)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, rows[2].ID, remaining[0].ID)
+}
+
 func TestRoutingCanaryEvaluationExternalDatabaseCompatibility(t *testing.T) {
 	tests := []struct {
 		name   string

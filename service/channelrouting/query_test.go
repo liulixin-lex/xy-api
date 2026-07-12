@@ -1,6 +1,7 @@
 package channelrouting
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -58,6 +59,75 @@ func TestSnapshotQueriesReturnOnlyRequestedPageAndDeepCopies(t *testing.T) {
 	assert.Equal(t, 202, current.Channels[1].CredentialIDs[0])
 	require.NotNil(t, current.Stats.UnknownClassificationRate)
 	assert.Equal(t, 0.25, *current.Stats.UnknownClassificationRate)
+}
+
+func TestListCostSnapshotsReturnsVersionedPricingAndMaskedAccountContract(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	inputRate := 2.5
+	outputRate := 7.5
+	pricing := &model.RoutingNormalizedPricing{
+		QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "mixed",
+		InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+	}
+	SetSnapshotForTest(SnapshotView{
+		Revision: 19, BuiltAtUnix: 1_700_000_000,
+		Pools: []PoolSnapshot{{
+			ID: 7, GroupName: "vip", Members: []PoolMemberSnapshot{{
+				ID: 11, PoolID: 7, ChannelID: 101, ChannelName: "provider-a",
+				Models: []ModelSnapshot{{
+					ModelName: "gpt-cost", CostKnown: true, Cost: 0.003, CostPricing: pricing,
+					CostPricingHash: strings.Repeat("a", 64), CostPricingVersion: "upstream-v3",
+					CostUpstreamGroup: "gold", CostUpstreamModel: "gpt-upstream",
+					CostObservedTime: 1_699_999_900, CostEffectiveTime: 1_699_999_800,
+					CostExpiresTime: 1_700_003_600, CostVersionConfidence: model.RoutingCostConfidenceExact,
+					CostConfidenceScore: 0.95, CostFreshness: model.RoutingCostFreshnessFresh,
+					CostFreshnessScore: 0.9, CostSourceSyncStatus: model.RoutingUpstreamSyncStatusPartial,
+					CostSourceSyncError: "one optional endpoint failed", upstreamAccountID: 41,
+					CostAccountSourceType: model.RoutingUpstreamTypeNewAPI,
+					CostAccountKeyHash:    strings.Repeat("b", 64), CostAccountMaskedID: "acct-***-42",
+					CostAccountStatus:       model.RoutingUpstreamAccountStatusDegraded,
+					CostAccountBalanceKnown: true, CostAccountBalance: 12.5,
+					CostAccountBalanceUpdatedAt: 1_699_999_950,
+					CostAccountSyncStatus:       model.RoutingUpstreamSyncStatusPartial,
+					CostAccountSyncError:        "pricing subset unavailable",
+				}},
+			}},
+		}},
+	})
+
+	known := true
+	items, total, metadata, ok := ListCostSnapshots("vip", "gpt-cost", &known, 0, 10)
+	require.True(t, ok)
+	require.Len(t, items, 1)
+	assert.Equal(t, 1, total)
+	assert.Equal(t, uint64(19), metadata.Revision)
+	item := items[0]
+	assert.Equal(t, 7, item.PoolID)
+	assert.Equal(t, 11, item.MemberID)
+	assert.Equal(t, 101, item.ChannelID)
+	assert.Equal(t, "provider-a", item.ChannelName)
+	assert.True(t, item.Known)
+	assert.Equal(t, 0.003, item.Cost)
+	assert.Equal(t, "USD", item.Currency)
+	assert.Equal(t, "mixed", item.Unit)
+	assert.Equal(t, strings.Repeat("a", 64), item.Version)
+	assert.Equal(t, "upstream-v3", item.PricingVersion)
+	assert.Equal(t, "gold", item.UpstreamGroup)
+	assert.Equal(t, "gpt-upstream", item.UpstreamModel)
+	assert.Equal(t, model.RoutingCostConfidenceExact, item.Confidence)
+	assert.Equal(t, model.RoutingCostFreshnessFresh, item.Freshness)
+	require.NotNil(t, item.Pricing)
+	assert.Equal(t, inputRate, *item.Pricing.InputCostPerMillion)
+	require.NotNil(t, item.Account)
+	assert.Equal(t, 41, item.Account.ID)
+	assert.Equal(t, "acct-***-42", item.Account.MaskedIdentity)
+	assert.True(t, item.Account.BalanceKnown)
+	assert.Equal(t, 12.5, item.Account.Balance)
+
+	encoded, err := common.Marshal(item)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), strings.Repeat("b", 64))
 }
 
 func TestTelemetryAggregateKeepsGlobalP95SeparateFromWorstMemberP95(t *testing.T) {

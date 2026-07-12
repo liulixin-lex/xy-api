@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 
@@ -34,6 +35,33 @@ func TestShadowReplayIsDeterministicAndHashBound(t *testing.T) {
 	tampered.Candidates[0].Cost = &cost
 	_, err = RunShadowReplay(tampered)
 	assert.ErrorIs(t, err, ErrShadowReplayHash)
+}
+
+func TestRequestProfileNeverSerializesCostRequestBodyOrHeaders(t *testing.T) {
+	base, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	require.NoError(t, err)
+	first := attachRoutingCostProfile(base, &model.RoutingCostRequestProfile{
+		Request: billingexpr.RequestInput{
+			Headers: map[string]string{"authorization": "secret-token"},
+			Body:    []byte(`{"private":"first"}`),
+		},
+	}, time.Now().Unix())
+	second := attachRoutingCostProfile(base, &model.RoutingCostRequestProfile{
+		Request: billingexpr.RequestInput{
+			Headers: map[string]string{"authorization": "different-token"},
+			Body:    []byte(`{"private":"second"}`),
+		},
+	}, time.Now().Unix()+1)
+
+	firstHash, err := first.Hash()
+	require.NoError(t, err)
+	secondHash, err := second.Hash()
+	require.NoError(t, err)
+	assert.Equal(t, firstHash, secondHash)
+	encoded, err := common.Marshal(first)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "secret-token")
+	assert.NotContains(t, string(encoded), "private")
 }
 
 func TestShadowSeedAndProfileHashAreStableAndScoped(t *testing.T) {
@@ -150,6 +178,12 @@ func TestCaptureShadowReplayUsesOneImmutablePoolSnapshot(t *testing.T) {
 		"top_k": 1
 	}`))
 	require.NoError(t, err)
+	groupRatio := 2.0
+	perRequestCost := 0.25
+	versionedPricing := &model.RoutingNormalizedPricing{
+		QuotaType: 1, BillingMode: "per_request", Currency: "USD", Unit: "request",
+		GroupRatio: &groupRatio, PerRequestCost: &perRequestCost,
+	}
 	view := SnapshotView{
 		Revision: 17, RuntimeGeneration: 9, PolicyHash: strings.Repeat("b", 64),
 		Pools: []PoolSnapshot{
@@ -166,6 +200,11 @@ func TestCaptureShadowReplayUsesOneImmutablePoolSnapshot(t *testing.T) {
 							P95LatencyMs: 300, OutputTokensPerSecond: 50, Inflight: 2,
 							CostKnown: true, CostUpdatedUnix: now, CostBillingMode: "per_request",
 							CostGroupRatio: 2, CostModelPrice: 0.25,
+							CostPricing: versionedPricing, CostPricingHash: strings.Repeat("c", 64),
+							CostPricingVersion: "capture-v1", CostObservedTime: now, CostEffectiveTime: now - 60,
+							CostExpiresTime: now + 3_600, CostVersionConfidence: model.RoutingCostConfidenceExact,
+							CostConfidenceScore: 1, CostFreshness: model.RoutingCostFreshnessFresh,
+							CostFreshnessScore: 1, CostSourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
 						}},
 					},
 					{
@@ -222,6 +261,22 @@ func TestCaptureShadowReplayUsesOneImmutablePoolSnapshot(t *testing.T) {
 	require.NotNil(t, input.Candidates[0].Cost)
 	assert.True(t, input.Candidates[0].Cost.Known)
 	assert.Equal(t, 0.5, input.Candidates[0].Cost.Cost)
+	fullEstimate, costKnown := ShadowCostEstimateForChannel(input, 501)
+	require.True(t, costKnown)
+	require.NotNil(t, fullEstimate)
+	assert.Equal(t, strings.Repeat("c", 64), fullEstimate.PricingHash)
+	encodedReplay, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedReplay), fullEstimate.PricingHash)
+	assert.NotContains(t, string(encodedReplay), "expected_breakdown")
+	var persistedReplay ShadowReplayInput
+	require.NoError(t, common.Unmarshal(encodedReplay, &persistedReplay))
+	require.NoError(t, persistedReplay.Validate())
+	liteEstimate, costKnown := ShadowCostEstimateForChannel(persistedReplay, 501)
+	require.True(t, costKnown)
+	require.NotNil(t, liteEstimate)
+	assert.Empty(t, liteEstimate.PricingHash)
+	assert.Equal(t, fullEstimate.Cost, liteEstimate.Cost)
 
 	view.Pools[0].DeploymentStage = model.RoutingDeploymentStageObserve
 	SetSnapshotForTest(view)
@@ -432,17 +487,17 @@ func shadowReplayInputForTest(t *testing.T) ShadowReplayInput {
 		{
 			PoolMemberID: 11, ChannelID: 101, Priority: 10, Weight: 10,
 			Metric: &ShadowMetricInput{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 300, P95TTFTMs: 100, OutputTokensPerSecond: 50},
-			Cost:   &ShadowCostInput{Known: true, Cost: 2, UpdatedUnix: 990},
+			Cost:   &ShadowReplayCostInput{Known: true, Cost: 2, UpdatedUnix: 990},
 		},
 		{
 			PoolMemberID: 12, ChannelID: 102, Priority: 10, Weight: 10,
 			Metric: &ShadowMetricInput{RequestCount: 100, SuccessCount: 98, ReliabilityRequestCount: 100, ReliabilityFailureCount: 2, P95LatencyMs: 250, P95TTFTMs: 80, OutputTokensPerSecond: 60},
-			Cost:   &ShadowCostInput{Known: true, Cost: 1, UpdatedUnix: 990},
+			Cost:   &ShadowReplayCostInput{Known: true, Cost: 1, UpdatedUnix: 990},
 		},
 		{
 			PoolMemberID: 13, ChannelID: 103, Priority: 5, Weight: 10,
 			Metric: &ShadowMetricInput{RequestCount: 100, SuccessCount: 100, ReliabilityRequestCount: 100, P95LatencyMs: 100, P95TTFTMs: 50, OutputTokensPerSecond: 80},
-			Cost:   &ShadowCostInput{Known: true, Cost: 0.5, UpdatedUnix: 990},
+			Cost:   &ShadowReplayCostInput{Known: true, Cost: 0.5, UpdatedUnix: 990},
 		},
 	})
 	require.NoError(t, err)

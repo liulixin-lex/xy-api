@@ -1,6 +1,7 @@
 package routinghotcache
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/model"
@@ -30,6 +31,27 @@ func TestHotcacheStoresMetricCostAndBreakerSnapshots(t *testing.T) {
 	breaker, ok := GetBreaker(key)
 	assert.True(t, ok)
 	assert.Equal(t, "degraded", breaker.State)
+}
+
+func TestHotcacheLoadsVersionedNormalizedPricing(t *testing.T) {
+	ResetForTest()
+	pricingJSON := `{"quota_type":0,"billing_mode":"token","currency":"USD","unit":"million_tokens","input_cost_per_million":2,"output_cost_per_million":10,"tiers":{},"extras":{}}`
+	LoadCostSnapshots([]model.RoutingCostSnapshot{{
+		AccountID: 7, ChannelID: 12, ModelName: "gpt-test", SnapshotTS: 100,
+		PricingHash: strings.Repeat("a", 64), PricingVersion: "provider-v1", PricingJSON: &pricingJSON,
+		ObservedTime: 100, EffectiveTime: 90, ExpiresTime: 200,
+		VersionConfidence: model.RoutingCostConfidenceExact, ConfidenceScore: 1,
+		Freshness: model.RoutingCostFreshnessFresh, FreshnessScore: 1,
+		AccountSourceType: model.RoutingUpstreamTypeNewAPI, AccountKeyHash: strings.Repeat("b", 64),
+	}})
+
+	cost, ok := GetCost(CostKey{ChannelID: 12, Model: "gpt-test"})
+	require.True(t, ok)
+	assert.True(t, cost.PricingKnown)
+	assert.Equal(t, "token", cost.Pricing.BillingMode)
+	assert.Equal(t, "million_tokens", cost.Pricing.Unit)
+	assert.Equal(t, strings.Repeat("a", 64), cost.PricingHash)
+	assert.Equal(t, strings.Repeat("b", 64), cost.AccountKeyHash)
 }
 
 func TestHotcacheResetClearsSnapshots(t *testing.T) {
@@ -326,13 +348,14 @@ func TestLoadSnapshotsKeepsLatestMetricAndCost(t *testing.T) {
 
 	costKey := CostKey{ChannelID: 78, Model: "gpt-test"}
 	LoadCostSnapshots([]model.RoutingCostSnapshot{
-		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 2, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
+		{AccountID: 17, ChannelID: 78, ModelName: "gpt-test", GroupRatio: 2, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
 		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 9, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 100},
 	})
 	cost, ok := GetCost(costKey)
 	require.True(t, ok)
 	assert.Equal(t, int64(200), cost.UpdatedUnix)
 	assert.Equal(t, 2.0, cost.Cost)
+	assert.Equal(t, 17, cost.AccountID)
 	LoadCostSnapshots([]model.RoutingCostSnapshot{
 		{ChannelID: 78, ModelName: "gpt-test", GroupRatio: 5, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
 	})

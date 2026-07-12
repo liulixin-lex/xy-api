@@ -33,14 +33,15 @@ const (
 	maxStableRetryAfterTotalMs = maxStableBucketCount * maxStableRetryAfterMs
 )
 
-// StableKey is the durable in-memory aggregation identity. Pool, physical
-// channel, and topology revision are metadata because they may change without
-// changing the member or credential identity.
+// StableKey is the durable in-memory aggregation identity. A policy revision
+// is part of the key so samples cannot cross an activation boundary inside the
+// same time bucket.
 type StableKey struct {
-	PoolMemberID int
-	CredentialID int
-	Model        string
-	BucketTs     int64
+	PoolMemberID     int
+	CredentialID     int
+	Model            string
+	BucketTs         int64
+	SnapshotRevision uint64
 }
 
 type StableInflightKey struct {
@@ -115,7 +116,6 @@ type stableBucket struct {
 	draining                   bool
 	poolID                     int
 	channelID                  int
-	lastSnapshotRevision       uint64
 	requestCount               int64
 	successCount               int64
 	failureCount               int64
@@ -268,10 +268,11 @@ func RequeueStableSnapshots(snapshots []StableSnapshot) {
 			continue
 		}
 		key := StableKey{
-			PoolMemberID: snapshot.PoolMemberID,
-			CredentialID: snapshot.CredentialID,
-			Model:        snapshot.Model,
-			BucketTs:     snapshot.BucketTs,
+			PoolMemberID:     snapshot.PoolMemberID,
+			CredentialID:     snapshot.CredentialID,
+			Model:            snapshot.Model,
+			BucketTs:         snapshot.BucketTs,
+			SnapshotRevision: snapshot.LastSnapshotRevision,
 		}
 		metadata := stableMetadata{
 			poolID:       snapshot.PoolID,
@@ -369,10 +370,11 @@ func recordStableClassifiedAttempt(
 		return
 	}
 	key := StableKey{
-		PoolMemberID: metadata.poolMemberID,
-		CredentialID: metadata.credentialID,
-		Model:        metadata.model,
-		BucketTs:     bucketStart(now.Unix()),
+		PoolMemberID:     metadata.poolMemberID,
+		CredentialID:     metadata.credentialID,
+		Model:            metadata.model,
+		BucketTs:         bucketStart(now.Unix()),
+		SnapshotRevision: metadata.revision,
 	}
 	store := loadOrCreateStableStore()
 	withWritableStableBucket(store, key, metadata, func(bucket *stableBucket) {
@@ -539,9 +541,8 @@ func (store *stableStore) loadOrCreateBucket(key StableKey, metadata stableMetad
 	}
 
 	bucket := &stableBucket{
-		poolID:               metadata.poolID,
-		channelID:            metadata.channelID,
-		lastSnapshotRevision: metadata.revision,
+		poolID:    metadata.poolID,
+		channelID: metadata.channelID,
 	}
 	store.buckets.Store(key, bucket)
 	store.bucketCount.Add(1)
@@ -675,16 +676,6 @@ func (store *stableStore) releaseInflightCounter(key StableInflightKey, counter 
 }
 
 func (bucket *stableBucket) updateMetadataLocked(metadata stableMetadata) {
-	if metadata.revision > bucket.lastSnapshotRevision {
-		bucket.lastSnapshotRevision = metadata.revision
-		if metadata.poolID > 0 {
-			bucket.poolID = metadata.poolID
-		}
-		if metadata.channelID > 0 {
-			bucket.channelID = metadata.channelID
-		}
-		return
-	}
 	if bucket.poolID <= 0 && metadata.poolID > 0 {
 		bucket.poolID = metadata.poolID
 	}
@@ -737,7 +728,7 @@ func (bucket *stableBucket) addLocked(
 			addStableCounter(&bucket.unknownClassificationCount, 1, maxStableBucketCount)
 		}
 		if (classification.Responsibility == routingerror.ResponsibilityProvider ||
-			classification.Responsibility == routingerror.ResponsibilityNetwork) &&
+			(classification.Responsibility == routingerror.ResponsibilityNetwork && classification.Scope != routingerror.ScopeEndpoint)) &&
 			(classification.HealthEffect == routingerror.HealthDegrade ||
 				classification.HealthEffect == routingerror.HealthOpen) {
 			addStableCounter(&bucket.reliabilityRequestCount, 1, maxStableBucketCount)
@@ -960,7 +951,7 @@ func (bucket *stableBucket) snapshotLocked(key StableKey) StableSnapshot {
 		ChannelID:                  bucket.channelID,
 		Model:                      key.Model,
 		BucketTs:                   key.BucketTs,
-		LastSnapshotRevision:       bucket.lastSnapshotRevision,
+		LastSnapshotRevision:       key.SnapshotRevision,
 		RequestCount:               bucket.requestCount,
 		SuccessCount:               bucket.successCount,
 		FailureCount:               bucket.failureCount,
@@ -1060,6 +1051,9 @@ func stableKeyLess(left StableKey, right StableKey) bool {
 	if left.BucketTs != right.BucketTs {
 		return left.BucketTs < right.BucketTs
 	}
+	if left.SnapshotRevision != right.SnapshotRevision {
+		return left.SnapshotRevision < right.SnapshotRevision
+	}
 	if left.PoolMemberID != right.PoolMemberID {
 		return left.PoolMemberID < right.PoolMemberID
 	}
@@ -1072,16 +1066,18 @@ func stableKeyLess(left StableKey, right StableKey) bool {
 func sortStableSnapshots(snapshots []StableSnapshot) {
 	sort.Slice(snapshots, func(i, j int) bool {
 		left := StableKey{
-			PoolMemberID: snapshots[i].PoolMemberID,
-			CredentialID: snapshots[i].CredentialID,
-			Model:        snapshots[i].Model,
-			BucketTs:     snapshots[i].BucketTs,
+			PoolMemberID:     snapshots[i].PoolMemberID,
+			CredentialID:     snapshots[i].CredentialID,
+			Model:            snapshots[i].Model,
+			BucketTs:         snapshots[i].BucketTs,
+			SnapshotRevision: snapshots[i].LastSnapshotRevision,
 		}
 		right := StableKey{
-			PoolMemberID: snapshots[j].PoolMemberID,
-			CredentialID: snapshots[j].CredentialID,
-			Model:        snapshots[j].Model,
-			BucketTs:     snapshots[j].BucketTs,
+			PoolMemberID:     snapshots[j].PoolMemberID,
+			CredentialID:     snapshots[j].CredentialID,
+			Model:            snapshots[j].Model,
+			BucketTs:         snapshots[j].BucketTs,
+			SnapshotRevision: snapshots[j].LastSnapshotRevision,
 		}
 		return stableKeyLess(left, right)
 	})

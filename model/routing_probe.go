@@ -39,6 +39,11 @@ type RoutingProbeResult struct {
 	GroupName          string `json:"group_name" gorm:"type:varchar(64);index;not null"`
 	ModelName          string `json:"model_name" gorm:"type:varchar(128);index;not null"`
 	EndpointHost       string `json:"endpoint_host" gorm:"type:varchar(255);index;not null"`
+	EndpointAuthority  string `json:"endpoint_authority" gorm:"type:varchar(320);not null"`
+	Region             string `json:"region" gorm:"type:varchar(64);index;not null"`
+	BreakerScope       string `json:"breaker_scope" gorm:"type:varchar(16);index;not null"`
+	EvidenceCount      int    `json:"evidence_count" gorm:"not null"`
+	NodeCount          int    `json:"node_count" gorm:"not null"`
 	BreakerState       string `json:"breaker_state" gorm:"type:varchar(32);index;not null"`
 	Outcome            string `json:"outcome" gorm:"type:varchar(32);index;not null"`
 	Responsibility     string `json:"responsibility" gorm:"type:varchar(32);index;not null"`
@@ -91,8 +96,13 @@ func CreateRoutingProbeResultContext(
 		if err := lockForUpdate(tx.WithContext(ctx)).Where("lease_name = ?", lease.LeaseName).First(&currentLease).Error; err != nil {
 			return err
 		}
+		databaseNowMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
 		if currentLease.HolderID != lease.HolderID || currentLease.LeaseToken != lease.LeaseToken ||
-			currentLease.FencingToken != lease.FencingToken || currentLease.LeaseUntilMs < result.FinishedTimeMs {
+			currentLease.FencingToken != lease.FencingToken || currentLease.LeaseUntilMs <= databaseNowMs ||
+			currentLease.LeaseUntilMs < result.FinishedTimeMs {
 			return ErrRoutingControlLeaseLost
 		}
 
@@ -195,7 +205,10 @@ func validateRoutingProbeResult(lease RoutingControlLease, result RoutingProbeRe
 		result.ProbeType != RoutingProbeTypeServing || result.SnapshotRevision <= 0 || result.PoolID <= 0 ||
 		result.MemberID <= 0 || result.ChannelID <= 0 || result.CredentialID < 0 ||
 		!validRoutingProbeText(result.GroupName, 64, false) || !validRoutingProbeText(result.ModelName, 128, false) ||
-		!validRoutingProbeText(result.EndpointHost, 255, false) || !validRoutingProbeText(result.BreakerState, 32, true) ||
+		!validRoutingProbeText(result.EndpointHost, 255, false) || !validRoutingProbeText(result.EndpointAuthority, 320, false) ||
+		!validRoutingProbeText(result.Region, 64, false) || !validRoutingProbeText(result.BreakerScope, 16, false) ||
+		result.EvidenceCount < 1 || result.NodeCount < 1 || result.NodeCount > result.EvidenceCount ||
+		!validRoutingProbeText(result.BreakerState, 32, true) ||
 		!validRoutingProbeOutcome(result.Outcome) || !validRoutingProbeText(result.Responsibility, 32, true) ||
 		!validRoutingProbeText(result.Scope, 32, true) || !validRoutingProbeText(result.Retryability, 32, true) ||
 		!validRoutingProbeText(result.HealthEffect, 32, true) || !validRoutingProbeText(result.CapacityEffect, 32, true) ||

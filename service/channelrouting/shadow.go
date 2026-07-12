@@ -70,6 +70,7 @@ type ShadowRequest struct {
 	RetryIndex              int
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
+	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
 }
 
 type RequestProfile struct {
@@ -81,6 +82,8 @@ type RequestProfile struct {
 	RetryIndex              int    `json:"retry_index"`
 	PromptTokenEstimate     int    `json:"prompt_token_estimate"`
 	CompletionTokenEstimate int    `json:"completion_token_estimate"`
+	costProfile             *model.RoutingCostRequestProfile
+	costAtUnix              int64
 }
 
 type ShadowSelectorSettings struct {
@@ -112,6 +115,36 @@ type ShadowMetricInput struct {
 }
 
 type ShadowCostInput struct {
+	Known                bool                       `json:"known"`
+	Cost                 float64                    `json:"cost"`
+	WorstCaseKnown       bool                       `json:"worst_case_known,omitempty"`
+	WorstCaseCost        float64                    `json:"worst_case_cost,omitempty"`
+	EffectiveKnown       bool                       `json:"effective_known,omitempty"`
+	EffectiveCost        float64                    `json:"effective_cost,omitempty"`
+	Currency             string                     `json:"currency,omitempty"`
+	Unit                 string                     `json:"unit,omitempty"`
+	PricingBasis         string                     `json:"pricing_basis,omitempty"`
+	PricingHash          string                     `json:"pricing_hash,omitempty"`
+	PricingVersion       string                     `json:"pricing_version,omitempty"`
+	ObservedTime         int64                      `json:"observed_time,omitempty"`
+	EffectiveTime        int64                      `json:"effective_time,omitempty"`
+	ExpiresTime          int64                      `json:"expires_time,omitempty"`
+	VersionConfidence    string                     `json:"version_confidence,omitempty"`
+	Freshness            string                     `json:"freshness,omitempty"`
+	SourceSyncStatus     string                     `json:"source_sync_status,omitempty"`
+	AccountSourceType    string                     `json:"account_source_type,omitempty"`
+	AccountKeyHash       string                     `json:"account_key_hash,omitempty"`
+	ConfidenceScore      float64                    `json:"confidence_score,omitempty"`
+	FreshnessScore       float64                    `json:"freshness_score,omitempty"`
+	ExpectedBreakdown    model.RoutingCostBreakdown `json:"expected_breakdown,omitempty"`
+	WorstSingleBreakdown model.RoutingCostBreakdown `json:"worst_single_breakdown,omitempty"`
+	UpdatedUnix          int64                      `json:"updated_unix"`
+}
+
+// ShadowReplayCostInput is the stable selector input persisted for replay.
+// Version metadata and cost breakdowns are audited separately and are not
+// needed to reproduce a routing decision.
+type ShadowReplayCostInput struct {
 	Known       bool    `json:"known"`
 	Cost        float64 `json:"cost"`
 	UpdatedUnix int64   `json:"updated_unix"`
@@ -132,17 +165,17 @@ type ShadowCapacityInput struct {
 }
 
 type ShadowCandidateInput struct {
-	PoolMemberID           int                  `json:"pool_member_id"`
-	ChannelID              int                  `json:"channel_id"`
-	CredentialID           int                  `json:"credential_id,omitempty"`
-	Priority               int64                `json:"priority"`
-	Weight                 uint                 `json:"weight"`
-	Metric                 *ShadowMetricInput   `json:"metric,omitempty"`
-	Cost                   *ShadowCostInput     `json:"cost,omitempty"`
-	Breaker                *ShadowBreakerInput  `json:"breaker,omitempty"`
-	Capacity               *ShadowCapacityInput `json:"capacity,omitempty"`
-	SlowStartFactor        float64              `json:"slow_start_factor,omitempty"`
-	RequestExclusionReason string               `json:"request_exclusion_reason,omitempty"`
+	PoolMemberID           int                    `json:"pool_member_id"`
+	ChannelID              int                    `json:"channel_id"`
+	CredentialID           int                    `json:"credential_id,omitempty"`
+	Priority               int64                  `json:"priority"`
+	Weight                 uint                   `json:"weight"`
+	Metric                 *ShadowMetricInput     `json:"metric,omitempty"`
+	Cost                   *ShadowReplayCostInput `json:"cost,omitempty"`
+	Breaker                *ShadowBreakerInput    `json:"breaker,omitempty"`
+	Capacity               *ShadowCapacityInput   `json:"capacity,omitempty"`
+	SlowStartFactor        float64                `json:"slow_start_factor,omitempty"`
+	RequestExclusionReason string                 `json:"request_exclusion_reason,omitempty"`
 }
 
 type ShadowReplayInput struct {
@@ -156,6 +189,7 @@ type ShadowReplayInput struct {
 	Profile           RequestProfile         `json:"profile"`
 	Settings          ShadowSelectorSettings `json:"settings"`
 	Candidates        []ShadowCandidateInput `json:"candidates"`
+	costEstimates     map[int]ShadowCostInput
 }
 
 type ShadowReplayResult struct {
@@ -266,6 +300,7 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 	if err != nil {
 		return ShadowReplayInput{}, true, err
 	}
+	profile = attachRoutingCostProfile(profile, request.CostProfile, time.Now().Unix())
 	seed, err := DeriveDecisionSeed(request.RequestID, snapshot.view.Revision, request.RetryIndex)
 	if err != nil {
 		return ShadowReplayInput{}, true, err
@@ -273,6 +308,7 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 	now := time.Now()
 	settings := pool.SelectorPolicy.selectorSettings(now.Unix(), now.UnixMilli(), seed, request.IsStream)
 	candidates := make([]ShadowCandidateInput, 0, len(pool.Members))
+	costEstimates := make(map[int]ShadowCostInput, len(pool.Members))
 	for memberIndex := range pool.Members {
 		member := pool.Members[memberIndex]
 		if member.PoolID != pool.ID || member.PhysicalStatus != common.ChannelStatusEnabled {
@@ -286,9 +322,12 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 		if !channelKnown || channel.Status != common.ChannelStatusEnabled {
 			continue
 		}
-		candidate, candidateErr := shadowCandidateFromSnapshot(*pool, member, observation, channel, profile, settings)
+		candidate, costEstimate, candidateErr := shadowCandidateFromSnapshot(*pool, member, observation, channel, profile, settings)
 		if candidateErr != nil {
 			return ShadowReplayInput{}, true, candidateErr
+		}
+		if costEstimate != nil {
+			costEstimates[member.ChannelID] = *costEstimate
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -301,6 +340,9 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 		settings,
 		candidates,
 	)
+	if err == nil {
+		input.costEstimates = costEstimates
+	}
 	return input, true, err
 }
 
@@ -517,9 +559,9 @@ func shadowCandidateFromSnapshot(
 	channel ChannelSnapshot,
 	profile RequestProfile,
 	settings routingselector.Settings,
-) (ShadowCandidateInput, error) {
+) (ShadowCandidateInput, *ShadowCostInput, error) {
 	if member.PoolID != pool.ID || member.LegacyWeight < 0 {
-		return ShadowCandidateInput{}, ErrShadowReplayInvalid
+		return ShadowCandidateInput{}, nil, ErrShadowReplayInvalid
 	}
 	candidate := ShadowCandidateInput{
 		PoolMemberID: member.ID,
@@ -548,9 +590,11 @@ func shadowCandidateFromSnapshot(
 	}
 	cost, err := shadowExpectedCost(observation, profile)
 	if err != nil {
-		return ShadowCandidateInput{}, err
+		return ShadowCandidateInput{}, nil, err
 	}
-	candidate.Cost = cost
+	if cost != nil {
+		candidate.Cost = &ShadowReplayCostInput{Known: cost.Known, Cost: cost.Cost, UpdatedUnix: cost.UpdatedUnix}
+	}
 	if observation.BreakerKnown {
 		candidate.Breaker = &ShadowBreakerInput{
 			State:             observation.BreakerState,
@@ -581,10 +625,68 @@ func shadowCandidateFromSnapshot(
 			UpdatedUnixMilli:       observation.CapacityUpdatedUnixMilli,
 		}
 	}
-	return candidate, nil
+	return candidate, cost, nil
 }
 
 func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*ShadowCostInput, error) {
+	if observation.CostPricing != nil {
+		requestProfile := model.RoutingCostRequestProfile{
+			PromptTokens:             int64(profile.PromptTokenEstimate),
+			ExpectedCompletionTokens: int64(profile.CompletionTokenEstimate),
+			MaximumCompletionTokens:  int64(profile.CompletionTokenEstimate),
+			MaxAttempts:              1,
+		}
+		if profile.costProfile != nil {
+			requestProfile = *profile.costProfile
+		}
+		atUnix := profile.costAtUnix
+		if atUnix <= 0 {
+			atUnix = time.Now().Unix()
+		}
+		version := model.RoutingCostSnapshotVersion{
+			PricingHash:      observation.CostPricingHash,
+			PricingVersion:   observation.CostPricingVersion,
+			ObservedTime:     observation.CostObservedTime,
+			EffectiveTime:    observation.CostEffectiveTime,
+			ExpiresTime:      observation.CostExpiresTime,
+			Confidence:       observation.CostVersionConfidence,
+			ConfidenceScore:  observation.CostConfidenceScore,
+			Freshness:        observation.CostFreshness,
+			FreshnessScore:   observation.CostFreshnessScore,
+			SourceSyncStatus: observation.CostSourceSyncStatus,
+			SourceSyncError:  observation.CostSourceSyncError,
+		}
+		estimate, err := model.EstimateRoutingCostSnapshot(version, *observation.CostPricing, requestProfile, atUnix)
+		if err != nil {
+			return nil, ErrShadowReplayInvalid
+		}
+		return &ShadowCostInput{
+			Known:                estimate.ExpectedKnown,
+			Cost:                 estimate.ExpectedCost,
+			WorstCaseKnown:       estimate.WorstCaseKnown,
+			WorstCaseCost:        estimate.WorstCaseCost,
+			EffectiveKnown:       estimate.ExpectedEffectiveKnown,
+			EffectiveCost:        estimate.ExpectedEffectiveCost,
+			Currency:             estimate.Currency,
+			Unit:                 estimate.Unit,
+			PricingBasis:         observation.CostPricing.BillingMode,
+			PricingHash:          observation.CostPricingHash,
+			PricingVersion:       observation.CostPricingVersion,
+			ObservedTime:         observation.CostObservedTime,
+			EffectiveTime:        observation.CostEffectiveTime,
+			ExpiresTime:          observation.CostExpiresTime,
+			VersionConfidence:    observation.CostVersionConfidence,
+			Freshness:            observation.CostFreshness,
+			SourceSyncStatus:     observation.CostSourceSyncStatus,
+			AccountSourceType:    observation.CostAccountSourceType,
+			AccountKeyHash:       observation.CostAccountKeyHash,
+			ConfidenceScore:      estimate.ConfidenceScore,
+			FreshnessScore:       estimate.FreshnessScore,
+			ExpectedBreakdown:    estimate.ExpectedBreakdown,
+			WorstSingleBreakdown: estimate.WorstCaseSingleBreakdown,
+			UpdatedUnix:          observation.CostObservedTime,
+		}, nil
+	}
 	if !observation.CostKnown && observation.CostUpdatedUnix <= 0 {
 		return nil, nil
 	}
@@ -621,20 +723,36 @@ func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*Sha
 	if !known {
 		cost = 0
 	}
-	return &ShadowCostInput{Known: known, Cost: cost, UpdatedUnix: observation.CostUpdatedUnix}, nil
+	return &ShadowCostInput{
+		Known: known, Cost: cost, PricingBasis: observation.CostBillingMode, UpdatedUnix: observation.CostUpdatedUnix,
+	}, nil
 }
 
 func ShadowExpectedCostForChannel(input ShadowReplayInput, channelID int) (float64, bool) {
-	if channelID <= 0 {
+	cost, known := ShadowCostEstimateForChannel(input, channelID)
+	if !known {
 		return 0, false
+	}
+	return cost.Cost, true
+}
+
+func ShadowCostEstimateForChannel(input ShadowReplayInput, channelID int) (*ShadowCostInput, bool) {
+	if channelID <= 0 {
+		return nil, false
+	}
+	if estimate, exists := input.costEstimates[channelID]; exists {
+		cost := estimate
+		return &cost, shadowCostKnown(&cost, input.Settings)
 	}
 	for index := range input.Candidates {
 		candidate := input.Candidates[index]
-		if candidate.ChannelID == channelID && shadowCostKnown(candidate.Cost, input.Settings) {
-			return candidate.Cost.Cost, true
+		if candidate.ChannelID == channelID && shadowReplayCostKnown(candidate.Cost, input.Settings) {
+			return &ShadowCostInput{
+				Known: candidate.Cost.Known, Cost: candidate.Cost.Cost, UpdatedUnix: candidate.Cost.UpdatedUnix,
+			}, true
 		}
 	}
-	return 0, false
+	return nil, false
 }
 
 func positiveShadowCostOrDefault(value float64, fallback float64) float64 {
@@ -682,7 +800,9 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 		memberByChannel[candidate.ChannelID] = candidate.PoolMemberID
 		credentialByChannel[candidate.ChannelID] = candidate.CredentialID
 		if candidate.Cost != nil {
-			costByChannel[candidate.ChannelID] = *candidate.Cost
+			costByChannel[candidate.ChannelID] = ShadowCostInput{
+				Known: candidate.Cost.Known, Cost: candidate.Cost.Cost, UpdatedUnix: candidate.Cost.UpdatedUnix,
+			}
 		}
 		if candidate.RequestExclusionReason != "" {
 			continue
@@ -809,11 +929,18 @@ func ClassifyShadowDifference(actualChannelID int, replay ShadowReplayResult) st
 }
 
 func ReplayDecisionAudit(audit model.RoutingDecisionAudit) (ShadowReplayResult, error) {
+	return ReplayDecisionAuditContext(context.Background(), audit)
+}
+
+func ReplayDecisionAuditContext(ctx context.Context, audit model.RoutingDecisionAudit) (ShadowReplayResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !audit.Replayable || audit.PoolID <= 0 || audit.SnapshotRevision <= 0 ||
 		audit.RuntimeGeneration <= 0 || !supportedDecisionAlgorithm(audit.AlgorithmVersion) {
 		return ShadowReplayResult{}, ErrShadowReplayAudit
 	}
-	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
+	replayInputJSON, err := model.LoadRoutingDecisionReplayInputContext(ctx, audit)
 	if err != nil {
 		if errors.Is(err, model.ErrRoutingDecisionReplayIntegrity) {
 			return ShadowReplayResult{}, ErrShadowReplayHash
@@ -976,8 +1103,12 @@ func shadowCostKnown(cost *ShadowCostInput, settings ShadowSelectorSettings) boo
 	if cost == nil || !cost.Known || !finiteShadowNumber(cost.Cost) || cost.Cost < 0 {
 		return false
 	}
-	return cost.UpdatedUnix <= 0 || settings.NowUnix <= 0 || settings.SnapshotStaleSec <= 0 ||
-		settings.NowUnix-cost.UpdatedUnix <= int64(settings.SnapshotStaleSec)
+	return !shadowCostStale(cost, settings)
+}
+
+func shadowCostStale(cost *ShadowCostInput, settings ShadowSelectorSettings) bool {
+	return cost != nil && cost.UpdatedUnix > 0 && settings.NowUnix > 0 && settings.SnapshotStaleSec > 0 &&
+		settings.NowUnix-cost.UpdatedUnix > int64(settings.SnapshotStaleSec)
 }
 
 func (input ShadowReplayInput) validateWithoutHash() error {
@@ -1063,7 +1194,7 @@ func validShadowCandidate(candidate ShadowCandidateInput) bool {
 			return false
 		}
 	}
-	if candidate.Cost != nil && (!finiteShadowNumber(candidate.Cost.Cost) || candidate.Cost.Cost < 0 || candidate.Cost.UpdatedUnix < 0) {
+	if !validShadowReplayCost(candidate.Cost) {
 		return false
 	}
 	if candidate.Breaker != nil && (!validShadowText(candidate.Breaker.State, 32) ||
@@ -1073,6 +1204,16 @@ func validShadowCandidate(candidate ShadowCandidateInput) bool {
 	}
 	return candidate.Capacity == nil || (candidate.Capacity.SourceStatusCode >= 0 &&
 		candidate.Capacity.CooldownUntilUnixMilli >= 0 && candidate.Capacity.UpdatedUnixMilli >= 0)
+}
+
+func validShadowReplayCost(cost *ShadowReplayCostInput) bool {
+	return cost == nil || (finiteShadowNumber(cost.Cost) && cost.Cost >= 0 && cost.UpdatedUnix >= 0)
+}
+
+func shadowReplayCostKnown(cost *ShadowReplayCostInput, settings ShadowSelectorSettings) bool {
+	return cost != nil && cost.Known && finiteShadowNumber(cost.Cost) && cost.Cost >= 0 &&
+		(cost.UpdatedUnix <= 0 || settings.NowUnix <= 0 || settings.SnapshotStaleSec <= 0 ||
+			settings.NowUnix-cost.UpdatedUnix <= int64(settings.SnapshotStaleSec))
 }
 
 func supportedDecisionAlgorithm(algorithmVersion string) bool {
@@ -1131,4 +1272,17 @@ func validShadowText(value string, maxRunes int) bool {
 
 func finiteShadowNumber(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validRoutingCostBreakdown(breakdown model.RoutingCostBreakdown) bool {
+	for _, value := range []float64{
+		breakdown.Input, breakdown.Output, breakdown.CacheRead, breakdown.CacheWrite,
+		breakdown.CacheWrite1h, breakdown.ImageInput, breakdown.ImageOutput, breakdown.ImageUnits,
+		breakdown.AudioInput, breakdown.AudioOutput, breakdown.PerRequest, breakdown.Expression, breakdown.Total,
+	} {
+		if !finiteShadowNumber(value) || value < 0 {
+			return false
+		}
+	}
+	return true
 }

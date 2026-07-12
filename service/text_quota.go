@@ -340,6 +340,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		outputTokens = int64(originUsage.CompletionTokens)
 	}
 	relayInfo.ObserveRoutingOutputTokensAt(outputTokens, observedAt)
+	relayInfo.ObserveRoutingAttemptUsage(originUsage)
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")
 	}

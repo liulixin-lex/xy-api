@@ -48,6 +48,57 @@ func TestDecisionAuditBufferIsBoundedAndFlushesLatestRetainedRecords(t *testing.
 	assert.NotContains(t, audits[0].CandidatesJSON, "api-key")
 }
 
+func TestDecisionAuditPersistsVersionedCostEstimatesWithoutRequestPayload(t *testing.T) {
+	db := openDecisionAuditTestDB(t, true)
+	withSnapshotTestDB(t, db)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	actual := &ShadowCostInput{
+		Known: true, Cost: 0.003, WorstCaseKnown: true, WorstCaseCost: 0.012,
+		EffectiveKnown: true, EffectiveCost: 0.004, Currency: "USD", Unit: "mixed",
+		PricingBasis: "token", PricingHash: strings.Repeat("a", 64), PricingVersion: "upstream-v3",
+		ObservedTime: 1_700_000_000, EffectiveTime: 1_699_999_900, ExpiresTime: 1_700_003_600,
+		VersionConfidence: model.RoutingCostConfidenceExact, Freshness: model.RoutingCostFreshnessFresh,
+		SourceSyncStatus:  model.RoutingUpstreamSyncStatusSuccess,
+		AccountSourceType: model.RoutingUpstreamTypeNewAPI, AccountKeyHash: strings.Repeat("b", 64),
+		ConfidenceScore: 0.95, FreshnessScore: 0.9,
+		ExpectedBreakdown:    model.RoutingCostBreakdown{Input: 0.001, Output: 0.002, Total: 0.003},
+		WorstSingleBreakdown: model.RoutingCostBreakdown{Input: 0.002, Output: 0.004, Total: 0.006},
+		UpdatedUnix:          1_700_000_000,
+	}
+	observed := *actual
+	observed.Cost = 0.0025
+	observed.EffectiveCost = 0.0035
+	observed.PricingHash = strings.Repeat("c", 64)
+	observed.ExpectedBreakdown = model.RoutingCostBreakdown{Input: 0.001, Output: 0.0015, Total: 0.0025}
+
+	decisionID, err := EnqueueDecision(DecisionInput{
+		RequestID: "cost-audit", PoolID: 7, GroupName: "vip", ModelName: "gpt-cost",
+		SnapshotRevision: 19, AlgorithmVersion: DecisionAlgorithmObserveV1,
+		ActualChannelID: 101, ObservedChannelID: 102,
+		ActualCostKnown: true, ActualExpectedCost: actual.Cost,
+		ObservedCostKnown: true, ObservedExpectedCost: observed.Cost,
+		ActualCostEstimate: actual, ObservedCostEstimate: &observed,
+	})
+	require.NoError(t, err)
+	flushed, err := FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+
+	var stored model.RoutingDecisionAudit
+	require.NoError(t, db.Where("decision_id = ?", decisionID).First(&stored).Error)
+	assert.Empty(t, stored.RequestProfileJSON)
+	assert.NotContains(t, stored.ActualCostEstimateJSON, "authorization")
+	assert.NotContains(t, stored.ActualCostEstimateJSON, "private-request-body")
+	var decoded ShadowCostInput
+	require.NoError(t, common.UnmarshalJsonStr(stored.ActualCostEstimateJSON, &decoded))
+	assert.Equal(t, actual.PricingHash, decoded.PricingHash)
+	assert.Equal(t, actual.AccountKeyHash, decoded.AccountKeyHash)
+	assert.Equal(t, actual.ExpectedBreakdown, decoded.ExpectedBreakdown)
+	assert.Equal(t, observed.Cost-actual.Cost, stored.ExpectedCostDelta)
+}
+
 func TestDecisionAuditStatsExposeOldestBufferedAge(t *testing.T) {
 	buffer := newAuditBuffer(2)
 	createdTime := common.GetTimestamp() - 10
@@ -229,7 +280,7 @@ func TestMaximumReplayPayloadProducesPersistedReplayableAudit(t *testing.T) {
 				P95LatencyMs: math.MaxFloat64, P95TTFTMs: math.MaxFloat64,
 				OutputTokensPerSecond: math.MaxFloat64, Inflight: math.MaxInt64,
 			},
-			Cost: &ShadowCostInput{Known: true, Cost: math.MaxFloat64, UpdatedUnix: math.MaxInt64},
+			Cost: &ShadowReplayCostInput{Known: true, Cost: math.MaxFloat64, UpdatedUnix: math.MaxInt64},
 			Breaker: &ShadowBreakerInput{
 				State: strings.Repeat("s", 32), Reason: strings.Repeat("r", 64),
 				CooldownUntilUnix: math.MaxInt64, HalfOpenInflight: math.MaxInt64, UpdatedUnix: math.MaxInt64,

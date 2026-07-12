@@ -642,10 +642,11 @@ func normalizeRoutingTelemetryBatchAt(batch RoutingTelemetryBatch, now time.Time
 		maxProducedBucketTs = producedAtSeconds + futureSkewSeconds
 	}
 	type metricKey struct {
-		memberID     int
-		credentialID int
-		modelKey     string
-		bucketTs     int64
+		memberID         int
+		credentialID     int
+		modelKey         string
+		bucketTs         int64
+		snapshotRevision int64
 	}
 	merged := make(map[metricKey]RoutingMetricRollup, len(batch.Items))
 	for index := range batch.Items {
@@ -658,10 +659,11 @@ func normalizeRoutingTelemetryBatchAt(batch RoutingTelemetryBatch, now time.Time
 			return nil, fmt.Errorf("%w: bucket timestamp is not plausible for produced time at item %d", ErrRoutingTelemetryInvalid, index)
 		}
 		key := metricKey{
-			memberID:     incoming.MemberID,
-			credentialID: incoming.CredentialID,
-			modelKey:     incoming.ModelKey,
-			bucketTs:     incoming.BucketTs,
+			memberID:         incoming.MemberID,
+			credentialID:     incoming.CredentialID,
+			modelKey:         incoming.ModelKey,
+			bucketTs:         incoming.BucketTs,
+			snapshotRevision: incoming.LastSnapshotRevision,
 		}
 		current, exists := merged[key]
 		if !exists {
@@ -696,7 +698,10 @@ func normalizeRoutingTelemetryBatchAt(batch RoutingTelemetryBatch, now time.Time
 		if left.ModelKey != right.ModelKey {
 			return left.ModelKey < right.ModelKey
 		}
-		return left.BucketTs < right.BucketTs
+		if left.BucketTs != right.BucketTs {
+			return left.BucketTs < right.BucketTs
+		}
+		return left.LastSnapshotRevision < right.LastSnapshotRevision
 	})
 	return rollups, nil
 }

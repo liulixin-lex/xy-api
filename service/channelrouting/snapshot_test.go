@@ -1084,23 +1084,34 @@ func TestBuildSnapshotHonorsCanceledContext(t *testing.T) {
 
 func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 	tests := []struct {
-		name      string
-		channels  []model.Channel
-		configure func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument)
+		name       string
+		channels   []model.Channel
+		configure  func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument)
+		invalidate func(t *testing.T, db *gorm.DB, document model.RoutingPolicyDocument)
 	}{
 		{
-			name: "missing channel",
+			name:     "missing channel",
+			channels: []model.Channel{{Id: 701, Name: "primary", Key: "key-a", Group: "default", Models: "gpt-test"}},
 			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
-				document.Pools[0].Members[0].Enabled = false
-				document.Pools[0].Members[0].ChannelID = 99_001
+				document.Pools[0].Members[0].ChannelID = 701
+			},
+			invalidate: func(t *testing.T, db *gorm.DB, document model.RoutingPolicyDocument) {
+				require.NoError(t, db.Where("id = ?", document.Pools[0].Members[0].ChannelID).
+					Delete(&model.Channel{}).Error)
 			},
 		},
 		{
 			name:     "missing credential",
 			channels: []model.Channel{{Id: 701, Name: "primary", Key: "key-a", Group: "default", Models: "gpt-test"}},
 			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
+				var credential model.RoutingCredentialRef
+				require.NoError(t, db.Where("channel_id = ? AND active = ?", 701, true).First(&credential).Error)
 				document.Pools[0].Members[0].ChannelID = 701
-				document.Pools[0].Members[0].CredentialIDs = []int{99_002}
+				document.Pools[0].Members[0].CredentialIDs = []int{credential.ID}
+			},
+			invalidate: func(t *testing.T, db *gorm.DB, document model.RoutingPolicyDocument) {
+				require.NoError(t, db.Where("id = ?", document.Pools[0].Members[0].CredentialIDs[0]).
+					Delete(&model.RoutingCredentialRef{}).Error)
 			},
 		},
 		{
@@ -1111,9 +1122,14 @@ func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 			},
 			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
 				var credential model.RoutingCredentialRef
-				require.NoError(t, db.Where("channel_id = ? AND active = ?", 703, true).First(&credential).Error)
+				require.NoError(t, db.Where("channel_id = ? AND active = ?", 702, true).First(&credential).Error)
 				document.Pools[0].Members[0].ChannelID = 702
 				document.Pools[0].Members[0].CredentialIDs = []int{credential.ID}
+			},
+			invalidate: func(t *testing.T, db *gorm.DB, document model.RoutingPolicyDocument) {
+				require.NoError(t, db.Model(&model.RoutingCredentialRef{}).
+					Where("id = ?", document.Pools[0].Members[0].CredentialIDs[0]).
+					Update("channel_id", 703).Error)
 			},
 		},
 	}
@@ -1123,11 +1139,9 @@ func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 			db := openSnapshotTestDB(t)
 			withSnapshotTestDB(t, db)
 			withSnapshotSecret(t)
-			if len(test.channels) > 0 {
-				require.NoError(t, db.Create(&test.channels).Error)
-				_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
-				require.NoError(t, err)
-			}
+			require.NoError(t, db.Create(&test.channels).Error)
+			_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+			require.NoError(t, err)
 			document := model.RoutingPolicyDocument{
 				SchemaVersion: model.RoutingPolicySchemaVersion,
 				Pools: []model.RoutingPolicyPoolContent{{
@@ -1142,11 +1156,12 @@ func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 				}},
 			}
 			test.configure(t, db, &document)
-			_, err := model.PublishRoutingPolicyRevisionDBContext(
+			_, err = model.PublishRoutingPolicyRevisionDBContext(
 				context.Background(), db, 0, document,
 				model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "reference_test"},
 			)
 			require.NoError(t, err)
+			test.invalidate(t, db, document)
 
 			_, err = buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
 			assert.ErrorIs(t, err, ErrSnapshotPolicyReference)

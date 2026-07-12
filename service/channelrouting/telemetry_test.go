@@ -230,14 +230,24 @@ func TestTelemetryStreamConsumerRunsWhenAuditPersistenceFails(t *testing.T) {
 }
 
 func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingMetricRollup{}, &model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}, &model.RoutingTelemetryReceipt{},
 		&model.RoutingConfigOutbox{}, &model.RoutingRuntimeCheckpoint{}, &model.RoutingCostSnapshotVersion{},
 		&model.RoutingProbeResult{}, &model.RoutingControlLease{},
+		&model.RoutingBreakerResetFence{}, &model.RoutingEndpointEvidence{}, &model.RoutingEndpointSharedState{},
+		&model.RoutingErrorBudgetCursor{}, &model.RoutingErrorBudgetHistory{},
+		&model.RoutingAuditExport{}, &model.RoutingAuditExportChunk{},
+		&model.RoutingOperation{}, &model.RoutingBreakerResetCommand{},
+		&model.RoutingBreakerResetTombstone{}, &model.RoutingBreakerResetOutbox{},
+		&model.RoutingPolicyHead{}, &model.RoutingPolicyDraft{}, &model.RoutingPolicyApproval{},
+		&model.RoutingPolicyRollbackApproval{}, &model.RoutingCanaryEvaluation{},
 	))
 	withSnapshotTestDB(t, db)
+	require.NoError(t, db.Create(&model.RoutingPolicyHead{ID: 1}).Error)
 
 	require.NoError(t, model.UpsertRoutingMetricRollupsContext(context.Background(), []model.RoutingMetricRollup{{
 		MemberID: 1, CredentialID: 0, ModelName: "old", BucketTs: 1,
@@ -271,16 +281,85 @@ func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 	require.NoError(t, db.Create(&model.RoutingProbeResult{
 		ProbeID: strings.Repeat("a", 64), TargetKey: strings.Repeat("b", 64), ProbeType: model.RoutingProbeTypeServing,
 		SnapshotRevision: 1, PoolID: 1, MemberID: 1, ChannelID: 1, GroupName: "default", ModelName: "old",
-		EndpointHost: "old.example", BreakerState: model.RoutingBreakerStateHealthy, Outcome: model.RoutingProbeOutcomeSuccess,
+		EndpointHost: "old.example", EndpointAuthority: "https://old.example:443", Region: "default",
+		BreakerScope: "member", EvidenceCount: 1, NodeCount: 1,
+		BreakerState: model.RoutingBreakerStateHealthy, Outcome: model.RoutingProbeOutcomeSuccess,
 		StartedTimeMs: 1, FinishedTimeMs: 1, LeaseFencingToken: 1, NodeEpochID: "old-node", CreatedTime: 1,
 	}).Error)
 	require.NoError(t, db.Create(&model.RoutingControlLease{
 		LeaseName: activeProbeLeasePrefix + "old", LeaseUntilMs: 0, LastCompletedMs: 1, UpdatedTimeMs: 1,
 	}).Error)
+	require.NoError(t, db.Create(&model.RoutingAuditExport{
+		ExportID: "rae_" + strings.Repeat("c", 32), OperationID: 1, ActorID: 1,
+		FromTime: 1, ToTime: 1, RecordCount: 0, ContentBytes: 2, ContentHash: fmt.Sprintf("%064x", 8),
+		ChunkCount: 1, CreatedTimeMs: 1, ExpiresTimeMs: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingAuditExportChunk{
+		ExportID: "rae_" + strings.Repeat("c", 32), ChunkIndex: 0, ChunkCount: 1,
+		PayloadBytes: 2, PayloadHash: fmt.Sprintf("%064x", 9), Payload: `[]`,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingOperation{
+		OperationType: model.RoutingOperationTypeCostSync, IdempotencyHash: fmt.Sprintf("%064x", 10),
+		CreateToken: fmt.Sprintf("%032x", 11), EvaluationHash: fmt.Sprintf("%064x", 12),
+		SubjectType: model.RoutingOperationSubjectRoutingCosts, Reason: "old operation",
+		Status: model.RoutingOperationStatusFailed, Attempts: 1, LastError: "old failure",
+		CreatedTimeMs: 1, UpdatedTimeMs: 1, CompletedTimeMs: 1,
+	}).Error)
+	resetOutbox := model.RoutingBreakerResetOutbox{
+		OperationID: 2, TargetKey: fmt.Sprintf("%064x", 13), Generation: 1,
+		PayloadJSON: `{}`, PayloadHash: fmt.Sprintf("%064x", 14),
+		CreatedTimeMs: 1, UpdatedTimeMs: 1, PublishedTimeMs: 1,
+	}
+	require.NoError(t, db.Create(&resetOutbox).Error)
+	require.NoError(t, db.Create(&model.RoutingBreakerResetCommand{
+		OperationID: 2, TargetKey: resetOutbox.TargetKey, Scope: model.RoutingBreakerResetScopeMember,
+		PoolID: 1, MemberID: 1, ChannelID: 1, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		ModelName: "old", GroupName: "default", Generation: 1, TombstoneID: 1, OutboxID: resetOutbox.ID,
+		CreatedTimeMs: 1, CompletedTimeMs: 1,
+	}).Error)
 
 	deleted, err := DeleteExpiredRoutingHistoryContext(context.Background(), 1)
 	require.NoError(t, err)
-	assert.Equal(t, int64(8), deleted)
+	assert.Equal(t, int64(13), deleted)
+}
+
+func TestCanaryEvaluationRetentionPreservesCurrentRollout(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RoutingPolicyHead{}, &model.RoutingCanaryEvaluation{}))
+	withSnapshotTestDB(t, db)
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+
+	require.NoError(t, db.Create(&model.RoutingPolicyHead{
+		ID: 1, CurrentRevision: 11, CurrentActivationID: 401,
+		CurrentHash: strings.Repeat("b", 64), CurrentStage: model.RoutingDeploymentStageCanary,
+		CreatedTime: 1, UpdatedTime: 1,
+	}).Error)
+	activeRollout, err := CanaryRolloutKey(29, 401, 11, 100)
+	require.NoError(t, err)
+	rows := []model.RoutingCanaryEvaluation{
+		{
+			EvaluationHash: strings.Repeat("1", 64), CreateToken: strings.Repeat("1", 32),
+			PolicyRevision: 11, ActivationID: 401, PoolID: 29,
+			RolloutKey: string(activeRollout), WindowStartMs: 1, WindowEndMs: 2,
+			Status: model.RoutingCanaryEvaluationStatusPassed, Reason: "active rollout", CreatedTimeMs: 10,
+		},
+		{
+			EvaluationHash: strings.Repeat("2", 64), CreateToken: strings.Repeat("2", 32),
+			PolicyRevision: 10, ActivationID: 400, PoolID: 30,
+			RolloutKey: strings.Repeat("d", 64), WindowStartMs: 1, WindowEndMs: 2,
+			Status: model.RoutingCanaryEvaluationStatusPassed, Reason: "expired rollout", CreatedTimeMs: 10,
+		},
+	}
+	require.NoError(t, db.Create(&rows).Error)
+
+	deleted, err := deleteExpiredRoutingCanaryEvaluationsContext(context.Background(), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	var remaining model.RoutingCanaryEvaluation
+	require.NoError(t, db.First(&remaining).Error)
+	assert.Equal(t, string(activeRollout), remaining.RolloutKey)
 }
 
 func enableStableTelemetryTest(t *testing.T) {

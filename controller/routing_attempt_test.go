@@ -8,6 +8,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -181,6 +183,13 @@ func TestRoutingAttemptClientCommitUsesProtocolBoundary(t *testing.T) {
 	_, err = nonStreamContext.Writer.Write([]byte("ok"))
 	require.NoError(t, err)
 	assert.True(t, routingAttemptClientCommitted(nonStreamContext, nonStream))
+
+	realtimeContext := routingAttemptContextForTest()
+	realtime := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatOpenAIRealtime}
+	assert.False(t, routingAttemptClientCommitted(realtimeContext, realtime))
+	_, err = realtimeContext.Writer.Write([]byte("websocket upgrade complete"))
+	require.NoError(t, err)
+	assert.True(t, routingAttemptClientCommitted(realtimeContext, realtime))
 }
 
 func TestRoutingAttemptRejectionReturnsTerminalErrorBeforeFirstSend(t *testing.T) {
@@ -195,6 +204,86 @@ func TestRoutingAttemptRejectionReturnsTerminalErrorBeforeFirstSend(t *testing.T
 	assert.Equal(t, http.StatusServiceUnavailable, budget.StatusCode)
 	assert.True(t, types.IsSkipRetryError(budget))
 	assert.ErrorIs(t, budget.Err, channelrouting.ErrRetryTokenBudgetExhausted)
+}
+
+func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, db.AutoMigrate(&model.RoutingHedgeAttemptAudit{}))
+	require.NoError(t, model.DB.Where("id > ?", 0).Delete(&model.RoutingHedgeAttemptAudit{}).Error)
+	channelrouting.ResetHedgeAttemptAuditsForTest()
+	t.Cleanup(func() { channelrouting.ResetHedgeAttemptAuditsForTest() })
+
+	ctx := routingAttemptContextForTest()
+	common.SetContextKey(ctx, constant.ContextKeyRoutingSnapshotRevision, uint64(17))
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 7)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingMemberID, 71)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCredentialID, 701)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingDecisionID, "serial-decision-1")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmBalancedV1)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointAuthority, "https://api.example.test:443")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRegion, "us-east-1")
+	channel := &model.Channel{Id: 101}
+	info := &relaycommon.RelayInfo{
+		RequestId: "serial-request-1", OriginModelName: "gpt-test",
+		RequestURLPath: "/v1/chat/completions", RetryIndex: 0,
+	}
+	info.ResetStreamAttemptState()
+	first, err := reserveRoutingSerialAttemptAudit(ctx, info, channel)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	apiErr := types.NewErrorWithStatusCode(
+		assert.AnError,
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+	classification := routingerror.Classification{
+		Rule: "provider_5xx", Responsibility: routingerror.ResponsibilityProvider,
+		Retryability: routingerror.RetryBeforeCommit,
+	}
+	require.NoError(t, completeRoutingSerialAttemptAudit(
+		ctx, info, channel, first, false, apiErr, classification, false, true,
+	))
+
+	info.RetryIndex = 1
+	info.ResetStreamAttemptState()
+	info.FirstResponseTime = info.RoutingAttemptStartTime()
+	second, err := reserveRoutingSerialAttemptAudit(ctx, info, channel)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.NoError(t, completeRoutingSerialAttemptAudit(
+		ctx,
+		info,
+		channel,
+		second,
+		true,
+		nil,
+		routingerror.Classification{},
+		true,
+		false,
+	))
+	flushed, err := channelrouting.FlushHedgeAttemptAuditsContext(ctx.Request.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, flushed)
+
+	summary, err := model.GetRoutingHedgeDecisionAuditContext(
+		ctx.Request.Context(),
+		"serial-decision-1",
+		"serial-request-1",
+	)
+	require.NoError(t, err)
+	require.Len(t, summary.Attempts, 2)
+	assert.Equal(t, model.RoutingAttemptExecutionSerial, summary.Attempts[0].ExecutionMode)
+	assert.True(t, summary.Attempts[0].UpstreamSent)
+	assert.True(t, summary.Attempts[0].WillRetry)
+	assert.False(t, summary.Attempts[0].FinalAttempt)
+	assert.Equal(t, string(routingerror.ResponsibilityProvider), summary.Attempts[0].ErrorResponsibility)
+	assert.Equal(t, model.RoutingHedgeAttemptResultSuccess, summary.FinalResult)
+	assert.Equal(t, 101, summary.FinalChannelID)
+	assert.Equal(t, "us-east-1", summary.FinalRegion)
+	assert.NotEmpty(t, summary.FinalNodeEpochID)
 }
 
 func routingAttemptContextForTest() *gin.Context {

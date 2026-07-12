@@ -46,9 +46,6 @@ func AutoRollbackRoutingCanaryPoolContext(
 		len(request.Lease.LeaseToken) != 32 || request.Lease.FencingToken <= 0 {
 		return RoutingCanaryAutoRollbackResult{}, ErrRoutingCanaryAutoRollbackInvalid
 	}
-	if request.Lease.LeaseUntilMs <= request.NowMs {
-		return RoutingCanaryAutoRollbackResult{}, ErrRoutingControlLeaseLost
-	}
 	if err := ctx.Err(); err != nil {
 		return RoutingCanaryAutoRollbackResult{}, err
 	}
@@ -67,11 +64,15 @@ func AutoRollbackRoutingCanaryPoolContext(
 			}
 			return err
 		}
+		databaseNowMs, err := routingDatabaseNowMs(tx.WithContext(ctx))
+		if err != nil {
+			return err
+		}
 		if currentLease.HolderID != request.Lease.HolderID ||
 			currentLease.LeaseToken != request.Lease.LeaseToken ||
 			currentLease.FencingToken != request.Lease.FencingToken ||
 			currentLease.LeaseUntilMs != request.Lease.LeaseUntilMs ||
-			currentLease.LeaseUntilMs <= request.NowMs {
+			currentLease.LeaseUntilMs <= databaseNowMs {
 			return ErrRoutingControlLeaseLost
 		}
 

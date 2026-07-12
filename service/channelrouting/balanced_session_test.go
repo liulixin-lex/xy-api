@@ -6,6 +6,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,6 +42,73 @@ func TestRequestRoutingSessionPlanBalancedUsesExactRequestCostAndPinnedSnapshot(
 	assert.Equal(t, 12, plan.SelectedIdentity.MemberID)
 	assert.True(t, plan.SelectedCostKnown)
 	assert.InDelta(t, 0.5, plan.SelectedCost, 1e-9)
+}
+
+func TestRequestRoutingSessionPlanBalancedScopesEndpointBreakerByRegion(t *testing.T) {
+	ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+		Consecutive5xxThreshold: 1, BaseCooldown: time.Minute, MaxCooldown: time.Minute,
+		EntryTTL: time.Hour, MaxEntries: 64,
+	})
+	t.Setenv("ROUTING_REGION", "us-east-1")
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
+	})
+	now := time.Now().Unix()
+	view := balancedActiveSnapshotForTest(t, now)
+	view.Pools[0].Members[0].Models[0].CostBaseRatio = 1.9
+	firstEndpoint := "https://first.example.test/v1"
+	secondEndpoint := "https://second.example.test/v1"
+	view.Channels[0].Endpoint = firstEndpoint
+	view.Channels[1].Endpoint = secondEndpoint
+	SetSnapshotForTest(view)
+
+	westKey := routingbreaker.NewEndpointKey(EndpointAuthority(secondEndpoint, 102), "us-west-1")
+	routingbreaker.RecordReliabilityFailure(westKey, routingbreaker.FailureNetwork)
+	westSession, err := NewRequestRoutingSession("balanced-endpoint-west", "default")
+	require.NoError(t, err)
+	westPlan, active, err := westSession.PlanBalanced(BalancedRoutingPlanInput{
+		RequestRoutingPlanInput: RequestRoutingPlanInput{
+			RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+			PromptTokenEstimate: int(common.QuotaPerUnit),
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Equal(t, 102, westPlan.SelectedChannelID, "another region must not affect this node")
+
+	eastKey := routingbreaker.NewEndpointKey(EndpointAuthority(secondEndpoint, 102), "us-east-1")
+	routingbreaker.RecordReliabilityFailure(eastKey, routingbreaker.FailureNetwork)
+	eastCached, eastCachedOK := routinghotcache.GetBreaker(eastKey.HotcacheKey())
+	require.True(t, eastCachedOK)
+	assert.Equal(t, string(routingbreaker.StateOpen), eastCached.State)
+	endpointBreaker, _, _ := endpointBreakerForChannel(view.Channels[1], time.Now(), view.Pools[0].BalancedPolicy.SnapshotStaleSec)
+	require.NotNil(t, endpointBreaker)
+	assert.Equal(t, string(routingbreaker.StateOpen), endpointBreaker.State)
+	eastSession, err := NewRequestRoutingSession("balanced-endpoint-east", "default")
+	require.NoError(t, err)
+	eastPlan, active, err := eastSession.PlanBalanced(BalancedRoutingPlanInput{
+		RequestRoutingPlanInput: RequestRoutingPlanInput{
+			RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+			PromptTokenEstimate: int(common.QuotaPerUnit),
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	var replayBreaker *ShadowBreakerInput
+	for _, state := range eastPlan.Replay.RuntimeStates {
+		if state.ChannelID == 102 {
+			replayBreaker = state.Breaker
+		}
+	}
+	require.NotNil(t, replayBreaker)
+	assert.Equal(t, routingselector.BreakerStateOpen, replayBreaker.State)
+	assert.Greater(t, replayBreaker.CooldownUntilUnix, time.Now().Unix())
+	assert.Equal(t, 101, eastPlan.SelectedChannelID)
+	assert.Positive(t, eastPlan.FilteredOpen)
 }
 
 func TestRequestRoutingSessionPlanBalancedUsesAffinityOnlyInsideProtectionBand(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/stretchr/testify/assert"
@@ -56,6 +57,74 @@ func TestActiveProbeSchedulerRequiresExplicitBalancedEnablement(t *testing.T) {
 	require.NoError(t, scheduler.RunCycle(context.Background(), settings))
 	assert.Equal(t, int64(1), targetCalls.Load())
 	assert.Equal(t, int64(1), executed.Load())
+}
+
+func TestActiveProbeSchedulerFencesResultAndEffectsAfterTargetChanges(t *testing.T) {
+	now := time.Unix(15_000, 0)
+	target := activeProbeTargetForTest("a", "one.example")
+	var validations atomic.Int64
+	var persisted model.RoutingProbeResult
+	scheduler := newActiveProbeScheduler(activeProbeDeps{
+		now: func() time.Time { return now },
+		targets: func(smart_routing_setting.SmartRoutingSetting, time.Time) []ActiveProbeTarget {
+			return []ActiveProbeTarget{target}
+		},
+		executor: func() ActiveProbeExecutor {
+			return func(context.Context, ActiveProbeTarget) ActiveProbeExecution {
+				return ActiveProbeExecution{StatusCode: 401, Err: errors.New("retired credential rejected")}
+			}
+		},
+		validate: func(ActiveProbeTarget) error {
+			if validations.Add(1) >= 1 {
+				return ErrActiveProbeTargetStale
+			}
+			return nil
+		},
+		acquire: successfulProbeLeaseForTest,
+		persist: func(_ context.Context, _ model.RoutingControlLease, result model.RoutingProbeResult) error {
+			persisted = result
+			return nil
+		},
+		complete:  func(context.Context, model.RoutingControlLease, int64) error { return nil },
+		release:   func(context.Context, model.RoutingControlLease, int64) error { return nil },
+		waitUntil: func(context.Context, time.Time) bool { return true },
+	})
+
+	require.NoError(t, scheduler.RunCycle(context.Background(), activeProbeSettingForTest()))
+	assert.Equal(t, model.RoutingProbeOutcomeLocalError, persisted.Outcome)
+	assert.Equal(t, "active_probe_target_stale", persisted.ClassificationRule)
+	assert.Equal(t, int64(1), validations.Load(), "stale results must stop before the effect phase")
+
+	validations.Store(0)
+	persisted = model.RoutingProbeResult{}
+	scheduler = newActiveProbeScheduler(activeProbeDeps{
+		now: func() time.Time { return now },
+		targets: func(smart_routing_setting.SmartRoutingSetting, time.Time) []ActiveProbeTarget {
+			return []ActiveProbeTarget{target}
+		},
+		executor: func() ActiveProbeExecutor {
+			return func(context.Context, ActiveProbeTarget) ActiveProbeExecution {
+				return ActiveProbeExecution{Err: errors.New("provider failed")}
+			}
+		},
+		validate: func(ActiveProbeTarget) error {
+			if validations.Add(1) == 2 {
+				return ErrActiveProbeTargetStale
+			}
+			return nil
+		},
+		acquire: successfulProbeLeaseForTest,
+		persist: func(_ context.Context, _ model.RoutingControlLease, result model.RoutingProbeResult) error {
+			persisted = result
+			return nil
+		},
+		complete:  func(context.Context, model.RoutingControlLease, int64) error { return nil },
+		release:   func(context.Context, model.RoutingControlLease, int64) error { return nil },
+		waitUntil: func(context.Context, time.Time) bool { return true },
+	})
+	require.NoError(t, scheduler.RunCycle(context.Background(), activeProbeSettingForTest()))
+	assert.Equal(t, model.RoutingProbeOutcomeFailure, persisted.Outcome)
+	assert.Equal(t, int64(2), validations.Load(), "the target must be fenced again after persistence")
 }
 
 func TestActiveProbeSchedulerSeparatesBudgetsAndBoundsConcurrencyPerHost(t *testing.T) {
@@ -375,6 +444,42 @@ func TestCurrentActiveProbeTargetsPrioritizeRecoveryStates(t *testing.T) {
 	assert.True(t, selectedOpen)
 }
 
+func TestCurrentActiveProbeTargetsCarrySelectedEndpointCooldown(t *testing.T) {
+	ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+	})
+	now := time.Unix(53_000, 0)
+	endpoint := "https://endpoint-cooldown.example/v1"
+	authority := EndpointAuthority(endpoint, 302)
+	region := RoutingRegion()
+	endpointKey := routingbreaker.NewEndpointKey(authority, region)
+	routinghotcache.SetBreakerForTest(endpointKey.HotcacheKey(), routinghotcache.BreakerSnapshot{
+		State: model.RoutingBreakerStateOpen, CooldownUntilUnix: now.Add(90 * time.Second).Unix(), UpdatedUnix: now.Unix(),
+	})
+	SetSnapshotForTest(SnapshotView{
+		Revision: 12,
+		Channels: []ChannelSnapshot{{
+			ID: 302, Status: common.ChannelStatusEnabled, Endpoint: endpoint,
+		}},
+		Pools: []PoolSnapshot{{
+			ID: 3, GroupName: "active", DeploymentStage: model.RoutingDeploymentStageActive,
+			Members: []PoolMemberSnapshot{{
+				ID: 32, PoolID: 3, ChannelID: 302, CredentialIDs: []int{92},
+				Models: []ModelSnapshot{{ModelName: "gpt-test", BreakerState: model.RoutingBreakerStateHealthy}},
+			}},
+		}},
+	})
+
+	targets := currentActiveProbeTargets(activeProbeSettingForTest(), now)
+	require.Len(t, targets, 1)
+	assert.Equal(t, BreakerScopeEndpoint, targets[0].BreakerScope)
+	assert.Equal(t, model.RoutingBreakerStateOpen, targets[0].BreakerState)
+	assert.Equal(t, now.Add(90*time.Second).Unix(), targets[0].BreakerCooldownUntil)
+}
+
 func TestCurrentActiveProbeTargetsDoNotMisattributeMultiKeyCredential(t *testing.T) {
 	ResetSnapshotForTest()
 	t.Cleanup(ResetSnapshotForTest)
@@ -413,6 +518,7 @@ func TestActiveProbeEstimatedCostUsesRequestSizedPricing(t *testing.T) {
 	})
 	assert.Equal(t, int64(30_000_000), perRequestCost)
 	assert.Equal(t, activeProbeUnknownCostNanoUSD, activeProbeEstimatedCostNanoUSD(ModelSnapshot{}))
+	assert.Greater(t, activeProbeUnknownCostNanoUSD, activeProbeCostBudgetNanoUSD(1_000))
 }
 
 func TestActiveProbeResultClassifiesTimeoutLocalAndCanceledOutcomes(t *testing.T) {
@@ -433,6 +539,11 @@ func TestActiveProbeResultClassifiesTimeoutLocalAndCanceledOutcomes(t *testing.T
 		LocalError: true,
 	}, started, started.Add(time.Second), nil, nil)
 	assert.Equal(t, model.RoutingProbeOutcomeLocalError, local.Outcome)
+	localTimeout := activeProbeResult(target, lease, ActiveProbeExecution{
+		Err:        context.DeadlineExceeded,
+		LocalError: true,
+	}, started, started.Add(time.Second), context.DeadlineExceeded, nil)
+	assert.Equal(t, model.RoutingProbeOutcomeLocalError, localTimeout.Outcome)
 
 	canceled := activeProbeResult(target, lease, ActiveProbeExecution{}, started, started, context.Canceled, context.Canceled)
 	assert.Equal(t, model.RoutingProbeOutcomeCanceled, canceled.Outcome)
@@ -457,7 +568,8 @@ func TestActiveProbeBreakerUsesPersistedOutcomeBoundary(t *testing.T) {
 	require.NoError(t, applyActiveProbeBreakerOutcome(
 		context.Background(), activeProbeSettingForTest(), target, ActiveProbeExecution{}, model.RoutingProbeOutcomeTimeout, now,
 	))
-	snapshots := routingbreaker.DirtySnapshots()
+	assert.Empty(t, routingbreaker.DirtySnapshots())
+	snapshots := routingbreaker.DirtyEndpointSnapshots()
 	require.Len(t, snapshots, 1)
 	assert.Equal(t, 1, snapshots[0].ConsecutiveFailures)
 	assert.Equal(t, routingbreaker.StateDegraded, snapshots[0].State)
@@ -490,6 +602,9 @@ func activeProbeTargetForTest(prefix string, host string) ActiveProbeTarget {
 		GroupName:            "default",
 		ModelName:            "gpt-test",
 		EndpointHost:         host,
+		EndpointAuthority:    "https://" + host + ":443",
+		Region:               "default",
+		BreakerScope:         "member",
 		BreakerState:         model.RoutingBreakerStateHealthy,
 		Interval:             time.Minute,
 		EstimatedTokens:      32,

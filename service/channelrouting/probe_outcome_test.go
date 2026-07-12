@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
@@ -22,11 +24,17 @@ import (
 func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/probe-outcome.db"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelHealthState{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.Channel{}, &model.RoutingCredentialRef{}, &model.RoutingChannelHealthState{},
+	))
 	previousDB := model.DB
+	previousSecret := common.CryptoSecret
 	model.DB = db
+	common.CryptoSecret = "stable-active-probe-outcome-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
 	t.Cleanup(func() {
 		model.DB = previousDB
+		common.CryptoSecret = previousSecret
 		routinghotcache.ResetForTest()
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	})
@@ -48,15 +56,29 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 	targetForChannel := func(channelID int) ActiveProbeTarget {
 		target := activeProbeTargetForTest("a", "one.example")
 		target.ChannelID = channelID
+		target.CredentialID = channelID + 100_000
 		target.GroupName = "default"
 		target.ModelName = "gpt-test"
 		return target
+	}
+	seedCredential := func(target ActiveProbeTarget) {
+		key := "probe-key-" + strconv.Itoa(target.ChannelID)
+		fingerprint, err := model.RoutingCredentialFingerprint(target.ChannelID, key)
+		require.NoError(t, err)
+		require.NoError(t, db.Create(&model.Channel{
+			Id: target.ChannelID, Key: key, Status: common.ChannelStatusEnabled,
+		}).Error)
+		require.NoError(t, db.Create(&model.RoutingCredentialRef{
+			ID: target.CredentialID, ChannelID: target.ChannelID, Fingerprint: fingerprint,
+			FingerprintVersion: model.RoutingCredentialFingerprintVersion, Active: true,
+		}).Error)
 	}
 
 	for _, statusCode := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run("credential_"+strconv.Itoa(statusCode), func(t *testing.T) {
 			resetEffects()
 			target := targetForChannel(1_000 + statusCode)
+			seedCredential(target)
 			execution := ActiveProbeExecution{
 				StatusCode: statusCode,
 				Err:        errors.New("credential rejected"),
@@ -178,6 +200,7 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 			Err: context.DeadlineExceeded,
 			Classification: routingerror.Classification{
 				Responsibility: routingerror.ResponsibilityNetwork,
+				Scope:          routingerror.ScopeEndpoint,
 				HealthEffect:   routingerror.HealthDegrade,
 				CapacityEffect: routingerror.CapacityNone,
 			},
@@ -186,14 +209,45 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 		require.NoError(t, applyActiveProbeBreakerOutcome(
 			context.Background(), setting, target, execution, model.RoutingProbeOutcomeTimeout, now,
 		))
-		snapshots := routingbreaker.DirtySnapshots()
+		assert.Empty(t, routingbreaker.DirtySnapshots())
+		snapshots := routingbreaker.DirtyEndpointSnapshots()
 		require.Len(t, snapshots, 1)
 		assert.Equal(t, "network", snapshots[0].Reason)
+	})
+
+	t.Run("local_timeout_never_changes_health", func(t *testing.T) {
+		resetEffects()
+		target := targetForChannel(4_001)
+		execution := ActiveProbeExecution{
+			StatusCode: http.StatusUnauthorized,
+			Err:        context.DeadlineExceeded,
+			LocalError: true,
+			Classification: routingerror.Classification{
+				Responsibility: routingerror.ResponsibilityGateway,
+				Scope:          routingerror.ScopeRequest,
+				HealthEffect:   routingerror.HealthIgnore,
+				CapacityEffect: routingerror.CapacityNone,
+			},
+		}
+
+		record := activeProbeResult(
+			target,
+			model.RoutingControlLease{HolderID: "node", LeaseToken: strings.Repeat("1", 32), FencingToken: 1},
+			execution, now, now.Add(time.Second), context.DeadlineExceeded, nil,
+		)
+		assert.Equal(t, model.RoutingProbeOutcomeLocalError, record.Outcome)
+		require.NoError(t, applyActiveProbeBreakerOutcome(
+			context.Background(), setting, target, execution, record.Outcome, now,
+		))
+		_, authFound := routinghotcache.GetAuthFailure(target.ChannelID)
+		assert.False(t, authFound)
+		assert.Empty(t, routingbreaker.DirtyEndpointSnapshots())
 	})
 
 	t.Run("success_clears_serving_markers_and_recovers_breaker", func(t *testing.T) {
 		resetEffects()
 		target := targetForChannel(5_000)
+		seedCredential(target)
 		target.AuthFailure = true
 		target.BreakerState = model.RoutingBreakerStateDegraded
 		key := routingbreaker.Key{

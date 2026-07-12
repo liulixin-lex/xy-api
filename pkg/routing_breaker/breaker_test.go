@@ -564,6 +564,8 @@ func TestBreakerDefaultsAndNormalizesEntryRetentionLimits(t *testing.T) {
 	defaults := DefaultConfig()
 	assert.Equal(t, 30*time.Minute, defaults.EntryTTL)
 	assert.Equal(t, 20_000, defaults.MaxEntries)
+	assert.Equal(t, 24*time.Hour, defaults.ResetGenerationTTL)
+	assert.Equal(t, 40_000, defaults.MaxResetGenerations)
 
 	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
 	breaker := New(Config{EntryTTL: 0, MaxEntries: -1, Now: clock.Now})
@@ -1006,4 +1008,46 @@ func TestResetDefaultKeyDoesNotClearCapacityCooldown(t *testing.T) {
 	ClearDefaultChannel(key.ChannelID)
 	_, ok = routinghotcache.GetCapacityCooldown(cacheKey)
 	assert.False(t, ok)
+}
+
+func TestEndpointBreakerIsIsolatedFromMemberAndRegion(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)}
+	ResetDefaultForTest(Config{
+		Consecutive5xxThreshold: 1,
+		BaseCooldown:            time.Minute,
+		MaxCooldown:             time.Minute,
+		EntryTTL:                time.Hour,
+		MaxEntries:              64,
+		Now:                     clock.Now,
+	})
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetDefaultForTest(DefaultConfig())
+		routinghotcache.ResetForTest()
+	})
+
+	memberKey := Key{ChannelID: 93, APIKeyIndex: SingleAPIKeyIndex, Model: "gpt-test", Group: "default"}
+	endpointEast := NewEndpointKey("https://api.example.test:443", "us-east-1")
+	endpointWest := NewEndpointKey("https://api.example.test:443", "us-west-1")
+
+	recorded := RecordReliabilityFailure(endpointEast, FailureNetwork)
+	assert.Equal(t, StateOpen, recorded.State)
+	assert.Empty(t, DirtySnapshots(), "endpoint failures must not enter the member persistence queue")
+	endpointDirty := DirtyEndpointSnapshots()
+	require.Len(t, endpointDirty, 1)
+	assert.Equal(t, endpointEast, endpointDirty[0].Key)
+
+	east, ok := routinghotcache.GetBreaker(endpointEast.HotcacheKey())
+	require.True(t, ok)
+	assert.Equal(t, string(StateOpen), east.State)
+	_, westExists := routinghotcache.GetBreaker(endpointWest.HotcacheKey())
+	assert.False(t, westExists)
+	_, memberExists := routinghotcache.GetBreaker(memberKey.HotcacheKey())
+	assert.False(t, memberExists)
+
+	RecordReliabilityFailure(memberKey, FailureProvider5xx)
+	memberDirty := DirtySnapshots()
+	require.Len(t, memberDirty, 1)
+	assert.Equal(t, memberKey, memberDirty[0].Key)
+	assert.Empty(t, DirtyEndpointSnapshots())
 }

@@ -102,6 +102,10 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	common.SetContextKey(ctx, common.RequestIdKey, "cohort-both-7500")
 	common.SetContextKey(ctx, constant.ContextKeyRoutingPromptProxy, 10)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingEstimatedOutput, 20)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInput, 10)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInputKnown, true)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutput, 20)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputKnown, true)
 	oldDB := model.DB
 	model.DB = nil
 	channel, group, err := CacheGetRandomSatisfiedChannel(&RetryParam{
@@ -330,11 +334,18 @@ func TestChannelRoutingCanaryReplaysWhenHalfOpenProbeLeaseIsUnavailable(t *testi
 		PoolID: 29, MemberID: 2, Model: "gpt-test",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, canaryPolicy.SlowStart.MinimumFactor, recoveryFactor, "the admitted recovery probe must restart slow start")
+	assert.Equal(t, 1.0, recoveryFactor, "admission alone must not restart slow start before the probe outcome")
 	probes, ok := common.GetContextKeyType[map[routingbreaker.Key]struct{}](ctx, constant.ContextKeyRoutingHalfOpenProbes)
 	require.True(t, ok)
 	_, secondProbeHeld := probes[secondProbeKey]
 	assert.True(t, secondProbeHeld)
+	require.NoError(t, ObserveRoutingSlowStartProbe(ctx, true, false))
+	recoveryFactor, err = channelRoutingCanaryRuntime.slowStartFactor(11, canaryPolicy, channelrouting.SlowStartKey{
+		PoolID: 29, MemberID: 2, Model: "gpt-test",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, canaryPolicy.SlowStart.MinimumFactor, recoveryFactor,
+		"a successful half-open outcome must restart slow start from the minimum")
 	require.NoError(t, CancelRoutingCapacityReservation(ctx))
 	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, time.Now()))
 	ReleaseAllRoutingHalfOpenProbes(ctx)
@@ -602,7 +613,7 @@ func channelRoutingCanarySnapshotForTest(revision uint64, activationID int64, ch
 	}
 }
 
-func TestChannelRoutingCanaryRuntimeSeparatesCapacityByPolicyRevision(t *testing.T) {
+func TestChannelRoutingCanaryRuntimeSharesCapacityAcrossPolicyRevisions(t *testing.T) {
 	manager, err := newChannelRoutingCanaryRuntimeManager(nil)
 	require.NoError(t, err)
 	policy := model.DefaultRoutingCanaryPolicy()
@@ -616,10 +627,13 @@ func TestChannelRoutingCanaryRuntimeSeparatesCapacityByPolicyRevision(t *testing
 	_, err = manager.tryReserve(11, policy, key, demand)
 	assert.ErrorIs(t, err, channelrouting.ErrCapacityExhausted)
 
+	_, err = manager.tryReserve(12, policy, key, demand)
+	assert.ErrorIs(t, err, channelrouting.ErrCapacityExhausted)
+	require.NoError(t, first.Release())
+
 	second, err := manager.tryReserve(12, policy, key, demand)
 	require.NoError(t, err)
 	require.NoError(t, second.Cancel())
-	require.NoError(t, first.Release())
 }
 
 func TestChannelRoutingCanaryRuntimeSlowStartsColdNodeNewMemberAndRevision(t *testing.T) {
@@ -652,6 +666,39 @@ func TestChannelRoutingCanaryRuntimeSlowStartsColdNodeNewMemberAndRevision(t *te
 	factor, err = manager.slowStartFactor(12, policy, firstKey)
 	require.NoError(t, err)
 	assert.InDelta(t, 0.20, factor, 1e-9, "a new policy revision must not inherit incompatible slow-start state")
+}
+
+func TestRoutingHalfOpenSlowStartRestartsFromMinimumAfterFailureThenSuccess(t *testing.T) {
+	clock := &channelRoutingCanaryTestClock{now: time.Unix(2_000, 0)}
+	manager, err := newChannelRoutingCanaryRuntimeManager(clock)
+	require.NoError(t, err)
+	previous := channelRoutingCanaryRuntime
+	channelRoutingCanaryRuntime = manager
+	t.Cleanup(func() { channelRoutingCanaryRuntime = previous })
+	policy := model.DefaultRoutingCanaryPolicy()
+	policy.SlowStart.MinimumFactor = 0.25
+	policy.SlowStart.RampSeconds = 60
+	policy.SlowStart.StateTTLSeconds = 600
+	key := channelrouting.SlowStartKey{PoolID: 31, MemberID: 7, Model: "gpt-test"}
+	ctx, _ := gin.CreateTestContext(nil)
+
+	require.NoError(t, prepareRoutingSlowStartProbe(ctx, 101, 21, policy, key))
+	require.NoError(t, ObserveRoutingSlowStartProbe(ctx, false, true))
+	factor, err := manager.slowStartFactor(21, policy, key)
+	require.NoError(t, err)
+	assert.Zero(t, factor, "a failed half-open probe must hard-stop the member")
+
+	clock.Advance(2 * time.Minute)
+	factor, err = manager.slowStartFactor(21, policy, key)
+	require.NoError(t, err)
+	assert.Zero(t, factor, "elapsed time alone must not recover a failed half-open probe")
+
+	require.NoError(t, prepareRoutingSlowStartProbe(ctx, 101, 21, policy, key))
+	require.NoError(t, ObserveRoutingSlowStartProbe(ctx, true, false))
+	factor, err = manager.slowStartFactor(21, policy, key)
+	require.NoError(t, err)
+	assert.InDelta(t, 0.25, factor, 1e-9,
+		"the next successful half-open probe must restart recovery from the minimum factor")
 }
 
 type channelRoutingCanaryTestClock struct {

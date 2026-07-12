@@ -153,6 +153,58 @@ func TestRequestRoutingSessionReadsFreshExpectedCostWithoutPlanningControlCandid
 	assert.Zero(t, cost)
 }
 
+func TestRequestRoutingSessionUsesVersionedExpectedAndWorstCost(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	now := time.Now().Unix()
+	inputRate := 2.0
+	outputRate := 10.0
+	pricing := &model.RoutingNormalizedPricing{
+		QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
+		InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+	}
+	view := canarySessionSnapshotForTest(11, 3, 401, 29, 101)
+	view.Pools[0].Members[0].Models[0] = ModelSnapshot{
+		ModelName: "gpt-test", CostPricing: pricing, CostPricingHash: strings.Repeat("a", 64),
+		CostPricingVersion: "provider-v1", CostObservedTime: now, CostEffectiveTime: now,
+		CostExpiresTime: now + 3600, CostVersionConfidence: model.RoutingCostConfidenceExact,
+		CostConfidenceScore: 1, CostFreshness: model.RoutingCostFreshnessFresh, CostFreshnessScore: 1,
+		CostSourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
+	}
+	SetSnapshotForTest(view)
+	session, err := NewRequestRoutingSession("cohort-0027", "default")
+	require.NoError(t, err)
+	profile := &model.RoutingCostRequestProfile{
+		PromptTokens: 1_000, ExpectedCompletionTokens: 500, MaximumCompletionTokens: 1_000,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true, MediaDimensionsKnown: true,
+		RequestInputKnown: true,
+	}
+	input := RequestRoutingCostInput{
+		RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+		PromptTokenEstimate: 1_000, CompletionTokenEstimate: 500, CostProfile: profile,
+	}
+
+	estimate, available, err := session.CostEstimateForChannel(101, input)
+	require.NoError(t, err)
+	require.True(t, available)
+	assert.True(t, estimate.Known)
+	assert.True(t, estimate.WorstCaseKnown)
+	assert.InDelta(t, 0.007, estimate.Cost, 1e-12)
+	assert.InDelta(t, 0.012, estimate.WorstCaseCost, 1e-12)
+	assert.Equal(t, "token", estimate.PricingBasis)
+
+	profile.InputTokensKnown = false
+	estimate, available, err = session.CostEstimateForChannel(101, input)
+	require.NoError(t, err)
+	require.True(t, available)
+	assert.True(t, estimate.Known)
+	assert.False(t, estimate.WorstCaseKnown)
+	_, worstKnown, err := session.WorstCaseCostForChannel(101, input)
+	require.NoError(t, err)
+	assert.False(t, worstKnown)
+}
+
 func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T) {
 	ResetSnapshotForTest()
 	t.Cleanup(ResetSnapshotForTest)

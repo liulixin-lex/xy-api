@@ -640,6 +640,11 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update() error {
+	_, err := channel.UpdateWithCredentialChange()
+	return err
+}
+
+func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
 		keyStr := channel.Key
@@ -677,15 +682,35 @@ func (channel *Channel) Update() error {
 			channel.ChannelInfo.MultiKeyPollingIndex = 0
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
-		return err
+	credentialChanged := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "key").
+			Where("id = ?", channel.Id).First(&current).Error; err != nil {
+			return err
+		}
+		credentialChanged = channel.Key != "" && channel.Key != current.Key
+		if err := tx.Model(channel).Updates(channel).Error; err != nil {
+			return err
+		}
+		if credentialChanged {
+			now := common.GetTimestamp()
+			if err := tx.Model(&RoutingChannelHealthState{}).Where("channel_id = ?", channel.Id).
+				Updates(map[string]any{
+					"auth_failure": false, "auth_failure_reason": "", "auth_failure_until": int64(0), "updated_time": now,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.First(channel, "id = ?", channel.Id).Error; err != nil {
+			return err
+		}
+		return channel.UpdateAbilities(tx)
+	})
+	if err == nil {
+		NotifyRoutingTopologyChanged()
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	NotifyRoutingTopologyChanged()
-	return err
+	return credentialChanged, err
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {

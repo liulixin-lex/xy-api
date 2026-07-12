@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2247,8 +2248,11 @@ func TestSmartRoutingRuntimePrunesStaleHotcacheWhenDisabled(t *testing.T) {
 }
 
 func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
-	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingHedgeAttemptAudit{},
+	))
 	routingmetrics.ResetForTest()
 	smart_routing_setting.ResetForTest()
 	smartRoutingRetentionLast.Store(0)
@@ -2259,13 +2263,14 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 	})
 
 	retentionSetting := smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
-		Enabled:            true,
-		Mode:               smart_routing_setting.ModeObserve,
-		SyncIntervalMin:    1,
-		HotcacheRefreshSec: 1,
-		MetricBucketSec:    60,
-		FlushIntervalMin:   1,
-		RetentionDays:      1,
+		Enabled:                 true,
+		Mode:                    smart_routing_setting.ModeObserve,
+		SyncIntervalMin:         1,
+		HotcacheRefreshSec:      1,
+		MetricBucketSec:         60,
+		FlushIntervalMin:        1,
+		RetentionDays:           1,
+		HedgeAuditRetentionDays: 1,
 	})
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
@@ -2295,15 +2300,52 @@ func TestFlushRoutingRuntimeStateAppliesConfiguredRetention(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&expired).Error)
 	require.NoError(t, db.Create(&fresh).Error)
+	require.NoError(t, db.Create(&[]model.RoutingHedgeAttemptAudit{
+		{
+			AttemptKey: strings.Repeat("a", 64), State: model.RoutingHedgeAttemptStateCompleted,
+			CompletedTimeMs: (now - 2*86400) * 1_000,
+		},
+		{
+			AttemptKey: strings.Repeat("b", 64), State: model.RoutingHedgeAttemptStateCompleted,
+			CompletedTimeMs: now * 1_000,
+		},
+		{
+			AttemptKey: strings.Repeat("c", 64), State: model.RoutingHedgeAttemptStateStarted,
+			CompletedTimeMs: (now - 2*86400) * 1_000,
+		},
+	}).Error)
 
 	summary, err := flushRoutingRuntimeState(context.Background(), retentionSetting)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), summary["retained_metrics_deleted"])
+	assert.Equal(t, int64(1), summary["retained_hedge_audits_deleted"])
 
 	var remaining []model.RoutingChannelMetric
 	require.NoError(t, db.Order("bucket_ts asc").Find(&remaining).Error)
 	require.Len(t, remaining, 1)
 	assert.Equal(t, fresh.BucketTs, remaining[0].BucketTs)
+	var remainingHedgeAudits int64
+	require.NoError(t, db.Model(&model.RoutingHedgeAttemptAudit{}).Count(&remainingHedgeAudits).Error)
+	assert.Equal(t, int64(2), remainingHedgeAudits)
+}
+
+func TestFlushRoutingRuntimeStateDoesNotAdvanceRetentionThrottleAfterHedgeCleanupFailure(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}))
+	require.NoError(t, db.Migrator().DropTable(&model.RoutingHedgeAttemptAudit{}))
+	routingmetrics.ResetForTest()
+	smartRoutingRetentionLast.Store(0)
+	t.Cleanup(func() {
+		routingmetrics.ResetForTest()
+		smartRoutingRetentionLast.Store(0)
+	})
+
+	_, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{
+		MetricBucketSec: 60, HedgeAuditRetentionDays: 1,
+	})
+	require.Error(t, err)
+	assert.Zero(t, smartRoutingRetentionLast.Load())
 }
 
 func TestFlushRoutingRuntimeStateMergesRepeatedBucketDeltasIntoHotcache(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 
@@ -33,6 +34,11 @@ type channelRoutingReplayView struct {
 	AuditVerified     bool   `json:"audit_verified"`
 	GateVerified      bool   `json:"gate_verified"`
 	Result            any    `json:"result"`
+}
+
+type channelRoutingHistoricalSimulationResponse struct {
+	Operation channelRoutingOperationView `json:"operation"`
+	Result    any                         `json:"result"`
 }
 
 func ReplayChannelRoutingDecision(c *gin.Context) {
@@ -129,16 +135,93 @@ func SimulateChannelRoutingGroup(c *gin.Context) {
 		return
 	}
 	request.PoolID = poolID
-	result, err := channelrouting.RunHistoricalSimulation(c.Request.Context(), request)
-	if err != nil {
-		if errors.Is(err, channelrouting.ErrSimulationInvalidOptions) {
-			writeChannelRoutingReplayError(c, http.StatusBadRequest, "invalid_simulation_options", "invalid channel routing simulation options")
-			return
-		}
-		writeChannelRoutingReplayError(c, http.StatusInternalServerError, "simulation_failed", "failed to simulate channel routing history")
+	if err := channelrouting.ValidateHistoricalSimulationOptions(request); err != nil {
+		writeChannelRoutingReplayError(c, http.StatusBadRequest, "invalid_simulation_request", "invalid channel routing simulation request")
 		return
 	}
-	common.ApiSuccess(c, result)
+	identity, ok := requireChannelRoutingOperationIdempotency(c, model.RoutingOperationTypeHistoricalSimulation, struct {
+		PoolID   int                                        `json:"pool_id"`
+		Cursor   int                                        `json:"cursor"`
+		Limit    int                                        `json:"limit"`
+		Selector channelrouting.SimulationSelectorOverrides `json:"selector"`
+	}{PoolID: poolID, Cursor: request.Cursor, Limit: request.Limit, Selector: request.Selector})
+	if !ok {
+		return
+	}
+	existing, lookupErr := model.GetRoutingOperationByRequestIdentityContext(c.Request.Context(), identity)
+	if lookupErr == nil {
+		if existing.OperationType != model.RoutingOperationTypeHistoricalSimulation {
+			writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "idempotency_key_conflict", "Idempotency-Key was already used for a different request", model.ErrRoutingOperationIdempotencyConflict)
+			return
+		}
+		view, viewErr := channelRoutingOperationViewFromModel(existing)
+		if viewErr != nil {
+			writeChannelRoutingPolicyControlError(c, viewErr)
+			return
+		}
+		common.ApiSuccess(c, channelRoutingHistoricalSimulationResponse{Operation: view, Result: view.Result})
+		return
+	}
+	if errors.Is(lookupErr, model.ErrRoutingOperationIdempotencyConflict) {
+		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "idempotency_key_conflict", "Idempotency-Key was already used for a different request", lookupErr)
+		return
+	}
+	if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		writeChannelRoutingPolicyControlError(c, lookupErr)
+		return
+	}
+	head, err := model.GetRoutingPolicyHeadContext(c.Request.Context())
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	spec := model.RoutingOperationSpec{
+		Type: model.RoutingOperationTypeHistoricalSimulation, EvaluationHash: identity.PayloadHash,
+		SubjectType: model.RoutingOperationSubjectRoutingPool, SubjectID: int64(poolID), PoolID: poolID,
+		ExpectedRevision: head.CurrentRevision, ExpectedActivationID: head.CurrentActivationID,
+		ActorID: common.GetContextKeyInt(c, constant.ContextKeyUserId), Reason: "historical routing simulation",
+		RequestKeyHash: identity.KeyHash, RequestPayloadHash: identity.PayloadHash,
+	}
+	result, err := channelrouting.RunHistoricalSimulation(c.Request.Context(), request)
+	if err != nil {
+		message := common.SanitizeErrorMessage(err.Error())
+		if message == "" {
+			message = "historical simulation failed"
+		}
+		operation, _, persistErr := model.CreateFailedRoutingOperationContext(c.Request.Context(), spec, errors.New(message))
+		if persistErr != nil {
+			writeChannelRoutingPolicyControlError(c, persistErr)
+			return
+		}
+		if errors.Is(err, channelrouting.ErrSimulationInvalidOptions) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false, "code": "invalid_simulation_options", "message": "invalid channel routing simulation options",
+				"operation": operation,
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false, "code": "simulation_failed", "message": "failed to simulate channel routing history",
+			"operation": operation,
+		})
+		return
+	}
+	operation, _, err := model.CreateSucceededRoutingOperationContext(
+		c.Request.Context(), spec, model.RoutingOperationResult{}, result,
+	)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	view, err := channelRoutingOperationViewFromModel(operation)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	publishChannelRoutingControlEvent(channelrouting.RoutingEventTypePolicySimulation, head.CurrentRevision, gin.H{
+		"operation_id": operation.ID, "pool_id": poolID, "evaluated_samples": result.EvaluatedSamples,
+	})
+	common.ApiSuccess(c, channelRoutingHistoricalSimulationResponse{Operation: view, Result: result})
 }
 
 func decodeChannelRoutingSimulationRequest(body io.Reader) (channelrouting.HistoricalSimulationOptions, error) {
