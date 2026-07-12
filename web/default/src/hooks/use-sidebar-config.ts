@@ -60,7 +60,7 @@ const DEFAULT_SIDEBAR_MODULES: SidebarModulesAdminConfig = {
   admin: {
     enabled: true,
     channel: true,
-    smart_routing: true,
+    channel_routing: true,
     models: true,
     redemption: true,
     user: true,
@@ -112,7 +112,11 @@ const URL_TO_CONFIG_MAP: Record<string, { section: string; module: string }> = {
   '/invite-rewards': { section: 'personal', module: 'invite_rewards' },
   '/profile': { section: 'personal', module: 'personal' },
   '/channels': { section: 'admin', module: 'channel' },
-  '/smart-routing': { section: 'admin', module: 'smart_routing' },
+  '/smart-routing': { section: 'admin', module: 'channel_routing' },
+  '/channel-routing/overview': {
+    section: 'admin',
+    module: 'channel_routing',
+  },
   '/models': { section: 'admin', module: 'models' },
   '/models/metadata': { section: 'admin', module: 'models' },
   '/models/deployments': { section: 'admin', module: 'models' },
@@ -136,6 +140,9 @@ function parseSidebarConfig(
 
   try {
     const parsed = JSON.parse(value) as SidebarModulesAdminConfig
+    if (parsed.admin) {
+      parsed.admin = normalizeRoutingModuleAlias(parsed.admin)
+    }
     return mergeWithDefaultSidebarModules(parsed)
   } catch {
     // eslint-disable-next-line no-console
@@ -158,10 +165,27 @@ function parseUserSidebarConfig(
   try {
     const parsed = JSON.parse(value) as SidebarModulesAdminConfig
     if (!parsed || typeof parsed !== 'object') return null
+    if (parsed.admin) {
+      parsed.admin = normalizeRoutingModuleAlias(parsed.admin)
+    }
     return parsed
   } catch {
     return null
   }
+}
+
+function normalizeRoutingModuleAlias(
+  section: SidebarSectionConfig
+): SidebarSectionConfig {
+  const normalized = { ...section }
+  if (
+    normalized.channel_routing === undefined &&
+    normalized.smart_routing !== undefined
+  ) {
+    normalized.channel_routing = normalized.smart_routing
+  }
+  delete normalized.smart_routing
+  return normalized
 }
 
 /**

@@ -7,6 +7,7 @@ export type AdminCapabilities = AdminPermissionMatrix
 
 export const ADMIN_PERMISSION_RESOURCES = {
   CHANNEL: 'channel',
+  CHANNEL_ROUTING: 'channel_routing',
   SYSTEM_SETTING: 'system_setting',
 } as const
 
@@ -14,7 +15,9 @@ export const ADMIN_PERMISSION_ACTIONS = {
   READ: 'read',
   OPERATE: 'operate',
   WRITE: 'write',
+  DEPLOY: 'deploy',
   SENSITIVE_WRITE: 'sensitive_write',
+  AUDIT_EXPORT: 'audit_export',
   SECRET_VIEW: 'secret_view',
   MANAGE: 'manage',
 } as const
