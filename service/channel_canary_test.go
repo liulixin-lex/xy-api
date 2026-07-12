@@ -97,6 +97,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	require.True(t, ok)
 	assert.Equal(t, routingCapacityReservationPending, reservation.state)
 	require.NoError(t, CancelRoutingCapacityReservation(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, false, false, false, 0, time.Now()))
 	assert.Equal(t, 1, channelrouting.DecisionAuditsStats().Entries)
 	flushed, err := channelrouting.FlushDecisionAuditsContext(ctx)
 	require.NoError(t, err)
@@ -122,14 +123,22 @@ func TestChannelRoutingCanaryControlCohortPreservesLegacyWithoutReservation(t *t
 	channelrouting.ResetSnapshotForTest()
 	channelrouting.ResetDecisionAuditsForTest()
 	smart_routing_setting.ResetForTest()
+	clock := &canaryOutcomeTestClock{now: time.Now().Truncate(time.Second)}
+	aggregator, err := channelrouting.NewCanaryWindowAggregator(channelrouting.CanaryWindowAggregatorConfig{
+		MaxEntries: 8, Shards: 4, TTL: 2 * time.Hour, Clock: clock,
+	})
+	require.NoError(t, err)
+	channelrouting.ResetCanaryWindowAggregatorForTest(aggregator)
 	previousMemoryCache := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled = previousMemoryCache
 		channelrouting.ResetSnapshotForTest()
 		channelrouting.ResetDecisionAuditsForTest()
+		channelrouting.ResetCanaryWindowAggregatorForTest()
 		smart_routing_setting.ResetForTest()
 	})
+	require.NoError(t, model.DB.AutoMigrate(&model.RoutingRuntimeCheckpoint{}))
 
 	priority := int64(10)
 	weight := uint(10)
@@ -142,7 +151,14 @@ func TestChannelRoutingCanaryControlCohortPreservesLegacyWithoutReservation(t *t
 		Enabled: true, Priority: &priority, Weight: weight,
 	}).Error)
 	model.InitChannelCache()
-	channelrouting.SetSnapshotForTest(channelRoutingCanarySnapshotForTest(21, 501, []int{201}))
+	view := channelRoutingCanarySnapshotForTest(21, 501, []int{201})
+	view.Pools[0].CanaryPolicy.Evaluation.WindowSeconds = 60
+	view.Pools[0].CanaryPolicy.Evaluation.CheckpointLatenessSeconds = 5
+	view.Pools[0].Members[0].Models[0] = channelrouting.ModelSnapshot{
+		ModelName: "gpt-test", CostKnown: true, CostUpdatedUnix: time.Now().Unix(),
+		CostBillingMode: "per_request", CostGroupRatio: 2, CostModelPrice: 0.25,
+	}
+	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true,
 		Mode:    smart_routing_setting.ModeEnterpriseSLO,
@@ -162,6 +178,20 @@ func TestChannelRoutingCanaryControlCohortPreservesLegacyWithoutReservation(t *t
 	assert.False(t, selected)
 	_, reserved := routingCapacityReservationFromContext(ctx)
 	assert.False(t, reserved)
+	require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+	require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 80, clock.Now()))
+	clock.Advance(2 * time.Minute)
+	flushed, err := channelrouting.FlushCanaryOutcomeCheckpointsContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+	var checkpoint model.RoutingRuntimeCheckpoint
+	require.NoError(t, model.DB.Where("checkpoint_kind = ?", channelrouting.CanaryCohortWindowCheckpointKind).First(&checkpoint).Error)
+	window, err := channelrouting.DecodeCanaryCohortWindowCheckpoint(checkpoint)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), window.Control.LogicalRequests)
+	assert.Equal(t, int64(1), window.Control.CostKnownRequests)
+	assert.Equal(t, int64(500_000_000), window.Control.ExpectedPlatformCostNanoUSD)
+	assert.Equal(t, 60, window.WindowSeconds)
 	assert.Equal(t, 1, channelrouting.DecisionAuditsStats().Entries)
 	require.NoError(t, model.DB.AutoMigrate(&model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}))
 	_, err = channelrouting.FlushDecisionAuditsContext(context.Background())
@@ -173,6 +203,10 @@ func TestChannelRoutingCanaryControlCohortPreservesLegacyWithoutReservation(t *t
 	assert.Equal(t, 1_001, audit.SelectedCredentialID)
 	assert.False(t, audit.Replayable)
 	assert.Empty(t, audit.ReservationMode)
+	assert.True(t, audit.ActualCostKnown)
+	assert.Equal(t, 0.5, audit.ActualExpectedCost)
+	assert.True(t, audit.ObservedCostKnown)
+	assert.Equal(t, 0.5, audit.ObservedExpectedCost)
 	bypass, err := ShouldBypassChannelRoutingAffinity(ctx, "default")
 	require.NoError(t, err)
 	assert.False(t, bypass)

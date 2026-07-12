@@ -3,6 +3,7 @@ package channelrouting
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -119,6 +120,37 @@ func TestRequestRoutingSessionReturnsCanaryGateForControlCohort(t *testing.T) {
 	assert.Zero(t, plan.Replay)
 	assert.Zero(t, plan.Result)
 	assert.Zero(t, plan.SelectedIdentity)
+}
+
+func TestRequestRoutingSessionReadsFreshExpectedCostWithoutPlanningControlCandidates(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	view := canarySessionSnapshotForTest(11, 3, 401, 29, 101)
+	view.Pools[0].Members[0].Models[0] = ModelSnapshot{
+		ModelName: "gpt-test", CostKnown: true, CostUpdatedUnix: time.Now().Unix(),
+		CostBillingMode: "per_request", CostGroupRatio: 2, CostModelPrice: 0.25,
+	}
+	SetSnapshotForTest(view)
+	session, err := NewRequestRoutingSession("cohort-0027", "default")
+	require.NoError(t, err)
+
+	cost, known, err := session.ExpectedCostForChannel(101, RequestRoutingCostInput{
+		RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+	})
+	require.NoError(t, err)
+	require.True(t, known)
+	assert.Equal(t, 0.5, cost)
+
+	view.Pools[0].Members[0].Models[0].CostUpdatedUnix = time.Now().Add(-time.Hour).Unix()
+	SetSnapshotForTest(view)
+	staleSession, err := NewRequestRoutingSession("cohort-0027", "default")
+	require.NoError(t, err)
+	cost, known, err = staleSession.ExpectedCostForChannel(101, RequestRoutingCostInput{
+		RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, known)
+	assert.Zero(t, cost)
 }
 
 func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T) {

@@ -35,8 +35,8 @@ func cacheGetChannelRoutingCanary(
 			return channel, param.TokenGroup, true, nil
 		}
 		channel, group, legacyErr := cacheGetRandomSatisfiedChannelLegacy(param)
-		if legacyErr == nil {
-			enqueueChannelRoutingControlDecision(param, group, channel)
+		if outcomeErr := enqueueChannelRoutingControlDecision(param, group, channel); outcomeErr != nil {
+			return nil, group, true, outcomeErr
 		}
 		return channel, group, true, legacyErr
 	}
@@ -94,7 +94,9 @@ func cacheGetChannelRoutingCanary(
 			}
 		} else if !inCanary {
 			channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
-			enqueueChannelRoutingControlDecision(param, group, channel)
+			if outcomeErr := enqueueChannelRoutingControlDecision(param, group, channel); outcomeErr != nil {
+				return nil, group, true, outcomeErr
+			}
 		}
 		if channel == nil {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index+1)
@@ -132,6 +134,13 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	}
 	canaryPolicy, err := session.CanaryPolicy()
 	if err != nil {
+		return nil, true, true, err
+	}
+	if err := PrepareChannelRoutingCanarySelection(param.Ctx, ChannelRoutingCanarySelection{
+		Gate:            gate,
+		WindowSeconds:   canaryPolicy.Evaluation.WindowSeconds,
+		LatenessSeconds: canaryPolicy.Evaluation.CheckpointLatenessSeconds,
+	}); err != nil {
 		return nil, true, true, err
 	}
 
@@ -208,6 +217,16 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
 			_ = reservation.Cancel()
 			return nil, true, true, err
+		}
+		if err := PrepareChannelRoutingCanarySelection(param.Ctx, ChannelRoutingCanarySelection{
+			Gate:              gate,
+			WindowSeconds:     canaryPolicy.Evaluation.WindowSeconds,
+			LatenessSeconds:   canaryPolicy.Evaluation.CheckpointLatenessSeconds,
+			ExpectedCostUSD:   plan.Result.SelectedCost,
+			ExpectedCostKnown: plan.Result.SelectedCostKnown,
+		}); err != nil {
+			cancelErr := CancelRoutingCapacityReservation(param.Ctx)
+			return nil, true, true, errors.Join(err, cancelErr)
 		}
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
 			ChannelID:        selected.Id,
@@ -312,37 +331,51 @@ func enqueueChannelRoutingCanaryDecision(
 	}
 }
 
-func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selected *model.Channel) {
+func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selected *model.Channel) error {
 	if param == nil || param.Ctx == nil || group == "" || group == "auto" {
-		return
+		return nil
 	}
 	gate, active, err := channelRoutingCanaryGate(param.Ctx, group)
 	if err != nil || !active || gate.InCanary {
 		if err != nil {
 			logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing control audit gate dropped: %v", err))
 		}
-		return
+		return err
 	}
 	sessions, err := channelRoutingSessionSet(param.Ctx)
 	if err != nil {
-		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing control audit session dropped: %v", err))
-		return
+		return err
 	}
 	session, err := sessions.Session(group)
 	if err != nil {
-		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing control audit session dropped: %v", err))
-		return
+		return err
+	}
+	canaryPolicy, err := session.CanaryPolicy()
+	if err != nil {
+		return err
 	}
 	channelID := 0
 	identity := channelrouting.Identity{}
 	candidates := []channelrouting.DecisionCandidate(nil)
+	expectedCost := float64(0)
+	expectedCostKnown := false
 	if selected != nil {
 		channelID = selected.Id
 		var known bool
 		identity, known = session.IdentityForChannel(channelID)
 		if !known {
-			logger.LogWarn(param.Ctx, "channel routing control audit identity dropped: selected channel is outside the pinned pool")
-			return
+			return channelrouting.ErrRoutingSessionInvalid
+		}
+		expectedCost, expectedCostKnown, err = session.ExpectedCostForChannel(channelID, channelrouting.RequestRoutingCostInput{
+			RequestPath:             param.RequestPath,
+			ModelName:               param.ModelName,
+			IsStream:                common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+			RetryIndex:              param.GetRetry(),
+			PromptTokenEstimate:     max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
+			CompletionTokenEstimate: max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+		})
+		if err != nil {
+			return err
 		}
 		candidates = []channelrouting.DecisionCandidate{{
 			PoolMemberID: identity.MemberID,
@@ -350,23 +383,37 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 			Eligible:     true,
 		}}
 	}
+	if err := PrepareChannelRoutingCanarySelection(param.Ctx, ChannelRoutingCanarySelection{
+		Gate:              gate,
+		WindowSeconds:     canaryPolicy.Evaluation.WindowSeconds,
+		LatenessSeconds:   canaryPolicy.Evaluation.CheckpointLatenessSeconds,
+		ExpectedCostUSD:   expectedCost,
+		ExpectedCostKnown: expectedCostKnown,
+	}); err != nil {
+		return err
+	}
 	_, err = channelrouting.EnqueueDecision(channelrouting.DecisionInput{
-		RequestID:         common.GetContextKeyString(param.Ctx, common.RequestIdKey),
-		PoolID:            gate.PoolID,
-		GroupName:         group,
-		ModelName:         param.ModelName,
-		SnapshotRevision:  gate.PolicyRevision,
-		AlgorithmVersion:  channelrouting.DecisionAlgorithmCanaryV1,
-		RetryIndex:        param.GetRetry(),
-		IsStream:          common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
-		ActualChannelID:   channelID,
-		ObservedChannelID: channelID,
-		Candidates:        candidates,
-		DifferenceType:    "control_legacy",
-		Gate:              &gate,
-		SelectedIdentity:  identity,
+		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
+		PoolID:               gate.PoolID,
+		GroupName:            group,
+		ModelName:            param.ModelName,
+		SnapshotRevision:     gate.PolicyRevision,
+		AlgorithmVersion:     channelrouting.DecisionAlgorithmCanaryV1,
+		RetryIndex:           param.GetRetry(),
+		IsStream:             common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+		ActualChannelID:      channelID,
+		ObservedChannelID:    channelID,
+		Candidates:           candidates,
+		DifferenceType:       "control_legacy",
+		ActualCostKnown:      expectedCostKnown,
+		ActualExpectedCost:   expectedCost,
+		ObservedCostKnown:    expectedCostKnown,
+		ObservedExpectedCost: expectedCost,
+		Gate:                 &gate,
+		SelectedIdentity:     identity,
 	})
 	if err != nil {
 		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing control audit dropped: %v", err))
 	}
+	return nil
 }

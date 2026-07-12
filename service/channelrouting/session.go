@@ -59,6 +59,15 @@ type RequestRoutingPlanInput struct {
 	SlowStartFactor            func(SlowStartKey) (float64, error)
 }
 
+type RequestRoutingCostInput struct {
+	RequestPath             string
+	ModelName               string
+	IsStream                bool
+	RetryIndex              int
+	PromptTokenEstimate     int
+	CompletionTokenEstimate int
+}
+
 type RequestRoutingPlan struct {
 	Gate             CanaryGate         `json:"gate"`
 	Replay           ShadowReplayInput  `json:"replay"`
@@ -182,6 +191,52 @@ func (session *RequestRoutingSession) IdentityForChannel(channelID int) (Identit
 		return identity, true
 	}
 	return Identity{}, false
+}
+
+func (session *RequestRoutingSession) ExpectedCostForChannel(
+	channelID int,
+	input RequestRoutingCostInput,
+) (float64, bool, error) {
+	if session == nil || session.snapshot == nil || channelID <= 0 ||
+		session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {
+		return 0, false, ErrRoutingSessionInvalid
+	}
+	pool := &session.snapshot.view.Pools[session.poolIndex]
+	if pool.ID <= 0 || pool.GroupName != session.groupName || session.planningTime.IsZero() {
+		return 0, false, ErrRoutingSessionInvalid
+	}
+	memberID, exists := session.snapshot.memberByPoolChannel[poolChannelKey{PoolID: pool.ID, ChannelID: channelID}]
+	if !exists || memberID <= 0 {
+		return 0, false, ErrRoutingSessionInvalid
+	}
+	profile, err := NewRequestProfile(
+		input.RequestPath,
+		session.groupName,
+		input.ModelName,
+		input.IsStream,
+		input.RetryIndex,
+		input.PromptTokenEstimate,
+		input.CompletionTokenEstimate,
+	)
+	if err != nil {
+		return 0, false, ErrRoutingSessionInvalid
+	}
+	observation, exists := session.snapshot.modelByMemberModel[memberModelKey{memberID: memberID, model: profile.ModelName}]
+	if !exists {
+		return 0, false, nil
+	}
+	cost, err := shadowExpectedCost(observation, profile)
+	if err != nil {
+		return 0, false, ErrRoutingSessionInvalid
+	}
+	settings := ShadowSelectorSettings{
+		NowUnix:          session.planningTime.Unix(),
+		SnapshotStaleSec: pool.SelectorPolicy.SnapshotStaleSec,
+	}
+	if cost == nil || !shadowCostKnown(cost, settings) {
+		return 0, false, nil
+	}
+	return cost.Cost, true, nil
 }
 
 func (session *RequestRoutingSession) Gate() (CanaryGate, bool, error) {
