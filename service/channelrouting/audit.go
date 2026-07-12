@@ -15,11 +15,14 @@ import (
 
 const (
 	DecisionAlgorithmObserveV1 = "smart-routing-beta-observe-v1"
-	MaxDecisionCandidates      = 128
+	// Policy pools may be larger; immutable audit/replay payloads are
+	// independently truncated to stay within the cross-database TEXT budget.
+	MaxDecisionCandidates = 64
 	// MySQL TEXT is limited to 64 KiB. Keep enough headroom for connection and
 	// charset differences so a valid in-memory audit cannot become a poison
 	// record that permanently blocks the ordered flush queue.
 	MaxDecisionCandidatesJSON  = 60 << 10
+	MaxDecisionReplayJSON      = 60 << 10
 	MaxDecisionReasonRunes     = 128
 	defaultDecisionBufferSize  = 4_096
 	defaultDecisionBufferBytes = 32 << 20
@@ -48,21 +51,27 @@ type DecisionCandidate struct {
 }
 
 type DecisionInput struct {
-	RequestID           string
-	PoolID              int
-	GroupName           string
-	ModelName           string
-	SnapshotRevision    uint64
-	AlgorithmVersion    string
-	RetryIndex          int
-	IsStream            bool
-	ActualChannelID     int
-	ObservedChannelID   int
-	FilteredOpen        int
-	FilteredCapacity    int
-	BreakerBypassed     bool
-	Candidates          []DecisionCandidate
-	CandidatesTruncated bool
+	RequestID            string
+	PoolID               int
+	GroupName            string
+	ModelName            string
+	SnapshotRevision     uint64
+	AlgorithmVersion     string
+	RetryIndex           int
+	IsStream             bool
+	ActualChannelID      int
+	ObservedChannelID    int
+	FilteredOpen         int
+	FilteredCapacity     int
+	BreakerBypassed      bool
+	Candidates           []DecisionCandidate
+	CandidatesTruncated  bool
+	ReplayInput          *ShadowReplayInput
+	DifferenceType       string
+	ActualCostKnown      bool
+	ActualExpectedCost   float64
+	ObservedCostKnown    bool
+	ObservedExpectedCost float64
 }
 
 type DecisionBufferStats struct {
@@ -76,6 +85,8 @@ type DecisionBufferStats struct {
 	Expired              int64 `json:"expired"`
 	UnknownIdentityDrops int64 `json:"unknown_identity_drops"`
 	Flushed              int64 `json:"flushed"`
+	OldestCreatedTime    int64 `json:"oldest_created_time"`
+	OldestAgeSec         int64 `json:"oldest_age_sec"`
 }
 
 var decisionBuffer = newAuditBuffer(defaultDecisionBufferSize)
@@ -135,6 +146,75 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 	}
 	algorithmVersion = truncateDecisionText(algorithmVersion, 64)
 	decisionID := common.GetUUID()
+	createdTime := common.GetTimestamp()
+	requestProfileJSON := ""
+	replayInputJSON := ""
+	replayInputHash := ""
+	replayInputBytes := 0
+	replayChunks := []model.RoutingDecisionReplayChunk(nil)
+	profileHash := ""
+	policyHash := ""
+	snapshotHash := ""
+	runtimeGeneration := int64(0)
+	seed := int64(0)
+	replayable := input.ReplayInput != nil
+	if replayable {
+		if err := input.ReplayInput.Validate(); err != nil {
+			return "", err
+		}
+		profile := input.ReplayInput.Profile
+		expectedSeed, err := DeriveShadowSeed(input.RequestID, input.SnapshotRevision, input.RetryIndex)
+		if err != nil || input.PoolID != input.ReplayInput.PoolID || input.SnapshotRevision != input.ReplayInput.PolicyRevision ||
+			input.AlgorithmVersion != input.ReplayInput.AlgorithmVersion || input.ReplayInput.Settings.RandomSeed != expectedSeed ||
+			input.GroupName != profile.GroupName ||
+			input.ModelName != profile.ModelName || input.RetryIndex != profile.RetryIndex || input.IsStream != profile.IsStream {
+			return "", ErrShadowReplayInvalid
+		}
+		profileJSON, err := common.Marshal(profile)
+		if err != nil {
+			return "", err
+		}
+		replayJSON, err := common.Marshal(input.ReplayInput)
+		if err != nil {
+			return "", err
+		}
+		if len(profileJSON) > MaxDecisionReplayJSON {
+			return "", ErrDecisionAuditTooLarge
+		}
+		replayInputHash, replayChunks, err = model.NewRoutingDecisionReplayChunks(decisionID, replayJSON, createdTime)
+		if err != nil {
+			return "", err
+		}
+		replayInputBytes = len(replayJSON)
+		if len(replayJSON) <= MaxDecisionReplayJSON {
+			replayInputJSON = string(replayJSON)
+			replayChunks = nil
+		} else {
+			replayInputJSON = ""
+		}
+		requestProfileJSON = string(profileJSON)
+		profileHash, err = profile.Hash()
+		if err != nil {
+			return "", err
+		}
+		policyHash = input.ReplayInput.PolicyHash
+		snapshotHash = input.ReplayInput.SnapshotHash
+		runtimeGeneration = snapshotRevisionInt64(input.ReplayInput.RuntimeGeneration)
+		seed = input.ReplayInput.Settings.RandomSeed
+	}
+	input.DifferenceType = truncateDecisionText(input.DifferenceType, 64)
+	if !input.ActualCostKnown || !finiteDecisionNumber(input.ActualExpectedCost) || input.ActualExpectedCost < 0 {
+		input.ActualCostKnown = false
+		input.ActualExpectedCost = 0
+	}
+	if !input.ObservedCostKnown || !finiteDecisionNumber(input.ObservedExpectedCost) || input.ObservedExpectedCost < 0 {
+		input.ObservedCostKnown = false
+		input.ObservedExpectedCost = 0
+	}
+	expectedCostDelta := 0.0
+	if input.ActualCostKnown && input.ObservedCostKnown {
+		expectedCostDelta = input.ObservedExpectedCost - input.ActualExpectedCost
+	}
 	decisionBuffer.enqueue(model.RoutingDecisionAudit{
 		DecisionID:            decisionID,
 		RequestID:             truncateDecisionText(input.RequestID, 64),
@@ -142,7 +222,12 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		GroupName:             input.GroupName,
 		ModelName:             input.ModelName,
 		SnapshotRevision:      snapshotRevisionInt64(input.SnapshotRevision),
+		RuntimeGeneration:     runtimeGeneration,
+		PolicyHash:            policyHash,
+		SnapshotHash:          snapshotHash,
+		ProfileHash:           profileHash,
 		AlgorithmVersion:      algorithmVersion,
+		Seed:                  seed,
 		RetryIndex:            input.RetryIndex,
 		IsStream:              input.IsStream,
 		ActualChannelID:       input.ActualChannelID,
@@ -153,8 +238,21 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		FilteredCapacity:      input.FilteredCapacity,
 		BreakerBypassed:       input.BreakerBypassed,
 		ObservedMatchesActual: input.ObservedChannelID > 0 && input.ObservedChannelID == input.ActualChannelID,
+		DifferenceType:        input.DifferenceType,
+		ActualCostKnown:       input.ActualCostKnown,
+		ActualExpectedCost:    input.ActualExpectedCost,
+		ObservedCostKnown:     input.ObservedCostKnown,
+		ObservedExpectedCost:  input.ObservedExpectedCost,
+		ExpectedCostDelta:     expectedCostDelta,
+		Replayable:            replayable,
+		RequestProfileJSON:    requestProfileJSON,
+		ReplayInputJSON:       replayInputJSON,
+		ReplayInputHash:       replayInputHash,
+		ReplayInputBytes:      replayInputBytes,
+		ReplayChunkCount:      len(replayChunks),
+		ReplayChunks:          replayChunks,
 		CandidatesJSON:        string(candidatesJSON),
-		CreatedTime:           common.GetTimestamp(),
+		CreatedTime:           createdTime,
 	})
 	return decisionID, nil
 }
@@ -425,7 +523,9 @@ func (buffer *auditBuffer) markUnknownIdentityDrop() {
 func (buffer *auditBuffer) stats() DecisionBufferStats {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
-	return DecisionBufferStats{
+	now := common.GetTimestamp()
+	buffer.expireLocked(now - int64(decisionBufferTTL/time.Second))
+	stats := DecisionBufferStats{
 		Entries:              buffer.size,
 		Capacity:             buffer.capacity,
 		Bytes:                buffer.bytes,
@@ -437,6 +537,11 @@ func (buffer *auditBuffer) stats() DecisionBufferStats {
 		UnknownIdentityDrops: buffer.unknownIdentityDrops,
 		Flushed:              buffer.flushed,
 	}
+	if buffer.size > 0 {
+		stats.OldestCreatedTime = buffer.items[buffer.head].CreatedTime
+		stats.OldestAgeSec = max(int64(0), now-stats.OldestCreatedTime)
+	}
+	return stats
 }
 
 func (buffer *auditBuffer) ensureAllocated() {
@@ -466,5 +571,11 @@ func (buffer *auditBuffer) expireLocked(cutoff int64) {
 }
 
 func decisionAuditSize(audit model.RoutingDecisionAudit) int64 {
-	return int64(len(audit.DecisionID) + len(audit.RequestID) + len(audit.GroupName) + len(audit.ModelName) + len(audit.AlgorithmVersion) + len(audit.CandidatesJSON) + 128)
+	size := int64(len(audit.DecisionID) + len(audit.RequestID) + len(audit.GroupName) + len(audit.ModelName) +
+		len(audit.AlgorithmVersion) + len(audit.PolicyHash) + len(audit.SnapshotHash) + len(audit.ProfileHash) +
+		len(audit.DifferenceType) + len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) + len(audit.CandidatesJSON) + 256)
+	for index := range audit.ReplayChunks {
+		size += int64(len(audit.ReplayChunks[index].Payload) + len(audit.ReplayChunks[index].PayloadHash) + 256)
+	}
+	return size
 }

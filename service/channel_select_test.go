@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -429,6 +430,114 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	assert.Equal(t, decision.Selected.Channel.Id, audits[0].ObservedChannelID)
 	assert.NotZero(t, audits[0].PoolID)
 	assert.NotZero(t, audits[0].SnapshotRevision)
+}
+
+func TestModeShadowDoesNotChangeLegacyChannelGroupOrRetry(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	channelrouting.ResetSnapshotForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+		channelrouting.ResetSnapshotForTest()
+	})
+
+	legacyPriority := int64(100)
+	shadowPriority := int64(1)
+	weight := uint(10)
+	for _, channel := range []model.Channel{
+		{Id: 219, Name: "legacy-winner", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &legacyPriority, Weight: &weight},
+		{Id: 220, Name: "shadow-winner", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &shadowPriority, Weight: &weight},
+	} {
+		channel := channel
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{
+			Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true,
+			Priority: channel.Priority, Weight: weight,
+		}).Error)
+	}
+	model.InitChannelCache()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true, Mode: smart_routing_setting.ModeShadow,
+	})
+
+	view := channelrouting.SnapshotView{
+		Revision: 23, RuntimeGeneration: 4, PolicyHash: strings.Repeat("c", 64),
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 9, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageObserve,
+			PolicyProfile: model.RoutingPolicyProfileCustom,
+			SelectorPolicy: channelrouting.PoolSelectorPolicy{
+				WeightAvailability: 1, AvailabilityFloor: 0, MinVolume: 1, TopK: 1,
+				MaxEjectedPct: 100, HalfOpenProbes: 1, SnapshotStaleSec: 1_800, BalanceMarginUSD: 1,
+			},
+			Members: []channelrouting.PoolMemberSnapshot{
+				{
+					ID: 91, PoolID: 9, ChannelID: 219, PhysicalStatus: common.ChannelStatusEnabled,
+					LegacyPriority: 10, LegacyWeight: 10,
+					Models: []channelrouting.ModelSnapshot{{
+						ModelName: "gpt-test", MetricKnown: true, RequestCount: 100, SuccessCount: 50,
+						ReliabilityRequestCount: 100, ReliabilityFailureCount: 50,
+					}},
+				},
+				{
+					ID: 92, PoolID: 9, ChannelID: 220, PhysicalStatus: common.ChannelStatusEnabled,
+					LegacyPriority: 10, LegacyWeight: 10,
+					Models: []channelrouting.ModelSnapshot{{
+						ModelName: "gpt-test", MetricKnown: true, RequestCount: 100, SuccessCount: 100,
+						ReliabilityRequestCount: 100, ReliabilityFailureCount: 0,
+					}},
+				},
+			},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{
+			{ID: 219, Status: common.ChannelStatusEnabled},
+			{ID: 220, Status: common.ChannelStatusEnabled},
+		},
+	}
+	channelrouting.SetSnapshotForTest(view)
+
+	selectLegacy := func(requestID string) (*model.Channel, string, int) {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		common.SetContextKey(ctx, common.RequestIdKey, requestID)
+		retry := 0
+		channel, group, err := CacheGetRandomSatisfiedChannel(&RetryParam{
+			Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test",
+			RequestPath: "/v1/chat/completions", Retry: &retry,
+		})
+		require.NoError(t, err)
+		return channel, group, retry
+	}
+
+	beforeChannel, beforeGroup, beforeRetry := selectLegacy("shadow-before")
+	require.NotNil(t, beforeChannel)
+	channelrouting.ResetDecisionAuditsForTest()
+	view.Pools[0].DeploymentStage = model.RoutingDeploymentStageShadow
+	channelrouting.SetSnapshotForTest(view)
+	afterChannel, afterGroup, afterRetry := selectLegacy("shadow-after")
+	require.NotNil(t, afterChannel)
+
+	assert.Equal(t, 219, beforeChannel.Id)
+	assert.Equal(t, beforeChannel.Id, afterChannel.Id)
+	assert.Equal(t, beforeGroup, afterGroup)
+	assert.Equal(t, beforeRetry, afterRetry)
+
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, model.DB.Where("request_id = ?", "shadow-after").First(&audit).Error)
+	assert.True(t, audit.Replayable)
+	assert.Equal(t, channelrouting.DecisionAlgorithmShadowV1, audit.AlgorithmVersion)
+	assert.Equal(t, 219, audit.ActualChannelID)
+	assert.Equal(t, 220, audit.ObservedChannelID)
+	assert.Equal(t, "ranking_difference", audit.DifferenceType)
+	replayed, err := channelrouting.ReplayDecisionAudit(audit)
+	require.NoError(t, err)
+	assert.Equal(t, 220, replayed.SelectedChannelID)
 }
 
 func TestObserveCandidatesUseStableMultiKeyTelemetryWithoutLegacyAggregate(t *testing.T) {

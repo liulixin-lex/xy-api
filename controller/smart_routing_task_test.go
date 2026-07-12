@@ -216,6 +216,179 @@ func TestRunRoutingCostSyncTaskFetchesNewAPIPricingSnapshots(t *testing.T) {
 	assert.Equal(t, "serving-auth-failure", health.AuthFailureReason)
 }
 
+func TestRunRoutingCostSyncTaskAggregatesNewAPIBindingsByUpstreamAccount(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+
+	requests := map[string]int{}
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests[r.URL.Path]++
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/self":
+			_, _ = io.WriteString(w, `{"success":true,"data":{"quota":2000000,"used_quota":500000}}`)
+		case "/api/pricing":
+			_, _ = io.WriteString(w, `{
+				"success":true,
+				"data":[{"model_name":"gpt-shared","quota_type":0,"model_ratio":2,"completion_ratio":3,"enable_groups":["all"]}],
+				"group_ratio":{"basic":1,"vip":1.5},
+				"pricing_version":"shared-v1"
+			}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+	for _, binding := range []model.RoutingChannelBinding{
+		{ChannelID: 790, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: server.URL, UpstreamGroup: "basic", NewAPIUserID: common.GetPointer(42), Enabled: true},
+		{ChannelID: 791, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: server.URL, UpstreamGroup: "vip", NewAPIUserID: common.GetPointer(42), Enabled: true},
+	} {
+		require.NoError(t, binding.SetCredentials(model.RoutingCredentials{NewAPIAccessToken: "shared-secret-token"}))
+		require.NoError(t, db.Create(&binding).Error)
+	}
+
+	summary, err := runRoutingCostSyncTask(context.Background())
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests["/api/user/self"])
+	assert.Equal(t, 1, requests["/api/pricing"])
+	assert.EqualValues(t, 1, summary["accounts"])
+	assert.EqualValues(t, 2, summary["snapshots"])
+	var accounts []model.RoutingUpstreamAccount
+	require.NoError(t, db.Find(&accounts).Error)
+	require.Len(t, accounts, 1)
+	assert.NotContains(t, accounts[0].AccountKey, "shared-secret-token")
+	assert.NotContains(t, accounts[0].MaskedIdentity, "shared-secret-token")
+	assert.Equal(t, model.RoutingUpstreamSyncStatusSuccess, accounts[0].LastSyncStatus)
+	var versions []model.RoutingCostSnapshotVersion
+	require.NoError(t, db.Order("channel_id asc").Find(&versions).Error)
+	require.Len(t, versions, 2)
+	assert.Equal(t, []int{790, 791}, []int{versions[0].ChannelID, versions[1].ChannelID})
+	assert.Equal(t, versions[0].ObservedTime, versions[1].ObservedTime)
+	var balances []model.RoutingChannelHealthState
+	require.NoError(t, db.Where("channel_id IN ?", []int{790, 791}).Order("channel_id asc").Find(&balances).Error)
+	require.Len(t, balances, 2)
+	assert.Equal(t, 3.0, balances[0].Balance)
+	assert.Equal(t, 3.0, balances[1].Balance)
+}
+
+func TestRunRoutingCostSyncTaskIsolatesInvalidGroupPricingWithinSharedAccount(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+
+	requests := 0
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/user/self" {
+			_, _ = io.WriteString(w, `{"success":true,"data":{"quota":1000000,"used_quota":0}}`)
+			return
+		}
+		if r.URL.Path == "/api/pricing" {
+			requests++
+			_, _ = io.WriteString(w, `{"success":true,"data":[{"model_name":"gpt-partial","quota_type":0,"model_ratio":1,"completion_ratio":1,"enable_groups":["all"]}],"group_ratio":{"basic":1,"vip":-1}}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+	for _, binding := range []model.RoutingChannelBinding{
+		{ChannelID: 792, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: server.URL, UpstreamGroup: "vip", NewAPIUserID: common.GetPointer(77), Enabled: true},
+		{ChannelID: 793, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: server.URL, UpstreamGroup: "basic", NewAPIUserID: common.GetPointer(77), Enabled: true},
+	} {
+		require.NoError(t, binding.SetCredentials(model.RoutingCredentials{NewAPIAccessToken: "partial-secret-token"}))
+		require.NoError(t, db.Create(&binding).Error)
+	}
+
+	summary, err := runRoutingCostSyncTask(context.Background())
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, requests)
+	assert.EqualValues(t, 1, summary["snapshots"])
+	assert.EqualValues(t, 1, summary["errors"])
+	assert.EqualValues(t, 1, summary["partial_accounts"])
+	var snapshots []model.RoutingCostSnapshot
+	require.NoError(t, db.Find(&snapshots).Error)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, 793, snapshots[0].ChannelID)
+	var failed model.RoutingChannelBinding
+	require.NoError(t, db.Where("channel_id = ?", 792).First(&failed).Error)
+	assert.Greater(t, failed.SyncBackoffUntil, common.GetTimestamp())
+	var account model.RoutingUpstreamAccount
+	require.NoError(t, db.First(&account).Error)
+	assert.Equal(t, model.RoutingUpstreamSyncStatusPartial, account.LastSyncStatus)
+	assert.Equal(t, model.RoutingUpstreamAccountStatusDegraded, account.Status)
+}
+
+func TestRunRoutingCostSyncTaskStoresFutureEffectivePriceWithoutActivatingLatest(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingChannelBinding{},
+		&model.RoutingCostSnapshot{},
+		&model.RoutingChannelMetric{},
+		&model.RoutingBreakerState{},
+		&model.RoutingChannelHealthState{},
+	))
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	now := common.GetTimestamp()
+	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/self":
+			_, _ = io.WriteString(w, `{"success":true,"data":{"quota":1000000,"used_quota":0}}`)
+		case "/api/pricing":
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":[{"model_name":"gpt-future","quota_type":0,"model_ratio":1,"completion_ratio":1}],"group_ratio":{"vip":1},"pricing_version":"future-v1","effective_time":%d,"expires_time":%d}`, now+3600, now+7200)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+	binding := model.RoutingChannelBinding{ChannelID: 794, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: server.URL, UpstreamGroup: "vip", NewAPIUserID: common.GetPointer(88), Enabled: true}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{NewAPIAccessToken: "future-token"}))
+	require.NoError(t, db.Create(&binding).Error)
+
+	_, err := runRoutingCostSyncTask(context.Background())
+
+	require.NoError(t, err)
+	var version model.RoutingCostSnapshotVersion
+	require.NoError(t, db.Where("channel_id = ?", 794).First(&version).Error)
+	assert.Equal(t, now+3600, version.EffectiveTime)
+	var latestCount int64
+	require.NoError(t, db.Model(&model.RoutingCostSnapshot{}).Where("channel_id = ?", 794).Count(&latestCount).Error)
+	assert.Zero(t, latestCount)
+	_, cached := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 794, Model: "gpt-future"})
+	assert.False(t, cached)
+}
+
 func TestRunRoutingCostSyncTaskDoesNotMarkServingAuthFailureOnUnauthorizedUpstream(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))

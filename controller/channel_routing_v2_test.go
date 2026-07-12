@@ -61,8 +61,15 @@ func TestChannelRoutingV2ReadAPIsExposeSnapshotWithoutSecrets(t *testing.T) {
 	assert.NotContains(t, overviewRecorder.Body.String(), "serving-secret")
 	assert.NotContains(t, overviewRecorder.Body.String(), "password")
 	assert.Contains(t, overviewRecorder.Body.String(), `"snapshot_available":true`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"control_plane_available":true`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"status":"complete"`)
 	assert.Contains(t, overviewRecorder.Body.String(), `"observed_requests":20`)
 	assert.Contains(t, overviewRecorder.Body.String(), `"identity_drops":0`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"p95_ttft_status":"available"`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"p95_ttft_ms":250`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"runtime_generation":1`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"policy_hash":"`)
+	assert.Contains(t, overviewRecorder.Body.String(), `"node_epoch_id":"`)
 
 	groupsRecorder := httptest.NewRecorder()
 	groupsContext, _ := gin.CreateTestContext(groupsRecorder)
@@ -95,6 +102,158 @@ func TestChannelRoutingV2ReadAPIsExposeSnapshotWithoutSecrets(t *testing.T) {
 	assert.Equal(t, http.StatusOK, costsRecorder.Code)
 	assert.Contains(t, costsRecorder.Body.String(), `"confidence":"full"`)
 	assert.Contains(t, costsRecorder.Body.String(), `"cost":0.002`)
+}
+
+func TestChannelRoutingOverviewExposesMetricTelemetryDegradation(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 1, PolicyHash: strings.Repeat("a", 64), BuiltAtUnix: common.GetTimestamp(),
+		Stats: channelrouting.SnapshotStats{
+			MetricTelemetryStatus:   "unavailable",
+			MetricTelemetryReason:   "metric_rollup_scan_rows_limit",
+			MetricRollupRows:        80,
+			MetricRollupRowLimit:    100,
+			MetricRollupScannedRows: 101,
+			MetricRollupScanLimit:   100,
+			MetricSketchBytes:       1024,
+			MetricSketchByteLimit:   2048,
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/overview", nil)
+	GetChannelRoutingOverview(ctx)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"status":"unavailable"`)
+	assert.Contains(t, body, `"reason":"metric_rollup_scan_rows_limit"`)
+	assert.Contains(t, body, `"metric_rollup_scanned_rows":101`)
+	assert.Contains(t, body, `"metric_rollup_scan_limit":100`)
+	assert.Contains(t, body, `"p95_ttft_status":"unavailable"`)
+	assert.NotContains(t, body, `"p95_ttft_status":"no_samples"`)
+}
+
+func TestChannelRoutingOverviewDoesNotReportConvergedWhenControlPlaneIsUnavailable(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 1, PolicyHash: strings.Repeat("a", 64), BuiltAtUnix: common.GetTimestamp(),
+	})
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/overview", nil)
+	GetChannelRoutingOverview(ctx)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"control_plane_available":false`)
+	assert.Contains(t, recorder.Body.String(), `"propagation_status":"unknown"`)
+	assert.NotContains(t, recorder.Body.String(), `"propagation_status":"converged"`)
+}
+
+func TestChannelRoutingOverviewReportsAheadAndHashConflict(t *testing.T) {
+	tests := []struct {
+		name             string
+		headRevision     int64
+		headHash         string
+		snapshotRevision uint64
+		snapshotHash     string
+		expectedStatus   string
+	}{
+		{
+			name: "snapshot ahead of restored database", headRevision: 2, headHash: strings.Repeat("a", 64),
+			snapshotRevision: 3, snapshotHash: strings.Repeat("b", 64), expectedStatus: "ahead",
+		},
+		{
+			name: "same revision hash conflict", headRevision: 3, headHash: strings.Repeat("a", 64),
+			snapshotRevision: 3, snapshotHash: strings.Repeat("b", 64), expectedStatus: "conflict",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openChannelRoutingControllerDB(t)
+			withChannelRoutingControllerState(t, db)
+			now := common.GetTimestamp()
+			require.NoError(t, db.Create(&model.RoutingPolicyHead{
+				ID: 1, CurrentRevision: test.headRevision, CurrentHash: test.headHash,
+				CurrentStage: model.RoutingDeploymentStageShadow, CreatedTime: now, UpdatedTime: now,
+			}).Error)
+			channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+				Revision: test.snapshotRevision, PolicyHash: test.snapshotHash, BuiltAtUnix: now,
+			})
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/overview", nil)
+			GetChannelRoutingOverview(ctx)
+
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), `"propagation_status":"`+test.expectedStatus+`"`)
+			assert.NotContains(t, recorder.Body.String(), `"propagation_status":"converged"`)
+			if test.expectedStatus == "ahead" {
+				assert.Contains(t, recorder.Body.String(), `"revision_ahead":1`)
+			}
+		})
+	}
+}
+
+func TestChannelRoutingNodesExposePerNodeRevisionLagAndStatus(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	now := common.GetTimestamp()
+	headHash := strings.Repeat("a", 64)
+	require.NoError(t, db.Create(&model.RoutingPolicyHead{
+		ID: 1, CurrentRevision: 3, CurrentHash: headHash,
+		CurrentStage: model.RoutingDeploymentStageShadow, CreatedTime: now, UpdatedTime: now,
+	}).Error)
+	for index, spec := range []struct {
+		nodeID     string
+		revision   int64
+		policyHash string
+	}{
+		{nodeID: "node-current-a", revision: 3, policyHash: headHash},
+		{nodeID: "node-lagging", revision: 2, policyHash: headHash},
+		{nodeID: "node-current-b", revision: 3, policyHash: headHash},
+		{nodeID: "node-ahead", revision: 4, policyHash: headHash},
+		{nodeID: "node-conflict", revision: 3, policyHash: strings.Repeat("b", 64)},
+	} {
+		checkpoint, err := model.NewRoutingRuntimeCheckpoint(
+			spec.nodeID,
+			channelrouting.RoutingConfigCheckpointKind,
+			channelrouting.RoutingConfigCheckpointScope,
+			spec.revision,
+			1,
+			map[string]any{"cursor": strconv.Itoa(index), "policy_hash": spec.policyHash},
+			now-int64(index),
+			now+600,
+		)
+		require.NoError(t, err)
+		_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), checkpoint)
+		require.NoError(t, err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/v2/nodes?limit=10", nil)
+	ListChannelRoutingNodes(ctx)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"control_plane_available":true`)
+	assert.Contains(t, body, `"control_plane_revision":3`)
+	assert.Equal(t, 2, strings.Count(body, `"status":"converged"`))
+	assert.Equal(t, 1, strings.Count(body, `"status":"lagging"`))
+	assert.Equal(t, 1, strings.Count(body, `"status":"ahead"`))
+	assert.Equal(t, 1, strings.Count(body, `"status":"conflict"`))
+	assert.Contains(t, body, `"node_id":"node-lagging"`)
+	assert.Contains(t, body, `"revision_lag":1`)
+	assert.Contains(t, body, `"revision_ahead":1`)
 }
 
 func TestChannelRoutingDecisionAPIsUseBoundedCursorPagination(t *testing.T) {
@@ -173,14 +332,61 @@ func TestChannelRoutingSnapshotAPIsReturnServiceUnavailableWhileInitializing(t *
 	assert.Contains(t, recorder.Body.String(), "initializing")
 }
 
+func TestChannelRoutingGroupDetailUsesBoundedNestedPagination(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	members := make([]channelrouting.PoolMemberSnapshot, 3)
+	for index := range members {
+		members[index] = channelrouting.PoolMemberSnapshot{
+			ID: index + 1, PoolID: 1, ChannelID: 100 + index,
+			CredentialIDs: []int{index + 1, index + 11},
+			Models: []channelrouting.ModelSnapshot{
+				{ModelName: "model-a"},
+				{ModelName: "model-b"},
+			},
+		}
+	}
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 1, PolicyHash: strings.Repeat("a", 64), BuiltAtUnix: common.GetTimestamp(),
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 1, GroupName: "default", DisplayName: "Default", MemberCount: len(members), Members: members,
+		}},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/channel-routing/v2/groups/1?page=2&page_size=1&model_limit=1&credential_limit=1",
+		nil,
+	)
+	GetChannelRoutingGroup(ctx)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	assert.Contains(t, body, `"member_count":3`)
+	assert.Contains(t, body, `"members_truncated":true`)
+	assert.Contains(t, body, `"channel_id":101`)
+	assert.NotContains(t, body, `"channel_id":100`)
+	assert.Contains(t, body, `"model_count":2`)
+	assert.Contains(t, body, `"models_truncated":true`)
+	assert.Contains(t, body, `"credential_count":2`)
+	assert.Contains(t, body, `"credentials_truncated":true`)
+	assert.Contains(t, body, `"next_page":3`)
+}
+
 func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
 		name    string
 		target  string
 		handler gin.HandlerFunc
+		params  gin.Params
 	}{
 		{name: "decision cursor", target: "/api/channel-routing/v2/decisions?cursor=not-a-number", handler: ListChannelRoutingDecisions},
+		{name: "node cursor", target: "/api/channel-routing/v2/nodes?cursor=not-a-cursor", handler: ListChannelRoutingNodes},
+		{name: "group model limit", target: "/api/channel-routing/v2/groups/1?model_limit=101", handler: GetChannelRoutingGroup, params: gin.Params{{Key: "id", Value: "1"}}},
 		{name: "channel status", target: "/api/channel-routing/v2/channels?status=unknown", handler: ListChannelRoutingChannels},
 		{name: "channel type", target: "/api/channel-routing/v2/channels?type=unknown", handler: ListChannelRoutingChannels},
 		{name: "cost known", target: "/api/channel-routing/v2/costs?known=unknown", handler: ListChannelRoutingCosts},
@@ -190,6 +396,7 @@ func TestChannelRoutingV2RejectsInvalidCursorsAndFilters(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Params = test.params
 			ctx.Request = httptest.NewRequest(http.MethodGet, test.target, nil)
 
 			test.handler(ctx)
@@ -209,9 +416,19 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingPool{},
 		&model.RoutingPoolMember{},
 		&model.RoutingCredentialRef{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
+		&model.RoutingRuntimeCheckpoint{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingDecisionAudit{},
 		&model.RoutingMetricRollup{},
+		&model.RoutingTelemetryReceipt{},
+		&model.RoutingUpstreamAccount{},
+		&model.RoutingCostSnapshotVersion{},
 	))
 	return db
 }

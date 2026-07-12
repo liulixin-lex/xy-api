@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -19,11 +22,11 @@ import (
 func TestFlushStableTelemetryPersistsAllBatchesAndRequeuesOnlyFailedTail(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.RoutingMetricRollup{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingMetricRollup{}, &model.RoutingTelemetryReceipt{}))
 	withSnapshotTestDB(t, db)
 	enableStableTelemetryTest(t)
 
-	snapshots := make([]routingmetrics.StableSnapshot, model.RoutingMetricRollupMaxBatch+1)
+	snapshots := make([]routingmetrics.StableSnapshot, model.RoutingTelemetryMaxItems+1)
 	for index := range snapshots {
 		snapshots[index] = routingmetrics.StableSnapshot{
 			PoolID: 1, PoolMemberID: index + 1, CredentialID: index + 1, ChannelID: index + 1,
@@ -35,6 +38,9 @@ func TestFlushStableTelemetryPersistsAllBatchesAndRequeuesOnlyFailedTail(t *test
 
 	var createCalls int
 	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("routing_rollup_fail_second_batch", func(tx *gorm.DB) {
+		if tx.Statement.Table != "routing_telemetry_receipts" {
+			return
+		}
 		createCalls++
 		if createCalls == 2 {
 			tx.AddError(errors.New("second batch failed"))
@@ -43,13 +49,14 @@ func TestFlushStableTelemetryPersistsAllBatchesAndRequeuesOnlyFailedTail(t *test
 
 	flushed, err := FlushStableTelemetryContext(context.Background())
 	require.ErrorContains(t, err, "second batch failed")
-	assert.Equal(t, model.RoutingMetricRollupMaxBatch, flushed)
+	assert.Equal(t, model.RoutingTelemetryMaxItems, flushed)
 	var persisted int64
 	require.NoError(t, db.Model(&model.RoutingMetricRollup{}).Count(&persisted).Error)
-	assert.Equal(t, int64(model.RoutingMetricRollupMaxBatch), persisted)
-	remaining := routingmetrics.StableSnapshots()
-	require.Len(t, remaining, 1)
-	assert.Equal(t, model.RoutingMetricRollupMaxBatch+1, remaining[0].PoolMemberID)
+	assert.Equal(t, int64(model.RoutingTelemetryMaxItems), persisted)
+	assert.Empty(t, routingmetrics.StableSnapshots(), "drained transport envelopes must not remain in the live snapshot overlay")
+	stats := RoutingTelemetryTransportRuntimeStats()
+	assert.Equal(t, 1, stats.PendingEnvelopes)
+	assert.Equal(t, 1, stats.PendingItems)
 
 	require.NoError(t, db.Callback().Create().Remove("routing_rollup_fail_second_batch"))
 	flushed, err = FlushStableTelemetryContext(context.Background())
@@ -57,7 +64,8 @@ func TestFlushStableTelemetryPersistsAllBatchesAndRequeuesOnlyFailedTail(t *test
 	assert.Equal(t, 1, flushed)
 	assert.Empty(t, routingmetrics.StableSnapshots())
 	require.NoError(t, db.Model(&model.RoutingMetricRollup{}).Count(&persisted).Error)
-	assert.Equal(t, int64(model.RoutingMetricRollupMaxBatch+1), persisted)
+	assert.Equal(t, int64(model.RoutingTelemetryMaxItems+1), persisted)
+	assert.Zero(t, RoutingTelemetryTransportRuntimeStats().PendingEnvelopes)
 }
 
 func TestFlushStableTelemetryDatabaseFailureKeepsLiveDelta(t *testing.T) {
@@ -73,13 +81,160 @@ func TestFlushStableTelemetryDatabaseFailureKeepsLiveDelta(t *testing.T) {
 	flushed, err := FlushStableTelemetryContext(context.Background())
 	require.Error(t, err)
 	assert.Zero(t, flushed)
-	require.Len(t, routingmetrics.StableSnapshots(), 1)
+	assert.Empty(t, routingmetrics.StableSnapshots())
+	stats := RoutingTelemetryTransportRuntimeStats()
+	assert.Equal(t, 1, stats.PendingEnvelopes)
+	assert.Equal(t, 1, stats.PendingItems)
+}
+
+func TestFlushStableTelemetryHonorsPerInvocationEnvelopeBudget(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RoutingMetricRollup{}, &model.RoutingTelemetryReceipt{}))
+	withSnapshotTestDB(t, db)
+	enableStableTelemetryTest(t)
+
+	snapshotCount := stableTelemetryFlushMaxEnvelopes*model.RoutingTelemetryMaxItems + 1
+	snapshots := make([]routingmetrics.StableSnapshot, snapshotCount)
+	for index := range snapshots {
+		snapshots[index] = routingmetrics.StableSnapshot{
+			PoolID: 1, PoolMemberID: index + 1, CredentialID: index + 1, ChannelID: index + 1,
+			Model: fmt.Sprintf("model-%03d", index), BucketTs: 60, LastSnapshotRevision: 1,
+			RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+		}
+	}
+	routingmetrics.RequeueStableSnapshots(snapshots)
+
+	flushed, err := FlushStableTelemetryContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, stableTelemetryFlushMaxEnvelopes*model.RoutingTelemetryMaxItems, flushed)
+	assert.Equal(t, int64(1), routingmetrics.StableRuntimeStats().Buckets)
+
+	lockCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, lockRoutingTelemetry(lockCtx), "the flush budget must release snapshot maintenance promptly")
+	unlockRoutingTelemetry()
+
+	flushed, err = FlushStableTelemetryContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+	assert.Zero(t, routingmetrics.StableRuntimeStats().Buckets)
+}
+
+func TestDefaultLocalDrainFlushesStableTelemetryToStream(t *testing.T) {
+	enableStableTelemetryTest(t)
+	common.RedisEnabled = true
+	common.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = common.RDB.Close() })
+	stub := &routingTelemetryRedisStub{}
+	withRoutingTelemetryRedis(t, stub)
+	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
+		PoolID: 1, PoolMemberID: 1, CredentialID: 0, ChannelID: 1,
+		Model: "gpt-test", BucketTs: 60, LastSnapshotRevision: 1,
+		RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+	}})
+
+	err := defaultRuntimeDeps().drainLocal(
+		context.Background(), smart_routing_setting.GetSetting(),
+	)
+	require.NoError(t, err)
+	assert.Empty(t, routingmetrics.StableSnapshots())
+	assert.Equal(t, int64(1), RoutingTelemetryTransportRuntimeStats().Published)
+}
+
+func TestDefaultLocalDrainDrainsAllDecisionAuditBatches(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RoutingDecisionAudit{}, &model.RoutingMetricRollup{}, &model.RoutingTelemetryReceipt{}))
+	withSnapshotTestDB(t, db)
+	enableStableTelemetryTest(t)
+	ResetDecisionAuditsForTest(model.RoutingDecisionAuditMaxBatch + 1)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	for index := 0; index < model.RoutingDecisionAuditMaxBatch+1; index++ {
+		_, err := EnqueueDecision(DecisionInput{
+			RequestID:        fmt.Sprintf("request-%03d", index),
+			PoolID:           1,
+			SnapshotRevision: 1,
+			GroupName:        "default",
+			ModelName:        "gpt-test",
+		})
+		require.NoError(t, err)
+	}
+
+	common.RedisEnabled = true
+	common.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = common.RDB.Close() })
+	withRoutingTelemetryRedis(t, &routingTelemetryRedisStub{})
+
+	err = defaultRuntimeDeps().drainLocal(context.Background(), smart_routing_setting.GetSetting())
+	require.NoError(t, err)
+	var persisted int64
+	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).Count(&persisted).Error)
+	assert.Equal(t, int64(model.RoutingDecisionAuditMaxBatch+1), persisted)
+	stats := DecisionAuditsStats()
+	assert.Zero(t, stats.Entries)
+	assert.Equal(t, int64(model.RoutingDecisionAuditMaxBatch+1), stats.Flushed)
+}
+
+func TestDefaultLocalDrainFlushesAuditWhenStableTelemetryFails(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RoutingDecisionAudit{}))
+	withSnapshotTestDB(t, db)
+	enableStableTelemetryTest(t)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
+		PoolID: 1, PoolMemberID: 1, CredentialID: 1, ChannelID: 1,
+		Model: "gpt-test", BucketTs: 60, LastSnapshotRevision: 1,
+		RequestCount: 1, SuccessCount: 1, ReliabilityRequestCount: 1,
+	}})
+	_, err = EnqueueDecision(DecisionInput{
+		PoolID: 1, SnapshotRevision: 1, GroupName: "default", ModelName: "gpt-test",
+	})
+	require.NoError(t, err)
+
+	err = defaultRuntimeDeps().drainLocal(context.Background(), smart_routing_setting.GetSetting())
+	require.Error(t, err)
+	assert.Zero(t, DecisionAuditsStats().Entries)
+	var persisted int64
+	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).Count(&persisted).Error)
+	assert.Equal(t, int64(1), persisted)
+	assert.Equal(t, 1, RoutingTelemetryTransportRuntimeStats().PendingEnvelopes)
+}
+
+func TestTelemetryStreamConsumerRunsWhenAuditPersistenceFails(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	withSnapshotTestDB(t, db)
+	enableStableTelemetryTest(t)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+	_, err = EnqueueDecision(DecisionInput{
+		PoolID: 1, SnapshotRevision: 1, GroupName: "default", ModelName: "gpt-test",
+	})
+	require.NoError(t, err)
+	require.Error(t, defaultRuntimeDeps().drainLocal(context.Background(), smart_routing_setting.GetSetting()))
+
+	common.RedisEnabled = true
+	common.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() { _ = common.RDB.Close() })
+	stub := &routingTelemetryRedisStub{}
+	withRoutingTelemetryRedis(t, stub)
+
+	require.NoError(t, defaultRuntimeDeps().consumeTelemetry(context.Background(), smart_routing_setting.GetSetting()))
+	assert.Equal(t, 1, stub.readCalls)
+	assert.Equal(t, 1, DecisionAuditsStats().Entries)
 }
 
 func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.RoutingMetricRollup{}, &model.RoutingDecisionAudit{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingMetricRollup{}, &model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}, &model.RoutingTelemetryReceipt{},
+		&model.RoutingConfigOutbox{}, &model.RoutingRuntimeCheckpoint{}, &model.RoutingCostSnapshotVersion{},
+	))
 	withSnapshotTestDB(t, db)
 
 	require.NoError(t, model.UpsertRoutingMetricRollupsContext(context.Background(), []model.RoutingMetricRollup{{
@@ -87,21 +242,53 @@ func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 		ChannelID: 1, PoolID: 1, LastSnapshotRevision: 1, RequestCount: 1,
 	}}))
 	require.NoError(t, db.Create(&model.RoutingDecisionAudit{DecisionID: "old", CreatedTime: 1}).Error)
+	require.NoError(t, db.Create(&model.RoutingTelemetryReceipt{
+		NodeID: "old-node", NodeKey: fmt.Sprintf("%064x", 1), Sequence: 1,
+		PayloadHash: fmt.Sprintf("%064x", 2), ApplyToken: fmt.Sprintf("%032x", 3),
+		ItemCount: 1, ProducedAtMs: 1, AppliedAt: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingConfigOutbox{
+		EventID: "old-event", Revision: 1, EventType: model.RoutingConfigEventPolicyRevision,
+		PayloadJSON: `{}`, PayloadHash: fmt.Sprintf("%064x", 4), CreatedTime: 1, PublishedTime: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingRuntimeCheckpoint{
+		IdentityKey: fmt.Sprintf("%064x", 5), NodeID: "node", CheckpointKind: "config_stream",
+		Scope: "stream", ScopeHash: fmt.Sprintf("%064x", 6), PayloadJSON: `{}`,
+		PayloadHash: fmt.Sprintf("%064x", 7), ExpiresTime: 1,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingCostSnapshotVersion{
+		SchemaVersion: 1, PricingHash: fmt.Sprintf("%064x", 8), ApplyToken: fmt.Sprintf("%032x", 9),
+		AccountID: 1, AccountKey: fmt.Sprintf("%064x", 10), SourceType: model.RoutingUpstreamTypeNewAPI,
+		ChannelID: 1, UpstreamGroup: "default", UpstreamGroupKey: fmt.Sprintf("%064x", 11),
+		UpstreamModel: "old", UpstreamModelKey: fmt.Sprintf("%064x", 12), LocalModel: "old",
+		LocalModelKey: fmt.Sprintf("%064x", 13), ObservedTime: 1, EffectiveTime: 1, ExpiresTime: 2,
+		PricingVersion: "old", PricingJSON: `{}`, Confidence: model.RoutingCostConfidenceUnknown,
+		Freshness: model.RoutingCostFreshnessUnknown, SourceSyncStatus: model.RoutingUpstreamSyncStatusUnknown,
+		CreatedTime: 1,
+	}).Error)
 
 	deleted, err := DeleteExpiredRoutingHistoryContext(context.Background(), 1)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), deleted)
+	assert.Equal(t, int64(6), deleted)
 }
 
 func enableStableTelemetryTest(t *testing.T) {
 	t.Helper()
 	routingmetrics.ResetForTest()
+	ResetRoutingTelemetryTransportForTest()
 	smart_routing_setting.ResetForTest()
+	previousRedisEnabled := common.RedisEnabled
+	previousRedis := common.RDB
+	common.RedisEnabled = false
+	common.RDB = nil
 	setting := smart_routing_setting.GetSetting()
 	setting.Enabled = true
 	smart_routing_setting.UpdateSetting(setting)
 	t.Cleanup(func() {
 		routingmetrics.ResetForTest()
+		ResetRoutingTelemetryTransportForTest()
 		smart_routing_setting.ResetForTest()
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRedis
 	})
 }

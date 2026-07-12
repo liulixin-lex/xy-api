@@ -221,6 +221,12 @@ func openDistributorRoutingIdentityDB(t *testing.T) *gorm.DB {
 		&model.RoutingCredentialRef{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingMetricRollup{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
 	))
 	return db
 }

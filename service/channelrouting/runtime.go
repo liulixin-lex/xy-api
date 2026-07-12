@@ -14,12 +14,26 @@ import (
 )
 
 const (
-	observeRefreshMinimum = 30 * time.Second
-	observeDisabledPoll   = 5 * time.Second
-	observeBackoffBase    = time.Second
-	observeBackoffCap     = time.Minute
-	observeFinalTimeout   = 15 * time.Second
+	observeRefreshMinimum        = 30 * time.Second
+	observeDisabledPoll          = 5 * time.Second
+	observeBackoffBase           = time.Second
+	observeBackoffCap            = time.Minute
+	observeFinalTimeout          = 15 * time.Second
+	observeStreamPoll            = 50 * time.Millisecond
+	observeLocalDrainRedis       = 2 * time.Second
+	observeLocalDrainFallback    = 5 * time.Second
+	observeRefreshTimeout        = 2 * time.Minute
+	observeSnapshotFallback      = 5 * time.Minute
+	routingLegacyLeaseTTL        = 3 * time.Minute
+	routingLegacyMinInterval     = 5 * time.Minute
+	decisionAuditFlushMaxBatches = 16
+	observeFinalFlushMaxAttempts = 4
+	observeFinalFlushRetryBase   = 50 * time.Millisecond
 )
+
+const routingLegacyReconcileLeaseName = "routing-v2-legacy-reconcile"
+
+var ErrRoutingLegacyReconcileBusy = errors.New("channel routing legacy reconcile is owned by another node")
 
 type RuntimeWorkerStats struct {
 	Runs                int64  `json:"runs"`
@@ -32,12 +46,22 @@ type RuntimeWorkerStats struct {
 }
 
 type RuntimeStats struct {
-	Refresh          RuntimeWorkerStats         `json:"refresh"`
-	Flush            RuntimeWorkerStats         `json:"flush"`
-	Audit            DecisionBufferStats        `json:"audit"`
-	Telemetry        routingmetrics.StableStats `json:"telemetry"`
-	SnapshotRevision uint64                     `json:"snapshot_revision"`
-	SnapshotBuiltAt  int64                      `json:"snapshot_built_at"`
+	Refresh                   RuntimeWorkerStats             `json:"refresh"`
+	Flush                     RuntimeWorkerStats             `json:"flush"`
+	LocalDrain                RuntimeWorkerStats             `json:"local_drain"`
+	TelemetryStream           RuntimeWorkerStats             `json:"telemetry_stream"`
+	ConfigPublisher           RuntimeWorkerStats             `json:"config_publisher"`
+	ConfigConsumer            RuntimeWorkerStats             `json:"config_consumer"`
+	Retention                 RuntimeWorkerStats             `json:"retention"`
+	Audit                     DecisionBufferStats            `json:"audit"`
+	Telemetry                 routingmetrics.StableStats     `json:"telemetry"`
+	TelemetryTransport        RoutingTelemetryTransportStats `json:"telemetry_transport"`
+	ConfigStream              RoutingConfigStreamStats       `json:"config_stream"`
+	SnapshotRevision          uint64                         `json:"snapshot_revision"`
+	SnapshotRuntimeGeneration uint64                         `json:"snapshot_runtime_generation"`
+	SnapshotPolicyHash        string                         `json:"snapshot_policy_hash"`
+	SnapshotBuiltAt           int64                          `json:"snapshot_built_at"`
+	NodeEpochID               string                         `json:"node_epoch_id"`
 }
 
 type Runtime struct {
@@ -45,11 +69,17 @@ type Runtime struct {
 	done   chan struct{}
 	wait   sync.WaitGroup
 
-	deps        runtimeDeps
-	wakeRefresh bool
+	deps          runtimeDeps
+	wakeRefresh   bool
+	topologyDirty atomic.Bool
 
-	refreshStats runtimeWorkerState
-	flushStats   runtimeWorkerState
+	refreshStats       runtimeWorkerState
+	flushStats         runtimeWorkerState
+	localDrainStats    runtimeWorkerState
+	streamStats        runtimeWorkerState
+	configPublishStats runtimeWorkerState
+	configConsumeStats runtimeWorkerState
+	retentionStats     runtimeWorkerState
 
 	lastRetentionUnix atomic.Int64
 	finalOnce         sync.Once
@@ -69,14 +99,25 @@ type runtimeWorkerState struct {
 	lastError           string
 }
 
+type pendingRoutingWriteStats struct {
+	audits           int
+	stableBuckets    int64
+	pendingEnvelopes int
+}
+
 type runtimeDeps struct {
-	getSetting      func() smart_routing_setting.SmartRoutingSetting
-	refresh         func(context.Context, smart_routing_setting.SmartRoutingSetting) error
-	flush           func(context.Context, smart_routing_setting.SmartRoutingSetting) error
-	retention       func(context.Context, int) (int64, error)
-	topologyChanges <-chan struct{}
-	wait            func(context.Context, time.Duration) bool
-	jitter          common.JitterFunc
+	getSetting       func() smart_routing_setting.SmartRoutingSetting
+	refresh          func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	refreshCurrent   func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	flush            func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	drainLocal       func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	consumeTelemetry func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	publishConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	consumeConfig    func(context.Context, smart_routing_setting.SmartRoutingSetting) error
+	retention        func(context.Context, int) (int64, error)
+	topologyChanges  <-chan struct{}
+	wait             func(context.Context, time.Duration) bool
+	jitter           common.JitterFunc
 }
 
 var activeRuntime atomic.Pointer[Runtime]
@@ -91,13 +132,19 @@ func BootstrapContext(ctx context.Context) error {
 	if !smart_routing_setting.Enabled() {
 		return nil
 	}
-	return refreshTopologySnapshotContext(ctx)
+	return refreshTopologySnapshotContext(ctx, false)
 }
 
 func CurrentRuntimeStats() RuntimeStats {
 	runtime := activeRuntime.Load()
 	if runtime == nil {
-		return RuntimeStats{Audit: DecisionAuditsStats(), Telemetry: routingmetrics.StableRuntimeStats()}
+		return RuntimeStats{
+			Audit:              DecisionAuditsStats(),
+			Telemetry:          routingmetrics.StableRuntimeStats(),
+			TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
+			ConfigStream:       RoutingConfigStreamRuntimeStats(),
+			NodeEpochID:        NodeEpochID(),
+		}
 	}
 	return runtime.Stats()
 }
@@ -106,25 +153,49 @@ func defaultRuntimeDeps() runtimeDeps {
 	return runtimeDeps{
 		getSetting: smart_routing_setting.GetSetting,
 		refresh: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
-			return refreshTopologySnapshotContext(ctx)
+			return refreshTopologySnapshotContext(ctx, true)
+		},
+		refreshCurrent: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			return refreshTopologySnapshotContext(ctx, false)
 		},
 		flush: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
-			if _, err := FlushStableTelemetryContext(ctx); err != nil {
-				return err
+			return flushLocalRoutingWritesContext(ctx)
+		},
+		drainLocal: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			return flushLocalRoutingWritesContext(ctx)
+		},
+		consumeTelemetry: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			if !common.RedisEnabled || common.RDB == nil {
+				if !waitRuntime(ctx, observeDisabledPoll) {
+					return ctx.Err()
+				}
+				return nil
 			}
-			for {
-				flushed, err := FlushDecisionAuditsContext(ctx)
-				if err != nil {
-					return err
+			_, err := ConsumeRoutingTelemetryOnceContext(ctx)
+			return err
+		},
+		publishConfig: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			if !common.RedisEnabled || common.RDB == nil {
+				if !waitRuntime(ctx, observeDisabledPoll) {
+					return ctx.Err()
 				}
-				if flushed < model.RoutingDecisionAuditMaxBatch {
-					break
-				}
-				if err := ctx.Err(); err != nil {
-					return err
-				}
+				return nil
 			}
-			return nil
+			published, err := PublishRoutingConfigOutboxOnceContext(ctx)
+			if err == nil && !published && !waitRuntime(ctx, time.Second) {
+				return ctx.Err()
+			}
+			return err
+		},
+		consumeConfig: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
+			if !common.RedisEnabled || common.RDB == nil {
+				if !waitRuntime(ctx, observeDisabledPoll) {
+					return ctx.Err()
+				}
+				return nil
+			}
+			_, err := ConsumeRoutingConfigOnceContext(ctx)
+			return err
 		},
 		retention:       DeleteExpiredRoutingHistoryContext,
 		topologyChanges: model.RoutingTopologyChanges(),
@@ -133,12 +204,104 @@ func defaultRuntimeDeps() runtimeDeps {
 	}
 }
 
-func refreshTopologySnapshotContext(ctx context.Context) error {
-	if _, err := model.ReconcileLegacyRoutingTopologyContext(ctx); err != nil {
+func flushLocalRoutingWritesContext(ctx context.Context) error {
+	_, telemetryErr := FlushStableTelemetryContext(ctx)
+	_, auditErr := flushDecisionAuditBatchesContext(ctx, decisionAuditFlushMaxBatches)
+	return errors.Join(telemetryErr, auditErr)
+}
+
+func flushDecisionAuditBatchesContext(ctx context.Context, maxBatches int) (int, error) {
+	if maxBatches <= 0 {
+		return 0, nil
+	}
+	flushedTotal := 0
+	for batchIndex := 0; batchIndex < maxBatches; batchIndex++ {
+		flushed, err := FlushDecisionAuditsContext(ctx)
+		if err != nil {
+			return flushedTotal, err
+		}
+		flushedTotal += flushed
+		if flushed < model.RoutingDecisionAuditMaxBatch {
+			return flushedTotal, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return flushedTotal, err
+		}
+	}
+	return flushedTotal, nil
+}
+
+func refreshTopologySnapshotContext(ctx context.Context, forceReconcile bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, observeRefreshTimeout)
+	defer cancel()
+	nowMs := time.Now().UnixMilli()
+	lease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
+		refreshCtx,
+		routingLegacyReconcileLeaseName,
+		NodeEpochID(),
+		nowMs,
+		int64(routingLegacyLeaseTTL/time.Millisecond),
+		int64(routingLegacyMinInterval/time.Millisecond),
+		forceReconcile,
+	)
+	if err != nil {
 		return err
 	}
-	_, err := RefreshSnapshotContext(ctx)
-	return err
+	if acquired {
+		if _, err := model.ReconcileLegacyRoutingTopologyContext(refreshCtx); err != nil {
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer finishCancel()
+			releaseErr := model.ReleaseRoutingControlLeaseContext(finishCtx, lease, time.Now().UnixMilli())
+			return errors.Join(err, releaseErr)
+		}
+		finishCtx, finishCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer finishCancel()
+		if err := model.CompleteRoutingControlLeaseContext(finishCtx, lease, time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	} else if forceReconcile {
+		return ErrRoutingLegacyReconcileBusy
+	}
+	metadata, err := refreshSnapshotIfNeededContext(refreshCtx, acquired)
+	if err != nil {
+		return err
+	}
+	if err := persistRoutingConfigCheckpointContext(ctx, RoutingConfigStreamRuntimeStats().Cursor, int64(metadata.Revision)); err != nil {
+		routingConfigState.markCheckpointFailure(err)
+	}
+	return nil
+}
+
+func refreshSnapshotIfNeededContext(ctx context.Context, force bool) (SnapshotMetadata, error) {
+	head, err := model.GetRoutingPolicyHeadContext(ctx)
+	if err != nil {
+		return SnapshotMetadata{}, err
+	}
+	current, available := CurrentSnapshotMetadata()
+	if available {
+		if int64(current.Revision) > head.CurrentRevision {
+			return SnapshotMetadata{}, ErrSnapshotRevisionRollback
+		}
+		if int64(current.Revision) == head.CurrentRevision && current.PolicyHash != head.CurrentHash {
+			return SnapshotMetadata{}, ErrSnapshotRevisionConflict
+		}
+		age := time.Since(time.Unix(current.BuiltAtUnix, 0))
+		if age < 0 {
+			age = 0
+		}
+		if !force && int64(current.Revision) == head.CurrentRevision && current.PolicyHash == head.CurrentHash &&
+			age < observeSnapshotFallback {
+			return current, nil
+		}
+	}
+	view, err := RefreshSnapshotContext(ctx)
+	if err != nil {
+		return SnapshotMetadata{}, err
+	}
+	return snapshotMetadata(view), nil
 }
 
 func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
@@ -155,9 +318,6 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 	if deps.jitter == nil {
 		deps.jitter = common.FullJitter
 	}
-	if deps.retention == nil {
-		deps.retention = DeleteExpiredRoutingHistoryContext
-	}
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &Runtime{
 		cancel:      cancel,
@@ -173,7 +333,23 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 		return runtime
 	}
 
-	runtime.wait.Add(2)
+	workerCount := 2
+	if deps.drainLocal != nil {
+		workerCount++
+	}
+	if deps.consumeTelemetry != nil {
+		workerCount++
+	}
+	if deps.publishConfig != nil {
+		workerCount++
+	}
+	if deps.consumeConfig != nil {
+		workerCount++
+	}
+	if deps.retention != nil {
+		workerCount++
+	}
+	runtime.wait.Add(workerCount)
 	go func() {
 		defer runtime.wait.Done()
 		runtime.runWorker(ctx, deps.refresh, observeRefreshInterval, &runtime.refreshStats)
@@ -182,6 +358,38 @@ func newRuntime(parent context.Context, deps runtimeDeps) *Runtime {
 		defer runtime.wait.Done()
 		runtime.runWorker(ctx, deps.flush, observeFlushInterval, &runtime.flushStats)
 	}()
+	if deps.drainLocal != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.drainLocal, observeLocalDrainInterval, &runtime.localDrainStats)
+		}()
+	}
+	if deps.consumeTelemetry != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.consumeTelemetry, observeStreamInterval, &runtime.streamStats)
+		}()
+	}
+	if deps.publishConfig != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.publishConfig, observeStreamInterval, &runtime.configPublishStats)
+		}()
+	}
+	if deps.consumeConfig != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, deps.consumeConfig, observeStreamInterval, &runtime.configConsumeStats)
+		}()
+	}
+	if deps.retention != nil {
+		go func() {
+			defer runtime.wait.Done()
+			runtime.runWorker(ctx, func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
+				return runtime.runRetention(ctx, setting.RetentionDays)
+			}, observeRetentionInterval, &runtime.retentionStats)
+		}()
+	}
 	go func() {
 		runtime.wait.Wait()
 		close(runtime.done)
@@ -223,13 +431,23 @@ func (runtime *Runtime) Stats() RuntimeStats {
 		return RuntimeStats{}
 	}
 	stats := RuntimeStats{
-		Refresh:   runtime.refreshStats.snapshot(),
-		Flush:     runtime.flushStats.snapshot(),
-		Audit:     DecisionAuditsStats(),
-		Telemetry: routingmetrics.StableRuntimeStats(),
+		Refresh:            runtime.refreshStats.snapshot(),
+		Flush:              runtime.flushStats.snapshot(),
+		LocalDrain:         runtime.localDrainStats.snapshot(),
+		TelemetryStream:    runtime.streamStats.snapshot(),
+		ConfigPublisher:    runtime.configPublishStats.snapshot(),
+		ConfigConsumer:     runtime.configConsumeStats.snapshot(),
+		Retention:          runtime.retentionStats.snapshot(),
+		Audit:              DecisionAuditsStats(),
+		Telemetry:          routingmetrics.StableRuntimeStats(),
+		TelemetryTransport: RoutingTelemetryTransportRuntimeStats(),
+		ConfigStream:       RoutingConfigStreamRuntimeStats(),
+		NodeEpochID:        NodeEpochID(),
 	}
 	if snapshot := currentSnapshot.Load(); snapshot != nil {
 		stats.SnapshotRevision = snapshot.view.Revision
+		stats.SnapshotRuntimeGeneration = snapshot.view.RuntimeGeneration
+		stats.SnapshotPolicyHash = snapshot.view.PolicyHash
 		stats.SnapshotBuiltAt = snapshot.view.BuiltAtUnix
 	}
 	return stats
@@ -247,7 +465,8 @@ func (runtime *Runtime) runWorker(
 			return
 		}
 		setting := runtime.deps.getSetting()
-		if !setting.Enabled || run == nil {
+		drainWhileDisabled := !setting.Enabled && runtime.shouldDrainWhileDisabled(state)
+		if (!setting.Enabled && !drainWhileDisabled) || run == nil {
 			consecutiveFailures = 0
 			state.consecutiveFailures.Store(0)
 			if !runtime.waitNext(ctx, observeDisabledPoll, state) {
@@ -257,9 +476,17 @@ func (runtime *Runtime) runWorker(
 		}
 
 		started := time.Now()
-		err := run(ctx, setting)
-		if err == nil && state == &runtime.flushStats {
-			err = runtime.runRetention(ctx, setting.RetentionDays)
+		selectedRun := run
+		forcedRefresh := false
+		if state == &runtime.refreshStats && runtime.deps.refreshCurrent != nil {
+			forcedRefresh = runtime.topologyDirty.Swap(false)
+			if !forcedRefresh {
+				selectedRun = runtime.deps.refreshCurrent
+			}
+		}
+		err := selectedRun(ctx, setting)
+		if err != nil && forcedRefresh {
+			runtime.topologyDirty.Store(true)
 		}
 		state.runs.Add(1)
 		state.lastDurationMs.Store(time.Since(started).Milliseconds())
@@ -307,6 +534,7 @@ func (runtime *Runtime) waitNext(ctx context.Context, duration time.Duration, st
 	case <-ctx.Done():
 		return false
 	case <-runtime.deps.topologyChanges:
+		runtime.topologyDirty.Store(true)
 		return true
 	case <-timer.C:
 		return true
@@ -335,18 +563,77 @@ func (runtime *Runtime) startFinalFlush(parent context.Context) {
 	runtime.finalOnce.Do(func() {
 		go func() {
 			defer close(runtime.finalDone)
-			if runtime.deps.flush == nil ||
-				(DecisionAuditsStats().Entries == 0 && routingmetrics.StableRuntimeStats().Buckets == 0) {
+			if runtime.deps.flush == nil || !hasPendingRoutingWrites() {
 				return
 			}
 			ctx, cancel := context.WithTimeout(parent, observeFinalTimeout)
 			defer cancel()
-			err := runtime.deps.flush(ctx, runtime.deps.getSetting())
+			var err error
+			failedAttempts := 0
+			for {
+				before := pendingRoutingWrites()
+				if !before.hasWrites() {
+					break
+				}
+				err = runtime.deps.flush(ctx, runtime.deps.getSetting())
+				if err != nil {
+					failedAttempts++
+					if failedAttempts >= observeFinalFlushMaxAttempts || ctx.Err() != nil {
+						break
+					}
+					retryDelay := observeFinalFlushRetryBase * time.Duration(1<<(failedAttempts-1))
+					if !waitRuntime(ctx, retryDelay) {
+						err = ctx.Err()
+						break
+					}
+					continue
+				}
+				failedAttempts = 0
+				after := pendingRoutingWrites()
+				if !after.hasWrites() || !after.lessThan(before) {
+					break
+				}
+			}
 			runtime.finalMu.Lock()
 			runtime.finalErr = err
 			runtime.finalMu.Unlock()
 		}()
 	})
+}
+
+func (runtime *Runtime) shouldDrainWhileDisabled(state *runtimeWorkerState) bool {
+	if runtime == nil {
+		return false
+	}
+	if state == &runtime.retentionStats {
+		return true
+	}
+	if state != &runtime.flushStats && state != &runtime.localDrainStats {
+		return false
+	}
+	return hasPendingRoutingWrites()
+}
+
+func hasPendingRoutingWrites() bool {
+	return pendingRoutingWrites().hasWrites()
+}
+
+func pendingRoutingWrites() pendingRoutingWriteStats {
+	return pendingRoutingWriteStats{
+		audits:           DecisionAuditsStats().Entries,
+		stableBuckets:    routingmetrics.StableRuntimeStats().Buckets,
+		pendingEnvelopes: RoutingTelemetryTransportRuntimeStats().PendingEnvelopes,
+	}
+}
+
+func (stats pendingRoutingWriteStats) hasWrites() bool {
+	return stats.audits > 0 || stats.stableBuckets > 0 || stats.pendingEnvelopes > 0
+}
+
+func (stats pendingRoutingWriteStats) lessThan(previous pendingRoutingWriteStats) bool {
+	return stats.audits < previous.audits ||
+		stats.stableBuckets < previous.stableBuckets ||
+		stats.pendingEnvelopes < previous.pendingEnvelopes
 }
 
 func (state *runtimeWorkerState) snapshot() RuntimeWorkerStats {
@@ -384,6 +671,21 @@ func observeFlushInterval(setting smart_routing_setting.SmartRoutingSetting) tim
 		return time.Minute
 	}
 	return interval
+}
+
+func observeStreamInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return observeStreamPoll
+}
+
+func observeLocalDrainInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	if common.RedisEnabled && common.RDB != nil {
+		return observeLocalDrainRedis
+	}
+	return observeLocalDrainFallback
+}
+
+func observeRetentionInterval(smart_routing_setting.SmartRoutingSetting) time.Duration {
+	return 6 * time.Hour
 }
 
 func waitRuntime(ctx context.Context, duration time.Duration) bool {

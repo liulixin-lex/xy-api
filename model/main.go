@@ -303,10 +303,22 @@ func migrateDB() error {
 		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
 		&RoutingDecisionAudit{},
+		&RoutingDecisionReplayChunk{},
+		&RoutingPolicyHead{},
+		&RoutingPolicyRevision{},
+		&RoutingPolicyPoolRevision{},
+		&RoutingPolicyMemberRevision{},
+		&RoutingPolicyActivation{},
+		&RoutingConfigOutbox{},
+		&RoutingRuntimeCheckpoint{},
+		&RoutingControlLease{},
+		&RoutingUpstreamAccount{},
+		&RoutingCostSnapshotVersion{},
 		&RoutingChannelBinding{},
 		&RoutingCostSnapshot{},
 		&RoutingChannelMetric{},
 		&RoutingMetricRollup{},
+		&RoutingTelemetryReceipt{},
 		&RoutingBreakerState{},
 		&RoutingChannelHealthState{},
 		&RoutingAgentRecommendation{},
@@ -317,6 +329,12 @@ func migrateDB() error {
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := EnsureRoutingPolicyHead(); err != nil {
+		return err
+	}
+	if err := migrateRoutingCostSnapshotModelKeys(DB); err != nil {
 		return err
 	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -373,10 +391,22 @@ func migrateDBFast() error {
 		{&RoutingPoolMember{}, "RoutingPoolMember"},
 		{&RoutingCredentialRef{}, "RoutingCredentialRef"},
 		{&RoutingDecisionAudit{}, "RoutingDecisionAudit"},
+		{&RoutingDecisionReplayChunk{}, "RoutingDecisionReplayChunk"},
+		{&RoutingPolicyHead{}, "RoutingPolicyHead"},
+		{&RoutingPolicyRevision{}, "RoutingPolicyRevision"},
+		{&RoutingPolicyPoolRevision{}, "RoutingPolicyPoolRevision"},
+		{&RoutingPolicyMemberRevision{}, "RoutingPolicyMemberRevision"},
+		{&RoutingPolicyActivation{}, "RoutingPolicyActivation"},
+		{&RoutingConfigOutbox{}, "RoutingConfigOutbox"},
+		{&RoutingRuntimeCheckpoint{}, "RoutingRuntimeCheckpoint"},
+		{&RoutingControlLease{}, "RoutingControlLease"},
+		{&RoutingUpstreamAccount{}, "RoutingUpstreamAccount"},
+		{&RoutingCostSnapshotVersion{}, "RoutingCostSnapshotVersion"},
 		{&RoutingChannelBinding{}, "RoutingChannelBinding"},
 		{&RoutingCostSnapshot{}, "RoutingCostSnapshot"},
 		{&RoutingChannelMetric{}, "RoutingChannelMetric"},
 		{&RoutingMetricRollup{}, "RoutingMetricRollup"},
+		{&RoutingTelemetryReceipt{}, "RoutingTelemetryReceipt"},
 		{&RoutingBreakerState{}, "RoutingBreakerState"},
 		{&RoutingChannelHealthState{}, "RoutingChannelHealthState"},
 		{&RoutingAgentRecommendation{}, "RoutingAgentRecommendation"},
@@ -406,6 +436,12 @@ func migrateDBFast() error {
 		if err != nil {
 			return err
 		}
+	}
+	if err := EnsureRoutingPolicyHead(); err != nil {
+		return err
+	}
+	if err := migrateRoutingCostSnapshotModelKeys(DB); err != nil {
+		return err
 	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {

@@ -583,10 +583,21 @@ var routingMigrationModels = []interface{}{
 	&RoutingPoolMember{},
 	&RoutingCredentialRef{},
 	&RoutingDecisionAudit{},
+	&RoutingPolicyHead{},
+	&RoutingPolicyRevision{},
+	&RoutingPolicyPoolRevision{},
+	&RoutingPolicyMemberRevision{},
+	&RoutingPolicyActivation{},
+	&RoutingConfigOutbox{},
+	&RoutingRuntimeCheckpoint{},
+	&RoutingControlLease{},
+	&RoutingUpstreamAccount{},
+	&RoutingCostSnapshotVersion{},
 	&RoutingChannelBinding{},
 	&RoutingCostSnapshot{},
 	&RoutingChannelMetric{},
 	&RoutingMetricRollup{},
+	&RoutingTelemetryReceipt{},
 	&RoutingBreakerState{},
 	&RoutingChannelHealthState{},
 	&RoutingAgentRecommendation{},
@@ -730,6 +741,8 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "GroupKey"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "ModelKey"))
 	require.True(t, DB.Migrator().HasColumn(&RoutingDecisionAudit{}, "RequestKey"))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCostSnapshot{}, "ModelKey"))
+	require.True(t, DB.Migrator().HasIndex(&RoutingCostSnapshot{}, "idx_routing_cost_channel_model_key"))
 	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{
 		{DecisionID: "case-upper", RequestID: "Request-X", PoolID: 1, GroupName: "VIP", ModelName: "Model-X", SnapshotRevision: 1, CreatedTime: 1},
 		{DecisionID: "case-lower", RequestID: "request-x", PoolID: 2, GroupName: "vip", ModelName: "model-x", SnapshotRevision: 1, CreatedTime: 1},

@@ -10,6 +10,11 @@ import (
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 )
 
+const (
+	stableTelemetryDrainMaxBytes     = routingTelemetryEnvelopeMaxBytes * 3 / 4
+	stableTelemetryFlushMaxEnvelopes = 8
+)
+
 var routingTelemetryMaintenance = func() chan struct{} {
 	token := make(chan struct{}, 1)
 	token <- struct{}{}
@@ -25,54 +30,86 @@ func FlushStableTelemetryContext(ctx context.Context) (int, error) {
 	}
 	defer unlockRoutingTelemetry()
 
-	snapshots := routingmetrics.DrainStableSnapshots()
-	if len(snapshots) == 0 {
-		return 0, nil
-	}
-
-	for start := 0; start < len(snapshots); start += model.RoutingMetricRollupMaxBatch {
-		end := min(start+model.RoutingMetricRollupMaxBatch, len(snapshots))
-		rollups := make([]model.RoutingMetricRollup, 0, end-start)
-		for index := start; index < end; index++ {
-			snapshot := snapshots[index]
-			if snapshot.LastSnapshotRevision > math.MaxInt64 {
-				routingmetrics.RequeueStableSnapshots(snapshots[start:])
-				return start, errors.New("routing metric snapshot revision exceeds database range")
+	flushed := 0
+	for envelopeIndex := 0; envelopeIndex < stableTelemetryFlushMaxEnvelopes; envelopeIndex++ {
+		now := time.Now()
+		envelope, exists := routingTelemetryTransport.peek(now)
+		if !exists {
+			if !routingTelemetryTransport.hasCapacity(now) {
+				return flushed, ErrRoutingTelemetryPendingFull
 			}
-			rollups = append(rollups, model.RoutingMetricRollup{
-				MemberID:                snapshot.PoolMemberID,
-				CredentialID:            snapshot.CredentialID,
-				ModelName:               snapshot.Model,
-				BucketTs:                snapshot.BucketTs,
-				ChannelID:               snapshot.ChannelID,
-				PoolID:                  snapshot.PoolID,
-				SchemaVersion:           model.RoutingMetricRollupSchemaVersion,
-				LastSnapshotRevision:    int64(snapshot.LastSnapshotRevision),
-				RequestCount:            snapshot.RequestCount,
-				SuccessCount:            snapshot.SuccessCount,
-				FailureCount:            snapshot.FailureCount,
-				UnknownCount:            snapshot.UnknownClassificationCount,
-				ReliabilityRequestCount: snapshot.ReliabilityRequestCount,
-				ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
-				TotalLatencyMs:          snapshot.TotalLatencyMs,
-				TtftSumMs:               snapshot.TtftSumMs,
-				TtftCount:               snapshot.TtftCount,
-				OutputTokens:            snapshot.OutputTokens,
-				GenerationMs:            snapshot.GenerationMs,
-				Err4xx:                  snapshot.Err4xx,
-				Err5xx:                  snapshot.Err5xx,
-				Err429:                  snapshot.Err429,
-				Err529:                  snapshot.Err529,
-				RetryAfterCount:         snapshot.RetryAfterCount,
-				RetryAfterTotalMs:       snapshot.RetryAfterTotalMs,
-			})
+			snapshots := routingmetrics.DrainStableSnapshotsLimited(model.RoutingTelemetryMaxItems, stableTelemetryDrainMaxBytes)
+			if len(snapshots) == 0 {
+				return flushed, nil
+			}
+			rollups, err := stableSnapshotsToRoutingRollups(snapshots)
+			if err != nil {
+				routingmetrics.RequeueStableSnapshots(snapshots)
+				return flushed, err
+			}
+			envelope, err = newRoutingTelemetryEnvelope(rollups, now)
+			if err != nil {
+				routingmetrics.RequeueStableSnapshots(snapshots)
+				return flushed, err
+			}
+			if err := routingTelemetryTransport.enqueue(envelope, now); err != nil {
+				routingmetrics.RequeueStableSnapshots(snapshots)
+				return flushed, err
+			}
 		}
-		if err := model.UpsertRoutingMetricRollupsContext(ctx, rollups); err != nil {
-			routingmetrics.RequeueStableSnapshots(snapshots[start:])
-			return start, err
+
+		if err := deliverRoutingTelemetryEnvelopeContext(ctx, envelope); err != nil {
+			return flushed, err
 		}
+		if !routingTelemetryTransport.remove(envelope.batch.Sequence) {
+			return flushed, errors.New("routing telemetry pending queue changed during flush")
+		}
+		flushed += len(envelope.batch.Items)
 	}
-	return len(snapshots), nil
+	return flushed, nil
+}
+
+func stableSnapshotsToRoutingRollups(snapshots []routingmetrics.StableSnapshot) ([]model.RoutingMetricRollup, error) {
+	rollups := make([]model.RoutingMetricRollup, 0, len(snapshots))
+	for index := range snapshots {
+		snapshot := snapshots[index]
+		if snapshot.LastSnapshotRevision > math.MaxInt64 {
+			return nil, errors.New("routing metric snapshot revision exceeds database range")
+		}
+		rollups = append(rollups, model.RoutingMetricRollup{
+			MemberID:                snapshot.PoolMemberID,
+			CredentialID:            snapshot.CredentialID,
+			ModelName:               snapshot.Model,
+			BucketTs:                snapshot.BucketTs,
+			ChannelID:               snapshot.ChannelID,
+			PoolID:                  snapshot.PoolID,
+			SchemaVersion:           model.RoutingMetricRollupSchemaVersion,
+			LastSnapshotRevision:    int64(snapshot.LastSnapshotRevision),
+			SketchCodecVersion:      snapshot.SketchCodecVersion,
+			LatencySampleCount:      snapshot.LatencySampleCount,
+			LatencySketch:           append([]byte(nil), snapshot.LatencySketch...),
+			TtftSampleCount:         snapshot.TtftSampleCount,
+			TtftSketch:              append([]byte(nil), snapshot.TtftSketch...),
+			RequestCount:            snapshot.RequestCount,
+			SuccessCount:            snapshot.SuccessCount,
+			FailureCount:            snapshot.FailureCount,
+			UnknownCount:            snapshot.UnknownClassificationCount,
+			ReliabilityRequestCount: snapshot.ReliabilityRequestCount,
+			ReliabilityFailureCount: snapshot.ReliabilityFailureCount,
+			TotalLatencyMs:          snapshot.TotalLatencyMs,
+			TtftSumMs:               snapshot.TtftSumMs,
+			TtftCount:               snapshot.TtftCount,
+			OutputTokens:            snapshot.OutputTokens,
+			GenerationMs:            snapshot.GenerationMs,
+			Err4xx:                  snapshot.Err4xx,
+			Err5xx:                  snapshot.Err5xx,
+			Err429:                  snapshot.Err429,
+			Err529:                  snapshot.Err529,
+			RetryAfterCount:         snapshot.RetryAfterCount,
+			RetryAfterTotalMs:       snapshot.RetryAfterTotalMs,
+		})
+	}
+	return rollups, nil
 }
 
 func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) (int64, error) {
@@ -97,7 +134,28 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 		return rollupsDeleted, err
 	}
 	auditsDeleted, err := model.DeleteRoutingDecisionAuditsBeforeContext(ctx, cutoff)
-	return rollupsDeleted + auditsDeleted, err
+	if err != nil {
+		return rollupsDeleted + auditsDeleted, err
+	}
+	costVersionsDeleted, err := model.DeleteRoutingCostSnapshotVersionsBeforeContext(ctx, cutoff)
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted, err
+	}
+	receiptRetentionDays := retentionDays + 1
+	if receiptRetentionDays < retentionDays || receiptRetentionDays > maxRetentionDays {
+		receiptRetentionDays = maxRetentionDays
+	}
+	receiptCutoff := time.Now().Add(-time.Duration(receiptRetentionDays) * 24 * time.Hour).UnixMilli()
+	receiptsDeleted, err := model.DeleteRoutingTelemetryReceiptsBeforeContext(ctx, receiptCutoff)
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted, err
+	}
+	outboxDeleted, err := model.DeletePublishedRoutingConfigOutboxBeforeContext(ctx, cutoff)
+	if err != nil {
+		return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted + outboxDeleted, err
+	}
+	checkpointsDeleted, err := model.DeleteExpiredRoutingRuntimeCheckpointsContext(ctx, time.Now().Unix())
+	return rollupsDeleted + auditsDeleted + costVersionsDeleted + receiptsDeleted + outboxDeleted + checkpointsDeleted, err
 }
 
 func lockRoutingTelemetry(ctx context.Context) error {

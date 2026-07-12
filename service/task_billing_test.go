@@ -54,11 +54,21 @@ func TestMain(m *testing.M) {
 		&model.RoutingPool{},
 		&model.RoutingPoolMember{},
 		&model.RoutingCredentialRef{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
+		&model.RoutingRuntimeCheckpoint{},
 		&model.RoutingDecisionAudit{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},
 		&model.RoutingMetricRollup{},
+		&model.RoutingTelemetryReceipt{},
+		&model.RoutingUpstreamAccount{},
+		&model.RoutingCostSnapshotVersion{},
 		&model.RoutingBreakerState{},
 		&model.RoutingChannelHealthState{},
 		&model.SystemTask{},
@@ -89,11 +99,21 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM routing_decision_audits")
+		model.DB.Exec("DELETE FROM routing_config_outbox")
+		model.DB.Exec("DELETE FROM routing_policy_activations")
+		model.DB.Exec("DELETE FROM routing_policy_member_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_pool_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_heads")
+		model.DB.Exec("DELETE FROM routing_runtime_checkpoints")
+		model.DB.Exec("DELETE FROM routing_telemetry_receipts")
 		model.DB.Exec("DELETE FROM routing_topology_metadata")
 		model.DB.Exec("DELETE FROM routing_credential_refs")
 		model.DB.Exec("DELETE FROM routing_pool_members")
 		model.DB.Exec("DELETE FROM routing_pools")
 		model.DB.Exec("DELETE FROM routing_cost_snapshots")
+		model.DB.Exec("DELETE FROM routing_cost_snapshot_versions")
+		model.DB.Exec("DELETE FROM routing_upstream_accounts")
 		model.DB.Exec("DELETE FROM routing_channel_metrics")
 		model.DB.Exec("DELETE FROM routing_metric_rollups")
 		model.DB.Exec("DELETE FROM routing_breaker_states")

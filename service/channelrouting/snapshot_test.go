@@ -2,13 +2,17 @@ package channelrouting
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -64,6 +68,9 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), view.Revision)
 	require.Len(t, view.Pools, 1)
+	assert.Equal(t, model.RoutingDeploymentStageObserve, view.Pools[0].DeploymentStage)
+	assert.Equal(t, model.RoutingPolicyProfileBalanced, view.Pools[0].PolicyProfile)
+	assert.InDelta(t, 0.45, view.Pools[0].SelectorPolicy.WeightAvailability, 0.000001)
 	require.Len(t, view.Pools[0].Members, 1)
 	member := view.Pools[0].Members[0]
 	assert.Equal(t, int64(11), member.LegacyPriority)
@@ -105,6 +112,67 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	assert.NotEqual(t, 999999, current.Pools[0].Members[0].CredentialIDs[0])
 	assert.Equal(t, "gpt-a", current.Pools[0].Members[0].Models[0].ModelName)
 	assert.NotEqual(t, 999999, current.Channels[0].CredentialIDs[0])
+
+	refreshed, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, view.Revision, refreshed.Revision)
+	assert.Equal(t, view.PolicyHash, refreshed.PolicyHash)
+	assert.Greater(t, refreshed.RuntimeGeneration, view.RuntimeGeneration)
+}
+
+func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	ResetSnapshotForTest()
+	smart_routing_setting.ResetForTest()
+	t.Setenv("SMART_ROUTING_MODE", smart_routing_setting.ModeEnterpriseSLO)
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 399, Name: "policy-source", Status: common.ChannelStatusEnabled,
+		Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight,
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	head, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
+	require.NoError(t, err)
+	require.Len(t, document.Pools, 1)
+	document.Pools[0].DeploymentStage = model.RoutingDeploymentStageShadow
+	document.Pools[0].PolicyProfile = model.RoutingPolicyProfileCustom
+	document.Pools[0].Policy = json.RawMessage(`{
+		"weight_availability": 0.8,
+		"weight_latency": 0.1,
+		"weight_throughput": 0.05,
+		"weight_cost": 0.05,
+		"availability_floor": 0.99,
+		"min_volume": 7,
+		"top_k": 1,
+		"snapshot_stale_sec": 90
+	}`)
+	_, err = model.PublishRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision, document, model.RoutingPolicyActivationSpec{
+		Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "shadow_test",
+	})
+	require.NoError(t, err)
+
+	view, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	require.Len(t, view.Pools, 1)
+	pool := view.Pools[0]
+	assert.Equal(t, model.RoutingDeploymentStageShadow, pool.DeploymentStage)
+	assert.Equal(t, model.RoutingPolicyProfileCustom, pool.PolicyProfile)
+	assert.InDelta(t, 0.8, pool.SelectorPolicy.WeightAvailability, 0.000001)
+	assert.InDelta(t, 0.1, pool.SelectorPolicy.WeightLatency, 0.000001)
+	assert.Equal(t, 7, pool.SelectorPolicy.MinVolume)
+	assert.Equal(t, 1, pool.SelectorPolicy.TopK)
+	assert.Equal(t, 90, pool.SelectorPolicy.SnapshotStaleSec)
 }
 
 func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback(t *testing.T) {
@@ -146,6 +214,9 @@ func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback
 		RequestCount: 3, SuccessCount: 2, FailureCount: 1, ReliabilityRequestCount: 3,
 		ReliabilityFailureCount: 1, TotalLatencyMs: 900, TtftSumMs: 200, TtftCount: 2,
 		OutputTokens: 30, GenerationMs: 300, Err5xx: 1,
+		SketchCodecVersion: routingdistribution.SketchCodecVersion,
+		LatencySampleCount: 3, LatencySketch: snapshotTestSketch(t, 100, 200, 600),
+		TtftSampleCount: 2, TtftSketch: snapshotTestSketch(t, 80, 120),
 	}}))
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: member.PoolID, PoolMemberID: member.ID, CredentialID: member.CredentialIDs[1], ChannelID: 305,
@@ -154,6 +225,9 @@ func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback
 		TotalLatencyMs: 1100, TtftSumMs: 400, TtftCount: 2,
 		OutputTokens: 20, GenerationMs: 200, Err429: 1, Err529: 1,
 		RetryAfterCount: 2, RetryAfterTotalMs: 3000,
+		SketchCodecVersion: routingdistribution.SketchCodecVersion,
+		LatencySampleCount: 2, LatencySketch: snapshotTestSketch(t, 400, 700),
+		TtftSampleCount: 2, TtftSketch: snapshotTestSketch(t, 150, 250),
 	}})
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
 		ChannelID: 305, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip",
@@ -172,7 +246,18 @@ func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback
 	assert.Equal(t, float64(150), observation.AverageTTFTMs)
 	assert.Equal(t, float64(100), observation.OutputTokensPerSecond)
 	assert.Equal(t, float64(1500), observation.AverageRetryAfterMs)
-	assert.Zero(t, observation.P95LatencyMs)
+	assert.True(t, observation.LatencyDistributionKnown)
+	assert.True(t, observation.TTFTDistributionKnown)
+	assert.True(t, observation.P95LatencyKnown)
+	assert.True(t, observation.P95TTFTKnown)
+	assert.Equal(t, float64(1), observation.LatencyDistributionCoverage)
+	assert.Equal(t, float64(1), observation.TTFTDistributionCoverage)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.50, 100, 200, 600, 400, 700), observation.P50LatencyMs, 0.000001)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.95, 100, 200, 600, 400, 700), observation.P95LatencyMs, 0.000001)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.99, 100, 200, 600, 400, 700), observation.P99LatencyMs, 0.000001)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.50, 80, 120, 150, 250), observation.P50TTFTMs, 0.000001)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.95, 80, 120, 150, 250), observation.P95TTFTMs, 0.000001)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.99, 80, 120, 150, 250), observation.P99TTFTMs, 0.000001)
 	assert.Equal(t, int64(1), observation.Err5xx)
 	assert.Equal(t, int64(1), observation.Err429)
 	assert.Equal(t, int64(1), observation.Err529)
@@ -337,6 +422,14 @@ func runSnapshotExternalContract(t *testing.T, db *gorm.DB, dbType common.Databa
 		&model.RoutingPool{},
 		&model.RoutingPoolMember{},
 		&model.RoutingCredentialRef{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
+		&model.RoutingDecisionAudit{},
+		&model.RoutingDecisionReplayChunk{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingMetricRollup{},
 	))
@@ -457,6 +550,8 @@ func TestSnapshotMetricLimitAppliesAfterDatabaseAggregation(t *testing.T) {
 		{MemberID: member.ID, CredentialID: credentials[0].ID, ModelName: "gpt-test", BucketTs: now - 60, ChannelID: 307, PoolID: member.PoolID, LastSnapshotRevision: 1, RequestCount: 1},
 		{MemberID: member.ID, CredentialID: credentials[1].ID, ModelName: "gpt-test", BucketTs: now, ChannelID: 307, PoolID: member.PoolID, LastSnapshotRevision: 1, RequestCount: 2},
 	}))
+	_, err = SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
 
 	snapshot, err := buildSnapshotContext(context.Background(), db, SnapshotLimits{
 		MaxPools: 1, MaxMembers: 1, MaxCredentials: 2, MaxChannels: 1,
@@ -464,7 +559,237 @@ func TestSnapshotMetricLimitAppliesAfterDatabaseAggregation(t *testing.T) {
 		MaxTotalChannelBytes: 4096, MaxTotalBindingBytes: 4096, MaxMetricAggregates: 1,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), snapshot.view.Pools[0].Members[0].Models[0].RequestCount)
+	observation := snapshot.view.Pools[0].Members[0].Models[0]
+	assert.Equal(t, int64(3), observation.RequestCount)
+	assert.False(t, observation.LatencyDistributionKnown)
+	assert.False(t, observation.P95LatencyKnown)
+	assert.Zero(t, observation.LatencyDistributionCoverage)
+	assert.Zero(t, observation.P95LatencyMs)
+}
+
+func TestSnapshotMetricPaginationStopsBeforePayloadLoadAtLimits(t *testing.T) {
+	tests := []struct {
+		name      string
+		rollups   func(t *testing.T, member model.RoutingPoolMember) []model.RoutingMetricRollup
+		configure func(t *testing.T, limits *SnapshotLimits)
+		reason    string
+	}{
+		{
+			name: "row limit",
+			rollups: func(t *testing.T, member model.RoutingPoolMember) []model.RoutingMetricRollup {
+				now := time.Now().Unix()
+				return []model.RoutingMetricRollup{
+					snapshotMetricRollup(member, model.RoutingMetricRollupModelKey("gpt-test"), "gpt-test", now-1, nil),
+					snapshotMetricRollup(member, model.RoutingMetricRollupModelKey("gpt-test"), "gpt-test", now, nil),
+				}
+			},
+			configure: func(t *testing.T, limits *SnapshotLimits) {
+				limits.MaxMetricRollupRows = 1
+			},
+			reason: snapshotTelemetryReasonRollupRows,
+		},
+		{
+			name: "scan row limit",
+			rollups: func(t *testing.T, member model.RoutingPoolMember) []model.RoutingMetricRollup {
+				now := time.Now().Unix()
+				return []model.RoutingMetricRollup{
+					snapshotMetricRollup(member, model.RoutingMetricRollupModelKey("gpt-test"), "gpt-test", now-1, nil),
+					snapshotMetricRollup(member, model.RoutingMetricRollupModelKey("gpt-test"), "gpt-test", now, nil),
+				}
+			},
+			configure: func(t *testing.T, limits *SnapshotLimits) {
+				limits.MaxMetricRollupScanRows = 1
+			},
+			reason: snapshotTelemetryReasonScanRows,
+		},
+		{
+			name: "total sketch bytes",
+			rollups: func(t *testing.T, member model.RoutingPoolMember) []model.RoutingMetricRollup {
+				return []model.RoutingMetricRollup{
+					snapshotMetricRollup(member, model.RoutingMetricRollupModelKey("gpt-test"), "gpt-test", time.Now().Unix(), snapshotTestSketch(t, 25)),
+				}
+			},
+			configure: func(t *testing.T, limits *SnapshotLimits) {
+				encoded := snapshotTestSketch(t, 25)
+				require.Greater(t, len(encoded), 1)
+				limits.MaxMetricSketchBytes = len(encoded) - 1
+			},
+			reason: snapshotTelemetryReasonSketchBytes,
+		},
+		{
+			name: "codec blob bytes",
+			rollups: func(t *testing.T, member model.RoutingPoolMember) []model.RoutingMetricRollup {
+				return []model.RoutingMetricRollup{
+					snapshotMetricRollup(
+						member,
+						model.RoutingMetricRollupModelKey("gpt-test"),
+						"gpt-test",
+						time.Now().Unix(),
+						make([]byte, routingdistribution.MaxEncodedBytes+1),
+					),
+				}
+			},
+			configure: func(t *testing.T, limits *SnapshotLimits) {},
+			reason:    snapshotTelemetryReasonSketchBlob,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, member := setupSnapshotMetricPaginationTest(t, 610)
+			rollups := test.rollups(t, member)
+			require.NoError(t, db.Create(&rollups).Error)
+			queries := observeSnapshotMetricQueries(t, db)
+			limits := DefaultSnapshotLimits
+			test.configure(t, &limits)
+
+			snapshot, err := buildSnapshotContext(context.Background(), db, limits)
+			require.NoError(t, err)
+			assert.Equal(t, snapshotTelemetryStatusUnavailable, snapshot.view.Stats.MetricTelemetryStatus)
+			assert.Equal(t, test.reason, snapshot.view.Stats.MetricTelemetryReason)
+			require.Len(t, snapshot.view.Pools, 1)
+			require.Len(t, snapshot.view.Pools[0].Members, 1)
+			require.Len(t, snapshot.view.Pools[0].Members[0].Models, 1)
+			observation := snapshot.view.Pools[0].Members[0].Models[0]
+			assert.False(t, observation.MetricKnown)
+			assert.False(t, observation.P95TTFTKnown)
+			assert.False(t, snapshot.view.AggregateP95TTFTKnown)
+			assert.Equal(t, 1, queries.total)
+			assert.Zero(t, queries.payload)
+		})
+	}
+}
+
+func TestSnapshotMetricPaginationMergesAcrossStableCompositeOrder(t *testing.T) {
+	db, member := setupSnapshotMetricPaginationTest(t, 611)
+	now := time.Now().Unix()
+	rollups := make([]model.RoutingMetricRollup, 0, snapshotMetricRollupPageSize+1)
+	for index := 0; index <= snapshotMetricRollupPageSize; index++ {
+		var sketch []byte
+		switch index {
+		case 0:
+			sketch = snapshotTestSketch(t, 1_000)
+		case snapshotMetricRollupPageSize:
+			sketch = snapshotTestSketch(t, 10)
+		}
+		rollups = append(rollups, snapshotMetricRollup(
+			member,
+			model.RoutingMetricRollupModelKey("gpt-test"),
+			"gpt-test",
+			now-int64(snapshotMetricRollupPageSize-index),
+			sketch,
+		))
+	}
+	require.NoError(t, db.CreateInBatches(&rollups, 20).Error)
+
+	snapshot, err := buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+	require.NoError(t, err)
+	require.Len(t, snapshot.view.Pools, 1)
+	require.Len(t, snapshot.view.Pools[0].Members, 1)
+	require.Len(t, snapshot.view.Pools[0].Members[0].Models, 1)
+	observation := snapshot.view.Pools[0].Members[0].Models[0]
+	assert.Equal(t, int64(2), observation.RequestCount)
+	assert.Equal(t, int64(2), observation.SuccessCount)
+	assert.True(t, observation.LatencyDistributionKnown)
+	assert.True(t, observation.P95LatencyKnown)
+	assert.Equal(t, float64(1), observation.LatencyDistributionCoverage)
+	assert.InDelta(t, snapshotTestQuantile(t, 0.95, 10, 1_000), observation.P95LatencyMs, 0.000001)
+}
+
+func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	routingmetrics.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+		routingmetrics.ResetForTest()
+	})
+
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 612, Name: "budget", Key: "key-a\nkey-b", Group: "default", Models: "current",
+		ChannelInfo: model.ChannelInfo{IsMultiKey: true},
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	head, err := SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
+	require.NoError(t, err)
+	require.Len(t, document.Pools, 1)
+	require.Len(t, document.Pools[0].Members, 1)
+	require.Len(t, document.Pools[0].Members[0].CredentialIDs, 2)
+	member := document.Pools[0].Members[0]
+	selectedCredential := member.CredentialIDs[0]
+	unselectedCredential := member.CredentialIDs[1]
+	document.Pools[0].Members[0].CredentialIDs = []int{selectedCredential}
+	published, err := model.PublishRoutingPolicyRevisionDBContext(
+		context.Background(), db, head.CurrentRevision, document,
+		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "select_one_credential"},
+	)
+	require.NoError(t, err)
+
+	now := time.Now().Unix()
+	require.NoError(t, model.UpsertRoutingMetricRollupsContext(context.Background(), []model.RoutingMetricRollup{
+		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, selectedCredential, "current", now, 10, published.Revision.Revision),
+		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, unselectedCredential, "current", now, 9_000, published.Revision.Revision),
+		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, unselectedCredential, "current", now-1, 8_000, published.Revision.Revision),
+		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, selectedCredential, "removed", now, 10_000, published.Revision.Revision),
+		snapshotTTFTRollup(t, 99_999, 99_999, 99_999, 0, "current", now, 10_000, published.Revision.Revision),
+	}))
+
+	limits := DefaultSnapshotLimits
+	limits.MaxMetricRollupRows = 1
+	first, err := buildSnapshotContext(context.Background(), db, limits)
+	require.NoError(t, err)
+	firstView, err := publishRuntimeSnapshot(first)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(published.Revision.Revision), firstView.Revision)
+	assert.Equal(t, snapshotTelemetryStatusComplete, firstView.Stats.MetricTelemetryStatus)
+	assert.Equal(t, 1, firstView.Stats.MetricRollupRows)
+	assert.GreaterOrEqual(t, firstView.Stats.MetricRollupScannedRows, 3)
+	require.Len(t, firstView.Pools, 1)
+	require.Len(t, firstView.Pools[0].Members, 1)
+	require.Len(t, firstView.Pools[0].Members[0].Models, 1)
+	observation := firstView.Pools[0].Members[0].Models[0]
+	require.True(t, observation.MetricKnown)
+	assert.Equal(t, int64(1), observation.RequestCount)
+	assert.InDelta(t, 10, observation.P95TTFTMs, 1)
+	assert.InDelta(t, 10, firstView.AggregateP95TTFTMs, 1)
+
+	document.Pools[0].Members[0].Weight++
+	next, err := model.PublishRoutingPolicyRevisionDBContext(
+		context.Background(), db, published.Revision.Revision, document,
+		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 8, Reason: "overflow_revision"},
+	)
+	require.NoError(t, err)
+	require.NoError(t, model.UpsertRoutingMetricRollupsContext(context.Background(), []model.RoutingMetricRollup{
+		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, selectedCredential, "current", now-1, 20, next.Revision.Revision),
+	}))
+	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 612, Model: "current"}, routinghotcache.CostSnapshot{
+		Known: true, Cost: 1.25, Confidence: model.RoutingCostConfidenceFull, UpdatedUnix: now,
+	})
+
+	second, err := buildSnapshotContext(context.Background(), db, limits)
+	require.NoError(t, err)
+	secondView, err := publishRuntimeSnapshot(second)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(next.Revision.Revision), secondView.Revision)
+	assert.Equal(t, snapshotTelemetryStatusUnavailable, secondView.Stats.MetricTelemetryStatus)
+	assert.Equal(t, snapshotTelemetryReasonRollupRows, secondView.Stats.MetricTelemetryReason)
+	assert.Equal(t, 2, secondView.Stats.MetricRollupRows)
+	observation = secondView.Pools[0].Members[0].Models[0]
+	assert.False(t, observation.MetricKnown)
+	assert.False(t, observation.P95TTFTKnown)
+	assert.False(t, secondView.AggregateP95TTFTKnown)
+	assert.True(t, observation.CostKnown, "cost comes from an independent complete source")
+	assert.Equal(t, 1.25, observation.Cost)
+	current, ok := CurrentSnapshot()
+	require.True(t, ok)
+	assert.Equal(t, secondView.Revision, current.Revision)
 }
 
 func TestResolveIdentityKeepsPoolMemberForKeylessChannel(t *testing.T) {
@@ -542,6 +867,124 @@ func TestBuildSnapshotHonorsCanceledContext(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
+	tests := []struct {
+		name      string
+		channels  []model.Channel
+		configure func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument)
+	}{
+		{
+			name: "missing channel",
+			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
+				document.Pools[0].Members[0].Enabled = false
+				document.Pools[0].Members[0].ChannelID = 99_001
+			},
+		},
+		{
+			name:     "missing credential",
+			channels: []model.Channel{{Id: 701, Name: "primary", Key: "key-a", Group: "default", Models: "gpt-test"}},
+			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
+				document.Pools[0].Members[0].ChannelID = 701
+				document.Pools[0].Members[0].CredentialIDs = []int{99_002}
+			},
+		},
+		{
+			name: "credential belongs to another channel",
+			channels: []model.Channel{
+				{Id: 702, Name: "primary", Key: "key-a", Group: "default", Models: "gpt-test"},
+				{Id: 703, Name: "secondary", Key: "key-b", Group: "other", Models: "gpt-test"},
+			},
+			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
+				var credential model.RoutingCredentialRef
+				require.NoError(t, db.Where("channel_id = ? AND active = ?", 703, true).First(&credential).Error)
+				document.Pools[0].Members[0].ChannelID = 702
+				document.Pools[0].Members[0].CredentialIDs = []int{credential.ID}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openSnapshotTestDB(t)
+			withSnapshotTestDB(t, db)
+			withSnapshotSecret(t)
+			if len(test.channels) > 0 {
+				require.NoError(t, db.Create(&test.channels).Error)
+				_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+				require.NoError(t, err)
+			}
+			document := model.RoutingPolicyDocument{
+				SchemaVersion: model.RoutingPolicySchemaVersion,
+				Pools: []model.RoutingPolicyPoolContent{{
+					PoolID:          8_001,
+					GroupName:       "manual",
+					DisplayName:     "Manual",
+					DeploymentStage: model.RoutingDeploymentStageShadow,
+					PolicyProfile:   model.RoutingPolicyProfileBalanced,
+					Members: []model.RoutingPolicyMemberContent{{
+						MemberID: 8_101, ChannelID: 1, Enabled: true, Weight: 1,
+					}},
+				}},
+			}
+			test.configure(t, db, &document)
+			_, err := model.PublishRoutingPolicyRevisionDBContext(
+				context.Background(), db, 0, document,
+				model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "reference_test"},
+			)
+			require.NoError(t, err)
+
+			_, err = buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+			assert.ErrorIs(t, err, ErrSnapshotPolicyReference)
+		})
+	}
+}
+
+func TestSlowSnapshotBuildReleasesTelemetryMaintenanceAfterDatabaseSnapshot(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 704, Name: "slow-build", Group: "default", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var blockOnce sync.Once
+	var releaseOnce sync.Once
+	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseBuild()
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:slow_snapshot_revision", func(tx *gorm.DB) {
+		if tx.Statement.Table != "routing_policy_revisions" {
+			return
+		}
+		blockOnce.Do(func() {
+			close(blocked)
+			<-release
+		})
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		_, buildErr := buildSnapshotContext(context.Background(), db, DefaultSnapshotLimits)
+		done <- buildErr
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot build did not reach the delayed revision query")
+	}
+	lockCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, lockRoutingTelemetry(lockCtx), "slow database work must not starve telemetry flush")
+	unlockRoutingTelemetry()
+	releaseBuild()
+	require.NoError(t, <-done)
+}
+
 func openSnapshotTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -552,6 +995,14 @@ func openSnapshotTestDB(t *testing.T) *gorm.DB {
 		&model.RoutingPool{},
 		&model.RoutingPoolMember{},
 		&model.RoutingCredentialRef{},
+		&model.RoutingDecisionAudit{},
+		&model.RoutingDecisionReplayChunk{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingMetricRollup{},
 	))
@@ -582,6 +1033,14 @@ func openSnapshotExternalTestDB(t *testing.T, dbType common.DatabaseType, dsn st
 		&model.RoutingMetricRollup{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingCredentialRef{},
+		&model.RoutingDecisionReplayChunk{},
+		&model.RoutingDecisionAudit{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
 		&model.RoutingPoolMember{},
 		&model.RoutingPool{},
 		&model.RoutingTopologyMetadata{},
@@ -623,4 +1082,218 @@ func withSnapshotSecret(t *testing.T) {
 	common.CryptoSecret = "stable-channel-routing-snapshot-secret"
 	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
 	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+}
+
+type snapshotMetricQueryCounts struct {
+	total   int
+	payload int
+}
+
+func setupSnapshotMetricPaginationTest(t *testing.T, channelID int) (*gorm.DB, model.RoutingPoolMember) {
+	t.Helper()
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	routinghotcache.ResetForTest()
+	routingmetrics.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		routingmetrics.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	require.NoError(t, db.Create(&model.Channel{
+		Id: channelID, Name: "pagination", Group: "default", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = SyncLegacyRoutingPolicyContext(context.Background())
+	require.NoError(t, err)
+	var member model.RoutingPoolMember
+	require.NoError(t, db.Where("channel_id = ?", channelID).First(&member).Error)
+	return db, member
+}
+
+func snapshotMetricRollup(
+	member model.RoutingPoolMember,
+	modelKey string,
+	modelName string,
+	bucketTs int64,
+	latencySketch []byte,
+) model.RoutingMetricRollup {
+	requestCount := int64(0)
+	codecVersion := 0
+	if len(latencySketch) > 0 {
+		requestCount = 1
+		codecVersion = routingdistribution.SketchCodecVersion
+	}
+	return model.RoutingMetricRollup{
+		MemberID:             member.ID,
+		CredentialID:         0,
+		ModelName:            modelName,
+		ModelKey:             modelKey,
+		BucketTs:             bucketTs,
+		ChannelID:            member.ChannelID,
+		PoolID:               member.PoolID,
+		SchemaVersion:        model.RoutingMetricRollupSchemaVersion,
+		LastSnapshotRevision: 1,
+		SketchCodecVersion:   codecVersion,
+		LatencySampleCount:   requestCount,
+		LatencySketch:        latencySketch,
+		RequestCount:         requestCount,
+		SuccessCount:         requestCount,
+		TotalLatencyMs:       requestCount,
+	}
+}
+
+func snapshotTTFTRollup(
+	t *testing.T,
+	memberID int,
+	poolID int,
+	channelID int,
+	credentialID int,
+	modelName string,
+	bucketTs int64,
+	ttftMs int64,
+	revision int64,
+) model.RoutingMetricRollup {
+	t.Helper()
+	sketch := snapshotTestSketch(t, ttftMs)
+	return model.RoutingMetricRollup{
+		MemberID:                memberID,
+		CredentialID:            credentialID,
+		ModelName:               modelName,
+		BucketTs:                bucketTs,
+		ChannelID:               channelID,
+		PoolID:                  poolID,
+		SchemaVersion:           model.RoutingMetricRollupSchemaVersion,
+		LastSnapshotRevision:    revision,
+		SketchCodecVersion:      routingdistribution.SketchCodecVersion,
+		LatencySampleCount:      1,
+		LatencySketch:           append([]byte(nil), sketch...),
+		TtftSampleCount:         1,
+		TtftSketch:              append([]byte(nil), sketch...),
+		RequestCount:            1,
+		SuccessCount:            1,
+		ReliabilityRequestCount: 1,
+		TotalLatencyMs:          ttftMs,
+		TtftSumMs:               ttftMs,
+		TtftCount:               1,
+	}
+}
+
+func observeSnapshotMetricQueries(t *testing.T, db *gorm.DB) *snapshotMetricQueryCounts {
+	t.Helper()
+	counts := &snapshotMetricQueryCounts{}
+	const callbackName = "channelrouting:snapshot_metric_query_counts"
+	require.NoError(t, db.Callback().Row().Before("gorm:row").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "metric_rollups" {
+			return
+		}
+		counts.total++
+		for _, selected := range tx.Statement.Selects {
+			if selected == "metric_rollups.*" {
+				counts.payload++
+				break
+			}
+		}
+	}))
+	return counts
+}
+
+func snapshotTestSketch(t *testing.T, values ...int64) []byte {
+	t.Helper()
+	sketch := routingdistribution.NewDurationSketch()
+	for _, value := range values {
+		_, err := sketch.AddMillis(value)
+		require.NoError(t, err)
+	}
+	data, err := sketch.MarshalBinary()
+	require.NoError(t, err)
+	return data
+}
+
+func TestAggregateRoutingMetricTTFTP95MergesUnderlyingSamples(t *testing.T) {
+	lowVolume := routingdistribution.NewDurationSketch()
+	for sample := 0; sample < 99; sample++ {
+		_, err := lowVolume.AddMillis(100)
+		require.NoError(t, err)
+	}
+	highOutlier := routingdistribution.NewDurationSketch()
+	_, err := highOutlier.AddMillis(10_000)
+	require.NoError(t, err)
+
+	metrics := map[stableMetricKey]stableMetricAggregate{
+		{memberID: 1, model: "gpt-test"}: {ttftCount: 99, ttftSketch: lowVolume},
+		{memberID: 2, model: "gpt-test"}: {ttftCount: 1, ttftSketch: highOutlier},
+	}
+	p95, known, err := aggregateRoutingMetricTTFTP95(metrics, map[memberModelKey]ModelSnapshot{
+		{memberID: 1, model: "gpt-test"}: {MetricSource: "stable_rollup"},
+		{memberID: 2, model: "gpt-test"}: {MetricSource: "stable_rollup"},
+	})
+	require.NoError(t, err)
+	require.True(t, known)
+	assert.InDelta(t, 100, p95, 3)
+}
+
+func TestAggregateRoutingMetricTTFTP95ExcludesModelsOutsideCurrentSnapshot(t *testing.T) {
+	current := routingdistribution.NewDurationSketch()
+	_, err := current.AddMillis(25)
+	require.NoError(t, err)
+	removed := routingdistribution.NewDurationSketch()
+	_, err = removed.AddMillis(10_000)
+	require.NoError(t, err)
+
+	p95, known, err := aggregateRoutingMetricTTFTP95(
+		map[stableMetricKey]stableMetricAggregate{
+			{memberID: 1, model: "current"}: {ttftCount: 1, ttftSketch: current},
+			{memberID: 1, model: "removed"}: {ttftCount: 1, ttftSketch: removed},
+		},
+		map[memberModelKey]ModelSnapshot{
+			{memberID: 1, model: "current"}: {MetricSource: "stable_rollup"},
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, known)
+	assert.InDelta(t, 25, p95, 1)
+}
+
+func TestPublishRuntimeSnapshotIsRevisionMonotonicAndHashBound(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	first, err := publishRuntimeSnapshot(&runtimeSnapshot{view: SnapshotView{
+		Revision: 5, PolicyHash: strings.Repeat("a", 64),
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), first.RuntimeGeneration)
+
+	_, err = publishRuntimeSnapshot(&runtimeSnapshot{view: SnapshotView{
+		Revision: 3, PolicyHash: strings.Repeat("a", 64),
+	}})
+	assert.ErrorIs(t, err, ErrSnapshotRevisionRollback)
+	_, err = publishRuntimeSnapshot(&runtimeSnapshot{view: SnapshotView{
+		Revision: 5, PolicyHash: strings.Repeat("b", 64),
+	}})
+	assert.ErrorIs(t, err, ErrSnapshotRevisionConflict)
+
+	current, ok := CurrentSnapshot()
+	require.True(t, ok)
+	assert.Equal(t, uint64(5), current.Revision)
+	assert.Equal(t, strings.Repeat("a", 64), current.PolicyHash)
+
+	refreshed, err := publishRuntimeSnapshot(&runtimeSnapshot{view: SnapshotView{
+		Revision: 5, PolicyHash: strings.Repeat("a", 64),
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), refreshed.RuntimeGeneration)
+}
+
+func snapshotTestQuantile(t *testing.T, quantile float64, values ...int64) float64 {
+	t.Helper()
+	sketch, err := routingdistribution.DecodeDurationSketch(snapshotTestSketch(t, values...), routingdistribution.SketchCodecVersion)
+	require.NoError(t, err)
+	result, err := sketch.Quantile(quantile)
+	require.NoError(t, err)
+	require.True(t, result.Known)
+	return result.ValueMilliseconds
 }

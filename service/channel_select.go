@@ -123,10 +123,72 @@ func RecordChannelRoutingObserveSelection(param *RetryParam, actualGroup string,
 	if param.Ctx != nil {
 		common.SetContextKey(param.Ctx, constant.ContextKeyRoutingObserveDecision, nil)
 	}
+	if recordChannelRoutingShadowAudit(param, actualGroup, actual, retryIndex) {
+		return
+	}
 	if actual != nil && actualGroup != "" && actualGroup != "auto" {
 		_, _ = selectSmartChannelForGroup(param, actualGroup, setting, false)
 	}
 	recordChannelRoutingObserveAudit(param, actualGroup, actual, retryIndex)
+}
+
+func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actual *model.Channel, retryIndex int) bool {
+	if param == nil || param.Ctx == nil || actualGroup == "" || actualGroup == "auto" {
+		return false
+	}
+	replayInput, active, err := channelrouting.CaptureShadowReplayRequest(channelrouting.ShadowRequest{
+		RequestID:               common.GetContextKeyString(param.Ctx, common.RequestIdKey),
+		RequestPath:             param.RequestPath,
+		GroupName:               actualGroup,
+		ModelName:               param.ModelName,
+		IsStream:                common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+		RetryIndex:              retryIndex,
+		PromptTokenEstimate:     max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
+		CompletionTokenEstimate: max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+	})
+	if !active {
+		return false
+	}
+	if err != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing shadow capture dropped: %v", err))
+		return true
+	}
+	replay, err := channelrouting.RunShadowReplay(replayInput)
+	if err != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing shadow replay dropped: %v", err))
+		return true
+	}
+	actualChannelID := 0
+	if actual != nil {
+		actualChannelID = actual.Id
+	}
+	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(replayInput, actualChannelID)
+	_, err = channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
+		PoolID:               replayInput.PoolID,
+		GroupName:            actualGroup,
+		ModelName:            param.ModelName,
+		SnapshotRevision:     replayInput.PolicyRevision,
+		AlgorithmVersion:     channelrouting.DecisionAlgorithmShadowV1,
+		RetryIndex:           retryIndex,
+		IsStream:             replayInput.Profile.IsStream,
+		ActualChannelID:      actualChannelID,
+		ObservedChannelID:    replay.SelectedChannelID,
+		FilteredOpen:         replay.FilteredOpen,
+		FilteredCapacity:     replay.FilteredCapacity,
+		BreakerBypassed:      replay.BreakerBypassed,
+		Candidates:           replay.Candidates,
+		ReplayInput:          &replayInput,
+		DifferenceType:       channelrouting.ClassifyShadowDifference(actualChannelID, replay),
+		ActualCostKnown:      actualCostKnown,
+		ActualExpectedCost:   actualCost,
+		ObservedCostKnown:    replay.SelectedCostKnown,
+		ObservedExpectedCost: replay.SelectedCost,
+	})
+	if err != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing shadow audit dropped: %v", err))
+	}
+	return true
 }
 
 func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, string, error) {

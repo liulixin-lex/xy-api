@@ -2,6 +2,7 @@ package routingmetrics
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
@@ -105,6 +107,9 @@ func TestStableMetricsRecordSingleAndMultiKeyBeforeLegacy(t *testing.T) {
 		Model:                   "gpt-single",
 		BucketTs:                stable[0].BucketTs,
 		LastSnapshotRevision:    7,
+		SketchCodecVersion:      stable[0].SketchCodecVersion,
+		LatencySampleCount:      stable[0].LatencySampleCount,
+		LatencySketch:           stable[0].LatencySketch,
 		RequestCount:            1,
 		SuccessCount:            1,
 		ReliabilityRequestCount: 1,
@@ -281,6 +286,109 @@ func TestStableMetricsDrainAndRequeueMergeOnlyAdditiveData(t *testing.T) {
 	assert.Equal(t, drained, StableSnapshots())
 }
 
+func TestStableMetricsRecordDrainAndRequeueMergeableDistributions(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	ctx := stableTestContext(611, 6, 61, 601, 12, true, "selected")
+	info := stableTestRelayInfo(611, "gpt-distribution")
+	info.IsStream = true
+	info.ResetStreamAttemptState()
+	attemptStart := info.RoutingAttemptStartTime()
+	info.FirstResponseTime = attemptStart.Add(25 * time.Millisecond)
+	info.ObserveRoutingOutputTokensAt(10, attemptStart.Add(100*time.Millisecond))
+	RecordClassifiedAttempt(ctx, info, 611, true, nil, routingerror.Classification{Rule: "success"})
+
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, routingdistribution.SketchCodecVersion, snapshots[0].SketchCodecVersion)
+	assert.Equal(t, int64(1), snapshots[0].LatencySampleCount)
+	assert.Equal(t, int64(1), snapshots[0].TtftSampleCount)
+	latency := stableTestDecodeSketch(t, snapshots[0].LatencySketch, snapshots[0].SketchCodecVersion)
+	latencyP95, err := latency.Quantile(0.95)
+	require.NoError(t, err)
+	require.True(t, latencyP95.Known)
+	assert.InDelta(t, 100, latencyP95.ValueMilliseconds, 2)
+	ttft := stableTestDecodeSketch(t, snapshots[0].TtftSketch, snapshots[0].SketchCodecVersion)
+	ttftP95, err := ttft.Quantile(0.95)
+	require.NoError(t, err)
+	require.True(t, ttftP95.Known)
+	assert.InDelta(t, 25, ttftP95.ValueMilliseconds, 1)
+
+	drained := DrainStableSnapshots()
+	require.Len(t, drained, 1)
+	secondLatency := routingdistribution.NewDurationSketch()
+	for range 19 {
+		_, err = secondLatency.AddMillis(1000)
+		require.NoError(t, err)
+	}
+	secondLatencyBytes, err := secondLatency.MarshalBinary()
+	require.NoError(t, err)
+	drained = append(drained, StableSnapshot{
+		PoolID: 6, PoolMemberID: 61, CredentialID: 601, ChannelID: 611,
+		Model: "gpt-distribution", BucketTs: drained[0].BucketTs, LastSnapshotRevision: 13,
+		RequestCount: 19, SuccessCount: 19, ReliabilityRequestCount: 19, TotalLatencyMs: 19_000,
+		SketchCodecVersion: routingdistribution.SketchCodecVersion,
+		LatencySampleCount: 19, LatencySketch: secondLatencyBytes,
+	})
+	RequeueStableSnapshots(drained)
+
+	merged := StableSnapshots()
+	require.Len(t, merged, 1)
+	assert.Equal(t, int64(20), merged[0].RequestCount)
+	assert.Equal(t, int64(20), merged[0].LatencySampleCount)
+	mergedLatency := stableTestDecodeSketch(t, merged[0].LatencySketch, merged[0].SketchCodecVersion)
+	mergedP95, err := mergedLatency.Quantile(0.95)
+	require.NoError(t, err)
+	require.True(t, mergedP95.Known)
+	assert.InDelta(t, 1000, mergedP95.ValueMilliseconds, 20)
+}
+
+func TestStableMetricsCorruptRequeueKeepsCountersAndDropsDistribution(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	RequeueStableSnapshots([]StableSnapshot{{
+		PoolID: 7, PoolMemberID: 71, CredentialID: 701, ChannelID: 711,
+		Model: "gpt-corrupt", BucketTs: 60, LastSnapshotRevision: 14,
+		RequestCount: 1, SuccessCount: 1,
+		SketchCodecVersion: routingdistribution.SketchCodecVersion,
+		LatencySampleCount: 1, LatencySketch: []byte("corrupt"),
+	}})
+
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(1), snapshots[0].RequestCount)
+	assert.Zero(t, snapshots[0].LatencySampleCount)
+	assert.Empty(t, snapshots[0].LatencySketch)
+	assert.Equal(t, int64(1), StableRuntimeStats().DistributionDrops)
+}
+
+func TestDrainStableSnapshotsLimitedUsesOldestFirstAndKeepsUndrainedBuckets(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	for _, bucketTs := range []int64{3, 1, 2} {
+		RequeueStableSnapshots([]StableSnapshot{{
+			PoolID: 8, PoolMemberID: int(bucketTs), CredentialID: int(bucketTs), ChannelID: int(bucketTs),
+			Model: "gpt-limited", BucketTs: bucketTs, LastSnapshotRevision: 15, RequestCount: 1,
+		}})
+	}
+
+	drained := DrainStableSnapshotsLimited(2, 1<<20)
+	require.Len(t, drained, 2)
+	assert.Equal(t, []int64{1, 2}, []int64{drained[0].BucketTs, drained[1].BucketTs})
+	remaining := StableSnapshots()
+	require.Len(t, remaining, 1)
+	assert.Equal(t, int64(3), remaining[0].BucketTs)
+
+	assert.Empty(t, DrainStableSnapshotsLimited(1, 1))
+	remaining = StableSnapshots()
+	require.Len(t, remaining, 1)
+	assert.Equal(t, int64(3), remaining[0].BucketTs)
+}
+
+func stableTestDecodeSketch(t *testing.T, data []byte, version int) *routingdistribution.DurationSketch {
+	t.Helper()
+	sketch, err := routingdistribution.DecodeDurationSketch(data, version)
+	require.NoError(t, err)
+	return sketch
+}
+
 func TestClearLegacyChannelPreservesStableTelemetry(t *testing.T) {
 	enableRoutingMetricsForTest(t)
 	ctx := stableTestContext(701, 7, 71, 711, 14, true, "selected")
@@ -369,4 +477,93 @@ func TestStableSnapshotExcludesNonMergeablePercentileScalars(t *testing.T) {
 		_, exists := typeOfSnapshot.FieldByName(fieldName)
 		assert.False(t, exists, fieldName)
 	}
+}
+
+func TestStableMetricsBoundExtremeAttemptValuesWithoutOverflow(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	ctx := stableTestContext(801, 8, 81, 801, 16, true, "selected")
+	info := stableTestRelayInfo(801, "gpt-bounded")
+	apiErr := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+	metadata, err := common.Marshal(map[string]int64{"retry_after_ms": math.MaxInt64})
+	require.NoError(t, err)
+	apiErr.Metadata = metadata
+
+	recordStableClassifiedAttempt(
+		ctx,
+		info,
+		801,
+		time.Unix(60, 0),
+		math.MaxInt64,
+		math.MaxInt64,
+		true,
+		math.MaxInt64,
+		math.MaxInt64,
+		false,
+		apiErr,
+		routingerror.Classification{
+			Responsibility: routingerror.ResponsibilityProvider,
+			HealthEffect:   routingerror.HealthDegrade,
+			Rule:           "provider_429",
+		},
+	)
+
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(1), snapshots[0].RequestCount)
+	assert.Equal(t, routingdistribution.MaxDurationMilliseconds, snapshots[0].TotalLatencyMs)
+	assert.Equal(t, routingdistribution.MaxDurationMilliseconds, snapshots[0].TtftSumMs)
+	assert.Equal(t, routingdistribution.MaxDurationMilliseconds, snapshots[0].GenerationMs)
+	assert.Equal(t, maxStableAttemptTokens, snapshots[0].OutputTokens)
+	assert.Equal(t, maxStableRetryAfterMs, snapshots[0].RetryAfterTotalMs)
+	assert.GreaterOrEqual(t, snapshots[0].TotalLatencyMs, int64(0))
+	assert.GreaterOrEqual(t, StableRuntimeStats().CounterSaturations, int64(5))
+	assert.Equal(t, int64(2), StableRuntimeStats().DistributionClamps)
+}
+
+func TestStableMetricsRejectInvalidRequeueWithoutPoisoningBucket(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	invalid := StableSnapshot{
+		PoolID: 9, PoolMemberID: 91, CredentialID: 901, ChannelID: 911,
+		Model: "gpt-invalid", BucketTs: 60, LastSnapshotRevision: 17,
+		RequestCount: math.MaxInt64,
+	}
+	RequeueStableSnapshots([]StableSnapshot{invalid})
+	assert.Empty(t, StableSnapshots())
+	assert.Equal(t, int64(1), StableRuntimeStats().InvalidSnapshotDrops)
+
+	valid := invalid
+	valid.RequestCount = 1
+	valid.SuccessCount = 1
+	valid.ReliabilityRequestCount = 1
+	RequeueStableSnapshots([]StableSnapshot{valid})
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, int64(1), snapshots[0].RequestCount)
+	assert.Equal(t, int64(1), snapshots[0].SuccessCount)
+}
+
+func TestStableMetricsRejectMergePastBucketBoundAndCanDrainRequeue(t *testing.T) {
+	enableRoutingMetricsForTest(t)
+	full := StableSnapshot{
+		PoolID: 10, PoolMemberID: 101, CredentialID: 1001, ChannelID: 1011,
+		Model: "gpt-full", BucketTs: 60, LastSnapshotRevision: 18,
+		RequestCount: maxStableBucketCount,
+	}
+	RequeueStableSnapshots([]StableSnapshot{full})
+	extra := full
+	extra.RequestCount = 1
+	RequeueStableSnapshots([]StableSnapshot{extra})
+
+	snapshots := StableSnapshots()
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, maxStableBucketCount, snapshots[0].RequestCount)
+	assert.Equal(t, int64(1), StableRuntimeStats().CounterSaturations)
+
+	drained := DrainStableSnapshots()
+	require.Len(t, drained, 1)
+	assert.Empty(t, StableSnapshots())
+	RequeueStableSnapshots(drained)
+	requeued := StableSnapshots()
+	require.Len(t, requeued, 1)
+	assert.Equal(t, maxStableBucketCount, requeued[0].RequestCount)
 }

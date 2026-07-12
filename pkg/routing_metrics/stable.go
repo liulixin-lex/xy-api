@@ -1,6 +1,7 @@
 package routingmetrics
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -21,6 +23,14 @@ import (
 const (
 	maxStableModelRunes = 128
 	maxStableModelBytes = 512
+
+	maxStableBucketCount       = int64(math.MaxInt32)
+	maxStableAttemptTokens     = int64(math.MaxInt32 / 2)
+	maxStableRetryAfterMs      = int64((7 * 24 * time.Hour) / time.Millisecond)
+	maxStableFutureBucketSkew  = int64((10 * time.Minute) / time.Second)
+	maxStableDurationTotalMs   = maxStableBucketCount * routingdistribution.MaxDurationMilliseconds
+	maxStableOutputTokensTotal = maxStableBucketCount * maxStableAttemptTokens
+	maxStableRetryAfterTotalMs = maxStableBucketCount * maxStableRetryAfterMs
 )
 
 // StableKey is the durable in-memory aggregation identity. Pool, physical
@@ -39,9 +49,9 @@ type StableInflightKey struct {
 	Model        string
 }
 
-// StableSnapshot intentionally contains only mergeable counters and totals.
-// Percentile scalars are excluded until the routing data plane has a
-// mergeable distribution representation.
+// StableSnapshot contains only mergeable counters, totals, and bounded
+// distributions. Percentile scalars are derived after persisted and live
+// snapshots have been merged.
 type StableSnapshot struct {
 	PoolID                     int    `json:"pool_id"`
 	PoolMemberID               int    `json:"pool_member_id"`
@@ -50,6 +60,11 @@ type StableSnapshot struct {
 	Model                      string `json:"model"`
 	BucketTs                   int64  `json:"bucket_ts"`
 	LastSnapshotRevision       uint64 `json:"last_snapshot_revision"`
+	SketchCodecVersion         int    `json:"sketch_codec_version"`
+	LatencySampleCount         int64  `json:"latency_sample_count"`
+	LatencySketch              []byte `json:"latency_sketch,omitempty"`
+	TtftSampleCount            int64  `json:"ttft_sample_count"`
+	TtftSketch                 []byte `json:"ttft_sketch,omitempty"`
 	RequestCount               int64  `json:"request_count"`
 	SuccessCount               int64  `json:"success_count"`
 	FailureCount               int64  `json:"failure_count"`
@@ -80,6 +95,10 @@ type StableStats struct {
 	InflightDrops           int64 `json:"inflight_drops"`
 	IdentityDrops           int64 `json:"identity_drops"`
 	InflightIdentityDrops   int64 `json:"inflight_identity_drops"`
+	DistributionClamps      int64 `json:"distribution_clamps"`
+	DistributionDrops       int64 `json:"distribution_drops"`
+	CounterSaturations      int64 `json:"counter_saturations"`
+	InvalidSnapshotDrops    int64 `json:"invalid_snapshot_drops"`
 }
 
 type stableMetadata struct {
@@ -114,6 +133,8 @@ type stableBucket struct {
 	err529                     int64
 	retryAfterCount            int64
 	retryAfterTotalMs          int64
+	latencySketch              *routingdistribution.DurationSketch
+	ttftSketch                 *routingdistribution.DurationSketch
 }
 
 type stableInflightCounter struct {
@@ -137,6 +158,10 @@ type stableStore struct {
 	inflightDropCount           atomic.Int64
 	identityDropCount           atomic.Int64
 	inflightIdentityDropCount   atomic.Int64
+	distributionClampCount      atomic.Int64
+	distributionDropCount       atomic.Int64
+	counterSaturationCount      atomic.Int64
+	invalidSnapshotDropCount    atomic.Int64
 }
 
 var stableStorePointer atomic.Pointer[stableStore]
@@ -161,33 +186,68 @@ func StableSnapshots() []StableSnapshot {
 }
 
 func DrainStableSnapshots() []StableSnapshot {
+	return drainStableSnapshots(0, 0)
+}
+
+func DrainStableSnapshotsLimited(maxItems int, maxBytes int) []StableSnapshot {
+	if maxItems <= 0 || maxBytes <= 0 {
+		return nil
+	}
+	return drainStableSnapshots(maxItems, maxBytes)
+}
+
+func drainStableSnapshots(maxItems int, maxBytes int) []StableSnapshot {
 	store := stableStorePointer.Load()
 	if store == nil {
 		return nil
 	}
 
-	snapshots := make([]StableSnapshot, 0)
+	type drainEntry struct {
+		key    StableKey
+		bucket *stableBucket
+	}
+	entries := make([]drainEntry, 0)
 	store.maintenanceMu.Lock()
 	store.buckets.Range(func(key any, value any) bool {
-		stableKey := key.(StableKey)
-		bucket := value.(*stableBucket)
+		entries = append(entries, drainEntry{key: key.(StableKey), bucket: value.(*stableBucket)})
+		return true
+	})
+	sort.Slice(entries, func(left int, right int) bool {
+		return stableKeyLess(entries[left].key, entries[right].key)
+	})
+	snapshots := make([]StableSnapshot, 0, len(entries))
+	totalBytes := 0
+	for index := range entries {
+		if maxItems > 0 && len(snapshots) >= maxItems {
+			break
+		}
+		stableKey := entries[index].key
+		bucket := entries[index].bucket
 		bucket.mu.Lock()
-		bucket.draining = true
 		snapshot := bucket.snapshotLocked(stableKey)
-		deleted := store.buckets.CompareAndDelete(key, value)
+		snapshotBytes := stableSnapshotApproxBytes(snapshot)
+		if maxBytes > 0 && snapshotBytes > maxBytes-totalBytes {
+			bucket.mu.Unlock()
+			break
+		}
+		bucket.draining = true
+		deleted := store.buckets.CompareAndDelete(stableKey, bucket)
 		bucket.mu.Unlock()
 		if !deleted {
-			return true
+			continue
 		}
 		decrementCount(&store.bucketCount)
 		if snapshot.RequestCount > 0 {
 			snapshots = append(snapshots, snapshot)
+			totalBytes += snapshotBytes
 		}
-		return true
-	})
+	}
 	store.maintenanceMu.Unlock()
-	sortStableSnapshots(snapshots)
 	return snapshots
+}
+
+func stableSnapshotApproxBytes(snapshot StableSnapshot) int {
+	return len(snapshot.Model) + len(snapshot.LatencySketch) + len(snapshot.TtftSketch) + 256
 }
 
 func RequeueStableSnapshots(snapshots []StableSnapshot) {
@@ -203,8 +263,8 @@ func RequeueStableSnapshots(snapshots []StableSnapshot) {
 	}
 	for i := range snapshots {
 		snapshot := snapshots[i]
-		if snapshot.PoolID <= 0 || snapshot.PoolMemberID <= 0 || snapshot.ChannelID <= 0 || snapshot.CredentialID < 0 ||
-			snapshot.LastSnapshotRevision == 0 || !validStableModel(snapshot.Model) || snapshot.RequestCount <= 0 {
+		if !validStableSnapshot(snapshot) {
+			store.invalidSnapshotDropCount.Add(1)
 			continue
 		}
 		key := StableKey{
@@ -222,7 +282,9 @@ func RequeueStableSnapshots(snapshots []StableSnapshot) {
 			model:        snapshot.Model,
 		}
 		withWritableStableBucket(store, key, metadata, func(bucket *stableBucket) {
-			bucket.addSnapshotLocked(snapshot)
+			distributionDrops, counterSaturations := bucket.addSnapshotLocked(snapshot)
+			store.distributionDropCount.Add(distributionDrops)
+			store.counterSaturationCount.Add(counterSaturations)
 		})
 	}
 }
@@ -259,6 +321,10 @@ func StableRuntimeStats() StableStats {
 		InflightDrops:           store.inflightDropCount.Load(),
 		IdentityDrops:           store.identityDropCount.Load(),
 		InflightIdentityDrops:   store.inflightIdentityDropCount.Load(),
+		DistributionClamps:      store.distributionClampCount.Load(),
+		DistributionDrops:       store.distributionDropCount.Load(),
+		CounterSaturations:      store.counterSaturationCount.Load(),
+		InvalidSnapshotDrops:    store.invalidSnapshotDropCount.Load(),
 	}
 }
 
@@ -310,7 +376,10 @@ func recordStableClassifiedAttempt(
 	}
 	store := loadOrCreateStableStore()
 	withWritableStableBucket(store, key, metadata, func(bucket *stableBucket) {
-		bucket.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
+		clamps, drops, counterSaturations := bucket.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
+		store.distributionClampCount.Add(clamps)
+		store.distributionDropCount.Add(drops)
+		store.counterSaturationCount.Add(counterSaturations)
 	})
 }
 
@@ -633,32 +702,80 @@ func (bucket *stableBucket) addLocked(
 	success bool,
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
-) {
-	bucket.requestCount++
+) (int64, int64, int64) {
+	var distributionClamps int64
+	var distributionDrops int64
+	var counterSaturations int64
+	if bucket.requestCount >= maxStableBucketCount {
+		return 0, 0, 1
+	}
+
+	boundedLatencyMs, clamped := boundedStableValue(latencyMs, routingdistribution.MaxDurationMilliseconds)
+	if clamped {
+		counterSaturations++
+	}
+	boundedTtftMs, clamped := boundedStableValue(ttftMs, routingdistribution.MaxDurationMilliseconds)
+	if clamped {
+		counterSaturations++
+	}
+	boundedGenerationMs, clamped := boundedStableValue(generationMs, routingdistribution.MaxDurationMilliseconds)
+	if clamped {
+		counterSaturations++
+	}
+	boundedOutputTokens, clamped := boundedStableValue(outputTokens, maxStableAttemptTokens)
+	if clamped {
+		counterSaturations++
+	}
+
+	addStableCounter(&bucket.requestCount, 1, maxStableBucketCount)
 	if success {
-		bucket.successCount++
-		bucket.reliabilityRequestCount++
+		addStableCounter(&bucket.successCount, 1, maxStableBucketCount)
+		addStableCounter(&bucket.reliabilityRequestCount, 1, maxStableBucketCount)
 	} else {
-		bucket.failureCount++
+		addStableCounter(&bucket.failureCount, 1, maxStableBucketCount)
 		if unknownStableClassification(classification) {
-			bucket.unknownClassificationCount++
+			addStableCounter(&bucket.unknownClassificationCount, 1, maxStableBucketCount)
 		}
 		if (classification.Responsibility == routingerror.ResponsibilityProvider ||
 			classification.Responsibility == routingerror.ResponsibilityNetwork) &&
 			(classification.HealthEffect == routingerror.HealthDegrade ||
 				classification.HealthEffect == routingerror.HealthOpen) {
-			bucket.reliabilityRequestCount++
-			bucket.reliabilityFailureCount++
+			addStableCounter(&bucket.reliabilityRequestCount, 1, maxStableBucketCount)
+			addStableCounter(&bucket.reliabilityFailureCount, 1, maxStableBucketCount)
 		}
 	}
-	bucket.totalLatencyMs += latencyMs
-	if hasTtft {
-		bucket.ttftSumMs += ttftMs
-		bucket.ttftCount++
+	if addStableCounter(&bucket.totalLatencyMs, boundedLatencyMs, maxStableDurationTotalMs) {
+		counterSaturations++
 	}
-	if outputTokens > 0 && generationMs > 0 {
-		bucket.outputTokens += outputTokens
-		bucket.generationMs += generationMs
+	if bucket.latencySketch == nil {
+		bucket.latencySketch = routingdistribution.NewDurationSketch()
+	}
+	if result, err := bucket.latencySketch.AddMillis(latencyMs); err != nil {
+		distributionDrops++
+	} else if result.Clamped {
+		distributionClamps++
+	}
+	if hasTtft {
+		if addStableCounter(&bucket.ttftSumMs, boundedTtftMs, maxStableDurationTotalMs) {
+			counterSaturations++
+		}
+		addStableCounter(&bucket.ttftCount, 1, maxStableBucketCount)
+		if bucket.ttftSketch == nil {
+			bucket.ttftSketch = routingdistribution.NewDurationSketch()
+		}
+		if result, err := bucket.ttftSketch.AddMillis(ttftMs); err != nil {
+			distributionDrops++
+		} else if result.Clamped {
+			distributionClamps++
+		}
+	}
+	if boundedOutputTokens > 0 && boundedGenerationMs > 0 {
+		if addStableCounter(&bucket.outputTokens, boundedOutputTokens, maxStableOutputTokensTotal) {
+			counterSaturations++
+		}
+		if addStableCounter(&bucket.generationMs, boundedGenerationMs, maxStableDurationTotalMs) {
+			counterSaturations++
+		}
 	}
 
 	statusCode := 0
@@ -667,38 +784,166 @@ func (bucket *stableBucket) addLocked(
 	}
 	switch {
 	case statusCode == 429:
-		bucket.err429++
+		addStableCounter(&bucket.err429, 1, maxStableBucketCount)
 	case statusCode == 529:
-		bucket.err529++
+		addStableCounter(&bucket.err529, 1, maxStableBucketCount)
 	case statusCode >= 500 && statusCode <= 599:
-		bucket.err5xx++
+		addStableCounter(&bucket.err5xx, 1, maxStableBucketCount)
 	case statusCode >= 400 && statusCode <= 499:
-		bucket.err4xx++
+		addStableCounter(&bucket.err4xx, 1, maxStableBucketCount)
 	}
 	if retryAfterMs := retryAfterMaxMS(apiErr); retryAfterMs > 0 {
-		bucket.retryAfterCount++
-		bucket.retryAfterTotalMs += retryAfterMs
+		boundedRetryAfterMs, retryAfterClamped := boundedStableValue(retryAfterMs, maxStableRetryAfterMs)
+		if retryAfterClamped {
+			counterSaturations++
+		}
+		addStableCounter(&bucket.retryAfterCount, 1, maxStableBucketCount)
+		if addStableCounter(&bucket.retryAfterTotalMs, boundedRetryAfterMs, maxStableRetryAfterTotalMs) {
+			counterSaturations++
+		}
 	}
+	return distributionClamps, distributionDrops, counterSaturations
 }
 
-func (bucket *stableBucket) addSnapshotLocked(snapshot StableSnapshot) {
-	bucket.requestCount += snapshot.RequestCount
-	bucket.successCount += snapshot.SuccessCount
-	bucket.failureCount += snapshot.FailureCount
-	bucket.unknownClassificationCount += snapshot.UnknownClassificationCount
-	bucket.reliabilityRequestCount += snapshot.ReliabilityRequestCount
-	bucket.reliabilityFailureCount += snapshot.ReliabilityFailureCount
-	bucket.totalLatencyMs += snapshot.TotalLatencyMs
-	bucket.ttftSumMs += snapshot.TtftSumMs
-	bucket.ttftCount += snapshot.TtftCount
-	bucket.outputTokens += snapshot.OutputTokens
-	bucket.generationMs += snapshot.GenerationMs
-	bucket.err4xx += snapshot.Err4xx
-	bucket.err5xx += snapshot.Err5xx
-	bucket.err429 += snapshot.Err429
-	bucket.err529 += snapshot.Err529
-	bucket.retryAfterCount += snapshot.RetryAfterCount
-	bucket.retryAfterTotalMs += snapshot.RetryAfterTotalMs
+func (bucket *stableBucket) addSnapshotLocked(snapshot StableSnapshot) (int64, int64) {
+	if !bucket.canAddSnapshotLocked(snapshot) {
+		return 0, 1
+	}
+	var distributionDrops int64
+	addStableCounter(&bucket.requestCount, snapshot.RequestCount, maxStableBucketCount)
+	addStableCounter(&bucket.successCount, snapshot.SuccessCount, maxStableBucketCount)
+	addStableCounter(&bucket.failureCount, snapshot.FailureCount, maxStableBucketCount)
+	addStableCounter(&bucket.unknownClassificationCount, snapshot.UnknownClassificationCount, maxStableBucketCount)
+	addStableCounter(&bucket.reliabilityRequestCount, snapshot.ReliabilityRequestCount, maxStableBucketCount)
+	addStableCounter(&bucket.reliabilityFailureCount, snapshot.ReliabilityFailureCount, maxStableBucketCount)
+	addStableCounter(&bucket.totalLatencyMs, snapshot.TotalLatencyMs, maxStableDurationTotalMs)
+	addStableCounter(&bucket.ttftSumMs, snapshot.TtftSumMs, maxStableDurationTotalMs)
+	addStableCounter(&bucket.ttftCount, snapshot.TtftCount, maxStableBucketCount)
+	addStableCounter(&bucket.outputTokens, snapshot.OutputTokens, maxStableOutputTokensTotal)
+	addStableCounter(&bucket.generationMs, snapshot.GenerationMs, maxStableDurationTotalMs)
+	addStableCounter(&bucket.err4xx, snapshot.Err4xx, maxStableBucketCount)
+	addStableCounter(&bucket.err5xx, snapshot.Err5xx, maxStableBucketCount)
+	addStableCounter(&bucket.err429, snapshot.Err429, maxStableBucketCount)
+	addStableCounter(&bucket.err529, snapshot.Err529, maxStableBucketCount)
+	addStableCounter(&bucket.retryAfterCount, snapshot.RetryAfterCount, maxStableBucketCount)
+	addStableCounter(&bucket.retryAfterTotalMs, snapshot.RetryAfterTotalMs, maxStableRetryAfterTotalMs)
+	if snapshot.LatencySampleCount > 0 {
+		incoming, err := routingdistribution.DecodeDurationSketch(snapshot.LatencySketch, snapshot.SketchCodecVersion)
+		if err != nil || incoming.Count() != snapshot.LatencySampleCount {
+			distributionDrops++
+		} else if bucket.latencySketch == nil {
+			bucket.latencySketch = incoming
+		} else if err := bucket.latencySketch.Merge(incoming); err != nil {
+			distributionDrops++
+		}
+	} else if len(snapshot.LatencySketch) != 0 {
+		distributionDrops++
+	}
+	if snapshot.TtftSampleCount > 0 {
+		incoming, err := routingdistribution.DecodeDurationSketch(snapshot.TtftSketch, snapshot.SketchCodecVersion)
+		if err != nil || incoming.Count() != snapshot.TtftSampleCount {
+			distributionDrops++
+		} else if bucket.ttftSketch == nil {
+			bucket.ttftSketch = incoming
+		} else if err := bucket.ttftSketch.Merge(incoming); err != nil {
+			distributionDrops++
+		}
+	} else if len(snapshot.TtftSketch) != 0 {
+		distributionDrops++
+	}
+	return distributionDrops, 0
+}
+
+func (bucket *stableBucket) canAddSnapshotLocked(snapshot StableSnapshot) bool {
+	targets := []int64{
+		bucket.requestCount,
+		bucket.successCount,
+		bucket.failureCount,
+		bucket.unknownClassificationCount,
+		bucket.reliabilityRequestCount,
+		bucket.reliabilityFailureCount,
+		bucket.totalLatencyMs,
+		bucket.ttftSumMs,
+		bucket.ttftCount,
+		bucket.outputTokens,
+		bucket.generationMs,
+		bucket.err4xx,
+		bucket.err5xx,
+		bucket.err429,
+		bucket.err529,
+		bucket.retryAfterCount,
+		bucket.retryAfterTotalMs,
+	}
+	deltas := []int64{
+		snapshot.RequestCount,
+		snapshot.SuccessCount,
+		snapshot.FailureCount,
+		snapshot.UnknownClassificationCount,
+		snapshot.ReliabilityRequestCount,
+		snapshot.ReliabilityFailureCount,
+		snapshot.TotalLatencyMs,
+		snapshot.TtftSumMs,
+		snapshot.TtftCount,
+		snapshot.OutputTokens,
+		snapshot.GenerationMs,
+		snapshot.Err4xx,
+		snapshot.Err5xx,
+		snapshot.Err429,
+		snapshot.Err529,
+		snapshot.RetryAfterCount,
+		snapshot.RetryAfterTotalMs,
+	}
+	limits := []int64{
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableDurationTotalMs,
+		maxStableDurationTotalMs,
+		maxStableBucketCount,
+		maxStableOutputTokensTotal,
+		maxStableDurationTotalMs,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableBucketCount,
+		maxStableRetryAfterTotalMs,
+	}
+	for index := range targets {
+		if targets[index] < 0 || deltas[index] < 0 || targets[index] > limits[index]-deltas[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func addStableCounter(target *int64, delta int64, limit int64) bool {
+	if delta <= 0 {
+		return delta < 0
+	}
+	if *target < 0 {
+		*target = 0
+		return true
+	}
+	if *target > limit-delta {
+		*target = limit
+		return true
+	}
+	*target += delta
+	return false
+}
+
+func boundedStableValue(value int64, limit int64) (int64, bool) {
+	if value < 0 {
+		return 0, true
+	}
+	if value > limit {
+		return limit, true
+	}
+	return value, false
 }
 
 func (bucket *stableBucket) snapshot(key StableKey) StableSnapshot {
@@ -708,7 +953,7 @@ func (bucket *stableBucket) snapshot(key StableKey) StableSnapshot {
 }
 
 func (bucket *stableBucket) snapshotLocked(key StableKey) StableSnapshot {
-	return StableSnapshot{
+	snapshot := StableSnapshot{
 		PoolID:                     bucket.poolID,
 		PoolMemberID:               key.PoolMemberID,
 		CredentialID:               key.CredentialID,
@@ -734,10 +979,76 @@ func (bucket *stableBucket) snapshotLocked(key StableKey) StableSnapshot {
 		RetryAfterCount:            bucket.retryAfterCount,
 		RetryAfterTotalMs:          bucket.retryAfterTotalMs,
 	}
+	if bucket.latencySketch != nil && bucket.latencySketch.Count() > 0 {
+		if data, err := bucket.latencySketch.MarshalBinary(); err == nil {
+			snapshot.SketchCodecVersion = routingdistribution.SketchCodecVersion
+			snapshot.LatencySampleCount = bucket.latencySketch.Count()
+			snapshot.LatencySketch = data
+		}
+	}
+	if bucket.ttftSketch != nil && bucket.ttftSketch.Count() > 0 {
+		if data, err := bucket.ttftSketch.MarshalBinary(); err == nil {
+			snapshot.SketchCodecVersion = routingdistribution.SketchCodecVersion
+			snapshot.TtftSampleCount = bucket.ttftSketch.Count()
+			snapshot.TtftSketch = data
+		}
+	}
+	return snapshot
 }
 
 func validStableModel(model string) bool {
 	return model != "" && utf8.ValidString(model) && len(model) <= maxStableModelBytes && utf8.RuneCountInString(model) <= maxStableModelRunes
+}
+
+func validStableSnapshot(snapshot StableSnapshot) bool {
+	maxBucketTs := int64(math.MaxInt64)
+	nowUnix := time.Now().Unix()
+	if nowUnix <= math.MaxInt64-maxStableFutureBucketSkew {
+		maxBucketTs = nowUnix + maxStableFutureBucketSkew
+	}
+	if snapshot.PoolID <= 0 || snapshot.PoolMemberID <= 0 || snapshot.ChannelID <= 0 || snapshot.CredentialID < 0 ||
+		snapshot.LastSnapshotRevision == 0 || !validStableModel(snapshot.Model) || snapshot.BucketTs < 0 || snapshot.BucketTs > maxBucketTs ||
+		snapshot.RequestCount <= 0 || snapshot.RequestCount > maxStableBucketCount {
+		return false
+	}
+	for _, counter := range []int64{
+		snapshot.SuccessCount,
+		snapshot.FailureCount,
+		snapshot.UnknownClassificationCount,
+		snapshot.ReliabilityRequestCount,
+		snapshot.ReliabilityFailureCount,
+		snapshot.TtftCount,
+		snapshot.Err4xx,
+		snapshot.Err5xx,
+		snapshot.Err429,
+		snapshot.Err529,
+		snapshot.RetryAfterCount,
+		snapshot.LatencySampleCount,
+		snapshot.TtftSampleCount,
+	} {
+		if counter < 0 || counter > maxStableBucketCount {
+			return false
+		}
+	}
+	if snapshot.TotalLatencyMs < 0 || snapshot.TotalLatencyMs > snapshot.RequestCount*routingdistribution.MaxDurationMilliseconds ||
+		snapshot.TtftSumMs < 0 || snapshot.TtftSumMs > snapshot.TtftCount*routingdistribution.MaxDurationMilliseconds ||
+		snapshot.GenerationMs < 0 || snapshot.GenerationMs > snapshot.RequestCount*routingdistribution.MaxDurationMilliseconds ||
+		snapshot.OutputTokens < 0 || snapshot.OutputTokens > snapshot.RequestCount*maxStableAttemptTokens ||
+		snapshot.RetryAfterTotalMs < 0 || snapshot.RetryAfterTotalMs > snapshot.RetryAfterCount*maxStableRetryAfterMs {
+		return false
+	}
+	if snapshot.SuccessCount > snapshot.RequestCount-snapshot.FailureCount ||
+		snapshot.UnknownClassificationCount > snapshot.FailureCount ||
+		snapshot.ReliabilityRequestCount > snapshot.RequestCount ||
+		snapshot.ReliabilityFailureCount > snapshot.ReliabilityRequestCount ||
+		snapshot.TtftCount > snapshot.RequestCount ||
+		snapshot.RetryAfterCount > snapshot.RequestCount ||
+		snapshot.LatencySampleCount > snapshot.RequestCount ||
+		snapshot.TtftSampleCount > snapshot.TtftCount {
+		return false
+	}
+	errorCount := snapshot.Err4xx + snapshot.Err5xx + snapshot.Err429 + snapshot.Err529
+	return errorCount >= 0 && errorCount <= snapshot.RequestCount
 }
 
 func unknownStableClassification(classification routingerror.Classification) bool {

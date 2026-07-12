@@ -3,12 +3,14 @@ package channelrouting
 import (
 	"context"
 	"math"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -46,6 +48,17 @@ func TestDecisionAuditBufferIsBoundedAndFlushesLatestRetainedRecords(t *testing.
 	assert.NotContains(t, audits[0].CandidatesJSON, "api-key")
 }
 
+func TestDecisionAuditStatsExposeOldestBufferedAge(t *testing.T) {
+	buffer := newAuditBuffer(2)
+	createdTime := common.GetTimestamp() - 10
+	buffer.enqueue(model.RoutingDecisionAudit{DecisionID: "oldest", CreatedTime: createdTime})
+	buffer.enqueue(model.RoutingDecisionAudit{DecisionID: "newest", CreatedTime: createdTime + 5})
+
+	stats := buffer.stats()
+	assert.Equal(t, createdTime, stats.OldestCreatedTime)
+	assert.GreaterOrEqual(t, stats.OldestAgeSec, int64(10))
+}
+
 func TestDecisionAuditFlushFailureRequeuesWithoutLosingOlderRecords(t *testing.T) {
 	db := openDecisionAuditTestDB(t, false)
 	withSnapshotTestDB(t, db)
@@ -70,6 +83,25 @@ func TestDecisionAuditFlushFailureRequeuesWithoutLosingOlderRecords(t *testing.T
 	require.Len(t, audits, 2)
 	assert.Equal(t, firstID, audits[0].DecisionID)
 	assert.Equal(t, secondID, audits[1].DecisionID)
+}
+
+func TestDecisionAuditBatchFlushHonorsInvocationBudget(t *testing.T) {
+	db := openDecisionAuditTestDB(t, true)
+	withSnapshotTestDB(t, db)
+	ResetDecisionAuditsForTest(model.RoutingDecisionAuditMaxBatch + 1)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	for index := 0; index < model.RoutingDecisionAuditMaxBatch+1; index++ {
+		enqueueDecisionForTest(t, index+1, index+1)
+	}
+
+	flushed, err := flushDecisionAuditBatchesContext(context.Background(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoutingDecisionAuditMaxBatch, flushed)
+	assert.Equal(t, 1, DecisionAuditsStats().Entries)
+	var persisted int64
+	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).Count(&persisted).Error)
+	assert.Equal(t, int64(model.RoutingDecisionAuditMaxBatch), persisted)
 }
 
 func TestEnqueueDecisionSanitizesNonFiniteScoresAndCapsCandidates(t *testing.T) {
@@ -134,6 +166,259 @@ func TestDecisionAuditPayloadFitsCrossDatabaseTextColumn(t *testing.T) {
 	require.NoError(t, common.UnmarshalJsonStr(batch[0].CandidatesJSON, &payload))
 	require.Len(t, payload.Candidates, MaxDecisionCandidates)
 	assert.Len(t, []rune(payload.Candidates[0].ExclusionReason), MaxDecisionReasonRunes)
+}
+
+func TestMaximumReplayPayloadProducesPersistedReplayableAudit(t *testing.T) {
+	db := openDecisionAuditTestDB(t, true)
+	withSnapshotTestDB(t, db)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	requestID := "max-pool-replay"
+	profile, err := NewRequestProfile(
+		"/v1/chat/completions", "default", "gpt-test", true, 0, 1_000, 200,
+	)
+	require.NoError(t, err)
+	seed, err := DeriveShadowSeed(requestID, 7, 0)
+	require.NoError(t, err)
+	candidates := make([]ShadowCandidateInput, MaxDecisionCandidates)
+	for index := range candidates {
+		candidates[index] = ShadowCandidateInput{
+			PoolMemberID: index + 1,
+			ChannelID:    index + 1,
+			Priority:     math.MaxInt64,
+			Weight:       math.MaxUint,
+			Metric: &ShadowMetricInput{
+				RequestCount: math.MaxInt64, SuccessCount: math.MaxInt64,
+				ReliabilityRequestCount: math.MaxInt64, ReliabilityFailureCount: math.MaxInt64,
+				P95LatencyMs: math.MaxFloat64, P95TTFTMs: math.MaxFloat64,
+				OutputTokensPerSecond: math.MaxFloat64, Inflight: math.MaxInt64,
+			},
+			Cost: &ShadowCostInput{Known: true, Cost: math.MaxFloat64, UpdatedUnix: math.MaxInt64},
+			Breaker: &ShadowBreakerInput{
+				State: strings.Repeat("s", 32), Reason: strings.Repeat("r", 64),
+				CooldownUntilUnix: math.MaxInt64, HalfOpenInflight: math.MaxInt64, UpdatedUnix: math.MaxInt64,
+			},
+			Capacity: &ShadowCapacityInput{
+				SourceStatusCode: 599, CooldownUntilUnixMilli: math.MaxInt64, UpdatedUnixMilli: math.MaxInt64,
+			},
+		}
+	}
+	input, err := BuildShadowReplayInput(1, 7, 3, strings.Repeat("a", 64), profile, routingselector.Settings{
+		WeightAvailability: 1, AvailabilityFloor: 0, MinVolume: 1, TopK: 1,
+		MaxEjectedPct: 50, HalfOpenProbes: 1, SnapshotStaleSec: 1_800,
+		NowUnix: 1_000, NowUnixMilli: 1_000_000, RandomSeed: seed, PreferTTFT: true,
+	}, candidates)
+	require.NoError(t, err)
+	replayJSON, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(replayJSON), MaxDecisionReplayJSON)
+
+	replay, err := RunShadowReplay(input)
+	require.NoError(t, err)
+	decisionID, err := EnqueueDecision(DecisionInput{
+		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
+		SnapshotRevision: 7, AlgorithmVersion: DecisionAlgorithmShadowV1, IsStream: true,
+		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
+		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
+		Candidates: replay.Candidates, ReplayInput: &input,
+		DifferenceType: ClassifyShadowDifference(0, replay),
+	})
+	require.NoError(t, err)
+	_, err = FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, db.Where("decision_id = ?", decisionID).First(&audit).Error)
+	assert.True(t, audit.Replayable)
+	assert.Equal(t, MaxDecisionCandidates, audit.CandidateCount)
+	_, err = ReplayDecisionAudit(audit)
+	require.NoError(t, err)
+}
+
+func TestShadowReplaySupportsPoolBeyondAuditCandidateLimit(t *testing.T) {
+	db := openDecisionAuditTestDB(t, true)
+	withSnapshotTestDB(t, db)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+
+	requestID := "large-pool-replay"
+	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	require.NoError(t, err)
+	seed, err := DeriveShadowSeed(requestID, 8, 0)
+	require.NoError(t, err)
+	candidates := make([]ShadowCandidateInput, MaxDecisionCandidates+1)
+	for index := range candidates {
+		candidates[index] = ShadowCandidateInput{
+			PoolMemberID: index + 1,
+			ChannelID:    index + 1,
+			Weight:       1,
+		}
+	}
+	input, err := BuildShadowReplayInput(1, 8, 4, strings.Repeat("b", 64), profile, routingselector.Settings{
+		WeightAvailability: 1, TopK: 1, MaxEjectedPct: 50, HalfOpenProbes: 1,
+		SnapshotStaleSec: 1_800, NowUnix: 2_000, NowUnixMilli: 2_000_000, RandomSeed: seed,
+	}, candidates)
+	require.NoError(t, err)
+	replayJSON, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(replayJSON), MaxDecisionReplayJSON)
+	replay, err := RunShadowReplay(input)
+	require.NoError(t, err)
+	require.Len(t, replay.Candidates, MaxDecisionCandidates+1)
+
+	decisionID, err := EnqueueDecision(DecisionInput{
+		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
+		SnapshotRevision: 8, AlgorithmVersion: DecisionAlgorithmShadowV1,
+		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
+		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
+		Candidates: replay.Candidates, ReplayInput: &input,
+		DifferenceType: ClassifyShadowDifference(0, replay),
+	})
+	require.NoError(t, err)
+	_, err = FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, db.Where("decision_id = ?", decisionID).First(&audit).Error)
+	assert.True(t, audit.Replayable)
+	assert.Equal(t, MaxDecisionCandidates+1, audit.CandidateCount)
+	var payload struct {
+		Truncated  bool                `json:"truncated"`
+		Candidates []DecisionCandidate `json:"candidates"`
+	}
+	require.NoError(t, common.UnmarshalJsonStr(audit.CandidatesJSON, &payload))
+	assert.True(t, payload.Truncated)
+	require.Len(t, payload.Candidates, MaxDecisionCandidates)
+	_, err = ReplayDecisionAudit(audit)
+	require.NoError(t, err)
+}
+
+func TestOversizedShadowReplayPersistsChunksAndReplaysExactly(t *testing.T) {
+	db := openDecisionAuditTestDB(t, true)
+	withSnapshotTestDB(t, db)
+	ResetDecisionAuditsForTest(2)
+	t.Cleanup(func() { ResetDecisionAuditsForTest() })
+	chunkBatches := 0
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:replay_chunk_batches", func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*[]model.RoutingDecisionReplayChunk); ok {
+			chunkBatches++
+		}
+	}))
+
+	requestID := "oversized-pool-replay"
+	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	require.NoError(t, err)
+	seed, err := DeriveShadowSeed(requestID, 9, 0)
+	require.NoError(t, err)
+	candidates := make([]ShadowCandidateInput, model.RoutingPolicyMaxMembersPerPool)
+	for index := range candidates {
+		candidates[index] = ShadowCandidateInput{
+			PoolMemberID: index + 1,
+			ChannelID:    index + 1,
+			Weight:       1,
+			Metric: &ShadowMetricInput{
+				RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100,
+				ReliabilityFailureCount: 1, P95LatencyMs: 50, P95TTFTMs: 10,
+				OutputTokensPerSecond: 100,
+			},
+		}
+	}
+	input, err := BuildShadowReplayInput(1, 9, 5, strings.Repeat("c", 64), profile, routingselector.Settings{
+		WeightAvailability: 1, TopK: 1, MaxEjectedPct: 50, HalfOpenProbes: 1,
+		SnapshotStaleSec: 1_800, NowUnix: 3_000, NowUnixMilli: 3_000_000, RandomSeed: seed,
+	}, candidates)
+	require.NoError(t, err)
+	replayJSON, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.Greater(t, len(replayJSON), MaxDecisionReplayJSON)
+	replay, err := RunShadowReplay(input)
+	require.NoError(t, err)
+	require.Len(t, replay.Candidates, len(candidates))
+
+	decisionID, err := EnqueueDecision(DecisionInput{
+		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
+		SnapshotRevision: 9, AlgorithmVersion: DecisionAlgorithmShadowV1,
+		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
+		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
+		Candidates: replay.Candidates, ReplayInput: &input,
+		DifferenceType: ClassifyShadowDifference(0, replay),
+	})
+	require.NoError(t, err)
+	_, err = FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, db.Where("decision_id = ?", decisionID).First(&audit).Error)
+	assert.True(t, audit.Replayable)
+	assert.Empty(t, audit.ReplayInputJSON)
+	assert.Positive(t, audit.ReplayChunkCount)
+	assert.Equal(t, len(replayJSON), audit.ReplayInputBytes)
+	assert.Equal(t, len(candidates), audit.CandidateCount)
+	var chunks []model.RoutingDecisionReplayChunk
+	require.NoError(t, db.Where("decision_id = ?", decisionID).Order("chunk_index asc").Find(&chunks).Error)
+	require.Len(t, chunks, audit.ReplayChunkCount)
+	assert.Greater(t, chunkBatches, 1, "maximum legal pool replay must use byte-bounded database batches")
+	for index := range chunks {
+		assert.LessOrEqual(t, chunks[index].PayloadBytes, model.RoutingDecisionReplayChunkMaxBytes)
+	}
+	reassembled, err := model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(replayJSON), reassembled)
+	_, err = ReplayDecisionAudit(audit)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.RoutingDecisionReplayChunk{}).
+		Where("decision_id = ? AND chunk_index = ?", decisionID, 0).
+		Update("payload", chunks[0].Payload+"x").Error)
+	_, err = model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
+	assert.ErrorIs(t, err, model.ErrRoutingDecisionAuditInvalid)
+}
+
+func TestDecisionReplayChunksExternalDatabaseCompatibility(t *testing.T) {
+	tests := []struct {
+		name   string
+		envKey string
+		dbType common.DatabaseType
+	}{
+		{name: "mysql", envKey: "ROUTING_TEST_MYSQL_DSN", dbType: common.DatabaseTypeMySQL},
+		{name: "postgres", envKey: "ROUTING_TEST_POSTGRES_DSN", dbType: common.DatabaseTypePostgreSQL},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := os.Getenv(test.envKey)
+			if dsn == "" {
+				t.Skipf("%s is not set", test.envKey)
+			}
+			db := openSnapshotExternalTestDB(t, test.dbType, dsn)
+			withSnapshotTestDBType(t, db, test.dbType)
+			require.NoError(t, db.AutoMigrate(&model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}))
+
+			decisionID := "external-chunk-replay"
+			snapshotHash := strings.Repeat("a", 64)
+			policyHash := strings.Repeat("b", 64)
+			payload := []byte(`{"snapshot_hash":"` + snapshotHash + `","policy_hash":"` + policyHash + `","payload":"` +
+				strings.Repeat("x", model.RoutingDecisionReplayChunkMaxBytes+1) + `"}`)
+			totalHash, chunks, err := model.NewRoutingDecisionReplayChunks(decisionID, payload, 10)
+			require.NoError(t, err)
+			require.Greater(t, len(chunks), 1)
+			audit := model.RoutingDecisionAudit{
+				DecisionID: decisionID, Replayable: true, SnapshotHash: snapshotHash, PolicyHash: policyHash,
+				ReplayInputHash: totalHash, ReplayInputBytes: len(payload), ReplayChunkCount: len(chunks), CreatedTime: 10,
+			}
+			require.NoError(t, db.Create(&audit).Error)
+			require.NoError(t, db.Create(&chunks).Error)
+
+			reassembled, err := model.LoadRoutingDecisionReplayInputContext(context.Background(), audit)
+			require.NoError(t, err)
+			assert.Equal(t, string(payload), reassembled)
+			deleted, err := model.DeleteRoutingDecisionAuditsBeforeContext(context.Background(), 11)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), deleted)
+			var chunkCount int64
+			require.NoError(t, db.Model(&model.RoutingDecisionReplayChunk{}).Count(&chunkCount).Error)
+			assert.Zero(t, chunkCount)
+		})
+	}
 }
 
 func TestDecisionAuditBufferEnforcesTTLAndByteBudget(t *testing.T) {
@@ -254,7 +539,7 @@ func openDecisionAuditTestDB(t *testing.T, migrate bool) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	if migrate {
-		require.NoError(t, db.AutoMigrate(&model.RoutingDecisionAudit{}))
+		require.NoError(t, db.AutoMigrate(&model.RoutingDecisionAudit{}, &model.RoutingDecisionReplayChunk{}))
 	}
 	return db
 }

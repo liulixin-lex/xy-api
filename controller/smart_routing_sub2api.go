@@ -79,6 +79,29 @@ type routingSub2APIChannel struct {
 	Image           float64 `json:"image"`
 }
 
+type routingSub2APIAccountPricing struct {
+	Groups           map[string]routingSub2APIGroup
+	Rates            map[string]float64
+	Channels         []routingSub2APIChannel
+	BalanceKnown     bool
+	Balance          float64
+	BalanceUpdatedAt int64
+	SyncStatus       string
+	SyncError        string
+}
+
+func (pricing routingSub2APIAccountPricing) VersionMaterial() any {
+	return struct {
+		Groups   map[string]routingSub2APIGroup `json:"groups"`
+		Rates    map[string]float64             `json:"rates"`
+		Channels []routingSub2APIChannel        `json:"channels"`
+	}{
+		Groups:   pricing.Groups,
+		Rates:    pricing.Rates,
+		Channels: pricing.Channels,
+	}
+}
+
 type routingSub2APIJWTCacheEntry struct {
 	Ciphertext string
 	ExpiresAt  int64
@@ -138,62 +161,32 @@ var routingSub2APILoginCoordinator = struct {
 }
 
 func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) ([]model.RoutingCostSnapshot, error) {
-	managedJWT := strings.TrimSpace(credentials.Sub2APIToken) == ""
-	authKey := newRoutingSub2APIAuthKey(binding, credentials)
-	for attempt := 0; attempt < 2; attempt++ {
-		jwt, err := routingSub2APIJWT(ctx, binding, credentials)
-		if err != nil {
-			return nil, err
-		}
-		snapshots, managedJWTRejected, err := fetchRoutingSub2APICostSnapshotsWithJWT(ctx, binding, credentials, jwt)
-		if err == nil {
-			return snapshots, nil
-		}
-		if !managedJWT || !managedJWTRejected || attempt > 0 {
-			return nil, err
-		}
-		evictRoutingSub2APIJWT(ctx, authKey, jwt)
-	}
-	return nil, errors.New("sub2api fetch retry exhausted")
-}
-
-func fetchRoutingSub2APICostSnapshotsWithJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) ([]model.RoutingCostSnapshot, bool, error) {
-	if err := fetchRoutingSub2APIBalance(ctx, binding, credentials, jwt); err != nil && routingUpstreamAuthError(err) {
-		return nil, strings.TrimSpace(credentials.GatewayAPIKey) == "", err
-	}
-
-	groupsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/available", jwt, nil)
+	pricing, err := fetchRoutingSub2APIAccountPricing(ctx, binding, credentials)
 	if err != nil {
-		return nil, routingUpstreamAuthError(err), err
+		return nil, err
 	}
-	groups := parseRoutingSub2APIGroups(groupsRaw)
-	groupInfo, groupFound := groups[binding.UpstreamGroup]
+	if pricing.BalanceKnown {
+		if err := persistRoutingBalance(ctx, binding, pricing.Balance, pricing.BalanceUpdatedAt); err != nil && routingUpstreamAuthError(err) {
+			return nil, err
+		}
+	}
+	groupInfo, groupFound := pricing.Groups[binding.UpstreamGroup]
 	groupRatio := routingSub2APIGroupRatio(groupInfo)
 	if groupRatio <= 0 {
 		groupRatio = 1
 	}
-
-	ratesRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/rates", jwt, nil)
-	if err != nil {
-		return nil, routingUpstreamAuthError(err), err
-	}
-	if ratio, ok := parseRoutingSub2APIRates(ratesRaw)[binding.UpstreamGroup]; ok && ratio > 0 {
+	if ratio, ok := pricing.Rates[binding.UpstreamGroup]; ok && ratio > 0 {
 		groupRatio = ratio
+		groupFound = true
 	}
-
-	channelsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/channels/available", jwt, nil)
-	if err != nil {
-		return nil, routingUpstreamAuthError(err), err
-	}
-	channels := parseRoutingSub2APIChannels(channelsRaw)
 
 	now := common.GetTimestamp()
-	snapshots := make([]model.RoutingCostSnapshot, 0, len(channels))
+	snapshots := make([]model.RoutingCostSnapshot, 0, len(pricing.Channels))
 	modelNameMap, err := routingModelReverseMapping(ctx, binding.ChannelID)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	for _, channel := range channels {
+	for _, channel := range pricing.Channels {
 		if !routingSub2APIChannelServesBinding(channel, binding) {
 			continue
 		}
@@ -205,7 +198,69 @@ func fetchRoutingSub2APICostSnapshotsWithJWT(ctx context.Context, binding model.
 			snapshots = append(snapshots, snapshot)
 		}
 	}
-	return snapshots, false, nil
+	return snapshots, nil
+}
+
+func fetchRoutingSub2APIAccountPricing(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (routingSub2APIAccountPricing, error) {
+	managedJWT := strings.TrimSpace(credentials.Sub2APIToken) == ""
+	authKey := newRoutingSub2APIAuthKey(binding, credentials)
+	for attempt := 0; attempt < 2; attempt++ {
+		jwt, err := routingSub2APIJWT(ctx, binding, credentials)
+		if err != nil {
+			return routingSub2APIAccountPricing{}, err
+		}
+		pricing, managedJWTRejected, err := fetchRoutingSub2APIAccountPricingWithJWT(ctx, binding, credentials, jwt)
+		if err == nil {
+			return pricing, nil
+		}
+		if !managedJWT || !managedJWTRejected || attempt > 0 {
+			return routingSub2APIAccountPricing{}, err
+		}
+		evictRoutingSub2APIJWT(ctx, authKey, jwt)
+	}
+	return routingSub2APIAccountPricing{}, errors.New("sub2api fetch retry exhausted")
+}
+
+func fetchRoutingSub2APIAccountPricingWithJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) (routingSub2APIAccountPricing, bool, error) {
+	balance, balanceKnown, balanceErr := fetchRoutingSub2APIBalanceValue(ctx, binding, credentials, jwt)
+	if balanceErr != nil && routingUpstreamAuthError(balanceErr) {
+		return routingSub2APIAccountPricing{}, strings.TrimSpace(credentials.GatewayAPIKey) == "", balanceErr
+	}
+
+	groupsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/available", jwt, nil)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
+	}
+	groups := parseRoutingSub2APIGroups(groupsRaw)
+
+	ratesRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/rates", jwt, nil)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
+	}
+	rates := parseRoutingSub2APIRates(ratesRaw)
+
+	channelsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/channels/available", jwt, nil)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
+	}
+	channels := parseRoutingSub2APIChannels(channelsRaw)
+	pricing := routingSub2APIAccountPricing{
+		Groups:           groups,
+		Rates:            rates,
+		Channels:         channels,
+		BalanceKnown:     balanceKnown,
+		Balance:          balance,
+		BalanceUpdatedAt: common.GetTimestamp(),
+		SyncStatus:       model.RoutingUpstreamSyncStatusSuccess,
+	}
+	if !balanceKnown {
+		pricing.BalanceUpdatedAt = 0
+	}
+	if balanceErr != nil {
+		pricing.SyncStatus = model.RoutingUpstreamSyncStatusPartial
+		pricing.SyncError = common.SanitizeErrorMessage(balanceErr.Error(), routingCredentialSecrets(credentials)...)
+	}
+	return pricing, false, nil
 }
 
 func routingSub2APIJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (string, error) {
@@ -495,21 +550,34 @@ func routingSub2APIEnvelopeAuthFailure(envelope routingSub2APIEnvelope) bool {
 }
 
 func fetchRoutingSub2APIBalance(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) error {
+	balance, known, err := fetchRoutingSub2APIBalanceValue(ctx, binding, credentials, jwt)
+	if err != nil || !known {
+		return err
+	}
+	return persistRoutingBalance(ctx, binding, balance, common.GetTimestamp())
+}
+
+func fetchRoutingSub2APIBalanceValue(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	jwt string,
+) (float64, bool, error) {
 	token := strings.TrimSpace(credentials.GatewayAPIKey)
 	if token == "" {
 		token = strings.TrimSpace(jwt)
 	}
 	if token == "" {
-		return nil
+		return 0, false, nil
 	}
 	raw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/v1/usage", token, nil)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if balance, ok := parseRoutingSub2APIBalance(raw); ok {
-		return persistRoutingBalance(ctx, binding, balance, common.GetTimestamp())
+		return balance, true, nil
 	}
-	return nil
+	return 0, false, nil
 }
 
 func parseRoutingSub2APIBalance(raw json.RawMessage) (float64, bool) {
@@ -696,6 +764,7 @@ func routingSub2APIChannelModels(channel routingSub2APIChannel) []string {
 	for modelName := range modelSet {
 		models = append(models, modelName)
 	}
+	sort.Strings(models)
 	return models
 }
 

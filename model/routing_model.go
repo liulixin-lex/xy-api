@@ -142,8 +142,9 @@ func (binding *RoutingChannelBinding) GetCredentials() (RoutingCredentials, erro
 
 type RoutingCostSnapshot struct {
 	ID              int     `json:"id" gorm:"primaryKey"`
-	ChannelID       int     `json:"channel_id" gorm:"uniqueIndex:idx_routing_cost_channel_model,priority:1;index"`
-	ModelName       string  `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_cost_channel_model,priority:2;index"`
+	ChannelID       int     `json:"channel_id" gorm:"uniqueIndex:idx_routing_cost_channel_model_key,priority:1;index"`
+	ModelName       string  `json:"model_name" gorm:"type:varchar(128);index"`
+	ModelKey        *string `json:"-" gorm:"type:char(64);uniqueIndex:idx_routing_cost_channel_model_key,priority:2"`
 	QuotaType       int     `json:"quota_type"`
 	GroupRatio      float64 `json:"group_ratio"`
 	BaseRatio       float64 `json:"base_ratio"`
@@ -173,12 +174,15 @@ func UpsertRoutingCostSnapshotContext(ctx context.Context, snapshot *RoutingCost
 }
 
 func upsertRoutingCostSnapshot(db *gorm.DB, snapshot *RoutingCostSnapshot) error {
+	modelKey := RoutingCostModelKey(snapshot.ModelName)
+	snapshot.ModelKey = &modelKey
 	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "channel_id"},
-			{Name: "model_name"},
+			{Name: "model_key"},
 		},
 		DoUpdates: clause.Assignments(map[string]interface{}{
+			"model_name":       snapshot.ModelName,
 			"quota_type":       snapshot.QuotaType,
 			"group_ratio":      snapshot.GroupRatio,
 			"base_ratio":       snapshot.BaseRatio,

@@ -22,10 +22,10 @@
 - 主仓库：`/opt/xy-api`
 - 专用工作树：`/root/.config/superpowers/worktrees/xy-api/feat-channel-routing-v2`
 - 分支：`feat/channel-routing-v2`
-- 当前 HEAD：`bcb6602b`（Gate 1 已提交）；Gate 2 已完成验证，等待单独提交。
+- 当前 HEAD：`90b25f8a`（Gate 2 已提交）；Gate 3 已完成验证，等待单独提交。
 - 开发基线位于专用分支 `feat/channel-routing-v2`，不在 `/opt/xy-api` 的 main 工作树直接开发。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
-- 正式 `web/default` 前端尚未开始；必须等 Phase 2 DTO/API/权限语义稳定后进入。
+- 正式 `web/default` 前端尚未开始；Gate 3 DTO/API/权限语义已稳定，后端 Phase 3–5 完成后进入正式工作区实现。
 - 旧并行 Task 4 工作树仍存在，但不作为当前实现真源。
 
 ## Progress
@@ -37,7 +37,7 @@
 - [x] Phase 0C：真实 Output Token、独立 attempt latency/generation duration 与 TTFT 接线；渠道级 TPS 改为真实 Token/s；重试 attempt 遥测隔离。
 - [x] Phase 0D：统一/收敛 `routing_metrics` 与 `perf_metrics` 生命周期语义；修复设置竞态、无界桶、永久 Worker、退避/Jitter/可观测边界；完成 Gate 1 总审计。
 - [x] Phase 1 Observe：Pool、Member、稳定 Credential ID、统一有界遥测、兼容迁移、只读 API、新选择器仅审计。
-- [ ] Phase 2 Shadow：双算、差异审计、决策重放、Revision/Outbox/Redis Stream、增量聚合、成本快照、多实例降级。
+- [x] Phase 2 Shadow：双算、差异审计、决策重放、Revision/Outbox/Redis Stream、增量聚合、成本快照、多实例降级。
 - [ ] Phase 3 Canary：确定性灰度、自动回滚、容量预留、慢启动、故障注入；Hedging 保持关闭。
 - [ ] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、兼容改名。
 - [ ] Phase 5 Enterprise SLO：严格容量租约、多区域、独立 RBAC、双人审批、Error Budget Burn、审计导出、预算 Hedging。
@@ -57,7 +57,7 @@
 | CR-0.6 | 真实 Output Token、TTFT、Token/s | `8f43ee5a..d7b3b3e2`；结算边界同步 usage、attempt end、routing bucket、Hot Cache、Selector 与 stream hint 测试 | PASS |
 | CR-0.7 | Cost Connector 与 Serving health 分离 | Phase 0B Task 9 tests | PASS |
 | CR-1 | Pool/Member/Credential/Observe/三库迁移/只读 API | Phase 1 模型、stable rollup、不可变快照、审计、v2 API、三库与 Race 证据 | PASS（Gate 2） |
-| CR-2 | Shadow、Revision、Outbox、Redis Stream、重放、正确可合并分布 | 尚无实现 | PENDING |
+| CR-2 | Shadow、Revision、Outbox、Redis Stream、重放、正确可合并分布 | Gate 3 实现、三库/Redis/Race/Vet/Build 与独立 P0/P1 审查 | PASS（等待提交） |
 | CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | 尚无实现 | PENDING |
 | CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 尚无 v2 实现 | PENDING |
 | CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | 尚无实现 | PENDING |
@@ -72,9 +72,34 @@
 1. [完成] Phase 0C：结算层真实 usage 与 attempt end、retry reset、渠道 bucket、真实 Token/s、流式 TTFT 评分及旧选择点 stream hint。
 2. [完成] Phase 0D / Gate 1：有界状态、正确分类、容量分离、真实 TTFT/Token/s、Worker 生命周期、安全与最终 flush。
 3. [完成] Phase 1 / Gate 2：稳定身份、stable telemetry + rollup、不可变快照、Observe 审计、只读 v2 API、三库与并发验证。
-4. [当前] Phase 2 / Gate 3：可合并分布、Shadow 双算/重放、Revision/Activation/Outbox、Redis Stream、node sequence 幂等与增量聚合。
-5. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
-6. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
+4. [完成] Phase 2 / Gate 3：可合并分布、Shadow 双算/重放、Revision/Activation/Outbox、Redis Stream、node sequence 幂等与增量聚合。
+5. [当前] Phase 3 / Gate 4：确定性 Canary、请求级固定快照、软容量预留、慢启动、结果窗口和自动回滚。
+6. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
+7. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
+
+### Phase 2 implementation slices
+
+1. 可合并分布：固定 DDSketch codec v1（2% 相对误差、384 bins、1 小时输入上限），保存 latency/TTFT 官方 protobuf；所有解码先做字节、mapping、bin、count、有限值和版本校验。
+2. Stable telemetry 接线：热桶维护分布，Snapshot/Drain/Requeue 深拷贝且有项目数/字节上限；Token/s 继续按 `sum(output_tokens) / sum(generation_ms)` 计算。
+3. Rollup 与幂等摄取：扩展 nullable sketch 字段，数据库事务内以 `(node_epoch_id, sequence)` Receipt 去重、受检累加计数并在 Go 中合并分布；模糊提交不得生成新 sequence。
+4. Snapshot 读取：Repeatable Read 内分页读取原始 Rollup，在 Go 中按 Member+Model 合并 Credential/Bucket；只有 sample coverage 完整时才公开 p50/p95/p99，旧数据不伪造百分位。
+5. 版本化控制平面：Policy Head CAS、不可变 Revision、版本化 Pool/Member、Activation、Transactional Outbox、Runtime Checkpoint；回滚只创建更高 Revision。
+6. Redis 多节点：配置 Stream 对每个节点广播并由 DB 对账兜底；遥测 Stream 使用 consumer group，DB Receipt 提供最终幂等；Redis 故障时继续 LKG 并走 DB fallback。
+7. 版本化成本：按 Upstream Account 聚合同步，不可变成本历史与兼容 latest dual-write，Expected/Worst/Effective Cost、freshness/confidence 语义完整且不改变用户结算。
+8. 确定性 Shadow/Replay：白名单 RequestProfile、DB Policy Revision、Snapshot Hash、算法版本以及 `Request ID + Revision + Retry Index` 种子；同一审计重放必须逐项一致，Shadow 不改变 legacy 实际渠道。
+9. Gate 3 收口：只读/重放/仿真 API、多节点传播状态、pipeline lag 和降级原因；完成三库、Redis 故障、Race/Vet/Build 与独立 P0/P1 审查后才进入 Canary。
+
+### Phase 3 implementation slices
+
+1. Activation 快照：在同一 Repeatable Read 中校验 Head、Revision 与 Activation；快照携带 Activation ID、Stage 和 Traffic Basis Points，并拒绝 Pool/Activation 阶段冲突。
+2. 确定性门控：按 `PoolID + RequestID` 计算稳定 0–9999 bucket；Canary 仅允许 100–500 BP，扩容时旧 cohort 必须保持为子集，Retry/节点变化不得改变 cohort。
+3. 请求级固定会话：一次逻辑请求固定 runtime snapshot、revision、pool/member identity；Canary cohort 绕过 legacy affinity，control cohort 完整保留旧行为。
+4. Canary 实际选路：复用 Shadow V1 的确定性候选与评分，加入请求内失败目标排除；Phase 4 前不启用 Weighted P2C/探索，Hedging 在策略和运行时双重禁止。
+5. 本机软容量：有界、分片、TTL 的 RPM/输入 TPM/输出 TPM/并发预留；Setup/发送失败可取消，结束释放，明确标记 `local_soft`，严格共享租约留 Phase 5。
+6. 慢启动：新成员和恢复成员从保守份额线性 Ramp；因子进入 Canary 重放和有效容量，冷节点重启不得瞬间恢复满流量。
+7. Canary 结果窗口：按 rollout/cohort 记录逻辑成功、TTFT 可合并分布、成本覆盖和 Retry 放大；使用绝对 checkpoint 与 node sequence，未知数据不伪造通过。
+8. 自动回滚：Control Lease 单执行者、持久化 Evaluation/Operation、连续完整窗口触发 Pool-scoped 更高 Revision 回滚；不得整 Revision 覆盖其他 Pool。
+9. Gate 4 故障注入：覆盖 DNS/TLS/401/403/402/429/529/5xx/首字超时/提交后错误，并断言最大并发 attempt 始终为 1。
 
 ## Validation and Acceptance
 
@@ -115,6 +140,17 @@
 - 全仓 Race 仍复现既有 `service/task_polling`/`logger` 竞态；本阶段相关包定向 Race 通过。
 - 独立 blocker review：无未解决 P0/P1。Phase 2 接管模糊提交去重、DDSketch/HDR 与 DB 聚合热点。
 
+### Gate 3 fresh evidence（2026-07-12）
+
+- `go test ./... -count=1`、`go vet ./...`、`go build ./...`：exit 0。
+- `go test -race ./service/channelrouting -count=1`：exit 0；Model 成本历史定向 Race、Middleware Race、Rollup/Distribution 定向 Race 均通过。
+- MySQL 5.7.44、PostgreSQL 15.18：Policy/Replay Chunk、Cost V2、Rollup/Receipt、Control Lease、Snapshot、旧非空成本表增量迁移和 Retention 全部 PASS，无 SKIP。
+- Redis 7.4.9：多节点 Config Stream、Telemetry commit-before-ack 幂等重投、pending/undelivered/backlog 与 oldest age 全部 PASS。
+- 60 KiB Receipt tombstone、4096 Policy Member/Shadow Candidate、约 1 MiB DB 动态分批、最大 Replay Chunk、最终 Flush、多节点传播状态等高风险回归通过。
+- 独立 P0/P1 审查发现并修复：成本观测历史无界增长、普通 Policy Head 检查深拷贝完整快照；修复后跨库与 Race 复验通过。
+- 全仓首次复跑发现 Middleware fixture 缺少 Policy 迁移，已补齐完整 Policy 控制面模型并通过全仓复跑。
+- `git diff --check`、JSON wrapper、敏感信息、临时容器/测试库清理审计：PASS。
+
 ## Surprises & Discoveries
 
 - 旧会话只完成 Phase 0A/0B；最后的“已完成”只指 Phase 0B 收尾，不是完整渠道路由 2.0。
@@ -150,4 +186,4 @@
 
 ## Outcomes & Retrospective
 
-Gate 2 已完成并有新鲜三库、Race、Vet、Build 与全仓测试证据；完整目标仍进行中。下一恢复点是 Phase 2 Shadow 的可合并分布与 node sequence/outbox 基础切片。
+Gate 3 已完成并有新鲜三库、Redis、Race、Vet、Build、全仓测试和独立 P0/P1 审查证据；完整目标仍进行中。下一恢复点是 Phase 3 Activation 快照、确定性 Canary 门控和请求级固定会话。
