@@ -462,6 +462,7 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingPolicyPoolRevision{},
 		&model.RoutingPolicyMemberRevision{},
 		&model.RoutingPolicyActivation{},
+		&model.RoutingPolicyDraft{},
 		&model.RoutingConfigOutbox{},
 		&model.RoutingRuntimeCheckpoint{},
 		&model.RoutingChannelBinding{},

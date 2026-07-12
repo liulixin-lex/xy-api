@@ -16,6 +16,9 @@ func registerChannelRoutingRoutes(apiRouter *gin.RouterGroup) {
 	for _, item := range channelRoutingReadRoutes {
 		route.Handle(item.method, item.path, middleware.RequirePermission(item.permission), item.handler)
 	}
+	for _, item := range channelRoutingWriteRoutes {
+		route.Handle(item.method, item.path, middleware.RequirePermission(item.permission), item.handler)
+	}
 }
 
 var channelRoutingReadRoutes = []permissionRoute{
@@ -29,4 +32,12 @@ var channelRoutingReadRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/decisions/:id", permission: authz.ChannelRead, handler: controller.GetChannelRoutingDecision},
 	{method: http.MethodPost, path: "/decisions/:id/replay", permission: authz.ChannelRead, handler: controller.ReplayChannelRoutingDecision},
 	{method: http.MethodPost, path: "/groups/:id/simulations", permission: authz.ChannelRead, handler: controller.SimulateChannelRoutingGroup},
+	{method: http.MethodGet, path: "/policy-drafts", permission: authz.ChannelRead, handler: controller.ListChannelRoutingPolicyDrafts},
+	{method: http.MethodGet, path: "/policy-drafts/:id", permission: authz.ChannelRead, handler: controller.GetChannelRoutingPolicyDraft},
+}
+
+var channelRoutingWriteRoutes = []permissionRoute{
+	{method: http.MethodPost, path: "/policy-drafts", permission: authz.ChannelWrite, handler: controller.CreateChannelRoutingPolicyDraft},
+	{method: http.MethodPut, path: "/policy-drafts/:id", permission: authz.ChannelWrite, handler: controller.UpdateChannelRoutingPolicyDraft},
+	{method: http.MethodPost, path: "/policy-drafts/:id/validate", permission: authz.ChannelWrite, handler: controller.ValidateChannelRoutingPolicyDraft},
 }

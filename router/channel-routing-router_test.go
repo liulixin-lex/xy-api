@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestChannelRoutingV2RoutesAreReadOnlyAndPermissionProtected(t *testing.T) {
+func TestChannelRoutingV2RoutesUseExplicitPermissions(t *testing.T) {
 	expected := map[string]string{
 		"/overview":               http.MethodGet,
 		"/nodes":                  http.MethodGet,
@@ -21,6 +21,8 @@ func TestChannelRoutingV2RoutesAreReadOnlyAndPermissionProtected(t *testing.T) {
 		"/decisions/:id":          http.MethodGet,
 		"/decisions/:id/replay":   http.MethodPost,
 		"/groups/:id/simulations": http.MethodPost,
+		"/policy-drafts":          http.MethodGet,
+		"/policy-drafts/:id":      http.MethodGet,
 	}
 	assert.Len(t, channelRoutingReadRoutes, len(expected))
 	paths := make(map[string]struct{}, len(channelRoutingReadRoutes))
@@ -30,5 +32,16 @@ func TestChannelRoutingV2RoutesAreReadOnlyAndPermissionProtected(t *testing.T) {
 		_, duplicate := paths[route.path]
 		assert.False(t, duplicate)
 		paths[route.path] = struct{}{}
+	}
+
+	writeExpected := map[string]string{
+		"/policy-drafts":              http.MethodPost,
+		"/policy-drafts/:id":          http.MethodPut,
+		"/policy-drafts/:id/validate": http.MethodPost,
+	}
+	assert.Len(t, channelRoutingWriteRoutes, len(writeExpected))
+	for _, route := range channelRoutingWriteRoutes {
+		assert.Equal(t, writeExpected[route.path], route.method)
+		assert.Equal(t, authz.ChannelWrite, route.permission)
 	}
 }

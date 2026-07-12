@@ -18,8 +18,9 @@ const (
 	RoutingPolicyDraftStatusValidated = "validated"
 	RoutingPolicyDraftStatusPublished = "published"
 
-	RoutingPolicyDraftMaxPageSize   = 100
-	routingPolicyDraftSchemaVersion = 1
+	RoutingPolicyDraftMaxPageSize      = 100
+	RoutingPolicyDraftMaxDocumentBytes = routingPolicyMaxCanonicalBytes
+	routingPolicyDraftSchemaVersion    = 1
 )
 
 var (
@@ -435,6 +436,10 @@ func (draft RoutingPolicyDraft) Document() (RoutingPolicyDocument, error) {
 		return RoutingPolicyDocument{}, ErrRoutingPolicyDraftInvalid
 	}
 	return document, nil
+}
+
+func (draft RoutingPolicyDraft) Summary() RoutingPolicyDraftSummary {
+	return draft.summary()
 }
 
 func normalizeRoutingPolicyDraftDocument(
