@@ -86,13 +86,20 @@ func cacheGetChannelRoutingCanary(
 			return nil, group, true, err
 		}
 		if !active {
-			if shouldActivateSmartRouting(setting) {
-				channel, err = selectSmartChannelForGroup(param, group, setting, true)
-				if err != nil {
-					return nil, group, true, err
+			var balancedActive bool
+			channel, balancedActive, err = selectChannelRoutingBalancedForGroup(param, group)
+			if err != nil {
+				return nil, group, true, err
+			}
+			if !balancedActive {
+				if shouldActivateSmartRouting(setting) {
+					channel, err = selectSmartChannelForGroup(param, group, setting, true)
+					if err != nil {
+						return nil, group, true, err
+					}
+				} else {
+					channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
 				}
-			} else {
-				channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
 			}
 		} else if !inCanary {
 			channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
@@ -347,6 +354,9 @@ func ShouldBypassChannelRoutingAffinity(c *gin.Context, group string) (bool, err
 	if c == nil || group == "" || group == "auto" || !setting.Enabled || !common.MemoryCacheEnabled {
 		return false, nil
 	}
+	if stage, exists := channelrouting.CurrentPoolDeploymentStage(group); exists && stage == model.RoutingDeploymentStageActive {
+		return true, nil
+	}
 	gate, active, err := channelRoutingCanaryGate(c, group)
 	if err != nil {
 		return true, err
@@ -387,6 +397,10 @@ func GetAdmissibleAffinityChannelWithRoutingGate(
 		}
 		if !preferredAllowed {
 			continue
+		}
+		if stage, exists := channelrouting.CurrentPoolDeploymentStage(group); exists && stage == model.RoutingDeploymentStageActive {
+			setChannelRoutingBalancedAffinity(c, group, preferredID)
+			return nil, group, true, nil
 		}
 
 		bypass, err := ShouldBypassChannelRoutingAffinity(c, group)

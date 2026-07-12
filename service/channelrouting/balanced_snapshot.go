@@ -69,6 +69,12 @@ func (snapshot *runtimeSnapshot) compileBalancedPools() error {
 				if err != nil {
 					return fmt.Errorf("compile balanced pool %d model %q: %w", pool.ID, key.model, err)
 				}
+				// Exact expected cost depends on the request token/media profile. Keep
+				// every structurally valid member in the immutable plan and require the
+				// request session to supply the authoritative runtime cost override.
+				candidate.Candidate.Cost = &routingselector.CostSnapshot{
+					Known: true, Cost: settings.CostTarget, UpdatedUnix: settings.NowUnix,
+				}
 				candidates = append(candidates, candidate)
 			}
 			prepared, err := routingselector.PrepareBalanced(candidates, settings)

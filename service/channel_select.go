@@ -98,6 +98,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	if channel, selectGroup, handled, err := cacheGetChannelRoutingCanary(param, smartSetting); handled {
 		return channel, selectGroup, err
 	}
+	if channel, selectGroup, handled, err := cacheGetChannelRoutingBalanced(param, smartSetting); handled {
+		return channel, selectGroup, err
+	}
 	if shouldActivateSmartRouting(smartSetting) {
 		channel, selectGroup, handled, err := cacheGetSmartSatisfiedChannel(param, smartSetting)
 		if err != nil {

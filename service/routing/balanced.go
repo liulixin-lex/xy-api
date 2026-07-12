@@ -416,6 +416,18 @@ func (prepared *PreparedBalancedPool) Select(request BalancedRequest) (BalancedD
 	return BalancedDecision{}, nil
 }
 
+// SelectDetailed returns the same deterministic choice as Select together
+// with immutable diagnostics for audit, simulation, and replay paths.
+func (prepared *PreparedBalancedPool) SelectDetailed(request BalancedRequest) (BalancedDecision, error) {
+	decision, err := prepared.Select(request)
+	if err != nil {
+		return BalancedDecision{}, err
+	}
+	prepared.materializeSelected(request, &decision)
+	prepared.decorateDecision(request, &decision)
+	return decision, nil
+}
+
 type balancedEffectiveRuntimeState struct {
 	capacityUtilization float64
 	queueDelayMs        float64
