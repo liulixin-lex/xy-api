@@ -144,10 +144,10 @@ func loadCanaryNodePresenceCheckpointsContext(
 	ctx context.Context,
 	target canaryEvaluationTarget,
 	now time.Time,
-) ([]model.RoutingRuntimeCheckpoint, error) {
+) ([]model.RoutingRuntimeCheckpoint, []model.RoutingRuntimeCheckpoint, error) {
 	identity, err := canaryNodePresenceIdentityFromTarget(target)
 	if err != nil || now.IsZero() {
-		return nil, ErrCanaryNodePresenceInvalid
+		return nil, nil, ErrCanaryNodePresenceInvalid
 	}
 	checkpoints, err := listCanaryCheckpointsContext(
 		ctx,
@@ -156,26 +156,29 @@ func loadCanaryNodePresenceCheckpointsContext(
 		now.Unix(),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	matching := make([]model.RoutingRuntimeCheckpoint, 0, len(checkpoints))
+	invalid := make([]model.RoutingRuntimeCheckpoint, 0)
 	for index := range checkpoints {
 		checkpoint := checkpoints[index]
 		if checkpoint.PolicyRevision != identity.PolicyRevision || checkpoint.ObservedTime <= 0 ||
 			checkpoint.ObservedTime > now.Unix() || checkpoint.CreatedTime <= 0 ||
 			checkpoint.CreatedTime > checkpoint.ObservedTime {
-			return nil, ErrCanaryNodePresenceInvalid
+			invalid = append(invalid, checkpoint)
+			continue
 		}
 		var payload canaryNodePresencePayload
 		if checkpoint.DecodePayload(&payload) != nil || payload.SchemaVersion != canaryNodePresenceSchemaVersion ||
 			payload.PolicyHash != identity.PolicyHash || payload.ActivationID != identity.ActivationID ||
 			payload.ActivationStage != model.RoutingDeploymentStageCanary ||
 			payload.TrafficBasisPoints != identity.TrafficBasisPoints {
-			return nil, ErrCanaryNodePresenceInvalid
+			invalid = append(invalid, checkpoint)
+			continue
 		}
 		matching = append(matching, checkpoint)
 	}
-	return matching, nil
+	return matching, invalid, nil
 }
 
 func canaryNodePresenceScope(identity canaryNodePresenceIdentity) string {

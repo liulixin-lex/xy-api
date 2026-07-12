@@ -138,7 +138,11 @@ func evaluateRoutingCanarySweepContext(
 	if len(pending) == 0 {
 		return nil
 	}
-	nodeCheckpoints, err := loadCanaryNodePresenceCheckpointsContext(ctx, pending[0].target, now)
+	nodeCheckpoints, invalidNodeCheckpoints, err := loadCanaryNodePresenceCheckpointsContext(
+		ctx,
+		pending[0].target,
+		now,
+	)
 	if err != nil {
 		return err
 	}
@@ -152,10 +156,20 @@ func evaluateRoutingCanarySweepContext(
 		if activeErr != nil {
 			return activeErr
 		}
+		invalidNodes, invalidErr := activeCanaryNodeIDsForWindow(
+			invalidNodeCheckpoints,
+			pending[index].windowStartMs,
+			pending[index].windowEndMs,
+			now,
+		)
+		if invalidErr != nil {
+			return invalidErr
+		}
 		if err := evaluateRoutingCanaryTargetContext(
 			ctx,
 			pending[index].target,
 			activeNodes,
+			len(invalidNodes) > 0,
 			pending[index].windowStartMs,
 			pending[index].windowEndMs,
 			now,
@@ -300,6 +314,7 @@ func evaluateRoutingCanaryTargetContext(
 	ctx context.Context,
 	target canaryEvaluationTarget,
 	activeNodes map[string]struct{},
+	forceTelemetryGap bool,
 	windowStartMs int64,
 	windowEndMs int64,
 	now time.Time,
@@ -326,6 +341,7 @@ func evaluateRoutingCanaryTargetContext(
 			ctx,
 			target,
 			activeNodes,
+			forceTelemetryGap,
 			windowStartMs,
 			windowEndMs,
 			now.Unix(),
@@ -371,6 +387,7 @@ func loadCanaryWindowAggregateContext(
 	ctx context.Context,
 	target canaryEvaluationTarget,
 	activeNodes map[string]struct{},
+	forceTelemetryGap bool,
 	windowStartMs int64,
 	windowEndMs int64,
 	nowUnix int64,
@@ -416,6 +433,9 @@ func loadCanaryWindowAggregateContext(
 	}
 	aggregate.ReportedNodes = len(reported)
 	aggregate.NodeCoverageBasisPoints = canaryBasisPoints(int64(aggregate.ReportedNodes), int64(aggregate.ExpectedNodes))
+	if forceTelemetryGap {
+		aggregate.NodeCoverageBasisPoints = 0
+	}
 	return aggregate, nil
 }
 

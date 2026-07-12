@@ -150,7 +150,7 @@ func TestCanaryNodePresenceHeartbeatFailsClosedWhenPersistenceIsUnavailable(t *t
 	assert.Error(t, err)
 }
 
-func TestCanaryNodePresenceRejectsMismatchedPayload(t *testing.T) {
+func TestCanaryNodePresenceSeparatesMismatchedPayload(t *testing.T) {
 	db := openCanaryWindowTestDB(t, true)
 	withCanaryWindowTestDB(t, db)
 	view := canaryPresenceSnapshotViewForTest()
@@ -174,6 +174,8 @@ func TestCanaryNodePresenceRejectsMismatchedPayload(t *testing.T) {
 		now.Add(canaryNodePresenceTTL).Unix(),
 	)
 	require.NoError(t, err)
+	checkpoint.CreatedTime = now.Unix()
+	checkpoint.UpdatedTime = now.Unix()
 	_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), checkpoint)
 	require.NoError(t, err)
 
@@ -182,8 +184,124 @@ func TestCanaryNodePresenceRejectsMismatchedPayload(t *testing.T) {
 	target.PolicyHash = identity.PolicyHash
 	target.ActivationID = identity.ActivationID
 	target.TrafficBasisPoints = identity.TrafficBasisPoints
-	_, err = loadCanaryNodePresenceCheckpointsContext(context.Background(), target, now)
-	assert.ErrorIs(t, err, ErrCanaryNodePresenceInvalid)
+	matching, invalid, err := loadCanaryNodePresenceCheckpointsContext(context.Background(), target, now)
+	require.NoError(t, err)
+	assert.Empty(t, matching)
+	require.Len(t, invalid, 1)
+	assert.Equal(t, "node-a", invalid[0].NodeID)
+
+	windowEnd := now.Add(-time.Minute).Truncate(time.Second)
+	invalidNodes, err := activeCanaryNodeIDsForWindow(
+		invalid,
+		windowEnd.Add(-5*time.Minute).UnixMilli(),
+		windowEnd.UnixMilli(),
+		now,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, invalidNodes, "presence created after a closed window must not poison that window")
+}
+
+func TestCanaryEvaluatorFailsClosedOnSemanticallyInvalidPresence(t *testing.T) {
+	ResetSnapshotForTest()
+	ResetCanaryControlForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	t.Cleanup(ResetCanaryControlForTest)
+	db := openCanaryWindowTestDB(t, false)
+	withCanaryWindowTestDB(t, db)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingRuntimeCheckpoint{},
+		&model.RoutingCanaryEvaluation{},
+		&model.RoutingOperation{},
+	))
+
+	windowEnd := time.Unix(1_700_000_100, 0)
+	windowStart := windowEnd.Add(-5 * time.Minute)
+	now := windowEnd.Add(11 * time.Second)
+	policy := model.DefaultRoutingCanaryPolicy()
+	policy.Evaluation.WindowSeconds = 300
+	policy.Evaluation.EvaluationIntervalSeconds = 60
+	policy.Evaluation.CheckpointLatenessSeconds = 5
+	policy.Evaluation.RolloutGraceSeconds = 0
+	policy.Evaluation.ConsecutiveBreachWindows = 1
+
+	view := canaryPresenceSnapshotViewForTest()
+	view.ActivationCreatedTime = windowStart.Add(-time.Hour).Unix()
+	view.Pools[0].CanaryPolicy = policy
+	currentSnapshot.Store(&runtimeSnapshot{view: view})
+	rolloutKey, err := CanaryRolloutKey(
+		view.Pools[0].ID,
+		view.ActivationID,
+		view.Revision,
+		view.TrafficBasisPoints,
+	)
+	require.NoError(t, err)
+
+	identity, err := canaryNodePresenceIdentityFromView(view)
+	require.NoError(t, err)
+	presence, err := model.NewRoutingRuntimeCheckpoint(
+		"node-a",
+		RoutingCanaryNodePresenceCheckpointKind,
+		canaryNodePresenceScope(identity),
+		identity.PolicyRevision,
+		1,
+		canaryNodePresencePayload{
+			SchemaVersion:      canaryNodePresenceSchemaVersion,
+			PolicyHash:         strings.Repeat("d", 64),
+			ActivationID:       identity.ActivationID,
+			ActivationStage:    model.RoutingDeploymentStageCanary,
+			TrafficBasisPoints: identity.TrafficBasisPoints,
+		},
+		now.Unix(),
+		now.Add(canaryNodePresenceTTL).Unix(),
+	)
+	require.NoError(t, err)
+	presence.CreatedTime = windowStart.Add(10 * time.Second).Unix()
+	presence.UpdatedTime = now.Unix()
+	_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), presence)
+	require.NoError(t, err)
+
+	stats := canaryWindowAggregateForEvaluatorFixture(t)
+	payload := CanaryCohortWindowCheckpoint{
+		SchemaVersion:      canaryCohortWindowSchemaVersion,
+		PoolID:             view.Pools[0].ID,
+		ActivationID:       view.ActivationID,
+		PolicyRevision:     view.Revision,
+		TrafficBasisPoints: view.TrafficBasisPoints,
+		RolloutKey:         rolloutKey,
+		WindowSeconds:      policy.Evaluation.WindowSeconds,
+		WindowStartUnixMs:  windowStart.UnixMilli(),
+		WindowEndUnixMs:    windowEnd.UnixMilli(),
+		Control:            canaryWindowStatsForTest(t, stats.Control),
+		Canary:             canaryWindowStatsForTest(t, stats.Canary),
+	}
+	windowCheckpoint, err := model.NewRoutingRuntimeCheckpoint(
+		"node-a",
+		CanaryCohortWindowCheckpointKind,
+		CanaryWindowCheckpointScope(payload),
+		int64(view.Revision),
+		1,
+		payload,
+		windowEnd.Unix(),
+		now.Add(time.Hour).Unix(),
+	)
+	require.NoError(t, err)
+	_, err = model.UpsertRoutingRuntimeCheckpointContext(context.Background(), windowCheckpoint)
+	require.NoError(t, err)
+
+	require.NoError(t, evaluateRoutingCanarySweepContext(
+		context.Background(),
+		smart_routing_setting.SmartRoutingSetting{Enabled: true},
+		now,
+	))
+	var evaluation model.RoutingCanaryEvaluation
+	require.NoError(t, db.First(&evaluation).Error)
+	assert.Equal(t, model.RoutingCanaryEvaluationStatusBreached, evaluation.Status)
+	assert.Equal(t, "node checkpoint coverage below policy", evaluation.Reason)
+	assert.Zero(t, evaluation.NodeCoverageBasisPoints)
+
+	var operationCount int64
+	require.NoError(t, db.Model(&model.RoutingOperation{}).Count(&operationCount).Error)
+	assert.Equal(t, int64(1), operationCount)
 }
 
 func TestCanaryNodePresenceOnlyCountsNodesCreatedBeforeWindowClose(t *testing.T) {
