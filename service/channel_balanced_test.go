@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy(t *testing.T) {
 	truncate(t)
 	channelrouting.ResetSnapshotForTest()
+	channelrouting.ResetDecisionAuditsForTest()
 	smart_routing_setting.ResetForTest()
 	previousMemoryCache := common.MemoryCacheEnabled
 	previousRuntime := channelRoutingCanaryRuntime
@@ -29,6 +31,7 @@ func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy
 		common.MemoryCacheEnabled = previousMemoryCache
 		channelRoutingCanaryRuntime = previousRuntime
 		channelrouting.ResetSnapshotForTest()
+		channelrouting.ResetDecisionAuditsForTest()
 		smart_routing_setting.ResetForTest()
 	})
 
@@ -48,7 +51,8 @@ func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy
 	now := time.Now().Unix()
 	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
 		Revision: 1, PolicyHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		ActivationID: 1, ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now,
+		RuntimeGeneration: 1, ActivationID: 1,
+		ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now,
 		Pools: []channelrouting.PoolSnapshot{{
 			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
 			PolicyProfile:  model.RoutingPolicyProfileBalanced,
@@ -89,6 +93,19 @@ func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy
 	require.True(t, ok)
 	assert.Equal(t, 12, identity.MemberID)
 	require.NoError(t, CancelRoutingCapacityReservation(ctx))
+	assert.Equal(t, 1, channelrouting.DecisionAuditsStats().Entries)
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+	var audit model.RoutingDecisionAudit
+	require.NoError(t, model.DB.Where("algorithm_version = ?", channelrouting.DecisionAlgorithmBalancedV1).
+		Order("id desc").First(&audit).Error)
+	assert.Equal(t, model.RoutingDeploymentStageActive, audit.ActivationStage)
+	assert.Equal(t, 12, audit.SelectedMemberID)
+	assert.True(t, audit.Replayable)
+	replayed, err := channelrouting.ReplayBalancedDecisionAudit(audit)
+	require.NoError(t, err)
+	assert.Equal(t, 102, replayed.SelectedChannelID)
 }
 
 func channelRoutingBalancedPolicyForTest(protectionBand int) channelrouting.BalancedPoolPolicy {

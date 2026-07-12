@@ -23,6 +23,7 @@ const (
 	RoutingDecisionExclusionMaxReasons  = 32
 	RoutingDecisionExclusionMaxBytes    = 8 << 10
 	RoutingDecisionAlgorithmCanaryV1    = "channel-routing-canary-v1"
+	RoutingDecisionAlgorithmBalancedV1  = "channel-routing-balanced-v1"
 	RoutingDecisionCohortControl        = "control"
 	RoutingDecisionCohortCanary         = "canary"
 	RoutingDecisionReservationLocalSoft = "local_soft"
@@ -421,6 +422,19 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 	hasReservation := audit.ReservationMode != "" || audit.ReservationRPM != 0 || audit.ReservationInputTPM != 0 ||
 		audit.ReservationOutputTPM != 0 || audit.ReservationInflight != 0 || audit.ReservationLimitRPM != 0 ||
 		audit.ReservationLimitInputTPM != 0 || audit.ReservationLimitOutputTPM != 0 || audit.ReservationLimitInflight != 0
+	if audit.AlgorithmVersion == RoutingDecisionAlgorithmBalancedV1 {
+		if audit.ActivationID <= 0 || audit.ActivationStage != RoutingDeploymentStageActive ||
+			audit.TrafficBasisPoints != 0 || audit.CanaryBucket != 0 || audit.RolloutKey != "" || audit.Cohort != "" ||
+			audit.SelectedMemberID < 0 || audit.SelectedCredentialID < 0 ||
+			(audit.SelectedCredentialID > 0 && audit.SelectedMemberID == 0) || !audit.Replayable {
+			return false
+		}
+		if audit.ObservedChannelID <= 0 {
+			return audit.ActualChannelID == 0 && !hasSelectedIdentity && !hasReservation
+		}
+		return audit.ActualChannelID == audit.ObservedChannelID && audit.SelectedMemberID > 0 &&
+			validRoutingDecisionReservation(audit)
+	}
 	if !hasCanaryMetadata {
 		return !hasSelectedIdentity && !hasReservation
 	}

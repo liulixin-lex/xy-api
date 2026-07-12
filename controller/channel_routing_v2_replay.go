@@ -21,18 +21,18 @@ import (
 const maxChannelRoutingSimulationBody = 16 << 10
 
 type channelRoutingReplayView struct {
-	DecisionID        string                            `json:"decision_id"`
-	PoolID            int                               `json:"pool_id"`
-	SnapshotRevision  int64                             `json:"snapshot_revision"`
-	RuntimeGeneration int64                             `json:"runtime_generation"`
-	AlgorithmVersion  string                            `json:"algorithm_version"`
-	ActualChannelID   int                               `json:"actual_channel_id"`
-	StoredChannelID   int                               `json:"stored_channel_id"`
-	ReplayedChannelID int                               `json:"replayed_channel_id"`
-	DifferenceType    string                            `json:"difference_type"`
-	AuditVerified     bool                              `json:"audit_verified"`
-	GateVerified      bool                              `json:"gate_verified"`
-	Result            channelrouting.ShadowReplayResult `json:"result"`
+	DecisionID        string `json:"decision_id"`
+	PoolID            int    `json:"pool_id"`
+	SnapshotRevision  int64  `json:"snapshot_revision"`
+	RuntimeGeneration int64  `json:"runtime_generation"`
+	AlgorithmVersion  string `json:"algorithm_version"`
+	ActualChannelID   int    `json:"actual_channel_id"`
+	StoredChannelID   int    `json:"stored_channel_id"`
+	ReplayedChannelID int    `json:"replayed_channel_id"`
+	DifferenceType    string `json:"difference_type"`
+	AuditVerified     bool   `json:"audit_verified"`
+	GateVerified      bool   `json:"gate_verified"`
+	Result            any    `json:"result"`
 }
 
 func ReplayChannelRoutingDecision(c *gin.Context) {
@@ -56,8 +56,33 @@ func ReplayChannelRoutingDecision(c *gin.Context) {
 		return
 	}
 	if audit.AlgorithmVersion != channelrouting.DecisionAlgorithmShadowV1 &&
-		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmCanaryV1 {
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmCanaryV1 &&
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmBalancedV1 {
 		writeChannelRoutingReplayError(c, http.StatusUnprocessableEntity, "replay_algorithm_unsupported", "channel routing replay algorithm is not supported")
+		return
+	}
+
+	if audit.AlgorithmVersion == channelrouting.DecisionAlgorithmBalancedV1 {
+		result, err := channelrouting.ReplayBalancedDecisionAudit(audit)
+		if err != nil {
+			if errors.Is(err, channelrouting.ErrBalancedReplayHash) || errors.Is(err, channelrouting.ErrBalancedReplayInvalid) {
+				writeChannelRoutingReplayError(c, http.StatusConflict, "replay_integrity_failed", "channel routing decision audit failed integrity verification")
+				return
+			}
+			writeChannelRoutingReplayError(c, http.StatusInternalServerError, "replay_failed", "failed to replay channel routing decision")
+			return
+		}
+		differenceType := "active_unavailable"
+		if result.SelectedChannelID > 0 {
+			differenceType = "active_selected"
+		}
+		common.ApiSuccess(c, channelRoutingReplayView{
+			DecisionID: audit.DecisionID, PoolID: audit.PoolID, SnapshotRevision: audit.SnapshotRevision,
+			RuntimeGeneration: audit.RuntimeGeneration, AlgorithmVersion: audit.AlgorithmVersion,
+			ActualChannelID: audit.ActualChannelID, StoredChannelID: audit.ObservedChannelID,
+			ReplayedChannelID: result.SelectedChannelID, DifferenceType: differenceType,
+			AuditVerified: true, GateVerified: true, Result: result,
+		})
 		return
 	}
 

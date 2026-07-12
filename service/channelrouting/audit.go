@@ -68,6 +68,7 @@ type DecisionInput struct {
 	Candidates           []DecisionCandidate
 	CandidatesTruncated  bool
 	ReplayInput          *ShadowReplayInput
+	BalancedReplayInput  *BalancedReplayInput
 	DifferenceType       string
 	ActualCostKnown      bool
 	ActualExpectedCost   float64
@@ -76,6 +77,7 @@ type DecisionInput struct {
 	Gate                 *CanaryGate
 	SelectedIdentity     Identity
 	CapacityAdmission    *CapacityAdmission
+	ActivationID         int64
 }
 
 type decisionCanaryAuditFields struct {
@@ -179,24 +181,55 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 	snapshotHash := ""
 	runtimeGeneration := int64(0)
 	seed := int64(0)
-	replayable := input.ReplayInput != nil
+	hasShadowReplay := input.ReplayInput != nil
+	hasBalancedReplay := input.BalancedReplayInput != nil
+	if hasShadowReplay && hasBalancedReplay {
+		return "", ErrShadowReplayInvalid
+	}
+	replayable := hasShadowReplay || hasBalancedReplay
 	if replayable {
-		if err := input.ReplayInput.Validate(); err != nil {
-			return "", err
-		}
-		profile := input.ReplayInput.Profile
+		var profile RequestProfile
+		var replayJSON []byte
 		expectedSeed, err := DeriveDecisionSeed(input.RequestID, input.SnapshotRevision, input.RetryIndex)
-		if err != nil || input.PoolID != input.ReplayInput.PoolID || input.SnapshotRevision != input.ReplayInput.PolicyRevision ||
-			input.AlgorithmVersion != input.ReplayInput.AlgorithmVersion || input.ReplayInput.Settings.RandomSeed != expectedSeed ||
-			input.GroupName != profile.GroupName ||
-			input.ModelName != profile.ModelName || input.RetryIndex != profile.RetryIndex || input.IsStream != profile.IsStream {
+		if err != nil {
+			return "", ErrShadowReplayInvalid
+		}
+		if hasShadowReplay {
+			if err := input.ReplayInput.Validate(); err != nil {
+				return "", err
+			}
+			profile = input.ReplayInput.Profile
+			if input.PoolID != input.ReplayInput.PoolID || input.SnapshotRevision != input.ReplayInput.PolicyRevision ||
+				input.AlgorithmVersion != input.ReplayInput.AlgorithmVersion || input.ReplayInput.Settings.RandomSeed != expectedSeed {
+				return "", ErrShadowReplayInvalid
+			}
+			policyHash = input.ReplayInput.PolicyHash
+			snapshotHash = input.ReplayInput.SnapshotHash
+			runtimeGeneration = snapshotRevisionInt64(input.ReplayInput.RuntimeGeneration)
+			seed = input.ReplayInput.Settings.RandomSeed
+			replayJSON, err = common.Marshal(input.ReplayInput)
+		} else {
+			if err := input.BalancedReplayInput.Validate(); err != nil {
+				return "", err
+			}
+			profile = input.BalancedReplayInput.Profile
+			if input.PoolID != input.BalancedReplayInput.PoolID ||
+				input.SnapshotRevision != input.BalancedReplayInput.PolicyRevision ||
+				input.AlgorithmVersion != input.BalancedReplayInput.AlgorithmVersion ||
+				input.BalancedReplayInput.Settings.RandomSeed != expectedSeed {
+				return "", ErrBalancedReplayInvalid
+			}
+			policyHash = input.BalancedReplayInput.PolicyHash
+			snapshotHash = input.BalancedReplayInput.SnapshotHash
+			runtimeGeneration = snapshotRevisionInt64(input.BalancedReplayInput.RuntimeGeneration)
+			seed = input.BalancedReplayInput.Settings.RandomSeed
+			replayJSON, err = common.Marshal(input.BalancedReplayInput)
+		}
+		if err != nil || input.GroupName != profile.GroupName || input.ModelName != profile.ModelName ||
+			input.RetryIndex != profile.RetryIndex || input.IsStream != profile.IsStream {
 			return "", ErrShadowReplayInvalid
 		}
 		profileJSON, err := common.Marshal(profile)
-		if err != nil {
-			return "", err
-		}
-		replayJSON, err := common.Marshal(input.ReplayInput)
 		if err != nil {
 			return "", err
 		}
@@ -219,10 +252,6 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		policyHash = input.ReplayInput.PolicyHash
-		snapshotHash = input.ReplayInput.SnapshotHash
-		runtimeGeneration = snapshotRevisionInt64(input.ReplayInput.RuntimeGeneration)
-		seed = input.ReplayInput.Settings.RandomSeed
 	}
 	canaryFields, err := decisionCanaryFieldsFromInput(input, replayable)
 	if err != nil {
@@ -303,6 +332,52 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 
 func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisionCanaryAuditFields, error) {
 	if input.Gate == nil {
+		if input.AlgorithmVersion == DecisionAlgorithmBalancedV1 {
+			if !replayable || input.BalancedReplayInput == nil || input.ReplayInput != nil || input.ActivationID <= 0 {
+				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+			}
+			fields := decisionCanaryAuditFields{
+				activationID: input.ActivationID, activationStage: model.RoutingDeploymentStageActive,
+			}
+			if input.ObservedChannelID <= 0 {
+				if input.ActualChannelID != 0 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
+					return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+				}
+				return fields, nil
+			}
+			identity := input.SelectedIdentity
+			if input.ActualChannelID != input.ObservedChannelID || identity.SnapshotRevision != input.SnapshotRevision ||
+				identity.PoolID != input.PoolID || identity.MemberID <= 0 || identity.CredentialID < 0 ||
+				input.CapacityAdmission == nil {
+				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+			}
+			matched := false
+			for index := range input.BalancedReplayInput.Candidates {
+				candidate := input.BalancedReplayInput.Candidates[index]
+				if candidate.ChannelID == input.ObservedChannelID && candidate.PoolMemberID == identity.MemberID &&
+					candidate.CredentialID == identity.CredentialID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+			}
+			admission := *input.CapacityAdmission
+			if admission.Mode != CapacityModeLocalSoft || admission.Key.PoolID != input.PoolID ||
+				admission.Key.MemberID != identity.MemberID || admission.Key.Model != input.ModelName ||
+				admission.Key.PolicyRevision != input.SnapshotRevision || !validDemand(admission.Demand) ||
+				!validLimit(admission.Limit) || !limitCoversDemand(admission.Limit, admission.Demand) ||
+				exceedsLimit(admission.Demand, admission.Limit) {
+				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
+			}
+			fields.selectedMemberID = identity.MemberID
+			fields.selectedCredentialID = identity.CredentialID
+			fields.reservationMode = string(admission.Mode)
+			fields.reservationDemand = admission.Demand
+			fields.reservationLimit = admission.Limit
+			return fields, nil
+		}
 		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
 			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 		}

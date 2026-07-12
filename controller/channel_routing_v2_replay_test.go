@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -91,6 +92,31 @@ func TestReplayChannelRoutingCanaryDecisionVerifiesGateAndMetadata(t *testing.T)
 
 	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).
 		Where("decision_id = ?", decisionID).Update("canary_bucket", 999).Error)
+	tampered := performControllerReplayRequest(decisionID)
+	assert.Equal(t, http.StatusConflict, tampered.Code)
+	assert.Contains(t, tampered.Body.String(), `"code":"replay_integrity_failed"`)
+}
+
+func TestReplayChannelRoutingBalancedDecisionVerifiesActiveMetadata(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	decisionID := enqueueControllerBalancedReplayAudit(t)
+	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, flushed)
+
+	valid := performControllerReplayRequest(decisionID)
+	assert.Equal(t, http.StatusOK, valid.Code)
+	assert.Contains(t, valid.Body.String(), `"algorithm_version":"`+channelrouting.DecisionAlgorithmBalancedV1+`"`)
+	assert.Contains(t, valid.Body.String(), `"audit_verified":true`)
+	assert.Contains(t, valid.Body.String(), `"stored_channel_id":101`)
+	assert.Contains(t, valid.Body.String(), `"replayed_channel_id":101`)
+	assert.Contains(t, valid.Body.String(), `"selected_member_id":11`)
+	assert.NotContains(t, valid.Body.String(), "replay_input_json")
+	assert.NotContains(t, valid.Body.String(), "request_profile")
+
+	require.NoError(t, db.Model(&model.RoutingDecisionAudit{}).
+		Where("decision_id = ?", decisionID).Update("selected_member_id", 999).Error)
 	tampered := performControllerReplayRequest(decisionID)
 	assert.Equal(t, http.StatusConflict, tampered.Code)
 	assert.Contains(t, tampered.Body.String(), `"code":"replay_integrity_failed"`)
@@ -248,6 +274,73 @@ func enqueueControllerCanaryReplayAudit(t *testing.T) string {
 			SnapshotRevision: policyRevision, PoolID: poolID, MemberID: 11, CredentialID: 1_001,
 		},
 		CapacityAdmission: &admission,
+	})
+	require.NoError(t, err)
+	return decisionID
+}
+
+func enqueueControllerBalancedReplayAudit(t *testing.T) string {
+	t.Helper()
+	const (
+		poolID         = 31
+		policyRevision = 9
+		requestID      = "balanced-controller-replay"
+	)
+	now := time.Now().Unix()
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: policyRevision, RuntimeGeneration: 4, ActivationID: 501,
+		PolicyHash: strings.Repeat("d", 64), ActivationStage: model.RoutingDeploymentStageActive,
+		BuiltAtUnix: now,
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: poolID, GroupName: "group-31", DeploymentStage: model.RoutingDeploymentStageActive,
+			PolicyProfile: model.RoutingPolicyProfileBalanced,
+			Members: []channelrouting.PoolMemberSnapshot{{
+				ID: 11, PoolID: poolID, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
+				LegacyWeight: 100, CredentialIDs: []int{1_001},
+				Models: []channelrouting.ModelSnapshot{{
+					ModelName: "gpt-test", MetricKnown: true, RequestCount: 100, SuccessCount: 100,
+					ReliabilityRequestCount: 100, P95LatencyKnown: true, P95LatencyMs: 200,
+					P95TTFTKnown: true, P95TTFTMs: 100, OutputTokensPerSecond: 30,
+					MetricUpdatedUnix: now, CostKnown: true, Cost: 1, CostUpdatedUnix: now,
+					CostGroupRatio: 1, CostBaseRatio: 1, CostCompletionRatio: 1, CostBillingMode: "token",
+				}},
+			}},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{{
+			ID: 101, Name: "balanced", Status: common.ChannelStatusEnabled,
+		}},
+	})
+	session, err := channelrouting.NewRequestRoutingSession(requestID, "group-31")
+	require.NoError(t, err)
+	plan, active, err := session.PlanBalanced(channelrouting.BalancedRoutingPlanInput{
+		RequestRoutingPlanInput: channelrouting.RequestRoutingPlanInput{
+			RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+			PromptTokenEstimate: int(common.QuotaPerUnit),
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	require.Equal(t, 101, plan.SelectedChannelID)
+	admission := channelrouting.CapacityAdmission{
+		Mode: channelrouting.CapacityModeLocalSoft,
+		Key: channelrouting.CapacityKey{
+			PolicyRevision: plan.PolicyRevision, PoolID: plan.PoolID,
+			MemberID: plan.SelectedIdentity.MemberID, Model: plan.Profile.ModelName,
+		},
+		Demand: channelrouting.Demand{RPM: 1, InputTPM: int64(common.QuotaPerUnit), Inflight: 1},
+		Limit:  channelrouting.Limit{RPM: 10, InputTPM: int64(common.QuotaPerUnit) * 10, Inflight: 4},
+	}
+	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+		RequestID: requestID, PoolID: plan.PoolID, GroupName: plan.Profile.GroupName,
+		ModelName: plan.Profile.ModelName, SnapshotRevision: plan.PolicyRevision,
+		AlgorithmVersion: channelrouting.DecisionAlgorithmBalancedV1,
+		ActualChannelID:  plan.SelectedChannelID, ObservedChannelID: plan.SelectedChannelID,
+		FilteredOpen: plan.FilteredOpen, FilteredCapacity: plan.FilteredCapacity,
+		Candidates: plan.Candidates, BalancedReplayInput: &plan.Replay,
+		DifferenceType: "active_selected", ActualCostKnown: plan.SelectedCostKnown,
+		ActualExpectedCost: plan.SelectedCost, ObservedCostKnown: plan.SelectedCostKnown,
+		ObservedExpectedCost: plan.SelectedCost, SelectedIdentity: plan.SelectedIdentity,
+		CapacityAdmission: &admission, ActivationID: plan.ActivationID,
 	})
 	require.NoError(t, err)
 	return decisionID

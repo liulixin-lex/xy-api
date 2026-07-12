@@ -98,7 +98,8 @@ func balancedActiveSnapshotForTest(t *testing.T, now int64) SnapshotView {
 	require.NoError(t, err)
 	return SnapshotView{
 		Revision: 1, PolicyHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		ActivationID: 1, ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now,
+		RuntimeGeneration: 1, ActivationID: 1,
+		ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now,
 		Pools: []PoolSnapshot{{
 			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
 			PolicyProfile: model.RoutingPolicyProfileBalanced, BalancedPolicy: policy,

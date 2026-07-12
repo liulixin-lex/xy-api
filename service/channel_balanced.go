@@ -170,6 +170,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			return nil, true, channelrouting.ErrRoutingSessionInvalid
 		}
 		if plan.SelectedChannelID <= 0 {
+			enqueueChannelRoutingBalancedDecision(param, group, plan, nil)
 			if lastProbeErr != nil {
 				return nil, true, fmt.Errorf("channel routing half-open probe admission failed: %w", lastProbeErr)
 			}
@@ -219,6 +220,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			}
 			return nil, true, fmt.Errorf("channel routing capacity admission failed: %w", reserveErr)
 		}
+		admission := reservation.Admission()
 		if err := SetRoutingCapacityReservation(param.Ctx, reservation); err != nil {
 			cancelErr := reservation.Cancel()
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
@@ -240,6 +242,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		if plan.AffinityUsed {
 			MarkChannelAffinityUsed(param.Ctx, group, selected.Id)
 		}
+		enqueueChannelRoutingBalancedDecision(param, group, plan, &admission)
 		return selected, true, nil
 	}
 	return nil, true, nil
@@ -265,4 +268,43 @@ func channelRoutingBalancedPreferredChannel(c *gin.Context, group string) int {
 		return 0
 	}
 	return affinity.ChannelID
+}
+
+func enqueueChannelRoutingBalancedDecision(
+	param *RetryParam,
+	group string,
+	plan channelrouting.BalancedRoutingPlan,
+	admission *channelrouting.CapacityAdmission,
+) {
+	differenceType := "active_unavailable"
+	if plan.SelectedChannelID > 0 {
+		differenceType = "active_selected"
+	}
+	_, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
+		RequestID:            common.GetContextKeyString(param.Ctx, common.RequestIdKey),
+		PoolID:               plan.PoolID,
+		GroupName:            group,
+		ModelName:            param.ModelName,
+		SnapshotRevision:     plan.PolicyRevision,
+		AlgorithmVersion:     channelrouting.DecisionAlgorithmBalancedV1,
+		RetryIndex:           param.GetRetry(),
+		IsStream:             plan.Profile.IsStream,
+		ActualChannelID:      plan.SelectedChannelID,
+		ObservedChannelID:    plan.SelectedChannelID,
+		FilteredOpen:         plan.FilteredOpen,
+		FilteredCapacity:     plan.FilteredCapacity,
+		Candidates:           plan.Candidates,
+		BalancedReplayInput:  &plan.Replay,
+		DifferenceType:       differenceType,
+		ActualCostKnown:      plan.SelectedCostKnown,
+		ActualExpectedCost:   plan.SelectedCost,
+		ObservedCostKnown:    plan.SelectedCostKnown,
+		ObservedExpectedCost: plan.SelectedCost,
+		SelectedIdentity:     plan.SelectedIdentity,
+		CapacityAdmission:    admission,
+		ActivationID:         plan.ActivationID,
+	})
+	if err != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing balanced audit dropped: %v", err))
+	}
 }

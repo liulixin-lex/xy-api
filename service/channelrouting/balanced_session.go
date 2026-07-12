@@ -2,6 +2,7 @@ package channelrouting
 
 import (
 	"math"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
@@ -20,6 +21,7 @@ type BalancedRoutingPlan struct {
 	PoolID            int                              `json:"pool_id"`
 	PolicyRevision    uint64                           `json:"policy_revision"`
 	RuntimeGeneration uint64                           `json:"runtime_generation"`
+	ActivationID      int64                            `json:"activation_id"`
 	PolicyHash        string                           `json:"policy_hash"`
 	Profile           RequestProfile                   `json:"profile"`
 	Policy            BalancedPoolPolicy               `json:"policy"`
@@ -32,6 +34,10 @@ type BalancedRoutingPlan struct {
 	AffinityUsed      bool                             `json:"affinity_used"`
 	ExplorationUsed   bool                             `json:"exploration_used"`
 	SoftFallback      bool                             `json:"soft_fallback"`
+	FilteredOpen      int                              `json:"filtered_open"`
+	FilteredCapacity  int                              `json:"filtered_capacity"`
+	Candidates        []DecisionCandidate              `json:"candidates"`
+	Replay            BalancedReplayInput              `json:"replay"`
 }
 
 func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInput) (BalancedRoutingPlan, bool, error) {
@@ -48,6 +54,9 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		return BalancedRoutingPlan{}, false, nil
 	}
 	if snapshot.view.ActivationStage != model.RoutingDeploymentStageActive || session.planningTime.IsZero() {
+		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
+	}
+	if snapshot.view.BuiltAtUnix <= 0 || snapshot.view.ActivationID <= 0 {
 		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
 	profile, err := NewRequestProfile(
@@ -94,6 +103,12 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	}
 	requestExcluded := make(map[int]struct{})
 	identities := make(map[int]Identity, len(pool.Members))
+	replayCandidates := make([]BalancedReplayCandidate, 0, len(pool.Members))
+	preparedAt := time.Unix(snapshot.view.BuiltAtUnix, 0)
+	preparedSettings := pool.BalancedPolicy.settings(preparedAt, 1, 0, profile.IsStream)
+	preparedProfile := profile
+	preparedProfile.PromptTokenEstimate = 0
+	preparedProfile.CompletionTokenEstimate = 0
 	memberIndexes := snapshot.memberIndexesByPoolModel[poolModelKey{poolID: pool.ID, model: profile.ModelName}]
 	for _, memberIndex := range memberIndexes {
 		if memberIndex < 0 || memberIndex >= len(pool.Members) {
@@ -104,6 +119,20 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		if !exists {
 			return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 		}
+		channel, exists := snapshot.channelByID[member.ChannelID]
+		if !exists {
+			return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
+		}
+		preparedCandidate, candidateErr := balancedCandidateFromSnapshot(
+			*pool, member, observation, channel, preparedProfile, preparedSettings,
+		)
+		if candidateErr != nil {
+			return BalancedRoutingPlan{}, true, candidateErr
+		}
+		preparedCandidate.Candidate.Cost = &routingselector.CostSnapshot{
+			Known: true, Cost: preparedSettings.CostTarget, UpdatedUnix: preparedSettings.NowUnix,
+		}
+		replayCandidates = append(replayCandidates, balancedReplayCandidateFromRouting(member, preparedCandidate))
 		state := runtimeByChannelID[member.ChannelID]
 		cost, costErr := shadowExpectedCost(observation, profile)
 		if costErr != nil {
@@ -137,29 +166,67 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		}
 		identities[member.ChannelID] = identity
 	}
-	decision, err := prepared.Select(routingselector.BalancedRequest{
+	balancedRequest := routingselector.BalancedRequest{
 		RandomSeed:         seed,
 		PreferredChannelID: input.PreferredChannelID,
 		NowUnixMilli:       session.planningTime.UnixMilli(),
 		ExcludedChannelIDs: requestExcluded,
 		RuntimeByChannelID: runtimeByChannelID,
-	})
+	}
+	decision, err := prepared.SelectDetailed(balancedRequest)
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
+	}
+	runtimeStates := make([]BalancedReplayRuntimeState, 0, len(runtimeByChannelID))
+	for channelID, state := range runtimeByChannelID {
+		runtimeStates = append(runtimeStates, balancedReplayRuntimeFromRouting(channelID, state))
+	}
+	excludedChannelIDs := make([]int, 0, len(requestExcluded))
+	for channelID := range requestExcluded {
+		excludedChannelIDs = append(excludedChannelIDs, channelID)
+	}
+	replay, err := buildBalancedReplayInput(
+		pool.ID,
+		snapshot.view.Revision,
+		snapshot.view.RuntimeGeneration,
+		snapshot.view.PolicyHash,
+		profile,
+		BalancedReplaySettings{
+			Policy: pool.BalancedPolicy, PreparedAtUnix: preparedAt.Unix(),
+			PreparedAtUnixMilli: preparedAt.UnixMilli(), RequestNowUnixMilli: session.planningTime.UnixMilli(),
+			RandomSeed: seed, PreferredChannelID: input.PreferredChannelID, PreferTTFT: profile.IsStream,
+		},
+		replayCandidates,
+		runtimeStates,
+		excludedChannelIDs,
+	)
+	if err != nil {
+		return BalancedRoutingPlan{}, true, err
+	}
+	replayResult, err := balancedReplayResultFromDecision(replay, decision)
+	if err != nil || replayResult.SelectedChannelID != decision.SelectedChannelID {
+		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
 	plan := BalancedRoutingPlan{
 		AlgorithmVersion:  DecisionAlgorithmBalancedV1,
 		PoolID:            pool.ID,
 		PolicyRevision:    snapshot.view.Revision,
 		RuntimeGeneration: snapshot.view.RuntimeGeneration,
+		ActivationID:      snapshot.view.ActivationID,
 		PolicyHash:        snapshot.view.PolicyHash,
 		Profile:           profile,
 		Policy:            pool.BalancedPolicy,
-		SelectedChannelID: decision.SelectedChannelID,
-		SampledChannelIDs: append([]int(nil), decision.SampledChannelIDs...),
-		AffinityUsed:      decision.AffinityUsed,
-		ExplorationUsed:   decision.ExplorationUsed,
-		SoftFallback:      decision.SoftFallback,
+		SelectedChannelID: replayResult.SelectedChannelID,
+		SelectedCost:      replayResult.SelectedCost,
+		SelectedCostKnown: replayResult.SelectedCostKnown,
+		SampledChannelIDs: append([]int(nil), replayResult.SampledChannelIDs...),
+		AffinityUsed:      replayResult.AffinityUsed,
+		ExplorationUsed:   replayResult.ExplorationUsed,
+		SoftFallback:      replayResult.SoftFallback,
+		FilteredOpen:      replayResult.FilteredOpen,
+		FilteredCapacity:  replayResult.FilteredCapacity,
+		Candidates:        append([]DecisionCandidate(nil), replayResult.Candidates...),
+		Replay:            replay,
 	}
 	if decision.SelectedChannelID <= 0 {
 		return plan, true, nil
@@ -170,10 +237,6 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	}
 	plan.SelectedIdentity = identity
 	selectedState := runtimeByChannelID[decision.SelectedChannelID]
-	if selectedState.Cost != nil && balancedRequestCostKnown(selectedState.Cost, pool.BalancedPolicy, session.planningTime.Unix()) {
-		plan.SelectedCost = selectedState.Cost.Cost
-		plan.SelectedCostKnown = true
-	}
 	if selectedState.Breaker != nil {
 		breaker := *selectedState.Breaker
 		plan.SelectedBreaker = &breaker
@@ -219,14 +282,6 @@ func cloneBalancedRuntimeState(state routingselector.BalancedRuntimeState) routi
 		cloned.Cost = &value
 	}
 	return cloned
-}
-
-func balancedRequestCostKnown(cost *routingselector.CostSnapshot, policy BalancedPoolPolicy, nowUnix int64) bool {
-	if cost == nil || !cost.Known || cost.UpdatedUnix <= 0 || cost.UpdatedUnix > nowUnix ||
-		!finiteShadowNumber(cost.Cost) || cost.Cost < 0 {
-		return false
-	}
-	return policy.SnapshotStaleSec > 0 && nowUnix-cost.UpdatedUnix <= int64(policy.SnapshotStaleSec)
 }
 
 func memberIndexesByChannelID(members []PoolMemberSnapshot, channelID int) int {
