@@ -30,9 +30,9 @@ import { cn } from '@/lib/utils'
 import type { ManualBillingReviewItem } from '../billing-review-types'
 import { useChannelRoutingFormatters } from '../lib/format'
 import {
-  getManualBillingReviewBlockerLabelKey,
+  getManualBillingReviewBlockerDisplay,
   getManualBillingReviewConsequenceRows,
-  getManualBillingReviewKindLabelKey,
+  getManualBillingReviewKindDisplay,
   manualBillingReviewIsOverage,
 } from '../lib/manual-billing-review'
 
@@ -94,7 +94,7 @@ export function ManualBillingReviewFinancialOutcomes(props: {
             <dt className='text-muted-foreground min-w-0 break-words'>
               {t(row.labelKey)}
             </dt>
-            <dd className='font-mono font-semibold tabular-nums'>
+            <dd className='min-w-0 text-right font-mono font-semibold break-all tabular-nums'>
               {format.number(row.value)}
             </dd>
           </div>
@@ -133,8 +133,8 @@ export function ManualBillingReviewCaseDetails(props: {
             <dt className='text-muted-foreground text-xs'>
               {t('Review type')}
             </dt>
-            <dd className='mt-1'>
-              {t(getManualBillingReviewKindLabelKey(props.review.review_kind))}
+            <dd className='mt-1 break-all'>
+              {getManualBillingReviewKindDisplay(props.review.review_kind, t)}
             </dd>
           </div>
           <div className='min-w-0'>
@@ -170,7 +170,12 @@ export function ManualBillingReviewCaseDetails(props: {
               {t('Reservation state')}
             </dt>
             <dd className='mt-1'>
-              <Badge variant='outline'>{props.review.state}</Badge>
+              <Badge
+                variant='outline'
+                className='h-auto max-w-full py-1 break-all whitespace-normal'
+              >
+                {props.review.state}
+              </Badge>
             </dd>
           </div>
           <div>
@@ -213,7 +218,7 @@ export function ManualBillingReviewCaseDetails(props: {
               >
                 <div className='flex items-center gap-2'>
                   <Badge variant='outline'>#{attempt.attempt_index}</Badge>
-                  <span>{attempt.state}</span>
+                  <span className='break-all'>{attempt.state}</span>
                 </div>
                 <div className='text-muted-foreground min-w-0 break-words'>
                   {t('Channel #{{channel}} · Credential #{{credential}}', {
@@ -271,8 +276,8 @@ export function ManualBillingReviewCaseDetails(props: {
             <AlertDescription>
               <ul className='list-disc space-y-1 pl-4'>
                 {props.review.blockers.map((blocker) => (
-                  <li key={blocker}>
-                    {t(getManualBillingReviewBlockerLabelKey(blocker))}
+                  <li key={blocker} className='break-all'>
+                    {getManualBillingReviewBlockerDisplay(blocker, t)}
                   </li>
                 ))}
               </ul>

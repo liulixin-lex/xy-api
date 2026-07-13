@@ -126,4 +126,21 @@ describe('manual billing review details', () => {
       /negative accepted adjustment reduces the current charge/i
     )
   })
+
+  test('keeps future review and blocker codes visible while the client fails closed', () => {
+    const html = renderToStaticMarkup(
+      createElement(ManualBillingReviewCaseDetails, {
+        review: {
+          ...review,
+          review_kind: 'provider_usage_reconciliation_v2',
+          blockers: ['provider_usage_receipt_missing_v2'],
+          can_accept: true,
+          can_reject: true,
+        },
+      })
+    )
+
+    assert.match(html, /Unknown review type: provider_usage_reconciliation_v2/)
+    assert.match(html, /Unknown: provider_usage_receipt_missing_v2/)
+  })
 })

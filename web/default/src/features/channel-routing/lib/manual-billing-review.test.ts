@@ -23,11 +23,17 @@ import type { ManualBillingReviewItem } from '../billing-review-types'
 import {
   buildManualBillingReviewResolution,
   createManualBillingReviewSchema,
+  getManualBillingReviewBlockerDisplay,
   getManualBillingReviewBlockerLabelKey,
   getManualBillingReviewConfirmationImpact,
   getManualBillingReviewConsequenceRows,
+  getManualBillingReviewKindDisplay,
   getManualBillingReviewKindLabelKey,
+  getManualBillingReviewNextCursor,
   ManualBillingReviewSession,
+  manualBillingReviewHasUnknownBlocker,
+  manualBillingReviewKindIsSupported,
+  manualBillingReviewNeedsRefresh,
   type ManualBillingReviewValidationMessages,
 } from './manual-billing-review'
 
@@ -397,6 +403,65 @@ describe('manual billing review decisions', () => {
     assert.equal(result.success, false)
   })
 
+  test('fails closed for a review kind introduced by a newer server', () => {
+    const futureReview = review({
+      review_kind: 'provider_usage_reconciliation_v2',
+      can_accept: true,
+      can_reject: true,
+      blockers: [],
+    })
+    const schema = createManualBillingReviewSchema(futureReview, messages)
+    const values = {
+      action: 'confirmed_accepted' as const,
+      rejection_provider_status: 'confirmed_rejected' as const,
+      upstream_task_id: 'upstream-1',
+      provider_checked_at: '2023-11-14T22:13:20.000Z',
+      evidence_reference: 'provider/case-1',
+      reason: 'confirmed',
+    }
+
+    assert.equal(
+      manualBillingReviewKindIsSupported(futureReview.review_kind),
+      false
+    )
+    assert.equal(schema.safeParse(values).success, false)
+    assert.throws(() =>
+      buildManualBillingReviewResolution(futureReview, values)
+    )
+    assert.equal(
+      getManualBillingReviewKindDisplay(futureReview.review_kind, (key) => key),
+      'Unknown review type: provider_usage_reconciliation_v2'
+    )
+  })
+
+  test('fails closed for an unknown blocker even when stale action flags allow resolution', () => {
+    const futureBlockerReview = review({
+      can_accept: true,
+      can_reject: true,
+      blockers: ['provider_receipt_pending_v2'],
+    })
+    const schema = createManualBillingReviewSchema(
+      futureBlockerReview,
+      messages
+    )
+
+    assert.equal(
+      manualBillingReviewHasUnknownBlocker(futureBlockerReview),
+      true
+    )
+    assert.equal(
+      schema.safeParse({
+        action: 'confirmed_accepted',
+        rejection_provider_status: 'confirmed_rejected',
+        upstream_task_id: 'upstream-1',
+        provider_checked_at: '2023-11-14T22:13:20.000Z',
+        evidence_reference: 'provider/case-1',
+        reason: 'confirmed',
+      }).success,
+      false
+    )
+  })
+
   test('maps every review kind and stable blocker to user-facing keys', () => {
     assert.deepEqual(
       [
@@ -424,6 +489,35 @@ describe('manual billing review decisions', () => {
         'The accepted handoff context is missing or invalid',
       ]
     )
+    assert.equal(getManualBillingReviewKindLabelKey('future_kind'), null)
+    assert.equal(getManualBillingReviewBlockerLabelKey('future_blocker'), null)
+    assert.equal(
+      getManualBillingReviewBlockerDisplay('future_blocker', (key) => key),
+      'Unknown: future_blocker'
+    )
+  })
+
+  test('requires a valid advancing cursor when the server reports more rows', () => {
+    assert.equal(
+      getManualBillingReviewNextCursor({ has_more: true, next_cursor: 84 }, 42),
+      84
+    )
+    assert.equal(getManualBillingReviewNextCursor({ has_more: true }, 42), 0)
+    assert.equal(
+      getManualBillingReviewNextCursor({ has_more: true, next_cursor: 42 }, 42),
+      0
+    )
+    assert.equal(
+      getManualBillingReviewNextCursor(
+        { has_more: false, next_cursor: 84 },
+        42
+      ),
+      0
+    )
+  })
+
+  test('refreshes capabilities after resolve permission is revoked', () => {
+    assert.equal(manualBillingReviewNeedsRefresh({ status: 403 }), true)
   })
 })
 

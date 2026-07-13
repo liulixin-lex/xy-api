@@ -18,7 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import { Plus, Search, ShieldAlert, X } from 'lucide-react'
+import {
+  Plus,
+  RefreshCw,
+  Search,
+  ShieldAlert,
+  TriangleAlert,
+  X,
+} from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -99,7 +106,6 @@ export function ChannelRoutingCostSourcesSection(props: {
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.costBindings(queryParams),
     queryFn: () => listChannelRoutingCostBindings(queryParams),
-    placeholderData: (previous) => previous,
     meta: { handleErrorLocally: true },
   })
 
@@ -406,11 +412,44 @@ export function ChannelRoutingCostSourcesSection(props: {
       </div>
 
       {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-      {query.isError ? (
+      {query.isError && !query.data ? (
         <ChannelRoutingErrorState
           error={query.error}
           onRetry={() => void query.refetch()}
         />
+      ) : null}
+      {query.isRefetchError && query.data ? (
+        <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
+          <TriangleAlert
+            className='text-amber-700 dark:text-amber-300'
+            aria-hidden='true'
+          />
+          <AlertTitle>{t('Cost source refresh failed')}</AlertTitle>
+          <AlertDescription className='space-y-2'>
+            <p>
+              {t(
+                'Showing the last confirmed cost source page. Retry before changing a connector.'
+              )}
+            </p>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={query.isFetching}
+              onClick={() => void query.refetch()}
+            >
+              <RefreshCw
+                aria-hidden='true'
+                className={
+                  query.isFetching
+                    ? 'animate-spin motion-reduce:animate-none'
+                    : undefined
+                }
+              />
+              {t('Retry')}
+            </Button>
+          </AlertDescription>
+        </Alert>
       ) : null}
       {query.data && items.length === 0 ? (
         <ChannelRoutingEmptyState

@@ -81,6 +81,19 @@ export function canManageSystemSettings(
   )
 }
 
+export function canAccessBillingReviews(
+  user: AuthUser | null | undefined
+): boolean {
+  return (
+    (user?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
+    hasPermission(
+      user,
+      ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+      ADMIN_PERMISSION_ACTIONS.READ
+    )
+  )
+}
+
 // roleGrants returns the baseline grant matrix for the given role key.
 export function roleGrants(
   catalog: PermissionCatalog,

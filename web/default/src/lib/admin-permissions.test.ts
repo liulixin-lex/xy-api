@@ -6,6 +6,7 @@ import type { AuthUser } from '@/stores/auth-store'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
+  canAccessBillingReviews,
   canManageSystemSettings,
   hasPermission,
 } from './admin-permissions'
@@ -123,6 +124,31 @@ describe('admin permission helpers', () => {
         ADMIN_PERMISSION_ACTIONS.RESOLVE
       ),
       false
+    )
+  })
+
+  test('matches the admin-auth boundary for direct billing review access', () => {
+    const billingGrant = {
+      admin_permissions: {
+        billing_review: { read: true, resolve: false },
+      },
+    }
+
+    assert.equal(
+      canAccessBillingReviews(
+        makeUser({ role: ROLE.USER, permissions: billingGrant })
+      ),
+      false
+    )
+    assert.equal(
+      canAccessBillingReviews(
+        makeUser({ role: ROLE.ADMIN, permissions: billingGrant })
+      ),
+      true
+    )
+    assert.equal(
+      canAccessBillingReviews(makeUser({ role: ROLE.SUPER_ADMIN })),
+      true
     )
   })
 })

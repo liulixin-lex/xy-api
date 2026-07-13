@@ -55,7 +55,9 @@ export type ManualBillingReviewFinancialConsequences = {
 export type ManualBillingReviewItem = {
   reservation_id: number
   kind: string
-  review_kind: ManualBillingReviewKind
+  // The server may add review kinds before this client is upgraded. Keep the
+  // response forward-compatible and fail closed in the resolution workflow.
+  review_kind: string
   public_task_id: string
   upstream_task_id?: string
   user_id: number
@@ -77,10 +79,10 @@ export type ManualBillingReviewPage = {
   pending_count: number
   oldest_age_seconds: number
   items: ManualBillingReviewItem[]
-  next_cursor: number
+  next_cursor?: number
   has_more: boolean
-  capabilities: {
-    can_resolve: boolean
+  capabilities?: {
+    can_resolve?: boolean
   }
 }
 
@@ -102,8 +104,8 @@ export type ManualBillingReviewResolutionResult = {
   current_quota: number
   resolution: {
     id: number
-    action: ManualBillingReviewAction
-    review_kind: ManualBillingReviewKind
+    action: string
+    review_kind: string
     before_state: string
     after_state: string
     before_quota: number

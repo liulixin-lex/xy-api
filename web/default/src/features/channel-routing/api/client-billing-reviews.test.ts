@@ -112,7 +112,7 @@ describe('manual billing review API', () => {
     assert.equal(captured[0]?.signal, controller.signal)
     assert.equal(captured[0]?.disableDuplicate, true)
     assert.equal(result.pending_count, 12)
-    assert.equal(result.capabilities.can_resolve, true)
+    assert.equal(result.capabilities?.can_resolve, true)
   })
 
   test('sends compare-and-swap and idempotency headers with the frozen payload', async () => {

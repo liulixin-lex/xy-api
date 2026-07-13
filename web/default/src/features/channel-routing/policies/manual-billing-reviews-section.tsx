@@ -38,6 +38,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { cn } from '@/lib/utils'
 
 import { listManualBillingReviews } from '../api/billing-reviews'
 import { channelRoutingQueryKeys } from '../api/query-keys'
@@ -50,7 +51,10 @@ import {
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
-import { getManualBillingReviewKindLabelKey } from '../lib/manual-billing-review'
+import {
+  getManualBillingReviewKindDisplay,
+  getManualBillingReviewNextCursor,
+} from '../lib/manual-billing-review'
 import { ManualBillingReviewSheet } from './manual-billing-review-sheet'
 
 const reviewPageLimit = 10
@@ -59,7 +63,10 @@ function reviewAge(
   sinceMs: number,
   translate: (key: string, options?: Record<string, unknown>) => string
 ): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - sinceMs) / 1000))
+  if (!Number.isFinite(sinceMs) || sinceMs <= 0) return translate('Unknown')
+  const elapsedMs = Date.now() - sinceMs
+  if (elapsedMs < 0) return translate('Unknown')
+  const seconds = Math.floor(elapsedMs / 1000)
   if (seconds >= 86_400) {
     return translate('{{count}} days ago', {
       count: Math.floor(seconds / 86_400),
@@ -78,6 +85,7 @@ function reviewAge(
 export function ManualBillingReviewsSection(props: {
   cursor: number
   canResolve: boolean
+  embedded?: boolean
   onCursorChange: (cursor: number) => void
 }) {
   const { t } = useTranslation()
@@ -101,7 +109,6 @@ export function ManualBillingReviewsSection(props: {
         },
         signal
       ),
-    placeholderData: (previous) => previous,
     refetchInterval: sheetOpen ? false : 30_000,
     meta: { handleErrorLocally: true },
   })
@@ -146,14 +153,19 @@ export function ManualBillingReviewsSection(props: {
   }
 
   const page = reviewsQuery.data
-  const serverCanResolve = page?.capabilities.can_resolve === true
+  const serverCanResolve = page?.capabilities?.can_resolve === true
   const canResolve = props.canResolve && serverCanResolve
+  const nextCursor = page ? getManualBillingReviewNextCursor(page, cursor) : 0
+  const paginationUnavailable = page?.has_more === true && nextCursor === 0
 
   return (
     <>
       <section
         id='manual-billing-reviews'
-        className='scroll-mt-20 space-y-3 border-t pt-5'
+        className={cn(
+          'scroll-mt-20 space-y-3',
+          props.embedded !== false && 'border-t pt-5'
+        )}
         aria-labelledby='manual-billing-reviews-heading'
       >
         <div className='flex flex-wrap items-start justify-between gap-3'>
@@ -230,11 +242,15 @@ export function ManualBillingReviewsSection(props: {
           </Alert>
         ) : null}
         {reviewsQuery.isLoading ? (
-          <ChannelRoutingLoadingState rows={4} />
+          <ChannelRoutingLoadingState
+            rows={4}
+            label={t('Loading billing reviews')}
+          />
         ) : null}
         {reviewsQuery.isError && !page ? (
           <ChannelRoutingErrorState
             error={reviewsQuery.error}
+            scope='billing-review'
             onRetry={() => void reviewsQuery.refetch()}
           />
         ) : null}
@@ -249,7 +265,7 @@ export function ManualBillingReviewsSection(props: {
 
         {page && page.items.length > 0 ? (
           <>
-            <div className='hidden overflow-hidden rounded-lg border md:block'>
+            <div className='hidden overflow-x-auto rounded-lg border md:block'>
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -267,25 +283,20 @@ export function ManualBillingReviewsSection(props: {
                   {page.items.map((review) => (
                     <TableRow key={review.reservation_id}>
                       <TableCell>
-                        <button
-                          type='button'
-                          className='focus-visible:ring-ring block max-w-64 text-left hover:underline focus-visible:rounded-sm focus-visible:ring-2 focus-visible:outline-none'
-                          onClick={() => openReview(review)}
-                        >
+                        <div className='block max-w-64 text-left'>
                           <span className='block font-mono text-xs font-medium break-all'>
                             #{review.reservation_id}
                           </span>
                           <span className='text-muted-foreground block truncate text-xs'>
                             {review.public_task_id}
                           </span>
-                        </button>
+                        </div>
                       </TableCell>
                       <TableCell>
                         <div className='text-sm font-medium'>
-                          {t(
-                            getManualBillingReviewKindLabelKey(
-                              review.review_kind
-                            )
+                          {getManualBillingReviewKindDisplay(
+                            review.review_kind,
+                            t
                           )}
                         </div>
                         <div className='text-muted-foreground text-xs'>
@@ -354,9 +365,13 @@ export function ManualBillingReviewsSection(props: {
                       <span className='font-mono text-xs font-semibold break-all'>
                         #{review.reservation_id}
                       </span>
-                      <Badge variant='outline'>
-                        {t(
-                          getManualBillingReviewKindLabelKey(review.review_kind)
+                      <Badge
+                        variant='outline'
+                        className='h-auto max-w-full py-1 text-left break-all whitespace-normal'
+                      >
+                        {getManualBillingReviewKindDisplay(
+                          review.review_kind,
+                          t
                         )}
                       </Badge>
                     </span>
@@ -387,9 +402,29 @@ export function ManualBillingReviewsSection(props: {
               ))}
             </div>
 
+            {paginationUnavailable ? (
+              <Alert
+                role='status'
+                className='border-amber-500/30 bg-amber-500/5'
+              >
+                <TriangleAlert
+                  className='text-amber-700 dark:text-amber-300'
+                  aria-hidden='true'
+                />
+                <AlertTitle>
+                  {t('Billing review pagination is unavailable')}
+                </AlertTitle>
+                <AlertDescription>
+                  {t(
+                    'The server did not return a valid cursor. Refresh the queue before continuing.'
+                  )}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
             <ChannelRoutingCursorPagination
               cursor={cursor}
-              nextCursor={page.has_more ? page.next_cursor : 0}
+              nextCursor={nextCursor}
               onCursorChange={props.onCursorChange}
             />
           </>

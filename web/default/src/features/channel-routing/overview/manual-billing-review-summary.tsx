@@ -33,12 +33,13 @@ import { Button } from '@/components/ui/button'
 import { listManualBillingReviews } from '../api/billing-reviews'
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import { useChannelRoutingFormatters } from '../lib/format'
-import { getManualBillingReviewKindLabelKey } from '../lib/manual-billing-review'
+import { getManualBillingReviewKindDisplay } from '../lib/manual-billing-review'
 
 function manualReviewAge(
   seconds: number,
   translate: (key: string, options?: Record<string, unknown>) => string
 ): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return translate('Unknown')
   if (seconds >= 86_400) {
     return translate('{{count}} days ago', {
       count: Math.floor(seconds / 86_400),
@@ -70,7 +71,10 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
 
   if (reviewsQuery.isError && !reviewsQuery.data) {
     return (
-      <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
+      <Alert
+        role='status'
+        className='border-amber-500/30 bg-amber-500/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
+      >
         <TriangleAlert
           className='text-amber-700 dark:text-amber-300'
           aria-hidden='true'
@@ -81,7 +85,7 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
             'The routing snapshot is available, but billing reviews could not be loaded.'
           )}
         </AlertDescription>
-        <AlertAction>
+        <AlertAction className='static col-span-full mt-2 justify-self-start sm:absolute sm:col-auto sm:mt-0'>
           <Button
             size='sm'
             variant='outline'
@@ -109,7 +113,7 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
   return (
     <Alert
       role='status'
-      className='border-amber-500/35 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
+      className='border-amber-500/35 bg-amber-500/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
     >
       <TriangleAlert aria-hidden='true' />
       <AlertTitle className='flex flex-wrap items-center gap-2'>
@@ -134,26 +138,19 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
                 <span className='min-w-0 truncate font-mono'>
                   #{review.reservation_id} · {review.public_task_id}
                 </span>
-                <span className='text-muted-foreground shrink-0'>
-                  {t(getManualBillingReviewKindLabelKey(review.review_kind))}
+                <span className='text-muted-foreground max-w-[48%] text-right break-all'>
+                  {getManualBillingReviewKindDisplay(review.review_kind, t)}
                 </span>
               </li>
             ))}
           </ul>
         ) : null}
       </AlertDescription>
-      <AlertAction>
+      <AlertAction className='static col-span-full mt-2 justify-self-start sm:absolute sm:col-auto sm:mt-0'>
         <Button
           size='sm'
           variant='outline'
-          render={
-            <Link
-              to='/channel-routing/$section'
-              params={{ section: 'policies' }}
-              search={{ billingReviewCursor: 0 }}
-              hash='manual-billing-reviews'
-            />
-          }
+          render={<Link to='/billing-reviews' search={{ cursor: 0 }} />}
         >
           {t('Open review queue')}
           <ArrowRight aria-hidden='true' />

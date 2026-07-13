@@ -80,9 +80,11 @@ import {
   createManualBillingReviewSchema,
   getManualBillingReviewEvidenceWindowStart,
   getManualBillingReviewConfirmationImpact,
-  getManualBillingReviewKindLabelKey,
+  getManualBillingReviewKindDisplay,
   getManualBillingReviewProviderStatus,
   ManualBillingReviewSession,
+  manualBillingReviewHasUnknownBlocker,
+  manualBillingReviewKindIsSupported,
   manualBillingReviewIsOverage,
   manualBillingReviewNeedsRefresh,
   toLocalDateTimeInput,
@@ -224,7 +226,7 @@ export function ManualBillingReviewSheet(props: {
       )
       setConfirmation(null)
       setRequestError(null)
-      await props.onResolved()
+      await props.onResolved().catch(() => undefined)
       if (!sessionRef.current.isCurrent(variables.generation)) return
       toast.success(
         variables.payload.action === 'confirmed_accepted'
@@ -262,10 +264,14 @@ export function ManualBillingReviewSheet(props: {
         setResolvedElsewhere(true)
       } catch {
         if (!sessionRef.current.isCurrent(variables.generation)) return
-        setRequestError({
-          status: apiError.status,
-          code: 'review_refresh_failed',
-        })
+        setRequestError(
+          apiError.status === 403
+            ? apiError
+            : {
+                status: apiError.status,
+                code: 'review_refresh_failed',
+              }
+        )
       }
     },
   })
@@ -330,6 +336,8 @@ export function ManualBillingReviewSheet(props: {
     props.canResolve &&
     !resolvedElsewhere &&
     workingReview != null &&
+    manualBillingReviewKindIsSupported(workingReview.review_kind) &&
+    !manualBillingReviewHasUnknownBlocker(workingReview) &&
     workingReview.etag.length > 0 &&
     workingReview.review_version > 0 &&
     (workingReview.can_accept || workingReview.can_reject)
@@ -439,11 +447,12 @@ export function ManualBillingReviewSheet(props: {
 
   let providerStatusLabel = t('Select a decision')
   if (workingReview && selectedAction) {
-    providerStatusLabel = getManualBillingReviewProviderStatus(
-      workingReview.review_kind,
-      selectedAction,
-      rejectionProviderStatus
-    )
+    providerStatusLabel =
+      getManualBillingReviewProviderStatus(
+        workingReview.review_kind,
+        selectedAction,
+        rejectionProviderStatus
+      ) ?? t('Unknown')
   }
   let acceptDecisionDescription = t(
     'Confirm that the upstream task was accepted'
@@ -463,8 +472,15 @@ export function ManualBillingReviewSheet(props: {
       'Accepted handoff reviews can only be accepted'
     )
   }
+  const decisionContractSupported =
+    workingReview != null &&
+    manualBillingReviewKindIsSupported(workingReview.review_kind) &&
+    !manualBillingReviewHasUnknownBlocker(workingReview)
+  const acceptDecisionAvailable =
+    workingReview?.can_accept === true && decisionContractSupported
   const rejectDecisionAvailable =
     workingReview?.can_reject === true &&
+    decisionContractSupported &&
     workingReview.review_kind !== 'accepted_handoff'
   const evidenceWindowStart = workingReview
     ? getManualBillingReviewEvidenceWindowStart(workingReview)
@@ -497,10 +513,9 @@ export function ManualBillingReviewSheet(props: {
             <SheetDescription className='line-clamp-2 break-all'>
               {workingReview
                 ? t('{{type}} · Task {{task}}', {
-                    type: t(
-                      getManualBillingReviewKindLabelKey(
-                        workingReview.review_kind
-                      )
+                    type: getManualBillingReviewKindDisplay(
+                      workingReview.review_kind,
+                      t
                     ),
                     task: workingReview.public_task_id,
                   })
@@ -544,7 +559,22 @@ export function ManualBillingReviewSheet(props: {
               <ManualBillingReviewCaseDetails review={workingReview} />
             ) : null}
 
-            {workingReview && props.canResolve ? (
+            {workingReview &&
+            !manualBillingReviewKindIsSupported(workingReview.review_kind) ? (
+              <Alert role='status'>
+                <LockKeyhole aria-hidden='true' />
+                <AlertTitle>
+                  {t('This billing review type is not supported')}
+                </AlertTitle>
+                <AlertDescription className='break-all'>
+                  {workingReview.review_kind || t('Unknown')}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
+            {workingReview &&
+            props.canResolve &&
+            manualBillingReviewKindIsSupported(workingReview.review_kind) ? (
               <Form {...form}>
                 <form
                   id='manual-billing-review-form'
@@ -588,13 +618,13 @@ export function ManualBillingReviewSheet(props: {
                               <label
                                 className={cn(
                                   'border-input bg-background hover:bg-accent/40 has-data-checked:border-emerald-600 has-data-checked:bg-emerald-500/5 flex min-w-0 cursor-pointer items-start gap-3 rounded-md border p-3 text-sm',
-                                  !workingReview.can_accept &&
+                                  !acceptDecisionAvailable &&
                                     'cursor-not-allowed opacity-50'
                                 )}
                               >
                                 <RadioGroupItem
                                   value='confirmed_accepted'
-                                  disabled={!workingReview.can_accept}
+                                  disabled={!acceptDecisionAvailable}
                                   aria-label={t('Accept verified outcome')}
                                 />
                                 <span className='min-w-0'>
@@ -822,7 +852,9 @@ export function ManualBillingReviewSheet(props: {
             >
               {t('Close')}
             </Button>
-            {props.canResolve ? (
+            {props.canResolve &&
+            workingReview &&
+            manualBillingReviewKindIsSupported(workingReview.review_kind) ? (
               <Button
                 type='submit'
                 form='manual-billing-review-form'

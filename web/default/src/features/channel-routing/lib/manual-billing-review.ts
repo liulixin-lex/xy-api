@@ -23,6 +23,8 @@ import type {
   ManualBillingReviewAction,
   ManualBillingReviewApiError,
   ManualBillingReviewItem,
+  ManualBillingReviewKind,
+  ManualBillingReviewPage,
   ManualBillingReviewResolutionRequest,
 } from '../billing-review-types'
 
@@ -59,7 +61,9 @@ export type ManualBillingReviewFormValues = Omit<
   action: ManualBillingReviewAction
 }
 
-export function getManualBillingReviewKindLabelKey(reviewKind: string): string {
+export function getManualBillingReviewKindLabelKey(
+  reviewKind: string
+): string | null {
   switch (reviewKind) {
     case 'send_outcome':
       return 'Send outcome'
@@ -70,8 +74,24 @@ export function getManualBillingReviewKindLabelKey(reviewKind: string): string {
     case 'terminal_overage':
       return 'Terminal overage'
     default:
-      return 'Unknown review type'
+      return null
   }
+}
+
+export function manualBillingReviewKindIsSupported(
+  reviewKind: string
+): reviewKind is ManualBillingReviewKind {
+  return getManualBillingReviewKindLabelKey(reviewKind) != null
+}
+
+export function getManualBillingReviewKindDisplay(
+  reviewKind: string,
+  translate: (key: string, options?: Record<string, unknown>) => string
+): string {
+  const labelKey = getManualBillingReviewKindLabelKey(reviewKind)
+  if (labelKey) return translate(labelKey)
+  const code = reviewKind.trim() || translate('Unknown')
+  return `${translate('Unknown review type')}: ${code}`
 }
 
 export function manualBillingReviewIsOverage(reviewKind: string): boolean {
@@ -227,6 +247,17 @@ export function createManualBillingReviewSchema(
       }),
     })
     .superRefine((value, context) => {
+      if (
+        !manualBillingReviewKindIsSupported(review.review_kind) ||
+        manualBillingReviewHasUnknownBlocker(review)
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['action'],
+          message: messages.actionUnavailable,
+        })
+        return
+      }
       if (value.action === 'confirmed_accepted' && !review.can_accept) {
         context.addIssue({
           code: 'custom',
@@ -262,7 +293,7 @@ export function getManualBillingReviewProviderStatus(
   reviewKind: string,
   action: ManualBillingReviewAction,
   rejectionStatus: 'confirmed_rejected' | 'confirmed_not_found'
-): ManualBillingProviderStatus {
+): ManualBillingProviderStatus | null {
   if (reviewKind === 'terminal_overage') return 'terminal_usage_verified'
   if (
     reviewKind === 'acceptance_overage' ||
@@ -270,6 +301,7 @@ export function getManualBillingReviewProviderStatus(
   ) {
     return 'confirmed_accepted'
   }
+  if (reviewKind !== 'send_outcome') return null
   if (action === 'confirmed_accepted') return 'confirmed_accepted'
   return rejectionStatus
 }
@@ -278,15 +310,19 @@ export function buildManualBillingReviewResolution(
   review: ManualBillingReviewItem,
   values: ManualBillingReviewFormValues
 ): ManualBillingReviewResolutionRequest {
+  const providerStatus = getManualBillingReviewProviderStatus(
+    review.review_kind,
+    values.action,
+    values.rejection_provider_status
+  )
+  if (!providerStatus) {
+    throw new Error('Unsupported manual billing review kind')
+  }
   return {
     action: values.action,
     expected_version: review.review_version,
     upstream_task_id: values.upstream_task_id.trim(),
-    provider_status: getManualBillingReviewProviderStatus(
-      review.review_kind,
-      values.action,
-      values.rejection_provider_status
-    ),
+    provider_status: providerStatus,
     provider_checked_ms: new Date(values.provider_checked_at).getTime(),
     evidence_reference: values.evidence_reference.trim(),
     reason: values.reason.trim(),
@@ -347,7 +383,9 @@ export function getManualBillingReviewConsequenceRows(
   ]
 }
 
-export function getManualBillingReviewBlockerLabelKey(blocker: string): string {
+export function getManualBillingReviewBlockerLabelKey(
+  blocker: string
+): string | null {
   switch (blocker) {
     case 'resolve_permission_required':
       return 'Resolve permission is required'
@@ -366,14 +404,49 @@ export function getManualBillingReviewBlockerLabelKey(blocker: string): string {
     case 'unknown_review_kind':
       return 'This billing review type is not supported'
     default:
-      return blocker
+      return null
   }
+}
+
+export function getManualBillingReviewBlockerDisplay(
+  blocker: string,
+  translate: (key: string, options?: Record<string, unknown>) => string
+): string {
+  const labelKey = getManualBillingReviewBlockerLabelKey(blocker)
+  if (labelKey) return translate(labelKey)
+  const code = blocker.trim() || translate('Unknown')
+  return `${translate('Unknown')}: ${code}`
+}
+
+export function manualBillingReviewHasUnknownBlocker(
+  review: Pick<ManualBillingReviewItem, 'blockers'>
+): boolean {
+  return review.blockers.some(
+    (blocker) => getManualBillingReviewBlockerLabelKey(blocker) == null
+  )
+}
+
+export function getManualBillingReviewNextCursor(
+  page: Pick<ManualBillingReviewPage, 'has_more' | 'next_cursor'>,
+  currentCursor: number
+): number {
+  if (!page.has_more) return 0
+  const nextCursor = page.next_cursor
+  if (
+    typeof nextCursor !== 'number' ||
+    !Number.isSafeInteger(nextCursor) ||
+    nextCursor <= currentCursor
+  ) {
+    return 0
+  }
+  return nextCursor
 }
 
 export function manualBillingReviewNeedsRefresh(
   error: ManualBillingReviewApiError
 ): boolean {
   return (
+    error.status === 403 ||
     error.status === 409 ||
     error.status === 412 ||
     error.status === 404 ||

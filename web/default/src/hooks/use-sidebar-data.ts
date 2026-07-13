@@ -28,6 +28,7 @@ import {
   ListTodo,
   MessageSquare,
   Radio,
+  ReceiptText,
   Route,
   ServerCog,
   Settings,
@@ -143,6 +144,15 @@ export function useSidebarData(): SidebarData {
             icon: Route,
             requiredPermission: {
               resource: ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
+              action: ADMIN_PERMISSION_ACTIONS.READ,
+            },
+          },
+          {
+            title: t('Manual billing reviews'),
+            url: '/billing-reviews',
+            icon: ReceiptText,
+            requiredPermission: {
+              resource: ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
               action: ADMIN_PERMISSION_ACTIONS.READ,
             },
           },
