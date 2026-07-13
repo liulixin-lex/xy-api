@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -31,51 +32,93 @@ type InflightKey struct {
 	Group       string
 }
 
+type Limits struct {
+	MaxBuckets      int
+	BucketTTL       time.Duration
+	MaxInflightKeys int
+}
+
+type Stats struct {
+	Buckets         int64
+	InflightKeys    int64
+	BucketEvictions int64
+	InflightDrops   int64
+}
+
 type bucket struct {
-	mu              sync.Mutex
-	draining        bool
-	requestCount    int64
-	successCount    int64
-	totalLatencyMs  int64
-	latencySamples  []int64
-	latencyP95Ms    int64
-	ttftSumMs       int64
-	ttftCount       int64
-	ttftSamples     []int64
-	ttftP95Ms       int64
-	outputTokens    int64
-	generationMs    int64
-	err4xx          int64
-	err5xx          int64
-	err429          int64
-	retryAfterMaxMs int64
+	mu                      sync.Mutex
+	draining                bool
+	requestCount            int64
+	successCount            int64
+	reliabilityRequestCount int64
+	reliabilityFailureCount int64
+	totalLatencyMs          int64
+	latencySamples          []int64
+	latencyP95Ms            int64
+	ttftSumMs               int64
+	ttftCount               int64
+	ttftSamples             []int64
+	ttftP95Ms               int64
+	outputTokens            int64
+	generationMs            int64
+	err4xx                  int64
+	err5xx                  int64
+	err429                  int64
+	err529                  int64
+	retryAfterMaxMs         int64
+}
+
+type inflightCounter struct {
+	mu      sync.Mutex
+	value   atomic.Int64
+	retired bool
+}
+
+var defaultLimits = Limits{
+	MaxBuckets:      20_000,
+	BucketTTL:       10 * time.Minute,
+	MaxInflightKeys: 20_000,
 }
 
 var buckets sync.Map
 var inflight sync.Map
 
+// maintenanceMu serializes entry creation/removal and limit changes. When an
+// entry lock is also needed, maintenanceMu must be acquired first.
+var maintenanceMu sync.Mutex
+var limits = defaultLimits
+var bucketCount atomic.Int64
+var inflightKeyCount atomic.Int64
+var bucketEvictionCount atomic.Int64
+var inflightDropCount atomic.Int64
+
+func noopInflightRelease() {}
+
 func BeginInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID int) func() {
-	key, ok := inflightKey(c, info, channelID)
-	if !ok {
-		return func() {}
+	if !smart_routing_setting.Enabled() {
+		return noopInflightRelease
 	}
-	keys := []InflightKey{key}
-	if key.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
-		aggregate := key
-		aggregate.APIKeyIndex = model.RoutingMetricSingleKeyIndex
-		keys = append(keys, aggregate)
+	releases := make([]func(), 0, 2)
+	if release := beginStableInflight(c, info, channelID); release != nil {
+		releases = append(releases, release)
 	}
-	for _, item := range keys {
-		inflightCounter(item).Add(1)
+	if !info.CurrentAttemptIsMultiKey(c) {
+		if key, ok := inflightKey(c, info, channelID); ok {
+			if counter, acquired := acquireInflightCounter(key); acquired {
+				releases = append(releases, func() {
+					releaseInflightCounter(key, counter)
+				})
+			}
+		}
+	}
+	if len(releases) == 0 {
+		return noopInflightRelease
 	}
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			for _, item := range keys {
-				counter := inflightCounter(item)
-				if counter.Add(-1) <= 0 {
-					inflight.Delete(item)
-				}
+			for _, release := range releases {
+				release()
 			}
 		})
 	}
@@ -86,33 +129,54 @@ func InflightCount(key InflightKey) int64 {
 	if !ok {
 		return 0
 	}
-	count := value.(*atomic.Int64).Load()
+	count := value.(*inflightCounter).value.Load()
 	if count < 0 {
 		return 0
 	}
 	return count
 }
 
-func inflightCounter(key InflightKey) *atomic.Int64 {
-	actual, _ := inflight.LoadOrStore(key, &atomic.Int64{})
-	return actual.(*atomic.Int64)
+func RuntimeStats() Stats {
+	return Stats{
+		Buckets:         bucketCount.Load(),
+		InflightKeys:    inflightKeyCount.Load(),
+		BucketEvictions: bucketEvictionCount.Load(),
+		InflightDrops:   inflightDropCount.Load(),
+	}
 }
 
-func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
-	now := time.Now()
-	key, ok := attemptBucketKey(c, info, channelID, now)
-	if !ok {
+func RecordClassifiedAttempt(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channelID int,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
+	if !smart_routing_setting.Enabled() {
 		return
 	}
+	if info == nil {
+		recordStableClassifiedAttempt(c, info, channelID, time.Now(), 0, 0, false, 0, 0, success, apiErr, classification)
+		return
+	}
+	now := info.RoutingAttemptEndTime()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	attemptStart := info.RoutingAttemptStartTime()
+	if attemptStart.IsZero() {
+		attemptStart = now
+	}
 
-	latencyMs := now.Sub(info.StartTime).Milliseconds()
+	latencyMs := now.Sub(attemptStart).Milliseconds()
 	if latencyMs < 0 {
 		latencyMs = 0
 	}
 	ttftMs := int64(0)
-	hasTtft := info.IsStream && info.HasSendResponse()
+	hasTtft := info.IsStream && info.FirstResponseTime.After(attemptStart)
 	if hasTtft {
-		ttftMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+		ttftMs = info.FirstResponseTime.Sub(attemptStart).Milliseconds()
 		if ttftMs < 0 {
 			ttftMs = 0
 		}
@@ -125,11 +189,31 @@ func RecordAttempt(c *gin.Context, info *relaycommon.RelayInfo, channelID int, a
 		}
 	}
 
-	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
-	if key.apiKeyIndex != model.RoutingMetricSingleKeyIndex {
-		key.apiKeyIndex = model.RoutingMetricSingleKeyIndex
-		recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+	outputTokens := info.RoutingOutputTokens()
+	recordEndpointClassifiedAttempt(c, info, now, latencyMs, ttftMs, hasTtft, success, apiErr, classification)
+	recordStableClassifiedAttempt(
+		c,
+		info,
+		channelID,
+		now,
+		latencyMs,
+		ttftMs,
+		hasTtft,
+		generationMs,
+		outputTokens,
+		success,
+		apiErr,
+		classification,
+	)
+	if info.CurrentAttemptIsMultiKey(c) {
+		return
 	}
+
+	key, ok := attemptBucketKey(c, info, channelID, now)
+	if !ok {
+		return
+	}
+	recordBucket(key, latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 }
 
 func Snapshots() []model.RoutingChannelMetric {
@@ -148,19 +232,25 @@ func Snapshots() []model.RoutingChannelMetric {
 
 func DrainSnapshots() []model.RoutingChannelMetric {
 	snapshots := make([]model.RoutingChannelMetric, 0)
+	maintenanceMu.Lock()
 	buckets.Range(func(key any, value any) bool {
 		k := key.(bucketKey)
 		b := value.(*bucket)
 		b.mu.Lock()
 		b.draining = true
 		snapshot := b.snapshotLocked(k)
+		deleted := buckets.CompareAndDelete(key, value)
 		b.mu.Unlock()
+		if !deleted {
+			return true
+		}
+		decrementCount(&bucketCount)
 		if snapshot.RequestCount > 0 {
 			snapshots = append(snapshots, snapshot)
 		}
-		buckets.CompareAndDelete(key, value)
 		return true
 	})
+	maintenanceMu.Unlock()
 	sortRoutingMetrics(snapshots)
 	return snapshots
 }
@@ -176,37 +266,72 @@ func RequeueSnapshots(snapshots []model.RoutingChannelMetric) {
 }
 
 func ClearChannel(channelID int) {
+	ClearLegacyChannel(channelID)
+}
+
+// ClearLegacyChannel removes only the index-based compatibility state. Stable
+// member/credential deltas have an independent persistence lifecycle and must
+// not be discarded when a legacy cost binding changes.
+func ClearLegacyChannel(channelID int) {
 	if channelID <= 0 {
 		return
 	}
+	maintenanceMu.Lock()
 	buckets.Range(func(key any, value any) bool {
 		if k, ok := key.(bucketKey); ok && k.channelID == channelID {
-			buckets.Delete(key)
+			removeBucketLocked(k, value.(*bucket), false)
 		}
 		return true
 	})
 	inflight.Range(func(key any, value any) bool {
 		if k, ok := key.(InflightKey); ok && k.ChannelID == channelID {
-			inflight.Delete(key)
+			removeInflightLocked(k, value.(*inflightCounter))
 		}
 		return true
 	})
+	maintenanceMu.Unlock()
+}
+
+func ClearStableChannel(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	clearStableChannel(channelID)
 }
 
 func ResetForTest() {
+	maintenanceMu.Lock()
 	buckets.Range(func(key any, value any) bool {
-		buckets.Delete(key)
+		removeBucketLocked(key.(bucketKey), value.(*bucket), false)
 		return true
 	})
 	inflight.Range(func(key any, value any) bool {
-		inflight.Delete(key)
+		removeInflightLocked(key.(InflightKey), value.(*inflightCounter))
 		return true
 	})
+	bucketCount.Store(0)
+	inflightKeyCount.Store(0)
+	bucketEvictionCount.Store(0)
+	inflightDropCount.Store(0)
+	limits = defaultLimits
+	maintenanceMu.Unlock()
+	resetStableForTest()
+	resetEndpointMetricsForTest()
 }
 
-func recordBucket(key bucketKey, latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+func recordBucket(
+	key bucketKey,
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	outputTokens int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	withWritableBucket(key, func(b *bucket) {
-		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+		b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
 	})
 }
 
@@ -225,7 +350,14 @@ func recordSnapshot(snapshot model.RoutingChannelMetric) {
 
 func withWritableBucket(key bucketKey, write func(*bucket)) {
 	for {
-		actual, _ := buckets.LoadOrStore(key, &bucket{})
+		actual, ok := buckets.Load(key)
+		if !ok {
+			b := loadOrCreateBucket(key)
+			if b == nil {
+				return
+			}
+			actual = b
+		}
 		b := actual.(*bucket)
 		b.mu.Lock()
 		if b.draining {
@@ -238,16 +370,235 @@ func withWritableBucket(key bucketKey, write func(*bucket)) {
 	}
 }
 
-func (b *bucket) add(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, apiErr)
+func loadOrCreateBucket(key bucketKey) *bucket {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+
+	if actual, ok := buckets.Load(key); ok {
+		return actual.(*bucket)
+	}
+
+	activeLimits := normalizedLimits(limits)
+	limits = activeLimits
+	ttlSeconds := int64(activeLimits.BucketTTL / time.Second)
+	if activeLimits.BucketTTL%time.Second != 0 {
+		ttlSeconds++
+	}
+	const minBucketTimestamp int64 = -1 << 63
+	if key.bucketTs >= minBucketTimestamp+ttlSeconds {
+		evictExpiredBucketsLocked(key.bucketTs - ttlSeconds)
+	}
+	for bucketCount.Load() >= int64(activeLimits.MaxBuckets) {
+		if !evictOldestBucketLocked() {
+			return nil
+		}
+	}
+
+	b := &bucket{}
+	buckets.Store(key, b)
+	bucketCount.Add(1)
+	return b
 }
 
-func (b *bucket) addLocked(latencyMs int64, ttftMs int64, hasTtft bool, generationMs int64, apiErr *types.NewAPIError) {
+func evictExpiredBucketsLocked(cutoff int64) {
+	buckets.Range(func(key any, value any) bool {
+		k := key.(bucketKey)
+		if k.bucketTs <= cutoff {
+			removeBucketLocked(k, value.(*bucket), true)
+		}
+		return true
+	})
+}
+
+func evictOldestBucketLocked() bool {
+	var oldestKey bucketKey
+	var oldestBucket *bucket
+	buckets.Range(func(key any, value any) bool {
+		candidate := key.(bucketKey)
+		if oldestBucket == nil || bucketKeyLess(candidate, oldestKey) {
+			oldestKey = candidate
+			oldestBucket = value.(*bucket)
+		}
+		return true
+	})
+	if oldestBucket == nil {
+		return false
+	}
+	return removeBucketLocked(oldestKey, oldestBucket, true)
+}
+
+func removeBucketLocked(key bucketKey, b *bucket, eviction bool) bool {
+	b.mu.Lock()
+	b.draining = true
+	deleted := buckets.CompareAndDelete(key, b)
+	b.mu.Unlock()
+	if !deleted {
+		return false
+	}
+	decrementCount(&bucketCount)
+	if eviction {
+		bucketEvictionCount.Add(1)
+	}
+	return true
+}
+
+func bucketKeyLess(left bucketKey, right bucketKey) bool {
+	if left.bucketTs != right.bucketTs {
+		return left.bucketTs < right.bucketTs
+	}
+	if left.channelID != right.channelID {
+		return left.channelID < right.channelID
+	}
+	if left.apiKeyIndex != right.apiKeyIndex {
+		return left.apiKeyIndex < right.apiKeyIndex
+	}
+	if left.modelName != right.modelName {
+		return left.modelName < right.modelName
+	}
+	return left.group < right.group
+}
+
+func acquireInflightCounter(key InflightKey) (*inflightCounter, bool) {
+	for {
+		if actual, ok := inflight.Load(key); ok {
+			counter := actual.(*inflightCounter)
+			counter.mu.Lock()
+			if counter.retired {
+				counter.mu.Unlock()
+				continue
+			}
+			counter.value.Add(1)
+			counter.mu.Unlock()
+			return counter, true
+		}
+
+		maintenanceMu.Lock()
+		if _, ok := inflight.Load(key); ok {
+			maintenanceMu.Unlock()
+			continue
+		}
+		activeLimits := normalizedLimits(limits)
+		limits = activeLimits
+		if inflightKeyCount.Load() >= int64(activeLimits.MaxInflightKeys) {
+			inflightDropCount.Add(1)
+			maintenanceMu.Unlock()
+			return nil, false
+		}
+		counter := &inflightCounter{}
+		counter.value.Store(1)
+		inflight.Store(key, counter)
+		inflightKeyCount.Add(1)
+		maintenanceMu.Unlock()
+		return counter, true
+	}
+}
+
+func releaseInflightCounter(key InflightKey, counter *inflightCounter) {
+	counter.mu.Lock()
+	count := counter.value.Load()
+	if counter.retired || count <= 0 {
+		counter.mu.Unlock()
+		return
+	}
+	if count > 1 {
+		counter.value.Add(-1)
+		counter.mu.Unlock()
+		return
+	}
+	counter.mu.Unlock()
+
+	// Retire the final reference under the maintenance lock. Releasing the
+	// counter lock first preserves lock order; the count is checked again below.
+	maintenanceMu.Lock()
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	defer maintenanceMu.Unlock()
+	count = counter.value.Load()
+	if counter.retired || count <= 0 {
+		return
+	}
+	if count > 1 {
+		counter.value.Add(-1)
+		return
+	}
+	counter.value.Store(0)
+	counter.retired = true
+	if inflight.CompareAndDelete(key, counter) {
+		decrementCount(&inflightKeyCount)
+	}
+}
+
+func removeInflightLocked(key InflightKey, counter *inflightCounter) bool {
+	counter.mu.Lock()
+	counter.retired = true
+	deleted := inflight.CompareAndDelete(key, counter)
+	counter.mu.Unlock()
+	if deleted {
+		decrementCount(&inflightKeyCount)
+	}
+	return deleted
+}
+
+func normalizedLimits(value Limits) Limits {
+	if value.MaxBuckets <= 0 {
+		value.MaxBuckets = defaultLimits.MaxBuckets
+	}
+	if value.BucketTTL <= 0 {
+		value.BucketTTL = defaultLimits.BucketTTL
+	}
+	if value.MaxInflightKeys <= 0 {
+		value.MaxInflightKeys = defaultLimits.MaxInflightKeys
+	}
+	return value
+}
+
+func decrementCount(counter *atomic.Int64) {
+	for {
+		current := counter.Load()
+		if current <= 0 {
+			return
+		}
+		if counter.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
+}
+
+func (b *bucket) add(
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	outputTokens int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.addLocked(latencyMs, ttftMs, hasTtft, generationMs, outputTokens, success, apiErr, classification)
+}
+
+func (b *bucket) addLocked(
+	latencyMs int64,
+	ttftMs int64,
+	hasTtft bool,
+	generationMs int64,
+	outputTokens int64,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
 	b.requestCount++
-	if apiErr == nil {
+	if success {
 		b.successCount++
+		b.reliabilityRequestCount++
+	} else if (classification.Responsibility == routingerror.ResponsibilityProvider ||
+		(classification.Responsibility == routingerror.ResponsibilityNetwork && classification.Scope != routingerror.ScopeEndpoint)) &&
+		(classification.HealthEffect == routingerror.HealthDegrade ||
+			classification.HealthEffect == routingerror.HealthOpen) {
+		b.reliabilityRequestCount++
+		b.reliabilityFailureCount++
 	}
 	b.totalLatencyMs += latencyMs
 	b.latencySamples = appendBoundedSample(b.latencySamples, latencyMs)
@@ -256,15 +607,20 @@ func (b *bucket) addLocked(latencyMs int64, ttftMs int64, hasTtft bool, generati
 		b.ttftCount++
 		b.ttftSamples = appendBoundedSample(b.ttftSamples, ttftMs)
 	}
-	b.generationMs += generationMs
+	if outputTokens > 0 && generationMs > 0 {
+		b.outputTokens += outputTokens
+		b.generationMs += generationMs
+	}
 
 	statusCode := 0
 	if apiErr != nil {
-		statusCode = apiErr.StatusCode
+		statusCode = apiErr.SourceStatusCode()
 	}
 	switch {
 	case statusCode == 429:
 		b.err429++
+	case statusCode == 529:
+		b.err529++
 	case statusCode >= 500 && statusCode <= 599:
 		b.err5xx++
 	case statusCode >= 400 && statusCode <= 499:
@@ -284,6 +640,8 @@ func (b *bucket) addSnapshot(snapshot model.RoutingChannelMetric) {
 func (b *bucket) addSnapshotLocked(snapshot model.RoutingChannelMetric) {
 	b.requestCount += snapshot.RequestCount
 	b.successCount += snapshot.SuccessCount
+	b.reliabilityRequestCount += snapshot.ReliabilityRequestCount
+	b.reliabilityFailureCount += snapshot.ReliabilityFailureCount
 	b.totalLatencyMs += snapshot.TotalLatencyMs
 	if snapshot.LatencyP95Ms > b.latencyP95Ms {
 		b.latencyP95Ms = snapshot.LatencyP95Ms
@@ -298,6 +656,7 @@ func (b *bucket) addSnapshotLocked(snapshot model.RoutingChannelMetric) {
 	b.err4xx += snapshot.Err4xx
 	b.err5xx += snapshot.Err5xx
 	b.err429 += snapshot.Err429
+	b.err529 += snapshot.Err529
 	if snapshot.RetryAfterMaxMs > b.retryAfterMaxMs {
 		b.retryAfterMaxMs = snapshot.RetryAfterMaxMs
 	}
@@ -324,24 +683,27 @@ func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 
 func (b *bucket) snapshotLocked(key bucketKey) model.RoutingChannelMetric {
 	return model.RoutingChannelMetric{
-		ChannelID:       key.channelID,
-		APIKeyIndex:     key.apiKeyIndex,
-		ModelName:       key.modelName,
-		Group:           key.group,
-		BucketTs:        key.bucketTs,
-		RequestCount:    b.requestCount,
-		SuccessCount:    b.successCount,
-		TotalLatencyMs:  b.totalLatencyMs,
-		LatencyP95Ms:    b.latencyP95(),
-		TtftSumMs:       b.ttftSumMs,
-		TtftCount:       b.ttftCount,
-		TtftP95Ms:       b.ttftP95(),
-		OutputTokens:    b.outputTokens,
-		GenerationMs:    b.generationMs,
-		Err4xx:          b.err4xx,
-		Err5xx:          b.err5xx,
-		Err429:          b.err429,
-		RetryAfterMaxMs: b.retryAfterMaxMs,
+		ChannelID:               key.channelID,
+		APIKeyIndex:             key.apiKeyIndex,
+		ModelName:               key.modelName,
+		Group:                   key.group,
+		BucketTs:                key.bucketTs,
+		RequestCount:            b.requestCount,
+		SuccessCount:            b.successCount,
+		ReliabilityRequestCount: b.reliabilityRequestCount,
+		ReliabilityFailureCount: b.reliabilityFailureCount,
+		TotalLatencyMs:          b.totalLatencyMs,
+		LatencyP95Ms:            b.latencyP95(),
+		TtftSumMs:               b.ttftSumMs,
+		TtftCount:               b.ttftCount,
+		TtftP95Ms:               b.ttftP95(),
+		OutputTokens:            b.outputTokens,
+		GenerationMs:            b.generationMs,
+		Err4xx:                  b.err4xx,
+		Err5xx:                  b.err5xx,
+		Err429:                  b.err429,
+		Err529:                  b.err529,
+		RetryAfterMaxMs:         b.retryAfterMaxMs,
 	}
 }
 
@@ -357,13 +719,6 @@ func (b *bucket) ttftP95() int64 {
 		return percentileNearestRank(b.ttftSamples, 0.95)
 	}
 	return b.ttftP95Ms
-}
-
-func apiKeyIndex(info *relaycommon.RelayInfo) int {
-	if info == nil || info.ChannelMeta == nil || !info.ChannelMeta.ChannelIsMultiKey {
-		return model.RoutingMetricSingleKeyIndex
-	}
-	return info.ChannelMeta.ChannelMultiKeyIndex
 }
 
 func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (InflightKey, bool) {
@@ -385,7 +740,7 @@ func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (In
 	}
 	return InflightKey{
 		ChannelID:   channelID,
-		APIKeyIndex: apiKeyIndex(info),
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model:       info.OriginModelName,
 		Group:       group,
 	}, true

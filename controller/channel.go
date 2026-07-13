@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
@@ -69,6 +70,17 @@ func clearChannelInfo(channel *model.Channel) {
 		channel.ChannelInfo.MultiKeyDisabledReason = nil
 		channel.ChannelInfo.MultiKeyDisabledTime = nil
 	}
+}
+
+func updateChannelAndInvalidateRoutingHealth(channel *model.Channel) error {
+	credentialChanged, err := channel.UpdateWithCredentialChange()
+	if err != nil {
+		return err
+	}
+	if credentialChanged {
+		routinghotcache.ClearAuthFailure(channel.Id)
+	}
+	return nil
 }
 
 func applyChannelStatusFilter(query *gorm.DB, statusFilter int) *gorm.DB {
@@ -233,7 +245,7 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	ids, err := fetchChannelUpstreamModelIDs(channel)
+	ids, err := fetchChannelUpstreamModelIDs(c.Request.Context(), channel)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -1046,7 +1058,10 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	err = channel.Update()
+	if channel.ChannelInfo.IsMultiKey && channel.Key != "" && channel.Key != originChannel.Key {
+		channel.ChannelInfo.RemapMultiKeyState(originChannel.GetKeys(), channel.GetKeys())
+	}
+	err = updateChannelAndInvalidateRoutingHealth(&channel.Channel)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1181,7 +1196,7 @@ func FetchModels(c *gin.Context) {
 	key = strings.Split(key, "\n")[0]
 
 	if req.Type == constant.ChannelTypeOllama {
-		models, err := ollama.FetchOllamaModels(baseURL, key)
+		models, err := ollama.FetchOllamaModels(c.Request.Context(), baseURL, key)
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -1203,7 +1218,7 @@ func FetchModels(c *gin.Context) {
 	}
 
 	if req.Type == constant.ChannelTypeGemini {
-		models, err := gemini.FetchGeminiModels(baseURL, key, "")
+		models, err := gemini.FetchGeminiModels(c.Request.Context(), baseURL, key, "")
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -1222,7 +1237,7 @@ func FetchModels(c *gin.Context) {
 	client := &http.Client{}
 	url := fmt.Sprintf("%s/v1/models", baseURL)
 
-	request, err := http.NewRequest("GET", url, nil)
+	request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, url, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -1241,6 +1256,7 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
+	defer response.Body.Close()
 	//check status code
 	if response.StatusCode != http.StatusOK {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -1249,15 +1265,13 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
-	defer response.Body.Close()
-
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+	if err := common.DecodeJson(response.Body, &result); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"message": err.Error(),
@@ -1622,7 +1636,7 @@ func ManageMultiKeys(c *gin.Context) {
 
 		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1664,7 +1678,7 @@ func ManageMultiKeys(c *gin.Context) {
 			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
 		}
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1688,7 +1702,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1735,7 +1749,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1766,38 +1780,15 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		keys := channel.GetKeys()
-		var remainingKeys []string
-		var newStatusList = make(map[int]int)
-		var newDisabledTime = make(map[int]int64)
-		var newDisabledReason = make(map[int]string)
-
-		newIndex := 0
-		for i, key := range keys {
+		oldKeys := channel.GetKeys()
+		remainingKeys := make([]string, 0, len(oldKeys))
+		for i, key := range oldKeys {
 			// 跳过要删除的密钥
 			if i == keyIndex {
 				continue
 			}
 
 			remainingKeys = append(remainingKeys, key)
-
-			// 保留其他密钥的状态信息，重新索引
-			if channel.ChannelInfo.MultiKeyStatusList != nil {
-				if status, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists && status != 1 {
-					newStatusList[newIndex] = status
-				}
-			}
-			if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-				if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
-					newDisabledTime[newIndex] = t
-				}
-			}
-			if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-				if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
-					newDisabledReason[newIndex] = r
-				}
-			}
-			newIndex++
 		}
 
 		if len(remainingKeys) == 0 {
@@ -1810,12 +1801,9 @@ func ManageMultiKeys(c *gin.Context) {
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.RemapMultiKeyState(oldKeys, remainingKeys)
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1829,15 +1817,11 @@ func ManageMultiKeys(c *gin.Context) {
 		return
 
 	case "delete_disabled_keys":
-		keys := channel.GetKeys()
-		var remainingKeys []string
+		oldKeys := channel.GetKeys()
+		remainingKeys := make([]string, 0, len(oldKeys))
 		var deletedCount int
-		var newStatusList = make(map[int]int)
-		var newDisabledTime = make(map[int]int64)
-		var newDisabledReason = make(map[int]string)
 
-		newIndex := 0
-		for i, key := range keys {
+		for i, key := range oldKeys {
 			status := 1 // default enabled
 			if channel.ChannelInfo.MultiKeyStatusList != nil {
 				if s, exists := channel.ChannelInfo.MultiKeyStatusList[i]; exists {
@@ -1850,21 +1834,6 @@ func ManageMultiKeys(c *gin.Context) {
 				deletedCount++
 			} else {
 				remainingKeys = append(remainingKeys, key)
-				// 保留非自动禁用密钥的状态信息，重新索引
-				if status != 1 {
-					newStatusList[newIndex] = status
-					if channel.ChannelInfo.MultiKeyDisabledTime != nil {
-						if t, exists := channel.ChannelInfo.MultiKeyDisabledTime[i]; exists {
-							newDisabledTime[newIndex] = t
-						}
-					}
-					if channel.ChannelInfo.MultiKeyDisabledReason != nil {
-						if r, exists := channel.ChannelInfo.MultiKeyDisabledReason[i]; exists {
-							newDisabledReason[newIndex] = r
-						}
-					}
-				}
-				newIndex++
 			}
 		}
 
@@ -1875,15 +1844,19 @@ func ManageMultiKeys(c *gin.Context) {
 			})
 			return
 		}
+		if len(remainingKeys) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "不能删除最后一个密钥",
+			})
+			return
+		}
 
 		// Update channel with remaining keys
 		channel.Key = strings.Join(remainingKeys, "\n")
-		channel.ChannelInfo.MultiKeySize = len(remainingKeys)
-		channel.ChannelInfo.MultiKeyStatusList = newStatusList
-		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
-		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.RemapMultiKeyState(oldKeys, remainingKeys)
 
-		err = channel.Update()
+		err = updateChannelAndInvalidateRoutingHealth(channel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1958,7 +1931,7 @@ func OllamaPullModel(c *gin.Context) {
 	}
 
 	key := strings.Split(channel.Key, "\n")[0]
-	err = ollama.PullOllamaModel(baseURL, key, req.ModelName)
+	err = ollama.PullOllamaModel(c.Request.Context(), baseURL, key, req.ModelName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -2036,7 +2009,7 @@ func OllamaPullModelStream(c *gin.Context) {
 	}
 
 	// 执行拉取
-	err = ollama.PullOllamaModelStream(baseURL, key, req.ModelName, progressCallback)
+	err = ollama.PullOllamaModelStream(c.Request.Context(), baseURL, key, req.ModelName, progressCallback)
 
 	if err != nil {
 		errorData, _ := json.Marshal(gin.H{
@@ -2103,7 +2076,7 @@ func OllamaDeleteModel(c *gin.Context) {
 	}
 
 	key := strings.Split(channel.Key, "\n")[0]
-	err = ollama.DeleteOllamaModel(baseURL, key, req.ModelName)
+	err = ollama.DeleteOllamaModel(c.Request.Context(), baseURL, key, req.ModelName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -2152,7 +2125,7 @@ func OllamaVersion(c *gin.Context) {
 	}
 
 	key := strings.Split(channel.Key, "\n")[0]
-	version, err := ollama.FetchOllamaVersion(baseURL, key)
+	version, err := ollama.FetchOllamaVersion(c.Request.Context(), baseURL, key)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

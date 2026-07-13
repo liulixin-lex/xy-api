@@ -2,12 +2,20 @@ package config
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testConfigWithMap struct {
 	Modes map[string]string `json:"modes"`
 	Exprs map[string]string `json:"exprs"`
 	Name  string            `json:"name"`
+}
+
+type testScalarConfig struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 func TestUpdateConfigFromMap_MapReplacement(t *testing.T) {
@@ -93,4 +101,96 @@ func TestUpdateConfigFromMap_ScalarFieldsUnchanged(t *testing.T) {
 	if cfg.Modes["m"] != "v" {
 		t.Errorf("Modes should be unchanged, got %v", cfg.Modes)
 	}
+}
+
+func TestConfigManagerSnapshotAndReplaceUseRegisteredValue(t *testing.T) {
+	manager := NewConfigManager()
+	registered := &testScalarConfig{Name: "before", Count: 1}
+	manager.Register("test", registered)
+
+	var snapshot testScalarConfig
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, testScalarConfig{Name: "before", Count: 1}, snapshot)
+
+	replacement := testScalarConfig{Name: "after", Count: 2}
+	require.True(t, manager.Replace("test", replacement))
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, testScalarConfig{Name: "after", Count: 2}, snapshot)
+
+	pointerReplacement := &testScalarConfig{Name: "pointer", Count: 3}
+	require.True(t, manager.Replace("test", pointerReplacement))
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, testScalarConfig{Name: "pointer", Count: 3}, snapshot)
+}
+
+func TestConfigManagerSnapshotRejectsMismatchedDestination(t *testing.T) {
+	manager := NewConfigManager()
+	manager.Register("test", &testScalarConfig{Name: "value"})
+
+	var wrong string
+	var nilConfig *testScalarConfig
+	assert.False(t, manager.Snapshot("missing", &testScalarConfig{}))
+	assert.False(t, manager.Snapshot("test", nil))
+	assert.False(t, manager.Snapshot("test", nilConfig))
+	assert.False(t, manager.Snapshot("test", testScalarConfig{}))
+	assert.False(t, manager.Snapshot("test", &wrong))
+
+	manager.Register("value", testScalarConfig{Name: "value"})
+	assert.False(t, manager.Snapshot("value", &testScalarConfig{}))
+	manager.Register("nil", nilConfig)
+	assert.False(t, manager.Snapshot("nil", &testScalarConfig{}))
+}
+
+func TestConfigManagerReplaceRejectsMismatchedReplacement(t *testing.T) {
+	manager := NewConfigManager()
+	manager.Register("test", &testScalarConfig{Name: "value"})
+
+	var nilConfig *testScalarConfig
+	assert.False(t, manager.Replace("missing", testScalarConfig{}))
+	var replaced bool
+	assert.NotPanics(t, func() {
+		replaced = manager.Replace("test", nil)
+	})
+	assert.False(t, replaced)
+	assert.False(t, manager.Replace("test", nilConfig))
+	assert.False(t, manager.Replace("test", "wrong"))
+
+	manager.Register("value", testScalarConfig{Name: "value"})
+	assert.False(t, manager.Replace("value", testScalarConfig{}))
+	manager.Register("nil", nilConfig)
+	assert.False(t, manager.Replace("nil", testScalarConfig{}))
+}
+
+func TestConfigManagerUpdateFromMapUpdatesRegisteredValue(t *testing.T) {
+	manager := NewConfigManager()
+	manager.Register("test", &testScalarConfig{Name: "before", Count: 1})
+
+	found, err := manager.UpdateFromMap("test", map[string]string{
+		"name":  "after",
+		"count": "2",
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+
+	var snapshot testScalarConfig
+	require.True(t, manager.Snapshot("test", &snapshot))
+	assert.Equal(t, testScalarConfig{Name: "after", Count: 2}, snapshot)
+}
+
+func TestConfigManagerUpdateFromMapRejectsMissingOrInvalidTarget(t *testing.T) {
+	manager := NewConfigManager()
+
+	found, err := manager.UpdateFromMap("missing", map[string]string{"name": "after"})
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	manager.Register("value", testScalarConfig{Name: "before"})
+	found, err = manager.UpdateFromMap("value", map[string]string{"name": "after"})
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	manager.Register("nil", (*testScalarConfig)(nil))
+	found, err = manager.UpdateFromMap("nil", map[string]string{"name": "after"})
+	require.NoError(t, err)
+	assert.False(t, found)
 }

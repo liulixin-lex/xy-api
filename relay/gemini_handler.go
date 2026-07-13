@@ -196,10 +196,14 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 	usage, openaiErr := adaptor.DoResponse(c, resp.(*http.Response), info)
 	if openaiErr != nil {
+		finalizeHTTPStreamError(c, info, usage, false)
 		service.ResetStatusCode(openaiErr, statusCodeMappingStr)
 		return openaiErr
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {

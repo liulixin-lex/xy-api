@@ -7,7 +7,9 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +19,14 @@ import (
 
 func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing.T) {
 	truncate(t)
+	previousPerfSetting := perf_metrics_setting.GetSetting()
+	perfSetting := previousPerfSetting
+	perfSetting.Enabled = true
+	perf_metrics_setting.UpdateSetting(perfSetting)
+	t.Cleanup(func() {
+		perf_metrics_setting.UpdateSetting(previousPerfSetting)
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.PerfMetric{}))
 	seedUser(t, 9921, 100000)
 	seedToken(t, 9922, 9921, "wss-token", 100000)
 	seedChannel(t, 9923)
@@ -39,8 +49,9 @@ func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing
 	}
 	require.Nil(t, PreConsumeBilling(ctx, 0, info))
 	usage := &dto.RealtimeUsage{
-		TotalTokens: 1000,
-		InputTokens: 1000,
+		TotalTokens:  1009,
+		InputTokens:  1000,
+		OutputTokens: 9,
 		InputTokenDetails: dto.InputTokenDetails{
 			TextTokens: 1000,
 		},
@@ -53,9 +64,157 @@ func TestPreWssConsumeQuotaReservesCumulativeUsageWithoutDoubleCharge(t *testing
 
 	PostWssConsumeQuota(ctx, info, info.OriginModelName, usage, "")
 
+	assert.Equal(t, int64(9), info.RoutingOutputTokens())
 	assert.Equal(t, 62500, getUserQuota(t, 9921))
 	assert.Equal(t, 62500, getTokenRemainQuota(t, 9922))
 	var logCount int64
 	require.NoError(t, model.DB.Model(&model.Log{}).Count(&logCount).Error)
 	assert.Equal(t, int64(1), logCount)
+	result, err := perfmetrics.Query(perfmetrics.QueryParams{Model: info.OriginModelName, Hours: 1})
+	require.NoError(t, err)
+	require.Len(t, result.Groups, 1)
+	assert.Equal(t, "default", result.Groups[0].Group)
+	assert.Equal(t, float64(100), result.Groups[0].SuccessRate)
+}
+
+func TestPostWssConsumeQuotaMissingUsageRetainsReservedQuotaAndRecordsConsumption(t *testing.T) {
+	truncate(t)
+	seedUser(t, 9931, 100000)
+	seedToken(t, 9932, 9931, "wss-missing-usage", 100000)
+	seedChannel(t, 9933)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		UserId:          9931,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 9933},
+		TokenId:         9932,
+		TokenKey:        "wss-missing-usage",
+		UsingGroup:      "default",
+		UserGroup:       "default",
+		OriginModelName: "gpt-realtime",
+		StartTime:       time.Now(),
+		IsStream:        true,
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
+	}
+
+	require.Nil(t, PreConsumeBilling(ctx, 250, info))
+	assert.Equal(t, 99750, getUserQuota(t, 9931))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9932))
+
+	require.NotPanics(t, func() {
+		PostWssConsumeQuota(ctx, info, info.OriginModelName, nil, "")
+	})
+
+	assert.Zero(t, info.RoutingOutputTokens())
+	assert.False(t, info.Billing.NeedsRefund())
+	assert.Equal(t, 99750, getUserQuota(t, 9931))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9932))
+
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 9931).First(&user).Error)
+	assert.Equal(t, 250, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", 9933).First(&channel).Error)
+	assert.Equal(t, int64(250), channel.UsedQuota)
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, int64(1), countLogs(t))
+	assert.Equal(t, 250, log.Quota)
+	assert.Zero(t, log.PromptTokens)
+	assert.Zero(t, log.CompletionTokens)
+	assert.Contains(t, log.Content, "缺少 usage")
+}
+
+func TestPostTextConsumeQuotaMissingUsageRetainsReservedQuotaAndRecordsConsumption(t *testing.T) {
+	truncate(t)
+	seedUser(t, 9941, 100000)
+	seedToken(t, 9942, 9941, "stream-missing-usage", 100000)
+	seedChannel(t, 9943)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		UserId:          9941,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 9943},
+		TokenId:         9942,
+		TokenKey:        "stream-missing-usage",
+		UsingGroup:      "default",
+		UserGroup:       "default",
+		OriginModelName: "stream-model",
+		StartTime:       time.Now(),
+		IsStream:        true,
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+	info.SetEstimatePromptTokens(100)
+
+	require.Nil(t, PreConsumeBilling(ctx, 250, info))
+	assert.Equal(t, 99750, getUserQuota(t, 9941))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9942))
+
+	PostTextConsumeQuota(ctx, info, nil, nil)
+
+	assert.Zero(t, info.RoutingOutputTokens())
+	assert.False(t, info.Billing.NeedsRefund())
+	assert.Equal(t, 99750, getUserQuota(t, 9941))
+	assert.Equal(t, 99750, getTokenRemainQuota(t, 9942))
+
+	var user model.User
+	require.NoError(t, model.DB.Select("used_quota", "request_count").Where("id = ?", 9941).First(&user).Error)
+	assert.Equal(t, 250, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("used_quota").Where("id = ?", 9943).First(&channel).Error)
+	assert.Equal(t, int64(250), channel.UsedQuota)
+
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, int64(1), countLogs(t))
+	assert.Equal(t, 250, log.Quota)
+	assert.Equal(t, 100, log.PromptTokens)
+	assert.Zero(t, log.CompletionTokens)
+	assert.Contains(t, log.Content, "按预扣额度结算")
+}
+
+func TestPostTextConsumeQuotaCapturesRoutingOutputTokens(t *testing.T) {
+	truncate(t)
+	seedUser(t, 9951, 100000)
+	seedToken(t, 9952, 9951, "stream-usage", 100000)
+	seedChannel(t, 9953)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{
+		UserId:          9951,
+		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 9953},
+		TokenId:         9952,
+		TokenKey:        "stream-usage",
+		UsingGroup:      "default",
+		UserGroup:       "default",
+		OriginModelName: "stream-model",
+		StartTime:       time.Now(),
+		IsStream:        true,
+		ForcePreConsume: true,
+		UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
+		PriceData: types.PriceData{
+			ModelRatio:      1,
+			CompletionRatio: 1,
+			GroupRatioInfo:  types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+	usage := &dto.Usage{
+		PromptTokens:     100,
+		CompletionTokens: 25,
+		TotalTokens:      125,
+	}
+
+	require.Nil(t, PreConsumeBilling(ctx, 250, info))
+	PostTextConsumeQuota(ctx, info, usage, nil)
+
+	assert.Equal(t, int64(25), info.RoutingOutputTokens())
 }

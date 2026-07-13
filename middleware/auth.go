@@ -200,7 +200,23 @@ func RequirePermission(permission authz.Permission) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		role := c.GetInt("role")
 		userID := c.GetInt("id")
-		if authz.Can(userID, role, permission) {
+		allowed := false
+		if authz.RequiresFreshPolicy(permission) {
+			var err error
+			allowed, err = authz.CanCurrent(c.Request.Context(), userID, role, permission)
+			if err != nil {
+				common.SysError("failed to check current authorization policy: " + err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"success": false,
+					"message": common.TranslateMessage(c, i18n.MsgDatabaseError),
+				})
+				c.Abort()
+				return
+			}
+		} else {
+			allowed = authz.Can(userID, role, permission)
+		}
+		if allowed {
 			c.Next()
 			return
 		}

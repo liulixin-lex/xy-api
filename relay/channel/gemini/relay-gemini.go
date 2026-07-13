@@ -1337,19 +1337,35 @@ func handleFinalStream(c *gin.Context, info *relaycommon.RelayInfo, resp *dto.Ch
 	if err != nil {
 		return fmt.Errorf("failed to marshal stream response: %w", err)
 	}
-	openai.HandleFinalResponse(c, info, string(streamData), resp.Id, resp.Created, resp.Model, resp.GetSystemFingerprint(), resp.Usage, false)
+	if err := openai.HandleFinalResponse(c, info, string(streamData), resp.Id, resp.Created, resp.Model, resp.GetSystemFingerprint(), resp.Usage, false); err != nil {
+		return fmt.Errorf("failed to send final stream response: %w", err)
+	}
 	return nil
+}
+
+func geminiStreamStatusError(info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil || !info.HTTPStreamHasFailure() {
+		return nil
+	}
+	status := info.StreamStatus
+	streamErr := status.EndError
+	if streamErr == nil {
+		streamErr = fmt.Errorf("gemini stream failed: %s", status.Summary())
+	}
+	return types.NewError(streamErr, types.ErrorCodeBadResponseBody)
 }
 
 func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, callback func(data string, geminiResponse *dto.GeminiChatResponse) bool) (*dto.Usage, *types.NewAPIError) {
 	var usage = &dto.Usage{}
 	var imageCount int
+	var streamErr *types.NewAPIError
 	responseText := strings.Builder{}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var geminiResponse dto.GeminiChatResponse
 		if err := common.UnmarshalJsonStr(data, &geminiResponse); err != nil {
-			sr.Stop(fmt.Errorf("unmarshal: %w", err))
+			streamErr = types.NewError(fmt.Errorf("unmarshal: %w", err), types.ErrorCodeBadResponseBody)
+			sr.Stop(streamErr)
 			return
 		}
 
@@ -1394,7 +1410,7 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 	}
 
-	return usage, nil
+	return usage, streamErr
 }
 
 func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -1403,6 +1419,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	finishReason := constant.FinishReasonStop
 	toolCallIndexByChoice := make(map[int]map[string]int)
 	nextToolCallIndexByChoice := make(map[int]int)
+	var downstreamErr *types.NewAPIError
 
 	usage, err := geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
 		response, isStop := streamResponseGeminiChat2OpenAI(geminiResponse)
@@ -1458,7 +1475,8 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 				finishReason = constant.FinishReasonToolCalls
 				err := handleStream(c, info, emptyResponse)
 				if err != nil {
-					logger.LogError(c, err.Error())
+					downstreamErr = types.NewError(err, types.ErrorCodeBadResponse)
+					return false
 				}
 
 				response.ClearToolCalls()
@@ -1468,18 +1486,23 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 			} else {
 				err := handleStream(c, info, emptyResponse)
 				if err != nil {
-					logger.LogError(c, err.Error())
+					downstreamErr = types.NewError(err, types.ErrorCodeBadResponse)
+					return false
 				}
 			}
 		}
 
 		err := handleStream(c, info, response)
 		if err != nil {
-			logger.LogError(c, err.Error())
+			downstreamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			return false
 		}
 		if isStop {
 			if info.RelayFormat != types.RelayFormatClaude {
-				_ = handleStream(c, info, helper.GenerateStopResponse(id, createAt, info.UpstreamModelName, finishReason))
+				if err := handleStream(c, info, helper.GenerateStopResponse(id, createAt, info.UpstreamModelName, finishReason)); err != nil {
+					downstreamErr = types.NewError(err, types.ErrorCodeBadResponse)
+					return false
+				}
 			}
 		}
 		return true
@@ -1488,8 +1511,14 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	if err != nil {
 		return usage, err
 	}
+	if downstreamErr != nil {
+		return usage, downstreamErr
+	}
 	if info.FirstByteTimedOutBeforeResponse() {
 		return nil, nil
+	}
+	if streamErr := geminiStreamStatusError(info); streamErr != nil {
+		return usage, streamErr
 	}
 
 	response := helper.GenerateFinalUsageResponse(id, createAt, info.UpstreamModelName, *usage)
@@ -1499,7 +1528,7 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 	}
 	handleErr := handleFinalStream(c, info, response)
 	if handleErr != nil {
-		common.SysLog("send final response failed: " + handleErr.Error())
+		return usage, types.NewError(handleErr, types.ErrorCodeBadResponse)
 	}
 	return usage, nil
 }
@@ -1683,7 +1712,10 @@ type GeminiModelsResponse struct {
 	NextPageToken string            `json:"nextPageToken"`
 }
 
-func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
+func FetchGeminiModels(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+	if ctx == nil {
+		return nil, errors.New("gemini model discovery context is unavailable")
+	}
 	client, err := service.GetHttpClientWithProxy(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP客户端失败: %v", err)
@@ -1699,8 +1731,8 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			url = fmt.Sprintf("%s?pageToken=%s", url, nextPageToken)
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		request, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		pageCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		request, err := http.NewRequestWithContext(pageCtx, http.MethodGet, url, nil)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("创建请求失败: %v", err)
@@ -1711,7 +1743,7 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 		response, err := client.Do(request)
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("请求失败: %v", err)
+			return nil, fmt.Errorf("请求失败: %w", err)
 		}
 
 		if response.StatusCode != http.StatusOK {
@@ -1725,7 +1757,7 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 		response.Body.Close()
 		cancel()
 		if err != nil {
-			return nil, fmt.Errorf("读取响应失败: %v", err)
+			return nil, fmt.Errorf("读取响应失败: %w", err)
 		}
 
 		var modelsResponse GeminiModelsResponse

@@ -18,13 +18,11 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { createFileRoute, redirect } from '@tanstack/react-router'
 
-import { SmartRouting } from '@/features/smart-routing'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
-import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated/smart-routing/')({
@@ -32,11 +30,9 @@ export const Route = createFileRoute('/_authenticated/smart-routing/')({
     const { auth } = useAuthStore.getState()
 
     if (
-      !auth.user ||
-      auth.user.role < ROLE.ADMIN ||
       !hasPermission(
         auth.user,
-        ADMIN_PERMISSION_RESOURCES.CHANNEL,
+        ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
         ADMIN_PERMISSION_ACTIONS.READ
       )
     ) {
@@ -44,6 +40,11 @@ export const Route = createFileRoute('/_authenticated/smart-routing/')({
         to: '/403',
       })
     }
+
+    throw redirect({
+      to: '/channel-routing/$section',
+      params: { section: 'overview' },
+      replace: true,
+    })
   },
-  component: SmartRouting,
 })

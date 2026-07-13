@@ -45,7 +45,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				var simpleResponse dto.SimpleResponse
 				if err := common.Unmarshal([]byte(data), &simpleResponse); err != nil {
 					logger.LogError(c, err.Error())
-					sr.Error(err)
+					sr.Stop(err)
+					return
 				} else if simpleResponse.Usage.TotalTokens != 0 {
 					usage.PromptTokens = simpleResponse.Usage.InputTokens
 					usage.CompletionTokens = simpleResponse.OutputTokens
@@ -53,7 +54,8 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 				}
 			}
 			if err := helper.StringData(c, data); err != nil {
-				sr.Error(err)
+				sr.Stop(err)
+				return
 			}
 		})
 		if info.FirstByteTimedOutBeforeResponse() {

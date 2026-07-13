@@ -78,23 +78,22 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		applySystemPromptIfNeeded(c, info, request)
 		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, request)
 		if newApiErr != nil {
+			finalizeHTTPStreamError(c, info, usage, false)
 			return newApiErr
 		}
-		if info.FirstByteTimedOutBeforeResponse() {
+		if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+			return nil
+		}
+		if info.HTTPStreamFailedBeforeCommit(c) {
 			return nil
 		}
 		if usage == nil {
 			return types.NewOpenAIError(fmt.Errorf("empty usage from responses adapter"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 		}
 
-		var containAudioTokens = usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
-		var containsAudioRatios = ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
-
-		if containAudioTokens && containsAudioRatios {
-			service.PostAudioConsumeQuota(c, info, usage, "")
-		} else {
-			service.PostTextConsumeQuota(c, info, usage, nil)
-		}
+		containAudioTokens := usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
+		containsAudioRatios := ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
+		settleOrCaptureTextUsage(c, info, usage, containAudioTokens && containsAudioRatios)
 		return nil
 	}
 
@@ -212,24 +211,24 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 
 	usage, newApiErr := adaptor.DoResponse(c, httpResp, info)
 	if newApiErr != nil {
+		finalizeHTTPStreamError(c, info, usage, false)
 		// reset status code 重置状态码
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return newApiErr
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {
 		return types.NewOpenAIError(fmt.Errorf("empty usage from channel response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 
-	var containAudioTokens = usage.(*dto.Usage).CompletionTokenDetails.AudioTokens > 0 || usage.(*dto.Usage).PromptTokensDetails.AudioTokens > 0
-	var containsAudioRatios = ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
-
-	if containAudioTokens && containsAudioRatios {
-		service.PostAudioConsumeQuota(c, info, usage.(*dto.Usage), "")
-	} else {
-		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
-	}
+	usageDto := usage.(*dto.Usage)
+	containAudioTokens := usageDto.CompletionTokenDetails.AudioTokens > 0 || usageDto.PromptTokensDetails.AudioTokens > 0
+	containsAudioRatios := ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
+	settleOrCaptureTextUsage(c, info, usageDto, containAudioTokens && containsAudioRatios)
 	return nil
 }

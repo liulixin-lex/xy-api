@@ -80,6 +80,78 @@ func TestRankCandidatesNormalizesWeights(t *testing.T) {
 	assert.InDelta(t, 0.5, decision.Weights.Cost, 0.000001)
 }
 
+func TestRankCandidatesAppliesBoundedScoreMultiplierWithoutChangingLegacyCandidates(t *testing.T) {
+	legacy := testCandidate(1, 1, 100, 10, nil, nil)
+	warming := testCandidate(2, 1, 100, 10, nil, nil)
+	warming.ScoreMultiplier = 0.2
+	invalid := testCandidate(3, 1, 100, 10, nil, nil)
+	invalid.ScoreMultiplier = math.Inf(1)
+
+	decision := RankCandidates([]Candidate{warming, legacy, invalid}, Settings{
+		WeightAvailability: 1,
+		MinVolume:          1,
+	})
+
+	require.Len(t, decision.Ranked, 3)
+	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+	assert.InDelta(t, 1, rankedByID(t, decision, 1).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, 0.2, rankedByID(t, decision, 2).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, 1, rankedByID(t, decision, 3).ScoreMultiplier, 0.000001)
+	assert.InDelta(t, rankedByID(t, decision, 1).Score*0.2, rankedByID(t, decision, 2).Score, 0.000001)
+}
+
+func TestSelectRankedFromCandidatesUsesTTFTOnlyWhenPreferred(t *testing.T) {
+	candidates := []Candidate{
+		testCandidate(1, 1, 900, 10, nil, nil),
+		testCandidate(2, 1, 200, 10, nil, nil),
+	}
+	candidates[0].Metric.P95TTFTMs = 100
+	candidates[1].Metric.P95TTFTMs = 500
+
+	streaming := SelectRankedFromCandidates(candidates, Settings{
+		WeightLatency: 1,
+		TopK:          1,
+		PreferTTFT:    true,
+	})
+	nonStreaming := SelectRankedFromCandidates(candidates, Settings{
+		WeightLatency: 1,
+		TopK:          1,
+	})
+
+	require.NotNil(t, streaming.Selected)
+	require.NotNil(t, nonStreaming.Selected)
+	assert.Equal(t, 1, streaming.Selected.Channel.Id)
+	assert.Equal(t, 2, nonStreaming.Selected.Channel.Id)
+}
+
+func TestSelectRankedFromCandidatesFallsBackToTotalLatencyForInvalidTTFT(t *testing.T) {
+	for _, ttft := range []struct {
+		name  string
+		value float64
+	}{
+		{name: "missing"},
+		{name: "nan", value: math.NaN()},
+	} {
+		t.Run(ttft.name, func(t *testing.T) {
+			candidates := []Candidate{
+				testCandidate(1, 1, 900, 10, nil, nil),
+				testCandidate(2, 1, 200, 10, nil, nil),
+			}
+			candidates[0].Metric.P95TTFTMs = ttft.value
+			candidates[1].Metric.P95TTFTMs = ttft.value
+
+			decision := SelectRankedFromCandidates(candidates, Settings{
+				WeightLatency: 1,
+				TopK:          1,
+				PreferTTFT:    true,
+			})
+
+			require.NotNil(t, decision.Selected)
+			assert.Equal(t, 2, decision.Selected.Channel.Id)
+		})
+	}
+}
+
 func TestRankCandidatesTreatsStaleCostsAsUnknown(t *testing.T) {
 	settings := Settings{
 		WeightAvailability: 1,
@@ -220,11 +292,77 @@ func TestRankCandidatesKeepsLowVolumeCandidatesDespiteAvailabilityFloor(t *testi
 	candidate := testCandidate(1, 0.1, 100, 10, nil, nil)
 	candidate.Metric.RequestCount = 3
 	candidate.Metric.SuccessCount = 0
+	candidate.Metric.ReliabilityRequestCount = 3
+	candidate.Metric.ReliabilityFailureCount = 3
 
 	decision := RankCandidates([]Candidate{candidate}, settings)
 
 	require.Len(t, decision.Ranked, 1)
 	assert.Equal(t, 1, decision.Ranked[0].Channel.Id)
+}
+
+func TestAvailabilityUsesReliabilitySamplesAndLegacyRowsStayNeutral(t *testing.T) {
+	settings := Settings{WeightAvailability: 1, MinVolume: 1}
+	reliable := testCandidate(1, 1, 100, 1, nil, nil)
+	reliable.Metric.ReliabilityRequestCount = 10
+	reliable.Metric.ReliabilityFailureCount = 2
+	reliable.Metric.RequestCount = 100
+	reliable.Metric.SuccessCount = 1
+
+	legacy := testCandidate(2, 0, 100, 1, nil, nil)
+	legacy.Metric.ReliabilityRequestCount = 0
+	legacy.Metric.ReliabilityFailureCount = 0
+	legacy.Metric.RequestCount = 100
+	legacy.Metric.SuccessCount = 0
+
+	decision := RankCandidates([]Candidate{reliable, legacy}, settings)
+
+	assert.InDelta(t, 0.8, rankedByID(t, decision, 1).Availability, 0.000001)
+	assert.InDelta(t, availabilityNeutralPrior, rankedByID(t, decision, 2).Availability, 0.000001)
+}
+
+func TestAvailabilityFloorUsesReliabilityVolumeOnly(t *testing.T) {
+	candidate := testCandidate(1, 0, 100, 1, nil, nil)
+	candidate.Metric.RequestCount = 1000
+	candidate.Metric.SuccessCount = 0
+	candidate.Metric.ReliabilityRequestCount = 3
+	candidate.Metric.ReliabilityFailureCount = 3
+
+	decision := RankCandidates([]Candidate{candidate}, Settings{
+		WeightAvailability: 1,
+		MinVolume:          10,
+		AvailabilityFloor:  0.99,
+	})
+
+	require.Len(t, decision.Ranked, 1)
+}
+
+func TestRankCandidatesCapacityCooldownIsHardFilterWithoutBreakerBypass(t *testing.T) {
+	cooling := testCandidate(1, 1, 100, 1, nil, &BreakerSnapshot{State: BreakerStateHealthy})
+	cooling.Capacity = &CapacityCooldownSnapshot{CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000}
+	open := testCandidate(2, 1, 100, 1, nil, &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 300, UpdatedUnix: 100})
+
+	decision := RankCandidates([]Candidate{cooling, open}, Settings{
+		WeightAvailability: 1,
+		MaxEjectedPct:      0,
+		NowUnix:            150,
+		NowUnixMilli:       150_000,
+	})
+
+	assert.Equal(t, 1, decision.FilteredCapacity)
+	assert.True(t, decision.BreakerBypassed)
+	require.Len(t, decision.Ranked, 1)
+	assert.Equal(t, 2, decision.Ranked[0].Channel.Id)
+}
+
+func TestRankCandidatesRestoresCapacityCandidateAtDeadline(t *testing.T) {
+	candidate := testCandidate(1, 1, 100, 1, nil, nil)
+	candidate.Capacity = &CapacityCooldownSnapshot{CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000}
+
+	decision := RankCandidates([]Candidate{candidate}, Settings{WeightAvailability: 1, NowUnix: 200, NowUnixMilli: 200_000})
+
+	assert.Zero(t, decision.FilteredCapacity)
+	require.Len(t, decision.Ranked, 1)
 }
 
 func TestRankCandidatesOrdersAdminPriorityBeforeScore(t *testing.T) {
@@ -413,16 +551,39 @@ func TestRankCandidatesDoesNotModifyOriginalChannelPointer(t *testing.T) {
 	assert.Equal(t, beforeBreaker, *breaker)
 }
 
+func TestBreakerNeedsHalfOpenProbeMatchesSelectorFreshnessAndCooldown(t *testing.T) {
+	settings := Settings{NowUnix: 1_000, SnapshotStaleSec: 300, HalfOpenProbes: 1}
+	tests := []struct {
+		name    string
+		breaker *BreakerSnapshot
+		want    bool
+	}{
+		{name: "fresh half open", breaker: &BreakerSnapshot{State: BreakerStateHalfOpen, UpdatedUnix: 900}, want: true},
+		{name: "stale half open", breaker: &BreakerSnapshot{State: BreakerStateHalfOpen, UpdatedUnix: 600}},
+		{name: "open cooldown elapsed", breaker: &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 1_000, UpdatedUnix: 900}, want: true},
+		{name: "open still cooling", breaker: &BreakerSnapshot{State: BreakerStateOpen, CooldownUntilUnix: 1_001, UpdatedUnix: 900}},
+		{name: "healthy", breaker: &BreakerSnapshot{State: BreakerStateHealthy, UpdatedUnix: 900}},
+		{name: "missing"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, BreakerNeedsHalfOpenProbe(test.breaker, settings))
+		})
+	}
+}
+
 func testCandidate(id int, availability float64, p95LatencyMs float64, tps float64, cost *CostSnapshot, breaker *BreakerSnapshot) Candidate {
 	requests := int64(100)
 	successes := int64(math.Round(availability * float64(requests)))
 	return Candidate{
 		Channel: &model.Channel{Id: id},
 		Metric: &MetricSnapshot{
-			RequestCount: requests,
-			SuccessCount: successes,
-			P95LatencyMs: p95LatencyMs,
-			TPS:          tps,
+			RequestCount:            requests,
+			SuccessCount:            successes,
+			ReliabilityRequestCount: requests,
+			ReliabilityFailureCount: requests - successes,
+			P95LatencyMs:            p95LatencyMs,
+			TPS:                     tps,
 		},
 		Cost:    cost,
 		Breaker: breaker,

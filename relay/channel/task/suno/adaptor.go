@@ -2,6 +2,7 @@ package suno
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +28,7 @@ type TaskAdaptor struct {
 // Suno polling uses a dedicated batch-fetch path (service.UpdateSunoTasks) that
 // receives dto.TaskResponse[[]dto.SunoDataResponse] from the upstream /fetch API.
 // This differs from the per-task polling used by video adaptors.
-func (a *TaskAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+func (a *TaskAdaptor) ParseTaskResult(context.Context, []byte) (*relaycommon.TaskInfo, error) {
 	return nil, fmt.Errorf("suno uses batch polling via UpdateSunoTasks, ParseTaskResult is not applicable")
 }
 
@@ -108,6 +109,10 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		taskErr = service.TaskErrorWrapper(fmt.Errorf("%s", sunoResponse.Message), sunoResponse.Code, http.StatusInternalServerError)
 		return
 	}
+	if strings.TrimSpace(sunoResponse.Data) == "" {
+		taskErr = service.TaskErrorWrapper(fmt.Errorf("task_id is empty"), "invalid_response", http.StatusInternalServerError)
+		return
+	}
 
 	// 使用公开 task_xxxx ID 替换上游 ID 返回给客户端
 	publicResponse := dto.TaskResponse[string]{
@@ -128,14 +133,14 @@ func (a *TaskAdaptor) GetChannelName() string {
 	return ChannelName
 }
 
-func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+func (a *TaskAdaptor) FetchTask(ctx context.Context, baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
 	requestUrl := fmt.Sprintf("%s/suno/fetch", baseUrl)
 	byteBody, err := common.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", requestUrl, bytes.NewBuffer(byteBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestUrl, bytes.NewBuffer(byteBody))
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task error: %v", err))
 		return nil, err

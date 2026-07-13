@@ -38,14 +38,20 @@ func HasCSAMViolationMarker(err *types.NewAPIError) bool {
 	return strings.Contains(msg, CSAMViolationMarker) || strings.Contains(err.Error(), ContentViolatesUsageMarker)
 }
 
-func WrapAsViolationFeeGrokCSAM(err *types.NewAPIError) *types.NewAPIError {
-	if err == nil {
+func WrapAsViolationFeeGrokCSAM(apiErr *types.NewAPIError) *types.NewAPIError {
+	if apiErr == nil {
 		return nil
 	}
-	oai := err.ToOpenAIError()
-	oai.Type = string(types.ErrorCodeViolationFeeGrokCSAM)
-	oai.Code = string(types.ErrorCodeViolationFeeGrokCSAM)
-	return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+	wrapped := types.NewErrorWithStatusCode(
+		apiErr.Cause(),
+		types.ErrorCodeViolationFeeGrokCSAM,
+		apiErr.SourceStatusCode(),
+		types.ErrOptionWithSkipRetry(),
+	)
+	wrapped.Metadata = apiErr.Metadata
+	wrapped.SetMessage(apiErr.Error())
+	wrapped.SetResponseStatusCode(apiErr.StatusCode)
+	return wrapped
 }
 
 // NormalizeViolationFeeError ensures:
@@ -63,8 +69,7 @@ func NormalizeViolationFeeError(err *types.NewAPIError) *types.NewAPIError {
 	}
 
 	if IsViolationFeeCode(err.GetErrorCode()) {
-		oai := err.ToOpenAIError()
-		return types.WithOpenAIError(oai, err.StatusCode, types.ErrOptionWithSkipRetry())
+		return types.NewError(err, err.GetErrorCode(), types.ErrOptionWithSkipRetry())
 	}
 
 	return err

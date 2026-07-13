@@ -149,15 +149,31 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 
 func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelName string,
 	usage *dto.RealtimeUsage, extraContent string) {
+	observedAt := time.Now()
+	usageMissing := usage == nil
+	if usageMissing {
+		usage = &dto.RealtimeUsage{}
+	}
+	relayInfo.ObserveRoutingOutputTokensAt(int64(usage.OutputTokens), observedAt)
+	if !usageMissing {
+		relayInfo.ObserveRoutingRealtimeUsage(usage)
+	}
 
-	var tieredResult *billingexpr.TieredResult
-	tieredOk, tieredQuota, tieredRes := TryTieredSettle(relayInfo, billingexpr.TokenParams{
-		P:   float64(usage.InputTokens),
-		C:   float64(usage.OutputTokens),
-		Len: float64(usage.InputTokens),
-	})
-	if tieredOk {
-		tieredResult = tieredRes
+	var (
+		tieredResult *billingexpr.TieredResult
+		tieredOk     bool
+		tieredQuota  int
+	)
+	if !usageMissing {
+		var tieredRes *billingexpr.TieredResult
+		tieredOk, tieredQuota, tieredRes = TryTieredSettle(relayInfo, billingexpr.TokenParams{
+			P:   float64(usage.InputTokens),
+			C:   float64(usage.OutputTokens),
+			Len: float64(usage.InputTokens),
+		})
+		if tieredOk {
+			tieredResult = tieredRes
+		}
 	}
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
@@ -192,10 +208,17 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		GroupRatio: groupRatio,
 	}
 
-	quota, clamp := calculateAudioQuota(quotaInfo)
-	noteQuotaClamp(relayInfo, clamp)
-	if tieredOk {
-		quota = tieredQuota
+	quota := relayInfo.FinalPreConsumedQuota
+	if relayInfo.Billing != nil {
+		quota = relayInfo.Billing.GetPreConsumedQuota()
+	}
+	if !usageMissing {
+		calculatedQuota, clamp := calculateAudioQuota(quotaInfo)
+		noteQuotaClamp(relayInfo, clamp)
+		quota = calculatedQuota
+		if tieredOk {
+			quota = tieredQuota
+		}
 	}
 
 	totalTokens := usage.TotalTokens
@@ -208,7 +231,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	}
 
 	// record all the consume log even if quota is 0
-	if totalTokens == 0 {
+	if totalTokens == 0 && !usageMissing {
 		// in this case, must be some error happened
 		// we cannot just return, because we may have to return the pre-consumed quota
 		quota = 0
@@ -218,6 +241,11 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	} else {
 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
+		if usageMissing {
+			logContent += "（已提交的 Realtime 响应缺少 usage，按预扣额度结算）"
+			logger.LogError(ctx, fmt.Sprintf("committed realtime response missing usage, settling reserved quota %d for userId %d, channelId %d, tokenId %d, model %s",
+				quota, relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, modelName))
+		}
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
@@ -248,6 +276,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
+	perfmetrics.RecordRelaySample(relayInfo, true, int64(usage.OutputTokens))
 }
 
 func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData) int {
@@ -272,6 +301,9 @@ func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
+	observedAt := time.Now()
+	relayInfo.ObserveRoutingOutputTokensAt(int64(usage.CompletionTokens), observedAt)
+	relayInfo.ObserveRoutingAttemptUsage(usage)
 
 	var tieredUsedVars map[string]bool
 	if snap := relayInfo.TieredBillingSnapshot; snap != nil {
@@ -371,9 +403,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(usage.CompletionTokens))
-	})
+	perfmetrics.RecordRelaySample(relayInfo, true, int64(usage.CompletionTokens))
 }
 
 func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {

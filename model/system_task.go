@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
@@ -48,6 +49,14 @@ type SystemTaskLock struct {
 	LockedBy    string `json:"locked_by" gorm:"type:varchar(128);index"`
 	LockedUntil int64  `json:"locked_until" gorm:"bigint;index"`
 	UpdatedAt   int64  `json:"updated_at" gorm:"bigint;index"`
+}
+
+func (SystemTask) TableName() string {
+	return "system_tasks"
+}
+
+func (SystemTaskLock) TableName() string {
+	return "system_task_locks"
 }
 
 type SystemTaskResponse struct {
@@ -348,15 +357,7 @@ func RenewSystemTaskLock(taskID string, lockedBy string, lockUntil int64) error 
 }
 
 func MarkSystemTaskLeaseExpired(taskID string) error {
-	result := DB.Model(&SystemTask{}).
-		Where("task_id = ? AND status = ?", taskID, SystemTaskStatusRunning).
-		Updates(map[string]any{
-			"status":     SystemTaskStatusFailed,
-			"active_key": nil,
-			"error":      "task lease expired",
-			"updated_at": common.GetTimestamp(),
-		})
-	return result.Error
+	return markSystemTaskLeaseExpiredContext(context.Background(), taskID)
 }
 
 func ExpireStaleSystemTaskLocks(now int64) error {
@@ -463,4 +464,17 @@ func decodeSystemTaskJSONValue(data string) any {
 		return data
 	}
 	return value
+}
+
+func validSystemTaskID(taskID string) bool {
+	if len(taskID) != len("systask_")+32 || taskID[:len("systask_")] != "systask_" {
+		return false
+	}
+	for _, character := range taskID[len("systask_"):] {
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') &&
+			(character < '0' || character > '9') {
+			return false
+		}
+	}
+	return true
 }

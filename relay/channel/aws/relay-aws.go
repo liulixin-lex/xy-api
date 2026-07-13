@@ -40,11 +40,11 @@ func getAwsErrorStatusCode(err error) int {
 	return http.StatusInternalServerError
 }
 
-func newAwsInvokeContext() (context.Context, context.CancelFunc) {
+func newAwsInvokeContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if common.RelayTimeout <= 0 {
-		return context.Background(), func() {}
+		return context.WithCancel(parent)
 	}
-	return context.WithTimeout(context.Background(), time.Duration(common.RelayTimeout)*time.Second)
+	return context.WithTimeout(parent, time.Duration(common.RelayTimeout)*time.Second)
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
@@ -223,7 +223,7 @@ func getAwsModelID(requestModel string) string {
 
 func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContext(c.Request.Context())
 	defer cancel()
 
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
@@ -253,7 +253,7 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 }
 
 func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContext(c.Request.Context())
 	defer cancel()
 
 	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
@@ -263,6 +263,15 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
+	return consumeAWSResponseStream(c, info, stream, cancel)
+}
+
+type awsResponseStream interface {
+	Events() <-chan bedrockruntimeTypes.ResponseStream
+	Err() error
+}
+
+func consumeAWSResponseStream(c *gin.Context, info *relaycommon.RelayInfo, stream awsResponseStream, cancel context.CancelFunc) (*types.NewAPIError, *dto.Usage) {
 	firstByteTimeout := helper.FirstByteFailoverTimeout(info)
 	var firstByteTimer *time.Timer
 	var firstByteC <-chan time.Time
@@ -289,6 +298,9 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	events := stream.Events()
 	for {
 		select {
+		case <-c.Request.Context().Done():
+			cancel()
+			return types.NewError(context.Cause(c.Request.Context()), types.ErrorCodeAwsInvokeError), claudeInfo.Usage
 		case <-firstByteC:
 			if info.FirstByteTimedOutBeforeResponse() || (info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 && !info.HasSendResponse()) {
 				if info.StreamStatus == nil {
@@ -300,7 +312,15 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 			}
 		case event, ok := <-events:
 			if !ok {
-				claude.HandleStreamFinalResponse(c, info, claudeInfo)
+				if c.Request.Context().Err() != nil {
+					return types.NewError(context.Cause(c.Request.Context()), types.ErrorCodeAwsInvokeError), claudeInfo.Usage
+				}
+				if err := stream.Err(); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponseBody), claudeInfo.Usage
+				}
+				if err := claude.HandleStreamFinalResponse(c, info, claudeInfo); err != nil {
+					return types.NewError(err, types.ErrorCodeBadResponse), claudeInfo.Usage
+				}
 				return nil, claudeInfo.Usage
 			}
 			markFirstByteSeen()
@@ -310,14 +330,14 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 				info.ReceivedResponseCount++
 				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
 				if respErr != nil {
-					return respErr, nil
+					return respErr, claudeInfo.Usage
 				}
 			case *bedrockruntimeTypes.UnknownUnionMember:
 				fmt.Println("unknown tag:", v.Tag)
-				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
+				return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), claudeInfo.Usage
 			default:
 				fmt.Println("union is nil or unknown type")
-				return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), nil
+				return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), claudeInfo.Usage
 			}
 		}
 	}
@@ -326,7 +346,7 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 // Nova模型处理函数
 func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContext(c.Request.Context())
 	defer cancel()
 
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))

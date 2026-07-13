@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,10 +28,16 @@ const (
 
 type Adaptor struct {
 	ClientMode ClientMode
-	AwsClient  *bedrockruntime.Client
+	AwsClient  bedrockRuntimeClient
 	AwsModelId string
 	AwsReq     any
 	IsNova     bool
+}
+
+type bedrockRuntimeClient interface {
+	Options() bedrockruntime.Options
+	InvokeModel(context.Context, *bedrockruntime.InvokeModelInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelOutput, error)
+	InvokeModelWithResponseStream(context.Context, *bedrockruntime.InvokeModelWithResponseStreamInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelWithResponseStreamOutput, error)
 }
 
 func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {

@@ -81,13 +81,28 @@ func NativeGeminiEmbeddingHandler(c *gin.Context, resp *http.Response, info *rel
 func GeminiTextGenerationStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	helper.SetEventStreamHeaders(c)
 
-	return geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
+	var downstreamErr *types.NewAPIError
+	usage, apiErr := geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
 		err := helper.StringData(c, data)
 		if err != nil {
 			logger.LogError(c, "failed to write stream data: "+err.Error())
+			downstreamErr = types.NewError(err, types.ErrorCodeBadResponse)
 			return false
 		}
 		info.SendResponseCount++
 		return true
 	})
+	if apiErr != nil {
+		return usage, apiErr
+	}
+	if downstreamErr != nil {
+		return usage, downstreamErr
+	}
+	if info.FirstByteTimedOutBeforeResponse() {
+		return nil, nil
+	}
+	if statusErr := geminiStreamStatusError(info); statusErr != nil {
+		return usage, statusErr
+	}
+	return usage, nil
 }

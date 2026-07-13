@@ -10,12 +10,29 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	smartRoutingDeprecation = "@1783814400"
+	smartRoutingSunset      = "Sat, 31 Jul 2027 23:59:59 GMT"
+	smartRoutingSuccessor   = "</api/channel-routing/v2>; rel=\"successor-version\""
+	smartRoutingMigration   = "Migrate to /api/channel-routing/v2; legacy APIs remain available during the compatibility window"
+)
+
 func registerSmartRoutingRoutes(apiRouter *gin.RouterGroup) {
 	route := apiRouter.Group("/smart-routing")
-	route.Use(middleware.AdminAuth())
+	route.Use(smartRoutingDeprecationHeaders(), middleware.AdminAuth())
 
 	for _, item := range smartRoutingPermissionRoutes {
 		route.Handle(item.method, item.path, middleware.RequirePermission(item.permission), item.handler)
+	}
+}
+
+func smartRoutingDeprecationHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Deprecation", smartRoutingDeprecation)
+		c.Header("Sunset", smartRoutingSunset)
+		c.Header("Link", smartRoutingSuccessor)
+		c.Header("X-Migration-Hint", smartRoutingMigration)
+		c.Next()
 	}
 }
 

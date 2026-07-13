@@ -16,7 +16,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
@@ -334,7 +333,14 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
+	observedAt := time.Now()
 	originUsage := usage
+	outputTokens := int64(0)
+	if originUsage != nil {
+		outputTokens = int64(originUsage.CompletionTokens)
+	}
+	relayInfo.ObserveRoutingOutputTokensAt(outputTokens, observedAt)
+	relayInfo.ObserveRoutingAttemptUsage(originUsage)
 	if usage == nil {
 		extraContent = append(extraContent, "上游无计费信息")
 	}
@@ -344,6 +350,13 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+	if originUsage == nil {
+		summary.Quota = relayInfo.FinalPreConsumedQuota
+		if relayInfo.Billing != nil {
+			summary.Quota = relayInfo.Billing.GetPreConsumedQuota()
+		}
+		extraContent = append(extraContent, "已提交的流式响应缺少完整 usage，按预扣额度结算")
+	}
 
 	var tieredResult *billingexpr.TieredResult
 	tieredBillingApplied := false
@@ -376,7 +389,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		extraContent = append(extraContent, fmt.Sprintf("Image Generation Call 花费 %s", decimal.NewFromFloat(summary.ImageGenerationCallPrice).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).String()))
 	}
 
-	if summary.TotalTokens == 0 {
+	if summary.TotalTokens == 0 && originUsage != nil {
 		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
 	} else {
@@ -489,7 +502,5 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		Group:            relayInfo.UsingGroup,
 		Other:            other,
 	})
-	gopool.Go(func() {
-		perfmetrics.RecordRelaySample(relayInfo, true, int64(summary.CompletionTokens))
-	})
+	perfmetrics.RecordRelaySample(relayInfo, true, int64(summary.CompletionTokens))
 }

@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"math"
-	mrand "math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,12 +19,15 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -97,19 +99,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
-			switch relayFormat {
-			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError())
-			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"type":  "error",
-					"error": newAPIError.ToClaudeError(),
-				})
-			default:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(),
-				})
-			}
+			writeRelayAPIErrorResponse(c, relayFormat, ws, newAPIError)
 		}
 	}()
 
@@ -129,6 +119,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
+	var (
+		canaryOutcomeKnown          bool
+		canaryOutcomeSuccess        bool
+		canaryOutcomeClassification routingerror.Classification
+	)
+	defer func() {
+		success := newAPIError == nil
+		if canaryOutcomeKnown {
+			success = canaryOutcomeSuccess
+		} else if newAPIError != nil {
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
+		}
+		finishRoutingCanaryOutcome(c, relayInfo, canaryOutcomeClassification, success)
+	}()
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
@@ -194,6 +198,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	attemptGuard := newRoutingAttemptGuard(c, relayInfo)
+	defer attemptGuard.Complete()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -201,12 +207,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
 			break
 		}
 
+		attemptLease, attemptErr := attemptGuard.Begin(c, relayInfo)
+		if attemptErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			logger.LogWarn(c, fmt.Sprintf("channel routing retry budget rejected attempt: %v", attemptErr))
+			if newAPIError == nil {
+				newAPIError = routingAttemptRejectionError(attemptErr)
+			}
+			break
+		}
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			attemptLease.Finish()
+			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
@@ -214,13 +233,68 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			} else {
 				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		if hedgeOutcome, handled := maybeExecuteRoutingHedge(
+			c, relayInfo, channel, retryParam, attemptLease, bodyStorage,
+		); handled {
+			canaryOutcomeKnown = true
+			canaryOutcomeSuccess = hedgeOutcome.success
+			canaryOutcomeClassification = hedgeOutcome.classification
+			if hedgeOutcome.success {
+				newAPIError = nil
+				relayInfo.LastError = nil
+				return
+			}
+			newAPIError = hedgeOutcome.apiErr
+			relayInfo.LastError = newAPIError
+			willRetry := hedgeOutcome.willRetry
+			if !hedgeOutcome.retryDecided {
+				willRetry = shouldRetry(
+					c, relayInfo, newAPIError, hedgeOutcome.classification,
+					common.RetryTimes-retryParam.GetRetry(),
+				)
+			}
+			if !willRetry {
+				break
+			}
+			continue
+		}
+		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			attemptLease.Finish()
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			newAPIError = capacityErr
+			canaryOutcomeClassification, _ = classifyRoutingRelayAttemptWithContext(c, newAPIError, relayInfo)
+			break
+		}
 
+		prepareRoutingRelayAttempt(relayInfo)
+		if attemptLease != nil {
+			if markErr := attemptLease.MarkSent(); markErr != nil {
+				attemptLease.Finish()
+				releaseRoutingCapacityReservation(c)
+				finishRoutingCanaryAttempt(c)
+				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+				newAPIError = types.NewErrorWithStatusCode(
+					fmt.Errorf("channel routing attempt state transition failed: %w", markErr),
+					types.ErrorCodeGetChannelFailed,
+					http.StatusServiceUnavailable,
+					types.ErrOptionWithSkipRetry(),
+				)
+				break
+			}
+		}
+		serialAudit, auditErr := reserveRoutingSerialAttemptAudit(c, relayInfo, channel)
+		if auditErr != nil {
+			logger.LogWarn(c, fmt.Sprintf("channel routing serial attempt audit unavailable: %v", auditErr))
+		}
 		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
 		func() {
+			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
+			defer finishRoutingCanaryAttempt(c)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				newAPIError = relay.WssHelper(c, relayInfo)
@@ -232,26 +306,74 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				newAPIError = relayHandler(c, relayInfo)
 			}
 		}()
-		if newAPIError == nil {
-			newAPIError = streamFirstByteTimeoutError(relayInfo)
+		attemptAPIError := newAPIError
+		if capacityFailure := service.RoutingCapacityReservationFailure(c); capacityFailure != nil {
+			attemptAPIError = types.NewErrorWithStatusCode(
+				capacityFailure,
+				types.ErrorCodeGetChannelFailed,
+				http.StatusServiceUnavailable,
+				types.ErrOptionWithSkipRetry(),
+			)
+			newAPIError = attemptAPIError
 		}
-		routingmetrics.RecordAttempt(c, relayInfo, channel.Id, newAPIError)
-		recordRoutingBreakerAttempt(c, relayInfo, channel.Id, newAPIError)
+		controlAPIError := relayAttemptControlError(c, attemptAPIError, relayInfo)
+		if attemptAPIError != nil && service.RoutingCapacityReservationFailure(c) != nil {
+			controlAPIError = attemptAPIError
+		}
+		clientCommitted := routingAttemptClientCommitted(c, relayInfo)
+		if attemptLease != nil && clientCommitted {
+			_ = attemptLease.MarkClientCommitted()
+		}
+		classificationAPIError := attemptAPIError
+		if classificationAPIError == nil {
+			classificationAPIError = controlAPIError
+		}
+		classification, attemptSuccess := classifyRoutingRelayAttemptWithContext(c, classificationAPIError, relayInfo)
+		canaryOutcomeKnown = true
+		canaryOutcomeSuccess = attemptSuccess
+		canaryOutcomeClassification = classification
+		classificationAPIError = service.NormalizeViolationFeeError(classificationAPIError)
+		willRetry := false
+		if controlAPIError != nil {
+			willRetry = shouldRetry(
+				c,
+				relayInfo,
+				classificationAPIError,
+				classification,
+				common.RetryTimes-retryParam.GetRetry(),
+			)
+		}
+		if err := completeRoutingSerialAttemptAudit(
+			c,
+			relayInfo,
+			channel,
+			serialAudit,
+			attemptSuccess,
+			classificationAPIError,
+			classification,
+			clientCommitted,
+			willRetry,
+		); err != nil {
+			logger.LogWarn(c, fmt.Sprintf("channel routing serial attempt audit completion failed: %v", err))
+		}
+		attemptLease.Finish()
+		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 
-		if newAPIError == nil {
+		if controlAPIError == nil {
+			newAPIError = nil
 			relayInfo.LastError = nil
 			return
 		}
+		newAPIError = classificationAPIError
 
-		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, classification)
 
-		if !shouldRetry(c, relayInfo, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		if !willRetry {
 			break
 		}
-		sleepRoutingRetryBackoff(newAPIError, retryParam.GetRetry())
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
@@ -260,50 +382,192 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		logger.LogInfo(c, retryLogStr)
 	}
 	if newAPIError != nil {
-		gopool.Go(func() {
-			perfmetrics.RecordRelaySample(relayInfo, false, 0)
+		perfmetrics.RecordRelaySample(relayInfo, false, 0)
+	}
+}
+
+func writeRelayAPIErrorResponse(
+	c *gin.Context,
+	relayFormat types.RelayFormat,
+	ws *websocket.Conn,
+	apiErr *types.NewAPIError,
+) {
+	if c == nil || apiErr == nil {
+		return
+	}
+	if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
+		return
+	}
+	switch relayFormat {
+	case types.RelayFormatOpenAIRealtime:
+		helper.WssError(c, ws, apiErr.ToOpenAIError())
+	case types.RelayFormatClaude:
+		c.JSON(apiErr.StatusCode, gin.H{
+			"type":  "error",
+			"error": apiErr.ToClaudeError(),
+		})
+	default:
+		c.JSON(apiErr.StatusCode, gin.H{
+			"error": apiErr.ToOpenAIError(),
 		})
 	}
 }
 
-func recordRoutingBreakerAttempt(c *gin.Context, relayInfo *relaycommon.RelayInfo, channelID int, apiErr *types.NewAPIError) {
-	if relayInfo == nil || relayInfo.OriginModelName == "" {
+func recordRoutingAttemptEffects(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channelID int,
+	success bool,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+) {
+	if info == nil || info.OriginModelName == "" {
 		return
 	}
-	group := relayInfo.UsingGroup
+	routingmetrics.RecordClassifiedAttempt(c, info, channelID, success, apiErr, classification)
+	statusCode := 0
+	if apiErr != nil {
+		statusCode = apiErr.SourceStatusCode()
+	}
+	ttft := time.Duration(0)
+	attemptStart := info.RoutingAttemptStartTime()
+	if !attemptStart.IsZero() && info.FirstResponseTime.After(attemptStart) {
+		ttft = info.FirstResponseTime.Sub(attemptStart)
+	}
+	service.ObserveRoutingAdaptiveConcurrency(c, channelrouting.AdaptiveConcurrencySignal{
+		Success:          success,
+		StatusCode:       statusCode,
+		TTFT:             ttft,
+		FirstByteTimeout: relayAttemptStreamSignal(info) == routingerror.SignalFirstByteTimeout,
+		ObservedAt:       time.Now(),
+	})
+	if err := service.ObserveRoutingSlowStartProbe(
+		c,
+		success,
+		!success && (classification.HealthEffect == routingerror.HealthDegrade || classification.HealthEffect == routingerror.HealthOpen),
+	); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing slow-start probe outcome failed: %v", err))
+	}
+	if !smart_routing_setting.Enabled() {
+		return
+	}
+	setting := smart_routing_setting.GetSetting()
+	syncRoutingBreakerConfigFromSetting(setting)
+	group := info.UsingGroup
 	if group == "" {
 		group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	}
 	if group == "" {
 		group = "default"
 	}
-	apiKeyIndex := model.RoutingMetricSingleKeyIndex
-	if relayInfo.ChannelMeta != nil && relayInfo.ChannelMeta.ChannelIsMultiKey {
-		apiKeyIndex = relayInfo.ChannelMeta.ChannelMultiKeyIndex
+	endpointAuthority := common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointAuthority)
+	region := common.GetContextKeyString(c, constant.ContextKeyRoutingRegion)
+	if info.ChannelMeta != nil {
+		if endpointAuthority == "" {
+			endpointAuthority = info.ChannelMeta.RoutingEndpointAuthority
+		}
+		if region == "" {
+			region = info.ChannelMeta.RoutingRegion
+		}
 	}
-	statusCode := 0
-	if apiErr != nil {
-		statusCode = apiErr.StatusCode
+	endpointKey := routingbreaker.NewEndpointKey(endpointAuthority, region)
+	endpointKnown := endpointKey.EndpointAuthority != "" && endpointKey.Region != ""
+	if endpointKnown {
+		switch {
+		case !success && classification.Responsibility == routingerror.ResponsibilityNetwork &&
+			classification.Scope == routingerror.ScopeEndpoint &&
+			(classification.HealthEffect == routingerror.HealthDegrade || classification.HealthEffect == routingerror.HealthOpen):
+			recordRoutingBreakerFailure(c, endpointKey, routingbreaker.FailureNetwork)
+		case success || classification.Responsibility == routingerror.ResponsibilityProvider ||
+			classification.Responsibility == routingerror.ResponsibilityCapacity ||
+			classification.Responsibility == routingerror.ResponsibilityCredential:
+			recordRoutingBreakerSuccess(c, endpointKey)
+		}
+	}
+	if info.CurrentAttemptIsMultiKey(c) {
+		return
 	}
 	key := routingbreaker.Key{
 		ChannelID:   channelID,
-		APIKeyIndex: apiKeyIndex,
-		Model:       relayInfo.OriginModelName,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       info.OriginModelName,
 		Group:       group,
 	}
-	breakerSetting := smart_routing_setting.GetSetting()
-	if breakerSetting.Enabled {
-		syncRoutingBreakerConfigFromSetting(breakerSetting)
+
+	if success {
+		recordRoutingBreakerSuccess(c, key)
+		return
 	}
-	retryAfterCap := time.Duration(breakerSetting.MaxCooldownSec) * time.Second
-	if retryAfterCap <= 0 {
-		retryAfterCap = routingbreaker.DefaultConfig().MaxCooldown
+	if classification.CapacityEffect == routingerror.CapacityCooldown {
+		maxCooldown := time.Duration(setting.MaxCooldownSec) * time.Second
+		if maxCooldown <= 0 {
+			maxCooldown = routingbreaker.DefaultConfig().MaxCooldown
+		}
+		baseCooldown := time.Duration(setting.BackoffBaseMs429) * time.Millisecond
+		if baseCooldown <= 0 {
+			baseCooldown = time.Second
+		}
+		retryAfter := retryAfterFromAPIError(apiErr, maxCooldown)
+		routinghotcache.RecordCapacityCooldown(key.HotcacheKey(), apiErr.SourceStatusCode(), retryAfter, baseCooldown, maxCooldown, time.Now())
 	}
-	retryAfter := retryAfterFromAPIError(apiErr, retryAfterCap)
-	routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
-	if apiKeyIndex != model.RoutingMetricSingleKeyIndex {
-		key.APIKeyIndex = model.RoutingMetricSingleKeyIndex
-		routingbreaker.RecordAttempt(key, apiErr == nil, statusCode, retryAfter)
+	switch classification.Responsibility {
+	case routingerror.ResponsibilityProvider:
+		if classification.HealthEffect == routingerror.HealthDegrade || classification.HealthEffect == routingerror.HealthOpen {
+			recordRoutingBreakerFailure(c, key, routingbreaker.FailureProvider5xx)
+		}
+	}
+}
+
+func recordRoutingBreakerSuccess(c *gin.Context, key routingbreaker.Key) {
+	previous := routingBreakerState(key)
+	current := routingbreaker.RecordReliabilitySuccess(key)
+	publishRoutingBreakerTransition(c, key, previous, current)
+}
+
+func recordRoutingBreakerFailure(c *gin.Context, key routingbreaker.Key, kind routingbreaker.FailureKind) {
+	previous := routingBreakerState(key)
+	current := routingbreaker.RecordReliabilityFailure(key, kind)
+	publishRoutingBreakerTransition(c, key, previous, current)
+}
+
+func routingBreakerState(key routingbreaker.Key) routingbreaker.State {
+	snapshot, ok := routinghotcache.GetBreaker(key.HotcacheKey())
+	if !ok || snapshot.State == "" {
+		return routingbreaker.StateHealthy
+	}
+	return routingbreaker.State(snapshot.State)
+}
+
+func publishRoutingBreakerTransition(
+	c *gin.Context,
+	key routingbreaker.Key,
+	previous routingbreaker.State,
+	current routingbreaker.Snapshot,
+) {
+	eventType := ""
+	if previous != routingbreaker.StateOpen && current.State == routingbreaker.StateOpen {
+		eventType = channelrouting.RoutingEventTypeBreakerOpened
+	} else if previous != routingbreaker.StateHealthy && current.State == routingbreaker.StateHealthy {
+		eventType = channelrouting.RoutingEventTypeBreakerRecovered
+	}
+	if eventType == "" {
+		return
+	}
+	revision := service.RoutingHedgePolicyRevision(c)
+	_, err := channelrouting.PublishRoutingEvent(eventType, revision, map[string]any{
+		"scope":              string(key.Scope),
+		"channel_id":         key.ChannelID,
+		"model_name":         key.Model,
+		"group_name":         key.Group,
+		"endpoint_authority": key.EndpointAuthority,
+		"region":             key.Region,
+		"previous_state":     string(previous),
+		"current_state":      string(current.State),
+		"reason":             current.Reason,
+		"cooldown_until_ms":  current.CooldownUntil.UnixMilli(),
+	})
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing breaker transition event failed: %v", err))
 	}
 }
 
@@ -420,92 +684,196 @@ func cappedSecondsDuration(seconds float64, capDuration time.Duration) time.Dura
 	return time.Duration(seconds * float64(time.Second))
 }
 
-func streamFirstByteTimeoutError(relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
-	if !relayInfo.FirstByteTimedOutBeforeResponse() {
+func prepareRoutingRelayAttempt(info *relaycommon.RelayInfo) {
+	info.ResetStreamAttemptState()
+}
+
+func commitRoutingCapacityAttempt(c *gin.Context) *types.NewAPIError {
+	if err := service.CommitRoutingCapacityReservation(c); err != nil {
+		cancelRoutingCapacityReservation(c)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("channel routing capacity reservation commit failed: %w", err),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if err := service.MarkChannelRoutingCanaryAttemptStarted(c); err != nil {
+		releaseErr := service.ReleaseRoutingCapacityReservation(c)
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("channel routing canary attempt registration failed: %w", errors.Join(err, releaseErr)),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	return nil
+}
+
+func finishRoutingCanaryOutcome(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	classification routingerror.Classification,
+	success bool,
+) {
+	include := success || classification.Responsibility != routingerror.ResponsibilityCaller
+	clientTTFTMilliseconds := int64(0)
+	if success && info != nil && !info.StartTime.IsZero() && info.FirstResponseTime.After(info.StartTime) {
+		clientTTFTMilliseconds = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
+		if clientTTFTMilliseconds < 0 {
+			clientTTFTMilliseconds = 0
+		}
+	}
+	if err := service.FinishChannelRoutingCanaryOutcome(
+		c, include, success, false, clientTTFTMilliseconds, time.Now(),
+	); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing canary outcome dropped: %v", err))
+	}
+}
+
+func finishRoutingCanaryAttempt(c *gin.Context) {
+	if err := service.FinishChannelRoutingCanaryAttempt(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing canary attempt release failed: %v", err))
+	}
+}
+
+func cancelRoutingCapacityReservation(c *gin.Context) {
+	if err := service.CancelRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation cancel failed: %v", err))
+	}
+}
+
+func releaseRoutingCapacityReservation(c *gin.Context) {
+	if err := service.ReleaseRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation release failed: %v", err))
+	}
+}
+
+func submitRoutingTaskAttempt(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+	prepareRoutingRelayAttempt(info)
+	return relay.RelayTaskSubmit(c, info)
+}
+
+func relayAttemptControlError(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) *types.NewAPIError {
+	isRealtime := info != nil && info.RelayFormat == types.RelayFormatOpenAIRealtime
+	isStream := info != nil && (info.IsStream || info.StreamStatus != nil || isRealtime)
+	clientCommitted := false
+	if isRealtime {
+		clientCommitted = info.ReceivedResponseCount > 0 || info.HasSendResponse()
+	} else if isStream {
+		clientCommitted = info.HTTPStreamClientCommitted(c)
+	}
+	return relayAttemptControlErrorWithClientCommit(apiErr, info, clientCommitted)
+}
+
+func relayAttemptControlErrorWithClientCommit(
+	apiErr *types.NewAPIError,
+	info *relaycommon.RelayInfo,
+	clientCommitted bool,
+) *types.NewAPIError {
+	if clientCommitted {
 		return nil
 	}
-	return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeFirstByteTimeout, http.StatusGatewayTimeout)
+	if apiErr != nil {
+		return apiErr
+	}
+
+	signal := relayAttemptStreamSignal(info)
+	if signal != routingerror.SignalFirstByteTimeout && signal != routingerror.SignalStreamCorruption {
+		return nil
+	}
+
+	if signal == routingerror.SignalFirstByteTimeout {
+		return types.NewErrorWithStatusCode(errors.New("upstream first byte timeout"), types.ErrorCodeFirstByteTimeout, http.StatusGatewayTimeout)
+	}
+	cause := errors.New("upstream stream failed before client commit")
+	if info != nil && info.StreamStatus != nil && info.StreamStatus.EndError != nil {
+		cause = fmt.Errorf("upstream stream failed before client commit: %w", info.StreamStatus.EndError)
+	}
+	return types.NewErrorWithStatusCode(
+		cause,
+		types.ErrorCodeBadResponse,
+		http.StatusBadGateway,
+		types.ErrOptionWithHideErrMsg("upstream stream failed before client commit"),
+	)
 }
 
-func sleepRoutingRetryBackoff(apiErr *types.NewAPIError, attempt int) {
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || (setting.Mode != smart_routing_setting.ModeBalanced && setting.Mode != smart_routing_setting.ModeEnterpriseSLO) {
-		return
+func relayAttemptStreamSignal(info *relaycommon.RelayInfo) routingerror.Signal {
+	if info == nil || info.StreamStatus == nil {
+		return routingerror.SignalNone
 	}
-	delay := routingRetryBackoffDuration(setting, apiErr, attempt, mrand.New(mrand.NewSource(time.Now().UnixNano())).Float64())
-	if delay > 0 {
-		time.Sleep(delay)
+	status := info.StreamStatus
+	if status.EndReason == relaycommon.StreamEndReasonClientGone {
+		return routingerror.SignalClientGone
+	}
+	if status.EndReason == relaycommon.StreamEndReasonHandlerStop || status.HasErrors() {
+		return routingerror.SignalStreamCorruption
+	}
+	switch status.EndReason {
+	case relaycommon.StreamEndReasonFirstByteTimeout:
+		return routingerror.SignalFirstByteTimeout
+	case relaycommon.StreamEndReasonTimeout,
+		relaycommon.StreamEndReasonScannerErr,
+		relaycommon.StreamEndReasonPanic,
+		relaycommon.StreamEndReasonPingFail:
+		return routingerror.SignalStreamCorruption
+	default:
+		return routingerror.SignalNone
 	}
 }
 
-func routingRetryBackoffDuration(setting smart_routing_setting.SmartRoutingSetting, apiErr *types.NewAPIError, attempt int, jitter float64) time.Duration {
-	if apiErr == nil {
-		return 0
-	}
-	if jitter < 0 || math.IsNaN(jitter) || math.IsInf(jitter, 0) {
-		jitter = 0
-	}
-	if jitter > 1 {
-		jitter = 1
-	}
-	baseMs := setting.BackoffBaseMs5xx
-	if apiErr.StatusCode == http.StatusTooManyRequests {
-		baseMs = setting.BackoffBaseMs429
-	}
-	if baseMs <= 0 {
-		if apiErr.StatusCode == http.StatusTooManyRequests {
-			baseMs = 1000
-		} else {
-			baseMs = 50
-		}
-	}
-	capMs := setting.BackoffCapMs
-	if capMs <= 0 {
-		capMs = 20000
-	}
-	if attempt < 0 {
-		attempt = 0
-	}
-	ceilingMs := baseMs
-	for range attempt {
-		if ceilingMs >= capMs {
-			ceilingMs = capMs
-			break
-		}
-		ceilingMs *= 2
-		if ceilingMs > capMs {
-			ceilingMs = capMs
-		}
-	}
-	backoff := time.Duration(jitter * float64(ceilingMs) * float64(time.Millisecond))
-	if retryAfter := retryAfterFromAPIError(apiErr, time.Duration(capMs)*time.Millisecond); retryAfter > 0 {
-		if retryAfter > time.Duration(capMs)*time.Millisecond {
-			return time.Duration(capMs) * time.Millisecond
-		}
-		total := retryAfter + backoff
-		if total > time.Duration(capMs)*time.Millisecond {
-			return time.Duration(capMs) * time.Millisecond
-		}
-		return total
-	}
-	return backoff
+func classifyRoutingRelayAttempt(apiErr *types.NewAPIError, info *relaycommon.RelayInfo) (routingerror.Classification, bool) {
+	return classifyRoutingRelayAttemptWithContext(nil, apiErr, info)
 }
 
-func recordRoutingTaskAttempt(c *gin.Context, relayInfo *relaycommon.RelayInfo, channelID int, taskErr *dto.TaskError) {
-	var apiErr *types.NewAPIError
-	if taskErr != nil {
-		err := taskErr.Error
+func classifyRoutingRelayAttemptWithContext(c *gin.Context, apiErr *types.NewAPIError, info *relaycommon.RelayInfo) (routingerror.Classification, bool) {
+	beforeClientCommit := c != nil && info != nil && info.HTTPStreamFailedBeforeCommit(c)
+	return classifyRoutingRelayAttemptAtCommitBoundary(apiErr, info, beforeClientCommit)
+}
+
+func classifyRoutingRelayAttemptAtCommitBoundary(
+	apiErr *types.NewAPIError,
+	info *relaycommon.RelayInfo,
+	beforeClientCommit bool,
+) (routingerror.Classification, bool) {
+	ctx := routingerror.Context{Component: routingerror.ComponentServing, Operation: routingerror.OperationRelay}
+	success := apiErr == nil
+	if apiErr != nil && service.HasCSAMViolationMarker(apiErr) {
+		ctx.Signal = routingerror.SignalContentSafety
+	} else {
+		ctx.Signal = relayAttemptStreamSignal(info)
+	}
+	ctx.BeforeCommit = ctx.Signal == routingerror.SignalStreamCorruption && beforeClientCommit
+	if ctx.Signal != routingerror.SignalNone {
+		success = false
+	}
+	return routingerror.ClassifyAPIError(apiErr, ctx), success
+}
+
+func taskErrorToAPIError(taskErr *dto.TaskError) *types.NewAPIError {
+	if taskErr == nil {
+		return nil
+	}
+	if taskErr.Code == "" {
+		taskErr.Code = string(types.ErrorCodeBadResponseStatusCode)
+	}
+	if taskErr.StatusCode == 0 {
+		taskErr.StatusCode = http.StatusInternalServerError
+	}
+	if taskErr.Message == "" {
+		taskErr.Message = "task relay failed"
+	}
+	if taskErr.Error == nil {
+		taskErr.Error = errors.New(taskErr.Message)
+	}
+	apiErr := types.NewErrorWithStatusCode(taskErr.Error, types.ErrorCode(taskErr.Code), taskErr.StatusCode)
+	if taskErr.RetryAfterMs > 0 {
+		metadata, err := common.Marshal(map[string]int64{"retry_after_ms": taskErr.RetryAfterMs})
 		if err == nil {
-			message := taskErr.Message
-			if message == "" {
-				message = "task relay failed"
-			}
-			err = errors.New(message)
+			apiErr.Metadata = metadata
 		}
-		apiErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
 	}
-	routingmetrics.RecordAttempt(c, relayInfo, channelID, apiErr)
-	recordRoutingBreakerAttempt(c, relayInfo, channelID, apiErr)
+	return apiErr
 }
 
 var upgrader = websocket.Upgrader{
@@ -578,67 +946,66 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 	if newAPIError != nil {
+		cancelRoutingCapacityReservation(c)
 		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, info.OriginModelName, selectGroup)
 		return nil, newAPIError
 	}
 	return channel, nil
 }
 
-func shouldRetry(c *gin.Context, relayInfo *relaycommon.RelayInfo, openaiErr *types.NewAPIError, retryTimes int) bool {
-	if openaiErr == nil {
+func shouldRetry(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+	retryTimes int,
+) bool {
+	if apiErr == nil {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
-	if relayInfo != nil && relayInfo.FirstByteTimedOutBeforeResponse() {
-		if relayInfo.RelayFormat != types.RelayFormatOpenAIRealtime && c != nil && c.Writer != nil && c.Writer.Written() {
+	if relayInfo != nil {
+		isRealtime := relayInfo.RelayFormat == types.RelayFormatOpenAIRealtime
+		isHTTPStream := relayInfo.IsStream || relayInfo.StreamStatus != nil
+		if (isRealtime || !isHTTPStream) &&
+			(relayInfo.SendResponseCount > 0 || relayInfo.HasSendResponse() || relayInfo.ReceivedResponseCount > 0) {
 			return false
 		}
-		if retryTimes <= 0 {
-			return false
-		}
-		if _, ok := c.Get("specific_channel_id"); ok {
-			return false
-		}
-		return true
-	}
-	if relayInfo != nil && (relayInfo.SendResponseCount > 0 || relayInfo.HasSendResponse() || relayInfo.ReceivedResponseCount > 0) {
-		return false
 	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
 		return false
 	}
-	if types.IsChannelError(openaiErr) {
-		return true
-	}
-	if types.IsSkipRetryError(openaiErr) {
+	if types.IsSkipRetryError(apiErr) {
 		return false
 	}
 	if retryTimes <= 0 {
 		return false
 	}
-	if _, ok := c.Get("specific_channel_id"); ok {
+	if c != nil {
+		if _, ok := c.Get("specific_channel_id"); ok {
+			return false
+		}
+	}
+	if classification.Retryability != routingerror.RetryBeforeCommit {
 		return false
 	}
-	code := openaiErr.StatusCode
-	if code >= 200 && code < 300 {
+	if operation_setting.IsAlwaysSkipRetryCode(apiErr.GetErrorCode()) {
 		return false
 	}
-	if code < 100 || code > 599 {
+	statusCode := apiErr.SourceStatusCode()
+	if statusCode < 100 || statusCode > 599 {
 		return true
 	}
-	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
-		return false
-	}
-	return operation_setting.ShouldRetryByStatusCode(code)
+	return operation_setting.ShouldRetryByStatusCode(statusCode)
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
+func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, classification routingerror.Classification) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
+	if service.ShouldDisableChannel(err, classification) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
@@ -783,6 +1150,24 @@ func RelayTask(c *gin.Context) {
 
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
+	var (
+		canaryOutcomeKnown          bool
+		canaryOutcomeSuccess        bool
+		canaryOutcomeClassification routingerror.Classification
+	)
+	defer func() {
+		if !canaryOutcomeKnown && taskErr != nil {
+			canaryOutcomeClassification = routingerror.ClassifyTaskError(taskErr, routingerror.Context{
+				Component: routingerror.ComponentServing,
+				Operation: routingerror.OperationTaskSubmit,
+			})
+		}
+		success := taskErr == nil
+		if canaryOutcomeKnown {
+			success = canaryOutcomeSuccess
+		}
+		finishRoutingCanaryOutcome(c, relayInfo, canaryOutcomeClassification, success)
+	}()
 	defer func() {
 		if taskErr != nil && relayInfo.Billing != nil {
 			relayInfo.Billing.Refund(c)
@@ -796,6 +1181,8 @@ func RelayTask(c *gin.Context) {
 		RequestPath: c.Request.URL.Path,
 		Retry:       common.GetPointer(0),
 	}
+	attemptGuard := newRoutingAttemptGuard(c, relayInfo)
+	defer attemptGuard.Complete()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		var channel *model.Channel
@@ -818,9 +1205,22 @@ func RelayTask(c *gin.Context) {
 			}
 		}
 
+		attemptLease, attemptErr := attemptGuard.Begin(c, relayInfo)
+		if attemptErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			logger.LogWarn(c, fmt.Sprintf("channel routing retry budget rejected task attempt: %v", attemptErr))
+			if taskErr == nil {
+				apiErr := routingAttemptRejectionError(attemptErr)
+				taskErr = service.TaskErrorWrapperLocal(apiErr.Err, "routing_attempt_rejected", apiErr.StatusCode)
+			}
+			break
+		}
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			attemptLease.Finish()
+			cancelRoutingCapacityReservation(c)
 			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
 				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusRequestEntityTooLarge)
@@ -830,9 +1230,76 @@ func RelayTask(c *gin.Context) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+			attemptLease.Finish()
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			taskErr = service.TaskErrorWrapperLocal(capacityErr.Err, "routing_capacity_commit_failed", http.StatusServiceUnavailable)
+			break
+		}
 
-		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
-		recordRoutingTaskAttempt(c, relayInfo, channel.Id, taskErr)
+		prepareRoutingRelayAttempt(relayInfo)
+		if attemptLease != nil {
+			if markErr := attemptLease.MarkSent(); markErr != nil {
+				attemptLease.Finish()
+				releaseRoutingCapacityReservation(c)
+				finishRoutingCanaryAttempt(c)
+				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+				taskErr = service.TaskErrorWrapperLocal(markErr, "routing_attempt_state_failed", http.StatusServiceUnavailable)
+				break
+			}
+		}
+		serialAudit, auditErr := reserveRoutingSerialAttemptAudit(c, relayInfo, channel)
+		if auditErr != nil {
+			logger.LogWarn(c, fmt.Sprintf("channel routing serial task attempt audit unavailable: %v", auditErr))
+		}
+		releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
+		func() {
+			defer releaseRoutingCapacityReservation(c)
+			defer releaseInflight()
+			defer finishRoutingCanaryAttempt(c)
+			result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
+		}()
+		taskAPIError := taskErrorToAPIError(taskErr)
+		classificationContext := routingerror.Context{
+			Component: routingerror.ComponentServing,
+			Operation: routingerror.OperationTaskSubmit,
+		}
+		if service.HasCSAMViolationMarker(taskAPIError) {
+			classificationContext.Signal = routingerror.SignalContentSafety
+		}
+		classification := routingerror.ClassifyTaskError(taskErr, classificationContext)
+		clientCommitted := taskErr == nil || classification.Retryability == routingerror.RetryIdempotencyRequired
+		if attemptLease != nil && clientCommitted {
+			_ = attemptLease.MarkClientCommitted()
+		}
+		willRetry := false
+		if taskErr != nil {
+			willRetry = shouldRetryTaskRelay(
+				c,
+				taskErr,
+				classification,
+				common.RetryTimes-retryParam.GetRetry(),
+			)
+		}
+		if err := completeRoutingSerialAttemptAudit(
+			c,
+			relayInfo,
+			channel,
+			serialAudit,
+			taskErr == nil,
+			taskAPIError,
+			classification,
+			clientCommitted,
+			willRetry,
+		); err != nil {
+			logger.LogWarn(c, fmt.Sprintf("channel routing serial task attempt audit completion failed: %v", err))
+		}
+		attemptLease.Finish()
+		canaryOutcomeKnown = true
+		canaryOutcomeSuccess = taskErr == nil
+		canaryOutcomeClassification = classification
+		recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 		if taskErr == nil {
 			break
 		}
@@ -841,10 +1308,11 @@ func RelayTask(c *gin.Context) {
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
+				taskAPIError,
+				classification)
 		}
 
-		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
+		if !willRetry {
 			break
 		}
 	}
@@ -900,8 +1368,11 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 	c.JSON(taskErr.StatusCode, taskErr)
 }
 
-func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
+func shouldRetryTaskRelay(c *gin.Context, taskErr *dto.TaskError, classification routingerror.Classification, retryTimes int) bool {
 	if taskErr == nil {
+		return false
+	}
+	if taskErr.LocalError {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -913,31 +1384,5 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	if _, ok := c.Get("specific_channel_id"); ok {
 		return false
 	}
-	if taskErr.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-	if taskErr.StatusCode == 307 {
-		return true
-	}
-	if taskErr.StatusCode/100 == 5 {
-		// 超时不重试
-		if operation_setting.IsAlwaysSkipRetryStatusCode(taskErr.StatusCode) {
-			return false
-		}
-		return true
-	}
-	if taskErr.StatusCode == http.StatusBadRequest {
-		return false
-	}
-	if taskErr.StatusCode == 408 {
-		// azure处理超时不重试
-		return false
-	}
-	if taskErr.LocalError {
-		return false
-	}
-	if taskErr.StatusCode/100 == 2 {
-		return false
-	}
-	return true
+	return classification.Retryability == routingerror.RetryBeforeCommit
 }

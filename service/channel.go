@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 )
@@ -42,20 +43,22 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
-func ShouldDisableChannel(err *types.NewAPIError) bool {
+func ShouldDisableChannel(err *types.NewAPIError, classification routingerror.Classification) bool {
 	if !common.AutomaticDisableChannelEnabled {
 		return false
 	}
 	if err == nil {
 		return false
 	}
-	if types.IsChannelError(err) {
-		return true
+	if classification.Component != routingerror.ComponentServing ||
+		classification.Responsibility != routingerror.ResponsibilityCredential ||
+		classification.Scope != routingerror.ScopeCredential {
+		return false
 	}
 	if types.IsSkipRetryError(err) {
 		return false
 	}
-	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {
+	if operation_setting.ShouldDisableByStatusCode(err.SourceStatusCode()) {
 		return true
 	}
 

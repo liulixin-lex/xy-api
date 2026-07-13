@@ -20,11 +20,13 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -36,9 +38,25 @@ import (
 )
 
 type testResult struct {
-	context     *gin.Context
-	localErr    error
-	newAPIError *types.NewAPIError
+	context          *gin.Context
+	localErr         error
+	newAPIError      *types.NewAPIError
+	usage            *dto.Usage
+	quota            int
+	sourceStatusCode int
+	retryAfterMs     int64
+}
+
+type channelTestOptions struct {
+	recordConsumption bool
+	logDetails        bool
+	maxOutputTokens   uint
+	groupName         string
+	probeLowCostOnly  bool
+}
+
+func init() {
+	channelrouting.RegisterActiveProbeExecutor(executeChannelRoutingActiveProbe)
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
@@ -73,6 +91,21 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 }
 
 func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+	return testChannelWithOptions(ctx, channel, testUserID, testModel, endpointType, isStream, channelTestOptions{
+		recordConsumption: true,
+		logDetails:        true,
+	})
+}
+
+func testChannelWithOptions(
+	ctx context.Context,
+	channel *model.Channel,
+	testUserID int,
+	testModel string,
+	endpointType string,
+	isStream bool,
+	options channelTestOptions,
+) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -171,6 +204,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	c.Set("channel", channel.Type)
 	c.Set("base_url", channel.GetBaseURL())
 	group, _ := model.GetUserGroup(testUserID, false)
+	if configuredGroup := strings.TrimSpace(options.groupName); configuredGroup != "" {
+		group = configuredGroup
+	}
 	c.Set("group", group)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
@@ -231,8 +267,16 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
 		}
 	}
+	if options.probeLowCostOnly && !channelRoutingProbeRelayFormatAllowed(relayFormat) {
+		err := fmt.Errorf("relay format %s is not eligible for low-cost active probes", relayFormat)
+		return testResult{
+			context: c, localErr: err,
+			newAPIError: types.NewError(err, types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry()),
+		}
+	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	applyChannelTestMaxOutputTokens(request, options.maxOutputTokens)
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -291,7 +335,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//// 创建一个用于日志的 info 副本，移除 ApiKey
 	//logInfo := info
 	//logInfo.ApiKey = ""
-	common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	if options.logDetails {
+		common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+	}
 
 	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 	if err != nil {
@@ -437,57 +483,68 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 	var httpResp *http.Response
+	upstreamStatusCode := 0
 	if resp != nil {
 		httpResp = resp.(*http.Response)
+		upstreamStatusCode = httpResp.StatusCode
 		if httpResp.StatusCode != http.StatusOK {
+			retryAfterMs := service.ParseRetryAfterHeader(httpResp.Header.Get("Retry-After"), time.Now()).Milliseconds()
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
-			common.SysError(fmt.Sprintf(
-				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
-				channel.Id,
-				channel.Name,
-				channel.Type,
-				testModel,
-				endpointType,
-				httpResp.StatusCode,
-				err,
-			))
+			if options.logDetails {
+				common.SysError(fmt.Sprintf(
+					"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
+					channel.Id,
+					channel.Name,
+					channel.Type,
+					testModel,
+					endpointType,
+					httpResp.StatusCode,
+					err,
+				))
+			}
 			return testResult{
-				context:     c,
-				localErr:    err,
-				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+				context:          c,
+				localErr:         err,
+				newAPIError:      types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+				sourceStatusCode: httpResp.StatusCode,
+				retryAfterMs:     max(retryAfterMs, 0),
 			}
 		}
 	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    respErr,
-			newAPIError: respErr,
+			context:          c,
+			localErr:         respErr,
+			newAPIError:      respErr,
+			sourceStatusCode: upstreamStatusCode,
 		}
 	}
 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
 	if usageErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    usageErr,
-			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			context:          c,
+			localErr:         usageErr,
+			newAPIError:      types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			sourceStatusCode: upstreamStatusCode,
 		}
 	}
 	result := w.Result()
 	respBody, err := readTestResponseBody(result.Body, isStream)
 	if err != nil {
 		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+			context:          c,
+			localErr:         err,
+			newAPIError:      types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+			sourceStatusCode: upstreamStatusCode,
 		}
 	}
 	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    bodyErr,
-			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			context:          c,
+			localErr:         bodyErr,
+			newAPIError:      types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			sourceStatusCode: upstreamStatusCode,
 		}
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
@@ -496,26 +553,199 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
-	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-		ChannelId:        channel.Id,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
-		TokenName:        "模型测试",
-		Quota:            quota,
-		Content:          "模型测试",
-		UseTimeSeconds:   int(consumedTime),
-		IsStream:         info.IsStream,
-		Group:            info.UsingGroup,
-		Other:            other,
-	})
-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
-	return testResult{
-		context:     c,
-		localErr:    nil,
-		newAPIError: nil,
+	if options.recordConsumption {
+		other := buildTestLogOther(c, info, priceData, usage, tieredResult)
+		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+			ChannelId:        channel.Id,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ModelName:        info.OriginModelName,
+			TokenName:        "模型测试",
+			Quota:            quota,
+			Content:          "模型测试",
+			UseTimeSeconds:   int(consumedTime),
+			IsStream:         info.IsStream,
+			Group:            info.UsingGroup,
+			Other:            other,
+		})
 	}
+	if options.logDetails {
+		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
+	return testResult{
+		context:          c,
+		localErr:         nil,
+		newAPIError:      nil,
+		usage:            usage,
+		quota:            quota,
+		sourceStatusCode: upstreamStatusCode,
+	}
+}
+
+func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting.ActiveProbeTarget) channelrouting.ActiveProbeExecution {
+	channel, err := currentChannelRoutingActiveProbeTarget(target)
+	if err != nil {
+		apiErr := types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
+	}
+	channel, err = activeProbeChannelCopy(channel)
+	if err != nil {
+		apiErr := types.NewError(err, types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
+	}
+	testUserID, err := resolveChannelTestUserID(nil)
+	if err != nil {
+		apiErr := types.NewError(err, types.ErrorCodeQueryDataError, types.ErrOptionWithSkipRetry())
+		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
+	}
+	result := testChannelWithOptions(ctx, channel, testUserID, target.ModelName, "", false, channelTestOptions{
+		recordConsumption: false,
+		logDetails:        false,
+		maxOutputTokens:   16,
+		groupName:         target.GroupName,
+		probeLowCostOnly:  true,
+	})
+	if _, validateErr := currentChannelRoutingActiveProbeTarget(target); validateErr != nil {
+		apiErr := types.NewError(validateErr, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		return channelRoutingProbeExecution(apiErr, 0, result.usage, result.quota, 0, true)
+	}
+	apiErr := result.newAPIError
+	if apiErr == nil && result.localErr != nil {
+		apiErr = types.NewError(result.localErr, types.ErrorCodeBadResponse)
+	}
+	if apiErr != nil && result.sourceStatusCode > 0 {
+		apiErr = types.NewErrorWithStatusCode(apiErr.Cause(), apiErr.GetErrorCode(), result.sourceStatusCode)
+	}
+	return channelRoutingProbeExecution(apiErr, result.sourceStatusCode, result.usage, result.quota, result.retryAfterMs, false)
+}
+
+func currentChannelRoutingActiveProbeTarget(target channelrouting.ActiveProbeTarget) (*model.Channel, error) {
+	_, identity, current := channelrouting.ResolveObserveModelSnapshot(target.GroupName, target.ChannelID, target.ModelName)
+	if !current || identity.SnapshotRevision != target.SnapshotRevision || identity.PoolID != target.PoolID || identity.MemberID != target.MemberID {
+		return nil, channelrouting.ErrActiveProbeTargetStale
+	}
+	channel, err := model.GetChannelById(target.ChannelID, true)
+	if err != nil {
+		return nil, err
+	}
+	if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey != target.MultiKey ||
+		channelrouting.EndpointHost(channel.GetBaseURL(), channel.Id) != target.EndpointHost ||
+		channelrouting.EndpointAuthority(channel.GetBaseURL(), channel.Id) != target.EndpointAuthority ||
+		channelrouting.RoutingRegion() != target.Region {
+		return nil, channelrouting.ErrActiveProbeTargetStale
+	}
+	if !target.MultiKey {
+		resolved, ok := channelrouting.ResolveIdentity(target.GroupName, target.ChannelID, channel.Key)
+		if !ok || resolved.SnapshotRevision != target.SnapshotRevision || resolved.CredentialID != target.CredentialID {
+			return nil, channelrouting.ErrActiveProbeTargetStale
+		}
+	}
+	return channel, nil
+}
+
+func channelRoutingProbeRelayFormatAllowed(relayFormat types.RelayFormat) bool {
+	switch relayFormat {
+	case types.RelayFormatOpenAI,
+		types.RelayFormatOpenAIResponses,
+		types.RelayFormatOpenAIResponsesCompaction,
+		types.RelayFormatClaude,
+		types.RelayFormatGemini,
+		types.RelayFormatRerank,
+		types.RelayFormatEmbedding:
+		return true
+	default:
+		return false
+	}
+}
+
+func activeProbeChannelCopy(channel *model.Channel) (*model.Channel, error) {
+	if channel == nil {
+		return nil, errors.New("channel routing active probe channel is nil")
+	}
+	if !channel.ChannelInfo.IsMultiKey {
+		return channel, nil
+	}
+	keys := channel.GetKeys()
+	selected := ""
+	for index, key := range keys {
+		status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
+		if !exists || status == common.ChannelStatusEnabled {
+			selected = key
+			break
+		}
+	}
+	if selected == "" {
+		return nil, errors.New("channel routing active probe has no enabled credential")
+	}
+	probeChannel := *channel
+	probeChannel.Key = selected
+	probeChannel.Keys = nil
+	probeChannel.ChannelInfo = channel.ChannelInfo
+	probeChannel.ChannelInfo.MultiKeySize = 1
+	probeChannel.ChannelInfo.MultiKeyStatusList = nil
+	probeChannel.ChannelInfo.MultiKeyDisabledReason = nil
+	probeChannel.ChannelInfo.MultiKeyDisabledTime = nil
+	probeChannel.ChannelInfo.MultiKeyPollingIndex = 0
+	probeChannel.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+	return &probeChannel, nil
+}
+
+func channelRoutingProbeExecution(
+	apiErr *types.NewAPIError,
+	statusCode int,
+	usage *dto.Usage,
+	quota int,
+	retryAfterMs int64,
+	localError bool,
+) channelrouting.ActiveProbeExecution {
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationProbe,
+	})
+	if classification.Responsibility == routingerror.ResponsibilityGateway ||
+		classification.Responsibility == routingerror.ResponsibilityConfig ||
+		classification.Responsibility == routingerror.ResponsibilityCaller {
+		localError = true
+	}
+	result := channelrouting.ActiveProbeExecution{
+		StatusCode:     statusCode,
+		LocalError:     localError,
+		Classification: classification,
+		RetryAfterMs:   max(retryAfterMs, 0),
+		CostNanoUSD:    channelTestQuotaNanoUSD(quota),
+	}
+	if result.RetryAfterMs > 0 {
+		result.Classification.CapacityEffect = routingerror.CapacityCooldown
+	}
+	if apiErr != nil {
+		result.Err = apiErr.Cause()
+		result.ErrorCode = string(apiErr.GetErrorCode())
+		if result.StatusCode == 0 {
+			result.StatusCode = apiErr.SourceStatusCode()
+		}
+		if result.StatusCode == 0 {
+			result.StatusCode = apiErr.StatusCode
+		}
+	}
+	if usage != nil {
+		result.PromptTokens = int64(max(usage.PromptTokens, 0))
+		result.CompletionTokens = int64(max(usage.CompletionTokens, 0))
+	}
+	return result
+}
+
+func channelTestQuotaNanoUSD(quota int) int64 {
+	if quota <= 0 || common.QuotaPerUnit <= 0 {
+		return 0
+	}
+	nanoUSD := float64(quota) / common.QuotaPerUnit * 1_000_000_000
+	if math.IsNaN(nanoUSD) || nanoUSD <= 0 {
+		return 0
+	}
+	if math.IsInf(nanoUSD, 1) || nanoUSD >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(math.Ceil(nanoUSD))
 }
 
 func attachTestBillingRequestInput(info *relaycommon.RelayInfo, request dto.Request) error {
@@ -542,15 +772,27 @@ func settleTestQuota(info *relaycommon.RelayInfo, priceData types.PriceData, usa
 
 	quota := 0
 	if !priceData.UsePrice {
-		quota = usage.PromptTokens + int(math.Round(float64(usage.CompletionTokens)*priceData.CompletionRatio))
-		quota = int(math.Round(float64(quota) * priceData.ModelRatio))
+		completionQuota, clamp := common.QuotaRoundChecked(float64(max(usage.CompletionTokens, 0)) * priceData.CompletionRatio)
+		quota, finalClamp := common.QuotaRoundChecked(
+			(float64(max(usage.PromptTokens, 0)) + float64(completionQuota)) * priceData.ModelRatio,
+		)
+		if finalClamp != nil {
+			clamp = finalClamp
+		}
+		if clamp != nil && info != nil {
+			info.QuotaClamp = clamp
+		}
 		if priceData.ModelRatio != 0 && quota <= 0 {
 			quota = 1
 		}
 		return quota, nil
 	}
 
-	return int(priceData.ModelPrice * common.QuotaPerUnit), nil
+	quota, clamp := common.QuotaFromFloatChecked(priceData.ModelPrice * common.QuotaPerUnit)
+	if clamp != nil && info != nil {
+		info.QuotaClamp = clamp
+	}
+	return quota, nil
 }
 
 func buildTestLogOther(c *gin.Context, info *relaycommon.RelayInfo, priceData types.PriceData, usage *dto.Usage, tieredResult *billingexpr.TieredResult) map[string]interface{} {
@@ -559,6 +801,7 @@ func buildTestLogOther(c *gin.Context, info *relaycommon.RelayInfo, priceData ty
 	if tieredResult != nil {
 		service.InjectTieredBillingInfo(other, info, tieredResult)
 	}
+	service.AttachQuotaSaturation(c, info, other)
 	return other
 }
 
@@ -690,6 +933,22 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 		return "upstream returned error payload"
 	}
 	return message
+}
+
+func applyChannelTestMaxOutputTokens(request dto.Request, maximum uint) {
+	if request == nil || maximum == 0 {
+		return
+	}
+	switch typed := request.(type) {
+	case *dto.GeneralOpenAIRequest:
+		if typed.MaxCompletionTokens != nil {
+			typed.MaxCompletionTokens = lo.ToPtr(maximum)
+			return
+		}
+		typed.MaxTokens = lo.ToPtr(maximum)
+	case *dto.OpenAIResponsesRequest:
+		typed.MaxOutputTokens = lo.ToPtr(maximum)
+	}
 }
 
 func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
@@ -935,9 +1194,10 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		shouldBanChannel := false
 		newAPIError := result.newAPIError
+		classification, _ := classifyRoutingRelayAttempt(newAPIError, nil)
 		// request error disables the channel
 		if newAPIError != nil {
-			shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+			shouldBanChannel = service.ShouldDisableChannel(newAPIError, classification)
 		}
 
 		// 当错误检查通过，才检查响应时间
@@ -945,7 +1205,8 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 			if milliseconds > disableThreshold {
 				err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
 				newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
-				shouldBanChannel = true
+				classification, _ = classifyRoutingRelayAttempt(newAPIError, nil)
+				shouldBanChannel = service.ShouldDisableChannel(newAPIError, classification)
 			}
 		}
 
@@ -957,7 +1218,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 
 		// disable channel
 		if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+			processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, classification)
 			summary.Disabled++
 		}
 

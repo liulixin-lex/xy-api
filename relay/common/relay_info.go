@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -61,23 +62,30 @@ type ResponsesUsageInfo struct {
 }
 
 type ChannelMeta struct {
-	ChannelType          int
-	ChannelId            int
-	ChannelIsMultiKey    bool
-	ChannelMultiKeyIndex int
-	ChannelBaseUrl       string
-	ApiType              int
-	ApiVersion           string
-	ApiKey               string
-	Organization         string
-	ChannelCreateTime    int64
-	ParamOverride        map[string]interface{}
-	HeadersOverride      map[string]interface{}
-	ChannelSetting       dto.ChannelSettings
-	ChannelOtherSettings dto.ChannelOtherSettings
-	UpstreamModelName    string
-	IsModelMapped        bool
-	SupportStreamOptions bool // 是否支持流式选项
+	ChannelType              int
+	ChannelId                int
+	ChannelIsMultiKey        bool
+	ChannelMultiKeyIndex     int
+	RoutingSnapshotRevision  uint64
+	RoutingPoolID            int
+	RoutingMemberID          int
+	RoutingCredentialID      int
+	RoutingEndpointHost      string
+	RoutingEndpointAuthority string
+	RoutingRegion            string
+	ChannelBaseUrl           string
+	ApiType                  int
+	ApiVersion               string
+	ApiKey                   string
+	Organization             string
+	ChannelCreateTime        int64
+	ParamOverride            map[string]interface{}
+	HeadersOverride          map[string]interface{}
+	ChannelSetting           dto.ChannelSettings
+	ChannelOtherSettings     dto.ChannelOtherSettings
+	UpstreamModelName        string
+	IsModelMapped            bool
+	SupportStreamOptions     bool // 是否支持流式选项
 }
 
 type TokenCountMeta struct {
@@ -86,16 +94,36 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
-	TokenId           int
-	TokenKey          string
-	TokenGroup        string
-	UserId            int
-	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
-	UserGroup         string // 用户所在分组
-	TokenUnlimited    bool
-	StartTime         time.Time
-	FirstResponseTime time.Time
-	isFirstResponse   bool
+	routingUsageSequence           uint64
+	routingOutputTokens            int64
+	routingAttemptDurationNanos    int64
+	routingUsagePromptTokens       int64
+	routingUsageCompletionTokens   int64
+	routingUsageCacheReadTokens    int64
+	routingUsageCacheWriteTokens   int64
+	routingUsageCacheWrite1hTokens int64
+	routingUsageImageInputTokens   int64
+	routingUsageImageOutputTokens  int64
+	routingUsageAudioInputTokens   int64
+	routingUsageAudioOutputTokens  int64
+	routingUsageKnown              int32
+	routingUsageClaudeSemantic     int32
+	TokenId                        int
+	TokenKey                       string
+	TokenGroup                     string
+	UserId                         int
+	UsingGroup                     string // 使用的分组，当auto跨分组重试时，会变动
+	UserGroup                      string // 用户所在分组
+	TokenUnlimited                 bool
+	StartTime                      time.Time
+	FirstResponseTime              time.Time
+	isFirstResponse                bool
+	routingAttemptStartTime        time.Time
+
+	attemptBaselineCaptured        bool
+	attemptIsStream                bool
+	attemptRequestConversionChain  []types.RelayFormat
+	attemptFinalRequestRelayFormat types.RelayFormat
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool
@@ -194,27 +222,90 @@ type RelayInfo struct {
 	*TaskRelayInfo
 }
 
+type RoutingAttemptUsage struct {
+	PromptTokens       int64
+	CompletionTokens   int64
+	CacheReadTokens    int64
+	CacheWriteTokens   int64
+	CacheWrite1hTokens int64
+	ImageInputTokens   int64
+	ImageOutputTokens  int64
+	AudioInputTokens   int64
+	AudioOutputTokens  int64
+	ClaudeSemantic     bool
+}
+
+func (usage RoutingAttemptUsage) DTO() (*dto.Usage, bool) {
+	maximumInt := int64(^uint(0) >> 1)
+	values := []int64{
+		usage.PromptTokens, usage.CompletionTokens, usage.CacheReadTokens,
+		usage.CacheWriteTokens, usage.CacheWrite1hTokens, usage.ImageInputTokens,
+		usage.ImageOutputTokens, usage.AudioInputTokens, usage.AudioOutputTokens,
+	}
+	for _, value := range values {
+		if value < 0 || value > maximumInt {
+			return nil, false
+		}
+	}
+	if usage.PromptTokens > maximumInt-usage.CompletionTokens {
+		return nil, false
+	}
+	semantic := ""
+	if usage.ClaudeSemantic {
+		semantic = "anthropic"
+	}
+	return &dto.Usage{
+		PromptTokens: int(usage.PromptTokens), CompletionTokens: int(usage.CompletionTokens),
+		TotalTokens:          int(usage.PromptTokens + usage.CompletionTokens),
+		PromptCacheHitTokens: int(usage.CacheReadTokens), UsageSemantic: semantic,
+		PromptTokensDetails: dto.InputTokenDetails{
+			CachedTokens: int(usage.CacheReadTokens), ImageTokens: int(usage.ImageInputTokens),
+			AudioTokens: int(usage.AudioInputTokens),
+		},
+		CompletionTokenDetails: dto.OutputTokenDetails{
+			ImageTokens: int(usage.ImageOutputTokens), AudioTokens: int(usage.AudioOutputTokens),
+		},
+		ClaudeCacheCreation5mTokens: int(usage.CacheWriteTokens),
+		ClaudeCacheCreation1hTokens: int(usage.CacheWrite1hTokens),
+	}, true
+}
+
+func (info *RelayInfo) CurrentAttemptIsMultiKey(c *gin.Context) bool {
+	if c != nil {
+		return common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
+	}
+	return info != nil && info.ChannelMeta != nil && info.ChannelMeta.ChannelIsMultiKey
+}
+
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)
 	headerOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)
+	routingSnapshotRevision, _ := common.GetContextKeyType[uint64](c, constant.ContextKeyRoutingSnapshotRevision)
 	apiType, _ := common.ChannelType2APIType(channelType)
 	channelMeta := &ChannelMeta{
-		ChannelType:          channelType,
-		ChannelId:            common.GetContextKeyInt(c, constant.ContextKeyChannelId),
-		ChannelIsMultiKey:    common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
-		ChannelMultiKeyIndex: common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
-		ChannelBaseUrl:       common.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl),
-		ApiType:              apiType,
-		ApiVersion:           c.GetString("api_version"),
-		ApiKey:               common.GetContextKeyString(c, constant.ContextKeyChannelKey),
-		Organization:         c.GetString("channel_organization"),
-		ChannelCreateTime:    c.GetInt64("channel_create_time"),
-		ParamOverride:        paramOverride,
-		HeadersOverride:      headerOverride,
-		UpstreamModelName:    common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
-		IsModelMapped:        false,
-		SupportStreamOptions: false,
+		ChannelType:              channelType,
+		ChannelId:                common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+		ChannelIsMultiKey:        common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
+		ChannelMultiKeyIndex:     common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
+		RoutingSnapshotRevision:  routingSnapshotRevision,
+		RoutingPoolID:            common.GetContextKeyInt(c, constant.ContextKeyRoutingPoolID),
+		RoutingMemberID:          common.GetContextKeyInt(c, constant.ContextKeyRoutingMemberID),
+		RoutingCredentialID:      common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),
+		RoutingEndpointHost:      common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointHost),
+		RoutingEndpointAuthority: common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointAuthority),
+		RoutingRegion:            common.GetContextKeyString(c, constant.ContextKeyRoutingRegion),
+		ChannelBaseUrl:           common.GetContextKeyString(c, constant.ContextKeyChannelBaseUrl),
+		ApiType:                  apiType,
+		ApiVersion:               c.GetString("api_version"),
+		ApiKey:                   common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+		Organization:             c.GetString("channel_organization"),
+		ChannelCreateTime:        c.GetInt64("channel_create_time"),
+		ParamOverride:            paramOverride,
+		HeadersOverride:          headerOverride,
+		UpstreamModelName:        common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
+		IsModelMapped:            false,
+		SupportStreamOptions:     false,
 	}
 
 	if channelType == constant.ChannelTypeAzure {
@@ -671,6 +762,276 @@ func (info *RelayInfo) SetFirstResponseTime() {
 
 func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
+}
+
+func (info *RelayInfo) ObserveRoutingAttemptUsage(usage *dto.Usage) {
+	if info == nil || usage == nil {
+		return
+	}
+	promptTokens := int64(usage.PromptTokens)
+	completionTokens := int64(usage.CompletionTokens)
+	if promptTokens == 0 && usage.InputTokens > 0 {
+		promptTokens = int64(usage.InputTokens)
+	}
+	if completionTokens == 0 && usage.OutputTokens > 0 {
+		completionTokens = int64(usage.OutputTokens)
+	}
+	cacheReadTokens := int64(max(usage.PromptCacheHitTokens, usage.PromptTokensDetails.CachedTokens))
+	cacheWriteTokens := int64(usage.ClaudeCacheCreation5mTokens)
+	cacheWrite1hTokens := int64(usage.ClaudeCacheCreation1hTokens)
+	imageInputTokens := int64(usage.PromptTokensDetails.ImageTokens)
+	audioInputTokens := int64(usage.PromptTokensDetails.AudioTokens)
+	if usage.InputTokensDetails != nil {
+		cacheReadTokens = max(cacheReadTokens, int64(usage.InputTokensDetails.CachedTokens))
+		imageInputTokens = int64(usage.InputTokensDetails.ImageTokens)
+		audioInputTokens = int64(usage.InputTokensDetails.AudioTokens)
+		if cacheWriteTokens == 0 && cacheWrite1hTokens == 0 {
+			cacheWriteTokens = int64(usage.InputTokensDetails.CachedCreationTokens)
+		}
+	}
+	if cacheWriteTokens == 0 && cacheWrite1hTokens == 0 {
+		cacheWriteTokens = int64(usage.PromptTokensDetails.CachedCreationTokens)
+	}
+	info.observeRoutingAttemptUsage(RoutingAttemptUsage{
+		PromptTokens: promptTokens, CompletionTokens: completionTokens,
+		CacheReadTokens: cacheReadTokens, CacheWriteTokens: cacheWriteTokens,
+		CacheWrite1hTokens: cacheWrite1hTokens,
+		ImageInputTokens:   imageInputTokens,
+		ImageOutputTokens:  int64(usage.CompletionTokenDetails.ImageTokens),
+		AudioInputTokens:   audioInputTokens,
+		AudioOutputTokens:  int64(usage.CompletionTokenDetails.AudioTokens),
+		ClaudeSemantic:     usage.UsageSemantic == "anthropic",
+	})
+}
+
+func (info *RelayInfo) ObserveRoutingRealtimeUsage(usage *dto.RealtimeUsage) {
+	if info == nil || usage == nil {
+		return
+	}
+	info.observeRoutingAttemptUsage(RoutingAttemptUsage{
+		PromptTokens:      int64(usage.InputTokens),
+		CompletionTokens:  int64(usage.OutputTokens),
+		CacheReadTokens:   int64(usage.InputTokenDetails.CachedTokens),
+		ImageInputTokens:  int64(usage.InputTokenDetails.ImageTokens),
+		ImageOutputTokens: int64(usage.OutputTokenDetails.ImageTokens),
+		AudioInputTokens:  int64(usage.InputTokenDetails.AudioTokens),
+		AudioOutputTokens: int64(usage.OutputTokenDetails.AudioTokens),
+	})
+}
+
+func (info *RelayInfo) RoutingAttemptUsageSnapshot() (RoutingAttemptUsage, bool) {
+	if info == nil {
+		return RoutingAttemptUsage{}, false
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		before := atomic.LoadUint64(&info.routingUsageSequence)
+		if before&1 != 0 {
+			continue
+		}
+		known := atomic.LoadInt32(&info.routingUsageKnown) != 0
+		usage := RoutingAttemptUsage{
+			PromptTokens:       atomic.LoadInt64(&info.routingUsagePromptTokens),
+			CompletionTokens:   atomic.LoadInt64(&info.routingUsageCompletionTokens),
+			CacheReadTokens:    atomic.LoadInt64(&info.routingUsageCacheReadTokens),
+			CacheWriteTokens:   atomic.LoadInt64(&info.routingUsageCacheWriteTokens),
+			CacheWrite1hTokens: atomic.LoadInt64(&info.routingUsageCacheWrite1hTokens),
+			ImageInputTokens:   atomic.LoadInt64(&info.routingUsageImageInputTokens),
+			ImageOutputTokens:  atomic.LoadInt64(&info.routingUsageImageOutputTokens),
+			AudioInputTokens:   atomic.LoadInt64(&info.routingUsageAudioInputTokens),
+			AudioOutputTokens:  atomic.LoadInt64(&info.routingUsageAudioOutputTokens),
+			ClaudeSemantic:     atomic.LoadInt32(&info.routingUsageClaudeSemantic) != 0,
+		}
+		after := atomic.LoadUint64(&info.routingUsageSequence)
+		if before == after && after&1 == 0 {
+			return usage, known
+		}
+	}
+	return RoutingAttemptUsage{}, false
+}
+
+func (info *RelayInfo) observeRoutingAttemptUsage(usage RoutingAttemptUsage) {
+	const maximum = int64(1_000_000_000_000)
+	values := []int64{
+		usage.PromptTokens, usage.CompletionTokens, usage.CacheReadTokens,
+		usage.CacheWriteTokens, usage.CacheWrite1hTokens, usage.ImageInputTokens,
+		usage.ImageOutputTokens, usage.AudioInputTokens, usage.AudioOutputTokens,
+	}
+	for _, value := range values {
+		if value < 0 || value > maximum {
+			return
+		}
+	}
+	sequence := info.beginRoutingUsageWrite()
+	atomic.StoreInt64(&info.routingUsagePromptTokens, usage.PromptTokens)
+	atomic.StoreInt64(&info.routingUsageCompletionTokens, usage.CompletionTokens)
+	atomic.StoreInt64(&info.routingUsageCacheReadTokens, usage.CacheReadTokens)
+	atomic.StoreInt64(&info.routingUsageCacheWriteTokens, usage.CacheWriteTokens)
+	atomic.StoreInt64(&info.routingUsageCacheWrite1hTokens, usage.CacheWrite1hTokens)
+	atomic.StoreInt64(&info.routingUsageImageInputTokens, usage.ImageInputTokens)
+	atomic.StoreInt64(&info.routingUsageImageOutputTokens, usage.ImageOutputTokens)
+	atomic.StoreInt64(&info.routingUsageAudioInputTokens, usage.AudioInputTokens)
+	atomic.StoreInt64(&info.routingUsageAudioOutputTokens, usage.AudioOutputTokens)
+	if usage.ClaudeSemantic {
+		atomic.StoreInt32(&info.routingUsageClaudeSemantic, 1)
+	} else {
+		atomic.StoreInt32(&info.routingUsageClaudeSemantic, 0)
+	}
+	atomic.StoreInt32(&info.routingUsageKnown, 1)
+	atomic.StoreUint64(&info.routingUsageSequence, sequence+2)
+}
+
+func (info *RelayInfo) beginRoutingUsageWrite() uint64 {
+	for {
+		sequence := atomic.LoadUint64(&info.routingUsageSequence)
+		if sequence&1 != 0 {
+			continue
+		}
+		if atomic.CompareAndSwapUint64(&info.routingUsageSequence, sequence, sequence+1) {
+			return sequence
+		}
+	}
+}
+
+func (info *RelayInfo) ObserveRoutingOutputTokens(tokens int64) {
+	info.ObserveRoutingOutputTokensAt(tokens, time.Now())
+}
+
+func (info *RelayInfo) ObserveRoutingOutputTokensAt(tokens int64, observedAt time.Time) {
+	if info == nil || tokens < 0 {
+		return
+	}
+	attemptStart := info.RoutingAttemptStartTime()
+	if attemptStart.IsZero() {
+		return
+	}
+	for {
+		current := atomic.LoadInt64(&info.routingOutputTokens)
+		if tokens < current {
+			return
+		}
+		if tokens == current || atomic.CompareAndSwapInt64(&info.routingOutputTokens, current, tokens) {
+			break
+		}
+	}
+
+	durationNanos := int64(observedAt.Sub(attemptStart))
+	if durationNanos <= 0 {
+		return
+	}
+	for {
+		if tokens < atomic.LoadInt64(&info.routingOutputTokens) {
+			return
+		}
+		current := atomic.LoadInt64(&info.routingAttemptDurationNanos)
+		if durationNanos <= current || atomic.CompareAndSwapInt64(&info.routingAttemptDurationNanos, current, durationNanos) {
+			return
+		}
+	}
+}
+
+func (info *RelayInfo) RoutingOutputTokens() int64 {
+	if info == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&info.routingOutputTokens)
+}
+
+func (info *RelayInfo) RoutingAttemptStartTime() time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	if !info.routingAttemptStartTime.IsZero() {
+		return info.routingAttemptStartTime
+	}
+	return info.StartTime
+}
+
+func (info *RelayInfo) RoutingAttemptEndTime() time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	attemptStart := info.RoutingAttemptStartTime()
+	durationNanos := atomic.LoadInt64(&info.routingAttemptDurationNanos)
+	if attemptStart.IsZero() || durationNanos <= 0 {
+		return time.Time{}
+	}
+	return attemptStart.Add(time.Duration(durationNanos))
+}
+
+func (info *RelayInfo) ResetStreamAttemptState() {
+	if info == nil {
+		return
+	}
+	info.routingAttemptStartTime = time.Now()
+	atomic.StoreInt64(&info.routingOutputTokens, 0)
+	atomic.StoreInt64(&info.routingAttemptDurationNanos, 0)
+	sequence := info.beginRoutingUsageWrite()
+	atomic.StoreInt64(&info.routingUsagePromptTokens, 0)
+	atomic.StoreInt64(&info.routingUsageCompletionTokens, 0)
+	atomic.StoreInt64(&info.routingUsageCacheReadTokens, 0)
+	atomic.StoreInt64(&info.routingUsageCacheWriteTokens, 0)
+	atomic.StoreInt64(&info.routingUsageCacheWrite1hTokens, 0)
+	atomic.StoreInt64(&info.routingUsageImageInputTokens, 0)
+	atomic.StoreInt64(&info.routingUsageImageOutputTokens, 0)
+	atomic.StoreInt64(&info.routingUsageAudioInputTokens, 0)
+	atomic.StoreInt64(&info.routingUsageAudioOutputTokens, 0)
+	atomic.StoreInt32(&info.routingUsageKnown, 0)
+	atomic.StoreInt32(&info.routingUsageClaudeSemantic, 0)
+	atomic.StoreUint64(&info.routingUsageSequence, sequence+2)
+	if !info.attemptBaselineCaptured {
+		info.attemptBaselineCaptured = true
+		info.attemptIsStream = info.IsStream
+		info.attemptRequestConversionChain = append([]types.RelayFormat(nil), info.RequestConversionChain...)
+		info.attemptFinalRequestRelayFormat = info.FinalRequestRelayFormat
+	}
+	info.IsStream = info.attemptIsStream
+	info.RequestConversionChain = append([]types.RelayFormat(nil), info.attemptRequestConversionChain...)
+	info.FinalRequestRelayFormat = info.attemptFinalRequestRelayFormat
+	info.StreamStatus = nil
+	info.SendResponseCount = 0
+	info.ReceivedResponseCount = 0
+	info.FirstResponseTime = time.Time{}
+	info.isFirstResponse = true
+}
+
+// HTTPStreamClientCommitted reports whether an HTTP stream has written a
+// response to the downstream client.
+func (info *RelayInfo) HTTPStreamClientCommitted(c *gin.Context) bool {
+	if info == nil || c == nil || c.Writer == nil {
+		return false
+	}
+	return (info.IsStream || info.StreamStatus != nil) && c.Writer.Written()
+}
+
+// HTTPStreamHasFailure reports whether the stream ended abnormally, including
+// downstream disconnects and soft parsing errors recorded during an otherwise
+// normal EOF/DONE sequence.
+func (info *RelayInfo) HTTPStreamHasFailure() bool {
+	if info == nil || info.StreamStatus == nil {
+		return false
+	}
+	status := info.StreamStatus
+	if status.HasErrors() {
+		return true
+	}
+	switch status.EndReason {
+	case StreamEndReasonNone, StreamEndReasonDone, StreamEndReasonEOF:
+		return false
+	default:
+		return true
+	}
+}
+
+// HTTPStreamFailedBeforeCommit reports a provider-side stream failure that is
+// still safe to retry because nothing has been written to the client.
+func (info *RelayInfo) HTTPStreamFailedBeforeCommit(c *gin.Context) bool {
+	if info == nil || info.StreamStatus == nil || info.HTTPStreamClientCommitted(c) {
+		return false
+	}
+	if info.StreamStatus.EndReason == StreamEndReasonClientGone {
+		return false
+	}
+	return info.HTTPStreamHasFailure()
 }
 
 func (info *RelayInfo) FirstByteTimedOutBeforeResponse() bool {

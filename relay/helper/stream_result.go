@@ -10,6 +10,7 @@ import (
 type StreamResult struct {
 	status  *relaycommon.StreamStatus
 	stopped bool
+	done    bool
 }
 
 func newStreamResult(status *relaycommon.StreamStatus) *StreamResult {
@@ -37,8 +38,8 @@ func (r *StreamResult) Stop(err error) {
 // Done signals that the handler has finished processing normally
 // (e.g., Dify "message_end"). The stream stops after this chunk.
 func (r *StreamResult) Done() {
-	r.status.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 	r.stopped = true
+	r.done = true
 }
 
 // IsStopped returns whether Stop() or Done() was called during this chunk.
@@ -46,7 +47,12 @@ func (r *StreamResult) IsStopped() bool {
 	return r.stopped
 }
 
+func (r *StreamResult) IsDone() bool {
+	return r.done
+}
+
 // reset clears the per-chunk stopped flag so the object can be reused.
 func (r *StreamResult) reset() {
 	r.stopped = false
+	r.done = false
 }

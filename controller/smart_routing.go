@@ -9,12 +9,14 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
@@ -58,6 +60,7 @@ type routingBindingView struct {
 	ServesClaudeCode bool                   `json:"serves_claude_code"`
 	NewAPIUserID     *int                   `json:"new_api_user_id,omitempty"`
 	Enabled          bool                   `json:"enabled"`
+	SyncFailureCount int                    `json:"sync_failure_count"`
 	SyncBackoffUntil int64                  `json:"sync_backoff_until"`
 	LastSyncError    *string                `json:"last_sync_error,omitempty"`
 	CredentialMasks  routingCredentialMasks `json:"credential_masks"`
@@ -76,9 +79,8 @@ func UpdateSmartRoutingSettings(c *gin.Context) {
 		common.ApiErrorMsg(c, "invalid smart routing settings")
 		return
 	}
-	updated := smart_routing_setting.UpdateSetting(request)
-	syncRoutingBreakerConfigFromSetting(updated)
-	values, err := config.ConfigToMap(updated)
+	normalized := smart_routing_setting.Normalize(request)
+	values, err := config.ConfigToMap(normalized)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -91,7 +93,9 @@ func UpdateSmartRoutingSettings(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, updated)
+	effective := smart_routing_setting.GetSetting()
+	syncRoutingBreakerConfigFromSetting(effective)
+	common.ApiSuccess(c, effective)
 }
 
 func ListSmartRoutingBindings(c *gin.Context) {
@@ -105,7 +109,7 @@ func ListSmartRoutingBindings(c *gin.Context) {
 		view, err := routingBindingViewWithStoredCredentials(binding)
 		if err != nil {
 			view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-			view.CredentialError = err.Error()
+			view.CredentialError = common.SanitizeErrorMessage(err.Error())
 		}
 		views = append(views, view)
 	}
@@ -120,7 +124,7 @@ func GetSmartRoutingBinding(c *gin.Context) {
 	view, err := routingBindingViewWithStoredCredentials(*binding)
 	if err != nil {
 		view = buildRoutingBindingView(*binding, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -142,14 +146,21 @@ func CreateSmartRoutingBinding(c *gin.Context) {
 			return
 		}
 	}
-	if err := model.DB.Create(&binding).Error; err != nil {
+	requestContext := c.Request.Context()
+	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	err := model.DB.WithContext(requestContext).Create(&binding).Error
+	smartRoutingRuntimeStateMu.Unlock()
+	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	view, err := routingBindingViewWithStoredCredentials(binding)
 	if err != nil {
 		view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -175,25 +186,63 @@ func UpdateSmartRoutingBinding(c *gin.Context) {
 	updated.CreatedTime = binding.CreatedTime
 	updated.EncCredentials = binding.EncCredentials
 	updated.KeyVersion = binding.KeyVersion
+	oldSub2APIAuthKey := newRoutingSub2APIAuthKey(*binding, model.RoutingCredentials{})
+	retireOldSub2APIAuth := binding.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+		updated.UpstreamType != model.RoutingUpstreamTypeSub2API
 	if hasRoutingCredentials(request.Credentials) {
 		existingCredentials, err := binding.GetCredentials()
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
-		if err := updated.SetCredentials(buildRoutingCredentials(request, existingCredentials)); err != nil {
+		updatedCredentials := buildRoutingCredentials(request, existingCredentials)
+		if err := updated.SetCredentials(updatedCredentials); err != nil {
 			common.ApiError(c, err)
 			return
 		}
 	}
-	if err := model.DB.Save(&updated).Error; err != nil {
+	newSub2APIAuthKey := newRoutingSub2APIAuthKey(updated, model.RoutingCredentials{})
+	authKeyChanged := oldSub2APIAuthKey != newSub2APIAuthKey
+	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+		updated.UpstreamType == model.RoutingUpstreamTypeSub2API && authKeyChanged {
+		retireOldSub2APIAuth = true
+	}
+	activateNewSub2APIAuth := updated.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+		(binding.UpstreamType != model.RoutingUpstreamTypeSub2API || authKeyChanged)
+	requestContext := c.Request.Context()
+	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	activationFence := routingSub2APIJWTActivationFence{}
+	if activateNewSub2APIAuth {
+		var err error
+		activationFence, err = prepareRoutingSub2APIJWTActivation(requestContext, updated)
+		if err != nil {
+			smartRoutingRuntimeStateMu.Unlock()
+			common.ApiError(c, err)
+			return
+		}
+	}
+	err := model.UpdateRoutingChannelBindingAndInvalidateCostContext(requestContext, *binding, &updated)
+	if err == nil {
+		routinghotcache.ClearCostChannel(updated.ChannelID)
+		if retireOldSub2APIAuth {
+			invalidateRoutingSub2APIJWT(requestContext, *binding)
+		}
+		if activateNewSub2APIAuth {
+			activateRoutingSub2APIJWT(requestContext, activationFence)
+		}
+	}
+	smartRoutingRuntimeStateMu.Unlock()
+	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	view, err := routingBindingViewWithStoredCredentials(updated)
 	if err != nil {
 		view = buildRoutingBindingView(updated, model.RoutingCredentials{})
-		view.CredentialError = err.Error()
+		view.CredentialError = common.SanitizeErrorMessage(err.Error())
 	}
 	common.ApiSuccess(c, view)
 }
@@ -203,7 +252,17 @@ func DeleteSmartRoutingBinding(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+	requestContext := c.Request.Context()
+	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	defer smartRoutingRuntimeStateMu.Unlock()
+	deletedBinding := model.RoutingChannelBinding{ChannelID: channelID}
+	if err := model.DB.WithContext(requestContext).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("channel_id = ?", channelID).Take(&deletedBinding).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
 			return err
 		}
@@ -221,9 +280,9 @@ func DeleteSmartRoutingBinding(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	invalidateRoutingSub2APIJWT(requestContext, deletedBinding)
 	routingmetrics.ClearChannel(channelID)
-	routingbreaker.ClearDefaultChannel(channelID)
-	routinghotcache.ClearChannel(channelID)
+	routingbreaker.ClearDefaultChannelWithCache(channelID, routinghotcache.ClearChannel)
 	common.ApiSuccess(c, nil)
 }
 
@@ -307,26 +366,141 @@ func ResetSmartRoutingBreaker(c *gin.Context) {
 		common.ApiErrorMsg(c, "invalid breaker id")
 		return
 	}
+	legacyRequest := c.GetHeader("Idempotency-Key") == ""
 	var state model.RoutingBreakerState
-	if err = model.DB.Where("id = ?", id).First(&state).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+	var resolved channelrouting.BreakerResetResolvedTarget
+	if legacyRequest {
+		if err = model.DB.WithContext(c.Request.Context()).Where("id = ?", id).First(&state).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				operation, command, replayErr := model.GetLatestLegacyRoutingBreakerResetContext(c.Request.Context(), id)
+				if replayErr != nil {
+					if errors.Is(replayErr, gorm.ErrRecordNotFound) {
+						c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+						return
+					}
+					writeChannelRoutingBreakerResetError(c, replayErr)
+					return
+				}
+				key := legacyBreakerResetIdempotencyKey(id, command.LegacyGeneration, command.TargetKey)
+				if key == "" {
+					writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+					return
+				}
+				view, viewErr := channelRoutingOperationViewFromModel(operation)
+				if viewErr != nil {
+					writeChannelRoutingBreakerResetError(c, viewErr)
+					return
+				}
+				c.Header("Idempotency-Key", key)
+				common.ApiSuccess(c, view)
+				return
+			}
+			common.ApiError(c, err)
 			return
 		}
-		common.ApiError(c, err)
+		if state.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		resolved, err = channelrouting.ResolveLegacyMemberBreakerResetTarget(
+			state.ChannelID, state.ModelName, state.Group,
+		)
+		if err != nil {
+			writeChannelRoutingBreakerResetError(c, err)
+			return
+		}
+		targetKey, targetErr := model.RoutingBreakerResetTargetKey(resolved.Target)
+		if targetErr != nil {
+			writeChannelRoutingBreakerResetError(c, targetErr)
+			return
+		}
+		key := legacyBreakerResetIdempotencyKey(id, state.ResetGeneration, targetKey)
+		if key == "" {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		c.Request.Header.Set("Idempotency-Key", key)
+	}
+	identity, ok := requireChannelRoutingOperationIdempotency(c, model.RoutingOperationTypeBreakerReset, struct {
+		LegacyBreakerID int `json:"legacy_breaker_id"`
+	}{LegacyBreakerID: id})
+	if !ok {
 		return
 	}
-	if err = model.DB.Delete(&model.RoutingBreakerState{}, id).Error; err != nil {
-		common.ApiError(c, err)
+	operation, lookupErr := model.GetRoutingOperationByRequestIdentityContext(c.Request.Context(), identity)
+	if lookupErr == nil {
+		if operation.OperationType != model.RoutingOperationTypeBreakerReset {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingOperationIdempotencyConflict)
+			return
+		}
+		view, viewErr := channelRoutingOperationViewFromModel(operation)
+		if viewErr != nil {
+			writeChannelRoutingBreakerResetError(c, viewErr)
+			return
+		}
+		common.ApiSuccess(c, view)
 		return
 	}
-	routingbreaker.ClearDefaultKey(routingbreaker.Key{
-		ChannelID:   state.ChannelID,
-		APIKeyIndex: state.APIKeyIndex,
-		Model:       state.ModelName,
-		Group:       state.Group,
-	})
-	common.ApiSuccess(c, nil)
+	if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		writeChannelRoutingBreakerResetError(c, lookupErr)
+		return
+	}
+	if !legacyRequest {
+		if err = model.DB.WithContext(c.Request.Context()).Where("id = ?", id).First(&state).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "routing breaker not found"})
+				return
+			}
+			common.ApiError(c, err)
+			return
+		}
+		if state.APIKeyIndex != model.RoutingMetricSingleKeyIndex {
+			writeChannelRoutingBreakerResetError(c, model.ErrRoutingBreakerResetInvalid)
+			return
+		}
+		resolved, err = channelrouting.ResolveLegacyMemberBreakerResetTarget(
+			state.ChannelID, state.ModelName, state.Group,
+		)
+		if err != nil {
+			writeChannelRoutingBreakerResetError(c, err)
+			return
+		}
+	}
+	spec := model.RoutingOperationSpec{
+		Type: model.RoutingOperationTypeBreakerReset, EvaluationHash: identity.PayloadHash,
+		SubjectType: model.RoutingOperationSubjectMemberBreaker,
+		SubjectID:   int64(resolved.Target.MemberID), PoolID: resolved.Target.PoolID,
+		ExpectedRevision: resolved.ExpectedRevision, ExpectedActivationID: resolved.ExpectedActivationID,
+		ActorID: common.GetContextKeyInt(c, constant.ContextKeyUserId), Reason: "legacy manual breaker reset",
+		RequestKeyHash: identity.KeyHash, RequestPayloadHash: identity.PayloadHash,
+	}
+	if legacyRequest {
+		operation, _, err = model.CreateLegacyRoutingBreakerResetOperationContext(
+			c.Request.Context(), spec, resolved.Target, id, state.ResetGeneration,
+		)
+	} else {
+		operation, _, err = model.CreateRoutingBreakerResetOperationContext(
+			c.Request.Context(), spec, resolved.Target,
+		)
+	}
+	if err != nil {
+		writeChannelRoutingBreakerResetError(c, err)
+		return
+	}
+	view, err := channelRoutingOperationViewFromModel(operation)
+	if err != nil {
+		writeChannelRoutingBreakerResetError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"success": true, "message": "", "data": view})
+}
+
+func legacyBreakerResetIdempotencyKey(breakerID int, generation int64, targetKey string) string {
+	if breakerID <= 0 || generation < 0 || len(targetKey) != 64 {
+		return ""
+	}
+	return "legacy-breaker-reset-" + strconv.Itoa(breakerID) + "-" +
+		strconv.FormatInt(generation, 10) + "-" + targetKey
 }
 
 func EnqueueSmartRoutingSync(c *gin.Context) {
@@ -360,6 +534,14 @@ func RejectSmartRoutingAgentRecommendation(c *gin.Context) {
 }
 
 func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) routingBindingView {
+	var lastSyncError *string
+	if binding.LastSyncError != nil {
+		message := common.SanitizeErrorMessage(*binding.LastSyncError, routingCredentialSecrets(credentials)...)
+		if message == "" {
+			message = "routing cost sync failed"
+		}
+		lastSyncError = &message
+	}
 	return routingBindingView{
 		ID:               binding.ID,
 		ChannelID:        binding.ChannelID,
@@ -369,8 +551,9 @@ func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials mo
 		ServesClaudeCode: binding.ServesClaudeCode,
 		NewAPIUserID:     binding.NewAPIUserID,
 		Enabled:          binding.Enabled,
+		SyncFailureCount: binding.SyncFailureCount,
 		SyncBackoffUntil: binding.SyncBackoffUntil,
-		LastSyncError:    binding.LastSyncError,
+		LastSyncError:    lastSyncError,
 		CredentialMasks: routingCredentialMasks{
 			NewAPIAccessToken: maskRoutingToken(credentials.NewAPIAccessToken),
 			GatewayAPIKey:     maskRoutingToken(credentials.GatewayAPIKey),
@@ -472,8 +655,8 @@ func validateRoutingBaseURL(value string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return errors.New("invalid base_url")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("base_url must use http or https")
+	if parsed.Scheme != "https" {
+		return errors.New("base_url must use https")
 	}
 	if parsed.User != nil {
 		return errors.New("base_url must not contain credentials")
@@ -487,6 +670,9 @@ func validateRoutingBaseURL(value string) error {
 			strings.Contains(normalized, "authorization") {
 			return errors.New("base_url must not contain sensitive query parameters")
 		}
+	}
+	if err = service.ValidateRoutingCostURL(parsed.String()); err != nil {
+		return err
 	}
 	return nil
 }

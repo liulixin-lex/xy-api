@@ -31,7 +31,7 @@ type taskPollingFetchAdaptor struct {
 
 func (a *taskPollingFetchAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
-func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+func (a *taskPollingFetchAdaptor) FetchTask(ctx context.Context, _ string, _ string, body map[string]any, _ string) (*http.Response, error) {
 	taskID, _ := body["task_id"].(string)
 	if taskID == a.blockTaskID && a.releaseBlock != nil {
 		a.blockOnce.Do(func() {
@@ -39,7 +39,11 @@ func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, body map[string]
 				close(a.blockStarted)
 			}
 		})
-		<-a.releaseBlock
+		select {
+		case <-a.releaseBlock:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		}
 	}
 
 	a.mu.Lock()
@@ -70,7 +74,7 @@ func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, body map[string]
 	}, nil
 }
 
-func (a *taskPollingFetchAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+func (a *taskPollingFetchAdaptor) ParseTaskResult(context.Context, []byte) (*relaycommon.TaskInfo, error) {
 	return &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, nil
 }
 
@@ -290,6 +294,53 @@ func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
 		fastFirst.GetUpstreamTaskID(),
 		fastSecond.GetUpstreamTaskID(),
 	}, adaptor.fetchedTaskIDs())
+}
+
+func TestUpdateVideoTasksCancelsInFlightFetch(t *testing.T) {
+	truncate(t)
+
+	const channelID = 253
+	seedTaskPollingChannel(t, channelID, true)
+	task := seedPollingTask(t, channelID, "task_public_cancel", "upstream_cancel")
+	adaptor := &taskPollingFetchAdaptor{
+		blockTaskID:  task.GetUpstreamTaskID(),
+		blockStarted: make(chan struct{}),
+		releaseBlock: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseBlockedTask := func() {
+		releaseOnce.Do(func() {
+			close(adaptor.releaseBlock)
+		})
+	}
+	t.Cleanup(releaseBlockedTask)
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	gopool.Go(func() {
+		result <- UpdateVideoTasks(ctx, constant.TaskPlatform("kling"), map[int][]string{
+			channelID: {task.GetUpstreamTaskID()},
+		}, map[string]*model.Task{task.GetUpstreamTaskID(): task})
+	})
+
+	select {
+	case <-adaptor.blockStarted:
+	case <-time.After(time.Second):
+		require.Fail(t, "task fetch did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		require.Fail(t, "task worker stayed blocked after cancellation")
+	}
 }
 
 func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {

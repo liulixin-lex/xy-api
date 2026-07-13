@@ -23,6 +23,7 @@ import (
 type ollamaChatStreamChunk struct {
 	Model     string `json:"model"`
 	CreatedAt string `json:"created_at"`
+	Error     string `json:"error,omitempty"`
 	// chat
 	Message *struct {
 		Role      string           `json:"role"`
@@ -106,6 +107,7 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	var responseId = common.GetUUID()
 	var created = time.Now().Unix()
 	var toolCallIndex int
+	var responseText strings.Builder
 	sentStart := false
 
 	for scanner.Scan() {
@@ -114,32 +116,43 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		if line == "" {
 			continue
 		}
+		firstByteGuard.MarkReceived()
 		var chunk ollamaChatStreamChunk
 		if err := common.Unmarshal([]byte(line), &chunk); err != nil {
 			logger.LogError(c, "ollama stream json decode error: "+err.Error()+" line="+line)
-			return usage, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+			return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+		}
+		if chunk.Error != "" {
+			err := fmt.Errorf("ollama provider error: %s", chunk.Error)
+			return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 		}
 		if chunk.Model != "" {
 			model = chunk.Model
 		}
 		created = toUnix(chunk.CreatedAt)
-		firstByteGuard.MarkReceived()
+		var content string
+		if !chunk.Done {
+			if chunk.Message != nil {
+				content = chunk.Message.Content
+			} else {
+				content = chunk.Response
+			}
+			responseText.WriteString(content)
+		}
 		if !sentStart {
 			start := helper.GenerateStartEmptyResponse(responseId, created, model, nil)
-			if data, err := common.Marshal(start); err == nil {
-				_ = helper.StringData(c, string(data))
+			data, err := common.Marshal(start)
+			if err != nil {
+				return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			if err := helper.StringData(c, string(data)); err != nil {
+				return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 			}
 			sentStart = true
 		}
 
 		if !chunk.Done {
 			// delta content
-			var content string
-			if chunk.Message != nil {
-				content = chunk.Message.Content
-			} else {
-				content = chunk.Response
-			}
 			delta := dto.ChatCompletionsStreamResponse{
 				Id:      responseId,
 				Object:  "chat.completion.chunk",
@@ -170,8 +183,12 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			if chunk.Message != nil && len(chunk.Message.ToolCalls) > 0 {
 				delta.Choices[0].Delta.ToolCalls, toolCallIndex = ollamaToolCallsToOpenAI(chunk.Message.ToolCalls, toolCallIndex, true)
 			}
-			if data, err := common.Marshal(delta); err == nil {
-				_ = helper.StringData(c, string(data))
+			data, err := common.Marshal(delta)
+			if err != nil {
+				return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			if err := helper.StringData(c, string(data)); err != nil {
+				return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 			}
 			continue
 		}
@@ -189,26 +206,58 @@ func ollamaStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 		}
 		// emit stop delta
 		if stop := helper.GenerateStopResponse(responseId, created, model, finishReason); stop != nil {
-			if data, err := common.Marshal(stop); err == nil {
-				_ = helper.StringData(c, string(data))
+			data, err := common.Marshal(stop)
+			if err != nil {
+				return usage, ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			if err := helper.StringData(c, string(data)); err != nil {
+				return usage, ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 			}
 		}
 		// emit usage frame
 		if final := helper.GenerateFinalUsageResponse(responseId, created, model, *usage); final != nil {
-			if data, err := common.Marshal(final); err == nil {
-				_ = helper.StringData(c, string(data))
+			data, err := common.Marshal(final)
+			if err != nil {
+				return usage, ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+			}
+			if err := helper.StringData(c, string(data)); err != nil {
+				return usage, ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
 			}
 		}
 		// send [DONE]
-		helper.Done(c)
+		if err := helper.Done(c); err != nil {
+			return usage, ollamaStreamError(info, relaycommon.StreamEndReasonHandlerStop, err)
+		}
+		if info.StreamStatus != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+		}
 		break
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
 		if !firstByteGuard.TimedOutBeforeResponse() {
 			logger.LogError(c, "ollama stream scan error: "+err.Error())
+			return ollamaStreamUsage(c, info, usage, responseText.String(), model), ollamaStreamError(info, relaycommon.StreamEndReasonScannerErr, err)
 		}
 	}
-	return usage, nil
+	return ollamaStreamUsage(c, info, usage, responseText.String(), model), nil
+}
+
+func ollamaStreamUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage, responseText string, model string) *dto.Usage {
+	if service.ValidUsage(usage) {
+		return usage
+	}
+	return service.ResponseText2Usage(c, responseText, model, info.GetEstimatePromptTokens())
+}
+
+func ollamaStreamError(info *relaycommon.RelayInfo, reason relaycommon.StreamEndReason, err error) *types.NewAPIError {
+	if info != nil {
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		info.StreamStatus.RecordError(err.Error())
+		info.StreamStatus.SetEndReason(reason, err)
+	}
+	return types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 }
 
 // non-stream handler for chat/generate

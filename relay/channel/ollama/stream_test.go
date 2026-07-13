@@ -1,11 +1,15 @@
 package ollama
 
 import (
+	stdjson "encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -16,6 +20,119 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type failingOllamaStreamWriter struct {
+	gin.ResponseWriter
+	err    error
+	writes int
+}
+
+func (w *failingOllamaStreamWriter) Write(_ []byte) (int, error) {
+	w.writes++
+	return 0, w.err
+}
+
+func (w *failingOllamaStreamWriter) WriteString(_ string) (int, error) {
+	w.writes++
+	return 0, w.err
+}
+
+func newOllamaStreamTestContext(t *testing.T, reader io.Reader) (*gin.Context, *httptest.ResponseRecorder, *http.Response, *relaycommon.RelayInfo) {
+	t.Helper()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream:    true,
+		DisablePing: true,
+		StartTime:   time.Now(),
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "llama-test"},
+	}
+	info.SetEstimatePromptTokens(4)
+	resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(reader)}
+	return ctx, recorder, resp, info
+}
+
+func TestOllamaStreamHandlerReturnsPartialUsageAndFirstUpstreamError(t *testing.T) {
+	validChunk := `{"model":"llama-test","created_at":"2026-07-11T00:00:00Z","message":{"role":"assistant","content":"partial"},"done":false}` + "\n"
+	scannerErr := errors.New("ollama upstream read failed")
+	tests := []struct {
+		name      string
+		reader    io.Reader
+		wantCause error
+	}{
+		{
+			name:   "malformed chunk after partial response",
+			reader: strings.NewReader(validChunk + "{malformed\n"),
+		},
+		{
+			name:      "scanner error after partial response",
+			reader:    io.MultiReader(strings.NewReader(validChunk), iotest.ErrReader(scannerErr)),
+			wantCause: scannerErr,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, recorder, resp, info := newOllamaStreamTestContext(t, tt.reader)
+
+			usage, apiErr := ollamaStreamHandler(ctx, info, resp)
+
+			require.NotNil(t, usage)
+			assert.Equal(t, 4, usage.PromptTokens)
+			assert.Positive(t, usage.CompletionTokens)
+			require.NotNil(t, apiErr)
+			if tt.wantCause != nil {
+				assert.ErrorIs(t, apiErr, tt.wantCause)
+			} else {
+				var syntaxErr *stdjson.SyntaxError
+				assert.ErrorAs(t, apiErr, &syntaxErr)
+			}
+			assert.Contains(t, recorder.Body.String(), "partial")
+			assert.NotContains(t, recorder.Body.String(), "[DONE]")
+			assert.NotContains(t, recorder.Body.String(), `"usage":{"prompt_tokens"`)
+		})
+	}
+}
+
+func TestOllamaStreamHandlerStopsOnFirstDownstreamWriteError(t *testing.T) {
+	body := strings.Repeat(`{"model":"llama-test","message":{"role":"assistant","content":"partial"},"done":false}`+"\n", 3)
+	ctx, _, resp, info := newOllamaStreamTestContext(t, strings.NewReader(body))
+	writeErr := errors.New("ollama downstream write failed")
+	writer := &failingOllamaStreamWriter{ResponseWriter: ctx.Writer, err: writeErr}
+	ctx.Writer = writer
+
+	usage, apiErr := ollamaStreamHandler(ctx, info, resp)
+
+	require.NotNil(t, usage)
+	assert.Equal(t, 4, usage.PromptTokens)
+	assert.Positive(t, usage.CompletionTokens)
+	require.NotNil(t, apiErr)
+	assert.ErrorIs(t, apiErr, writeErr)
+	assert.Equal(t, 1, writer.writes)
+}
+
+func TestOllamaStreamHandlerStopsOnProviderErrorFrame(t *testing.T) {
+	validChunk := `{"model":"llama-test","created_at":"2026-07-11T00:00:00Z","message":{"role":"assistant","content":"partial"},"done":false}` + "\n"
+	errorChunk := `{"error":"ollama model runner failed"}` + "\n"
+	lateChunk := `{"model":"llama-test","message":{"role":"assistant","content":"late response"},"done":false}` + "\n"
+	doneChunk := `{"model":"llama-test","done":true,"done_reason":"stop","prompt_eval_count":4,"eval_count":8}` + "\n"
+	ctx, recorder, resp, info := newOllamaStreamTestContext(t, strings.NewReader(validChunk+errorChunk+lateChunk+doneChunk))
+
+	usage, apiErr := ollamaStreamHandler(ctx, info, resp)
+
+	require.NotNil(t, usage)
+	assert.Equal(t, 4, usage.PromptTokens)
+	assert.Positive(t, usage.CompletionTokens)
+	require.NotNil(t, apiErr)
+	require.Error(t, apiErr.Cause())
+	assert.Contains(t, apiErr.Cause().Error(), "ollama model runner failed")
+	assert.Contains(t, recorder.Body.String(), "partial")
+	assert.NotContains(t, recorder.Body.String(), "late response")
+	assert.NotContains(t, recorder.Body.String(), "[DONE]")
+	assert.NotContains(t, recorder.Body.String(), `"usage":{"prompt_tokens"`)
+}
 
 func TestOllamaChatHandlerNonStreamToolCalls(t *testing.T) {
 	gin.SetMode(gin.TestMode)

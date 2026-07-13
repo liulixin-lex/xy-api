@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"context"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -23,8 +24,19 @@ func newAuthzTestDB(t *testing.T) *gorm.DB {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.CasbinRule{}, &model.AuthzRole{}))
+	require.NoError(t, db.AutoMigrate(&authzUserForTest{}, &model.CasbinRule{}, &model.AuthzRole{}))
 	return db
+}
+
+type authzUserForTest struct {
+	Id        int `gorm:"primaryKey"`
+	Role      int
+	Status    int
+	DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+func (authzUserForTest) TableName() string {
+	return "users"
 }
 
 func TestInitSeedsBuiltInRolesAndPoliciesOnce(t *testing.T) {
@@ -105,6 +117,14 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 			ActionSensitiveWrite: true,
 			ActionSecretView:     false,
 		},
+		ResourceChannelRouting: {
+			ActionRead:           true,
+			ActionOperate:        true,
+			ActionWrite:          true,
+			ActionDeploy:         false,
+			ActionSensitiveWrite: false,
+			ActionAuditExport:    false,
+		},
 		ResourceSystemSetting: {
 			ActionManage: false,
 		},
@@ -135,6 +155,14 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 			ActionWrite:          true,
 			ActionSensitiveWrite: false,
 			ActionSecretView:     false,
+		},
+		ResourceChannelRouting: {
+			ActionRead:           true,
+			ActionOperate:        true,
+			ActionWrite:          true,
+			ActionDeploy:         false,
+			ActionSensitiveWrite: false,
+			ActionAuditExport:    false,
 		},
 		ResourceSystemSetting: {
 			ActionManage: false,
@@ -232,6 +260,12 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.True(t, capabilities[ResourceChannel][ActionWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSecretView])
+	assert.True(t, capabilities[ResourceChannelRouting][ActionRead])
+	assert.True(t, capabilities[ResourceChannelRouting][ActionOperate])
+	assert.True(t, capabilities[ResourceChannelRouting][ActionWrite])
+	assert.False(t, capabilities[ResourceChannelRouting][ActionDeploy])
+	assert.False(t, capabilities[ResourceChannelRouting][ActionSensitiveWrite])
+	assert.False(t, capabilities[ResourceChannelRouting][ActionAuditExport])
 	assert.False(t, capabilities[ResourceSystemSetting][ActionManage])
 }
 
@@ -249,4 +283,110 @@ func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
 	}))
 
 	assert.True(t, Can(2, common.RoleAdminUser, SystemSettingManage))
+}
+
+func TestCanCurrentRejectsARevokedGrantBeforePolicyReload(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+	require.NoError(t, db.Create(&authzUserForTest{
+		Id: 42, Role: common.RoleAdminUser, Status: common.UserStatusEnabled,
+	}).Error)
+	require.NoError(t, SetUserPermissions(42, PermissionsMap{
+		ResourceChannelRouting: {
+			ActionDeploy: true,
+		},
+	}))
+	require.True(t, Can(42, common.RoleAdminUser, ChannelRoutingDeploy))
+
+	require.NoError(t, db.Where(
+		"ptype = ? AND v0 = ? AND v1 = ? AND v2 = ?",
+		"p", UserSubject(42), ResourceChannelRouting, ActionDeploy,
+	).Delete(&model.CasbinRule{}).Error)
+	assert.True(t, Can(42, common.RoleAdminUser, ChannelRoutingDeploy), "the local snapshot intentionally remains stale")
+
+	allowed, err := CanCurrent(context.Background(), 42, common.RoleAdminUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.False(t, allowed)
+}
+
+func TestCanCurrentFailsClosedWhenPolicyDatabaseIsUnavailable(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+	require.NoError(t, db.Create(&authzUserForTest{
+		Id: 42, Role: common.RoleAdminUser, Status: common.UserStatusEnabled,
+	}).Error)
+	require.NoError(t, SetUserPermissions(42, PermissionsMap{
+		ResourceChannelRouting: {
+			ActionAuditExport: true,
+		},
+	}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+
+	allowed, err := CanCurrent(context.Background(), 42, common.RoleAdminUser, ChannelRoutingAuditExport)
+	require.Error(t, err)
+	assert.False(t, allowed)
+
+	allowed, err = CanCurrent(context.Background(), 1, common.RoleRootUser, ChannelRoutingAuditExport)
+	require.Error(t, err)
+	assert.False(t, allowed)
+}
+
+func TestCanCurrentUsesCurrentUserStatusAndRoleInsteadOfSessionRole(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+	require.NoError(t, db.Create(&[]authzUserForTest{
+		{Id: 1, Role: common.RoleRootUser, Status: common.UserStatusEnabled},
+		{Id: 2, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+		{Id: 3, Role: common.RoleCommonUser, Status: common.UserStatusEnabled},
+		{Id: 4, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+	}).Error)
+	require.NoError(t, SetUserPermissions(2, PermissionsMap{
+		ResourceChannelRouting: {
+			ActionDeploy: true,
+		},
+	}))
+	require.NoError(t, SetUserPermissions(4, PermissionsMap{
+		ResourceChannelRouting: {
+			ActionDeploy: true,
+		},
+	}))
+
+	allowed, err := CanCurrent(context.Background(), 1, common.RoleRootUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.True(t, allowed)
+	require.NoError(t, db.Model(&authzUserForTest{}).Where("id = ?", 1).
+		Update("status", common.UserStatusDisabled).Error)
+	allowed, err = CanCurrent(context.Background(), 1, common.RoleRootUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.False(t, allowed, "a disabled root user must fail closed")
+
+	allowed, err = CanCurrent(context.Background(), 2, common.RoleAdminUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.True(t, allowed)
+	require.NoError(t, db.Model(&authzUserForTest{}).Where("id = ?", 2).
+		Update("role", common.RoleCommonUser).Error)
+	allowed, err = CanCurrent(context.Background(), 2, common.RoleAdminUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.False(t, allowed, "a demoted admin user must fail closed")
+
+	allowed, err = CanCurrent(context.Background(), 3, common.RoleRootUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.False(t, allowed, "a stale root session must not override the database role")
+
+	require.NoError(t, db.Delete(&authzUserForTest{}, 4).Error)
+	allowed, err = CanCurrent(context.Background(), 4, common.RoleAdminUser, ChannelRoutingDeploy)
+	require.NoError(t, err)
+	assert.False(t, allowed, "a soft-deleted admin user must fail closed")
+}
+
+func TestRequiresFreshPolicyIsLimitedToHighRiskChannelRoutingActions(t *testing.T) {
+	assert.True(t, RequiresFreshPolicy(ChannelRoutingDeploy))
+	assert.True(t, RequiresFreshPolicy(ChannelRoutingSensitiveWrite))
+	assert.True(t, RequiresFreshPolicy(ChannelRoutingAuditExport))
+	assert.False(t, RequiresFreshPolicy(ChannelRoutingRead))
+	assert.False(t, RequiresFreshPolicy(ChannelRoutingOperate))
+	assert.False(t, RequiresFreshPolicy(ChannelRoutingWrite))
+	assert.False(t, RequiresFreshPolicy(ChannelSensitiveWrite))
 }

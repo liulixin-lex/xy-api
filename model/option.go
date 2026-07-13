@@ -1,8 +1,11 @@
 package model
 
 import (
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -13,12 +16,19 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
 }
+
+// optionCommitPublishMu serializes authoritative in-memory publications. DB
+// commits stay outside the lock; bulk writers re-read committed truth while
+// holding it, and stale poll reads re-read when the publication revision moves.
+var optionCommitPublishMu sync.Mutex
+var optionPublishRevision atomic.Uint64
 
 func AllOption() ([]*Option, error) {
 	var options []*Option
@@ -187,13 +197,57 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
-	options, _ := AllOption()
+	observedRevision := optionPublishRevision.Load()
+	options, err := AllOption()
+	if err != nil {
+		common.SysError("failed to load options from database: " + err.Error())
+		return
+	}
+
+	optionCommitPublishMu.Lock()
+	defer optionCommitPublishMu.Unlock()
+	// A local writer or another poll may have published after this poll read.
+	// Re-read under the publication gate so an older snapshot cannot win last.
+	if optionPublishRevision.Load() != observedRevision {
+		options, err = AllOption()
+		if err != nil {
+			common.SysError("failed to reload options from database: " + err.Error())
+			return
+		}
+	}
+
+	values := make(map[string]string, len(options))
+	configNames := make(map[string]struct{})
 	for _, option := range options {
+		values[option.Key] = option.Value
+		parts := strings.SplitN(option.Key, ".", 2)
+		if len(parts) == 2 {
+			configNames[parts[0]] = struct{}{}
+		}
+	}
+
+	common.OptionMapRWMutex.Lock()
+	for key, value := range values {
+		common.OptionMap[key] = value
+	}
+	if err := config.GlobalConfig.LoadFromDB(values); err != nil {
+		common.SysError("failed to load config from database: " + err.Error())
+	}
+	for configName := range configNames {
+		handleConfigPostUpdate(configName)
+	}
+	common.OptionMapRWMutex.Unlock()
+
+	for _, option := range options {
+		if strings.Contains(option.Key, ".") {
+			continue
+		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
 	}
+	optionPublishRevision.Add(1)
 }
 
 func SyncOptions(frequency int) {
@@ -205,38 +259,53 @@ func SyncOptions(frequency int) {
 }
 
 func UpdateOption(key string, value string) error {
-	// Save to database first
-	option := Option{
-		Key: key,
-	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
-	// Update OptionMap
-	return updateOptionMap(key, value)
+	return UpdateOptionsBulk(map[string]string{key: value})
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
-// transaction, then dispatches them through updateOptionMap in one pass. If
-// any DB write fails the whole transaction rolls back and no in-memory state
-// is touched — safe for callers that must commit a set of related options
-// atomically (e.g. payment gateway binding).
+// transaction, then re-reads committed truth before publishing OptionMap in
+// one batch and each touched config namespace as a complete grouped update.
+// If any DB write fails the whole transaction rolls back and no in-memory
+// state is touched.
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	keys := make([]string, 0, len(values))
+	lockSortKeys := make(map[string]string, len(values))
+	for key := range values {
+		keys = append(keys, key)
+		lockSortKey := strings.ToLower(strings.TrimSpace(key))
+		var canonical Option
+		result := DB.Select("key").Where("key = ?", key).Limit(1).Find(&canonical)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			lockSortKey = canonical.Key
+		}
+		lockSortKeys[key] = lockSortKey
+	}
+	// Existing database-equivalent aliases use the stored key spelling, while
+	// new conventional option keys use a case-folded fallback. This keeps
+	// overlapping bulk transactions on one row-lock order under CI collations.
+	sort.Slice(keys, func(i, j int) bool {
+		left := lockSortKeys[keys[i]]
+		right := lockSortKeys[keys[j]]
+		if left == right {
+			return keys[i] < keys[j]
+		}
+		return left < right
+	})
+
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range values {
-			option := Option{Key: k}
-			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
-				return err
-			}
-			option.Value = v
-			if err := tx.Save(&option).Error; err != nil {
+		for _, key := range keys {
+			option := Option{Key: key, Value: values[key]}
+			// A single upsert avoids the concurrent FirstOrCreate create race.
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoUpdates: clause.AssignmentColumns([]string{"value"}),
+			}).Create(&option).Error; err != nil {
 				return err
 			}
 		}
@@ -245,7 +314,103 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
+
+	optionCommitPublishMu.Lock()
+	defer optionCommitPublishMu.Unlock()
+	options, err := AllOption()
+	if err != nil {
+		return err
+	}
+	resolvedRequestedKeys := make(map[string]string, len(values))
+	for _, option := range options {
+		if _, requested := values[option.Key]; requested {
+			resolvedRequestedKeys[option.Key] = option.Key
+		}
+	}
+	resolvedAlias := false
+	for _, requestedKey := range keys {
+		if _, resolved := resolvedRequestedKeys[requestedKey]; resolved {
+			continue
+		}
+		// Let the database collation resolve aliases to the stored key spelling.
+		var canonical Option
+		if err := DB.Select("key").Where("key = ?", requestedKey).First(&canonical).Error; err != nil {
+			return err
+		}
+		resolvedRequestedKeys[requestedKey] = canonical.Key
+		resolvedAlias = true
+	}
+	// Keep the published group on one fresh database snapshot after alias lookup.
+	if resolvedAlias {
+		options, err = AllOption()
+		if err != nil {
+			return err
+		}
+	}
+
+	actualRequestedKeys := make(map[string]struct{}, len(resolvedRequestedKeys))
+	for _, actualKey := range resolvedRequestedKeys {
+		actualRequestedKeys[actualKey] = struct{}{}
+	}
+	touchedConfigNames := make(map[string]struct{})
+	for actualKey := range actualRequestedKeys {
+		parts := strings.SplitN(actualKey, ".", 2)
+		if len(parts) == 2 {
+			touchedConfigNames[parts[0]] = struct{}{}
+		}
+	}
+	latestValues := make(map[string]string, len(values))
+	foundActualKeys := make(map[string]struct{}, len(actualRequestedKeys))
+	for _, option := range options {
+		if _, requested := actualRequestedKeys[option.Key]; requested {
+			foundActualKeys[option.Key] = struct{}{}
+			latestValues[option.Key] = option.Value
+			continue
+		}
+		parts := strings.SplitN(option.Key, ".", 2)
+		if len(parts) == 2 {
+			if _, touched := touchedConfigNames[parts[0]]; touched {
+				latestValues[option.Key] = option.Value
+			}
+		}
+	}
+	if len(foundActualKeys) != len(actualRequestedKeys) {
+		return gorm.ErrRecordNotFound
+	}
+	values = latestValues
+
+	configValues := make(map[string]map[string]string)
 	for k, v := range values {
+		parts := strings.SplitN(k, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if configValues[parts[0]] == nil {
+			configValues[parts[0]] = make(map[string]string)
+		}
+		configValues[parts[0]][parts[1]] = v
+	}
+
+	handledConfigs := make(map[string]struct{}, len(configValues))
+	common.OptionMapRWMutex.Lock()
+	for k, v := range values {
+		common.OptionMap[k] = v
+	}
+	for configName, configMap := range configValues {
+		if handleConfigUpdates(configName, configMap) {
+			handledConfigs[configName] = struct{}{}
+		}
+	}
+	common.OptionMapRWMutex.Unlock()
+	optionPublishRevision.Add(1)
+
+	for k, v := range values {
+		parts := strings.SplitN(k, ".", 2)
+		if len(parts) == 2 {
+			if _, handled := handledConfigs[parts[0]]; handled {
+				continue
+			}
+		}
 		if err := updateOptionMap(k, v); err != nil {
 			return err
 		}
@@ -315,8 +480,11 @@ func updateOptionMap(key string, value string) (err error) {
 			if !boolValue {
 				newVal = "TOKENS"
 			}
-			if cfg := config.GlobalConfig.Get("general_setting"); cfg != nil {
-				_ = config.UpdateConfigFromMap(cfg, map[string]string{"quota_display_type": newVal})
+			if found, updateErr := config.GlobalConfig.UpdateFromMap(
+				"general_setting",
+				map[string]string{"quota_display_type": newVal},
+			); found && updateErr != nil {
+				common.SysError("failed to update config general_setting: " + updateErr.Error())
 			}
 		case "DisplayTokenStatEnabled":
 			common.DisplayTokenStatEnabled = boolValue
@@ -582,22 +750,23 @@ func handleConfigUpdate(key, value string) bool {
 	if len(parts) != 2 {
 		return false // 不是分层配置
 	}
+	return handleConfigUpdates(parts[0], map[string]string{parts[1]: value})
+}
 
-	configName := parts[0]
-	configKey := parts[1]
-
-	// 获取配置对象
-	cfg := config.GlobalConfig.Get(configName)
-	if cfg == nil {
+func handleConfigUpdates(configName string, configMap map[string]string) bool {
+	found, err := config.GlobalConfig.UpdateFromMap(configName, configMap)
+	if !found {
 		return false // 未注册的配置
 	}
-
-	// 更新配置
-	configMap := map[string]string{
-		configKey: value,
+	if err != nil {
+		common.SysError("failed to update config " + configName + ": " + err.Error())
 	}
-	config.UpdateConfigFromMap(cfg, configMap)
 
+	handleConfigPostUpdate(configName)
+	return true // 已处理
+}
+
+func handleConfigPostUpdate(configName string) {
 	// 特定配置的后处理
 	if configName == "performance_setting" {
 		performance_setting.UpdateAndSync()
@@ -609,6 +778,4 @@ func handleConfigUpdate(key, value string) bool {
 	} else if configName == "theme" {
 		system_setting.UpdateAndSyncTheme()
 	}
-
-	return true // 已处理
 }

@@ -19,12 +19,18 @@ For commercial licensing, please contact support@quantumnous.com
 import { cn } from '@/lib/utils'
 
 type MainProps = React.HTMLAttributes<HTMLElement> & {
+  as?: 'main' | 'div'
   fluid?: boolean
 }
 
-export function Main({ className, fluid = true, ...props }: MainProps) {
+export function Main({
+  as: Component = 'main',
+  className,
+  fluid = true,
+  ...props
+}: MainProps) {
   return (
-    <main
+    <Component
       className={cn(
         'flex min-h-0 flex-1 flex-col overflow-hidden',
         !fluid &&

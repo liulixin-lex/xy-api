@@ -88,7 +88,7 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 		writer.Close()
 
 		// Create HTTP request
-		req, err := http.NewRequest("POST", uploadUrl, body)
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, uploadUrl, body)
 		if err != nil {
 			common.SysLog("failed to create request: " + err.Error())
 			return nil
@@ -110,7 +110,7 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 		var result struct {
 			Id string `json:"id"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := common.DecodeJson(resp.Body, &result); err != nil {
 			common.SysLog("failed to decode response: " + err.Error())
 			return nil
 		}
@@ -227,12 +227,16 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 	var responseText string
 	usage := &dto.Usage{}
 	var nodeToken int
+	var streamErr *types.NewAPIError
 	helper.SetEventStreamHeaders(c)
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var difyResponse DifyChunkChatCompletionResponse
 		if err := json.Unmarshal([]byte(data), &difyResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			}
+			sr.Stop(err)
 			return
 		}
 		if difyResponse.Event == "message_end" {
@@ -240,7 +244,11 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 			sr.Done()
 			return
 		} else if difyResponse.Event == "error" {
-			sr.Stop(fmt.Errorf("dify error event"))
+			err := fmt.Errorf("dify error event")
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			}
+			sr.Stop(err)
 			return
 		}
 		openaiResponse := *streamResponseDify2OpenAI(difyResponse)
@@ -252,17 +260,34 @@ func difyStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.R
 		}
 		if err := helper.ObjectData(c, openaiResponse); err != nil {
 			common.SysLog(err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			}
+			sr.Stop(err)
+			return
 		}
 	})
-	if info.FirstByteTimedOutBeforeResponse() {
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil, nil
 	}
-	helper.Done(c)
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
 	}
 	usage.CompletionTokens += nodeToken
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.HTTPStreamHasFailure() {
+		status := info.StreamStatus
+		err := status.EndError
+		if err == nil {
+			err = fmt.Errorf("dify stream ended abnormally: %s", status.Summary())
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if err := helper.Done(c); err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
 	return usage, nil
 }
 

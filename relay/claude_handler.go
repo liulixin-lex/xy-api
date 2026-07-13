@@ -142,9 +142,13 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, openAIRequest)
 		if newApiErr != nil {
+			finalizeHTTPStreamError(c, info, usage, false)
 			return newApiErr
 		}
-		if info.FirstByteTimedOutBeforeResponse() {
+		if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+			return nil
+		}
+		if info.HTTPStreamFailedBeforeCommit(c) {
 			return nil
 		}
 		if usage == nil {
@@ -219,11 +223,15 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
+		finalizeHTTPStreamError(c, info, usage, false)
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, false) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {

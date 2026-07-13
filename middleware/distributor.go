@@ -14,10 +14,13 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -104,13 +107,25 @@ func Distribute() func(c *gin.Context) {
 
 				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
 					affinityUsable := false
-					if preferred, affinityGroup, ok := service.GetAdmissibleAffinityChannel(c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path); ok {
+					affinityBypassedForCanary := false
+					preferred, affinityGroup, bypassAffinity, gateErr := service.GetAdmissibleAffinityChannelWithRoutingGate(
+						c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path,
+					)
+					if gateErr != nil {
+						logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
+					}
+					affinityBypassedForCanary = bypassAffinity
+					if preferred != nil {
 						channel = preferred
 						selectGroup = affinityGroup
 						affinityUsable = true
 						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
+						service.RecordChannelRoutingObserveSelection(&service.RetryParam{
+							Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
+							RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+						}, affinityGroup, preferred, 0)
 					}
-					if !affinityUsable && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
+					if !affinityUsable && !affinityBypassedForCanary && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
 						service.ClearCurrentChannelAffinityCache(c)
 					}
 				}
@@ -147,19 +162,47 @@ func Distribute() func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		if channel != nil {
 			if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+				cleanupRoutingCapacityReservation(c)
 				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 				return
 			}
 		}
 		c.Next()
+		cleanupRoutingCapacityReservation(c)
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
 }
 
+func cleanupRoutingCapacityReservation(c *gin.Context) {
+	if err := service.CancelRoutingCapacityReservation(c); err != nil {
+		logger.LogError(c, fmt.Sprintf("channel routing capacity reservation cleanup failed: %v", err))
+	}
+}
+
 func setRoutingPromptCostProxy(c *gin.Context) {
-	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+	if c == nil || c.Request == nil {
+		return
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
+		estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, nil)
+		setRoutingCapacityEstimate(c, estimate)
+		common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+			c.Request.URL.Path, nil, c.Request.Header, estimate, 0, 0,
+		))
+		common.SetContextKey(c, constant.ContextKeyIsStream, true)
+		return
+	}
+	if !strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+		estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, nil)
+		setRoutingCapacityEstimate(c, estimate)
+		common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+			c.Request.URL.Path, nil, c.Request.Header, estimate, 0, 0,
+		))
+		if estimate.StreamKnown {
+			common.SetContextKey(c, constant.ContextKeyIsStream, estimate.Stream)
+		}
 		return
 	}
 	storage, err := common.GetBodyStorage(c)
@@ -170,28 +213,41 @@ func setRoutingPromptCostProxy(c *gin.Context) {
 	if err != nil || len(body) == 0 || !gjson.ValidBytes(body) {
 		return
 	}
-	proxy := len(body) / 4
-	if proxy < 1 {
-		proxy = 1
-	}
-	common.SetContextKey(c, constant.ContextKeyRoutingPromptProxy, proxy)
-	outputCap := proxy + proxy/2
-	if outputCap < 1 {
-		outputCap = 1
-	}
-	if outputCap > 512 {
-		outputCap = 512
-	}
+	estimate := estimateRoutingCapacityTokens(c.Request.URL.Path, body)
+	promptProxy := max(len(body)/4, 1)
+	common.SetContextKey(c, constant.ContextKeyRoutingPromptProxy, promptProxy)
+	outputProxy := min(promptProxy+promptProxy/2, 512)
 	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
 		value := gjson.GetBytes(body, field)
 		if value.Exists() && value.Num > 0 {
-			if value.Num < float64(outputCap) {
-				outputCap = int(value.Num)
-			}
+			outputProxy = min(outputProxy, int(value.Num))
 			break
 		}
 	}
-	common.SetContextKey(c, constant.ContextKeyRoutingEstimatedOutput, outputCap)
+	common.SetContextKey(c, constant.ContextKeyRoutingEstimatedOutput, max(outputProxy, 1))
+	setRoutingCapacityEstimate(c, estimate)
+	common.SetContextKey(c, constant.ContextKeyRoutingCostProfile, buildRoutingCostRequestProfile(
+		c.Request.URL.Path,
+		body,
+		c.Request.Header,
+		estimate,
+		promptProxy,
+		max(outputProxy, 1),
+	))
+	if c.Query("alt") == "sse" {
+		common.SetContextKey(c, constant.ContextKeyIsStream, true)
+	} else if estimate.StreamKnown {
+		common.SetContextKey(c, constant.ContextKeyIsStream, estimate.Stream)
+	}
+}
+
+func setRoutingCapacityEstimate(c *gin.Context, estimate routingCapacityTokenEstimate) {
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInput, estimate.Input.Tokens)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInputKnown, estimate.Input.Known())
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityInputState, estimate.Input.State)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutput, estimate.Output.Tokens)
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutputKnown, estimate.Output.Known())
+	common.SetContextKey(c, constant.ContextKeyRoutingCapacityOutputState, estimate.Output.State)
 }
 
 // channelSupportsRequestPath reports whether a channel can serve the request path.
@@ -467,6 +523,13 @@ func getTaskOriginModelName(c *gin.Context) string {
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, uint64(0))
+	common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -490,42 +553,46 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	routingGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup)
-	if routingGroup == "" {
-		routingGroup = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-	}
-	disallowedIndexes := map[int]struct{}{}
-	var key string
-	var index int
-	var newAPIError *types.NewAPIError
-	for {
-		key, index, newAPIError = channel.GetNextEnabledKeyFiltered(func(index int) bool {
-			if _, disallowed := disallowedIndexes[index]; disallowed {
-				return false
-			}
-			return service.IsMultiKeyIndexRoutingAdmissible(c, channel.Id, index, modelName, routingGroup)
-		})
-		if newAPIError != nil || !channel.ChannelInfo.IsMultiKey {
-			break
-		}
-		if service.AcquireMultiKeyRoutingHalfOpenProbe(c, channel.Id, index, modelName, routingGroup) {
-			break
-		}
-		disallowedIndexes[index] = struct{}{}
-	}
+	key, index, newAPIError := channel.GetNextEnabledKey()
 	if newAPIError != nil {
 		return newAPIError
 	}
-	if channel.ChannelInfo.IsMultiKey {
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
-		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
-	} else {
-		// 必须设置为 false，否则在重试到单个 key 的时候会导致日志显示错误
-		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	isMultiKey := channel.ChannelInfo.IsMultiKey
+	if !isMultiKey {
+		index = model.RoutingMetricSingleKeyIndex
 	}
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, isMultiKey)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
-	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if routingGroup == "auto" {
+		if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
+			routingGroup = selectedGroup
+		}
+	}
+	if selected, ok := service.GetSelectedRoutingIdentity(c, channel.Id); ok {
+		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selected.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selected.PoolID)
+		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selected.MemberID)
+		if identity, resolved := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); resolved &&
+			identity.PoolID == selected.PoolID && identity.MemberID == selected.MemberID {
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
+		}
+		service.ClearSelectedRoutingIdentity(c)
+	} else if smart_routing_setting.Enabled() {
+		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
+			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
+			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
+		}
+	}
+	channelBaseURL := channel.GetBaseURL()
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channelBaseURL)
+	common.SetContextKey(c, constant.ContextKeyRoutingEndpointHost, channelrouting.EndpointHost(channelBaseURL, channel.Id))
+	common.SetContextKey(c, constant.ContextKeyRoutingEndpointAuthority, channelrouting.EndpointAuthority(channelBaseURL, channel.Id))
+	common.SetContextKey(c, constant.ContextKeyRoutingRegion, channelrouting.RoutingRegion())
 
 	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, false)
 

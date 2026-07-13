@@ -14,6 +14,7 @@ import (
 var (
 	enforcerMu sync.RWMutex
 	enforcer   *casbin.SyncedEnforcer
+	policyDB   *gorm.DB
 )
 
 const modelText = `
@@ -52,6 +53,7 @@ func Init(db *gorm.DB) error {
 
 	enforcerMu.Lock()
 	enforcer = e
+	policyDB = db
 	enforcerMu.Unlock()
 
 	if !common.IsMasterNode {
@@ -64,6 +66,12 @@ func currentEnforcer() *casbin.SyncedEnforcer {
 	enforcerMu.RLock()
 	defer enforcerMu.RUnlock()
 	return enforcer
+}
+
+func currentPolicyDB() *gorm.DB {
+	enforcerMu.RLock()
+	defer enforcerMu.RUnlock()
+	return policyDB
 }
 
 func ReloadPolicy() error {

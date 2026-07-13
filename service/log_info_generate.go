@@ -49,6 +49,11 @@ func attachQuotaSaturation(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, o
 		clamp.Op, clamp.Kind, clamp.Original, clamp.Clamped, relayInfo.UserId, relayInfo.OriginModelName))
 }
 
+// AttachQuotaSaturation exposes the same audit boundary to controller-owned consume logs.
+func AttachQuotaSaturation(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {
+	attachQuotaSaturation(ctx, relayInfo, other)
+}
+
 func appendRequestPath(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {
 	if other == nil {
 		return
@@ -98,6 +103,15 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	if isMultiKey {
 		adminInfo["is_multi_key"] = true
 		adminInfo["multi_key_index"] = common.GetContextKeyInt(ctx, constant.ContextKeyChannelMultiKeyIndex)
+	}
+	if poolID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingPoolID); poolID > 0 {
+		routingSnapshotRevision, _ := common.GetContextKeyType[uint64](ctx, constant.ContextKeyRoutingSnapshotRevision)
+		adminInfo["routing_snapshot_revision"] = routingSnapshotRevision
+		adminInfo["routing_pool_id"] = poolID
+		adminInfo["routing_member_id"] = common.GetContextKeyInt(ctx, constant.ContextKeyRoutingMemberID)
+		if credentialID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID); credentialID > 0 {
+			adminInfo["routing_credential_id"] = credentialID
+		}
 	}
 
 	isLocalCountTokens := common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,48 @@ type ChannelInfo struct {
 	MultiKeyDisabledTime   map[int]int64         `json:"multi_key_disabled_time,omitempty"`   // key禁用时间列表，key index -> time
 	MultiKeyPollingIndex   int                   `json:"multi_key_polling_index"`             // 多Key模式下轮询的key索引
 	MultiKeyMode           constant.MultiKeyMode `json:"multi_key_mode"`
+}
+
+func (info *ChannelInfo) RemapMultiKeyState(oldKeys []string, newKeys []string) {
+	oldKeyCounts := make(map[string]int, len(oldKeys))
+	oldKeyIndexes := make(map[string]int, len(oldKeys))
+	for index, key := range oldKeys {
+		oldKeyCounts[key]++
+		oldKeyIndexes[key] = index
+	}
+
+	newKeyCounts := make(map[string]int, len(newKeys))
+	for _, key := range newKeys {
+		newKeyCounts[key]++
+	}
+
+	newStatusList := make(map[int]int)
+	newDisabledReason := make(map[int]string)
+	newDisabledTime := make(map[int]int64)
+	for newIndex, key := range newKeys {
+		if oldKeyCounts[key] != 1 || newKeyCounts[key] != 1 {
+			continue
+		}
+
+		oldIndex := oldKeyIndexes[key]
+		status, ok := info.MultiKeyStatusList[oldIndex]
+		if !ok || (status != common.ChannelStatusManuallyDisabled && status != common.ChannelStatusAutoDisabled) {
+			continue
+		}
+		newStatusList[newIndex] = status
+		if reason, ok := info.MultiKeyDisabledReason[oldIndex]; ok {
+			newDisabledReason[newIndex] = reason
+		}
+		if disabledTime, ok := info.MultiKeyDisabledTime[oldIndex]; ok {
+			newDisabledTime[newIndex] = disabledTime
+		}
+	}
+
+	info.MultiKeySize = len(newKeys)
+	info.MultiKeyStatusList = newStatusList
+	info.MultiKeyDisabledReason = newDisabledReason
+	info.MultiKeyDisabledTime = newDisabledTime
+	info.MultiKeyPollingIndex = 0
 }
 
 type ChannelSortOptions struct {
@@ -170,6 +213,58 @@ func (c ChannelInfo) Value() (driver.Value, error) {
 func (c *ChannelInfo) Scan(value interface{}) error {
 	bytesValue, _ := value.([]byte)
 	return common.Unmarshal(bytesValue, c)
+}
+
+type LegacyRoutingStateEligibility struct {
+	channelID   int
+	apiKeyIndex int
+	supported   bool
+}
+
+func (eligibility LegacyRoutingStateEligibility) Supported() bool {
+	return eligibility.supported &&
+		eligibility.channelID > 0 &&
+		eligibility.apiKeyIndex == RoutingMetricSingleKeyIndex
+}
+
+func ResolveLegacyRoutingStateEligibility(channelID int, apiKeyIndex int) (LegacyRoutingStateEligibility, error) {
+	return ResolveLegacyRoutingStateEligibilityContext(context.Background(), channelID, apiKeyIndex)
+}
+
+func ResolveLegacyRoutingStateEligibilityContext(ctx context.Context, channelID int, apiKeyIndex int) (LegacyRoutingStateEligibility, error) {
+	unsupported := LegacyRoutingStateEligibility{}
+	if channelID <= 0 || apiKeyIndex != RoutingMetricSingleKeyIndex {
+		return unsupported, nil
+	}
+	memoryCacheEnabled := common.MemoryCacheEnabled
+	var info *ChannelInfo
+	var err error
+	if memoryCacheEnabled {
+		info, err = CacheGetChannelInfo(channelID)
+	} else {
+		var channel Channel
+		err = DB.WithContext(ctx).Select("channel_info").First(&channel, "id = ?", channelID).Error
+		info = &channel.ChannelInfo
+	}
+	if err != nil {
+		if memoryCacheEnabled || errors.Is(err, gorm.ErrRecordNotFound) {
+			return unsupported, nil
+		}
+		return unsupported, err
+	}
+	if info == nil || info.IsMultiKey {
+		return unsupported, nil
+	}
+	return LegacyRoutingStateEligibility{
+		channelID:   channelID,
+		apiKeyIndex: apiKeyIndex,
+		supported:   true,
+	}, nil
+}
+
+func SupportsLegacyRoutingState(channelID int, apiKeyIndex int) bool {
+	eligibility, err := ResolveLegacyRoutingStateEligibility(channelID, apiKeyIndex)
+	return err == nil && eligibility.Supported()
 }
 
 func (channel *Channel) GetKeys() []string {
@@ -320,7 +415,7 @@ func (channel *Channel) GetOtherInfo() map[string]interface{} {
 }
 
 func (channel *Channel) SetOtherInfo(otherInfo map[string]interface{}) {
-	otherInfoBytes, err := json.Marshal(otherInfo)
+	otherInfoBytes, err := common.Marshal(otherInfo)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("failed to marshal other info: channel_id=%d, tag=%s, name=%s, error=%v", channel.Id, channel.GetTag(), channel.Name, err))
 		return
@@ -347,14 +442,22 @@ func (channel *Channel) GetAutoBan() bool {
 }
 
 func (channel *Channel) Save() error {
-	return DB.Save(channel).Error
+	err := DB.Save(channel).Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func (channel *Channel) SaveWithoutKey() error {
 	if channel.Id == 0 {
 		return errors.New("channel ID is 0")
 	}
-	return DB.Omit("key").Save(channel).Error
+	err := DB.Omit("key").Save(channel).Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func GetAllChannels(startIdx int, num int, selectAll bool, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
@@ -453,7 +556,11 @@ func BatchInsertChannels(channels []Channel) error {
 			}
 		}
 	}
-	return tx.Commit().Error
+	err := tx.Commit().Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func BatchDeleteChannels(ids []int) error {
@@ -475,7 +582,11 @@ func BatchDeleteChannels(ids []int) error {
 			return err
 		}
 	}
-	return tx.Commit().Error
+	err := tx.Commit().Error
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
+	return err
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -524,56 +635,82 @@ func (channel *Channel) Insert() error {
 		return err
 	}
 	err = channel.AddAbilities(nil)
+	NotifyRoutingTopologyChanged()
 	return err
 }
 
 func (channel *Channel) Update() error {
+	_, err := channel.UpdateWithCredentialChange()
+	return err
+}
+
+func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
+		keyStr := channel.Key
+		if keyStr == "" {
 			// If key is not provided, read the existing key from the database
 			if existing, err := GetChannelById(channel.Id, true); err == nil {
 				keyStr = existing.Key
 			}
 		}
-		// Parse the key list (supports newline separation or JSON array)
-		keys := []string{}
-		if keyStr != "" {
-			trimmed := strings.TrimSpace(keyStr)
-			if strings.HasPrefix(trimmed, "[") {
-				var arr []json.RawMessage
-				if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
-					keys = make([]string, len(arr))
-					for i, v := range arr {
-						keys[i] = string(v)
-					}
-				}
-			}
-			if len(keys) == 0 { // fallback to newline split
-				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
-			}
-		}
+		keys := (&Channel{Key: keyStr}).GetKeys()
 		channel.ChannelInfo.MultiKeySize = len(keys)
 		// Clean up status data that exceeds the new key count to prevent index out of range
 		if channel.ChannelInfo.MultiKeyStatusList != nil {
 			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
 					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
 				}
 			}
 		}
+		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
+			for idx := range channel.ChannelInfo.MultiKeyDisabledReason {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
+					delete(channel.ChannelInfo.MultiKeyDisabledReason, idx)
+				}
+			}
+		}
+		if channel.ChannelInfo.MultiKeyDisabledTime != nil {
+			for idx := range channel.ChannelInfo.MultiKeyDisabledTime {
+				if idx < 0 || idx >= channel.ChannelInfo.MultiKeySize {
+					delete(channel.ChannelInfo.MultiKeyDisabledTime, idx)
+				}
+			}
+		}
+		if channel.ChannelInfo.MultiKeyPollingIndex < 0 || channel.ChannelInfo.MultiKeyPollingIndex >= channel.ChannelInfo.MultiKeySize {
+			channel.ChannelInfo.MultiKeyPollingIndex = 0
+		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
-		return err
+	credentialChanged := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "key").
+			Where("id = ?", channel.Id).First(&current).Error; err != nil {
+			return err
+		}
+		credentialChanged = channel.Key != "" && channel.Key != current.Key
+		if err := tx.Model(channel).Updates(channel).Error; err != nil {
+			return err
+		}
+		if credentialChanged {
+			now := common.GetTimestamp()
+			if err := tx.Model(&RoutingChannelHealthState{}).Where("channel_id = ?", channel.Id).
+				Updates(map[string]any{
+					"auth_failure": false, "auth_failure_reason": "", "auth_failure_until": int64(0), "updated_time": now,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.First(channel, "id = ?", channel.Id).Error; err != nil {
+			return err
+		}
+		return channel.UpdateAbilities(tx)
+	})
+	if err == nil {
+		NotifyRoutingTopologyChanged()
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	return credentialChanged, err
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -603,6 +740,7 @@ func (channel *Channel) Delete() error {
 		return err
 	}
 	err = channel.DeleteAbilities()
+	NotifyRoutingTopologyChanged()
 	return err
 }
 
@@ -671,6 +809,8 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 		}
 		if status == common.ChannelStatusEnabled {
 			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
+			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
+			delete(channel.ChannelInfo.MultiKeyDisabledTime, keyIndex)
 		} else {
 			channel.ChannelInfo.MultiKeyStatusList[keyIndex] = status
 			if channel.ChannelInfo.MultiKeyDisabledReason == nil {
@@ -788,6 +928,9 @@ func EnableChannelByTag(tag string) error {
 		return err
 	}
 	err = UpdateAbilityStatusByTag(tag, true)
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
 	return err
 }
 
@@ -797,6 +940,9 @@ func DisableChannelByTag(tag string) error {
 		return err
 	}
 	err = UpdateAbilityStatusByTag(tag, false)
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
 	return err
 }
 
@@ -853,6 +999,7 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 			return err
 		}
 	}
+	NotifyRoutingTopologyChanged()
 	return nil
 }
 
@@ -873,11 +1020,17 @@ func updateChannelUsedQuota(id int, quota int) {
 
 func DeleteChannelByStatus(status int64) (int64, error) {
 	result := DB.Where("status = ?", status).Delete(&Channel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		NotifyRoutingTopologyChanged()
+	}
 	return result.RowsAffected, result.Error
 }
 
 func DeleteDisabledChannel() (int64, error) {
 	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		NotifyRoutingTopologyChanged()
+	}
 	return result.RowsAffected, result.Error
 }
 

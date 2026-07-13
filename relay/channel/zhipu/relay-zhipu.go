@@ -3,6 +3,7 @@ package zhipu
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -157,75 +158,107 @@ func streamMetaResponseZhipu2OpenAI(zhipuResponse *ZhipuStreamMetaResponse) (*dt
 
 func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var usage *dto.Usage
+	var responseText strings.Builder
+	var streamErr *types.NewAPIError
+	normalEndReason := relaycommon.StreamEndReasonEOF
 	scanner := helper.NewStreamScanner(resp.Body)
 	scanner.Split(bufio.ScanLines)
 	firstByteGuard := helper.NewFirstByteGuard(info, resp.Body)
 	defer firstByteGuard.Stop()
-	dataChan := make(chan string)
-	metaChan := make(chan string)
-	stopChan := make(chan bool)
-	go func() {
-		for scanner.Scan() {
-			data := scanner.Text()
-			lines := strings.Split(data, "\n")
-			for i, line := range lines {
-				if len(line) < 5 {
-					continue
-				}
-				if line[:5] == "data:" {
-					firstByteGuard.MarkReceived()
-					dataChan <- line[5:]
-					if i != len(lines)-1 {
-						dataChan <- "\n"
-					}
-				} else if line[:5] == "meta:" {
-					firstByteGuard.MarkReceived()
-					metaChan <- line[5:]
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
-			common.SysLog("error reading stream: " + err.Error())
-		}
-		stopChan <- true
-	}()
 	helper.SetEventStreamHeaders(c)
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case data := <-dataChan:
-			response := streamResponseZhipu2OpenAI(data)
-			jsonResponse, err := common.Marshal(response)
-			if err != nil {
-				common.SysLog("error marshalling stream response: " + err.Error())
-				return true
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) < 5 {
+			continue
+		}
+		switch line[:5] {
+		case "data:":
+			firstByteGuard.MarkReceived()
+			data := line[5:]
+			if strings.TrimSpace(data) == "[DONE]" {
+				normalEndReason = relaycommon.StreamEndReasonDone
+				break
 			}
-			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
-			return true
-		case data := <-metaChan:
+			responseText.WriteString(data)
+			response := streamResponseZhipu2OpenAI(data)
+			if err := helper.ObjectData(c, response); err != nil {
+				common.SysLog("error sending stream response: " + err.Error())
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+				if info.StreamStatus != nil {
+					info.StreamStatus.RecordError(err.Error())
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+				}
+			}
+		case "meta:":
+			firstByteGuard.MarkReceived()
+			data := line[5:]
 			var zhipuResponse ZhipuStreamMetaResponse
-			err := common.Unmarshal([]byte(data), &zhipuResponse)
-			if err != nil {
+			if err := common.Unmarshal([]byte(data), &zhipuResponse); err != nil {
 				common.SysLog("error unmarshalling stream response: " + err.Error())
-				return true
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+				if info.StreamStatus != nil {
+					info.StreamStatus.RecordError(err.Error())
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+				}
+				break
 			}
 			response, zhipuUsage := streamMetaResponseZhipu2OpenAI(&zhipuResponse)
-			jsonResponse, err := common.Marshal(response)
-			if err != nil {
-				common.SysLog("error marshalling stream response: " + err.Error())
-				return true
-			}
 			usage = zhipuUsage
-			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
-			return true
-		case <-stopChan:
-			if firstByteGuard.TimedOutBeforeResponse() {
-				return false
+			if err := helper.ObjectData(c, response); err != nil {
+				common.SysLog("error sending stream response: " + err.Error())
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+				if info.StreamStatus != nil {
+					info.StreamStatus.RecordError(err.Error())
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+				}
 			}
-			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
 		}
-	})
+		if streamErr != nil || normalEndReason == relaycommon.StreamEndReasonDone {
+			break
+		}
+	}
+
+	if streamErr == nil {
+		if err := scanner.Err(); err != nil && !firstByteGuard.TimedOutBeforeResponse() {
+			common.SysLog("error reading stream: " + err.Error())
+			streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			if info.StreamStatus != nil {
+				info.StreamStatus.RecordError(err.Error())
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+			}
+		}
+	}
+
 	service.CloseResponseBodyGracefully(resp)
+	if firstByteGuard.TimedOutBeforeResponse() {
+		return nil, nil
+	}
+	if !service.ValidUsage(usage) && responseText.Len() > 0 {
+		usage = service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
+		return nil, nil
+	}
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.HTTPStreamHasFailure() {
+		err := info.StreamStatus.EndError
+		if err == nil {
+			err = fmt.Errorf("zhipu stream ended abnormally: %s", info.StreamStatus.Summary())
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if err := helper.Done(c); err != nil {
+		if info.StreamStatus != nil {
+			info.StreamStatus.RecordError(err.Error())
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
+	if info.StreamStatus != nil {
+		info.StreamStatus.SetEndReason(normalEndReason, nil)
+	}
 	return usage, nil
 }
 

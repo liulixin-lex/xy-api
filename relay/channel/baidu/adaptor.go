@@ -17,6 +17,7 @@ import (
 )
 
 type Adaptor struct {
+	accessToken string
 }
 
 func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
@@ -102,12 +103,10 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 		suffix += strings.ToLower(info.UpstreamModelName)
 	}
 	fullRequestURL := fmt.Sprintf("%s/rpc/2.0/ai_custom/v1/wenxinworkshop/%s", info.ChannelBaseUrl, suffix)
-	var accessToken string
-	var err error
-	if accessToken, err = getBaiduAccessToken(info.ApiKey); err != nil {
-		return "", err
+	if a.accessToken == "" {
+		return "", errors.New("baidu access token is unavailable")
 	}
-	fullRequestURL += "?access_token=" + accessToken
+	fullRequestURL += "?access_token=" + a.accessToken
 	return fullRequestURL, nil
 }
 
@@ -143,6 +142,15 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("baidu request context is unavailable")
+	}
+	a.accessToken = ""
+	accessToken, err := getBaiduAccessToken(c.Request.Context(), info.ApiKey)
+	if err != nil {
+		return nil, err
+	}
+	a.accessToken = accessToken
 	return channel.DoApiRequest(a, c, info, requestBody)
 }
 

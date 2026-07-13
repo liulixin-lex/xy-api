@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
@@ -47,6 +48,61 @@ func setupStreamTest(t *testing.T, body io.Reader) (*gin.Context, *http.Response
 	}
 
 	return c, resp, info
+}
+
+type blockingResponseWriter struct {
+	header           http.Header
+	writeStarted     chan struct{}
+	releaseWrite     chan struct{}
+	writeStartedOnce sync.Once
+	releaseOnce      sync.Once
+	mu               sync.Mutex
+	body             strings.Builder
+}
+
+type rejectedFirstByteBody struct {
+	io.ReadCloser
+	markCalls atomic.Int64
+}
+
+func (body *rejectedFirstByteBody) RoutingFirstByteGuarded() bool {
+	return true
+}
+
+func (body *rejectedFirstByteBody) RoutingMarkFirstByte() bool {
+	body.markCalls.Add(1)
+	return false
+}
+
+func (w *blockingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingResponseWriter) WriteHeader(_ int) {}
+
+func (w *blockingResponseWriter) Write(data []byte) (int, error) {
+	w.writeStartedOnce.Do(func() {
+		close(w.writeStarted)
+	})
+	<-w.releaseWrite
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(data)
+}
+
+func (w *blockingResponseWriter) Flush() {}
+
+func (w *blockingResponseWriter) release() {
+	w.releaseOnce.Do(func() {
+		close(w.releaseWrite)
+	})
+}
+
+func (w *blockingResponseWriter) bodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
 }
 
 func buildSSEBody(n int) string {
@@ -112,6 +168,9 @@ func TestStreamScannerHandler_1000Chunks(t *testing.T) {
 	var count atomic.Int64
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 		count.Add(1)
+		if err := StringData(c, data); err != nil {
+			sr.Error(err)
+		}
 	})
 
 	assert.Equal(t, int64(numChunks), count.Load())
@@ -212,6 +271,107 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 	})
 
 	assert.Equal(t, "{\"trimmed\":true}", got)
+}
+
+func TestStreamScannerHandler_MalformedFirstChunkRemainsPreCommit(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {malformed\ndata: [DONE]\n"))}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+	initialFirstResponseTime := info.FirstResponseTime
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		var payload map[string]any
+		if err := common.UnmarshalJsonStr(data, &payload); err != nil {
+			sr.Error(err)
+			return
+		}
+		if err := StringData(c, data); err != nil {
+			sr.Error(err)
+		}
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Zero(t, info.SendResponseCount)
+	assert.False(t, info.HasSendResponse())
+	assert.Equal(t, initialFirstResponseTime, info.FirstResponseTime)
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestStreamScannerHandler_DropsBufferedBusinessEventWhenTransportDeadlineWon(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	body := &rejectedFirstByteBody{ReadCloser: io.NopCloser(strings.NewReader("data: {\"id\":1}\n"))}
+	resp := &http.Response{Body: body}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, context.DeadlineExceeded)
+	var handled atomic.Bool
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		handled.Store(true)
+		if err := StringData(c, data); err != nil {
+			sr.Error(err)
+		}
+	})
+
+	assert.True(t, handled.Load())
+	assert.Equal(t, int64(1), body.markCalls.Load())
+	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.False(t, info.HasSendResponse())
+	assert.Empty(t, recorder.Body.String())
+}
+
+func TestStreamScannerHandler_WriteThenHandlerErrorRemainsCommitted(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {\"id\":1}\ndata: {malformed\ndata: [DONE]\n"))}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+
+	var pending string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if pending != "" {
+			if err := StringData(c, pending); err != nil {
+				sr.Error(err)
+				return
+			}
+		}
+		var payload map[string]any
+		if err := common.UnmarshalJsonStr(data, &payload); err != nil {
+			sr.Error(err)
+			return
+		}
+		pending = data
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.True(t, info.StreamStatus.HasErrors())
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.True(t, info.HasSendResponse())
+	assert.Contains(t, recorder.Body.String(), "{\"id\":1}")
+}
+
+func TestStreamScannerHandlerRecordsHandlerPanicEvenIfScannerFinishesFirst(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: {}\ndata: [DONE]\n"))
+
+	StreamScannerHandler(c, resp, info, func(_ string, _ *StreamResult) {
+		panic("handler exploded")
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	require.True(t, info.StreamStatus.HasErrors())
+	require.NotEmpty(t, info.StreamStatus.Errors)
+	assert.Contains(t, info.StreamStatus.Errors[0].Message, "handler panic")
+	assert.True(t, info.HTTPStreamHasFailure())
 }
 
 // TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns pins the
@@ -390,7 +550,11 @@ func TestStreamScannerHandler_StreamStatus_DoneReason(t *testing.T) {
 	body := buildSSEBody(10)
 	c, resp, info := setupStreamTest(t, strings.NewReader(body))
 
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
+	})
 
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
@@ -408,7 +572,11 @@ func TestStreamScannerHandler_StreamStatus_EOFWithoutDone(t *testing.T) {
 	}
 	c, resp, info := setupStreamTest(t, strings.NewReader(b.String()))
 
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
+	})
 
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
@@ -443,6 +611,10 @@ func TestStreamScannerHandler_StreamStatus_HandlerDone(t *testing.T) {
 	var count atomic.Int64
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 		n := count.Add(1)
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+			return
+		}
 		if n >= 5 {
 			sr.Done()
 		}
@@ -452,6 +624,35 @@ func TestStreamScannerHandler_StreamStatus_HandlerDone(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
 	assert.False(t, info.StreamStatus.HasErrors())
+}
+
+func TestStreamScannerHandler_EmptyDoneBeforeBusinessIsProtocolFailure(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: [DONE]\n"))
+	var handled atomic.Bool
+
+	StreamScannerHandler(c, resp, info, func(_ string, _ *StreamResult) {
+		handled.Store(true)
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.False(t, handled.Load())
+	assert.Equal(t, relaycommon.StreamEndReasonScannerErr, info.StreamStatus.EndReason)
+	assert.ErrorIs(t, info.StreamStatus.EndError, errStreamEndedBeforeBusinessEvent)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.False(t, info.HasSendResponse())
+}
+
+func TestStreamScannerHandler_DroppedFrameThenEOFIsProtocolFailure(t *testing.T) {
+	c, resp, info := setupStreamTest(t, strings.NewReader("data: {\"type\":\"response.created\"}\n"))
+
+	StreamScannerHandler(c, resp, info, func(_ string, _ *StreamResult) {})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonScannerErr, info.StreamStatus.EndReason)
+	assert.ErrorIs(t, info.StreamStatus.EndError, errStreamEndedBeforeBusinessEvent)
+	assert.Zero(t, info.SendResponseCount)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.False(t, info.HasSendResponse())
 }
 
 func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
@@ -489,6 +690,76 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
 	assert.False(t, info.StreamStatus.IsNormalEnd())
+}
+
+func TestStreamScannerHandler_FirstByteTimerWaitsForInFlightWriteCommit(t *testing.T) {
+	const firstByteTimeout = 30 * time.Millisecond
+
+	smart_routing_setting.ResetForTest()
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           int(firstByteTimeout / time.Millisecond),
+		FirstByteCapMs:           int(firstByteTimeout / time.Millisecond),
+		FirstByteP95Multiplier:   1,
+	})
+	t.Cleanup(smart_routing_setting.ResetForTest)
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+
+	writer := &blockingResponseWriter{
+		header:       make(http.Header),
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+	}
+	t.Cleanup(writer.release)
+
+	c, _ := gin.CreateTestContext(writer)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{Body: pr}
+	info := relaycommon.GenRelayInfoOpenAI(c, nil)
+	info.DisablePing = true
+	info.ChannelMeta = &relaycommon.ChannelMeta{}
+
+	done := make(chan struct{})
+	go func() {
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+			if err := StringData(c, data); err != nil {
+				sr.Error(err)
+			}
+		})
+		close(done)
+	}()
+
+	_, err := fmt.Fprint(pw, "data: {\"id\":1}\n")
+	require.NoError(t, err)
+
+	select {
+	case <-writer.writeStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for the client write to start")
+	}
+
+	time.Sleep(3 * firstByteTimeout)
+	writer.release()
+	require.NoError(t, pw.Close())
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "stream handler did not return after the in-flight write completed")
+	}
+
+	require.NotNil(t, info.StreamStatus)
+	assert.NotEqual(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+	assert.Contains(t, writer.bodyString(), "{\"id\":1}")
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	assert.True(t, info.HasSendResponse())
 }
 
 func TestStreamScannerHandler_FirstByteTimeoutStopsBeforeWritingClient(t *testing.T) {
@@ -606,6 +877,40 @@ func TestFirstByteFailoverTimeoutUsesMetricP95WithinCap(t *testing.T) {
 	assert.Equal(t, 100*time.Millisecond, firstByteFailoverTimeout(info))
 }
 
+func TestFirstByteFailoverTimeoutIgnoresLegacySingleKeyMetricForMultiKey(t *testing.T) {
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled:                  true,
+		Mode:                     smart_routing_setting.ModeBalanced,
+		FirstByteFailoverEnabled: true,
+		FirstByteMinMs:           30,
+		FirstByteCapMs:           100,
+		FirstByteP95Multiplier:   2,
+	})
+	routinghotcache.SetMetricForTest(routinghotcache.Key{
+		ChannelID:   78,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test",
+		Group:       "vip",
+	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, P95TTFTMs: 40})
+
+	info := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-test",
+		UsingGroup:      "vip",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         78,
+			ChannelIsMultiKey: true,
+		},
+	}
+
+	assert.Equal(t, 30*time.Millisecond, firstByteFailoverTimeout(info))
+}
+
 func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {
 	t.Parallel()
 
@@ -614,6 +919,9 @@ func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {
 
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 		sr.Error(fmt.Errorf("soft error for chunk"))
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
 	})
 
 	require.NotNil(t, info.StreamStatus)
@@ -631,6 +939,9 @@ func TestStreamScannerHandler_StreamStatus_MultipleErrorsPerChunk(t *testing.T) 
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
 		sr.Error(fmt.Errorf("error A"))
 		sr.Error(fmt.Errorf("error B"))
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
 	})
 
 	require.NotNil(t, info.StreamStatus)
@@ -670,12 +981,16 @@ func TestStreamScannerHandler_StreamStatus_InitializedIfNil(t *testing.T) {
 
 	assert.Nil(t, info.StreamStatus)
 
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
+	})
 
 	assert.NotNil(t, info.StreamStatus)
 }
 
-func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) {
+func TestStreamScannerHandler_StreamStatus_PreservesPreInitialized(t *testing.T) {
 	t.Parallel()
 
 	body := buildSSEBody(5)
@@ -684,8 +999,12 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	info.StreamStatus.RecordError("pre-existing error")
 
-	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		if err := StringData(c, data); err != nil {
+			sr.Stop(err)
+		}
+	})
 
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
-	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
+	assert.Equal(t, 1, info.StreamStatus.TotalErrorCount())
 }

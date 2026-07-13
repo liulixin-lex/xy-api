@@ -63,11 +63,17 @@ func AudioHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
+		usageDto, _ := usage.(*dto.Usage)
+		finalizeHTTPStreamError(c, info, usage, hasHTTPAudioTokens(usageDto))
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
-	if info.FirstByteTimedOutBeforeResponse() {
+	usageDto, _ := usage.(*dto.Usage)
+	if finalizeCommittedHTTPStreamFailure(c, info, usage, hasHTTPAudioTokens(usageDto)) {
+		return nil
+	}
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil
 	}
 	if usage == nil {

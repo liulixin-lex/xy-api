@@ -13,18 +13,23 @@ const (
 )
 
 type Candidate struct {
-	Channel *model.Channel
-	Metric  *MetricSnapshot
-	Cost    *CostSnapshot
-	Breaker *BreakerSnapshot
+	Channel         *model.Channel
+	Metric          *MetricSnapshot
+	Cost            *CostSnapshot
+	Breaker         *BreakerSnapshot
+	Capacity        *CapacityCooldownSnapshot
+	ScoreMultiplier float64
 }
 
 type MetricSnapshot struct {
-	RequestCount int64
-	SuccessCount int64
-	P95LatencyMs float64
-	TPS          float64
-	Inflight     int64
+	RequestCount            int64
+	SuccessCount            int64
+	ReliabilityRequestCount int64
+	ReliabilityFailureCount int64
+	P95LatencyMs            float64
+	P95TTFTMs               float64
+	TPS                     float64
+	Inflight                int64
 }
 
 type CostSnapshot struct {
@@ -41,6 +46,12 @@ type BreakerSnapshot struct {
 	UpdatedUnix       int64
 }
 
+type CapacityCooldownSnapshot struct {
+	SourceStatusCode       int
+	CooldownUntilUnixMilli int64
+	UpdatedUnixMilli       int64
+}
+
 type Settings struct {
 	WeightAvailability float64
 	WeightLatency      float64
@@ -53,7 +64,9 @@ type Settings struct {
 	HalfOpenProbes     int
 	SnapshotStaleSec   int
 	NowUnix            int64
+	NowUnixMilli       int64
 	RandomSeed         int64
+	PreferTTFT         bool
 }
 
 type Weights struct {
@@ -64,11 +77,12 @@ type Weights struct {
 }
 
 type Decision struct {
-	Ranked          []RankedCandidate
-	Selected        *RankedCandidate
-	Weights         Weights
-	BreakerBypassed bool
-	FilteredOpen    int
+	Ranked           []RankedCandidate
+	Selected         *RankedCandidate
+	Weights          Weights
+	BreakerBypassed  bool
+	FilteredOpen     int
+	FilteredCapacity int
 }
 
 type RankedCandidate struct {
@@ -83,6 +97,7 @@ type RankedCandidate struct {
 	Degraded        bool
 	Open            bool
 	Inflight        int64
+	ScoreMultiplier float64
 	originalIndex   int
 	healthSortOrder int
 }

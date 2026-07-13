@@ -1,98 +1,146 @@
 package perfmetrics
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"strconv"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 )
 
-func flushLoop() {
-	for {
-		interval := perf_metrics_setting.GetFlushIntervalMinutes()
-		time.Sleep(time.Duration(interval) * time.Minute)
-		setting := perf_metrics_setting.GetSetting()
-		if !setting.Enabled {
-			continue
-		}
-		flushCompletedBuckets()
-		cleanupExpiredMetrics(setting.RetentionDays)
-	}
+type drainedBucket struct {
+	key      bucketKey
+	bucket   *bucket
+	counters counters
 }
 
-func flushCompletedBuckets() {
-	currentBucket := bucketStart(time.Now().Unix())
-	hotBuckets.Range(func(key, value any) bool {
-		k := key.(bucketKey)
-		if k.bucketTs >= currentBucket {
-			return true
+func flushBucketsWith(
+	ctx context.Context,
+	currentBucket int64,
+	includeActive bool,
+	persist func(context.Context, *model.PerfMetric) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	drainedBuckets := drainBuckets(currentBucket, includeActive)
+	var flushErrors []error
+	for index, drained := range drainedBuckets {
+		if err := ctx.Err(); err != nil {
+			requeueDrainedBuckets(drainedBuckets[index:])
+			return errors.Join(append(flushErrors, err)...)
 		}
 
-		bucket := value.(*atomicBucket)
-		drained := bucket.drain()
-		if drained.requestCount == 0 {
-			deleteOldEmptyBucket(k, key)
-			return true
-		}
-
-		err := model.UpsertPerfMetric(&model.PerfMetric{
+		k := drained.key
+		value := drained.counters
+		err := persist(ctx, &model.PerfMetric{
 			ModelName:      k.model,
 			Group:          k.group,
 			BucketTs:       k.bucketTs,
-			RequestCount:   drained.requestCount,
-			SuccessCount:   drained.successCount,
-			TotalLatencyMs: drained.totalLatencyMs,
-			TtftSumMs:      drained.ttftSumMs,
-			TtftCount:      drained.ttftCount,
-			OutputTokens:   drained.outputTokens,
-			GenerationMs:   drained.generationMs,
+			RequestCount:   value.requestCount,
+			SuccessCount:   value.successCount,
+			TotalLatencyMs: value.totalLatencyMs,
+			TtftSumMs:      value.ttftSumMs,
+			TtftCount:      value.ttftCount,
+			OutputTokens:   value.outputTokens,
+			GenerationMs:   value.generationMs,
 		})
-		if err != nil {
-			bucket.addCounters(drained)
+		if err == nil {
+			completeDrainedBucket(drained)
+			continue
+		}
+		requeueDrainedBucket(drained)
+		if ctx.Err() == nil {
 			common.SysError(fmt.Sprintf("failed to flush perf metric bucket model=%s group=%s bucket=%d: %s", k.model, k.group, k.bucketTs, err.Error()))
+		}
+		flushErrors = append(flushErrors, fmt.Errorf("flush perf metric bucket model=%s group=%s bucket=%d: %w", k.model, k.group, k.bucketTs, err))
+		if ctx.Err() != nil {
+			requeueDrainedBuckets(drainedBuckets[index+1:])
+			break
+		}
+	}
+	return errors.Join(flushErrors...)
+}
+
+func drainBuckets(currentBucket int64, includeActive bool) []drainedBucket {
+	drainedBuckets := make([]drainedBucket, 0)
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+	hotBuckets.Range(func(key, value any) bool {
+		k := key.(bucketKey)
+		if !includeActive && k.bucketTs >= currentBucket {
 			return true
 		}
 
-		deleteOldEmptyBucket(k, key)
+		bucket := value.(*bucket)
+		bucket.mu.Lock()
+		if bucket.draining {
+			bucket.mu.Unlock()
+			return true
+		}
+		bucket.draining = true
+		drained := bucket.counters
+		bucket.counters = counters{}
+		if drained.requestCount == 0 {
+			deleted := hotBuckets.CompareAndDelete(key, value)
+			bucket.mu.Unlock()
+			if deleted {
+				bucketCount.Add(-1)
+			}
+			return true
+		}
+		bucket.mu.Unlock()
+		drainedBuckets = append(drainedBuckets, drainedBucket{key: k, bucket: bucket, counters: drained})
 		return true
 	})
+	return drainedBuckets
 }
 
-func deleteOldEmptyBucket(k bucketKey, rawKey any) {
-	if k.bucketTs < bucketStart(time.Now().Add(-24*time.Hour).Unix()) {
-		hotBuckets.Delete(rawKey)
+func requeueDrainedBuckets(drainedBuckets []drainedBucket) {
+	for _, drained := range drainedBuckets {
+		requeueDrainedBucket(drained)
 	}
 }
 
-func cleanupExpiredMetrics(retentionDays int) {
-	if retentionDays <= 0 {
+func requeueDrainedBucket(drained drainedBucket) {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+
+	actual, ok := hotBuckets.Load(drained.key)
+	if !ok {
+		b := &bucket{counters: drained.counters}
+		hotBuckets.Store(drained.key, b)
+		bucketCount.Add(1)
 		return
 	}
-	cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
-	if err := model.DeletePerfMetricsBefore(cutoff); err != nil {
-		common.SysError("failed to cleanup expired perf metrics: " + err.Error())
+	b := actual.(*bucket)
+	b.mu.Lock()
+	b.addCountersLocked(drained.counters)
+	if b == drained.bucket {
+		b.draining = false
 	}
+	b.mu.Unlock()
 }
 
-func redisCounters(values map[string]string) counters {
-	return counters{
-		requestCount:   parseRedisInt(values["req"]),
-		successCount:   parseRedisInt(values["ok"]),
-		totalLatencyMs: parseRedisInt(values["lat"]),
-		ttftSumMs:      parseRedisInt(values["ttft"]),
-		ttftCount:      parseRedisInt(values["ttft_n"]),
-		outputTokens:   parseRedisInt(values["out"]),
-		generationMs:   parseRedisInt(values["gen_ms"]),
-	}
-}
+func completeDrainedBucket(drained drainedBucket) {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
 
-func parseRedisInt(value string) int64 {
-	if value == "" {
-		return 0
+	actual, ok := hotBuckets.Load(drained.key)
+	if !ok || actual != drained.bucket {
+		return
 	}
-	parsed, _ := strconv.ParseInt(value, 10, 64)
-	return parsed
+	b := drained.bucket
+	b.mu.Lock()
+	if b.counters.requestCount > 0 {
+		b.draining = false
+		b.mu.Unlock()
+		return
+	}
+	deleted := hotBuckets.CompareAndDelete(drained.key, b)
+	b.mu.Unlock()
+	if deleted {
+		bucketCount.Add(-1)
+	}
 }

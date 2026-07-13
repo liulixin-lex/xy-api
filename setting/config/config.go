@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
@@ -36,6 +35,83 @@ func (cm *ConfigManager) Get(name string) interface{} {
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 	return cm.configs[name]
+}
+
+// Snapshot copies only the top-level registered value while holding the
+// manager's read lock. The registered value and destination must both be
+// non-nil pointers, and their element types must match exactly. Reference
+// fields must be immutable/copy-on-write or updated through UpdateFromMap.
+func (cm *ConfigManager) Snapshot(name string, destination any) bool {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false
+	}
+	target := reflect.ValueOf(destination)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false
+	}
+	source := reflect.ValueOf(registered)
+	if source.Kind() != reflect.Ptr || source.IsNil() {
+		return false
+	}
+	source = source.Elem()
+	if target.Elem().Type() != source.Type() {
+		return false
+	}
+	target.Elem().Set(source)
+	return true
+}
+
+// Replace assigns only the top-level value of a registered non-nil pointer
+// while holding the manager's write lock. The replacement may be either the
+// concrete value or a non-nil pointer to that exact type. Reference fields
+// must be immutable/copy-on-write or updated through UpdateFromMap.
+func (cm *ConfigManager) Replace(name string, replacement any) bool {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false
+	}
+	target := reflect.ValueOf(registered)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false
+	}
+	source := reflect.ValueOf(replacement)
+	if !source.IsValid() {
+		return false
+	}
+	registeredValue := target.Elem()
+	if source.Type() == registeredValue.Type() {
+		registeredValue.Set(source)
+		return true
+	}
+	if source.Kind() != reflect.Ptr || source.IsNil() || source.Elem().Type() != registeredValue.Type() {
+		return false
+	}
+	registeredValue.Set(source.Elem())
+	return true
+}
+
+// UpdateFromMap updates a registered configuration while holding the
+// manager's write lock for the complete lookup and mutation.
+func (cm *ConfigManager) UpdateFromMap(name string, values map[string]string) (bool, error) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	registered, ok := cm.configs[name]
+	if !ok {
+		return false, nil
+	}
+	target := reflect.ValueOf(registered)
+	if target.Kind() != reflect.Ptr || target.IsNil() {
+		return false, nil
+	}
+	return true, updateConfigFromMap(registered, values)
 }
 
 // LoadFromDB 从数据库加载配置
@@ -134,7 +210,7 @@ func configToMap(config interface{}) (map[string]string, error) {
 		case reflect.Ptr:
 			// 处理指针类型：如果非 nil，序列化指向的值
 			if !field.IsNil() {
-				bytes, err := json.Marshal(field.Interface())
+				bytes, err := common.Marshal(field.Interface())
 				if err != nil {
 					return nil, err
 				}
@@ -145,7 +221,7 @@ func configToMap(config interface{}) (map[string]string, error) {
 			}
 		case reflect.Map, reflect.Slice, reflect.Struct:
 			// 复杂类型使用JSON序列化
-			bytes, err := json.Marshal(field.Interface())
+			bytes, err := common.Marshal(field.Interface())
 			if err != nil {
 				return nil, err
 			}
@@ -247,22 +323,22 @@ func updateConfigFromMap(config interface{}, configMap map[string]string) error 
 					field.Set(reflect.New(field.Type().Elem()))
 				}
 				// 反序列化到指针指向的值
-				err := json.Unmarshal([]byte(strValue), field.Interface())
+				err := common.Unmarshal([]byte(strValue), field.Interface())
 				if err != nil {
 					continue
 				}
 			}
 		case reflect.Map:
-			// json.Unmarshal merges into existing maps (keeps old keys that are
+			// JSON unmarshal merges into existing maps (keeps old keys that are
 			// absent from the new JSON). Allocate a fresh map so removed keys
 			// are properly cleared.
 			fresh := reflect.New(field.Type())
-			if err := json.Unmarshal([]byte(strValue), fresh.Interface()); err != nil {
+			if err := common.Unmarshal([]byte(strValue), fresh.Interface()); err != nil {
 				continue
 			}
 			field.Set(fresh.Elem())
 		case reflect.Slice, reflect.Struct:
-			err := json.Unmarshal([]byte(strValue), field.Addr().Interface())
+			err := common.Unmarshal([]byte(strValue), field.Addr().Interface())
 			if err != nil {
 				continue
 			}
@@ -277,7 +353,7 @@ func ConfigToMap(config interface{}) (map[string]string, error) {
 	return configToMap(config)
 }
 
-// UpdateConfigFromMap 从map更新配置对象（导出函数）
+// UpdateConfigFromMap 从map更新配置对象（导出函数）。调用方负责同步；已注册配置应使用 ConfigManager.UpdateFromMap。
 func UpdateConfigFromMap(config interface{}, configMap map[string]string) error {
 	return updateConfigFromMap(config, configMap)
 }

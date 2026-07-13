@@ -75,7 +75,7 @@ export const SIDEBAR_MODULES_DEFAULT: SidebarModulesAdminConfig = {
   admin: {
     enabled: true,
     channel: true,
-    smart_routing: true,
+    channel_routing: true,
     models: true,
     redemption: true,
     user: true,
@@ -206,12 +206,23 @@ export function parseSidebarModulesAdmin(
       Object.entries(raw as Record<string, unknown>).forEach(
         ([moduleKey, moduleValue]) => {
           if (moduleKey === 'enabled') return
+          if (moduleKey === 'smart_routing') {
+            if (!Object.hasOwn(raw, 'channel_routing')) {
+              sectionConfig.channel_routing = toBoolean(
+                moduleValue,
+                defaultSection.channel_routing ?? true
+              )
+            }
+            return
+          }
           sectionConfig[moduleKey] = toBoolean(
             moduleValue,
             defaultSection[moduleKey] ?? true
           )
         }
       )
+
+      delete sectionConfig.smart_routing
 
       result[sectionKey] = sectionConfig
     })

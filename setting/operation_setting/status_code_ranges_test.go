@@ -51,6 +51,12 @@ func TestShouldDisableByStatusCode(t *testing.T) {
 	require.False(t, ShouldDisableByStatusCode(200))
 }
 
+func TestShouldDisableByStatusCode_DefaultCredentialStatuses(t *testing.T) {
+	require.True(t, ShouldDisableByStatusCode(401))
+	require.False(t, ShouldDisableByStatusCode(402))
+	require.True(t, ShouldDisableByStatusCode(403))
+}
+
 func TestShouldRetryByStatusCode(t *testing.T) {
 	orig := AutomaticRetryStatusCodeRanges
 	t.Cleanup(func() { AutomaticRetryStatusCodeRanges = orig })
@@ -62,26 +68,31 @@ func TestShouldRetryByStatusCode(t *testing.T) {
 
 	require.True(t, ShouldRetryByStatusCode(429))
 	require.True(t, ShouldRetryByStatusCode(500))
-	require.False(t, ShouldRetryByStatusCode(504))
+	require.True(t, ShouldRetryByStatusCode(504))
 	require.False(t, ShouldRetryByStatusCode(524))
 	require.False(t, ShouldRetryByStatusCode(400))
 	require.False(t, ShouldRetryByStatusCode(200))
 }
 
-func TestShouldRetryByStatusCode_DefaultMatchesLegacyBehavior(t *testing.T) {
+func TestShouldRetryByStatusCode_DefaultExcludes1xxAnd3xx(t *testing.T) {
+	require.False(t, ShouldRetryByStatusCode(100))
+	require.False(t, ShouldRetryByStatusCode(199))
 	require.False(t, ShouldRetryByStatusCode(200))
-	require.False(t, ShouldRetryByStatusCode(400))
+	require.False(t, ShouldRetryByStatusCode(300))
+	require.False(t, ShouldRetryByStatusCode(399))
+	require.True(t, ShouldRetryByStatusCode(400))
 	require.True(t, ShouldRetryByStatusCode(401))
 	require.False(t, ShouldRetryByStatusCode(408))
 	require.True(t, ShouldRetryByStatusCode(429))
 	require.True(t, ShouldRetryByStatusCode(500))
-	require.False(t, ShouldRetryByStatusCode(504))
+	require.True(t, ShouldRetryByStatusCode(504))
 	require.False(t, ShouldRetryByStatusCode(524))
 	require.True(t, ShouldRetryByStatusCode(599))
 }
 
 func TestIsAlwaysSkipRetryStatusCode(t *testing.T) {
-	require.True(t, IsAlwaysSkipRetryStatusCode(504))
+	require.True(t, IsAlwaysSkipRetryStatusCode(408))
 	require.True(t, IsAlwaysSkipRetryStatusCode(524))
+	require.False(t, IsAlwaysSkipRetryStatusCode(504))
 	require.False(t, IsAlwaysSkipRetryStatusCode(500))
 }

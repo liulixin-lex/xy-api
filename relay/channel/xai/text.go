@@ -1,6 +1,7 @@
 package xai
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -40,6 +41,7 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var responseTextBuilder strings.Builder
 	var toolCount int
 	var containStreamUsage bool
+	var streamErr *types.NewAPIError
 
 	helper.SetEventStreamHeaders(c)
 
@@ -47,7 +49,18 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		var xAIResp *dto.ChatCompletionsStreamResponse
 		if err := common.UnmarshalJsonStr(data, &xAIResp); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			}
+			sr.Stop(err)
+			return
+		}
+		if xAIResp == nil {
+			err := fmt.Errorf("xai null stream response")
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			}
+			sr.Stop(err)
 			return
 		}
 
@@ -63,19 +76,36 @@ func xAIStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		_ = openai.ProcessStreamResponse(*openaiResponse, &responseTextBuilder, &toolCount)
 		if err := helper.ObjectData(c, openaiResponse); err != nil {
 			common.SysLog(err.Error())
-			sr.Error(err)
+			if streamErr == nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse)
+			}
+			sr.Stop(err)
+			return
 		}
 	})
 
-	if info.FirstByteTimedOutBeforeResponse() {
+	if info.HTTPStreamFailedBeforeCommit(c) {
 		return nil, nil
 	}
 	if !containStreamUsage {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
 	}
+	if streamErr != nil {
+		return usage, streamErr
+	}
+	if info.HTTPStreamHasFailure() {
+		status := info.StreamStatus
+		err := status.EndError
+		if err == nil {
+			err = fmt.Errorf("xai stream ended abnormally: %s", status.Summary())
+		}
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
 
-	helper.Done(c)
+	if err := helper.Done(c); err != nil {
+		return usage, types.NewError(err, types.ErrorCodeBadResponse)
+	}
 	service.CloseResponseBodyGracefully(resp)
 	return usage, nil
 }

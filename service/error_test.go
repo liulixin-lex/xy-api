@@ -3,11 +3,14 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/types"
@@ -15,6 +18,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type errorReadCloser struct {
+	err    error
+	closed bool
+}
+
+func (reader *errorReadCloser) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func (reader *errorReadCloser) Close() error {
+	reader.closed = true
+	return nil
+}
 
 func TestResetStatusCode(t *testing.T) {
 	t.Parallel()
@@ -63,6 +80,81 @@ func TestResetStatusCode(t *testing.T) {
 			require.Equal(t, tc.expectedCode, newAPIError.StatusCode)
 		})
 	}
+}
+
+func TestResetStatusCodePreservesSourceStatusCode(t *testing.T) {
+	newAPIError := types.NewErrorWithStatusCode(
+		errors.New("rate limited"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusTooManyRequests,
+	)
+
+	ResetStatusCode(newAPIError, `{"429":503}`)
+
+	assert.Equal(t, http.StatusServiceUnavailable, newAPIError.StatusCode)
+	assert.Equal(t, http.StatusTooManyRequests, newAPIError.SourceStatusCode())
+}
+
+func TestTaskErrorFromAPIErrorKeepsPublicMessageAndWrappedCause(t *testing.T) {
+	cause := errors.New("billing failure")
+	apiErr := types.NewErrorWithStatusCode(
+		cause,
+		types.ErrorCodePreConsumeTokenQuotaFailed,
+		http.StatusTooManyRequests,
+		types.ErrOptionWithHideErrMsg("public task error"),
+	)
+
+	taskErr := TaskErrorFromAPIError(apiErr)
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "public task error", taskErr.Message)
+	assert.Equal(t, string(types.ErrorCodePreConsumeTokenQuotaFailed), taskErr.Code)
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.True(t, taskErr.LocalError)
+	assert.Same(t, apiErr, taskErr.Error)
+	assert.ErrorIs(t, taskErr.Error, cause)
+}
+
+func TestTaskErrorFromUpstreamResponsePreservesStatusAndRetryAfter(t *testing.T) {
+	response := &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}
+	response.Header.Set("Retry-After", "2")
+
+	taskErr := TaskErrorFromUpstreamResponse(response, errors.New("rate limited"), time.Unix(100, 0))
+
+	assert.Equal(t, string(types.ErrorCodeBadResponseStatusCode), taskErr.Code)
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.Equal(t, int64(2000), taskErr.RetryAfterMs)
+	assert.False(t, taskErr.LocalError)
+}
+
+func TestParseRetryAfterHeaderSaturatesHugeDeltaSeconds(t *testing.T) {
+	duration := ParseRetryAfterHeader("1e20", time.Unix(100, 0))
+
+	assert.Equal(t, time.Duration(1<<63-1), duration)
+}
+
+func TestRelayErrorHandlerReadFailurePreservesCauseAndClosesBody(t *testing.T) {
+	cause := &net.DNSError{Name: "upstream.example.com", Err: "response interrupted"}
+	body := &errorReadCloser{err: cause}
+	response := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{"Retry-After": []string{"3"}},
+		Body:       body,
+	}
+
+	apiErr := RelayErrorHandler(context.Background(), response, false)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, body.closed)
+	assert.Equal(t, types.ErrorCodeReadResponseBodyFailed, apiErr.GetErrorCode())
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.SourceStatusCode())
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.Same(t, cause, apiErr.Cause())
+	assert.ErrorIs(t, apiErr, cause)
+	assert.Equal(t, "failed to read upstream response body", apiErr.Error())
+	var metadata map[string]int64
+	require.NoError(t, common.Unmarshal(apiErr.Metadata, &metadata))
+	assert.Equal(t, int64(3000), metadata["retry_after_ms"])
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {

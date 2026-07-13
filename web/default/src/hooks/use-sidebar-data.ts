@@ -39,6 +39,10 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarData } from '@/components/layout/types'
+import {
+  ADMIN_PERMISSION_ACTIONS,
+  ADMIN_PERMISSION_RESOURCES,
+} from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
 
 /**
@@ -132,9 +136,15 @@ export function useSidebarData(): SidebarData {
             icon: Radio,
           },
           {
-            title: t('Smart Routing'),
-            url: '/smart-routing',
+            title: t('Channel Routing'),
+            url: '/channel-routing/overview',
+            activeUrls: ['/channel-routing', '/smart-routing'],
+            configUrls: ['/channel-routing/overview', '/smart-routing'],
             icon: Route,
+            requiredPermission: {
+              resource: ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
+              action: ADMIN_PERMISSION_ACTIONS.READ,
+            },
           },
           {
             title: t('Models'),

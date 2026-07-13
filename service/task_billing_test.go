@@ -11,7 +11,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/glebarez/sqlite"
 	"github.com/shopspring/decimal"
@@ -48,8 +50,25 @@ func TestMain(m *testing.M) {
 		&model.Ability{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.RoutingTopologyMetadata{},
+		&model.RoutingPool{},
+		&model.RoutingPoolMember{},
+		&model.RoutingCredentialRef{},
+		&model.RoutingPolicyHead{},
+		&model.RoutingPolicyRevision{},
+		&model.RoutingPolicyPoolRevision{},
+		&model.RoutingPolicyMemberRevision{},
+		&model.RoutingPolicyActivation{},
+		&model.RoutingConfigOutbox{},
+		&model.RoutingRuntimeCheckpoint{},
+		&model.RoutingDecisionAudit{},
+		&model.RoutingChannelBinding{},
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},
+		&model.RoutingMetricRollup{},
+		&model.RoutingTelemetryReceipt{},
+		&model.RoutingUpstreamAccount{},
+		&model.RoutingCostSnapshotVersion{},
 		&model.RoutingBreakerState{},
 		&model.RoutingChannelHealthState{},
 		&model.SystemTask{},
@@ -67,6 +86,9 @@ func TestMain(m *testing.M) {
 
 func truncate(t *testing.T) {
 	t.Helper()
+	channelrouting.ResetDecisionAuditsForTest()
+	channelrouting.ResetSnapshotForTest()
+	routingmetrics.ResetForTest()
 	t.Cleanup(func() {
 		model.DB.Exec("DELETE FROM tasks")
 		model.DB.Exec("DELETE FROM users")
@@ -76,12 +98,31 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM abilities")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
+		model.DB.Exec("DELETE FROM routing_decision_audits")
+		model.DB.Exec("DELETE FROM routing_config_outbox")
+		model.DB.Exec("DELETE FROM routing_policy_activations")
+		model.DB.Exec("DELETE FROM routing_policy_member_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_pool_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_revisions")
+		model.DB.Exec("DELETE FROM routing_policy_heads")
+		model.DB.Exec("DELETE FROM routing_runtime_checkpoints")
+		model.DB.Exec("DELETE FROM routing_telemetry_receipts")
+		model.DB.Exec("DELETE FROM routing_topology_metadata")
+		model.DB.Exec("DELETE FROM routing_credential_refs")
+		model.DB.Exec("DELETE FROM routing_pool_members")
+		model.DB.Exec("DELETE FROM routing_pools")
 		model.DB.Exec("DELETE FROM routing_cost_snapshots")
+		model.DB.Exec("DELETE FROM routing_cost_snapshot_versions")
+		model.DB.Exec("DELETE FROM routing_upstream_accounts")
 		model.DB.Exec("DELETE FROM routing_channel_metrics")
+		model.DB.Exec("DELETE FROM routing_metric_rollups")
 		model.DB.Exec("DELETE FROM routing_breaker_states")
 		model.DB.Exec("DELETE FROM routing_channel_health_states")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		channelrouting.ResetDecisionAuditsForTest()
+		channelrouting.ResetSnapshotForTest()
+		routingmetrics.ResetForTest()
 	})
 }
 
@@ -731,10 +772,12 @@ type mockAdaptor struct {
 }
 
 func (m *mockAdaptor) Init(_ *relaycommon.RelayInfo) {}
-func (m *mockAdaptor) FetchTask(string, string, map[string]any, string) (*http.Response, error) {
+func (m *mockAdaptor) FetchTask(context.Context, string, string, map[string]any, string) (*http.Response, error) {
 	return nil, nil
 }
-func (m *mockAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) { return nil, nil }
+func (m *mockAdaptor) ParseTaskResult(context.Context, []byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
 func (m *mockAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
 	return m.adjustReturn
 }

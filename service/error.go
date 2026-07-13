@@ -87,15 +87,21 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 	retryAfterHeader := resp.Header.Get("Retry-After")
+	defer CloseResponseBodyGracefully(resp)
 	defer func() {
 		attachRetryAfterMetadata(newApiErr, retryAfterHeader, time.Now())
 	}()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		newApiErr = types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeReadResponseBodyFailed,
+			resp.StatusCode,
+			types.ErrOptionWithHideErrMsg("failed to read upstream response body"),
+		)
 		return
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
@@ -139,7 +145,7 @@ func attachRetryAfterMetadata(newApiErr *types.NewAPIError, header string, now t
 	if newApiErr == nil || strings.TrimSpace(header) == "" {
 		return
 	}
-	retryAfter := parseRetryAfterHeader(header, now)
+	retryAfter := ParseRetryAfterHeader(header, now)
 	if retryAfter <= 0 {
 		return
 	}
@@ -155,7 +161,8 @@ func attachRetryAfterMetadata(newApiErr *types.NewAPIError, header string, now t
 	newApiErr.Metadata = data
 }
 
-func parseRetryAfterHeader(header string, now time.Time) time.Duration {
+// ParseRetryAfterHeader parses delta-seconds and HTTP-date Retry-After values.
+func ParseRetryAfterHeader(header string, now time.Time) time.Duration {
 	value := strings.TrimSpace(header)
 	if value == "" {
 		return 0
@@ -163,6 +170,10 @@ func parseRetryAfterHeader(header string, now time.Time) time.Duration {
 	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
 		if seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
 			return 0
+		}
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds >= float64(maxDuration)/float64(time.Second) {
+			return maxDuration
 		}
 		return time.Duration(seconds * float64(time.Second))
 	}
@@ -196,7 +207,7 @@ func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) 
 		if !ok {
 			return
 		}
-		newApiErr.StatusCode = intCode
+		newApiErr.SetResponseStatusCode(intCode)
 	}
 }
 
@@ -254,6 +265,19 @@ func TaskErrorWrapper(err error, code string, statusCode int) *dto.TaskError {
 	return taskError
 }
 
+// TaskErrorFromUpstreamResponse preserves upstream status and retry timing on task failures.
+func TaskErrorFromUpstreamResponse(resp *http.Response, cause error, now time.Time) *dto.TaskError {
+	if resp == nil {
+		return TaskErrorWrapperLocal(errors.New("upstream response is nil"), string(types.ErrorCodeBadResponse), http.StatusInternalServerError)
+	}
+	if cause == nil {
+		cause = fmt.Errorf("upstream task returned status %d", resp.StatusCode)
+	}
+	taskErr := TaskErrorWrapper(cause, string(types.ErrorCodeBadResponseStatusCode), resp.StatusCode)
+	taskErr.RetryAfterMs = ParseRetryAfterHeader(resp.Header.Get("Retry-After"), now).Milliseconds()
+	return taskErr
+}
+
 // TaskErrorFromAPIError 将 PreConsumeBilling 返回的 NewAPIError 转换为 TaskError。
 func TaskErrorFromAPIError(apiErr *types.NewAPIError) *dto.TaskError {
 	if apiErr == nil {
@@ -261,8 +285,9 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *dto.TaskError {
 	}
 	return &dto.TaskError{
 		Code:       string(apiErr.GetErrorCode()),
-		Message:    apiErr.Err.Error(),
+		Message:    apiErr.Error(),
 		StatusCode: apiErr.StatusCode,
-		Error:      apiErr.Err,
+		LocalError: true,
+		Error:      apiErr,
 	}
 }

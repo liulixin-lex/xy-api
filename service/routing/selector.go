@@ -43,7 +43,13 @@ type scoreBounds struct {
 func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	health := make([]candidateHealth, 0, len(candidates))
 	openCount := 0
+	filteredCapacity := 0
 	for i, candidate := range candidates {
+		if candidate.Capacity != nil && settings.NowUnixMilli > 0 &&
+			candidate.Capacity.CooldownUntilUnixMilli > settings.NowUnixMilli {
+			filteredCapacity++
+			continue
+		}
 		degraded, open, hardOpen := classifyBreaker(candidate.Breaker, settings)
 		if open && !hardOpen {
 			openCount++
@@ -57,7 +63,7 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 		})
 	}
 
-	breakerBypassed := shouldBypassOpenFilter(openCount, len(candidates), settings.MaxEjectedPct)
+	breakerBypassed := shouldBypassOpenFilter(openCount, len(health), settings.MaxEjectedPct)
 	included := make([]candidateHealth, 0, len(health))
 	bypassedOpen := make([]candidateHealth, 0)
 	filteredOpen := 0
@@ -119,10 +125,11 @@ func RankCandidates(candidates []Candidate, settings Settings) Decision {
 	})
 
 	return Decision{
-		Ranked:          ranked,
-		Weights:         weights,
-		BreakerBypassed: breakerBypassed,
-		FilteredOpen:    filteredOpen,
+		Ranked:           ranked,
+		Weights:          weights,
+		BreakerBypassed:  breakerBypassed,
+		FilteredOpen:     filteredOpen,
+		FilteredCapacity: filteredCapacity,
 	}
 }
 
@@ -204,7 +211,7 @@ func collectScoreBounds(candidates []candidateHealth, settings Settings) scoreBo
 	}
 	for _, item := range candidates {
 		if item.candidate.Metric != nil {
-			latency := item.candidate.Metric.P95LatencyMs
+			latency := candidateLatencyMs(item.candidate.Metric, settings)
 			if finitePositive(latency) {
 				bounds.hasLatency = true
 				if latency < bounds.minLatency {
@@ -237,11 +244,12 @@ func collectScoreBounds(candidates []candidateHealth, settings Settings) scoreBo
 
 func scoreCandidate(item candidateHealth, bounds scoreBounds, weights Weights, settings Settings) RankedCandidate {
 	availability := availabilityScore(item.candidate.Metric, settings.MinVolume)
-	latency := latencyScore(item.candidate.Metric, bounds)
+	latency := latencyScore(item.candidate.Metric, bounds, settings)
 	throughput := throughputScore(item.candidate.Metric, bounds)
 	cost, knownCost := costScore(item.candidate.Cost, bounds, settings)
 
-	score, healthOrder := weightedScore(weights, availability, latency, throughput, cost, knownCost), 0
+	scoreMultiplier := candidateScoreMultiplier(item.candidate.ScoreMultiplier)
+	score, healthOrder := weightedScore(weights, availability, latency, throughput, cost, knownCost)*scoreMultiplier, 0
 	if item.degraded {
 		score *= degradedScoreMultiplier
 		healthOrder = 1
@@ -259,9 +267,20 @@ func scoreCandidate(item candidateHealth, bounds scoreBounds, weights Weights, s
 		Degraded:        item.degraded,
 		Open:            item.open,
 		Inflight:        inflightCount(item.candidate.Metric),
+		ScoreMultiplier: scoreMultiplier,
 		originalIndex:   item.index,
 		healthSortOrder: healthOrder,
 	}
+}
+
+func candidateScoreMultiplier(value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 1
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
 }
 
 func inflightCount(metric *MetricSnapshot) int64 {
@@ -285,47 +304,62 @@ func weightedScore(weights Weights, availability float64, latency float64, throu
 }
 
 func availabilityScore(metric *MetricSnapshot, minVolume int) float64 {
-	if metric == nil {
+	if metric == nil || metric.ReliabilityRequestCount <= 0 {
 		return availabilityNeutralPrior
 	}
 	if minVolume < 0 {
 		minVolume = 0
 	}
-	if metric.RequestCount < int64(minVolume) {
+	if metric.ReliabilityRequestCount < int64(minVolume) {
 		return availabilityNeutralPrior
 	}
-	if metric.RequestCount <= 0 {
-		return availabilityNeutralPrior
+	failures := metric.ReliabilityFailureCount
+	if failures < 0 {
+		failures = 0
 	}
-	return clamp01(float64(metric.SuccessCount) / float64(metric.RequestCount))
+	if failures > metric.ReliabilityRequestCount {
+		failures = metric.ReliabilityRequestCount
+	}
+	return clamp01(1 - float64(failures)/float64(metric.ReliabilityRequestCount))
 }
 
 func belowAvailabilityFloor(metric *MetricSnapshot, settings Settings) bool {
 	floor := settings.AvailabilityFloor
-	if floor <= 0 || floor > 1 || metric == nil {
+	if floor <= 0 || floor > 1 || metric == nil || metric.ReliabilityRequestCount <= 0 {
 		return false
 	}
 	minVolume := settings.MinVolume
 	if minVolume < 0 {
 		minVolume = 0
 	}
-	if metric.RequestCount < int64(minVolume) || metric.RequestCount <= 0 {
+	if metric.ReliabilityRequestCount < int64(minVolume) {
 		return false
 	}
-	return float64(metric.SuccessCount)/float64(metric.RequestCount) < floor
+	return availabilityScore(metric, 0) < floor
 }
 
-func latencyScore(metric *MetricSnapshot, bounds scoreBounds) float64 {
+func candidateLatencyMs(metric *MetricSnapshot, settings Settings) float64 {
+	if metric == nil {
+		return 0
+	}
+	if settings.PreferTTFT && finitePositive(metric.P95TTFTMs) {
+		return metric.P95TTFTMs
+	}
+	return metric.P95LatencyMs
+}
+
+func latencyScore(metric *MetricSnapshot, bounds scoreBounds, settings Settings) float64 {
 	if !bounds.hasLatency {
 		return 1
 	}
-	if metric == nil || !finitePositive(metric.P95LatencyMs) {
+	latency := candidateLatencyMs(metric, settings)
+	if !finitePositive(latency) {
 		return 0
 	}
 	if almostEqual(bounds.minLatency, bounds.maxLatency) {
 		return 1
 	}
-	return clamp01((bounds.maxLatency - metric.P95LatencyMs) / (bounds.maxLatency - bounds.minLatency))
+	return clamp01((bounds.maxLatency - latency) / (bounds.maxLatency - bounds.minLatency))
 }
 
 func throughputScore(metric *MetricSnapshot, bounds scoreBounds) float64 {
@@ -399,6 +433,18 @@ func classifyBreaker(breaker *BreakerSnapshot, settings Settings) (bool, bool, b
 	default:
 		return false, false, false
 	}
+}
+
+func BreakerNeedsHalfOpenProbe(breaker *BreakerSnapshot, settings Settings) bool {
+	if breaker == nil || breakerStale(breaker, settings) {
+		return false
+	}
+	state := strings.ToLower(strings.TrimSpace(breaker.State))
+	if state == BreakerStateHalfOpen {
+		return true
+	}
+	return state == BreakerStateOpen && settings.NowUnix > 0 && breaker.CooldownUntilUnix > 0 &&
+		settings.NowUnix >= breaker.CooldownUntilUnix
 }
 
 func breakerStale(breaker *BreakerSnapshot, settings Settings) bool {

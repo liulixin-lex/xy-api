@@ -80,7 +80,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 	if privateData.Key != "" {
 		key = privateData.Key
 	}
-	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
+	resp, err := adaptor.FetchTask(ctx, baseURL, key, map[string]any{
 		"task_id": taskId,
 		"action":  task.Action,
 	}, proxy)
@@ -110,7 +110,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 		taskResult.Progress = t.Progress
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
-	} else if taskResult, err = adaptor.ParseTaskResult(responseBody); err != nil {
+	} else if taskResult, err = adaptor.ParseTaskResult(ctx, responseBody); err != nil {
 		return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
 	} else {
 		task.Data = redactVideoResponseBody(responseBody)

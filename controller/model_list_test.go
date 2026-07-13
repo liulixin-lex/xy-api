@@ -50,7 +50,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}, &model.ReferralCapture{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}, &model.ReferralCapture{}, &model.RoutingUpstreamAccount{}, &model.RoutingCostSnapshotVersion{}, &model.RoutingBreakerResetFence{}, &model.RoutingHedgeAttemptAudit{}))
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()
@@ -81,7 +81,7 @@ func initModelListColumnNames(t *testing.T) {
 		}
 	}()
 
-	common.IsMasterNode = false
+	common.IsMasterNode = true
 	common.SQLitePath = fmt.Sprintf("file:%s_init?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	require.NoError(t, os.Setenv("SQL_DSN", "local"))
