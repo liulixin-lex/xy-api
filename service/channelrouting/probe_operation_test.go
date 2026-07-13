@@ -184,6 +184,9 @@ func activeProbeOperationTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
 	previousDB := model.DB
 	previousRedisEnabled := common.RedisEnabled
 	model.DB = db
@@ -192,9 +195,7 @@ func activeProbeOperationTestDB(t *testing.T) *gorm.DB {
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.RedisEnabled = previousRedisEnabled
-		if sqlDB, dbErr := db.DB(); dbErr == nil {
-			_ = sqlDB.Close()
-		}
+		_ = sqlDB.Close()
 	})
 	require.NoError(t, db.AutoMigrate(&model.RoutingOperation{}, &model.RoutingPolicyHead{}))
 	require.NoError(t, db.Create(&model.RoutingPolicyHead{

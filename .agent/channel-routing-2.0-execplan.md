@@ -22,11 +22,11 @@
 - 主仓库：`/opt/xy-api`
 - 专用工作树：`/root/.config/superpowers/worktrees/xy-api/feat-channel-routing-v2`
 - 分支：`feat/channel-routing-v2`
-- 当前 HEAD：`90b25f8a`（Gate 2 已提交）；Gate 3 已完成验证，等待单独提交。
+- 当前 HEAD：`569ffb16`；后端主体提交 `0962012d` 与前端提交 `18c3c69a` 已通过非快进合并进入本分支，发布前发现的 SSE Flush、日志器并发和测试夹具稳定性修复仍在工作树中等待最终提交。
 - 开发基线位于专用分支 `feat/channel-routing-v2`，不在 `/opt/xy-api` 的 main 工作树直接开发。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
-- 正式 `web/default` 前端尚未开始；Gate 3 DTO/API/权限语义已稳定，后端 Phase 3–5 完成后进入正式工作区实现。
-- 旧并行 Task 4 工作树仍存在，但不作为当前实现真源。
+- 正式 `web/default` 七页工作区已合并；Typecheck、Lint、i18n、单测、Build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。
+- 子 Agent 已全部收敛，最终总装、PR、CI 与发布由根线串行完成，避免并行写入和限流干扰。
 
 ## Progress
 
@@ -38,11 +38,11 @@
 - [x] Phase 0D：统一/收敛 `routing_metrics` 与 `perf_metrics` 生命周期语义；修复设置竞态、无界桶、永久 Worker、退避/Jitter/可观测边界；完成 Gate 1 总审计。
 - [x] Phase 1 Observe：Pool、Member、稳定 Credential ID、统一有界遥测、兼容迁移、只读 API、新选择器仅审计。
 - [x] Phase 2 Shadow：双算、差异审计、决策重放、Revision/Outbox/Redis Stream、增量聚合、成本快照、多实例降级。
-- [ ] Phase 3 Canary：确定性灰度、自动回滚、容量预留、慢启动、故障注入；Hedging 保持关闭。
-- [ ] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、兼容改名。主动探测与提交前串行故障转移切片已实现并验证，Balanced 热路径与治理仍在继续。
-- [ ] Phase 5 Enterprise SLO：严格容量租约、多区域、独立 RBAC、双人审批、Error Budget Burn、审计导出、预算 Hedging。
-- [ ] Gate 7 前端：七个深链页面、单 SSE、完整状态、六语言、A11y、响应式、明暗主题与视觉验证。
-- [ ] 最终验证：三数据库、Redis/多节点、race/vet/build、故障注入、benchmark/soak、前端测试/E2E/Axe/视觉与独立 P0/P1 审查。
+- [x] Phase 3 Canary：确定性灰度、请求级固定会话、自动回滚、容量预留、慢启动、故障注入；Hedging 保持关闭。
+- [x] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、幂等 Operation、兼容入口和 SSE 已完成。
+- [x] Phase 5 Enterprise SLO：严格容量租约、共享份额、区域作用域、独立 RBAC、双人审批、Error Budget、持久审计导出、预算 Hedging、多节点失效语义与成本审计已完成。
+- [x] Gate 7 前端：七个深链页面、七语 i18n、SSE/轮询降级、A11y、320/768/1440、200% 缩放、明暗主题、深链、权限与错误恢复已验收并合入。
+- [x] 最终实现验证：SQLite/MySQL 5.7/PostgreSQL 9.6、真实 Redis/多节点、相关 race、vet/build、故障矩阵、benchmark、前端测试/E2E/Axe/视觉与独立 P0/P1 审查已完成；合入最新 main 后还需复跑发布门槛。
 - [ ] Git/发布：提交分支、PR、同步最新 main、合入前复验、合入 main、按正常节奏构建下一版镜像。
 
 ## Requirement Traceability Matrix
@@ -57,14 +57,14 @@
 | CR-0.6 | 真实 Output Token、TTFT、Token/s | `8f43ee5a..d7b3b3e2`；结算边界同步 usage、attempt end、routing bucket、Hot Cache、Selector 与 stream hint 测试 | PASS |
 | CR-0.7 | Cost Connector 与 Serving health 分离 | Phase 0B Task 9 tests | PASS |
 | CR-1 | Pool/Member/Credential/Observe/三库迁移/只读 API | Phase 1 模型、stable rollup、不可变快照、审计、v2 API、三库与 Race 证据 | PASS（Gate 2） |
-| CR-2 | Shadow、Revision、Outbox、Redis Stream、重放、正确可合并分布 | Gate 3 实现、三库/Redis/Race/Vet/Build 与独立 P0/P1 审查 | PASS（等待提交） |
-| CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | 尚无实现 | PENDING |
-| CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 尚无 v2 实现 | PENDING |
-| CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | 尚无实现 | PENDING |
-| CR-FE | 七页渠道路由工作区、六语言、SSE/A11y/响应式/视觉 | `web/default` 相对 main 无差异 | PENDING |
-| CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/配置保留，Observe 双算不改变实际 legacy 渠道 | PASS（正式改名提示留 Gate 5/7） |
-| CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 现有成本连接器未满足完整威胁模型 | PENDING |
-| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | Phase 0B 修复提交边界；v2 成本审计尚无 | PARTIAL |
+| CR-2 | Shadow、Revision、Outbox、Redis Stream、重放、正确可合并分布 | Gate 3 实现、三库/Redis/Race/Vet/Build 与独立 P0/P1 审查 | PASS |
+| CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | Canary cohort/outcome/evaluator、Pool-scoped rollback、故障矩阵、跨节点 presence/checkpoint | PASS |
+| CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 真实 Balanced、Replay、Probe、Attempt Coordinator、草稿仿真/发布/回滚 Operation、SSE 与兼容入口 | PASS |
+| CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | strict/local/adaptive capacity、region scope、approval/authz、error budget、audit export、真实预算 hedge | PASS |
+| CR-FE | 七页渠道路由工作区、七语、SSE/A11y/响应式/视觉 | 前端提交 `18c3c69a`；21/21 单测、14/14 Playwright、Typecheck、Build、Axe、键盘、缩放与视觉矩阵 | PASS |
+| CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
+| CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
+| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | Hedge 单次用户结算、完整 attempt timeline、平台成本与饱和审计；未知 Probe 价格 fail-closed | PASS |
 | CR-GIT | PR、同步 main、合入、镜像构建 | 尚未执行 | PENDING |
 
 ## Plan of Work
@@ -73,9 +73,11 @@
 2. [完成] Phase 0D / Gate 1：有界状态、正确分类、容量分离、真实 TTFT/Token/s、Worker 生命周期、安全与最终 flush。
 3. [完成] Phase 1 / Gate 2：稳定身份、stable telemetry + rollup、不可变快照、Observe 审计、只读 v2 API、三库与并发验证。
 4. [完成] Phase 2 / Gate 3：可合并分布、Shadow 双算/重放、Revision/Activation/Outbox、Redis Stream、node sequence 幂等与增量聚合。
-5. [当前] Phase 3 / Gate 4 收口与 Phase 4 / Gate 5 并行推进：Canary P1 审查继续；Balanced 主动探测和提交前串行故障转移已完成切片验证，继续接入正式热路径与策略治理。
-6. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
-7. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
+5. [完成] Phase 3 / Gate 4：Canary 真实门控、固定会话、容量/慢启动、结果窗口、原子多 Pool 自动回滚和故障注入。
+6. [完成] Phase 4 / Gate 5 与 Phase 5 / Gate 6：Balanced、严格租约、区域、RBAC/审批、Burn、审计导出、预算 Hedge、SSE、兼容入口和完整 attempt timeline 已集成。
+7. [完成] Gate 7 前端：七页正式工作区、七语、单连接 SSE 与轮询降级、浏览器/A11y/视觉验收已完成并合入。
+8. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
+9. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
 
 ### Phase 2 implementation slices
 
@@ -161,6 +163,26 @@
 - MySQL 5.7 与 PostgreSQL 15 隔离容器实跑 Probe/完整 Routing migration contract：PASS；临时容器已删除。
 - `go test ./... -count=1`：除根包因工作树缺少 `web/classic/dist` embed 生成物而 setup failed 外，其余所有包 PASS；最终 Gate 在生成前端 dist 后复跑。
 
+### Gate 4 / Gate 5 continuation evidence（2026-07-12）
+
+- 提交 `6d525b3e`、`6d04ec97`、`77ee5e4b`、`6b192d37`、`ac99d822`、`569004e3`、`2855ad11`、`fa31b70f`、`bc4f8f51`、`ee50b7b4`、`39049b54`、`fa745fe2` 已覆盖 Canary catch-up/失败语义、Balanced 预计算与真实选路、完整决策审计/Replay、多 Pool 原子回滚、主动探测和兼容重试。
+- Gate 5 当前工作树已实现草稿 Balanced 反事实仿真、持久化仿真/发布/回滚 Operation、Current/Revision/Operation API、强 ETag 和同事务 Revision/Activation/Outbox/Operation。
+- `go test ./model ./service/channelrouting ./controller ./router -count=1` 在 Gate 6 路由权限切换前 PASS；相关定向 Race、Vet 与 `git diff --check` PASS。Gate 6 并行中间态一度仅因 Router test 仍断言旧权限而失败，不作为最终证据。
+- SQLite 旧 `routing_operations` 表真实增量迁移测试 PASS；新增列保持 nullable，旧 Canary Operation 可读且 v1 idempotency hash 不变。
+- 独立审查修复：仿真历史变化时旧 Operation 被错误复用；Realtime/WebSocket 握手后仍允许首字超时跨渠道重试；未知价格 Probe 低估为 0.01 美元及高成本 RelayFormat 可能被发送。修复后对应 Controller/Model/Probe 定向测试 PASS。
+
+### Final integrated evidence（2026-07-13）
+
+- 集成 HEAD：`569ffb16`；后端主体 `0962012d`、前端 `18c3c69a` 已合并。发布前追加三项根因修复：流事件原子缓冲提交后恢复底层 `Flush`、日志轮换计数/门闩改为原子状态、主动探测 SQLite 夹具限制单连接以移除非目标锁竞争。
+- `GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...`：exit 0。
+- `go test -race ./relay/helper ./relay/channel/openai -count=1`：exit 0；真实 Redis Config/Event/Telemetry/Strict Capacity 定向 race：exit 0；真实 Redis Hedge 端到端 race：exit 0。
+- SQLite 由全仓测试覆盖；全新隔离库中，MySQL 5.7 与 PostgreSQL 9.6 的 `./model`、`./service/channelrouting` 全包契约在 `-p 1` 下 PASS，覆盖审批/RBAC、操作租约、Replay/Audit、成本、Rollup、Error Budget、Probe、Breaker reset 和迁移；测试库已删除并复核无残留。
+- Redis 7：独立测试实例上的 Config Stream、三节点 Event、Telemetry 幂等重投/backlog、Redis block lease/revision fencing 全包 PASS；另一独立实例上的真实 Hedge“secondary wins + 单次结算 + 两条 attempt 审计”PASS。
+- 性能：4096 候选动态 Prepared Balanced selector 100000 次、3 轮 p99 为 `525684–568314 ns`；Adaptive Concurrency 为 `6204–8266 ns/op`；Redis block local lease 为 `27219–50145 ns/op`。
+- 前端：Bun 单测 21/21、Playwright 14/14、Typecheck、Lint 0 error、七语 i18n missing/extras/untranslated 全 0、Build PASS；Axe、键盘、200% zoom、320/768/1440、明暗主题、RBAC、SSE、幂等、审批/回滚、导出及离线恢复均 PASS。
+- 独立审查未发现 P0；所有确认 P1 已修复并完成相关回归。`git diff --check` PASS，未跟踪临时文件为 0；最终敏感信息、受保护标识和发布供应链审计仍在 PR 前执行。
+- 根线最终复跑：Classic `bun run build` PASS；`GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；`git diff --check` PASS；当前工作树差异敏感词与受保护项目标识扫描无命中。`gitleaks`/`trufflehog` 本机未安装，未作为最终证据。
+
 ## Surprises & Discoveries
 
 - 旧会话只完成 Phase 0A/0B；最后的“已完成”只指 Phase 0B 收尾，不是完整渠道路由 2.0。
@@ -175,6 +197,12 @@
 - Stable additive upsert 在“数据库已提交但客户端收到错误”的模糊提交场景仍可能重复计数；Phase 2 必须引入 `node_id + sequence` 幂等协议。
 - 近期 Rollup 的 DB `GROUP BY` 在高流量下是可预见热点；Phase 2 使用增量聚合与可合并分布替代持续全窗扫描。
 - Phase 0B 的完整 race 记录包含既有 logger、task polling 和并行 `gin.SetMode` 竞态；新增路径定向 race 通过。最终 Gate 需要重新判断这些基线竞态是否仍阻止仓库级完整 race 声明。
+- Gate 5 审查发现仿真 Operation 的评估哈希只包含请求参数，历史样本变化后会复用旧 Operation；现已把完整有界仿真结果哈希纳入评估身份。
+- Realtime 首字前重试实现可缓存客户端消息，但批准方案把 WebSocket 握手定义为不可逆边界；最终采用更保守语义，握手后禁止跨渠道重试。
+- Active Probe 的未知成本固定值会低估图片/任务类风险；最终改为未知价格 fail-closed，并在真实请求前限制为低成本 RelayFormat。
+- 发布前全仓复跑发现 `streamEventBufferWriter.commit` 成功写入后没有向底层 writer Flush；这会让小 SSE 事件滞留，并使取消边界回归测试永久等待。最终在完整写入且无短写后恢复 Flush，所有流式普通测试与 race 通过。
+- 流式 race 暴露日志器 `logCount/setupLogWorking` 的既有并发读写；最终使用原子计数和 CAS 门闩，异步轮换任务自行释放门闩，日志格式与轮换阈值不变。
+- 主动探测 Operation 测试在全仓高负载下偶发 SQLite 共享缓存锁错误；测试不验证多连接锁竞争，因此把该专用夹具限制为单连接。真实并发契约继续由 MySQL/PostgreSQL、Redis 和专门 lease/race 用例承担。
 
 ## Decision Log
 
@@ -185,6 +213,10 @@
 - 2026-07-11：兼容保留字段名 `TPS`，但其语义在 Phase 0C 修正为真实输出 Token/s；后续 v2 DTO 使用明确 `output_tokens_per_second` 名称。
 - 2026-07-11：attempt end 保存为相对 attempt start 的原子 duration，而不是绝对 Unix 时间；这样可保留单调时钟语义、支持确定性测试，并避免本地结算耗时污染上游吞吐。
 - 2026-07-11：流式请求仅在 P95 TTFT 为有限正数时优先 TTFT；非流式或无效 TTFT 保持 P95 total latency 兼容行为。
+- 2026-07-12：用户明确授权继续直至 PR/main 合入和 `v0.1.10`、`latest` 多架构镜像实际发布核验；完成镜像发布前不得结束 Goal。
+- 2026-07-12：子 Agent 数量通常维持约 2 条并行线，不把 2 视为硬上限；发现派生第三条线后立即中断并由企业后端线接管共享改动。
+- 2026-07-12：Gate 5 与 Gate 6 已在 Policy/Router 文件形成交叉，停止强行拆分提交，改为企业后端统一收口、根代理独立审查后原子提交。
+- 2026-07-13：最终总装以全仓行为为边界；发现共享 SSE/Logger 问题时修复基础设施根因，不通过删除测试、放宽断言或串行化生产路径规避。
 
 ## Idempotence and Recovery
 
@@ -196,4 +228,4 @@
 
 ## Outcomes & Retrospective
 
-Gate 3 已完成并有新鲜三库、Redis、Race、Vet、Build、全仓测试和独立 P0/P1 审查证据；完整目标仍进行中。下一恢复点是 Phase 3 Activation 快照、确定性 Canary 门控和请求级固定会话。
+Phase 0–5、后端控制面/数据面、七页正式前端、三数据库/真实 Redis/并发/性能/浏览器验收均已完成。当前只剩：提交最终总装修复与台账、同步最新 main 后复跑、创建并通过 PR/CI、合入 main、发布 `v0.1.10`，并核验 GHCR `amd64/arm64/latest`、manifest、SBOM、provenance、Cosign 身份和容器 `--version`。完整 Goal 在发布核验完成前保持进行中。

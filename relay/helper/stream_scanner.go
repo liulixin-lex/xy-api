@@ -129,6 +129,7 @@ func (writer *streamEventBufferWriter) commit() (int, error) {
 	if written != writer.buffer.Len() {
 		return written, io.ErrShortWrite
 	}
+	writer.ResponseWriter.Flush()
 	return written, nil
 }
 
