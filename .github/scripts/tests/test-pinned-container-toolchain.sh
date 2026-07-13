@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Workflow assertions intentionally match literal shell expressions.
+# shellcheck disable=SC2016
+
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
@@ -48,5 +51,18 @@ if rg -n 'driver-opts:\s*image=moby/buildkit(?::|@)(?!sha256:0168606be2315b7c807
   echo 'found a mutable or unexpected BuildKit image reference' >&2
   exit 1
 fi
+
+stable_workflow="$repo_root/.github/workflows/docker-build.yml"
+[ "$(grep -Fc 'TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}' "$stable_workflow")" -eq 3 ]
+[ "$(grep -Fc 'git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"' "$stable_workflow")" -eq 3 ]
+[ "$(grep -Fc 'echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"' "$stable_workflow")" -eq 3 ]
+grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/resolve-stable-architecture.sh"' "$stable_workflow"
+grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/resolve-stable-latest.sh"' "$stable_workflow"
+grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/verify-release-attestations.sh"' "$stable_workflow"
+if rg -n '^\s+\.github/scripts/' "$stable_workflow"; then
+  echo 'stable release workflow executes tooling from the checked-out release tag' >&2
+  exit 1
+fi
+grep -Fq 'context: .' "$stable_workflow"
 
 printf 'container publishing toolchain pin tests passed\n'

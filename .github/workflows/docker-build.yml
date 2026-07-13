@@ -64,6 +64,31 @@ jobs:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
 
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
+            exit 1
+          fi
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
+
       - name: Validate tag, VERSION, and main ancestry
         id: release
         run: |
@@ -99,10 +124,11 @@ jobs:
 
       - name: Test release verification scripts
         run: |
-          .github/scripts/tests/test-resolve-stable-architecture.sh
-          .github/scripts/tests/test-verify-release-attestations.sh
-          .github/scripts/tests/test-verify-stable-architecture.sh
-          .github/scripts/tests/test-verify-stable-reuse-handoff.sh
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-resolve-stable-architecture.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-resolve-stable-latest.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-release-attestations.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-stable-architecture.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-stable-reuse-handoff.sh"
 
   build_single_arch:
     name: Build, smoke, and sign (${{ matrix.arch }})
@@ -136,6 +162,31 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
+
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
+            exit 1
+          fi
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
 
       - name: Set release environment
         run: |
@@ -189,7 +240,7 @@ jobs:
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
             args+=(--secondary-repository "$DOCKERHUB_REPOSITORY")
           fi
-          .github/scripts/resolve-stable-architecture.sh "${args[@]}"
+          "$RELEASE_CI_ROOT/.github/scripts/resolve-stable-architecture.sh" "${args[@]}"
 
       - name: Extract immutable image metadata
         id: meta
@@ -288,7 +339,7 @@ jobs:
           verify_repository() {
             local repository=$1
             local evidence_name=$2
-            .github/scripts/verify-stable-architecture.sh \
+            "$RELEASE_CI_ROOT/.github/scripts/verify-stable-architecture.sh" \
               --repository "$repository" \
               --digest "$IMAGE_DIGEST" \
               --platform "$PLATFORM" \
@@ -299,7 +350,7 @@ jobs:
               --run-attempt "$GITHUB_RUN_ATTEMPT" \
               --workflow-ref "$GITHUB_WORKFLOW_REF" \
               --workflow-sha "$GITHUB_WORKFLOW_SHA" \
-              --output-dir "$RUNNER_TEMP/stable-reuse/${{ matrix.arch }}/${evidence_name}"
+              --output-dir "$RUNNER_TEMP/stable-verification/${{ matrix.arch }}/${evidence_name}"
           }
 
           verify_repository "ghcr.io/${GHCR_REPOSITORY}" ghcr
@@ -374,6 +425,9 @@ jobs:
           fi
 
       - name: Sign new and verify architecture image by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -390,24 +444,34 @@ jobs:
             done
           }
 
-          ghcr_ref="ghcr.io/${GHCR_REPOSITORY}@${IMAGE_DIGEST}"
-          if [ "$BUILD_REUSED" != 'true' ]; then
-            sign_with_backoff "$ghcr_ref"
-          fi
-          cosign verify \
-            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
-            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
-            "$ghcr_ref" >/dev/null
+          verify_fresh_repository() {
+            local repository=$1
+            local evidence_name=$2
+            "$RELEASE_CI_ROOT/.github/scripts/verify-stable-architecture.sh" \
+              --repository "$repository" \
+              --digest "$IMAGE_DIGEST" \
+              --platform "$PLATFORM" \
+              --version "$TAG" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --output-dir "$RUNNER_TEMP/stable-verification/${{ matrix.arch }}/${evidence_name}"
+          }
 
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+          if [ "$BUILD_REUSED" != 'true' ]; then
+            ghcr_ref="ghcr.io/${GHCR_REPOSITORY}@${IMAGE_DIGEST}"
+            sign_with_backoff "$ghcr_ref"
+            verify_fresh_repository "ghcr.io/${GHCR_REPOSITORY}" ghcr
+          fi
+
+          if [ "$BUILD_REUSED" != 'true' ] && \
+            [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
             dockerhub_ref="${DOCKERHUB_REPOSITORY}@${IMAGE_DIGEST}"
-            if [ "$BUILD_REUSED" != 'true' ]; then
-              sign_with_backoff "$dockerhub_ref"
-            fi
-            cosign verify \
-              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
-              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
-              "$dockerhub_ref" >/dev/null
+            sign_with_backoff "$dockerhub_ref"
+            verify_fresh_repository "$DOCKERHUB_REPOSITORY" dockerhub
           fi
 
       - name: Export architecture digest
@@ -417,22 +481,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/stable-digest"
-          if [ "$BUILD_REUSED" = 'true' ]; then
-            cp -R \
-              "$RUNNER_TEMP/stable-reuse/${ARCH}" \
-              "$RUNNER_TEMP/stable-digest/${ARCH}-reuse"
-          fi
+          cp -R \
+            "$RUNNER_TEMP/stable-verification/${ARCH}" \
+            "$RUNNER_TEMP/stable-digest/${ARCH}-verification"
           jq '{success: .success, version: .data.version}' \
             "$RUNNER_TEMP/status.json" > "$RUNNER_TEMP/stable-digest/${ARCH}-status.json"
+          certificate_identity=$(jq -r '.signature.certificate_identity' \
+            "$RUNNER_TEMP/stable-verification/${ARCH}/ghcr/verification.json")
+          reuse_mode=$(jq -r '.reuse_policy.mode' \
+            "$RUNNER_TEMP/stable-verification/${ARCH}/ghcr/verification.json")
           jq -n \
             --arg arch "$ARCH" \
             --arg platform "$PLATFORM" \
             --arg digest "$IMAGE_DIGEST" \
             --arg version "$TAG" \
             --arg source_sha "${{ needs.prepare.outputs.sha }}" \
-            --arg certificate_identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --arg certificate_identity "$certificate_identity" \
             --arg build_reused "$BUILD_REUSED" \
-            '{arch: $arch, platform: $platform, digest: $digest, version: $version, source_sha: $source_sha, smoke_tested: true, signature_verified: true, signature_created: ($build_reused != "true"), certificate_identity: $certificate_identity, reused_immutable_tag: ($build_reused == "true")}' \
+            --arg reuse_mode "$reuse_mode" \
+            '{arch: $arch, platform: $platform, digest: $digest, version: $version, source_sha: $source_sha, smoke_tested: true, signature_verified: true, signature_created: ($build_reused != "true"), certificate_identity: $certificate_identity, reuse_mode: $reuse_mode, reused_immutable_tag: ($build_reused == "true")}' \
             > "$RUNNER_TEMP/stable-digest/${ARCH}.json"
 
       - name: Upload architecture digest evidence
@@ -512,6 +579,31 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
+            exit 1
+          fi
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
@@ -542,7 +634,6 @@ jobs:
               --arg platform "linux/$arch" \
               --arg version "${{ needs.prepare.outputs.tag }}" \
               --arg source_sha "${{ needs.prepare.outputs.sha }}" \
-              --arg certificate_identity "$COSIGN_CERTIFICATE_IDENTITY" \
               '.arch == $arch and
                .platform == $platform and
                .version == $version and
@@ -550,53 +641,77 @@ jobs:
                .smoke_tested == true and
                .signature_verified == true and
                .signature_created == (.reused_immutable_tag | not) and
-               .certificate_identity == $certificate_identity and
+               (.certificate_identity | type == "string" and startswith("https://github.com/")) and
+               (.reuse_mode == "same_run" or .reuse_mode == "canonical_tag_run") and
                (.digest | test("^sha256:[0-9a-f]{64}$"))' \
               "$file" >/dev/null
             jq -e \
               --arg version "${{ needs.prepare.outputs.tag }}" \
               '.success == true and .version == $version' \
               "$status_file" >/dev/null
-            if jq -e '.reused_immutable_tag == true' "$file" >/dev/null; then
-              registries=(ghcr)
-              if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
-                registries+=(dockerhub)
+            registries=(ghcr)
+            if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+              registries+=(dockerhub)
+            fi
+            for registry in "${registries[@]}"; do
+              verification_file="$RUNNER_TEMP/stable-digests/${arch}-verification/${registry}/verification.json"
+              cosign_file="$RUNNER_TEMP/stable-digests/${arch}-verification/${registry}/cosign.json"
+              if [ ! -f "$verification_file" ] || [ ! -f "$cosign_file" ]; then
+                echo "::error::Missing trusted architecture evidence for $arch in $registry."
+                exit 1
               fi
-              for registry in "${registries[@]}"; do
-                verification_file="$RUNNER_TEMP/stable-digests/${arch}-reuse/${registry}/verification.json"
-                cosign_file="$RUNNER_TEMP/stable-digests/${arch}-reuse/${registry}/cosign.json"
-                if [ ! -f "$verification_file" ] || [ ! -f "$cosign_file" ]; then
-                  echo "::error::Missing trusted reuse evidence for $arch in $registry."
-                  exit 1
-                fi
-                repository="ghcr.io/${GHCR_REPOSITORY}"
-                if [ "$registry" = dockerhub ]; then
-                  repository=$DOCKERHUB_REPOSITORY
-                fi
-                .github/scripts/verify-stable-reuse-handoff.sh \
-                  --verification "$verification_file" \
-                  --cosign "$cosign_file" \
-                  --source-sha "${{ needs.prepare.outputs.sha }}" \
-                  --run-id "$GITHUB_RUN_ID" \
-                  --run-attempt "$GITHUB_RUN_ATTEMPT" \
-                  --workflow-ref "$GITHUB_WORKFLOW_REF" \
-                  --workflow-sha "$GITHUB_WORKFLOW_SHA" \
-                  --repository "$repository" \
-                  --digest "$(jq -r '.digest' "$file")" \
-                  --platform "linux/$arch"
-              done
-              cp -R \
-                "$RUNNER_TEMP/stable-digests/${arch}-reuse" \
-                "$evidence_dir/smoke/${arch}-reuse"
-            elif [ -e "$RUNNER_TEMP/stable-digests/${arch}-reuse" ]; then
-              echo "::error::Unexpected reuse evidence for freshly built $arch image."
+              repository="ghcr.io/${GHCR_REPOSITORY}"
+              if [ "$registry" = dockerhub ]; then
+                repository=$DOCKERHUB_REPOSITORY
+              fi
+              "$RELEASE_CI_ROOT/.github/scripts/verify-stable-reuse-handoff.sh" \
+                --verification "$verification_file" \
+                --cosign "$cosign_file" \
+                --source-repository "$GITHUB_REPOSITORY" \
+                --source-sha "${{ needs.prepare.outputs.sha }}" \
+                --version "${{ needs.prepare.outputs.tag }}" \
+                --run-id "$GITHUB_RUN_ID" \
+                --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --workflow-ref "$GITHUB_WORKFLOW_REF" \
+                --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+                --repository "$repository" \
+                --digest "$(jq -r '.digest' "$file")" \
+                --platform "linux/$arch"
+              jq -e \
+                --slurpfile verification "$verification_file" '
+                .certificate_identity == $verification[0].signature.certificate_identity and
+                .reuse_mode == $verification[0].reuse_policy.mode and
+                (if .reused_immutable_tag then true else .reuse_mode == "same_run" end)
+              ' "$file" >/dev/null
+            done
+            if [ "$DOCKERHUB_ENABLED" = 'true' ] && ! jq -n -e \
+              --slurpfile ghcr "$RUNNER_TEMP/stable-digests/${arch}-verification/ghcr/verification.json" \
+              --slurpfile dockerhub "$RUNNER_TEMP/stable-digests/${arch}-verification/dockerhub/verification.json" \
+              --arg platform "linux/$arch" \
+              '$ghcr[0].attested_runs[$platform] == $dockerhub[0].attested_runs[$platform] and
+               $ghcr[0].reuse_policy.mode == $dockerhub[0].reuse_policy.mode' >/dev/null; then
+              echo "::error::Registry architecture evidence disagrees for $arch."
               exit 1
             fi
+            cp -R \
+              "$RUNNER_TEMP/stable-digests/${arch}-verification" \
+              "$evidence_dir/smoke/${arch}-verification"
             cp "$file" "$evidence_dir/smoke/${arch}.json"
             cp "$status_file" "$evidence_dir/smoke/${arch}-status.json"
           done
           echo "AMD64_DIGEST=$(jq -r '.digest' "$RUNNER_TEMP/stable-digests/amd64.json")" >> "$GITHUB_ENV"
           echo "ARM64_DIGEST=$(jq -r '.digest' "$RUNNER_TEMP/stable-digests/arm64.json")" >> "$GITHUB_ENV"
+          jq -n \
+            --slurpfile amd64 "$RUNNER_TEMP/stable-digests/amd64-verification/ghcr/verification.json" \
+            --slurpfile arm64 "$RUNNER_TEMP/stable-digests/arm64-verification/ghcr/verification.json" '
+            def handoff($evidence; $platform):
+              $evidence.attested_runs[$platform] |
+              {run_id, run_attempt, workflow_ref, workflow_sha, mode};
+            {
+              "linux/amd64": handoff($amd64[0]; "linux/amd64"),
+              "linux/arm64": handoff($arm64[0]; "linux/arm64")
+            }
+          ' > "$evidence_dir/attested-runs.json"
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
@@ -719,9 +834,10 @@ jobs:
             local sbom_file="$evidence_dir/attestations/${evidence_prefix}-sbom.json"
             local provenance_file="$evidence_dir/attestations/${evidence_prefix}-provenance.json"
             local verification_file="$evidence_dir/attestations/${evidence_prefix}-verification.json"
+            local verification_base_file="$evidence_dir/attestations/${evidence_prefix}-verification-base.json"
             docker buildx imagetools inspect "$immutable_reference" --format '{{json .SBOM}}' > "$sbom_file"
             docker buildx imagetools inspect "$immutable_reference" --format '{{json .Provenance}}' > "$provenance_file"
-            .github/scripts/verify-release-attestations.sh \
+            "$RELEASE_CI_ROOT/.github/scripts/verify-release-attestations.sh" \
               --sbom "$sbom_file" \
               --provenance "$provenance_file" \
               --source-repository "$GITHUB_REPOSITORY" \
@@ -730,8 +846,24 @@ jobs:
               --run-attempt "$GITHUB_RUN_ATTEMPT" \
               --workflow-ref "$GITHUB_WORKFLOW_REF" \
               --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --attested-runs "$evidence_dir/attested-runs.json" \
+              --release-tag "$TAG" \
               --image-reference "$immutable_reference" \
-              --output "$verification_file"
+              --output "$verification_base_file"
+            jq \
+              --arg immutable_reference "$immutable_reference" \
+              --arg digest "$digest" '
+              . + {
+                retrieval_binding: {
+                  immutable_reference: $immutable_reference,
+                  requested_digest: $digest,
+                  resolved_manifest_digest: $digest,
+                  sbom_and_provenance_retrieved_by_digest: true
+                }
+              } |
+              .checks.immutable_retrieval_binding = true
+            ' "$verification_base_file" > "$verification_file"
+            rm -f "$verification_base_file"
 
             printf '%s\n' "$digest" > "$evidence_dir/${evidence_prefix}-candidate.digest"
           }
@@ -855,44 +987,79 @@ jobs:
             fi
           }
 
-          assert_latest_not_newer() {
+          plan_latest() {
             local repository=$1
-            local expected_digest=$2
-            local evidence_name=$3
-            local reference="${repository}:latest"
-            local manifest_file="$evidence_dir/preflight-${evidence_name}-latest.json"
-            local image_file="$evidence_dir/preflight-${evidence_name}-latest-images.json"
-            if inspect_optional_manifest "$reference" "$manifest_file"; then
-              local actual_digest
-              actual_digest=$(jq -r '.digest' "$manifest_file")
-              docker buildx imagetools inspect "$reference" --format '{{json .Image}}' > "$image_file"
-              mapfile -t versions < <(jq -r '[.[] | .config.Labels["org.opencontainers.image.version"] // ""] | unique[]' "$image_file")
-              if [ "${#versions[@]}" -ne 1 ] || [[ ! "${versions[0]}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-                echo "::error::Existing $reference does not expose one trustworthy stable version label."
-                exit 1
-              fi
-              highest=$(printf '%s\n%s\n' "${versions[0]}" "$TAG" | LC_ALL=C sort -V | tail -n 1)
-              if [ "$highest" != "$TAG" ]; then
-                echo "::error::Refusing to move latest backward from ${versions[0]} to $TAG."
-                exit 1
-              fi
-              if [ "${versions[0]}" = "$TAG" ] && [ "$actual_digest" != "$expected_digest" ]; then
-                echo "::error::Existing $reference claims $TAG but has a different immutable digest."
-                exit 1
-              fi
+            local candidate_digest=$2
+            local prefix=$3
+            local output_file="$RUNNER_TEMP/${prefix}-latest-plan.env"
+            local promote_latest
+            local expected_latest_digest
+            local current_latest_digest
+            local current_latest_version
+            "$RELEASE_CI_ROOT/.github/scripts/resolve-stable-latest.sh" \
+              --repository "$repository" \
+              --tag "$TAG" \
+              --candidate-digest "$candidate_digest" \
+              --output "$output_file"
+            promote_latest=''
+            expected_latest_digest=''
+            current_latest_digest=''
+            current_latest_version=''
+            while IFS='=' read -r key value; do
+              case "$key" in
+                promote_latest) promote_latest=$value ;;
+                expected_latest_digest) expected_latest_digest=$value ;;
+                current_latest_digest) current_latest_digest=$value ;;
+                current_latest_version) current_latest_version=$value ;;
+                *)
+                  echo "::error::Unexpected stable latest plan key: $key"
+                  exit 1
+                  ;;
+              esac
+            done < "$output_file"
+            case "$promote_latest" in
+              true|false) ;;
+              *) echo '::error::Stable latest plan omitted a valid promotion decision.'; exit 1 ;;
+            esac
+            if [[ ! "$expected_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::Stable latest plan omitted a valid expected digest.'
+              exit 1
             fi
+            if [ -n "$current_latest_digest" ] &&
+              [[ ! "$current_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::Stable latest plan returned an invalid previous digest.'
+              exit 1
+            fi
+            if [ -n "$current_latest_version" ] &&
+              [[ ! "$current_latest_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo '::error::Stable latest plan returned an invalid previous version.'
+              exit 1
+            fi
+            {
+              echo "${prefix}_PROMOTE_LATEST=$promote_latest"
+              echo "${prefix}_EXPECTED_LATEST_DIGEST=$expected_latest_digest"
+              echo "${prefix}_PREVIOUS_LATEST_DIGEST=$current_latest_digest"
+              echo "${prefix}_PREVIOUS_LATEST_VERSION=$current_latest_version"
+            } >> "$GITHUB_ENV"
           }
 
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" ghcr-amd64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" ghcr-arm64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}" "$GHCR_CANDIDATE_DIGEST" ghcr-version
-          assert_latest_not_newer "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" ghcr
+          plan_latest "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" GHCR
 
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" dockerhub-amd64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" dockerhub-arm64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub-version
-            assert_latest_not_newer "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub
+            plan_latest "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" DOCKERHUB
+          else
+            {
+              echo 'DOCKERHUB_PROMOTE_LATEST=false'
+              echo 'DOCKERHUB_EXPECTED_LATEST_DIGEST='
+              echo 'DOCKERHUB_PREVIOUS_LATEST_DIGEST='
+              echo 'DOCKERHUB_PREVIOUS_LATEST_VERSION='
+            } >> "$GITHUB_ENV"
           fi
 
       - name: Promote signed candidates to stable tags
@@ -902,21 +1069,28 @@ jobs:
           promote_registry() {
             local repository=$1
             local manifest_digest=$2
+            local promote_latest=$3
             docker buildx imagetools create \
               -t "${repository}:${TAG}-amd64" \
               "${repository}@${AMD64_DIGEST}"
             docker buildx imagetools create \
               -t "${repository}:${TAG}-arm64" \
               "${repository}@${ARM64_DIGEST}"
-            docker buildx imagetools create \
-              -t "${repository}:${TAG}" \
-              -t "${repository}:latest" \
-              "${repository}@${manifest_digest}"
+            if [ "$promote_latest" = 'true' ]; then
+              docker buildx imagetools create \
+                -t "${repository}:${TAG}" \
+                -t "${repository}:latest" \
+                "${repository}@${manifest_digest}"
+            else
+              docker buildx imagetools create \
+                -t "${repository}:${TAG}" \
+                "${repository}@${manifest_digest}"
+            fi
           }
 
-          promote_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST"
+          promote_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" "$GHCR_PROMOTE_LATEST"
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
-            promote_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST"
+            promote_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" "$DOCKERHUB_PROMOTE_LATEST"
           fi
 
       - name: Verify promoted tags and signatures
@@ -926,8 +1100,9 @@ jobs:
 
           verify_promoted_registry() {
             local repository=$1
-            local expected_digest=$2
-            local evidence_prefix=$3
+            local expected_version_digest=$2
+            local expected_latest_digest=$3
+            local evidence_prefix=$4
             local version_file="$evidence_dir/${evidence_prefix}-version-manifest.json"
             local latest_file="$evidence_dir/${evidence_prefix}-latest-manifest.json"
             local version_digest
@@ -941,8 +1116,12 @@ jobs:
             latest_digest=$(jq -r '.digest' "$latest_file")
             amd64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-amd64" --format '{{.Manifest.Digest}}')
             arm64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-arm64" --format '{{.Manifest.Digest}}')
-            if [ "$version_digest" != "$expected_digest" ] || [ "$latest_digest" != "$expected_digest" ]; then
-              echo "::error::Promoted $repository version/latest digest does not match the signed candidate."
+            if [ "$version_digest" != "$expected_version_digest" ]; then
+              echo "::error::Promoted $repository version digest does not match the signed candidate."
+              exit 1
+            fi
+            if [ "$latest_digest" != "$expected_latest_digest" ]; then
+              echo "::error::Promoted $repository latest digest changed unexpectedly."
               exit 1
             fi
             if [ "$amd64_digest" != "$AMD64_DIGEST" ] || [ "$arm64_digest" != "$ARM64_DIGEST" ]; then
@@ -954,22 +1133,34 @@ jobs:
               --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
               --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
               --output json \
-              "${repository}@${expected_digest}" > "$evidence_dir/cosign-${evidence_prefix}-stable.json"
+              "${repository}@${expected_version_digest}" > "$evidence_dir/cosign-${evidence_prefix}-stable.json"
+            amd64_identity=$(jq -r '.signature.certificate_identity' \
+              "$RUNNER_TEMP/stable-digests/amd64-verification/${evidence_prefix}/verification.json")
+            arm64_identity=$(jq -r '.signature.certificate_identity' \
+              "$RUNNER_TEMP/stable-digests/arm64-verification/${evidence_prefix}/verification.json")
             cosign verify \
-              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-identity "$amd64_identity" \
               --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
               --output json \
               "${repository}@${AMD64_DIGEST}" > "$evidence_dir/cosign-${evidence_prefix}-amd64.json"
             cosign verify \
-              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-identity "$arm64_identity" \
               --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
               --output json \
               "${repository}@${ARM64_DIGEST}" > "$evidence_dir/cosign-${evidence_prefix}-arm64.json"
           }
 
-          verify_promoted_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" ghcr
+          verify_promoted_registry \
+            "ghcr.io/${GHCR_REPOSITORY}" \
+            "$GHCR_CANDIDATE_DIGEST" \
+            "$GHCR_EXPECTED_LATEST_DIGEST" \
+            ghcr
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
-            verify_promoted_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub
+            verify_promoted_registry \
+              "$DOCKERHUB_REPOSITORY" \
+              "$DOCKERHUB_CANDIDATE_DIGEST" \
+              "$DOCKERHUB_EXPECTED_LATEST_DIGEST" \
+              dockerhub
           fi
 
       - name: Write release evidence
@@ -1029,7 +1220,9 @@ jobs:
                 latest_monotonic: true,
                 tag_revalidated: true,
                 signatures_verified: true,
-                attestation_contents_verified: true
+                attestation_contents_verified: true,
+                trusted_workflow_tooling: true,
+                immutable_attestation_retrieval: true
               }
             }' \
             > "$evidence_dir/release.json"

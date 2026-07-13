@@ -58,6 +58,7 @@ jobs:
           .github/scripts/tests/test-publish-gitee-release.sh
           .github/scripts/tests/test-pinned-container-toolchain.sh
           .github/scripts/tests/test-resolve-stable-architecture.sh
+          .github/scripts/tests/test-resolve-stable-latest.sh
           .github/scripts/tests/test-verify-release-attestations.sh
           .github/scripts/tests/test-verify-stable-architecture.sh
           .github/scripts/tests/test-verify-stable-reuse-handoff.sh

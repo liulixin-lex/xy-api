@@ -120,11 +120,33 @@ grep -Fq 'published release v0.1.11 is missing required assets' "$temp_dir/publi
 
 create_electron_assets
 write_release_json true
+if "$finalizer" \
+  --tag v0.1.11 \
+  --verify-only \
+  --download-dir "$temp_dir/draft-download" \
+  > "$temp_dir/draft-verify.stdout" 2> "$temp_dir/draft-verify.stderr"; then
+  echo 'expected read-only verification of a draft release to fail' >&2
+  exit 1
+fi
+grep -Fq 'must already be published' "$temp_dir/draft-verify.stderr"
 : > "$MOCK_CALLS"
 "$finalizer" --tag v0.1.11 > "$temp_dir/complete.stdout"
 grep -Fq 'complete verified 10-asset inventory' "$temp_dir/complete.stdout"
 grep -Fq 'api --method PATCH repos/liulixin-lex/xy-api/releases/101' "$MOCK_CALLS"
 grep -Fq 'release edit v0.1.11 --repo liulixin-lex/xy-api --latest' "$MOCK_CALLS"
+
+: > "$MOCK_CALLS"
+"$finalizer" \
+  --tag v0.1.11 \
+  --verify-only \
+  --download-dir "$temp_dir/verified-download" > "$temp_dir/verify-only.stdout"
+grep -Fq 'complete verified 10-asset inventory (read-only)' "$temp_dir/verify-only.stdout"
+find "$temp_dir/verified-download" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+  LC_ALL=C sort > "$temp_dir/verify-only-assets.txt"
+find "$MOCK_ASSET_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+  LC_ALL=C sort > "$temp_dir/source-assets.txt"
+cmp "$temp_dir/source-assets.txt" "$temp_dir/verify-only-assets.txt"
+[ ! -s "$MOCK_CALLS" ]
 
 rm -f "$MOCK_ASSET_DIR"/*
 create_electron_assets

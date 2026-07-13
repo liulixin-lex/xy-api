@@ -8,6 +8,8 @@ fail() {
 }
 
 tag=''
+verify_only=false
+requested_download_dir=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --tag)
@@ -15,8 +17,17 @@ while [ "$#" -gt 0 ]; do
       tag=$2
       shift 2
       ;;
+    --verify-only)
+      verify_only=true
+      shift
+      ;;
+    --download-dir)
+      [ "$#" -ge 2 ] || fail '--download-dir requires a value'
+      requested_download_dir=$2
+      shift 2
+      ;;
     --help|-h)
-      printf 'Usage: finalize-release-assets.sh --tag TAG\n'
+      printf 'Usage: finalize-release-assets.sh --tag TAG [--verify-only --download-dir DIRECTORY]\n'
       exit 0
       ;;
     *)
@@ -33,6 +44,11 @@ if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
 fi
 if [[ ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   fail "invalid GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}"
+fi
+if [ "$verify_only" = true ]; then
+  [ -n "$requested_download_dir" ] || fail '--verify-only requires --download-dir'
+elif [ -n "$requested_download_dir" ]; then
+  fail '--download-dir requires --verify-only'
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -72,6 +88,9 @@ jq -e --arg tag "$tag" '
     (.name | length) > 0 and
     (.name | contains("\n") | not))
 ' "$release_file" >/dev/null || fail "release $tag is not a valid stable release or draft"
+if [ "$verify_only" = true ] && ! jq -e '.isDraft == false' "$release_file" >/dev/null; then
+  fail "release $tag must already be published before read-only verification"
+fi
 
 jq -r '.assets[].name' "$release_file" | LC_ALL=C sort > "$actual_file"
 if [ -n "$(uniq -d "$actual_file")" ]; then
@@ -93,10 +112,10 @@ if [ -s "$missing_file" ]; then
   exit 0
 fi
 
-download_dir="$temp_dir/assets"
-mkdir -p "$download_dir"
-gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$download_dir"
-find "$download_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+verified_assets_dir="$temp_dir/assets"
+mkdir -p "$verified_assets_dir"
+gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$verified_assets_dir"
+find "$verified_assets_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
   LC_ALL=C sort > "$temp_dir/downloaded-assets.txt"
 if ! cmp -s "$expected_file" "$temp_dir/downloaded-assets.txt"; then
   fail 'downloaded release asset inventory changed during finalization'
@@ -120,7 +139,7 @@ validate_checksum_inventory() {
       next
     }
     { exit 1 }
-  ' "$download_dir/$checksum_file" | LC_ALL=C sort > "$actual" ||
+  ' "$verified_assets_dir/$checksum_file" | LC_ALL=C sort > "$actual" ||
     fail "invalid checksum syntax in $checksum_file"
   if ! cmp -s "$expected" "$actual"; then
     fail "checksum inventory does not match required assets: $checksum_file"
@@ -137,12 +156,25 @@ validate_checksum_inventory checksums-electron-windows.txt \
   "New-API-App.Setup.${version}.exe"
 
 (
-  cd "$download_dir"
+  cd "$verified_assets_dir"
   sha256sum --check --strict checksums-linux.txt
   sha256sum --check --strict checksums-macos.txt
   sha256sum --check --strict checksums-windows.txt
   sha256sum --check --strict checksums-electron-windows.txt
 ) >/dev/null
+
+if [ "$verify_only" = true ]; then
+  if [ -e "$requested_download_dir" ] &&
+    [ -n "$(find "$requested_download_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    fail "download directory must be empty: $requested_download_dir"
+  fi
+  mkdir -p "$requested_download_dir"
+  while IFS= read -r asset_name; do
+    cp -p -- "$verified_assets_dir/$asset_name" "$requested_download_dir/$asset_name"
+  done < "$expected_file"
+  printf 'release %s has the complete verified 10-asset inventory (read-only)\n' "$tag"
+  exit 0
+fi
 
 if jq -e '.isDraft == true' "$release_file" >/dev/null; then
   api_base=${GITHUB_API_URL:-https://api.github.com}

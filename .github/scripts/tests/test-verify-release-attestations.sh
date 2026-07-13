@@ -42,6 +42,27 @@ verify() {
   "$verifier" "${args[@]}"
 }
 
+verify_attested() {
+  local sbom=$1
+  local provenance=$2
+  local attested_runs=$3
+  local output=$4
+
+  "$verifier" \
+    --sbom "$sbom" \
+    --provenance "$provenance" \
+    --source-repository "$source_repository" \
+    --source-sha "$source_sha" \
+    --run-id "$run_id" \
+    --run-attempt "$run_attempt" \
+    --workflow-ref "$workflow_ref" \
+    --workflow-sha "$workflow_sha" \
+    --attested-runs "$attested_runs" \
+    --release-tag v0.1.11 \
+    --image-reference "$image_reference" \
+    --output "$output"
+}
+
 expect_failure() {
   local name=$1
   shift
@@ -118,6 +139,79 @@ jq -e '
   .platforms["linux/amd64"].provenance.builder_id ==
     "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/1"
 ' "$temp_dir/mixed-attempts-summary.json" >/dev/null
+
+jq \
+  --arg source_sha "$source_sha" '
+  ."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_id = "987654321" |
+  ."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_attempt = "4" |
+  ."linux/amd64".SLSA.buildDefinition.internalParameters.github_workflow_sha = $source_sha |
+  ."linux/amd64".SLSA.runDetails.builder.id =
+    "https://github.com/liulixin-lex/xy-api/actions/runs/987654321/attempts/4"
+' "$valid_provenance" > "$temp_dir/historical-provenance.json"
+jq -n \
+  --arg workflow_ref "$workflow_ref" \
+  --arg workflow_sha "$workflow_sha" \
+  --arg source_sha "$source_sha" '{
+  "linux/amd64": {
+    run_id: "987654321",
+    run_attempt: "4",
+    workflow_ref: $workflow_ref,
+    workflow_sha: $source_sha,
+    mode: "canonical_tag_run"
+  },
+  "linux/arm64": {
+    run_id: "123456789",
+    run_attempt: "2",
+    workflow_ref: $workflow_ref,
+    workflow_sha: $workflow_sha,
+    mode: "same_run"
+  }
+}' > "$temp_dir/historical-runs.json"
+verify_attested \
+  "$valid_sbom" \
+  "$temp_dir/historical-provenance.json" \
+  "$temp_dir/historical-runs.json" \
+  "$temp_dir/historical-summary.json"
+jq -e '
+  .verifier_run.run_id == "123456789" and
+  .attested_runs["linux/amd64"].run_id == "987654321" and
+  .attested_runs["linux/amd64"].mode == "canonical_tag_run" and
+  .attested_runs["linux/arm64"].mode == "same_run" and
+  .actions_run.run_id == null
+' "$temp_dir/historical-summary.json" >/dev/null
+
+jq '."linux/amd64".workflow_ref =
+  "liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/heads/old-release"' \
+  "$temp_dir/historical-runs.json" > "$temp_dir/arbitrary-historical-run.json"
+expect_failure arbitrary-historical-run verify_attested \
+  "$valid_sbom" \
+  "$temp_dir/historical-provenance.json" \
+  "$temp_dir/arbitrary-historical-run.json" \
+  "$temp_dir/arbitrary-historical-output.json"
+
+jq '."linux/amd64".workflow_sha = "2222222222222222222222222222222222222222"' \
+  "$temp_dir/historical-runs.json" > "$temp_dir/historical-wrong-workflow-sha.json"
+expect_failure historical-wrong-workflow-sha verify_attested \
+  "$valid_sbom" \
+  "$temp_dir/historical-provenance.json" \
+  "$temp_dir/historical-wrong-workflow-sha.json" \
+  "$temp_dir/historical-wrong-workflow-sha-output.json"
+
+jq '."linux/arm64".run_attempt = "3"' \
+  "$temp_dir/historical-runs.json" > "$temp_dir/same-run-future-attempt.json"
+expect_failure same-run-future-attempt verify_attested \
+  "$valid_sbom" \
+  "$temp_dir/historical-provenance.json" \
+  "$temp_dir/same-run-future-attempt.json" \
+  "$temp_dir/same-run-future-attempt-output.json"
+
+jq '."linux/amd64".run_attempt = "3"' \
+  "$temp_dir/historical-runs.json" > "$temp_dir/historical-attempt-mismatch.json"
+expect_failure historical-attempt-mismatch verify_attested \
+  "$valid_sbom" \
+  "$temp_dir/historical-provenance.json" \
+  "$temp_dir/historical-attempt-mismatch.json" \
+  "$temp_dir/historical-attempt-mismatch-output.json"
 
 jq '
   ."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_attempt = "3" |
