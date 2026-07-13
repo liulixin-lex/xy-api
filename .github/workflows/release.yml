@@ -1,12 +1,16 @@
 name: Release (Linux, macOS, Windows)
 permissions:
-  contents: write
+  contents: read
 
 on:
   workflow_dispatch:
     inputs:
       tag:
         description: 'Release tag to build (e.g., v0.0.1)'
+        required: true
+        type: string
+      confirm_tag:
+        description: 'Type the same tag again to confirm this stable release'
         required: true
         type: string
       name:
@@ -17,28 +21,94 @@ on:
       - 'v*'
       - '!v*-*'
 
+concurrency:
+  group: stable-binary-release-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
 jobs:
+  prepare:
+    name: Validate stable release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    permissions:
+      contents: read
+    steps:
+      - name: Validate release request
+        env:
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Stable release tags must use lowercase v semver. Current value: $RELEASE_TAG"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ] && [ "$CONFIRM_TAG" != "$RELEASE_TAG" ]; then
+            echo '::error::confirm_tag must exactly match tag before publishing release assets.'
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ] && [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Manual stable releases must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+
+      - name: Validate tag, VERSION, and main ancestry
+        id: release
+        run: |
+          set -euo pipefail
+          if ! cmp -s VERSION <(printf '%s\n' "$RELEASE_TAG"); then
+            echo "::error::VERSION must contain exactly $RELEASE_TAG followed by one newline."
+            exit 1
+          fi
+
+          release_sha=$(git rev-parse HEAD)
+          tag_sha=$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")
+          if [ "$tag_sha" != "$release_sha" ]; then
+            echo "::error::Tag $RELEASE_TAG does not resolve to the checked-out commit."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$release_sha" origin/main; then
+            echo "::error::Release commit $release_sha is not an ancestor of origin/main."
+            exit 1
+          fi
+
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+
   linux:
     name: Linux Release
+    needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 1
       - name: Determine Version
         run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          VERSION="${{ needs.prepare.outputs.tag }}"
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
             exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.3.14'
@@ -67,40 +137,44 @@ jobs:
       - name: Build Backend (amd64)
         run: |
           go mod download
-          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o new-api-$VERSION
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o "new-api-$VERSION"
       - name: Build Backend (arm64)
         run: |
           sudo apt-get update
           DEBIAN_FRONTEND=noninteractive sudo apt-get install -y gcc-aarch64-linux-gnu
-          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o new-api-arm64-$VERSION
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o "new-api-arm64-$VERSION"
       - name: Generate checksums
         run: sha256sum new-api-* > checksums-linux.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release
           path: |
             new-api-*
             checksums-linux.txt
+          if-no-files-found: error
+          overwrite: true
 
   macos:
     name: macOS Release
+    needs: prepare
     runs-on: macos-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 1
       - name: Determine Version
         run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          VERSION="${{ needs.prepare.outputs.tag }}"
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
             exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.3.14'
@@ -130,21 +204,25 @@ jobs:
       - name: Build Backend
         run: |
           go mod download
-          go build -ldflags "-X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-macos-$VERSION
+          go build -ldflags "-X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o "new-api-macos-$VERSION"
       - name: Generate checksums
         run: shasum -a 256 new-api-macos-* > checksums-macos.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-release
           path: |
             new-api-macos-*
             checksums-macos.txt
+          if-no-files-found: error
+          overwrite: true
 
   windows:
     name: Windows Release
+    needs: prepare
     runs-on: windows-latest
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -152,16 +230,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 1
       - name: Determine Version
         run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          VERSION="${{ needs.prepare.outputs.tag }}"
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
             exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: '1.3.14'
@@ -190,37 +268,61 @@ jobs:
       - name: Build Backend
         run: |
           go mod download
-          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-$VERSION.exe
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o "new-api-$VERSION.exe"
       - name: Generate checksums
         run: sha256sum new-api-*.exe > checksums-windows.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-release
           path: |
             new-api-*.exe
             checksums-windows.txt
+          if-no-files-found: error
+          overwrite: true
 
   release:
     name: Upload Release
-    needs: [linux, macos, windows]
+    needs: [prepare, linux, macos, windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     concurrency:
-      group: release-upload-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      group: release-upload-${{ needs.prepare.outputs.tag }}
       cancel-in-progress: false
+    permissions:
+      contents: write
     steps:
+      - name: Check out validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
           merge-multiple: true
 
+      - name: Revalidate release tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          current_tag_sha=$(git rev-list -n 1 "refs/tags/${TAG}")
+          if [ "$current_tag_sha" != '${{ needs.prepare.outputs.sha }}' ]; then
+            echo "::error::Release tag $TAG moved during the build; refusing asset upload."
+            exit 1
+          fi
+
       - name: Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          fail_on_unmatched_files: true
           files: |
             release-assets/*
         env:

@@ -10,24 +10,43 @@ on:
         description: "reason"
         required: false
 
+concurrency:
+  group: rolling-container-publish-nightly-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   prepare_version:
     name: Prepare nightly version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
+      sha: ${{ steps.version.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
     steps:
+      - name: Validate manual nightly request
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Manual nightly builds must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+
       - name: Check out (shallow)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/nightly' || github.sha }}
 
       - name: Determine nightly version
         id: version
         run: |
           VERSION="nightly-$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Prepared nightly version: $VERSION"
 
@@ -45,6 +64,7 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -56,42 +76,43 @@ jobs:
 
     steps:
       - name: Check out (shallow)
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
+          ref: ${{ needs.prepare_version.outputs.sha }}
 
       - name: Determine nightly version
         id: version
         run: |
           VERSION="${{ needs.prepare_version.outputs.version }}"
           echo "$VERSION" > VERSION
-          echo "value=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Publishing version: $VERSION for ${{ matrix.arch }}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ghcr.io/${{ env.GHCR_REPOSITORY }}
@@ -112,7 +133,7 @@ jobs:
 
       - name: Build & push single-arch
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -126,19 +147,22 @@ jobs:
 
       - name: Output digest
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "ghcr.io/${GHCR_REPOSITORY}:nightly-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "${DOCKERHUB_REPOSITORY}:nightly-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Docker Image Digest (${{ matrix.arch }})"
+            echo '```'
+            echo "ghcr.io/${GHCR_REPOSITORY}:nightly-${{ matrix.arch }}"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo "${DOCKERHUB_REPOSITORY}:nightly-${{ matrix.arch }}"
+            fi
+            echo "${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   create_manifests:
     name: Create multi-arch manifests
     needs: [prepare_version, build_single_arch]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -149,16 +173,16 @@ jobs:
 
     steps:
       - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set nightly version
         run: |
           VERSION="${{ needs.prepare_version.outputs.version }}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -167,46 +191,48 @@ jobs:
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:nightly \
-            ${DOCKERHUB_REPOSITORY}:nightly-amd64 \
-            ${DOCKERHUB_REPOSITORY}:nightly-arm64
+            -t "${DOCKERHUB_REPOSITORY}:nightly" \
+            "${DOCKERHUB_REPOSITORY}:nightly-amd64" \
+            "${DOCKERHUB_REPOSITORY}:nightly-arm64"
 
       - name: Create & push manifest (Docker Hub - versioned nightly)
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${VERSION} \
-            ${DOCKERHUB_REPOSITORY}:${VERSION}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${VERSION}-arm64
+            -t "${DOCKERHUB_REPOSITORY}:${VERSION}" \
+            "${DOCKERHUB_REPOSITORY}:${VERSION}-amd64" \
+            "${DOCKERHUB_REPOSITORY}:${VERSION}-arm64"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create & push manifest (GHCR - nightly)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:nightly \
-            ghcr.io/${GHCR_REPOSITORY}:nightly-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:nightly-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:nightly" \
+            "ghcr.io/${GHCR_REPOSITORY}:nightly-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:nightly-arm64"
 
       - name: Create & push manifest (GHCR - versioned nightly)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${VERSION} \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:${VERSION}" \
+            "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64"
 
       - name: Output manifest digest
         run: |
-          echo "### Multi-arch Manifest Digests" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:nightly >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "---" >> $GITHUB_STEP_SUMMARY
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:nightly >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo '### Multi-arch Manifest Digests'
+            echo '```'
+            docker buildx imagetools inspect "ghcr.io/${GHCR_REPOSITORY}:nightly"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo '---'
+              docker buildx imagetools inspect "${DOCKERHUB_REPOSITORY}:nightly"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
