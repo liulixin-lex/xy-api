@@ -21,6 +21,8 @@ import { describe, test } from 'node:test'
 
 import type { RoutingCostBinding } from '../types'
 import {
+  boundedCostBindingGroups,
+  COST_BINDING_GROUP_DOM_LIMIT,
   costBindingFormValues,
   costBindingRequest,
   costBindingUpdateRequest,
@@ -109,6 +111,42 @@ describe('channel routing cost binding form contract', () => {
     assert.equal(request.enabled, false)
   })
 
+  test('serializes only provider credentials plus shared gateway and CA settings', () => {
+    const values = costBindingFormValues(binding)
+    values.newApiAccessToken = 'newapi-token'
+    values.sub2apiEmail = 'operator@example.com'
+    values.sub2apiPassword = 'sub2api-password'
+    values.sub2apiToken = 'sub2api-token'
+    values.gatewayApiKey = 'gateway-key'
+    values.customCaPem = 'shared-ca'
+
+    assert.deepEqual(costBindingRequest(values).credentials, {
+      new_api_access_token: 'newapi-token',
+      gateway_api_key: 'gateway-key',
+      custom_ca_pem: 'shared-ca',
+    })
+
+    values.upstreamType = 'sub2api'
+    assert.deepEqual(costBindingRequest(values).credentials, {
+      sub2api_email: 'operator@example.com',
+      sub2api_password: 'sub2api-password',
+      sub2api_token: 'sub2api-token',
+      gateway_api_key: 'gateway-key',
+      custom_ca_pem: 'shared-ca',
+    })
+  })
+
+  test('does not clear credentials owned by an inactive provider', () => {
+    const values = costBindingFormValues(binding)
+    values.upstreamType = 'sub2api'
+    values.clearNewApiAccessToken = true
+    values.clearSub2apiToken = true
+
+    assert.deepEqual(costBindingRequest(values).credentials, {
+      sub2api_token: '',
+    })
+  })
+
   test('omits an optional user ID that contains only whitespace', () => {
     const values = costBindingFormValues(binding)
     values.newApiUserId = '   '
@@ -190,5 +228,32 @@ describe('channel routing cost binding form contract', () => {
       enabled: false,
       credentials: {},
     })
+  })
+
+  test('bounds and deduplicates untrusted upstream groups for UI state', () => {
+    const groups = Array.from(
+      { length: COST_BINDING_GROUP_DOM_LIMIT + 50 },
+      (_, index) => `group-${index}`
+    )
+    groups.splice(2, 0, 'group-1', '', 'x'.repeat(129))
+
+    const result = boundedCostBindingGroups({
+      channel_id: 42,
+      upstream_type: 'newapi',
+      groups,
+      groups_total: 500,
+      groups_truncated: true,
+      model_count: 12,
+    })
+
+    assert.equal(result.groups.length, COST_BINDING_GROUP_DOM_LIMIT)
+    assert.equal(new Set(result.groups).size, COST_BINDING_GROUP_DOM_LIMIT)
+    assert.equal(result.groups_total, 500)
+    assert.equal(result.groups_truncated, true)
+    assert.equal(result.groups.includes(''), false)
+    assert.equal(
+      result.groups.some((group) => group.length > 128),
+      false
+    )
   })
 })

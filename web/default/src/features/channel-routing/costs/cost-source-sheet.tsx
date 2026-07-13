@@ -28,8 +28,8 @@ import {
   ShieldCheck,
   TriangleAlert,
 } from 'lucide-react'
-import { useEffect, useId, useMemo, useState } from 'react'
-import { useForm, useFormContext, useWatch } from 'react-hook-form'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -45,7 +45,6 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
 import {
   Form,
   FormControl,
@@ -81,40 +80,35 @@ import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   costBindingFormValues,
   costBindingRequest,
+  boundedCostBindingGroups,
   createCostBindingSchema,
   type CostBindingFormValues,
 } from '../lib/cost-binding'
+import {
+  costBindingServerFieldError,
+  CostBindingEditorSessionManager,
+  mergeCostBindingConflictDraft,
+  type CostBindingEditorSession,
+} from '../lib/cost-binding-editor'
 import type {
   RoutingCostBinding,
   RoutingCostBindingActionResult,
-  RoutingCostBindingCredentialMasks,
 } from '../types'
+import {
+  CostSourceCredentialFields,
+  CostSourceCredentialSummary,
+  CostSourceCustomCAField,
+} from './cost-source-credentials'
+import { CostSourceGroupDatalist } from './cost-source-groups'
 
-type CredentialValueName =
-  | 'newApiAccessToken'
-  | 'gatewayApiKey'
-  | 'sub2apiEmail'
-  | 'sub2apiPassword'
-  | 'sub2apiToken'
-
-type CredentialClearName =
-  | 'clearNewApiAccessToken'
-  | 'clearGatewayApiKey'
-  | 'clearSub2apiEmail'
-  | 'clearSub2apiPassword'
-  | 'clearSub2apiToken'
-
-const credentialRows: Array<{
-  key: keyof RoutingCostBindingCredentialMasks
-  label: string
-}> = [
-  { key: 'new_api_access_token', label: 'New API Access Token' },
-  { key: 'gateway_api_key', label: 'Gateway API Key' },
-  { key: 'sub2api_email', label: 'Sub2API Email' },
-  { key: 'sub2api_password', label: 'Sub2API Password' },
-  { key: 'sub2api_token', label: 'Sub2API Token' },
-  { key: 'custom_ca_configured', label: 'Custom CA' },
-]
+const credentialClearFields = [
+  'clearNewApiAccessToken',
+  'clearGatewayApiKey',
+  'clearSub2apiEmail',
+  'clearSub2apiPassword',
+  'clearSub2apiToken',
+  'clearCustomCaPem',
+] as const
 
 async function invalidateCostBindingSurfaces(
   queryClient: ReturnType<typeof useQueryClient>
@@ -136,180 +130,6 @@ async function invalidateCostBindingSurfaces(
       queryKey: channelRoutingQueryKeys.overview(),
     }),
   ])
-}
-
-export function CostSourceCredentialSummary(props: {
-  masks: RoutingCostBindingCredentialMasks
-  error?: string
-}) {
-  const { t } = useTranslation()
-  const saved = credentialRows.filter((row) => props.masks[row.key])
-
-  return (
-    <div className='space-y-3'>
-      {saved.length === 0 ? (
-        <p className='text-muted-foreground text-sm'>
-          {t('No credentials are saved for this cost source.')}
-        </p>
-      ) : (
-        <dl className='divide-y rounded-md border'>
-          {saved.map((row) => (
-            <div
-              key={row.key}
-              className='grid min-w-0 gap-1 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] sm:items-center'
-            >
-              <dt className='text-muted-foreground text-xs'>{t(row.label)}</dt>
-              <dd className='min-w-0 font-mono text-xs break-all sm:text-end'>
-                {typeof props.masks[row.key] === 'boolean'
-                  ? t('Configured')
-                  : props.masks[row.key]}
-              </dd>
-            </div>
-          ))}
-        </dl>
-      )}
-      {props.error ? (
-        <Alert variant='destructive' role='alert'>
-          <TriangleAlert aria-hidden='true' />
-          <AlertTitle>{t('Stored credentials could not be read')}</AlertTitle>
-          <AlertDescription className='break-words'>
-            {props.error}
-          </AlertDescription>
-        </Alert>
-      ) : null}
-    </div>
-  )
-}
-
-function CustomCACredentialField(props: { configured: boolean }) {
-  const { t } = useTranslation()
-  const form = useFormContext<CostBindingFormValues>()
-  const clear = Boolean(
-    useWatch({ control: form.control, name: 'clearCustomCaPem' })
-  )
-
-  return (
-    <FormField
-      control={form.control}
-      name='customCaPem'
-      render={({ field }) => (
-        <FormItem>
-          <FormLabel>{t('Custom CA')}</FormLabel>
-          <FormControl>
-            <Textarea
-              {...field}
-              value={field.value}
-              rows={6}
-              disabled={clear}
-              spellCheck={false}
-              autoComplete='off'
-              className='min-h-32 resize-y font-mono text-xs'
-              placeholder={
-                props.configured
-                  ? t('Leave blank to keep the saved value')
-                  : t('Paste a PEM-encoded CA certificate')
-              }
-            />
-          </FormControl>
-          <FormDescription>
-            {props.configured
-              ? t('A custom CA certificate is saved.')
-              : t(
-                  'System trust remains active when no custom CA is configured.'
-                )}
-          </FormDescription>
-          {props.configured ? (
-            <FormField
-              control={form.control}
-              name='clearCustomCaPem'
-              render={({ field: clearField }) => (
-                <label className='text-foreground flex min-h-11 cursor-pointer items-center gap-2 text-sm'>
-                  <Checkbox
-                    checked={clearField.value}
-                    onCheckedChange={(checked) =>
-                      clearField.onChange(Boolean(checked))
-                    }
-                  />
-                  <span>{t('Clear the saved custom CA')}</span>
-                </label>
-              )}
-            />
-          ) : null}
-          <FormMessage />
-        </FormItem>
-      )}
-    />
-  )
-}
-
-function CredentialField(props: {
-  valueName: CredentialValueName
-  clearName: CredentialClearName
-  label: string
-  mask?: string
-  type?: 'text' | 'password' | 'email'
-  autoComplete?: string
-}) {
-  const { t } = useTranslation()
-  const form = useFormContext<CostBindingFormValues>()
-  const clear = Boolean(
-    useWatch({ control: form.control, name: props.clearName })
-  )
-
-  return (
-    <FormField
-      control={form.control}
-      name={props.valueName}
-      render={({ field }) => (
-        <FormItem>
-          <FormLabel>{t(props.label)}</FormLabel>
-          <FormControl>
-            <Input
-              {...field}
-              value={field.value}
-              type={props.type ?? 'password'}
-              autoComplete={props.autoComplete ?? 'new-password'}
-              disabled={clear}
-              placeholder={
-                props.mask
-                  ? t('Leave blank to keep the saved value')
-                  : t('Optional')
-              }
-            />
-          </FormControl>
-          {props.mask ? (
-            <>
-              <FormDescription>
-                <span className='block font-mono text-xs break-all'>
-                  {t('Current saved value: {{mask}}', { mask: props.mask })}
-                </span>
-              </FormDescription>
-              <FormField
-                control={form.control}
-                name={props.clearName}
-                render={({ field: clearField }) => (
-                  <label className='text-foreground flex min-h-11 cursor-pointer items-center gap-2 text-sm'>
-                    <Checkbox
-                      checked={clearField.value}
-                      onCheckedChange={(checked) =>
-                        clearField.onChange(Boolean(checked))
-                      }
-                    />
-                    <span>{t('Clear the saved credential')}</span>
-                  </label>
-                )}
-              />
-            </>
-          ) : (
-            <FormDescription>
-              {t('Credentials are encrypted and never shown again.')}
-            </FormDescription>
-          )}
-          <FormMessage />
-        </FormItem>
-      )}
-    />
-  )
 }
 
 function saveErrorMessage(error: unknown, t: (key: string) => string): string {
@@ -342,6 +162,13 @@ function actionErrorMessage(
   return t('Could not contact the upstream cost source. Try again.')
 }
 
+function serverFieldError(error: unknown, t: (key: string) => string) {
+  return costBindingServerFieldError(
+    getChannelRoutingCostBindingApiError(error),
+    t
+  )
+}
+
 export function ChannelRoutingCostSourceSheet(props: {
   open: boolean
   binding: RoutingCostBinding | null
@@ -366,6 +193,24 @@ export function ChannelRoutingCostSourceSheet(props: {
     result: RoutingCostBindingActionResult
   } | null>(null)
   const [actionError, setActionError] = useState('')
+  const [conflictMerge, setConflictMerge] = useState<{
+    serverChangedLabels: string[]
+    overlappingLabels: string[]
+  } | null>(null)
+  const baselineBindingRef = useRef<RoutingCostBinding | null>(props.binding)
+  const sessionManagerRef = useRef<CostBindingEditorSessionManager | null>(null)
+  if (sessionManagerRef.current == null) {
+    sessionManagerRef.current = new CostBindingEditorSessionManager()
+  }
+  const sessionManager = sessionManagerRef.current
+  let editorSubject = 'binding:closed'
+  if (props.open) {
+    editorSubject = props.binding
+      ? `binding:${props.binding.channel_id}:${props.binding.etag}`
+      : 'binding:new'
+  }
+  const editorSubjectRef = useRef(editorSubject)
+  editorSubjectRef.current = editorSubject
   const form = useForm<CostBindingFormValues>({
     resolver: zodResolver(schema),
     defaultValues: costBindingFormValues(props.binding),
@@ -376,6 +221,8 @@ export function ChannelRoutingCostSourceSheet(props: {
   })
   const channelId = useWatch({ control: form.control, name: 'channelId' })
   const readOnly = workingBinding != null && !props.canSensitiveWrite
+  const providerChanged =
+    workingBinding != null && upstreamType !== workingBinding.upstream_type
 
   const channelsQuery = useQuery({
     queryKey: [...channelRoutingQueryKeys.channelsRoot(), 'cost-source-picker'],
@@ -390,34 +237,60 @@ export function ChannelRoutingCostSourceSheet(props: {
   )
 
   useEffect(() => {
-    if (!props.open) return
+    if (!props.open) {
+      sessionManager.deactivate()
+      return
+    }
+    sessionManager.activate(editorSubject)
+    baselineBindingRef.current = props.binding
     setWorkingBinding(props.binding)
     setConflict(null)
+    setConflictMerge(null)
     setGroups([])
     setActionResult(null)
     setActionError('')
     form.reset(costBindingFormValues(props.binding))
-  }, [form, props.binding, props.open])
+    return () => sessionManager.deactivate()
+  }, [editorSubject, form, props.binding, props.open, sessionManager])
+
+  const isCurrentSession = (session: CostBindingEditorSession) =>
+    sessionManager.isCurrent(session, editorSubjectRef.current)
+
+  const handleOpenChange = (open: boolean) => {
+    if (!open) sessionManager.deactivate()
+    props.onOpenChange(open)
+  }
 
   const saveMutation = useMutation({
-    mutationFn: async (values: CostBindingFormValues) => {
+    mutationFn: async (payload: {
+      values: CostBindingFormValues
+      binding: RoutingCostBinding | null
+      session: CostBindingEditorSession
+    }) => {
       if (!props.canSensitiveWrite) {
         throw new Error('Cost source write permission is unavailable')
       }
-      const request = costBindingRequest(values)
-      return workingBinding
-        ? updateChannelRoutingCostBinding(workingBinding, request)
-        : createChannelRoutingCostBinding(request)
+      const request = costBindingRequest(payload.values)
+      return payload.binding
+        ? updateChannelRoutingCostBinding(
+            payload.binding,
+            request,
+            payload.session.signal
+          )
+        : createChannelRoutingCostBinding(request, payload.session.signal)
     },
-    onSuccess: async (binding) => {
+    onSuccess: async (binding, payload) => {
       await invalidateCostBindingSurfaces(queryClient)
+      if (!isCurrentSession(payload.session)) return
       toast.success(
-        workingBinding ? t('Cost source updated') : t('Cost source created')
+        payload.binding ? t('Cost source updated') : t('Cost source created')
       )
+      sessionManager.deactivate()
       props.onSaved(binding)
       props.onOpenChange(false)
     },
-    onError: (error) => {
+    onError: (error, payload) => {
+      if (!isCurrentSession(payload.session)) return
       if (error instanceof ChannelRoutingCostBindingConflictError) {
         setConflict(error)
         form.setError('root.server', {
@@ -426,8 +299,11 @@ export function ChannelRoutingCostSourceSheet(props: {
         return
       }
       const failure = getChannelRoutingCostBindingApiError(error)
+      const fieldError = serverFieldError(error, t)
       const message = saveErrorMessage(error, t)
-      if (
+      if (fieldError) {
+        form.setError(fieldError.name, { message: fieldError.message })
+      } else if (
         failure.code === 'channel_not_found' ||
         failure.code === 'cost_binding_exists'
       ) {
@@ -443,40 +319,74 @@ export function ChannelRoutingCostSourceSheet(props: {
     mutationFn: (payload: {
       channelId: number | 'new'
       request?: ReturnType<typeof costBindingRequest>
-    }) => testChannelRoutingCostBinding(payload.channelId, payload.request),
-    onSuccess: (result) => {
+      session: CostBindingEditorSession
+    }) =>
+      testChannelRoutingCostBinding(
+        payload.channelId,
+        payload.request,
+        payload.session.signal
+      ),
+    onSuccess: (result, payload) => {
+      if (!isCurrentSession(payload.session)) return
+      const boundedResult = boundedCostBindingGroups(result)
       setActionError('')
-      setActionResult({ kind: 'test', result })
+      setActionResult({ kind: 'test', result: boundedResult })
       toast.success(
         t('Connection test found {{count}} priced models', {
           count: result.model_count,
         })
       )
     },
-    onError: (error) => setActionError(actionErrorMessage(error, t)),
+    onError: (error, payload) => {
+      if (!isCurrentSession(payload.session)) return
+      const fieldError = serverFieldError(error, t)
+      if (fieldError) {
+        form.setError(fieldError.name, { message: fieldError.message })
+      }
+      setActionError(actionErrorMessage(error, t))
+    },
   })
 
   const groupsMutation = useMutation({
     mutationFn: (payload: {
       channelId: number | 'new'
       request?: ReturnType<typeof costBindingRequest>
+      session: CostBindingEditorSession
     }) =>
-      loadChannelRoutingCostBindingGroups(payload.channelId, payload.request),
-    onSuccess: (result) => {
+      loadChannelRoutingCostBindingGroups(
+        payload.channelId,
+        payload.request,
+        payload.session.signal
+      ),
+    onSuccess: (result, payload) => {
+      if (!isCurrentSession(payload.session)) return
+      const boundedResult = boundedCostBindingGroups(result)
       setActionError('')
-      setGroups(result.groups)
-      setActionResult({ kind: 'groups', result })
-      if (result.groups.length > 0 && !form.getValues('upstreamGroup').trim()) {
-        form.setValue('upstreamGroup', result.groups[0] ?? '', {
+      setGroups(boundedResult.groups)
+      setActionResult({ kind: 'groups', result: boundedResult })
+      if (
+        boundedResult.groups.length > 0 &&
+        !form.getValues('upstreamGroup').trim()
+      ) {
+        form.setValue('upstreamGroup', boundedResult.groups[0] ?? '', {
           shouldDirty: true,
           shouldValidate: true,
         })
       }
       toast.success(
-        t('Loaded {{count}} upstream groups', { count: result.groups.length })
+        t('Loaded {{count}} upstream groups', {
+          count: boundedResult.groups.length,
+        })
       )
     },
-    onError: (error) => setActionError(actionErrorMessage(error, t)),
+    onError: (error, payload) => {
+      if (!isCurrentSession(payload.session)) return
+      const fieldError = serverFieldError(error, t)
+      if (fieldError) {
+        form.setError(fieldError.name, { message: fieldError.message })
+      }
+      setActionError(actionErrorMessage(error, t))
+    },
   })
   const actionPending = testMutation.isPending || groupsMutation.isPending
   const actionDisabled =
@@ -487,16 +397,18 @@ export function ChannelRoutingCostSourceSheet(props: {
 
   const runAction = async (kind: 'test' | 'groups') => {
     if (!props.canOperate) return
+    const session = sessionManager.activate(editorSubjectRef.current)
     setActionError('')
     let request: ReturnType<typeof costBindingRequest> | undefined
     if (workingBinding == null || props.canSensitiveWrite) {
       const valid = await form.trigger()
-      if (!valid) return
+      if (!valid || !isCurrentSession(session)) return
       request = costBindingRequest(form.getValues())
     }
     const payload = {
       channelId: workingBinding?.channel_id ?? ('new' as const),
       request,
+      session,
     }
     if (kind === 'test') {
       testMutation.mutate(payload)
@@ -511,9 +423,24 @@ export function ChannelRoutingCostSourceSheet(props: {
       ...conflict.current,
       etag: conflict.currentETag || conflict.current.etag,
     }
+    const baseline = baselineBindingRef.current ?? workingBinding
+    if (!baseline) return
+    const merged = mergeCostBindingConflictDraft({
+      baseline,
+      latest: current,
+      draft: form.getValues(),
+      dirtyFields: form.formState.dirtyFields,
+    })
+    sessionManager.rotate(editorSubjectRef.current)
+    baselineBindingRef.current = current
     setWorkingBinding(current)
-    form.reset(costBindingFormValues(current))
+    form.reset(merged.values, { keepDirty: true, keepTouched: true })
     setConflict(null)
+    setConflictMerge({
+      serverChangedLabels: merged.serverChangedLabels,
+      overlappingLabels: merged.overlappingLabels,
+    })
+    form.clearErrors('root.server')
     setGroups([])
     setActionResult(null)
     setActionError('')
@@ -548,9 +475,41 @@ export function ChannelRoutingCostSourceSheet(props: {
       'Channel suggestions could not be loaded. You can still enter an ID.'
     )
   }
+  let groupDescription = t(
+    'Load upstream groups to verify and select a provider group.'
+  )
+  if (groups.length > 0) {
+    groupDescription = t('{{count}} upstream groups are available.', {
+      count: groups.length,
+    })
+  }
+  if (actionResult?.kind === 'groups' && actionResult.result.groups_truncated) {
+    const total = actionResult.result.groups_total ?? groups.length
+    groupDescription =
+      total > groups.length
+        ? t(
+            'Showing {{shown}} of {{total}} upstream groups. Enter an exact group if it is not listed.',
+            { shown: groups.length, total }
+          )
+        : t(
+            'Showing the first {{count}} upstream groups. Enter an exact group if it is not listed.',
+            { count: groups.length }
+          )
+  }
+  let credentialDescription = t(
+    'Leave a field blank to keep its saved value, or explicitly clear it.'
+  )
+  if (providerChanged) {
+    credentialDescription = t(
+      'Enter credentials for the new provider. Previous saved values will not be reused.'
+    )
+  }
+  if (readOnly) {
+    credentialDescription = t('Only masked credential values are available.')
+  }
 
   return (
-    <Sheet open={props.open} onOpenChange={props.onOpenChange}>
+    <Sheet open={props.open} onOpenChange={handleOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName(
           'max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-2xl'
@@ -568,9 +527,14 @@ export function ChannelRoutingCostSourceSheet(props: {
           <form
             id='channel-routing-cost-source-form'
             className={sideDrawerFormClassName()}
-            onSubmit={form.handleSubmit((values) =>
-              saveMutation.mutate(values)
-            )}
+            onSubmit={form.handleSubmit((values) => {
+              const session = sessionManager.activate(editorSubjectRef.current)
+              saveMutation.mutate({
+                values,
+                binding: workingBinding,
+                session,
+              })
+            })}
           >
             {conflict ? (
               <Alert variant='destructive' role='alert'>
@@ -610,6 +574,53 @@ export function ChannelRoutingCostSourceSheet(props: {
                 <ShieldAlert aria-hidden='true' />
                 <AlertTitle>{t('Latest version loaded')}</AlertTitle>
                 <AlertDescription>{props.notice}</AlertDescription>
+              </Alert>
+            ) : null}
+
+            {conflictMerge && !conflict ? (
+              <Alert role='status' aria-live='polite'>
+                <ShieldCheck aria-hidden='true' />
+                <AlertTitle>
+                  {t('Draft preserved on latest version')}
+                </AlertTitle>
+                <AlertDescription className='space-y-3'>
+                  <p>
+                    {t(
+                      'Your unsaved changes and newly entered credentials were kept.'
+                    )}
+                  </p>
+                  {conflictMerge.serverChangedLabels.length > 0 ? (
+                    <div className='space-y-1.5'>
+                      <p className='text-xs font-medium'>
+                        {t('Changed elsewhere')}
+                      </p>
+                      <div className='flex flex-wrap gap-1.5'>
+                        {conflictMerge.serverChangedLabels.map((label) => (
+                          <Badge key={label} variant='outline'>
+                            {t(label)}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {conflictMerge.overlappingLabels.length > 0 ? (
+                    <div className='space-y-1.5'>
+                      <p className='text-xs font-medium'>
+                        {t('Changed here and elsewhere')}
+                      </p>
+                      <div className='flex flex-wrap gap-1.5'>
+                        {conflictMerge.overlappingLabels.map((label) => (
+                          <Badge key={label} variant='secondary'>
+                            {t(label)}
+                          </Badge>
+                        ))}
+                      </div>
+                      <p className='text-xs'>
+                        {t('Review these fields before saving again.')}
+                      </p>
+                    </div>
+                  ) : null}
+                </AlertDescription>
               </Alert>
             ) : null}
 
@@ -671,9 +682,19 @@ export function ChannelRoutingCostSourceSheet(props: {
                         <NativeSelect
                           value={field.value}
                           disabled={readOnly}
-                          onChange={(event) =>
-                            field.onChange(event.target.value)
-                          }
+                          onChange={(event) => {
+                            const nextProvider = event.target.value as
+                              | 'newapi'
+                              | 'sub2api'
+                            if (nextProvider !== field.value) {
+                              for (const clearField of credentialClearFields) {
+                                form.setValue(clearField, false, {
+                                  shouldDirty: true,
+                                })
+                              }
+                            }
+                            field.onChange(nextProvider)
+                          }}
                         >
                           <NativeSelectOption value='newapi'>
                             New API
@@ -687,6 +708,19 @@ export function ChannelRoutingCostSourceSheet(props: {
                     </FormItem>
                   )}
                 />
+                {providerChanged ? (
+                  <Alert role='status' className='sm:col-span-2'>
+                    <ShieldAlert aria-hidden='true' />
+                    <AlertTitle>
+                      {t('Credentials must be reconfigured')}
+                    </AlertTitle>
+                    <AlertDescription>
+                      {t(
+                        'Changing the provider clears all saved credentials and the custom CA. Re-enter credentials and trust settings for the new provider.'
+                      )}
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
                 <FormField
                   control={form.control}
                   name='baseUrl'
@@ -728,20 +762,11 @@ export function ChannelRoutingCostSourceSheet(props: {
                           autoComplete='off'
                         />
                       </FormControl>
-                      <datalist id={groupListId}>
-                        {groups.map((group) => (
-                          <option key={group} value={group} />
-                        ))}
-                      </datalist>
-                      <FormDescription>
-                        {groups.length > 0
-                          ? t('{{count}} upstream groups are available.', {
-                              count: groups.length,
-                            })
-                          : t(
-                              'Load upstream groups to verify and select a provider group.'
-                            )}
-                      </FormDescription>
+                      <CostSourceGroupDatalist
+                        id={groupListId}
+                        groups={groups}
+                      />
+                      <FormDescription>{groupDescription}</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -902,8 +927,9 @@ export function ChannelRoutingCostSourceSheet(props: {
                       </FormItem>
                     )}
                   />
-                  <CustomCACredentialField
+                  <CostSourceCustomCAField
                     configured={Boolean(
+                      !providerChanged &&
                       workingBinding?.credential_masks.custom_ca_configured
                     )}
                   />
@@ -1005,6 +1031,13 @@ export function ChannelRoutingCostSourceSheet(props: {
                         ) : null}
                       </div>
                     ) : null}
+                    {actionResult.result.groups_truncated ? (
+                      <p>
+                        {t(
+                          'Group results are limited in this view. Enter an exact group name when needed.'
+                        )}
+                      </p>
+                    ) : null}
                   </AlertDescription>
                 </Alert>
               ) : null}
@@ -1013,13 +1046,7 @@ export function ChannelRoutingCostSourceSheet(props: {
             <SideDrawerSection>
               <SideDrawerSectionHeader
                 title={t('Credentials')}
-                description={
-                  readOnly
-                    ? t('Only masked credential values are available.')
-                    : t(
-                        'Leave a field blank to keep its saved value, or explicitly clear it.'
-                      )
-                }
+                description={credentialDescription}
                 icon={<KeyRound className='size-4' aria-hidden='true' />}
               />
               {readOnly ? (
@@ -1028,48 +1055,10 @@ export function ChannelRoutingCostSourceSheet(props: {
                   error={workingBinding?.credential_error}
                 />
               ) : (
-                <div className='grid gap-4 sm:grid-cols-2'>
-                  {upstreamType === 'newapi' ? (
-                    <CredentialField
-                      valueName='newApiAccessToken'
-                      clearName='clearNewApiAccessToken'
-                      label='New API Access Token'
-                      mask={
-                        workingBinding?.credential_masks.new_api_access_token
-                      }
-                    />
-                  ) : null}
-                  <CredentialField
-                    valueName='gatewayApiKey'
-                    clearName='clearGatewayApiKey'
-                    label='Gateway API Key'
-                    mask={workingBinding?.credential_masks.gateway_api_key}
-                  />
-                  {upstreamType === 'sub2api' ? (
-                    <>
-                      <CredentialField
-                        valueName='sub2apiEmail'
-                        clearName='clearSub2apiEmail'
-                        label='Sub2API Email'
-                        mask={workingBinding?.credential_masks.sub2api_email}
-                        type='email'
-                        autoComplete='off'
-                      />
-                      <CredentialField
-                        valueName='sub2apiPassword'
-                        clearName='clearSub2apiPassword'
-                        label='Sub2API Password'
-                        mask={workingBinding?.credential_masks.sub2api_password}
-                      />
-                      <CredentialField
-                        valueName='sub2apiToken'
-                        clearName='clearSub2apiToken'
-                        label='Sub2API Token'
-                        mask={workingBinding?.credential_masks.sub2api_token}
-                      />
-                    </>
-                  ) : null}
-                </div>
+                <CostSourceCredentialFields
+                  upstreamType={upstreamType}
+                  binding={providerChanged ? null : workingBinding}
+                />
               )}
             </SideDrawerSection>
           </form>
@@ -1080,7 +1069,7 @@ export function ChannelRoutingCostSourceSheet(props: {
             type='button'
             variant='outline'
             disabled={saveMutation.isPending}
-            onClick={() => props.onOpenChange(false)}
+            onClick={() => handleOpenChange(false)}
           >
             {readOnly ? t('Close') : t('Cancel')}
           </Button>

@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export type ChannelRoutingSection =
   | 'overview'
   | 'groups'
@@ -446,6 +445,8 @@ export type RoutingCostBindingActionResult = {
   credential_ready?: boolean
   credential_test?: boolean
   groups: string[]
+  groups_truncated?: boolean
+  groups_total?: number
   model_count: number
   pricing_version?: string
   requires_sync?: boolean

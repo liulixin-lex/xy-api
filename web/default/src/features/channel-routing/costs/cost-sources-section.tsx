@@ -18,17 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import {
-  Cable,
-  Eye,
-  MoreHorizontal,
-  Pencil,
-  Plus,
-  Search,
-  ShieldAlert,
-  Trash2,
-  X,
-} from 'lucide-react'
+import { Plus, Search, ShieldAlert, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -41,26 +31,9 @@ import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Switch } from '@/components/ui/switch'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
 
 import {
   ChannelRoutingCostBindingConflictError,
@@ -71,145 +44,18 @@ import {
   updateChannelRoutingCostBinding,
 } from '../api/client'
 import { channelRoutingQueryKeys } from '../api/query-keys'
-import { ChannelRoutingIdentityText } from '../components/identity-text'
 import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
-import { ChannelRoutingStatusBadge } from '../components/status-badge'
-import {
-  costBindingCredentialCount,
-  costBindingUpdateRequest,
-} from '../lib/cost-binding'
-import { useChannelRoutingFormatters } from '../lib/format'
+import { costBindingUpdateRequest } from '../lib/cost-binding'
 import type { RoutingCostBinding } from '../types'
+import { CostSourceList } from './cost-source-list'
 import { ChannelRoutingCostSourceSheet } from './cost-source-sheet'
 
 const route = getRouteApi('/_authenticated/channel-routing/$section')
-
-function SyncHealth(props: { binding: RoutingCostBinding }) {
-  const { t } = useTranslation()
-  const format = useChannelRoutingFormatters()
-  const binding = props.binding
-  const backoffActive = binding.sync_backoff_until * 1_000 > Date.now()
-
-  if (binding.egress_policy_error) {
-    return (
-      <div className='space-y-1'>
-        <ChannelRoutingStatusBadge
-          status='failed'
-          label={t('Network trust error')}
-        />
-        <ChannelRoutingIdentityText
-          text={binding.egress_policy_error}
-          className='text-destructive text-xs whitespace-normal'
-        />
-      </div>
-    )
-  }
-  if (binding.credential_error) {
-    return (
-      <div className='space-y-1'>
-        <ChannelRoutingStatusBadge
-          status='failed'
-          label={t('Credential error')}
-        />
-        <ChannelRoutingIdentityText
-          text={binding.credential_error}
-          className='text-destructive text-xs whitespace-normal'
-        />
-      </div>
-    )
-  }
-  if (backoffActive) {
-    return (
-      <div className='space-y-1'>
-        <ChannelRoutingStatusBadge status='warning' label={t('Backoff')} />
-        <p className='text-muted-foreground text-xs'>
-          {t('Retry after {{time}}', {
-            time: format.timestamp(binding.sync_backoff_until),
-          })}
-        </p>
-      </div>
-    )
-  }
-  if (binding.last_sync_error || binding.sync_failure_count > 0) {
-    return (
-      <div className='space-y-1'>
-        <ChannelRoutingStatusBadge
-          status='failed'
-          label={t('Sync needs attention')}
-        />
-        {binding.last_sync_error ? (
-          <ChannelRoutingIdentityText
-            text={binding.last_sync_error}
-            className='text-destructive text-xs whitespace-normal'
-          />
-        ) : null}
-      </div>
-    )
-  }
-  return <ChannelRoutingStatusBadge status='healthy' />
-}
-
-function CostSourceActions(props: {
-  canOperate: boolean
-  canSensitiveWrite: boolean
-  testing: boolean
-  testDisabled: boolean
-  onOpen: () => void
-  onTest: () => void
-  onDelete: () => void
-}) {
-  const { t } = useTranslation()
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            type='button'
-            size='icon-sm'
-            variant='ghost'
-            aria-label={t('Open cost source actions')}
-            className='data-popup-open:bg-muted'
-          />
-        }
-      >
-        <MoreHorizontal aria-hidden='true' />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align='end' className='w-52'>
-        <DropdownMenuItem onClick={props.onOpen}>
-          {props.canSensitiveWrite ? (
-            <Pencil aria-hidden='true' />
-          ) : (
-            <Eye aria-hidden='true' />
-          )}
-          {props.canSensitiveWrite ? t('Edit cost source') : t('View details')}
-        </DropdownMenuItem>
-        {props.canOperate ? (
-          <DropdownMenuItem
-            disabled={props.testDisabled}
-            onClick={props.onTest}
-          >
-            <Cable aria-hidden='true' />
-            {props.testing ? t('Testing connection') : t('Test connection')}
-          </DropdownMenuItem>
-        ) : null}
-        {props.canSensitiveWrite ? (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem variant='destructive' onClick={props.onDelete}>
-              <Trash2 aria-hidden='true' />
-              {t('Delete cost source')}
-            </DropdownMenuItem>
-          </>
-        ) : null}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
 
 function failureMessage(error: unknown, t: (key: string) => string): string {
   const failure = getChannelRoutingCostBindingApiError(error)
@@ -223,26 +69,11 @@ function failureMessage(error: unknown, t: (key: string) => string): string {
   return t('The cost source action failed. Try again.')
 }
 
-function costSourceToggleLabel(
-  binding: RoutingCostBinding,
-  t: (key: string, options?: Record<string, unknown>) => string
-): string {
-  if (binding.enabled) {
-    return t('Disable cost source for channel {{id}}', {
-      id: binding.channel_id,
-    })
-  }
-  return t('Enable cost source for channel {{id}}', {
-    id: binding.channel_id,
-  })
-}
-
 export function ChannelRoutingCostSourcesSection(props: {
   canOperate: boolean
   canSensitiveWrite: boolean
 }) {
   const { t } = useTranslation()
-  const format = useChannelRoutingFormatters()
   const queryClient = useQueryClient()
   const search = route.useSearch()
   const navigate = route.useNavigate()
@@ -590,203 +421,24 @@ export function ChannelRoutingCostSourcesSection(props: {
       ) : null}
 
       {items.length > 0 ? (
-        <>
-          <div className='hidden overflow-hidden rounded-lg border lg:block'>
-            <Table
-              className='min-w-[72rem] table-fixed'
-              scrollAreaLabel={t('Cost sources table')}
-            >
-              <TableHeader>
-                <TableRow>
-                  <TableHead className='w-56'>{t('Channel')}</TableHead>
-                  <TableHead className='w-72'>{t('Upstream source')}</TableHead>
-                  <TableHead className='w-36'>{t('Credentials')}</TableHead>
-                  <TableHead className='w-52'>{t('Sync health')}</TableHead>
-                  <TableHead className='w-36'>{t('Updated')}</TableHead>
-                  <TableHead className='w-32'>{t('Enabled')}</TableHead>
-                  <TableHead className='w-10'>
-                    <span className='sr-only'>{t('Actions')}</span>
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {items.map((binding) => {
-                  const credentialCount = costBindingCredentialCount(binding)
-                  const testing =
-                    testMutation.isPending &&
-                    testMutation.variables?.channel_id === binding.channel_id
-                  return (
-                    <TableRow key={binding.channel_id}>
-                      <TableCell className='min-w-0 overflow-hidden align-top'>
-                        <ChannelRoutingIdentityText
-                          text={
-                            binding.channel_name ||
-                            t('Channel #{{id}}', { id: binding.channel_id })
-                          }
-                          className='font-medium whitespace-normal'
-                        />
-                        <div className='text-muted-foreground mt-1 font-mono text-xs'>
-                          #{binding.channel_id}
-                        </div>
-                      </TableCell>
-                      <TableCell className='min-w-0 overflow-hidden align-top'>
-                        <div className='flex min-w-0 items-center gap-2'>
-                          <Badge variant='outline'>
-                            {binding.upstream_type === 'newapi'
-                              ? 'New API'
-                              : 'Sub2API'}
-                          </Badge>
-                          <span className='text-muted-foreground min-w-0 truncate text-xs'>
-                            {binding.upstream_group}
-                          </span>
-                        </div>
-                        <ChannelRoutingIdentityText
-                          text={binding.base_url}
-                          breakAll
-                          className='mt-1 font-mono text-xs whitespace-normal'
-                        />
-                      </TableCell>
-                      <TableCell className='min-w-0 overflow-hidden align-top'>
-                        <div className='text-sm'>
-                          {t('{{count}} saved credentials', {
-                            count: credentialCount,
-                          })}
-                        </div>
-                      </TableCell>
-                      <TableCell className='min-w-0 overflow-hidden align-top'>
-                        <SyncHealth binding={binding} />
-                      </TableCell>
-                      <TableCell className='text-muted-foreground text-xs'>
-                        {format.timestamp(binding.updated_time)}
-                      </TableCell>
-                      <TableCell>
-                        <div className='flex min-h-11 items-center gap-2'>
-                          <Switch
-                            checked={binding.enabled}
-                            disabled={
-                              !props.canSensitiveWrite ||
-                              toggleMutation.isPending
-                            }
-                            aria-label={costSourceToggleLabel(binding, t)}
-                            onCheckedChange={(value) =>
-                              toggleMutation.mutate({
-                                binding,
-                                enabled: value,
-                              })
-                            }
-                          />
-                          <span className='text-muted-foreground text-xs'>
-                            {binding.enabled ? t('Enabled') : t('Disabled')}
-                          </span>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <CostSourceActions
-                          canOperate={props.canOperate}
-                          canSensitiveWrite={props.canSensitiveWrite}
-                          testing={testing}
-                          testDisabled={testMutation.isPending}
-                          onOpen={() => openBinding(binding)}
-                          onTest={() => testMutation.mutate(binding)}
-                          onDelete={() => setPendingDelete(binding)}
-                        />
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-
-          <div className='divide-y rounded-lg border lg:hidden'>
-            {items.map((binding) => {
-              const credentialCount = costBindingCredentialCount(binding)
-              const testing =
-                testMutation.isPending &&
-                testMutation.variables?.channel_id === binding.channel_id
-              return (
-                <article key={binding.channel_id} className='min-w-0 p-3'>
-                  <div className='flex min-w-0 items-start justify-between gap-3'>
-                    <div className='min-w-0'>
-                      <h3 className='text-sm font-medium break-words'>
-                        {binding.channel_name ||
-                          t('Channel #{{id}}', { id: binding.channel_id })}
-                      </h3>
-                      <p className='text-muted-foreground mt-1 font-mono text-xs'>
-                        #{binding.channel_id}
-                      </p>
-                    </div>
-                    <ChannelRoutingStatusBadge
-                      status={binding.enabled ? 'enabled' : 'disabled'}
-                    />
-                  </div>
-                  <div className='mt-3 min-w-0'>
-                    <div className='flex flex-wrap items-center gap-2'>
-                      <Badge variant='outline'>
-                        {binding.upstream_type === 'newapi'
-                          ? 'New API'
-                          : 'Sub2API'}
-                      </Badge>
-                      <span className='text-muted-foreground text-xs break-all'>
-                        {binding.upstream_group}
-                      </span>
-                    </div>
-                    <ChannelRoutingIdentityText
-                      text={binding.base_url}
-                      breakAll
-                      className='mt-2 font-mono text-xs'
-                    />
-                  </div>
-                  <dl className='mt-3 grid grid-cols-2 gap-3 text-xs'>
-                    <div className='min-w-0'>
-                      <dt className='text-muted-foreground'>
-                        {t('Credentials')}
-                      </dt>
-                      <dd className='mt-1 font-medium'>
-                        {t('{{count}} saved', { count: credentialCount })}
-                      </dd>
-                    </div>
-                    <div className='min-w-0'>
-                      <dt className='text-muted-foreground'>{t('Updated')}</dt>
-                      <dd className='mt-1 font-medium break-words'>
-                        {format.timestamp(binding.updated_time)}
-                      </dd>
-                    </div>
-                  </dl>
-                  <div className='mt-3'>
-                    <SyncHealth binding={binding} />
-                  </div>
-                  <div className='mt-3 flex min-h-11 items-center justify-between gap-3 border-t pt-3'>
-                    <label className='flex min-h-11 cursor-pointer items-center gap-2 text-sm'>
-                      <Switch
-                        checked={binding.enabled}
-                        disabled={
-                          !props.canSensitiveWrite || toggleMutation.isPending
-                        }
-                        aria-label={costSourceToggleLabel(binding, t)}
-                        onCheckedChange={(value) =>
-                          toggleMutation.mutate({ binding, enabled: value })
-                        }
-                      />
-                      <span>
-                        {binding.enabled ? t('Enabled') : t('Disabled')}
-                      </span>
-                    </label>
-                    <CostSourceActions
-                      canOperate={props.canOperate}
-                      canSensitiveWrite={props.canSensitiveWrite}
-                      testing={testing}
-                      testDisabled={testMutation.isPending}
-                      onOpen={() => openBinding(binding)}
-                      onTest={() => testMutation.mutate(binding)}
-                      onDelete={() => setPendingDelete(binding)}
-                    />
-                  </div>
-                </article>
-              )
-            })}
-          </div>
-        </>
+        <CostSourceList
+          items={items}
+          canOperate={props.canOperate}
+          canSensitiveWrite={props.canSensitiveWrite}
+          testingChannelId={
+            testMutation.isPending
+              ? testMutation.variables?.channel_id
+              : undefined
+          }
+          testDisabled={testMutation.isPending}
+          toggleDisabled={toggleMutation.isPending}
+          onOpen={openBinding}
+          onTest={(binding) => testMutation.mutate(binding)}
+          onDelete={setPendingDelete}
+          onToggle={(binding, enabled) =>
+            toggleMutation.mutate({ binding, enabled })
+          }
+        />
       ) : null}
 
       {query.data && query.data.total > 0 ? (
@@ -850,3 +502,5 @@ export function ChannelRoutingCostSourcesSection(props: {
     </div>
   )
 }
+
+export default ChannelRoutingCostSourcesSection

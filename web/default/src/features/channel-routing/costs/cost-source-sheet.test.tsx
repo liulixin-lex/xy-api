@@ -24,7 +24,9 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 import '@/i18n/config'
 
-import { CostSourceCredentialSummary } from './cost-source-sheet'
+import { COST_BINDING_GROUP_DOM_LIMIT } from '../lib/cost-binding'
+import { CostSourceCredentialSummary } from './cost-source-credentials'
+import { CostSourceGroupDatalist } from './cost-source-groups'
 
 describe('cost source credential summary', () => {
   test('renders only server-provided masks in a semantic details list', () => {
@@ -46,5 +48,20 @@ describe('cost source credential summary', () => {
     assert.match(html, /a\*\*\*z@example\.com/)
     assert.match(html, /Configured/)
     assert.doesNotMatch(html, /gateway_api_key/)
+  })
+
+  test('keeps group suggestion DOM bounded for oversized upstream responses', () => {
+    const html = renderToStaticMarkup(
+      createElement(CostSourceGroupDatalist, {
+        id: 'groups',
+        groups: Array.from(
+          { length: COST_BINDING_GROUP_DOM_LIMIT + 500 },
+          (_, index) => `group-${index}`
+        ),
+      })
+    )
+
+    assert.equal((html.match(/<option/g) ?? []).length, 100)
+    assert.doesNotMatch(html, /group-100"/)
   })
 })

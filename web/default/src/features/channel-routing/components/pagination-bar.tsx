@@ -16,12 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { ChevronLeft, ChevronRight, ChevronsLeft } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+
+import { CHANNEL_ROUTING_PAGE_SIZES } from '../lib/pagination'
 
 export function ChannelRoutingPagination(props: {
   page: number
@@ -47,7 +48,7 @@ export function ChannelRoutingPagination(props: {
             props.onPageSizeChange(Number(event.target.value))
           }
         >
-          {[10, 20, 50].map((size) => (
+          {CHANNEL_ROUTING_PAGE_SIZES.map((size) => (
             <NativeSelectOption key={size} value={size}>
               {size}
             </NativeSelectOption>

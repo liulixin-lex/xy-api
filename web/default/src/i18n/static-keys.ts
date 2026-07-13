@@ -597,6 +597,17 @@ export const STATIC_I18N_KEYS = [
   'Batch detection failed',
   'Batch detection complete: {{channels}} channels, {{add}} to add, {{remove}} to remove, {{fails}} failed',
 
+  // Channel routing cost source validation
+  'This field is required.',
+  'Enter a valid value.',
+  'This value is not supported.',
+  'This value is too long.',
+  'This value is outside the allowed range.',
+  'Enter the required credential.',
+  'The server rejected this value. Review it and try again.',
+  'HTTPS is required. Do not place tokens or passwords in the URL.',
+  'This target is blocked by the network trust policy.',
+
   // Dashboard flow stages (labels/descriptions passed to t at runtime)
   'User',
   'Node',

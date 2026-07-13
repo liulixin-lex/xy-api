@@ -35,8 +35,12 @@ import type {
 } from '../types'
 import {
   ChannelRoutingCostBindingConflictError,
+  createChannelRoutingCostBinding,
+  getChannelRoutingCostBindingApiError,
   getChannelRoutingCostBinding,
   listChannelRoutingCostBindings,
+  loadChannelRoutingCostBindingGroups,
+  testChannelRoutingCostBinding,
   updateChannelRoutingCostBinding,
 } from './client'
 
@@ -183,6 +187,83 @@ describe('channel routing cost binding API', () => {
         assert.ok(error instanceof ChannelRoutingCostBindingConflictError)
         assert.equal(error.current?.upstream_group, 'enterprise')
         assert.equal(error.currentETag, current.etag)
+        return true
+      }
+    )
+  })
+
+  test('forwards AbortSignal to save and draft connection requests', async () => {
+    const captured: InternalAxiosRequestConfig[] = []
+    api.defaults.adapter = async (config) => {
+      captured.push(config)
+      const action =
+        config.url?.endsWith('/test') || config.url?.endsWith('/groups')
+      return {
+        data: {
+          success: true,
+          data: action
+            ? {
+                channel_id: 77,
+                upstream_type: 'newapi',
+                groups: [],
+                model_count: 1,
+              }
+            : binding,
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: new AxiosHeaders(),
+        config,
+      }
+    }
+    const controller = new AbortController()
+
+    await createChannelRoutingCostBinding(request, controller.signal)
+    await updateChannelRoutingCostBinding(binding, request, controller.signal)
+    await testChannelRoutingCostBinding('new', request, controller.signal)
+    await loadChannelRoutingCostBindingGroups('new', request, controller.signal)
+
+    assert.equal(captured.length, 4)
+    for (const config of captured) {
+      assert.equal(config.signal, controller.signal)
+    }
+  })
+
+  test('preserves structured field and reason validation metadata', async () => {
+    api.defaults.adapter = async (config) => {
+      const response = {
+        data: {
+          success: false,
+          code: 'invalid_cost_binding',
+          message: 'invalid cost binding',
+          field: 'credentials.gateway_api_key',
+          reason: 'required',
+        },
+        status: 400,
+        statusText: 'Bad Request',
+        headers: new AxiosHeaders(),
+        config,
+      }
+      throw new AxiosError(
+        'Request failed with status code 400',
+        AxiosError.ERR_BAD_REQUEST,
+        config,
+        undefined,
+        response
+      )
+    }
+
+    await assert.rejects(
+      () => createChannelRoutingCostBinding(request),
+      (error: unknown) => {
+        assert.deepEqual(getChannelRoutingCostBindingApiError(error), {
+          status: 400,
+          code: 'invalid_cost_binding',
+          message: 'invalid cost binding',
+          detail: undefined,
+          field: 'credentials.gateway_api_key',
+          reason: 'required',
+        })
         return true
       }
     )

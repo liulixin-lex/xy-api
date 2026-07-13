@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { isAxiosError } from 'axios'
 
 import { api } from '@/lib/api'
@@ -82,6 +81,8 @@ type ChannelRoutingCostBindingErrorPayload = {
   code?: string
   message?: string
   detail?: string
+  field?: string
+  reason?: string
   conflict?: {
     current?: RoutingCostBinding | null
     current_etag?: string
@@ -93,6 +94,8 @@ export type ChannelRoutingCostBindingApiError = {
   code?: string
   message?: string
   detail?: string
+  field?: string
+  reason?: string
 }
 
 export class ChannelRoutingCostBindingConflictError extends Error {
@@ -116,6 +119,8 @@ export function getChannelRoutingCostBindingApiError(
     code: error.response?.data?.code,
     message: error.response?.data?.message,
     detail: error.response?.data?.detail,
+    field: error.response?.data?.field,
+    reason: error.response?.data?.reason,
   }
 }
 
@@ -318,12 +323,13 @@ export async function getChannelRoutingCostBinding(
 }
 
 export async function createChannelRoutingCostBinding(
-  request: RoutingCostBindingRequest
+  request: RoutingCostBindingRequest,
+  signal?: AbortSignal
 ): Promise<RoutingCostBinding> {
   const response = await api.post<ApiEnvelope<RoutingCostBinding>>(
     '/api/channel-routing/v2/cost-bindings',
     request,
-    requestConfig
+    { ...requestConfig, signal }
   )
   const binding = unwrap(response.data)
   return { ...binding, etag: response.headers.etag || binding.etag }
@@ -331,7 +337,8 @@ export async function createChannelRoutingCostBinding(
 
 export async function updateChannelRoutingCostBinding(
   binding: Pick<RoutingCostBinding, 'channel_id' | 'etag'>,
-  request: RoutingCostBindingRequest
+  request: RoutingCostBindingRequest,
+  signal?: AbortSignal
 ): Promise<RoutingCostBinding> {
   try {
     const response = await api.put<ApiEnvelope<RoutingCostBinding>>(
@@ -339,6 +346,7 @@ export async function updateChannelRoutingCostBinding(
       request,
       {
         ...requestConfig,
+        signal,
         headers: { 'If-Match': binding.etag },
       }
     )
@@ -372,13 +380,15 @@ export async function deleteChannelRoutingCostBinding(
 
 export async function testChannelRoutingCostBinding(
   channelId: number | 'new',
-  request?: RoutingCostBindingRequest
+  request?: RoutingCostBindingRequest,
+  signal?: AbortSignal
 ): Promise<RoutingCostBindingActionResult> {
   const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
     `/api/channel-routing/v2/cost-bindings/${channelId}/test`,
     request,
     {
       ...requestConfig,
+      signal,
       timeout: 30_000,
     }
   )
@@ -387,13 +397,15 @@ export async function testChannelRoutingCostBinding(
 
 export async function loadChannelRoutingCostBindingGroups(
   channelId: number | 'new',
-  request?: RoutingCostBindingRequest
+  request?: RoutingCostBindingRequest,
+  signal?: AbortSignal
 ): Promise<RoutingCostBindingActionResult> {
   const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
     `/api/channel-routing/v2/cost-bindings/${channelId}/groups`,
     request,
     {
       ...requestConfig,
+      signal,
       timeout: 30_000,
     }
   )

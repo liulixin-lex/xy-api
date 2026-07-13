@@ -20,6 +20,7 @@ import z from 'zod'
 
 import type {
   RoutingCostBinding,
+  RoutingCostBindingActionResult,
   RoutingCostBindingCredentials,
   RoutingCostBindingRequest,
 } from '../types'
@@ -245,36 +246,42 @@ export function costBindingRequest(
 ): RoutingCostBindingRequest {
   const credentials: RoutingCostBindingCredentials = {}
   const newApiUserId = values.newApiUserId.trim()
-  setCredential(
-    credentials,
-    'new_api_access_token',
-    values.newApiAccessToken,
-    values.clearNewApiAccessToken
-  )
+
+  if (values.upstreamType === 'newapi') {
+    setCredential(
+      credentials,
+      'new_api_access_token',
+      values.newApiAccessToken,
+      values.clearNewApiAccessToken
+    )
+  } else {
+    setCredential(
+      credentials,
+      'sub2api_email',
+      values.sub2apiEmail,
+      values.clearSub2apiEmail
+    )
+    setCredential(
+      credentials,
+      'sub2api_password',
+      values.sub2apiPassword,
+      values.clearSub2apiPassword,
+      false
+    )
+    setCredential(
+      credentials,
+      'sub2api_token',
+      values.sub2apiToken,
+      values.clearSub2apiToken
+    )
+  }
+
+  // Gateway authentication and custom trust are shared by both providers.
   setCredential(
     credentials,
     'gateway_api_key',
     values.gatewayApiKey,
     values.clearGatewayApiKey
-  )
-  setCredential(
-    credentials,
-    'sub2api_email',
-    values.sub2apiEmail,
-    values.clearSub2apiEmail
-  )
-  setCredential(
-    credentials,
-    'sub2api_password',
-    values.sub2apiPassword,
-    values.clearSub2apiPassword,
-    false
-  )
-  setCredential(
-    credentials,
-    'sub2api_token',
-    values.sub2apiToken,
-    values.clearSub2apiToken
   )
   setCredential(
     credentials,
@@ -325,4 +332,41 @@ export function costBindingCredentialCount(
   binding: Pick<RoutingCostBinding, 'credential_masks'>
 ): number {
   return Object.values(binding.credential_masks).filter(Boolean).length
+}
+
+export const COST_BINDING_GROUP_DOM_LIMIT = 100
+
+export function boundedCostBindingGroups(
+  result: RoutingCostBindingActionResult
+): RoutingCostBindingActionResult {
+  const rawGroups = Array.isArray(result.groups) ? result.groups : []
+  const groups: string[] = []
+  const seen = new Set<string>()
+  const scanLimit = Math.min(rawGroups.length, COST_BINDING_GROUP_DOM_LIMIT * 4)
+
+  for (let index = 0; index < scanLimit; index += 1) {
+    const raw = rawGroups[index]
+    if (typeof raw !== 'string') continue
+    const group = raw.trim()
+    if (!group || group.length > 128 || seen.has(group)) continue
+    seen.add(group)
+    groups.push(group)
+    if (groups.length >= COST_BINDING_GROUP_DOM_LIMIT) break
+  }
+
+  const reportedTotal = Number.isSafeInteger(result.groups_total)
+    ? Math.max(0, result.groups_total ?? 0)
+    : rawGroups.length
+  const groupsTotal = Math.max(groups.length, reportedTotal, rawGroups.length)
+  const groupsTruncated =
+    Boolean(result.groups_truncated) ||
+    groupsTotal > groups.length ||
+    rawGroups.length > groups.length
+
+  return {
+    ...result,
+    groups,
+    groups_total: groupsTotal,
+    groups_truncated: groupsTruncated,
+  }
 }

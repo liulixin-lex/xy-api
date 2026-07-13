@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import {
   useIsFetching,
   useMutation,
@@ -35,7 +34,15 @@ import {
   TriangleAlert,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -86,7 +93,10 @@ import type {
   CostSnapshotSummary,
 } from '../types'
 import { ChannelRoutingCostDetailsSheet } from './cost-details-sheet'
-import { ChannelRoutingCostSourcesSection } from './cost-sources-section'
+
+const LazyChannelRoutingCostSourcesSection = lazy(
+  () => import('./cost-sources-section')
+)
 
 const route = getRouteApi('/_authenticated/channel-routing/$section')
 
@@ -738,10 +748,12 @@ export function ChannelRoutingCostsPage() {
               ) : null}
             </>
           ) : (
-            <ChannelRoutingCostSourcesSection
-              canOperate={canOperate}
-              canSensitiveWrite={canSensitiveWrite}
-            />
+            <Suspense fallback={<ChannelRoutingLoadingState />}>
+              <LazyChannelRoutingCostSourcesSection
+                canOperate={canOperate}
+                canSensitiveWrite={canSensitiveWrite}
+              />
+            </Suspense>
           )}
         </div>
       </ChannelRoutingPageFrame>

@@ -16,11 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { ChannelRoutingSectionPage } from '@/features/channel-routing'
+import { isChannelRoutingPageSize } from '@/features/channel-routing/lib/pagination'
 import type { ChannelRoutingSection } from '@/features/channel-routing/types'
 
 const sections = new Set<ChannelRoutingSection>([
@@ -52,7 +52,12 @@ const searchSchema = z.object({
   known: triStateSearchSchema,
   costView: z.enum(['snapshots', 'sources']).optional().catch('snapshots'),
   sourcePage: z.number().int().min(1).optional().catch(1),
-  sourcePageSize: z.number().int().min(1).max(100).optional().catch(20),
+  sourcePageSize: z
+    .number()
+    .int()
+    .refine(isChannelRoutingPageSize)
+    .optional()
+    .catch(20),
   sourceSearch: z.string().max(256).optional().catch(''),
   sourceType: z.enum(['all', 'newapi', 'sub2api']).optional().catch('all'),
   sourceEnabled: triStateSearchSchema,
