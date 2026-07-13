@@ -1,0 +1,50 @@
+{
+  "linux/amd64": {
+    "SPDX": {
+      "spdxVersion": "SPDX-2.3",
+      "dataLicense": "CC0-1.0",
+      "SPDXID": "SPDXRef-DOCUMENT",
+      "name": "release-amd64",
+      "documentNamespace": "https://example.invalid/spdx/release-amd64",
+      "creationInfo": {
+        "created": "2026-07-13T00:00:00Z",
+        "creators": ["Tool: syft-v1.42.3", "Tool: buildkit-v0.30.0"]
+      },
+      "packages": [
+        {
+          "SPDXID": "SPDXRef-Package-release-amd64",
+          "name": "release-amd64",
+          "downloadLocation": "NOASSERTION",
+          "filesAnalyzed": false,
+          "licenseConcluded": "NOASSERTION",
+          "licenseDeclared": "NOASSERTION",
+          "copyrightText": "NOASSERTION"
+        }
+      ]
+    }
+  },
+  "linux/arm64": {
+    "SPDX": {
+      "spdxVersion": "SPDX-2.3",
+      "dataLicense": "CC0-1.0",
+      "SPDXID": "SPDXRef-DOCUMENT",
+      "name": "release-arm64",
+      "documentNamespace": "https://example.invalid/spdx/release-arm64",
+      "creationInfo": {
+        "created": "2026-07-13T00:00:01Z",
+        "creators": ["Tool: syft-v1.42.3", "Tool: buildkit-v0.30.0"]
+      },
+      "packages": [
+        {
+          "SPDXID": "SPDXRef-Package-release-arm64",
+          "name": "release-arm64",
+          "downloadLocation": "NOASSERTION",
+          "filesAnalyzed": false,
+          "licenseConcluded": "NOASSERTION",
+          "licenseDeclared": "NOASSERTION",
+          "copyrightText": "NOASSERTION"
+        }
+      ]
+    }
+  }
+}

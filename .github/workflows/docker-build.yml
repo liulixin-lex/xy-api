@@ -97,6 +97,9 @@ jobs:
           echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "Validated $tag at $release_sha"
 
+      - name: Test release attestation verifier
+        run: .github/scripts/tests/test-verify-release-attestations.sh
+
   build_single_arch:
     name: Build, smoke, and sign (${{ matrix.arch }})
     needs: prepare
@@ -463,6 +466,8 @@ jobs:
 
       - name: Verify candidate manifests, labels, and attestations
         id: verify_candidates
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -euo pipefail
           evidence_dir="$RUNNER_TEMP/stable-release-evidence"
@@ -474,23 +479,52 @@ jobs:
             local reference="${repository}:${CANDIDATE_TAG}"
             local manifest_file="$evidence_dir/${evidence_prefix}-candidate-manifest.json"
             local image_file="$evidence_dir/${evidence_prefix}-candidate-images.json"
+            local amd64_source_file="$evidence_dir/${evidence_prefix}-amd64-source-manifest.json"
+            local arm64_source_file="$evidence_dir/${evidence_prefix}-arm64-source-manifest.json"
+            local immutable_reference
             local digest
 
             docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' > "$manifest_file"
-            docker buildx imagetools inspect "$reference" --format '{{json .Image}}' > "$image_file"
+            docker buildx imagetools inspect "${repository}@${AMD64_DIGEST}" --format '{{json .Manifest}}' > "$amd64_source_file"
+            docker buildx imagetools inspect "${repository}@${ARM64_DIGEST}" --format '{{json .Manifest}}' > "$arm64_source_file"
 
-            jq -e '
+            jq -e \
+              --slurpfile amd64_source "$amd64_source_file" \
+              --slurpfile arm64_source "$arm64_source_file" \
+              --arg amd64_digest "$AMD64_DIGEST" \
+              --arg arm64_digest "$ARM64_DIGEST" '
+              def valid_source($source; $architecture; $expected_digest):
+                $source.mediaType == "application/vnd.oci.image.index.v1+json" and
+                $source.digest == $expected_digest and
+                ($source.manifests | length) == 2 and
+                ([$source.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | length) == 1 and
+                ([$source.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length) == 1 and
+                ([$source.manifests[] | select(.platform.os == "linux") | .digest] ==
+                  [$source.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .annotations["vnd.docker.reference.digest"]]);
+
+              valid_source($amd64_source[0]; "amd64"; $amd64_digest) and
+              valid_source($arm64_source[0]; "arm64"; $arm64_digest) and
               .mediaType == "application/vnd.oci.image.index.v1+json" and
               (.manifests | length) == 4 and
               ([.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort) == ["amd64", "arm64"] and
               ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length) == 2 and
               ([.manifests[] | select(.platform.os == "linux") | .digest] | sort) ==
-                ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .annotations["vnd.docker.reference.digest"]] | sort)
+                ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .annotations["vnd.docker.reference.digest"]] | sort) and
+              (.manifests | sort_by(.digest)) ==
+                (($amd64_source[0].manifests + $arm64_source[0].manifests) | sort_by(.digest))
             ' "$manifest_file" >/dev/null
+
+            digest=$(jq -r '.digest' "$manifest_file")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Candidate $reference returned an invalid digest: $digest"
+              exit 1
+            fi
+            immutable_reference="${repository}@${digest}"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .Image}}' > "$image_file"
 
             jq -e \
               --arg version "$TAG" \
-              --arg revision "${{ needs.prepare.outputs.sha }}" \
+              --arg revision "$SOURCE_SHA" \
               '(keys | sort) == ["linux/amd64", "linux/arm64"] and
                all(.[];
                  .config.Labels["org.opencontainers.image.version"] == $version and
@@ -511,11 +545,22 @@ jobs:
               ' "$attestation_file" >/dev/null
             done < <(jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$manifest_file")
 
-            digest=$(jq -r '.digest' "$manifest_file")
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::Candidate $reference returned an invalid digest: $digest"
-              exit 1
-            fi
+            local sbom_file="$evidence_dir/attestations/${evidence_prefix}-sbom.json"
+            local provenance_file="$evidence_dir/attestations/${evidence_prefix}-provenance.json"
+            local verification_file="$evidence_dir/attestations/${evidence_prefix}-verification.json"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .SBOM}}' > "$sbom_file"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .Provenance}}' > "$provenance_file"
+            .github/scripts/verify-release-attestations.sh \
+              --sbom "$sbom_file" \
+              --provenance "$provenance_file" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --image-reference "$immutable_reference" \
+              --output "$verification_file"
+
             printf '%s\n' "$digest" > "$evidence_dir/${evidence_prefix}-candidate.digest"
           }
 
@@ -730,8 +775,22 @@ jobs:
 
       - name: Write release evidence
         run: |
+          set -euo pipefail
           evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+          attestation_evidence="$evidence_dir/attestation-verification.json"
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            jq -n \
+              --slurpfile ghcr "$evidence_dir/attestations/ghcr-verification.json" \
+              --slurpfile dockerhub "$evidence_dir/attestations/dockerhub-verification.json" \
+              '{ghcr: $ghcr[0], dockerhub: $dockerhub[0]}' > "$attestation_evidence"
+          else
+            jq -n \
+              --slurpfile ghcr "$evidence_dir/attestations/ghcr-verification.json" \
+              '{ghcr: $ghcr[0], dockerhub: null}' > "$attestation_evidence"
+          fi
+
           jq -n \
+            --slurpfile attestations "$attestation_evidence" \
             --arg tag "$TAG" \
             --arg candidate_tag "$CANDIDATE_TAG" \
             --arg source_sha "${{ needs.prepare.outputs.sha }}" \
@@ -746,7 +805,32 @@ jobs:
             --arg dockerhub_digest "$DOCKERHUB_CANDIDATE_DIGEST" \
             --arg amd64_digest "$AMD64_DIGEST" \
             --arg arm64_digest "$ARM64_DIGEST" \
-            '{tag: $tag, candidate_tag: $candidate_tag, source_sha: $source_sha, repository: $repository, actor: $actor, event_name: $event_name, run_id: $run_id, run_attempt: $run_attempt, created_at: $created_at, workflow_ref: $workflow_ref, ghcr_digest: $ghcr_digest, dockerhub_digest: (if $dockerhub_digest == "" then null else $dockerhub_digest end), architecture_digests: {amd64: $amd64_digest, arm64: $arm64_digest}, controls: {stable_version_immutable: true, latest_monotonic: true, tag_revalidated: true, signatures_verified: true}}' \
+            '{
+              tag: $tag,
+              candidate_tag: $candidate_tag,
+              source_sha: $source_sha,
+              repository: $repository,
+              actor: $actor,
+              event_name: $event_name,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              created_at: $created_at,
+              workflow_ref: $workflow_ref,
+              ghcr_digest: $ghcr_digest,
+              dockerhub_digest: (if $dockerhub_digest == "" then null else $dockerhub_digest end),
+              architecture_digests: {
+                amd64: $amd64_digest,
+                arm64: $arm64_digest
+              },
+              attestations: $attestations[0],
+              controls: {
+                stable_version_immutable: true,
+                latest_monotonic: true,
+                tag_revalidated: true,
+                signatures_verified: true,
+                attestation_contents_verified: true
+              }
+            }' \
             > "$evidence_dir/release.json"
 
       - name: Upload stable release evidence
@@ -767,7 +851,7 @@ jobs:
             echo "ghcr.io/${GHCR_REPOSITORY}:latest"
             echo "$GHCR_CANDIDATE_DIGEST"
             echo 'Platforms: linux/amd64, linux/arm64'
-            echo 'Attestations: SPDX SBOM, SLSA provenance'
+            echo 'Attestations: verified SPDX-2.3 packages and BuildKit SLSA source identity'
             echo 'Cosign: signed and verified before stable promotion'
             echo 'Version tags: immutable; latest: monotonic'
             echo '```'
