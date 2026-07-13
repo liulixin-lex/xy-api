@@ -298,7 +298,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Download release artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -315,6 +315,11 @@ jobs:
           current_tag_sha=$(git rev-list -n 1 "refs/tags/${TAG}")
           if [ "$current_tag_sha" != '${{ needs.prepare.outputs.sha }}' ]; then
             echo "::error::Release tag $TAG moved during the build; refusing asset upload."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$current_tag_sha" origin/main; then
+            echo "::error::Release commit $current_tag_sha is no longer an ancestor of origin/main."
             exit 1
           fi
 
@@ -370,3 +375,10 @@ jobs:
             ${{ runner.temp }}/release-assets-upload/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure existing release is latest
+        if: steps.release_assets.outputs.upload_required == 'false' && steps.release_assets.outputs.make_latest == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: .github/scripts/ensure-release-latest.sh --tag "$TAG"

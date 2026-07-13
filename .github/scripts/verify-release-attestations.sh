@@ -14,6 +14,7 @@ Usage: verify-release-attestations.sh \
   --workflow-ref WORKFLOW_REF \
   --workflow-sha COMMIT_SHA \
   --image-reference REFERENCE \
+  [--platform linux/amd64|linux/arm64] \
   --output FILE
 EOF
 }
@@ -32,6 +33,7 @@ run_attempt=''
 workflow_ref=''
 workflow_sha=''
 image_reference=''
+expected_platform=''
 output_file=''
 
 while [ "$#" -gt 0 ]; do
@@ -81,6 +83,11 @@ while [ "$#" -gt 0 ]; do
       image_reference=$2
       shift 2
       ;;
+    --platform)
+      [ "$#" -ge 2 ] || fail '--platform requires a value'
+      expected_platform=$2
+      shift 2
+      ;;
     --output)
       [ "$#" -ge 2 ] || fail '--output requires a value'
       output_file=$2
@@ -121,6 +128,10 @@ fi
 if [[ ! "$run_attempt" =~ ^[1-9][0-9]*$ ]]; then
   fail "invalid GitHub Actions run attempt: $run_attempt"
 fi
+case "$expected_platform" in
+  ''|linux/amd64|linux/arm64) ;;
+  *) fail "unsupported expected platform: $expected_platform" ;;
+esac
 workflow_prefix="$source_repository/.github/workflows/docker-build.yml@refs/"
 case "$workflow_ref" in
   "${workflow_prefix}heads/"?*|"${workflow_prefix}tags/"?*) ;;
@@ -128,8 +139,12 @@ case "$workflow_ref" in
 esac
 
 source_uri="https://github.com/${source_repository}"
-builder_id="${source_uri}/actions/runs/${run_id}/attempts/${run_attempt}"
 build_type='https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md'
+if [ -n "$expected_platform" ]; then
+  expected_platforms=$(jq -cn --arg platform "$expected_platform" '[$platform]')
+else
+  expected_platforms='["linux/amd64","linux/arm64"]'
+fi
 
 if ! jq empty "$sbom_file" >/dev/null 2>&1; then
   fail 'SBOM output is not valid JSON'
@@ -138,7 +153,8 @@ if ! jq empty "$provenance_file" >/dev/null 2>&1; then
   fail 'provenance output is not valid JSON'
 fi
 
-if ! jq -e '
+if ! jq -e \
+  --argjson expected_platforms "$expected_platforms" '
   def nonempty_string:
     type == "string" and length > 0;
   def valid_package:
@@ -151,7 +167,7 @@ if ! jq -e '
     (.copyrightText? | nonempty_string);
 
   type == "object" and
-  (keys | sort) == ["linux/amd64", "linux/arm64"] and
+  (keys | sort) == ($expected_platforms | sort) and
   all(.[];
     (.SPDX | type) == "object" and
     .SPDX.spdxVersion == "SPDX-2.3" and
@@ -168,12 +184,12 @@ if ! jq -e '
     all(.SPDX.packages[]; valid_package)
   )
 ' "$sbom_file" >/dev/null; then
-  fail 'SBOM must contain valid, non-empty SPDX-2.3 documents for linux/amd64 and linux/arm64'
+  fail 'SBOM must contain valid, non-empty SPDX-2.3 documents for every expected platform'
 fi
 
 if ! jq -e \
   --arg build_type "$build_type" \
-  --arg builder_id "$builder_id" \
+  --argjson expected_platforms "$expected_platforms" \
   --arg source_sha "$source_sha" \
   --arg source_uri "$source_uri" \
   --arg source_repository "$source_repository" \
@@ -198,17 +214,22 @@ if ! jq -e \
       .SLSA.buildDefinition.externalParameters.request.root.request.args["vcs:source"],
       .SLSA.runDetails.metadata.buildkit_metadata.vcs.source
     ] | map(select(type == "string" and length > 0));
+  def valid_run_attempt($maximum):
+    type == "string" and
+    test("^[1-9][0-9]*$") and
+    (tonumber <= ($maximum | tonumber));
 
   type == "object" and
-  (keys | sort) == ["linux/amd64", "linux/arm64"] and
+  (keys | sort) == ($expected_platforms | sort) and
   all(to_entries[];
     .key as $platform |
     .value |
+    .SLSA.buildDefinition.internalParameters.github_run_attempt as $build_attempt |
     (.SLSA | type) == "object" and
     .SLSA.buildDefinition.buildType == $build_type and
     .SLSA.buildDefinition.internalParameters.github_repository == $source_repository and
     .SLSA.buildDefinition.internalParameters.github_run_id == $run_id and
-    .SLSA.buildDefinition.internalParameters.github_run_attempt == $run_attempt and
+    ($build_attempt | valid_run_attempt($run_attempt)) and
     .SLSA.buildDefinition.internalParameters.github_job == "build_single_arch" and
     .SLSA.buildDefinition.internalParameters.github_workflow_ref == $workflow_ref and
     .SLSA.buildDefinition.internalParameters.github_workflow_sha == $workflow_sha and
@@ -216,7 +237,8 @@ if ! jq -e \
     .SLSA.buildDefinition.internalParameters.github_runner_os == "Linux" and
     .SLSA.buildDefinition.internalParameters.github_runner_arch ==
       (if $platform == "linux/amd64" then "X64" else "ARM64" end) and
-    .SLSA.runDetails.builder.id == $builder_id and
+    .SLSA.runDetails.builder.id ==
+      ($source_uri + "/actions/runs/" + $run_id + "/attempts/" + $build_attempt) and
     .SLSA.runDetails.metadata.buildkit_completeness.request == true and
     (.SLSA.runDetails.metadata.invocationId | nonempty_string) and
     (.SLSA.runDetails.metadata.startedOn | nonempty_string) and
@@ -227,7 +249,7 @@ if ! jq -e \
     all(source_claims[]; . == $source_uri)
   )
 ' "$provenance_file" >/dev/null; then
-  fail 'provenance must bind both platforms to the release SHA and this repository GitHub Actions run using BuildKit SLSA'
+  fail 'provenance must bind every expected platform to the release SHA and an allowed attempt of this repository GitHub Actions run using BuildKit SLSA'
 fi
 
 sbom_sha256=$(sha256sum "$sbom_file" | awk '{print $1}')
@@ -244,6 +266,7 @@ jq -n \
   --arg run_attempt "$run_attempt" \
   --arg workflow_ref "$workflow_ref" \
   --arg workflow_sha "$workflow_sha" \
+  --argjson expected_platforms "$expected_platforms" \
   --arg sbom_sha256 "$sbom_sha256" \
   --arg provenance_sha256 "$provenance_sha256" '
   def platform_evidence($platform):
@@ -261,6 +284,7 @@ jq -n \
         source_revision: $provenance[0][$platform].SLSA.runDetails.metadata.buildkit_metadata.vcs.revision,
         workflow_ref: $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_workflow_ref,
         workflow_sha: $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_workflow_sha,
+        run_attempt: $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_run_attempt,
         builder_id: $provenance[0][$platform].SLSA.runDetails.builder.id,
         runner_arch: $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_runner_arch,
         runner_environment: $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_runner_environment,
@@ -280,16 +304,17 @@ jq -n \
     actions_run: {
       run_id: $run_id,
       run_attempt: $run_attempt,
-      builder_id: $provenance[0]["linux/amd64"].SLSA.runDetails.builder.id
+      platform_attempts: (reduce $expected_platforms[] as $platform ({};
+        .[$platform] = $provenance[0][$platform].SLSA.buildDefinition.internalParameters.github_run_attempt)),
+      builder_ids: (reduce $expected_platforms[] as $platform ({};
+        .[$platform] = $provenance[0][$platform].SLSA.runDetails.builder.id))
     },
     raw_evidence_sha256: {
       sbom: $sbom_sha256,
       provenance: $provenance_sha256
     },
-    platforms: {
-      "linux/amd64": platform_evidence("linux/amd64"),
-      "linux/arm64": platform_evidence("linux/arm64")
-    },
+    platforms: (reduce $expected_platforms[] as $platform ({};
+      .[$platform] = platform_evidence($platform))),
     checks: {
       exact_platforms: true,
       spdx_2_3: true,
@@ -298,6 +323,7 @@ jq -n \
       source_revision_matches: true,
       source_repository_matches: true,
       github_actions_builder_matches: true,
+      build_attempt_not_newer_than_verifier: true,
       stable_workflow_ref_matches: true,
       workflow_sha_matches: true
     }

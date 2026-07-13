@@ -41,6 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           actionlint
+          shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
           yamllint \
             -d '{extends: default, rules: {document-start: disable, line-length: disable, truthy: disable, comments: disable}}' \
             .github/workflows .github/dependabot.yml
@@ -51,7 +52,10 @@ jobs:
             exit 1
           fi
           .github/scripts/tests/test-prepare-release-assets.sh
+          .github/scripts/tests/test-ensure-release-latest.sh
+          .github/scripts/tests/test-resolve-stable-architecture.sh
           .github/scripts/tests/test-verify-release-attestations.sh
+          .github/scripts/tests/test-verify-stable-architecture.sh
 
   backend:
     name: Backend tests
@@ -85,7 +89,21 @@ jobs:
           fi
 
       - name: Run backend tests
-        run: go list ./... | grep -v '/node_modules/' | xargs go test
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          mapfile -t discovered_packages <<< "$package_list"
+          packages=()
+          for package in "${discovered_packages[@]}"; do
+            if [ -n "$package" ] && [[ "$package" != */node_modules/* ]]; then
+              packages+=("$package")
+            fi
+          done
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo '::error::go list returned no testable backend packages.'
+            exit 1
+          fi
+          go test "${packages[@]}"
 
   frontend-default:
     name: Default frontend build

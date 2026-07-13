@@ -22,18 +22,24 @@ verify() {
   local output=$3
   local selected_workflow_ref=${4:-$workflow_ref}
   local selected_image_reference=${5:-$image_reference}
+  local selected_platform=${6:-}
 
-  "$verifier" \
-    --sbom "$sbom" \
-    --provenance "$provenance" \
-    --source-repository "$source_repository" \
-    --source-sha "$source_sha" \
-    --run-id "$run_id" \
-    --run-attempt "$run_attempt" \
-    --workflow-ref "$selected_workflow_ref" \
-    --workflow-sha "$workflow_sha" \
-    --image-reference "$selected_image_reference" \
+  local args=(
+    --sbom "$sbom"
+    --provenance "$provenance"
+    --source-repository "$source_repository"
+    --source-sha "$source_sha"
+    --run-id "$run_id"
+    --run-attempt "$run_attempt"
+    --workflow-ref "$selected_workflow_ref"
+    --workflow-sha "$workflow_sha"
+    --image-reference "$selected_image_reference"
     --output "$output"
+  )
+  if [ -n "$selected_platform" ]; then
+    args+=(--platform "$selected_platform")
+  fi
+  "$verifier" "${args[@]}"
 }
 
 expect_failure() {
@@ -67,8 +73,64 @@ jq -e \
     .platforms["linux/amd64"].sbom.package_count == 1 and
     .platforms["linux/arm64"].sbom.package_count == 1 and
     .platforms["linux/arm64"].provenance.source_revision == $source_sha and
+    .actions_run.platform_attempts["linux/amd64"] == "2" and
+    .platforms["linux/arm64"].provenance.run_attempt == "2" and
     all(.checks[]; . == true)
   ' "$summary" >/dev/null
+
+jq 'del(."linux/arm64")' "$valid_sbom" > "$temp_dir/amd64-sbom.json"
+jq 'del(."linux/arm64")' "$valid_provenance" > "$temp_dir/amd64-provenance.json"
+verify \
+  "$temp_dir/amd64-sbom.json" \
+  "$temp_dir/amd64-provenance.json" \
+  "$temp_dir/amd64-summary.json" \
+  "$workflow_ref" \
+  "$image_reference" \
+  'linux/amd64'
+jq -e '
+  (.platforms | keys) == ["linux/amd64"] and
+  .actions_run.platform_attempts["linux/amd64"] == "2" and
+  .platforms["linux/amd64"].provenance.run_attempt == "2"
+' "$temp_dir/amd64-summary.json" >/dev/null
+
+jq 'del(."linux/amd64")' "$valid_sbom" > "$temp_dir/arm64-sbom.json"
+jq 'del(."linux/amd64")' "$valid_provenance" > "$temp_dir/arm64-provenance.json"
+verify \
+  "$temp_dir/arm64-sbom.json" \
+  "$temp_dir/arm64-provenance.json" \
+  "$temp_dir/arm64-summary.json" \
+  "$workflow_ref" \
+  "$image_reference" \
+  'linux/arm64'
+jq -e '
+  (.platforms | keys) == ["linux/arm64"] and
+  .platforms["linux/arm64"].provenance.runner_arch == "ARM64"
+' "$temp_dir/arm64-summary.json" >/dev/null
+
+jq '
+  ."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_attempt = "1" |
+  ."linux/amd64".SLSA.runDetails.builder.id =
+    "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/1"
+' "$valid_provenance" > "$temp_dir/mixed-attempts.json"
+verify "$valid_sbom" "$temp_dir/mixed-attempts.json" "$temp_dir/mixed-attempts-summary.json"
+jq -e '
+  .actions_run.platform_attempts == {"linux/amd64": "1", "linux/arm64": "2"} and
+  .platforms["linux/amd64"].provenance.builder_id ==
+    "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/1"
+' "$temp_dir/mixed-attempts-summary.json" >/dev/null
+
+jq '
+  ."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_attempt = "3" |
+  ."linux/amd64".SLSA.runDetails.builder.id =
+    "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/3"
+' "$valid_provenance" > "$temp_dir/future-attempt.json"
+expect_failure future-attempt verify \
+  "$valid_sbom" "$temp_dir/future-attempt.json" "$temp_dir/future-attempt-output.json"
+
+jq '."linux/amd64".SLSA.buildDefinition.internalParameters.github_run_attempt = "1"' \
+  "$valid_provenance" > "$temp_dir/attempt-builder-mismatch.json"
+expect_failure attempt-builder-mismatch verify \
+  "$valid_sbom" "$temp_dir/attempt-builder-mismatch.json" "$temp_dir/attempt-builder-mismatch-output.json"
 
 jq 'del(."linux/arm64")' "$valid_sbom" > "$temp_dir/missing-platform.json"
 expect_failure missing-platform verify \
