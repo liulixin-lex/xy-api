@@ -28,7 +28,7 @@
           "github_runner_environment": "github-hosted",
           "github_runner_os": "Linux",
           "github_workflow_ref": "liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/tags/v0.1.11",
-          "github_workflow_sha": "1111111111111111111111111111111111111111"
+          "github_workflow_sha": "3333333333333333333333333333333333333333"
         }
       },
       "runDetails": {
@@ -82,7 +82,7 @@
           "github_runner_environment": "github-hosted",
           "github_runner_os": "Linux",
           "github_workflow_ref": "liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/tags/v0.1.11",
-          "github_workflow_sha": "1111111111111111111111111111111111111111"
+          "github_workflow_sha": "3333333333333333333333333333333333333333"
         }
       },
       "runDetails": {

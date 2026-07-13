@@ -558,6 +558,7 @@ jobs:
               --run-id "$GITHUB_RUN_ID" \
               --run-attempt "$GITHUB_RUN_ATTEMPT" \
               --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
               --image-reference "$immutable_reference" \
               --output "$verification_file"
 
@@ -665,11 +666,14 @@ jobs:
 
           assert_latest_not_newer() {
             local repository=$1
-            local evidence_name=$2
+            local expected_digest=$2
+            local evidence_name=$3
             local reference="${repository}:latest"
             local manifest_file="$evidence_dir/preflight-${evidence_name}-latest.json"
             local image_file="$evidence_dir/preflight-${evidence_name}-latest-images.json"
             if inspect_optional_manifest "$reference" "$manifest_file"; then
+              local actual_digest
+              actual_digest=$(jq -r '.digest' "$manifest_file")
               docker buildx imagetools inspect "$reference" --format '{{json .Image}}' > "$image_file"
               mapfile -t versions < <(jq -r '[.[] | .config.Labels["org.opencontainers.image.version"] // ""] | unique[]' "$image_file")
               if [ "${#versions[@]}" -ne 1 ] || [[ ! "${versions[0]}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -681,19 +685,23 @@ jobs:
                 echo "::error::Refusing to move latest backward from ${versions[0]} to $TAG."
                 exit 1
               fi
+              if [ "${versions[0]}" = "$TAG" ] && [ "$actual_digest" != "$expected_digest" ]; then
+                echo "::error::Existing $reference claims $TAG but has a different immutable digest."
+                exit 1
+              fi
             fi
           }
 
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" ghcr-amd64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" ghcr-arm64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}" "$GHCR_CANDIDATE_DIGEST" ghcr-version
-          assert_latest_not_newer "ghcr.io/${GHCR_REPOSITORY}" ghcr
+          assert_latest_not_newer "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" ghcr
 
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" dockerhub-amd64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" dockerhub-arm64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub-version
-            assert_latest_not_newer "$DOCKERHUB_REPOSITORY" dockerhub
+            assert_latest_not_newer "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub
           fi
 
       - name: Promote signed candidates to stable tags
@@ -801,6 +809,7 @@ jobs:
             --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg created_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --arg workflow_ref "${{ github.workflow_ref }}" \
+            --arg workflow_sha "${{ github.workflow_sha }}" \
             --arg ghcr_digest "$GHCR_CANDIDATE_DIGEST" \
             --arg dockerhub_digest "$DOCKERHUB_CANDIDATE_DIGEST" \
             --arg amd64_digest "$AMD64_DIGEST" \
@@ -816,6 +825,7 @@ jobs:
               run_attempt: $run_attempt,
               created_at: $created_at,
               workflow_ref: $workflow_ref,
+              workflow_sha: $workflow_sha,
               ghcr_digest: $ghcr_digest,
               dockerhub_digest: (if $dockerhub_digest == "" then null else $dockerhub_digest end),
               architecture_digests: {

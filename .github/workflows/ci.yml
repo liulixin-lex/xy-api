@@ -50,6 +50,8 @@ jobs:
             echo '::error::Every external GitHub Action must be pinned to a full commit SHA.'
             exit 1
           fi
+          .github/scripts/tests/test-prepare-release-assets.sh
+          .github/scripts/tests/test-verify-release-attestations.sh
 
   backend:
     name: Backend tests

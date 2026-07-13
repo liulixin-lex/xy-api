@@ -56,8 +56,8 @@ jobs:
 
       - name: Validate Gitee target
         run: |
-          if [ -z "$GITEE_OWNER" ] || [ -z "$GITEE_REPO" ]; then
-            echo "::error::Set repository variables GITEE_OWNER and GITEE_REPO before syncing to Gitee."
+          if [[ ! "$GITEE_OWNER" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ ! "$GITEE_REPO" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Set valid repository variables GITEE_OWNER and GITEE_REPO before syncing to Gitee."
             exit 1
           fi
 
@@ -77,10 +77,32 @@ jobs:
           release_name_file="$RUNNER_TEMP/gitee-release-name.txt"
           release_body_file="$RUNNER_TEMP/gitee-release-body.txt"
           target_commitish_file="$RUNNER_TEMP/gitee-target-commitish.txt"
-          gh release view "$TAG_NAME" --json name,body,tagName,targetCommitish,assets > "$release_info_file"
-          jq -r '.name // .tagName' "$release_info_file" > "$release_name_file"
-          jq -r '.body // ""' "$release_info_file" > "$release_body_file"
-          jq -r '.targetCommitish // ""' "$release_info_file" > "$target_commitish_file"
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          git fetch --no-tags origin main
+          tag_sha=$(git rev-list -n 1 "refs/tags/${TAG_NAME}")
+          if [[ ! "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve $TAG_NAME to one immutable Git commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_sha" origin/main; then
+            echo "::error::Release commit $tag_sha is not an ancestor of origin/main."
+            exit 1
+          fi
+          if ! git show "${tag_sha}:VERSION" | cmp -s - <(printf '%s\n' "$TAG_NAME"); then
+            echo "::error::VERSION at $TAG_NAME does not exactly match the release tag."
+            exit 1
+          fi
+
+          gh release view "$TAG_NAME" --json name,body,tagName,isDraft,isPrerelease,assets > "$release_info_file"
+          jq -e --arg tag "$TAG_NAME" '
+            .tagName == $tag and
+            .isDraft == false and
+            .isPrerelease == false and
+            (.assets | type) == "array"
+          ' "$release_info_file" >/dev/null
+          jq -r 'if (.name // "") == "" then .tagName else .name end' "$release_info_file" > "$release_name_file"
+          jq -r 'if (.body // "") == "" then "-" else .body end' "$release_info_file" > "$release_body_file"
+          printf '%s\n' "$tag_sha" > "$target_commitish_file"
 
           write_multiline_output() {
             local name=$1

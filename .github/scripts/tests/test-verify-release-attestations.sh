@@ -10,6 +10,7 @@ trap 'rm -rf "$temp_dir"' EXIT
 
 source_repository='liulixin-lex/xy-api'
 source_sha='1111111111111111111111111111111111111111'
+workflow_sha='3333333333333333333333333333333333333333'
 run_id='123456789'
 run_attempt='2'
 workflow_ref='liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/tags/v0.1.11'
@@ -30,6 +31,7 @@ verify() {
     --run-id "$run_id" \
     --run-attempt "$run_attempt" \
     --workflow-ref "$selected_workflow_ref" \
+    --workflow-sha "$workflow_sha" \
     --image-reference "$selected_image_reference" \
     --output "$output"
 }
@@ -58,6 +60,7 @@ jq -e \
     .schema_version == 1 and
     .image_reference == $image_reference and
     .source_sha == $source_sha and
+    .workflow_sha == "3333333333333333333333333333333333333333" and
     (.raw_evidence_sha256.sbom | test("^[0-9a-f]{64}$")) and
     (.raw_evidence_sha256.provenance | test("^[0-9a-f]{64}$")) and
     .platforms["linux/amd64"].sbom.spdx_version == "SPDX-2.3" and

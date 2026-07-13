@@ -10,6 +10,9 @@ on:
         description: "reason"
         required: false
 
+permissions:
+  contents: read
+
 concurrency:
   group: rolling-container-publish-alpha-${{ github.repository }}
   cancel-in-progress: false
@@ -69,6 +72,8 @@ jobs:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
@@ -147,11 +152,21 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Sign image with cosign
+      - name: Sign and verify image with cosign
         run: |
-          cosign sign --yes "ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+          ghcr_ref="ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "$ghcr_ref"
+          cosign verify \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            "$ghcr_ref" >/dev/null
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes "${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}"
+            dockerhub_ref="${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}"
+            cosign sign --yes "$dockerhub_ref"
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "$dockerhub_ref" >/dev/null
           fi
 
       - name: Output digest
@@ -176,6 +191,8 @@ jobs:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
@@ -232,6 +249,33 @@ jobs:
             -t "ghcr.io/${GHCR_REPOSITORY}:${VERSION}" \
             "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64" \
             "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign and verify multi-arch manifests by digest
+        run: |
+          set -euo pipefail
+
+          sign_and_verify() {
+            local repository=$1
+            local digest
+            digest=$(docker buildx imagetools inspect "${repository}:${VERSION}" --format '{{.Manifest.Digest}}')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid alpha manifest digest for $repository: $digest"
+              exit 1
+            fi
+            cosign sign --yes "${repository}@${digest}"
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "${repository}@${digest}" >/dev/null
+          }
+
+          sign_and_verify "ghcr.io/${GHCR_REPOSITORY}"
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            sign_and_verify "$DOCKERHUB_REPOSITORY"
+          fi
 
       - name: Output manifest digest
         run: |

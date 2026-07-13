@@ -10,6 +10,9 @@ on:
         description: "reason"
         required: false
 
+permissions:
+  contents: read
+
 concurrency:
   group: rolling-container-publish-nightly-${{ github.repository }}
   cancel-in-progress: false

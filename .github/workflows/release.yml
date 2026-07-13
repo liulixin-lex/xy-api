@@ -289,7 +289,7 @@ jobs:
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     concurrency:
-      group: release-upload-${{ needs.prepare.outputs.tag }}
+      group: stable-github-release-${{ github.repository }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -318,12 +318,55 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release asset inventory and checksums
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          expected_file="$RUNNER_TEMP/release-assets-expected.txt"
+          actual_file="$RUNNER_TEMP/release-assets-actual.txt"
+          printf '%s\n' \
+            checksums-linux.txt \
+            checksums-macos.txt \
+            checksums-windows.txt \
+            "new-api-${TAG}" \
+            "new-api-arm64-${TAG}" \
+            "new-api-macos-${TAG}" \
+            "new-api-${TAG}.exe" | LC_ALL=C sort > "$expected_file"
+          find release-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > "$actual_file"
+          if ! cmp -s "$expected_file" "$actual_file"; then
+            echo '::error::Release artifact inventory does not match the expected stable assets.'
+            diff -u "$expected_file" "$actual_file" || true
+            exit 1
+          fi
+          (
+            cd release-assets
+            sha256sum --check --strict checksums-linux.txt
+            sha256sum --check --strict checksums-macos.txt
+            sha256sum --check --strict checksums-windows.txt
+          )
+
+      - name: Prepare immutable release asset upload
+        id: release_assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          .github/scripts/prepare-release-assets.sh \
+            --tag "$TAG" \
+            --source-dir release-assets \
+            --upload-dir "$RUNNER_TEMP/release-assets-upload" \
+            --output "$GITHUB_OUTPUT"
+
       - name: Release
+        if: steps.release_assets.outputs.upload_required == 'true'
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           fail_on_unmatched_files: true
+          overwrite_files: false
+          make_latest: ${{ steps.release_assets.outputs.make_latest }}
           files: |
-            release-assets/*
+            ${{ runner.temp }}/release-assets-upload/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -12,6 +12,7 @@ Usage: verify-release-attestations.sh \
   --run-id ID \
   --run-attempt NUMBER \
   --workflow-ref WORKFLOW_REF \
+  --workflow-sha COMMIT_SHA \
   --image-reference REFERENCE \
   --output FILE
 EOF
@@ -29,6 +30,7 @@ source_sha=''
 run_id=''
 run_attempt=''
 workflow_ref=''
+workflow_sha=''
 image_reference=''
 output_file=''
 
@@ -69,6 +71,11 @@ while [ "$#" -gt 0 ]; do
       workflow_ref=$2
       shift 2
       ;;
+    --workflow-sha)
+      [ "$#" -ge 2 ] || fail '--workflow-sha requires a value'
+      workflow_sha=$2
+      shift 2
+      ;;
     --image-reference)
       [ "$#" -ge 2 ] || fail '--image-reference requires a value'
       image_reference=$2
@@ -104,6 +111,9 @@ if [[ ! "$source_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
 fi
 if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
   fail "invalid source SHA: $source_sha"
+fi
+if [[ ! "$workflow_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  fail "invalid workflow SHA: $workflow_sha"
 fi
 if [[ ! "$run_id" =~ ^[1-9][0-9]*$ ]]; then
   fail "invalid GitHub Actions run ID: $run_id"
@@ -169,7 +179,8 @@ if ! jq -e \
   --arg source_repository "$source_repository" \
   --arg run_id "$run_id" \
   --arg run_attempt "$run_attempt" \
-  --arg workflow_ref "$workflow_ref" '
+  --arg workflow_ref "$workflow_ref" \
+  --arg workflow_sha "$workflow_sha" '
   def nonempty_string:
     type == "string" and length > 0;
   def revision_claims:
@@ -200,7 +211,7 @@ if ! jq -e \
     .SLSA.buildDefinition.internalParameters.github_run_attempt == $run_attempt and
     .SLSA.buildDefinition.internalParameters.github_job == "build_single_arch" and
     .SLSA.buildDefinition.internalParameters.github_workflow_ref == $workflow_ref and
-    .SLSA.buildDefinition.internalParameters.github_workflow_sha == $source_sha and
+    .SLSA.buildDefinition.internalParameters.github_workflow_sha == $workflow_sha and
     .SLSA.buildDefinition.internalParameters.github_runner_environment == "github-hosted" and
     .SLSA.buildDefinition.internalParameters.github_runner_os == "Linux" and
     .SLSA.buildDefinition.internalParameters.github_runner_arch ==
@@ -232,6 +243,7 @@ jq -n \
   --arg run_id "$run_id" \
   --arg run_attempt "$run_attempt" \
   --arg workflow_ref "$workflow_ref" \
+  --arg workflow_sha "$workflow_sha" \
   --arg sbom_sha256 "$sbom_sha256" \
   --arg provenance_sha256 "$provenance_sha256" '
   def platform_evidence($platform):
@@ -264,6 +276,7 @@ jq -n \
     source_repository: $source_repository,
     source_sha: $source_sha,
     workflow_ref: $workflow_ref,
+    workflow_sha: $workflow_sha,
     actions_run: {
       run_id: $run_id,
       run_attempt: $run_attempt,
