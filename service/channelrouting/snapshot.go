@@ -143,6 +143,13 @@ type PoolMemberSnapshot struct {
 
 type ModelSnapshot struct {
 	ModelName                   string                          `json:"model_name"`
+	UpstreamModelName           string                          `json:"upstream_model_name,omitempty"`
+	UpstreamModelKnown          bool                            `json:"upstream_model_known"`
+	RequestKindsKnown           RequestKindMask                 `json:"request_kinds_known"`
+	RequestKindsSupported       RequestKindMask                 `json:"request_kinds_supported"`
+	CapabilitiesKnown           RequestCapabilityMask           `json:"capabilities_known"`
+	CapabilitiesSupported       RequestCapabilityMask           `json:"capabilities_supported"`
+	CapabilityRevision          uint64                          `json:"capability_revision,omitempty"`
 	MetricKnown                 bool                            `json:"metric_known"`
 	MetricSource                string                          `json:"metric_source,omitempty"`
 	RequestCount                int64                           `json:"request_count"`
@@ -1356,6 +1363,11 @@ func snapshotModel(
 	telemetryAvailable bool,
 ) (ModelSnapshot, int) {
 	view := ModelSnapshot{ModelName: modelName}
+	upstreamModel, _, mappingErr := model.ResolveChannelModelMapping(channel.GetModelMapping(), modelName)
+	if mappingErr == nil && strings.TrimSpace(upstreamModel) != "" && validShadowText(upstreamModel, 256) {
+		view.UpstreamModelName = upstreamModel
+		view.UpstreamModelKnown = true
+	}
 	if len(credentialIDs) == 0 {
 		view.Inflight = routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
 			PoolMemberID: memberID,

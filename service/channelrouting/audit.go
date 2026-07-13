@@ -362,7 +362,7 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 
 func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisionCanaryAuditFields, error) {
 	if input.Gate == nil {
-		if input.AlgorithmVersion == DecisionAlgorithmBalancedV1 {
+		if supportedBalancedAlgorithm(input.AlgorithmVersion) {
 			if !replayable || input.BalancedReplayInput == nil || input.ReplayInput != nil || input.ActivationID <= 0 {
 				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
 			}
@@ -440,7 +440,8 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 			}
 			return fields, nil
 		}
-		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
+		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.AlgorithmVersion == DecisionAlgorithmCanaryV2 ||
+			input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
 			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 		}
 		return decisionCanaryAuditFields{}, nil
@@ -453,7 +454,8 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 		input.RequestID,
 		gate.TrafficBasisPoints,
 	)
-	if err != nil || gate != expectedGate || input.AlgorithmVersion != DecisionAlgorithmCanaryV1 ||
+	if err != nil || gate != expectedGate ||
+		(input.AlgorithmVersion != DecisionAlgorithmCanaryV1 && input.AlgorithmVersion != DecisionAlgorithmCanaryV2) ||
 		gate.PoolID != input.PoolID || gate.PolicyRevision != input.SnapshotRevision {
 		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 	}

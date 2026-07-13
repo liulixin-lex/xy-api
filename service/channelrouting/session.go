@@ -54,6 +54,7 @@ type RequestRoutingPlanInput struct {
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
 	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
+	Profile                 *RequestProfile                  `json:"-"`
 	// A nil allowed list means unrestricted. A non-nil empty list fails closed.
 	AllowedChannelIDs          []int
 	ExcludedChannelIDs         []int
@@ -70,6 +71,7 @@ type RequestRoutingCostInput struct {
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
 	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
+	Profile                 *RequestProfile                  `json:"-"`
 }
 
 type RequestRoutingPlan struct {
@@ -238,7 +240,8 @@ func (session *RequestRoutingSession) CostEstimateForChannel(
 	if !exists || memberID <= 0 {
 		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
-	profile, err := NewRequestProfile(
+	profile, err := resolveRequestProfile(
+		input.Profile,
 		input.RequestPath,
 		session.groupName,
 		input.ModelName,
@@ -311,7 +314,8 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		return plan, true, nil
 	}
 
-	profile, err := NewRequestProfile(
+	profile, err := resolveRequestProfile(
+		input.Profile,
 		input.RequestPath,
 		session.groupName,
 		input.ModelName,
@@ -392,28 +396,30 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				region    string
 			}{authority: authority, region: region}
 		}
-		switch {
-		case routingSessionChannelContains(excludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonRequestFailed
-		case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
-		case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
-		case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonChannelNotAllowed
-		case member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1:
-			candidate.RequestExclusionReason = ExclusionReasonMultiKeyUnsupported
-		case input.SlowStartFactor != nil:
-			factor, factorErr := session.slowStartFactor(SlowStartKey{
-				PoolID: pool.ID, MemberID: member.ID, Model: profile.ModelName,
-			}, input.SlowStartFactor)
-			if factorErr != nil || math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 0 || factor > 1 {
-				return RequestRoutingPlan{}, true, fmt.Errorf("%w: slow start factor", ErrRoutingSessionInvalid)
-			}
-			if factor == 0 {
-				candidate.RequestExclusionReason = ExclusionReasonSlowStartUnavailable
-			} else {
-				candidate.SlowStartFactor = factor
+		if candidate.RequestExclusionReason == "" {
+			switch {
+			case routingSessionChannelContains(excludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonRequestFailed
+			case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
+			case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
+			case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonChannelNotAllowed
+			case member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1:
+				candidate.RequestExclusionReason = ExclusionReasonMultiKeyUnsupported
+			case input.SlowStartFactor != nil:
+				factor, factorErr := session.slowStartFactor(SlowStartKey{
+					PoolID: pool.ID, MemberID: member.ID, Model: profile.ModelName,
+				}, input.SlowStartFactor)
+				if factorErr != nil || math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 0 || factor > 1 {
+					return RequestRoutingPlan{}, true, fmt.Errorf("%w: slow start factor", ErrRoutingSessionInvalid)
+				}
+				if factor == 0 {
+					candidate.RequestExclusionReason = ExclusionReasonSlowStartUnavailable
+				} else {
+					candidate.SlowStartFactor = factor
+				}
 			}
 		}
 		identity := Identity{SnapshotRevision: snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}

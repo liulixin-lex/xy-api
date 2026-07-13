@@ -343,7 +343,7 @@ func simulateHistoricalDecision(
 			ctx, audit, *options.BalancedPolicy, options.BalancedPool, options.PolicyHash,
 		)
 	}
-	if audit.AlgorithmVersion != DecisionAlgorithmShadowV1 {
+	if audit.AlgorithmVersion != DecisionAlgorithmShadowV1 && audit.AlgorithmVersion != DecisionAlgorithmShadowV2 {
 		return historicalSimulationDecision{}, historicalSimulationDecision{}, "", ErrShadowReplayAlgorithm
 	}
 	baseline, err := ReplayDecisionAudit(audit)
@@ -396,7 +396,7 @@ func simulateBalancedHistoricalDecision(
 	var baseline historicalSimulationDecision
 	var input BalancedReplayInput
 	switch audit.AlgorithmVersion {
-	case DecisionAlgorithmBalancedV1:
+	case DecisionAlgorithmBalancedV1, DecisionAlgorithmBalancedV2:
 		baselineResult, replayErr := ReplayBalancedDecisionAudit(audit)
 		if replayErr != nil {
 			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", replayErr
@@ -408,7 +408,7 @@ func simulateBalancedHistoricalDecision(
 			channelID: baselineResult.SelectedChannelID,
 			cost:      baselineResult.SelectedCost, costKnown: baselineResult.SelectedCostKnown,
 		}
-	case DecisionAlgorithmShadowV1, DecisionAlgorithmCanaryV1:
+	case DecisionAlgorithmShadowV1, DecisionAlgorithmCanaryV1, DecisionAlgorithmShadowV2, DecisionAlgorithmCanaryV2:
 		baselineResult, replayErr := ReplayDecisionAudit(audit)
 		if replayErr != nil {
 			return historicalSimulationDecision{}, historicalSimulationDecision{}, "", replayErr
@@ -538,7 +538,8 @@ func balancedReplayInputFromShadow(input ShadowReplayInput, policy BalancedPoolP
 			}
 		}
 		slowStartFactor := source.SlowStartFactor
-		if input.AlgorithmVersion == DecisionAlgorithmShadowV1 && slowStartFactor == 0 {
+		if (input.AlgorithmVersion == DecisionAlgorithmShadowV1 || input.AlgorithmVersion == DecisionAlgorithmShadowV2) &&
+			slowStartFactor == 0 {
 			slowStartFactor = 1
 		}
 		metricUpdatedUnix := int64(0)

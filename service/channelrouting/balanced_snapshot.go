@@ -119,6 +119,9 @@ func balancedCandidateFromSnapshot(
 	if member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1 {
 		candidate.HardExclusionReason = routingselector.BalancedExclusionCredentialUnavailable
 	}
+	if reason := requestCapabilityExclusionReason(profile, observation); reason != "" {
+		candidate.HardExclusionReason = reason
+	}
 	if observation.MetricKnown || observation.Inflight > 0 {
 		candidate.Candidate.Metric = &routingselector.MetricSnapshot{
 			RequestCount:            observation.RequestCount,

@@ -8,7 +8,10 @@ import (
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 )
 
-const DecisionAlgorithmBalancedV1 = "channel-routing-balanced-v1"
+const (
+	DecisionAlgorithmBalancedV1 = "channel-routing-balanced-v1"
+	DecisionAlgorithmBalancedV2 = "channel-routing-balanced-v2"
+)
 
 type BalancedRoutingPlanInput struct {
 	RequestRoutingPlanInput
@@ -71,7 +74,8 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	if snapshot.view.BuiltAtUnix <= 0 || snapshot.view.ActivationID <= 0 {
 		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
-	profile, err := NewRequestProfile(
+	profile, err := resolveRequestProfile(
+		input.Profile,
 		input.RequestPath,
 		session.groupName,
 		input.ModelName,
@@ -151,6 +155,9 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 			Known: true, Cost: preparedSettings.CostTarget, UpdatedUnix: preparedSettings.NowUnix,
 		}
 		replayCandidates = append(replayCandidates, balancedReplayCandidateFromRouting(member, preparedCandidate))
+		if isRequestCapabilityExclusion(preparedCandidate.HardExclusionReason) {
+			requestExcluded[member.ChannelID] = struct{}{}
+		}
 		state := runtimeByChannelID[member.ChannelID]
 		endpointBreaker, authority, region := endpointBreakerForChannel(channel, session.planningTime, pool.BalancedPolicy.SnapshotStaleSec)
 		baseBreaker := preparedCandidate.Candidate.Breaker
@@ -239,8 +246,11 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	if err != nil || replayResult.SelectedChannelID != decision.SelectedChannelID {
 		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
 	}
+	if !applyBalancedReplayHardExclusionReasons(&replayResult, replayCandidates) {
+		return BalancedRoutingPlan{}, true, ErrRoutingSessionInvalid
+	}
 	plan := BalancedRoutingPlan{
-		AlgorithmVersion:  DecisionAlgorithmBalancedV1,
+		AlgorithmVersion:  balancedAlgorithmVersion(profile),
 		PoolID:            pool.ID,
 		PolicyRevision:    snapshot.view.Revision,
 		RuntimeGeneration: snapshot.view.RuntimeGeneration,
@@ -310,6 +320,34 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		}
 	}
 	return plan, true, nil
+}
+
+func applyBalancedReplayHardExclusionReasons(
+	result *BalancedReplayResult,
+	candidates []BalancedReplayCandidate,
+) bool {
+	if result == nil {
+		return false
+	}
+	reasonByChannel := make(map[int]string)
+	for index := range candidates {
+		candidate := candidates[index]
+		if candidate.HardExclusionReason != "" {
+			reasonByChannel[candidate.ChannelID] = candidate.HardExclusionReason
+		}
+	}
+	for index := range result.Candidates {
+		candidate := &result.Candidates[index]
+		reason := reasonByChannel[candidate.ChannelID]
+		if reason == "" {
+			continue
+		}
+		if candidate.Eligible {
+			return false
+		}
+		candidate.ExclusionReason = reason
+	}
+	return true
 }
 
 func cloneBalancedRuntimeState(state routingselector.BalancedRuntimeState) routingselector.BalancedRuntimeState {
