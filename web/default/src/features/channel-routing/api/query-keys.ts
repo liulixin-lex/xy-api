@@ -100,6 +100,10 @@ export const channelRoutingQueryKeys = {
       ...channelRoutingQueryKeys.policyRollbackApprovalsRoot(revision),
       params,
     ] as const,
+  billingReviewsRoot: () =>
+    [...channelRoutingQueryKeys.all, 'billing-reviews'] as const,
+  billingReviews: (params: object) =>
+    [...channelRoutingQueryKeys.billingReviewsRoot(), params] as const,
   operationsRoot: () => [...channelRoutingQueryKeys.all, 'operations'] as const,
   operations: (params: object) =>
     [...channelRoutingQueryKeys.operationsRoot(), params] as const,

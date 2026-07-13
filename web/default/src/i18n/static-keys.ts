@@ -36,6 +36,13 @@ export const STATIC_I18N_KEYS = [
   'Channel health checks',
   'Request retry',
 
+  // Runtime RBAC catalog labels returned by the backend
+  'Billing review',
+  'View billing reviews',
+  'Resolve billing reviews',
+  'View ambiguous asynchronous billing cases and their financial consequences.',
+  'Approve or reject an asynchronous billing reconciliation decision.',
+
   // System settings sidebar
   'System Administration',
   'General',
@@ -607,6 +614,28 @@ export const STATIC_I18N_KEYS = [
   'The server rejected this value. Review it and try again.',
   'HTTPS is required. Do not place tokens or passwords in the URL.',
   'This target is blocked by the network trust policy.',
+
+  // Manual billing review server-provided consequence and blocker labels
+  'Current charge',
+  'Additional charge if accepted',
+  'Charge adjustment if accepted',
+  'Final charge if accepted',
+  'Refund if rejected',
+  'Final charge if rejected',
+  'Write-off if rejected',
+  'Resolve permission is required',
+  'The authorized attempt is missing or ambiguous',
+  'The acceptance intent is missing or invalid',
+  'The submission send lease is still active',
+  'The acceptance overage context is missing or invalid',
+  'The accepted handoff context is missing or invalid',
+  'The terminal billing operation is missing or invalid',
+  'This billing review type is not supported',
+  'Send outcome',
+  'Acceptance overage',
+  'Accepted handoff',
+  'Terminal overage',
+  'Unknown review type',
 
   // Dashboard flow stages (labels/descriptions passed to t at runtime)
   'User',

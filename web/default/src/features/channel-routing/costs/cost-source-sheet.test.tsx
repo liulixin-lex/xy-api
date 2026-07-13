@@ -50,6 +50,20 @@ describe('cost source credential summary', () => {
     assert.doesNotMatch(html, /gateway_api_key/)
   })
 
+  test('replaces credential decryption details with an actionable recovery message', () => {
+    const html = renderToStaticMarkup(
+      createElement(CostSourceCredentialSummary, {
+        masks: {},
+        error: 'cipher: message authentication failed for credential 77',
+      })
+    )
+
+    assert.match(html, /Credentials need to be re-entered/)
+    assert.match(html, /administrator with credential access/i)
+    assert.doesNotMatch(html, /No credentials are saved/i)
+    assert.doesNotMatch(html, /cipher|authentication failed|credential 77/i)
+  })
+
   test('keeps group suggestion DOM bounded for oversized upstream responses', () => {
     const html = renderToStaticMarkup(
       createElement(CostSourceGroupDatalist, {

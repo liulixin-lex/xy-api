@@ -6,6 +6,7 @@ export type AdminPermissionMatrix = Record<string, Record<string, boolean>>
 export type AdminCapabilities = AdminPermissionMatrix
 
 export const ADMIN_PERMISSION_RESOURCES = {
+  BILLING_REVIEW: 'billing_review',
   CHANNEL: 'channel',
   CHANNEL_ROUTING: 'channel_routing',
   SYSTEM_SETTING: 'system_setting',
@@ -20,6 +21,7 @@ export const ADMIN_PERMISSION_ACTIONS = {
   AUDIT_EXPORT: 'audit_export',
   SECRET_VIEW: 'secret_view',
   MANAGE: 'manage',
+  RESOLVE: 'resolve',
 } as const
 
 // The role whose baseline grants are used as defaults in the permission editor.

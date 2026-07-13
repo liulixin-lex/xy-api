@@ -75,11 +75,12 @@ export function CostSourceCredentialSummary(props: {
 
   return (
     <div className='space-y-3'>
-      {saved.length === 0 ? (
+      {saved.length === 0 && !props.error ? (
         <p className='text-muted-foreground text-sm'>
           {t('No credentials are saved for this cost source.')}
         </p>
-      ) : (
+      ) : null}
+      {saved.length > 0 ? (
         <dl className='divide-y rounded-md border'>
           {saved.map((row) => (
             <div
@@ -95,17 +96,33 @@ export function CostSourceCredentialSummary(props: {
             </div>
           ))}
         </dl>
-      )}
+      ) : null}
       {props.error ? (
-        <Alert variant='destructive' role='alert'>
-          <TriangleAlert aria-hidden='true' />
-          <AlertTitle>{t('Stored credentials could not be read')}</AlertTitle>
-          <AlertDescription className='break-words'>
-            {props.error}
-          </AlertDescription>
-        </Alert>
+        <CostSourceCredentialRecoveryAlert canEdit={false} />
       ) : null}
     </div>
+  )
+}
+
+export function CostSourceCredentialRecoveryAlert(props: { canEdit: boolean }) {
+  const { t } = useTranslation()
+  return (
+    <Alert className='border-amber-500/30 bg-amber-500/5' role='alert'>
+      <TriangleAlert
+        className='text-amber-700 dark:text-amber-300'
+        aria-hidden='true'
+      />
+      <AlertTitle>{t('Credentials need to be re-entered')}</AlertTitle>
+      <AlertDescription>
+        {props.canEdit
+          ? t(
+              'Saved credentials could not be read. Re-enter every required credential before saving this cost source.'
+            )
+          : t(
+              'Saved credentials could not be read. An administrator with credential access must re-enter them to restore this cost source.'
+            )}
+      </AlertDescription>
+    </Alert>
   )
 }
 

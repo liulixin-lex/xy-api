@@ -98,4 +98,31 @@ describe('admin permission helpers', () => {
       )
     }
   })
+
+  test('keeps billing review read and resolve grants explicit', () => {
+    const reviewer = makeUser({
+      permissions: {
+        admin_permissions: {
+          billing_review: { read: true, resolve: false },
+        },
+      },
+    })
+
+    assert.equal(
+      hasPermission(
+        reviewer,
+        ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+        ADMIN_PERMISSION_ACTIONS.READ
+      ),
+      true
+    )
+    assert.equal(
+      hasPermission(
+        reviewer,
+        ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+        ADMIN_PERMISSION_ACTIONS.RESOLVE
+      ),
+      false
+    )
+  })
 })

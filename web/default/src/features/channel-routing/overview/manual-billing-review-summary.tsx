@@ -1,0 +1,164 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import { ArrowRight, RefreshCw, TriangleAlert } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+
+import {
+  Alert,
+  AlertAction,
+  AlertDescription,
+  AlertTitle,
+} from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+
+import { listManualBillingReviews } from '../api/billing-reviews'
+import { channelRoutingQueryKeys } from '../api/query-keys'
+import { useChannelRoutingFormatters } from '../lib/format'
+import { getManualBillingReviewKindLabelKey } from '../lib/manual-billing-review'
+
+function manualReviewAge(
+  seconds: number,
+  translate: (key: string, options?: Record<string, unknown>) => string
+): string {
+  if (seconds >= 86_400) {
+    return translate('{{count}} days ago', {
+      count: Math.floor(seconds / 86_400),
+    })
+  }
+  if (seconds >= 3_600) {
+    return translate('{{count}} hours ago', {
+      count: Math.floor(seconds / 3_600),
+    })
+  }
+  return translate('{{count}} minutes ago', {
+    count: Math.max(1, Math.floor(seconds / 60)),
+  })
+}
+
+export function ManualBillingReviewSummary(props: { enabled: boolean }) {
+  const { t } = useTranslation()
+  const format = useChannelRoutingFormatters()
+  const reviewsQuery = useQuery({
+    queryKey: channelRoutingQueryKeys.billingReviews({ cursor: 0, limit: 3 }),
+    queryFn: ({ signal }) =>
+      listManualBillingReviews({ cursor: 0, limit: 3 }, signal),
+    enabled: props.enabled,
+    refetchInterval: 30_000,
+    meta: { handleErrorLocally: true },
+  })
+
+  if (!props.enabled || reviewsQuery.isLoading) return null
+
+  if (reviewsQuery.isError && !reviewsQuery.data) {
+    return (
+      <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
+        <TriangleAlert
+          className='text-amber-700 dark:text-amber-300'
+          aria-hidden='true'
+        />
+        <AlertTitle>{t('Billing review queue unavailable')}</AlertTitle>
+        <AlertDescription>
+          {t(
+            'The routing snapshot is available, but billing reviews could not be loaded.'
+          )}
+        </AlertDescription>
+        <AlertAction>
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={reviewsQuery.isFetching}
+            onClick={() => void reviewsQuery.refetch()}
+          >
+            <RefreshCw
+              aria-hidden='true'
+              className={
+                reviewsQuery.isFetching
+                  ? 'animate-spin motion-reduce:animate-none'
+                  : undefined
+              }
+            />
+            {t('Retry')}
+          </Button>
+        </AlertAction>
+      </Alert>
+    )
+  }
+
+  const page = reviewsQuery.data
+  if (!page || page.pending_count <= 0) return null
+
+  return (
+    <Alert
+      role='status'
+      className='border-amber-500/35 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
+    >
+      <TriangleAlert aria-hidden='true' />
+      <AlertTitle className='flex flex-wrap items-center gap-2'>
+        <span>{t('Manual billing review required')}</span>
+        <Badge variant='outline' className='bg-background/80 tabular-nums'>
+          {format.number(page.pending_count)}
+        </Badge>
+      </AlertTitle>
+      <AlertDescription className='space-y-3'>
+        <p>
+          {t('Oldest review entered the queue {{age}}.', {
+            age: manualReviewAge(page.oldest_age_seconds, t),
+          })}
+        </p>
+        {page.items.length > 0 ? (
+          <ul className='divide-border/70 divide-y border-y text-xs'>
+            {page.items.map((review) => (
+              <li
+                key={review.reservation_id}
+                className='flex min-w-0 items-center justify-between gap-3 py-2'
+              >
+                <span className='min-w-0 truncate font-mono'>
+                  #{review.reservation_id} · {review.public_task_id}
+                </span>
+                <span className='text-muted-foreground shrink-0'>
+                  {t(getManualBillingReviewKindLabelKey(review.review_kind))}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </AlertDescription>
+      <AlertAction>
+        <Button
+          size='sm'
+          variant='outline'
+          render={
+            <Link
+              to='/channel-routing/$section'
+              params={{ section: 'policies' }}
+              search={{ billingReviewCursor: 0 }}
+              hash='manual-billing-reviews'
+            />
+          }
+        >
+          {t('Open review queue')}
+          <ArrowRight aria-hidden='true' />
+        </Button>
+      </AlertAction>
+    </Alert>
+  )
+}

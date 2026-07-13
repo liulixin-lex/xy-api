@@ -73,6 +73,7 @@ const searchSchema = z.object({
   endpointPage: z.number().int().min(1).optional().catch(1),
   endpointPageSize: z.number().int().min(1).max(100).optional().catch(20),
   operationCursor: z.number().int().min(0).optional().catch(0),
+  billingReviewCursor: z.number().int().min(0).optional().catch(0),
   operationType: z
     .enum([
       '',

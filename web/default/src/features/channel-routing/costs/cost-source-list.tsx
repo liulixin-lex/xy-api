@@ -69,12 +69,13 @@ function CostSourceSyncHealth(props: { binding: RoutingCostBinding }) {
       <div className='space-y-1'>
         <ChannelRoutingStatusBadge
           status='failed'
-          label={t('Credential error')}
+          label={t('Credentials need to be re-entered')}
         />
-        <ChannelRoutingIdentityText
-          text={binding.credential_error}
-          className='text-destructive text-xs whitespace-normal'
-        />
+        <p className='text-destructive text-xs leading-5'>
+          {t(
+            'Saved credentials could not be read. Re-enter the required credentials to restore this cost source.'
+          )}
+        </p>
       </div>
     )
   }

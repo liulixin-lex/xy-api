@@ -96,6 +96,7 @@ import type {
 } from '../types'
 import {
   CostSourceCredentialFields,
+  CostSourceCredentialRecoveryAlert,
   CostSourceCredentialSummary,
   CostSourceCustomCAField,
 } from './cost-source-credentials'
@@ -527,6 +528,8 @@ export function ChannelRoutingCostSourceSheet(props: {
           <form
             id='channel-routing-cost-source-form'
             className={sideDrawerFormClassName()}
+            tabIndex={0}
+            aria-label={t('Cost source details')}
             onSubmit={form.handleSubmit((values) => {
               const session = sessionManager.activate(editorSubjectRef.current)
               saveMutation.mutate({
@@ -801,7 +804,9 @@ export function ChannelRoutingCostSourceSheet(props: {
                   name='enabled'
                   render={({ field }) => (
                     <div
-                      className={sideDrawerSwitchItemClassName('border-y-0')}
+                      className={sideDrawerSwitchItemClassName(
+                        'border-y-0 pr-3'
+                      )}
                     >
                       <div className='min-w-0'>
                         <div className='text-sm font-medium'>
@@ -828,7 +833,9 @@ export function ChannelRoutingCostSourceSheet(props: {
                     name='servesClaudeCode'
                     render={({ field }) => (
                       <div
-                        className={sideDrawerSwitchItemClassName('border-y-0')}
+                        className={sideDrawerSwitchItemClassName(
+                          'border-y-0 pr-3'
+                        )}
                       >
                         <div className='min-w-0'>
                           <div className='text-sm font-medium'>
@@ -1055,10 +1062,15 @@ export function ChannelRoutingCostSourceSheet(props: {
                   error={workingBinding?.credential_error}
                 />
               ) : (
-                <CostSourceCredentialFields
-                  upstreamType={upstreamType}
-                  binding={providerChanged ? null : workingBinding}
-                />
+                <div className='space-y-4'>
+                  {workingBinding?.credential_error ? (
+                    <CostSourceCredentialRecoveryAlert canEdit />
+                  ) : null}
+                  <CostSourceCredentialFields
+                    upstreamType={upstreamType}
+                    binding={providerChanged ? null : workingBinding}
+                  />
+                </div>
               )}
             </SideDrawerSection>
           </form>
