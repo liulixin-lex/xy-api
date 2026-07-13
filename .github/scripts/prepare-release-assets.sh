@@ -93,10 +93,10 @@ fi
 if [ "$release_exists" = true ]; then
   jq -e --arg tag "$tag" '
     .tagName == $tag and
-    .isDraft == false and
+    (.isDraft | type) == "boolean" and
     .isPrerelease == false and
     (.assets | type) == "array"
-  ' "$release_file" >/dev/null || fail "existing release $tag is not a published stable release"
+  ' "$release_file" >/dev/null || fail "existing release $tag is not a stable release or draft"
 fi
 
 api_base=${GITHUB_API_URL:-https://api.github.com}
@@ -143,30 +143,12 @@ done < <(find "$source_dir" -mindepth 1 -maxdepth 1 -type f -print0)
 
 [ "$asset_count" -gt 0 ] || fail "no release assets found in $source_dir"
 
-latest_file="$temp_dir/latest.json"
-latest_error="$temp_dir/latest.error"
-make_latest=true
-if gh api "repos/${GITHUB_REPOSITORY}/releases/latest" > "$latest_file" 2> "$latest_error"; then
-  latest_tag=$(jq -r '.tag_name // ""' "$latest_file")
-  if [[ ! "$latest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-    fail "current latest release does not use stable lowercase v semver: $latest_tag"
-  fi
-  highest=$(printf '%s\n%s\n' "$latest_tag" "$tag" | LC_ALL=C sort -V | tail -n 1)
-  if [ "$highest" != "$tag" ]; then
-    make_latest=false
-  fi
-elif ! grep -Eq '(Not Found|not found|HTTP 404)' "$latest_error"; then
-  cat "$latest_error" >&2
-  fail 'could not determine the current latest release'
-fi
-
 {
   if [ "$upload_count" -gt 0 ]; then
     echo 'upload_required=true'
   else
     echo 'upload_required=false'
   fi
-  echo "make_latest=$make_latest"
   echo "asset_count=$asset_count"
   echo "upload_count=$upload_count"
 } >> "$output_file"

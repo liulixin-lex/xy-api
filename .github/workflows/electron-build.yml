@@ -205,7 +205,7 @@ jobs:
 
       # - name: Upload artifacts (macOS)
       #   if: runner.os == 'macOS'
-      #   uses: actions/upload-artifact@v4
+      #   uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       #   with:
       #     name: macos-build
       #     path: |
@@ -298,17 +298,17 @@ jobs:
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
+          draft: true
           fail_on_unmatched_files: true
           overwrite_files: false
-          make_latest: ${{ steps.release_assets.outputs.make_latest }}
+          make_latest: false
           files: |
             ${{ runner.temp }}/release-assets-upload/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Ensure existing release is latest
-        if: steps.release_assets.outputs.upload_required == 'false' && steps.release_assets.outputs.make_latest == 'true'
+      - name: Finalize complete stable release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
-        run: .github/scripts/ensure-release-latest.sh --tag "$TAG"
+        run: .github/scripts/finalize-release-assets.sh --tag "$TAG"

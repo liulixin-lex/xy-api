@@ -62,7 +62,6 @@ jobs:
           fi
 
       - name: Get Release Info
-        id: release_info
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.event.inputs.tag_name }}
@@ -100,27 +99,9 @@ jobs:
             .isPrerelease == false and
             (.assets | type) == "array"
           ' "$release_info_file" >/dev/null
-          jq -r 'if (.name // "") == "" then .tagName else .name end' "$release_info_file" > "$release_name_file"
-          jq -r 'if (.body // "") == "" then "-" else .body end' "$release_info_file" > "$release_body_file"
-          printf '%s\n' "$tag_sha" > "$target_commitish_file"
-
-          write_multiline_output() {
-            local name=$1
-            local source_file=$2
-            local delimiter="ghadelimiter_${GITHUB_RUN_ID}_${RANDOM}_${RANDOM}"
-            while grep -Fxq "$delimiter" "$source_file"; do
-              delimiter="ghadelimiter_${GITHUB_RUN_ID}_${RANDOM}_${RANDOM}"
-            done
-            {
-              printf '%s<<%s\n' "$name" "$delimiter"
-              cat "$source_file"
-              printf '%s\n' "$delimiter"
-            } >> "$GITHUB_OUTPUT"
-          }
-
-          write_multiline_output release_name "$release_name_file"
-          write_multiline_output release_body "$release_body_file"
-          write_multiline_output target_commitish "$target_commitish_file"
+          jq -rj 'if (.name // "") == "" then .tagName else .name end' "$release_info_file" > "$release_name_file"
+          jq -rj 'if (.body // "") == "" then "-" else .body end' "$release_info_file" > "$release_body_file"
+          printf '%s' "$tag_sha" > "$target_commitish_file"
 
           asset_count=$(jq '.assets | length' "$release_info_file")
           if [ "$asset_count" -gt 0 ]; then
@@ -128,31 +109,24 @@ jobs:
             gh release download "$TAG_NAME" --dir release_assets
           fi
 
-      - name: Create Gitee Release
-        id: create_release
-        uses: nICEnnnnnnnLee/action-gitee-release@44b412edade0c837fb0ad7d73f4674ec07c8b722 # v2.0.0
-        with:
-          gitee_action: create_release
-          gitee_owner: ${{ env.GITEE_OWNER }}
-          gitee_repo: ${{ env.GITEE_REPO }}
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          gitee_tag_name: ${{ github.event.inputs.tag_name }}
-          gitee_release_name: ${{ steps.release_info.outputs.release_name }}
-          gitee_release_body: ${{ steps.release_info.outputs.release_body }}
-          gitee_target_commitish: ${{ steps.release_info.outputs.target_commitish }}
-
-      - name: Upload Assets to Gitee
-        if: hashFiles('release_assets/*') != ''
-        uses: nICEnnnnnnnLee/action-gitee-release@44b412edade0c837fb0ad7d73f4674ec07c8b722 # v2.0.0
-        with:
-          gitee_action: upload_asset
-          gitee_owner: ${{ env.GITEE_OWNER }}
-          gitee_repo: ${{ env.GITEE_REPO }}
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          gitee_release_id: ${{ steps.create_release.outputs.release-id }}
-          gitee_upload_retry_times: 3
-          gitee_files: |
-            release_assets/*
+      - name: Publish verified release to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG_NAME: ${{ github.event.inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          args=(
+            --owner "$GITEE_OWNER"
+            --repository "$GITEE_REPO"
+            --tag "$TAG_NAME"
+            --name-file "$RUNNER_TEMP/gitee-release-name.txt"
+            --body-file "$RUNNER_TEMP/gitee-release-body.txt"
+            --target-file "$RUNNER_TEMP/gitee-target-commitish.txt"
+          )
+          if [ -d release_assets ]; then
+            args+=(--assets-dir release_assets)
+          fi
+          .github/scripts/publish-gitee-release.sh "${args[@]}"
 
       - name: Cleanup
         if: always()

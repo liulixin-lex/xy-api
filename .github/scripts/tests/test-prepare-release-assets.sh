@@ -79,26 +79,22 @@ run_prepare() {
 }
 
 export MOCK_RELEASE_STATE=missing
-export MOCK_LATEST_STATE=missing
 mkdir -p "$temp_dir/new/source"
 printf 'binary-a\n' > "$temp_dir/new/source/a.bin"
 printf 'binary-b\n' > "$temp_dir/new/source/b.bin"
 run_prepare new
 grep -Fxq 'upload_required=true' "$temp_dir/new/output"
-grep -Fxq 'make_latest=true' "$temp_dir/new/output"
 grep -Fxq 'asset_count=2' "$temp_dir/new/output"
 grep -Fxq 'upload_count=2' "$temp_dir/new/output"
 cmp "$temp_dir/new/source/a.bin" "$temp_dir/new/upload/a.bin"
 cmp "$temp_dir/new/source/b.bin" "$temp_dir/new/upload/b.bin"
 
 export MOCK_RELEASE_STATE=existing
-export MOCK_LATEST_STATE=existing
-export MOCK_LATEST_TAG=v0.1.10
 export MOCK_RELEASE_JSON="$temp_dir/partial-release.json"
 printf 'binary-a\n' > "$temp_dir/assets/101"
 cat > "$MOCK_RELEASE_JSON" <<'EOF'
 {
-  "isDraft": false,
+  "isDraft": true,
   "isPrerelease": false,
   "tagName": "v0.1.11",
   "assets": [
@@ -114,11 +110,12 @@ printf 'binary-a\n' > "$temp_dir/partial/source/a.bin"
 printf 'binary-b\n' > "$temp_dir/partial/source/b.bin"
 run_prepare partial
 grep -Fxq 'upload_required=true' "$temp_dir/partial/output"
-grep -Fxq 'make_latest=true' "$temp_dir/partial/output"
 grep -Fxq 'upload_count=1' "$temp_dir/partial/output"
 [ ! -e "$temp_dir/partial/upload/a.bin" ]
 cmp "$temp_dir/partial/source/b.bin" "$temp_dir/partial/upload/b.bin"
 
+jq '.isDraft = false' "$MOCK_RELEASE_JSON" > "$temp_dir/published-release.json"
+export MOCK_RELEASE_JSON="$temp_dir/published-release.json"
 mkdir -p "$temp_dir/complete/source"
 printf 'binary-a\n' > "$temp_dir/complete/source/a.bin"
 run_prepare complete
@@ -133,13 +130,6 @@ expect_failure immutable-conflict "$preparer" \
   --source-dir "$temp_dir/conflict/source" \
   --upload-dir "$temp_dir/conflict/upload" \
   --output "$temp_dir/conflict/output"
-
-export MOCK_RELEASE_STATE=missing
-export MOCK_LATEST_TAG=v0.1.12
-mkdir -p "$temp_dir/older/source"
-printf 'older\n' > "$temp_dir/older/source/older.bin"
-run_prepare older v0.1.11
-grep -Fxq 'make_latest=false' "$temp_dir/older/output"
 
 export MOCK_RELEASE_STATE=error
 mkdir -p "$temp_dir/api-error/source" "$temp_dir/api-error/upload"
