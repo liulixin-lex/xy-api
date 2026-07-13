@@ -27,14 +27,15 @@ import {
   ShieldCheck,
   WifiOff,
 } from 'lucide-react'
-import { useEffect, useRef, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsTrigger } from '@/components/ui/tabs'
 
 import { useChannelRoutingRealtimeStatus } from '../shell/realtime-state'
 import type { ChannelRoutingSection } from '../types'
+import { ChannelRoutingScrollableTabsList } from './scrollable-tabs-list'
 
 const sections: Array<{
   id: ChannelRoutingSection
@@ -59,21 +60,6 @@ export function ChannelRoutingPageFrame(props: {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const realtimeStatus = useChannelRoutingRealtimeStatus()
-  const tabsViewportRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const animationFrame = window.requestAnimationFrame(() => {
-      const activeTab = tabsViewportRef.current?.querySelector<HTMLElement>(
-        '[role="tab"][aria-selected="true"]'
-      )
-      activeTab?.scrollIntoView({
-        behavior: 'auto',
-        block: 'nearest',
-        inline: 'start',
-      })
-    })
-    return () => window.cancelAnimationFrame(animationFrame)
-  }, [props.activeSection])
 
   return (
     <SectionPageLayout as='div' fixedContent headingAs='h1'>
@@ -105,27 +91,21 @@ export function ChannelRoutingPageFrame(props: {
               })
             }}
           >
-            <div ref={tabsViewportRef} className='overflow-x-auto pb-1'>
-              <TabsList
-                activateOnFocus
-                variant='line'
-                className='min-w-max justify-start'
-              >
-                {sections.map((section) => {
-                  const Icon = section.icon
-                  return (
-                    <TabsTrigger
-                      key={section.id}
-                      value={section.id}
-                      className='scroll-ml-2 max-lg:min-h-11'
-                    >
-                      <Icon aria-hidden='true' />
-                      {t(section.label)}
-                    </TabsTrigger>
-                  )
-                })}
-              </TabsList>
-            </div>
+            <ChannelRoutingScrollableTabsList activeValue={props.activeSection}>
+              {sections.map((section) => {
+                const Icon = section.icon
+                return (
+                  <TabsTrigger
+                    key={section.id}
+                    value={section.id}
+                    className='max-lg:min-h-11'
+                  >
+                    <Icon aria-hidden='true' />
+                    {t(section.label)}
+                  </TabsTrigger>
+                )
+              })}
+            </ChannelRoutingScrollableTabsList>
           </Tabs>
           {realtimeStatus === 'polling' ? (
             <div

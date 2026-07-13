@@ -46,6 +46,12 @@ export const channelRoutingQueryKeys = {
   costsRoot: () => [...channelRoutingQueryKeys.all, 'costs'] as const,
   costs: (params: object) =>
     [...channelRoutingQueryKeys.costsRoot(), params] as const,
+  costBindingsRoot: () =>
+    [...channelRoutingQueryKeys.all, 'cost-bindings'] as const,
+  costBindings: (params: object) =>
+    [...channelRoutingQueryKeys.costBindingsRoot(), params] as const,
+  costBinding: (channelId: number) =>
+    [...channelRoutingQueryKeys.costBindingsRoot(), channelId] as const,
   costDetail: (poolId: number, memberId: number, model: string) =>
     [
       ...channelRoutingQueryKeys.costsRoot(),
