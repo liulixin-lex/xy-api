@@ -70,7 +70,6 @@ require (
 require (
 	github.com/ClickHouse/ch-go v0.65.0 // indirect
 	github.com/ClickHouse/clickhouse-go/v2 v2.32.0 // indirect
-	github.com/alicebob/miniredis/v2 v2.35.0 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.6.1 // indirect
 	github.com/casbin/govaluate v1.10.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
@@ -85,7 +84,10 @@ require (
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 )
 
-require github.com/Azure/go-ntlmssp v0.1.1
+require (
+	github.com/Azure/go-ntlmssp v0.1.1
+	github.com/alicebob/miniredis/v2 v2.35.0
+)
 
 require (
 	github.com/DmitriyVTitov/size v1.5.0 // indirect
