@@ -24,12 +24,11 @@
 
 - 主仓库与当前交付工作树：`/opt/xy-api`
 - 分支：`fix/channel-routing-v0.1.11`
-- 恢复检查点 HEAD：`871cd5e27e6fe93e65b98b829259f0db78e487d4`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。
-- 当前工作树包含渠道路由发布终审发现的跨模块修复，尚未形成最终集成提交；不得 reset、checkout、stash、rebase、amend 或覆盖并行子线改动。
-- 旧兼容列表上限候选 `68452343` 已按当前文件增量手工集成并保留跨数据库契约测试；剩余独立集成候选为 Cost Sources 前端基线 `a78aa2fb` 及其增量提交、供应链 `259917d7`、`a26402ca` 与收口提交 `6097f09b`。
+- 当前实现候选及本地候选镜像的源码基线：`e86f24c4fce0e9a70765d792056d761ad7e6cd5a`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。最终发布 SHA 以 PR 合入后的精确 merge SHA 为准。
+- durable async billing、accepted/terminal 投影、Cost Sources、Manual Reviews、Projection Operations、发布供应链和 SQLite 旧卷升级修复均已集成到当前分支。不得 reset、checkout、stash、rebase、amend 或覆盖并行改动。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
-- 正式 `web/default` 七页工作区已合并；Typecheck、Lint、i18n、单测、Build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。
-- 当前三条并行线分别拥有 durable async billing、统计/日志投影、发布供应链审查；Cost Sources worktree 已完成且保持 clean，待 manual review API 稳定后重新唤醒实现复核 UI。根线负责交叉审查、集成、最终验证和发布，文件所有权交接前不得交叉写入。
+- 正式 `web/default` 工作区已合并；Typecheck、Lint、七语 i18n、`bun test`（175 pass、0 fail、47 files）、production build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。
+- 基于 `e86f24c4` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过。当前只剩远端发布闭环：推送分支、创建并合入 PR、打 `v0.1.11` tag，并核验正式多架构镜像及供应链资产。
 
 ## Progress
 
@@ -45,17 +44,17 @@
 - [x] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、幂等 Operation、兼容入口和 SSE 已完成。
 - [x] Phase 5 Enterprise SLO：严格容量租约、共享份额、区域作用域、独立 RBAC、双人审批、Error Budget、持久审计导出、预算 Hedging、多节点失效语义与成本审计已完成。
 - [x] Gate 7 前端：七个深链页面、七语 i18n、SSE/轮询降级、A11y、320/768/1440、200% 缩放、明暗主题、深链、权限与错误恢复已验收并合入。
-- [ ] 发布终审硬化：完成 Task/MJ durable async billing 的 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、滚动升级门禁和保留期。
-- [ ] 计费投影：完成 accepted/terminal 统计、外部日志、缓存同步各自独立幂等与故障恢复，并补齐三数据库并发/崩溃点证据。
-- [ ] Cost Sources 前端：完成独立提交集成及 Impeccable、七语 i18n、浏览器矩阵和 production build 复验。
-- [ ] 最终实现验证：在当前最终代码上重新执行 SQLite/MySQL 5.7/PostgreSQL 9.6、Redis、多节点、ClickHouse、race、vet/build、故障矩阵、benchmark、前端和仓库审计；历史证据只作基线，不替代新鲜证据。
-- [ ] Git/发布：提交并推送分支、PR、同步最新 main、复验、合入 main，发布并核验 `v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 Release。
+- [x] 发布终审硬化：Task/MJ durable async billing 的 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、滚动升级门禁和保留期已完成并集成。
+- [x] 计费投影：accepted/terminal 统计、外部日志、缓存同步各自独立幂等与故障恢复已完成，三数据库并发/崩溃点证据已补齐。
+- [x] Cost Sources 前端：独立实现已集成，Impeccable、七语 i18n、浏览器矩阵、无障碍和 production build 已复验。
+- [x] 最终实现验证：当前实现候选已完成全量 Go、SQLite/MySQL 5.7/PostgreSQL 9.6、Redis/ClickHouse 高风险定向契约、定向 race、vet/build、故障矩阵、benchmark、前端和仓库审计；候选镜像真实旧卷升级也已作为独立发布门禁通过。
+- [ ] Git/发布：推送分支、创建 PR、同步最新 main、复验、合入 main，发布并核验 `v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 Release。
 
 ## Requirement Traceability Matrix
 
 | ID | Requirement | Current evidence | Status / next evidence |
 | --- | --- | --- | --- |
-| CR-0.1 | 关闭态不分配，所有缓存/Map/锁有 TTL、容量、统计 | Phase 0A 计划、`pkg/routing_*`、Sub2API JWT 测试 | PASS（后续统一遥测仍需复核） |
+| CR-0.1 | 关闭态不分配，所有缓存/Map/锁有 TTL、容量、统计 | Phase 0A 计划、`pkg/routing_*`、Sub2API JWT 测试 | PASS |
 | CR-0.2 | 设置并发安全，Worker 可取消、可等待，Retention 生效 | Gate 1 提交 `bcb6602b`、Runtime/Race/Retention 测试 | PASS |
 | CR-0.3 | 错误责任/作用域/重试/健康/容量分类正确 | Phase 0B 计划、`pkg/routing_error`、Controller/Task tests | PASS |
 | CR-0.4 | 429/529 与 Reliability Breaker 分离 | `pkg/routing_hotcache/capacity.go`、Phase 0B tests | PASS |
@@ -67,11 +66,11 @@
 | CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | Canary cohort/outcome/evaluator、Pool-scoped rollback、故障矩阵、跨节点 presence/checkpoint | PASS |
 | CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 真实 Balanced、Replay、Probe、Attempt Coordinator、草稿仿真/发布/回滚 Operation、SSE 与兼容入口 | PASS |
 | CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | strict/local/adaptive capacity、region scope、approval/authz、error budget、audit export、真实预算 hedge | PASS |
-| CR-FE | 七页渠道路由工作区、七语、SSE/A11y/响应式/视觉 | 前端提交 `18c3c69a`；21/21 单测、14/14 Playwright、Typecheck、Build、Axe、键盘、缩放与视觉矩阵 | PASS |
+| CR-FE | 渠道路由工作区、七语、SSE/A11y/响应式/视觉 | production release-final：投影 18/18、Operations 12/12 响应式明暗矩阵，边界态 3+4，Axe 0；错误焦点、对比度和 768px 响应式复验通过 | PASS |
 | CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
-| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步请求链已通过；Task/MJ durable reservation、终态结算和恢复正在发布终审硬化 | IN PROGRESS |
-| CR-GIT | PR、同步 main、合入、镜像构建 | 供应链候选提交已独立验证，尚未集成、推送或发布 | PENDING |
+| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步与异步链均已覆盖；Task/MJ durable reservation、终态结算、恢复、manual review 和 accepted/terminal 独立投影已集成并通过跨库验证 | PASS |
+| CR-GIT | PR、同步 main、合入、镜像构建 | 供应链、候选镜像和真实旧卷升级已验证；推送、PR、tag 和正式发布仍待完成 | PENDING |
 
 ## Plan of Work
 
@@ -82,8 +81,10 @@
 5. [完成] Phase 3 / Gate 4：Canary 真实门控、固定会话、容量/慢启动、结果窗口、原子多 Pool 自动回滚和故障注入。
 6. [完成] Phase 4 / Gate 5 与 Phase 5 / Gate 6：Balanced、严格租约、区域、RBAC/审批、Burn、审计导出、预算 Hedge、SSE、兼容入口和完整 attempt timeline 已集成。
 7. [完成] Gate 7 前端：七页正式工作区、七语、单连接 SSE 与轮询降级、浏览器/A11y/视觉验收已完成并合入。
-8. 每个行为切片先写失败测试并确认 RED，再实现最小根因修复、运行最窄测试、审查并扩大验证。
-9. 每个 Gate 结束后更新本台账和追踪矩阵，创建单一职责本地提交；不把旧会话报告当作新鲜证据。
+8. [完成] 发布终审实现：durable async billing、独立投影、恢复/manual review、Cost Sources、供应链门禁和 SQLite `v0.1.10` 日志表兼容迁移已集成。
+9. [完成] 最终实现验证：后端全量与跨库矩阵、前端 production release-final、性能、安全、格式和仓库审计已完成。
+10. [完成] 候选镜像与真实升级：基于 `e86f24c4` 构建候选镜像，用全新隔离卷从固定 digest 的正式 `v0.1.10` 初始化；升级、重启幂等、marker/旧日志、新 schema、索引行为、版本、默认前端与日志健康均通过。
+11. [待完成] Git 与正式发布：推送分支、创建 PR、同步 main、通过 required checks、合入、对精确 merge SHA 打 `v0.1.11` tag，并终验 Release/GHCR/Cosign/SBOM/SLSA。
 
 ### Phase 2 implementation slices
 
@@ -116,7 +117,7 @@
 - `go test ./... -count=1`：exit 0。
 - `bun run typecheck`（`web/default`）：exit 0。
 - `git diff --check main...HEAD`：exit 0。
-- MySQL/PostgreSQL DSN 当前尚未确认；旧 Phase 0 记录为未配置并 SKIP，最终 Gate 必须补齐隔离三库验证或明确真实环境阻塞。
+- 当时 MySQL/PostgreSQL DSN 尚未配置并发生 SKIP；后续最终矩阵已使用隔离的 MySQL 5.7.44、PostgreSQL 9.6.24 环境补齐，无遗留阻塞。
 
 ### Phase 0C fresh evidence (2026-07-11)
 
@@ -130,15 +131,13 @@
 - JSON wrapper、Testify、受保护标识与 `git diff --check` 审计：均无新增违规。
 - 全量 `service -race` 仍会命中既有 `task_polling/logger/model.Task` 竞态；本次相关 service 定向 race 与阶段要求的 race 包均通过，未把既有竞态误报为 Phase 0C 成功证据。
 
-### Required final evidence
+### Release completion evidence（candidate complete; remote pending）
 
-- Go：相关包、`go test ./...`、`go vet ./...`、`go build ./...`、相关及尽可能全仓 race。
-- DB：SQLite、MySQL 5.7.8+、PostgreSQL 9.6+ 的迁移幂等与行为契约。
-- Redis/多节点：Revision、Stream、租约、Half-open、容量与故障降级。
-- 安全/故障注入：DNS、TLS、401/403、402、429、529、5xx、首字超时、流中错误、SSRF 与重定向。
-- 性能：本地 selector p99、配置传播、Heap/Goroutine 差分、独立 benchmark/soak。
-- 前端：typecheck、lint、format、i18n、关键测试、build、E2E、Axe、键盘、明暗主题、320/768/1440 视觉检查。
-- 最终独立审查：无未解决 P0/P1；`git diff --check`、敏感信息、临时文件、生成物、无关依赖与受保护标识审计。
+- 候选镜像：已基于 `e86f24c4` 构建 `xy-api:v0.1.11-candidate-e86f24c4`，本地 image ID 为 `sha256:973d103a7e0e452305bf950ed5963f13f62a2f2014864436de8c0580bc4654e3`，容器 `--version` 为 `v0.1.11`。
+- 真实升级：固定正式旧镜像 `ghcr.io/liulixin-lex/xy-api@sha256:40b1650c134ec9fe7afad833f2c3b635bf0818ca534e5d12e4ee0f429a80b12d` 初始化全新 SQLite 卷；候选首次启动和重启均通过。marker、旧日志、默认前端、核心表/列、两个唯一索引的结构与实际 NULL/重复行为、前端 build descriptor 和精确迁移日志门禁全部 PASS，容器与卷清理 PASS。最终结果 JSON SHA-256 为 `e0a49325d26600c73f5677a37dd2427b26f3b9e490a5f984ec909b3ccc401eb3`，保留阶段日志的证据清单 SHA-256 为 `8c3e4113b7a148171e1b9d014d396171302d2e58f03f93964526ea504772f154`。
+- Git（pending）：推送分支；Backend、Default frontend、Classic frontend、Workflow supply-chain checks、pr-quality 全部通过；同步最新 main、解决讨论、合入，并确保 `v0.1.11` tag 精确指向 main 上的 merge SHA 且该提交的 `VERSION` 为 `v0.1.11`。
+- Release（pending）：GitHub Release 必须为非 draft、非 prerelease且严格包含 10 个资产；四份 checksum 必须完整覆盖其余六个载荷并通过 `sha256sum --check --strict`。至少一个 finalizer 日志必须明确输出 stable release complete，不能只依据三条顶层 workflow 绿灯。
+- GHCR（pending）：`v0.1.11` 与 `latest` 必须同 digest；OCI index 精确包含 amd64、arm64 和两份 attestation manifest；多架构及子架构 Cosign 签名、双平台非空 SPDX-2.3 SBOM、SLSA v1 provenance、OCI version/revision labels、容器 `--version`、`/api/status` 和前端 build revision 均需终验。若发布时配置了 Docker Hub，再额外验证其 digest 与 GHCR 一致。
 
 ### Gate 2 fresh evidence（2026-07-12）
 
@@ -172,12 +171,12 @@
 ### Gate 4 / Gate 5 continuation evidence（2026-07-12）
 
 - 提交 `6d525b3e`、`6d04ec97`、`77ee5e4b`、`6b192d37`、`ac99d822`、`569004e3`、`2855ad11`、`fa31b70f`、`bc4f8f51`、`ee50b7b4`、`39049b54`、`fa745fe2` 已覆盖 Canary catch-up/失败语义、Balanced 预计算与真实选路、完整决策审计/Replay、多 Pool 原子回滚、主动探测和兼容重试。
-- Gate 5 当前工作树已实现草稿 Balanced 反事实仿真、持久化仿真/发布/回滚 Operation、Current/Revision/Operation API、强 ETag 和同事务 Revision/Activation/Outbox/Operation。
+- Gate 5 当时工作树已实现草稿 Balanced 反事实仿真、持久化仿真/发布/回滚 Operation、Current/Revision/Operation API、强 ETag 和同事务 Revision/Activation/Outbox/Operation。
 - `go test ./model ./service/channelrouting ./controller ./router -count=1` 在 Gate 6 路由权限切换前 PASS；相关定向 Race、Vet 与 `git diff --check` PASS。Gate 6 并行中间态一度仅因 Router test 仍断言旧权限而失败，不作为最终证据。
 - SQLite 旧 `routing_operations` 表真实增量迁移测试 PASS；新增列保持 nullable，旧 Canary Operation 可读且 v1 idempotency hash 不变。
 - 独立审查修复：仿真历史变化时旧 Operation 被错误复用；Realtime/WebSocket 握手后仍允许首字超时跨渠道重试；未知价格 Probe 低估为 0.01 美元及高成本 RelayFormat 可能被发送。修复后对应 Controller/Model/Probe 定向测试 PASS。
 
-### Final integrated evidence（2026-07-13）
+### Pre-release integrated evidence（2026-07-13）
 
 - 集成 HEAD：`569ffb16`；后端主体 `0962012d`、前端 `18c3c69a` 已合并。发布前追加三项根因修复：流事件原子缓冲提交后恢复底层 `Flush`、日志轮换计数/门闩改为原子状态、主动探测 SQLite 夹具限制单连接以移除非目标锁竞争。
 - `GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...`：exit 0。
@@ -186,18 +185,22 @@
 - Redis 7：独立测试实例上的 Config Stream、三节点 Event、Telemetry 幂等重投/backlog、Redis block lease/revision fencing 全包 PASS；另一独立实例上的真实 Hedge“secondary wins + 单次结算 + 两条 attempt 审计”PASS。
 - 性能：4096 候选动态 Prepared Balanced selector 100000 次、3 轮 p99 为 `525684–568314 ns`；Adaptive Concurrency 为 `6204–8266 ns/op`；Redis block local lease 为 `27219–50145 ns/op`。
 - 前端：Bun 单测 21/21、Playwright 14/14、Typecheck、Lint 0 error、七语 i18n missing/extras/untranslated 全 0、Build PASS；Axe、键盘、200% zoom、320/768/1440、明暗主题、RBAC、SSE、幂等、审批/回滚、导出及离线恢复均 PASS。
-- 独立审查未发现 P0；所有确认 P1 已修复并完成相关回归。`git diff --check` PASS，未跟踪临时文件为 0；最终敏感信息、受保护标识和发布供应链审计仍在 PR 前执行。
-- 根线最终复跑：Classic `bun run build` PASS；`GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；`git diff --check` PASS；当前工作树差异敏感词与受保护项目标识扫描无命中。`gitleaks`/`trufflehog` 本机未安装，未作为最终证据。
+- 独立审查未发现当时的 P0；所有确认 P1 已修复并完成相关回归。`git diff --check` PASS，未跟踪临时文件为 0。
+- 根线复跑：Classic `bun run build` PASS；`GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；`git diff --check` PASS。该证据随后由 2026-07-14 最终发布候选矩阵取代。
 
-### v0.1.11 发布终审恢复检查点（2026-07-13）
+### v0.1.11 final release-candidate evidence（2026-07-14）
 
-- 权威方案、执行契约和提示词套件 SHA-256 再次校验一致；工作树、所有 worktree、候选提交与当前三条子线完成状态对账。
-- MJ 图片/视频鉴权、所有权、受保护代理、Range/If-Range、内容类型与大小边界已通过定向回归；Stateful Task/MJ 固定原渠道与稳定 Credential ID，历史缺失稳定身份时 fail closed。
-- Cost Sources 后端的 provider 凭证隔离、切换清理、空 envelope、CA readiness、500 groups 上限、稳定字段错误、SSRF/TLS/重定向/私网/响应边界已完成并通过相关测试。
-- SQL/ClickHouse 计费日志 receipt、可见视图去重/冲突隔离、周期审计、DB lease 和七语标签已有独立证据；当前继续补 accepted/terminal usage projection 的独立幂等阶段。
-- Cost Sources 前端独立 worktree 的 9/9 浏览器矩阵、scoped Axe、内容区/抽屉无横向溢出、27/27 定向测试与 Impeccable detector 0 命中已通过；仍待最终构建检查、提交与主线集成。
-- 发布供应链独立审查新增 `6097f09b`：Release/Electron 资产不可覆盖、跨工作流串行上传、旧版本不得倒退 Latest、同版本不同 digest fail closed、alpha 子架构与最终 manifest 均签名；Action SHA、actionlint、yamllint、shellcheck、脚本测试及真实 `v0.1.10` GHCR/Release/SBOM/Provenance 回放均 PASS。
-- 最大 P0 是 Task/MJ durable async billing：状态机和 Task 提交链已部分落盘，MJ、terminal operation、恢复、manual resolution、客户端幂等契约、滚动升级与三数据库崩溃点证据尚未完成，因此历史“最终验证 PASS”不能作为当前发布结论。
+- 当前实现候选及本地候选镜像的源码基线为 `e86f24c4`。`c2de5c5d` 完成 durable channel routing operations，`ea6511af` 合并计费控制台，`c04261ec` 完成发布收口；后续 `100423fc`、`276b79c7`、`5c7f91e7` 和 `e86f24c4` 依次收口 SQLite 升级、操作反馈、无障碍与测试依赖分类。
+- Task/MJ durable async billing 已覆盖 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、客户端幂等、滚动升级协议门禁与保留期；Stateful Task/MJ 固定原渠道和稳定 Credential ID，历史缺失身份时 fail closed。
+- accepted/terminal usage、统计、SQL/ClickHouse 外部日志和缓存同步采用独立持久幂等阶段；receipt、冲突隔离、恢复重放、周期审计和 DB lease 已完成三数据库故障/崩溃点验证。
+- Cost Sources、Manual Reviews 和 Projection Operations 已完成前后端集成；provider 凭证隔离、切换清理、CA readiness、SSRF/TLS/重定向/私网/响应边界、ETag 冲突、双阶段人工确认和权限降级均有回归证据。
+- 真实 `v0.1.10` SQLite 卷首次升级候选暴露 P0：GORM 尝试执行 `ALTER TABLE logs ADD billing_operation_key varchar(191) UNIQUE`，而 SQLite 禁止通过 `ADD COLUMN` 增加 UNIQUE 列。`100423fc` 改为先用无 unique tag 的兼容迁移模型增加 nullable 列，再由正式 `Log` AutoMigrate 创建命名唯一索引，并同时覆盖 `migrateDB`、`migrateDBFast` 和 `migrateLOGDB`。
+- SQLite 修复回归覆盖旧日志保留、重启幂等、多个 NULL operation key 可并存、重复非 NULL key 被拒；相关 SQLite `-count=3`、MySQL 5.7 和 PostgreSQL 9.6 迁移契约均 PASS。
+- 当前候选后端 `GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` 均 PASS；SQLite 回归与 MySQL 5.7.44、PostgreSQL 9.6.24、Redis 7.4.9、ClickHouse 24.8.14.39 的高风险定向外部契约均在 `e86f24c4` 上新鲜 PASS，SKIP 0、FAIL 0。过宽全域 race 曾因 SQLite migration 超过 10 分钟终止，未发现 race detector 报告，也不作为成功证据。
+- 前端 Typecheck、Lint 0 error、`bun test`（175 pass、0 fail、47 files）、changed-scope oxfmt、七语 i18n missing/extras/untranslated 全 0 和 `VITE_REACT_APP_VERSION=v0.1.11 bun run build` 均 PASS。
+- production release-final 浏览器证据覆盖投影页 18/18、Operations 12/12 的 320/768/1440 明暗矩阵和边界态 3+4；所有布局无文本/横向溢出，Axe 0。错误发生后的焦点恢复、浅色错误文案对比度和 768px 响应式工具栏/操作区已修复并复验，键盘、200% 等效缩放、reduced-motion 和权限状态均通过。
+- 发布供应链实现已集成：Release/Electron 资产不可覆盖、跨工作流串行上传、旧版本不得倒退 `latest`、同版本不同 digest fail closed、子架构及最终 manifest 签名；Action SHA、actionlint、yamllint、shellcheck 和脚本测试均 PASS。
+- SQLite P0 之前构建的候选镜像已废弃。基于 `e86f24c4` 的候选镜像和真实 `v0.1.10` 隔离卷首次升级/重启门禁已通过；分支尚未推送，PR、main 合入、`v0.1.11` tag、正式镜像和 Release 均未完成，不能把本节实现验证写成正式发布完成。
 
 ## Surprises & Discoveries
 
@@ -212,13 +215,14 @@
 - Gate 2 发现 MySQL 默认 CI collation 会折叠 `VIP`/`vip` 与 `Model-X`/`model-x`；Pool、Rollup 和 Decision 过滤统一改用原始文本 SHA-256 稳定键。
 - Stable additive upsert 在“数据库已提交但客户端收到错误”的模糊提交场景仍可能重复计数；Phase 2 必须引入 `node_id + sequence` 幂等协议。
 - 近期 Rollup 的 DB `GROUP BY` 在高流量下是可预见热点；Phase 2 使用增量聚合与可合并分布替代持续全窗扫描。
-- Phase 0B 的完整 race 记录包含既有 logger、task polling 和并行 `gin.SetMode` 竞态；新增路径定向 race 通过。最终 Gate 需要重新判断这些基线竞态是否仍阻止仓库级完整 race 声明。
+- Phase 0B 的完整 race 记录包含当时的 logger、task polling 和并行 `gin.SetMode` 竞态；发布终审采用高风险定向 race 并全部通过，过宽全域 race 不作为成功证据，也未据此宣称全仓 race clean。
 - Gate 5 审查发现仿真 Operation 的评估哈希只包含请求参数，历史样本变化后会复用旧 Operation；现已把完整有界仿真结果哈希纳入评估身份。
 - Realtime 首字前重试实现可缓存客户端消息，但批准方案把 WebSocket 握手定义为不可逆边界；最终采用更保守语义，握手后禁止跨渠道重试。
 - Active Probe 的未知成本固定值会低估图片/任务类风险；最终改为未知价格 fail-closed，并在真实请求前限制为低成本 RelayFormat。
 - 发布前全仓复跑发现 `streamEventBufferWriter.commit` 成功写入后没有向底层 writer Flush；这会让小 SSE 事件滞留，并使取消边界回归测试永久等待。最终在完整写入且无短写后恢复 Flush，所有流式普通测试与 race 通过。
 - 流式 race 暴露日志器 `logCount/setupLogWorking` 的既有并发读写；最终使用原子计数和 CAS 门闩，异步轮换任务自行释放门闩，日志格式与轮换阈值不变。
 - 主动探测 Operation 测试在全仓高负载下偶发 SQLite 共享缓存锁错误；测试不验证多连接锁竞争，因此把该专用夹具限制为单连接。真实并发契约继续由 MySQL/PostgreSQL、Redis 和专门 lease/race 用例承担。
+- 真实旧卷升级发现 SQLite 不允许 `ALTER TABLE ... ADD COLUMN ... UNIQUE`；开发期全新库 AutoMigrate 不会暴露这一兼容风险。最终采用“两阶段迁移”：先增加 nullable 普通列，再由正式模型创建唯一索引，同时用旧日志保留和重启幂等回归保护三条迁移入口。
 
 ## Decision Log
 
@@ -229,7 +233,7 @@
 - 2026-07-11：兼容保留字段名 `TPS`，但其语义在 Phase 0C 修正为真实输出 Token/s；后续 v2 DTO 使用明确 `output_tokens_per_second` 名称。
 - 2026-07-11：attempt end 保存为相对 attempt start 的原子 duration，而不是绝对 Unix 时间；这样可保留单调时钟语义、支持确定性测试，并避免本地结算耗时污染上游吞吐。
 - 2026-07-11：流式请求仅在 P95 TTFT 为有限正数时优先 TTFT；非流式或无效 TTFT 保持 P95 total latency 兼容行为。
-- 2026-07-12：用户明确授权继续直至 PR/main 合入和 `v0.1.10`、`latest` 多架构镜像实际发布核验；完成镜像发布前不得结束 Goal。
+- 2026-07-12：用户当时明确授权继续直至 PR/main 合入和版本镜像、`latest` 实际发布核验；发布目标随后在 2026-07-13 提升为 `v0.1.11`，完成正式镜像发布前不得结束 Goal。
 - 2026-07-12：子 Agent 数量通常维持约 2 条并行线，不把 2 视为硬上限；发现派生第三条线后立即中断并由企业后端线接管共享改动。
 - 2026-07-12：Gate 5 与 Gate 6 已在 Policy/Router 文件形成交叉，停止强行拆分提交，改为企业后端统一收口、根代理独立审查后原子提交。
 - 2026-07-13：最终总装以全仓行为为边界；发现共享 SSE/Logger 问题时修复基础设施根因，不通过删除测试、放宽断言或串行化生产路径规避。
@@ -237,6 +241,8 @@
 - 2026-07-13：Task/MJ 上游发送后的模糊结果一律保留扣款并进入 manual review；只有可证明的发送前失败或明确拒绝才能自动释放。accepted、terminal、stats、外部日志和缓存同步分别使用持久幂等阶段。
 - 2026-07-13：v2 writer 必须在所有在线实例报告协议能力后启用，避免旧 poller 按 legacy 语义重复结算；历史 v1 数据继续兼容且不提前删除字段。
 - 2026-07-13：三条子线允许并行，但使用明确文件所有权；根线在交接后统一审查与集成，避免通过局部修复破坏其他链路。
+- 2026-07-14：SQLite 旧表新增唯一字段必须使用“普通 nullable 列 + 独立命名唯一索引”的两阶段兼容迁移；真实 `v0.1.10` 卷升级是候选镜像进入 PR 前的强制门禁。
+- 2026-07-14：`e86f24c4` 候选以固定正式 `v0.1.10` digest 完成首次升级与重启门禁；只有 PR 合入、精确 tag 和全部正式供应链终验完成后才可结束 Goal。
 
 ## Idempotence and Recovery
 
@@ -248,4 +254,4 @@
 
 ## Outcomes & Retrospective
 
-Phase 0–5 控制面/数据面和七页正式前端已完成，但 `v0.1.11` 发布终审新增的 Task/MJ durable async billing、投影恢复、Cost Sources 集成与供应链门禁仍在实施。完成后必须在最终代码上重跑全矩阵，随后提交/推送、PR、同步 main、复验、合入并发布；只有 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本和 GitHub Release 全部核验通过，完整 Goal 才能结束。
+Phase 0–5 控制面/数据面、正式前端、Task/MJ durable async billing、独立投影、Cost Sources、人工复核、供应链门禁、SQLite `v0.1.10` 兼容修复、候选镜像和真实旧卷双启动升级均已完成并通过最终实现矩阵。当前只剩远端发布闭环：推送、PR、同步 main、复验、合入和发布；只有 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本和 GitHub Release 全部核验通过，完整 Goal 才能结束。
