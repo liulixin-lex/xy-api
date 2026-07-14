@@ -244,7 +244,7 @@ func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
 		Retryability: routingerror.RetryBeforeCommit,
 	}
 	require.NoError(t, completeRoutingSerialAttemptAudit(
-		ctx, info, channel, first, false, apiErr, classification, false, true,
+		ctx, info, channel, first, false, apiErr, classification, true, false, true,
 	))
 
 	info.RetryIndex = 1
@@ -261,6 +261,7 @@ func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
 		true,
 		nil,
 		routingerror.Classification{},
+		true,
 		true,
 		false,
 	))

@@ -110,6 +110,14 @@ write_release_json true
 "$finalizer" --tag v0.1.11 > "$temp_dir/incomplete.stdout"
 grep -Fq 'remains draft' "$temp_dir/incomplete.stdout"
 [ ! -s "$MOCK_CALLS" ]
+ready_status=0
+"$finalizer" \
+  --tag v0.1.11 \
+  --verify-ready \
+  --download-dir "$temp_dir/incomplete-ready" \
+  > "$temp_dir/incomplete-ready.stdout" || ready_status=$?
+[ "$ready_status" -eq 3 ]
+grep -Fq 'remains draft' "$temp_dir/incomplete-ready.stdout"
 
 write_release_json false
 if "$finalizer" --tag v0.1.11 > "$temp_dir/published-incomplete.stdout" 2> "$temp_dir/published-incomplete.stderr"; then
@@ -129,6 +137,18 @@ if "$finalizer" \
   exit 1
 fi
 grep -Fq 'must already be published' "$temp_dir/draft-verify.stderr"
+: > "$MOCK_CALLS"
+"$finalizer" \
+  --tag v0.1.11 \
+  --verify-ready \
+  --download-dir "$temp_dir/ready-download" > "$temp_dir/ready.stdout"
+grep -Fq 'complete verified 10-asset inventory (ready)' "$temp_dir/ready.stdout"
+[ ! -s "$MOCK_CALLS" ]
+find "$temp_dir/ready-download" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+  LC_ALL=C sort > "$temp_dir/ready-assets.txt"
+find "$MOCK_ASSET_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' |
+  LC_ALL=C sort > "$temp_dir/ready-source-assets.txt"
+cmp "$temp_dir/ready-source-assets.txt" "$temp_dir/ready-assets.txt"
 : > "$MOCK_CALLS"
 "$finalizer" --tag v0.1.11 > "$temp_dir/complete.stdout"
 grep -Fq 'complete verified 10-asset inventory' "$temp_dir/complete.stdout"

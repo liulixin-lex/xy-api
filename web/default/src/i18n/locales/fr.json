@@ -759,6 +759,7 @@
     "Billing group = premium (the token has a group, so use it)": "Groupe de facturation = premium (le jeton a un groupe, on l’utilise)",
     "Billing group = vip (the token has no group, so use the user group)": "Groupe de facturation = vip (le jeton n’a pas de groupe, on utilise le groupe de l’utilisateur)",
     "Billing History": "Historique de facturation",
+    "Billing log integrity audit": "Audit d'intégrité des journaux de facturation",
     "Billing Mode": "Mode de facturation",
     "Billing Process": "Processus de facturation",
     "Billing Source": "Source de facturation",

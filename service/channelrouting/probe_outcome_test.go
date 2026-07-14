@@ -63,13 +63,15 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 	}
 	seedCredential := func(target ActiveProbeTarget) {
 		key := "probe-key-" + strconv.Itoa(target.ChannelID)
-		fingerprint, err := model.RoutingCredentialFingerprint(target.ChannelID, key)
-		require.NoError(t, err)
-		require.NoError(t, db.Create(&model.Channel{
+		channel := model.Channel{
 			Id: target.ChannelID, Key: key, Status: common.ChannelStatusEnabled,
-		}).Error)
+		}
+		require.NoError(t, db.Create(&channel).Error)
+		fingerprint, err := model.RoutingCredentialFingerprint(target.ChannelID, channel.RoutingGeneration, key)
+		require.NoError(t, err)
 		require.NoError(t, db.Create(&model.RoutingCredentialRef{
-			ID: target.CredentialID, ChannelID: target.ChannelID, Fingerprint: fingerprint,
+			ID: target.CredentialID, ChannelID: target.ChannelID,
+			ChannelGeneration: channel.RoutingGeneration, Fingerprint: fingerprint,
 			FingerprintVersion: model.RoutingCredentialFingerprintVersion, Active: true,
 		}).Error)
 	}

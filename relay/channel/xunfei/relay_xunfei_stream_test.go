@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -246,5 +247,36 @@ func TestXunfeiMakeRequestClosesConnectedUpstreamOnRequestCancel(t *testing.T) {
 	case <-endChan:
 	case <-time.After(time.Second):
 		require.Fail(t, "xunfei stream producer did not stop after request cancellation")
+	}
+}
+
+func TestXunfeiMakeRequestPreservesHandshakeStatus(t *testing.T) {
+	statusCodes := []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusPaymentRequired,
+		http.StatusTooManyRequests,
+	}
+	for _, statusCode := range statusCodes {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			authURL := "ws" + strings.TrimPrefix(server.URL, "http")
+			_, _, _, err := xunfeiMakeRequest(
+				context.Background(),
+				&relaycommon.RelayInfo{},
+				dto.GeneralOpenAIRequest{},
+				"general",
+				authURL,
+				"app",
+			)
+
+			var apiErr *types.NewAPIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, statusCode, apiErr.SourceStatusCode())
+		})
 	}
 }

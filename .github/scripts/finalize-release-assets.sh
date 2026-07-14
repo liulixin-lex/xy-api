@@ -8,7 +8,9 @@ fail() {
 }
 
 tag=''
+default_branch=''
 verify_only=false
+verify_ready=false
 requested_download_dir=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -17,8 +19,17 @@ while [ "$#" -gt 0 ]; do
       tag=$2
       shift 2
       ;;
+    --default-branch)
+      [ "$#" -ge 2 ] || fail '--default-branch requires a value'
+      default_branch=$2
+      shift 2
+      ;;
     --verify-only)
       verify_only=true
+      shift
+      ;;
+    --verify-ready)
+      verify_ready=true
       shift
       ;;
     --download-dir)
@@ -27,7 +38,7 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --help|-h)
-      printf 'Usage: finalize-release-assets.sh --tag TAG [--verify-only --download-dir DIRECTORY]\n'
+      printf 'Usage: finalize-release-assets.sh --tag TAG [--default-branch BRANCH] [--verify-only|--verify-ready --download-dir DIRECTORY]\n'
       exit 0
       ;;
     *)
@@ -45,10 +56,19 @@ fi
 if [[ ! "${GITHUB_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   fail "invalid GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}"
 fi
-if [ "$verify_only" = true ]; then
-  [ -n "$requested_download_dir" ] || fail '--verify-only requires --download-dir'
+if [ -n "$default_branch" ] && {
+  [[ ! "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+  [[ "$default_branch" == .* ]] || [[ "$default_branch" == */.* ]];
+}; then
+  fail "invalid default branch: $default_branch"
+fi
+if [ "$verify_only" = true ] && [ "$verify_ready" = true ]; then
+  fail '--verify-only and --verify-ready are mutually exclusive'
+fi
+if [ "$verify_only" = true ] || [ "$verify_ready" = true ]; then
+  [ -n "$requested_download_dir" ] || fail 'read-only verification requires --download-dir'
 elif [ -n "$requested_download_dir" ]; then
-  fail '--download-dir requires --verify-only'
+  fail '--download-dir requires --verify-only or --verify-ready'
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -109,6 +129,9 @@ if [ -s "$missing_file" ]; then
   fi
   printf 'release %s remains draft; waiting for required assets:\n' "$tag"
   sed 's/^/  - /' "$missing_file"
+  if [ "$verify_ready" = true ]; then
+    exit 3
+  fi
   exit 0
 fi
 
@@ -163,7 +186,7 @@ validate_checksum_inventory checksums-electron-windows.txt \
   sha256sum --check --strict checksums-electron-windows.txt
 ) >/dev/null
 
-if [ "$verify_only" = true ]; then
+if [ "$verify_only" = true ] || [ "$verify_ready" = true ]; then
   if [ -e "$requested_download_dir" ] &&
     [ -n "$(find "$requested_download_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
     fail "download directory must be empty: $requested_download_dir"
@@ -172,7 +195,11 @@ if [ "$verify_only" = true ]; then
   while IFS= read -r asset_name; do
     cp -p -- "$verified_assets_dir/$asset_name" "$requested_download_dir/$asset_name"
   done < "$expected_file"
-  printf 'release %s has the complete verified 10-asset inventory (read-only)\n' "$tag"
+  if [ "$verify_ready" = true ]; then
+    printf 'release %s has the complete verified 10-asset inventory (ready)\n' "$tag"
+  else
+    printf 'release %s has the complete verified 10-asset inventory (read-only)\n' "$tag"
+  fi
   exit 0
 fi
 
@@ -197,5 +224,9 @@ if jq -e '.isDraft == true' "$release_file" >/dev/null; then
     fail "GitHub did not publish stable release $tag"
 fi
 
-"$script_dir/ensure-release-latest.sh" --tag "$tag"
+ensure_args=(--tag "$tag")
+if [ -n "$default_branch" ]; then
+  ensure_args+=(--default-branch "$default_branch")
+fi
+"$script_dir/ensure-release-latest.sh" "${ensure_args[@]}"
 printf 'release %s has the complete verified 10-asset inventory\n' "$tag"

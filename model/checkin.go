@@ -105,6 +105,11 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 			Update("quota", gorm.Expr("quota + ?", quotaAwarded)).Error; err != nil {
 			return errors.New("签到失败：更新额度出错")
 		}
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, userId, time.Now()); err != nil {
+				return err
+			}
+		}
 
 		return nil
 	})
@@ -113,10 +118,7 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 		return nil, err
 	}
 
-	// 事务成功后，异步更新缓存
-	go func() {
-		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
-	}()
+	syncUserCacheAfterCommitBestEffort(userId, "checkin quota award")
 
 	return checkin, nil
 }

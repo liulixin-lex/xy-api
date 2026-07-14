@@ -31,6 +31,7 @@ export type SmartRoutingMode =
   | 'enterprise_slo'
 
 export type SmartRoutingSettings = {
+  server_etag?: string
   enabled: boolean
   mode: SmartRoutingMode
   weight_availability: number
@@ -86,6 +87,7 @@ export type RoutingCredentialMasks = {
 export type RoutingBinding = {
   id: number
   channel_id: number
+  etag: string
   upstream_type: 'newapi' | 'sub2api'
   base_url: string
   upstream_group: string

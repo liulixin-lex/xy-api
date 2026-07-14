@@ -2291,6 +2291,36 @@ func TestRoutingCostEndpointsRejectNonJSONContentType(t *testing.T) {
 	assert.Contains(t, err.Error(), "Content-Type")
 }
 
+func TestRoutingCostRequestsRejectInvalidEgressPolicyBeforeSending(t *testing.T) {
+	var calls atomic.Int32
+	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("request must not be sent")
+	}))
+
+	invalidPolicy := `{not-json}`
+	binding := model.RoutingChannelBinding{
+		ChannelID:        994,
+		BaseURL:          "https://routing.example.com",
+		UpstreamGroup:    "vip",
+		EgressPolicyJSON: &invalidPolicy,
+	}
+	_, err := fetchRoutingNewAPIPricingPayload(context.Background(), binding, model.RoutingCredentials{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid routing cost egress policy")
+	assert.Zero(t, calls.Load())
+
+	binding.EgressPolicyJSON = nil
+	_, err = routingSub2APIRequest(
+		context.Background(), binding,
+		model.RoutingCredentials{CustomCAPEM: "not-a-certificate"},
+		http.MethodGet, "/api/test", "", nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid routing cost custom CA")
+	assert.Zero(t, calls.Load())
+}
+
 func TestRoutingSub2APIRequestDecodesGzipJSON(t *testing.T) {
 	server := newRoutingCostTLSServerForTest(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

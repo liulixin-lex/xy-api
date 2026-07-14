@@ -111,6 +111,15 @@ func (reservation *HedgeAttemptAuditReservation) Complete(
 	return reservation.buffer.complete(reservation.attemptKey, spec)
 }
 
+// Discard removes an attempt reservation that was proven to be a local replay
+// before any upstream send. It deliberately creates no routing observation.
+func (reservation *HedgeAttemptAuditReservation) Discard() error {
+	if reservation == nil || reservation.buffer == nil || reservation.attemptKey == "" {
+		return ErrHedgeAuditTransition
+	}
+	return reservation.buffer.discard(reservation.attemptKey)
+}
+
 func FlushHedgeAttemptAuditsContext(ctx context.Context) (int, error) {
 	flushedTotal := 0
 	for batchIndex := 0; batchIndex < hedgeAuditFlushMaxBatches; batchIndex++ {
@@ -228,6 +237,21 @@ func (buffer *hedgeAttemptAuditBuffer) complete(
 	}
 	copy := spec
 	entry.completion = &copy
+	return nil
+}
+
+func (buffer *hedgeAttemptAuditBuffer) discard(attemptKey string) error {
+	buffer.flushMu.Lock()
+	defer buffer.flushMu.Unlock()
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	entry, exists := buffer.entries[attemptKey]
+	if !exists || entry.auditID != 0 || entry.completion != nil {
+		return ErrHedgeAuditTransition
+	}
+	delete(buffer.entries, attemptKey)
+	buffer.order.Remove(entry.element)
+	buffer.bytes -= entry.bytes
 	return nil
 }
 

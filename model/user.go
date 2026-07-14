@@ -1,22 +1,28 @@
 package model
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
 
 const UserNameMaxLength = 20
+
+var (
+	ErrUserQuotaInsufficient = errors.New("user quota is insufficient")
+	ErrQuotaRefundOutOfRange = errors.New("quota refund is outside the supported range")
+)
 
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
@@ -117,10 +123,21 @@ func UpdateUserSetting(userId int, setting dto.UserSetting) error {
 		return err
 	}
 	settingValue := string(settingBytes)
-	if err = DB.Model(&User{}).Where("id = ?", userId).Update("setting", settingValue).Error; err != nil {
+	now := time.Now()
+	if err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", userId).Update("setting", settingValue).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			_, err := queueUserCacheSyncTx(tx, userId, now)
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	return updateUserSettingCache(userId, settingValue)
+	syncUserCacheAfterCommitBestEffort(userId, "user setting update")
+	return nil
 }
 
 // 根据用户角色生成默认的边栏配置
@@ -432,12 +449,44 @@ func HardDeleteUserById(id int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
+	var tokenKeys []string
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", id).First(&user).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, id, time.Now()); err != nil {
+				return err
+			}
+			var tokens []Token
+			if err := lockForUpdate(tx.Unscoped()).Select("id", commonKeyCol).
+				Where("user_id = ?", id).Order("id asc").Find(&tokens).Error; err != nil {
+				return err
+			}
+			for index := range tokens {
+				if _, err := queueTokenCacheSyncTx(tx, tokens[index].Key, time.Now()); err != nil {
+					return err
+				}
+				tokenKeys = append(tokenKeys, tokens[index].Key)
+			}
+		}
+		if err := EnsureNoAsyncBillingReferencesForUserTx(tx, id); err != nil {
+			return err
+		}
 		if err := deleteUserOAuthBindingsByUserId(tx, id); err != nil {
 			return err
 		}
 		return tx.Unscoped().Delete(&User{}, "id = ?", id).Error
 	})
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if err == nil {
+		syncUserCacheAfterCommitBestEffort(id, "user hard deletion")
+		syncTokenCachesAfterCommitBestEffort(tokenKeys, "user hard deletion")
+	}
+	return nil
 }
 
 func inviteUser(inviterId int) (err error) {
@@ -494,9 +543,18 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 	if err := tx.Save(user).Error; err != nil {
 		return err
 	}
+	if common.RedisEnabled {
+		if _, err := queueUserCacheSyncTx(tx, user.Id, time.Now()); err != nil {
+			return err
+		}
+	}
 
 	// 提交事务
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	syncUserCacheAfterCommitBestEffort(user.Id, "affiliate quota transfer")
+	return nil
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
@@ -516,6 +574,9 @@ func (user *User) prepareForInsert(tx *gorm.DB) error {
 // user, serializing concurrent binds of the same email so two accounts cannot
 // end up sharing one address. The email is normalized before check and store.
 func BindEmailToUser(user *User, email string) error {
+	if user == nil || user.Id <= 0 {
+		return errors.New("user id is empty")
+	}
 	email = NormalizeEmail(email)
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		return withNormalizedEmailLock(tx, email, func(tx *gorm.DB) error {
@@ -528,7 +589,8 @@ func BindEmailToUser(user *User, email string) error {
 	}); err != nil {
 		return err
 	}
-	return updateUserCache(*user)
+	syncUserCacheAfterCommitBestEffort(user.Id, "user email binding")
+	return nil
 }
 
 func ensureEmailAvailableWithTx(tx *gorm.DB, email string, excludeUserID int) error {
@@ -675,10 +737,13 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 }
 
 func (user *User) Update(updatePassword bool) error {
-	if err := user.UpdateWithTx(DB, updatePassword); err != nil {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return user.UpdateWithTx(tx, updatePassword)
+	}); err != nil {
 		return err
 	}
-	return updateUserCache(*user)
+	syncUserCacheAfterCommitBestEffort(user.Id, "user update")
+	return nil
 }
 
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
@@ -720,14 +785,23 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	if err = tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
 	}
-	return tx.First(user, user.Id).Error
+	if err = tx.First(user, user.Id).Error; err != nil {
+		return err
+	}
+	if common.RedisEnabled {
+		_, err = queueUserCacheSyncTx(tx, user.Id, time.Now())
+	}
+	return err
 }
 
 func (user *User) Edit(updatePassword bool) error {
-	if err := user.EditWithTx(DB, updatePassword); err != nil {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return user.EditWithTx(tx, updatePassword)
+	}); err != nil {
 		return err
 	}
-	return updateUserCache(*user)
+	syncUserCacheAfterCommitBestEffort(user.Id, "user edit")
+	return nil
 }
 
 func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
@@ -757,14 +831,19 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	if err = tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
 	}
-	return tx.First(user, user.Id).Error
+	if err = tx.First(user, user.Id).Error; err != nil {
+		return err
+	}
+	if common.RedisEnabled {
+		_, err = queueUserCacheSyncTx(tx, user.Id, time.Now())
+	}
+	return err
 }
 
 func (user *User) ClearBinding(bindingType string) error {
 	if user.Id == 0 {
 		return errors.New("user id is empty")
 	}
-
 	bindingColumnMap := map[string]string{
 		"email":    "email",
 		"github":   "github_id",
@@ -780,39 +859,50 @@ func (user *User) ClearBinding(bindingType string) error {
 		return errors.New("invalid binding type")
 	}
 
-	if err := DB.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", user.Id).First(user).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			_, err := queueUserCacheSyncTx(tx, user.Id, time.Now())
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-
-	if err := DB.Where("id = ?", user.Id).First(user).Error; err != nil {
-		return err
-	}
-
-	return updateUserCache(*user)
+	syncUserCacheAfterCommitBestEffort(user.Id, "user binding clear")
+	return nil
 }
 
 func (user *User) Delete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	if err := DB.Delete(user).Error; err != nil {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(user).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			_, err := queueUserCacheSyncTx(tx, user.Id, time.Now())
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-
-	// 清除缓存
-	return invalidateUserCache(user.Id)
+	syncUserCacheAfterCommitBestEffort(user.Id, "user deletion")
+	return nil
 }
 
 func (user *User) HardDelete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		if err := deleteUserOAuthBindingsByUserId(tx, user.Id); err != nil {
-			return err
-		}
-		return tx.Unscoped().Delete(user).Error
-	})
+	return HardDeleteUserById(user.Id)
 }
 
 // ValidateAndFill check password & user status
@@ -1001,11 +1091,19 @@ func ValidateAccessToken(token string) (*User, error) {
 
 // GetUserQuota gets quota from Redis first, falls back to DB if needed
 func GetUserQuota(id int, fromDB bool) (quota int, err error) {
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if fromDB && common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
+	}
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) {
-			gopool.Go(func() {
-				if err := updateUserQuotaCache(id, quota); err != nil {
+		if shouldUpdateRedis(fromDB, err) && cacheEpochReady {
+			runAsyncCacheBackfill(func() {
+				if err := updateUserQuotaCacheIfEpoch(id, quota, cacheEpoch); err != nil {
 					common.SysLog("failed to update user quota cache: " + err.Error())
 				}
 			})
@@ -1017,6 +1115,10 @@ func GetUserQuota(id int, fromDB bool) (quota int, err error) {
 			return quota, nil
 		}
 		// Don't return error - fall through to DB
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 	fromDB = true
 	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
@@ -1039,11 +1141,19 @@ func GetUserEmail(id int) (email string, err error) {
 
 // GetUserGroup gets group from Redis first, falls back to DB if needed
 func GetUserGroup(id int, fromDB bool) (group string, err error) {
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if fromDB && common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
+	}
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) {
-			gopool.Go(func() {
-				if err := updateUserGroupCache(id, group); err != nil {
+		if shouldUpdateRedis(fromDB, err) && cacheEpochReady {
+			runAsyncCacheBackfill(func() {
+				if err := updateUserGroupCacheIfEpoch(id, group, cacheEpoch); err != nil {
 					common.SysLog("failed to update user group cache: " + err.Error())
 				}
 			})
@@ -1055,6 +1165,10 @@ func GetUserGroup(id int, fromDB bool) (group string, err error) {
 			return group, nil
 		}
 		// Don't return error - fall through to DB
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 	fromDB = true
 	err = DB.Model(&User{}).Where("id = ?", id).Select(commonGroupCol).Find(&group).Error
@@ -1068,22 +1182,34 @@ func GetUserGroup(id int, fromDB bool) (group string, err error) {
 // GetUserSetting gets setting from Redis first, falls back to DB if needed
 func GetUserSetting(id int, fromDB bool) (settingMap dto.UserSetting, err error) {
 	var setting string
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if fromDB && common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
+	}
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) {
-			gopool.Go(func() {
-				if err := updateUserSettingCache(id, setting); err != nil {
+		if shouldUpdateRedis(fromDB, err) && cacheEpochReady {
+			runAsyncCacheBackfill(func() {
+				if err := updateUserSettingCacheIfEpoch(id, setting, cacheEpoch); err != nil {
 					common.SysLog("failed to update user setting cache: " + err.Error())
 				}
 			})
 		}
 	}()
 	if !fromDB && common.RedisEnabled {
-		setting, err := getUserSettingCache(id)
+		settingMap, err = getUserSettingCache(id)
 		if err == nil {
-			return setting, nil
+			return settingMap, nil
 		}
 		// Don't return error - fall through to DB
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 	fromDB = true
 	// can be nil setting
@@ -1107,17 +1233,277 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheIncrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to increase user quota: " + err.Error())
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("user quota cache epoch unavailable; durable invalidation queued: " + err.Error())
 		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
+	}
+	now := time.Now()
+	var cacheSyncVersion int64
+	if err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", id).
+			Update("quota", gorm.Expr("quota + ?", quota)).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var queueErr error
+			cacheSyncVersion, queueErr = queueUserCacheSyncTx(tx, id, now)
+			return queueErr
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheIncrUserQuota(id, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getUserCacheKey(id), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("user quota increase committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+func preConsumeUserQuotaTx(tx *gorm.DB, id int, quota int) error {
+	if tx == nil || id <= 0 || quota <= 0 || quota > common.MaxQuota {
+		return errors.New("invalid user quota pre-consume")
+	}
+	result := tx.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrUserQuotaInsufficient
+	}
+	return nil
+}
+
+func refundUserQuotaTx(tx *gorm.DB, id int, quota int) error {
+	if tx == nil || id <= 0 || quota <= 0 || quota > common.MaxQuota {
+		return errors.New("invalid user quota refund")
+	}
+	result := tx.Model(&User{}).
+		Where("id = ? AND quota <= ?", id, common.MaxQuota-quota).
+		Update("quota", gorm.Expr("quota + ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrQuotaRefundOutOfRange
+	}
+	return nil
+}
+
+// PreConsumeUserQuota atomically reserves wallet quota without changing the
+// legacy post-settlement behavior of DecreaseUserQuota.
+func PreConsumeUserQuota(id int, quota int) error {
+	if quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid user quota pre-consume")
+	}
+	if quota == 0 {
 		return nil
 	}
-	return increaseUserQuota(id, quota)
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		var err error
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("user quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
+	}
+	now := time.Now()
+	var cacheSyncVersion int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := preConsumeUserQuotaTx(tx, id, quota); err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var err error
+			cacheSyncVersion, err = queueUserCacheSyncTx(tx, id, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheDecrUserQuota(id, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getUserCacheKey(id), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("user quota pre-consume committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+// RefundUserQuota restores a previous wallet reservation while refusing a
+// write that would overflow the quota column.
+func RefundUserQuota(id int, quota int) error {
+	if quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid user quota refund")
+	}
+	if quota == 0 {
+		return nil
+	}
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		var err error
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("user quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
+	}
+	now := time.Now()
+	var cacheSyncVersion int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := refundUserQuotaTx(tx, id, quota); err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var err error
+			cacheSyncVersion, err = queueUserCacheSyncTx(tx, id, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheIncrUserQuota(id, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getUserCacheKey(id), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("user quota refund committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+// PreConsumeUserAndTokenQuota reserves wallet and token quota in one primary
+// database transaction. The user row is updated first to preserve the global
+// user -> token lock order used by durable async billing.
+func PreConsumeUserAndTokenQuota(userID int, tokenID int, tokenKey string, quota int, consumeToken bool) error {
+	if userID <= 0 || quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid combined quota pre-consume")
+	}
+	if consumeToken && (tokenID <= 0 || strings.TrimSpace(tokenKey) == "") {
+		return errors.New("invalid token quota pre-consume")
+	}
+	if quota == 0 {
+		return nil
+	}
+
+	var userCacheEpoch int64
+	userCacheEpochReady := false
+	var tokenCacheEpoch int64
+	tokenCacheEpochReady := false
+	if common.RedisEnabled {
+		var err error
+		userCacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(userID))
+		if err == nil {
+			userCacheEpochReady = true
+		} else {
+			common.SysLog("user quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
+		if consumeToken {
+			tokenCacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(tokenKey))
+			if err == nil {
+				tokenCacheEpochReady = true
+			} else {
+				common.SysLog("token quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+			}
+		}
+	}
+
+	now := time.Now()
+	var userCacheSyncVersion int64
+	var tokenCacheSyncVersion int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := preConsumeUserQuotaTx(tx, userID, quota); err != nil {
+			return err
+		}
+		if consumeToken {
+			if err := preConsumeTokenQuotaTx(tx, tokenID, userID, tokenKey, quota); err != nil {
+				return err
+			}
+		}
+		if common.RedisEnabled {
+			var err error
+			userCacheSyncVersion, err = queueUserCacheSyncTx(tx, userID, now)
+			if err != nil {
+				return err
+			}
+			if consumeToken {
+				tokenCacheSyncVersion, err = queueTokenCacheSyncTx(tx, tokenKey, now)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if common.RedisEnabled && userCacheEpochReady {
+		cacheErr := cacheDecrUserQuota(userID, int64(quota), userCacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getUserCacheKey(userID), userCacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("combined wallet pre-consume committed but durable user cache sync is pending: " + syncErr.Error())
+		}
+	}
+	if consumeToken && common.RedisEnabled && tokenCacheEpochReady {
+		cacheErr := cacheDecrTokenQuota(tokenKey, int64(quota), tokenCacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getTokenCacheKey(tokenKey), tokenCacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("combined wallet pre-consume committed but durable token cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+func SetUserQuota(id int, quota int) error {
+	if id <= 0 || quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid user quota")
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&User{}).Where("id = ?", id).Update("quota", quota)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		if common.RedisEnabled {
+			_, err := queueUserCacheSyncTx(tx, id, time.Now())
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	syncUserCacheAfterCommitBestEffort(id, "user quota override")
+	return nil
 }
 
 func increaseUserQuota(id int, quota int) (err error) {
@@ -1132,17 +1518,41 @@ func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to decrease user quota: " + err.Error())
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("user quota cache epoch unavailable; durable invalidation queued: " + err.Error())
 		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
-		return nil
 	}
-	return decreaseUserQuota(id, quota)
+	now := time.Now()
+	var cacheSyncVersion int64
+	if err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&User{}).Where("id = ?", id).
+			Update("quota", gorm.Expr("quota - ?", quota)).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var queueErr error
+			cacheSyncVersion, queueErr = queueUserCacheSyncTx(tx, id, now)
+			return queueErr
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheDecrUserQuota(id, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getUserCacheKey(id), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("user quota decrease committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
@@ -1244,11 +1654,19 @@ func updateUserRequestCount(id int, count int) {
 
 // GetUsernameById gets username from Redis first, falls back to DB if needed
 func GetUsernameById(id int, fromDB bool) (username string, err error) {
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if fromDB && common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
+	}
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) {
-			gopool.Go(func() {
-				if err := updateUserNameCache(id, username); err != nil {
+		if shouldUpdateRedis(fromDB, err) && cacheEpochReady {
+			runAsyncCacheBackfill(func() {
+				if err := updateUserNameCacheIfEpoch(id, username, cacheEpoch); err != nil {
 					common.SysLog("failed to update user name cache: " + err.Error())
 				}
 			})
@@ -1260,6 +1678,10 @@ func GetUsernameById(id int, fromDB bool) (username string, err error) {
 			return username, nil
 		}
 		// Don't return error - fall through to DB
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(id))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 	fromDB = true
 	err = DB.Model(&User{}).Where("id = ?", id).Select("username").Find(&username).Error

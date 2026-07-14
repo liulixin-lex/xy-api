@@ -332,6 +332,8 @@ docker run --name new-api -d --restart always \
 
 📖 **完整配置：** [环境变量文档](https://docs.newapi.pro/zh/docs/installation/config-maintenance/environment-variables)
 
+📘 **渠道路由 2.0 上线：** [运维与滚动升级手册](docs/channel/channel-routing-v2-operations.md)
+
 </details>
 
 ### 🔧 部署方式

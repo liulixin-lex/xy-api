@@ -134,7 +134,7 @@ func TestRequiredCapabilitiesFailClosedAcrossShadowAndBalanced(t *testing.T) {
 	require.NoError(t, err)
 	pool := PoolSnapshot{
 		ID: 1, GroupName: "default", SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
-		BalancedPolicy: policy,
+		BalancedPolicy: policy, CapabilityRoutingEnabled: true,
 	}
 	member := PoolMemberSnapshot{
 		ID: 11, PoolID: 1, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
@@ -201,7 +201,7 @@ func TestV2ReplayHardCapabilityExclusionSurvivesAffinityAndSoftFallback(t *testi
 	require.NoError(t, err)
 	pool := PoolSnapshot{
 		ID: 5, GroupName: "default", SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
-		BalancedPolicy: policy,
+		BalancedPolicy: policy, CapabilityRoutingEnabled: true,
 	}
 	settings := pool.SelectorPolicy.selectorSettings(1_000, 1_000_000, 99, false)
 	unsupportedMember := PoolMemberSnapshot{
@@ -274,6 +274,7 @@ func TestPlanBalancedAppliesV2CapabilityFilterBeforeAffinity(t *testing.T) {
 	t.Cleanup(ResetSnapshotForTest)
 	now := time.Now().Unix()
 	view := balancedActiveSnapshotForTest(t, now)
+	view.Pools[0].CapabilityRoutingEnabled = true
 	view.Pools[0].BalancedPolicy.ProtectionBandBasisPoints = 10_000
 	kindMask, ok := RequestKindResponses.Mask()
 	require.True(t, ok)
@@ -314,8 +315,9 @@ func TestCaptureShadowReplayUsesV2CapabilityFilter(t *testing.T) {
 		Revision: 7, RuntimeGeneration: 3, PolicyHash: strings.Repeat("b", 64), BuiltAtUnix: time.Now().Unix(),
 		Pools: []PoolSnapshot{{
 			ID: 5, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageShadow,
-			PolicyProfile:  model.RoutingPolicyProfileBalanced,
-			SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
+			PolicyProfile:            model.RoutingPolicyProfileBalanced,
+			CapabilityRoutingEnabled: true,
+			SelectorPolicy:           defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
 			Members: []PoolMemberSnapshot{
 				{
 					ID: 51, PoolID: 5, ChannelID: 501, PhysicalStatus: common.ChannelStatusEnabled,

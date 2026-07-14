@@ -10,6 +10,8 @@ fail() {
 repository=''
 tag=''
 candidate_digest=''
+trusted_current_version=''
+trusted_current_digest=''
 output_file=''
 
 while [ "$#" -gt 0 ]; do
@@ -29,13 +31,23 @@ while [ "$#" -gt 0 ]; do
       candidate_digest=$2
       shift 2
       ;;
+    --trusted-current-version)
+      [ "$#" -ge 2 ] || fail '--trusted-current-version requires a value'
+      trusted_current_version=$2
+      shift 2
+      ;;
+    --trusted-current-digest)
+      [ "$#" -ge 2 ] || fail '--trusted-current-digest requires a value'
+      trusted_current_digest=$2
+      shift 2
+      ;;
     --output)
       [ "$#" -ge 2 ] || fail '--output requires a value'
       output_file=$2
       shift 2
       ;;
     --help|-h)
-      printf '%s\n' 'Usage: resolve-stable-latest.sh --repository REPOSITORY --tag TAG --candidate-digest DIGEST --output FILE'
+      printf '%s\n' 'Usage: resolve-stable-latest.sh --repository REPOSITORY --tag TAG --candidate-digest DIGEST [--trusted-current-version TAG --trusted-current-digest DIGEST] --output FILE'
       exit 0
       ;;
     *)
@@ -55,6 +67,14 @@ fi
 if [[ ! "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   fail "invalid candidate digest: $candidate_digest"
 fi
+if [ -n "$trusted_current_version" ] || [ -n "$trusted_current_digest" ]; then
+  if [[ ! "$trusted_current_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    fail "invalid trusted current version: $trusted_current_version"
+  fi
+  if [[ ! "$trusted_current_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    fail "invalid trusted current digest: $trusted_current_digest"
+  fi
+fi
 [ -n "$output_file" ] || fail '--output is required'
 
 temp_dir=$(mktemp -d)
@@ -66,6 +86,9 @@ error_file="$temp_dir/manifest.error"
 if ! docker buildx imagetools inspect "$reference" \
   --format '{{json .Manifest}}' > "$manifest_file" 2> "$error_file"; then
   if grep -Eiq 'manifest unknown|not found|no such manifest|name unknown' "$error_file"; then
+    if [ -n "$trusted_current_version" ] || [ -n "$trusted_current_digest" ]; then
+      fail "$reference disappeared after trusted verification"
+    fi
     mkdir -p "$(dirname "$output_file")"
     {
       echo 'promote_latest=true'
@@ -92,6 +115,12 @@ if [ "${#versions[@]}" -ne 1 ] ||
   fail "$reference does not expose one trustworthy stable version label"
 fi
 current_version=${versions[0]}
+if [ -z "$trusted_current_version" ] || [ -z "$trusted_current_digest" ]; then
+  fail "$reference must be trusted before it can influence stable promotion"
+fi
+if [ "$current_version" != "$trusted_current_version" ] || [ "$current_digest" != "$trusted_current_digest" ]; then
+  fail "$reference changed after trusted verification"
+fi
 highest=$(printf '%s\n%s\n' "$current_version" "$tag" | LC_ALL=C sort -V | tail -n 1)
 
 promote_latest=true

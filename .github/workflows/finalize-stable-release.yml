@@ -1,0 +1,159 @@
+name: Finalize stable release
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      default_branch:
+        required: true
+        type: string
+      dockerhub_repository:
+        required: false
+        default: ''
+        type: string
+    secrets:
+      dockerhub_username:
+        required: false
+      dockerhub_token:
+        required: false
+
+jobs:
+  finalize:
+    name: Converge stable release publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: stable-publication-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    env:
+      DOCKERHUB_REPOSITORY: ${{ inputs.dockerhub_repository }}
+
+    steps:
+      - name: Check out validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Stage trusted finalization tooling
+        # The caller may be a release tag. Execute finalization scripts only from
+        # the protected default-branch commit, never from the release checkout.
+        env:
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+            [[ "$DEFAULT_BRANCH" == .* ]] || [[ "$DEFAULT_BRANCH" == */.* ]]; then
+            echo '::error::The default branch name is invalid.'
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The release source SHA is invalid.'
+            exit 1
+          fi
+          trusted_sha=$(git ls-remote origin "refs/heads/${DEFAULT_BRANCH}" | awk 'NR == 1 { print $1 }')
+          if [[ ! "$trusted_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve the protected default-branch commit.'
+            exit 1
+          fi
+          if ! git cat-file -e "${trusted_sha}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$trusted_sha"
+          fi
+          if [ "$(git rev-parse "${trusted_sha}^{commit}")" != "$trusted_sha" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SOURCE_SHA" "$trusted_sha"; then
+            echo '::error::Release source is not an ancestor of the protected default branch.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-finalizer"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$trusted_sha" .github/scripts | tar -xf - -C "$trusted_root"
+          for script in \
+            finalize-stable-release.sh \
+            finalize-release-assets.sh \
+            ensure-release-latest.sh \
+            resolve-stable-latest.sh; do
+            [ -x "$trusted_root/.github/scripts/$script" ] || {
+              echo "::error::Trusted stable finalization tooling is missing $script."
+              exit 1
+            }
+          done
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
+
+      - name: Validate optional Docker Hub configuration
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
+          DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
+        run: |
+          set -euo pipefail
+          configured=0
+          for value in "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" "$DOCKERHUB_REPOSITORY"; do
+            if [ -n "$value" ]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [ "$configured" -ne 0 ] && [ "$configured" -ne 3 ]; then
+            echo '::error::Docker Hub finalization requires username, token, and repository together.'
+            exit 1
+          fi
+          if [ "$configured" -eq 3 ]; then
+            echo 'DOCKERHUB_ENABLED=true' >> "$GITHUB_ENV"
+          else
+            echo 'DOCKERHUB_ENABLED=false' >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver: docker
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_ENABLED == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Finalize stable release when all domains are ready
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          args=(
+            --tag "$TAG"
+            --source-sha "$SOURCE_SHA"
+            --repository "ghcr.io/${GITHUB_REPOSITORY,,}"
+            --default-branch "$DEFAULT_BRANCH"
+          )
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            args+=(--secondary-repository "$DOCKERHUB_REPOSITORY")
+          fi
+          "$RELEASE_CI_ROOT/.github/scripts/finalize-stable-release.sh" "${args[@]}"

@@ -57,6 +57,8 @@ function eventResourceQueryKey(
       return channelRoutingQueryKeys.endpointsRoot()
     case 'costs':
       return channelRoutingQueryKeys.costsRoot()
+    case 'cost-bindings':
+      return channelRoutingQueryKeys.costBindingsRoot()
     case 'probes':
       return channelRoutingQueryKeys.probesRoot()
     case 'decisions':

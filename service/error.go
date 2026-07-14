@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -92,7 +91,13 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		attachRetryAfterMetadata(newApiErr, retryAfterHeader, time.Now())
 	}()
 
-	responseBody, err := io.ReadAll(resp.Body)
+	var responseBody []byte
+	var err error
+	if resp.ContentLength > DefaultMaxUpstreamResponseBytes {
+		err = ErrUpstreamResponseBodyTooLarge
+	} else {
+		responseBody, err = ReadUpstreamResponseBody(resp.Body, DefaultMaxUpstreamResponseBytes)
+	}
 	if err != nil {
 		newApiErr = types.NewErrorWithStatusCode(
 			err,

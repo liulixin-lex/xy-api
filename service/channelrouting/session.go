@@ -20,12 +20,15 @@ var (
 )
 
 const (
-	ExclusionReasonRequestFailed        = "request_failed"
-	ExclusionReasonChannelNotAllowed    = "channel_not_allowed"
-	ExclusionReasonLocalCapacity        = "local_capacity_exhausted"
-	ExclusionReasonHalfOpenProbe        = "half_open_probe_unavailable"
-	ExclusionReasonMultiKeyUnsupported  = "multi_key_unsupported"
-	ExclusionReasonSlowStartUnavailable = "slow_start_unavailable"
+	ExclusionReasonRequestFailed         = "request_failed"
+	ExclusionReasonChannelNotAllowed     = "channel_not_allowed"
+	ExclusionReasonLocalCapacity         = "local_capacity_exhausted"
+	ExclusionReasonHalfOpenProbe         = "half_open_probe_unavailable"
+	ExclusionReasonMultiKeyUnsupported   = "multi_key_unsupported"
+	ExclusionReasonCredentialUnavailable = "credential_unavailable"
+	ExclusionReasonCredentialRequest     = "credential_request_excluded"
+	ExclusionReasonUpstreamAccount       = "upstream_account_unavailable"
+	ExclusionReasonSlowStartUnavailable  = "slow_start_unavailable"
 )
 
 type RequestRoutingSession struct {
@@ -58,6 +61,8 @@ type RequestRoutingPlanInput struct {
 	// A nil allowed list means unrestricted. A non-nil empty list fails closed.
 	AllowedChannelIDs          []int
 	ExcludedChannelIDs         []int
+	ExcludedCredentialIDs      []int
+	RequiredCredentialID       int
 	CapacityExcludedChannelIDs []int
 	ProbeExcludedChannelIDs    []int
 	SlowStartFactor            func(SlowStartKey) (float64, error)
@@ -297,6 +302,9 @@ func (session *RequestRoutingSession) Gate() (CanaryGate, bool, error) {
 }
 
 func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (RequestRoutingPlan, bool, error) {
+	if input.RequiredCredentialID < 0 {
+		return RequestRoutingPlan{}, false, ErrRoutingSessionInvalid
+	}
 	if session == nil || session.snapshot == nil || session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {
 		return RequestRoutingPlan{}, false, ErrRoutingSessionInvalid
 	}
@@ -333,6 +341,10 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		return RequestRoutingPlan{}, true, err
 	}
 	excludedChannels, _, err := routingSessionChannelSet(input.ExcludedChannelIDs)
+	if err != nil {
+		return RequestRoutingPlan{}, true, err
+	}
+	excludedCredentials, _, err := routingSessionChannelSet(input.ExcludedCredentialIDs)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
@@ -396,6 +408,23 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				region    string
 			}{authority: authority, region: region}
 		}
+		credentialID, credentialReason := snapshot.selectCredential(
+			member, profile.ModelName, seed, excludedCredentials, input.RequiredCredentialID, now,
+		)
+		candidate.CredentialID = credentialID
+		if candidate.RequestExclusionReason == "" {
+			switch credentialReason {
+			case credentialExclusionRequest:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialRequest
+			case credentialExclusionUnavailable:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialUnavailable
+			}
+		}
+		if candidate.RequestExclusionReason == "" && observation.upstreamAccountID > 0 {
+			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, now); blocked {
+				candidate.RequestExclusionReason = ExclusionReasonUpstreamAccount
+			}
+		}
 		if candidate.RequestExclusionReason == "" {
 			switch {
 			case routingSessionChannelContains(excludedChannels, member.ChannelID):
@@ -406,8 +435,8 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
 			case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):
 				candidate.RequestExclusionReason = ExclusionReasonChannelNotAllowed
-			case member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1:
-				candidate.RequestExclusionReason = ExclusionReasonMultiKeyUnsupported
+			case member.CredentialsTruncated:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialUnavailable
 			case input.SlowStartFactor != nil:
 				factor, factorErr := session.slowStartFactor(SlowStartKey{
 					PoolID: pool.ID, MemberID: member.ID, Model: profile.ModelName,
@@ -422,9 +451,12 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				}
 			}
 		}
-		identity := Identity{SnapshotRevision: snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}
-		if len(member.CredentialIDs) == 1 {
-			identity.CredentialID = member.CredentialIDs[0]
+		identity := Identity{
+			SnapshotRevision:  snapshot.view.Revision,
+			PoolID:            pool.ID,
+			MemberID:          member.ID,
+			CredentialID:      credentialID,
+			UpstreamAccountID: observation.upstreamAccountID,
 		}
 		identities[member.ID] = identity
 		candidates = append(candidates, candidate)

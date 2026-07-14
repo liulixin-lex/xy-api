@@ -40,17 +40,16 @@ func TestActiveProbeOperationIsClaimedOnceAndLeaseIsRenewed(t *testing.T) {
 		)
 	}()
 	<-started
-	nowMs, err := model.RoutingEndpointDatabaseNowMsContext(context.Background())
-	require.NoError(t, err)
-	require.NoError(t, db.Model(&model.RoutingOperation{}).Where("id = ?", operation.ID).
-		Update("claim_until_ms", nowMs+1_000).Error)
 	before, err := model.GetRoutingOperationContext(context.Background(), operation.ID)
 	require.NoError(t, err)
+	shortClaimUntilMs := before.UpdatedTimeMs + 1_000
+	require.NoError(t, db.Model(&model.RoutingOperation{}).Where("id = ?", operation.ID).
+		Update("claim_until_ms", shortClaimUntilMs).Error)
 	heartbeatTicks <- time.Now()
 	require.NoError(t, <-heartbeatResults)
 	after, err := model.GetRoutingOperationContext(context.Background(), operation.ID)
 	require.NoError(t, err)
-	assert.Greater(t, after.ClaimUntilMs, before.ClaimUntilMs)
+	assert.Greater(t, after.ClaimUntilMs, shortClaimUntilMs)
 	close(release)
 	require.NoError(t, <-cycleResult)
 

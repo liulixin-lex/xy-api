@@ -53,12 +53,13 @@ if rg -n 'driver-opts:\s*image=moby/buildkit(?::|@)(?!sha256:0168606be2315b7c807
 fi
 
 stable_workflow="$repo_root/.github/workflows/docker-build.yml"
+finalizer_script="$repo_root/.github/scripts/finalize-stable-release.sh"
 [ "$(grep -Fc 'TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}' "$stable_workflow")" -eq 3 ]
 [ "$(grep -Fc 'git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"' "$stable_workflow")" -eq 3 ]
 [ "$(grep -Fc 'echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"' "$stable_workflow")" -eq 3 ]
 grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/resolve-stable-architecture.sh"' "$stable_workflow"
-grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/resolve-stable-latest.sh"' "$stable_workflow"
 grep -Fq '"$RELEASE_CI_ROOT/.github/scripts/verify-release-attestations.sh"' "$stable_workflow"
+grep -Fq '"$script_dir/resolve-stable-latest.sh"' "$finalizer_script"
 if rg -n '^\s+\.github/scripts/' "$stable_workflow"; then
   echo 'stable release workflow executes tooling from the checked-out release tag' >&2
   exit 1

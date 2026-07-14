@@ -70,6 +70,7 @@ type ChannelMeta struct {
 	RoutingPoolID            int
 	RoutingMemberID          int
 	RoutingCredentialID      int
+	RoutingUpstreamAccountID int
 	RoutingEndpointHost      string
 	RoutingEndpointAuthority string
 	RoutingRegion            string
@@ -140,7 +141,6 @@ type RelayInfo struct {
 	InputAudioFormat       string
 	OutputAudioFormat      string
 	RealtimeTools          []dto.RealTimeTool
-	RealtimeReplayMessages [][]byte
 	IsFirstRequest         bool
 	AudioUsage             bool
 	ReasoningEffort        string
@@ -292,6 +292,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		RoutingPoolID:            common.GetContextKeyInt(c, constant.ContextKeyRoutingPoolID),
 		RoutingMemberID:          common.GetContextKeyInt(c, constant.ContextKeyRoutingMemberID),
 		RoutingCredentialID:      common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),
+		RoutingUpstreamAccountID: common.GetContextKeyInt(c, constant.ContextKeyRoutingUpstreamAccountID),
 		RoutingEndpointHost:      common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointHost),
 		RoutingEndpointAuthority: common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointAuthority),
 		RoutingRegion:            common.GetContextKeyString(c, constant.ContextKeyRoutingRegion),
@@ -1045,11 +1046,24 @@ func (info *RelayInfo) FirstByteTimedOutBeforeResponse() bool {
 }
 
 type TaskRelayInfo struct {
-	Action       string
-	OriginTaskID string
+	Action               string
+	OriginTaskID         string
+	OriginUpstreamTaskID string
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
 	PublicTaskID string
+	// AsyncBillingReservationID is non-zero only after the fleet-gated v2
+	// reservation has committed. The send-boundary callback authorizes exactly
+	// one attempt before any upstream bytes may be sent.
+	AsyncBillingReservationID      int64
+	AsyncBillingV2Decided          bool
+	AsyncBillingV2Enabled          bool
+	AsyncBillingClientKeyHash      string
+	AsyncBillingClientPayloadHash  string
+	AsyncBillingClientScope        string
+	AsyncBillingClientKeyPresent   bool
+	AsyncBillingManualReviewMarked bool
+	AsyncBillingSendDeadlineMs     int64
 
 	ConsumeQuota bool
 
@@ -1057,20 +1071,27 @@ type TaskRelayInfo struct {
 	// a specific channel (e.g., remix on origin task's channel). Stored as any
 	// to avoid an import cycle with model; callers type-assert to *model.Channel.
 	LockedChannel any
+	// These fields retain the origin task's stable routing scope. They are
+	// admission constraints and must not be used as billing inputs.
+	LockedRoutingGroup        string
+	LockedRoutingCredentialID int
 }
 
 type TaskSubmitReq struct {
-	Prompt         string                 `json:"prompt"`
-	Model          string                 `json:"model,omitempty"`
-	Mode           string                 `json:"mode,omitempty"`
-	Image          string                 `json:"image,omitempty"`
-	Images         []string               `json:"images,omitempty"`
-	Size           string                 `json:"size,omitempty"`
-	Duration       int                    `json:"duration,omitempty"`
-	Seconds        string                 `json:"seconds,omitempty"`
-	InputReference string                 `json:"input_reference,omitempty"`
-	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	Prompt          string                 `json:"prompt"`
+	Model           string                 `json:"model,omitempty"`
+	Mode            string                 `json:"mode,omitempty"`
+	Image           string                 `json:"image,omitempty"`
+	Images          []string               `json:"images,omitempty"`
+	Size            string                 `json:"size,omitempty"`
+	Duration        int                    `json:"duration,omitempty"`
+	Seconds         string                 `json:"seconds,omitempty"`
+	InputReference  string                 `json:"input_reference,omitempty"`
+	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+	DurationPresent bool                   `json:"-"`
 }
+
+var ErrInvalidTaskDuration = errors.New("invalid task duration")
 
 func (t *TaskSubmitReq) GetPrompt() string {
 	return t.Prompt
@@ -1094,17 +1115,21 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	if len(aux.Duration) > 0 {
+	if len(aux.Duration) > 0 && strings.TrimSpace(string(aux.Duration)) != "null" {
+		t.DurationPresent = true
 		var durationInt int
 		if err := common.Unmarshal(aux.Duration, &durationInt); err == nil {
 			t.Duration = durationInt
 		} else {
 			var durationStr string
-			if err := common.Unmarshal(aux.Duration, &durationStr); err == nil && durationStr != "" {
-				if v, err := strconv.Atoi(durationStr); err == nil {
-					t.Duration = v
-				}
+			if err := common.Unmarshal(aux.Duration, &durationStr); err != nil || strings.TrimSpace(durationStr) == "" {
+				return fmt.Errorf("%w: duration must be an integer", ErrInvalidTaskDuration)
 			}
+			v, err := strconv.ParseInt(strings.TrimSpace(durationStr), 10, 0)
+			if err != nil {
+				return fmt.Errorf("%w: duration must be an integer: %v", ErrInvalidTaskDuration, err)
+			}
+			t.Duration = int(v)
 		}
 	}
 

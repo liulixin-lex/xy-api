@@ -759,6 +759,7 @@
     "Billing group = premium (the token has a group, so use it)": "Тарифная группа = premium (у токена есть группа, используем её)",
     "Billing group = vip (the token has no group, so use the user group)": "Тарифная группа = vip (у токена нет группы, используем группу пользователя)",
     "Billing History": "История биллинга",
+    "Billing log integrity audit": "Аудит целостности журналов биллинга",
     "Billing Mode": "Режим биллинга",
     "Billing Process": "Процесс тарификации",
     "Billing Source": "Источник биллинга",

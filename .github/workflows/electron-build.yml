@@ -307,8 +307,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Finalize complete stable release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: .github/scripts/finalize-release-assets.sh --tag "$TAG"
+  finalize_stable_release:
+    name: Finalize stable release across registries and assets
+    needs: [prepare, release]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/finalize-stable-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      source_sha: ${{ needs.prepare.outputs.sha }}
+      default_branch: ${{ github.event.repository.default_branch }}
+      dockerhub_repository: ${{ vars.DOCKERHUB_REPOSITORY }}
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}

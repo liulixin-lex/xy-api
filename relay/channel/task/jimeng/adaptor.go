@@ -99,7 +99,17 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := a.convertToRequestPayload(&req, info); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	return nil
 }
 
 // BuildRequestURL constructs the upstream URL.
@@ -184,7 +194,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -194,7 +204,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	// Parse Jimeng response
 	var jResp responsePayload
 	if err := common.Unmarshal(responseBody, &jResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -389,12 +399,15 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 		Prompt: req.Prompt,
 	}
 
+	expectedFrames := 121
 	switch req.Duration {
 	case 10:
-		r.Frames = 241 // 24*10+1 = 241
+		expectedFrames = 241 // 24*10+1 = 241
+	case 0, 5:
 	default:
-		r.Frames = 121 // 24*5+1 = 121
+		return nil, fmt.Errorf("duration must be 5 or 10 seconds")
 	}
+	r.Frames = expectedFrames
 
 	// Handle one-of image_urls or binary_data_base64
 	if req.HasImage() {
@@ -406,6 +419,9 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 	}
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, &r); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
+	}
+	if r.Frames != expectedFrames {
+		return nil, fmt.Errorf("frames must match the selected duration: expected %d", expectedFrames)
 	}
 
 	// 即梦视频3.0 ReqKey转换
@@ -466,13 +482,15 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	openAIVideo.ID = originTask.TaskID
 	openAIVideo.Status = originTask.Status.ToVideoStatus()
 	openAIVideo.SetProgressStr(originTask.Progress)
-	openAIVideo.SetMetadata("url", jimengResp.Data.VideoUrl)
+	if resultURL := originTask.GetResultURL(); resultURL != "" {
+		openAIVideo.SetMetadata("url", resultURL)
+	}
 	openAIVideo.CreatedAt = originTask.CreatedAt
 	openAIVideo.CompletedAt = originTask.UpdatedAt
 
 	if jimengResp.Code != 10000 {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: jimengResp.Message,
+			Message: common.SanitizeErrorMessage(jimengResp.Message),
 			Code:    fmt.Sprintf("%d", jimengResp.Code),
 		}
 	}

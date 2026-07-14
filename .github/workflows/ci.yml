@@ -54,6 +54,7 @@ jobs:
           .github/scripts/tests/test-prepare-release-assets.sh
           .github/scripts/tests/test-ensure-release-latest.sh
           .github/scripts/tests/test-finalize-release-assets.sh
+          .github/scripts/tests/test-finalize-stable-release.sh
           .github/scripts/tests/test-release-workflow-coordination.sh
           .github/scripts/tests/test-publish-gitee-release.sh
           .github/scripts/tests/test-pinned-container-toolchain.sh

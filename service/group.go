@@ -53,6 +53,32 @@ func GetUserAutoGroup(userGroup string) []string {
 	return autoGroups
 }
 
+// StatefulRoutingGroupAllowed prevents a continuation from using a Pool that
+// the current token could not select for a new request. Empty origin groups are
+// retained only for historical rows that predate stable routing identity.
+func StatefulRoutingGroupAllowed(tokenGroup string, userGroup string, originGroup string) bool {
+	originGroup = strings.TrimSpace(originGroup)
+	if originGroup == "" {
+		return true
+	}
+	tokenGroup = strings.TrimSpace(tokenGroup)
+	if tokenGroup == "" {
+		tokenGroup = strings.TrimSpace(userGroup)
+	}
+	if tokenGroup == originGroup {
+		return true
+	}
+	if tokenGroup != "auto" {
+		return false
+	}
+	for _, group := range GetUserAutoGroup(userGroup) {
+		if group == originGroup {
+			return true
+		}
+	}
+	return false
+}
+
 // GetUserGroupRatio 获取用户使用某个分组的倍率
 // userGroup 用户分组
 // group 需要获取倍率的分组

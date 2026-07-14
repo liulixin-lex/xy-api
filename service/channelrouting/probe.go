@@ -52,6 +52,7 @@ type ActiveProbeTarget struct {
 	MemberID             int
 	ChannelID            int
 	CredentialID         int
+	UpstreamAccountID    int
 	GroupName            string
 	ModelName            string
 	EndpointHost         string
@@ -578,7 +579,8 @@ func validateActiveProbeTarget(target ActiveProbeTarget) error {
 		snapshot.memberByPoolChannel[poolChannelKey{PoolID: poolID, ChannelID: target.ChannelID}] != target.MemberID {
 		return ErrActiveProbeTargetStale
 	}
-	if _, exists := snapshot.modelByMemberModel[memberModelKey{memberID: target.MemberID, model: target.ModelName}]; !exists {
+	observation, exists := snapshot.modelByMemberModel[memberModelKey{memberID: target.MemberID, model: target.ModelName}]
+	if !exists || observation.upstreamAccountID != target.UpstreamAccountID {
 		return ErrActiveProbeTargetStale
 	}
 	channel, exists := snapshot.channelByID[target.ChannelID]
@@ -588,13 +590,14 @@ func validateActiveProbeTarget(target ActiveProbeTarget) error {
 		RoutingRegion() != target.Region {
 		return ErrActiveProbeTargetStale
 	}
-	if target.MultiKey {
-		if target.CredentialID != 0 {
+	if target.CredentialID == 0 {
+		if channel.CredentialRequired || len(channel.CredentialIDs) > 0 {
 			return ErrActiveProbeTargetStale
 		}
 		return nil
 	}
-	if target.CredentialID <= 0 {
+	credential, exists := snapshot.credentialByID[target.CredentialID]
+	if !exists || credential.ChannelID != target.ChannelID || !credential.Operational {
 		return ErrActiveProbeTargetStale
 	}
 	for _, credentialID := range channel.CredentialIDs {
@@ -626,9 +629,12 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 			if !exists || channel.Status != common.ChannelStatusEnabled {
 				continue
 			}
-			credentialID := 0
-			if !member.MultiKey && len(member.CredentialIDs) == 1 {
-				credentialID = member.CredentialIDs[0]
+			credentialIDs := append([]int(nil), member.CredentialIDs...)
+			if len(credentialIDs) == 0 && !channel.CredentialRequired {
+				credentialIDs = []int{0}
+			}
+			if member.CredentialsTruncated || len(credentialIDs) == 0 {
+				continue
 			}
 			for _, observation := range member.Models {
 				if strings.TrimSpace(observation.ModelName) == "" {
@@ -655,36 +661,58 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 				if endpointSelected {
 					breakerScope = BreakerScopeEndpoint
 				}
-				target := ActiveProbeTarget{
-					SnapshotRevision:     snapshot.view.Revision,
-					PoolID:               pool.ID,
-					MemberID:             member.ID,
-					ChannelID:            member.ChannelID,
-					CredentialID:         credentialID,
-					GroupName:            pool.GroupName,
-					ModelName:            observation.ModelName,
-					EndpointHost:         EndpointHost(channel.Endpoint, member.ChannelID),
-					EndpointAuthority:    endpointAuthority,
-					Region:               region,
-					BreakerScope:         breakerScope,
-					BreakerState:         breakerState,
-					BreakerCooldownUntil: breakerCooldownUntil,
-					AuthFailure:          channel.AuthFailure,
-					MultiKey:             member.MultiKey,
-					Interval:             activeProbeTargetInterval(setting, breakerState),
-					EstimatedTokens:      activeProbeEstimatedTokens,
-					EstimatedCostNanoUSD: activeProbeEstimatedCostNanoUSD(observation),
-				}
-				target.TargetKey = activeProbeTargetKey(target)
-				ranked := activeProbeRankedTarget{
-					target: target, priority: activeProbeTargetPriority(target.BreakerState),
-					rank: activeProbeTargetRank(target.TargetKey, seed),
-				}
-				if len(targets) < maxTargets {
-					heap.Push(&targets, ranked)
-				} else if activeProbeRankedTargetLess(ranked, targets[0]) {
-					heap.Pop(&targets)
-					heap.Push(&targets, ranked)
+				for _, credentialID := range credentialIDs {
+					if credentialID > 0 {
+						credential, operational := snapshot.credentialByID[credentialID]
+						if !operational || credential.ChannelID != member.ChannelID || !credential.Operational {
+							continue
+						}
+					}
+					credentialAuthFailure := false
+					if credentialID > 0 {
+						if state, known := CredentialRuntimeHealth(credentialID); known {
+							credentialAuthFailure = state.AuthFailure &&
+								(state.AuthFailureUntilMs <= 0 || state.AuthFailureUntilMs > now.UnixMilli())
+						}
+					}
+					targetBreakerState := breakerState
+					targetBreakerCooldown := breakerCooldownUntil
+					if credentialAuthFailure {
+						targetBreakerState = model.RoutingBreakerStateOpen
+						targetBreakerCooldown = now.Unix()
+					}
+					target := ActiveProbeTarget{
+						SnapshotRevision:     snapshot.view.Revision,
+						PoolID:               pool.ID,
+						MemberID:             member.ID,
+						ChannelID:            member.ChannelID,
+						CredentialID:         credentialID,
+						UpstreamAccountID:    observation.upstreamAccountID,
+						GroupName:            pool.GroupName,
+						ModelName:            observation.ModelName,
+						EndpointHost:         EndpointHost(channel.Endpoint, member.ChannelID),
+						EndpointAuthority:    endpointAuthority,
+						Region:               region,
+						BreakerScope:         breakerScope,
+						BreakerState:         targetBreakerState,
+						BreakerCooldownUntil: targetBreakerCooldown,
+						AuthFailure:          credentialAuthFailure || (!member.MultiKey && channel.AuthFailure),
+						MultiKey:             member.MultiKey,
+						Interval:             activeProbeTargetInterval(setting, targetBreakerState),
+						EstimatedTokens:      activeProbeEstimatedTokens,
+						EstimatedCostNanoUSD: activeProbeEstimatedCostNanoUSD(observation),
+					}
+					target.TargetKey = activeProbeTargetKey(target)
+					ranked := activeProbeRankedTarget{
+						target: target, priority: activeProbeTargetPriority(target.BreakerState),
+						rank: activeProbeTargetRank(target.TargetKey, seed),
+					}
+					if len(targets) < maxTargets {
+						heap.Push(&targets, ranked)
+					} else if activeProbeRankedTargetLess(ranked, targets[0]) {
+						heap.Pop(&targets)
+						heap.Push(&targets, ranked)
+					}
 				}
 			}
 		}
@@ -813,9 +841,6 @@ func applyActiveProbeBreakerOutcome(
 	} else if endpointReachable {
 		routingbreaker.RecordReliabilitySuccess(endpointKey)
 	}
-	if target.MultiKey {
-		return nil
-	}
 	key := routingbreaker.Key{
 		ChannelID:   target.ChannelID,
 		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
@@ -823,6 +848,16 @@ func applyActiveProbeBreakerOutcome(
 		Group:       target.GroupName,
 	}
 	if outcome == model.RoutingProbeOutcomeSuccess {
+		if target.CredentialID > 0 {
+			ClearCredentialAuthFailure(target.CredentialID, target.ChannelID, now)
+			ClearCredentialCapacityCooldown(target.CredentialID, target.ChannelID, now)
+		}
+		if target.UpstreamAccountID > 0 {
+			ClearUpstreamAccountUnavailable(target.UpstreamAccountID, now)
+		}
+		if target.MultiKey {
+			return nil
+		}
 		_, cachedAuthFailure := routinghotcache.GetAuthFailure(target.ChannelID)
 		if target.AuthFailure || cachedAuthFailure {
 			applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
@@ -852,6 +887,18 @@ func applyActiveProbeBreakerOutcome(
 			until = nowUnix + staleSeconds
 		}
 		reason := "active_probe_http_" + strconv.Itoa(execution.StatusCode)
+		if target.CredentialID > 0 {
+			RecordCredentialAuthFailure(
+				target.CredentialID,
+				target.ChannelID,
+				reason,
+				time.Unix(until, 0),
+				now,
+			)
+		}
+		if target.MultiKey {
+			return nil
+		}
 		applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
 			ctx, target.ChannelID, target.CredentialID, true, reason, until,
 		)
@@ -859,6 +906,16 @@ func applyActiveProbeBreakerOutcome(
 			return err
 		}
 		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix})
+		return nil
+	}
+	if execution.StatusCode == http.StatusPaymentRequired && target.UpstreamAccountID > 0 {
+		RecordUpstreamAccountUnavailable(
+			target.UpstreamAccountID,
+			execution.StatusCode,
+			"active_probe_http_402",
+			time.Time{},
+			now,
+		)
 		return nil
 	}
 
@@ -877,9 +934,26 @@ func applyActiveProbeBreakerOutcome(
 		baseCooldown := time.Duration(baseCooldownMilliseconds) * time.Millisecond
 		retryAfterMs := min(max(execution.RetryAfterMs, 0), maxCooldown.Milliseconds())
 		retryAfter := time.Duration(retryAfterMs) * time.Millisecond
-		routinghotcache.RecordCapacityCooldown(
-			key.HotcacheKey(), execution.StatusCode, retryAfter, baseCooldown, maxCooldown, now,
-		)
+		cooldown := retryAfter
+		if cooldown <= 0 {
+			cooldown = baseCooldown
+		}
+		if maxCooldown > 0 && cooldown > maxCooldown {
+			cooldown = maxCooldown
+		}
+		if target.CredentialID > 0 && execution.Classification.Responsibility == routingerror.ResponsibilityCapacity {
+			RecordCredentialCapacityCooldown(
+				target.CredentialID, target.ChannelID, execution.StatusCode, now.Add(cooldown), now,
+			)
+		}
+		if !target.MultiKey {
+			routinghotcache.RecordCapacityCooldown(
+				key.HotcacheKey(), execution.StatusCode, retryAfter, baseCooldown, maxCooldown, now,
+			)
+		}
+	}
+	if target.MultiKey {
+		return nil
 	}
 	if outcome == model.RoutingProbeOutcomeTimeout {
 		return nil
@@ -942,12 +1016,13 @@ func activeProbeCostBudgetNanoUSD(costUSD float64) int64 {
 
 func activeProbeTargetKey(target ActiveProbeTarget) string {
 	payload := fmt.Sprintf(
-		"routing-probe-target:v3\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		"routing-probe-target:v4\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
 		target.SnapshotRevision,
 		target.PoolID,
 		target.MemberID,
 		target.ChannelID,
 		target.CredentialID,
+		target.UpstreamAccountID,
 		target.GroupName,
 		target.ModelName,
 		target.EndpointHost,

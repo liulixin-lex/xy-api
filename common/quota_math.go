@@ -62,10 +62,10 @@ func saturateQuota(value float64, op string) (int, *QuotaClamp) {
 	case math.IsNaN(value):
 		SysError(fmt.Sprintf("quota conversion (%s) received NaN, falling back to 0", op))
 		return 0, &QuotaClamp{Op: op, Kind: QuotaClampNaN, Original: value, Clamped: 0}
-	case value >= MaxQuota:
+	case value > MaxQuota:
 		SysError(fmt.Sprintf("quota conversion (%s) overflow: %g exceeds max quota, clamped to %d", op, value, MaxQuota))
 		return MaxQuota, &QuotaClamp{Op: op, Kind: QuotaClampOverflow, Original: value, Clamped: MaxQuota}
-	case value <= MinQuota:
+	case value < MinQuota:
 		SysError(fmt.Sprintf("quota conversion (%s) underflow: %g below min quota, clamped to %d", op, value, MinQuota))
 		return MinQuota, &QuotaClamp{Op: op, Kind: QuotaClampUnderflow, Original: value, Clamped: MinQuota}
 	default:

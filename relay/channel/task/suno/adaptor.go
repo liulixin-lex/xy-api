@@ -51,13 +51,13 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		return
 	}
 
-	//if sunoRequest.ContinueClipId != "" {
-	//	if sunoRequest.TaskID == "" {
-	//		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf("task id is empty"), "invalid_request", http.StatusBadRequest)
-	//		return
-	//	}
-	//	info.OriginTaskID = sunoRequest.TaskID
-	//}
+	if strings.TrimSpace(sunoRequest.ContinueClipId) != "" && strings.TrimSpace(sunoRequest.TaskID) == "" {
+		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf("task id is required for continuation"), "invalid_request", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(sunoRequest.TaskID) != "" {
+		info.OriginTaskID = strings.TrimSpace(sunoRequest.TaskID)
+	}
 
 	info.Action = action
 	c.Set("task_request", sunoRequest)
@@ -82,6 +82,19 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if !ok {
 		return nil, fmt.Errorf("task_request not found in context")
 	}
+	if info != nil && strings.TrimSpace(info.OriginTaskID) != "" {
+		upstreamTaskID := strings.TrimSpace(info.OriginUpstreamTaskID)
+		if upstreamTaskID == "" {
+			return nil, fmt.Errorf("origin task upstream identity is unavailable")
+		}
+		request, ok := sunoRequest.(*dto.SunoSubmitReq)
+		if !ok || request == nil {
+			return nil, fmt.Errorf("invalid Suno continuation request")
+		}
+		requestCopy := *request
+		requestCopy.TaskID = upstreamTaskID
+		sunoRequest = &requestCopy
+	}
 	data, err := common.Marshal(sunoRequest)
 	if err != nil {
 		return nil, err
@@ -94,7 +107,8 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return

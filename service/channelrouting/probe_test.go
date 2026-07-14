@@ -3,6 +3,7 @@ package channelrouting
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -498,9 +499,12 @@ func TestCurrentActiveProbeTargetsDoNotMisattributeMultiKeyCredential(t *testing
 	})
 
 	targets := currentActiveProbeTargets(activeProbeSettingForTest(), time.Unix(55_000, 0))
-	require.Len(t, targets, 1)
+	require.Len(t, targets, 2)
+	credentialIDs := []int{targets[0].CredentialID, targets[1].CredentialID}
+	sort.Ints(credentialIDs)
+	assert.Equal(t, []int{81, 82}, credentialIDs)
 	assert.True(t, targets[0].MultiKey)
-	assert.Zero(t, targets[0].CredentialID)
+	assert.True(t, targets[1].MultiKey)
 }
 
 func TestActiveProbeEstimatedCostUsesRequestSizedPricing(t *testing.T) {

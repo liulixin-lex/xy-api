@@ -2,15 +2,24 @@ package model
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
+
+	"gorm.io/gorm"
 )
+
+var ErrTaskIdentityAmbiguous = errors.New("task identity is ambiguous")
 
 type TaskStatus string
 
@@ -32,6 +41,13 @@ func (t TaskStatus) ToVideoStatus() string {
 }
 
 const (
+	// Version 0 is the implicit protocol of rows written before the field was
+	// introduced. It remains readable so an upgrade can durably settle tasks
+	// that were still in flight when the old binary stopped.
+	TaskBillingHistoricalProtocolVersion = 0
+	TaskBillingLegacyProtocolVersion     = 1
+	TaskBillingProtocolVersion           = 2
+
 	TaskStatusNotStart   TaskStatus = "NOT_START"
 	TaskStatusSubmitted             = "SUBMITTED"
 	TaskStatusQueued                = "QUEUED"
@@ -42,24 +58,27 @@ const (
 )
 
 type Task struct {
-	ID         int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
-	CreatedAt  int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt  int64                 `json:"updated_at"`
-	TaskID     string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
-	Platform   constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId     int                   `json:"user_id" gorm:"index"`
-	Group      string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
-	ChannelId  int                   `json:"channel_id" gorm:"index"`
-	Quota      int                   `json:"quota"`
-	Action     string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status     TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
-	FailReason string                `json:"fail_reason"`
-	SubmitTime int64                 `json:"submit_time" gorm:"index"`
-	StartTime  int64                 `json:"start_time" gorm:"index"`
-	FinishTime int64                 `json:"finish_time" gorm:"index"`
-	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties Properties            `json:"properties" gorm:"type:json"`
-	Username   string                `json:"username,omitempty" gorm:"-"`
+	ID                        int64                 `json:"id" gorm:"primaryKey"`
+	CreatedAt                 int64                 `json:"created_at" gorm:"index"`
+	UpdatedAt                 int64                 `json:"updated_at"`
+	TaskID                    string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
+	Platform                  constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
+	UserId                    int                   `json:"user_id" gorm:"index"`
+	Group                     string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
+	ChannelId                 int                   `json:"channel_id" gorm:"index"`
+	Quota                     int                   `json:"quota"`
+	DurableQuota              int                   `json:"-" gorm:"column:durable_quota"`
+	DurablePrivateDataPayload []byte                `json:"-" gorm:"column:durable_private_data"`
+	DurablePrivateDataHash    string                `json:"-" gorm:"column:durable_private_data_hash;type:varchar(64)"`
+	Action                    string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
+	Status                    TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	FailReason                string                `json:"fail_reason"`
+	SubmitTime                int64                 `json:"submit_time" gorm:"index"`
+	StartTime                 int64                 `json:"start_time" gorm:"index"`
+	FinishTime                int64                 `json:"finish_time" gorm:"index"`
+	Progress                  string                `json:"progress" gorm:"type:varchar(20);index"`
+	Properties                Properties            `json:"properties" gorm:"type:json"`
+	Username                  string                `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -80,6 +99,34 @@ type Properties struct {
 	OriginModelName   string `json:"origin_model_name,omitempty"`
 }
 
+// GetOriginModelName returns the client-facing model recorded for a task.
+// Historical rows may only have the model in their billing snapshot, upstream
+// model field, or raw task payload, so stateful authorization uses the same
+// ordered fallback everywhere.
+func (t *Task) GetOriginModelName() string {
+	if t == nil {
+		return ""
+	}
+	if modelName := strings.TrimSpace(t.Properties.OriginModelName); modelName != "" {
+		return modelName
+	}
+	if billingContext := t.EffectiveBillingContext(); billingContext != nil {
+		if modelName := strings.TrimSpace(billingContext.OriginModelName); modelName != "" {
+			return modelName
+		}
+	}
+	if modelName := strings.TrimSpace(t.Properties.UpstreamModelName); modelName != "" {
+		return modelName
+	}
+	var taskData map[string]any
+	if common.Unmarshal(t.Data, &taskData) == nil {
+		if modelName, ok := taskData["model"].(string); ok {
+			return strings.TrimSpace(modelName)
+		}
+	}
+	return ""
+}
+
 func (m *Properties) Scan(val interface{}) error {
 	bytesValue, _ := val.([]byte)
 	if len(bytesValue) == 0 {
@@ -97,15 +144,169 @@ func (m Properties) Value() (driver.Value, error) {
 }
 
 type TaskPrivateData struct {
-	Key            string `json:"key,omitempty"`
-	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
+	BillingProtocolVersion    int   `json:"billing_protocol_version,omitempty"`
+	AsyncBillingReservationID int64 `json:"async_billing_reservation_id,omitempty"`
+	// Key is retained only for decoding historical rows. New tasks must persist
+	// the stable credential identity instead of plaintext credential material.
+	Key                      string `json:"key,omitempty"`
+	RoutingCredentialID      int    `json:"routing_credential_id,omitempty"`
+	RoutingChannelGeneration string `json:"routing_channel_generation,omitempty"`
+	UpstreamTaskID           string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
+	UpstreamResultURL        string `json:"upstream_result_url,omitempty"`
+	// ResultURL is retained only for decoding historical rows. New tasks store
+	// provider result locations in UpstreamResultURL and derive the public URL.
+	ResultURL string `json:"result_url,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
 	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	// DurableBillingContext is the authoritative v2 snapshot. BillingContext
+	// remains a legacy-safe view so an old poller cannot perform settlement.
+	DurableBillingContext *TaskBillingContext                `json:"durable_billing_context,omitempty"`
+	BillingAudit          *AsyncBillingAcceptedAuditSnapshot `json:"billing_audit,omitempty"`
+}
+
+func (t *Task) EffectiveBillingQuota() int {
+	if t != nil && t.PrivateData.BillingProtocolVersion == TaskBillingProtocolVersion {
+		return t.DurableQuota
+	}
+	if t == nil {
+		return 0
+	}
+	return t.Quota
+}
+
+func (t *Task) EffectiveBillingContext() *TaskBillingContext {
+	if t == nil {
+		return nil
+	}
+	if t.PrivateData.BillingProtocolVersion == TaskBillingProtocolVersion &&
+		t.PrivateData.DurableBillingContext != nil {
+		return t.PrivateData.DurableBillingContext
+	}
+	return t.PrivateData.BillingContext
+}
+
+// IsolateV2BillingFromLegacyPollers keeps the real charge in v2-only fields.
+// Old binaries see quota=0 and a per-call snapshot, so terminal polling may
+// update task state but cannot mutate balances.
+func (t *Task) IsolateV2BillingFromLegacyPollers(quota int) error {
+	if t == nil || t.PrivateData.BillingProtocolVersion != TaskBillingProtocolVersion ||
+		quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid v2 task billing isolation")
+	}
+	t.DurableQuota = quota
+	t.Quota = 0
+	if t.PrivateData.DurableBillingContext == nil && t.PrivateData.BillingContext != nil {
+		durable := *t.PrivateData.BillingContext
+		durable.OtherRatios = copyTaskBillingRatios(t.PrivateData.BillingContext.OtherRatios)
+		t.PrivateData.DurableBillingContext = &durable
+	}
+	if t.PrivateData.BillingContext != nil {
+		legacySafe := *t.PrivateData.BillingContext
+		legacySafe.OtherRatios = copyTaskBillingRatios(t.PrivateData.BillingContext.OtherRatios)
+		legacySafe.PerCallBilling = true
+		t.PrivateData.BillingContext = &legacySafe
+	} else {
+		t.PrivateData.BillingContext = &TaskBillingContext{PerCallBilling: true}
+	}
+	return t.freezeV2PrivateData()
+}
+
+func (t *Task) freezeV2PrivateData() error {
+	if t == nil || t.PrivateData.BillingProtocolVersion != TaskBillingProtocolVersion ||
+		t.PrivateData.AsyncBillingReservationID <= 0 {
+		return errors.New("invalid v2 task private data")
+	}
+	payload, err := common.Marshal(t.PrivateData)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(payload)
+	t.DurablePrivateDataPayload = payload
+	t.DurablePrivateDataHash = hex.EncodeToString(digest[:])
+	return nil
+}
+
+func (t *Task) restoreV2PrivateData() error {
+	if t == nil || len(t.DurablePrivateDataPayload) == 0 {
+		if t != nil && t.PrivateData.BillingProtocolVersion == TaskBillingProtocolVersion {
+			return errors.New("v2 task private data snapshot is missing")
+		}
+		return nil
+	}
+	legacyUpstreamResultURL := strings.TrimSpace(t.PrivateData.UpstreamResultURL)
+	legacyResultURL := strings.TrimSpace(t.PrivateData.ResultURL)
+	if len(t.DurablePrivateDataHash) != sha256.Size*2 {
+		return errors.New("v2 task private data hash is invalid")
+	}
+	digest := sha256.Sum256(t.DurablePrivateDataPayload)
+	if !strings.EqualFold(t.DurablePrivateDataHash, hex.EncodeToString(digest[:])) {
+		return errors.New("v2 task private data hash mismatch")
+	}
+	var privateData TaskPrivateData
+	if err := common.Unmarshal(t.DurablePrivateDataPayload, &privateData); err != nil ||
+		privateData.BillingProtocolVersion != TaskBillingProtocolVersion ||
+		privateData.AsyncBillingReservationID <= 0 {
+		return errors.New("v2 task private data snapshot is invalid")
+	}
+	// Old pollers rewrite private_data without fields they do not understand.
+	// Merge only terminal media locations; billing and credential fields remain
+	// authoritative in the hashed durable snapshot.
+	if legacyUpstreamResultURL != "" {
+		privateData.UpstreamResultURL = legacyUpstreamResultURL
+	}
+	if legacyResultURL != "" {
+		privateData.ResultURL = legacyResultURL
+	}
+	t.PrivateData = privateData
+	return nil
+}
+
+func (t *Task) BeforeSave(_ *gorm.DB) error {
+	if t != nil && t.PrivateData.BillingProtocolVersion == TaskBillingProtocolVersion {
+		return t.freezeV2PrivateData()
+	}
+	return nil
+}
+
+func (t *Task) AfterFind(_ *gorm.DB) error {
+	return t.restoreV2PrivateData()
+}
+
+func copyTaskBillingRatios(ratios map[string]float64) map[string]float64 {
+	if ratios == nil {
+		return nil
+	}
+	copyRatios := make(map[string]float64, len(ratios))
+	for key, ratio := range ratios {
+		copyRatios[key] = ratio
+	}
+	return copyRatios
+}
+
+// HistoricalPlaintextCredential returns credential material only for rows
+// written before the v2 stable-credential protocol. V2 rows must resolve their
+// persisted credential identity even if malformed historical data left Key set.
+func (p TaskPrivateData) HistoricalPlaintextCredential() (string, bool) {
+	if p.RoutingCredentialID != 0 || p.BillingProtocolVersion < 0 ||
+		p.BillingProtocolVersion >= TaskBillingProtocolVersion {
+		return "", false
+	}
+	credential := strings.TrimSpace(p.Key)
+	return credential, credential != ""
+}
+
+// SupportsDurableTaskBillingProtocol identifies versions whose non-terminal
+// rows can enter the terminal-operation protocol. A version-0 row that was
+// already terminal before upgrade remains historical-closed because its old
+// settlement side effect cannot be distinguished from an interrupted one.
+// Version 2 additionally requires an accepted-handoff reservation; unknown
+// future and malformed versions fail closed.
+func SupportsDurableTaskBillingProtocol(version int) bool {
+	return version >= TaskBillingHistoricalProtocolVersion && version <= TaskBillingProtocolVersion
 }
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。
@@ -127,13 +328,48 @@ func (t *Task) GetUpstreamTaskID() string {
 	return t.TaskID
 }
 
-// GetResultURL 获取任务结果 URL（视频地址等）
-// 新数据存在 PrivateData.ResultURL 中；旧数据回退到 FailReason（历史兼容）
-func (t *Task) GetResultURL() string {
-	if t.PrivateData.ResultURL != "" {
-		return t.PrivateData.ResultURL
+// GetUpstreamResultURL returns the private provider result location used by the
+// authenticated content proxy. Historical rows may have stored it in ResultURL
+// or, before PrivateData existed, in FailReason.
+func (t *Task) GetUpstreamResultURL() string {
+	if t == nil {
+		return ""
 	}
-	return t.FailReason
+	if resultURL := strings.TrimSpace(t.PrivateData.UpstreamResultURL); resultURL != "" {
+		return resultURL
+	}
+	if resultURL := strings.TrimSpace(t.PrivateData.ResultURL); resultURL != "" && !t.isLocalResultProxyURL(resultURL) {
+		return resultURL
+	}
+	legacy := strings.TrimSpace(t.FailReason)
+	if (strings.HasPrefix(legacy, "https://") || strings.HasPrefix(legacy, "http://") || strings.HasPrefix(legacy, "data:")) &&
+		!t.isLocalResultProxyURL(legacy) {
+		return legacy
+	}
+	return ""
+}
+
+func (t *Task) SetUpstreamResultURL(resultURL string) {
+	if t == nil {
+		return
+	}
+	t.PrivateData.UpstreamResultURL = strings.TrimSpace(resultURL)
+}
+
+// GetResultURL returns only the local authenticated proxy location. Provider
+// URLs and embedded media are never part of the public task contract.
+func (t *Task) GetResultURL() string {
+	if t == nil || t.Status != TaskStatusSuccess || t.Platform == constant.TaskPlatformSuno || strings.TrimSpace(t.TaskID) == "" {
+		return ""
+	}
+	return "/v1/videos/" + url.PathEscape(t.TaskID) + "/content"
+}
+
+func (t *Task) isLocalResultProxyURL(resultURL string) bool {
+	if t == nil || strings.TrimSpace(t.TaskID) == "" {
+		return false
+	}
+	return strings.Contains(resultURL, "/v1/videos/"+url.PathEscape(t.TaskID)+"/content")
 }
 
 // GenerateTaskID 生成对外暴露的 task_xxxx 格式 ID
@@ -174,10 +410,7 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 	properties := Properties{}
 	privateData := TaskPrivateData{}
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
-		if relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeVertexAi {
-			privateData.Key = relayInfo.ChannelMeta.ApiKey
-		}
+		privateData.RoutingCredentialID = relayInfo.ChannelMeta.RoutingCredentialID
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName
 		}
@@ -334,29 +567,35 @@ func GetByOnlyTaskId(taskId string) (*Task, bool, error) {
 	if taskId == "" {
 		return nil, false, nil
 	}
-	var task *Task
-	var err error
-	err = DB.Where("task_id = ?", taskId).First(&task).Error
-	exist, err := RecordExist(err)
-	if err != nil {
+	var tasks []*Task
+	if err := DB.Where("task_id = ?", taskId).Order("id asc").Limit(2).Find(&tasks).Error; err != nil {
 		return nil, false, err
 	}
-	return task, exist, err
+	if len(tasks) > 1 {
+		return nil, false, ErrTaskIdentityAmbiguous
+	}
+	if len(tasks) == 0 {
+		return nil, false, nil
+	}
+	return tasks[0], true, nil
 }
 
 func GetByTaskId(userId int, taskId string) (*Task, bool, error) {
 	if taskId == "" {
 		return nil, false, nil
 	}
-	var task *Task
-	var err error
-	err = DB.Where("user_id = ? and task_id = ?", userId, taskId).
-		First(&task).Error
-	exist, err := RecordExist(err)
-	if err != nil {
+	var tasks []*Task
+	if err := DB.Where("user_id = ? and task_id = ?", userId, taskId).
+		Order("id asc").Limit(2).Find(&tasks).Error; err != nil {
 		return nil, false, err
 	}
-	return task, exist, err
+	if len(tasks) > 1 {
+		return nil, false, ErrTaskIdentityAmbiguous
+	}
+	if len(tasks) == 0 {
+		return nil, false, nil
+	}
+	return tasks[0], true, nil
 }
 
 func GetByTaskIds(userId int, taskIds []any) ([]*Task, error) {
@@ -366,9 +605,19 @@ func GetByTaskIds(userId int, taskIds []any) ([]*Task, error) {
 	var task []*Task
 	var err error
 	err = DB.Where("user_id = ? and task_id in (?)", userId, taskIds).
-		Find(&task).Error
+		Order("id asc").Find(&task).Error
 	if err != nil {
 		return nil, err
+	}
+	seen := make(map[string]struct{}, len(task))
+	for _, item := range task {
+		if item == nil || item.TaskID == "" {
+			return nil, ErrTaskIdentityAmbiguous
+		}
+		if _, duplicate := seen[item.TaskID]; duplicate {
+			return nil, ErrTaskIdentityAmbiguous
+		}
+		seen[item.TaskID] = struct{}{}
 	}
 	return task, nil
 }
@@ -380,13 +629,13 @@ func (Task *Task) Insert() error {
 }
 
 type taskSnapshot struct {
-	Status     TaskStatus
-	Progress   string
-	StartTime  int64
-	FinishTime int64
-	FailReason string
-	ResultURL  string
-	Data       json.RawMessage
+	Status            TaskStatus
+	Progress          string
+	StartTime         int64
+	FinishTime        int64
+	FailReason        string
+	UpstreamResultURL string
+	Data              json.RawMessage
 }
 
 func (s taskSnapshot) Equal(other taskSnapshot) bool {
@@ -395,19 +644,19 @@ func (s taskSnapshot) Equal(other taskSnapshot) bool {
 		s.StartTime == other.StartTime &&
 		s.FinishTime == other.FinishTime &&
 		s.FailReason == other.FailReason &&
-		s.ResultURL == other.ResultURL &&
+		s.UpstreamResultURL == other.UpstreamResultURL &&
 		bytes.Equal(s.Data, other.Data)
 }
 
 func (t *Task) Snapshot() taskSnapshot {
 	return taskSnapshot{
-		Status:     t.Status,
-		Progress:   t.Progress,
-		StartTime:  t.StartTime,
-		FinishTime: t.FinishTime,
-		FailReason: t.FailReason,
-		ResultURL:  t.PrivateData.ResultURL,
-		Data:       t.Data,
+		Status:            t.Status,
+		Progress:          t.Progress,
+		StartTime:         t.StartTime,
+		FinishTime:        t.FinishTime,
+		FailReason:        t.FailReason,
+		UpstreamResultURL: t.PrivateData.UpstreamResultURL,
+		Data:              t.Data,
 	}
 }
 

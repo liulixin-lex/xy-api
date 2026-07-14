@@ -570,7 +570,7 @@ func testChannelWithOptions(
 		})
 	}
 	if options.logDetails {
-		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+		common.SysLog(fmt.Sprintf("testing channel #%d, response_bytes=%d", channel.Id, len(respBody)))
 	}
 	return testResult{
 		context:          c,
@@ -588,7 +588,7 @@ func executeChannelRoutingActiveProbe(ctx context.Context, target channelrouting
 		apiErr := types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
 	}
-	channel, err = activeProbeChannelCopy(channel)
+	channel, err = activeProbeChannelCopy(channel, target.CredentialID)
 	if err != nil {
 		apiErr := types.NewError(err, types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
 		return channelRoutingProbeExecution(apiErr, 0, nil, 0, 0, true)
@@ -634,11 +634,23 @@ func currentChannelRoutingActiveProbeTarget(target channelrouting.ActiveProbeTar
 		channelrouting.RoutingRegion() != target.Region {
 		return nil, channelrouting.ErrActiveProbeTargetStale
 	}
-	if !target.MultiKey {
+	if target.CredentialID > 0 {
+		if _, _, resolved := channelrouting.ResolveCredentialKey(channel, target.CredentialID); !resolved {
+			return nil, channelrouting.ErrActiveProbeTargetStale
+		}
+	}
+	if !target.MultiKey && target.CredentialID > 0 {
 		resolved, ok := channelrouting.ResolveIdentity(target.GroupName, target.ChannelID, channel.Key)
 		if !ok || resolved.SnapshotRevision != target.SnapshotRevision || resolved.CredentialID != target.CredentialID {
 			return nil, channelrouting.ErrActiveProbeTargetStale
 		}
+	}
+	if accountID, known := channelrouting.ResolveUpstreamAccountID(target.GroupName, target.ChannelID, target.ModelName); known {
+		if accountID != target.UpstreamAccountID {
+			return nil, channelrouting.ErrActiveProbeTargetStale
+		}
+	} else if target.UpstreamAccountID != 0 {
+		return nil, channelrouting.ErrActiveProbeTargetStale
 	}
 	return channel, nil
 }
@@ -658,23 +670,28 @@ func channelRoutingProbeRelayFormatAllowed(relayFormat types.RelayFormat) bool {
 	}
 }
 
-func activeProbeChannelCopy(channel *model.Channel) (*model.Channel, error) {
+func activeProbeChannelCopy(channel *model.Channel, credentialID int) (*model.Channel, error) {
 	if channel == nil {
 		return nil, errors.New("channel routing active probe channel is nil")
 	}
 	if !channel.ChannelInfo.IsMultiKey {
 		return channel, nil
 	}
-	keys := channel.GetKeys()
 	selected := ""
-	for index, key := range keys {
-		status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
-		if !exists || status == common.ChannelStatusEnabled {
-			selected = key
-			break
+	resolved := false
+	if credentialID > 0 {
+		selected, _, resolved = channelrouting.ResolveCredentialKey(channel, credentialID)
+	} else {
+		for index, key := range channel.GetKeys() {
+			status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
+			if !exists || status == common.ChannelStatusEnabled {
+				selected = key
+				resolved = true
+				break
+			}
 		}
 	}
-	if selected == "" {
+	if !resolved || selected == "" {
 		return nil, errors.New("channel routing active probe has no enabled credential")
 	}
 	probeChannel := *channel
@@ -836,9 +853,9 @@ func readTestResponseBody(body io.ReadCloser, isStream bool) ([]byte, error) {
 	defer func() { _ = body.Close() }()
 	const maxStreamLogBytes = 8 << 10
 	if isStream {
-		return io.ReadAll(io.LimitReader(body, maxStreamLogBytes))
+		return service.ReadUpstreamResponseBody(body, maxStreamLogBytes)
 	}
-	return io.ReadAll(body)
+	return service.ReadUpstreamResponseBody(body, service.DefaultMaxUpstreamResponseBytes)
 }
 
 func detectErrorFromTestResponseBody(respBody []byte) error {

@@ -38,7 +38,17 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := a.convertToRequestPayload(&req, info); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	return nil
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
@@ -80,7 +90,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -89,7 +99,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 
 	var hResp VideoResponse
 	if err := common.Unmarshal(responseBody, &hResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -164,8 +174,17 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 		Duration:   &duration,
 		Resolution: resolution,
 	}
-	if err := req.UnmarshalMetadata(&videoRequest); err != nil {
+	if _, attemptsModelOverride := req.Metadata["model"]; attemptsModelOverride {
+		return nil, fmt.Errorf("metadata cannot override model")
+	}
+	if err := taskcommon.UnmarshalMetadata(req.Metadata, &videoRequest); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata to video request failed")
+	}
+	if videoRequest.Model != info.UpstreamModelName {
+		return nil, fmt.Errorf("metadata cannot override model")
+	}
+	if videoRequest.Duration == nil || !containsInt(modelConfig.SupportedDurations, *videoRequest.Duration) {
+		return nil, fmt.Errorf("duration must be one of %v", modelConfig.SupportedDurations)
 	}
 
 	return videoRequest, nil
@@ -238,9 +257,13 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	}
 
 	openAIVideo := originTask.ToOpenAIVideo()
+	openAIVideo.Metadata = nil
+	if resultURL := originTask.GetResultURL(); resultURL != "" {
+		openAIVideo.SetMetadata("url", resultURL)
+	}
 	if hailuoResp.BaseResp.StatusCode != StatusSuccess {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: hailuoResp.BaseResp.StatusMsg,
+			Message: common.SanitizeErrorMessage(hailuoResp.BaseResp.StatusMsg),
 			Code:    strconv.Itoa(hailuoResp.BaseResp.StatusCode),
 		}
 	}
@@ -274,7 +297,7 @@ func (a *TaskAdaptor) buildVideoURL(ctx context.Context, _, fileID string) strin
 	}
 	defer resp.Body.Close()
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		return ""
 	}

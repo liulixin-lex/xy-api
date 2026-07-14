@@ -346,6 +346,16 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 		if candidateErr != nil {
 			return ShadowReplayInput{}, true, candidateErr
 		}
+		credentialID, credentialReason := snapshot.selectCredential(member, profile.ModelName, seed, nil, 0, now)
+		candidate.CredentialID = credentialID
+		if candidate.RequestExclusionReason == "" && credentialReason != "" {
+			candidate.RequestExclusionReason = credentialReason
+		}
+		if candidate.RequestExclusionReason == "" && observation.upstreamAccountID > 0 {
+			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, now); blocked {
+				candidate.RequestExclusionReason = ExclusionReasonUpstreamAccount
+			}
+		}
 		if costEstimate != nil {
 			costEstimates[member.ChannelID] = *costEstimate
 		}
@@ -597,14 +607,13 @@ func shadowCandidateFromSnapshot(
 		return ShadowCandidateInput{}, nil, ErrShadowReplayInvalid
 	}
 	candidate := ShadowCandidateInput{
-		PoolMemberID:           member.ID,
-		ChannelID:              member.ChannelID,
-		Priority:               member.LegacyPriority,
-		Weight:                 uint(member.LegacyWeight),
-		RequestExclusionReason: requestCapabilityExclusionReason(profile, observation),
+		PoolMemberID: member.ID,
+		ChannelID:    member.ChannelID,
+		Priority:     member.LegacyPriority,
+		Weight:       uint(member.LegacyWeight),
 	}
-	if len(member.CredentialIDs) == 1 {
-		candidate.CredentialID = member.CredentialIDs[0]
+	if pool.CapabilityRoutingEnabled {
+		candidate.RequestExclusionReason = requestCapabilityExclusionReason(profile, observation)
 	}
 	if observation.MetricKnown || observation.Inflight > 0 {
 		candidate.Metric = &ShadowMetricInput{

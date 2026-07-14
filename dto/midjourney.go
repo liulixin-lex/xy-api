@@ -40,8 +40,10 @@ type MidjourneyUploadResponse struct {
 }
 
 type MidjourneyResponseWithStatusCode struct {
-	StatusCode int `json:"statusCode"`
-	Response   MidjourneyResponse
+	StatusCode               int `json:"statusCode"`
+	UpstreamStatusCode       int `json:"-"`
+	Response                 MidjourneyResponse
+	UpstreamResponseReceived bool `json:"-"`
 }
 
 type MidjourneyDto struct {

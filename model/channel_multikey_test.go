@@ -252,10 +252,10 @@ func TestChannelCredentialUpdateClearsPersistedRoutingAuthFailure(t *testing.T) 
 		Models: "gpt-test", Group: "default",
 	}
 	require.NoError(t, db.Create(channel).Error)
-	fingerprint, err := RoutingCredentialFingerprint(channel.Id, channel.Key)
+	fingerprint, err := RoutingCredentialFingerprint(channel.Id, channel.RoutingGeneration, channel.Key)
 	require.NoError(t, err)
 	credential := RoutingCredentialRef{
-		ChannelID: channel.Id, Fingerprint: fingerprint,
+		ChannelID: channel.Id, ChannelGeneration: channel.RoutingGeneration, Fingerprint: fingerprint,
 		FingerprintVersion: RoutingCredentialFingerprintVersion, Active: true,
 	}
 	require.NoError(t, db.Create(&credential).Error)

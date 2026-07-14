@@ -1,10 +1,17 @@
 package model
 
 import (
+	"errors"
+
 	"github.com/QuantumNous/new-api/common"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+)
+
+var (
+	ErrSystemInstanceActiveLimit         = errors.New("active system instance limit exceeded")
+	ErrSystemInstanceIncarnationConflict = errors.New("active system instance incarnation conflict")
 )
 
 const (
@@ -43,36 +50,102 @@ func (instance *SystemInstance) BeforeCreate(_ *gorm.DB) error {
 	return nil
 }
 
-func UpsertSystemInstance(nodeName string, info any, startedAt int64, lastSeenAt int64) error {
+func UpsertSystemInstance(nodeName string, incarnationID string, info any, startedAt int64, lastSeenAt int64) error {
+	if DB == nil || nodeName == "" || incarnationID == "" || startedAt <= 0 {
+		return errors.New("system instance identity is invalid")
+	}
 	infoText, err := marshalSystemInstanceInfo(info)
 	if err != nil {
 		return err
 	}
+	if systemInstanceIncarnationID(infoText) != incarnationID {
+		return errors.New("system instance incarnation payload is invalid")
+	}
 	if lastSeenAt == 0 {
 		lastSeenAt = common.GetTimestamp()
 	}
-	instance := &SystemInstance{
+	incoming := &SystemInstance{
 		NodeName:   nodeName,
 		Info:       infoText,
 		StartedAt:  startedAt,
 		LastSeenAt: lastSeenAt,
 		UpdatedAt:  lastSeenAt,
 	}
-	return DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "node_name"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"info",
-			"started_at",
-			"last_seen_at",
-			"updated_at",
-		}),
-	}).Create(instance).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		created := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "node_name"}},
+			DoNothing: true,
+		}).Create(incoming)
+		if created.Error != nil {
+			return created.Error
+		}
+		if created.RowsAffected == 1 {
+			return nil
+		}
+		var existing SystemInstance
+		if err := lockForUpdate(tx).Where("node_name = ?", nodeName).First(&existing).Error; err != nil {
+			return err
+		}
+		existingIncarnationID := systemInstanceIncarnationID(existing.Info)
+		if existingIncarnationID != incarnationID &&
+			existing.LastSeenAt >= lastSeenAt-SystemInstanceStaleAfterSeconds {
+			return ErrSystemInstanceIncarnationConflict
+		}
+		if existingIncarnationID == incarnationID && existing.LastSeenAt > lastSeenAt {
+			return nil
+		}
+		updated := tx.Model(&SystemInstance{}).Where(
+			"node_name = ? AND started_at = ? AND last_seen_at = ?",
+			existing.NodeName, existing.StartedAt, existing.LastSeenAt,
+		).Updates(map[string]any{
+			"info": infoText, "started_at": startedAt,
+			"last_seen_at": lastSeenAt, "updated_at": lastSeenAt,
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrSystemInstanceIncarnationConflict
+		}
+		return nil
+	})
+}
+
+func systemInstanceIncarnationID(info string) string {
+	var payload struct {
+		Capabilities struct {
+			IncarnationID string `json:"async_billing_incarnation_id"`
+		} `json:"capabilities"`
+	}
+	if common.UnmarshalJsonStr(info, &payload) != nil {
+		return ""
+	}
+	return payload.Capabilities.IncarnationID
 }
 
 func ListSystemInstances() ([]*SystemInstance, error) {
 	var instances []*SystemInstance
 	err := DB.Order("last_seen_at desc").Find(&instances).Error
 	return instances, err
+}
+
+func ListActiveSystemInstances(now int64, limit int) ([]*SystemInstance, error) {
+	if now <= 0 {
+		now = common.GetTimestamp()
+	}
+	if limit <= 0 || limit > 10_000 {
+		return nil, ErrSystemInstanceActiveLimit
+	}
+	var instances []*SystemInstance
+	err := DB.Where("last_seen_at >= ?", now-SystemInstanceStaleAfterSeconds).
+		Order("node_name asc").Limit(limit + 1).Find(&instances).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(instances) > limit {
+		return nil, ErrSystemInstanceActiveLimit
+	}
+	return instances, nil
 }
 
 func DeleteStaleSystemInstances(now int64) (int64, error) {

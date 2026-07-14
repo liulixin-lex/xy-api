@@ -18,6 +18,7 @@ import (
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
@@ -32,6 +33,18 @@ type routingCostDoerFunc func(*http.Request) (*http.Response, error)
 
 func (do routingCostDoerFunc) Do(request *http.Request) (*http.Response, error) {
 	return do(request)
+}
+
+func setSmartRoutingBindingIfMatchForTest(t *testing.T, ctx *gin.Context, channelID int) {
+	t.Helper()
+	require.NotNil(t, ctx)
+	require.NotNil(t, ctx.Request)
+	binding, err := model.GetRoutingChannelBindingContext(context.Background(), channelID)
+	require.NoError(t, err)
+	if ctx.GetInt("id") <= 0 {
+		ctx.Set("id", 1)
+	}
+	ctx.Request.Header.Set("If-Match", channelRoutingCostBindingETag(binding))
 }
 
 func TestBuildRoutingBindingViewSanitizesStoredLastSyncError(t *testing.T) {
@@ -52,7 +65,7 @@ func TestBuildRoutingBindingViewSanitizesStoredLastSyncError(t *testing.T) {
 
 func TestUpdateSmartRoutingSettingsPersistenceFailureKeepsPublishedState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.RoutingRuntimeSettingsState{}, &model.RoutingControlAudit{}))
 	smart_routing_setting.ResetForTest()
 	routinghotcache.ResetForTest()
 	t.Cleanup(func() {
@@ -104,10 +117,17 @@ func TestUpdateSmartRoutingSettingsPersistenceFailureKeepsPublishedState(t *test
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/settings", bytes.NewReader(body))
+	ctx.Set("id", 10)
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/api/smart-routing/settings", nil)
+	GetSmartRoutingSettings(getContext)
+	require.Equal(t, http.StatusOK, getRecorder.Code)
+	ctx.Request.Header.Set("If-Match", getRecorder.Header().Get("ETag"))
 
 	UpdateSmartRoutingSettings(ctx)
 
-	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
 	var response struct {
 		Success bool `json:"success"`
 	}
@@ -130,7 +150,7 @@ func TestUpdateSmartRoutingSettingsPersistenceFailureKeepsPublishedState(t *test
 
 func TestUpdateSmartRoutingSettingsDoesNotPersistEnvironmentOverrides(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.RoutingRuntimeSettingsState{}, &model.RoutingControlAudit{}))
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(func() {
 		smart_routing_setting.ResetForTest()
@@ -168,6 +188,13 @@ func TestUpdateSmartRoutingSettingsDoesNotPersistEnvironmentOverrides(t *testing
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/settings", bytes.NewReader(body))
+	ctx.Set("id", 10)
+	getRecorder := httptest.NewRecorder()
+	getContext, _ := gin.CreateTestContext(getRecorder)
+	getContext.Request = httptest.NewRequest(http.MethodGet, "/api/smart-routing/settings", nil)
+	GetSmartRoutingSettings(getContext)
+	require.Equal(t, http.StatusOK, getRecorder.Code)
+	ctx.Request.Header.Set("If-Match", getRecorder.Header().Get("ETag"))
 
 	UpdateSmartRoutingSettings(ctx)
 
@@ -226,7 +253,7 @@ func TestBuildRoutingBindingViewMasksCredentials(t *testing.T) {
 	assert.Equal(t, 3, view.SyncFailureCount)
 	assert.Equal(t, "****cdef", view.CredentialMasks.NewAPIAccessToken)
 	assert.Equal(t, "****7654", view.CredentialMasks.GatewayAPIKey)
-	assert.Equal(t, "********", view.CredentialMasks.Sub2APIPassword)
+	assert.Empty(t, view.CredentialMasks.Sub2APIPassword)
 	assert.NotContains(t, view.CredentialMasks.NewAPIAccessToken, "1234567890")
 }
 
@@ -256,9 +283,38 @@ func TestBuildRoutingCredentialsKeepsEmptyEditFieldsUnset(t *testing.T) {
 	assert.Equal(t, "jwt-token", credentials.Sub2APIToken)
 }
 
+func TestBuildRoutingCredentialsDropsCredentialsFromAnotherProvider(t *testing.T) {
+	newAPICredentials := buildRoutingCredentials(routingBindingRequest{
+		UpstreamType: model.RoutingUpstreamTypeNewAPI,
+		Credentials: routingCredentialRequest{
+			NewAPIAccessToken: common.GetPointer("newapi-token"),
+			Sub2APIEmail:      common.GetPointer("must-not-survive@example.com"),
+			Sub2APIToken:      common.GetPointer("must-not-survive"),
+		},
+	}, model.RoutingCredentials{
+		Sub2APIEmail:    "stored@example.com",
+		Sub2APIPassword: "stored-password",
+		Sub2APIToken:    "stored-token",
+	})
+	assert.Equal(t, "newapi-token", newAPICredentials.NewAPIAccessToken)
+	assert.Empty(t, newAPICredentials.Sub2APIEmail)
+	assert.Empty(t, newAPICredentials.Sub2APIPassword)
+	assert.Empty(t, newAPICredentials.Sub2APIToken)
+
+	sub2APICredentials := buildRoutingCredentials(routingBindingRequest{
+		UpstreamType: model.RoutingUpstreamTypeSub2API,
+		Credentials: routingCredentialRequest{
+			NewAPIAccessToken: common.GetPointer("must-not-survive"),
+			Sub2APIToken:      common.GetPointer("sub2api-token"),
+		},
+	}, model.RoutingCredentials{NewAPIAccessToken: "stored-newapi-token"})
+	assert.Empty(t, sub2APICredentials.NewAPIAccessToken)
+	assert.Equal(t, "sub2api-token", sub2APICredentials.Sub2APIToken)
+}
+
 func TestRoutingBindingFromRequestClearsUpstreamSpecificFields(t *testing.T) {
 	userID := 42
-	newAPIBinding := routingBindingFromRequest(routingBindingRequest{
+	newAPIBinding, err := routingBindingFromRequest(routingBindingRequest{
 		ChannelID:        11,
 		UpstreamType:     model.RoutingUpstreamTypeNewAPI,
 		BaseURL:          "https://newapi.example.com",
@@ -266,10 +322,11 @@ func TestRoutingBindingFromRequestClearsUpstreamSpecificFields(t *testing.T) {
 		ServesClaudeCode: true,
 		NewAPIUserID:     &userID,
 	})
+	require.NoError(t, err)
 	assert.False(t, newAPIBinding.ServesClaudeCode)
 	require.NotNil(t, newAPIBinding.NewAPIUserID)
 
-	sub2apiBinding := routingBindingFromRequest(routingBindingRequest{
+	sub2apiBinding, err := routingBindingFromRequest(routingBindingRequest{
 		ChannelID:        12,
 		UpstreamType:     model.RoutingUpstreamTypeSub2API,
 		BaseURL:          "https://sub2api.example.com",
@@ -277,6 +334,7 @@ func TestRoutingBindingFromRequestClearsUpstreamSpecificFields(t *testing.T) {
 		ServesClaudeCode: true,
 		NewAPIUserID:     &userID,
 	})
+	require.NoError(t, err)
 	assert.True(t, sub2apiBinding.ServesClaudeCode)
 	assert.Nil(t, sub2apiBinding.NewAPIUserID)
 }
@@ -309,7 +367,7 @@ func TestValidateRoutingBindingRequestRejectsUnsafeBaseURL(t *testing.T) {
 	}
 }
 
-func TestUpdateSmartRoutingBindingMergesCredentialFields(t *testing.T) {
+func TestUpdateSmartRoutingBindingMergesOnlyProviderCompatibleCredentialFields(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelHealthState{}))
 	previousSecret := common.CryptoSecret
@@ -340,6 +398,7 @@ func TestUpdateSmartRoutingBindingMergesCredentialFields(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: "55"}}
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/55", bytes.NewReader(body))
+	setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 
 	UpdateSmartRoutingBinding(ctx)
 
@@ -350,7 +409,7 @@ func TestUpdateSmartRoutingBindingMergesCredentialFields(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "old-access-token", credentials.NewAPIAccessToken)
 	assert.Equal(t, "new-gateway-key", credentials.GatewayAPIKey)
-	assert.Equal(t, "old-password", credentials.Sub2APIPassword)
+	assert.Empty(t, credentials.Sub2APIPassword)
 }
 
 func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
@@ -395,6 +454,7 @@ func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: "56"}}
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/56", bytes.NewReader(body))
+	setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 
 	UpdateSmartRoutingBinding(ctx)
 
@@ -462,6 +522,7 @@ func TestUpdateSmartRoutingBindingDoesNotReviveDeletedBinding(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: "57"}}
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/57", bytes.NewReader(body))
+	setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 
 	done := make(chan struct{})
 	go func() {
@@ -490,6 +551,15 @@ func TestUpdateSmartRoutingBindingDoesNotReviveDeletedBinding(t *testing.T) {
 
 func TestLoadSmartRoutingBindingGroupsAcceptsInlineCreateBinding(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.CasbinRule{}, &model.AuthzRole{}, &model.RoutingChannelBinding{},
+	))
+	require.NoError(t, db.Create(&model.User{
+		Id: 1, Username: "routing-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled,
+	}).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 991, Name: "inline-cost-source", Key: "channel-key"}).Error)
+	require.NoError(t, authz.Init(db))
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -604,6 +674,11 @@ func TestRoutingSafeErrorPreservesCancellationAndAuthClassification(t *testing.T
 	safeAuthErr := routingSafeErrorWithCredentials(authErr, model.RoutingCredentials{NewAPIAccessToken: "sk-secret"})
 	assert.True(t, routingUpstreamAuthError(safeAuthErr))
 	assert.NotContains(t, safeAuthErr.Error(), "sk-secret")
+	safeCAErr := routingSafeErrorWithCredentials(
+		errors.New("certificate parse failed for custom-ca-secret"),
+		model.RoutingCredentials{CustomCAPEM: "custom-ca-secret"},
+	)
+	assert.NotContains(t, safeCAErr.Error(), "custom-ca-secret")
 
 	safeCanceled := routingSafeErrorWithCredentials(context.Canceled, model.RoutingCredentials{})
 	assert.ErrorIs(t, safeCanceled, context.Canceled)
@@ -646,7 +721,7 @@ func TestRoutingBindingForActionRejectsInvalidJSON(t *testing.T) {
 	assert.NotEqual(t, http.StatusOK, recorder.Code)
 }
 
-func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
+func TestDeleteSmartRoutingBindingPreservesServingState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}, &model.RoutingChannelHealthState{}))
 	routinghotcache.ResetForTest()
@@ -658,6 +733,8 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	})
 
+	require.NoError(t, db.AutoMigrate(&model.Channel{}))
+	require.NoError(t, db.Create(&model.Channel{Id: 66, Name: "serving", Key: "serving-key"}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelBinding{ChannelID: 66, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: "https://upstream.example.com", UpstreamGroup: "vip", Enabled: true}).Error)
 	require.NoError(t, db.Create(&model.RoutingCostSnapshot{ChannelID: 66, ModelName: "gpt-test"}).Error)
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
@@ -668,8 +745,12 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 		State:           model.RoutingBreakerStateOpen,
 		SemanticVersion: model.RoutingBreakerSemanticVersion,
 	}).Error)
-	require.NoError(t, db.Create(&model.RoutingChannelMetric{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", BucketTs: 60, RequestCount: 1}).Error)
-	require.NoError(t, db.Create(&model.RoutingChannelHealthState{ChannelID: 66, AuthFailure: true, UpdatedTime: common.GetTimestamp()}).Error)
+	bucketTs := common.GetTimestamp() / 60 * 60
+	require.NoError(t, db.Create(&model.RoutingChannelMetric{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test", Group: "vip", BucketTs: bucketTs, RequestCount: 1}).Error)
+	require.NoError(t, db.Create(&model.RoutingChannelHealthState{
+		ChannelID: 66, AuthFailure: true, BalanceKnown: true, Balance: 1,
+		BalanceUpdatedTime: common.GetTimestamp(), UpdatedTime: common.GetTimestamp(),
+	}).Error)
 	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen})
 	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"}, routinghotcache.CostSnapshot{Known: true, Cost: 1})
 	routinghotcache.SetMetricForTest(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"}, routinghotcache.MetricSnapshot{RequestCount: 1})
@@ -686,7 +767,7 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 		APIKeyIndex:  model.RoutingMetricSingleKeyIndex,
 		ModelName:    "gpt-test",
 		Group:        "vip",
-		BucketTs:     120,
+		BucketTs:     bucketTs,
 		RequestCount: 1,
 	}})
 
@@ -694,36 +775,50 @@ func TestDeleteSmartRoutingBindingCleansAssociatedState(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: "66"}}
 	ctx.Request = httptest.NewRequest(http.MethodDelete, "/api/smart-routing/bindings/66", nil)
+	setSmartRoutingBindingIfMatchForTest(t, ctx, 66)
 
 	DeleteSmartRoutingBinding(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	for _, table := range []any{&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingBreakerState{}, &model.RoutingChannelMetric{}, &model.RoutingChannelHealthState{}} {
+	for _, table := range []any{&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}} {
 		var count int64
 		require.NoError(t, db.Model(table).Where("channel_id = ?", 66).Count(&count).Error)
 		assert.Zero(t, count)
 	}
+	for _, table := range []any{&model.RoutingBreakerState{}, &model.RoutingChannelMetric{}, &model.RoutingChannelHealthState{}} {
+		var count int64
+		require.NoError(t, db.Model(table).Where("channel_id = ?", 66).Count(&count).Error)
+		assert.Equal(t, int64(1), count)
+	}
+	var health model.RoutingChannelHealthState
+	require.NoError(t, db.Where("channel_id = ?", 66).First(&health).Error)
+	assert.True(t, health.AuthFailure)
+	assert.False(t, health.BalanceKnown)
 	_, breakerOK := routinghotcache.GetBreaker(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	_, costOK := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 66, Model: "gpt-test"})
 	_, metricOK := routinghotcache.GetMetric(routinghotcache.Key{ChannelID: 66, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip"})
 	_, authOK := routinghotcache.GetAuthFailure(66)
 	_, balanceOK := routinghotcache.GetBalance(66)
-	assert.False(t, breakerOK)
+	assert.True(t, breakerOK)
 	assert.False(t, costOK)
-	assert.False(t, metricOK)
-	assert.False(t, authOK)
+	assert.True(t, metricOK)
+	assert.True(t, authOK)
 	assert.False(t, balanceOK)
 	statsAfterClear := routingbreaker.RuntimeStats()
-	assert.Zero(t, statsAfterClear.Entries)
-	assert.Zero(t, statsAfterClear.Dirty)
+	assert.Equal(t, statsBeforeClear.Entries, statsAfterClear.Entries)
+	assert.Equal(t, statsBeforeClear.Dirty, statsAfterClear.Dirty)
 	assert.Equal(t, statsBeforeClear.Evictions, statsAfterClear.Evictions)
 	_, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.GetSetting())
 	require.NoError(t, err)
-	for _, table := range []any{&model.RoutingBreakerState{}, &model.RoutingChannelMetric{}} {
-		var count int64
-		require.NoError(t, db.Model(table).Where("channel_id = ?", 66).Count(&count).Error)
-		assert.Zero(t, count)
-	}
+	var breakerCount int64
+	require.NoError(t, db.Model(&model.RoutingBreakerState{}).Where("channel_id = ?", 66).Count(&breakerCount).Error)
+	assert.Equal(t, int64(1), breakerCount)
+	var metricCount int64
+	require.NoError(t, db.Model(&model.RoutingChannelMetric{}).Where("channel_id = ?", 66).Count(&metricCount).Error)
+	assert.Equal(t, int64(1), metricCount)
+	var metric model.RoutingChannelMetric
+	require.NoError(t, db.Where("channel_id = ?", 66).First(&metric).Error)
+	assert.Equal(t, int64(2), metric.RequestCount)
 }
 
 func TestDeleteSmartRoutingBindingCanceledRequestDoesNotMutateState(t *testing.T) {
@@ -750,6 +845,7 @@ func TestDeleteSmartRoutingBindingCanceledRequestDoesNotMutateState(t *testing.T
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: "67"}}
 	ctx.Request = httptest.NewRequest(http.MethodDelete, "/api/smart-routing/bindings/67", nil).WithContext(requestContext)
+	setSmartRoutingBindingIfMatchForTest(t, ctx, 67)
 
 	DeleteSmartRoutingBinding(ctx)
 

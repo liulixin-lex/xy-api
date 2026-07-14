@@ -37,7 +37,7 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	if amount <= 0 {
 		return nil
 	}
-	if err := model.DecreaseUserQuota(w.userId, amount, false); err != nil {
+	if err := model.PreConsumeUserQuota(w.userId, amount); err != nil {
 		return err
 	}
 	w.consumed = amount
@@ -51,16 +51,17 @@ func (w *WalletFunding) Settle(delta int) error {
 	if delta > 0 {
 		return model.DecreaseUserQuota(w.userId, delta, false)
 	}
-	return model.IncreaseUserQuota(w.userId, -delta, false)
+	return model.RefundUserQuota(w.userId, -delta)
 }
 
 func (w *WalletFunding) Refund() error {
 	if w.consumed <= 0 {
 		return nil
 	}
-	// IncreaseUserQuota 是 quota += N 的非幂等操作，不能重试，否则会多退额度。
+	// Wallet refunds remain process-idempotent through BillingSession.refunded;
+	// the model helper additionally refuses an overflowing credit.
 	// 订阅的 RefundSubscriptionPreConsume 有 requestId 幂等保护所以可以重试。
-	return model.IncreaseUserQuota(w.userId, w.consumed, false)
+	return model.RefundUserQuota(w.userId, w.consumed)
 }
 
 // ---------------------------------------------------------------------------

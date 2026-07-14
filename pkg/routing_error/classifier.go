@@ -31,6 +31,7 @@ const (
 	ScopeRequest    Scope = "request"
 	ScopeModel      Scope = "model"
 	ScopeCredential Scope = "credential"
+	ScopeAccount    Scope = "account"
 	ScopeEndpoint   Scope = "endpoint"
 	ScopePoolMember Scope = "pool_member"
 	ScopeChannel    Scope = "channel"
@@ -133,7 +134,10 @@ func ClassifyAPIError(apiErr *types.NewAPIError, ctx Context) Classification {
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
 		return finish(result(ctx, ResponsibilityCredential, ScopeCredential, RetryBeforeCommit, HealthOpen, CapacityNone, "serving_credential_status"))
 	}
-	if statusCode == http.StatusPaymentRequired || statusCode == http.StatusTooManyRequests || statusCode == 529 {
+	if statusCode == http.StatusPaymentRequired {
+		return finish(result(ctx, ResponsibilityCapacity, ScopeAccount, RetryBeforeCommit, HealthOpen, CapacityNone, "upstream_account_balance"))
+	}
+	if statusCode == http.StatusTooManyRequests || statusCode == 529 {
 		return finish(result(ctx, ResponsibilityCapacity, ScopePoolMember, RetryBeforeCommit, HealthIgnore, CapacityCooldown, "capacity_status"))
 	}
 	if statusCode == http.StatusGatewayTimeout {

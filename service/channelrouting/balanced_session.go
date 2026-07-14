@@ -56,6 +56,9 @@ type BalancedRoutingPlan struct {
 }
 
 func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInput) (BalancedRoutingPlan, bool, error) {
+	if input.RequiredCredentialID < 0 {
+		return BalancedRoutingPlan{}, false, ErrRoutingSessionInvalid
+	}
 	if session == nil || session.snapshot == nil || session.poolIndex < 0 ||
 		session.poolIndex >= len(session.snapshot.view.Pools) {
 		return BalancedRoutingPlan{}, false, ErrRoutingSessionInvalid
@@ -103,6 +106,10 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		return BalancedRoutingPlan{}, true, err
 	}
 	excludedChannels, _, err := routingSessionChannelSet(input.ExcludedChannelIDs)
+	if err != nil {
+		return BalancedRoutingPlan{}, true, err
+	}
+	excludedCredentials, _, err := routingSessionChannelSet(input.ExcludedCredentialIDs)
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
 	}
@@ -154,8 +161,21 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		preparedCandidate.Candidate.Cost = &routingselector.CostSnapshot{
 			Known: true, Cost: preparedSettings.CostTarget, UpdatedUnix: preparedSettings.NowUnix,
 		}
-		replayCandidates = append(replayCandidates, balancedReplayCandidateFromRouting(member, preparedCandidate))
-		if isRequestCapabilityExclusion(preparedCandidate.HardExclusionReason) {
+		credentialID, credentialReason := snapshot.selectCredential(
+			member, profile.ModelName, seed, excludedCredentials, input.RequiredCredentialID, session.planningTime,
+		)
+		if preparedCandidate.HardExclusionReason == "" && credentialReason != "" {
+			preparedCandidate.HardExclusionReason = credentialReason
+		}
+		if preparedCandidate.HardExclusionReason == "" && observation.upstreamAccountID > 0 {
+			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, session.planningTime); blocked {
+				preparedCandidate.HardExclusionReason = ExclusionReasonUpstreamAccount
+			}
+		}
+		replayCandidate := balancedReplayCandidateFromRouting(member, preparedCandidate)
+		replayCandidate.CredentialID = credentialID
+		replayCandidates = append(replayCandidates, replayCandidate)
+		if preparedCandidate.HardExclusionReason != "" {
 			requestExcluded[member.ChannelID] = struct{}{}
 		}
 		state := runtimeByChannelID[member.ChannelID]
@@ -199,9 +219,12 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 			(allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID)) {
 			requestExcluded[member.ChannelID] = struct{}{}
 		}
-		identity := Identity{SnapshotRevision: snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}
-		if len(member.CredentialIDs) == 1 {
-			identity.CredentialID = member.CredentialIDs[0]
+		identity := Identity{
+			SnapshotRevision:  snapshot.view.Revision,
+			PoolID:            pool.ID,
+			MemberID:          member.ID,
+			CredentialID:      credentialID,
+			UpstreamAccountID: observation.upstreamAccountID,
 		}
 		identities[member.ChannelID] = identity
 	}

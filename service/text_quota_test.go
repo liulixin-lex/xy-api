@@ -281,6 +281,50 @@ func TestCalculateTextQuotaSummarySeparatesOpenRouterCacheCreationFromPromptBill
 	require.Equal(t, 3012, summary.Quota)
 }
 
+func TestCalcOpenRouterCacheCreateTokensRejectsUnsafeDerivedCounts(t *testing.T) {
+	priceData := types.PriceData{
+		ModelRatio:         1,
+		CompletionRatio:    1,
+		CacheRatio:         0.1,
+		CacheCreationRatio: 1.25,
+	}
+	baseUsage := dto.Usage{
+		PromptTokens:     1000,
+		CompletionTokens: 100,
+		Cost:             1125 / common.QuotaPerUnit,
+	}
+	require.Equal(t, 100, CalcOpenRouterCacheCreateTokens(baseUsage, priceData))
+
+	tests := []struct {
+		name     string
+		mutate   func(*dto.Usage, *types.PriceData)
+		expected int
+	}{
+		{name: "negative cost", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = -1.0 }},
+		{name: "nan cost", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = math.NaN() }},
+		{name: "infinite cost", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = math.Inf(1) }},
+		{name: "non numeric cost", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = "0.1" }},
+		{name: "negative prompt tokens", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.PromptTokens = -1 }},
+		{name: "cache read exceeds prompt", mutate: func(usage *dto.Usage, _ *types.PriceData) {
+			usage.PromptTokensDetails.CachedTokens = usage.PromptTokens + 1
+		}},
+		{name: "zero model ratio", mutate: func(_ *dto.Usage, price *types.PriceData) { price.ModelRatio = 0 }},
+		{name: "non finite creation ratio", mutate: func(_ *dto.Usage, price *types.PriceData) {
+			price.CacheCreationRatio = math.Inf(1)
+		}},
+		{name: "negative inferred tokens", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = 0.0001 }},
+		{name: "inferred tokens exceed prompt", mutate: func(usage *dto.Usage, _ *types.PriceData) { usage.Cost = 1.0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			usage := baseUsage
+			price := priceData
+			test.mutate(&usage, &price)
+			require.Equal(t, test.expected, CalcOpenRouterCacheCreateTokens(usage, price))
+		})
+	}
+}
+
 func TestCalculateTextQuotaSummaryKeepsPrePRClaudeOpenRouterBilling(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

@@ -202,6 +202,10 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 }
 
 func fetchRoutingSub2APIAccountPricing(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (routingSub2APIAccountPricing, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, err
+	}
 	managedJWT := strings.TrimSpace(credentials.Sub2APIToken) == ""
 	authKey := newRoutingSub2APIAuthKey(binding, credentials)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -461,6 +465,10 @@ func routingSub2APILoginCacheTTL(expiresIn *int64) time.Duration {
 }
 
 func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, method string, path string, bearer string, body []byte) (json.RawMessage, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return nil, err
+	}
 	var reader io.Reader
 	if len(body) > 0 {
 		reader = bytes.NewReader(body)
@@ -1401,6 +1409,7 @@ func routingCredentialSecrets(credentials model.RoutingCredentials) []string {
 		credentials.Sub2APIEmail,
 		credentials.Sub2APIPassword,
 		credentials.Sub2APIToken,
+		credentials.CustomCAPEM,
 	}
 }
 

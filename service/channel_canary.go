@@ -175,9 +175,27 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		excludedIDs = append(excludedIDs, channelID)
 	}
 	sort.Ints(excludedIDs)
+	excludedCredentialSet := smartRoutingExcludedCredentialIDs(param.Ctx)
+	excludedCredentialIDs := make([]int, 0, len(excludedCredentialSet))
+	for credentialID := range excludedCredentialSet {
+		excludedCredentialIDs = append(excludedCredentialIDs, credentialID)
+	}
+	sort.Ints(excludedCredentialIDs)
 	capacityExcluded := make([]int, 0, len(allowedIDs))
 	probeExcluded := make([]int, 0, len(allowedIDs))
 	capacityInput, capacityOutput := routingCapacityTokenEstimate(param.Ctx)
+	promptTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)
+	completionTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)
+	profile, profileErr := routingRequestProfile(
+		param.Ctx,
+		group,
+		param.GetRetry(),
+		promptTokens,
+		completionTokens,
+	)
+	if profileErr != nil {
+		return nil, true, true, profileErr
+	}
 	var lastProbeErr error
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, planActive, planErr := session.Plan(channelrouting.RequestRoutingPlanInput{
@@ -185,11 +203,13 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			ModelName:                  param.ModelName,
 			IsStream:                   common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 			RetryIndex:                 param.GetRetry(),
-			PromptTokenEstimate:        max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
-			CompletionTokenEstimate:    max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+			PromptTokenEstimate:        promptTokens,
+			CompletionTokenEstimate:    completionTokens,
 			CostProfile:                routingCostRequestProfile(param.Ctx),
+			Profile:                    profile,
 			AllowedChannelIDs:          allowedIDs,
 			ExcludedChannelIDs:         excludedIDs,
+			ExcludedCredentialIDs:      excludedCredentialIDs,
 			CapacityExcludedChannelIDs: capacityExcluded,
 			ProbeExcludedChannelIDs:    probeExcluded,
 			SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
@@ -350,10 +370,12 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			}
 		}
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
-			ChannelID:        selected.Id,
-			SnapshotRevision: plan.SelectedIdentity.SnapshotRevision,
-			PoolID:           plan.SelectedIdentity.PoolID,
-			MemberID:         plan.SelectedIdentity.MemberID,
+			ChannelID:         selected.Id,
+			SnapshotRevision:  plan.SelectedIdentity.SnapshotRevision,
+			PoolID:            plan.SelectedIdentity.PoolID,
+			MemberID:          plan.SelectedIdentity.MemberID,
+			CredentialID:      plan.SelectedIdentity.CredentialID,
+			UpstreamAccountID: plan.SelectedIdentity.UpstreamAccountID,
 		})
 		enqueueChannelRoutingCanaryDecision(param, group, plan, &admission)
 		return selected, true, true, nil
@@ -500,7 +522,7 @@ func enqueueChannelRoutingCanaryDecision(
 		GroupName:            group,
 		ModelName:            param.ModelName,
 		SnapshotRevision:     plan.Gate.PolicyRevision,
-		AlgorithmVersion:     channelrouting.DecisionAlgorithmCanaryV1,
+		AlgorithmVersion:     plan.Replay.AlgorithmVersion,
 		RetryIndex:           param.GetRetry(),
 		IsStream:             plan.Replay.Profile.IsStream,
 		ActualChannelID:      plan.Result.SelectedChannelID,
@@ -526,7 +548,7 @@ func enqueueChannelRoutingCanaryDecision(
 		return
 	}
 	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
-	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmCanaryV1)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, plan.Replay.AlgorithmVersion)
 }
 
 func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selected *model.Channel) error {
@@ -564,13 +586,26 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 		if !known {
 			return channelrouting.ErrRoutingSessionInvalid
 		}
+		promptTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)
+		completionTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)
+		profile, profileErr := routingRequestProfile(
+			param.Ctx,
+			group,
+			param.GetRetry(),
+			promptTokens,
+			completionTokens,
+		)
+		if profileErr != nil {
+			return profileErr
+		}
 		expectedCost, expectedCostKnown, err = session.ExpectedCostForChannel(channelID, channelrouting.RequestRoutingCostInput{
 			RequestPath:             param.RequestPath,
 			ModelName:               param.ModelName,
 			IsStream:                common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 			RetryIndex:              param.GetRetry(),
-			PromptTokenEstimate:     max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
-			CompletionTokenEstimate: max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+			PromptTokenEstimate:     promptTokens,
+			CompletionTokenEstimate: completionTokens,
+			Profile:                 profile,
 		})
 		if err != nil {
 			return err

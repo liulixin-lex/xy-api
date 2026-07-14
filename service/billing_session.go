@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -44,6 +45,9 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	if s.settled {
 		return nil
 	}
+	if actualQuota < 0 || actualQuota > common.MaxQuota {
+		return fmt.Errorf("actual quota is outside the supported range: %d", actualQuota)
+	}
 	delta := actualQuota - s.preConsumedQuota
 	if delta == 0 {
 		s.settled = true
@@ -62,7 +66,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		if delta > 0 {
 			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
 		} else {
-			tokenErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
+			tokenErr = model.RefundTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
 		}
 		if tokenErr != nil {
 			// 资金来源已提交，令牌调整失败只能记录日志；标记 settled 防止 Refund 误退资金
@@ -115,7 +119,7 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
-			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
+			if err := model.RefundTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
 			}
 		}
@@ -153,7 +157,17 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.settled || s.refunded || targetQuota <= s.preConsumedQuota {
+	if s.settled || s.refunded {
+		return nil
+	}
+	if targetQuota < 0 || targetQuota > common.MaxQuota {
+		return types.NewError(
+			fmt.Errorf("target quota is outside the supported range: %d", targetQuota),
+			types.ErrorCodeUpdateDataError,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if targetQuota <= s.preConsumedQuota {
 		return nil
 	}
 
@@ -162,16 +176,36 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 		return nil
 	}
 
-	if err := s.reserveFunding(delta); err != nil {
-		return err
-	}
-	if err := s.reserveToken(delta); err != nil {
-		s.rollbackFundingReserve(delta)
-		return err
+	if wallet, ok := s.funding.(*WalletFunding); ok {
+		if err := model.PreConsumeUserAndTokenQuota(
+			wallet.userId, s.relayInfo.TokenId, s.relayInfo.TokenKey, delta, !s.relayInfo.IsPlayground,
+		); err != nil {
+			switch {
+			case errors.Is(err, model.ErrTokenQuotaInsufficient):
+				return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			case errors.Is(err, model.ErrUserQuotaInsufficient):
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			default:
+				return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+			}
+		}
+		wallet.consumed += delta
+	} else {
+		if err := s.reserveFunding(delta); err != nil {
+			return err
+		}
+		if err := s.reserveToken(delta); err != nil {
+			s.rollbackFundingReserve(delta)
+			return err
+		}
 	}
 
 	s.preConsumedQuota += delta
-	s.tokenConsumed += delta
+	if !s.relayInfo.IsPlayground {
+		s.tokenConsumed += delta
+	}
 	s.extraReserved += delta
 	s.syncRelayInfo()
 	return nil
@@ -181,9 +215,16 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 // PreConsume — 统一预扣费入口（含信任额度旁路）
 // ---------------------------------------------------------------------------
 
-// preConsume 执行预扣费：信任检查 -> 令牌预扣 -> 资金来源预扣。
-// 任一步骤失败时原子回滚已完成的步骤。
+// preConsume 执行预扣费。钱包与令牌在同一事务内预扣；订阅路径在
+// 订阅预扣失败时补偿已完成的令牌预扣。
 func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIError {
+	if quota < 0 || quota > common.MaxQuota {
+		return types.NewError(
+			fmt.Errorf("pre-consume quota is outside the supported range: %d", quota),
+			types.ErrorCodeUpdateDataError,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 	effectiveQuota := quota
 
 	// ---- 信任额度旁路 ----
@@ -193,6 +234,30 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 		logger.LogInfo(c, fmt.Sprintf("用户 %d 额度充足, 信任且不需要预扣费 (funding=%s)", s.relayInfo.UserId, s.funding.Source()))
 	} else if effectiveQuota > 0 {
 		logger.LogInfo(c, fmt.Sprintf("用户 %d 需要预扣费 %s (funding=%s)", s.relayInfo.UserId, logger.FormatQuota(effectiveQuota), s.funding.Source()))
+	}
+	if wallet, ok := s.funding.(*WalletFunding); ok && effectiveQuota > 0 {
+		err := model.PreConsumeUserAndTokenQuota(
+			wallet.userId, s.relayInfo.TokenId, s.relayInfo.TokenKey, effectiveQuota, !s.relayInfo.IsPlayground,
+		)
+		if err != nil {
+			switch {
+			case errors.Is(err, model.ErrTokenQuotaInsufficient):
+				return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			case errors.Is(err, model.ErrUserQuotaInsufficient):
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
+					types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			default:
+				return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+			}
+		}
+		wallet.consumed = effectiveQuota
+		if !s.relayInfo.IsPlayground {
+			s.tokenConsumed = effectiveQuota
+		}
+		s.preConsumedQuota = effectiveQuota
+		s.syncRelayInfo()
+		return nil
 	}
 
 	// ---- 1) 预扣令牌额度 ----
@@ -207,7 +272,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	if err := s.funding.PreConsume(effectiveQuota); err != nil {
 		// 预扣费失败，回滚令牌额度
 		if s.tokenConsumed > 0 && !s.relayInfo.IsPlayground {
-			if rollbackErr := model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed); rollbackErr != nil {
+			if rollbackErr := model.RefundTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed); rollbackErr != nil {
 				common.SysLog(fmt.Sprintf("error rolling back token quota (userId=%d, tokenId=%d, amount=%d, fundingErr=%s): %s",
 					s.relayInfo.UserId, s.relayInfo.TokenId, s.tokenConsumed, err.Error(), rollbackErr.Error()))
 			}
@@ -232,7 +297,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+		if err := model.PreConsumeUserQuota(funding.userId, delta); err != nil {
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
 		funding.consumed += delta
@@ -256,7 +321,7 @@ func (s *BillingSession) reserveFunding(delta int) error {
 func (s *BillingSession) rollbackFundingReserve(delta int) {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.IncreaseUserQuota(funding.userId, delta, false); err != nil {
+		if err := model.RefundUserQuota(funding.userId, delta); err != nil {
 			common.SysLog("error rolling back wallet funding reserve: " + err.Error())
 		} else {
 			funding.consumed -= delta
@@ -342,6 +407,13 @@ func (s *BillingSession) syncRelayInfo() {
 func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int) (*BillingSession, *types.NewAPIError) {
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+	if preConsumedQuota < 0 || preConsumedQuota > common.MaxQuota {
+		return nil, types.NewError(
+			fmt.Errorf("pre-consume quota is outside the supported range: %d", preConsumedQuota),
+			types.ErrorCodeUpdateDataError,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 
 	pref := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)

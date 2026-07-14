@@ -53,11 +53,20 @@ other='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 
 run_resolver() {
   local name=$1
-  "$resolver" \
-    --repository ghcr.io/liulixin-lex/xy-api \
-    --tag v0.1.11 \
-    --candidate-digest "$candidate" \
+  local trusted=${2:-false}
+  local -a args=(
+    --repository ghcr.io/liulixin-lex/xy-api
+    --tag v0.1.11
+    --candidate-digest "$candidate"
     --output "$temp_dir/${name}.output"
+  )
+  if [ "$trusted" = true ]; then
+    args+=(
+      --trusted-current-version "$MOCK_LATEST_VERSION"
+      --trusted-current-digest "$MOCK_LATEST_DIGEST"
+    )
+  fi
+  "$resolver" "${args[@]}"
 }
 
 export MOCK_LATEST_STATE=missing
@@ -68,41 +77,61 @@ grep -Fxq "expected_latest_digest=$candidate" "$temp_dir/missing.output"
 export MOCK_LATEST_STATE=existing
 export MOCK_LATEST_DIGEST="$other"
 export MOCK_LATEST_VERSION=v0.1.10
-run_resolver older
+if run_resolver untrusted-existing > "$temp_dir/untrusted-existing.stdout" 2> "$temp_dir/untrusted-existing.stderr"; then
+  echo 'expected an untrusted existing latest to fail' >&2
+  exit 1
+fi
+grep -Fq 'must be trusted' "$temp_dir/untrusted-existing.stderr"
+
+run_resolver older true
 grep -Fxq 'promote_latest=true' "$temp_dir/older.output"
 grep -Fxq "expected_latest_digest=$candidate" "$temp_dir/older.output"
 
 export MOCK_LATEST_DIGEST="$candidate"
 export MOCK_LATEST_VERSION=v0.1.11
-run_resolver same
+run_resolver same true
 grep -Fxq 'promote_latest=false' "$temp_dir/same.output"
 grep -Fxq "expected_latest_digest=$candidate" "$temp_dir/same.output"
 
 export MOCK_LATEST_DIGEST="$other"
 export MOCK_LATEST_VERSION=v0.1.12
-run_resolver newer
+run_resolver newer true
 grep -Fxq 'promote_latest=false' "$temp_dir/newer.output"
 grep -Fxq "expected_latest_digest=$other" "$temp_dir/newer.output"
-workflow="$repo_root/.github/workflows/docker-build.yml"
-grep -Fq -- '-t "${repository}:${TAG}-amd64"' "$workflow"
-grep -Fq -- '-t "${repository}:${TAG}-arm64"' "$workflow"
-[ "$(grep -Fc -- '-t "${repository}:${TAG}"' "$workflow")" -eq 2 ]
-[ "$(grep -Fc -- '-t "${repository}:latest"' "$workflow")" -eq 1 ]
-grep -Fq 'if [ "$promote_latest" = '\''true'\'' ]; then' "$workflow"
-grep -Fq 'if [ "$latest_digest" != "$expected_latest_digest" ]; then' "$workflow"
+finalizer="$repo_root/.github/scripts/finalize-stable-release.sh"
+grep -Fq -- '-t "${image_repository}:latest"' "$finalizer"
+grep -Fq -- '--trusted-current-version "$CURRENT_LATEST_VERSION"' "$finalizer"
+grep -Fq -- '--trusted-current-digest "$CURRENT_LATEST_DIGEST"' "$finalizer"
+grep -Fq 'if [ "$latest_digest" != "${expected_latest_digests[$repository_name]}" ]; then' "$finalizer"
 
 export MOCK_LATEST_VERSION=v0.1.11
-if run_resolver same-conflict > "$temp_dir/same-conflict.stdout" 2> "$temp_dir/same-conflict.stderr"; then
+if run_resolver same-conflict true > "$temp_dir/same-conflict.stdout" 2> "$temp_dir/same-conflict.stderr"; then
   echo 'expected same-version digest conflict to fail' >&2
   exit 1
 fi
 grep -Fq 'different immutable digest' "$temp_dir/same-conflict.stderr"
 
 export MOCK_LATEST_STATE=error
-if run_resolver error > "$temp_dir/error.stdout" 2> "$temp_dir/error.stderr"; then
+if run_resolver error true > "$temp_dir/error.stdout" 2> "$temp_dir/error.stderr"; then
   echo 'expected registry error to fail closed' >&2
   exit 1
 fi
 grep -Fq 'could not safely inspect' "$temp_dir/error.stderr"
+
+export MOCK_LATEST_STATE=existing
+export MOCK_LATEST_VERSION=v0.1.12
+export MOCK_LATEST_DIGEST="$other"
+if "$resolver" \
+  --repository ghcr.io/liulixin-lex/xy-api \
+  --tag v0.1.11 \
+  --candidate-digest "$candidate" \
+  --trusted-current-version v0.1.12 \
+  --trusted-current-digest sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --output "$temp_dir/trusted-mismatch.output" \
+  > "$temp_dir/trusted-mismatch.stdout" 2> "$temp_dir/trusted-mismatch.stderr"; then
+  echo 'expected trusted latest mismatch to fail' >&2
+  exit 1
+fi
+grep -Fq 'changed after trusted verification' "$temp_dir/trusted-mismatch.stderr"
 
 printf 'stable latest resolution tests passed\n'

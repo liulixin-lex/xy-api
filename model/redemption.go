@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -142,6 +143,7 @@ func Redeem(key string, userId int) (quota int, err error) {
 		return 0, errors.New("无效的 user id")
 	}
 	redemption := &Redemption{}
+	cacheMutated := false
 
 	keyCol := "`key`"
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
@@ -175,11 +177,24 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if result.RowsAffected == 0 {
 			return errors.New("该兑换码已被使用")
 		}
-		return tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error
+		if err := tx.Model(&User{}).Where("id = ?", userId).
+			Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error; err != nil {
+			return err
+		}
+		if redemption.Quota != 0 && common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, userId, time.Now()); err != nil {
+				return err
+			}
+		}
+		cacheMutated = redemption.Quota != 0
+		return nil
 	})
 	if err != nil {
 		common.SysError("redemption failed: " + err.Error())
 		return 0, ErrRedeemFailed
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(userId, "redemption quota credit")
 	}
 	RecordLog(userId, LogTypeTopup, fmt.Sprintf("通过兑换码充值 %s，兑换码ID %d", logger.LogQuota(redemption.Quota), redemption.Id))
 	return redemption.Quota, nil

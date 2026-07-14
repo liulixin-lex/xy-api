@@ -78,6 +78,20 @@ func TestQuotaFromFloatChecked(t *testing.T) {
 	}
 }
 
+func TestQuotaCheckedExactBoundsAreNotSaturation(t *testing.T) {
+	quota, clamp := QuotaFromFloatChecked(MaxQuota)
+	assert.Equal(t, MaxQuota, quota)
+	assert.Nil(t, clamp)
+
+	quota, clamp = QuotaRoundChecked(MinQuota)
+	assert.Equal(t, MinQuota, quota)
+	assert.Nil(t, clamp)
+
+	quota, clamp = QuotaFromDecimalChecked(decimal.NewFromInt(MaxQuota))
+	assert.Equal(t, MaxQuota, quota)
+	assert.Nil(t, clamp)
+}
+
 // TestQuotaRoundChecked verifies the rounding entry point reports clamps the
 // same way.
 func TestQuotaRoundChecked(t *testing.T) {

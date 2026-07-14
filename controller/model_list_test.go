@@ -50,7 +50,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}, &model.ReferralCapture{}, &model.RoutingUpstreamAccount{}, &model.RoutingCostSnapshotVersion{}, &model.RoutingBreakerResetFence{}, &model.RoutingHedgeAttemptAudit{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.TopUp{}, &model.AffiliateRewardRecord{}, &model.InviteInitialQuotaRecord{}, &model.InviteLinkBatch{}, &model.ReferralCapture{}, &model.RoutingUpstreamAccount{}, &model.RoutingCostSnapshotVersion{}, &model.RoutingBreakerResetFence{}, &model.RoutingHedgeAttemptAudit{}, &model.RoutingControlAudit{}))
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()

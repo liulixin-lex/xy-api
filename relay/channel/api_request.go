@@ -314,7 +314,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
-	logger.LogDebug(c, "fullRequestURL: %s", fullRequestURL)
+	logger.LogDebug(c, "upstream request URL: %s", common2.SanitizeErrorMessage(fullRequestURL))
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
@@ -347,7 +347,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
-	logger.LogDebug(c, "fullRequestURL: %s", fullRequestURL)
+	logger.LogDebug(c, "upstream request URL: %s", common2.SanitizeErrorMessage(fullRequestURL))
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
@@ -409,7 +409,10 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	}
 
 	dialer := *websocket.DefaultDialer
-	targetConn, _, err := dialer.DialContext(dialCtx, fullRequestURL, targetHeader)
+	if err := common.MarkRoutingUpstreamSent(c); err != nil {
+		return nil, fmt.Errorf("mark routing upstream sent: %w", err)
+	}
+	targetConn, handshakeResponse, err := dialer.DialContext(dialCtx, fullRequestURL, targetHeader)
 	if err != nil {
 		if firstByteTimeout > 0 && firstByteDeadlineExceeded(dialCtx, err) {
 			if info.StreamStatus == nil {
@@ -417,7 +420,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 			}
 			info.StreamStatus.SetEndReason(common.StreamEndReasonFirstByteTimeout, err)
 		}
-		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
+		return nil, common.NewWebSocketHandshakeError(handshakeResponse, err)
 	}
 	// send request body
 	//all, err := io.ReadAll(requestBody)
@@ -715,6 +718,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	if err := common.MarkRoutingUpstreamSent(c); err != nil {
+		return nil, fmt.Errorf("mark routing upstream sent: %w", err)
+	}
 	resp, err := client.Do(req)
 	if stopPinger != nil {
 		stopPinger()

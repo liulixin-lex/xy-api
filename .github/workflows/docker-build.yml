@@ -938,7 +938,7 @@ jobs:
               "$dockerhub_ref" > "$evidence_dir/cosign-dockerhub.json"
           fi
 
-      - name: Enforce immutable versions and monotonic latest
+      - name: Enforce immutable version tags
         run: |
           set -euo pipefail
           evidence_dir="$RUNNER_TEMP/stable-release-evidence"
@@ -987,113 +987,40 @@ jobs:
             fi
           }
 
-          plan_latest() {
-            local repository=$1
-            local candidate_digest=$2
-            local prefix=$3
-            local output_file="$RUNNER_TEMP/${prefix}-latest-plan.env"
-            local promote_latest
-            local expected_latest_digest
-            local current_latest_digest
-            local current_latest_version
-            "$RELEASE_CI_ROOT/.github/scripts/resolve-stable-latest.sh" \
-              --repository "$repository" \
-              --tag "$TAG" \
-              --candidate-digest "$candidate_digest" \
-              --output "$output_file"
-            promote_latest=''
-            expected_latest_digest=''
-            current_latest_digest=''
-            current_latest_version=''
-            while IFS='=' read -r key value; do
-              case "$key" in
-                promote_latest) promote_latest=$value ;;
-                expected_latest_digest) expected_latest_digest=$value ;;
-                current_latest_digest) current_latest_digest=$value ;;
-                current_latest_version) current_latest_version=$value ;;
-                *)
-                  echo "::error::Unexpected stable latest plan key: $key"
-                  exit 1
-                  ;;
-              esac
-            done < "$output_file"
-            case "$promote_latest" in
-              true|false) ;;
-              *) echo '::error::Stable latest plan omitted a valid promotion decision.'; exit 1 ;;
-            esac
-            if [[ ! "$expected_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo '::error::Stable latest plan omitted a valid expected digest.'
-              exit 1
-            fi
-            if [ -n "$current_latest_digest" ] &&
-              [[ ! "$current_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo '::error::Stable latest plan returned an invalid previous digest.'
-              exit 1
-            fi
-            if [ -n "$current_latest_version" ] &&
-              [[ ! "$current_latest_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo '::error::Stable latest plan returned an invalid previous version.'
-              exit 1
-            fi
-            {
-              echo "${prefix}_PROMOTE_LATEST=$promote_latest"
-              echo "${prefix}_EXPECTED_LATEST_DIGEST=$expected_latest_digest"
-              echo "${prefix}_PREVIOUS_LATEST_DIGEST=$current_latest_digest"
-              echo "${prefix}_PREVIOUS_LATEST_VERSION=$current_latest_version"
-            } >> "$GITHUB_ENV"
-          }
-
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" ghcr-amd64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" ghcr-arm64
           assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}" "$GHCR_CANDIDATE_DIGEST" ghcr-version
-          plan_latest "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" GHCR
 
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" dockerhub-amd64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" dockerhub-arm64
             assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub-version
-            plan_latest "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" DOCKERHUB
-          else
-            {
-              echo 'DOCKERHUB_PROMOTE_LATEST=false'
-              echo 'DOCKERHUB_EXPECTED_LATEST_DIGEST='
-              echo 'DOCKERHUB_PREVIOUS_LATEST_DIGEST='
-              echo 'DOCKERHUB_PREVIOUS_LATEST_VERSION='
-            } >> "$GITHUB_ENV"
           fi
 
-      - name: Promote signed candidates to stable tags
+      - name: Publish signed immutable version tags
         run: |
           set -euo pipefail
 
-          promote_registry() {
+          publish_registry() {
             local repository=$1
             local manifest_digest=$2
-            local promote_latest=$3
             docker buildx imagetools create \
               -t "${repository}:${TAG}-amd64" \
               "${repository}@${AMD64_DIGEST}"
             docker buildx imagetools create \
               -t "${repository}:${TAG}-arm64" \
               "${repository}@${ARM64_DIGEST}"
-            if [ "$promote_latest" = 'true' ]; then
-              docker buildx imagetools create \
-                -t "${repository}:${TAG}" \
-                -t "${repository}:latest" \
-                "${repository}@${manifest_digest}"
-            else
-              docker buildx imagetools create \
-                -t "${repository}:${TAG}" \
-                "${repository}@${manifest_digest}"
-            fi
+            docker buildx imagetools create \
+              -t "${repository}:${TAG}" \
+              "${repository}@${manifest_digest}"
           }
 
-          promote_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST" "$GHCR_PROMOTE_LATEST"
+          publish_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST"
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
-            promote_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST" "$DOCKERHUB_PROMOTE_LATEST"
+            publish_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST"
           fi
 
-      - name: Verify promoted tags and signatures
+      - name: Verify immutable version tags and signatures
         run: |
           set -euo pipefail
           evidence_dir="$RUNNER_TEMP/stable-release-evidence"
@@ -1101,27 +1028,18 @@ jobs:
           verify_promoted_registry() {
             local repository=$1
             local expected_version_digest=$2
-            local expected_latest_digest=$3
-            local evidence_prefix=$4
+            local evidence_prefix=$3
             local version_file="$evidence_dir/${evidence_prefix}-version-manifest.json"
-            local latest_file="$evidence_dir/${evidence_prefix}-latest-manifest.json"
             local version_digest
-            local latest_digest
             local amd64_digest
             local arm64_digest
 
             docker buildx imagetools inspect "${repository}:${TAG}" --format '{{json .Manifest}}' > "$version_file"
-            docker buildx imagetools inspect "${repository}:latest" --format '{{json .Manifest}}' > "$latest_file"
             version_digest=$(jq -r '.digest' "$version_file")
-            latest_digest=$(jq -r '.digest' "$latest_file")
             amd64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-amd64" --format '{{.Manifest.Digest}}')
             arm64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-arm64" --format '{{.Manifest.Digest}}')
             if [ "$version_digest" != "$expected_version_digest" ]; then
               echo "::error::Promoted $repository version digest does not match the signed candidate."
-              exit 1
-            fi
-            if [ "$latest_digest" != "$expected_latest_digest" ]; then
-              echo "::error::Promoted $repository latest digest changed unexpectedly."
               exit 1
             fi
             if [ "$amd64_digest" != "$AMD64_DIGEST" ] || [ "$arm64_digest" != "$ARM64_DIGEST" ]; then
@@ -1153,13 +1071,11 @@ jobs:
           verify_promoted_registry \
             "ghcr.io/${GHCR_REPOSITORY}" \
             "$GHCR_CANDIDATE_DIGEST" \
-            "$GHCR_EXPECTED_LATEST_DIGEST" \
             ghcr
           if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
             verify_promoted_registry \
               "$DOCKERHUB_REPOSITORY" \
               "$DOCKERHUB_CANDIDATE_DIGEST" \
-              "$DOCKERHUB_EXPECTED_LATEST_DIGEST" \
               dockerhub
           fi
 
@@ -1217,7 +1133,7 @@ jobs:
               attestations: $attestations[0],
               controls: {
                 stable_version_immutable: true,
-                latest_monotonic: true,
+                latest_deferred_to_shared_finalizer: true,
                 tag_revalidated: true,
                 signatures_verified: true,
                 attestation_contents_verified: true,
@@ -1242,11 +1158,27 @@ jobs:
             echo '### Verified stable multi-arch image'
             echo '```text'
             echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}"
-            echo "ghcr.io/${GHCR_REPOSITORY}:latest"
             echo "$GHCR_CANDIDATE_DIGEST"
             echo 'Platforms: linux/amd64, linux/arm64'
             echo 'Attestations: verified SPDX-2.3 packages and BuildKit SLSA source identity'
-            echo 'Cosign: signed and verified before stable promotion'
-            echo 'Version tags: immutable; latest: monotonic'
+            echo 'Cosign: signed and verified before immutable version publication'
+            echo 'Latest: deferred until the shared finalizer verifies all 10 Release assets'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  finalize_stable_release:
+    name: Finalize stable release across registries and assets
+    needs: [prepare, create_manifests]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/finalize-stable-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      source_sha: ${{ needs.prepare.outputs.sha }}
+      default_branch: ${{ github.event.repository.default_branch }}
+      dockerhub_repository: ${{ vars.DOCKERHUB_REPOSITORY }}
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}

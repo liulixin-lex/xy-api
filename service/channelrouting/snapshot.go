@@ -106,19 +106,20 @@ type SnapshotView struct {
 }
 
 type PoolSnapshot struct {
-	ID               int                       `json:"id"`
-	GroupName        string                    `json:"group_name"`
-	DisplayName      string                    `json:"display_name"`
-	Source           string                    `json:"source"`
-	DeploymentStage  string                    `json:"deployment_stage"`
-	PolicyProfile    string                    `json:"policy_profile"`
-	SelectorPolicy   PoolSelectorPolicy        `json:"selector_policy"`
-	BalancedPolicy   BalancedPoolPolicy        `json:"balanced_policy"`
-	CanaryPolicy     model.RoutingCanaryPolicy `json:"canary_policy"`
-	MemberCount      int                       `json:"member_count"`
-	MembersTruncated bool                      `json:"members_truncated"`
-	Members          []PoolMemberSnapshot      `json:"members"`
-	enterprisePolicy EnterprisePoolPolicy
+	ID                       int                       `json:"id"`
+	GroupName                string                    `json:"group_name"`
+	DisplayName              string                    `json:"display_name"`
+	Source                   string                    `json:"source"`
+	DeploymentStage          string                    `json:"deployment_stage"`
+	PolicyProfile            string                    `json:"policy_profile"`
+	CapabilityRoutingEnabled bool                      `json:"capability_routing_enabled"`
+	SelectorPolicy           PoolSelectorPolicy        `json:"selector_policy"`
+	BalancedPolicy           BalancedPoolPolicy        `json:"balanced_policy"`
+	CanaryPolicy             model.RoutingCanaryPolicy `json:"canary_policy"`
+	MemberCount              int                       `json:"member_count"`
+	MembersTruncated         bool                      `json:"members_truncated"`
+	Members                  []PoolMemberSnapshot      `json:"members"`
+	enterprisePolicy         EnterprisePoolPolicy
 }
 
 type PoolMemberSnapshot struct {
@@ -231,6 +232,7 @@ type ModelSnapshot struct {
 
 type ChannelSnapshot struct {
 	ID                   int      `json:"id"`
+	RoutingGeneration    string   `json:"-"`
 	Name                 string   `json:"name"`
 	Type                 int      `json:"type"`
 	Status               int      `json:"status"`
@@ -238,6 +240,7 @@ type ChannelSnapshot struct {
 	ModelMapping         string   `json:"-"`
 	ModelNames           []string `json:"-"`
 	MultiKey             bool     `json:"multi_key"`
+	CredentialRequired   bool     `json:"credential_required"`
 	CredentialIDs        []int    `json:"credential_ids"`
 	AuthFailure          bool     `json:"auth_failure"`
 	AuthFailureUpdatedAt int64    `json:"auth_failure_updated_at"`
@@ -251,10 +254,11 @@ type ChannelSnapshot struct {
 }
 
 type Identity struct {
-	SnapshotRevision uint64 `json:"snapshot_revision"`
-	PoolID           int    `json:"pool_id"`
-	MemberID         int    `json:"member_id"`
-	CredentialID     int    `json:"credential_id"`
+	SnapshotRevision  uint64 `json:"snapshot_revision"`
+	PoolID            int    `json:"pool_id"`
+	MemberID          int    `json:"member_id"`
+	CredentialID      int    `json:"credential_id"`
+	UpstreamAccountID int    `json:"upstream_account_id,omitempty"`
 }
 
 type runtimeSnapshot struct {
@@ -262,12 +266,13 @@ type runtimeSnapshot struct {
 	poolByGroup              map[string]int
 	memberByPoolChannel      map[poolChannelKey]int
 	credentialByFingerprint  map[credentialFingerprintKey]int
+	credentialByID           map[int]credentialRuntime
 	modelByMemberModel       map[memberModelKey]ModelSnapshot
 	channelByID              map[int]ChannelSnapshot
 	poolIndexByID            map[int]int
 	memberIndexesByPoolModel map[poolModelKey][]int
 	preparedBalancedPools    map[balancedPoolModelKey]*routingselector.PreparedBalancedPool
-	strictCapacityPlans      map[memberModelKey]strictCapacityPlan
+	strictCapacityPlans      map[strictCapacityPlanKey]strictCapacityPlan
 	poolSummaries            []PoolSnapshotSummary
 	telemetrySummary         TelemetryAggregate
 }
@@ -280,6 +285,16 @@ type poolChannelKey struct {
 type credentialFingerprintKey struct {
 	ChannelID   int
 	Fingerprint string
+}
+
+type credentialRuntime struct {
+	ID                 int
+	ChannelID          int
+	Fingerprint        string
+	FingerprintVersion int
+	LastSeenIndex      int
+	CurrentOccurrences int
+	Operational        bool
 }
 
 type memberModelKey struct {
@@ -442,7 +457,11 @@ func ResolveIdentity(group string, channelID int, credential string) (Identity, 
 	if credential == "" {
 		return identity, true
 	}
-	fingerprint, err := model.RoutingCredentialFingerprint(channelID, credential)
+	channel, ok := snapshot.channelByID[channelID]
+	if !ok || channel.RoutingGeneration == "" {
+		return identity, true
+	}
+	fingerprint, err := model.RoutingCredentialFingerprint(channelID, channel.RoutingGeneration, credential)
 	if err != nil {
 		return identity, true
 	}
@@ -475,9 +494,10 @@ func ResolveObserveModelSnapshot(group string, channelID int, modelName string) 
 		return ModelSnapshot{}, Identity{}, false
 	}
 	return observation, Identity{
-		SnapshotRevision: snapshot.view.Revision,
-		PoolID:           poolID,
-		MemberID:         memberID,
+		SnapshotRevision:  snapshot.view.Revision,
+		PoolID:            poolID,
+		MemberID:          memberID,
+		UpstreamAccountID: observation.upstreamAccountID,
 	}, true
 }
 
@@ -645,8 +665,10 @@ func buildSnapshotWithinTransaction(
 	selectorPolicyByPoolID := make(map[int]PoolSelectorPolicy, len(document.Pools))
 	balancedPolicyByPoolID := make(map[int]BalancedPoolPolicy, len(document.Pools))
 	canaryPolicyByPoolID := make(map[int]model.RoutingCanaryPolicy, len(document.Pools))
+	capabilityRoutingByPoolID := make(map[int]bool, len(document.Pools))
 	enterprisePolicyByPoolID := make(map[int]EnterprisePoolPolicy, len(document.Pools))
 	enterpriseMemberPolicyByID := make(map[int]enterpriseMemberPolicy, revision.MemberCount)
+	capabilityOverridesByMemberID := make(map[int]routingCapabilityOverrides, revision.MemberCount)
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
 		selectorPolicy, err := resolvePoolSelectorPolicy(pool.PolicyProfile, pool.Policy)
@@ -669,6 +691,11 @@ func buildSnapshotWithinTransaction(
 		selectorPolicyByPoolID[pool.PoolID] = selectorPolicy
 		balancedPolicyByPoolID[pool.PoolID] = balancedPolicy
 		canaryPolicyByPoolID[pool.PoolID] = canaryPolicy
+		capabilityRoutingEnabled, err := resolveCapabilityRoutingPolicy(pool.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid capability routing policy for pool %d: %w", pool.PoolID, err)
+		}
+		capabilityRoutingByPoolID[pool.PoolID] = capabilityRoutingEnabled
 		enterprisePolicyByPoolID[pool.PoolID] = enterprisePolicy
 		pools = append(pools, model.RoutingPool{
 			ID:          pool.PoolID,
@@ -679,6 +706,11 @@ func buildSnapshotWithinTransaction(
 		})
 		for memberIndex := range pool.Members {
 			member := pool.Members[memberIndex]
+			capabilityOverrides, err := resolveMemberCapabilityEvidence(member.Overrides)
+			if err != nil {
+				return nil, fmt.Errorf("invalid routing capability override for member %d: %w", member.MemberID, err)
+			}
+			capabilityOverridesByMemberID[member.MemberID] = capabilityOverrides
 			enterpriseMemberPolicy, err := resolveEnterpriseMemberPolicy(pool.PolicyProfile, member.Overrides, enterprisePolicy)
 			if err != nil {
 				return nil, fmt.Errorf("invalid enterprise routing override for member %d: %w", member.MemberID, err)
@@ -968,12 +1000,14 @@ metricPages:
 
 	channels := make([]model.Channel, 0)
 	credentialRequiredByChannel := make(map[int]bool)
+	credentialOperationalByFingerprint := make(map[credentialFingerprintKey]bool, len(credentials))
+	credentialIndexByFingerprint := make(map[credentialFingerprintKey]int, len(credentials))
 	lastChannelID := 0
 	totalChannelBytes := 0
 	for len(channels) <= limits.MaxChannels {
 		var page []model.Channel
 		query := db.WithContext(ctx).
-			Select("id", "type", "status", "name", "key", "base_url", "balance", "balance_updated_time", "models", "channel_info").
+			Select("id", "routing_generation", "type", "status", "name", "key", "base_url", "balance", "balance_updated_time", "models", "channel_info").
 			Order("id asc").Limit(500)
 		if lastChannelID > 0 {
 			query = query.Where("id > ?", lastChannelID)
@@ -985,11 +1019,46 @@ metricPages:
 			break
 		}
 		for index := range page {
-			channelInfo, err := common.Marshal(page[index].ChannelInfo)
+			channelInfo := page[index].ChannelInfo
+			keys := page[index].GetKeys()
+			keyIndexes := make([]int, len(keys))
+			if channelInfo.IsMultiKey {
+				for keyIndex := range keyIndexes {
+					keyIndexes[keyIndex] = keyIndex
+				}
+			} else if len(keyIndexes) > 0 {
+				keyIndexes[0] = model.RoutingMetricSingleKeyIndex
+			}
+			for keyOffset, key := range keys {
+				if key == "" {
+					continue
+				}
+				fingerprint, fingerprintErr := model.RoutingCredentialFingerprint(
+					page[index].Id, page[index].RoutingGeneration, key,
+				)
+				if fingerprintErr != nil {
+					return nil, fingerprintErr
+				}
+				fingerprintKey := credentialFingerprintKey{ChannelID: page[index].Id, Fingerprint: fingerprint}
+				keyIndex := keyIndexes[keyOffset]
+				operational := true
+				if channelInfo.IsMultiKey && channelInfo.MultiKeyStatusList != nil {
+					if status, exists := channelInfo.MultiKeyStatusList[keyIndex]; exists {
+						operational = status == common.ChannelStatusEnabled
+					}
+				}
+				if existingIndex, exists := credentialIndexByFingerprint[fingerprintKey]; exists && existingIndex != keyIndex {
+					credentialOperationalByFingerprint[fingerprintKey] = false
+				} else {
+					credentialIndexByFingerprint[fingerprintKey] = keyIndex
+					credentialOperationalByFingerprint[fingerprintKey] = operational
+				}
+			}
+			channelInfoJSON, err := common.Marshal(page[index].ChannelInfo)
 			if err != nil {
 				return nil, err
 			}
-			channelBytes := len(page[index].Name) + len(page[index].Key) + len(page[index].Models) + len(channelInfo)
+			channelBytes := len(page[index].Name) + len(page[index].Key) + len(page[index].Models) + len(channelInfoJSON)
 			if page[index].BaseURL != nil {
 				channelBytes += len(*page[index].BaseURL)
 			}
@@ -1062,12 +1131,21 @@ metricPages:
 
 	credentialsByChannel := make(map[int][]int)
 	credentialByFingerprint := make(map[credentialFingerprintKey]int, len(credentials))
+	credentialByID := make(map[int]credentialRuntime, len(credentials))
 	for _, credential := range credentials {
+		fingerprintKey := credentialFingerprintKey{ChannelID: credential.ChannelID, Fingerprint: credential.Fingerprint}
 		credentialsByChannel[credential.ChannelID] = append(credentialsByChannel[credential.ChannelID], credential.ID)
-		credentialByFingerprint[credentialFingerprintKey{
-			ChannelID:   credential.ChannelID,
-			Fingerprint: credential.Fingerprint,
-		}] = credential.ID
+		credentialByFingerprint[fingerprintKey] = credential.ID
+		credentialByID[credential.ID] = credentialRuntime{
+			ID:                 credential.ID,
+			ChannelID:          credential.ChannelID,
+			Fingerprint:        credential.Fingerprint,
+			FingerprintVersion: credential.FingerprintVersion,
+			LastSeenIndex:      credentialIndexByFingerprint[fingerprintKey],
+			CurrentOccurrences: credential.CurrentOccurrences,
+			Operational: credential.FingerprintVersion == model.RoutingCredentialFingerprintVersion &&
+				credential.CurrentOccurrences == 1 && credentialOperationalByFingerprint[fingerprintKey],
+		}
 	}
 	for channelID := range credentialsByChannel {
 		sort.Ints(credentialsByChannel[channelID])
@@ -1083,15 +1161,17 @@ metricPages:
 	invalidNumericValues := 0
 	for _, channel := range channels {
 		view := ChannelSnapshot{
-			ID:            channel.Id,
-			Name:          channel.Name,
-			Type:          channel.Type,
-			Status:        channel.Status,
-			Endpoint:      safeEndpoint(channel.BaseURL),
-			ModelMapping:  channel.GetModelMapping(),
-			ModelNames:    append([]string(nil), modelNamesByChannel[channel.Id]...),
-			MultiKey:      channel.ChannelInfo.IsMultiKey,
-			CredentialIDs: append([]int(nil), credentialsByChannel[channel.Id]...),
+			ID:                 channel.Id,
+			RoutingGeneration:  channel.RoutingGeneration,
+			Name:               channel.Name,
+			Type:               channel.Type,
+			Status:             channel.Status,
+			Endpoint:           safeEndpoint(channel.BaseURL),
+			ModelMapping:       channel.GetModelMapping(),
+			ModelNames:         append([]string(nil), modelNamesByChannel[channel.Id]...),
+			MultiKey:           channel.ChannelInfo.IsMultiKey,
+			CredentialRequired: credentialRequiredByChannel[channel.Id],
+			CredentialIDs:      append([]int(nil), credentialsByChannel[channel.Id]...),
 		}
 		if authFailure, ok := routinghotcache.GetAuthFailure(channel.Id); ok {
 			view.AuthFailure = authFailure.Marked
@@ -1161,18 +1241,19 @@ metricPages:
 	for _, pool := range pools {
 		policyPool := policyPoolByID[pool.ID]
 		poolView := PoolSnapshot{
-			ID:               pool.ID,
-			GroupName:        pool.GroupName,
-			DisplayName:      pool.DisplayName,
-			Source:           pool.Source,
-			DeploymentStage:  policyPool.DeploymentStage,
-			PolicyProfile:    policyPool.PolicyProfile,
-			SelectorPolicy:   selectorPolicyByPoolID[pool.ID],
-			BalancedPolicy:   balancedPolicyByPoolID[pool.ID],
-			CanaryPolicy:     canaryPolicyByPoolID[pool.ID],
-			enterprisePolicy: enterprisePolicyByPoolID[pool.ID],
-			MemberCount:      len(membersByPool[pool.ID]),
-			Members:          make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
+			ID:                       pool.ID,
+			GroupName:                pool.GroupName,
+			DisplayName:              pool.DisplayName,
+			Source:                   pool.Source,
+			DeploymentStage:          policyPool.DeploymentStage,
+			PolicyProfile:            policyPool.PolicyProfile,
+			CapabilityRoutingEnabled: capabilityRoutingByPoolID[pool.ID],
+			SelectorPolicy:           selectorPolicyByPoolID[pool.ID],
+			BalancedPolicy:           balancedPolicyByPoolID[pool.ID],
+			CanaryPolicy:             canaryPolicyByPoolID[pool.ID],
+			enterprisePolicy:         enterprisePolicyByPoolID[pool.ID],
+			MemberCount:              len(membersByPool[pool.ID]),
+			Members:                  make([]PoolMemberSnapshot, 0, len(membersByPool[pool.ID])),
 		}
 		for _, member := range membersByPool[pool.ID] {
 			memberIndex := len(poolView.Members)
@@ -1206,6 +1287,12 @@ metricPages:
 					return nil, fmt.Errorf("%w: model snapshots", ErrSnapshotLimitExceeded)
 				}
 				modelView, invalidValues := snapshotModel(channel, member.ID, credentialIDs, pool.GroupName, modelName, stableMetrics, telemetryAvailable)
+				capabilityEvidence := resolveRoutingCapabilityEvidence(channel.Type, modelName, capabilityOverridesByMemberID[member.ID])
+				modelView.RequestKindsKnown = capabilityEvidence.requestKindsKnown
+				modelView.RequestKindsSupported = capabilityEvidence.requestKindsSupported
+				modelView.CapabilitiesKnown = capabilityEvidence.capabilitiesKnown
+				modelView.CapabilitiesSupported = capabilityEvidence.capabilitiesSupported
+				modelView.CapabilityRevision = capabilityEvidence.revision
 				invalidNumericValues += invalidValues
 				if modelView.MetricSource == "stable_rollup" {
 					allFailedAttempts = saturatingMetricTotal(allFailedAttempts, modelView.FailureCount)
@@ -1300,12 +1387,13 @@ metricPages:
 		poolByGroup:              poolByGroup,
 		memberByPoolChannel:      memberByPoolChannel,
 		credentialByFingerprint:  credentialByFingerprint,
+		credentialByID:           credentialByID,
 		modelByMemberModel:       modelByMemberModel,
 		channelByID:              channelViewByID,
 		poolIndexByID:            poolIndexByID,
 		memberIndexesByPoolModel: memberIndexesByPoolModel,
 		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
-		strictCapacityPlans:      make(map[memberModelKey]strictCapacityPlan),
+		strictCapacityPlans:      make(map[strictCapacityPlanKey]strictCapacityPlan),
 		poolSummaries:            poolSummaries,
 		telemetrySummary:         telemetryAggregate(view),
 	}
@@ -1903,6 +1991,7 @@ func ResetSnapshotForTest() {
 	currentSnapshot.Store(nil)
 	snapshotRuntimeGeneration.Store(0)
 	snapshotPublishMu.Unlock()
+	resetRuntimeHealthForTest()
 }
 
 func SetSnapshotForTest(view SnapshotView) {
@@ -1912,12 +2001,13 @@ func SetSnapshotForTest(view SnapshotView) {
 		poolByGroup:              make(map[string]int, len(cloned.Pools)),
 		memberByPoolChannel:      make(map[poolChannelKey]int),
 		credentialByFingerprint:  make(map[credentialFingerprintKey]int),
+		credentialByID:           make(map[int]credentialRuntime),
 		modelByMemberModel:       make(map[memberModelKey]ModelSnapshot),
 		channelByID:              make(map[int]ChannelSnapshot, len(cloned.Channels)),
 		poolIndexByID:            make(map[int]int, len(cloned.Pools)),
 		memberIndexesByPoolModel: make(map[poolModelKey][]int),
 		preparedBalancedPools:    make(map[balancedPoolModelKey]*routingselector.PreparedBalancedPool),
-		strictCapacityPlans:      make(map[memberModelKey]strictCapacityPlan),
+		strictCapacityPlans:      make(map[strictCapacityPlanKey]strictCapacityPlan),
 		poolSummaries:            make([]PoolSnapshotSummary, len(cloned.Pools)),
 	}
 	for index := range cloned.Channels {
@@ -1937,6 +2027,15 @@ func SetSnapshotForTest(view SnapshotView) {
 		for memberIndex := range pool.Members {
 			member := pool.Members[memberIndex]
 			snapshot.memberByPoolChannel[poolChannelKey{PoolID: pool.ID, ChannelID: member.ChannelID}] = member.ID
+			for _, credentialID := range member.CredentialIDs {
+				if credentialID > 0 {
+					snapshot.credentialByID[credentialID] = credentialRuntime{
+						ID: credentialID, ChannelID: member.ChannelID,
+						FingerprintVersion: model.RoutingCredentialFingerprintVersion,
+						CurrentOccurrences: 1, Operational: true,
+					}
+				}
+			}
 			for modelIndex := range member.Models {
 				observation := member.Models[modelIndex]
 				snapshot.modelByMemberModel[memberModelKey{memberID: member.ID, model: observation.ModelName}] = observation

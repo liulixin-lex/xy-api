@@ -92,6 +92,9 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	if err != nil {
 		return service.TaskErrorWrapper(err, "get_task_request_failed", http.StatusBadRequest)
 	}
+	if _, err := a.convertToRequestPayload(&req, info); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
 	action := constant.TaskActionTextGenerate
 	if meatAction, ok := req.Metadata["action"]; ok {
 		action, _ = meatAction.(string)
@@ -163,7 +166,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -172,12 +175,12 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	var vResp responsePayload
 	err = common.Unmarshal(responseBody, &vResp)
 	if err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrap(err, fmt.Sprintf("%s", responseBody)), "unmarshal_response_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_failed", http.StatusInternalServerError)
 		return
 	}
 
 	if vResp.State == "failed" {
-		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf("task failed"), "task_failed", http.StatusBadRequest)
+		taskErr = service.TaskErrorWrapper(fmt.Errorf("task failed"), "task_failed", http.StatusBadRequest)
 		return
 	}
 	if strings.TrimSpace(vResp.TaskId) == "" {
@@ -242,6 +245,9 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, &r); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
+	if r.Duration <= 0 || r.Duration > relaycommon.MaxTaskDurationSeconds {
+		return nil, fmt.Errorf("duration must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+	}
 	return &r, nil
 }
 
@@ -290,14 +296,14 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	openAIVideo.CreatedAt = originTask.CreatedAt
 	openAIVideo.CompletedAt = originTask.UpdatedAt
 
-	if len(viduResp.Creations) > 0 && viduResp.Creations[0].URL != "" {
-		openAIVideo.SetMetadata("url", viduResp.Creations[0].URL)
+	if resultURL := originTask.GetResultURL(); resultURL != "" {
+		openAIVideo.SetMetadata("url", resultURL)
 	}
 
 	if viduResp.State == "failed" && viduResp.ErrCode != "" {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: viduResp.ErrCode,
-			Code:    viduResp.ErrCode,
+			Message: common.SanitizeErrorMessage(viduResp.ErrCode),
+			Code:    common.SanitizeErrorMessage(viduResp.ErrCode),
 		}
 	}
 

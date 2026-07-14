@@ -120,7 +120,17 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
 	// Accept only POST /v1/video/generations as "generate" action.
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := a.convertToRequestPayload(&req); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	return nil
 }
 
 // BuildRequestURL constructs the upstream URL.
@@ -210,7 +220,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -220,7 +230,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	// Parse Doubao response
 	var dResp responsePayload
 	if err := common.Unmarshal(responseBody, &dResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -295,8 +305,20 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 
-	if sec, _ := strconv.Atoi(req.Seconds); sec > 0 {
+	if req.Duration > 0 {
+		r.Duration = lo.ToPtr(dto.IntValue(req.Duration))
+	} else if sec, _ := strconv.Atoi(req.Seconds); sec > 0 {
 		r.Duration = lo.ToPtr(dto.IntValue(sec))
+	}
+	if r.Duration != nil && (int(*r.Duration) <= 0 || int(*r.Duration) > relaycommon.MaxTaskDurationSeconds) {
+		return nil, fmt.Errorf("duration must be between 1 and %d", relaycommon.MaxTaskDurationSeconds)
+	}
+	const maxFrames = relaycommon.MaxTaskDurationSeconds*60 + 1
+	if r.Frames != nil && (int(*r.Frames) <= 0 || int(*r.Frames) > maxFrames) {
+		return nil, fmt.Errorf("frames must be between 1 and %d", maxFrames)
+	}
+	if r.Duration != nil && r.Frames != nil {
+		return nil, fmt.Errorf("duration and frames cannot both be set")
 	}
 
 	r.Content = lo.Reject(r.Content, func(c ContentItem, _ int) bool { return c.Type == "text" })
@@ -357,15 +379,17 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	openAIVideo.TaskID = originTask.TaskID
 	openAIVideo.Status = originTask.Status.ToVideoStatus()
 	openAIVideo.SetProgressStr(originTask.Progress)
-	openAIVideo.SetMetadata("url", dResp.Content.VideoURL)
+	if resultURL := originTask.GetResultURL(); resultURL != "" {
+		openAIVideo.SetMetadata("url", resultURL)
+	}
 	openAIVideo.CreatedAt = originTask.CreatedAt
 	openAIVideo.CompletedAt = originTask.UpdatedAt
 	openAIVideo.Model = originTask.Properties.OriginModelName
 
 	if dResp.Status == "failed" {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: dResp.Error.Message,
-			Code:    dResp.Error.Code,
+			Message: common.SanitizeErrorMessage(dResp.Error.Message),
+			Code:    common.SanitizeErrorMessage(dResp.Error.Code),
 		}
 	}
 

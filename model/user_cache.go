@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,18 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 )
+
+var runAsyncCacheBackfill = func(task func()) {
+	gopool.Go(task)
+}
+
+func identityCacheTTL() time.Duration {
+	ttl := time.Duration(common.RedisKeyCacheSeconds()) * time.Second
+	if ttl <= 0 || ttl > time.Minute {
+		return time.Minute
+	}
+	return ttl
+}
 
 // UserBase struct remains the same as it represents the cached data structure
 type UserBase struct {
@@ -49,12 +62,16 @@ func getUserCacheKey(userId int) string {
 	return fmt.Sprintf("user:%d", userId)
 }
 
+func getUserCacheEpochKey(userId int) string {
+	return fmt.Sprintf("cache_epoch:user:%d", userId)
+}
+
 // invalidateUserCache clears user cache
 func invalidateUserCache(userId int) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return common.RedisDelKey(getUserCacheKey(userId))
+	return common.RedisBumpCacheEpochAndDelete(getUserCacheEpochKey(userId), getUserCacheKey(userId))
 }
 
 // InvalidateUserCache is the exported version of invalidateUserCache.
@@ -63,49 +80,32 @@ func InvalidateUserCache(userId int) error {
 	return invalidateUserCache(userId)
 }
 
-func populateUserCache(user User) error {
+func populateUserCacheIfEpoch(user User, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-
-	return common.RedisHSetObj(
-		getUserCacheKey(user.Id),
-		user.ToBaseUser(),
-		time.Duration(common.RedisKeyCacheSeconds())*time.Second,
+	_, err := common.RedisHSetObjIfCacheEpoch(
+		getUserCacheEpochKey(user.Id), epoch, getUserCacheKey(user.Id), user.ToBaseUser(),
+		identityCacheTTL(),
 	)
+	return err
 }
 
-// updateUserCache refreshes non-quota user cache fields.
-// Quota is maintained by atomic quota delta paths and must not be overwritten
-// by stale user snapshots from profile/settings updates.
 func updateUserCache(user User) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	if err := updateUserGroupCache(user.Id, user.Group); err != nil {
-		return err
-	}
-	if err := updateUserEmailCache(user.Id, user.Email); err != nil {
-		return err
-	}
-	if err := updateUserStatusCache(user.Id, user.Status == common.UserStatusEnabled); err != nil {
-		return err
-	}
-	if err := updateUserNameCache(user.Id, user.Username); err != nil {
-		return err
-	}
-	return updateUserSettingCache(user.Id, user.Setting)
+	return invalidateUserCache(user.Id)
 }
 
 // GetUserCache gets complete user cache from hash
 func GetUserCache(userId int) (userCache *UserBase, err error) {
 	var user *User
 	var fromDB bool
+	var cacheEpoch int64
+	cacheEpochReady := false
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) && user != nil {
-			gopool.Go(func() {
-				if err := populateUserCache(*user); err != nil {
+		if shouldUpdateRedis(fromDB, err) && user != nil && cacheEpochReady {
+			runAsyncCacheBackfill(func() {
+				if err := populateUserCacheIfEpoch(*user, cacheEpoch); err != nil {
 					common.SysLog("failed to update user status cache: " + err.Error())
 				}
 			})
@@ -116,6 +116,12 @@ func GetUserCache(userId int) (userCache *UserBase, err error) {
 	userCache, err = cacheGetUserBase(userId)
 	if err == nil {
 		return userCache, nil
+	}
+	if common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getUserCacheEpochKey(userId))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 
 	// If Redis fails, get from DB
@@ -153,15 +159,28 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 }
 
 // Add atomic quota operations using hash fields
-func cacheIncrUserQuota(userId int, delta int64) error {
+func cacheIncrUserQuota(userId int, delta int64, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return common.RedisHIncrBy(getUserCacheKey(userId), "Quota", delta)
+	advanced, err := common.RedisHIncrByAndAdvanceCacheEpoch(
+		getUserCacheEpochKey(userId), epoch, getUserCacheKey(userId), "Quota", delta,
+	)
+	if err == nil && advanced {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("user quota cache epoch changed concurrently")
+	}
+	if invalidateErr := invalidateUserCache(userId); invalidateErr != nil {
+		return errors.Join(err, fmt.Errorf("invalidate user quota cache: %w", invalidateErr))
+	}
+	common.SysError("user quota cache epoch conflict; invalidated cache: " + err.Error())
+	return nil
 }
 
-func cacheDecrUserQuota(userId int, delta int64) error {
-	return cacheIncrUserQuota(userId, -delta)
+func cacheDecrUserQuota(userId int, delta int64, epoch int64) error {
+	return cacheIncrUserQuota(userId, -delta, epoch)
 }
 
 // Helper functions to get individual fields if needed
@@ -205,55 +224,51 @@ func getUserSettingCache(userId int) (dto.UserSetting, error) {
 	return cache.GetSetting(), nil
 }
 
-// New functions for individual field updates
-func updateUserStatusCache(userId int, status bool) error {
+func updateUserQuotaCacheIfEpoch(userId int, quota int, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	statusInt := common.UserStatusEnabled
-	if !status {
-		statusInt = common.UserStatusDisabled
-	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Status", fmt.Sprintf("%d", statusInt))
+	_, err := common.RedisHSetFieldIfCacheEpoch(
+		getUserCacheEpochKey(userId), epoch, getUserCacheKey(userId), "Quota", fmt.Sprintf("%d", quota),
+	)
+	return err
 }
 
-func updateUserQuotaCache(userId int, quota int) error {
+func updateUserGroupCacheIfEpoch(userId int, group string, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Quota", fmt.Sprintf("%d", quota))
-}
-
-func updateUserGroupCache(userId int, group string) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Group", group)
+	_, err := common.RedisHSetFieldIfCacheEpoch(
+		getUserCacheEpochKey(userId), epoch, getUserCacheKey(userId), "Group", group,
+	)
+	return err
 }
 
 func UpdateUserGroupCache(userId int, group string) error {
-	return updateUserGroupCache(userId, group)
+	if err := invalidateUserCache(userId); err != nil {
+		common.SysError("user group committed but cache fence failed: " + err.Error())
+	}
+	return nil
 }
 
-func updateUserEmailCache(userId int, email string) error {
+func updateUserNameCacheIfEpoch(userId int, username string, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Email", email)
+	_, err := common.RedisHSetFieldIfCacheEpoch(
+		getUserCacheEpochKey(userId), epoch, getUserCacheKey(userId), "Username", username,
+	)
+	return err
 }
 
-func updateUserNameCache(userId int, username string) error {
+func updateUserSettingCacheIfEpoch(userId int, setting string, epoch int64) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Username", username)
-}
-
-func updateUserSettingCache(userId int, setting string) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	return common.RedisHSetField(getUserCacheKey(userId), "Setting", setting)
+	_, err := common.RedisHSetFieldIfCacheEpoch(
+		getUserCacheEpochKey(userId), epoch, getUserCacheKey(userId), "Setting", setting,
+	)
+	return err
 }
 
 // GetUserLanguage returns the user's language preference from cache

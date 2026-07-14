@@ -21,13 +21,16 @@ import (
 	"gorm.io/gorm"
 )
 
-var commonGroupCol string
-var commonKeyCol string
-var commonTrueVal string
-var commonFalseVal string
+// SQLite/MySQL-safe defaults keep package-level test databases usable even
+// when they are installed directly instead of through InitDB/InitLogDB.
+// Production initialization still overwrites these for PostgreSQL.
+var commonGroupCol = "`group`"
+var commonKeyCol = "`key`"
+var commonTrueVal = "1"
+var commonFalseVal = "0"
 
-var logKeyCol string
-var logGroupCol string
+var logKeyCol = "`key`"
+var logGroupCol = "`group`"
 
 const (
 	routingV2AlphaDrainedEnv         = "ROUTING_V2_ALPHA_DRAINED"
@@ -187,6 +190,9 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 }
 
 func InitDB() (err error) {
+	if err := ValidateRoutingCredentialEncryptionConfiguration(); err != nil {
+		return err
+	}
 	db, dbType, err := chooseDB("SQL_DSN", false)
 	if err == nil {
 		common.SetMainDatabaseType(dbType)
@@ -213,7 +219,16 @@ func InitDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
-			return waitRoutingV2SchemaReady(DB)
+			if err := waitRoutingV2SchemaReady(DB); err != nil {
+				return err
+			}
+			if err := waitAsyncBillingV2SchemaReadyFromEnv(); err != nil {
+				return err
+			}
+			if err := waitBillingStatsProjectionSchemaReadyFromEnv(); err != nil {
+				return err
+			}
+			return waitBillingLogProjectionSchemaReadyFromEnv()
 		}
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
@@ -232,7 +247,10 @@ func InitLogDB() (err error) {
 		LOG_DB = DB
 		common.SetLogDatabaseType(common.MainDatabaseType())
 		initCol()
-		return
+		if common.IsMasterNode {
+			return waitBillingLogSchemaReady(context.Background(), LOG_DB, 0)
+		}
+		return waitBillingLogSchemaReadyFromEnv()
 	}
 	db, dbType, err := chooseDB("LOG_SQL_DSN", true)
 	if err == nil {
@@ -257,7 +275,7 @@ func InitLogDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
-			return nil
+			return waitBillingLogSchemaReadyFromEnv()
 		}
 		common.SysLog("database migration started")
 		err = migrateLOGDB()
@@ -292,6 +310,16 @@ func migrateDB() error {
 		&Ability{},
 		&Log{},
 		&Midjourney{},
+		&MidjourneyBillingOperation{},
+		&IdentityCacheSync{},
+		&AsyncBillingReservation{},
+		&AsyncBillingAttempt{},
+		&BillingStatsProjection{},
+		&BillingLogProjection{},
+		&BillingLogSinkConflictAudit{},
+		&BillingLogSinkConflictResolution{},
+		&BillingProjectionAdminOperation{},
+		&AsyncBillingManualResolution{},
 		&TopUp{},
 		&AffiliateRewardRecord{},
 		&InviteInitialQuotaRecord{},
@@ -299,6 +327,7 @@ func migrateDB() error {
 		&ReferralCapture{},
 		&QuotaData{},
 		&Task{},
+		&TaskBillingOperation{},
 		&Model{},
 		&Vendor{},
 		&PrefillGroup{},
@@ -309,6 +338,7 @@ func migrateDB() error {
 		&SubscriptionOrder{},
 		&UserSubscription{},
 		&SubscriptionPreConsumeRecord{},
+		&SubscriptionBillingPeriod{},
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
@@ -343,6 +373,9 @@ func migrateDB() error {
 		&RoutingAuditExportChunk{},
 		&RoutingHedgeAttemptAudit{},
 		&RoutingUpstreamAccount{},
+		&RoutingUpstreamAccountHealthState{},
+		&RoutingRuntimeSettingsState{},
+		&RoutingControlAudit{},
 		&RoutingCostSnapshotVersion{},
 		&RoutingChannelBinding{},
 		&RoutingCostSnapshot{},
@@ -350,6 +383,7 @@ func migrateDB() error {
 		&RoutingTelemetryReceipt{},
 		&RoutingBreakerState{},
 		&RoutingChannelHealthState{},
+		&RoutingCredentialHealthState{},
 		&RoutingAgentRecommendation{},
 		&SystemInstance{},
 		&SystemTask{},
@@ -358,6 +392,21 @@ func migrateDB() error {
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := ensureAsyncBillingManualResolutionUniqueIndex(DB); err != nil {
+		return err
+	}
+	if err := waitBillingStatsProjectionSchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := waitBillingLogProjectionSchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := WaitAsyncBillingV2SchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := EnsureChannelRoutingGenerations(DB); err != nil {
 		return err
 	}
 	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
@@ -407,6 +456,16 @@ func migrateDBFast() error {
 		{&Ability{}, "Ability"},
 		{&Log{}, "Log"},
 		{&Midjourney{}, "Midjourney"},
+		{&MidjourneyBillingOperation{}, "MidjourneyBillingOperation"},
+		{&IdentityCacheSync{}, "IdentityCacheSync"},
+		{&AsyncBillingReservation{}, "AsyncBillingReservation"},
+		{&AsyncBillingAttempt{}, "AsyncBillingAttempt"},
+		{&BillingStatsProjection{}, "BillingStatsProjection"},
+		{&BillingLogProjection{}, "BillingLogProjection"},
+		{&BillingLogSinkConflictAudit{}, "BillingLogSinkConflictAudit"},
+		{&BillingLogSinkConflictResolution{}, "BillingLogSinkConflictResolution"},
+		{&BillingProjectionAdminOperation{}, "BillingProjectionAdminOperation"},
+		{&AsyncBillingManualResolution{}, "AsyncBillingManualResolution"},
 		{&TopUp{}, "TopUp"},
 		{&AffiliateRewardRecord{}, "AffiliateRewardRecord"},
 		{&InviteInitialQuotaRecord{}, "InviteInitialQuotaRecord"},
@@ -414,6 +473,7 @@ func migrateDBFast() error {
 		{&ReferralCapture{}, "ReferralCapture"},
 		{&QuotaData{}, "QuotaData"},
 		{&Task{}, "Task"},
+		{&TaskBillingOperation{}, "TaskBillingOperation"},
 		{&Model{}, "Model"},
 		{&Vendor{}, "Vendor"},
 		{&PrefillGroup{}, "PrefillGroup"},
@@ -424,6 +484,7 @@ func migrateDBFast() error {
 		{&SubscriptionOrder{}, "SubscriptionOrder"},
 		{&UserSubscription{}, "UserSubscription"},
 		{&SubscriptionPreConsumeRecord{}, "SubscriptionPreConsumeRecord"},
+		{&SubscriptionBillingPeriod{}, "SubscriptionBillingPeriod"},
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
 		{&PerfMetric{}, "PerfMetric"},
@@ -458,6 +519,9 @@ func migrateDBFast() error {
 		{&RoutingAuditExportChunk{}, "RoutingAuditExportChunk"},
 		{&RoutingHedgeAttemptAudit{}, "RoutingHedgeAttemptAudit"},
 		{&RoutingUpstreamAccount{}, "RoutingUpstreamAccount"},
+		{&RoutingUpstreamAccountHealthState{}, "RoutingUpstreamAccountHealthState"},
+		{&RoutingRuntimeSettingsState{}, "RoutingRuntimeSettingsState"},
+		{&RoutingControlAudit{}, "RoutingControlAudit"},
 		{&RoutingCostSnapshotVersion{}, "RoutingCostSnapshotVersion"},
 		{&RoutingChannelBinding{}, "RoutingChannelBinding"},
 		{&RoutingCostSnapshot{}, "RoutingCostSnapshot"},
@@ -465,6 +529,7 @@ func migrateDBFast() error {
 		{&RoutingTelemetryReceipt{}, "RoutingTelemetryReceipt"},
 		{&RoutingBreakerState{}, "RoutingBreakerState"},
 		{&RoutingChannelHealthState{}, "RoutingChannelHealthState"},
+		{&RoutingCredentialHealthState{}, "RoutingCredentialHealthState"},
 		{&RoutingAgentRecommendation{}, "RoutingAgentRecommendation"},
 		{&SystemInstance{}, "SystemInstance"},
 		{&SystemTask{}, "SystemTask"},
@@ -492,6 +557,21 @@ func migrateDBFast() error {
 		if err != nil {
 			return err
 		}
+	}
+	if err := ensureAsyncBillingManualResolutionUniqueIndex(DB); err != nil {
+		return err
+	}
+	if err := waitBillingStatsProjectionSchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := waitBillingLogProjectionSchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := WaitAsyncBillingV2SchemaReady(context.Background(), DB, 0); err != nil {
+		return err
+	}
+	if err := EnsureChannelRoutingGenerations(DB); err != nil {
+		return err
 	}
 	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
 		return err
@@ -563,7 +643,17 @@ func migrateLOGDB() error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return migrateClickHouseLogDB()
 	}
-	return LOG_DB.AutoMigrate(&Log{})
+	if err := LOG_DB.AutoMigrate(&Log{}); err != nil {
+		return err
+	}
+	ready, err := billingLogSchemaReady(LOG_DB)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return errors.New("billing log schema migration completed without the required unique receipt index")
+	}
+	return nil
 }
 
 func migrateClickHouseLogDB() error {
@@ -571,7 +661,36 @@ func migrateClickHouseLogDB() error {
 	if err := LOG_DB.Exec(clickHouseLogCreateTableSQL(ttlDays)).Error; err != nil {
 		return err
 	}
-	return syncClickHouseLogTTL(ttlDays)
+	for _, statement := range clickHouseBillingLogColumnMigrations() {
+		if err := LOG_DB.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	if err := LOG_DB.Exec(clickHouseVisibleLogsViewSQL()).Error; err != nil {
+		return err
+	}
+	if err := syncClickHouseLogTTL(ttlDays); err != nil {
+		return err
+	}
+	ready, err := billingLogSchemaReady(LOG_DB)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return errors.New("ClickHouse billing log schema migration did not become ready")
+	}
+	return nil
+}
+
+func waitBillingLogSchemaReadyFromEnv() error {
+	waitSeconds := common.GetEnvOrDefault(billingLogSchemaReadyWaitEnv, billingLogSchemaReadyWaitDefault)
+	if waitSeconds < 0 {
+		return fmt.Errorf("%s must be non-negative", billingLogSchemaReadyWaitEnv)
+	}
+	if err := waitBillingLogSchemaReady(context.Background(), LOG_DB, time.Duration(waitSeconds)*time.Second); err != nil {
+		return fmt.Errorf("wait for billing log sink schema: %w", err)
+	}
+	return nil
 }
 
 func clickHouseLogTTLDays() int {
@@ -619,11 +738,49 @@ CREATE TABLE IF NOT EXISTS logs (
 	ip String DEFAULT '',
 	request_id String DEFAULT '',
 	upstream_request_id String DEFAULT '',
+	billing_operation_key Nullable(String) DEFAULT NULL,
+	billing_payload_hash String DEFAULT '',
+	billing_payload_protocol UInt16 DEFAULT 0,
+	billing_sink_written_at Int64 DEFAULT 0,
 	other String DEFAULT ''
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(toDateTime(created_at))
 ORDER BY (created_at, request_id)%s`, clickHouseLogTTLClause(ttlDays))
+}
+
+func clickHouseBillingLogColumnMigrations() []string {
+	return []string{
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS billing_operation_key Nullable(String) DEFAULT NULL AFTER upstream_request_id",
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS billing_payload_hash String DEFAULT '' AFTER billing_operation_key",
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS billing_payload_protocol UInt16 DEFAULT 0 AFTER billing_payload_hash",
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS billing_sink_written_at Int64 DEFAULT 0 AFTER billing_payload_protocol",
+	}
+}
+
+func clickHouseVisibleLogsViewSQL() string {
+	return fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS
+SELECT *
+FROM logs
+WHERE billing_operation_key IS NULL
+UNION ALL
+SELECT *
+FROM
+(
+	SELECT *
+	FROM logs
+	WHERE billing_operation_key IS NOT NULL
+		AND billing_operation_key IN
+		(
+			SELECT billing_operation_key
+			FROM logs
+			WHERE billing_operation_key IS NOT NULL
+			GROUP BY billing_operation_key
+			HAVING uniqExact(tuple(billing_payload_protocol, billing_payload_hash)) = 1
+		)
+	ORDER BY created_at ASC, request_id ASC
+	LIMIT 1 BY billing_operation_key
+)`, clickHouseVisibleLogsView)
 }
 
 func syncClickHouseLogTTL(ttlDays int) error {

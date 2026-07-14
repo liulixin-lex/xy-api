@@ -124,6 +124,8 @@ type TaskAdaptor struct {
 	baseURL     string
 }
 
+var errAliDurationInvalid = errors.New("ali video duration is invalid")
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.ChannelType = info.ChannelType
 	a.baseURL = info.ChannelBaseUrl
@@ -132,7 +134,21 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
 	// ValidateMultipartDirect 负责解析并将原始 TaskSubmitReq 存入 context
-	return relaycommon.ValidateMultipartDirect(c, info)
+	if taskErr := relaycommon.ValidateMultipartDirect(c, info); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := a.convertToAliRequest(info, req); err != nil {
+		code := "invalid_request"
+		if errors.Is(err, errAliDurationInvalid) {
+			code = "invalid_seconds"
+		}
+		return service.TaskErrorWrapperLocal(err, code, http.StatusBadRequest)
+	}
+	return nil
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
@@ -440,6 +456,11 @@ func (a *TaskAdaptor) convertToAliRequest(info *relaycommon.RelayInfo, req relay
 	if err := normalizeWan27I2VInput(aliReq, req); err != nil {
 		return nil, err
 	}
+	if aliReq.Parameters.Duration <= 0 || aliReq.Parameters.Duration > relaycommon.MaxTaskDurationSeconds {
+		return nil, errors.Wrapf(
+			errAliDurationInvalid, "duration must be between 1 and %d", relaycommon.MaxTaskDurationSeconds,
+		)
+	}
 
 	return aliReq, nil
 }
@@ -457,10 +478,8 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		return nil
 	}
 
-	// metadata can override Duration past standard request validation;
-	// cap it because it is used as a billing multiplier.
 	otherRatios := map[string]float64{
-		"seconds": float64(min(aliReq.Parameters.Duration, relaycommon.MaxTaskDurationSeconds)),
+		"seconds": float64(aliReq.Parameters.Duration),
 	}
 	ratios, err := ProcessAliOtherRatios(aliReq)
 	if err != nil {
@@ -479,7 +498,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -489,7 +508,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	// 解析阿里响应
 	var aliResp AliVideoResponse
 	if err := common.Unmarshal(responseBody, &aliResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -597,25 +616,26 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 
 	openAIResp := dto.NewOpenAIVideo()
 	openAIResp.ID = task.TaskID
-	openAIResp.Status = convertAliStatus(aliResp.Output.TaskStatus)
+	openAIResp.Status = task.Status.ToVideoStatus()
 	openAIResp.Model = task.Properties.OriginModelName
 	openAIResp.SetProgressStr(task.Progress)
 	openAIResp.CreatedAt = task.CreatedAt
 	openAIResp.CompletedAt = task.UpdatedAt
 
-	// 设置视频URL（核心字段）
-	openAIResp.SetMetadata("url", aliResp.Output.VideoURL)
+	if resultURL := task.GetResultURL(); resultURL != "" {
+		openAIResp.SetMetadata("url", resultURL)
+	}
 
 	// 错误处理
 	if aliResp.Code != "" {
 		openAIResp.Error = &dto.OpenAIVideoError{
-			Code:    aliResp.Code,
-			Message: aliResp.Message,
+			Code:    common.SanitizeErrorMessage(aliResp.Code),
+			Message: common.SanitizeErrorMessage(aliResp.Message),
 		}
 	} else if aliResp.Output.Code != "" {
 		openAIResp.Error = &dto.OpenAIVideoError{
-			Code:    aliResp.Output.Code,
-			Message: aliResp.Output.Message,
+			Code:    common.SanitizeErrorMessage(aliResp.Output.Code),
+			Message: common.SanitizeErrorMessage(aliResp.Output.Message),
 		}
 	}
 

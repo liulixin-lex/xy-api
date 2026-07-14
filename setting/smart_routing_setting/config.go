@@ -26,6 +26,7 @@ const (
 
 type SmartRoutingSetting struct {
 	Enabled                  bool    `json:"enabled"`
+	RequestProfileV2Enabled  bool    `json:"request_profile_v2_enabled"`
 	Mode                     string  `json:"mode"`
 	WeightAvailability       float64 `json:"weight_availability"`
 	WeightLatency            float64 `json:"weight_latency"`
@@ -84,6 +85,7 @@ type SmartRoutingSetting struct {
 
 var defaultSmartRoutingSetting = SmartRoutingSetting{
 	Enabled:                  false,
+	RequestProfileV2Enabled:  false,
 	Mode:                     ModeObserve,
 	WeightAvailability:       0.45,
 	WeightLatency:            0.25,
@@ -147,12 +149,21 @@ func init() {
 }
 
 func GetSetting() SmartRoutingSetting {
+	setting := GetStoredSetting()
+	applyEnvOverrides(&setting)
+	normalize(&setting)
+	return setting
+}
+
+// GetStoredSetting returns the normalized database/config snapshot before
+// environment overrides. Control-plane ETags are based on this persisted view
+// so a process-local override cannot create false cross-node conflicts.
+func GetStoredSetting() SmartRoutingSetting {
 	setting := defaultSmartRoutingSetting
 	// Snapshot is a shallow copy; SmartRoutingSetting contains scalar fields only.
 	if !config.GlobalConfig.Snapshot(configName, &setting) {
 		setting = defaultSmartRoutingSetting
 	}
-	applyEnvOverrides(&setting)
 	normalize(&setting)
 	return setting
 }
@@ -189,6 +200,11 @@ func applyEnvOverrides(setting *SmartRoutingSetting) {
 	}
 	if value, ok := os.LookupEnv("SMART_ROUTING_MODE"); ok {
 		setting.Mode = value
+	}
+	if value, ok := os.LookupEnv("SMART_ROUTING_REQUEST_PROFILE_V2_ENABLED"); ok {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			setting.RequestProfileV2Enabled = parsed
+		}
 	}
 	if value, ok := os.LookupEnv("SMART_ROUTING_AGENT_ENABLED"); ok {
 		if parsed, err := strconv.ParseBool(value); err == nil {

@@ -28,6 +28,8 @@ const (
 	RequestKindTask             RequestKind = "task"
 	RequestKindMidjourney       RequestKind = "midjourney"
 	RequestKindSuno             RequestKind = "suno"
+	RequestKindGeminiEmbedding  RequestKind = "gemini_embedding"
+	RequestKindGeminiBatchEmbed RequestKind = "gemini_batch_embedding"
 )
 
 type RequestKindMask uint64
@@ -46,6 +48,8 @@ const (
 	RequestKindMaskTask
 	RequestKindMaskMidjourney
 	RequestKindMaskSuno
+	RequestKindMaskGeminiEmbedding
+	RequestKindMaskGeminiBatchEmbed
 
 	requestKindMaskAll = RequestKindMaskChatCompletions |
 		RequestKindMaskResponses |
@@ -59,7 +63,9 @@ const (
 		RequestKindMaskRealtime |
 		RequestKindMaskTask |
 		RequestKindMaskMidjourney |
-		RequestKindMaskSuno
+		RequestKindMaskSuno |
+		RequestKindMaskGeminiEmbedding |
+		RequestKindMaskGeminiBatchEmbed
 )
 
 func (kind RequestKind) Mask() (RequestKindMask, bool) {
@@ -90,6 +96,10 @@ func (kind RequestKind) Mask() (RequestKindMask, bool) {
 		return RequestKindMaskMidjourney, true
 	case RequestKindSuno:
 		return RequestKindMaskSuno, true
+	case RequestKindGeminiEmbedding:
+		return RequestKindMaskGeminiEmbedding, true
+	case RequestKindGeminiBatchEmbed:
+		return RequestKindMaskGeminiBatchEmbed, true
 	default:
 		return 0, false
 	}
@@ -111,6 +121,8 @@ const (
 	RequestSourceFormatTask                      RequestSourceFormat = "task"
 	RequestSourceFormatMidjourney                RequestSourceFormat = "midjourney"
 	RequestSourceFormatSuno                      RequestSourceFormat = "suno"
+	RequestSourceFormatGeminiEmbedding           RequestSourceFormat = "gemini_embedding"
+	RequestSourceFormatGeminiBatchEmbedding      RequestSourceFormat = "gemini_batch_embedding"
 )
 
 func (format RequestSourceFormat) valid() bool {
@@ -127,7 +139,9 @@ func (format RequestSourceFormat) valid() bool {
 		RequestSourceFormatOpenAIRealtime,
 		RequestSourceFormatTask,
 		RequestSourceFormatMidjourney,
-		RequestSourceFormatSuno:
+		RequestSourceFormatSuno,
+		RequestSourceFormatGeminiEmbedding,
+		RequestSourceFormatGeminiBatchEmbedding:
 		return true
 	default:
 		return false
@@ -162,6 +176,10 @@ func requestSourceFormatSupportsKind(format RequestSourceFormat, kind RequestKin
 		return kind == RequestKindMidjourney
 	case RequestSourceFormatSuno:
 		return kind == RequestKindSuno
+	case RequestSourceFormatGeminiEmbedding:
+		return kind == RequestKindGeminiEmbedding
+	case RequestSourceFormatGeminiBatchEmbedding:
+		return kind == RequestKindGeminiBatchEmbed
 	default:
 		return false
 	}

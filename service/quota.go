@@ -280,24 +280,47 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 }
 
 func CalcOpenRouterCacheCreateTokens(usage dto.Usage, priceData types.PriceData) int {
+	// Zero means "do not infer"; callers retain normal prompt-token billing
+	// instead of applying an unsafe derived discount or surcharge.
 	if priceData.CacheCreationRatio == 1 {
+		return 0
+	}
+	cost, ok := usage.Cost.(float64)
+	if !ok || cost <= 0 || math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return 0
+	}
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 ||
+		usage.PromptTokensDetails.CachedTokens < 0 || usage.PromptTokensDetails.CachedTokens > usage.PromptTokens {
+		return 0
+	}
+	if common.QuotaPerUnit <= 0 || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) ||
+		priceData.ModelRatio <= 0 || math.IsNaN(priceData.ModelRatio) || math.IsInf(priceData.ModelRatio, 0) ||
+		priceData.CacheRatio < 0 || math.IsNaN(priceData.CacheRatio) || math.IsInf(priceData.CacheRatio, 0) ||
+		priceData.CompletionRatio < 0 || math.IsNaN(priceData.CompletionRatio) || math.IsInf(priceData.CompletionRatio, 0) ||
+		priceData.CacheCreationRatio <= 0 || math.IsNaN(priceData.CacheCreationRatio) || math.IsInf(priceData.CacheCreationRatio, 0) {
 		return 0
 	}
 	quotaPrice := priceData.ModelRatio / common.QuotaPerUnit
 	promptCacheCreatePrice := quotaPrice * priceData.CacheCreationRatio
 	promptCacheReadPrice := quotaPrice * priceData.CacheRatio
 	completionPrice := quotaPrice * priceData.CompletionRatio
-
-	cost, _ := usage.Cost.(float64)
+	denominator := promptCacheCreatePrice - quotaPrice
+	if denominator == 0 || math.IsNaN(denominator) || math.IsInf(denominator, 0) {
+		return 0
+	}
 	totalPromptTokens := float64(usage.PromptTokens)
 	completionTokens := float64(usage.CompletionTokens)
 	promptCacheReadTokens := float64(usage.PromptTokensDetails.CachedTokens)
-
-	return int(math.Round((cost -
+	estimatedTokens := (cost -
 		totalPromptTokens*quotaPrice +
 		promptCacheReadTokens*(quotaPrice-promptCacheReadPrice) -
 		completionTokens*completionPrice) /
-		(promptCacheCreatePrice - quotaPrice)))
+		denominator
+	if estimatedTokens <= 0 || math.IsNaN(estimatedTokens) || math.IsInf(estimatedTokens, 0) ||
+		estimatedTokens > totalPromptTokens || estimatedTokens > float64(common.MaxQuota) {
+		return 0
+	}
+	return common.QuotaRound(estimatedTokens)
 }
 
 func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent string) {
@@ -407,8 +430,11 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 }
 
 func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
-	if quota < 0 {
-		return errors.New("quota 不能为负数！")
+	if relayInfo == nil {
+		return errors.New("relayInfo is nil")
+	}
+	if quota < 0 || quota > common.MaxQuota {
+		return errors.New("quota is outside the supported range")
 	}
 	if relayInfo.IsPlayground {
 		return nil
@@ -423,17 +449,27 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	if !relayInfo.TokenUnlimited && token.RemainQuota < quota {
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
 	}
-	err = model.DecreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota)
+	err = model.PreConsumeTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota)
 	if err != nil {
+		if errors.Is(err, model.ErrTokenQuotaInsufficient) {
+			return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s: %w",
+				logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota), err)
+		}
 		return err
 	}
 	return nil
 }
 
 func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (err error) {
+	if relayInfo == nil {
+		return errors.New("relayInfo is nil")
+	}
+	if quota < -common.MaxQuota || quota > common.MaxQuota || preConsumedQuota < 0 || preConsumedQuota > common.MaxQuota {
+		return errors.New("quota is outside the supported range")
+	}
 
 	// 1) Consume from wallet quota OR subscription item
-	if relayInfo != nil && relayInfo.BillingSource == BillingSourceSubscription {
+	if relayInfo.BillingSource == BillingSourceSubscription {
 		if relayInfo.SubscriptionId == 0 {
 			return errors.New("subscription id is missing")
 		}
@@ -448,8 +484,8 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 		// Wallet
 		if quota > 0 {
 			err = model.DecreaseUserQuota(relayInfo.UserId, quota, false)
-		} else {
-			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)
+		} else if quota < 0 {
+			err = model.RefundUserQuota(relayInfo.UserId, -quota)
 		}
 		if err != nil {
 			return err
@@ -459,8 +495,8 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 	if !relayInfo.IsPlayground {
 		if quota > 0 {
 			err = model.DecreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota)
-		} else {
-			err = model.IncreaseTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, -quota)
+		} else if quota < 0 {
+			err = model.RefundTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, -quota)
 		}
 		if err != nil {
 			return err

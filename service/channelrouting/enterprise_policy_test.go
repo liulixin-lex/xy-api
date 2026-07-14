@@ -147,7 +147,7 @@ func TestEnterpriseStrictCapacityCompilesSharedAccountFairShares(t *testing.T) {
 
 	runtime := currentSnapshot.Load()
 	require.NotNil(t, runtime)
-	planKey := memberModelKey{memberID: 11, model: clientModel}
+	planKey := strictCapacityPlanKey{memberID: 11, credentialID: 1_001, model: clientModel}
 	plan := runtime.strictCapacityPlans[planKey]
 	plan.Limit.CostNanoUSD = 1_000
 	runtime.strictCapacityPlans[planKey] = plan
@@ -245,7 +245,7 @@ func TestEnterpriseStrictCapacityCompilesPartialGuaranteesDeterministically(t *t
 	session, err := NewRequestRoutingSession("partial-guarantee", "explicit")
 	require.NoError(t, err)
 	request, strict, err := session.StrictCapacityRequest(
-		Identity{SnapshotRevision: 12, PoolID: 1, MemberID: 11}, "gpt-test", "upstream-gpt",
+		Identity{SnapshotRevision: 12, PoolID: 1, MemberID: 11, CredentialID: 1_001}, "gpt-test", "upstream-gpt",
 		CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown, Tokens: 1},
 		CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown, Tokens: 1},
 		0, false,
@@ -256,6 +256,15 @@ func TestEnterpriseStrictCapacityCompilesPartialGuaranteesDeterministically(t *t
 		{PoolID: 1, GuaranteedBasisPoints: 6_000, MaximumBasisPoints: 10_000},
 		{PoolID: 2, GuaranteedBasisPoints: 4_000, MaximumBasisPoints: 10_000},
 	}, request.PoolShares)
+
+	_, strict, err = session.StrictCapacityRequest(
+		Identity{SnapshotRevision: 12, PoolID: 1, MemberID: 11}, "gpt-test", "upstream-gpt",
+		CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown, Tokens: 1},
+		CapacityDimensionEstimate{State: CapacityDimensionBoundedKnown, Tokens: 1},
+		0, false,
+	)
+	require.True(t, strict)
+	assert.ErrorIs(t, err, ErrEnterpriseCapacityIdentity)
 
 	overcommitted := defaulted
 	overcommitted.Capacity.GuaranteedBasisPoints = 5_000

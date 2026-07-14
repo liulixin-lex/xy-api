@@ -62,13 +62,17 @@ func ReplayChannelRoutingDecision(c *gin.Context) {
 		return
 	}
 	if audit.AlgorithmVersion != channelrouting.DecisionAlgorithmShadowV1 &&
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmShadowV2 &&
 		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmCanaryV1 &&
-		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmBalancedV1 {
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmCanaryV2 &&
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmBalancedV1 &&
+		audit.AlgorithmVersion != channelrouting.DecisionAlgorithmBalancedV2 {
 		writeChannelRoutingReplayError(c, http.StatusUnprocessableEntity, "replay_algorithm_unsupported", "channel routing replay algorithm is not supported")
 		return
 	}
 
-	if audit.AlgorithmVersion == channelrouting.DecisionAlgorithmBalancedV1 {
+	if audit.AlgorithmVersion == channelrouting.DecisionAlgorithmBalancedV1 ||
+		audit.AlgorithmVersion == channelrouting.DecisionAlgorithmBalancedV2 {
 		result, err := channelrouting.ReplayBalancedDecisionAudit(audit)
 		if err != nil {
 			if errors.Is(err, channelrouting.ErrBalancedReplayHash) || errors.Is(err, channelrouting.ErrBalancedReplayInvalid) {
@@ -118,8 +122,9 @@ func ReplayChannelRoutingDecision(c *gin.Context) {
 		ReplayedChannelID: result.SelectedChannelID,
 		DifferenceType:    channelrouting.ClassifyShadowDifference(audit.ActualChannelID, result),
 		AuditVerified:     true,
-		GateVerified:      audit.AlgorithmVersion == channelrouting.DecisionAlgorithmCanaryV1,
-		Result:            result,
+		GateVerified: audit.AlgorithmVersion == channelrouting.DecisionAlgorithmCanaryV1 ||
+			audit.AlgorithmVersion == channelrouting.DecisionAlgorithmCanaryV2,
+		Result: result,
 	})
 }
 

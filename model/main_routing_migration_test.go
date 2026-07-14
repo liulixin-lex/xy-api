@@ -84,3 +84,61 @@ func TestRoutingV2SchemaVersionGateRequiresExactMarkerAndPhysicalSchema(t *testi
 	assert.False(t, ready)
 	assert.ErrorIs(t, waitRoutingV2SchemaReady(db), ErrRoutingV2SchemaNotReady)
 }
+
+func TestMigrateDBPathsRegisterDurableTaskBillingOperations(t *testing.T) {
+	tests := []struct {
+		name    string
+		migrate func() error
+	}{
+		{name: "serial", migrate: migrateDB},
+		{name: "fast", migrate: migrateDBFast},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openRoutingSQLiteTestDB(t)
+			withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+			t.Setenv(routingV2AlphaDrainedEnv, "true")
+			require.NoError(t, db.AutoMigrate(&AsyncBillingManualResolution{}))
+			require.NoError(t, db.Migrator().DropIndex(
+				&AsyncBillingManualResolution{}, asyncBillingManualResolutionUniqueIndex,
+			))
+			require.NoError(t, db.Migrator().CreateIndex(
+				&legacyAsyncBillingManualResolutionIndex{}, asyncBillingManualResolutionUniqueIndex,
+			))
+
+			require.NoError(t, test.migrate())
+			require.NoError(t, test.migrate(), "migration must remain idempotent across restarts")
+
+			assert.True(t, db.Migrator().HasTable(&TaskBillingOperation{}))
+			assert.True(t, db.Migrator().HasIndex(&TaskBillingOperation{}, "uidx_task_billing_operation_task"))
+			assert.True(t, db.Migrator().HasIndex(&TaskBillingOperation{}, "uidx_task_billing_operation_key"))
+			assert.True(t, db.Migrator().HasIndex(&TaskBillingOperation{}, "idx_task_billing_pending"))
+			assert.True(t, db.Migrator().HasIndex(&TaskBillingOperation{}, "idx_task_billing_lease"))
+			assert.True(t, db.Migrator().HasIndex(&TaskBillingOperation{}, "idx_task_billing_log_pending"))
+
+			assert.True(t, db.Migrator().HasTable(&MidjourneyBillingOperation{}))
+			assert.True(t, db.Migrator().HasIndex(&MidjourneyBillingOperation{}, "uidx_midjourney_billing_operation_task"))
+			assert.True(t, db.Migrator().HasIndex(&MidjourneyBillingOperation{}, "uidx_midjourney_billing_operation_key"))
+			assert.True(t, db.Migrator().HasIndex(&MidjourneyBillingOperation{}, "idx_midjourney_billing_pending"))
+			assert.True(t, db.Migrator().HasIndex(&MidjourneyBillingOperation{}, "idx_midjourney_billing_lease"))
+			assert.True(t, db.Migrator().HasIndex(&MidjourneyBillingOperation{}, "idx_midjourney_billing_log_pending"))
+			assert.True(t, db.Migrator().HasTable(&IdentityCacheSync{}))
+			assert.True(t, db.Migrator().HasIndex(&IdentityCacheSync{}, "idx_identity_cache_sync_pending"))
+			assert.True(t, db.Migrator().HasIndex(&IdentityCacheSync{}, "idx_identity_cache_sync_live_pending"))
+
+			ready, err := RoutingV2SchemaReady(db)
+			require.NoError(t, err)
+			assert.True(t, ready)
+			asyncBillingReady, err := AsyncBillingV2SchemaReady(db)
+			require.NoError(t, err)
+			assert.True(t, asyncBillingReady)
+			manualIndexReady, err := asyncBillingUniqueIndexReady(
+				db, "async_billing_manual_resolutions", asyncBillingManualResolutionUniqueIndex,
+				[]string{"reservation_id", "expected_version"},
+			)
+			require.NoError(t, err)
+			assert.True(t, manualIndexReady)
+		})
+	}
+}

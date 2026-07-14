@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -17,8 +20,9 @@ const (
 	RoutingUpstreamTypeNewAPI  = "newapi"
 	RoutingUpstreamTypeSub2API = "sub2api"
 
-	RoutingCredentialKeyVersion = 1
-	RoutingMetricSingleKeyIndex = -1
+	RoutingCredentialLegacyKeyVersion = 1
+	RoutingCredentialKeyVersion       = 2
+	RoutingMetricSingleKeyIndex       = -1
 
 	RoutingCostConfidenceFull      = "full"
 	RoutingCostConfidenceGroupOnly = "group_only"
@@ -45,6 +49,46 @@ type RoutingCredentials struct {
 	Sub2APIEmail      string `json:"-"`
 	Sub2APIPassword   string `json:"-"`
 	Sub2APIToken      string `json:"-"`
+	CustomCAPEM       string `json:"-"`
+}
+
+func (credentials RoutingCredentials) ForUpstream(upstreamType string) RoutingCredentials {
+	credentials.NewAPIAccessToken = strings.TrimSpace(credentials.NewAPIAccessToken)
+	credentials.GatewayAPIKey = strings.TrimSpace(credentials.GatewayAPIKey)
+	credentials.Sub2APIEmail = strings.TrimSpace(credentials.Sub2APIEmail)
+	credentials.Sub2APIToken = strings.TrimSpace(credentials.Sub2APIToken)
+	credentials.CustomCAPEM = strings.TrimSpace(credentials.CustomCAPEM)
+	switch strings.ToLower(strings.TrimSpace(upstreamType)) {
+	case RoutingUpstreamTypeNewAPI:
+		credentials.Sub2APIEmail = ""
+		credentials.Sub2APIPassword = ""
+		credentials.Sub2APIToken = ""
+	case RoutingUpstreamTypeSub2API:
+		credentials.NewAPIAccessToken = ""
+	}
+	return credentials
+}
+
+func (credentials RoutingCredentials) Empty() bool {
+	return strings.TrimSpace(credentials.NewAPIAccessToken) == "" &&
+		strings.TrimSpace(credentials.GatewayAPIKey) == "" &&
+		strings.TrimSpace(credentials.Sub2APIEmail) == "" &&
+		credentials.Sub2APIPassword == "" &&
+		strings.TrimSpace(credentials.Sub2APIToken) == "" &&
+		strings.TrimSpace(credentials.CustomCAPEM) == ""
+}
+
+func (credentials RoutingCredentials) ReadyForUpstream(upstreamType string) bool {
+	credentials = credentials.ForUpstream(upstreamType)
+	switch strings.ToLower(strings.TrimSpace(upstreamType)) {
+	case RoutingUpstreamTypeNewAPI:
+		return credentials.NewAPIAccessToken != "" || credentials.GatewayAPIKey != ""
+	case RoutingUpstreamTypeSub2API:
+		return credentials.Sub2APIToken != "" || credentials.GatewayAPIKey != "" ||
+			(credentials.Sub2APIEmail != "" && credentials.Sub2APIPassword != "")
+	default:
+		return false
+	}
 }
 
 type routingCredentialsEnvelope struct {
@@ -53,6 +97,11 @@ type routingCredentialsEnvelope struct {
 	Sub2APIEmail      string `json:"sub2api_email,omitempty"`
 	Sub2APIPassword   string `json:"sub2api_password,omitempty"`
 	Sub2APIToken      string `json:"sub2api_token,omitempty"`
+	CustomCAPEM       string `json:"custom_ca_pem,omitempty"`
+}
+
+type routingCostEgressPolicyEnvelope struct {
+	AllowedPrivateCIDRs []string `json:"allowed_private_cidrs,omitempty"`
 }
 
 type RoutingChannelBinding struct {
@@ -62,6 +111,7 @@ type RoutingChannelBinding struct {
 	BaseURL          string  `json:"base_url" gorm:"type:varchar(512);not null"`
 	UpstreamGroup    string  `json:"upstream_group" gorm:"type:varchar(128);not null"`
 	ServesClaudeCode bool    `json:"serves_claude_code"`
+	EgressPolicyJSON *string `json:"-" gorm:"type:text"`
 	EncCredentials   *string `json:"-" gorm:"type:text"`
 	KeyVersion       int     `json:"key_version"`
 	NewAPIUserID     *int    `json:"new_api_user_id"`
@@ -71,6 +121,23 @@ type RoutingChannelBinding struct {
 	LastSyncError    *string `json:"last_sync_error" gorm:"type:text"`
 	CreatedTime      int64   `json:"created_time" gorm:"bigint"`
 	UpdatedTime      int64   `json:"updated_time" gorm:"bigint"`
+}
+
+type RoutingChannelBindingFilter struct {
+	Search       string
+	UpstreamType string
+	Enabled      *bool
+	ChannelID    *int
+}
+
+type RoutingChannelStateFence struct {
+	ChannelID   int
+	Generation  string
+	CreatedTime int64
+}
+
+func (fence RoutingChannelStateFence) Valid() bool {
+	return fence.ChannelID > 0 && fence.Generation != ""
 }
 
 func (RoutingChannelBinding) TableName() string {
@@ -94,8 +161,11 @@ func (binding *RoutingChannelBinding) BeforeUpdate(_ *gorm.DB) error {
 }
 
 func (binding *RoutingChannelBinding) SetCredentials(credentials RoutingCredentials) error {
-	if !common.CryptoSecretIsPersistent() {
-		return ErrCredentialSecretUnstable
+	credentials = credentials.ForUpstream(binding.UpstreamType)
+	if credentials.Empty() {
+		binding.EncCredentials = nil
+		binding.KeyVersion = 0
+		return nil
 	}
 	data, err := common.Marshal(routingCredentialsEnvelope{
 		NewAPIAccessToken: credentials.NewAPIAccessToken,
@@ -103,41 +173,118 @@ func (binding *RoutingChannelBinding) SetCredentials(credentials RoutingCredenti
 		Sub2APIEmail:      credentials.Sub2APIEmail,
 		Sub2APIPassword:   credentials.Sub2APIPassword,
 		Sub2APIToken:      credentials.Sub2APIToken,
+		CustomCAPEM:       credentials.CustomCAPEM,
 	})
 	if err != nil {
 		return err
 	}
-	encrypted, err := common.EncryptAESGCMString(string(data))
+	encrypted, keyVersion, err := encryptRoutingCredentials(binding.ChannelID, data)
 	if err != nil {
 		return err
 	}
 	binding.EncCredentials = &encrypted
-	binding.KeyVersion = RoutingCredentialKeyVersion
+	binding.KeyVersion = keyVersion
 	return nil
 }
 
 func (binding *RoutingChannelBinding) GetCredentials() (RoutingCredentials, error) {
-	if binding.EncCredentials == nil || *binding.EncCredentials == "" {
-		return RoutingCredentials{}, nil
+	credentials, _, err := binding.GetCredentialsWithState()
+	return credentials, err
+}
+
+func (binding *RoutingChannelBinding) SetEgressAllowedPrivateCIDRs(values []string) error {
+	if len(values) == 0 {
+		binding.EgressPolicyJSON = nil
+		return nil
 	}
-	if binding.KeyVersion != RoutingCredentialKeyVersion {
-		return RoutingCredentials{}, ErrCredentialKeyMismatch
-	}
-	plaintext, err := common.DecryptAESGCMString(*binding.EncCredentials)
+	data, err := common.Marshal(routingCostEgressPolicyEnvelope{AllowedPrivateCIDRs: values})
 	if err != nil {
-		return RoutingCredentials{}, fmt.Errorf("%w: %v", ErrCredentialKeyMismatch, err)
+		return err
 	}
-	var envelope routingCredentialsEnvelope
-	if err = common.UnmarshalJsonStr(plaintext, &envelope); err != nil {
-		return RoutingCredentials{}, fmt.Errorf("%w: %v", ErrCredentialKeyMismatch, err)
+	encoded := string(data)
+	binding.EgressPolicyJSON = &encoded
+	return nil
+}
+
+func (binding RoutingChannelBinding) GetEgressAllowedPrivateCIDRs() ([]string, error) {
+	if binding.EgressPolicyJSON == nil || strings.TrimSpace(*binding.EgressPolicyJSON) == "" {
+		return nil, nil
 	}
-	return RoutingCredentials{
-		NewAPIAccessToken: envelope.NewAPIAccessToken,
-		GatewayAPIKey:     envelope.GatewayAPIKey,
-		Sub2APIEmail:      envelope.Sub2APIEmail,
-		Sub2APIPassword:   envelope.Sub2APIPassword,
-		Sub2APIToken:      envelope.Sub2APIToken,
-	}, nil
+	var envelope routingCostEgressPolicyEnvelope
+	if err := common.UnmarshalJsonStr(*binding.EgressPolicyJSON, &envelope); err != nil {
+		return nil, err
+	}
+	return append([]string(nil), envelope.AllowedPrivateCIDRs...), nil
+}
+
+func GetRoutingChannelBindingContext(ctx context.Context, channelID int) (RoutingChannelBinding, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if channelID <= 0 {
+		return RoutingChannelBinding{}, gorm.ErrRecordNotFound
+	}
+	var binding RoutingChannelBinding
+	err := DB.WithContext(ctx).Where("channel_id = ?", channelID).First(&binding).Error
+	return binding, err
+}
+
+func ListRoutingChannelBindingsContext(
+	ctx context.Context,
+	filter RoutingChannelBindingFilter,
+	offset int,
+	limit int,
+) ([]RoutingChannelBinding, int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if offset < 0 || limit < 1 || limit > 100 {
+		return nil, 0, ErrRoutingBindingChanged
+	}
+	query := DB.WithContext(ctx).Model(&RoutingChannelBinding{}).
+		Joins("LEFT JOIN channels ON channels.id = routing_channel_bindings.channel_id")
+	if filter.ChannelID != nil {
+		query = query.Where("routing_channel_bindings.channel_id = ?", *filter.ChannelID)
+	}
+	if filter.UpstreamType != "" {
+		query = query.Where("routing_channel_bindings.upstream_type = ?", filter.UpstreamType)
+	}
+	if filter.Enabled != nil {
+		query = query.Where("routing_channel_bindings.enabled = ?", *filter.Enabled)
+	}
+	search := strings.TrimSpace(filter.Search)
+	if search != "" {
+		replacer := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
+		pattern := "%" + replacer.Replace(search) + "%"
+		searchQuery := query.Where(
+			"(routing_channel_bindings.base_url LIKE ? ESCAPE '!' OR routing_channel_bindings.upstream_group LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
+			pattern, pattern, pattern,
+		)
+		if channelID, err := strconv.Atoi(search); err == nil && channelID > 0 {
+			searchQuery = query.Where(
+				"(routing_channel_bindings.channel_id = ? OR routing_channel_bindings.base_url LIKE ? ESCAPE '!' OR routing_channel_bindings.upstream_group LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
+				channelID, pattern, pattern, pattern,
+			)
+		}
+		query = searchQuery
+	}
+
+	var total int64
+	if err := query.Distinct("routing_channel_bindings.id").Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	capacity := limit
+	if total < int64(capacity) {
+		capacity = int(total)
+	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	bindings := make([]RoutingChannelBinding, 0, capacity)
+	err := query.Select("routing_channel_bindings.*").
+		Order("routing_channel_bindings.channel_id asc").
+		Offset(offset).Limit(limit).Find(&bindings).Error
+	return bindings, total, err
 }
 
 type RoutingCostSnapshot struct {
@@ -309,9 +456,31 @@ func UpdateRoutingCostSyncFailureContext(
 }
 
 func UpdateRoutingChannelBindingAndInvalidateCostContext(ctx context.Context, expected RoutingChannelBinding, updated *RoutingChannelBinding) error {
+	return updateRoutingChannelBindingAndInvalidateCostContext(ctx, expected, updated, 0, false)
+}
+
+func UpdateRoutingChannelBindingAndInvalidateCostWithAuditContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	updated *RoutingChannelBinding,
+	actorID int,
+) error {
+	return updateRoutingChannelBindingAndInvalidateCostContext(ctx, expected, updated, actorID, true)
+}
+
+func updateRoutingChannelBindingAndInvalidateCostContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	updated *RoutingChannelBinding,
+	actorID int,
+	audit bool,
+) error {
 	if updated == nil || expected.ID <= 0 || expected.ChannelID <= 0 ||
-		updated.ID != expected.ID || updated.ChannelID != expected.ChannelID {
+		updated.ID != expected.ID || updated.ChannelID != expected.ChannelID || audit && actorID <= 0 {
 		return ErrRoutingBindingChanged
+	}
+	if err := prepareRoutingCredentialReencryptionForBindingUpdate(expected, updated); err != nil {
+		return err
 	}
 	updated.UpdatedTime = nextRoutingBindingUpdatedTime(expected.UpdatedTime)
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -320,6 +489,7 @@ func UpdateRoutingChannelBindingAndInvalidateCostContext(ctx context.Context, ex
 			"base_url":           updated.BaseURL,
 			"upstream_group":     updated.UpstreamGroup,
 			"serves_claude_code": updated.ServesClaudeCode,
+			"egress_policy_json": updated.EgressPolicyJSON,
 			"enc_credentials":    updated.EncCredentials,
 			"key_version":        updated.KeyVersion,
 			"new_api_user_id":    updated.NewAPIUserID,
@@ -338,13 +508,92 @@ func UpdateRoutingChannelBindingAndInvalidateCostContext(ctx context.Context, ex
 		if err := tx.Where("channel_id = ?", updated.ChannelID).Delete(&RoutingCostSnapshot{}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&RoutingChannelHealthState{}).
+		if err := tx.Model(&RoutingChannelHealthState{}).
 			Where("channel_id = ?", updated.ChannelID).
 			Updates(map[string]any{
 				"balance_known":        false,
 				"balance":              0,
 				"balance_updated_time": 0,
-			}).Error
+			}).Error; err != nil {
+			return err
+		}
+		if !audit {
+			return nil
+		}
+		beforeHash, err := RoutingChannelBindingStateHash(expected)
+		if err != nil {
+			return err
+		}
+		afterHash, err := RoutingChannelBindingStateHash(*updated)
+		if err != nil {
+			return err
+		}
+		return insertRoutingControlAuditTx(tx, RoutingControlAudit{
+			SubjectType: RoutingControlSubjectCostBinding, SubjectID: int64(updated.ChannelID),
+			Action: RoutingControlActionUpdate, ActorID: actorID,
+			BeforeHash: beforeHash, AfterHash: afterHash,
+			SummaryJSON: routingCostBindingAuditSummary(*updated, &expected), CreatedTimeMs: time.Now().UnixMilli(),
+		})
+	})
+}
+
+func DeleteRoutingChannelBindingAndInvalidateCostContext(ctx context.Context, expected RoutingChannelBinding) error {
+	return deleteRoutingChannelBindingAndInvalidateCostContext(ctx, expected, 0, false)
+}
+
+func DeleteRoutingChannelBindingAndInvalidateCostWithAuditContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	actorID int,
+) error {
+	return deleteRoutingChannelBindingAndInvalidateCostContext(ctx, expected, actorID, true)
+}
+
+func deleteRoutingChannelBindingAndInvalidateCostContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	actorID int,
+	audit bool,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if expected.ID <= 0 || expected.ChannelID <= 0 || audit && actorID <= 0 {
+		return ErrRoutingBindingChanged
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		deleted := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).
+			Delete(&RoutingChannelBinding{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		if deleted.RowsAffected != 1 {
+			return ErrRoutingBindingChanged
+		}
+		if err := tx.Where("channel_id = ?", expected.ChannelID).Delete(&RoutingCostSnapshot{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&RoutingChannelHealthState{}).
+			Where("channel_id = ?", expected.ChannelID).
+			Updates(map[string]any{
+				"balance_known":        false,
+				"balance":              0,
+				"balance_updated_time": 0,
+			}).Error; err != nil {
+			return err
+		}
+		if !audit {
+			return nil
+		}
+		beforeHash, err := RoutingChannelBindingStateHash(expected)
+		if err != nil {
+			return err
+		}
+		return insertRoutingControlAuditTx(tx, RoutingControlAudit{
+			SubjectType: RoutingControlSubjectCostBinding, SubjectID: int64(expected.ChannelID),
+			Action: RoutingControlActionDelete, ActorID: actorID, BeforeHash: beforeHash,
+			SummaryJSON: routingCostBindingAuditSummary(expected, &expected), CreatedTimeMs: time.Now().UnixMilli(),
+		})
 	})
 }
 
@@ -371,6 +620,11 @@ func routingBindingSyncSourceQuery(query *gorm.DB, expected RoutingChannelBindin
 		query = query.Where("enc_credentials IS NULL")
 	} else {
 		query = query.Where("enc_credentials = ?", *expected.EncCredentials)
+	}
+	if expected.EgressPolicyJSON == nil {
+		query = query.Where("egress_policy_json IS NULL")
+	} else {
+		query = query.Where("egress_policy_json = ?", *expected.EgressPolicyJSON)
 	}
 	if expected.NewAPIUserID == nil {
 		return query.Where("new_api_user_id IS NULL")
@@ -403,10 +657,14 @@ func routingBindingSyncSourceEqual(current RoutingChannelBinding, expected Routi
 		return false
 	}
 	if (current.EncCredentials == nil) != (expected.EncCredentials == nil) ||
+		(current.EgressPolicyJSON == nil) != (expected.EgressPolicyJSON == nil) ||
 		(current.NewAPIUserID == nil) != (expected.NewAPIUserID == nil) {
 		return false
 	}
 	if current.EncCredentials != nil && *current.EncCredentials != *expected.EncCredentials {
+		return false
+	}
+	if current.EgressPolicyJSON != nil && *current.EgressPolicyJSON != *expected.EgressPolicyJSON {
 		return false
 	}
 	return current.NewAPIUserID == nil || *current.NewAPIUserID == *expected.NewAPIUserID
@@ -494,6 +752,26 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricForBi
 		)
 	}
 	return withRoutingBindingStateWrite(ctx, metric.ChannelID, expectedBindingID, metric.BucketTs, func(tx *gorm.DB) error {
+		return eligibility.upsertRoutingChannelMetric(tx, metric)
+	})
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricForChannelContext(
+	ctx context.Context,
+	metric *RoutingChannelMetric,
+	expectedFence RoutingChannelStateFence,
+) (RoutingChannelStateFence, bool, error) {
+	if metric == nil || metric.RequestCount == 0 || !eligibility.Supported() {
+		return RoutingChannelStateFence{}, false, nil
+	}
+	if metric.ChannelID != eligibility.channelID || metric.APIKeyIndex != eligibility.apiKeyIndex {
+		return RoutingChannelStateFence{}, false, fmt.Errorf("%w: eligibility=(%d,%d) metric=(%d,%d)",
+			ErrLegacyRoutingStateEligibilityMismatch,
+			eligibility.channelID, eligibility.apiKeyIndex,
+			metric.ChannelID, metric.APIKeyIndex,
+		)
+	}
+	return withRoutingChannelStateWrite(ctx, metric.ChannelID, expectedFence, metric.BucketTs, func(tx *gorm.DB) error {
 		return eligibility.upsertRoutingChannelMetric(tx, metric)
 	})
 }
@@ -623,6 +901,26 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateForBin
 		)
 	}
 	return withRoutingBindingStateWrite(ctx, state.ChannelID, expectedBindingID, state.UpdatedTime, func(tx *gorm.DB) error {
+		return eligibility.upsertRoutingBreakerState(tx, state)
+	})
+}
+
+func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateForChannelContext(
+	ctx context.Context,
+	state *RoutingBreakerState,
+	expectedFence RoutingChannelStateFence,
+) (RoutingChannelStateFence, bool, error) {
+	if state == nil || state.ChannelID <= 0 || state.ModelName == "" || state.Group == "" || !eligibility.Supported() {
+		return RoutingChannelStateFence{}, false, nil
+	}
+	if state.ChannelID != eligibility.channelID || state.APIKeyIndex != eligibility.apiKeyIndex {
+		return RoutingChannelStateFence{}, false, fmt.Errorf("%w: eligibility=(%d,%d) breaker=(%d,%d)",
+			ErrLegacyRoutingStateEligibilityMismatch,
+			eligibility.channelID, eligibility.apiKeyIndex,
+			state.ChannelID, state.APIKeyIndex,
+		)
+	}
+	return withRoutingChannelStateWrite(ctx, state.ChannelID, expectedFence, state.UpdatedTime, func(tx *gorm.DB) error {
 		return eligibility.upsertRoutingBreakerState(tx, state)
 	})
 }
@@ -765,6 +1063,69 @@ func withRoutingBindingStateWrite(ctx context.Context, channelID int, expectedBi
 	return bindingID, stateAccepted, err
 }
 
+func withRoutingChannelStateWrite(
+	ctx context.Context,
+	channelID int,
+	expectedFence RoutingChannelStateFence,
+	stateUpdatedTime int64,
+	write func(*gorm.DB) error,
+) (RoutingChannelStateFence, bool, error) {
+	if channelID <= 0 || write == nil {
+		return RoutingChannelStateFence{}, false, nil
+	}
+	fence := RoutingChannelStateFence{}
+	stateAccepted := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		query := tx.Select("id", "routing_generation", "created_time").Where("id = ?", channelID)
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&channel).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		fence = RoutingChannelStateFence{
+			ChannelID: channel.Id, Generation: channel.RoutingGeneration, CreatedTime: channel.CreatedTime,
+		}
+		if !fence.Valid() {
+			return nil
+		}
+		if expectedFence.Valid() && expectedFence != fence {
+			return nil
+		}
+		if channel.CreatedTime > 0 && stateUpdatedTime <= channel.CreatedTime {
+			return nil
+		}
+		if err := write(tx); err != nil {
+			return err
+		}
+		stateAccepted = true
+		return nil
+	})
+	return fence, stateAccepted, err
+}
+
+func RoutingChannelStateFenceMatchesContext(ctx context.Context, fence RoutingChannelStateFence) (bool, error) {
+	if !fence.Valid() {
+		return false, nil
+	}
+	var channel Channel
+	err := DB.WithContext(ctx).Select("id", "routing_generation", "created_time").
+		Where("id = ?", fence.ChannelID).First(&channel).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return channel.Id == fence.ChannelID &&
+		channel.RoutingGeneration == fence.Generation &&
+		channel.CreatedTime == fence.CreatedTime, nil
+}
+
 func RoutingChannelBindingMatchesContext(ctx context.Context, channelID int, bindingID int) (bool, error) {
 	if channelID <= 0 || bindingID <= 0 {
 		return false, nil
@@ -867,7 +1228,7 @@ func ApplyRoutingChannelProbeAuthStateContext(
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var channel Channel
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id", "key", "status", "channel_info").Where("id = ?", channelID).First(&channel).Error; err != nil {
+			Select("id", "routing_generation", "key", "status", "channel_info").Where("id = ?", channelID).First(&channel).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
@@ -885,7 +1246,7 @@ func ApplyRoutingChannelProbeAuthStateContext(
 			}
 			return err
 		}
-		fingerprint, err := RoutingCredentialFingerprint(channelID, channel.Key)
+		fingerprint, err := RoutingCredentialFingerprint(channelID, channel.RoutingGeneration, channel.Key)
 		if err != nil {
 			return err
 		}

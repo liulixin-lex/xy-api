@@ -24,6 +24,7 @@ import (
 
 type wssResponseAdaptor struct {
 	channel.Adaptor
+	requestErr  error
 	usage       any
 	responseErr *types.NewAPIError
 }
@@ -31,11 +32,26 @@ type wssResponseAdaptor struct {
 func (a *wssResponseAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *wssResponseAdaptor) DoRequest(_ *gin.Context, _ *relaycommon.RelayInfo, _ io.Reader) (any, error) {
-	return nil, nil
+	return nil, a.requestErr
 }
 
 func (a *wssResponseAdaptor) DoResponse(_ *gin.Context, _ *http.Response, _ *relaycommon.RelayInfo) (any, *types.NewAPIError) {
 	return a.usage, a.responseErr
+}
+
+func TestWssHelperPreservesHandshakeSourceStatus(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	upstreamErr := types.NewErrorWithStatusCode(
+		errors.New("websocket handshake rejected"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusPaymentRequired,
+	)
+
+	gotErr := wssHelperWithAdaptor(ctx, &relaycommon.RelayInfo{}, &wssResponseAdaptor{requestErr: upstreamErr})
+
+	require.Same(t, upstreamErr, gotErr)
+	assert.Equal(t, http.StatusPaymentRequired, gotErr.SourceStatusCode())
 }
 
 type wssBillingSpy struct {

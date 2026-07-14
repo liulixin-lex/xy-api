@@ -33,139 +33,55 @@ type ModelRequest struct {
 }
 
 func Distribute() func(c *gin.Context) {
+	return distribute(false)
+}
+
+func DistributeDeferred() func(c *gin.Context) {
+	return distribute(true)
+}
+
+type distributorSelectionFailure struct {
+	statusCode int
+	message    string
+	errorCode  types.ErrorCode
+}
+
+type tokenRoutingAuthorization struct {
+	specificChannelID int
+	hasSpecific       bool
+}
+
+func distribute(deferred bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
-		var channel *model.Channel
-		channelId, ok := common.GetContextKey(c, constant.ContextKeyTokenSpecificChannelId)
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
 		setRoutingPromptCostProxy(c)
-		if ok {
-			id, err := strconv.Atoi(channelId.(string))
-			if err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
-				return
-			}
-			channel, err = model.GetChannelById(id, true)
-			if err != nil {
-				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
-				return
-			}
-			if channel.Status != common.ChannelStatusEnabled {
-				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
-				return
-			}
-		} else {
-			// Select a channel for the user
-			// check token model mapping
-			modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
-			if modelLimitEnable {
-				s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
-				if !ok {
-					// token model limit is empty, all models are not allowed
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenNoModelAccess))
-					return
-				}
-				var tokenModelLimit map[string]bool
-				tokenModelLimit, ok = s.(map[string]bool)
-				if !ok {
-					tokenModelLimit = map[string]bool{}
-				}
-				matchName := ratio_setting.FormatMatchingModelName(modelRequest.Model) // match gpts & thinking-*
-				if _, ok := tokenModelLimit[matchName]; !ok {
-					abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelRequest.Model}))
-					return
-				}
-			}
-
-			if shouldSelectChannel {
-				if modelRequest.Model == "" {
-					abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorModelNameRequired))
-					return
-				}
-				var selectGroup string
-				usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
-				// check path is /pg/chat/completions
-				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
-					playgroundRequest := &dto.PlayGroundRequest{}
-					err = common.UnmarshalBodyReusable(c, playgroundRequest)
-					if err != nil {
-						abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()}))
-						return
-					}
-					if playgroundRequest.Group != "" {
-						if !service.GroupInUserUsableGroups(usingGroup, playgroundRequest.Group) && playgroundRequest.Group != usingGroup {
-							abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorGroupAccessDenied))
-							return
-						}
-						usingGroup = playgroundRequest.Group
-						common.SetContextKey(c, constant.ContextKeyUsingGroup, usingGroup)
-					}
-				}
-
-				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
-					affinityUsable := false
-					affinityBypassedForCanary := false
-					preferred, affinityGroup, bypassAffinity, gateErr := service.GetAdmissibleAffinityChannelWithRoutingGate(
-						c, preferredChannelID, modelRequest.Model, usingGroup, c.Request.URL.Path,
-					)
-					if gateErr != nil {
-						logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
-					}
-					affinityBypassedForCanary = bypassAffinity
-					if preferred != nil {
-						channel = preferred
-						selectGroup = affinityGroup
-						affinityUsable = true
-						service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
-						service.RecordChannelRoutingObserveSelection(&service.RetryParam{
-							Ctx: c, TokenGroup: usingGroup, ModelName: modelRequest.Model,
-							RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
-						}, affinityGroup, preferred, 0)
-					}
-					if !affinityUsable && !affinityBypassedForCanary && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
-						service.ClearCurrentChannelAffinityCache(c)
-					}
-				}
-
-				if channel == nil {
-					channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
-						Ctx:         c,
-						ModelName:   modelRequest.Model,
-						TokenGroup:  usingGroup,
-						RequestPath: c.Request.URL.Path,
-						Retry:       common.GetPointer(0),
-					})
-					if err != nil {
-						showGroup := usingGroup
-						if usingGroup == "auto" {
-							showGroup = fmt.Sprintf("auto(%s)", selectGroup)
-						}
-						message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": showGroup, "Model": modelRequest.Model, "Error": err.Error()})
-						// 如果错误，但是渠道不为空，说明是数据库一致性问题
-						//if channel != nil {
-						//	common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
-						//	message = "数据库一致性已被破坏，请联系管理员"
-						//}
-						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, message, types.ErrorCodeModelNotFound)
-						return
-					}
-					if channel == nil {
-						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
-						return
-					}
-				}
-			}
-		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if channel != nil {
-			if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
-				cleanupRoutingCapacityReservation(c)
-				abortWithOpenAiMessage(c, http.StatusServiceUnavailable, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
-				return
+		c.Set("original_model", modelRequest.Model)
+		if deferred {
+			common.SetContextKey(c, constant.ContextKeyRoutingSelectionDeferred, true)
+			c.Next()
+			cleanupRoutingCapacityReservation(c)
+			if c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+				if channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId); channelID > 0 {
+					service.RecordChannelAffinity(c, channelID)
+				}
 			}
+			return
+		}
+
+		channel, failure := selectAndSetupChannel(c, modelRequest.Model, shouldSelectChannel, true)
+		if failure != nil {
+			cleanupRoutingCapacityReservation(c)
+			if failure.errorCode != "" {
+				abortWithOpenAiMessage(c, failure.statusCode, failure.message, failure.errorCode)
+			} else {
+				abortWithOpenAiMessage(c, failure.statusCode, failure.message)
+			}
+			return
 		}
 		c.Next()
 		cleanupRoutingCapacityReservation(c)
@@ -173,6 +89,250 @@ func Distribute() func(c *gin.Context) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+
+func SelectChannelForValidatedRequest(c *gin.Context, modelName string) (*model.Channel, *types.NewAPIError) {
+	channel, failure := selectAndSetupChannel(c, strings.TrimSpace(modelName), true, true)
+	if failure == nil {
+		return channel, nil
+	}
+	cleanupRoutingCapacityReservation(c)
+	return nil, distributorSelectionAPIError(failure)
+}
+
+func SelectChannelMetadataForValidatedRequest(c *gin.Context, modelName string) (*model.Channel, *types.NewAPIError) {
+	channel, failure := selectAndSetupChannel(c, strings.TrimSpace(modelName), true, false)
+	if failure == nil {
+		return channel, nil
+	}
+	cleanupRoutingCapacityReservation(c)
+	return nil, distributorSelectionAPIError(failure)
+}
+
+// AuthorizeTokenRoutingTarget validates model access and, for requests that
+// produce upstream work, the final channel pinned by the token.
+func AuthorizeTokenRoutingTarget(
+	c *gin.Context,
+	modelName string,
+	finalChannelID int,
+	enforceSpecificChannel bool,
+) *types.NewAPIError {
+	_, failure := authorizeTokenRoutingTarget(c, strings.TrimSpace(modelName), finalChannelID, enforceSpecificChannel)
+	return distributorSelectionAPIError(failure)
+}
+
+func distributorSelectionAPIError(failure *distributorSelectionFailure) *types.NewAPIError {
+	if failure == nil {
+		return nil
+	}
+	errorCode := failure.errorCode
+	if errorCode == "" {
+		errorCode = types.ErrorCodeGetChannelFailed
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New(failure.message),
+		errorCode,
+		failure.statusCode,
+		types.ErrOptionWithSkipRetry(),
+	)
+}
+
+func authorizeTokenRoutingTarget(
+	c *gin.Context,
+	modelName string,
+	finalChannelID int,
+	enforceSpecificChannel bool,
+) (tokenRoutingAuthorization, *distributorSelectionFailure) {
+	authorization := tokenRoutingAuthorization{}
+	if common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+		value, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
+		if !ok {
+			return authorization, &distributorSelectionFailure{
+				statusCode: http.StatusForbidden,
+				message:    i18n.T(c, i18n.MsgDistributorTokenNoModelAccess),
+				errorCode:  types.ErrorCodeAccessDenied,
+			}
+		}
+		tokenModelLimit, ok := value.(map[string]bool)
+		if !ok {
+			tokenModelLimit = map[string]bool{}
+		}
+		matchName := ratio_setting.FormatMatchingModelName(modelName)
+		if allowed, exists := tokenModelLimit[matchName]; !exists || !allowed {
+			return authorization, &distributorSelectionFailure{
+				statusCode: http.StatusForbidden,
+				message:    i18n.T(c, i18n.MsgDistributorTokenModelForbidden, map[string]any{"Model": modelName}),
+				errorCode:  types.ErrorCodeAccessDenied,
+			}
+		}
+	}
+	if !enforceSpecificChannel {
+		return authorization, nil
+	}
+
+	value, specific := common.GetContextKey(c, constant.ContextKeyTokenSpecificChannelId)
+	if !specific {
+		return authorization, nil
+	}
+	rawChannelID, ok := value.(string)
+	if !ok {
+		return authorization, &distributorSelectionFailure{
+			statusCode: http.StatusBadRequest,
+			message:    i18n.T(c, i18n.MsgDistributorInvalidChannelId),
+			errorCode:  types.ErrorCodeInvalidRequest,
+		}
+	}
+	specificChannelID, err := strconv.Atoi(strings.TrimSpace(rawChannelID))
+	if err != nil || specificChannelID <= 0 {
+		return authorization, &distributorSelectionFailure{
+			statusCode: http.StatusBadRequest,
+			message:    i18n.T(c, i18n.MsgDistributorInvalidChannelId),
+			errorCode:  types.ErrorCodeInvalidRequest,
+		}
+	}
+	authorization.specificChannelID = specificChannelID
+	authorization.hasSpecific = true
+	if finalChannelID > 0 && finalChannelID != specificChannelID {
+		return authorization, &distributorSelectionFailure{
+			statusCode: http.StatusForbidden,
+			message: i18n.T(c, i18n.MsgDistributorTokenChannelForbidden, map[string]any{
+				"Channel": specificChannelID,
+			}),
+			errorCode: types.ErrorCodeAccessDenied,
+		}
+	}
+	return authorization, nil
+}
+
+func selectAndSetupChannel(
+	c *gin.Context,
+	modelName string,
+	shouldSelectChannel bool,
+	selectCredential bool,
+) (*model.Channel, *distributorSelectionFailure) {
+	authorization, failure := authorizeTokenRoutingTarget(c, modelName, 0, shouldSelectChannel)
+	if failure != nil {
+		return nil, failure
+	}
+	if !shouldSelectChannel {
+		return nil, nil
+	}
+	if modelName == "" {
+		return nil, &distributorSelectionFailure{statusCode: http.StatusBadRequest, message: i18n.T(c, i18n.MsgDistributorModelNameRequired)}
+	}
+	if authorization.hasSpecific {
+		channel, err := model.GetChannelById(authorization.specificChannelID, true)
+		if err != nil {
+			return nil, &distributorSelectionFailure{statusCode: http.StatusBadRequest, message: i18n.T(c, i18n.MsgDistributorInvalidChannelId)}
+		}
+		if channel.Status != common.ChannelStatusEnabled {
+			return nil, &distributorSelectionFailure{statusCode: http.StatusForbidden, message: i18n.T(c, i18n.MsgDistributorChannelDisabled)}
+		}
+		if setupErr := setupSelectedChannelContext(c, channel, modelName, selectCredential); setupErr != nil {
+			return nil, &distributorSelectionFailure{
+				statusCode: http.StatusServiceUnavailable,
+				message:    setupErr.MaskSensitiveError(),
+				errorCode:  setupErr.GetErrorCode(),
+			}
+		}
+		return channel, nil
+	}
+
+	usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
+		playgroundRequest := &dto.PlayGroundRequest{}
+		if err := common.UnmarshalBodyReusable(c, playgroundRequest); err != nil {
+			return nil, &distributorSelectionFailure{
+				statusCode: http.StatusBadRequest,
+				message:    i18n.T(c, i18n.MsgDistributorInvalidPlayground, map[string]any{"Error": err.Error()}),
+			}
+		}
+		if playgroundRequest.Group != "" {
+			if !service.GroupInUserUsableGroups(usingGroup, playgroundRequest.Group) && playgroundRequest.Group != usingGroup {
+				return nil, &distributorSelectionFailure{statusCode: http.StatusForbidden, message: i18n.T(c, i18n.MsgDistributorGroupAccessDenied)}
+			}
+			usingGroup = playgroundRequest.Group
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, usingGroup)
+		}
+	}
+
+	var channel *model.Channel
+	if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelName, usingGroup); found {
+		affinityUsable := false
+		affinityBypassedForCanary := false
+		preferred, affinityGroup, bypassAffinity, gateErr := service.GetAdmissibleAffinityChannelWithRoutingGate(
+			c,
+			preferredChannelID,
+			modelName,
+			usingGroup,
+			c.Request.URL.Path,
+		)
+		if gateErr != nil {
+			logger.LogWarn(c, fmt.Sprintf("channel routing canary affinity gate failed: %v", gateErr))
+		}
+		affinityBypassedForCanary = bypassAffinity
+		if preferred != nil {
+			channel = preferred
+			affinityUsable = true
+			service.MarkChannelAffinityUsed(c, affinityGroup, preferred.Id)
+			service.RecordChannelRoutingObserveSelection(&service.RetryParam{
+				Ctx: c, TokenGroup: usingGroup, ModelName: modelName,
+				RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+			}, affinityGroup, preferred, 0)
+		}
+		if !affinityUsable && !affinityBypassedForCanary && !service.ShouldKeepChannelAffinityOnChannelDisabled() {
+			service.ClearCurrentChannelAffinityCache(c)
+		}
+	}
+
+	if channel == nil {
+		selected, selectGroup, err := service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
+			Ctx: c, ModelName: modelName, TokenGroup: usingGroup,
+			RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+		})
+		if err != nil {
+			showGroup := usingGroup
+			if usingGroup == "auto" {
+				showGroup = fmt.Sprintf("auto(%s)", selectGroup)
+			}
+			return nil, &distributorSelectionFailure{
+				statusCode: http.StatusServiceUnavailable,
+				message: i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{
+					"Group": showGroup, "Model": modelName, "Error": err.Error(),
+				}),
+				errorCode: types.ErrorCodeModelNotFound,
+			}
+		}
+		if selected == nil {
+			return nil, &distributorSelectionFailure{
+				statusCode: http.StatusServiceUnavailable,
+				message:    i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelName}),
+				errorCode:  types.ErrorCodeModelNotFound,
+			}
+		}
+		channel = selected
+	}
+
+	if setupErr := setupSelectedChannelContext(c, channel, modelName, selectCredential); setupErr != nil {
+		return nil, &distributorSelectionFailure{
+			statusCode: http.StatusServiceUnavailable,
+			message:    setupErr.MaskSensitiveError(),
+			errorCode:  setupErr.GetErrorCode(),
+		}
+	}
+	return channel, nil
+}
+
+func setupSelectedChannelContext(
+	c *gin.Context,
+	channel *model.Channel,
+	modelName string,
+	selectCredential bool,
+) *types.NewAPIError {
+	if selectCredential {
+		return SetupContextForSelectedChannel(c, channel, modelName)
+	}
+	return SetupContextForSelectedChannelMetadata(c, channel, modelName)
 }
 
 func cleanupRoutingCapacityReservation(c *gin.Context) {
@@ -516,12 +676,19 @@ func getTaskOriginModelName(c *gin.Context) string {
 
 	userId := c.GetInt("id")
 	if task, exist, err := model.GetByTaskId(userId, taskId); err == nil && exist && task != nil {
-		return task.Properties.OriginModelName
+		return task.GetOriginModelName()
 	}
 	return ""
 }
 
 func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
+	if setupErr := SetupContextForSelectedChannelMetadata(c, channel, modelName); setupErr != nil {
+		return setupErr
+	}
+	return CommitSelectedChannelCredential(c, channel)
+}
+
+func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Channel, modelName string) *types.NewAPIError {
 	c.Set("original_model", modelName) // for retry
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
 	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
@@ -530,6 +697,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -553,18 +721,6 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
-	}
-	isMultiKey := channel.ChannelInfo.IsMultiKey
-	if !isMultiKey {
-		index = model.RoutingMetricSingleKeyIndex
-	}
-	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, isMultiKey)
-	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
-	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
-	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	if routingGroup == "auto" {
 		if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
@@ -575,18 +731,6 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selected.SnapshotRevision)
 		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selected.PoolID)
 		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selected.MemberID)
-		if identity, resolved := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); resolved &&
-			identity.PoolID == selected.PoolID && identity.MemberID == selected.MemberID {
-			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
-		}
-		service.ClearSelectedRoutingIdentity(c)
-	} else if smart_routing_setting.Enabled() {
-		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
-			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
-			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
-			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
-			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
-		}
 	}
 	channelBaseURL := channel.GetBaseURL()
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channelBaseURL)
@@ -614,6 +758,162 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		c.Set("api_version", channel.Other)
 	case constant.ChannelTypeCoze:
 		c.Set("bot_id", channel.Other)
+	}
+	return nil
+}
+
+func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *types.NewAPIError {
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
+	if channel == nil {
+		service.ClearSelectedRoutingIdentity(c)
+		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	selected, planned := service.GetSelectedRoutingIdentity(c, channel.Id)
+	key := ""
+	index := model.RoutingMetricSingleKeyIndex
+	var newAPIError *types.NewAPIError
+	if planned && selected.CredentialID > 0 {
+		var resolved bool
+		key, index, resolved = channelrouting.ResolveCredentialKey(channel, selected.CredentialID)
+		if !resolved {
+			newAPIError = types.NewError(
+				errors.New("selected routing credential is no longer available"),
+				types.ErrorCodeChannelNoAvailableKey,
+			)
+		}
+	} else if planned && selected.CredentialID == 0 && strings.TrimSpace(channel.Key) == "" {
+		key = ""
+	} else {
+		key, index, newAPIError = channel.GetNextEnabledKey()
+	}
+	if newAPIError != nil {
+		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, uint64(0))
+		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
+		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
+		service.ClearSelectedRoutingIdentity(c)
+		return newAPIError
+	}
+	isMultiKey := channel.ChannelInfo.IsMultiKey
+	if !isMultiKey {
+		index = model.RoutingMetricSingleKeyIndex
+	}
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, isMultiKey)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
+
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if routingGroup == "auto" {
+		if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
+			routingGroup = selectedGroup
+		}
+	}
+	if planned && selected.CredentialID == 0 && key != "" {
+		if identity, resolved := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); resolved &&
+			identity.PoolID == selected.PoolID && identity.MemberID == selected.MemberID {
+			selected.CredentialID = identity.CredentialID
+		}
+	}
+	if planned && selected.UpstreamAccountID == 0 {
+		if accountID, known := channelrouting.ResolveUpstreamAccountID(
+			routingGroup, channel.Id, common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
+		); known {
+			selected.UpstreamAccountID = accountID
+		}
+	}
+	if planned {
+		common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, selected.CredentialID)
+		common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, selected.UpstreamAccountID)
+		service.ClearSelectedRoutingIdentity(c)
+	} else if smart_routing_setting.Enabled() {
+		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
+			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
+			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
+			if accountID, known := channelrouting.ResolveUpstreamAccountID(routingGroup, channel.Id, common.GetContextKeyString(c, constant.ContextKeyOriginalModel)); known {
+				common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, accountID)
+			}
+		}
+	}
+	return nil
+}
+
+// CommitTaskChannelCredential binds a stateful continuation to the exact
+// credential used by its origin task. Historical single-key rows may omit the
+// stable ID; multi-key rows fail closed because an array position is not a
+// durable credential identity.
+func CommitTaskChannelCredential(c *gin.Context, channel *model.Channel, credentialID int) *types.NewAPIError {
+	if c == nil || channel == nil || channel.Id <= 0 {
+		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "")
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
+	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
+	key := ""
+	index := model.RoutingMetricSingleKeyIndex
+	if credentialID > 0 {
+		requestContext := c.Request.Context()
+		resolvedKey, resolvedIndex, err := channelrouting.ResolvePersistedCredentialKey(requestContext, channel, credentialID)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+		}
+		key = resolvedKey
+		index = resolvedIndex
+	} else {
+		keys := channel.GetKeys()
+		if channel.ChannelInfo.IsMultiKey || len(keys) != 1 || strings.TrimSpace(keys[0]) == "" {
+			return types.NewError(
+				channelrouting.ErrPersistedCredentialUnavailable,
+				types.ErrorCodeChannelNoAvailableKey,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		key = keys[0]
+		if resolvedID, err := channelrouting.ResolvePersistedCredentialID(c.Request.Context(), channel, key); err == nil {
+			credentialID = resolvedID
+		}
+	}
+
+	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, channel.ChannelInfo.IsMultiKey)
+	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
+	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, credentialID)
+
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if routingGroup == "auto" {
+		if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
+			routingGroup = selectedGroup
+		}
+	}
+	if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
+		if credentialID > 0 && identity.CredentialID > 0 && identity.CredentialID != credentialID {
+			return types.NewError(
+				channelrouting.ErrPersistedCredentialUnavailable,
+				types.ErrorCodeChannelNoAvailableKey,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
+		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
+		if credentialID == 0 {
+			credentialID = identity.CredentialID
+			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, credentialID)
+		}
+	}
+	if accountID, known := channelrouting.ResolveUpstreamAccountID(
+		routingGroup,
+		channel.Id,
+		common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
+	); known {
+		common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, accountID)
 	}
 	return nil
 }

@@ -14,7 +14,7 @@ import (
 
 const (
 	routingV2SchemaComponent    = "channel-routing-v2"
-	routingV2SchemaVersion      = "channel-routing-v2-phase5-20260712.2"
+	routingV2SchemaVersion      = "channel-routing-v2-phase5-20260714.8"
 	routingV2SchemaPollInterval = 100 * time.Millisecond
 )
 
@@ -37,6 +37,7 @@ func routingV2RequiredSchemaModels() []any {
 		&RoutingPool{},
 		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
+		&RoutingCredentialHealthState{},
 		&RoutingDecisionAudit{},
 		&RoutingDecisionReplayChunk{},
 		&RoutingPolicyHead{},
@@ -63,6 +64,9 @@ func routingV2RequiredSchemaModels() []any {
 		&RoutingAuditExportChunk{},
 		&RoutingHedgeAttemptAudit{},
 		&RoutingUpstreamAccount{},
+		&RoutingUpstreamAccountHealthState{},
+		&RoutingRuntimeSettingsState{},
+		&RoutingControlAudit{},
 		&RoutingCostSnapshotVersion{},
 		&RoutingChannelBinding{},
 		&RoutingCostSnapshot{},
@@ -78,6 +82,13 @@ func routingV2RequiredSchemaModels() []any {
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
+		&TaskBillingOperation{},
+		&MidjourneyBillingOperation{},
+		&IdentityCacheSync{},
+		&SubscriptionBillingPeriod{},
+		&AsyncBillingReservation{},
+		&AsyncBillingAttempt{},
+		&AsyncBillingManualResolution{},
 	}
 }
 

@@ -2,10 +2,8 @@ package baidu
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -168,12 +166,12 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var baiduResponse BaiduChatResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &baiduResponse)
+	err = common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -181,7 +179,7 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), nil
 	}
 	fullTextResponse := responseBaidu2OpenAI(&baiduResponse)
-	jsonResponse, err := json.Marshal(fullTextResponse)
+	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -193,12 +191,12 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 
 func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var baiduResponse BaiduEmbeddingResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
 	service.CloseResponseBodyGracefully(resp)
-	err = json.Unmarshal(responseBody, &baiduResponse)
+	err = common.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -206,7 +204,7 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 		return types.NewError(fmt.Errorf("%s", baiduResponse.ErrorMsg), types.ErrorCodeBadResponseBody), nil
 	}
 	fullTextResponse := embeddingResponseBaidu2OpenAI(&baiduResponse)
-	jsonResponse, err := json.Marshal(fullTextResponse)
+	jsonResponse, err := common.Marshal(fullTextResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
@@ -216,7 +214,7 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	return nil, &fullTextResponse.Usage
 }
 
-func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
+func getBaiduAccessToken(ctx context.Context, apiKey string, beforeSend func() error) (string, error) {
 	if val, ok := baiduTokenStore.Load(apiKey); ok {
 		var accessToken BaiduAccessToken
 		if accessToken, ok = val.(BaiduAccessToken); ok {
@@ -224,7 +222,7 @@ func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
 			if now.Add(time.Hour).Before(accessToken.ExpiresAt) {
 				return accessToken.AccessToken, nil
 			}
-			refreshed, err := getBaiduAccessTokenHelper(ctx, apiKey)
+			refreshed, err := getBaiduAccessTokenHelper(ctx, apiKey, beforeSend)
 			if err == nil {
 				return refreshed.AccessToken, nil
 			}
@@ -237,7 +235,7 @@ func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
 			return "", err
 		}
 	}
-	accessToken, err := getBaiduAccessTokenHelper(ctx, apiKey)
+	accessToken, err := getBaiduAccessTokenHelper(ctx, apiKey, beforeSend)
 	if err != nil {
 		return "", err
 	}
@@ -247,7 +245,7 @@ func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
 	return (*accessToken).AccessToken, nil
 }
 
-func getBaiduAccessTokenHelper(ctx context.Context, apiKey string) (*BaiduAccessToken, error) {
+func getBaiduAccessTokenHelper(ctx context.Context, apiKey string, beforeSend func() error) (*BaiduAccessToken, error) {
 	parts := strings.Split(apiKey, "|")
 	if len(parts) != 2 {
 		return nil, errors.New("invalid baidu apikey")
@@ -259,6 +257,11 @@ func getBaiduAccessTokenHelper(ctx context.Context, apiKey string) (*BaiduAccess
 	}
 	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("Accept", "application/json")
+	if beforeSend != nil {
+		if err := beforeSend(); err != nil {
+			return nil, fmt.Errorf("mark Baidu token request sent: %w", err)
+		}
+	}
 	res, err := service.GetHttpClient().Do(req)
 	if err != nil {
 		return nil, err

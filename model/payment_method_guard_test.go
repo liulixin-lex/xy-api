@@ -158,6 +158,33 @@ func TestCompleteSubscriptionOrder_RejectsMismatchedPaymentProvider(t *testing.T
 	assert.Nil(t, topUp)
 }
 
+func TestCompleteSubscriptionOrderCommitsWithSingleSQLiteConnection(t *testing.T) {
+	truncateTables(t)
+
+	insertUserForPaymentGuardTest(t, 203, 0)
+	plan := insertSubscriptionPlanForPaymentGuardTest(t, 302)
+	insertSubscriptionOrderForPaymentGuardTest(t, "sub-complete-single-connection", 203, plan.Id, PaymentProviderStripe)
+
+	require.NoError(t, CompleteSubscriptionOrder(
+		"sub-complete-single-connection",
+		`{"provider":"stripe"}`,
+		PaymentProviderStripe,
+		"card",
+	))
+
+	order := GetSubscriptionOrderByTradeNo("sub-complete-single-connection")
+	require.NotNil(t, order)
+	assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+	assert.Equal(t, "card", order.PaymentMethod)
+	assert.Equal(t, int64(1), countUserSubscriptionsForPaymentGuardTest(t, 203))
+
+	topUp := GetTopUpByTradeNo("sub-complete-single-connection")
+	require.NotNil(t, topUp)
+	assert.Equal(t, common.TopUpStatusSuccess, topUp.Status)
+	assert.Equal(t, "card", topUp.PaymentMethod)
+	assert.Equal(t, PaymentProviderStripe, topUp.PaymentProvider)
+}
+
 func TestExpireSubscriptionOrder_RejectsMismatchedPaymentProvider(t *testing.T) {
 	truncateTables(t)
 

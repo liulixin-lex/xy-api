@@ -157,6 +157,24 @@ func TestRelayErrorHandlerReadFailurePreservesCauseAndClosesBody(t *testing.T) {
 	assert.Equal(t, int64(3000), metadata["retry_after_ms"])
 }
 
+func TestRelayErrorHandlerRejectsOversizedBodyAndClosesIt(t *testing.T) {
+	body := &errorReadCloser{}
+	response := &http.Response{
+		StatusCode:    http.StatusBadGateway,
+		ContentLength: DefaultMaxUpstreamResponseBytes + 1,
+		Header:        make(http.Header),
+		Body:          body,
+	}
+
+	apiErr := RelayErrorHandler(context.Background(), response, false)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, body.closed)
+	assert.Equal(t, types.ErrorCodeReadResponseBodyFailed, apiErr.GetErrorCode())
+	assert.ErrorIs(t, apiErr, ErrUpstreamResponseBodyTooLarge)
+	assert.Equal(t, "failed to read upstream response body", apiErr.Error())
+}
+
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
 	withDebugEnabled(t, false)
 

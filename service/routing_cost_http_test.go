@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -111,6 +112,147 @@ func TestRoutingCostURLValidation(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestRoutingCostEgressPolicyAllowsOnlyExplicitPrivateCIDRs(t *testing.T) {
+	normalized, err := NormalizeRoutingCostEgressCIDRs([]string{
+		" 10.20.30.7/24 ", "10.20.30.0/24", "fd12:3456::1/64",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.20.30.0/24", "fd12:3456::/64"}, normalized)
+
+	for _, target := range []string{
+		"https://10.20.30.8/api/pricing",
+		"https://[fd12:3456::8]/api/pricing",
+		"https://example.com/api/pricing",
+	} {
+		require.NoError(t, ValidateRoutingCostURLWithEgressPolicy(target, normalized), target)
+	}
+	for _, target := range []string{
+		"https://10.20.31.8/api/pricing",
+		"https://[fd12:3457::8]/api/pricing",
+		"https://169.254.169.254/latest/meta-data",
+		"https://127.0.0.1/api/pricing",
+	} {
+		require.Error(t, ValidateRoutingCostURLWithEgressPolicy(target, normalized), target)
+	}
+
+	for _, cidr := range []string{
+		"127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4",
+		"10.0.0.0/7", "172.0.0.0/8", "fc00::/6", "fe80::/10", "ff00::/8",
+	} {
+		_, err := NormalizeRoutingCostEgressCIDRs([]string{cidr})
+		require.Error(t, err, cidr)
+	}
+	tooMany := make([]string, routingCostMaxAllowedCIDRs+1)
+	for index := range tooMany {
+		tooMany[index] = fmt.Sprintf("10.%d.0.0/16", index)
+	}
+	_, err = NormalizeRoutingCostEgressCIDRs(tooMany)
+	require.Error(t, err)
+}
+
+func TestRoutingCostPrivateDNSRequiresEveryAddressInAllowlist(t *testing.T) {
+	ctx, err := WithRoutingCostEgressPolicy(context.Background(), []string{"10.20.30.0/24"}, "")
+	require.NoError(t, err)
+	egress := routingCostEgressFromContext(ctx)
+
+	var dialCount atomic.Int32
+	dialer := routingCostDialer{
+		resolver: routingCostStaticResolver{
+			"allowed.example.com": {netip.MustParseAddr("10.20.30.8")},
+			"mixed.example.com": {
+				netip.MustParseAddr("10.20.30.8"),
+				netip.MustParseAddr("10.20.31.8"),
+			},
+		},
+		egress: egress,
+		dialContext: func(context.Context, string, string) (net.Conn, error) {
+			dialCount.Add(1)
+			return nil, errors.New("dial stopped by test")
+		},
+	}
+
+	_, err = dialer.DialContext(context.Background(), "tcp", "allowed.example.com:443")
+	require.Error(t, err)
+	assert.EqualValues(t, 1, dialCount.Load())
+	_, err = dialer.DialContext(context.Background(), "tcp", "mixed.example.com:443")
+	require.Error(t, err)
+	assert.EqualValues(t, 1, dialCount.Load())
+}
+
+func TestRoutingCostCustomCAIsStrictAndExtendsTrust(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "trusted")
+	}))
+	t.Cleanup(server.Close)
+	certificatePEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))
+
+	ctx, err := WithRoutingCostEgressPolicy(context.Background(), nil, certificatePEM)
+	require.NoError(t, err)
+	egress := routingCostEgressFromContext(ctx)
+	require.NotNil(t, egress.rootCAs)
+	second, err := WithRoutingCostEgressPolicy(ctx, nil, certificatePEM)
+	require.NoError(t, err)
+	assert.Equal(t, ctx, second)
+
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err)
+	client := newRoutingCostHTTPClient(routingCostHTTPClientOptions{
+		resolver: routingCostStaticResolver{
+			"routing.example.com": {netip.MustParseAddr("8.8.8.8")},
+		},
+		dialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: time.Second}
+			return dialer.DialContext(ctx, network, server.Listener.Addr().String())
+		},
+		rootCAs: egress.rootCAs,
+	})
+	response, err := client.Get("https://routing.example.com:" + port + "/api/pricing")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+
+	privateKeyBlock := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte{1, 2, 3}}))
+	for _, invalid := range []string{
+		"not a certificate",
+		"garbage\n" + certificatePEM,
+		certificatePEM + "\ngarbage",
+		certificatePEM + privateKeyBlock,
+		string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("invalid")})),
+	} {
+		_, err := WithRoutingCostEgressPolicy(context.Background(), nil, invalid)
+		require.Error(t, err)
+	}
+}
+
+func TestRoutingCostTransportCacheIsBoundedAndExpiresIdlePolicies(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cache := &routingCostTransportCache{
+		entries: make(map[string]routingCostTransportCacheEntry),
+		now:     func() time.Time { return now },
+	}
+	first, err := cache.get(routingCostEgressContext{cacheKey: "policy-0"})
+	require.NoError(t, err)
+	for index := 1; index <= routingCostTransportCacheMax; index++ {
+		_, err := cache.get(routingCostEgressContext{cacheKey: fmt.Sprintf("policy-%d", index)})
+		require.NoError(t, err)
+	}
+	assert.Len(t, cache.entries, routingCostTransportCacheMax)
+	assert.NotContains(t, cache.entries, "policy-0")
+
+	current, err := cache.get(routingCostEgressContext{cacheKey: "policy-1"})
+	require.NoError(t, err)
+	assert.NotSame(t, first, current)
+	reused, err := cache.get(routingCostEgressContext{cacheKey: "policy-1"})
+	require.NoError(t, err)
+	assert.Same(t, current, reused)
+
+	now = now.Add(routingCostTransportCacheTTL + time.Second)
+	_, err = cache.get(routingCostEgressContext{cacheKey: "fresh-policy"})
+	require.NoError(t, err)
+	assert.Len(t, cache.entries, 1)
+	assert.Contains(t, cache.entries, "fresh-policy")
 }
 
 func TestRoutingCostDialerRejectsSpecialUseAddressWithoutDialing(t *testing.T) {

@@ -35,8 +35,8 @@ import { useEffect, useMemo, useState, type ChangeEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
-import { ErrorState } from '@/components/error-state'
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -94,13 +94,13 @@ import {
   ADMIN_PERMISSION_RESOURCES,
   hasPermission,
 } from '@/lib/admin-permissions'
-import { useAuthStore } from '@/stores/auth-store'
 import {
   formatNumber,
   formatTimestampRelative,
   formatTimestampToDate,
 } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
   approveSmartRoutingAgentRecommendation,
@@ -998,9 +998,7 @@ function SettingsPanel(props: {
               value={draft.first_byte_p95_multiplier}
               min={1}
               step={0.1}
-              onChange={(value) =>
-                setField('first_byte_p95_multiplier', value)
-              }
+              onChange={(value) => setField('first_byte_p95_multiplier', value)}
             />
           </Field>
           <Field>
@@ -1622,7 +1620,13 @@ function BindingsPanel(props: {
     mutationFn: (payload: {
       channelId: number
       request: RoutingBindingRequest
-    }) => updateSmartRoutingBinding(payload.channelId, payload.request),
+      etag: string
+    }) =>
+      updateSmartRoutingBinding(
+        payload.channelId,
+        payload.request,
+        payload.etag
+      ),
     onSuccess: (response) => {
       if (!response.success) {
         toast.error(response.message || t('Failed to update routing binding'))
@@ -1795,10 +1799,10 @@ function BindingsPanel(props: {
                           </Badge>
                           {binding.upstream_type === 'sub2api' &&
                             binding.serves_claude_code && (
-                            <span className='text-muted-foreground text-xs'>
-                              {t('Claude Code')}
-                            </span>
-                          )}
+                              <span className='text-muted-foreground text-xs'>
+                                {t('Claude Code')}
+                              </span>
+                            )}
                         </div>
                       </TableCell>
                       <TableCell className='max-w-[260px] py-3 align-top'>
@@ -1947,6 +1951,7 @@ function BindingsPanel(props: {
             updateMutation.mutate({
               channelId: original.channel_id,
               request,
+              etag: original.etag,
             })
           } else {
             createMutation.mutate(request)
@@ -1968,7 +1973,7 @@ function BindingsPanel(props: {
         isLoading={deleteMutation.isPending}
         handleConfirm={() => {
           if (pendingDeleteBinding) {
-            deleteMutation.mutate(pendingDeleteBinding.channel_id)
+            deleteMutation.mutate(pendingDeleteBinding)
           }
         }}
       />
@@ -2485,10 +2490,7 @@ function AgentPanel(props: {
                   </TableCell>
                   <TableCell className='py-3'>
                     <Badge variant='secondary'>
-                      {translatedRecommendationStatus(
-                        recommendation.status,
-                        t
-                      )}
+                      {translatedRecommendationStatus(recommendation.status, t)}
                     </Badge>
                   </TableCell>
                   <TableCell className='py-3 pr-4'>
@@ -2597,7 +2599,9 @@ export function SmartRouting() {
   const recommendationsQuery = useQuery({
     queryKey: ['smart-routing', 'agent-recommendations'],
     queryFn: async () =>
-      requireData(await listSmartRoutingAgentRecommendations(TABLE_INITIAL_LIMIT)),
+      requireData(
+        await listSmartRoutingAgentRecommendations(TABLE_INITIAL_LIMIT)
+      ),
     staleTime: QUERY_STALE_MS,
     enabled: canRead && activeTab === 'agent',
   })
@@ -2692,7 +2696,12 @@ export function SmartRouting() {
           value={activeTab}
           onValueChange={(value) =>
             setActiveTab(
-              value as 'settings' | 'bindings' | 'metrics' | 'breakers' | 'agent'
+              value as
+                | 'settings'
+                | 'bindings'
+                | 'metrics'
+                | 'breakers'
+                | 'agent'
             )
           }
           className='flex min-h-0 flex-col gap-4'

@@ -759,6 +759,7 @@
     "Billing group = premium (the token has a group, so use it)": "计费分组 = premium（令牌设置了分组，就用令牌的）",
     "Billing group = vip (the token has no group, so use the user group)": "计费分组 = vip（令牌没设置分组，就用用户自己的分组）",
     "Billing History": "计费历史",
+    "Billing log integrity audit": "账务日志完整性审计",
     "Billing Mode": "计费模式",
     "Billing Process": "计费过程",
     "Billing Source": "计费来源",

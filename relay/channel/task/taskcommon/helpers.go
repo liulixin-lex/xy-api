@@ -2,7 +2,12 @@ package taskcommon
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -27,6 +32,83 @@ func UnmarshalMetadata(metadata map[string]any, target any) error {
 		return fmt.Errorf("unmarshal metadata failed: %w", err)
 	}
 	return nil
+}
+
+// NormalizeMetadataInt canonicalizes a user-controlled metadata multiplier so
+// typed adaptor DTOs and billing see the same bounded integer.
+func NormalizeMetadataInt(metadata map[string]any, key string, minValue, maxValue int) (int, bool, error) {
+	if metadata == nil {
+		return 0, false, nil
+	}
+	raw, present := metadata[key]
+	if !present {
+		return 0, false, nil
+	}
+	if minValue > maxValue {
+		return 0, true, fmt.Errorf("invalid bounds for metadata field %s", key)
+	}
+	var value int64
+	switch typed := raw.(type) {
+	case int:
+		value = int64(typed)
+	case int8:
+		value = int64(typed)
+	case int16:
+		value = int64(typed)
+	case int32:
+		value = int64(typed)
+	case int64:
+		value = typed
+	case uint:
+		if uint64(typed) > math.MaxInt64 {
+			return 0, true, fmt.Errorf("metadata field %s is out of range", key)
+		}
+		value = int64(typed)
+	case uint8:
+		value = int64(typed)
+	case uint16:
+		value = int64(typed)
+	case uint32:
+		value = int64(typed)
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, true, fmt.Errorf("metadata field %s is out of range", key)
+		}
+		value = int64(typed)
+	case float32:
+		floatValue := float64(typed)
+		if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) || math.Trunc(floatValue) != floatValue ||
+			floatValue < math.MinInt64 || floatValue > math.MaxInt64 {
+			return 0, true, fmt.Errorf("metadata field %s must be a finite integer", key)
+		}
+		value = int64(floatValue)
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || math.Trunc(typed) != typed ||
+			typed < math.MinInt64 || typed > math.MaxInt64 {
+			return 0, true, fmt.Errorf("metadata field %s must be a finite integer", key)
+		}
+		value = int64(typed)
+	case json.Number:
+		parsed, err := strconv.ParseInt(string(typed), 10, 64)
+		if err != nil {
+			return 0, true, fmt.Errorf("metadata field %s must be an integer: %w", key, err)
+		}
+		value = parsed
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if err != nil {
+			return 0, true, fmt.Errorf("metadata field %s must be an integer: %w", key, err)
+		}
+		value = parsed
+	default:
+		return 0, true, fmt.Errorf("metadata field %s must be an integer", key)
+	}
+	if value < int64(minValue) || value > int64(maxValue) {
+		return 0, true, fmt.Errorf("metadata field %s must be between %d and %d", key, minValue, maxValue)
+	}
+	canonical := int(value)
+	metadata[key] = canonical
+	return canonical, true, nil
 }
 
 // DefaultString returns val if non-empty, otherwise fallback.
@@ -63,7 +145,7 @@ func DecodeLocalTaskID(id string) (string, error) {
 // BuildProxyURL constructs the video proxy URL using the public task ID.
 // e.g., "https://your-server.com/v1/videos/task_xxxx/content"
 func BuildProxyURL(taskID string) string {
-	return fmt.Sprintf("%s/v1/videos/%s/content", system_setting.ServerAddress, taskID)
+	return fmt.Sprintf("%s/v1/videos/%s/content", strings.TrimRight(system_setting.ServerAddress, "/"), url.PathEscape(taskID))
 }
 
 // Status-to-progress mapping constants for polling updates.

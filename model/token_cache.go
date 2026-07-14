@@ -1,52 +1,54 @@
 package model
 
 import (
+	"errors"
 	"fmt"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 )
 
-func cacheSetToken(token Token) error {
-	key := common.GenerateHMAC(token.Key)
+func getTokenCacheKey(key string) string {
+	return fmt.Sprintf("token:%s", common.GenerateHMAC(key))
+}
+
+func getTokenCacheEpochKey(key string) string {
+	return fmt.Sprintf("cache_epoch:token:%s", common.GenerateHMAC(key))
+}
+
+func cacheSetTokenIfEpoch(token Token, epoch int64) error {
+	cacheKey := getTokenCacheKey(token.Key)
+	epochKey := getTokenCacheEpochKey(token.Key)
 	token.Clean()
-	err := common.RedisHSetObj(fmt.Sprintf("token:%s", key), &token, time.Duration(common.RedisKeyCacheSeconds())*time.Second)
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err := common.RedisHSetObjIfCacheEpoch(
+		epochKey, epoch, cacheKey, &token, identityCacheTTL(),
+	)
+	return err
 }
 
 func cacheDeleteToken(key string) error {
-	key = common.GenerateHMAC(key)
-	err := common.RedisDelKey(fmt.Sprintf("token:%s", key))
-	if err != nil {
-		return err
+	return common.RedisBumpCacheEpochAndDelete(getTokenCacheEpochKey(key), getTokenCacheKey(key))
+}
+
+func cacheIncrTokenQuota(key string, increment int64, epoch int64) error {
+	advanced, err := common.RedisHIncrByAndAdvanceCacheEpoch(
+		getTokenCacheEpochKey(key), epoch, getTokenCacheKey(key), constant.TokenFiledRemainQuota, increment,
+	)
+	if err == nil && advanced {
+		return nil
 	}
+	if err == nil {
+		err = errors.New("token quota cache epoch changed concurrently")
+	}
+	if invalidateErr := cacheDeleteToken(key); invalidateErr != nil {
+		return errors.Join(err, fmt.Errorf("invalidate token quota cache: %w", invalidateErr))
+	}
+	common.SysError("token quota cache epoch conflict; invalidated cache: " + err.Error())
 	return nil
 }
 
-func cacheIncrTokenQuota(key string, increment int64) error {
-	key = common.GenerateHMAC(key)
-	err := common.RedisHIncrBy(fmt.Sprintf("token:%s", key), constant.TokenFiledRemainQuota, increment)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func cacheDecrTokenQuota(key string, decrement int64) error {
-	return cacheIncrTokenQuota(key, -decrement)
-}
-
-func cacheSetTokenField(key string, field string, value string) error {
-	key = common.GenerateHMAC(key)
-	err := common.RedisHSetField(fmt.Sprintf("token:%s", key), field, value)
-	if err != nil {
-		return err
-	}
-	return nil
+func cacheDecrTokenQuota(key string, decrement int64, epoch int64) error {
+	return cacheIncrTokenQuota(key, -decrement, epoch)
 }
 
 // CacheGetTokenByKey 从缓存中获取 token，如果缓存中不存在，则从数据库中获取

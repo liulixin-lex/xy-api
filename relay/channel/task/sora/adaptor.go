@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -22,7 +23,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
-	"github.com/tidwall/sjson"
 )
 
 // ============================
@@ -83,6 +83,11 @@ func validateRemixRequest(c *gin.Context) *dto.TaskError {
 	if strings.TrimSpace(req.Prompt) == "" {
 		return service.TaskErrorWrapperLocal(fmt.Errorf("field prompt is required"), "invalid_request", http.StatusBadRequest)
 	}
+	if req.DurationPresent || req.Duration != 0 || strings.TrimSpace(req.Seconds) != "" {
+		return service.TaskErrorWrapperLocal(
+			fmt.Errorf("duration fields are not supported for remix"), "invalid_seconds", http.StatusBadRequest,
+		)
+	}
 	// 存储原始请求到 context，与 ValidateMultipartDirect 路径保持一致
 	c.Set("task_request", req)
 	return nil
@@ -132,7 +137,11 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if info.Action == constant.TaskActionRemix {
-		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
+		upstreamTaskID := strings.TrimSpace(info.OriginUpstreamTaskID)
+		if upstreamTaskID == "" {
+			return "", fmt.Errorf("origin task upstream identity is unavailable")
+		}
+		return fmt.Sprintf("%s/v1/videos/%s/remix", strings.TrimRight(a.baseURL, "/"), url.PathEscape(upstreamTaskID)), nil
 	}
 	return fmt.Sprintf("%s/v1/videos", a.baseURL), nil
 }
@@ -145,6 +154,10 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
 }
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	taskReq, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return nil, errors.Wrap(err, "get_task_request_failed")
+	}
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return nil, errors.Wrap(err, "get_request_body_failed")
@@ -159,6 +172,12 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		var bodyMap map[string]interface{}
 		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
 			bodyMap["model"] = info.UpstreamModelName
+			if taskReq.DurationPresent {
+				bodyMap["duration"] = taskReq.Duration
+			}
+			if taskReq.Seconds != "" {
+				bodyMap["seconds"] = taskReq.Seconds
+			}
 			if newBody, err := common.Marshal(bodyMap); err == nil {
 				return bytes.NewReader(newBody), nil
 			}
@@ -179,6 +198,12 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 				continue
 			}
 			for _, v := range values {
+				if key == "duration" && taskReq.DurationPresent {
+					v = strconv.Itoa(taskReq.Duration)
+				}
+				if key == "seconds" && taskReq.Seconds != "" {
+					v = taskReq.Seconds
+				}
 				writer.WriteField(key, v)
 			}
 		}
@@ -227,7 +252,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -237,7 +262,7 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	// Parse Sora response
 	var dResp responseTask
 	if err := common.Unmarshal(responseBody, &dResp); err != nil {
-		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
+		taskErr = service.TaskErrorWrapper(service.UnparseableUpstreamResponseError(err, responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -323,10 +348,45 @@ func (a *TaskAdaptor) ParseTaskResult(_ context.Context, respBody []byte) (*rela
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
-	data := task.Data
-	var err error
-	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
-		return nil, errors.Wrap(err, "set id failed")
+	var soraResp responseTask
+	if err := common.Unmarshal(task.Data, &soraResp); err != nil {
+		return nil, errors.Wrap(err, "unmarshal sora task data failed")
 	}
-	return data, nil
+
+	video := dto.NewOpenAIVideo()
+	video.ID = task.TaskID
+	if soraResp.TaskID != "" {
+		video.TaskID = task.TaskID
+	}
+	video.Model = task.Properties.OriginModelName
+	if video.Model == "" {
+		video.Model = soraResp.Model
+	}
+	video.Status = task.Status.ToVideoStatus()
+	video.SetProgressStr(task.Progress)
+	if task.Progress == "" {
+		video.Progress = soraResp.Progress
+	}
+	video.CreatedAt = task.CreatedAt
+	if video.CreatedAt == 0 {
+		video.CreatedAt = soraResp.CreatedAt
+	}
+	video.CompletedAt = task.UpdatedAt
+	if soraResp.CompletedAt > 0 {
+		video.CompletedAt = soraResp.CompletedAt
+	}
+	video.ExpiresAt = soraResp.ExpiresAt
+	video.Seconds = soraResp.Seconds
+	video.Size = soraResp.Size
+	if soraResp.Error != nil {
+		video.Error = &dto.OpenAIVideoError{
+			Message: common.SanitizeErrorMessage(soraResp.Error.Message),
+			Code:    common.SanitizeErrorMessage(soraResp.Error.Code),
+		}
+	}
+	if resultURL := task.GetResultURL(); resultURL != "" {
+		video.SetMetadata("url", resultURL)
+	}
+
+	return common.Marshal(video)
 }

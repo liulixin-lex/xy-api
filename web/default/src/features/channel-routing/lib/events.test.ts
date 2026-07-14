@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import {
+  channelRoutingEventNames,
   getChannelRoutingEventResources,
   getChannelRoutingReadyCursor,
   getChannelRoutingRetryDelayMs,
@@ -58,27 +59,122 @@ describe('channel routing event contract', () => {
     )
   })
 
-  test('keeps probe events scoped to health evidence queries', () => {
-    assert.deepEqual(
-      getChannelRoutingEventResources('routing.probe.completed'),
-      ['probes', 'endpoints']
-    )
-    assert.deepEqual(getChannelRoutingEventResources('routing.reset'), ['all'])
-    assert.deepEqual(
-      getChannelRoutingEventResources('routing.cost_sync.queued'),
-      ['operations']
-    )
-    assert.deepEqual(
-      getChannelRoutingEventResources('routing.error_budget.changed'),
-      ['overview', 'groups']
-    )
-    assert.deepEqual(getChannelRoutingEventResources('routing.breaker.reset'), [
-      'overview',
-      'groups',
-      'endpoints',
-      'probes',
-      'operations',
+  test('maps every subscribed state event to its affected query resources', () => {
+    const expected = new Map<string, string[]>([
+      ['routing.ready', []],
+      ['routing.reset', ['all']],
+      ['reset', ['all']],
+      ['routing.policy_draft.changed', ['policy-drafts']],
+      [
+        'routing.policy_simulation.completed',
+        ['policy-drafts', 'operations'],
+      ],
+      [
+        'routing.policy.published',
+        ['overview', 'groups', 'policy-drafts', 'policies', 'operations'],
+      ],
+      [
+        'routing.policy.rolled_back',
+        ['overview', 'groups', 'policy-drafts', 'policies', 'operations'],
+      ],
+      [
+        'policy.published',
+        ['overview', 'groups', 'policy-drafts', 'policies', 'operations'],
+      ],
+      [
+        'policy.rolled_back',
+        ['overview', 'groups', 'policy-drafts', 'policies', 'operations'],
+      ],
+      [
+        'routing.policy.applied',
+        [
+          'overview',
+          'nodes',
+          'groups',
+          'channels',
+          'endpoints',
+          'costs',
+          'policies',
+        ],
+      ],
+      ['routing.cost_sync.queued', ['operations']],
+      [
+        'routing.cost_sync.completed',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'costs',
+          'cost-bindings',
+          'operations',
+        ],
+      ],
+      [
+        'cost_sync.completed',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'costs',
+          'cost-bindings',
+          'operations',
+        ],
+      ],
+      [
+        'routing.cost_binding.changed',
+        ['overview', 'groups', 'channels', 'costs', 'cost-bindings'],
+      ],
+      [
+        'routing.probe.completed',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'endpoints',
+          'probes',
+          'operations',
+        ],
+      ],
+      [
+        'probe.completed',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'endpoints',
+          'probes',
+          'operations',
+        ],
+      ],
+      ['routing.audit_export.ready', ['audit-exports', 'operations']],
+      ['audit_export.ready', ['audit-exports', 'operations']],
+      ['routing.error_budget.changed', ['overview', 'groups']],
+      ['error_budget.changed', ['overview', 'groups']],
+      [
+        'routing.breaker.reset',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'endpoints',
+          'probes',
+          'operations',
+        ],
+      ],
+      [
+        'routing.breaker.opened',
+        ['overview', 'groups', 'channels', 'endpoints', 'probes'],
+      ],
+      [
+        'routing.breaker.recovered',
+        ['overview', 'groups', 'channels', 'endpoints', 'probes'],
+      ],
     ])
+
+    assert.deepEqual([...channelRoutingEventNames].sort(), [...expected.keys()].sort())
+    for (const [eventType, resources] of expected) {
+      assert.deepEqual(getChannelRoutingEventResources(eventType), resources)
+    }
   })
 
   test('resumes from the ready cursor and honors bounded retry headers', () => {

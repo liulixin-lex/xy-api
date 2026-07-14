@@ -116,11 +116,13 @@ func balancedCandidateFromSnapshot(
 	if member.PhysicalStatus != common.ChannelStatusEnabled || channel.Status != common.ChannelStatusEnabled {
 		candidate.HardExclusionReason = routingselector.BalancedExclusionRuntimeBlocked
 	}
-	if member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1 {
+	if member.CredentialsTruncated || (channel.CredentialRequired && len(member.CredentialIDs) == 0) {
 		candidate.HardExclusionReason = routingselector.BalancedExclusionCredentialUnavailable
 	}
-	if reason := requestCapabilityExclusionReason(profile, observation); reason != "" {
-		candidate.HardExclusionReason = reason
+	if pool.CapabilityRoutingEnabled {
+		if reason := requestCapabilityExclusionReason(profile, observation); reason != "" {
+			candidate.HardExclusionReason = reason
+		}
 	}
 	if observation.MetricKnown || observation.Inflight > 0 {
 		candidate.Candidate.Metric = &routingselector.MetricSnapshot{

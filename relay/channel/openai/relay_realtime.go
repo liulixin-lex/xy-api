@@ -101,8 +101,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 
 	clientClosed := make(chan struct{})
 	targetClosed := make(chan struct{})
-	sendChan := make(chan []byte, 100)
-	receiveChan := make(chan []byte, 100)
 	errChan := make(chan realtimeRelayError, 2)
 	firstTargetMessage := make(chan struct{}, 1)
 	firstByteState := &realtimeFirstByteState{
@@ -116,10 +114,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	localUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
 	var (
-		wg           sync.WaitGroup
-		cleanupOnce  sync.Once
-		replayMu     sync.Mutex
-		replayBuffer = cloneRealtimeMessages(info.RealtimeReplayMessages)
+		wg          sync.WaitGroup
+		cleanupOnce sync.Once
 	)
 
 	cleanupAttempt := func() {
@@ -132,23 +128,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 		})
 	}
 	defer cleanupAttempt()
-
-	for _, message := range replayBuffer {
-		if relayErr := handleRealtimeClientMessage(c, info, targetConn, message, localUsage); relayErr != nil {
-			if relayErr.endReason != relaycommon.StreamEndReasonNone {
-				info.StreamStatus.SetEndReason(relayErr.endReason, relayErr.err)
-			}
-			if relayErr.apiErr != nil {
-				return relayErr.apiErr, nil
-			}
-			return types.NewErrorWithStatusCode(
-				relayErr.err,
-				types.ErrorCodeDoRequestFailed,
-				http.StatusBadGateway,
-				types.ErrOptionWithHideErrMsg("upstream realtime request failed"),
-			), nil
-		}
-	}
 
 	wg.Add(1)
 	gopool.Go(func() {
@@ -186,14 +165,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				if relayErr := handleRealtimeClientMessage(c, info, targetConn, message, localUsage); relayErr != nil {
 					errChan <- *relayErr
 					return
-				}
-				replayMu.Lock()
-				replayBuffer = append(replayBuffer, append([]byte(nil), message...))
-				replayMu.Unlock()
-
-				select {
-				case sendChan <- message:
-				default:
 				}
 			}
 		}
@@ -351,10 +322,6 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 
-				select {
-				case receiveChan <- message:
-				default:
-				}
 			}
 		}
 	})
@@ -429,12 +396,8 @@ waitLoop:
 		}
 	}
 	if handlerErr != nil {
-		replayMu.Lock()
-		info.RealtimeReplayMessages = cloneRealtimeMessages(replayBuffer)
-		replayMu.Unlock()
 		return handlerErr, sumUsage
 	}
-	info.RealtimeReplayMessages = nil
 
 	// check usage total tokens, if 0, use local usage
 
@@ -479,17 +442,6 @@ func handleRealtimeClientMessage(c *gin.Context, info *relaycommon.RelayInfo, ta
 		}
 	}
 	return nil
-}
-
-func cloneRealtimeMessages(messages [][]byte) [][]byte {
-	if len(messages) == 0 {
-		return nil
-	}
-	cloned := make([][]byte, 0, len(messages))
-	for _, message := range messages {
-		cloned = append(cloned, append([]byte(nil), message...))
-	}
-	return cloned
 }
 
 func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {

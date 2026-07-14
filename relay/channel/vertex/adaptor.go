@@ -1,7 +1,6 @@
 package vertex
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -215,7 +214,12 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, req)
 	if info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey {
-		accessToken, err := getAccessToken(c.Request.Context(), a, info)
+		accessToken, err := getAccessToken(
+			c.Request.Context(),
+			a,
+			info,
+			func() error { return relaycommon.MarkRoutingUpstreamSent(c) },
+		)
 		if err != nil {
 			return err
 		}
@@ -267,7 +271,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 		if len(request.ExtraBody) > 0 {
 			var extra map[string]any
-			if err := json.Unmarshal(request.ExtraBody, &extra); err == nil {
+			if err := common.Unmarshal(request.ExtraBody, &extra); err == nil {
 				if n, ok := extra["n"].(float64); ok && n > 0 {
 					imgReq.N = lo.ToPtr(uint(n))
 				}

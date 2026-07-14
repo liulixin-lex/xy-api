@@ -759,6 +759,7 @@
     "Billing group = premium (the token has a group, so use it)": "Nhóm tính phí = premium (token có nhóm nên dùng nhóm đó)",
     "Billing group = vip (the token has no group, so use the user group)": "Nhóm tính phí = vip (token không có nhóm nên dùng nhóm người dùng)",
     "Billing History": "Lịch sử thanh toán",
+    "Billing log integrity audit": "Kiểm tra tính toàn vẹn nhật ký tính phí",
     "Billing Mode": "Chế độ thanh toán",
     "Billing Process": "Quá trình tính phí",
     "Billing Source": "Nguồn thanh toán",

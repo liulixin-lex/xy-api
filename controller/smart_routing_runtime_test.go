@@ -1119,7 +1119,7 @@ func TestFlushRoutingRuntimeStateContextCancellationRequeuesDirtyState(t *testin
 	assert.Equal(t, "cancel-breaker", requeuedBreakers[0].Key.Model)
 }
 
-func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeFirstWrite(t *testing.T) {
+func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenChannelWasRecreatedBeforeFirstWrite(t *testing.T) {
 	testCases := []struct {
 		name      string
 		channelID int
@@ -1133,6 +1133,7 @@ func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeF
 		t.Run(testCase.name, func(t *testing.T) {
 			db := setupModelListControllerTestDB(t)
 			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
 				&model.RoutingChannelBinding{},
 				&model.RoutingChannelMetric{},
 				&model.RoutingBreakerState{},
@@ -1158,9 +1159,11 @@ func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeF
 				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 			})
 
-			require.NoError(t, db.Create(&model.Channel{
-				Id: testCase.channelID, Name: "pre-flush-recreation-" + testCase.name, Key: "single-key",
-			}).Error)
+			oldChannel := model.Channel{
+				Id: testCase.channelID, Name: "pre-flush-recreation-" + testCase.name,
+				Key: "single-key", CreatedTime: 100,
+			}
+			require.NoError(t, db.Create(&oldChannel).Error)
 			oldBinding := model.RoutingChannelBinding{
 				ChannelID:     testCase.channelID,
 				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
@@ -1190,22 +1193,17 @@ func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeF
 				}, routingbreaker.FailureProvider5xx)
 			}
 
-			replacementBinding := model.RoutingChannelBinding{
-				ID:            oldBinding.ID + 10_000,
-				ChannelID:     testCase.channelID,
-				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
-				BaseURL:       "https://replacement-routing.example.com",
-				UpstreamGroup: "default",
-				Enabled:       true,
-				CreatedTime:   replacementCreatedTime,
-				UpdatedTime:   replacementCreatedTime,
+			replacementChannel := model.Channel{
+				Id: testCase.channelID, Name: "replacement-" + testCase.name,
+				Key: "replacement-key", CreatedTime: replacementCreatedTime,
 			}
 			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				if err := tx.Where("id = ?", oldBinding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+				if err := tx.Where("id = ?", oldChannel.Id).Delete(&model.Channel{}).Error; err != nil {
 					return err
 				}
-				return tx.Create(&replacementBinding).Error
+				return tx.Create(&replacementChannel).Error
 			}))
+			require.NotEqual(t, oldChannel.RoutingGeneration, replacementChannel.RoutingGeneration)
 
 			summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 			require.NoError(t, err)
@@ -1214,7 +1212,7 @@ func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeF
 
 			var currentBinding model.RoutingChannelBinding
 			require.NoError(t, db.Where("channel_id = ?", testCase.channelID).First(&currentBinding).Error)
-			assert.Equal(t, replacementBinding.ID, currentBinding.ID)
+			assert.Equal(t, oldBinding.ID, currentBinding.ID)
 			for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
 				var count int64
 				require.NoError(t, db.Model(table).Where("channel_id = ?", testCase.channelID).Count(&count).Error)
@@ -1231,7 +1229,7 @@ func TestFlushRoutingRuntimeStateRejectsDirtyStateWhenBindingWasRecreatedBeforeF
 	}
 }
 
-func TestFlushRoutingRuntimeStateDoesNotRecreateStateAfterRemoteBindingDelete(t *testing.T) {
+func TestFlushRoutingRuntimeStateDoesNotRecreateStateAfterRemoteChannelDelete(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingChannelBinding{},
@@ -1272,8 +1270,8 @@ func TestFlushRoutingRuntimeStateDoesNotRecreateStateAfterRemoteBindingDelete(t 
 		ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "deleted-breaker", Group: "default",
 	}, routingbreaker.FailureProvider5xx)
 
-	// Simulate another node deleting the binding without touching this process's dirty state.
-	require.NoError(t, db.Delete(&model.RoutingChannelBinding{}, binding.ID).Error)
+	// Simulate another node deleting the physical channel without touching this process's dirty state.
+	require.NoError(t, db.Delete(&model.Channel{}, channelID).Error)
 
 	summary, err := flushRoutingRuntimeState(context.Background(), smart_routing_setting.SmartRoutingSetting{MetricBucketSec: 60})
 	require.NoError(t, err)
@@ -1288,7 +1286,7 @@ func TestFlushRoutingRuntimeStateDoesNotRecreateStateAfterRemoteBindingDelete(t 
 	assert.Empty(t, routingbreaker.DirtySnapshots())
 }
 
-func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforePublish(t *testing.T) {
+func TestFlushRoutingRuntimeStateClearsCommittedStateWhenChannelIsDeletedBeforePublish(t *testing.T) {
 	testCases := []struct {
 		name           string
 		channelID      int
@@ -1305,6 +1303,7 @@ func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforeP
 		t.Run(testCase.name, func(t *testing.T) {
 			db := setupModelListControllerTestDB(t)
 			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
 				&model.RoutingChannelBinding{},
 				&model.RoutingChannelMetric{},
 				&model.RoutingBreakerState{},
@@ -1365,21 +1364,21 @@ func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforeP
 					close(releasePostCommitCheck)
 				}
 			}()
-			var bindingQueries atomic.Int64
-			callbackName := "test:block_flush_post_commit_binding_check_" + testCase.name
-			blockSecondBindingQuery := func(tx *gorm.DB) {
-				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelBinding{}).TableName() {
+			var channelQueries atomic.Int64
+			callbackName := "test:block_flush_post_commit_channel_check_" + testCase.name
+			blockPostWriteChannelQuery := func(tx *gorm.DB) {
+				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "channels" {
 					return
 				}
-				if bindingQueries.Add(1) == 2 {
+				if channelQueries.Add(1) == 3 {
 					close(afterCommit)
 					<-releasePostCommitCheck
 				}
 			}
 			if testCase.afterPostCheck {
-				require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, blockSecondBindingQuery))
+				require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, blockPostWriteChannelQuery))
 			} else {
-				require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, blockSecondBindingQuery))
+				require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, blockPostWriteChannelQuery))
 			}
 			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
 
@@ -1396,7 +1395,7 @@ func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforeP
 			select {
 			case <-afterCommit:
 			case <-time.After(time.Second):
-				require.FailNow(t, "flush did not reach the post-commit binding check")
+				require.FailNow(t, "flush did not reach the post-commit channel check")
 			}
 
 			persistedModel := any(&model.RoutingBreakerState{})
@@ -1409,11 +1408,11 @@ func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforeP
 				Count(&committedCount).Error)
 			assert.Equal(t, int64(1), committedCount)
 
-			// Simulate the binding and its persisted runtime state being deleted by another node
+			// Simulate the physical channel and its persisted runtime state being deleted by another node
 			// after this flush commits. The after-query cases delete after the first post-check
-			// has already observed the binding, covering the check-to-publish/return window.
+			// has already observed the channel, covering the check-to-publish/return window.
 			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				if err := tx.Where("id = ?", binding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+				if err := tx.Where("id = ?", testCase.channelID).Delete(&model.Channel{}).Error; err != nil {
 					return err
 				}
 				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
@@ -1445,7 +1444,7 @@ func TestFlushRoutingRuntimeStateClearsCommittedStateWhenBindingIsDeletedBeforeP
 	}
 }
 
-func TestFlushRoutingRuntimeStateFailsClosedWhenFinalBindingCheckFails(t *testing.T) {
+func TestFlushRoutingRuntimeStateFailsClosedWhenFinalChannelCheckFails(t *testing.T) {
 	testCases := []struct {
 		name      string
 		channelID int
@@ -1459,6 +1458,7 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenFinalBindingCheckFails(t *testin
 		t.Run(testCase.name, func(t *testing.T) {
 			db := setupModelListControllerTestDB(t)
 			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
 				&model.RoutingChannelBinding{},
 				&model.RoutingChannelMetric{},
 				&model.RoutingBreakerState{},
@@ -1509,12 +1509,12 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenFinalBindingCheckFails(t *testin
 				}, routingbreaker.FailureProvider5xx)
 			}
 
-			forcedErr := errors.New("forced final binding verification failure")
-			var bindingQueries atomic.Int64
-			callbackName := "test:fail_final_flush_binding_check_" + testCase.name
+			forcedErr := errors.New("forced final channel verification failure")
+			var channelQueries atomic.Int64
+			callbackName := "test:fail_final_flush_channel_check_" + testCase.name
 			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == (model.RoutingChannelBinding{}).TableName() &&
-					bindingQueries.Add(1) == 3 {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channels" &&
+					channelQueries.Add(1) == 4 {
 					tx.AddError(forcedErr)
 				}
 			}))
@@ -1543,7 +1543,7 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenFinalBindingCheckFails(t *testin
 	}
 }
 
-func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *testing.T) {
+func TestFlushRoutingRuntimeStateFailsClosedWhenInitialChannelCheckFails(t *testing.T) {
 	testCases := []struct {
 		name      string
 		channelID int
@@ -1557,6 +1557,7 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *test
 		t.Run(testCase.name, func(t *testing.T) {
 			db := setupModelListControllerTestDB(t)
 			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
 				&model.RoutingChannelBinding{},
 				&model.RoutingChannelMetric{},
 				&model.RoutingBreakerState{},
@@ -1608,7 +1609,7 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *test
 				}, routingbreaker.FailureProvider5xx)
 			}
 
-			forcedErr := errors.New("forced initial binding verification failure")
+			forcedErr := errors.New("forced initial channel verification failure")
 			initialCheckStarted := make(chan struct{})
 			releaseInitialCheck := make(chan struct{})
 			released := false
@@ -1617,11 +1618,11 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *test
 					close(releaseInitialCheck)
 				}
 			}()
-			var bindingQueries atomic.Int64
-			callbackName := "test:fail_initial_flush_binding_check_" + testCase.name
+			var channelQueries atomic.Int64
+			callbackName := "test:fail_initial_flush_channel_check_" + testCase.name
 			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == (model.RoutingChannelBinding{}).TableName() &&
-					bindingQueries.Add(1) == 2 {
+				if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channels" &&
+					channelQueries.Add(1) == 3 {
 					close(initialCheckStarted)
 					<-releaseInitialCheck
 					tx.AddError(forcedErr)
@@ -1641,10 +1642,10 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *test
 			select {
 			case <-initialCheckStarted:
 			case <-time.After(time.Second):
-				require.FailNow(t, "flush did not reach the initial binding check")
+				require.FailNow(t, "flush did not reach the initial channel check")
 			}
 			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+				if err := tx.Where("id = ?", testCase.channelID).Delete(&model.Channel{}).Error; err != nil {
 					return err
 				}
 				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
@@ -1678,7 +1679,7 @@ func TestFlushRoutingRuntimeStateFailsClosedWhenInitialBindingCheckFails(t *test
 	}
 }
 
-func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreation(t *testing.T) {
+func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterChannelRecreation(t *testing.T) {
 	testCases := []struct {
 		name      string
 		channelID int
@@ -1692,6 +1693,7 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 		t.Run(testCase.name, func(t *testing.T) {
 			db := setupModelListControllerTestDB(t)
 			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
 				&model.RoutingChannelBinding{},
 				&model.RoutingChannelMetric{},
 				&model.RoutingBreakerState{},
@@ -1712,9 +1714,11 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 				routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 			})
 
-			require.NoError(t, db.Create(&model.Channel{
-				Id: testCase.channelID, Name: "binding-recreated-" + testCase.name, Key: "single-key",
-			}).Error)
+			oldChannel := model.Channel{
+				Id: testCase.channelID, Name: "channel-recreated-" + testCase.name,
+				Key: "single-key", CreatedTime: 1,
+			}
+			require.NoError(t, db.Create(&oldChannel).Error)
 			oldBinding := model.RoutingChannelBinding{
 				ChannelID:     testCase.channelID,
 				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
@@ -1766,13 +1770,13 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 					close(releaseFirstPostCheck)
 				}
 			}()
-			var bindingQueries atomic.Int64
-			callbackName := "test:block_flush_before_binding_recreation_" + testCase.name
+			var channelQueries atomic.Int64
+			callbackName := "test:block_flush_before_channel_recreation_" + testCase.name
 			require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelBinding{}).TableName() {
+				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "channels" {
 					return
 				}
-				if bindingQueries.Add(1) == 2 {
+				if channelQueries.Add(1) == 3 {
 					close(afterFirstPostCheck)
 					<-releaseFirstPostCheck
 				}
@@ -1792,7 +1796,7 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 			select {
 			case <-afterFirstPostCheck:
 			case <-time.After(time.Second):
-				require.FailNow(t, "flush did not finish the first binding post-check")
+				require.FailNow(t, "flush did not finish the first channel post-check")
 			}
 
 			persistedModel := any(&model.RoutingBreakerState{})
@@ -1805,16 +1809,12 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 				Count(&committedCount).Error)
 			assert.Equal(t, int64(1), committedCount)
 
-			replacementBinding := model.RoutingChannelBinding{
-				ID:            oldBinding.ID + 10_000,
-				ChannelID:     testCase.channelID,
-				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
-				BaseURL:       "https://new-routing.example.com",
-				UpstreamGroup: "default",
-				Enabled:       true,
+			replacementChannel := model.Channel{
+				Id: testCase.channelID, Name: "replacement-" + testCase.name,
+				Key: "replacement-key", CreatedTime: 2,
 			}
 			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				if err := tx.Where("id = ?", oldBinding.ID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
+				if err := tx.Where("id = ?", oldChannel.Id).Delete(&model.Channel{}).Error; err != nil {
 					return err
 				}
 				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
@@ -1823,8 +1823,9 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 				if err := tx.Where("channel_id = ?", testCase.channelID).Delete(&model.RoutingBreakerState{}).Error; err != nil {
 					return err
 				}
-				return tx.Create(&replacementBinding).Error
+				return tx.Create(&replacementChannel).Error
 			}))
+			require.NotEqual(t, oldChannel.RoutingGeneration, replacementChannel.RoutingGeneration)
 			close(releaseFirstPostCheck)
 			released = true
 
@@ -1832,11 +1833,11 @@ func TestFlushRoutingRuntimeStateRejectsRemainingDirtyStateAfterBindingRecreatio
 			require.NoError(t, flush.err)
 			assert.Equal(t, 0, flush.summary["metrics"])
 			assert.Equal(t, 0, flush.summary["breakers"])
-			assert.Equal(t, int64(3), bindingQueries.Load(), "the rejected channel must not query or write the third dirty item")
+			assert.Equal(t, int64(4), channelQueries.Load(), "the rejected channel must not query or write the third dirty item")
 
 			var currentBinding model.RoutingChannelBinding
 			require.NoError(t, db.Where("channel_id = ?", testCase.channelID).First(&currentBinding).Error)
-			assert.Equal(t, replacementBinding.ID, currentBinding.ID)
+			assert.Equal(t, oldBinding.ID, currentBinding.ID)
 			for _, table := range []any{&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}} {
 				var count int64
 				require.NoError(t, db.Model(table).Where("channel_id = ?", testCase.channelID).Count(&count).Error)
@@ -1889,7 +1890,8 @@ func TestFlushRoutingRuntimeStateQueriesEligibilityOncePerChannelAcrossMetricsAn
 	const callbackName = "test:count_flush_channel_eligibility_queries"
 	channelQueryCount := 0
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channels" {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Table == "channels" &&
+			len(tx.Statement.Selects) == 1 && tx.Statement.Selects[0] == "channel_info" {
 			channelQueryCount++
 		}
 	}))

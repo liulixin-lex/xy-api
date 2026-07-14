@@ -5,6 +5,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/channelrouting"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -65,8 +66,93 @@ func routingCostRequestProfile(c *gin.Context) *model.RoutingCostRequestProfile 
 	return profile
 }
 
+func routingRequestProfile(
+	c *gin.Context,
+	group string,
+	retryIndex int,
+	promptTokens int,
+	completionTokens int,
+) (*channelrouting.RequestProfile, error) {
+	if c == nil {
+		return nil, nil
+	}
+	setting := smart_routing_setting.GetSetting()
+	if !setting.Enabled || !setting.RequestProfileV2Enabled {
+		return nil, nil
+	}
+	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
+		c,
+		constant.ContextKeyRoutingRequestProfile,
+	)
+	if !ok {
+		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileV2Input](
+			c,
+			constant.ContextKeyRoutingRequestProfile,
+		); pointerOK && pointer != nil {
+			template = *pointer
+			ok = true
+		}
+	}
+	if !ok {
+		return nil, nil
+	}
+	template.GroupName = group
+	template.RetryIndex = retryIndex
+	if template.InputTokens.State != channelrouting.RequestQuantityNotApplicable &&
+		common.GetContextKeyBool(c, constant.ContextKeyRoutingPromptKnown) {
+		template.InputTokens = channelrouting.KnownRequestQuantity(int64(max(promptTokens, 0)))
+	}
+	if template.OutputTokens.State != channelrouting.RequestQuantityNotApplicable &&
+		common.GetContextKeyBool(c, constant.ContextKeyRoutingOutputKnown) {
+		template.OutputTokens = channelrouting.KnownRequestQuantity(int64(max(completionTokens, 0)))
+	}
+	profile, err := channelrouting.NewRequestProfileV2(template)
+	if err != nil {
+		return nil, err
+	}
+	return &profile, nil
+}
+
+type RoutingRequestAttemptPolicy struct {
+	RetryAllowed             bool
+	CrossChannelRetryAllowed bool
+	HedgeAllowed             bool
+}
+
+func ChannelRoutingRequestAttemptPolicy(c *gin.Context) (RoutingRequestAttemptPolicy, bool) {
+	if c == nil {
+		return RoutingRequestAttemptPolicy{}, false
+	}
+	setting := smart_routing_setting.GetSetting()
+	if !setting.Enabled || !setting.RequestProfileV2Enabled {
+		return RoutingRequestAttemptPolicy{}, false
+	}
+	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
+		c,
+		constant.ContextKeyRoutingRequestProfile,
+	)
+	if !ok {
+		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileV2Input](
+			c,
+			constant.ContextKeyRoutingRequestProfile,
+		); pointerOK && pointer != nil {
+			template = *pointer
+			ok = true
+		}
+	}
+	if !ok {
+		return RoutingRequestAttemptPolicy{}, false
+	}
+	return RoutingRequestAttemptPolicy{
+		RetryAllowed:             template.RetryAllowed,
+		CrossChannelRetryAllowed: template.CrossChannelRetryAllowed,
+		HedgeAllowed:             template.HedgeAllowed,
+	}, true
+}
+
 func routingStrictCapacityCost(
 	session *channelrouting.RequestRoutingSession,
+	group string,
 	channelID int,
 	param *RetryParam,
 	input channelrouting.CapacityDimensionEstimate,
@@ -94,6 +180,16 @@ func routingStrictCapacityCost(
 			MaximumCompletionKnown:   output.Known(),
 		}
 	}
+	requestProfile, err := routingRequestProfile(
+		param.Ctx,
+		group,
+		param.GetRetry(),
+		input.Tokens,
+		output.Tokens,
+	)
+	if err != nil {
+		return 0, false, err
+	}
 	return session.WorstCaseCostForChannel(channelID, channelrouting.RequestRoutingCostInput{
 		RequestPath:             param.RequestPath,
 		ModelName:               param.ModelName,
@@ -102,5 +198,6 @@ func routingStrictCapacityCost(
 		PromptTokenEstimate:     input.Tokens,
 		CompletionTokenEstimate: output.Tokens,
 		CostProfile:             costProfile,
+		Profile:                 requestProfile,
 	})
 }

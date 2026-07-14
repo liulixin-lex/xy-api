@@ -8,8 +8,11 @@
 
 - `/opt/临时/渠道路由-企业级重构最终方案.md`
   - 期望 SHA-256：`e46728b64adbadcde7d3942c192431f83e79f4e5434856c8b7a8bc1852b70fab`
-  - 2026-07-11 已校验一致。
+  - 2026-07-13 恢复检查点再次校验一致。
 - `/opt/临时/渠道路由-2.0-Codex执行契约.md`
+  - SHA-256：`e634a688013deb726a6b2f8e7c9f892eae2d22f4163b6bb63dd6b838fbc28afc`
+- `/opt/临时/渠道路由-2.0-Codex提示词套件.md`
+  - SHA-256：`243fe4f6d78182420a03fdf44dbee6644c683e4e054d6683640ed2710f1a66c2`
 - `docs/superpowers/specs/2026-07-10-channel-routing-v2-design.md`
 - `docs/superpowers/plans/2026-07-10-channel-routing-phase0-runtime-safety.md`
 - `docs/superpowers/plans/2026-07-10-channel-routing-phase0b-error-capacity-multikey.md`
@@ -19,14 +22,14 @@
 
 ## Context and Orientation
 
-- 主仓库：`/opt/xy-api`
-- 专用工作树：`/root/.config/superpowers/worktrees/xy-api/feat-channel-routing-v2`
-- 分支：`feat/channel-routing-v2`
-- 当前 HEAD：`569ffb16`；后端主体提交 `0962012d` 与前端提交 `18c3c69a` 已通过非快进合并进入本分支，发布前发现的 SSE Flush、日志器并发和测试夹具稳定性修复仍在工作树中等待最终提交。
-- 开发基线位于专用分支 `feat/channel-routing-v2`，不在 `/opt/xy-api` 的 main 工作树直接开发。
+- 主仓库与当前交付工作树：`/opt/xy-api`
+- 分支：`fix/channel-routing-v0.1.11`
+- 恢复检查点 HEAD：`871cd5e27e6fe93e65b98b829259f0db78e487d4`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。
+- 当前工作树包含渠道路由发布终审发现的跨模块修复，尚未形成最终集成提交；不得 reset、checkout、stash、rebase、amend 或覆盖并行子线改动。
+- 旧兼容列表上限候选 `68452343` 已按当前文件增量手工集成并保留跨数据库契约测试；剩余独立集成候选为 Cost Sources 前端基线 `a78aa2fb` 及其增量提交、供应链 `259917d7`、`a26402ca` 与收口提交 `6097f09b`。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
 - 正式 `web/default` 七页工作区已合并；Typecheck、Lint、i18n、单测、Build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。
-- 子 Agent 已全部收敛，最终总装、PR、CI 与发布由根线串行完成，避免并行写入和限流干扰。
+- 当前三条并行线分别拥有 durable async billing、统计/日志投影、发布供应链审查；Cost Sources worktree 已完成且保持 clean，待 manual review API 稳定后重新唤醒实现复核 UI。根线负责交叉审查、集成、最终验证和发布，文件所有权交接前不得交叉写入。
 
 ## Progress
 
@@ -42,8 +45,11 @@
 - [x] Phase 4 Balanced：硬约束、绝对 SLO、Weighted P2C、探索、亲和保护、主动探测、首字前切换、策略治理、幂等 Operation、兼容入口和 SSE 已完成。
 - [x] Phase 5 Enterprise SLO：严格容量租约、共享份额、区域作用域、独立 RBAC、双人审批、Error Budget、持久审计导出、预算 Hedging、多节点失效语义与成本审计已完成。
 - [x] Gate 7 前端：七个深链页面、七语 i18n、SSE/轮询降级、A11y、320/768/1440、200% 缩放、明暗主题、深链、权限与错误恢复已验收并合入。
-- [x] 最终实现验证：SQLite/MySQL 5.7/PostgreSQL 9.6、真实 Redis/多节点、相关 race、vet/build、故障矩阵、benchmark、前端测试/E2E/Axe/视觉与独立 P0/P1 审查已完成；合入最新 main 后还需复跑发布门槛。
-- [ ] Git/发布：提交分支、PR、同步最新 main、合入前复验、合入 main、按正常节奏构建下一版镜像。
+- [ ] 发布终审硬化：完成 Task/MJ durable async billing 的 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、滚动升级门禁和保留期。
+- [ ] 计费投影：完成 accepted/terminal 统计、外部日志、缓存同步各自独立幂等与故障恢复，并补齐三数据库并发/崩溃点证据。
+- [ ] Cost Sources 前端：完成独立提交集成及 Impeccable、七语 i18n、浏览器矩阵和 production build 复验。
+- [ ] 最终实现验证：在当前最终代码上重新执行 SQLite/MySQL 5.7/PostgreSQL 9.6、Redis、多节点、ClickHouse、race、vet/build、故障矩阵、benchmark、前端和仓库审计；历史证据只作基线，不替代新鲜证据。
+- [ ] Git/发布：提交并推送分支、PR、同步最新 main、复验、合入 main，发布并核验 `v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 Release。
 
 ## Requirement Traceability Matrix
 
@@ -64,8 +70,8 @@
 | CR-FE | 七页渠道路由工作区、七语、SSE/A11y/响应式/视觉 | 前端提交 `18c3c69a`；21/21 单测、14/14 Playwright、Typecheck、Build、Axe、键盘、缩放与视觉矩阵 | PASS |
 | CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
-| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | Hedge 单次用户结算、完整 attempt timeline、平台成本与饱和审计；未知 Probe 价格 fail-closed | PASS |
-| CR-GIT | PR、同步 main、合入、镜像构建 | 尚未执行 | PENDING |
+| CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步请求链已通过；Task/MJ durable reservation、终态结算和恢复正在发布终审硬化 | IN PROGRESS |
+| CR-GIT | PR、同步 main、合入、镜像构建 | 供应链候选提交已独立验证，尚未集成、推送或发布 | PENDING |
 
 ## Plan of Work
 
@@ -183,6 +189,16 @@
 - 独立审查未发现 P0；所有确认 P1 已修复并完成相关回归。`git diff --check` PASS，未跟踪临时文件为 0；最终敏感信息、受保护标识和发布供应链审计仍在 PR 前执行。
 - 根线最终复跑：Classic `bun run build` PASS；`GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；`git diff --check` PASS；当前工作树差异敏感词与受保护项目标识扫描无命中。`gitleaks`/`trufflehog` 本机未安装，未作为最终证据。
 
+### v0.1.11 发布终审恢复检查点（2026-07-13）
+
+- 权威方案、执行契约和提示词套件 SHA-256 再次校验一致；工作树、所有 worktree、候选提交与当前三条子线完成状态对账。
+- MJ 图片/视频鉴权、所有权、受保护代理、Range/If-Range、内容类型与大小边界已通过定向回归；Stateful Task/MJ 固定原渠道与稳定 Credential ID，历史缺失稳定身份时 fail closed。
+- Cost Sources 后端的 provider 凭证隔离、切换清理、空 envelope、CA readiness、500 groups 上限、稳定字段错误、SSRF/TLS/重定向/私网/响应边界已完成并通过相关测试。
+- SQL/ClickHouse 计费日志 receipt、可见视图去重/冲突隔离、周期审计、DB lease 和七语标签已有独立证据；当前继续补 accepted/terminal usage projection 的独立幂等阶段。
+- Cost Sources 前端独立 worktree 的 9/9 浏览器矩阵、scoped Axe、内容区/抽屉无横向溢出、27/27 定向测试与 Impeccable detector 0 命中已通过；仍待最终构建检查、提交与主线集成。
+- 发布供应链独立审查新增 `6097f09b`：Release/Electron 资产不可覆盖、跨工作流串行上传、旧版本不得倒退 Latest、同版本不同 digest fail closed、alpha 子架构与最终 manifest 均签名；Action SHA、actionlint、yamllint、shellcheck、脚本测试及真实 `v0.1.10` GHCR/Release/SBOM/Provenance 回放均 PASS。
+- 最大 P0 是 Task/MJ durable async billing：状态机和 Task 提交链已部分落盘，MJ、terminal operation、恢复、manual resolution、客户端幂等契约、滚动升级与三数据库崩溃点证据尚未完成，因此历史“最终验证 PASS”不能作为当前发布结论。
+
 ## Surprises & Discoveries
 
 - 旧会话只完成 Phase 0A/0B；最后的“已完成”只指 Phase 0B 收尾，不是完整渠道路由 2.0。
@@ -217,6 +233,10 @@
 - 2026-07-12：子 Agent 数量通常维持约 2 条并行线，不把 2 视为硬上限；发现派生第三条线后立即中断并由企业后端线接管共享改动。
 - 2026-07-12：Gate 5 与 Gate 6 已在 Policy/Router 文件形成交叉，停止强行拆分提交，改为企业后端统一收口、根代理独立审查后原子提交。
 - 2026-07-13：最终总装以全仓行为为边界；发现共享 SSE/Logger 问题时修复基础设施根因，不通过删除测试、放宽断言或串行化生产路径规避。
+- 2026-07-13：发布版本提升为 `v0.1.11`；只有合入后的 tag commit 可触发正式发布，`latest` 必须单调更新并与不可变版本 tag 指向同一镜像 digest。
+- 2026-07-13：Task/MJ 上游发送后的模糊结果一律保留扣款并进入 manual review；只有可证明的发送前失败或明确拒绝才能自动释放。accepted、terminal、stats、外部日志和缓存同步分别使用持久幂等阶段。
+- 2026-07-13：v2 writer 必须在所有在线实例报告协议能力后启用，避免旧 poller 按 legacy 语义重复结算；历史 v1 数据继续兼容且不提前删除字段。
+- 2026-07-13：三条子线允许并行，但使用明确文件所有权；根线在交接后统一审查与集成，避免通过局部修复破坏其他链路。
 
 ## Idempotence and Recovery
 
@@ -228,4 +248,4 @@
 
 ## Outcomes & Retrospective
 
-Phase 0–5、后端控制面/数据面、七页正式前端、三数据库/真实 Redis/并发/性能/浏览器验收均已完成。当前只剩：提交最终总装修复与台账、同步最新 main 后复跑、创建并通过 PR/CI、合入 main、发布 `v0.1.10`，并核验 GHCR `amd64/arm64/latest`、manifest、SBOM、provenance、Cosign 身份和容器 `--version`。完整 Goal 在发布核验完成前保持进行中。
+Phase 0–5 控制面/数据面和七页正式前端已完成，但 `v0.1.11` 发布终审新增的 Task/MJ durable async billing、投影恢复、Cost Sources 集成与供应链门禁仍在实施。完成后必须在最终代码上重跑全矩阵，随后提交/推送、PR、同步 main、复验、合入并发布；只有 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本和 GitHub Release 全部核验通过，完整 Goal 才能结束。

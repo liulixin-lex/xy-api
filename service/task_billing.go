@@ -94,7 +94,7 @@ func taskAdjustFunding(task *model.Task, delta int) error {
 	if delta > 0 {
 		return model.DecreaseUserQuota(task.UserId, delta, false)
 	}
-	return model.IncreaseUserQuota(task.UserId, -delta, false)
+	return model.RefundUserQuota(task.UserId, -delta)
 }
 
 // taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
@@ -111,7 +111,7 @@ func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
 	if delta > 0 {
 		err = model.DecreaseTokenQuota(task.PrivateData.TokenId, tokenKey, delta)
 	} else {
-		err = model.IncreaseTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
+		err = model.RefundTokenQuota(task.PrivateData.TokenId, tokenKey, -delta)
 	}
 	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("调整令牌额度失败 (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
@@ -163,8 +163,14 @@ func taskModelName(task *model.Task) string {
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，将预扣的 quota 退还给用户（支持钱包和订阅），并退还令牌额度。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
+	if task == nil {
+		return
+	}
 	quota := task.Quota
-	if quota == 0 {
+	if quota <= 0 || quota > common.MaxQuota {
+		if quota != 0 {
+			logger.LogWarn(ctx, fmt.Sprintf("拒绝异常任务退款额度 task %s: %d", task.TaskID, quota))
+		}
 		return
 	}
 
@@ -199,11 +205,20 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
 // reason 用于日志记录（例如 "token重算" 或 "adaptor调整"）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
 func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string, clamps ...*common.QuotaClamp) {
-	if actualQuota <= 0 {
+	if task == nil || actualQuota <= 0 || actualQuota > common.MaxQuota {
 		return
 	}
 	preConsumedQuota := task.Quota
-	quotaDelta := actualQuota - preConsumedQuota
+	if preConsumedQuota < 0 || preConsumedQuota > common.MaxQuota {
+		logger.LogWarn(ctx, fmt.Sprintf("拒绝异常任务预扣额度 task %s: %d", task.TaskID, preConsumedQuota))
+		return
+	}
+	quotaDelta64 := int64(actualQuota) - int64(preConsumedQuota)
+	if quotaDelta64 < int64(common.MinQuota) || quotaDelta64 > int64(common.MaxQuota) {
+		logger.LogWarn(ctx, fmt.Sprintf("拒绝异常任务结算差值 task %s: %d", task.TaskID, quotaDelta64))
+		return
+	}
+	quotaDelta := int(quotaDelta64)
 
 	if quotaDelta == 0 {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 预扣费准确（%s，%s）",
