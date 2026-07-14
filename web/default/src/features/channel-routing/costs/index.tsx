@@ -16,19 +16,33 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useIsFetching,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { getRouteApi, Link } from '@tanstack/react-router'
 import {
   CheckCircle2,
+  Cable,
   Clock3,
+  Coins,
   Eye,
   RefreshCw,
   Search,
   TriangleAlert,
   X,
 } from 'lucide-react'
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -44,6 +58,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { Tabs, TabsTrigger } from '@/components/ui/tabs'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -66,6 +81,7 @@ import {
   ChannelRoutingLoadingState,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
+import { ChannelRoutingScrollableTabsList } from '../components/scrollable-tabs-list'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
 import {
@@ -77,6 +93,10 @@ import type {
   CostSnapshotSummary,
 } from '../types'
 import { ChannelRoutingCostDetailsSheet } from './cost-details-sheet'
+
+const LazyChannelRoutingCostSourcesSection = lazy(
+  () => import('./cost-sources-section')
+)
 
 const route = getRouteApi('/_authenticated/channel-routing/$section')
 
@@ -132,6 +152,11 @@ export function ChannelRoutingCostsPage() {
     ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
     ADMIN_PERMISSION_ACTIONS.OPERATE
   )
+  const canSensitiveWrite = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
+    ADMIN_PERMISSION_ACTIONS.SENSITIVE_WRITE
+  )
   const costSyncKeyRef = useRef<string | null>(null)
   const refreshedCostSyncRef = useRef<number | null>(null)
   const [selectedCost, setSelectedCost] = useState<CostSnapshotSummary | null>(
@@ -139,6 +164,7 @@ export function ChannelRoutingCostsPage() {
   )
   const search = route.useSearch()
   const navigate = route.useNavigate()
+  const costView = search.costView ?? 'snapshots'
   const page = search.page ?? 1
   const pageSize = search.pageSize ?? 20
   const known = search.known ?? 'all'
@@ -153,7 +179,13 @@ export function ChannelRoutingCostsPage() {
     queryKey: channelRoutingQueryKeys.costs(queryParams),
     queryFn: () => listChannelRoutingCosts(queryParams),
     placeholderData: (previous) => previous,
+    enabled: costView === 'snapshots',
+    meta: { handleErrorLocally: true },
   })
+  const sourceFetching =
+    useIsFetching({
+      queryKey: channelRoutingQueryKeys.costBindingsRoot(),
+    }) > 0
   const costSync = useMutation({
     mutationFn: () => {
       costSyncKeyRef.current ??= createChannelRoutingIdempotencyKey('cost-sync')
@@ -243,14 +275,20 @@ export function ChannelRoutingCostsPage() {
     ])
   }, [queryClient, trackedCostSync])
 
-  const updateSearch = (
-    patch: Record<string, string | number | boolean | undefined>
-  ) => {
-    void navigate({
-      search: (previous) => ({ ...previous, ...patch }),
-      replace: true,
-    })
-  }
+  const updateSearch = useCallback(
+    (patch: Record<string, string | number | boolean | undefined>) => {
+      void navigate({
+        search: (previous) => ({ ...previous, ...patch }),
+        replace: true,
+      })
+    },
+    [navigate]
+  )
+  useEffect(() => {
+    if (costView !== 'snapshots' || !query.data) return
+    const totalPages = Math.max(1, Math.ceil(query.data.total / pageSize))
+    if (page > totalPages) updateSearch({ page: totalPages })
+  }, [costView, page, pageSize, query.data, updateSearch])
   const handleFilters = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const form = new FormData(event.currentTarget)
@@ -258,6 +296,17 @@ export function ChannelRoutingCostsPage() {
       page: 1,
       group: String(form.get('group') ?? '').trim(),
       model: String(form.get('model') ?? '').trim(),
+    })
+  }
+  const activeFetching =
+    costView === 'snapshots' ? query.isFetching : sourceFetching
+  const refreshActiveView = () => {
+    if (costView === 'snapshots') {
+      void query.refetch()
+      return
+    }
+    void queryClient.invalidateQueries({
+      queryKey: channelRoutingQueryKeys.costBindingsRoot(),
     })
   }
 
@@ -272,19 +321,19 @@ export function ChannelRoutingCostsPage() {
               size='icon-sm'
               variant='outline'
               aria-label={t('Refresh')}
-              disabled={query.isFetching}
-              onClick={() => void query.refetch()}
+              disabled={activeFetching}
+              onClick={refreshActiveView}
             >
               <RefreshCw
                 aria-hidden='true'
                 className={
-                  query.isFetching
+                  activeFetching
                     ? 'animate-spin motion-reduce:animate-none'
                     : undefined
                 }
               />
             </Button>
-            {canOperate ? (
+            {costView === 'snapshots' && canOperate ? (
               <Button
                 size='sm'
                 disabled={costSyncActive}
@@ -305,342 +354,407 @@ export function ChannelRoutingCostsPage() {
         }
       >
         <div className='space-y-3 pb-2'>
-          {trackedCostSync ? (
-            <Alert
-              role={costSyncStatus === 'failed' ? 'alert' : 'status'}
-              variant={costSyncStatus === 'failed' ? 'destructive' : 'default'}
-            >
-              <CostSyncIcon aria-hidden='true' />
-              <AlertTitle className='flex flex-wrap items-center gap-2'>
-                <span>{t('Cost sync')}</span>
-                <ChannelRoutingStatusBadge status={costSyncStatus} />
-              </AlertTitle>
-              <AlertDescription className='space-y-2 text-pretty'>
-                <div className='flex flex-wrap gap-x-3 gap-y-1'>
-                  <span>
-                    {t('Operation #{{id}}', { id: trackedCostSync.id })}
-                  </span>
-                  {systemTaskId ? (
-                    <span className='break-all'>
-                      {t('System task')}: {systemTaskId}
-                    </span>
-                  ) : null}
-                </div>
-                {costSyncStatus === 'partial' ? (
-                  <p>
-                    {t(
-                      'The cost sync completed with partial results. Review the error count before relying on the refreshed costs.'
-                    )}
-                  </p>
-                ) : null}
-                {costSyncStatus === 'failed' ? (
-                  <p>
-                    {trackedCostSync.last_error ||
-                      t('The cost sync failed before completion.')}
-                  </p>
-                ) : null}
-                {costSyncSummaryItems.length > 0 ? (
-                  <dl className='grid grid-cols-2 gap-2 pt-1 sm:grid-cols-4'>
-                    {costSyncSummaryItems.map(([label, value]) => (
-                      <div key={label} className='min-w-0'>
-                        <dt className='text-xs'>{label}</dt>
-                        <dd className='text-foreground mt-0.5 font-medium'>
-                          {typeof value === 'number'
-                            ? format.number(value)
-                            : t('Unknown')}
-                        </dd>
-                      </div>
-                    ))}
-                  </dl>
-                ) : null}
-                {costSyncOperationQuery.isError ? (
-                  <div
-                    className='flex flex-wrap items-center gap-2'
-                    role='alert'
-                  >
-                    <span>{t('Could not refresh the cost sync status.')}</span>
-                    <Button
-                      type='button'
-                      size='sm'
-                      variant='outline'
-                      className='min-h-11 sm:min-h-7'
-                      onClick={() => void costSyncOperationQuery.refetch()}
-                    >
-                      {t('Retry')}
-                    </Button>
-                  </div>
-                ) : null}
-              </AlertDescription>
-            </Alert>
-          ) : null}
-          <div className='flex flex-wrap items-center gap-2'>
-            <form
-              key={`${search.group}-${search.model}`}
-              className='grid min-w-64 flex-1 gap-2 sm:max-w-2xl sm:grid-cols-[1fr_1fr_auto]'
-              onSubmit={handleFilters}
-            >
-              <Input
-                name='group'
-                defaultValue={search.group}
-                aria-label={t('Group')}
-                placeholder={t('Group')}
-              />
-              <Input
-                name='model'
-                defaultValue={search.model}
-                aria-label={t('Model')}
-                placeholder={t('Model')}
-              />
-              <Button type='submit' size='sm' variant='outline'>
-                <Search aria-hidden='true' />
-                {t('Apply filters')}
-              </Button>
-            </form>
-            <NativeSelect
-              size='sm'
-              value={known === 'all' ? 'all' : String(known)}
-              aria-label={t('Cost availability')}
-              onChange={(event) =>
-                updateSearch({
-                  page: 1,
-                  known:
-                    event.target.value === 'all'
-                      ? 'all'
-                      : event.target.value === 'true',
-                })
-              }
-            >
-              <NativeSelectOption value='all'>
-                {t('All costs')}
-              </NativeSelectOption>
-              <NativeSelectOption value='true'>
-                {t('Known costs')}
-              </NativeSelectOption>
-              <NativeSelectOption value='false'>
-                {t('Unknown costs')}
-              </NativeSelectOption>
-            </NativeSelect>
-            {search.group || search.model || known !== 'all' ? (
-              <Button
-                size='sm'
-                variant='ghost'
-                onClick={() =>
-                  updateSearch({ page: 1, group: '', model: '', known: 'all' })
-                }
-              >
-                <X aria-hidden='true' />
-                {t('Clear')}
-              </Button>
-            ) : null}
-          </div>
-
-          {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-          {query.isError ? (
-            <ChannelRoutingErrorState
-              error={query.error}
-              onRetry={() => void query.refetch()}
-            />
-          ) : null}
-          {query.data && query.data.items.length === 0 ? (
-            <ChannelRoutingEmptyState
-              title={t('No cost snapshots')}
-              description={t(
-                'No upstream cost snapshots match the current filters.'
-              )}
-            />
-          ) : null}
-
-          {query.data && query.data.items.length > 0 ? (
+          <Tabs
+            value={costView}
+            onValueChange={(value) =>
+              updateSearch({
+                costView: value === 'sources' ? 'sources' : 'snapshots',
+              })
+            }
+          >
+            <ChannelRoutingScrollableTabsList activeValue={costView}>
+              <TabsTrigger value='snapshots' className='max-lg:min-h-11'>
+                <Coins aria-hidden='true' />
+                {t('Cost snapshots')}
+              </TabsTrigger>
+              <TabsTrigger value='sources' className='max-lg:min-h-11'>
+                <Cable aria-hidden='true' />
+                {t('Cost sources')}
+              </TabsTrigger>
+            </ChannelRoutingScrollableTabsList>
+          </Tabs>
+          {costView === 'snapshots' ? (
             <>
-              <div className='hidden overflow-hidden rounded-lg border xl:block'>
-                <Table
-                  className='min-w-[72rem]'
-                  scrollAreaLabel={t('Cost snapshots table')}
+              {trackedCostSync ? (
+                <Alert
+                  role={costSyncStatus === 'failed' ? 'alert' : 'status'}
+                  variant={
+                    costSyncStatus === 'failed' ? 'destructive' : 'default'
+                  }
                 >
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{t('Group')}</TableHead>
-                      <TableHead>{t('Channel')}</TableHead>
-                      <TableHead>{t('Model')}</TableHead>
-                      <TableHead>{t('Availability')}</TableHead>
-                      <TableHead className='text-right'>
-                        {t('Cost value')}
-                      </TableHead>
-                      <TableHead>{t('Billing Mode')}</TableHead>
-                      <TableHead>{t('Confidence / freshness')}</TableHead>
-                      <TableHead>{t('Validity')}</TableHead>
-                      <TableHead className='w-10'>
-                        <span className='sr-only'>{t('Actions')}</span>
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {query.data.items.map((cost) => {
-                      const costKnown = hasKnownCostSemantics(cost)
-                      return (
-                        <TableRow
-                          key={`${cost.pool_id}-${cost.member_id}-${cost.model_name}`}
-                        >
-                          <TableCell>
-                            <Link
-                              to='/channel-routing/groups/$id'
-                              params={{ id: String(cost.pool_id) }}
-                              className='font-medium hover:underline'
-                            >
-                              {cost.group_name}
-                            </Link>
-                          </TableCell>
-                          <TableCell>
-                            <div className='font-medium'>
-                              {cost.channel_name || `#${cost.channel_id}`}
-                            </div>
-                            <div className='text-muted-foreground text-xs'>
-                              #{cost.channel_id}
-                            </div>
-                          </TableCell>
-                          <TableCell>{cost.model_name}</TableCell>
-                          <TableCell>
-                            <ChannelRoutingStatusBadge
-                              status={costKnown ? 'known' : 'unknown'}
-                            />
-                          </TableCell>
-                          <TableCell className='text-right font-medium'>
-                            <ChannelRoutingCostValue cost={cost} />
-                          </TableCell>
-                          <TableCell>
-                            {costKnown
-                              ? format.billingMode(cost.billing_mode)
-                              : t('Unknown')}
-                          </TableCell>
-                          <TableCell>
-                            <div className='flex flex-wrap gap-1'>
-                              <ChannelRoutingStatusBadge
-                                status={costKnown ? cost.confidence : 'unknown'}
-                              />
-                              <ChannelRoutingStatusBadge
-                                status={costKnown ? cost.freshness : 'unknown'}
-                              />
-                            </div>
-                          </TableCell>
-                          <TableCell className='text-xs'>
-                            <div>
-                              {t('Effective')}:{' '}
-                              {format.timestamp(cost.effective_time)}
-                            </div>
-                            <div className='text-muted-foreground mt-1'>
-                              {t('Expires')}:{' '}
-                              {format.timestamp(cost.expires_time)}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Button
-                              type='button'
-                              size='icon-sm'
-                              variant='ghost'
-                              aria-label={t('View cost details')}
-                              title={t('View cost details')}
-                              onClick={() => setSelectedCost(cost)}
-                            >
-                              <Eye aria-hidden='true' />
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-              </div>
-
-              <div className='divide-y rounded-lg border xl:hidden'>
-                {query.data.items.map((cost) => {
-                  const costKnown = hasKnownCostSemantics(cost)
-                  return (
-                    <article
-                      key={`${cost.pool_id}-${cost.member_id}-${cost.model_name}`}
-                      className='p-3'
-                    >
-                      <div className='flex items-start justify-between gap-3'>
-                        <div className='min-w-0'>
-                          <h3>
-                            <ChannelRoutingIdentityText
-                              text={cost.model_name}
-                              className='text-sm font-medium'
-                            />
-                          </h3>
-                          <ChannelRoutingIdentityText
-                            text={`${cost.group_name} · ${cost.channel_name || `#${cost.channel_id}`}`}
-                            className='text-muted-foreground text-xs'
-                          />
-                        </div>
-                        <ChannelRoutingStatusBadge
-                          status={costKnown ? 'known' : 'unknown'}
-                        />
-                      </div>
-                      <dl className='mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4'>
-                        <div>
-                          <dt className='text-muted-foreground'>
-                            {t('Cost value')}
-                          </dt>
-                          <dd className='mt-1 font-medium'>
-                            <ChannelRoutingCostValue cost={cost} />
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className='text-muted-foreground'>
-                            {t('Billing Mode')}
-                          </dt>
-                          <dd className='mt-1 font-medium'>
-                            {costKnown
-                              ? format.billingMode(cost.billing_mode)
-                              : t('Unknown')}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className='text-muted-foreground'>
-                            {t('Confidence')}
-                          </dt>
-                          <dd className='mt-1 font-medium'>
-                            {costKnown
-                              ? `${cost.confidence} · ${cost.freshness}`
-                              : t('Unknown')}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className='text-muted-foreground'>
-                            {t('Snapshot time')}
-                          </dt>
-                          <dd className='mt-1 font-medium'>
-                            {format.timestamp(cost.effective_time)}
-                          </dd>
-                        </div>
+                  <CostSyncIcon aria-hidden='true' />
+                  <AlertTitle className='flex flex-wrap items-center gap-2'>
+                    <span>{t('Cost sync')}</span>
+                    <ChannelRoutingStatusBadge status={costSyncStatus} />
+                  </AlertTitle>
+                  <AlertDescription className='space-y-2 text-pretty'>
+                    <div className='flex flex-wrap gap-x-3 gap-y-1'>
+                      <span>
+                        {t('Operation #{{id}}', { id: trackedCostSync.id })}
+                      </span>
+                      {systemTaskId ? (
+                        <span className='break-all'>
+                          {t('System task')}: {systemTaskId}
+                        </span>
+                      ) : null}
+                    </div>
+                    {costSyncStatus === 'partial' ? (
+                      <p>
+                        {t(
+                          'The cost sync completed with partial results. Review the error count before relying on the refreshed costs.'
+                        )}
+                      </p>
+                    ) : null}
+                    {costSyncStatus === 'failed' ? (
+                      <p>
+                        {trackedCostSync.last_error ||
+                          t('The cost sync failed before completion.')}
+                      </p>
+                    ) : null}
+                    {costSyncSummaryItems.length > 0 ? (
+                      <dl className='grid grid-cols-2 gap-2 pt-1 sm:grid-cols-4'>
+                        {costSyncSummaryItems.map(([label, value]) => (
+                          <div key={label} className='min-w-0'>
+                            <dt className='text-xs'>{label}</dt>
+                            <dd className='text-foreground mt-0.5 font-medium'>
+                              {typeof value === 'number'
+                                ? format.number(value)
+                                : t('Unknown')}
+                            </dd>
+                          </div>
+                        ))}
                       </dl>
-                      <div className='mt-3 flex justify-end'>
+                    ) : null}
+                    {costSyncOperationQuery.isError ? (
+                      <div
+                        className='flex flex-wrap items-center gap-2'
+                        role='alert'
+                      >
+                        <span>
+                          {t('Could not refresh the cost sync status.')}
+                        </span>
                         <Button
                           type='button'
                           size='sm'
-                          variant='ghost'
-                          onClick={() => setSelectedCost(cost)}
+                          variant='outline'
+                          className='min-h-11 sm:min-h-7'
+                          onClick={() => void costSyncOperationQuery.refetch()}
                         >
-                          <Eye aria-hidden='true' />
-                          {t('View details')}
+                          {t('Retry')}
                         </Button>
                       </div>
-                    </article>
-                  )
-                })}
+                    ) : null}
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+              <div className='flex flex-wrap items-center gap-2'>
+                <form
+                  key={`${search.group}-${search.model}`}
+                  className='grid min-w-64 flex-1 gap-2 sm:max-w-2xl sm:grid-cols-[1fr_1fr_auto]'
+                  onSubmit={handleFilters}
+                >
+                  <Input
+                    name='group'
+                    defaultValue={search.group}
+                    aria-label={t('Group')}
+                    placeholder={t('Group')}
+                  />
+                  <Input
+                    name='model'
+                    defaultValue={search.model}
+                    aria-label={t('Model')}
+                    placeholder={t('Model')}
+                  />
+                  <Button type='submit' size='sm' variant='outline'>
+                    <Search aria-hidden='true' />
+                    {t('Apply filters')}
+                  </Button>
+                </form>
+                <NativeSelect
+                  size='sm'
+                  value={known === 'all' ? 'all' : String(known)}
+                  aria-label={t('Cost availability')}
+                  onChange={(event) =>
+                    updateSearch({
+                      page: 1,
+                      known:
+                        event.target.value === 'all'
+                          ? 'all'
+                          : event.target.value === 'true',
+                    })
+                  }
+                >
+                  <NativeSelectOption value='all'>
+                    {t('All costs')}
+                  </NativeSelectOption>
+                  <NativeSelectOption value='true'>
+                    {t('Known costs')}
+                  </NativeSelectOption>
+                  <NativeSelectOption value='false'>
+                    {t('Unknown costs')}
+                  </NativeSelectOption>
+                </NativeSelect>
+                {search.group || search.model || known !== 'all' ? (
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    onClick={() =>
+                      updateSearch({
+                        page: 1,
+                        group: '',
+                        model: '',
+                        known: 'all',
+                      })
+                    }
+                  >
+                    <X aria-hidden='true' />
+                    {t('Clear')}
+                  </Button>
+                ) : null}
               </div>
 
-              <ChannelRoutingPagination
-                page={page}
-                pageSize={pageSize}
-                total={query.data.total}
-                onPageChange={(nextPage) => updateSearch({ page: nextPage })}
-                onPageSizeChange={(nextSize) =>
-                  updateSearch({ page: 1, pageSize: nextSize })
-                }
-              />
+              {query.isLoading ? <ChannelRoutingLoadingState /> : null}
+              {query.isError ? (
+                <ChannelRoutingErrorState
+                  error={query.error}
+                  onRetry={() => void query.refetch()}
+                />
+              ) : null}
+              {query.data && query.data.items.length === 0 ? (
+                <ChannelRoutingEmptyState
+                  title={
+                    query.data.total > 0
+                      ? t('This cost snapshot page is empty')
+                      : t('No cost snapshots')
+                  }
+                  description={
+                    query.data.total > 0
+                      ? t(
+                          'Return to the first page to continue browsing cost snapshots.'
+                        )
+                      : t(
+                          'No upstream cost snapshots match the current filters.'
+                        )
+                  }
+                  action={
+                    query.data.total > 0 ? (
+                      <Button
+                        type='button'
+                        variant='outline'
+                        onClick={() => updateSearch({ page: 1 })}
+                      >
+                        {t('First page')}
+                      </Button>
+                    ) : undefined
+                  }
+                />
+              ) : null}
+
+              {query.data && query.data.items.length > 0 ? (
+                <>
+                  <div className='hidden overflow-hidden rounded-lg border xl:block'>
+                    <Table
+                      className='min-w-[72rem]'
+                      scrollAreaLabel={t('Cost snapshots table')}
+                    >
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>{t('Group')}</TableHead>
+                          <TableHead>{t('Channel')}</TableHead>
+                          <TableHead>{t('Model')}</TableHead>
+                          <TableHead>{t('Availability')}</TableHead>
+                          <TableHead className='text-right'>
+                            {t('Cost value')}
+                          </TableHead>
+                          <TableHead>{t('Billing Mode')}</TableHead>
+                          <TableHead>{t('Confidence / freshness')}</TableHead>
+                          <TableHead>{t('Validity')}</TableHead>
+                          <TableHead className='w-10'>
+                            <span className='sr-only'>{t('Actions')}</span>
+                          </TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {query.data.items.map((cost) => {
+                          const costKnown = hasKnownCostSemantics(cost)
+                          return (
+                            <TableRow
+                              key={`${cost.pool_id}-${cost.member_id}-${cost.model_name}`}
+                            >
+                              <TableCell>
+                                <Link
+                                  to='/channel-routing/groups/$id'
+                                  params={{ id: String(cost.pool_id) }}
+                                  className='font-medium hover:underline'
+                                >
+                                  {cost.group_name}
+                                </Link>
+                              </TableCell>
+                              <TableCell>
+                                <div className='font-medium'>
+                                  {cost.channel_name || `#${cost.channel_id}`}
+                                </div>
+                                <div className='text-muted-foreground text-xs'>
+                                  #{cost.channel_id}
+                                </div>
+                              </TableCell>
+                              <TableCell>{cost.model_name}</TableCell>
+                              <TableCell>
+                                <ChannelRoutingStatusBadge
+                                  status={costKnown ? 'known' : 'unknown'}
+                                />
+                              </TableCell>
+                              <TableCell className='text-right font-medium'>
+                                <ChannelRoutingCostValue cost={cost} />
+                              </TableCell>
+                              <TableCell>
+                                {costKnown
+                                  ? format.billingMode(cost.billing_mode)
+                                  : t('Unknown')}
+                              </TableCell>
+                              <TableCell>
+                                <div className='flex flex-wrap gap-1'>
+                                  <ChannelRoutingStatusBadge
+                                    status={
+                                      costKnown ? cost.confidence : 'unknown'
+                                    }
+                                  />
+                                  <ChannelRoutingStatusBadge
+                                    status={
+                                      costKnown ? cost.freshness : 'unknown'
+                                    }
+                                  />
+                                </div>
+                              </TableCell>
+                              <TableCell className='text-xs'>
+                                <div>
+                                  {t('Effective')}:{' '}
+                                  {format.timestamp(cost.effective_time)}
+                                </div>
+                                <div className='text-muted-foreground mt-1'>
+                                  {t('Expires')}:{' '}
+                                  {format.timestamp(cost.expires_time)}
+                                </div>
+                              </TableCell>
+                              <TableCell>
+                                <Button
+                                  type='button'
+                                  size='icon-sm'
+                                  variant='ghost'
+                                  aria-label={t('View cost details')}
+                                  title={t('View cost details')}
+                                  onClick={() => setSelectedCost(cost)}
+                                >
+                                  <Eye aria-hidden='true' />
+                                </Button>
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })}
+                      </TableBody>
+                    </Table>
+                  </div>
+
+                  <div className='divide-y rounded-lg border xl:hidden'>
+                    {query.data.items.map((cost) => {
+                      const costKnown = hasKnownCostSemantics(cost)
+                      return (
+                        <article
+                          key={`${cost.pool_id}-${cost.member_id}-${cost.model_name}`}
+                          className='p-3'
+                        >
+                          <div className='flex items-start justify-between gap-3'>
+                            <div className='min-w-0'>
+                              <h3>
+                                <ChannelRoutingIdentityText
+                                  text={cost.model_name}
+                                  className='text-sm font-medium'
+                                />
+                              </h3>
+                              <ChannelRoutingIdentityText
+                                text={`${cost.group_name} · ${cost.channel_name || `#${cost.channel_id}`}`}
+                                className='text-muted-foreground text-xs'
+                              />
+                            </div>
+                            <ChannelRoutingStatusBadge
+                              status={costKnown ? 'known' : 'unknown'}
+                            />
+                          </div>
+                          <dl className='mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4'>
+                            <div>
+                              <dt className='text-muted-foreground'>
+                                {t('Cost value')}
+                              </dt>
+                              <dd className='mt-1 font-medium'>
+                                <ChannelRoutingCostValue cost={cost} />
+                              </dd>
+                            </div>
+                            <div>
+                              <dt className='text-muted-foreground'>
+                                {t('Billing Mode')}
+                              </dt>
+                              <dd className='mt-1 font-medium'>
+                                {costKnown
+                                  ? format.billingMode(cost.billing_mode)
+                                  : t('Unknown')}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt className='text-muted-foreground'>
+                                {t('Confidence')}
+                              </dt>
+                              <dd className='mt-1 font-medium'>
+                                {costKnown
+                                  ? `${cost.confidence} · ${cost.freshness}`
+                                  : t('Unknown')}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt className='text-muted-foreground'>
+                                {t('Snapshot time')}
+                              </dt>
+                              <dd className='mt-1 font-medium'>
+                                {format.timestamp(cost.effective_time)}
+                              </dd>
+                            </div>
+                          </dl>
+                          <div className='mt-3 flex justify-end'>
+                            <Button
+                              type='button'
+                              size='sm'
+                              variant='ghost'
+                              onClick={() => setSelectedCost(cost)}
+                            >
+                              <Eye aria-hidden='true' />
+                              {t('View details')}
+                            </Button>
+                          </div>
+                        </article>
+                      )
+                    })}
+                  </div>
+                </>
+              ) : null}
+              {query.data && query.data.total > 0 ? (
+                <ChannelRoutingPagination
+                  page={page}
+                  pageSize={pageSize}
+                  total={query.data.total}
+                  onPageChange={(nextPage) => updateSearch({ page: nextPage })}
+                  onPageSizeChange={(nextSize) =>
+                    updateSearch({ page: 1, pageSize: nextSize })
+                  }
+                />
+              ) : null}
             </>
-          ) : null}
+          ) : (
+            <Suspense fallback={<ChannelRoutingLoadingState />}>
+              <LazyChannelRoutingCostSourcesSection
+                canOperate={canOperate}
+                canSensitiveWrite={canSensitiveWrite}
+              />
+            </Suspense>
+          )}
         </div>
       </ChannelRoutingPageFrame>
       <ChannelRoutingCostDetailsSheet

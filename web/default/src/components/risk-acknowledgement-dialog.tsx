@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { cn } from '@/lib/utils'
+
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -32,6 +32,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { cn } from '@/lib/utils'
 
 type RequiredTextPart = {
   type: 'input' | 'static'
@@ -61,6 +62,7 @@ type RiskAcknowledgementDialogProps = {
   isLoading?: boolean
   onConfirm: () => void
   className?: string
+  finalFocus?: React.RefObject<HTMLElement | null>
 }
 
 function getRequiredTextRows(text: string) {
@@ -85,6 +87,7 @@ export function RiskAcknowledgementDialog({
   isLoading = false,
   onConfirm,
   className,
+  finalFocus,
 }: RiskAcknowledgementDialogProps) {
   const { t } = useTranslation()
   const [checkedItems, setCheckedItems] = useState<boolean[]>([])
@@ -181,6 +184,7 @@ export function RiskAcknowledgementDialog({
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent
+        finalFocus={finalFocus}
         className={cn(
           'flex max-h-[min(88dvh,760px)] w-[calc(100vw-1.5rem)] !max-w-[44rem] grid-rows-none flex-col gap-0 overflow-hidden !p-0 sm:w-[min(44rem,calc(100vw-3rem))]',
           className
@@ -200,7 +204,7 @@ export function RiskAcknowledgementDialog({
 
         <div className='min-h-0 flex-1 space-y-4 overflow-y-auto px-4 pb-4 sm:px-6'>
           {items.length > 0 ? (
-            <ol className='border-border/70 bg-muted/30 text-foreground list-decimal space-y-2 rounded-lg border px-4 py-3 pl-8 text-sm leading-6 sm:px-5 sm:py-4 sm:pl-9'>
+            <ol className='border-border/70 bg-muted/30 text-foreground list-decimal space-y-2 rounded-lg border px-4 py-3 pl-8 text-sm leading-6 [overflow-wrap:anywhere] break-words sm:px-5 sm:py-4 sm:pl-9'>
               {items.map((item) => (
                 <li key={item}>{item}</li>
               ))}
@@ -223,7 +227,7 @@ export function RiskAcknowledgementDialog({
                     />
                     <Label
                       htmlFor={id}
-                      className='text-muted-foreground text-sm leading-5 font-normal'
+                      className='text-muted-foreground min-w-0 text-sm leading-5 font-normal [overflow-wrap:anywhere] break-words'
                     >
                       {item}
                     </Label>

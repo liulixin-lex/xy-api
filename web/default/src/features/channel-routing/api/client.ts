@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isAxiosError } from 'axios'
 
 import { api } from '@/lib/api'
 
@@ -55,6 +56,10 @@ import type {
   PoolSnapshot,
   PoolSnapshotSummary,
   RoutingOperation,
+  RoutingCostBinding,
+  RoutingCostBindingActionResult,
+  RoutingCostBindingPage,
+  RoutingCostBindingRequest,
   RoutingPolicyRevisionDetail,
   RoutingProbeResult,
 } from '../types'
@@ -70,6 +75,70 @@ function unwrap<T>(response: ApiEnvelope<T>): T {
     throw new Error(response.message || 'Channel routing request failed')
   }
   return response.data
+}
+
+type ChannelRoutingCostBindingErrorPayload = {
+  code?: string
+  message?: string
+  detail?: string
+  field?: string
+  reason?: string
+  conflict?: {
+    current?: RoutingCostBinding | null
+    current_etag?: string
+  }
+}
+
+export type ChannelRoutingCostBindingApiError = {
+  status?: number
+  code?: string
+  message?: string
+  detail?: string
+  field?: string
+  reason?: string
+}
+
+export class ChannelRoutingCostBindingConflictError extends Error {
+  current: RoutingCostBinding | null
+  currentETag: string
+
+  constructor(current: RoutingCostBinding | null, currentETag: string) {
+    super('Channel routing cost binding changed')
+    this.name = 'ChannelRoutingCostBindingConflictError'
+    this.current = current
+    this.currentETag = currentETag
+  }
+}
+
+export function getChannelRoutingCostBindingApiError(
+  error: unknown
+): ChannelRoutingCostBindingApiError {
+  if (!isAxiosError<ChannelRoutingCostBindingErrorPayload>(error)) return {}
+  return {
+    status: error.response?.status,
+    code: error.response?.data?.code,
+    message: error.response?.data?.message,
+    detail: error.response?.data?.detail,
+    field: error.response?.data?.field,
+    reason: error.response?.data?.reason,
+  }
+}
+
+function costBindingConflictFromError(
+  error: unknown
+): ChannelRoutingCostBindingConflictError | null {
+  if (!isAxiosError<ChannelRoutingCostBindingErrorPayload>(error)) return null
+  const response = error.response
+  if (
+    response?.status !== 409 ||
+    response.data?.code !== 'cost_binding_conflict'
+  ) {
+    return null
+  }
+  const current = response.data.conflict?.current ?? null
+  const currentETag =
+    response.data.conflict?.current_etag || current?.etag || ''
+  return new ChannelRoutingCostBindingConflictError(current, currentETag)
 }
 
 export async function getChannelRoutingOverview(): Promise<ChannelRoutingOverview> {
@@ -224,6 +293,122 @@ export async function syncChannelRoutingCosts(
     ...requestConfig,
     headers: { 'Idempotency-Key': idempotencyKey },
   })
+  return unwrap(response.data)
+}
+
+export async function listChannelRoutingCostBindings(params: {
+  page: number
+  page_size: number
+  search?: string
+  upstream_type?: string
+  enabled?: boolean
+  channel_id?: number
+}): Promise<RoutingCostBindingPage> {
+  const response = await api.get<ApiEnvelope<RoutingCostBindingPage>>(
+    '/api/channel-routing/v2/cost-bindings',
+    { ...requestConfig, params }
+  )
+  return unwrap(response.data)
+}
+
+export async function getChannelRoutingCostBinding(
+  channelId: number
+): Promise<RoutingCostBinding> {
+  const response = await api.get<ApiEnvelope<RoutingCostBinding>>(
+    `/api/channel-routing/v2/cost-bindings/${channelId}`,
+    requestConfig
+  )
+  const binding = unwrap(response.data)
+  return { ...binding, etag: response.headers.etag || binding.etag }
+}
+
+export async function createChannelRoutingCostBinding(
+  request: RoutingCostBindingRequest,
+  signal?: AbortSignal
+): Promise<RoutingCostBinding> {
+  const response = await api.post<ApiEnvelope<RoutingCostBinding>>(
+    '/api/channel-routing/v2/cost-bindings',
+    request,
+    { ...requestConfig, signal }
+  )
+  const binding = unwrap(response.data)
+  return { ...binding, etag: response.headers.etag || binding.etag }
+}
+
+export async function updateChannelRoutingCostBinding(
+  binding: Pick<RoutingCostBinding, 'channel_id' | 'etag'>,
+  request: RoutingCostBindingRequest,
+  signal?: AbortSignal
+): Promise<RoutingCostBinding> {
+  try {
+    const response = await api.put<ApiEnvelope<RoutingCostBinding>>(
+      `/api/channel-routing/v2/cost-bindings/${binding.channel_id}`,
+      request,
+      {
+        ...requestConfig,
+        signal,
+        headers: { 'If-Match': binding.etag },
+      }
+    )
+    const updated = unwrap(response.data)
+    return { ...updated, etag: response.headers.etag || updated.etag }
+  } catch (error) {
+    const conflict = costBindingConflictFromError(error)
+    if (conflict) throw conflict
+    throw error
+  }
+}
+
+export async function deleteChannelRoutingCostBinding(
+  binding: Pick<RoutingCostBinding, 'channel_id' | 'etag'>
+): Promise<{ channel_id: number }> {
+  try {
+    const response = await api.delete<ApiEnvelope<{ channel_id: number }>>(
+      `/api/channel-routing/v2/cost-bindings/${binding.channel_id}`,
+      {
+        ...requestConfig,
+        headers: { 'If-Match': binding.etag },
+      }
+    )
+    return unwrap(response.data)
+  } catch (error) {
+    const conflict = costBindingConflictFromError(error)
+    if (conflict) throw conflict
+    throw error
+  }
+}
+
+export async function testChannelRoutingCostBinding(
+  channelId: number | 'new',
+  request?: RoutingCostBindingRequest,
+  signal?: AbortSignal
+): Promise<RoutingCostBindingActionResult> {
+  const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
+    `/api/channel-routing/v2/cost-bindings/${channelId}/test`,
+    request,
+    {
+      ...requestConfig,
+      signal,
+      timeout: 30_000,
+    }
+  )
+  return unwrap(response.data)
+}
+
+export async function loadChannelRoutingCostBindingGroups(
+  channelId: number | 'new',
+  request?: RoutingCostBindingRequest,
+  signal?: AbortSignal
+): Promise<RoutingCostBindingActionResult> {
+  const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
+    `/api/channel-routing/v2/cost-bindings/${channelId}/groups`,
+    request,
+    {
+      ...requestConfig,
+      signal,
+      timeout: 30_000,
+    }
+  )
   return unwrap(response.data)
 }
 

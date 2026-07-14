@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AxiosError } from 'axios'
@@ -86,6 +85,7 @@ import {
 } from '../lib/operations'
 import type { ChannelRoutingActiveProbeResult } from '../types'
 import { ChannelRoutingEndpointNetworkSection } from './endpoint-network-section'
+import { ManualBillingReviewSummary } from './manual-billing-review-summary'
 
 const overviewRefreshIntervalMs = 15_000
 const overviewRefreshMaxBackoffMs = 120_000
@@ -169,6 +169,11 @@ export function ChannelRoutingOverviewPage() {
     user,
     ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
     ADMIN_PERMISSION_ACTIONS.OPERATE
+  )
+  const canReadBillingReviews = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+    ADMIN_PERMISSION_ACTIONS.READ
   )
   const activeProbeKeyRef = useRef<string | null>(null)
   const notifiedActiveProbeRef = useRef<number | null>(null)
@@ -549,6 +554,7 @@ export function ChannelRoutingOverviewPage() {
             </AlertAction>
           </Alert>
         ) : null}
+        <ManualBillingReviewSummary enabled={canReadBillingReviews} />
         <section
           className='grid overflow-hidden rounded-lg border sm:grid-cols-2 lg:grid-cols-3 [&>*]:border-r [&>*]:border-b [&>*:nth-child(2n)]:border-r-0 sm:[&>*:nth-child(2n)]:border-r lg:[&>*:nth-child(3n)]:border-r-0 [&>*:nth-last-child(-n+2)]:border-b-0 lg:[&>*:nth-last-child(-n+3)]:border-b-0'
           aria-label={t('Routing health summary')}

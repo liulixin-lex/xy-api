@@ -28,6 +28,7 @@ import {
   ListTodo,
   MessageSquare,
   Radio,
+  ReceiptText,
   Route,
   ServerCog,
   Settings,
@@ -145,6 +146,21 @@ export function useSidebarData(): SidebarData {
               resource: ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
               action: ADMIN_PERMISSION_ACTIONS.READ,
             },
+          },
+          {
+            title: t('Billing operations'),
+            url: '/billing-reviews',
+            icon: ReceiptText,
+            requiredAnyPermission: [
+              {
+                resource: ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+                action: ADMIN_PERMISSION_ACTIONS.READ,
+              },
+              {
+                resource: ADMIN_PERMISSION_RESOURCES.BILLING_PROJECTION_OPS,
+                action: ADMIN_PERMISSION_ACTIONS.READ,
+              },
+            ],
           },
           {
             title: t('Models'),
