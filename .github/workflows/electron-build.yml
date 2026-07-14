@@ -321,5 +321,6 @@ jobs:
       default_branch: ${{ github.event.repository.default_branch }}
       dockerhub_repository: ${{ vars.DOCKERHUB_REPOSITORY }}
     secrets:
+      ghcr_token: ${{ secrets.GHCR_TOKEN }}
       dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
       dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
