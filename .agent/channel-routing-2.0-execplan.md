@@ -24,11 +24,11 @@
 
 - 主仓库与当前交付工作树：`/opt/xy-api`
 - 分支：`fix/channel-routing-v0.1.11`
-- 当前实现候选及本地候选镜像的源码基线：`e86f24c4fce0e9a70765d792056d761ad7e6cd5a`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。最终发布 SHA 以 PR 合入后的精确 merge SHA 为准。
+- 当前代码候选及本地候选镜像的源码基线：`6ca75bda2695bef3116c8c138f54356200862d10`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。最终发布 SHA 以 PR 合入后的精确 merge SHA 为准。
 - durable async billing、accepted/terminal 投影、Cost Sources、Manual Reviews、Projection Operations、发布供应链和 SQLite 旧卷升级修复均已集成到当前分支。不得 reset、checkout、stash、rebase、amend 或覆盖并行改动。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
-- 正式 `web/default` 工作区已合并；Typecheck、Lint、七语 i18n、`bun test`（175 pass、0 fail、47 files）、production build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。
-- 基于 `e86f24c4` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过。当前只剩远端发布闭环：推送分支、创建并合入 PR、打 `v0.1.11` tag，并核验正式多架构镜像及供应链资产。
+- 正式 `web/default` 工作区已合并；Typecheck、Lint、七语 i18n、`bun test`（176 pass、0 fail、48 files）、production build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。RU/FR 320px Cursor 分页及运行时 `<html lang>` 已完成 8/8 真浏览器回归。
+- 基于 `6ca75bda` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过。当前只剩远端发布闭环：推送分支、合入现有 PR #21、打 `v0.1.11` tag，并核验正式多架构镜像及供应链资产。
 
 ## Progress
 
@@ -66,7 +66,7 @@
 | CR-3 | Canary、确定性灰度、自动回滚、容量预留、慢启动 | Canary cohort/outcome/evaluator、Pool-scoped rollback、故障矩阵、跨节点 presence/checkpoint | PASS |
 | CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 真实 Balanced、Replay、Probe、Attempt Coordinator、草稿仿真/发布/回滚 Operation、SSE 与兼容入口 | PASS |
 | CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | strict/local/adaptive capacity、region scope、approval/authz、error budget、audit export、真实预算 hedge | PASS |
-| CR-FE | 渠道路由工作区、七语、SSE/A11y/响应式/视觉 | production release-final：投影 18/18、Operations 12/12 响应式明暗矩阵，边界态 3+4，Axe 0；错误焦点、对比度和 768px 响应式复验通过 | PASS |
+| CR-FE | 渠道路由工作区、七语、SSE/A11y/响应式/视觉 | production release-final：投影 18/18、Operations 12/12 响应式明暗矩阵，边界态 3+4，Axe 0；RU/FR 320px Cursor 分页 8/8 无越界且 `<html lang>` 正确 | PASS |
 | CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
 | CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步与异步链均已覆盖；Task/MJ durable reservation、终态结算、恢复、manual review 和 accepted/terminal 独立投影已集成并通过跨库验证 | PASS |
@@ -83,8 +83,8 @@
 7. [完成] Gate 7 前端：七页正式工作区、七语、单连接 SSE 与轮询降级、浏览器/A11y/视觉验收已完成并合入。
 8. [完成] 发布终审实现：durable async billing、独立投影、恢复/manual review、Cost Sources、供应链门禁和 SQLite `v0.1.10` 日志表兼容迁移已集成。
 9. [完成] 最终实现验证：后端全量与跨库矩阵、前端 production release-final、性能、安全、格式和仓库审计已完成。
-10. [完成] 候选镜像与真实升级：基于 `e86f24c4` 构建候选镜像，用全新隔离卷从固定 digest 的正式 `v0.1.10` 初始化；升级、重启幂等、marker/旧日志、新 schema、索引行为、版本、默认前端与日志健康均通过。
-11. [待完成] Git 与正式发布：推送分支、创建 PR、同步 main、通过 required checks、合入、对精确 merge SHA 打 `v0.1.11` tag，并终验 Release/GHCR/Cosign/SBOM/SLSA。
+10. [完成] 候选镜像与真实升级：基于 `6ca75bda` 构建候选镜像，用全新隔离卷从固定 digest 的正式 `v0.1.10` 初始化；升级、重启幂等、marker/旧日志、新 schema、索引行为、版本、默认前端与日志健康均通过。
+11. [待完成] Git 与正式发布：推送分支、更新 PR #21、同步 main、通过 required checks、合入、对精确 merge SHA 打 `v0.1.11` tag，并终验 Release/GHCR/Cosign/SBOM/SLSA。
 
 ### Phase 2 implementation slices
 
@@ -133,11 +133,14 @@
 
 ### Release completion evidence（candidate complete; remote pending）
 
-- 候选镜像：已基于 `e86f24c4` 构建 `xy-api:v0.1.11-candidate-e86f24c4`，本地 image ID 为 `sha256:973d103a7e0e452305bf950ed5963f13f62a2f2014864436de8c0580bc4654e3`，容器 `--version` 为 `v0.1.11`。
-- 真实升级：固定正式旧镜像 `ghcr.io/liulixin-lex/xy-api@sha256:40b1650c134ec9fe7afad833f2c3b635bf0818ca534e5d12e4ee0f429a80b12d` 初始化全新 SQLite 卷；候选首次启动和重启均通过。marker、旧日志、默认前端、核心表/列、两个唯一索引的结构与实际 NULL/重复行为、前端 build descriptor 和精确迁移日志门禁全部 PASS，容器与卷清理 PASS。最终结果 JSON SHA-256 为 `e0a49325d26600c73f5677a37dd2427b26f3b9e490a5f984ec909b3ccc401eb3`，保留阶段日志的证据清单 SHA-256 为 `8c3e4113b7a148171e1b9d014d396171302d2e58f03f93964526ea504772f154`。
+- 代码候选：`6ca75bda2695bef3116c8c138f54356200862d10`。后端全量 `go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；Go test 日志 SHA-256 为 `af34581f10cd646292fa057e2e24217e20b8513e3ecfdc651677d944f1cdf884`。前端 `bun test` 为 176 pass、0 fail、48 files，Typecheck、Default/Classic production build 和目标文件 format/lint 均 PASS。
+- 前端终验：RU/FR 320px 在 Manual Reviews 与三类 Projection Cursor 页面共 8/8 PASS；document/body 宽度均为 320，按钮无越界，`<html lang>` 与存储语言均精确为 `ru`/`fr`。浏览器报告 SHA-256 为 `16f2f30f7dcef116a028be621ea1e8ca935d1654be299ac85cf1f45cdd248148`。
+- 候选镜像：`xy-api:v0.1.11-candidate-6ca75bda`，本地 image ID 为 `sha256:49e205864cd5b7ac4faa19d8f87026b3a477cdd088b8eb16c9cb4bd19f893818`；OCI labels 精确绑定 version `v0.1.11`、revision `6ca75bda2695bef3116c8c138f54356200862d10` 和受保护仓库 source，容器 `--version` 为 `v0.1.11`。构建日志 SHA-256 为 `31d713dcac4e2b8dd4890e1be44e497e4b710360610929f94b52d8c923505699`。
+- 真实升级：固定正式旧镜像 `ghcr.io/liulixin-lex/xy-api@sha256:40b1650c134ec9fe7afad833f2c3b635bf0818ca534e5d12e4ee0f429a80b12d` 初始化全新 SQLite 卷；候选首次启动和重启均通过。marker、旧日志、默认前端、核心表/列、两个唯一索引的结构与实际 NULL/重复行为、前端 build descriptor 和精确迁移日志门禁全部 PASS，容器与卷清理 PASS。升级日志 SHA-256 为 `be67bc480e5e94f90e2bece8b8671093366f429a866cb345a281dd2df741d8e5`，保留阶段证据聚合 SHA-256 为 `f72a37b6577ef1c0d91cbf3cc28ebdf66fa95569014c85bafdde6bab0739658f`。
 - Git（pending）：推送分支；Backend、Default frontend、Classic frontend、Workflow supply-chain checks、pr-quality 全部通过；同步最新 main、解决讨论、合入，并确保 `v0.1.11` tag 精确指向 main 上的 merge SHA 且该提交的 `VERSION` 为 `v0.1.11`。
 - Release（pending）：GitHub Release 必须为非 draft、非 prerelease且严格包含 10 个资产；四份 checksum 必须完整覆盖其余六个载荷并通过 `sha256sum --check --strict`。至少一个 finalizer 日志必须明确输出 stable release complete，不能只依据三条顶层 workflow 绿灯。
 - GHCR（pending）：`v0.1.11` 与 `latest` 必须同 digest；OCI index 精确包含 amd64、arm64 和两份 attestation manifest；多架构及子架构 Cosign 签名、双平台非空 SPDX-2.3 SBOM、SLSA v1 provenance、OCI version/revision labels、容器 `--version`、`/api/status` 和前端 build revision 均需终验。若发布时配置了 Docker Hub，再额外验证其 digest 与 GHCR 一致。
+- 正式只读 verifier：`/opt/临时/verify-v0.1.11-release.sh`，SHA-256 `8f5bd170651d5c81b34b165e903f309739f71b74147546918378981e1c5a22bd`；已通过 `bash -n`、ShellCheck 与正负 fixtures，tag 推送后必须实跑并保留完整输出。
 
 ### Gate 2 fresh evidence（2026-07-12）
 
@@ -190,17 +193,17 @@
 
 ### v0.1.11 final release-candidate evidence（2026-07-14）
 
-- 当前实现候选及本地候选镜像的源码基线为 `e86f24c4`。`c2de5c5d` 完成 durable channel routing operations，`ea6511af` 合并计费控制台，`c04261ec` 完成发布收口；后续 `100423fc`、`276b79c7`、`5c7f91e7` 和 `e86f24c4` 依次收口 SQLite 升级、操作反馈、无障碍与测试依赖分类。
+- 当前代码候选及本地候选镜像的源码基线为 `6ca75bda`。`c2de5c5d` 完成 durable channel routing operations，`ea6511af` 合并计费控制台，`c04261ec` 完成发布收口；`100423fc`、`276b79c7`、`5c7f91e7`、`e86f24c4` 依次收口 SQLite 升级、操作反馈、无障碍与测试依赖分类，`2a121fcb`/`4c4acfc3` 收口 Operation 逻辑时钟、迁移修复和 Breaker fencing，`6ca75bda` 关闭多语言移动分页与文档语言无障碍缺口。
 - Task/MJ durable async billing 已覆盖 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、客户端幂等、滚动升级协议门禁与保留期；Stateful Task/MJ 固定原渠道和稳定 Credential ID，历史缺失身份时 fail closed。
 - accepted/terminal usage、统计、SQL/ClickHouse 外部日志和缓存同步采用独立持久幂等阶段；receipt、冲突隔离、恢复重放、周期审计和 DB lease 已完成三数据库故障/崩溃点验证。
 - Cost Sources、Manual Reviews 和 Projection Operations 已完成前后端集成；provider 凭证隔离、切换清理、CA readiness、SSRF/TLS/重定向/私网/响应边界、ETag 冲突、双阶段人工确认和权限降级均有回归证据。
 - 真实 `v0.1.10` SQLite 卷首次升级候选暴露 P0：GORM 尝试执行 `ALTER TABLE logs ADD billing_operation_key varchar(191) UNIQUE`，而 SQLite 禁止通过 `ADD COLUMN` 增加 UNIQUE 列。`100423fc` 改为先用无 unique tag 的兼容迁移模型增加 nullable 列，再由正式 `Log` AutoMigrate 创建命名唯一索引，并同时覆盖 `migrateDB`、`migrateDBFast` 和 `migrateLOGDB`。
 - SQLite 修复回归覆盖旧日志保留、重启幂等、多个 NULL operation key 可并存、重复非 NULL key 被拒；相关 SQLite `-count=3`、MySQL 5.7 和 PostgreSQL 9.6 迁移契约均 PASS。
-- 当前候选后端 `GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` 均 PASS；SQLite 回归与 MySQL 5.7.44、PostgreSQL 9.6.24、Redis 7.4.9、ClickHouse 24.8.14.39 的高风险定向外部契约均在 `e86f24c4` 上新鲜 PASS，SKIP 0、FAIL 0。过宽全域 race 曾因 SQLite migration 超过 10 分钟终止，未发现 race detector 报告，也不作为成功证据。
-- 前端 Typecheck、Lint 0 error、`bun test`（175 pass、0 fail、47 files）、changed-scope oxfmt、七语 i18n missing/extras/untranslated 全 0 和 `VITE_REACT_APP_VERSION=v0.1.11 bun run build` 均 PASS。
-- production release-final 浏览器证据覆盖投影页 18/18、Operations 12/12 的 320/768/1440 明暗矩阵和边界态 3+4；所有布局无文本/横向溢出，Axe 0。错误发生后的焦点恢复、浅色错误文案对比度和 768px 响应式工具栏/操作区已修复并复验，键盘、200% 等效缩放、reduced-motion 和权限状态均通过。
+- 当前候选后端 `GOTOOLCHAIN=go1.26.1 go test ./... -count=1`、`go vet ./...`、`go build ./...` 均 PASS；SQLite 回归与 MySQL 5.7.44、PostgreSQL 9.6.24、Redis 7.4.9、ClickHouse 24.8.14.39 的高风险定向外部契约均在最终后端基线 `4c4acfc3` 上新鲜 PASS，SKIP 0、FAIL 0；`6ca75bda` 仅修改前端。过宽全域 race 曾因 SQLite migration 超过 10 分钟终止，未发现 race detector 报告，也不作为成功证据。
+- 前端 Typecheck、Lint 0 error、`bun test`（176 pass、0 fail、48 files）、changed-scope oxfmt、七语 i18n missing/extras/untranslated 全 0 和 `VITE_REACT_APP_VERSION=v0.1.11 bun run build` 均 PASS。
+- production release-final 浏览器证据覆盖投影页 18/18、Operations 12/12 的 320/768/1440 明暗矩阵和边界态 3+4；所有布局无文本/横向溢出，Axe 0。额外 RU/FR 320px 8/8 回归确认共享 Cursor 分页无越界、页面宽度稳定且 `<html lang>` 正确；键盘、200% 等效缩放、reduced-motion 和权限状态均通过。
 - 发布供应链实现已集成：Release/Electron 资产不可覆盖、跨工作流串行上传、旧版本不得倒退 `latest`、同版本不同 digest fail closed、子架构及最终 manifest 签名；Action SHA、actionlint、yamllint、shellcheck 和脚本测试均 PASS。
-- SQLite P0 之前构建的候选镜像已废弃。基于 `e86f24c4` 的候选镜像和真实 `v0.1.10` 隔离卷首次升级/重启门禁已通过；分支尚未推送，PR、main 合入、`v0.1.11` tag、正式镜像和 Release 均未完成，不能把本节实现验证写成正式发布完成。
+- 所有早期 `e86f24c4`/`4c4acfc3` 候选证据均已被 `6ca75bda` 的干净代码候选、镜像与真实升级证据取代。分支尚未推送最新提交，PR #21、main 合入、`v0.1.11` tag、正式镜像和 Release 均未完成，不能把本节实现验证写成正式发布完成。
 
 ## Surprises & Discoveries
 
@@ -242,7 +245,8 @@
 - 2026-07-13：v2 writer 必须在所有在线实例报告协议能力后启用，避免旧 poller 按 legacy 语义重复结算；历史 v1 数据继续兼容且不提前删除字段。
 - 2026-07-13：三条子线允许并行，但使用明确文件所有权；根线在交接后统一审查与集成，避免通过局部修复破坏其他链路。
 - 2026-07-14：SQLite 旧表新增唯一字段必须使用“普通 nullable 列 + 独立命名唯一索引”的两阶段兼容迁移；真实 `v0.1.10` 卷升级是候选镜像进入 PR 前的强制门禁。
-- 2026-07-14：`e86f24c4` 候选以固定正式 `v0.1.10` digest 完成首次升级与重启门禁；只有 PR 合入、精确 tag 和全部正式供应链终验完成后才可结束 Goal。
+- 2026-07-14：Operation 的资格、租约过期和 CAS 使用调用方同一次 `observedNowMs`，持久化时间以 `max(observedNowMs, created, updated)` 单调推进；创建保持宿主时钟，避免嵌套 SQLite 事务增加 read-before-write 锁升级窗口。
+- 2026-07-14：早期 `e86f24c4`/`4c4acfc3` 候选已废弃；`6ca75bda` 候选以固定正式 `v0.1.10` digest 完成首次升级与重启门禁。只有 PR 合入、精确 tag 和全部正式供应链终验完成后才可结束 Goal。
 
 ## Idempotence and Recovery
 
