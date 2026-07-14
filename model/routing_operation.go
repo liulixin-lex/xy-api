@@ -165,14 +165,11 @@ func createRoutingOperationDB(
 	if err := ctx.Err(); err != nil {
 		return RoutingOperation{}, false, err
 	}
-	nowMs, err := routingDatabaseNowMs(db.WithContext(ctx))
-	if err != nil {
-		return RoutingOperation{}, false, err
-	}
 	createToken, err := newRoutingPersistenceToken()
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
+	nowMs := time.Now().UnixMilli()
 	operation := RoutingOperation{
 		OperationType:        normalized.Type,
 		IdempotencyHash:      idempotencyHash,
@@ -544,7 +541,14 @@ func ClaimRoutingOperationContext(
 		if err := query.First(&claimed).Error; err != nil {
 			return err
 		}
+		if err := validateStoredRoutingOperation(claimed); err != nil {
+			return err
+		}
 		if claimed.Attempts == int(^uint(0)>>1) {
+			return ErrRoutingOperationInvalid
+		}
+		claimNowMs := max(nowMs, claimed.CreatedTimeMs, claimed.UpdatedTimeMs)
+		if claimNowMs > math.MaxInt64-leaseMs {
 			return ErrRoutingOperationInvalid
 		}
 		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
@@ -553,9 +557,9 @@ func ClaimRoutingOperationContext(
 			Updates(map[string]any{
 				"status":          RoutingOperationStatusRunning,
 				"claim_token":     claimToken,
-				"claim_until_ms":  nowMs + leaseMs,
+				"claim_until_ms":  claimNowMs + leaseMs,
 				"attempts":        claimed.Attempts + 1,
-				"updated_time_ms": nowMs,
+				"updated_time_ms": claimNowMs,
 			})
 		if updated.Error != nil {
 			return updated.Error
@@ -563,7 +567,10 @@ func ClaimRoutingOperationContext(
 		if updated.RowsAffected != 1 {
 			return ErrRoutingOperationClaimLost
 		}
-		return tx.WithContext(ctx).Where("id = ? AND claim_token = ?", claimed.ID, claimToken).First(&claimed).Error
+		if err := tx.WithContext(ctx).Where("id = ? AND claim_token = ?", claimed.ID, claimToken).First(&claimed).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(claimed)
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -572,6 +579,34 @@ func ClaimRoutingOperationContext(
 		return nil, err
 	}
 	return &claimed, nil
+}
+
+func lockRoutingOperationClaimTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	id int64,
+	claimToken string,
+	nowMs int64,
+) (RoutingOperation, error) {
+	if tx == nil || id <= 0 || len(claimToken) != 32 || nowMs <= 0 {
+		return RoutingOperation{}, ErrRoutingOperationInvalid
+	}
+	var operation RoutingOperation
+	err := lockForUpdate(tx.WithContext(ctx)).
+		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
+			id, RoutingOperationStatusRunning, claimToken, nowMs,
+		).
+		First(&operation).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return RoutingOperation{}, ErrRoutingOperationClaimLost
+	}
+	if err != nil {
+		return RoutingOperation{}, err
+	}
+	if err := validateStoredRoutingOperation(operation); err != nil {
+		return RoutingOperation{}, err
+	}
+	return operation, nil
 }
 
 func RenewRoutingOperationClaimContext(
@@ -588,15 +623,46 @@ func RenewRoutingOperationClaimContext(
 		leaseMs > routingOperationMaxClaimMs || nowMs > math.MaxInt64-leaseMs {
 		return ErrRoutingOperationInvalid
 	}
-	updated := DB.WithContext(ctx).Model(&RoutingOperation{}).
-		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
-			id, RoutingOperationStatusRunning, claimToken, nowMs,
-		).
-		Updates(map[string]any{
-			"claim_until_ms":  nowMs + leaseMs,
-			"updated_time_ms": nowMs,
-		})
-	return routingOperationCASResult(updated)
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		operation, err := lockRoutingOperationClaimTx(ctx, tx, id, claimToken, nowMs)
+		if err != nil {
+			return err
+		}
+		transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+		if transitionTimeMs > math.MaxInt64-leaseMs {
+			return ErrRoutingOperationInvalid
+		}
+		claimUntilMs := transitionTimeMs + leaseMs
+		if claimUntilMs <= operation.ClaimUntilMs {
+			unchanged := tx.WithContext(ctx).Model(&RoutingOperation{}).
+				Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
+					id, RoutingOperationStatusRunning, claimToken, nowMs,
+				).
+				Update("claim_until_ms", operation.ClaimUntilMs)
+			if unchanged.Error != nil {
+				return unchanged.Error
+			}
+			if unchanged.RowsAffected != 1 && tx.Dialector.Name() != "mysql" {
+				return ErrRoutingOperationClaimLost
+			}
+			return nil
+		}
+		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
+			Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
+				id, RoutingOperationStatusRunning, claimToken, nowMs,
+			).
+			Updates(map[string]any{
+				"claim_until_ms":  claimUntilMs,
+				"updated_time_ms": transitionTimeMs,
+			})
+		if err := routingOperationCASResult(updated); err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).Where("id = ?", id).First(&operation).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(operation)
+	})
 }
 
 func HasRunnableRoutingOperationContext(
@@ -642,25 +708,42 @@ func RetryRoutingOperationContext(
 	if lastError == "" {
 		return ErrRoutingOperationInvalid
 	}
-	updated := DB.WithContext(ctx).Model(&RoutingOperation{}).
-		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
-			id, RoutingOperationStatusRunning, claimToken, nowMs,
-		).
-		Updates(map[string]any{
-			"status":               RoutingOperationStatusPending,
-			"claim_token":          "",
-			"claim_until_ms":       0,
-			"next_retry_ms":        nextRetryMs,
-			"last_error":           lastError,
-			"result_revision":      0,
-			"result_activation_id": 0,
-			"result_outbox_id":     0,
-			"result_payload_json":  "",
-			"result_payload_hash":  "",
-			"completed_time_ms":    0,
-			"updated_time_ms":      nowMs,
-		})
-	return routingOperationCASResult(updated)
+	retryDelayMs := nextRetryMs - nowMs
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		operation, err := lockRoutingOperationClaimTx(ctx, tx, id, claimToken, nowMs)
+		if err != nil {
+			return err
+		}
+		transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+		if transitionTimeMs > math.MaxInt64-retryDelayMs {
+			return ErrRoutingOperationInvalid
+		}
+		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
+			Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
+				id, RoutingOperationStatusRunning, claimToken, nowMs,
+			).
+			Updates(map[string]any{
+				"status":               RoutingOperationStatusPending,
+				"claim_token":          "",
+				"claim_until_ms":       0,
+				"next_retry_ms":        transitionTimeMs + retryDelayMs,
+				"last_error":           lastError,
+				"result_revision":      0,
+				"result_activation_id": 0,
+				"result_outbox_id":     0,
+				"result_payload_json":  "",
+				"result_payload_hash":  "",
+				"completed_time_ms":    0,
+				"updated_time_ms":      transitionTimeMs,
+			})
+		if err := routingOperationCASResult(updated); err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).Where("id = ?", id).First(&operation).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(operation)
+	})
 }
 
 func SucceedRoutingOperationContext(
@@ -757,37 +840,47 @@ func finishRoutingOperationContext(
 		!validRoutingOperationTerminalState(status, lastError, result) {
 		return ErrRoutingOperationInvalid
 	}
-	updated := DB.WithContext(ctx).Model(&RoutingOperation{}).
-		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
-			id, RoutingOperationStatusRunning, claimToken, nowMs,
-		).
-		Updates(routingOperationTerminalUpdates(status, lastError, result, nowMs))
-	return routingOperationCASResult(updated)
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		_, err := finishRoutingOperationTx(
+			ctx, tx, RoutingOperation{ID: id, ClaimToken: claimToken}, nowMs, nowMs, status, lastError, result,
+		)
+		return err
+	})
 }
 
 func finishRoutingOperationTx(
 	ctx context.Context,
 	tx *gorm.DB,
 	operation RoutingOperation,
-	nowMs int64,
+	observedNowMs int64,
+	minimumWriteTimeMs int64,
 	status RoutingOperationStatus,
 	lastError string,
 	result RoutingOperationResult,
 ) (RoutingOperation, error) {
-	if operation.ID <= 0 || len(operation.ClaimToken) != 32 || nowMs <= 0 ||
+	if tx == nil || operation.ID <= 0 || len(operation.ClaimToken) != 32 || observedNowMs <= 0 ||
+		minimumWriteTimeMs <= 0 ||
 		!validRoutingOperationTerminalState(status, lastError, result) {
 		return RoutingOperation{}, ErrRoutingOperationInvalid
 	}
+	current, err := lockRoutingOperationClaimTx(ctx, tx, operation.ID, operation.ClaimToken, observedNowMs)
+	if err != nil {
+		return RoutingOperation{}, err
+	}
+	transitionTimeMs := max(minimumWriteTimeMs, observedNowMs, current.CreatedTimeMs, current.UpdatedTimeMs)
 	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
-			operation.ID, RoutingOperationStatusRunning, operation.ClaimToken, nowMs,
+			operation.ID, RoutingOperationStatusRunning, operation.ClaimToken, observedNowMs,
 		).
-		Updates(routingOperationTerminalUpdates(status, lastError, result, nowMs))
+		Updates(routingOperationTerminalUpdates(status, lastError, result, transitionTimeMs))
 	if err := routingOperationCASResult(updated); err != nil {
 		return RoutingOperation{}, err
 	}
 	var stored RoutingOperation
 	if err := tx.WithContext(ctx).Where("id = ?", operation.ID).First(&stored).Error; err != nil {
+		return RoutingOperation{}, err
+	}
+	if err := validateStoredRoutingOperation(stored); err != nil {
 		return RoutingOperation{}, err
 	}
 	return stored, nil

@@ -14,7 +14,7 @@ import (
 
 const (
 	routingV2SchemaComponent    = "channel-routing-v2"
-	routingV2SchemaVersion      = "channel-routing-v2-phase5-20260714.8"
+	routingV2SchemaVersion      = "channel-routing-v2-phase5-20260714.9"
 	routingV2SchemaPollInterval = 100 * time.Millisecond
 )
 

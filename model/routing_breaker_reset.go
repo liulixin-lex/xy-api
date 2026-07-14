@@ -320,6 +320,9 @@ func ExecuteRoutingBreakerResetOperationContext(
 		if err := query.First(&operation).Error; err != nil {
 			return err
 		}
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return err
+		}
 		if operation.OperationType != RoutingOperationTypeBreakerReset || operation.Status != RoutingOperationStatusRunning ||
 			operation.ClaimToken != claimed.ClaimToken || operation.ClaimUntilMs <= nowMs {
 			return ErrRoutingOperationClaimLost
@@ -332,6 +335,12 @@ func ExecuteRoutingBreakerResetOperationContext(
 			command.TombstoneID != 0 || command.OutboxID != 0 {
 			return ErrRoutingBreakerResetInvalid
 		}
+		transitionTimeMs := max(
+			nowMs,
+			operation.CreatedTimeMs,
+			operation.UpdatedTimeMs,
+			command.CreatedTimeMs,
+		)
 		target := command.Target()
 		if target.Scope == RoutingBreakerResetScopeMember {
 			current, currentErr := routingBreakerResetMemberTargetCurrentTx(ctx, tx, operation, target)
@@ -341,16 +350,19 @@ func ExecuteRoutingBreakerResetOperationContext(
 			if !current {
 				updated := tx.WithContext(ctx).Model(&RoutingBreakerResetCommand{}).
 					Where("id = ? AND operation_id = ? AND completed_time_ms = 0", command.ID, operation.ID).
-					Update("completed_time_ms", nowMs)
+					Update("completed_time_ms", transitionTimeMs)
 				if updated.Error != nil {
 					return updated.Error
 				}
 				if updated.RowsAffected != 1 {
 					return ErrRoutingOperationClaimLost
 				}
-				command.CompletedTimeMs = nowMs
+				command.CompletedTimeMs = transitionTimeMs
+				if !validRoutingBreakerResetCommand(command) {
+					return ErrRoutingBreakerResetInvalid
+				}
 				finished, finishErr := finishRoutingOperationTx(
-					ctx, tx, operation, nowMs, RoutingOperationStatusSuperseded,
+					ctx, tx, operation, nowMs, transitionTimeMs, RoutingOperationStatusSuperseded,
 					ErrRoutingBreakerResetTargetGone.Error(), RoutingOperationResult{},
 				)
 				if finishErr != nil {
@@ -360,10 +372,18 @@ func ExecuteRoutingBreakerResetOperationContext(
 				return nil
 			}
 		}
-		tombstone, err := incrementRoutingBreakerResetGenerationTx(ctx, tx, target, operation.ID, nowMs)
+		tombstone, err := incrementRoutingBreakerResetGenerationTx(
+			ctx, tx, target, operation.ID, transitionTimeMs,
+		)
 		if err != nil {
 			return err
 		}
+		transitionTimeMs = max(
+			transitionTimeMs,
+			tombstone.ResetAtMs,
+			tombstone.CreatedTimeMs,
+			tombstone.UpdatedTimeMs,
+		)
 		if target.Scope == RoutingBreakerResetScopeMember {
 			result := tx.WithContext(ctx).Where(&RoutingBreakerState{
 				ChannelID: target.ChannelID, APIKeyIndex: target.APIKeyIndex,
@@ -417,18 +437,21 @@ func ExecuteRoutingBreakerResetOperationContext(
 		command.Generation = tombstone.Generation
 		command.TombstoneID = tombstone.ID
 		command.OutboxID = outbox.ID
-		command.CompletedTimeMs = nowMs
+		command.CompletedTimeMs = transitionTimeMs
 		updated := tx.WithContext(ctx).Model(&RoutingBreakerResetCommand{}).
 			Where("id = ? AND operation_id = ? AND completed_time_ms = 0", command.ID, operation.ID).
 			Updates(map[string]any{
 				"generation": command.Generation, "tombstone_id": command.TombstoneID,
-				"outbox_id": command.OutboxID, "completed_time_ms": nowMs,
+				"outbox_id": command.OutboxID, "completed_time_ms": transitionTimeMs,
 			})
 		if updated.Error != nil {
 			return updated.Error
 		}
 		if updated.RowsAffected != 1 {
 			return ErrRoutingOperationClaimLost
+		}
+		if !validRoutingBreakerResetCommand(command) {
+			return ErrRoutingBreakerResetInvalid
 		}
 		resultPayload := struct {
 			Scope      string                    `json:"scope"`
@@ -440,7 +463,7 @@ func ExecuteRoutingBreakerResetOperationContext(
 		if err != nil {
 			return err
 		}
-		finished, err := finishRoutingOperationTx(ctx, tx, operation, nowMs, RoutingOperationStatusSucceeded, "", RoutingOperationResult{
+		finished, err := finishRoutingOperationTx(ctx, tx, operation, nowMs, transitionTimeMs, RoutingOperationStatusSucceeded, "", RoutingOperationResult{
 			PayloadJSON: resultJSON, PayloadHash: resultHash,
 		})
 		if err != nil {
@@ -791,13 +814,34 @@ func incrementRoutingBreakerResetGenerationTx(
 	if err != nil {
 		return RoutingBreakerResetTombstone{}, err
 	}
+	transitionTimeMs := max(nowMs, fence.CreatedTimeMs, fence.UpdatedTimeMs)
+	var previous RoutingBreakerResetTombstone
+	err = lockForUpdate(tx.WithContext(ctx)).Where("target_key = ?", targetKey).First(&previous).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return RoutingBreakerResetTombstone{}, err
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if fence.Generation != 0 {
+			return RoutingBreakerResetTombstone{}, ErrRoutingBreakerResetInvalid
+		}
+	} else {
+		if !validRoutingBreakerResetTombstone(previous) || previous.Generation != fence.Generation {
+			return RoutingBreakerResetTombstone{}, ErrRoutingBreakerResetInvalid
+		}
+		transitionTimeMs = max(
+			transitionTimeMs,
+			previous.ResetAtMs,
+			previous.CreatedTimeMs,
+			previous.UpdatedTimeMs,
+		)
+	}
 	if fence.Generation == math.MaxInt64 {
 		return RoutingBreakerResetTombstone{}, ErrRoutingBreakerResetGeneration
 	}
 	updated := tx.WithContext(ctx).Model(&RoutingBreakerResetFence{}).
 		Where("target_key = ? AND generation = ?", targetKey, fence.Generation).
 		Updates(map[string]any{
-			"generation": fence.Generation + 1, "updated_time_ms": nowMs,
+			"generation": fence.Generation + 1, "updated_time_ms": transitionTimeMs,
 		})
 	if updated.Error != nil {
 		return RoutingBreakerResetTombstone{}, updated.Error
@@ -805,9 +849,9 @@ func incrementRoutingBreakerResetGenerationTx(
 	if updated.RowsAffected != 1 {
 		return RoutingBreakerResetTombstone{}, ErrRoutingOperationClaimLost
 	}
-	tombstone := routingBreakerResetTombstoneFromTarget(targetKey, normalized, nowMs)
+	tombstone := routingBreakerResetTombstoneFromTarget(targetKey, normalized, transitionTimeMs)
 	tombstone.Generation = fence.Generation + 1
-	tombstone.ResetAtMs = nowMs
+	tombstone.ResetAtMs = transitionTimeMs
 	tombstone.LastOperationID = operationID
 	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "target_key"}},

@@ -609,6 +609,9 @@ func migrateDBFast() error {
 
 func migrateRoutingV2DedicatedSchemas(db *gorm.DB) error {
 	alphaV2Drained := common.GetEnvOrDefaultBool(routingV2AlphaDrainedEnv, false)
+	if err := migrateRoutingOperationStateInvariants(db); err != nil {
+		return routingV2MigrationError("routing operation invariants", err)
+	}
 	rollupOptions := RoutingMetricRollupMigrationOptions{AlphaV2Drained: alphaV2Drained}
 	if err := MigrateRoutingMetricRollupRevisionKeyWithOptions(db, rollupOptions); err != nil {
 		return routingV2MigrationError("routing metric rollup", err)

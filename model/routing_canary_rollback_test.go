@@ -80,6 +80,10 @@ func TestRoutingCanaryAutoRollbackBatchesBreachedPoolsFromSameRevision(t *testin
 		assert.Equal(t, result.Publish.Revision.Revision, operations[index].ResultRevision)
 		assert.Equal(t, result.Publish.Activation.ID, operations[index].ResultActivationID)
 		assert.Equal(t, result.Publish.Outbox.ID, operations[index].ResultOutboxID)
+		stored, getErr := GetRoutingOperationContext(context.Background(), operations[index].ID)
+		require.NoError(t, getErr)
+		assert.GreaterOrEqual(t, stored.Attempts, 1)
+		assert.GreaterOrEqual(t, stored.CompletedTimeMs, stored.CreatedTimeMs)
 	}
 	assert.Equal(t, secondOperation.ID, operations[1].ID)
 
@@ -227,6 +231,10 @@ func TestRoutingCanaryAutoRollbackSupersedesChangedHead(t *testing.T) {
 	for index := range operations {
 		assert.Equal(t, RoutingOperationStatusSuperseded, operations[index].Status)
 		assert.Equal(t, "routing policy head or activation changed", operations[index].LastError)
+		stored, getErr := GetRoutingOperationContext(context.Background(), operations[index].ID)
+		require.NoError(t, getErr)
+		assert.GreaterOrEqual(t, stored.Attempts, 1)
+		assert.GreaterOrEqual(t, stored.CompletedTimeMs, stored.CreatedTimeMs)
 	}
 
 	head, err := GetRoutingPolicyHeadContext(context.Background())
@@ -423,7 +431,7 @@ func newRoutingCanaryRollbackFixture(
 	})
 	require.NoError(t, err)
 	claimed, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 20_000, 60_000,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, operation.CreatedTimeMs, 60_000,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)

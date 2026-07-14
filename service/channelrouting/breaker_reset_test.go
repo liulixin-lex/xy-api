@@ -198,6 +198,10 @@ func breakerResetServiceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	withSnapshotTestDB(t, db)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingOperation{}, &model.RoutingBreakerResetCommand{}, &model.RoutingBreakerResetFence{},

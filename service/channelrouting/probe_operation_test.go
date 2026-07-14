@@ -92,22 +92,28 @@ func TestActiveProbeOperationHeartbeatFailureCancelsAndLeavesRecoverableClaim(t 
 	<-started
 	claimed, err := model.GetRoutingOperationContext(context.Background(), operation.ID)
 	require.NoError(t, err)
+	lostClaimToken := strings.Repeat("f", 32)
+	if lostClaimToken == claimed.ClaimToken {
+		lostClaimToken = strings.Repeat("e", 32)
+	}
 	require.NoError(t, db.Model(&model.RoutingOperation{}).Where("id = ?", operation.ID).
-		Update("claim_until_ms", int64(1)).Error)
+		Update("claim_token", lostClaimToken).Error)
 	heartbeatTicks <- time.Now()
 	assert.ErrorIs(t, <-heartbeatResults, model.ErrRoutingOperationClaimLost)
 	<-canceled
 	assert.ErrorIs(t, <-cycleResult, model.ErrRoutingOperationClaimLost)
 
-	nowMs, err := model.RoutingEndpointDatabaseNowMsContext(context.Background())
+	stored, err := model.GetRoutingOperationContext(context.Background(), operation.ID)
 	require.NoError(t, err)
 	recovered, err := model.ClaimRoutingOperationContext(
-		context.Background(), model.RoutingOperationTypeActiveProbe, nowMs, time.Second.Milliseconds(),
+		context.Background(), model.RoutingOperationTypeActiveProbe,
+		stored.ClaimUntilMs+1, time.Second.Milliseconds(),
 	)
 	require.NoError(t, err)
 	require.NotNil(t, recovered)
 	assert.Equal(t, operation.ID, recovered.ID)
 	assert.NotEqual(t, claimed.ClaimToken, recovered.ClaimToken)
+	assert.NotEqual(t, lostClaimToken, recovered.ClaimToken)
 }
 
 func TestActiveProbeOperationDisabledSettingBecomesSuperseded(t *testing.T) {
