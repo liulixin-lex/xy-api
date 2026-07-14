@@ -24,7 +24,19 @@ import { canAccessBillingReviews } from '@/lib/admin-permissions'
 import { useAuthStore } from '@/stores/auth-store'
 
 const billingReviewsSearchSchema = z.object({
+  tab: z.enum(['reviews', 'projections']).optional().catch(undefined),
   cursor: z
+    .number()
+    .int()
+    .min(0)
+    .max(Number.MAX_SAFE_INTEGER)
+    .optional()
+    .catch(0),
+  projectionKind: z
+    .enum(['stats', 'logs', 'conflicts'])
+    .optional()
+    .catch('stats'),
+  projectionCursor: z
     .number()
     .int()
     .min(0)

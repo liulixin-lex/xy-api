@@ -21,6 +21,7 @@ export type ManualBillingReviewKind =
   | 'acceptance_overage'
   | 'accepted_handoff'
   | 'terminal_overage'
+  | 'terminal_usage'
 
 export type ManualBillingReviewAction =
   | 'confirmed_accepted'

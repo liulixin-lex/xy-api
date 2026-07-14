@@ -62,6 +62,7 @@ type RiskAcknowledgementDialogProps = {
   isLoading?: boolean
   onConfirm: () => void
   className?: string
+  finalFocus?: React.RefObject<HTMLElement | null>
 }
 
 function getRequiredTextRows(text: string) {
@@ -86,6 +87,7 @@ export function RiskAcknowledgementDialog({
   isLoading = false,
   onConfirm,
   className,
+  finalFocus,
 }: RiskAcknowledgementDialogProps) {
   const { t } = useTranslation()
   const [checkedItems, setCheckedItems] = useState<boolean[]>([])
@@ -182,6 +184,7 @@ export function RiskAcknowledgementDialog({
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent
+        finalFocus={finalFocus}
         className={cn(
           'flex max-h-[min(88dvh,760px)] w-[calc(100vw-1.5rem)] !max-w-[44rem] grid-rows-none flex-col gap-0 overflow-hidden !p-0 sm:w-[min(44rem,calc(100vw-3rem))]',
           className

@@ -135,7 +135,7 @@ export function ManualBillingReviewSheet(props: {
         'This decision is blocked by the latest server evidence'
       ),
       upstreamTaskRequired: t(
-        'Upstream task ID is required when accepting a send outcome'
+        'The frozen upstream task ID is required for this decision'
       ),
       upstreamTaskTooLong: t('Upstream task ID must be 191 bytes or fewer'),
       evidenceRequired: t('Provider evidence reference is required'),
@@ -228,11 +228,13 @@ export function ManualBillingReviewSheet(props: {
       setRequestError(null)
       await props.onResolved().catch(() => undefined)
       if (!sessionRef.current.isCurrent(variables.generation)) return
-      toast.success(
-        variables.payload.action === 'confirmed_accepted'
-          ? t('Billing review accepted')
-          : t('Billing review rejected')
-      )
+      let successMessage = t('Billing review rejected')
+      if (variables.review.review_kind === 'terminal_usage') {
+        successMessage = t('Terminal usage verified')
+      } else if (variables.payload.action === 'confirmed_accepted') {
+        successMessage = t('Billing review accepted')
+      }
+      toast.success(successMessage)
       props.onOpenChange(false)
     },
     onError: async (error, variables) => {
@@ -340,6 +342,8 @@ export function ManualBillingReviewSheet(props: {
     !manualBillingReviewHasUnknownBlocker(workingReview) &&
     workingReview.etag.length > 0 &&
     workingReview.review_version > 0 &&
+    (workingReview.review_kind !== 'terminal_usage' ||
+      (workingReview.upstream_task_id ?? '').trim().length > 0) &&
     (workingReview.can_accept || workingReview.can_reject)
 
   let requestErrorTitle = t('Billing review decision failed')
@@ -428,6 +432,11 @@ export function ManualBillingReviewSheet(props: {
         final: format.number(confirmationImpactDetails.final),
       }
     )
+  } else if (confirmationImpactDetails?.kind === 'terminal_usage') {
+    confirmationImpact = t(
+      'This verifies terminal usage for the frozen upstream task and keeps the final charge at {{final}}. No refund or additional charge is created.',
+      { final: format.number(confirmationImpactDetails.final) }
+    )
   } else if (confirmationImpactDetails?.kind === 'accepted') {
     confirmationImpact = t(
       'This confirms the upstream task and sets the final charge to {{final}}.',
@@ -471,20 +480,51 @@ export function ManualBillingReviewSheet(props: {
     rejectDecisionDescription = t(
       'Accepted handoff reviews can only be accepted'
     )
+  } else if (workingReview?.review_kind === 'terminal_usage') {
+    acceptDecisionDescription = t(
+      'Verify terminal usage and retain the current charge'
+    )
+    rejectDecisionDescription = t(
+      'Terminal usage verification cannot be rejected or refunded'
+    )
   }
   const decisionContractSupported =
     workingReview != null &&
     manualBillingReviewKindIsSupported(workingReview.review_kind) &&
     !manualBillingReviewHasUnknownBlocker(workingReview)
+  const terminalUsageContextAvailable =
+    workingReview?.review_kind !== 'terminal_usage' ||
+    (workingReview.upstream_task_id ?? '').trim().length > 0
   const acceptDecisionAvailable =
-    workingReview?.can_accept === true && decisionContractSupported
+    workingReview?.can_accept === true &&
+    decisionContractSupported &&
+    terminalUsageContextAvailable
   const rejectDecisionAvailable =
     workingReview?.can_reject === true &&
     decisionContractSupported &&
-    workingReview.review_kind !== 'accepted_handoff'
+    workingReview.review_kind !== 'accepted_handoff' &&
+    workingReview.review_kind !== 'terminal_usage'
   const evidenceWindowStart = workingReview
     ? getManualBillingReviewEvidenceWindowStart(workingReview)
     : 0
+  let confirmationTitle = t('Confirm rejected billing outcome')
+  let confirmationChecklist = t(
+    'I understand this rejection applies the server-calculated refund or write-off outcome.'
+  )
+  let confirmationButtonText = t('Reject verified outcome')
+  if (confirmationReview?.review_kind === 'terminal_usage') {
+    confirmationTitle = t('Confirm terminal usage verification')
+    confirmationChecklist = t(
+      'I understand this verification retains the current charge without a refund or additional charge.'
+    )
+    confirmationButtonText = t('Verify terminal usage')
+  } else if (confirmationAction === 'confirmed_accepted') {
+    confirmationTitle = t('Confirm accepted billing outcome')
+    confirmationChecklist = t(
+      'I understand this acceptance applies the server-calculated financial outcome.'
+    )
+    confirmationButtonText = t('Accept verified outcome')
+  }
 
   return (
     <>
@@ -568,6 +608,21 @@ export function ManualBillingReviewSheet(props: {
                 </AlertTitle>
                 <AlertDescription className='break-all'>
                   {workingReview.review_kind || t('Unknown')}
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
+            {workingReview?.review_kind === 'terminal_usage' &&
+            !terminalUsageContextAvailable ? (
+              <Alert variant='destructive' role='alert'>
+                <ShieldAlert aria-hidden='true' />
+                <AlertTitle>
+                  {t(
+                    'The frozen upstream task ID is required for this decision'
+                  )}
+                </AlertTitle>
+                <AlertDescription>
+                  {t('This decision is blocked by the latest server evidence')}
                 </AlertDescription>
               </Alert>
             ) : null}
@@ -881,11 +936,7 @@ export function ManualBillingReviewSheet(props: {
         onOpenChange={(open) => {
           if (!open && !isSubmitting) setConfirmation(null)
         }}
-        title={
-          confirmationAction === 'confirmed_accepted'
-            ? t('Confirm accepted billing outcome')
-            : t('Confirm rejected billing outcome')
-        }
+        title={confirmationTitle}
         description={
           <span
             className={cn(
@@ -899,6 +950,13 @@ export function ManualBillingReviewSheet(props: {
           </span>
         }
         items={[
+          ...(confirmationReview?.review_kind === 'terminal_usage'
+            ? [
+                t('Frozen upstream task ID: {{task}}', {
+                  task: confirmationReview.upstream_task_id ?? '',
+                }),
+              ]
+            : []),
           t('Provider status: {{status}}', {
             status: confirmation?.payload.provider_status ?? '',
           }),
@@ -911,23 +969,13 @@ export function ManualBillingReviewSheet(props: {
         ]}
         checklist={[
           t('I verified the provider evidence and decision reason.'),
-          confirmationAction === 'confirmed_accepted'
-            ? t(
-                'I understand this acceptance applies the server-calculated financial outcome.'
-              )
-            : t(
-                'I understand this rejection applies the server-calculated refund or write-off outcome.'
-              ),
+          confirmationChecklist,
         ]}
         requiredText={String(confirmationReview?.reservation_id ?? '')}
         inputPrompt={t('Type the reservation ID to confirm:')}
         inputPlaceholder={t('Type the reservation ID')}
         mismatchHint={t('The reservation ID does not match.')}
-        confirmText={
-          confirmationAction === 'confirmed_accepted'
-            ? t('Accept verified outcome')
-            : t('Reject verified outcome')
-        }
+        confirmText={confirmationButtonText}
         destructive={confirmationAction === 'confirmed_rejected'}
         isLoading={isSubmitting}
         onConfirm={submitFrozenDecision}

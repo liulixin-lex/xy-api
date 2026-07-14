@@ -127,6 +127,30 @@ describe('manual billing review details', () => {
     )
   })
 
+  test('shows terminal usage as charge retention without refund consequences', () => {
+    const html = renderToStaticMarkup(
+      createElement(ManualBillingReviewFinancialOutcomes, {
+        review: {
+          ...review,
+          review_kind: 'terminal_usage',
+          can_reject: false,
+          financial_consequences: {
+            current_charge: 101,
+            accept_additional_charge: 0,
+            accept_final_charge: 101,
+            reject_refund: 0,
+            reject_final_charge: 101,
+            reject_write_off: 0,
+          },
+        },
+      })
+    )
+
+    assert.equal((html.match(/data-outcome=/g) ?? []).length, 2)
+    assert.match(html, /preserves the current charge/i)
+    assert.doesNotMatch(html, /Refund if rejected|Write-off if rejected/)
+  })
+
   test('keeps future review and blocker codes visible while the client fails closed', () => {
     const html = renderToStaticMarkup(
       createElement(ManualBillingReviewCaseDetails, {

@@ -14,6 +14,10 @@ export default defineConfig(({ envMode }) => {
     process.env.VITE_REACT_APP_SERVER_URL ||
     env.rawPublicVars.VITE_REACT_APP_SERVER_URL ||
     'http://localhost:3000'
+  const buildVersion =
+    process.env.VITE_REACT_APP_VERSION ??
+    env.rawPublicVars.VITE_REACT_APP_VERSION ??
+    ''
 
   const isProd = envMode === 'production'
   const devProxy = Object.fromEntries(
@@ -55,6 +59,9 @@ export default defineConfig(({ envMode }) => {
     source: {
       entry: {
         index: './src/main.tsx',
+      },
+      define: {
+        'import.meta.env.VITE_REACT_APP_VERSION': JSON.stringify(buildVersion),
       },
     },
     resolve: {

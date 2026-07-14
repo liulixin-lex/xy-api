@@ -16,7 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Clock3, ReceiptText, ShieldAlert, Waypoints } from 'lucide-react'
+import {
+  Clock3,
+  FileCheck2,
+  ReceiptText,
+  ShieldAlert,
+  Waypoints,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -75,6 +81,17 @@ export function ManualBillingReviewFinancialOutcomes(props: {
           <AlertDescription>
             {t(
               'A negative accepted adjustment reduces the current charge to the server-calculated final charge.'
+            )}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {props.review.review_kind === 'terminal_usage' ? (
+        <Alert>
+          <FileCheck2 aria-hidden='true' />
+          <AlertTitle>{t('Terminal usage verification')}</AlertTitle>
+          <AlertDescription>
+            {t(
+              'Verify the provider terminal usage for the frozen upstream task. This preserves the current charge and does not create a refund or an additional charge.'
             )}
           </AlertDescription>
         </Alert>

@@ -148,13 +148,19 @@ export function useSidebarData(): SidebarData {
             },
           },
           {
-            title: t('Manual billing reviews'),
+            title: t('Billing operations'),
             url: '/billing-reviews',
             icon: ReceiptText,
-            requiredPermission: {
-              resource: ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
-              action: ADMIN_PERMISSION_ACTIONS.READ,
-            },
+            requiredAnyPermission: [
+              {
+                resource: ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+                action: ADMIN_PERMISSION_ACTIONS.READ,
+              },
+              {
+                resource: ADMIN_PERMISSION_RESOURCES.BILLING_PROJECTION_OPS,
+                action: ADMIN_PERMISSION_ACTIONS.READ,
+              },
+            ],
           },
           {
             title: t('Models'),

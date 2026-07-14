@@ -73,6 +73,8 @@ export function getManualBillingReviewKindLabelKey(
       return 'Accepted handoff'
     case 'terminal_overage':
       return 'Terminal overage'
+    case 'terminal_usage':
+      return 'Terminal usage verification'
     default:
       return null
   }
@@ -113,6 +115,7 @@ export type ManualBillingReviewConfirmationImpact =
   | { kind: 'overage_accept'; additional: number; final: number }
   | { kind: 'overage_reject'; writeOff: number; final: number }
   | { kind: 'accepted_handoff'; adjustment: number; final: number }
+  | { kind: 'terminal_usage'; final: number }
   | { kind: 'accepted'; final: number }
   | { kind: 'rejected'; refund: number; final: number }
 
@@ -121,6 +124,9 @@ export function getManualBillingReviewConfirmationImpact(
   action: ManualBillingReviewAction
 ): ManualBillingReviewConfirmationImpact {
   const consequences = review.financial_consequences
+  if (review.review_kind === 'terminal_usage') {
+    return { kind: 'terminal_usage', final: consequences.accept_final_charge }
+  }
   if (manualBillingReviewIsOverage(review.review_kind)) {
     if (action === 'confirmed_accepted') {
       return {
@@ -267,7 +273,9 @@ export function createManualBillingReviewSchema(
       }
       if (
         value.action === 'confirmed_rejected' &&
-        (!review.can_reject || review.review_kind === 'accepted_handoff')
+        (!review.can_reject ||
+          review.review_kind === 'accepted_handoff' ||
+          review.review_kind === 'terminal_usage')
       ) {
         context.addIssue({
           code: 'custom',
@@ -276,7 +284,8 @@ export function createManualBillingReviewSchema(
         })
       }
       if (
-        review.review_kind === 'send_outcome' &&
+        (review.review_kind === 'send_outcome' ||
+          review.review_kind === 'terminal_usage') &&
         value.action === 'confirmed_accepted' &&
         value.upstream_task_id.length === 0
       ) {
@@ -284,6 +293,16 @@ export function createManualBillingReviewSchema(
           code: 'custom',
           path: ['upstream_task_id'],
           message: messages.upstreamTaskRequired,
+        })
+      }
+      if (
+        review.review_kind === 'terminal_usage' &&
+        value.upstream_task_id !== (review.upstream_task_id ?? '').trim()
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['upstream_task_id'],
+          message: messages.actionUnavailable,
         })
       }
     })
@@ -294,7 +313,9 @@ export function getManualBillingReviewProviderStatus(
   action: ManualBillingReviewAction,
   rejectionStatus: 'confirmed_rejected' | 'confirmed_not_found'
 ): ManualBillingProviderStatus | null {
-  if (reviewKind === 'terminal_overage') return 'terminal_usage_verified'
+  if (reviewKind === 'terminal_overage' || reviewKind === 'terminal_usage') {
+    return 'terminal_usage_verified'
+  }
   if (
     reviewKind === 'acceptance_overage' ||
     reviewKind === 'accepted_handoff'
@@ -310,6 +331,12 @@ export function buildManualBillingReviewResolution(
   review: ManualBillingReviewItem,
   values: ManualBillingReviewFormValues
 ): ManualBillingReviewResolutionRequest {
+  if (
+    review.review_kind === 'terminal_usage' &&
+    values.action !== 'confirmed_accepted'
+  ) {
+    throw new Error('Terminal usage reviews can only be accepted')
+  }
   const providerStatus = getManualBillingReviewProviderStatus(
     review.review_kind,
     values.action,
@@ -318,10 +345,17 @@ export function buildManualBillingReviewResolution(
   if (!providerStatus) {
     throw new Error('Unsupported manual billing review kind')
   }
+  const upstreamTaskId =
+    review.review_kind === 'terminal_usage'
+      ? (review.upstream_task_id ?? '').trim()
+      : values.upstream_task_id.trim()
+  if (review.review_kind === 'terminal_usage' && !upstreamTaskId) {
+    throw new Error('Terminal usage review is missing its upstream task id')
+  }
   return {
     action: values.action,
     expected_version: review.review_version,
-    upstream_task_id: values.upstream_task_id.trim(),
+    upstream_task_id: upstreamTaskId,
     provider_status: providerStatus,
     provider_checked_ms: new Date(values.provider_checked_at).getTime(),
     evidence_reference: values.evidence_reference.trim(),
@@ -340,6 +374,22 @@ export function getManualBillingReviewConsequenceRows(
   review: ManualBillingReviewItem
 ): ManualBillingReviewConsequenceRow[] {
   const consequences = review.financial_consequences
+  if (review.review_kind === 'terminal_usage') {
+    return [
+      {
+        key: 'current_charge',
+        labelKey: 'Current charge',
+        value: consequences.current_charge,
+        outcome: 'current',
+      },
+      {
+        key: 'accept_final_charge',
+        labelKey: 'Charge retained after verification',
+        value: consequences.accept_final_charge,
+        outcome: 'accept',
+      },
+    ]
+  }
   return [
     {
       key: 'current_charge',

@@ -141,6 +141,21 @@ describe('manual billing review decisions', () => {
     )
     assert.equal(
       buildManualBillingReviewResolution(
+        review({
+          review_kind: 'terminal_usage',
+          upstream_task_id: 'frozen-upstream-task',
+          can_reject: false,
+        }),
+        {
+          ...common,
+          upstream_task_id: 'stale-form-value',
+          action: 'confirmed_accepted',
+        }
+      ).provider_status,
+      'terminal_usage_verified'
+    )
+    assert.equal(
+      buildManualBillingReviewResolution(
         review({ review_kind: 'terminal_overage' }),
         { ...common, action: 'confirmed_rejected' }
       ).provider_status,
@@ -302,10 +317,14 @@ describe('manual billing review decisions', () => {
     )
   })
 
-  test('requires an upstream task id only when accepting a send outcome', () => {
+  test('requires a frozen upstream task id for terminal usage verification', () => {
     const sendSchema = createManualBillingReviewSchema(review(), messages)
     const terminalSchema = createManualBillingReviewSchema(
-      review({ review_kind: 'terminal_overage' }),
+      review({
+        review_kind: 'terminal_usage',
+        upstream_task_id: 'frozen-upstream-task',
+        can_reject: false,
+      }),
       messages
     )
     const base = {
@@ -325,9 +344,87 @@ describe('manual billing review decisions', () => {
       true
     )
     assert.equal(
-      terminalSchema.safeParse({ ...base, action: 'confirmed_accepted' })
-        .success,
+      terminalSchema.safeParse({
+        ...base,
+        action: 'confirmed_accepted',
+        upstream_task_id: 'frozen-upstream-task',
+      }).success,
       true
+    )
+    assert.equal(
+      terminalSchema.safeParse({
+        ...base,
+        action: 'confirmed_rejected',
+        upstream_task_id: 'frozen-upstream-task',
+      }).success,
+      false
+    )
+    assert.equal(
+      createManualBillingReviewSchema(
+        review({
+          review_kind: 'terminal_usage',
+          upstream_task_id: '',
+          can_reject: false,
+        }),
+        messages
+      ).safeParse({ ...base, action: 'confirmed_accepted' }).success,
+      false
+    )
+  })
+
+  test('keeps terminal usage consequences limited to the retained charge', () => {
+    const item = review({
+      review_kind: 'terminal_usage',
+      upstream_task_id: 'frozen-upstream-task',
+      can_reject: false,
+      financial_consequences: {
+        current_charge: 100,
+        accept_additional_charge: 0,
+        accept_final_charge: 100,
+        reject_refund: 0,
+        reject_final_charge: 100,
+        reject_write_off: 0,
+      },
+    })
+
+    assert.deepEqual(getManualBillingReviewConsequenceRows(item), [
+      {
+        key: 'current_charge',
+        labelKey: 'Current charge',
+        value: 100,
+        outcome: 'current',
+      },
+      {
+        key: 'accept_final_charge',
+        labelKey: 'Charge retained after verification',
+        value: 100,
+        outcome: 'accept',
+      },
+    ])
+    assert.deepEqual(
+      getManualBillingReviewConfirmationImpact(item, 'confirmed_accepted'),
+      { kind: 'terminal_usage', final: 100 }
+    )
+    assert.equal(
+      buildManualBillingReviewResolution(item, {
+        action: 'confirmed_accepted',
+        rejection_provider_status: 'confirmed_rejected',
+        upstream_task_id: 'tampered-form-value',
+        provider_checked_at: '2023-11-14T22:13:20.000Z',
+        evidence_reference: 'provider/case-1',
+        reason: 'verified terminal usage',
+      }).upstream_task_id,
+      'frozen-upstream-task'
+    )
+    assert.throws(() =>
+      buildManualBillingReviewResolution(item, {
+        action: 'confirmed_rejected',
+        rejection_provider_status: 'confirmed_rejected',
+        upstream_task_id: 'frozen-upstream-task',
+        provider_checked_at: '2023-11-14T22:13:20.000Z',
+        evidence_reference: 'provider/case-1',
+        reason: 'invalid rejection',
+      })
     )
   })
 
@@ -469,12 +566,14 @@ describe('manual billing review decisions', () => {
         'acceptance_overage',
         'accepted_handoff',
         'terminal_overage',
+        'terminal_usage',
       ].map(getManualBillingReviewKindLabelKey),
       [
         'Send outcome',
         'Acceptance overage',
         'Accepted handoff',
         'Terminal overage',
+        'Terminal usage verification',
       ]
     )
     assert.deepEqual(

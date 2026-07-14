@@ -22,7 +22,7 @@ import { useTranslation } from 'react-i18next'
 
 import { resolveSidebarView } from '@/components/layout/lib/sidebar-view-registry'
 import type { NavGroup, ResolvedSidebarView } from '@/components/layout/types'
-import { hasPermission } from '@/lib/admin-permissions'
+import { hasAnyPermission, hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -66,7 +66,9 @@ export function useSidebarView(): ResolvedSidebarView {
                 user,
                 item.requiredPermission.resource,
                 item.requiredPermission.action
-              ))
+              )) &&
+            (item.requiredAnyPermission === undefined ||
+              hasAnyPermission(user, item.requiredAnyPermission))
         )
         return items.length === group.items.length ? group : { ...group, items }
       })

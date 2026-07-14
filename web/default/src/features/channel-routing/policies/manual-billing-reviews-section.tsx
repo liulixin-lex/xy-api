@@ -311,17 +311,22 @@ export function ManualBillingReviewsSection(props: {
                       </TableCell>
                       <TableCell className='text-xs tabular-nums'>
                         <div>
-                          {t('Accept')}:{' '}
+                          {review.review_kind === 'terminal_usage'
+                            ? t('Retained charge')
+                            : t('Accept')}
+                          :{' '}
                           {format.number(
                             review.financial_consequences.accept_final_charge
                           )}
                         </div>
-                        <div className='text-muted-foreground'>
-                          {t('Reject')}:{' '}
-                          {format.number(
-                            review.financial_consequences.reject_final_charge
-                          )}
-                        </div>
+                        {review.review_kind !== 'terminal_usage' ? (
+                          <div className='text-muted-foreground'>
+                            {t('Reject')}:{' '}
+                            {format.number(
+                              review.financial_consequences.reject_final_charge
+                            )}
+                          </div>
+                        ) : null}
                       </TableCell>
                       <TableCell>
                         {review.blockers.length > 0 ? (
@@ -381,17 +386,22 @@ export function ManualBillingReviewsSection(props: {
                     <span className='text-muted-foreground mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs'>
                       <span>{reviewAge(review.manual_review_since_ms, t)}</span>
                       <span>
-                        {t('Accept')}:{' '}
+                        {review.review_kind === 'terminal_usage'
+                          ? t('Retained charge')
+                          : t('Accept')}
+                        :{' '}
                         {format.number(
                           review.financial_consequences.accept_final_charge
                         )}
                       </span>
-                      <span>
-                        {t('Reject')}:{' '}
-                        {format.number(
-                          review.financial_consequences.reject_final_charge
-                        )}
-                      </span>
+                      {review.review_kind !== 'terminal_usage' ? (
+                        <span>
+                          {t('Reject')}:{' '}
+                          {format.number(
+                            review.financial_consequences.reject_final_charge
+                          )}
+                        </span>
+                      ) : null}
                     </span>
                   </span>
                   <ChevronRight
