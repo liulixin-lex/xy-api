@@ -91,7 +91,7 @@ export function ChannelRoutingCursorPagination(props: {
   const { t } = useTranslation()
   const next = Number(props.nextCursor || 0)
   return (
-    <div className='flex items-center justify-end gap-2 border-t pt-3'>
+    <div className='flex flex-wrap items-center justify-end gap-2 border-t pt-3'>
       <Button
         size='sm'
         variant='outline'
