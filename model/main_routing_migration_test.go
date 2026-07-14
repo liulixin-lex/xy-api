@@ -99,6 +99,11 @@ func TestMigrateDBPathsRegisterDurableTaskBillingOperations(t *testing.T) {
 			db := openRoutingSQLiteTestDB(t)
 			withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 			t.Setenv(routingV2AlphaDrainedEnv, "true")
+			require.NoError(t, db.AutoMigrate(&legacyLogV0110{}))
+			require.NoError(t, db.Create(&legacyLogV0110{
+				UserId: 19, CreatedAt: 1_720_000_000, Type: LogTypeManage,
+				Content: "v0.1.10 main migration log", RequestId: "legacy-main-log",
+			}).Error)
 			require.NoError(t, db.AutoMigrate(&AsyncBillingManualResolution{}))
 			require.NoError(t, db.Migrator().DropIndex(
 				&AsyncBillingManualResolution{}, asyncBillingManualResolutionUniqueIndex,
@@ -126,6 +131,11 @@ func TestMigrateDBPathsRegisterDurableTaskBillingOperations(t *testing.T) {
 			assert.True(t, db.Migrator().HasTable(&IdentityCacheSync{}))
 			assert.True(t, db.Migrator().HasIndex(&IdentityCacheSync{}, "idx_identity_cache_sync_pending"))
 			assert.True(t, db.Migrator().HasIndex(&IdentityCacheSync{}, "idx_identity_cache_sync_live_pending"))
+			var retainedLog Log
+			require.NoError(t, db.Where("request_id = ?", "legacy-main-log").First(&retainedLog).Error)
+			assert.Equal(t, "v0.1.10 main migration log", retainedLog.Content)
+			assert.Nil(t, retainedLog.BillingOperationKey)
+			assert.True(t, db.Migrator().HasIndex(&Log{}, billingLogOperationKeyIndex))
 
 			ready, err := RoutingV2SchemaReady(db)
 			require.NoError(t, err)

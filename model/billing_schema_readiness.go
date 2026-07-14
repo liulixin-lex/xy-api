@@ -8,6 +8,30 @@ import (
 	"gorm.io/gorm"
 )
 
+// billingLogOperationKeyMigration deliberately omits the unique index tag.
+// SQLite cannot add a constrained UNIQUE column to an existing table, so the
+// nullable column must exist before Log's normal AutoMigrate creates the index.
+type billingLogOperationKeyMigration struct {
+	BillingOperationKey *string `gorm:"column:billing_operation_key;type:varchar(191)"`
+}
+
+func (billingLogOperationKeyMigration) TableName() string {
+	return "logs"
+}
+
+func prepareBillingLogOperationKeyColumn(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("billing log database is unavailable")
+	}
+	if !db.Migrator().HasTable(&Log{}) || db.Migrator().HasColumn(&Log{}, "BillingOperationKey") {
+		return nil
+	}
+	if err := db.Migrator().AddColumn(&billingLogOperationKeyMigration{}, "BillingOperationKey"); err != nil {
+		return fmt.Errorf("add nullable billing log operation key column: %w", err)
+	}
+	return nil
+}
+
 func billingUniqueReceiptIndexReady(
 	db *gorm.DB,
 	databaseType common.DatabaseType,

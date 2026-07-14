@@ -299,6 +299,9 @@ func migrateDB() error {
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
 		return err
 	}
+	if err := prepareBillingLogOperationKeyColumn(DB); err != nil {
+		return err
+	}
 
 	err := DB.AutoMigrate(
 		&Channel{},
@@ -438,6 +441,9 @@ func migrateDBFast() error {
 		return err
 	}
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
+		return err
+	}
+	if err := prepareBillingLogOperationKeyColumn(DB); err != nil {
 		return err
 	}
 
@@ -642,6 +648,9 @@ func routingV2MigrationError(component string, err error) error {
 func migrateLOGDB() error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return migrateClickHouseLogDB()
+	}
+	if err := prepareBillingLogOperationKeyColumn(LOG_DB); err != nil {
+		return err
 	}
 	if err := LOG_DB.AutoMigrate(&Log{}); err != nil {
 		return err

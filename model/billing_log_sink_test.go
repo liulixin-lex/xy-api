@@ -19,6 +19,36 @@ import (
 	"gorm.io/gorm"
 )
 
+// legacyLogV0110 mirrors the SQL-backed log schema shipped by v0.1.10. Keep
+// this fixture constraint-accurate so upgrade tests exercise an existing table
+// instead of silently validating only a fresh install.
+type legacyLogV0110 struct {
+	Id                int   `gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
+	UserId            int   `gorm:"index;index:idx_user_id_id,priority:1"`
+	CreatedAt         int64 `gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
+	Type              int   `gorm:"index:idx_created_at_type"`
+	Content           string
+	Username          string `gorm:"index;index:index_username_model_name,priority:2;default:''"`
+	TokenName         string `gorm:"index;default:''"`
+	ModelName         string `gorm:"index;index:index_username_model_name,priority:1;default:''"`
+	Quota             int    `gorm:"default:0"`
+	PromptTokens      int    `gorm:"default:0"`
+	CompletionTokens  int    `gorm:"default:0"`
+	UseTime           int    `gorm:"default:0"`
+	IsStream          bool
+	ChannelId         int    `gorm:"index"`
+	TokenId           int    `gorm:"default:0;index"`
+	Group             string `gorm:"index"`
+	Ip                string `gorm:"index;default:''"`
+	RequestId         string `gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
+	UpstreamRequestId string `gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
+	Other             string
+}
+
+func (legacyLogV0110) TableName() string {
+	return "logs"
+}
+
 func frozenBillingLogFixture(t *testing.T, operationKey string) (string, string, int) {
 	t.Helper()
 	payload, payloadHash, protocol, err := freezeBillingLogPayload(operationKey, &Log{
@@ -275,6 +305,37 @@ func TestBillingLogSchemaReadinessRequiresUniqueReceiptIndex(t *testing.T) {
 	require.NoError(t, waitBillingLogSchemaReady(context.Background(), LOG_DB, 0))
 }
 
+func TestMigrateLOGDBUpgradesV0110SQLiteLogs(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&legacyLogV0110{}))
+	require.NoError(t, db.Create(&legacyLogV0110{
+		UserId: 17, CreatedAt: 1_720_000_000, Type: LogTypeManage,
+		Content: "v0.1.10 retained log", RequestId: "legacy-log-request",
+	}).Error)
+
+	require.NoError(t, migrateLOGDB())
+	require.NoError(t, migrateLOGDB(), "v0.1.10 log upgrade must be restart-safe")
+
+	var retained Log
+	require.NoError(t, db.Where("request_id = ?", "legacy-log-request").First(&retained).Error)
+	assert.Equal(t, "v0.1.10 retained log", retained.Content)
+	assert.Nil(t, retained.BillingOperationKey)
+	assert.Empty(t, retained.BillingPayloadHash)
+	assert.Zero(t, retained.BillingPayloadProtocol)
+	assert.Zero(t, retained.BillingSinkWrittenAt)
+	ready, err := billingLogSchemaReady(db)
+	require.NoError(t, err)
+	assert.True(t, ready)
+
+	receiptKey := "task:legacy-upgrade:terminal:v1"
+	require.NoError(t, db.Create(&Log{CreatedAt: 1_720_000_001, BillingOperationKey: &receiptKey}).Error)
+	err = db.Create(&Log{CreatedAt: 1_720_000_002, BillingOperationKey: &receiptKey}).Error
+	assert.Error(t, err, "the post-upgrade receipt index must reject duplicate non-NULL keys")
+	require.NoError(t, db.Create(&Log{CreatedAt: 1_720_000_003}).Error)
+	require.NoError(t, db.Create(&Log{CreatedAt: 1_720_000_004}).Error)
+}
+
 func TestBillingLogSchemaReadinessRejectsNonUniqueOrNonNullableReceipt(t *testing.T) {
 	previousLogType := common.LogDatabaseType()
 	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
@@ -351,17 +412,26 @@ func TestSQLBillingLogSinkExternalDatabaseCompatibility(t *testing.T) {
 			if db.Migrator().HasTable(&Log{}) {
 				t.Skip("refusing to use a non-empty external log database")
 			}
+			t.Cleanup(func() { _ = db.Migrator().DropTable(&Log{}) })
+			require.NoError(t, db.AutoMigrate(&legacyLogV0110{}))
+			require.NoError(t, db.Create(&legacyLogV0110{
+				UserId: 18, CreatedAt: 1_720_000_000, Type: LogTypeManage,
+				Content: "v0.1.10 external retained log", RequestId: "legacy-external-log",
+			}).Error)
 			previousLogDB := LOG_DB
 			previousLogType := common.LogDatabaseType()
 			LOG_DB = db
 			common.SetLogDatabaseType(test.dbType)
 			t.Cleanup(func() {
-				_ = db.Migrator().DropTable(&Log{})
 				LOG_DB = previousLogDB
 				common.SetLogDatabaseType(previousLogType)
 			})
 			require.NoError(t, migrateLOGDB())
 			require.NoError(t, migrateLOGDB(), "billing log migration must be idempotent")
+			var retained Log
+			require.NoError(t, db.Where("request_id = ?", "legacy-external-log").First(&retained).Error)
+			assert.Equal(t, "v0.1.10 external retained log", retained.Content)
+			assert.Nil(t, retained.BillingOperationKey)
 
 			// Multiple ordinary logs keep NULL receipt keys and must not collide.
 			require.NoError(t, db.Create(&Log{CreatedAt: 1_800_200_000, RequestId: "ordinary-a"}).Error)
@@ -389,7 +459,7 @@ func TestSQLBillingLogSinkExternalDatabaseCompatibility(t *testing.T) {
 			assert.Equal(t, int64(1), billingCount)
 			var ordinaryCount int64
 			require.NoError(t, db.Model(&Log{}).Where("billing_operation_key IS NULL").Count(&ordinaryCount).Error)
-			assert.Equal(t, int64(2), ordinaryCount)
+			assert.Equal(t, int64(3), ordinaryCount)
 		})
 	}
 }
