@@ -363,6 +363,9 @@ export function ManualBillingReviewsSection(props: {
                   key={review.reservation_id}
                   type='button'
                   className='hover:bg-muted/40 focus-visible:bg-muted/40 flex w-full min-w-0 items-start justify-between gap-3 p-3 text-left focus-visible:outline-none'
+                  aria-label={t('Open billing review #{{id}}', {
+                    id: review.reservation_id,
+                  })}
                   onClick={() => openReview(review)}
                 >
                   <span className='min-w-0 flex-1'>

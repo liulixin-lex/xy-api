@@ -587,7 +587,7 @@ export function ManualBillingReviewSheet(props: {
                 variant={requestErrorIsWarning ? 'default' : 'destructive'}
                 tabIndex={-1}
                 className={cn(
-                  'focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none',
+                  'focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none *:data-[slot=alert-description]:text-foreground',
                   requestErrorIsWarning &&
                     'border-amber-500/30 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
                 )}

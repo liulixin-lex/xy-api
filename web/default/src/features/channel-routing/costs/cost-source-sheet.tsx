@@ -546,7 +546,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                 variant='destructive'
                 role='alert'
                 tabIndex={-1}
-                className='focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none'
+                className='focus-visible:ring-ring/50 *:data-[slot=alert-description]:text-foreground focus-visible:ring-2 focus-visible:outline-none'
               >
                 <ShieldAlert aria-hidden='true' />
                 <AlertTitle>
@@ -569,6 +569,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                       type='button'
                       size='sm'
                       variant='outline'
+                      className='text-foreground'
                       onClick={loadConflictCurrent}
                     >
                       <RefreshCw aria-hidden='true' />
