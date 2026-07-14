@@ -188,7 +188,11 @@ export function BillingReviewsPage() {
                       {t('Sink conflicts')}
                     </TabsTrigger>
                   </ChannelRoutingScrollableTabsList>
-                  <div className='pt-2'>
+                  <TabsContent
+                    key={projectionKind}
+                    value={projectionKind}
+                    className='pt-2'
+                  >
                     <ProjectionFailuresSection
                       dataset={projectionKind as BillingProjectionDataset}
                       cursor={search.projectionCursor ?? 0}
@@ -197,7 +201,7 @@ export function BillingReviewsPage() {
                       onCursorChange={handleProjectionCursorChange}
                       onPermissionRevoked={refreshPermissions}
                     />
-                  </div>
+                  </TabsContent>
                 </Tabs>
               </TabsContent>
             ) : null}
