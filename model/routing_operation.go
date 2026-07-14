@@ -165,11 +165,14 @@ func createRoutingOperationDB(
 	if err := ctx.Err(); err != nil {
 		return RoutingOperation{}, false, err
 	}
+	nowMs, err := routingDatabaseNowMs(db.WithContext(ctx))
+	if err != nil {
+		return RoutingOperation{}, false, err
+	}
 	createToken, err := newRoutingPersistenceToken()
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
-	nowMs := time.Now().UnixMilli()
 	operation := RoutingOperation{
 		OperationType:        normalized.Type,
 		IdempotencyHash:      idempotencyHash,
