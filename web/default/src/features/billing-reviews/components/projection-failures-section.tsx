@@ -85,6 +85,7 @@ function ProjectionQueryError(props: { error: unknown; onRetry: () => void }) {
         <EmptyMedia variant='icon'>
           <HugeiconsIcon
             icon={permissionDenied ? ShieldKeyIcon : Alert02Icon}
+            aria-hidden='true'
           />
         </EmptyMedia>
         <EmptyTitle>
@@ -103,7 +104,11 @@ function ProjectionQueryError(props: { error: unknown; onRetry: () => void }) {
       {!permissionDenied ? (
         <EmptyContent>
           <Button variant='outline' onClick={props.onRetry}>
-            <HugeiconsIcon icon={RefreshIcon} data-icon='inline-start' />
+            <HugeiconsIcon
+              icon={RefreshIcon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {t('Retry')}
           </Button>
         </EmptyContent>
@@ -134,7 +139,7 @@ function ProjectionSectionHeader(props: {
           ) : null}
           {!props.canOperate ? (
             <Badge variant='outline'>
-              <HugeiconsIcon icon={ShieldKeyIcon} />
+              <HugeiconsIcon icon={ShieldKeyIcon} aria-hidden='true' />
               {t('Read only')}
             </Badge>
           ) : null}
@@ -154,6 +159,7 @@ function ProjectionSectionHeader(props: {
       >
         <HugeiconsIcon
           icon={RefreshIcon}
+          aria-hidden='true'
           className={
             props.isFetching
               ? 'animate-spin motion-reduce:animate-none'
@@ -169,7 +175,7 @@ function StaleProjectionAlert() {
   const { t } = useTranslation()
   return (
     <Alert role='status'>
-      <HugeiconsIcon icon={Alert02Icon} />
+      <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
       <AlertTitle>{t('Projection refresh failed')}</AlertTitle>
       <AlertDescription>
         {t(
@@ -184,7 +190,7 @@ function InvalidCursorAlert() {
   const { t } = useTranslation()
   return (
     <Alert role='status'>
-      <HugeiconsIcon icon={Alert02Icon} />
+      <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
       <AlertTitle>{t('Projection pagination is unavailable')}</AlertTitle>
       <AlertDescription>
         {t(

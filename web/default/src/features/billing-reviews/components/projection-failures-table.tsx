@@ -228,12 +228,13 @@ export function FailedProjectionTable(props: {
                       <HugeiconsIcon
                         icon={DatabaseRestoreIcon}
                         data-icon='inline-start'
+                        aria-hidden='true'
                       />
                       {t('Requeue')}
                     </Button>
                   ) : (
                     <Badge variant='outline'>
-                      <HugeiconsIcon icon={ShieldKeyIcon} />
+                      <HugeiconsIcon icon={ShieldKeyIcon} aria-hidden='true' />
                       {projection.requeueable
                         ? t('Read only')
                         : t('Alternate remediation')}
@@ -320,6 +321,7 @@ export function FailedProjectionTable(props: {
                 <HugeiconsIcon
                   icon={DatabaseRestoreIcon}
                   data-icon='inline-start'
+                  aria-hidden='true'
                 />
                 {t('Requeue projection')}
               </Button>
@@ -396,6 +398,7 @@ export function BillingConflictTable(props: {
               <HugeiconsIcon
                 icon={DatabaseRestoreIcon}
                 data-icon='inline-start'
+                aria-hidden='true'
               />
               {t('Resolve and requeue')}
             </Button>
@@ -404,7 +407,7 @@ export function BillingConflictTable(props: {
               variant='outline'
               className='justify-self-start md:justify-self-end'
             >
-              <HugeiconsIcon icon={ShieldKeyIcon} />
+              <HugeiconsIcon icon={ShieldKeyIcon} aria-hidden='true' />
               {t('Read only')}
             </Badge>
           )}
