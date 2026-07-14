@@ -265,8 +265,8 @@ export function ManualBillingReviewsSection(props: {
 
         {page && page.items.length > 0 ? (
           <>
-            <div className='hidden overflow-x-auto rounded-lg border md:block'>
-              <Table>
+            <div className='hidden rounded-lg border lg:block'>
+              <Table scrollAreaLabel={t('Manual billing reviews')}>
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('Reservation')}</TableHead>
@@ -357,7 +357,7 @@ export function ManualBillingReviewsSection(props: {
               </Table>
             </div>
 
-            <div className='divide-y overflow-hidden rounded-lg border md:hidden'>
+            <div className='divide-y overflow-hidden rounded-lg border lg:hidden'>
               {page.items.map((review) => (
                 <button
                   key={review.reservation_id}

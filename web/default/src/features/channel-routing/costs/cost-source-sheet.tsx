@@ -34,6 +34,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import {
+  revealSideDrawerAlert,
   sideDrawerContentClassName,
   sideDrawerFooterClassName,
   sideDrawerFormClassName,
@@ -540,7 +541,13 @@ export function ChannelRoutingCostSourceSheet(props: {
             })}
           >
             {conflict ? (
-              <Alert variant='destructive' role='alert'>
+              <Alert
+                ref={revealSideDrawerAlert}
+                variant='destructive'
+                role='alert'
+                tabIndex={-1}
+                className='focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none'
+              >
                 <ShieldAlert aria-hidden='true' />
                 <AlertTitle>
                   {conflict.current

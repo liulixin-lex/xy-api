@@ -122,7 +122,7 @@ export function FailedProjectionTable(props: {
 
   return (
     <>
-      <div className='hidden rounded-lg border md:block'>
+      <div className='hidden rounded-lg border xl:block'>
         <Table
           className='min-w-[880px]'
           scrollAreaLabel={t('Projection failures')}
@@ -247,7 +247,7 @@ export function FailedProjectionTable(props: {
         </Table>
       </div>
 
-      <div className='divide-y overflow-hidden rounded-lg border md:hidden'>
+      <div className='divide-y overflow-hidden rounded-lg border xl:hidden'>
         {props.items.map((projection) => (
           <article
             key={projection.id}

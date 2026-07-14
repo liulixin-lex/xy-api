@@ -23,10 +23,32 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import '@/i18n/config'
+import { revealSideDrawerAlert } from '@/components/drawer-layout'
 
 import { COST_BINDING_GROUP_DOM_LIMIT } from '../lib/cost-binding'
 import { CostSourceCredentialSummary } from './cost-source-credentials'
 import { CostSourceGroupDatalist } from './cost-source-groups'
+
+describe('cost source conflict recovery', () => {
+  test('reveals and focuses a stale-write alert immediately', () => {
+    const events: Array<[string, unknown]> = []
+    const alert = {
+      scrollIntoView: (options?: ScrollIntoViewOptions) => {
+        events.push(['scroll', options])
+      },
+      focus: (options?: FocusOptions) => {
+        events.push(['focus', options])
+      },
+    }
+
+    revealSideDrawerAlert(alert)
+
+    assert.deepEqual(events, [
+      ['scroll', { block: 'nearest' }],
+      ['focus', { preventScroll: true }],
+    ])
+  })
+})
 
 describe('cost source credential summary', () => {
   test('renders only server-provided masks in a semantic details list', () => {

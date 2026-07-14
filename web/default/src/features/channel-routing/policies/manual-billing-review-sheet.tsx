@@ -32,6 +32,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import {
+  revealSideDrawerAlert,
   sideDrawerContentClassName,
   sideDrawerFooterClassName,
   sideDrawerFormClassName,
@@ -581,13 +582,15 @@ export function ManualBillingReviewSheet(props: {
             ) : null}
             {requestError ? (
               <Alert
+                ref={revealSideDrawerAlert}
                 role='alert'
                 variant={requestErrorIsWarning ? 'default' : 'destructive'}
-                className={
-                  requestErrorIsWarning
-                    ? 'border-amber-500/30 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
-                    : undefined
-                }
+                tabIndex={-1}
+                className={cn(
+                  'focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none',
+                  requestErrorIsWarning &&
+                    'border-amber-500/30 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
+                )}
               >
                 <ShieldAlert aria-hidden='true' />
                 <AlertTitle>{requestErrorTitle}</AlertTitle>

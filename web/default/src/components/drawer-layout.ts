@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createElement, type ReactNode } from 'react'
+
 import { cn } from '@/lib/utils'
 
 export const sideDrawerContentClassName = (className?: string) =>
@@ -54,6 +55,14 @@ export const sideDrawerSwitchItemClassName = (className?: string) =>
     'border-border/60 flex min-h-16 flex-row items-center justify-between gap-3 border-y py-3',
     className
   )
+
+export function revealSideDrawerAlert(
+  alert: Pick<HTMLElement, 'focus' | 'scrollIntoView'> | null
+): void {
+  if (!alert) return
+  alert.scrollIntoView({ block: 'nearest' })
+  alert.focus({ preventScroll: true })
+}
 
 export function SideDrawerSection(props: {
   children: ReactNode
