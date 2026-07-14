@@ -9,7 +9,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 
-	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -131,6 +130,114 @@ func TestRoutingBreakerResetMemberOperationIsIdempotentAndFencesStaleSnapshots(t
 	require.NoError(t, eligibility.upsertRoutingBreakerState(db, &current))
 	require.NoError(t, db.Model(&RoutingBreakerState{}).Count(&persistedCount).Error)
 	assert.Equal(t, int64(1), persistedCount)
+}
+
+func TestRoutingBreakerResetExecutionPreservesLogicalTimeAcrossState(t *testing.T) {
+	db := routingBreakerResetTestDB(t)
+	target := routingBreakerResetMemberTargetForTest()
+	seedRoutingBreakerResetPolicyForTest(t, db, target, 1, 1)
+
+	first, _, err := CreateRoutingBreakerResetOperationContext(
+		context.Background(), routingBreakerResetOperationSpecForTest(target, "a"), target,
+	)
+	require.NoError(t, err)
+	nowMs, err := RoutingEndpointDatabaseNowMsContext(context.Background())
+	require.NoError(t, err)
+	claimed, err := ClaimRoutingOperationContext(
+		context.Background(), RoutingOperationTypeBreakerReset, nowMs, 30_000,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	logicalTimeMs := claimed.UpdatedTimeMs + 1_000
+	require.Less(t, logicalTimeMs, claimed.ClaimUntilMs)
+	require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", first.ID).Updates(map[string]any{
+		"created_time_ms": logicalTimeMs,
+		"updated_time_ms": logicalTimeMs,
+	}).Error)
+	require.NoError(t, db.Model(&RoutingBreakerResetCommand{}).Where("operation_id = ?", first.ID).
+		Update("created_time_ms", logicalTimeMs).Error)
+
+	firstExecution, err := ExecuteRoutingBreakerResetOperationContext(context.Background(), *claimed)
+	require.NoError(t, err)
+	assert.Equal(t, logicalTimeMs, firstExecution.Operation.CompletedTimeMs)
+	assert.Equal(t, logicalTimeMs, firstExecution.Command.CompletedTimeMs)
+	assert.Equal(t, logicalTimeMs, firstExecution.Tombstone.ResetAtMs)
+	assert.Positive(t, firstExecution.Outbox.CreatedTimeMs)
+	assert.Equal(t, firstExecution.Outbox.CreatedTimeMs, firstExecution.Outbox.UpdatedTimeMs)
+	_, err = GetRoutingOperationContext(context.Background(), first.ID)
+	require.NoError(t, err)
+	_, err = GetRoutingBreakerResetCommandByOperationContext(context.Background(), first.ID)
+	require.NoError(t, err)
+
+	second, _, err := CreateRoutingBreakerResetOperationContext(
+		context.Background(), routingBreakerResetOperationSpecForTest(target, "b"), target,
+	)
+	require.NoError(t, err)
+	nowMs, err = RoutingEndpointDatabaseNowMsContext(context.Background())
+	require.NoError(t, err)
+	claimed, err = ClaimRoutingOperationContext(
+		context.Background(), RoutingOperationTypeBreakerReset, nowMs, 30_000,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	fenceTimeMs := logicalTimeMs + 1_000
+	require.Less(t, fenceTimeMs, claimed.ClaimUntilMs)
+	require.NoError(t, db.Model(&RoutingBreakerResetFence{}).
+		Where("target_key = ?", firstExecution.Tombstone.TargetKey).
+		Update("updated_time_ms", fenceTimeMs).Error)
+	require.NoError(t, db.Model(&RoutingBreakerResetTombstone{}).
+		Where("target_key = ?", firstExecution.Tombstone.TargetKey).
+		Updates(map[string]any{"reset_at_ms": fenceTimeMs, "updated_time_ms": fenceTimeMs}).Error)
+
+	secondExecution, err := ExecuteRoutingBreakerResetOperationContext(context.Background(), *claimed)
+	require.NoError(t, err)
+	assert.Equal(t, second.ID, secondExecution.Operation.ID)
+	assert.Equal(t, int64(2), secondExecution.Tombstone.Generation)
+	assert.Equal(t, fenceTimeMs, secondExecution.Operation.CompletedTimeMs)
+	assert.Equal(t, fenceTimeMs, secondExecution.Command.CompletedTimeMs)
+	assert.Equal(t, fenceTimeMs, secondExecution.Tombstone.ResetAtMs)
+	assert.Positive(t, secondExecution.Outbox.CreatedTimeMs)
+	assert.Equal(t, secondExecution.Outbox.CreatedTimeMs, secondExecution.Outbox.UpdatedTimeMs)
+}
+
+func TestRoutingBreakerResetRejectsFenceTombstoneGenerationMismatch(t *testing.T) {
+	db := routingBreakerResetTestDB(t)
+	target := routingBreakerResetMemberTargetForTest()
+	seedRoutingBreakerResetPolicyForTest(t, db, target, 1, 1)
+
+	_, _, err := CreateRoutingBreakerResetOperationContext(
+		context.Background(), routingBreakerResetOperationSpecForTest(target, "a"), target,
+	)
+	require.NoError(t, err)
+	firstExecution := claimAndExecuteRoutingBreakerResetForTest(t)
+	assert.Equal(t, int64(1), firstExecution.Tombstone.Generation)
+
+	second, _, err := CreateRoutingBreakerResetOperationContext(
+		context.Background(), routingBreakerResetOperationSpecForTest(target, "b"), target,
+	)
+	require.NoError(t, err)
+	nowMs, err := RoutingEndpointDatabaseNowMsContext(context.Background())
+	require.NoError(t, err)
+	claimed, err := ClaimRoutingOperationContext(
+		context.Background(), RoutingOperationTypeBreakerReset, nowMs, 30_000,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.NoError(t, db.Model(&RoutingBreakerResetTombstone{}).
+		Where("target_key = ?", firstExecution.Tombstone.TargetKey).
+		Update("generation", firstExecution.Tombstone.Generation+1).Error)
+
+	_, err = ExecuteRoutingBreakerResetOperationContext(context.Background(), *claimed)
+	assert.ErrorIs(t, err, ErrRoutingBreakerResetInvalid)
+	var fence RoutingBreakerResetFence
+	require.NoError(t, db.Where("target_key = ?", firstExecution.Tombstone.TargetKey).First(&fence).Error)
+	assert.Equal(t, int64(1), fence.Generation)
+	var tombstone RoutingBreakerResetTombstone
+	require.NoError(t, db.Where("target_key = ?", firstExecution.Tombstone.TargetKey).First(&tombstone).Error)
+	assert.Equal(t, int64(2), tombstone.Generation)
+	stored, err := GetRoutingOperationContext(context.Background(), second.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingOperationStatusRunning, stored.Status)
 }
 
 func TestRoutingBreakerResetEndpointFencesLateEvidenceAndSharedEvaluation(t *testing.T) {
@@ -259,8 +366,7 @@ func TestRoutingBreakerResetSupersedesDriftedMemberTargetAndRemainsReplayable(t 
 
 func routingBreakerResetTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared"), &gorm.Config{})
-	require.NoError(t, err)
+	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, db.AutoMigrate(
 		&RoutingOperation{}, &RoutingBreakerResetCommand{}, &RoutingBreakerResetFence{},

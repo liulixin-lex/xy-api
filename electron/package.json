@@ -150,8 +150,12 @@
       ]
     },
     "nsis": {
+      "artifactName": "${productName}.Setup.${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "portable": {
+      "artifactName": "${productName}.${version}.${ext}"
     }
   }
 }

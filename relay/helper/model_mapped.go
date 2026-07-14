@@ -38,9 +38,6 @@ func ModelMappedHelper(c *gin.Context, info *relaycommon.RelayInfo, request dto.
 	info.IsModelMapped = mapped
 	info.UpstreamModelName = upstreamModelName
 
-	if isResponsesCompact {
-		info.OriginModelName = ratio_setting.WithCompactModelSuffix(info.UpstreamModelName)
-	}
 	if request != nil {
 		request.SetModelName(info.UpstreamModelName)
 	}

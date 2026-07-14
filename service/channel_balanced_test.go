@@ -112,6 +112,99 @@ func TestChannelRoutingBalancedActiveUsesExactCostWithoutBypassingAffinityPolicy
 	assert.Equal(t, 102, replayed.SelectedChannelID)
 }
 
+func TestReservePinnedChannelRoutingAttemptKeepsExactIdentityAndCapacity(t *testing.T) {
+	truncate(t)
+	channelrouting.ResetSnapshotForTest()
+	previousRuntime := channelRoutingCanaryRuntime
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	var err error
+	channelRoutingCanaryRuntime, err = newChannelRoutingCanaryRuntimeManager(nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		channelRoutingCanaryRuntime = previousRuntime
+		channelrouting.ResetSnapshotForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(100)
+	for _, channelID := range []int{201, 202} {
+		require.NoError(t, model.DB.Create(&model.Channel{
+			Id: channelID, Name: "pinned", Status: common.ChannelStatusEnabled,
+			Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight,
+		}).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{
+			Group: "default", Model: "gpt-test", ChannelId: channelID,
+			Enabled: true, Priority: &priority, Weight: weight,
+		}).Error)
+	}
+	model.InitChannelCache()
+
+	now := time.Now().Unix()
+	capacityPolicy := model.DefaultRoutingCanaryPolicy()
+	capacityPolicy.Capacity.RPM = 1
+	firstMember := channelRoutingBalancedMemberForTest(21, 201, 4, now)
+	firstMember.CredentialIDs = []int{2_001, 2_002}
+	secondMember := channelRoutingBalancedMemberForTest(22, 202, 0.5, now)
+	secondMember.CredentialIDs = []int{2_003}
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 2, PolicyHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		RuntimeGeneration: 2, ActivationID: 2,
+		ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now,
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
+			PolicyProfile:  model.RoutingPolicyProfileBalanced,
+			BalancedPolicy: channelRoutingBalancedPolicyForTest(0),
+			CanaryPolicy:   capacityPolicy,
+			Members:        []channelrouting.PoolMemberSnapshot{firstMember, secondMember},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{
+			{ID: 201, Name: "expensive", Status: common.ChannelStatusEnabled, MultiKey: true,
+				CredentialRequired: true, CredentialIDs: []int{2_001, 2_002}},
+			{ID: 202, Name: "cheap", Status: common.ChannelStatusEnabled,
+				CredentialRequired: true, CredentialIDs: []int{2_003}},
+		},
+	})
+
+	newParam := func(requestID string) *RetryParam {
+		ctx, _ := gin.CreateTestContext(nil)
+		common.SetContextKey(ctx, common.RequestIdKey, requestID)
+		common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInput, 1)
+		common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInputKnown, true)
+		common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutput, 1)
+		common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputKnown, true)
+		return &RetryParam{
+			Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test",
+			RequestPath: "/v1/videos", Retry: common.GetPointer(0),
+		}
+	}
+
+	firstParam := newParam("pinned-first")
+	selected, active, err := ReservePinnedChannelRoutingAttempt(firstParam, "default", 201, 2_002)
+	require.NoError(t, err)
+	require.True(t, active)
+	require.NotNil(t, selected)
+	assert.Equal(t, 201, selected.Id)
+	identity, planned := GetSelectedRoutingIdentity(firstParam.Ctx, 201)
+	require.True(t, planned)
+	assert.Equal(t, 2_002, identity.CredentialID)
+
+	secondParam := newParam("pinned-second")
+	selected, active, err = ReservePinnedChannelRoutingAttempt(secondParam, "default", 201, 2_002)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, channelrouting.ErrCapacityExhausted)
+	assert.True(t, active)
+	assert.Nil(t, selected, "capacity pressure on the pinned target must not borrow another channel")
+
+	require.NoError(t, CancelRoutingCapacityReservation(firstParam.Ctx))
+	unavailableParam := newParam("pinned-unavailable")
+	selected, active, err = ReservePinnedChannelRoutingAttempt(unavailableParam, "default", 201, 9_999)
+	require.ErrorIs(t, err, ErrPinnedRoutingIdentityUnavailable)
+	assert.True(t, active)
+	assert.Nil(t, selected)
+}
+
 func channelRoutingBalancedPolicyForTest(protectionBand int) channelrouting.BalancedPoolPolicy {
 	return channelrouting.BalancedPoolPolicy{
 		WeightAvailability: 0.1, WeightLatency: 0.1, WeightThroughput: 0.1, WeightCost: 0.7,

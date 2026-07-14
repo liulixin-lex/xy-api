@@ -144,6 +144,17 @@ func TestConvertToAliRequestWan27I2VKeepsExplicitMetadataMedia(t *testing.T) {
 	require.NotContains(t, string(body), `"img_url"`)
 }
 
+func TestConvertToAliRequestRejectsMetadataDurationBeyondBillingBound(t *testing.T) {
+	adaptor := &TaskAdaptor{}
+	_, err := adaptor.convertToAliRequest(testRelayInfo(), relaycommon.TaskSubmitReq{
+		Model: "wan2.7-i2v", Prompt: "animate", Image: "https://example.com/first.png",
+		Metadata: map[string]any{
+			"parameters": map[string]any{"duration": relaycommon.MaxTaskDurationSeconds + 1},
+		},
+	})
+	require.ErrorIs(t, err, errAliDurationInvalid)
+}
+
 func TestConvertToAliRequestWan27I2VRequiresMedia(t *testing.T) {
 	adaptor := &TaskAdaptor{}
 	req := relaycommon.TaskSubmitReq{

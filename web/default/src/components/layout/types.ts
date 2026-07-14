@@ -39,6 +39,11 @@ type BaseNavItem = {
     resource: string
     action: string
   }
+  /** Show when at least one explicit backend capability is granted. */
+  requiredAnyPermission?: Array<{
+    resource: string
+    action: string
+  }>
 }
 
 /**

@@ -16,11 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import { LockKeyhole, Plus, RefreshCw } from 'lucide-react'
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -58,6 +57,7 @@ import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
 import type { PolicyDraftSummary } from '../types'
 import { ChannelRoutingCurrentPolicySection } from './current-policy-section'
+import { ManualBillingReviewsSection } from './manual-billing-reviews-section'
 import { ChannelRoutingOperationsSection } from './operations-section'
 import { ChannelRoutingPolicyActivationSheet } from './policy-activation-sheet'
 import { ChannelRoutingPolicyDraftActions } from './policy-draft-actions'
@@ -95,9 +95,32 @@ export function ChannelRoutingPoliciesPage() {
     ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
     ADMIN_PERMISSION_ACTIONS.DEPLOY
   )
+  const canReadBillingReviews = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+    ADMIN_PERMISSION_ACTIONS.READ
+  )
+  const canResolveBillingReviews = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.BILLING_REVIEW,
+    ADMIN_PERMISSION_ACTIONS.RESOLVE
+  )
   const [editorOpen, setEditorOpen] = useState(false)
   const [selectedDraft, setSelectedDraft] = useState<PolicyDraftSummary | null>(
     null
+  )
+  const handleBillingReviewCursorChange = useCallback(
+    (billingReviewCursor: number) => {
+      void navigate({
+        search: (previous) => ({
+          ...previous,
+          billingReviewCursor,
+        }),
+        replace: true,
+        hash: 'manual-billing-reviews',
+      })
+    },
+    [navigate]
   )
   const [simulationDraft, setSimulationDraft] =
     useState<PolicyDraftSummary | null>(null)
@@ -402,6 +425,14 @@ export function ChannelRoutingPoliciesPage() {
               </>
             ) : null}
           </section>
+
+          {canReadBillingReviews ? (
+            <ManualBillingReviewsSection
+              cursor={search.billingReviewCursor ?? 0}
+              canResolve={canResolveBillingReviews}
+              onCursorChange={handleBillingReviewCursorChange}
+            />
+          ) : null}
 
           <ChannelRoutingOperationsSection
             cursor={search.operationCursor ?? 0}

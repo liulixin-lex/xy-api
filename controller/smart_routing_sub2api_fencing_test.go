@@ -512,6 +512,7 @@ func TestRoutingSub2APIJWTInFlightLoginCannotPublishAfterBindingMutation(t *test
 				ctx, _ := gin.CreateTestContext(recorder)
 				ctx.Params = gin.Params{{Key: "channelId", Value: strconv.Itoa(channelID)}}
 				ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/704", bytes.NewReader(body))
+				setSmartRoutingBindingIfMatchForTest(t, ctx, channelID)
 				UpdateSmartRoutingBinding(ctx)
 				return recorder
 			},
@@ -523,6 +524,7 @@ func TestRoutingSub2APIJWTInFlightLoginCannotPublishAfterBindingMutation(t *test
 				ctx, _ := gin.CreateTestContext(recorder)
 				ctx.Params = gin.Params{{Key: "channelId", Value: strconv.Itoa(channelID)}}
 				ctx.Request = httptest.NewRequest(http.MethodDelete, "/api/smart-routing/bindings/704", nil)
+				setSmartRoutingBindingIfMatchForTest(t, ctx, channelID)
 				DeleteSmartRoutingBinding(ctx)
 				return recorder
 			},
@@ -649,6 +651,7 @@ func TestUpdateSmartRoutingBindingGroupOnlyChangeKeepsSub2APIJWTIdentityActive(t
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: strconv.Itoa(binding.ChannelID)}}
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/707", bytes.NewReader(body))
+	setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 	UpdateSmartRoutingBinding(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
@@ -686,6 +689,7 @@ func TestUpdateSmartRoutingBindingReactivatesPreviouslyRetiredSub2APIAuthKey(t *
 		ctx, _ := gin.CreateTestContext(recorder)
 		ctx.Params = gin.Params{{Key: "channelId", Value: strconv.Itoa(binding.ChannelID)}}
 		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/713", bytes.NewReader(body))
+		setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 		UpdateSmartRoutingBinding(ctx)
 		require.Equal(t, http.StatusOK, recorder.Code)
 	}
@@ -894,6 +898,7 @@ func TestUpdateSmartRoutingBindingCredentialRewriteRetiresPreviousSub2APIAuthKey
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "channelId", Value: strconv.Itoa(binding.ChannelID)}}
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/710", bytes.NewReader(body))
+	setSmartRoutingBindingIfMatchForTest(t, ctx, binding.ChannelID)
 	UpdateSmartRoutingBinding(ctx)
 
 	require.Equal(t, http.StatusOK, recorder.Code)

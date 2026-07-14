@@ -674,9 +674,11 @@ func runSnapshotExternalContract(t *testing.T, db *gorm.DB, dbType common.Databa
 	var credentials []model.RoutingCredentialRef
 	require.NoError(t, db.Where("channel_id = ?", 501).Order("id asc").Find(&credentials).Error)
 	require.Len(t, credentials, 2)
-	fingerprintA, err := model.RoutingCredentialFingerprint(501, "key-a")
+	var channel501 model.Channel
+	require.NoError(t, db.Select("id", "routing_generation").Where("id = ?", 501).First(&channel501).Error)
+	fingerprintA, err := model.RoutingCredentialFingerprint(501, channel501.RoutingGeneration, "key-a")
 	require.NoError(t, err)
-	fingerprintB, err := model.RoutingCredentialFingerprint(501, "key-b")
+	fingerprintB, err := model.RoutingCredentialFingerprint(501, channel501.RoutingGeneration, "key-b")
 	require.NoError(t, err)
 	credentialByFingerprint := make(map[string]model.RoutingCredentialRef, len(credentials))
 	for _, credential := range credentials {

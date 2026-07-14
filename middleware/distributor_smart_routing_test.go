@@ -242,6 +242,47 @@ func TestSetupContextForSelectedChannelPreservesPinnedRoutingIdentity(t *testing
 	assert.Equal(t, currentIdentity.CredentialID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID))
 }
 
+func TestSetupContextForSelectedChannelLocksPlannedCredentialAcrossKeyReordering(t *testing.T) {
+	db := openDistributorRoutingIdentityDB(t)
+	withDistributorRoutingIdentityState(t, db)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 9211, Name: "multi-key-pinned-channel", Key: "key-a\nkey-b", Group: "vip", Models: "gpt-test",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2, MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{0: common.ChannelStatusEnabled, 1: common.ChannelStatusEnabled},
+		},
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	identity, ok := channelrouting.ResolveIdentity("vip", 9211, "key-a")
+	require.True(t, ok)
+	require.Positive(t, identity.CredentialID)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "vip")
+	service.SetSelectedRoutingIdentity(ctx, service.SelectedRoutingIdentity{
+		ChannelID: 9211, SnapshotRevision: identity.SnapshotRevision,
+		PoolID: identity.PoolID, MemberID: identity.MemberID, CredentialID: identity.CredentialID,
+	})
+	reordered := &model.Channel{
+		Id: 9211, Name: "multi-key-pinned-channel", Key: "key-b\nkey-a", Status: common.ChannelStatusEnabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2, MultiKeyPollingIndex: 1, MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{0: common.ChannelStatusEnabled, 1: common.ChannelStatusEnabled},
+		},
+	}
+
+	errResult := SetupContextForSelectedChannel(ctx, reordered, "gpt-test")
+	require.Nil(t, errResult)
+	assert.Equal(t, "key-a", common.GetContextKeyString(ctx, constant.ContextKeyChannelKey))
+	assert.Equal(t, 1, common.GetContextKeyInt(ctx, constant.ContextKeyChannelMultiKeyIndex))
+	assert.Equal(t, identity.CredentialID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID))
+	assert.Equal(t, 1, reordered.ChannelInfo.MultiKeyPollingIndex, "exact locking must not advance the production cursor")
+}
+
 func openDistributorRoutingIdentityDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

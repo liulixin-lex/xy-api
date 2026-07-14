@@ -8,10 +8,12 @@ import (
 )
 
 type SelectedRoutingIdentity struct {
-	ChannelID        int
-	SnapshotRevision uint64
-	PoolID           int
-	MemberID         int
+	ChannelID         int
+	SnapshotRevision  uint64
+	PoolID            int
+	MemberID          int
+	CredentialID      int
+	UpstreamAccountID int
 }
 
 func SetSelectedRoutingIdentity(c *gin.Context, identity SelectedRoutingIdentity) {

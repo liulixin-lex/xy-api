@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -47,8 +48,17 @@ func getSubscriptionResetSub(t *testing.T, id int) UserSubscription {
 	return sub
 }
 
-func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(t *testing.T) {
+func prepareSubscriptionResetTest(t *testing.T) {
+	t.Helper()
 	truncateTables(t)
+	require.NoError(t, DB.AutoMigrate(&SubscriptionBillingPeriod{}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Exec("DELETE FROM subscription_billing_periods").Error)
+	})
+}
+
+func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(t *testing.T) {
+	prepareSubscriptionResetTest(t)
 
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
@@ -108,7 +118,7 @@ func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(
 }
 
 func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
-	truncateTables(t)
+	prepareSubscriptionResetTest(t)
 
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
@@ -137,7 +147,7 @@ func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
 }
 
 func TestAdminResetUserSubscriptionsByPlanNoActiveMatchReturnsError(t *testing.T) {
-	truncateTables(t)
+	prepareSubscriptionResetTest(t)
 
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
@@ -199,7 +209,7 @@ func TestAdminResetPlanSubscriptionsTxUsesRowLock(t *testing.T) {
 }
 
 func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
-	truncateTables(t)
+	prepareSubscriptionResetTest(t)
 
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
@@ -239,7 +249,7 @@ func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
 }
 
 func TestAdminResetPlanSubscriptionsNoMatchSucceeds(t *testing.T) {
-	truncateTables(t)
+	prepareSubscriptionResetTest(t)
 
 	plan := &SubscriptionPlan{
 		Id:            9601,
@@ -259,4 +269,48 @@ func TestAdminResetPlanSubscriptionsNoMatchSucceeds(t *testing.T) {
 	assert.Zero(t, result.ResetCount)
 	assert.Zero(t, result.UserCount)
 	assert.Empty(t, result.AffectedUserIds)
+}
+
+func TestSubscriptionBillingPeriodDeltaRejectsOverflowAndUnderflow(t *testing.T) {
+	require.NoError(t, DB.AutoMigrate(&SubscriptionBillingPeriod{}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Exec("DELETE FROM subscription_billing_periods").Error)
+	})
+
+	for _, test := range []struct {
+		name       string
+		id         int
+		amountUsed int64
+		delta      int64
+	}{
+		{name: "overflow", id: 9801, amountUsed: math.MaxInt64, delta: 1},
+		{name: "underflow", id: 9802, amountUsed: 0, delta: math.MinInt64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prepareSubscriptionResetTest(t)
+			require.NoError(t, DB.Create(&UserSubscription{
+				Id: test.id, UserId: test.id, AmountTotal: 0, AmountUsed: test.amountUsed,
+				BillingPeriodSequence: 1, Status: "active",
+			}).Error)
+			period := &SubscriptionBillingPeriod{
+				SubscriptionID: test.id, PeriodSequence: 1, UserID: test.id,
+				AmountTotal: 0, AmountUsed: test.amountUsed, CreatedTime: 1, UpdatedTime: 1,
+			}
+			require.NoError(t, DB.Create(period).Error)
+
+			err := DB.Transaction(func(tx *gorm.DB) error {
+				return applySubscriptionBillingPeriodDeltaTx(
+					tx, test.id, period.ID, test.id, test.delta, 2,
+				)
+			})
+			require.Error(t, err)
+
+			var storedPeriod SubscriptionBillingPeriod
+			var storedSubscription UserSubscription
+			require.NoError(t, DB.First(&storedPeriod, period.ID).Error)
+			require.NoError(t, DB.First(&storedSubscription, test.id).Error)
+			assert.Equal(t, test.amountUsed, storedPeriod.AmountUsed)
+			assert.Equal(t, test.amountUsed, storedSubscription.AmountUsed)
+		})
+	}
 }

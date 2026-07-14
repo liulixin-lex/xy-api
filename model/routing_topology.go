@@ -18,7 +18,7 @@ import (
 
 const (
 	RoutingPoolSourceLegacyGroup         = "legacy_group"
-	RoutingCredentialFingerprintVersion  = 1
+	RoutingCredentialFingerprintVersion  = 2
 	routingTopologyMetadataID            = 1
 	routingTopologyMaxChannels           = 100_000
 	routingTopologyMaxPools              = 4_096
@@ -76,6 +76,7 @@ func (RoutingPoolMember) TableName() string {
 type RoutingCredentialRef struct {
 	ID                 int    `json:"id" gorm:"primaryKey"`
 	ChannelID          int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_credential_ref,priority:1;index;not null"`
+	ChannelGeneration  string `json:"-" gorm:"type:varchar(32);index"`
 	Fingerprint        string `json:"-" gorm:"type:varchar(64);uniqueIndex:idx_routing_credential_ref,priority:2;not null"`
 	FingerprintVersion int    `json:"fingerprint_version"`
 	Active             bool   `json:"active" gorm:"index"`
@@ -102,14 +103,15 @@ type RoutingTopologyReconcileSummary struct {
 	RetiredCredentials int `json:"retired_credentials"`
 }
 
-func RoutingCredentialFingerprint(channelID int, key string) (string, error) {
-	if channelID <= 0 || key == "" {
+func RoutingCredentialFingerprint(channelID int, channelGeneration string, key string) (string, error) {
+	if channelID <= 0 || channelGeneration == "" || key == "" {
 		return "", errors.New("routing credential identity is invalid")
 	}
 	if !common.CryptoSecretIsPersistent() {
 		return "", ErrCredentialSecretUnstable
 	}
-	payload := "routing-credential:v" + strconv.Itoa(RoutingCredentialFingerprintVersion) + "\x00" + strconv.Itoa(channelID) + "\x00" + key
+	payload := "routing-credential:v" + strconv.Itoa(RoutingCredentialFingerprintVersion) + "\x00" +
+		strconv.Itoa(channelID) + "\x00" + channelGeneration + "\x00" + key
 	return common.GenerateHMAC(payload), nil
 }
 
@@ -159,7 +161,7 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 		totalKeyBytes := 0
 		for len(channels) <= routingTopologyMaxChannels {
 			var page []Channel
-			query := tx.Select("id", "key", "group", "priority", "weight", "channel_info").Order("id asc").Limit(500)
+			query := tx.Select("id", "routing_generation", "key", "group", "priority", "weight", "channel_info").Order("id asc").Limit(500)
 			if lastChannelID > 0 {
 				query = query.Where("id > ?", lastChannelID)
 			}
@@ -406,6 +408,7 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			if !exists {
 				candidate := RoutingCredentialRef{
 					ChannelID:          identity.ChannelID,
+					ChannelGeneration:  observation.ChannelGeneration,
 					Fingerprint:        identity.Fingerprint,
 					FingerprintVersion: RoutingCredentialFingerprintVersion,
 					Active:             true,
@@ -426,9 +429,12 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 				if candidate.ID != 0 && candidate.ID == ref.ID {
 					summary.CreatedCredentials++
 				}
-			} else if !ref.Active || ref.FingerprintVersion != RoutingCredentialFingerprintVersion || ref.LastSeenIndex != observation.FirstIndex || ref.CurrentOccurrences != observation.Occurrences || ref.RetiredTime != 0 {
+			} else if !ref.Active || ref.ChannelGeneration != observation.ChannelGeneration ||
+				ref.FingerprintVersion != RoutingCredentialFingerprintVersion || ref.LastSeenIndex != observation.FirstIndex ||
+				ref.CurrentOccurrences != observation.Occurrences || ref.RetiredTime != 0 {
 				if err := tx.Model(&RoutingCredentialRef{}).Where("id = ?", ref.ID).Updates(map[string]any{
 					"active":              true,
+					"channel_generation":  observation.ChannelGeneration,
 					"fingerprint_version": RoutingCredentialFingerprintVersion,
 					"last_seen_index":     observation.FirstIndex,
 					"current_occurrences": observation.Occurrences,
@@ -478,8 +484,9 @@ type routingCredentialIdentity struct {
 }
 
 type routingCredentialObservation struct {
-	FirstIndex  int
-	Occurrences int
+	ChannelGeneration string
+	FirstIndex        int
+	Occurrences       int
 }
 
 func normalizedRoutingGroups(groups []string) []string {
@@ -510,6 +517,9 @@ func routingCredentialSecretVerifier() string {
 }
 
 func routingCredentialObservations(channel Channel) (map[routingCredentialIdentity]routingCredentialObservation, error) {
+	if channel.RoutingGeneration == "" {
+		return nil, errors.New("routing channel generation is invalid")
+	}
 	keys := []string{channel.Key}
 	indexes := []int{RoutingMetricSingleKeyIndex}
 	if channel.ChannelInfo.IsMultiKey {
@@ -528,13 +538,14 @@ func routingCredentialObservations(channel Channel) (map[routingCredentialIdenti
 		if key == "" {
 			continue
 		}
-		fingerprint, err := RoutingCredentialFingerprint(channel.Id, key)
+		fingerprint, err := RoutingCredentialFingerprint(channel.Id, channel.RoutingGeneration, key)
 		if err != nil {
 			return nil, fmt.Errorf("routing credential fingerprint for channel %d: %w", channel.Id, err)
 		}
 		identity := routingCredentialIdentity{ChannelID: channel.Id, Fingerprint: fingerprint}
 		observation, exists := result[identity]
 		if !exists {
+			observation.ChannelGeneration = channel.RoutingGeneration
 			observation.FirstIndex = indexes[index]
 		}
 		observation.Occurrences++

@@ -23,9 +23,16 @@ import (
 
 const ginKeyChannelRoutingBalancedAffinity = "channel_routing_balanced_affinity"
 
+var ErrPinnedRoutingIdentityUnavailable = errors.New("pinned routing identity is unavailable")
+
 type channelRoutingBalancedAffinity struct {
 	Group     string
 	ChannelID int
+}
+
+type channelRoutingBalancedRequirement struct {
+	channelID    int
+	credentialID int
 }
 
 func cacheGetChannelRoutingBalanced(
@@ -104,6 +111,31 @@ func cacheGetChannelRoutingBalanced(
 }
 
 func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*model.Channel, bool, error) {
+	return selectChannelRoutingBalancedForGroupWithRequirement(param, group, channelRoutingBalancedRequirement{})
+}
+
+// ReservePinnedChannelRoutingAttempt admits stateful work through the same
+// health, breaker and capacity path as Balanced traffic, while forbidding any
+// other channel or Credential from being selected.
+func ReservePinnedChannelRoutingAttempt(
+	param *RetryParam,
+	group string,
+	channelID int,
+	credentialID int,
+) (*model.Channel, bool, error) {
+	if param == nil || param.Ctx == nil || strings.TrimSpace(group) == "" || channelID <= 0 || credentialID < 0 {
+		return nil, false, ErrPinnedRoutingIdentityUnavailable
+	}
+	return selectChannelRoutingBalancedForGroupWithRequirement(param, group, channelRoutingBalancedRequirement{
+		channelID: channelID, credentialID: credentialID,
+	})
+}
+
+func selectChannelRoutingBalancedForGroupWithRequirement(
+	param *RetryParam,
+	group string,
+	requirement channelRoutingBalancedRequirement,
+) (*model.Channel, bool, error) {
 	stage, exists := channelrouting.CurrentPoolDeploymentStage(group)
 	if !exists || stage != model.RoutingDeploymentStageActive {
 		return nil, false, nil
@@ -133,12 +165,26 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		allowedIDs = append(allowedIDs, channel.Id)
 		channelByID[channel.Id] = channel
 	}
+	if requirement.channelID > 0 {
+		requiredChannel := channelByID[requirement.channelID]
+		if requiredChannel == nil {
+			return nil, true, ErrPinnedRoutingIdentityUnavailable
+		}
+		allowedIDs = []int{requirement.channelID}
+		channelByID = map[int]*model.Channel{requirement.channelID: requiredChannel}
+	}
 	excludedSet := smartRoutingExcludedChannelIDs(param.Ctx)
 	excludedIDs := make([]int, 0, len(excludedSet))
 	for channelID := range excludedSet {
 		excludedIDs = append(excludedIDs, channelID)
 	}
 	sort.Ints(excludedIDs)
+	excludedCredentialSet := smartRoutingExcludedCredentialIDs(param.Ctx)
+	excludedCredentialIDs := make([]int, 0, len(excludedCredentialSet))
+	for credentialID := range excludedCredentialSet {
+		excludedCredentialIDs = append(excludedCredentialIDs, credentialID)
+	}
+	sort.Ints(excludedCredentialIDs)
 	preferredChannelID := channelRoutingBalancedPreferredChannel(param.Ctx, group)
 	policyRevision := session.SnapshotRevision()
 	if policyRevision == 0 {
@@ -146,10 +192,21 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 	}
 	promptTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)
 	completionTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)
+	profile, profileErr := routingRequestProfile(
+		param.Ctx,
+		group,
+		param.GetRetry(),
+		promptTokens,
+		completionTokens,
+	)
+	if profileErr != nil {
+		return nil, true, profileErr
+	}
 	capacityInput, capacityOutput := routingCapacityTokenEstimate(param.Ctx)
 	capacityExcluded := make([]int, 0, len(allowedIDs))
 	probeExcluded := make([]int, 0, len(allowedIDs))
 	var lastProbeErr error
+	var lastCapacityErr error
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, active, planErr := session.PlanBalanced(channelrouting.BalancedRoutingPlanInput{
 			RequestRoutingPlanInput: channelrouting.RequestRoutingPlanInput{
@@ -160,8 +217,11 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 				PromptTokenEstimate:        promptTokens,
 				CompletionTokenEstimate:    completionTokens,
 				CostProfile:                routingCostRequestProfile(param.Ctx),
+				Profile:                    profile,
 				AllowedChannelIDs:          allowedIDs,
 				ExcludedChannelIDs:         excludedIDs,
+				ExcludedCredentialIDs:      excludedCredentialIDs,
+				RequiredCredentialID:       requirement.credentialID,
 				CapacityExcludedChannelIDs: capacityExcluded,
 				ProbeExcludedChannelIDs:    probeExcluded,
 				SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
@@ -178,8 +238,14 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		}
 		if plan.SelectedChannelID <= 0 {
 			enqueueChannelRoutingBalancedDecision(param, group, plan, nil)
+			if requirement.channelID > 0 && lastCapacityErr != nil {
+				return nil, true, lastCapacityErr
+			}
 			if lastProbeErr != nil {
 				return nil, true, fmt.Errorf("channel routing half-open probe admission failed: %w", lastProbeErr)
+			}
+			if requirement.channelID > 0 {
+				return nil, true, ErrPinnedRoutingIdentityUnavailable
 			}
 			return nil, true, nil
 		}
@@ -238,7 +304,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			Inflight:  1,
 		}
 		strictCost, strictCostKnown, costErr := routingStrictCapacityCost(
-			session, selected.Id, param, capacityInput, capacityOutput,
+			session, group, selected.Id, param, capacityInput, capacityOutput,
 		)
 		if costErr != nil {
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
@@ -253,6 +319,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 			if errors.Is(strictErr, channelrouting.ErrStrictCapacityExhausted) ||
 				errors.Is(strictErr, channelrouting.ErrEnterpriseCapacityCostUnknown) {
+				lastCapacityErr = strictErr
 				capacityExcluded = append(capacityExcluded, selected.Id)
 				continue
 			}
@@ -275,6 +342,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 			if errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyExhausted) ||
 				errors.Is(adaptiveErr, channelrouting.ErrAdaptiveConcurrencyConflict) {
+				lastCapacityErr = adaptiveErr
 				capacityExcluded = append(capacityExcluded, selected.Id)
 				continue
 			}
@@ -291,6 +359,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 				_ = adaptiveLease.Release()
 				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 				if errors.Is(reserveErr, channelrouting.ErrStrictCapacityExhausted) {
+					lastCapacityErr = reserveErr
 					capacityExcluded = append(capacityExcluded, selected.Id)
 					continue
 				}
@@ -319,6 +388,7 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
 				if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
 					errors.Is(reserveErr, channelrouting.ErrCapacityLimitConflict) {
+					lastCapacityErr = reserveErr
 					capacityExcluded = append(capacityExcluded, selected.Id)
 					continue
 				}
@@ -350,6 +420,8 @@ func selectChannelRoutingBalancedForGroup(param *RetryParam, group string) (*mod
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
 			ChannelID: selected.Id, SnapshotRevision: plan.SelectedIdentity.SnapshotRevision,
 			PoolID: plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID,
+			CredentialID:      plan.SelectedIdentity.CredentialID,
+			UpstreamAccountID: plan.SelectedIdentity.UpstreamAccountID,
 		})
 		if plan.AffinityUsed {
 			MarkChannelAffinityUsed(param.Ctx, group, selected.Id)
@@ -398,7 +470,7 @@ func enqueueChannelRoutingBalancedDecision(
 		GroupName:            group,
 		ModelName:            param.ModelName,
 		SnapshotRevision:     plan.PolicyRevision,
-		AlgorithmVersion:     channelrouting.DecisionAlgorithmBalancedV1,
+		AlgorithmVersion:     plan.AlgorithmVersion,
 		RetryIndex:           param.GetRetry(),
 		IsStream:             plan.Profile.IsStream,
 		ActualChannelID:      plan.SelectedChannelID,
@@ -423,5 +495,5 @@ func enqueueChannelRoutingBalancedDecision(
 		return
 	}
 	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
-	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmBalancedV1)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, plan.AlgorithmVersion)
 }

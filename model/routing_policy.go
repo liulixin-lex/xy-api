@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
+	routingcapability "github.com/QuantumNous/new-api/pkg/routing_capability"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -1299,6 +1300,9 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 		if err := validateRoutingPolicyCanaryConfiguration(policy); err != nil {
 			return RoutingPolicyDocument{}, "", err
 		}
+		if _, err := routingcapability.ParsePoolPolicy(policy); err != nil {
+			return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
+		}
 		pool.Policy = policy
 		pool.Members = append([]RoutingPolicyMemberContent(nil), pool.Members...)
 		if len(pool.Members) > RoutingPolicyMaxMembersPerPool {
@@ -1349,6 +1353,9 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 			overrides, err := normalizeRoutingPolicyJSONObject(member.Overrides)
 			if err != nil {
 				return RoutingPolicyDocument{}, "", err
+			}
+			if _, err := routingcapability.ParseMemberOverrides(overrides); err != nil {
+				return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 			}
 			member.Overrides = overrides
 		}

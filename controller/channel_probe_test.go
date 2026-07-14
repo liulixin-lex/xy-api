@@ -50,7 +50,7 @@ func TestChannelRoutingProbeExecutionClassifiesOperationalFailures(t *testing.T)
 		},
 		{
 			name: "payment", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponse, http.StatusPaymentRequired), statusCode: http.StatusPaymentRequired,
-			responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown,
+			responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeAccount, health: routingerror.HealthOpen, capacity: routingerror.CapacityNone,
 		},
 		{
 			name: "rate limit", apiErr: types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponse, http.StatusTooManyRequests), statusCode: http.StatusTooManyRequests,
@@ -170,7 +170,7 @@ func TestActiveProbeChannelCopyDoesNotAdvanceProductionMultiKeyState(t *testing.
 		},
 	}
 
-	probeChannel, err := activeProbeChannelCopy(original)
+	probeChannel, err := activeProbeChannelCopy(original, 0)
 	require.NoError(t, err)
 	require.NotSame(t, original, probeChannel)
 	assert.Equal(t, "enabled-key", probeChannel.Key)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -103,9 +104,10 @@ func AttachRoutingCostSyncOperationContext(
 		}
 
 		nowMs := time.Now().UnixMilli()
+		transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
 		updates := map[string]any{
 			"system_task_id":  attachedTask.TaskID,
-			"updated_time_ms": nowMs,
+			"updated_time_ms": transitionTimeMs,
 		}
 		if attachedTask.Status == SystemTaskStatusRunning {
 			lockValid, err := routingCostSyncTaskLockValidTx(ctx, tx, attachedTask, nowMs)
@@ -113,9 +115,16 @@ func AttachRoutingCostSyncOperationContext(
 				return err
 			}
 			if lockValid {
+				if operation.Attempts == int(^uint(0)>>1) {
+					return ErrRoutingOperationInvalid
+				}
+				leaseMs := int64(time.Minute / time.Millisecond)
+				if transitionTimeMs > math.MaxInt64-leaseMs {
+					return ErrRoutingOperationInvalid
+				}
 				updates["status"] = RoutingOperationStatusRunning
 				updates["claim_token"] = routingCostSyncClaimToken(attachedTask.TaskID, attachedTask.LockedBy)
-				updates["claim_until_ms"] = nowMs + int64(time.Minute/time.Millisecond)
+				updates["claim_until_ms"] = transitionTimeMs + leaseMs
 				updates["attempts"] = gorm.Expr("attempts + ?", 1)
 			}
 		}
@@ -129,7 +138,11 @@ func AttachRoutingCostSyncOperationContext(
 		if updated.RowsAffected != 1 {
 			return ErrRoutingOperationClaimLost
 		}
-		return nil
+		var stored RoutingOperation
+		if err := tx.WithContext(ctx).Where("id = ?", operation.ID).First(&stored).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(stored)
 	})
 	if err != nil {
 		return nil, false, err
@@ -152,7 +165,8 @@ func ClaimRoutingCostSyncOperationsContext(
 		if err != nil {
 			return err
 		}
-		return syncRoutingCostSyncOperationClaimsTx(ctx, tx, task, nowMs, leaseMs)
+		_, err = syncRoutingCostSyncOperationClaimsTx(ctx, tx, task, nowMs, leaseMs)
+		return err
 	})
 }
 
@@ -193,7 +207,8 @@ func FinishRoutingCostSyncTaskContext(
 			return err
 		}
 		leaseMs := int64(time.Minute / time.Millisecond)
-		if err := syncRoutingCostSyncOperationClaimsTx(ctx, tx, task, nowMs, leaseMs); err != nil {
+		transitionTimeMs, err := syncRoutingCostSyncOperationClaimsTx(ctx, tx, task, nowMs, leaseMs)
+		if err != nil {
 			return err
 		}
 
@@ -223,12 +238,21 @@ func FinishRoutingCostSyncTaskContext(
 		finishedOperations := tx.WithContext(ctx).Model(&RoutingOperation{}).
 			Where("system_task_id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
 				task.TaskID, RoutingOperationStatusRunning, claimToken, nowMs).
-			Updates(routingOperationTerminalUpdates(operationStatus, lastError, operationResult, nowMs))
+			Updates(routingOperationTerminalUpdates(operationStatus, lastError, operationResult, transitionTimeMs))
 		if finishedOperations.Error != nil {
 			return finishedOperations.Error
 		}
 		if finishedOperations.RowsAffected != operationCount {
 			return ErrRoutingOperationClaimLost
+		}
+		var storedOperations []RoutingOperation
+		if err := tx.WithContext(ctx).Where("system_task_id = ?", task.TaskID).Find(&storedOperations).Error; err != nil {
+			return err
+		}
+		for index := range storedOperations {
+			if err := validateStoredRoutingOperation(storedOperations[index]); err != nil {
+				return err
+			}
 		}
 
 		resultText, err := marshalSystemTaskJSON(resultPayload)
@@ -276,16 +300,41 @@ func FailUnattachedRoutingOperationContext(
 	if operationID <= 0 || lastError == "" {
 		return ErrRoutingOperationInvalid
 	}
-	nowMs := time.Now().UnixMilli()
-	updates := routingOperationTerminalUpdates(
-		RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, nowMs,
-	)
-	updates["attempts"] = gorm.Expr("attempts + ?", 1)
-	updated := DB.WithContext(ctx).Model(&RoutingOperation{}).
-		Where("id = ? AND operation_type = ? AND status = ?", operationID, RoutingOperationTypeCostSync, RoutingOperationStatusPending).
-		Where("system_task_id = '' OR system_task_id IS NULL").
-		Updates(updates)
-	return routingOperationCASResult(updated)
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var operation RoutingOperation
+		err := lockForUpdate(tx.WithContext(ctx)).
+			Where("id = ? AND operation_type = ? AND status = ?", operationID, RoutingOperationTypeCostSync, RoutingOperationStatusPending).
+			Where("system_task_id = '' OR system_task_id IS NULL").
+			First(&operation).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrRoutingOperationClaimLost
+		}
+		if err != nil {
+			return err
+		}
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return err
+		}
+		if operation.Attempts == int(^uint(0)>>1) {
+			return ErrRoutingOperationInvalid
+		}
+		nowMs := max(time.Now().UnixMilli(), operation.CreatedTimeMs, operation.UpdatedTimeMs)
+		updates := routingOperationTerminalUpdates(
+			RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, nowMs,
+		)
+		updates["attempts"] = gorm.Expr("attempts + ?", 1)
+		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
+			Where("id = ? AND operation_type = ? AND status = ?", operationID, RoutingOperationTypeCostSync, RoutingOperationStatusPending).
+			Where("system_task_id = '' OR system_task_id IS NULL").
+			Updates(updates)
+		if err := routingOperationCASResult(updated); err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).Where("id = ?", operationID).First(&operation).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(operation)
+	})
 }
 
 func ownedRoutingCostSyncTaskTx(
@@ -341,12 +390,41 @@ func syncRoutingCostSyncOperationClaimsTx(
 	task SystemTask,
 	nowMs int64,
 	leaseMs int64,
-) error {
-	if leaseMs <= 0 || leaseMs > routingOperationMaxClaimMs || nowMs <= 0 || nowMs > int64(^uint64(0)>>1)-leaseMs {
-		return ErrRoutingOperationInvalid
+) (int64, error) {
+	if tx == nil || leaseMs <= 0 || leaseMs > routingOperationMaxClaimMs || nowMs <= 0 || nowMs > math.MaxInt64-leaseMs {
+		return 0, ErrRoutingOperationInvalid
 	}
+	var activeOperations []RoutingOperation
+	if err := lockForUpdate(tx.WithContext(ctx)).
+		Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
+			RoutingOperationStatusPending, RoutingOperationStatusRunning,
+		}).
+		Find(&activeOperations).Error; err != nil {
+		return 0, err
+	}
+	transitionTimeMs := nowMs
 	claimToken := routingCostSyncClaimToken(task.TaskID, task.LockedBy)
-	claimUntilMs := nowMs + leaseMs
+	for index := range activeOperations {
+		operation := activeOperations[index]
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return 0, err
+		}
+		if operation.Attempts == int(^uint(0)>>1) &&
+			(operation.Status == RoutingOperationStatusPending || operation.ClaimUntilMs <= nowMs) {
+			return 0, ErrRoutingOperationInvalid
+		}
+		transitionTimeMs = max(transitionTimeMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+	}
+	if transitionTimeMs > math.MaxInt64-leaseMs {
+		return 0, ErrRoutingOperationInvalid
+	}
+	claimUntilMs := transitionTimeMs + leaseMs
+	for index := range activeOperations {
+		operation := activeOperations[index]
+		if operation.Status == RoutingOperationStatusRunning && operation.ClaimToken == claimToken {
+			claimUntilMs = max(claimUntilMs, operation.ClaimUntilMs)
+		}
+	}
 	claimable := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("system_task_id = ?", task.TaskID).
 		Where("status = ? OR (status = ? AND claim_until_ms <= ?)",
@@ -354,36 +432,43 @@ func syncRoutingCostSyncOperationClaimsTx(
 		Updates(map[string]any{
 			"status": RoutingOperationStatusRunning, "claim_token": claimToken,
 			"claim_until_ms": claimUntilMs, "attempts": gorm.Expr("attempts + ?", 1),
-			"updated_time_ms": nowMs,
+			"updated_time_ms": transitionTimeMs,
 		})
 	if claimable.Error != nil {
-		return claimable.Error
+		return 0, claimable.Error
 	}
 	renewed := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("system_task_id = ? AND status = ? AND claim_token = ?",
 			task.TaskID, RoutingOperationStatusRunning, claimToken).
-		Updates(map[string]any{"claim_until_ms": claimUntilMs, "updated_time_ms": nowMs})
+		Updates(map[string]any{
+			"claim_until_ms":  claimUntilMs,
+			"updated_time_ms": transitionTimeMs,
+		})
 	if renewed.Error != nil {
-		return renewed.Error
+		return 0, renewed.Error
 	}
-	var activeCount int64
-	if err := tx.WithContext(ctx).Model(&RoutingOperation{}).
+	var ownedOperations []RoutingOperation
+	if err := tx.WithContext(ctx).
 		Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
 			RoutingOperationStatusPending, RoutingOperationStatusRunning,
-		}).Count(&activeCount).Error; err != nil {
-		return err
+		}).
+		Find(&ownedOperations).Error; err != nil {
+		return 0, err
 	}
-	var ownedCount int64
-	if err := tx.WithContext(ctx).Model(&RoutingOperation{}).
-		Where("system_task_id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
-			task.TaskID, RoutingOperationStatusRunning, claimToken, nowMs).
-		Count(&ownedCount).Error; err != nil {
-		return err
+	if len(activeOperations) != len(ownedOperations) {
+		return 0, ErrRoutingOperationClaimLost
 	}
-	if activeCount != ownedCount {
-		return ErrRoutingOperationClaimLost
+	for index := range ownedOperations {
+		operation := ownedOperations[index]
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return 0, err
+		}
+		if operation.Status != RoutingOperationStatusRunning || operation.ClaimToken != claimToken ||
+			operation.ClaimUntilMs <= nowMs {
+			return 0, ErrRoutingOperationClaimLost
+		}
 	}
-	return nil
+	return transitionTimeMs, nil
 }
 
 func routingCostSyncClaimToken(taskID string, runnerID string) string {
@@ -409,16 +494,27 @@ func reconcileAttachedRoutingCostSyncOperationTx(
 		if err != nil || !valid {
 			return err
 		}
+		transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+		leaseMs := int64(time.Minute / time.Millisecond)
+		if operation.Attempts == int(^uint(0)>>1) || transitionTimeMs > math.MaxInt64-leaseMs {
+			return ErrRoutingOperationInvalid
+		}
 		claimToken := routingCostSyncClaimToken(task.TaskID, task.LockedBy)
 		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 			Where("id = ? AND system_task_id = ? AND status = ?",
 				operation.ID, task.TaskID, RoutingOperationStatusPending).
 			Updates(map[string]any{
 				"status": RoutingOperationStatusRunning, "claim_token": claimToken,
-				"claim_until_ms": nowMs + int64(time.Minute/time.Millisecond),
-				"attempts":       gorm.Expr("attempts + ?", 1), "updated_time_ms": nowMs,
+				"claim_until_ms": transitionTimeMs + leaseMs,
+				"attempts":       gorm.Expr("attempts + ?", 1), "updated_time_ms": transitionTimeMs,
 			})
-		return updated.Error
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if err := tx.WithContext(ctx).Where("id = ?", operation.ID).First(&operation).Error; err != nil {
+			return err
+		}
+		return validateStoredRoutingOperation(operation)
 	}
 
 	operationStatus := RoutingOperationStatusFailed
@@ -442,12 +538,20 @@ func reconcileAttachedRoutingCostSyncOperationTx(
 	} else if lastError == "" {
 		lastError = "cost sync task failed"
 	}
-	updates := routingOperationTerminalUpdates(operationStatus, lastError, operationResult, nowMs)
+	transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+	updates := routingOperationTerminalUpdates(operationStatus, lastError, operationResult, transitionTimeMs)
 	updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
-	return tx.WithContext(ctx).Model(&RoutingOperation{}).
+	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("id = ? AND system_task_id = ? AND status IN ?", operation.ID, task.TaskID, []RoutingOperationStatus{
 			RoutingOperationStatusPending, RoutingOperationStatusRunning,
-		}).Updates(updates).Error
+		}).Updates(updates)
+	if updated.Error != nil {
+		return updated.Error
+	}
+	if err := tx.WithContext(ctx).Where("id = ?", operation.ID).First(&operation).Error; err != nil {
+		return err
+	}
+	return validateStoredRoutingOperation(operation)
 }
 
 func routingCostSyncResultExecutionState(resultPayload any) string {
@@ -483,8 +587,29 @@ func markSystemTaskLeaseExpiredContext(ctx context.Context, taskID string) error
 		}
 		lastError := "task lease expired"
 		if tx.Migrator().HasTable(&RoutingOperation{}) {
+			var activeOperations []RoutingOperation
+			if err := lockForUpdate(tx.WithContext(ctx)).
+				Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
+					RoutingOperationStatusPending, RoutingOperationStatusRunning,
+				}).
+				Find(&activeOperations).Error; err != nil {
+				return err
+			}
+			for index := range activeOperations {
+				if err := validateStoredRoutingOperation(activeOperations[index]); err != nil {
+					return err
+				}
+			}
+			transitionTimeMs := nowMs
+			for index := range activeOperations {
+				transitionTimeMs = max(
+					transitionTimeMs,
+					activeOperations[index].CreatedTimeMs,
+					activeOperations[index].UpdatedTimeMs,
+				)
+			}
 			updates := routingOperationTerminalUpdates(
-				RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, nowMs,
+				RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, transitionTimeMs,
 			)
 			updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
 			if err := tx.WithContext(ctx).Model(&RoutingOperation{}).
@@ -492,6 +617,24 @@ func markSystemTaskLeaseExpiredContext(ctx context.Context, taskID string) error
 					RoutingOperationStatusPending, RoutingOperationStatusRunning,
 				}).Updates(updates).Error; err != nil {
 				return err
+			}
+			if len(activeOperations) > 0 {
+				ids := make([]int64, len(activeOperations))
+				for index := range activeOperations {
+					ids[index] = activeOperations[index].ID
+				}
+				var storedOperations []RoutingOperation
+				if err := tx.WithContext(ctx).Where("id IN ?", ids).Find(&storedOperations).Error; err != nil {
+					return err
+				}
+				if len(storedOperations) != len(activeOperations) {
+					return ErrRoutingOperationClaimLost
+				}
+				for index := range storedOperations {
+					if err := validateStoredRoutingOperation(storedOperations[index]); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		return tx.WithContext(ctx).Model(&SystemTask{}).

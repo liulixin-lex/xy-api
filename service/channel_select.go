@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strconv"
 	"strings"
 	"time"
 
@@ -143,6 +142,13 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 	if param == nil || param.Ctx == nil || actualGroup == "" || actualGroup == "auto" {
 		return false
 	}
+	promptTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0)
+	completionTokens := max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0)
+	profile, profileErr := routingRequestProfile(param.Ctx, actualGroup, retryIndex, promptTokens, completionTokens)
+	if profileErr != nil {
+		logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing request profile dropped: %v", profileErr))
+		return true
+	}
 	replayInput, active, err := channelrouting.CaptureShadowReplayRequest(channelrouting.ShadowRequest{
 		RequestID:               common.GetContextKeyString(param.Ctx, common.RequestIdKey),
 		RequestPath:             param.RequestPath,
@@ -150,9 +156,10 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 		ModelName:               param.ModelName,
 		IsStream:                common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 		RetryIndex:              retryIndex,
-		PromptTokenEstimate:     max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingPromptProxy), 0),
-		CompletionTokenEstimate: max(common.GetContextKeyInt(param.Ctx, constant.ContextKeyRoutingEstimatedOutput), 0),
+		PromptTokenEstimate:     promptTokens,
+		CompletionTokenEstimate: completionTokens,
 		CostProfile:             routingCostRequestProfile(param.Ctx),
+		Profile:                 profile,
 	})
 	if !active {
 		return false
@@ -179,7 +186,7 @@ func recordChannelRoutingShadowAudit(param *RetryParam, actualGroup string, actu
 		GroupName:            actualGroup,
 		ModelName:            param.ModelName,
 		SnapshotRevision:     replayInput.PolicyRevision,
-		AlgorithmVersion:     channelrouting.DecisionAlgorithmShadowV1,
+		AlgorithmVersion:     replayInput.AlgorithmVersion,
 		RetryIndex:           retryIndex,
 		IsStream:             replayInput.Profile.IsStream,
 		ActualChannelID:      actualChannelID,
@@ -961,10 +968,28 @@ func smartRoutingExcludedChannelIDs(c *gin.Context) map[int]struct{} {
 			}
 		}
 	}
-	for _, raw := range c.GetStringSlice("use_channel") {
-		id, err := strconv.Atoi(strings.TrimSpace(raw))
-		if err == nil && id > 0 {
-			excluded[id] = struct{}{}
+	return excluded
+}
+
+func smartRoutingExcludedCredentialIDs(c *gin.Context) map[int]struct{} {
+	excluded := map[int]struct{}{}
+	if c == nil {
+		return excluded
+	}
+	if stored, ok := common.GetContextKey(c, constant.ContextKeyRoutingExcludedCredentials); ok {
+		switch typed := stored.(type) {
+		case map[int]struct{}:
+			for id := range typed {
+				if id > 0 {
+					excluded[id] = struct{}{}
+				}
+			}
+		case []int:
+			for _, id := range typed {
+				if id > 0 {
+					excluded[id] = struct{}{}
+				}
+			}
 		}
 	}
 	return excluded
@@ -990,6 +1015,28 @@ func MarkRoutingTried(c *gin.Context, channelID int) int {
 	common.SetContextKey(c, constant.ContextKeyRoutingExcludedChannels, excluded)
 	common.SetContextKey(c, constant.ContextKeyRoutingSwitchCount, switchCount)
 	return switchCount
+}
+
+func MarkRoutingTargetTried(c *gin.Context, channelID int, credentialID int, multiKey bool) int {
+	if c == nil || channelID <= 0 {
+		return 0
+	}
+	if !multiKey || credentialID <= 0 {
+		return MarkRoutingTried(c, channelID)
+	}
+	excluded := smartRoutingExcludedCredentialIDs(c)
+	excluded[credentialID] = struct{}{}
+	common.SetContextKey(c, constant.ContextKeyRoutingExcludedCredentials, excluded)
+	switchCount := len(smartRoutingExcludedChannelIDs(c)) + len(excluded) - 1
+	if switchCount < 0 {
+		switchCount = 0
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingSwitchCount, switchCount)
+	return switchCount
+}
+
+func MarkRoutingChannelFailed(c *gin.Context, channelID int) int {
+	return MarkRoutingTried(c, channelID)
 }
 
 func AffinityAdmissible(channelID int) bool {

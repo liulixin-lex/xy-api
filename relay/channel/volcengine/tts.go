@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -144,7 +144,7 @@ func getContentTypeByEncoding(encoding string) string {
 }
 
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
-	body, readErr := io.ReadAll(resp.Body)
+	body, readErr := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if readErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("failed to read volcengine response"),
@@ -211,23 +211,12 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	header.Set("Authorization", fmt.Sprintf("Bearer;%s", token))
 
 	requestCtx := c.Request.Context()
+	if err := relaycommon.MarkRoutingUpstreamSent(c); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+	}
 	conn, resp, dialErr := websocket.DefaultDialer.DialContext(requestCtx, requestURL, header)
 	if dialErr != nil {
-		if resp != nil {
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			return nil, types.NewErrorWithStatusCode(
-				fmt.Errorf("failed to connect to websocket: %w, status: %d", dialErr, resp.StatusCode),
-				types.ErrorCodeBadResponseStatusCode,
-				http.StatusBadGateway,
-			)
-		}
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("failed to connect to websocket: %w", dialErr),
-			types.ErrorCodeBadResponseStatusCode,
-			http.StatusBadGateway,
-		)
+		return nil, relaycommon.NewWebSocketHandshakeError(resp, dialErr)
 	}
 	connectionDone := make(chan struct{})
 	var closeOnce sync.Once

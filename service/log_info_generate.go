@@ -112,6 +112,9 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 		if credentialID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID); credentialID > 0 {
 			adminInfo["routing_credential_id"] = credentialID
 		}
+		if accountID := common.GetContextKeyInt(ctx, constant.ContextKeyRoutingUpstreamAccountID); accountID > 0 {
+			adminInfo["routing_upstream_account_id"] = accountID
+		}
 	}
 
 	isLocalCountTokens := common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens)

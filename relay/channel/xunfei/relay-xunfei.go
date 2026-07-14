@@ -134,8 +134,15 @@ func buildXunfeiAuthUrl(hostUrl string, apiKey, apiSecret string) string {
 
 func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
+	if err := relaycommon.MarkRoutingUpstreamSent(c); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+	}
 	dataChan, endChan, closeUpstream, err := xunfeiMakeRequest(c.Request.Context(), info, textRequest, domain, authUrl, appId)
 	if err != nil {
+		var upstreamErr *types.NewAPIError
+		if errors.As(err, &upstreamErr) {
+			return nil, upstreamErr
+		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	return relayXunfeiStream(c, info, dataChan, endChan, closeUpstream)
@@ -215,8 +222,15 @@ func xunfeiStreamError(info *relaycommon.RelayInfo, reason relaycommon.StreamEnd
 
 func xunfeiHandler(c *gin.Context, textRequest dto.GeneralOpenAIRequest, appId string, apiSecret string, apiKey string) (*dto.Usage, *types.NewAPIError) {
 	domain, authUrl := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
+	if err := relaycommon.MarkRoutingUpstreamSent(c); err != nil {
+		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+	}
 	dataChan, endChan, closeUpstream, err := xunfeiMakeRequest(c.Request.Context(), nil, textRequest, domain, authUrl, appId)
 	if err != nil {
+		var upstreamErr *types.NewAPIError
+		if errors.As(err, &upstreamErr) {
+			return nil, upstreamErr
+		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 	defer closeUpstream.Close()
@@ -288,7 +302,7 @@ func xunfeiMakeRequest(ctx context.Context, info *relaycommon.RelayInfo, textReq
 			}
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstByteTimeout, err)
 		}
-		return nil, nil, nil, err
+		return nil, nil, nil, relaycommon.NewWebSocketHandshakeError(resp, err)
 	}
 	if resp == nil || resp.StatusCode != http.StatusSwitchingProtocols {
 		_ = conn.Close()

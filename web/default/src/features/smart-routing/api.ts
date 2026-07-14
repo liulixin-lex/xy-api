@@ -36,6 +36,9 @@ export async function getSmartRoutingSettings() {
     '/api/smart-routing/settings',
     { skipBusinessError: true }
   )
+  if (res.data.data) {
+    res.data.data.server_etag = res.headers.etag || ''
+  }
   return res.data
 }
 
@@ -45,8 +48,14 @@ export async function updateSmartRoutingSettings(
   const res = await api.put<ApiResponse<SmartRoutingSettings>>(
     '/api/smart-routing/settings',
     request,
-    { skipBusinessError: true }
+    {
+      skipBusinessError: true,
+      headers: { 'If-Match': request.server_etag || '' },
+    }
   )
+  if (res.data.data) {
+    res.data.data.server_etag = res.headers.etag || ''
+  }
   return res.data
 }
 
@@ -71,20 +80,24 @@ export async function createSmartRoutingBinding(
 
 export async function updateSmartRoutingBinding(
   channelId: number,
-  request: RoutingBindingRequest
+  request: RoutingBindingRequest,
+  etag: string
 ) {
   const res = await api.put<ApiResponse<RoutingBinding>>(
     `/api/smart-routing/bindings/${channelId}`,
     request,
-    { skipBusinessError: true }
+    { skipBusinessError: true, headers: { 'If-Match': etag } }
   )
   return res.data
 }
 
-export async function deleteSmartRoutingBinding(channelId: number) {
-  const res = await api.delete<ApiResponse<null>>(
-    `/api/smart-routing/bindings/${channelId}`,
-    { skipBusinessError: true }
+export async function deleteSmartRoutingBinding(binding: RoutingBinding) {
+  const res = await api.delete<ApiResponse<{ channel_id: number }>>(
+    `/api/smart-routing/bindings/${binding.channel_id}`,
+    {
+      skipBusinessError: true,
+      headers: { 'If-Match': binding.etag },
+    }
   )
   return res.data
 }

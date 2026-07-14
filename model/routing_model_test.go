@@ -30,12 +30,13 @@ func TestRoutingChannelBindingCredentialsRoundTripAndMaskJSON(t *testing.T) {
 	creds := RoutingCredentials{
 		NewAPIAccessToken: "newapi-token-secret",
 		GatewayAPIKey:     "gateway-key-secret",
+		CustomCAPEM:       "-----BEGIN CERTIFICATE-----\ncustom-ca-secret\n-----END CERTIFICATE-----",
 	}
 
 	require.NoError(t, binding.SetCredentials(creds))
 	require.NotNil(t, binding.EncCredentials)
 	assert.NotContains(t, *binding.EncCredentials, "newapi-token-secret")
-	assert.Equal(t, RoutingCredentialKeyVersion, binding.KeyVersion)
+	assert.Equal(t, RoutingCredentialLegacyKeyVersion, binding.KeyVersion)
 
 	decoded, err := binding.GetCredentials()
 	require.NoError(t, err)
@@ -46,12 +47,36 @@ func TestRoutingChannelBindingCredentialsRoundTripAndMaskJSON(t *testing.T) {
 	jsonText := string(jsonBytes)
 	assert.NotContains(t, jsonText, "newapi-token-secret")
 	assert.NotContains(t, jsonText, "gateway-key-secret")
+	assert.NotContains(t, jsonText, "custom-ca-secret")
 	assert.NotContains(t, jsonText, "enc_credentials")
 
 	credsJSON, err := common.Marshal(creds)
 	require.NoError(t, err)
 	assert.NotContains(t, string(credsJSON), "newapi-token-secret")
 	assert.NotContains(t, string(credsJSON), "gateway-key-secret")
+	assert.NotContains(t, string(credsJSON), "custom-ca-secret")
+}
+
+func TestRoutingChannelBindingEgressPolicyRoundTripAndMaskJSON(t *testing.T) {
+	binding := RoutingChannelBinding{ChannelID: 1004}
+	require.NoError(t, binding.SetEgressAllowedPrivateCIDRs([]string{"10.20.30.0/24", "fd12:3456::/64"}))
+	require.NotNil(t, binding.EgressPolicyJSON)
+
+	decoded, err := binding.GetEgressAllowedPrivateCIDRs()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.20.30.0/24", "fd12:3456::/64"}, decoded)
+	decoded[0] = "changed"
+	reloaded, err := binding.GetEgressAllowedPrivateCIDRs()
+	require.NoError(t, err)
+	assert.Equal(t, "10.20.30.0/24", reloaded[0])
+
+	jsonBytes, err := common.Marshal(binding)
+	require.NoError(t, err)
+	assert.NotContains(t, string(jsonBytes), "egress_policy")
+	assert.NotContains(t, string(jsonBytes), "10.20.30.0/24")
+
+	require.NoError(t, binding.SetEgressAllowedPrivateCIDRs(nil))
+	assert.Nil(t, binding.EgressPolicyJSON)
 }
 
 func TestRoutingChannelBindingCredentialsFailClosedWhenSecretUnstable(t *testing.T) {
@@ -610,6 +635,7 @@ var routingMigrationModels = []interface{}{
 	&SystemTask{},
 	&SystemTaskLock{},
 	&RoutingUpstreamAccount{},
+	&RoutingUpstreamAccountHealthState{},
 	&RoutingCostSnapshotVersion{},
 	&RoutingChannelBinding{},
 	&RoutingCostSnapshot{},
@@ -618,6 +644,7 @@ var routingMigrationModels = []interface{}{
 	&RoutingTelemetryReceipt{},
 	&RoutingBreakerState{},
 	&RoutingChannelHealthState{},
+	&RoutingCredentialHealthState{},
 	&RoutingAgentRecommendation{},
 }
 
@@ -685,8 +712,36 @@ type routingBreakerStateBeforeSemanticVersion struct {
 	UpdatedTime         int64 `gorm:"bigint;index"`
 }
 
+type routingCredentialRefBeforeChannelGeneration struct {
+	ID                 int    `gorm:"primaryKey"`
+	ChannelID          int    `gorm:"uniqueIndex:idx_routing_credential_ref,priority:1;index;not null"`
+	Fingerprint        string `gorm:"type:varchar(64);uniqueIndex:idx_routing_credential_ref,priority:2;not null"`
+	FingerprintVersion int
+	Active             bool `gorm:"index"`
+	LastSeenIndex      int
+	CurrentOccurrences int
+	CreatedTime        int64 `gorm:"bigint"`
+	UpdatedTime        int64 `gorm:"bigint;index"`
+	RetiredTime        int64 `gorm:"bigint;index"`
+}
+
+func (routingCredentialRefBeforeChannelGeneration) TableName() string {
+	return "routing_credential_refs"
+}
+
 func (routingBreakerStateBeforeSemanticVersion) TableName() string {
 	return "routing_breaker_states"
+}
+
+type channelBeforeRoutingGeneration struct {
+	Id          int    `gorm:"primaryKey"`
+	Key         string `gorm:"not null"`
+	Name        string
+	CreatedTime int64 `gorm:"bigint"`
+}
+
+func (channelBeforeRoutingGeneration) TableName() string {
+	return "channels"
 }
 
 func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType common.DatabaseType) {
@@ -700,7 +755,13 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		&routingChannelBindingBeforeSyncFailureCount{},
 		&routingChannelMetricBeforeReliability{},
 		&routingBreakerStateBeforeSemanticVersion{},
+		&routingCredentialRefBeforeChannelGeneration{},
 	))
+	legacyCredential := routingCredentialRefBeforeChannelGeneration{
+		ID: 9902, ChannelID: 9902, Fingerprint: strings.Repeat("a", 64),
+		FingerprintVersion: 1, Active: true, CreatedTime: 100, UpdatedTime: 100,
+	}
+	require.NoError(t, DB.Create(&legacyCredential).Error)
 	legacyBinding := routingChannelBindingBeforeSyncFailureCount{
 		ChannelID:        77,
 		UpstreamType:     RoutingUpstreamTypeNewAPI,
@@ -744,8 +805,26 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	require.NoError(t, DB.Create(&legacyBreaker).Error)
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
+	require.True(t, DB.Migrator().HasColumn(&RoutingCredentialRef{}, "channel_generation"))
+	var migratedLegacyCredential RoutingCredentialRef
+	require.NoError(t, DB.First(&migratedLegacyCredential, "id = ?", legacyCredential.ID).Error)
+	assert.Empty(t, migratedLegacyCredential.ChannelGeneration)
+	require.NoError(t, DB.Delete(&RoutingCredentialRef{}, legacyCredential.ID).Error)
 	t.Cleanup(func() { _ = db.Migrator().DropTable(&Channel{}) })
+	require.NoError(t, DB.AutoMigrate(&channelBeforeRoutingGeneration{}))
+	require.NoError(t, DB.Create(&channelBeforeRoutingGeneration{
+		Id: 9901, Key: "legacy-key", Name: "legacy-channel", CreatedTime: 100,
+	}).Error)
 	require.NoError(t, DB.AutoMigrate(&Channel{}))
+	require.NoError(t, EnsureChannelRoutingGenerations(DB))
+	var migratedChannel Channel
+	require.NoError(t, DB.First(&migratedChannel, "id = ?", 9901).Error)
+	require.NotEmpty(t, migratedChannel.RoutingGeneration)
+	migratedGeneration := migratedChannel.RoutingGeneration
+	require.NoError(t, EnsureChannelRoutingGenerations(DB))
+	require.NoError(t, DB.First(&migratedChannel, "id = ?", 9901).Error)
+	assert.Equal(t, migratedGeneration, migratedChannel.RoutingGeneration)
+	require.NoError(t, DB.Delete(&Channel{}, 9901).Error)
 	require.NoError(t, DB.Create(&[]Channel{
 		{Id: 1, Name: "single-one", Key: "single-key-one", Group: "default"},
 		{Id: 91, Name: "single-ninety-one", Key: "single-key-ninety-one", Group: "legacy"},
@@ -754,6 +833,16 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 			ChannelInfo: ChannelInfo{IsMultiKey: true},
 		},
 	}).Error)
+	var createdChannels []Channel
+	require.NoError(t, DB.Where("id IN ?", []int{1, 91, 92}).Order("id asc").Find(&createdChannels).Error)
+	require.Len(t, createdChannels, 3)
+	seenGenerations := make(map[string]struct{}, len(createdChannels))
+	for i := range createdChannels {
+		require.NotEmpty(t, createdChannels[i].RoutingGeneration)
+		_, duplicate := seenGenerations[createdChannels[i].RoutingGeneration]
+		assert.False(t, duplicate)
+		seenGenerations[createdChannels[i].RoutingGeneration] = struct{}{}
+	}
 	runRoutingTopologyReconcileContract(t)
 
 	for _, model := range routingMigrationModels {
@@ -906,6 +995,31 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.False(t, savedBinding.ServesClaudeCode)
 	assert.NotZero(t, savedBinding.CreatedTime)
 	assert.NotZero(t, savedBinding.UpdatedTime)
+
+	literalChannel := Channel{Id: 95, Name: "literal%_!source", Key: "literal-key"}
+	require.NoError(t, DB.Create(&literalChannel).Error)
+	literalBinding := RoutingChannelBinding{
+		ChannelID: 95, UpstreamType: RoutingUpstreamTypeSub2API,
+		BaseURL: "https://literal-search.example", UpstreamGroup: "group%_!", Enabled: true,
+	}
+	require.NoError(t, DB.Create(&literalBinding).Error)
+	for _, search := range []string{"%_!", "literal%_!source", "group%_!"} {
+		listed, total, listErr := ListRoutingChannelBindingsContext(
+			context.Background(), RoutingChannelBindingFilter{Search: search}, 0, 20,
+		)
+		require.NoError(t, listErr)
+		assert.Equal(t, int64(1), total)
+		require.Len(t, listed, 1)
+		assert.Equal(t, literalBinding.ChannelID, listed[0].ChannelID)
+	}
+	listed, total, listErr := ListRoutingChannelBindingsContext(
+		context.Background(), RoutingChannelBindingFilter{Search: "missing%_!"}, 0, 20,
+	)
+	require.NoError(t, listErr)
+	assert.Zero(t, total)
+	assert.Empty(t, listed)
+	require.NoError(t, DB.Delete(&literalBinding).Error)
+	require.NoError(t, DB.Delete(&literalChannel).Error)
 
 	initialTiersJSON := `{"type":"expr","expr":"input * 1"}`
 	require.NoError(t, UpsertRoutingCostSnapshot(&RoutingCostSnapshot{

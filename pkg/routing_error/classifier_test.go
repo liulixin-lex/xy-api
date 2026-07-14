@@ -46,6 +46,11 @@ func TestClassifyAPIErrorMatrix(t *testing.T) {
 			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopePoolMember, Retryability: RetryBeforeCommit, HealthEffect: HealthIgnore, CapacityEffect: CapacityCooldown, Component: ComponentServing, Rule: "capacity_status"},
 		},
 		{
+			name: "upstream account balance exhausted",
+			err:  types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, http.StatusPaymentRequired),
+			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopeAccount, Retryability: RetryBeforeCommit, HealthEffect: HealthOpen, CapacityEffect: CapacityNone, Component: ComponentServing, Rule: "upstream_account_balance"},
+		},
+		{
 			name: "provider overload 529",
 			err:  types.NewErrorWithStatusCode(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, 529),
 			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopePoolMember, Retryability: RetryBeforeCommit, HealthEffect: HealthIgnore, CapacityEffect: CapacityCooldown, Component: ComponentServing, Rule: "capacity_status"},

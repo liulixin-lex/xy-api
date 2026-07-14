@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export type ChannelRoutingSection =
   | 'overview'
   | 'groups'
@@ -376,6 +375,83 @@ export type ChannelRoutingCostDetailResponse = {
   item: CostSnapshot
   snapshot_revision: number
   snapshot_built_at: number
+}
+
+export type RoutingCostBindingUpstreamType = 'newapi' | 'sub2api'
+
+export type RoutingCostBindingCredentialMasks = {
+  new_api_access_token?: string
+  gateway_api_key?: string
+  sub2api_email?: string
+  sub2api_password?: string
+  sub2api_token?: string
+  custom_ca_configured?: boolean
+}
+
+export type RoutingCostBindingCredentials = {
+  new_api_access_token?: string
+  gateway_api_key?: string
+  sub2api_email?: string
+  sub2api_password?: string
+  sub2api_token?: string
+  custom_ca_pem?: string
+}
+
+export type RoutingCostBinding = {
+  id: number
+  channel_id: number
+  channel_name?: string
+  etag: string
+  upstream_type: RoutingCostBindingUpstreamType
+  base_url: string
+  upstream_group: string
+  serves_claude_code: boolean
+  egress_allowed_private_cidrs?: string[] | null
+  new_api_user_id?: number
+  enabled: boolean
+  sync_failure_count: number
+  sync_backoff_until: number
+  last_sync_error?: string
+  credential_masks: RoutingCostBindingCredentialMasks
+  credential_error?: string
+  egress_policy_error?: string
+  created_time: number
+  updated_time: number
+}
+
+export type RoutingCostBindingRequest = {
+  channel_id: number
+  upstream_type: RoutingCostBindingUpstreamType
+  base_url: string
+  upstream_group: string
+  serves_claude_code: boolean
+  egress_allowed_private_cidrs: string[]
+  new_api_user_id?: number
+  enabled: boolean
+  credentials: RoutingCostBindingCredentials
+}
+
+export type RoutingCostBindingPage = {
+  items: RoutingCostBinding[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export type RoutingCostBindingActionResult = {
+  channel_id: number
+  upstream_type: RoutingCostBindingUpstreamType
+  upstream_group?: string
+  credential_ready?: boolean
+  credential_test?: boolean
+  groups: string[]
+  groups_truncated?: boolean
+  groups_total?: number
+  model_count: number
+  pricing_version?: string
+  requires_sync?: boolean
+  sync_task_type?: string
+  serves_claude?: boolean
 }
 
 export type RoutingNormalizedPricing = {

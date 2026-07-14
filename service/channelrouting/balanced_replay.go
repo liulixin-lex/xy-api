@@ -15,7 +15,11 @@ import (
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 )
 
-const balancedReplaySchemaVersion = 1
+const (
+	balancedReplaySchemaVersionV1 = 1
+	balancedReplaySchemaVersionV2 = 2
+	balancedReplaySchemaVersion   = balancedReplaySchemaVersionV1
+)
 
 var (
 	ErrBalancedReplayInvalid = errors.New("invalid balanced routing replay")
@@ -162,7 +166,7 @@ func ReplayBalancedDecisionAuditContext(ctx context.Context, audit model.Routing
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !audit.Replayable || audit.AlgorithmVersion != DecisionAlgorithmBalancedV1 || audit.PoolID <= 0 ||
+	if !audit.Replayable || !supportedBalancedAlgorithm(audit.AlgorithmVersion) || audit.PoolID <= 0 ||
 		audit.SnapshotRevision <= 0 || audit.RuntimeGeneration <= 0 || audit.ActivationID <= 0 ||
 		audit.ActivationStage != model.RoutingDeploymentStageActive {
 		return BalancedReplayResult{}, ErrBalancedReplayInvalid
@@ -185,7 +189,8 @@ func ReplayBalancedDecisionAuditContext(ctx context.Context, audit model.Routing
 		return BalancedReplayResult{}, ErrBalancedReplayInvalid
 	}
 	expectedSeed, err := DeriveDecisionSeed(audit.RequestID, uint64(audit.SnapshotRevision), audit.RetryIndex)
-	if err != nil || input.PoolID != audit.PoolID || input.PolicyRevision != uint64(audit.SnapshotRevision) ||
+	if err != nil || input.AlgorithmVersion != audit.AlgorithmVersion || input.PoolID != audit.PoolID ||
+		input.PolicyRevision != uint64(audit.SnapshotRevision) ||
 		input.RuntimeGeneration != uint64(audit.RuntimeGeneration) || input.PolicyHash != audit.PolicyHash ||
 		input.SnapshotHash != audit.SnapshotHash || input.Settings.RandomSeed != expectedSeed ||
 		input.Profile.GroupName != audit.GroupName || input.Profile.ModelName != audit.ModelName ||
@@ -315,8 +320,15 @@ func buildBalancedReplayInput(
 	runtimeStates []BalancedReplayRuntimeState,
 	excludedChannelIDs []int,
 ) (BalancedReplayInput, error) {
+	profile = cloneRequestProfile(profile)
+	schemaVersion := balancedReplaySchemaVersionV1
+	algorithmVersion := DecisionAlgorithmBalancedV1
+	if profile.SchemaVersion == RequestProfileSchemaV2 {
+		schemaVersion = balancedReplaySchemaVersionV2
+		algorithmVersion = DecisionAlgorithmBalancedV2
+	}
 	input := BalancedReplayInput{
-		SchemaVersion: balancedReplaySchemaVersion, AlgorithmVersion: DecisionAlgorithmBalancedV1,
+		SchemaVersion: schemaVersion, AlgorithmVersion: algorithmVersion,
 		PoolID: poolID, PolicyRevision: policyRevision, RuntimeGeneration: runtimeGeneration,
 		PolicyHash: policyHash, Profile: profile, Settings: settings,
 		Candidates:         append([]BalancedReplayCandidate(nil), candidates...),
@@ -338,7 +350,7 @@ func buildBalancedReplayInput(
 }
 
 func (input BalancedReplayInput) validateWithoutHash() error {
-	if input.SchemaVersion != balancedReplaySchemaVersion || input.AlgorithmVersion != DecisionAlgorithmBalancedV1 ||
+	if !validBalancedReplayVersion(input.SchemaVersion, input.AlgorithmVersion, input.Profile.SchemaVersion) ||
 		input.PoolID <= 0 || input.PolicyRevision == 0 || input.RuntimeGeneration == 0 ||
 		!validShadowHash(input.PolicyHash) || input.Profile.Validate() != nil ||
 		len(input.Candidates) > routingselector.MaxBalancedCandidates ||
@@ -393,6 +405,24 @@ func (input BalancedReplayInput) validateWithoutHash() error {
 		}
 	}
 	return nil
+}
+
+func balancedAlgorithmVersion(profile RequestProfile) string {
+	if profile.SchemaVersion == RequestProfileSchemaV2 {
+		return DecisionAlgorithmBalancedV2
+	}
+	return DecisionAlgorithmBalancedV1
+}
+
+func supportedBalancedAlgorithm(algorithmVersion string) bool {
+	return algorithmVersion == DecisionAlgorithmBalancedV1 || algorithmVersion == DecisionAlgorithmBalancedV2
+}
+
+func validBalancedReplayVersion(schemaVersion int, algorithmVersion string, profileSchemaVersion int) bool {
+	return (schemaVersion == balancedReplaySchemaVersionV1 && profileSchemaVersion == RequestProfileSchemaV1 &&
+		algorithmVersion == DecisionAlgorithmBalancedV1) ||
+		(schemaVersion == balancedReplaySchemaVersionV2 && profileSchemaVersion == RequestProfileSchemaV2 &&
+			algorithmVersion == DecisionAlgorithmBalancedV2)
 }
 
 func validBalancedReplayCandidate(candidate BalancedReplayCandidate) bool {

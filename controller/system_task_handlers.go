@@ -143,6 +143,8 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(asyncBillingRecoveryHandler{})
+	service.RegisterSystemTaskHandler(billingLogAuditHandler{})
 	service.RegisterSystemTaskHandler(routingCostSyncHandler{})
 	service.RegisterSystemTaskHandler(routingAgentHandler{})
 }
@@ -184,15 +186,18 @@ func defaultSmartRoutingRuntimeDeps() smartRoutingRuntimeDeps {
 			var err error
 			if setting.Enabled {
 				syncRoutingBreakerConfigFromSetting(setting)
-				_, err = refreshRoutingHotcacheFromDB(ctx, setting)
+				if err = channelrouting.RefreshRuntimeHealthContext(ctx); err == nil {
+					_, err = refreshRoutingHotcacheFromDB(ctx, setting)
+				}
 			}
 			routinghotcache.Prune(common.GetTimestamp(), int64(setting.SnapshotStaleSec))
 			return err
 		},
 		flush: func(ctx context.Context, setting smart_routing_setting.SmartRoutingSetting) error {
 			syncRoutingBreakerConfigFromSetting(setting)
-			_, err := flushRoutingRuntimeState(ctx, setting)
-			return err
+			_, stateErr := flushRoutingRuntimeState(ctx, setting)
+			healthErr := channelrouting.FlushRuntimeHealthContext(ctx)
+			return errors.Join(stateErr, healthErr)
 		},
 		waitRefresh: waitRoutingRuntime,
 		waitFlush:   waitRoutingRuntime,
@@ -440,7 +445,7 @@ type midjourneyPollHandler struct{}
 func (midjourneyPollHandler) Type() string { return model.SystemTaskTypeMidjourneyPoll }
 
 func (midjourneyPollHandler) Enabled() bool {
-	return constant.UpdateTask && model.HasUnfinishedMidjourneyTasks()
+	return (constant.UpdateTask && model.HasUnfinishedMidjourneyTasks()) || model.HasPendingMidjourneyBillingOperations()
 }
 
 func (midjourneyPollHandler) Interval() time.Duration { return 15 * time.Second }
@@ -460,7 +465,7 @@ type asyncTaskPollHandler struct{}
 func (asyncTaskPollHandler) Type() string { return model.SystemTaskTypeAsyncTaskPoll }
 
 func (asyncTaskPollHandler) Enabled() bool {
-	return constant.UpdateTask && model.HasUnfinishedSyncTasks()
+	return (constant.UpdateTask && model.HasUnfinishedSyncTasks()) || model.HasRecoverableTaskBillingOperations()
 }
 
 func (asyncTaskPollHandler) Interval() time.Duration { return 15 * time.Second }
@@ -470,6 +475,332 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type asyncBillingRecoveryHandler struct{}
+
+func (asyncBillingRecoveryHandler) Type() string { return model.SystemTaskTypeAsyncBillingRecovery }
+
+func (asyncBillingRecoveryHandler) Enabled() bool {
+	return model.HasAsyncBillingRecoveryWork(time.Now())
+}
+
+func (asyncBillingRecoveryHandler) Interval() time.Duration { return 30 * time.Second }
+
+func (handler asyncBillingRecoveryHandler) NewPayload() any {
+	cursor := service.AsyncBillingRecoveryCursor{}
+	latest, err := model.GetLatestSystemTask(handler.Type())
+	if err != nil || latest == nil || strings.TrimSpace(latest.Result) == "" {
+		return cursor
+	}
+	var previous service.AsyncBillingRecoverySummary
+	if err := common.UnmarshalJsonStr(latest.Result, &previous); err != nil {
+		return cursor
+	}
+	cursor.TaskTerminalAfterID = previous.NextTaskTerminalAfterID
+	cursor.MidjourneyTerminalAfterID = previous.NextMidjourneyTerminalAfterID
+	cursor.ReceiptCleanupAfterID = previous.NextReceiptCleanupAfterID
+	return cursor
+}
+
+func (asyncBillingRecoveryHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	cursor := service.AsyncBillingRecoveryCursor{}
+	if task != nil && strings.TrimSpace(task.Payload) != "" {
+		if err := common.UnmarshalJsonStr(task.Payload, &cursor); err != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+			return
+		}
+	}
+	summary := service.RunAsyncBillingRecoveryOnceWithCursor(ctx, runnerID, cursor)
+	status := model.SystemTaskStatusSucceeded
+	var runErr error
+	if summary.Errors > 0 {
+		status = model.SystemTaskStatusFailed
+		runErr = fmt.Errorf("async billing recovery completed with %d errors", summary.Errors)
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, runErr)
+}
+
+const billingLogAuditInterval = 5 * time.Minute
+const (
+	billingProjectionCleanupPageSize  = 500
+	billingLogConflictAuditPageSize   = 1000
+	billingLogConflictAuditMaxPages   = 20
+	billingLogConflictAuditTimeBudget = 30 * time.Second
+	billingLogConflictAuditOverlap    = 15 * time.Minute
+	// The scheduler waits another audit interval after completion. Scanning up
+	// to 350k rows per type preserves at least ~833 candidates/second even when
+	// a run consumes its full two-minute budget.
+	billingProjectionCleanupMaxPagesPerRun = 700
+	billingProjectionCleanupTimeBudget     = 2 * time.Minute
+)
+
+type billingLogAuditPayload struct {
+	InsertedAfter    int64  `json:"inserted_after"`
+	AuditThrough     int64  `json:"audit_through,omitempty"`
+	ConflictAfterKey string `json:"conflict_after_key,omitempty"`
+	StatsAfterID     int64  `json:"stats_after_id,omitempty"`
+	LogsAfterID      int64  `json:"logs_after_id,omitempty"`
+	AdminOpsAfterID  int64  `json:"admin_ops_after_id,omitempty"`
+}
+
+type billingLogAuditResult struct {
+	InsertedAfter           int64  `json:"inserted_after"`
+	AuditThrough            int64  `json:"audit_through"`
+	ConflictCount           int    `json:"conflict_count"`
+	OpenConflictCount       int64  `json:"open_conflict_count"`
+	ConflictPages           int    `json:"conflict_pages"`
+	ConflictBudgetExhausted bool   `json:"conflict_budget_exhausted"`
+	NextConflictAfterKey    string `json:"next_conflict_after_key,omitempty"`
+	StatsDeleted            int64  `json:"stats_deleted"`
+	LogsDeleted             int64  `json:"logs_deleted"`
+	StatsPages              int    `json:"stats_pages"`
+	LogsPages               int    `json:"logs_pages"`
+	AdminOpsDeleted         int64  `json:"admin_ops_deleted"`
+	AdminOpsHasMore         bool   `json:"admin_ops_has_more"`
+	BudgetExhausted         bool   `json:"budget_exhausted"`
+	NextStatsAfterID        int64  `json:"next_stats_after_id,omitempty"`
+	NextLogsAfterID         int64  `json:"next_logs_after_id,omitempty"`
+	NextAdminOpsAfterID     int64  `json:"next_admin_ops_after_id,omitempty"`
+}
+
+type billingProjectionCleanupResult struct {
+	StatsDeleted     int64
+	LogsDeleted      int64
+	StatsPages       int
+	LogsPages        int
+	BudgetExhausted  bool
+	NextStatsAfterID int64
+	NextLogsAfterID  int64
+}
+
+type billingProjectionCleanupDeps struct {
+	now       func() time.Time
+	statsPage func(context.Context, time.Time, int64, int) (int64, int64, bool, error)
+	logsPage  func(context.Context, time.Time, int64, int) (int64, int64, bool, error)
+}
+
+func drainExpiredBillingProjectionPages(
+	ctx context.Context,
+	cleanupNow time.Time,
+	statsAfterID int64,
+	logsAfterID int64,
+	deps billingProjectionCleanupDeps,
+) (billingProjectionCleanupResult, error) {
+	result := billingProjectionCleanupResult{
+		NextStatsAfterID: statsAfterID,
+		NextLogsAfterID:  logsAfterID,
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cleanupNow.IsZero() {
+		cleanupNow = time.Now()
+	}
+	if deps.now == nil {
+		deps.now = time.Now
+	}
+	if deps.statsPage == nil {
+		deps.statsPage = model.CleanupExpiredBillingStatsProjectionsPage
+	}
+	if deps.logsPage == nil {
+		deps.logsPage = model.CleanupExpiredBillingLogProjectionsPage
+	}
+
+	cleanupDeadline := cleanupNow.Add(billingProjectionCleanupTimeBudget)
+	statsDone := false
+	logsDone := false
+	for !statsDone || !logsDone {
+		progressed := false
+		if !statsDone && result.StatsPages < billingProjectionCleanupMaxPagesPerRun &&
+			deps.now().Before(cleanupDeadline) {
+			deleted, afterID, hasMore, err := deps.statsPage(
+				ctx, cleanupNow, result.NextStatsAfterID, billingProjectionCleanupPageSize,
+			)
+			if err != nil {
+				return result, err
+			}
+			result.StatsDeleted += deleted
+			result.StatsPages++
+			progressed = true
+			if hasMore {
+				result.NextStatsAfterID = afterID
+			} else {
+				result.NextStatsAfterID = 0
+				statsDone = true
+			}
+		}
+		if !logsDone && result.LogsPages < billingProjectionCleanupMaxPagesPerRun &&
+			deps.now().Before(cleanupDeadline) {
+			deleted, afterID, hasMore, err := deps.logsPage(
+				ctx, cleanupNow, result.NextLogsAfterID, billingProjectionCleanupPageSize,
+			)
+			if err != nil {
+				return result, err
+			}
+			result.LogsDeleted += deleted
+			result.LogsPages++
+			progressed = true
+			if hasMore {
+				result.NextLogsAfterID = afterID
+			} else {
+				result.NextLogsAfterID = 0
+				logsDone = true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	result.BudgetExhausted = !statsDone || !logsDone
+	return result, nil
+}
+
+type billingLogAuditHandler struct{}
+
+func (billingLogAuditHandler) Type() string { return model.SystemTaskTypeBillingLogAudit }
+
+func (billingLogAuditHandler) Enabled() bool {
+	return model.BillingLogSinkConflictAuditEnabled() || model.BillingProjectionMaintenanceEnabled()
+}
+
+func (billingLogAuditHandler) Interval() time.Duration { return billingLogAuditInterval }
+
+func (billingLogAuditHandler) NewPayload() any {
+	now := time.Now()
+	payload := billingLogAuditPayload{InsertedAfter: now.Add(-24 * time.Hour).Unix()}
+	latest, err := model.GetLatestSystemTask(model.SystemTaskTypeBillingLogAudit)
+	if err != nil || latest == nil {
+		return payload
+	}
+	if latest.Status == model.SystemTaskStatusSucceeded {
+		var previous billingLogAuditResult
+		if common.UnmarshalJsonStr(latest.Result, &previous) == nil {
+			payload.StatsAfterID = previous.NextStatsAfterID
+			payload.LogsAfterID = previous.NextLogsAfterID
+			payload.AdminOpsAfterID = previous.NextAdminOpsAfterID
+			if previous.ConflictBudgetExhausted && previous.InsertedAfter > 0 &&
+				previous.AuditThrough > previous.InsertedAfter && previous.NextConflictAfterKey != "" {
+				payload.InsertedAfter = previous.InsertedAfter
+				payload.AuditThrough = previous.AuditThrough
+				payload.ConflictAfterKey = previous.NextConflictAfterKey
+				return payload
+			}
+			if previous.AuditThrough > 0 {
+				payload.InsertedAfter = time.Unix(previous.AuditThrough, 0).
+					Add(-billingLogConflictAuditOverlap).Unix()
+				return payload
+			}
+		}
+		// Transitional fallback for tasks written before audit_through existed.
+		payload.InsertedAfter = time.Unix(latest.UpdatedAt, 0).
+			Add(-billingLogConflictAuditOverlap).Unix()
+		return payload
+	}
+	var previous billingLogAuditPayload
+	if latest.DecodePayload(&previous) == nil && previous.InsertedAfter > 0 &&
+		previous.InsertedAfter <= now.Add(time.Minute).Unix() && previous.AuditThrough >= 0 &&
+		(previous.AuditThrough == 0 || previous.AuditThrough > previous.InsertedAfter) &&
+		previous.StatsAfterID >= 0 && previous.LogsAfterID >= 0 && previous.AdminOpsAfterID >= 0 &&
+		len(previous.ConflictAfterKey) <= 64 {
+		payload = previous
+	}
+	return payload
+}
+
+func (billingLogAuditHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	payload := billingLogAuditPayload{}
+	if err := task.DecodePayload(&payload); err != nil || payload.InsertedAfter <= 0 ||
+		payload.InsertedAfter > time.Now().Add(time.Minute).Unix() || payload.AuditThrough < 0 ||
+		(payload.AuditThrough > 0 && payload.AuditThrough <= payload.InsertedAfter) ||
+		payload.StatsAfterID < 0 || payload.LogsAfterID < 0 || payload.AdminOpsAfterID < 0 ||
+		len(payload.ConflictAfterKey) > 64 {
+		if err == nil {
+			err = errors.New("billing log audit payload is invalid")
+		}
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	auditThrough := time.Unix(payload.AuditThrough, 0)
+	if payload.AuditThrough == 0 {
+		var err error
+		auditThrough, err = model.BillingLogSinkAuditWindowEnd(ctx)
+		if err != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+			return
+		}
+	}
+	conflictCount := 0
+	conflictPages := 0
+	conflictAfterKey := payload.ConflictAfterKey
+	conflictHasMore := false
+	conflictDeadline := time.Now().Add(billingLogConflictAuditTimeBudget)
+	for conflictPages < billingLogConflictAuditMaxPages && time.Now().Before(conflictDeadline) {
+		page, err := model.AuditBillingLogSinkConflictsPage(
+			ctx, time.Unix(payload.InsertedAfter, 0), auditThrough,
+			conflictAfterKey, billingLogConflictAuditPageSize,
+		)
+		if err != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+			return
+		}
+		conflictPages++
+		if err := model.QuarantineBillingLogSinkConflicts(ctx, page.Conflicts, time.Now()); err != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+			return
+		}
+		conflictCount += len(page.Conflicts)
+		conflictHasMore = page.HasMore
+		if !page.HasMore {
+			conflictAfterKey = ""
+			break
+		}
+		if page.NextOperationKey == "" || page.NextOperationKey <= conflictAfterKey {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil,
+				errors.New("billing log conflict audit cursor did not advance"))
+			return
+		}
+		conflictAfterKey = page.NextOperationKey
+	}
+	openConflictCount, err := model.CountOpenBillingLogSinkConflicts(ctx)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	cleanup, err := drainExpiredBillingProjectionPages(
+		ctx, time.Now(), payload.StatsAfterID, payload.LogsAfterID, billingProjectionCleanupDeps{},
+	)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	adminOpsDeleted, nextAdminOpsAfterID, adminOpsHasMore, err :=
+		model.CleanupExpiredBillingProjectionAdminOperationsPage(
+			ctx, time.Now(), payload.AdminOpsAfterID, billingProjectionCleanupPageSize,
+		)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, billingLogAuditResult{
+		InsertedAfter:           payload.InsertedAfter,
+		AuditThrough:            auditThrough.Unix(),
+		ConflictCount:           conflictCount,
+		OpenConflictCount:       openConflictCount,
+		ConflictPages:           conflictPages,
+		ConflictBudgetExhausted: conflictHasMore,
+		NextConflictAfterKey:    conflictAfterKey,
+		StatsDeleted:            cleanup.StatsDeleted,
+		LogsDeleted:             cleanup.LogsDeleted,
+		StatsPages:              cleanup.StatsPages,
+		LogsPages:               cleanup.LogsPages,
+		AdminOpsDeleted:         adminOpsDeleted,
+		AdminOpsHasMore:         adminOpsHasMore,
+		BudgetExhausted:         cleanup.BudgetExhausted,
+		NextStatsAfterID:        cleanup.NextStatsAfterID,
+		NextLogsAfterID:         cleanup.NextLogsAfterID,
+		NextAdminOpsAfterID:     nextAdminOpsAfterID,
+	}, nil)
 }
 
 type routingCostSyncHandler struct{}
@@ -671,23 +1002,23 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
-	acceptedBindingIDs := make(map[int]int)
-	fencedBindingIDs := make(map[int]int)
+	acceptedChannelFences := make(map[int]model.RoutingChannelStateFence)
+	fencedChannelFences := make(map[int]model.RoutingChannelStateFence)
 	rejectedChannels := make(map[int]struct{})
 	persistedMetricsByChannel := make(map[int][]model.RoutingChannelMetric)
 	persistedBreakerCounts := make(map[int]int)
 	defer func() {
 		persistedMetrics := make([]model.RoutingChannelMetric, 0)
 		for channelID, metrics := range persistedMetricsByChannel {
-			if _, accepted := acceptedBindingIDs[channelID]; accepted {
+			if _, accepted := acceptedChannelFences[channelID]; accepted {
 				persistedMetrics = append(persistedMetrics, metrics...)
 			}
 		}
 		routinghotcache.ApplyMetricDeltas(persistedMetrics, setting.MetricBucketSec)
 
-		metricCount, breakerCount, verifyErr := finalizeFlushedRoutingBindingState(
+		metricCount, breakerCount, verifyErr := finalizeFlushedRoutingChannelState(
 			ctx,
-			acceptedBindingIDs,
+			acceptedChannelFences,
 			persistedMetricsByChannel,
 			persistedBreakerCounts,
 		)
@@ -742,8 +1073,8 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 			continue
 		}
 		eligibility := eligibilityByChannel[metric.ChannelID]
-		expectedBindingID := fencedBindingIDs[metric.ChannelID]
-		bindingID, stateAccepted, err := eligibility.UpsertRoutingChannelMetricForBindingContext(ctx, &metric, expectedBindingID)
+		expectedFence := fencedChannelFences[metric.ChannelID]
+		fence, stateAccepted, err := eligibility.UpsertRoutingChannelMetricForChannelContext(ctx, &metric, expectedFence)
 		if err != nil {
 			routingmetrics.RequeueSnapshots(validMetrics[i:])
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -751,20 +1082,20 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 			}
 			return summary, err
 		}
-		if bindingID == 0 {
+		if !fence.Valid() {
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(acceptedChannelFences, metric.ChannelID)
 			delete(persistedMetricsByChannel, metric.ChannelID)
 			delete(persistedBreakerCounts, metric.ChannelID)
 			continue
 		}
-		if expectedBindingID == 0 {
-			fencedBindingIDs[metric.ChannelID] = bindingID
-		} else if bindingID != expectedBindingID {
+		if !expectedFence.Valid() {
+			fencedChannelFences[metric.ChannelID] = fence
+		} else if fence != expectedFence {
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(acceptedChannelFences, metric.ChannelID)
 			delete(persistedMetricsByChannel, metric.ChannelID)
 			delete(persistedBreakerCounts, metric.ChannelID)
 			continue
@@ -772,21 +1103,21 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		if !stateAccepted {
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(acceptedChannelFences, metric.ChannelID)
 			delete(persistedMetricsByChannel, metric.ChannelID)
 			delete(persistedBreakerCounts, metric.ChannelID)
 			continue
 		}
-		matches, verifyErr := model.RoutingChannelBindingMatchesContext(ctx, metric.ChannelID, bindingID)
+		matches, verifyErr := model.RoutingChannelStateFenceMatchesContext(ctx, fence)
 		if verifyErr != nil {
-			if acceptedBindingID, accepted := acceptedBindingIDs[metric.ChannelID]; accepted && acceptedBindingID != bindingID {
+			if acceptedFence, accepted := acceptedChannelFences[metric.ChannelID]; accepted && acceptedFence != fence {
 				clearRoutingRuntimeChannelState(metric.ChannelID)
 				rejectedChannels[metric.ChannelID] = struct{}{}
-				delete(acceptedBindingIDs, metric.ChannelID)
+				delete(acceptedChannelFences, metric.ChannelID)
 				delete(persistedMetricsByChannel, metric.ChannelID)
 				delete(persistedBreakerCounts, metric.ChannelID)
 			} else {
-				acceptedBindingIDs[metric.ChannelID] = bindingID
+				acceptedChannelFences[metric.ChannelID] = fence
 				persistedMetricsByChannel[metric.ChannelID] = append(persistedMetricsByChannel[metric.ChannelID], metric)
 			}
 			routingmetrics.RequeueSnapshots(validMetrics[i+1:])
@@ -795,20 +1126,20 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		if !matches {
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(acceptedChannelFences, metric.ChannelID)
 			delete(persistedMetricsByChannel, metric.ChannelID)
 			delete(persistedBreakerCounts, metric.ChannelID)
 			continue
 		}
-		if acceptedBindingID, accepted := acceptedBindingIDs[metric.ChannelID]; accepted && acceptedBindingID != bindingID {
+		if acceptedFence, accepted := acceptedChannelFences[metric.ChannelID]; accepted && acceptedFence != fence {
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, metric.ChannelID)
+			delete(acceptedChannelFences, metric.ChannelID)
 			delete(persistedMetricsByChannel, metric.ChannelID)
 			delete(persistedBreakerCounts, metric.ChannelID)
 			continue
 		}
-		acceptedBindingIDs[metric.ChannelID] = bindingID
+		acceptedChannelFences[metric.ChannelID] = fence
 		persistedMetricsByChannel[metric.ChannelID] = append(persistedMetricsByChannel[metric.ChannelID], metric)
 	}
 
@@ -850,8 +1181,8 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		}
 		state := routingBreakerSnapshotToModel(snapshot)
 		eligibility := eligibilityByChannel[snapshot.Key.ChannelID]
-		expectedBindingID := fencedBindingIDs[snapshot.Key.ChannelID]
-		bindingID, stateAccepted, err := eligibility.UpsertRoutingBreakerStateForBindingContext(ctx, &state, expectedBindingID)
+		expectedFence := fencedChannelFences[snapshot.Key.ChannelID]
+		fence, stateAccepted, err := eligibility.UpsertRoutingBreakerStateForChannelContext(ctx, &state, expectedFence)
 		if err != nil {
 			routingbreaker.RequeueDirtySnapshots(validBreakers[i:])
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -859,20 +1190,20 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 			}
 			return summary, err
 		}
-		if bindingID == 0 {
+		if !fence.Valid() {
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(acceptedChannelFences, snapshot.Key.ChannelID)
 			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			continue
 		}
-		if expectedBindingID == 0 {
-			fencedBindingIDs[snapshot.Key.ChannelID] = bindingID
-		} else if bindingID != expectedBindingID {
+		if !expectedFence.Valid() {
+			fencedChannelFences[snapshot.Key.ChannelID] = fence
+		} else if fence != expectedFence {
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(acceptedChannelFences, snapshot.Key.ChannelID)
 			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			continue
@@ -880,21 +1211,21 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		if !stateAccepted {
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(acceptedChannelFences, snapshot.Key.ChannelID)
 			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			continue
 		}
-		matches, verifyErr := model.RoutingChannelBindingMatchesContext(ctx, snapshot.Key.ChannelID, bindingID)
+		matches, verifyErr := model.RoutingChannelStateFenceMatchesContext(ctx, fence)
 		if verifyErr != nil {
-			if acceptedBindingID, accepted := acceptedBindingIDs[snapshot.Key.ChannelID]; accepted && acceptedBindingID != bindingID {
+			if acceptedFence, accepted := acceptedChannelFences[snapshot.Key.ChannelID]; accepted && acceptedFence != fence {
 				clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 				rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-				delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+				delete(acceptedChannelFences, snapshot.Key.ChannelID)
 				delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 				delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			} else {
-				acceptedBindingIDs[snapshot.Key.ChannelID] = bindingID
+				acceptedChannelFences[snapshot.Key.ChannelID] = fence
 				persistedBreakerCounts[snapshot.Key.ChannelID]++
 			}
 			routingbreaker.RequeueDirtySnapshots(validBreakers[i+1:])
@@ -903,20 +1234,20 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 		if !matches {
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(acceptedChannelFences, snapshot.Key.ChannelID)
 			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			continue
 		}
-		if acceptedBindingID, accepted := acceptedBindingIDs[snapshot.Key.ChannelID]; accepted && acceptedBindingID != bindingID {
+		if acceptedFence, accepted := acceptedChannelFences[snapshot.Key.ChannelID]; accepted && acceptedFence != fence {
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
-			delete(acceptedBindingIDs, snapshot.Key.ChannelID)
+			delete(acceptedChannelFences, snapshot.Key.ChannelID)
 			delete(persistedMetricsByChannel, snapshot.Key.ChannelID)
 			delete(persistedBreakerCounts, snapshot.Key.ChannelID)
 			continue
 		}
-		acceptedBindingIDs[snapshot.Key.ChannelID] = bindingID
+		acceptedChannelFences[snapshot.Key.ChannelID] = fence
 		persistedBreakerCounts[snapshot.Key.ChannelID]++
 	}
 
@@ -961,16 +1292,16 @@ func clearRoutingRuntimeChannelState(channelID int) {
 	routingbreaker.ClearDefaultChannelWithCache(channelID, routinghotcache.ClearChannel)
 }
 
-func finalizeFlushedRoutingBindingState(
+func finalizeFlushedRoutingChannelState(
 	ctx context.Context,
-	acceptedBindingIDs map[int]int,
+	acceptedChannelFences map[int]model.RoutingChannelStateFence,
 	persistedMetricsByChannel map[int][]model.RoutingChannelMetric,
 	persistedBreakerCounts map[int]int,
 ) (int, int, error) {
-	for channelID, bindingID := range acceptedBindingIDs {
-		matches, err := model.RoutingChannelBindingMatchesContext(ctx, channelID, bindingID)
+	for channelID, fence := range acceptedChannelFences {
+		matches, err := model.RoutingChannelStateFenceMatchesContext(ctx, fence)
 		if err != nil {
-			for acceptedChannelID := range acceptedBindingIDs {
+			for acceptedChannelID := range acceptedChannelFences {
 				clearRoutingRuntimeChannelState(acceptedChannelID)
 			}
 			return 0, 0, err
@@ -985,13 +1316,13 @@ func finalizeFlushedRoutingBindingState(
 
 	metricCount := 0
 	for channelID, metrics := range persistedMetricsByChannel {
-		if _, accepted := acceptedBindingIDs[channelID]; accepted {
+		if _, accepted := acceptedChannelFences[channelID]; accepted {
 			metricCount += len(metrics)
 		}
 	}
 	breakerCount := 0
 	for channelID, count := range persistedBreakerCounts {
-		if _, accepted := acceptedBindingIDs[channelID]; accepted {
+		if _, accepted := acceptedChannelFences[channelID]; accepted {
 			breakerCount += count
 		}
 	}
@@ -1195,18 +1526,39 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	syncRoutingBreakerConfigFromSetting(setting)
 
 	summary := map[string]any{
-		"bindings":            0,
-		"accounts":            0,
-		"snapshots":           0,
-		"versions_created":    0,
-		"metrics":             0,
-		"breakers":            0,
-		"loaded_breakers":     0,
-		"errors":              0,
-		"successful_accounts": 0,
-		"partial_accounts":    0,
-		"skipped_backoff":     0,
-		"stale_bindings":      0,
+		"bindings":             0,
+		"accounts":             0,
+		"snapshots":            0,
+		"versions_created":     0,
+		"metrics":              0,
+		"breakers":             0,
+		"loaded_breakers":      0,
+		"errors":               0,
+		"successful_accounts":  0,
+		"partial_accounts":     0,
+		"skipped_backoff":      0,
+		"stale_bindings":       0,
+		"credentials_scanned":  0,
+		"credentials_rotated":  0,
+		"credential_conflicts": 0,
+	}
+
+	credentialCursor := 0
+	for {
+		batch, err := model.ReencryptRoutingChannelBindingCredentialsBatchContext(ctx, credentialCursor, 100)
+		if err != nil {
+			return summary, err
+		}
+		summary["credentials_scanned"] = summary["credentials_scanned"].(int) + batch.Scanned
+		summary["credentials_rotated"] = summary["credentials_rotated"].(int) + batch.Changed
+		summary["credential_conflicts"] = summary["credential_conflicts"].(int) + batch.Conflicts
+		if batch.Done {
+			break
+		}
+		if batch.NextID <= credentialCursor {
+			return summary, model.ErrRoutingBindingChanged
+		}
+		credentialCursor = batch.NextID
 	}
 
 	flushSummary, err := flushRoutingRuntimeState(ctx, setting)
@@ -1503,7 +1855,7 @@ func routingUpstreamAccountIdentity(binding model.RoutingChannelBinding, credent
 			identityParts = append(identityParts, fmt.Sprintf("user:%d", *binding.NewAPIUserID))
 			maskedIdentity += fmt.Sprintf(" / user %d", *binding.NewAPIUserID)
 		} else {
-			token := routingBearerToken(credentials)
+			token := routingBearerToken(binding.UpstreamType, credentials)
 			identityParts = append(identityParts, "token:"+token)
 			maskedIdentity += " / " + maskRoutingToken(token)
 		}
@@ -2013,6 +2365,10 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 		if err != nil {
 			return nil, err
 		}
+		ctx, err = withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+		if err != nil {
+			return nil, err
+		}
 		return fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
 	}
 
@@ -2130,6 +2486,10 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 			err = routingSafeErrorWithCredentials(err, credentials)
 		}
 	}()
+	ctx, err = withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
 	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
 		snapshots, err := fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
 		if err != nil {
@@ -2169,6 +2529,10 @@ func fetchRoutingNewAPIPricingPayload(
 	binding model.RoutingChannelBinding,
 	credentials model.RoutingCredentials,
 ) (routingPricingResponse, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/pricing", nil)
 	if err != nil {
 		return routingPricingResponse{}, err
@@ -2254,6 +2618,10 @@ func fetchRoutingUpstreamBalanceValue(
 	binding model.RoutingChannelBinding,
 	credentials model.RoutingCredentials,
 ) (float64, bool, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return 0, false, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/user/self", nil)
 	if err != nil {
 		return 0, false, err
@@ -2295,6 +2663,18 @@ func fetchRoutingUpstreamBalanceValue(
 	return balance, true, nil
 }
 
+func withRoutingCostBindingEgressPolicy(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) (context.Context, error) {
+	allowedPrivateCIDRs, err := binding.GetEgressAllowedPrivateCIDRs()
+	if err != nil {
+		return nil, errors.New("invalid routing cost egress policy")
+	}
+	return service.WithRoutingCostEgressPolicy(ctx, allowedPrivateCIDRs, credentials.CustomCAPEM)
+}
+
 func persistRoutingBalance(ctx context.Context, binding model.RoutingChannelBinding, balance float64, updatedTime int64) error {
 	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
 		return err
@@ -2314,7 +2694,7 @@ func persistRoutingBalance(ctx context.Context, binding model.RoutingChannelBind
 }
 
 func applyRoutingAuthHeaders(request *http.Request, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) {
-	if token := routingBearerToken(credentials); token != "" {
+	if token := routingBearerToken(binding.UpstreamType, credentials); token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	if binding.NewAPIUserID != nil && *binding.NewAPIUserID > 0 {
@@ -2330,17 +2710,19 @@ func routingCleanUpstreamErrorMessage(message string) string {
 	return message
 }
 
-func routingBearerToken(credentials model.RoutingCredentials) string {
-	switch {
-	case strings.TrimSpace(credentials.NewAPIAccessToken) != "":
-		return strings.TrimSpace(credentials.NewAPIAccessToken)
-	case strings.TrimSpace(credentials.Sub2APIToken) != "":
-		return strings.TrimSpace(credentials.Sub2APIToken)
-	case strings.TrimSpace(credentials.GatewayAPIKey) != "":
-		return strings.TrimSpace(credentials.GatewayAPIKey)
-	default:
-		return ""
+func routingBearerToken(upstreamType string, credentials model.RoutingCredentials) string {
+	credentials = credentials.ForUpstream(upstreamType)
+	switch strings.ToLower(strings.TrimSpace(upstreamType)) {
+	case model.RoutingUpstreamTypeNewAPI:
+		if credentials.NewAPIAccessToken != "" {
+			return credentials.NewAPIAccessToken
+		}
+	case model.RoutingUpstreamTypeSub2API:
+		if credentials.Sub2APIToken != "" {
+			return credentials.Sub2APIToken
+		}
 	}
+	return credentials.GatewayAPIKey
 }
 
 func routingPricingItemServesGroup(enableGroups []string, group string) bool {
@@ -2355,7 +2737,9 @@ func routingPricingItemServesGroup(enableGroups []string, group string) bool {
 	return false
 }
 
-func routingPricingGroups(payload routingPricingResponse) []string {
+const routingPricingGroupOutputLimit = 500
+
+func routingPricingGroups(payload routingPricingResponse) ([]string, int) {
 	groupSet := map[string]struct{}{}
 	for group := range payload.GroupRatio {
 		groupSet[group] = struct{}{}
@@ -2375,7 +2759,11 @@ func routingPricingGroups(payload routingPricingResponse) []string {
 		groups = append(groups, group)
 	}
 	sort.Strings(groups)
-	return groups
+	total := len(groups)
+	if len(groups) > routingPricingGroupOutputLimit {
+		groups = groups[:routingPricingGroupOutputLimit]
+	}
+	return groups, total
 }
 
 func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.RoutingBreakerState {

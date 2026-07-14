@@ -1,10 +1,10 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -38,6 +38,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gorm.io/gorm"
 )
 
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
@@ -85,16 +86,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		ws          *websocket.Conn
 	)
 
-	if relayFormat == types.RelayFormatOpenAIRealtime {
-		var err error
-		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
-		if err != nil {
-			helper.WssError(c, ws, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry()).ToOpenAIError())
-			return
-		}
-		defer ws.Close()
-	}
-
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
@@ -109,10 +100,26 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
 			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
 		} else {
-			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest)
+			newAPIError = types.NewErrorWithStatusCode(
+				err,
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
 		return
 	}
+	validatedModelName := validatedRoutingModelName(c, relayFormat, request)
+	if validatedModelName == "" {
+		newAPIError = types.NewErrorWithStatusCode(
+			errors.New("model is required"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+		return
+	}
+	c.Set("original_model", validatedModelName)
 
 	relayInfo, err := relaycommon.GenRelayInfo(c, relayFormat, request, ws)
 	if err != nil {
@@ -160,6 +167,40 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 
 	relayInfo.SetEstimatePromptTokens(tokens)
+	outputTokens := max(common.GetContextKeyInt(c, constant.ContextKeyRoutingEstimatedOutput), 0)
+	if meta != nil && meta.MaxTokens > 0 {
+		outputTokens = meta.MaxTokens
+	}
+	requestProfile, profileErr := buildRoutingRequestProfileTemplate(
+		c,
+		relayFormat,
+		request,
+		validatedModelName,
+	)
+	if profileErr != nil {
+		newAPIError = types.NewErrorWithStatusCode(
+			profileErr,
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+		return
+	}
+	applyValidatedRoutingTokenEstimate(
+		c,
+		relayFormat,
+		max(tokens, 0),
+		max(outputTokens, 0),
+		meta != nil && meta.MaxTokens > 0,
+		requestProfile,
+	)
+	common.SetContextKey(c, constant.ContextKeyRoutingRequestProfile, requestProfile)
+	if common.GetContextKeyBool(c, constant.ContextKeyRoutingSelectionDeferred) {
+		if _, selectionErr := middleware.SelectChannelForValidatedRequest(c, validatedModelName); selectionErr != nil {
+			newAPIError = selectionErr
+			return
+		}
+	}
 
 	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
 	if err != nil {
@@ -188,6 +229,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError)
 		}
 	}()
+	if relayFormat == types.RelayFormatOpenAIRealtime {
+		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			newAPIError = types.NewErrorWithStatusCode(
+				fmt.Errorf("upgrade realtime websocket: %w", err),
+				types.ErrorCodeGetChannelFailed,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+			return
+		}
+		relayInfo.ClientWs = ws
+		defer ws.Close()
+	}
 
 	retryParam := &service.RetryParam{
 		Ctx:         c,
@@ -271,21 +326,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		prepareRoutingRelayAttempt(relayInfo)
-		if attemptLease != nil {
-			if markErr := attemptLease.MarkSent(); markErr != nil {
-				attemptLease.Finish()
-				releaseRoutingCapacityReservation(c)
-				finishRoutingCanaryAttempt(c)
-				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
-				newAPIError = types.NewErrorWithStatusCode(
-					fmt.Errorf("channel routing attempt state transition failed: %w", markErr),
-					types.ErrorCodeGetChannelFailed,
-					http.StatusServiceUnavailable,
-					types.ErrOptionWithSkipRetry(),
-				)
-				break
-			}
-		}
+		sendState := bindRoutingUpstreamAttempt(c, relayInfo, channel, attemptLease)
 		serialAudit, auditErr := reserveRoutingSerialAttemptAudit(c, relayInfo, channel)
 		if auditErr != nil {
 			logger.LogWarn(c, fmt.Sprintf("channel routing serial attempt audit unavailable: %v", auditErr))
@@ -294,7 +335,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		func() {
 			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
-			defer finishRoutingCanaryAttempt(c)
+			defer finishRoutingCanaryAttempt(c, sendState)
+			defer relaycommon.ClearRoutingUpstreamSendState(c)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				newAPIError = relay.WssHelper(c, relayInfo)
@@ -307,6 +349,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 		}()
 		attemptAPIError := newAPIError
+		if attemptAPIError == nil && !sendState.Sent() {
+			attemptAPIError = types.NewErrorWithStatusCode(
+				errors.New("relay completed without crossing the upstream send boundary"),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+			newAPIError = attemptAPIError
+		}
 		if capacityFailure := service.RoutingCapacityReservationFailure(c); capacityFailure != nil {
 			attemptAPIError = types.NewErrorWithStatusCode(
 				capacityFailure,
@@ -320,7 +371,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if attemptAPIError != nil && service.RoutingCapacityReservationFailure(c) != nil {
 			controlAPIError = attemptAPIError
 		}
-		clientCommitted := routingAttemptClientCommitted(c, relayInfo)
+		clientCommitted := sendState.Sent() && routingAttemptClientCommitted(c, relayInfo)
 		if attemptLease != nil && clientCommitted {
 			_ = attemptLease.MarkClientCommitted()
 		}
@@ -351,13 +402,21 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			attemptSuccess,
 			classificationAPIError,
 			classification,
+			sendState.Sent(),
 			clientCommitted,
 			willRetry,
 		); err != nil {
 			logger.LogWarn(c, fmt.Sprintf("channel routing serial attempt audit completion failed: %v", err))
 		}
 		attemptLease.Finish()
-		recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
+		if sendState.Sent() {
+			recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
+			if !attemptSuccess &&
+				(classification.Responsibility == routingerror.ResponsibilityProvider ||
+					classification.Responsibility == routingerror.ResponsibilityNetwork) {
+				service.MarkRoutingChannelFailed(c, channel.Id)
+			}
+		}
 		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
 
 		if controlAPIError == nil {
@@ -369,7 +428,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, classification)
+		if sendState.Sent() {
+			processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, classification)
+		}
 
 		if !willRetry {
 			break
@@ -395,12 +456,16 @@ func writeRelayAPIErrorResponse(
 	if c == nil || apiErr == nil {
 		return
 	}
-	if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
+	if c.Writer.Written() && (relayFormat != types.RelayFormatOpenAIRealtime || ws == nil) {
 		return
 	}
 	switch relayFormat {
 	case types.RelayFormatOpenAIRealtime:
-		helper.WssError(c, ws, apiErr.ToOpenAIError())
+		if ws != nil {
+			helper.WssError(c, ws, apiErr.ToOpenAIError())
+			return
+		}
+		c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError()})
 	case types.RelayFormatClaude:
 		c.JSON(apiErr.StatusCode, gin.H{
 			"type":  "error",
@@ -453,6 +518,57 @@ func recordRoutingAttemptEffects(
 	}
 	setting := smart_routing_setting.GetSetting()
 	syncRoutingBreakerConfigFromSetting(setting)
+	credentialID := common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID)
+	upstreamAccountID := common.GetContextKeyInt(c, constant.ContextKeyRoutingUpstreamAccountID)
+	if info.ChannelMeta != nil {
+		if credentialID <= 0 {
+			credentialID = info.ChannelMeta.RoutingCredentialID
+		}
+		if upstreamAccountID <= 0 {
+			upstreamAccountID = info.ChannelMeta.RoutingUpstreamAccountID
+		}
+	}
+	now := time.Now()
+	if success {
+		if credentialID > 0 {
+			channelrouting.ClearCredentialAuthFailure(credentialID, channelID, now)
+			channelrouting.ClearCredentialCapacityCooldown(credentialID, channelID, now)
+		}
+		if upstreamAccountID > 0 {
+			channelrouting.ClearUpstreamAccountUnavailable(upstreamAccountID, now)
+		}
+	} else {
+		switch {
+		case classification.Responsibility == routingerror.ResponsibilityCredential && credentialID > 0:
+			channelrouting.RecordCredentialAuthFailure(
+				credentialID, channelID, classification.Rule, time.Time{}, now,
+			)
+		case statusCode == http.StatusPaymentRequired && upstreamAccountID > 0:
+			channelrouting.RecordUpstreamAccountUnavailable(
+				upstreamAccountID, statusCode, classification.Rule, time.Time{}, now,
+			)
+		case classification.Responsibility == routingerror.ResponsibilityCapacity &&
+			classification.CapacityEffect == routingerror.CapacityCooldown && credentialID > 0:
+			maxCooldown := time.Duration(setting.MaxCooldownSec) * time.Second
+			if maxCooldown <= 0 {
+				maxCooldown = routingbreaker.DefaultConfig().MaxCooldown
+			}
+			baseCooldown := time.Duration(setting.BackoffBaseMs429) * time.Millisecond
+			if baseCooldown <= 0 {
+				baseCooldown = time.Second
+			}
+			cooldown := retryAfterFromAPIError(apiErr, maxCooldown)
+			if cooldown <= 0 {
+				cooldown = baseCooldown
+			}
+			if maxCooldown > 0 && cooldown > maxCooldown {
+				cooldown = maxCooldown
+			}
+			channelrouting.RecordCredentialCapacityCooldown(
+				credentialID, channelID, statusCode, now.Add(cooldown), now,
+			)
+		}
+	}
 	group := info.UsingGroup
 	if group == "" {
 		group = common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -698,16 +814,70 @@ func commitRoutingCapacityAttempt(c *gin.Context) *types.NewAPIError {
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if err := service.MarkChannelRoutingCanaryAttemptStarted(c); err != nil {
-		releaseErr := service.ReleaseRoutingCapacityReservation(c)
-		return types.NewErrorWithStatusCode(
-			fmt.Errorf("channel routing canary attempt registration failed: %w", errors.Join(err, releaseErr)),
-			types.ErrorCodeGetChannelFailed,
-			http.StatusServiceUnavailable,
-			types.ErrOptionWithSkipRetry(),
-		)
-	}
 	return nil
+}
+
+func bindRoutingUpstreamAttempt(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	channel *model.Channel,
+	attemptLease *channelrouting.AttemptLease,
+) *relaycommon.RoutingUpstreamSendState {
+	state := relaycommon.NewRoutingUpstreamSendState(func() error {
+		var persistContext context.Context
+		var cancel context.CancelFunc
+		reservationAuthorized := false
+		if info != nil && info.TaskRelayInfo != nil && info.AsyncBillingReservationID > 0 {
+			if channel == nil || channel.Id <= 0 {
+				return model.ErrAsyncBillingReservationInvariant
+			}
+			acceptanceIntent, ok := relay.GetAsyncBillingAcceptanceIntent(c)
+			if !ok || acceptanceIntent == nil {
+				return model.ErrAsyncBillingReservationInvariant
+			}
+			persistContext = context.Background()
+			if c != nil && c.Request != nil {
+				persistContext = context.WithoutCancel(c.Request.Context())
+			}
+			persistContext, cancel = context.WithTimeout(persistContext, 5*time.Second)
+			defer cancel()
+			if _, err := model.AuthorizeAsyncBillingAttempt(persistContext, info.AsyncBillingReservationID, model.AsyncBillingAttemptSpec{
+				AttemptIndex:     info.RetryIndex,
+				ChannelID:        channel.Id,
+				CredentialID:     common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),
+				ChannelVersion:   channel.RoutingGeneration,
+				SendDeadlineMs:   info.AsyncBillingSendDeadlineMs,
+				AcceptanceIntent: acceptanceIntent,
+			}, time.Now()); err != nil {
+				return err
+			}
+			reservationAuthorized = true
+		}
+		rejectAuthorized := func(cause error) error {
+			if !reservationAuthorized {
+				return cause
+			}
+			rejectErr := model.RejectAsyncBillingAttempt(
+				persistContext, info.AsyncBillingReservationID, info.RetryIndex,
+				"local_send_gate_failed", time.Now(),
+			)
+			return errors.Join(cause, rejectErr)
+		}
+		if attemptLease != nil {
+			if err := attemptLease.MarkSent(); err != nil {
+				return rejectAuthorized(err)
+			}
+		}
+		if err := service.MarkChannelRoutingCanaryAttemptStarted(c); err != nil {
+			if attemptLease != nil {
+				attemptLease.Finish()
+			}
+			return rejectAuthorized(err)
+		}
+		return nil
+	})
+	relaycommon.BindRoutingUpstreamSendState(c, state)
+	return state
 }
 
 func finishRoutingCanaryOutcome(
@@ -731,7 +901,10 @@ func finishRoutingCanaryOutcome(
 	}
 }
 
-func finishRoutingCanaryAttempt(c *gin.Context) {
+func finishRoutingCanaryAttempt(c *gin.Context, sendState *relaycommon.RoutingUpstreamSendState) {
+	if sendState == nil || !sendState.Sent() {
+		return
+	}
 	if err := service.FinishChannelRoutingCanaryAttempt(c); err != nil {
 		logger.LogError(c, fmt.Sprintf("channel routing canary attempt release failed: %v", err))
 	}
@@ -887,7 +1060,12 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	useChannel := c.GetStringSlice("use_channel")
 	useChannel = append(useChannel, fmt.Sprintf("%d", channelId))
 	c.Set("use_channel", useChannel)
-	service.MarkRoutingTried(c, channelId)
+	service.MarkRoutingTargetTried(
+		c,
+		channelId,
+		common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),
+		common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
+	)
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
@@ -953,6 +1131,35 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
+func getTaskRetryChannel(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	retryParam *service.RetryParam,
+) (*model.Channel, *types.NewAPIError) {
+	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
+	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
+	if err != nil {
+		return nil, types.NewError(
+			fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()),
+			types.ErrorCodeGetChannelFailed,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if channel == nil {
+		return nil, types.NewError(
+			fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName),
+			types.ErrorCodeGetChannelFailed,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if setupErr := middleware.SetupContextForSelectedChannelMetadata(c, channel, info.OriginModelName); setupErr != nil {
+		cancelRoutingCapacityReservation(c)
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, info.OriginModelName, selectGroup)
+		return nil, setupErr
+	}
+	return channel, nil
+}
+
 func shouldRetry(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
@@ -961,6 +1168,10 @@ func shouldRetry(
 	retryTimes int,
 ) bool {
 	if apiErr == nil {
+		return false
+	}
+	if policy, ok := service.ChannelRoutingRequestAttemptPolicy(c); ok &&
+		(!policy.RetryAllowed || !policy.CrossChannelRetryAllowed) {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -1049,48 +1260,508 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 }
 
 func RelayMidjourney(c *gin.Context) {
-	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatMjProxy, nil, nil)
+	defer service.ReleaseAllRoutingHalfOpenProbes(c)
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"description": fmt.Sprintf("failed to generate relay info: %s", err.Error()),
-			"type":        "upstream_error",
-			"code":        4,
+	relayMode := c.GetInt("relay_mode")
+	if relayMode == relayconstant.RelayModeUnknown {
+		relayMode = relayconstant.Path2RelayModeMidjourney(c.Request.URL.Path)
+		c.Set("relay_mode", relayMode)
+	}
+	switch relayMode {
+	case relayconstant.RelayModeMidjourneyNotify:
+		writeMidjourneyOutcome(c, relay.MidjourneyRelayOutcome{
+			Error: relay.RelayMidjourneyNotify(c), StatusCode: http.StatusBadRequest, LocalError: true,
 		})
+		return
+	case relayconstant.RelayModeMidjourneyTaskFetch, relayconstant.RelayModeMidjourneyTaskFetchByCondition:
+		if authorizationErr := authorizeMidjourneyFetchModels(c, relayMode); authorizationErr != nil {
+			writeMidjourneyAPIError(c, authorizationErr)
+			return
+		}
+		writeMidjourneyOutcome(c, relay.MidjourneyRelayOutcome{
+			Error: relay.RelayMidjourneyTask(c, relayMode), StatusCode: http.StatusBadRequest, LocalError: true,
+		})
+		return
+	case relayconstant.RelayModeMidjourneyTaskImageSeed:
+		originTask, channel, apiErr := prepareMidjourneyOriginChannel(
+			c, c.Param("id"), "", true,
+		)
+		if apiErr != nil {
+			writeMidjourneyAPIError(c, apiErr)
+			return
+		}
+		modelName := service.CovertMjpActionToModelName(originTask.Action)
+		c.Set("original_model", modelName)
+		relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatMjProxy, nil, nil)
+		if err != nil {
+			writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+				err, types.ErrorCodeGenRelayInfoFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry(),
+			))
+			return
+		}
+		relayInfo.OriginModelName = modelName
+		relayInfo.InitChannelMeta(c)
+		outcome := executeMidjourneyRoutingAttempt(c, relayInfo, channel, func() relay.MidjourneyRelayOutcome {
+			return relay.RelayMidjourneyTaskImageSeed(
+				c, originTask, channel, common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+			)
+		})
+		writeMidjourneyOutcome(c, outcome)
 		return
 	}
 
-	var mjErr *dto.MidjourneyResponse
-	switch relayInfo.RelayMode {
-	case relayconstant.RelayModeMidjourneyNotify:
-		mjErr = relay.RelayMidjourneyNotify(c)
-	case relayconstant.RelayModeMidjourneyTaskFetch, relayconstant.RelayModeMidjourneyTaskFetchByCondition:
-		mjErr = relay.RelayMidjourneyTask(c, relayInfo.RelayMode)
-	case relayconstant.RelayModeMidjourneyTaskImageSeed:
-		mjErr = relay.RelayMidjourneyTaskImageSeed(c)
-	case relayconstant.RelayModeSwapFace:
-		mjErr = relay.RelaySwapFace(c, relayInfo)
-	default:
-		mjErr = relay.RelayMidjourneySubmit(c, relayInfo)
+	var request dto.MidjourneyRequest
+	if err := common.UnmarshalBodyReusable(c, &request); err != nil {
+		writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+			err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		))
+		return
 	}
-	//err = relayMidjourneySubmit(c, relayMode)
-	log.Println(mjErr)
-	if mjErr != nil {
-		statusCode := http.StatusBadRequest
-		if mjErr.Code == 30 {
-			mjErr.Result = "当前分组负载已饱和，请稍后再试，或升级账户以提升服务质量。"
-			statusCode = http.StatusTooManyRequests
-		}
-		c.JSON(statusCode, gin.H{
-			"description": fmt.Sprintf("%s %s", mjErr.Description, mjErr.Result),
-			"type":        "upstream_error",
-			"code":        mjErr.Code,
+	prepared, mjErr := service.PrepareMidjourneyRequest(relayMode, request)
+	if mjErr != nil || prepared == nil {
+		writeMidjourneyOutcome(c, relay.MidjourneyRelayOutcome{
+			Error: mjErr, StatusCode: http.StatusBadRequest, LocalError: true,
 		})
-		channelId := c.GetInt("channel_id")
-		logger.LogError(c, fmt.Sprintf("relay error (channel #%d, status code %d): %s", channelId, statusCode, fmt.Sprintf("%s %s", mjErr.Description, mjErr.Result)))
+		return
 	}
+	c.Set("original_model", prepared.ModelName)
+	requestProfile, profileErr := buildMidjourneyRoutingRequestProfileTemplate(c, prepared.ModelName, prepared.RelayMode)
+	if profileErr != nil {
+		writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+			profileErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		))
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingRequestProfile, requestProfile)
+
+	var (
+		originTask *model.Midjourney
+		channel    *model.Channel
+	)
+	if prepared.Stateful {
+		var apiErr *types.NewAPIError
+		originTask, channel, apiErr = prepareMidjourneyOriginChannel(
+			c, prepared.TaskReference, prepared.ModelName,
+			prepared.RelayMode != relayconstant.RelayModeMidjourneyModal,
+		)
+		if apiErr != nil {
+			writeMidjourneyAPIError(c, apiErr)
+			return
+		}
+	} else if common.GetContextKeyBool(c, constant.ContextKeyRoutingSelectionDeferred) {
+		selected, selectionErr := middleware.SelectChannelForValidatedRequest(c, prepared.ModelName)
+		if selectionErr != nil {
+			writeMidjourneyAPIError(c, selectionErr)
+			return
+		}
+		channel = selected
+	} else {
+		channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId)
+		selected, err := model.GetChannelById(channelID, true)
+		if err != nil {
+			writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+				err, types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+			))
+			return
+		}
+		channel = selected
+	}
+	if channel == nil {
+		writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+			errors.New("selected Midjourney channel is unavailable"),
+			types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+		))
+		return
+	}
+
+	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatMjProxy, nil, nil)
+	if err != nil {
+		writeMidjourneyAPIError(c, types.NewErrorWithStatusCode(
+			err, types.ErrorCodeGenRelayInfoFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry(),
+		))
+		return
+	}
+	relayInfo.RelayMode = prepared.RelayMode
+	relayInfo.OriginModelName = prepared.ModelName
+	if replayOutcome, handled := relay.ReplayPreparedMidjourneySubmit(c, relayInfo, prepared, originTask); handled {
+		writeMidjourneyOutcome(c, replayOutcome)
+		return
+	}
+	outcome := executeMidjourneyRoutingAttempt(c, relayInfo, channel, func() relay.MidjourneyRelayOutcome {
+		return relay.RelayPreparedMidjourneySubmit(c, relayInfo, prepared, originTask, channel)
+	})
+	writeMidjourneyOutcome(c, outcome)
 }
 
+func authorizeMidjourneyFetchModels(c *gin.Context, relayMode int) *types.NewAPIError {
+	if c == nil || !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+		return nil
+	}
+	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	if userID <= 0 {
+		userID = c.GetInt("id")
+	}
+	var tasks []*model.Midjourney
+	switch relayMode {
+	case relayconstant.RelayModeMidjourneyTaskFetch:
+		task, err := model.FindMidjourneyByPublicID(userID, strings.TrimSpace(c.Param("id")))
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, model.ErrMidjourneyIdentityInvalid) {
+			return nil
+		}
+		if err != nil {
+			return types.NewErrorWithStatusCode(
+				errors.New("load Midjourney task authorization failed"),
+				types.ErrorCodeGetChannelFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		tasks = []*model.Midjourney{task}
+	case relayconstant.RelayModeMidjourneyTaskFetchByCondition:
+		var condition struct {
+			IDs []string `json:"ids"`
+		}
+		if err := common.UnmarshalBodyReusable(c, &condition); err != nil || len(condition.IDs) > 1_000 {
+			return nil
+		}
+		loaded, err := model.FindMidjourneysByPublicIDs(userID, condition.IDs)
+		if errors.Is(err, model.ErrMidjourneyIdentityInvalid) || errors.Is(err, model.ErrMidjourneyIdentityAmbiguous) {
+			return nil
+		}
+		if err != nil {
+			return types.NewErrorWithStatusCode(
+				errors.New("load Midjourney task authorization failed"),
+				types.ErrorCodeGetChannelFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		tasks = loaded
+	default:
+		return nil
+	}
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		modelName := service.CovertMjpActionToModelName(task.Action)
+		if authorizationErr := middleware.AuthorizeTokenRoutingTarget(c, modelName, 0, false); authorizationErr != nil {
+			return authorizationErr
+		}
+	}
+	return nil
+}
+
+func prepareMidjourneyOriginChannel(
+	c *gin.Context,
+	publicTaskID string,
+	modelName string,
+	requireSuccess bool,
+) (*model.Midjourney, *model.Channel, *types.NewAPIError) {
+	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	if userID <= 0 {
+		userID = c.GetInt("id")
+	}
+	originTask, err := model.FindMidjourneyByPublicID(userID, strings.TrimSpace(publicTaskID))
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		message := "load Midjourney task failed"
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			statusCode = http.StatusNotFound
+			message = "Midjourney task not found"
+		} else {
+			logger.LogError(c, "load Midjourney origin task: "+err.Error())
+		}
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New(message), types.ErrorCodeInvalidRequest, statusCode, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if !service.StatefulRoutingGroupAllowed(
+		common.GetContextKeyString(c, constant.ContextKeyTokenGroup),
+		common.GetContextKeyString(c, constant.ContextKeyUserGroup),
+		originTask.Group,
+	) {
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New("task_routing_group_forbidden"),
+			types.ErrorCodeAccessDenied,
+			http.StatusForbidden,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if requireSuccess && setting.MjActionCheckSuccessEnabled && originTask.Status != "SUCCESS" {
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New("origin Midjourney task is not successful"),
+			types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	channel, err := model.GetChannelById(originTask.ChannelId, true)
+	if err != nil {
+		logger.LogError(c, "load Midjourney origin channel: "+err.Error())
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New("origin Midjourney channel is unavailable"),
+			types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if channel.Status != common.ChannelStatusEnabled {
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New("origin Midjourney channel is disabled"),
+			types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if originTask.ChannelGeneration != "" && originTask.ChannelGeneration != channel.RoutingGeneration {
+		return nil, nil, types.NewErrorWithStatusCode(
+			errors.New("origin Midjourney channel generation no longer exists"),
+			types.ErrorCodeChannelNoAvailableKey, http.StatusConflict, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if modelName == "" {
+		modelName = service.CovertMjpActionToModelName(originTask.Action)
+	}
+	if authorizationErr := middleware.AuthorizeTokenRoutingTarget(c, modelName, channel.Id, true); authorizationErr != nil {
+		return nil, nil, authorizationErr
+	}
+	c.Set("original_model", modelName)
+	requestProfile, profileErr := buildMidjourneyRoutingRequestProfileTemplate(
+		c, modelName, relayconstant.Path2RelayModeMidjourney(c.Request.URL.Path),
+	)
+	if profileErr != nil {
+		return nil, nil, types.NewErrorWithStatusCode(
+			profileErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingRequestProfile, requestProfile)
+	routingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+	if routingGroup == "auto" {
+		if originTask.Group != "" {
+			routingGroup = originTask.Group
+		} else if selectedGroup := common.GetContextKeyString(c, constant.ContextKeyAutoGroup); selectedGroup != "" {
+			routingGroup = selectedGroup
+		}
+	}
+	if routingGroup == "" {
+		routingGroup = "default"
+	}
+	if common.GetContextKeyString(c, constant.ContextKeyUsingGroup) == "auto" {
+		common.SetContextKey(c, constant.ContextKeyAutoGroup, routingGroup)
+	}
+	pinned, active, reserveErr := service.ReservePinnedChannelRoutingAttempt(
+		&service.RetryParam{
+			Ctx: c, TokenGroup: routingGroup,
+			ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0),
+		},
+		routingGroup,
+		channel.Id,
+		originTask.RoutingCredentialID,
+	)
+	if reserveErr != nil {
+		return nil, nil, types.NewErrorWithStatusCode(
+			reserveErr, types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if active {
+		if pinned == nil || pinned.Id != channel.Id {
+			cancelMidjourneyPinnedRoutingAdmission(c, channel.Id)
+			return nil, nil, types.NewErrorWithStatusCode(
+				service.ErrPinnedRoutingIdentityUnavailable,
+				types.ErrorCodeGetChannelFailed, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry(),
+			)
+		}
+		channel = pinned
+	}
+	if setupErr := middleware.SetupContextForSelectedChannelMetadata(c, channel, modelName); setupErr != nil {
+		cancelMidjourneyPinnedRoutingAdmission(c, channel.Id)
+		return nil, nil, setupErr
+	}
+	if credentialErr := middleware.CommitTaskChannelCredential(c, channel, originTask.RoutingCredentialID); credentialErr != nil {
+		cancelMidjourneyPinnedRoutingAdmission(c, channel.Id)
+		return nil, nil, credentialErr
+	}
+	return originTask, channel, nil
+}
+
+func cancelMidjourneyPinnedRoutingAdmission(c *gin.Context, channelID int) {
+	cancelRoutingCapacityReservation(c)
+	service.ReleaseRoutingHalfOpenProbe(c, channelID, "", "")
+}
+
+func executeMidjourneyRoutingAttempt(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	channel *model.Channel,
+	run func() relay.MidjourneyRelayOutcome,
+) relay.MidjourneyRelayOutcome {
+	attemptGuard := newRoutingAttemptGuard(c, relayInfo)
+	defer attemptGuard.Complete()
+
+	attemptLease, err := attemptGuard.Begin(c, relayInfo)
+	if err != nil {
+		cancelRoutingCapacityReservation(c)
+		return relay.MidjourneyRelayOutcome{
+			Error:      &dto.MidjourneyResponse{Code: constant.MjRequestError, Description: "routing_attempt_rejected"},
+			StatusCode: routingAttemptRejectionError(err).StatusCode, LocalError: true, Cause: err,
+		}
+	}
+	if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
+		attemptLease.Finish()
+		return relay.MidjourneyRelayOutcome{
+			Error:      &dto.MidjourneyResponse{Code: constant.MjRequestError, Description: "routing_capacity_commit_failed"},
+			StatusCode: capacityErr.StatusCode, LocalError: true, Cause: capacityErr.Err,
+		}
+	}
+	addUsedChannel(c, channel.Id)
+	prepareRoutingRelayAttempt(relayInfo)
+	sendState := bindRoutingUpstreamAttempt(c, relayInfo, channel, attemptLease)
+	serialAudit, auditErr := reserveRoutingSerialAttemptAudit(c, relayInfo, channel)
+	if auditErr != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing Midjourney attempt audit unavailable: %v", auditErr))
+	}
+	releaseInflight := routingmetrics.BeginInflight(c, relayInfo, channel.Id)
+	var outcome relay.MidjourneyRelayOutcome
+	func() {
+		defer releaseRoutingCapacityReservation(c)
+		defer releaseInflight()
+		defer finishRoutingCanaryAttempt(c, sendState)
+		defer relaycommon.ClearRoutingUpstreamSendState(c)
+		outcome = run()
+	}()
+	if outcome.IdempotentReplay {
+		if serialAudit != nil {
+			if err := serialAudit.Discard(); err != nil {
+				logger.LogWarn(c, fmt.Sprintf("discard Midjourney replay attempt audit failed: %v", err))
+			}
+		}
+		if attemptLease != nil {
+			attemptLease.Finish()
+		}
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+		return outcome
+	}
+	if outcome.Error == nil && !sendState.Sent() {
+		outcome = relay.MidjourneyRelayOutcome{
+			Error:      &dto.MidjourneyResponse{Code: constant.MjRequestError, Description: "routing_upstream_not_sent"},
+			StatusCode: http.StatusInternalServerError, LocalError: true,
+			Cause: errors.New("Midjourney relay completed without crossing the upstream send boundary"),
+		}
+	}
+
+	apiErr := midjourneyOutcomeAPIError(outcome)
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component:    routingerror.ComponentServing,
+		Operation:    routingerror.OperationTaskSubmit,
+		BeforeCommit: !sendState.Sent(),
+	})
+	if outcome.LocalError {
+		responsibility := routingerror.ResponsibilityGateway
+		if outcome.StatusCode >= http.StatusBadRequest && outcome.StatusCode < http.StatusInternalServerError {
+			responsibility = routingerror.ResponsibilityCaller
+		}
+		classification = routingerror.Classification{
+			Responsibility: responsibility,
+			Scope:          routingerror.ScopeRequest,
+			Retryability:   routingerror.RetryNever,
+			HealthEffect:   routingerror.HealthIgnore,
+			CapacityEffect: routingerror.CapacityNone,
+			Component:      routingerror.ComponentServing,
+			Rule:           "midjourney_local_failure",
+		}
+	}
+	success := outcome.Error == nil
+	clientCommitted := sendState.Sent()
+	if attemptLease != nil && clientCommitted {
+		_ = attemptLease.MarkClientCommitted()
+	}
+	if err := completeRoutingSerialAttemptAudit(
+		c, relayInfo, channel, serialAudit, success, apiErr, classification,
+		sendState.Sent(), clientCommitted, false,
+	); err != nil {
+		logger.LogWarn(c, fmt.Sprintf("channel routing Midjourney attempt audit completion failed: %v", err))
+	}
+	attemptLease.Finish()
+	if sendState.Sent() {
+		recordRoutingAttemptEffects(c, relayInfo, channel.Id, success, apiErr, classification)
+		if !success && (classification.Responsibility == routingerror.ResponsibilityProvider ||
+			classification.Responsibility == routingerror.ResponsibilityNetwork) {
+			service.MarkRoutingChannelFailed(c, channel.Id)
+		}
+	}
+	service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+	finishRoutingCanaryOutcome(c, relayInfo, classification, success)
+	if !success && sendState.Sent() && !outcome.LocalError {
+		processChannelError(c,
+			*types.NewChannelError(
+				channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
+				common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan(),
+			),
+			apiErr,
+			classification,
+		)
+	}
+	return outcome
+}
+
+func midjourneyOutcomeAPIError(outcome relay.MidjourneyRelayOutcome) *types.NewAPIError {
+	if outcome.Error == nil {
+		return nil
+	}
+	statusCode := outcome.StatusCode
+	if statusCode <= 0 {
+		statusCode = http.StatusBadGateway
+	}
+	cause := outcome.Cause
+	if cause == nil {
+		cause = errors.New(strings.TrimSpace(outcome.Error.Description + " " + outcome.Error.Result))
+	}
+	code := types.ErrorCodeBadResponseStatusCode
+	if outcome.LocalError {
+		code = types.ErrorCodeInvalidRequest
+		if statusCode >= http.StatusInternalServerError {
+			code = types.ErrorCodeDoRequestFailed
+		}
+	}
+	return types.NewErrorWithStatusCode(cause, code, statusCode, types.ErrOptionWithSkipRetry())
+}
+
+func writeMidjourneyOutcome(c *gin.Context, outcome relay.MidjourneyRelayOutcome) {
+	if outcome.Error == nil || (c.Writer != nil && c.Writer.Written()) {
+		return
+	}
+	apiErr := midjourneyOutcomeAPIError(outcome)
+	message := strings.TrimSpace(outcome.Error.Description + " " + outcome.Error.Result)
+	if outcome.LocalError || message == "" {
+		message = apiErr.MaskSensitiveError()
+	}
+	message = common.MessageWithRequestId(message, c.GetString(common.RequestIdKey))
+	code := outcome.Error.Code
+	if code == 0 {
+		code = constant.MjRequestError
+	}
+	c.JSON(apiErr.StatusCode, gin.H{
+		"description": message, "type": "upstream_error", "code": code,
+	})
+	logger.LogError(c, fmt.Sprintf(
+		"Midjourney relay error (channel #%d, status %d, code %d): %s",
+		common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+		apiErr.StatusCode,
+		code,
+		common.LocalLogPreview(message),
+	))
+}
+
+func writeMidjourneyAPIError(c *gin.Context, apiErr *types.NewAPIError) {
+	if c == nil || apiErr == nil || (c.Writer != nil && c.Writer.Written()) {
+		return
+	}
+	message := apiErr.MaskSensitiveError()
+	c.JSON(apiErr.StatusCode, gin.H{
+		"description": message, "type": "upstream_error", "code": constant.MjRequestError,
+	})
+	logger.LogError(c, fmt.Sprintf(
+		"Midjourney relay error (channel #%d, status %d): %s",
+		common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+		apiErr.StatusCode,
+		common.LocalLogPreview(message),
+	))
+}
 func RelayNotImplemented(c *gin.Context) {
 	err := types.OpenAIError{
 		Message: "API not implemented",
@@ -1147,9 +1818,71 @@ func RelayTask(c *gin.Context) {
 		respondTaskError(c, taskErr)
 		return
 	}
+	if taskErr := relay.ValidateTaskRequestForRouting(c, relayInfo); taskErr != nil {
+		respondTaskError(c, taskErr)
+		return
+	}
+	if relayInfo.OriginTaskID != "" && relayInfo.LockedChannel == nil {
+		if taskErr := relay.ResolveOriginTask(c, relayInfo); taskErr != nil {
+			respondTaskError(c, taskErr)
+			return
+		}
+	}
+	if relayInfo.OriginModelName == "" {
+		if request, requestErr := relaycommon.GetTaskRequest(c); requestErr == nil {
+			relayInfo.OriginModelName = strings.TrimSpace(request.Model)
+		}
+	}
+	if relayInfo.OriginModelName == "" {
+		respondTaskError(c, service.TaskErrorWrapperLocal(errors.New("model is required"), "missing_model", http.StatusBadRequest))
+		return
+	}
+	if lockedChannel, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedChannel != nil {
+		if authorizationErr := middleware.AuthorizeTokenRoutingTarget(
+			c, relayInfo.OriginModelName, lockedChannel.Id, true,
+		); authorizationErr != nil {
+			respondTaskError(c, service.TaskErrorWrapperLocal(
+				authorizationErr.Err,
+				string(authorizationErr.GetErrorCode()),
+				authorizationErr.StatusCode,
+			))
+			return
+		}
+	}
+	c.Set("original_model", relayInfo.OriginModelName)
+	requestProfile, profileErr := buildTaskRoutingRequestProfileTemplate(c, relayInfo)
+	if profileErr != nil {
+		respondTaskError(c, service.TaskErrorWrapperLocal(profileErr, "invalid_request", http.StatusBadRequest))
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingRequestProfile, requestProfile)
+
+	var initialChannel *model.Channel
+	if lockedChannel, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedChannel != nil {
+		initialChannel = lockedChannel
+	} else if common.GetContextKeyBool(c, constant.ContextKeyRoutingSelectionDeferred) {
+		selected, selectionErr := middleware.SelectChannelMetadataForValidatedRequest(c, relayInfo.OriginModelName)
+		if selectionErr != nil {
+			respondTaskError(c, service.TaskErrorWrapperLocal(selectionErr.Err, "get_channel_failed", selectionErr.StatusCode))
+			return
+		}
+		initialChannel = selected
+	} else if channelID := common.GetContextKeyInt(c, constant.ContextKeyChannelId); channelID > 0 {
+		selected, channelErr := model.GetChannelById(channelID, true)
+		if channelErr != nil {
+			respondTaskError(c, service.TaskErrorWrapperLocal(channelErr, "get_channel_failed", http.StatusServiceUnavailable))
+			return
+		}
+		initialChannel = selected
+		if setupErr := middleware.SetupContextForSelectedChannelMetadata(c, initialChannel, relayInfo.OriginModelName); setupErr != nil {
+			respondTaskError(c, service.TaskErrorWrapperLocal(setupErr.Err, "setup_channel_failed", http.StatusServiceUnavailable))
+			return
+		}
+	}
 
 	var result *relay.TaskSubmitResult
 	var taskErr *dto.TaskError
+	idempotentTaskReplay := false
 	var (
 		canaryOutcomeKnown          bool
 		canaryOutcomeSuccess        bool
@@ -1185,30 +1918,95 @@ func RelayTask(c *gin.Context) {
 	defer attemptGuard.Complete()
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		relayInfo.RetryIndex = retryParam.GetRetry()
 		var channel *model.Channel
+		attemptRoutingGroup := relayInfo.UsingGroup
+		lockedChannel, stateful := relayInfo.LockedChannel.(*model.Channel)
+		stateful = stateful && lockedChannel != nil
 
-		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
-			channel = lockedCh
-			if retryParam.GetRetry() > 0 {
-				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
-					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
-					break
-				}
-			}
+		if retryParam.GetRetry() == 0 && initialChannel != nil {
+			channel = initialChannel
+		} else if stateful {
+			channel = lockedChannel
 		} else {
 			var channelErr *types.NewAPIError
-			channel, channelErr = getChannel(c, relayInfo, retryParam)
+			channel, channelErr = getTaskRetryChannel(c, relayInfo, retryParam)
 			if channelErr != nil {
 				logger.LogError(c, channelErr.Error())
 				taskErr = service.TaskErrorWrapperLocal(channelErr.Err, "get_channel_failed", http.StatusInternalServerError)
 				break
 			}
 		}
+		if stateful {
+			if relayInfo.LockedRoutingGroup != "" {
+				attemptRoutingGroup = relayInfo.LockedRoutingGroup
+			}
+			pinnedChannel, active, reserveErr := service.ReservePinnedChannelRoutingAttempt(
+				retryParam,
+				attemptRoutingGroup,
+				lockedChannel.Id,
+				relayInfo.LockedRoutingCredentialID,
+			)
+			if reserveErr != nil {
+				statusCode := http.StatusServiceUnavailable
+				code := "task_routing_identity_unavailable"
+				if errors.Is(reserveErr, channelrouting.ErrCapacityExhausted) ||
+					errors.Is(reserveErr, channelrouting.ErrStrictCapacityExhausted) ||
+					errors.Is(reserveErr, channelrouting.ErrAdaptiveConcurrencyExhausted) {
+					statusCode = http.StatusTooManyRequests
+					code = "task_routing_capacity_exhausted"
+				}
+				taskErr = service.TaskErrorWrapperLocal(reserveErr, code, statusCode)
+				if statusCode == http.StatusTooManyRequests {
+					taskErr.RetryAfterMs = time.Second.Milliseconds()
+				}
+				break
+			}
+			if active {
+				if pinnedChannel == nil || pinnedChannel.Id != lockedChannel.Id {
+					taskErr = service.TaskErrorWrapperLocal(
+						service.ErrPinnedRoutingIdentityUnavailable,
+						"task_routing_identity_unavailable",
+						http.StatusServiceUnavailable,
+					)
+					break
+				}
+				channel = pinnedChannel
+			}
+			if setupErr := middleware.SetupContextForSelectedChannelMetadata(c, channel, relayInfo.OriginModelName); setupErr != nil {
+				cancelRoutingCapacityReservation(c)
+				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
+				taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusServiceUnavailable)
+				break
+			}
+		}
+
+		prepared, prepareErr := relay.PrepareTaskAttempt(c, relayInfo)
+		if prepareErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
+			taskErr = prepareErr
+			break
+		}
+		replayResult, replayErr := prepared.IdempotentReplayResult(c)
+		if replayErr != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
+			taskErr = service.TaskErrorWrapperLocal(replayErr, "idempotency_replay_unavailable", http.StatusServiceUnavailable)
+			break
+		}
+		if replayResult != nil {
+			cancelRoutingCapacityReservation(c)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
+			result = replayResult
+			idempotentTaskReplay = true
+			break
+		}
 
 		attemptLease, attemptErr := attemptGuard.Begin(c, relayInfo)
 		if attemptErr != nil {
 			cancelRoutingCapacityReservation(c)
-			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
 			logger.LogWarn(c, fmt.Sprintf("channel routing retry budget rejected task attempt: %v", attemptErr))
 			if taskErr == nil {
 				apiErr := routingAttemptRejectionError(attemptErr)
@@ -1216,38 +2014,23 @@ func RelayTask(c *gin.Context) {
 			}
 			break
 		}
-		addUsedChannel(c, channel.Id)
-		bodyStorage, bodyErr := common.GetBodyStorage(c)
-		if bodyErr != nil {
+		if credentialErr := middleware.CommitSelectedChannelCredential(c, channel); credentialErr != nil {
 			attemptLease.Finish()
 			cancelRoutingCapacityReservation(c)
-			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
-			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
-				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusRequestEntityTooLarge)
-			} else {
-				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusBadRequest)
-			}
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
+			taskErr = service.TaskErrorWrapperLocal(credentialErr.Err, "select_channel_credential_failed", http.StatusServiceUnavailable)
 			break
 		}
-		c.Request.Body = io.NopCloser(bodyStorage)
+		addUsedChannel(c, channel.Id)
 		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
 			attemptLease.Finish()
-			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+			service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
 			taskErr = service.TaskErrorWrapperLocal(capacityErr.Err, "routing_capacity_commit_failed", http.StatusServiceUnavailable)
 			break
 		}
 
 		prepareRoutingRelayAttempt(relayInfo)
-		if attemptLease != nil {
-			if markErr := attemptLease.MarkSent(); markErr != nil {
-				attemptLease.Finish()
-				releaseRoutingCapacityReservation(c)
-				finishRoutingCanaryAttempt(c)
-				service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
-				taskErr = service.TaskErrorWrapperLocal(markErr, "routing_attempt_state_failed", http.StatusServiceUnavailable)
-				break
-			}
-		}
+		sendState := bindRoutingUpstreamAttempt(c, relayInfo, channel, attemptLease)
 		serialAudit, auditErr := reserveRoutingSerialAttemptAudit(c, relayInfo, channel)
 		if auditErr != nil {
 			logger.LogWarn(c, fmt.Sprintf("channel routing serial task attempt audit unavailable: %v", auditErr))
@@ -1256,9 +2039,17 @@ func RelayTask(c *gin.Context) {
 		func() {
 			defer releaseRoutingCapacityReservation(c)
 			defer releaseInflight()
-			defer finishRoutingCanaryAttempt(c)
-			result, taskErr = submitRoutingTaskAttempt(c, relayInfo)
+			defer finishRoutingCanaryAttempt(c, sendState)
+			defer relaycommon.ClearRoutingUpstreamSendState(c)
+			result, taskErr = relay.RelayPreparedTaskSubmit(c, relayInfo, prepared)
 		}()
+		if taskErr == nil && !sendState.Sent() {
+			taskErr = service.TaskErrorWrapperLocal(
+				errors.New("task relay completed without crossing the upstream send boundary"),
+				"routing_upstream_not_sent",
+				http.StatusInternalServerError,
+			)
+		}
 		taskAPIError := taskErrorToAPIError(taskErr)
 		classificationContext := routingerror.Context{
 			Component: routingerror.ComponentServing,
@@ -1268,7 +2059,7 @@ func RelayTask(c *gin.Context) {
 			classificationContext.Signal = routingerror.SignalContentSafety
 		}
 		classification := routingerror.ClassifyTaskError(taskErr, classificationContext)
-		clientCommitted := taskErr == nil || classification.Retryability == routingerror.RetryIdempotencyRequired
+		clientCommitted := sendState.Sent() && (taskErr == nil || classification.Retryability == routingerror.RetryIdempotencyRequired)
 		if attemptLease != nil && clientCommitted {
 			_ = attemptLease.MarkClientCommitted()
 		}
@@ -1289,6 +2080,7 @@ func RelayTask(c *gin.Context) {
 			taskErr == nil,
 			taskAPIError,
 			classification,
+			sendState.Sent(),
 			clientCommitted,
 			willRetry,
 		); err != nil {
@@ -1298,13 +2090,20 @@ func RelayTask(c *gin.Context) {
 		canaryOutcomeKnown = true
 		canaryOutcomeSuccess = taskErr == nil
 		canaryOutcomeClassification = classification
-		recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
-		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, relayInfo.UsingGroup)
+		if sendState.Sent() {
+			recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
+			if taskErr != nil &&
+				(classification.Responsibility == routingerror.ResponsibilityProvider ||
+					classification.Responsibility == routingerror.ResponsibilityNetwork) {
+				service.MarkRoutingChannelFailed(c, channel.Id)
+			}
+		}
+		service.ReleaseRoutingHalfOpenProbe(c, channel.Id, relayInfo.OriginModelName, attemptRoutingGroup)
 		if taskErr == nil {
 			break
 		}
 
-		if !taskErr.LocalError {
+		if sendState.Sent() && !taskErr.LocalError {
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
@@ -1323,18 +2122,13 @@ func RelayTask(c *gin.Context) {
 		logger.LogInfo(c, retryLogStr)
 	}
 
-	// ── 成功：结算 + 日志 + 插入任务 ──
-	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-			common.SysError("settle task billing error: " + settleErr.Error())
-			taskErr = service.TaskErrorWrapperLocal(settleErr, "settle_billing_failed", http.StatusInternalServerError)
-		}
-	}
-	if taskErr == nil {
-		service.LogTaskConsumption(c, relayInfo)
-
+	// Persist the accepted upstream task before committing the buffered client
+	// response. V2 performs task creation, final submit quota adjustment, accepted
+	// identity fencing, and projection freezing in one main-database transaction.
+	if taskErr == nil && !idempotentTaskReplay {
 		task := model.InitTask(result.Platform, relayInfo)
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+		task.PrivateData.BillingProtocolVersion = model.TaskBillingLegacyProtocolVersion
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
@@ -1348,22 +2142,147 @@ func RelayTask(c *gin.Context) {
 			PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
 		}
 		task.Quota = result.Quota
-		task.Data = result.TaskData
+		task.Data = service.SanitizeTaskData(result.TaskData)
 		task.Action = relayInfo.Action
-		if insertErr := task.Insert(); insertErr != nil {
-			common.SysError("insert task error: " + insertErr.Error())
+		replaySpec, replaySnapshotErr := relay.TaskSubmissionReplaySnapshot(
+			result, relayInfo.PublicTaskID, relayInfo.OriginModelName,
+		)
+		var finalAudit model.AsyncBillingAcceptedAuditSnapshot
+		if relayInfo.AsyncBillingReservationID > 0 {
+			var auditErr error
+			finalAudit, auditErr = relay.BuildAsyncBillingFinalAudit(c, relayInfo, task)
+			if auditErr != nil {
+				reviewContext, reviewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, reviewErr := model.MarkAsyncBillingAcceptedHandoffManualReviewFromAttempt(
+					reviewContext, relayInfo.AsyncBillingReservationID, result.Quota, result.UpstreamTaskID,
+					replaySpec, "freeze_final_task_billing_audit_failed: "+auditErr.Error(), time.Now(),
+				)
+				reviewCancel()
+				if reviewErr == nil {
+					relayInfo.AsyncBillingManualReviewMarked = true
+				}
+				taskErr = service.TaskErrorWrapperLocal(errors.Join(auditErr, replaySnapshotErr, reviewErr),
+					"persist_task_failed", http.StatusInternalServerError)
+			}
+		}
+		if relayInfo.AsyncBillingReservationID > 0 && taskErr == nil {
+			persistContext, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+			if replaySnapshotErr != nil {
+				cancel()
+				reviewContext, reviewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, reviewErr := model.MarkAsyncBillingAcceptedHandoffManualReview(
+					reviewContext, relayInfo.AsyncBillingReservationID, result.Quota, finalAudit,
+					result.UpstreamTaskID, replaySpec,
+					"freeze_task_response_failed: "+replaySnapshotErr.Error(), time.Now(),
+				)
+				reviewCancel()
+				if reviewErr == nil {
+					relayInfo.AsyncBillingManualReviewMarked = true
+				}
+				taskErr = service.TaskErrorWrapperLocal(
+					errors.Join(replaySnapshotErr, reviewErr), "freeze_task_response_failed", http.StatusInternalServerError,
+				)
+			} else {
+				_, acceptErr := model.AcceptAsyncTaskReservation(
+					persistContext,
+					relayInfo.AsyncBillingReservationID,
+					relayInfo.RetryIndex,
+					task,
+					result.UpstreamTaskID,
+					result.Quota,
+					finalAudit,
+					replaySpec,
+					time.Now(),
+				)
+				cancel()
+				if acceptErr != nil {
+					common.SysError("persist accepted task reservation error: " + common.SanitizeErrorMessage(acceptErr.Error()))
+					reviewContext, reviewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					var reviewErr error
+					if errors.Is(acceptErr, model.ErrAsyncBillingInsufficientQuota) ||
+						errors.Is(acceptErr, model.ErrAsyncBillingSubscriptionExhausted) {
+						_, reviewErr = model.MarkAsyncBillingAcceptanceOverageManualReviewWithReplay(
+							reviewContext, relayInfo.AsyncBillingReservationID, result.Quota,
+							finalAudit, result.UpstreamTaskID, replaySpec, time.Now(),
+						)
+					} else {
+						_, reviewErr = model.MarkAsyncBillingAcceptedHandoffManualReview(
+							reviewContext, relayInfo.AsyncBillingReservationID, result.Quota,
+							finalAudit, result.UpstreamTaskID, replaySpec,
+							"accepted_task_handoff_failed: "+acceptErr.Error(), time.Now(),
+						)
+					}
+					reviewCancel()
+					if reviewErr == nil {
+						relayInfo.AsyncBillingManualReviewMarked = true
+					}
+					taskErr = service.TaskErrorWrapperLocal(
+						errors.Join(acceptErr, reviewErr), "persist_task_failed", http.StatusInternalServerError,
+					)
+				}
+			}
+		} else if relayInfo.AsyncBillingReservationID == 0 {
+			if insertErr := task.Insert(); insertErr != nil {
+				common.SysError("insert accepted task error: " + common.SanitizeErrorMessage(insertErr.Error()))
+				taskErr = service.TaskErrorWrapperLocal(insertErr, "persist_task_failed", http.StatusInternalServerError)
+			}
+		}
+	}
+
+	if taskErr == nil && !idempotentTaskReplay && relayInfo.AsyncBillingReservationID == 0 {
+		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+			common.SysError("settle task billing error: " + settleErr.Error())
+			taskErr = service.TaskErrorWrapperLocal(settleErr, "settle_billing_failed", http.StatusInternalServerError)
+		}
+	}
+	if taskErr == nil {
+		if !idempotentTaskReplay && relayInfo.AsyncBillingReservationID == 0 {
+			service.LogTaskConsumption(c, relayInfo)
+		}
+		if commitErr := result.CommitResponse(c); commitErr != nil {
+			// The upstream task and charge are already durable. Never refund or
+			// append a second response after a client transport failure.
+			logger.LogWarn(c, fmt.Sprintf("commit accepted task response failed: %v", commitErr))
 		}
 	}
 
 	if taskErr != nil {
+		if relayInfo.AsyncBillingReservationID > 0 && !relayInfo.AsyncBillingManualReviewMarked {
+			cleanupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, releaseErr := model.ReleaseAsyncBillingReservation(
+				cleanupContext, relayInfo.AsyncBillingReservationID, time.Now(),
+			)
+			if errors.Is(releaseErr, model.ErrAsyncBillingReservationAmbiguous) {
+				_, reviewErr := model.MarkAsyncBillingReservationManualReview(
+					cleanupContext,
+					relayInfo.AsyncBillingReservationID,
+					"task_submit_outcome_ambiguous: "+taskErr.Message,
+					"",
+					time.Now(),
+				)
+				if reviewErr != nil {
+					logger.LogError(c, "mark task billing reservation for manual review: "+reviewErr.Error())
+				}
+			} else if releaseErr != nil && !errors.Is(releaseErr, model.ErrAsyncBillingReservationAccepted) {
+				logger.LogError(c, "release task billing reservation: "+releaseErr.Error())
+			}
+			cancel()
+		}
 		respondTaskError(c, taskErr)
 	}
 }
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
 func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
+	if taskErr == nil {
+		return
+	}
 	if taskErr.StatusCode == http.StatusTooManyRequests {
 		taskErr.Message = "当前分组上游负载已饱和，请稍后再试"
+	}
+	if taskErr.RetryAfterMs > 0 {
+		seconds := (taskErr.RetryAfterMs + time.Second.Milliseconds() - 1) / time.Second.Milliseconds()
+		c.Header("Retry-After", strconv.FormatInt(max(seconds, 1), 10))
 	}
 	c.JSON(taskErr.StatusCode, taskErr)
 }
@@ -1373,6 +2292,10 @@ func shouldRetryTaskRelay(c *gin.Context, taskErr *dto.TaskError, classification
 		return false
 	}
 	if taskErr.LocalError {
+		return false
+	}
+	if policy, ok := service.ChannelRoutingRequestAttemptPolicy(c); ok &&
+		(!policy.RetryAllowed || !policy.CrossChannelRetryAllowed) {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {

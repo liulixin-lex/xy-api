@@ -1,0 +1,110 @@
+{
+  "linux/amd64": {
+    "SLSA": {
+      "buildDefinition": {
+        "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
+        "externalParameters": {
+          "request": {
+            "args": {
+              "label:org.opencontainers.image.revision": "1111111111111111111111111111111111111111",
+              "label:org.opencontainers.image.source": "https://github.com/liulixin-lex/xy-api"
+            },
+            "root": {
+              "request": {
+                "args": {
+                  "vcs:revision": "1111111111111111111111111111111111111111",
+                  "vcs:source": "https://github.com/liulixin-lex/xy-api"
+                }
+              }
+            }
+          }
+        },
+        "internalParameters": {
+          "github_job": "build_single_arch",
+          "github_repository": "liulixin-lex/xy-api",
+          "github_run_attempt": "2",
+          "github_run_id": "123456789",
+          "github_runner_arch": "X64",
+          "github_runner_environment": "github-hosted",
+          "github_runner_os": "Linux",
+          "github_workflow_ref": "liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/tags/v0.1.11",
+          "github_workflow_sha": "3333333333333333333333333333333333333333"
+        }
+      },
+      "runDetails": {
+        "builder": {
+          "id": "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/2"
+        },
+        "metadata": {
+          "buildkit_completeness": {
+            "request": true,
+            "resolvedDependencies": false
+          },
+          "buildkit_metadata": {
+            "vcs": {
+              "revision": "1111111111111111111111111111111111111111",
+              "source": "https://github.com/liulixin-lex/xy-api"
+            }
+          },
+          "invocationId": "fixture-amd64",
+          "startedOn": "2026-07-13T00:00:00Z",
+          "finishedOn": "2026-07-13T00:01:00Z"
+        }
+      }
+    }
+  },
+  "linux/arm64": {
+    "SLSA": {
+      "buildDefinition": {
+        "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
+        "externalParameters": {
+          "request": {
+            "args": {
+              "label:org.opencontainers.image.revision": "1111111111111111111111111111111111111111",
+              "label:org.opencontainers.image.source": "https://github.com/liulixin-lex/xy-api"
+            },
+            "root": {
+              "request": {
+                "args": {
+                  "vcs:revision": "1111111111111111111111111111111111111111",
+                  "vcs:source": "https://github.com/liulixin-lex/xy-api"
+                }
+              }
+            }
+          }
+        },
+        "internalParameters": {
+          "github_job": "build_single_arch",
+          "github_repository": "liulixin-lex/xy-api",
+          "github_run_attempt": "2",
+          "github_run_id": "123456789",
+          "github_runner_arch": "ARM64",
+          "github_runner_environment": "github-hosted",
+          "github_runner_os": "Linux",
+          "github_workflow_ref": "liulixin-lex/xy-api/.github/workflows/docker-build.yml@refs/tags/v0.1.11",
+          "github_workflow_sha": "3333333333333333333333333333333333333333"
+        }
+      },
+      "runDetails": {
+        "builder": {
+          "id": "https://github.com/liulixin-lex/xy-api/actions/runs/123456789/attempts/2"
+        },
+        "metadata": {
+          "buildkit_completeness": {
+            "request": true,
+            "resolvedDependencies": false
+          },
+          "buildkit_metadata": {
+            "vcs": {
+              "revision": "1111111111111111111111111111111111111111",
+              "source": "https://github.com/liulixin-lex/xy-api"
+            }
+          },
+          "invocationId": "fixture-arm64",
+          "startedOn": "2026-07-13T00:00:01Z",
+          "finishedOn": "2026-07-13T00:01:01Z"
+        }
+      }
+    }
+  }
+}

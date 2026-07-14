@@ -100,11 +100,16 @@ func ChannelRoutingHedgeCostEstimate(
 	if err != nil {
 		return channelrouting.ShadowCostInput{}, false, err
 	}
+	requestProfile, err := routingRequestProfile(c, group, retryIndex, promptTokens, completionTokens)
+	if err != nil {
+		return channelrouting.ShadowCostInput{}, false, err
+	}
 	estimate, exists, err := session.CostEstimateForChannel(channelID, channelrouting.RequestRoutingCostInput{
 		RequestPath: requestPath, ModelName: modelName,
 		IsStream: common.GetContextKeyBool(c, constant.ContextKeyIsStream), RetryIndex: retryIndex,
 		PromptTokenEstimate: promptTokens, CompletionTokenEstimate: completionTokens,
 		CostProfile: profile,
+		Profile:     requestProfile,
 	})
 	if err != nil || !exists {
 		return channelrouting.ShadowCostInput{}, false, err
@@ -183,11 +188,16 @@ func ChannelRoutingHedgeActualCost(
 	if err != nil {
 		return RoutingHedgeActualCost{}, err
 	}
+	requestProfile, err := routingRequestProfile(c, group, retryIndex, normalized.promptTokens, normalized.completionTokens)
+	if err != nil {
+		return RoutingHedgeActualCost{}, err
+	}
 	estimate, exists, err := session.CostEstimateForChannel(channelID, channelrouting.RequestRoutingCostInput{
 		RequestPath: requestPath, ModelName: modelName,
 		IsStream: common.GetContextKeyBool(c, constant.ContextKeyIsStream), RetryIndex: retryIndex,
 		PromptTokenEstimate: normalized.promptTokens, CompletionTokenEstimate: normalized.completionTokens,
 		CostProfile: &actualProfile,
+		Profile:     requestProfile,
 	})
 	if err != nil || !exists || !estimate.Known || math.IsNaN(estimate.Cost) || math.IsInf(estimate.Cost, 0) || estimate.Cost < 0 {
 		return RoutingHedgeActualCost{}, err

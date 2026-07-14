@@ -241,6 +241,10 @@ func TokenOrUserAuth() func(c *gin.Context) {
 		if id := session.Get("id"); id != nil {
 			if status, ok := session.Get("status").(int); ok && status == common.UserStatusEnabled {
 				c.Set("id", id)
+				c.Set("username", session.Get("username"))
+				c.Set("role", session.Get("role"))
+				c.Set("group", session.Get("group"))
+				c.Set("user_group", session.Get("group"))
 				c.Next()
 				return
 			}

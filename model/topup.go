@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -114,6 +115,7 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 	var quotaToAdd int
 	var affiliateReward int
 	var affiliateInviterId int
+	var cacheMutated bool
 	topUp := &TopUp{}
 
 	refCol := "`trade_no`"
@@ -153,13 +155,21 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		if err != nil {
 			return err
 		}
-
+		if quotaToAdd != 0 && common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
+		cacheMutated = quotaToAdd != 0
 		return nil
 	})
 
 	if err != nil {
 		common.SysError("topup failed: " + err.Error())
 		return errors.New("充值失败，请稍后重试")
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(topUp.UserId, "stripe topup")
 	}
 
 	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用在线充值成功，充值金额: %v，支付金额：%d", logger.FormatQuota(quotaToAdd), topUp.Amount), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
@@ -176,6 +186,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 	var quotaToAdd int
 	var affiliateReward int
 	var affiliateInviterId int
+	var cacheMutated bool
 	topUp := &TopUp{}
 
 	refCol := "`trade_no`"
@@ -227,12 +238,20 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 		if err := tx.Model(&User{}).Where("id = ?", topUp.UserId).Update("quota", gorm.Expr("quota + ?", quotaToAdd)).Error; err != nil {
 			return err
 		}
-
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
+		cacheMutated = true
 		return nil
 	})
 
 	if err != nil {
 		return err
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(topUp.UserId, "epay topup")
 	}
 
 	if quotaToAdd > 0 {
@@ -467,6 +486,11 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		if err := tx.Model(&User{}).Where("id = ?", topUp.UserId).Update("quota", gorm.Expr("quota + ?", quotaToAdd)).Error; err != nil {
 			return err
 		}
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
 
 		userId = topUp.UserId
 		payMoney = topUp.Money
@@ -480,6 +504,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 	}
 
 	if completed {
+		syncUserCacheAfterCommitBestEffort(userId, "manual topup completion")
 		// 事务外记录日志，避免阻塞
 		RecordTopupLog(userId, fmt.Sprintf("管理员补单成功，充值金额: %v，支付金额：%f", logger.FormatQuota(quotaToAdd), payMoney), callerIp, paymentMethod, "admin")
 		recordAffiliateTopUpRewardLog(affiliateInviterId, affiliateReward)
@@ -494,6 +519,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 	var quota int
 	var affiliateReward int
 	var affiliateInviterId int
+	var cacheMutated bool
 	topUp := &TopUp{}
 
 	refCol := "`trade_no`"
@@ -547,6 +573,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 			// 如果用户邮箱为空，则更新为支付时使用的邮箱
 			if user.Email == "" {
 				updateFields["email"] = customerEmail
+				cacheMutated = true
 			}
 		}
 
@@ -554,13 +581,21 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 		if err != nil {
 			return err
 		}
-
+		cacheMutated = cacheMutated || quota != 0
+		if cacheMutated && common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 
 	if err != nil {
 		common.SysError("creem topup failed: " + err.Error())
 		return errors.New("充值失败，请稍后重试")
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(topUp.UserId, "creem topup")
 	}
 
 	RecordTopupLog(topUp.UserId, fmt.Sprintf("使用Creem充值成功，充值额度: %v，支付金额：%.2f", quota, topUp.Money), callerIp, topUp.PaymentMethod, PaymentMethodCreem)
@@ -577,6 +612,7 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 	var quotaToAdd int
 	var affiliateReward int
 	var affiliateInviterId int
+	var cacheMutated bool
 	topUp := &TopUp{}
 
 	refCol := "`trade_no`"
@@ -624,13 +660,21 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 		if err := tx.Model(&User{}).Where("id = ?", topUp.UserId).Update("quota", gorm.Expr("quota + ?", quotaToAdd)).Error; err != nil {
 			return err
 		}
-
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
+		cacheMutated = true
 		return nil
 	})
 
 	if err != nil {
 		common.SysError("waffo topup failed: " + err.Error())
 		return errors.New("充值失败，请稍后重试")
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(topUp.UserId, "waffo topup")
 	}
 
 	if quotaToAdd > 0 {
@@ -649,6 +693,7 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 	var quotaToAdd int
 	var affiliateReward int
 	var affiliateInviterId int
+	var cacheMutated bool
 	topUp := &TopUp{}
 
 	refCol := "`trade_no`"
@@ -694,13 +739,21 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 		if err := tx.Model(&User{}).Where("id = ?", topUp.UserId).Update("quota", gorm.Expr("quota + ?", quotaToAdd)).Error; err != nil {
 			return err
 		}
-
+		if common.RedisEnabled {
+			if _, err := queueUserCacheSyncTx(tx, topUp.UserId, time.Now()); err != nil {
+				return err
+			}
+		}
+		cacheMutated = true
 		return nil
 	})
 
 	if err != nil {
 		common.SysError("waffo pancake topup failed: " + err.Error())
 		return errors.New("充值失败，请稍后重试")
+	}
+	if cacheMutated {
+		syncUserCacheAfterCommitBestEffort(topUp.UserId, "waffo pancake topup")
 	}
 
 	if quotaToAdd > 0 {

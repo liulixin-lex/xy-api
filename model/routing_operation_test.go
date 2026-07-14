@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -106,24 +107,44 @@ func TestRoutingOperationExternalDatabaseCompatibility(t *testing.T) {
 				"claim_token":      true,
 			}, varcharColumns)
 
-			_, _, err = CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+			operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
 			require.NoError(t, err)
+			baseTimeMs := operation.CreatedTimeMs
 			claimed, err := ClaimRoutingOperationContext(
-				context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000, 100,
+				context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs, 100,
 			)
 			require.NoError(t, err)
 			require.NotNil(t, claimed)
 			require.NoError(t, RetryRoutingOperationContext(
-				context.Background(), claimed.ID, claimed.ClaimToken, 1_050, 1_100, errors.New("retry"),
+				context.Background(), claimed.ID, claimed.ClaimToken,
+				baseTimeMs+50, baseTimeMs+100, errors.New("retry"),
 			))
 			recovered, err := ClaimRoutingOperationContext(
-				context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_100, 100,
+				context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+100, 100,
 			)
 			require.NoError(t, err)
 			require.NotNil(t, recovered)
 			require.NoError(t, SupersedeRoutingOperationContext(
-				context.Background(), recovered.ID, recovered.ClaimToken, 1_150, "head changed",
+				context.Background(), recovered.ID, recovered.ClaimToken, baseTimeMs+150, "head changed",
 			))
+
+			legacyRepairSpec := routingOperationSpecForTest()
+			legacyRepairSpec.EvaluationHash = strings.Repeat("e", 64)
+			legacyRepair, _, err := CreateRoutingOperationContext(context.Background(), legacyRepairSpec)
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", legacyRepair.ID).Updates(map[string]any{
+				"status":               RoutingOperationStatusSucceeded,
+				"attempts":             0,
+				"result_revision":      12,
+				"result_activation_id": 22,
+				"result_outbox_id":     32,
+				"completed_time_ms":    legacyRepair.CreatedTimeMs,
+				"updated_time_ms":      legacyRepair.CreatedTimeMs,
+			}).Error)
+			require.NoError(t, migrateRoutingOperationStateInvariants(db))
+			repaired, err := GetRoutingOperationContext(context.Background(), legacyRepair.ID)
+			require.NoError(t, err)
+			assert.Equal(t, 1, repaired.Attempts)
 
 			costOperation, _, err := CreateRoutingOperationContext(
 				context.Background(), routingCostSyncOperationSpecForTest("d"),
@@ -188,7 +209,7 @@ func TestRoutingOperationIsIdempotentAndClaimIsCAS(t *testing.T) {
 			defer wait.Done()
 			<-start
 			claimed[index], errs[index] = ClaimRoutingOperationContext(
-				context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000, 100,
+				context.Background(), RoutingOperationTypeCanaryAutoRollback, first.CreatedTimeMs, 100,
 			)
 		}(index)
 	}
@@ -505,6 +526,60 @@ func TestRoutingCostSyncOperationsShareTaskAndConvergeWithFencing(t *testing.T) 
 	assert.Equal(t, SystemTaskStatusSucceeded, finishedTask.Status)
 }
 
+func TestRoutingCostSyncOperationsPreserveGroupLogicalTime(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&RoutingOperation{}, &SystemTask{}, &SystemTaskLock{}))
+
+	first, _, err := CreateRoutingOperationContext(context.Background(), routingCostSyncOperationSpecForTest("4"))
+	require.NoError(t, err)
+	second, _, err := CreateRoutingOperationContext(context.Background(), routingCostSyncOperationSpecForTest("5"))
+	require.NoError(t, err)
+	task, created, err := AttachRoutingCostSyncOperationContext(context.Background(), first.ID)
+	require.NoError(t, err)
+	require.True(t, created)
+	secondTask, created, err := AttachRoutingCostSyncOperationContext(context.Background(), second.ID)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, task.TaskID, secondTask.TaskID)
+
+	const runnerID = "routing-cost-logical-clock-runner"
+	claimedTask, claimed, err := ClaimSystemTask(task.ID, task.Type, runnerID, common.GetTimestamp()+60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	observedTimeMs := time.Now().UnixMilli()
+	futureTimeMs := observedTimeMs + 1_000
+	require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", second.ID).Updates(map[string]any{
+		"created_time_ms": futureTimeMs,
+		"updated_time_ms": futureTimeMs,
+	}).Error)
+
+	require.NoError(t, ClaimRoutingCostSyncOperationsContext(
+		context.Background(), claimedTask.TaskID, runnerID, observedTimeMs, 100,
+	))
+	for _, operationID := range []int64{first.ID, second.ID} {
+		stored, getErr := GetRoutingOperationContext(context.Background(), operationID)
+		require.NoError(t, getErr)
+		assert.Equal(t, RoutingOperationStatusRunning, stored.Status)
+		assert.Equal(t, futureTimeMs, stored.UpdatedTimeMs)
+		assert.Equal(t, futureTimeMs+100, stored.ClaimUntilMs)
+	}
+
+	finished, err := FinishRoutingCostSyncTaskContext(
+		context.Background(), claimedTask.TaskID, runnerID, SystemTaskStatusSucceeded,
+		map[string]int{"snapshots": 2}, "", observedTimeMs+1,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), finished)
+	for _, operationID := range []int64{first.ID, second.ID} {
+		stored, getErr := GetRoutingOperationContext(context.Background(), operationID)
+		require.NoError(t, getErr)
+		assert.Equal(t, RoutingOperationStatusSucceeded, stored.Status)
+		assert.Equal(t, futureTimeMs, stored.UpdatedTimeMs)
+		assert.Equal(t, futureTimeMs, stored.CompletedTimeMs)
+	}
+}
+
 func TestRoutingCostSyncLeaseExpiryFailsAssociatedOperations(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
@@ -597,17 +672,18 @@ func TestRoutingOperationExpiredClaimIsRecoverableAndFenced(t *testing.T) {
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
 	require.NoError(t, ensureRoutingOperationRequestKeyUniqueIndex(db))
-	_, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+	operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
 	require.NoError(t, err)
+	baseTimeMs := operation.CreatedTimeMs
 
 	first, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs, 100,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, first)
 
 	recovered, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_101, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+101, 100,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, recovered)
@@ -615,17 +691,158 @@ func TestRoutingOperationExpiredClaimIsRecoverableAndFenced(t *testing.T) {
 	assert.Equal(t, 2, recovered.Attempts)
 
 	result := RoutingOperationResult{Revision: 12, ActivationID: 22, OutboxID: 32}
-	err = SucceedRoutingOperationContext(context.Background(), first.ID, first.ClaimToken, 1_102, result)
+	err = SucceedRoutingOperationContext(context.Background(), first.ID, first.ClaimToken, baseTimeMs+102, result)
 	assert.ErrorIs(t, err, ErrRoutingOperationClaimLost)
 	require.NoError(t, SucceedRoutingOperationContext(
-		context.Background(), recovered.ID, recovered.ClaimToken, 1_102, result,
+		context.Background(), recovered.ID, recovered.ClaimToken, baseTimeMs+102, result,
 	))
 
 	claimed, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 2_000, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+1_000, 100,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, claimed)
+}
+
+func TestRoutingOperationClaimPreservesMonotonicTimestamps(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
+
+	operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+	require.NoError(t, err)
+	futureTimeMs := operation.CreatedTimeMs + 1
+	require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", operation.ID).Updates(map[string]any{
+		"created_time_ms": futureTimeMs,
+		"updated_time_ms": futureTimeMs,
+	}).Error)
+
+	claimed, err := ClaimRoutingOperationContext(
+		context.Background(), operation.OperationType, futureTimeMs-1, 100,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, futureTimeMs, claimed.UpdatedTimeMs)
+	assert.Equal(t, futureTimeMs+100, claimed.ClaimUntilMs)
+
+	stored, err := GetRoutingOperationContext(context.Background(), operation.ID)
+	require.NoError(t, err)
+	assert.Equal(t, claimed.ClaimToken, stored.ClaimToken)
+}
+
+func TestRoutingOperationTransitionsPreserveMonotonicTimestamps(t *testing.T) {
+	t.Run("renew", func(t *testing.T) {
+		db := openRoutingSQLiteTestDB(t)
+		withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+		require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
+
+		operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+		require.NoError(t, err)
+		futureTimeMs := operation.CreatedTimeMs + 1
+		require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", operation.ID).Updates(map[string]any{
+			"created_time_ms": futureTimeMs,
+			"updated_time_ms": futureTimeMs,
+		}).Error)
+		claimed, err := ClaimRoutingOperationContext(
+			context.Background(), operation.OperationType, futureTimeMs-1, 100,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		require.NoError(t, RenewRoutingOperationClaimContext(
+			context.Background(), claimed.ID, claimed.ClaimToken, futureTimeMs-1, 200,
+		))
+		stored, err := GetRoutingOperationContext(context.Background(), operation.ID)
+		require.NoError(t, err)
+		assert.Equal(t, futureTimeMs, stored.UpdatedTimeMs)
+		assert.Equal(t, futureTimeMs+200, stored.ClaimUntilMs)
+
+		require.NoError(t, RenewRoutingOperationClaimContext(
+			context.Background(), claimed.ID, claimed.ClaimToken, futureTimeMs-1, 100,
+		))
+		unchanged, err := GetRoutingOperationContext(context.Background(), operation.ID)
+		require.NoError(t, err)
+		assert.Equal(t, stored.ClaimUntilMs, unchanged.ClaimUntilMs)
+	})
+
+	t.Run("retry", func(t *testing.T) {
+		db := openRoutingSQLiteTestDB(t)
+		withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+		require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
+
+		operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+		require.NoError(t, err)
+		futureTimeMs := operation.CreatedTimeMs + 1
+		require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", operation.ID).Updates(map[string]any{
+			"created_time_ms": futureTimeMs,
+			"updated_time_ms": futureTimeMs,
+		}).Error)
+		claimed, err := ClaimRoutingOperationContext(
+			context.Background(), operation.OperationType, futureTimeMs-1, 1_000,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		require.NoError(t, RetryRoutingOperationContext(
+			context.Background(), claimed.ID, claimed.ClaimToken,
+			futureTimeMs-1, futureTimeMs+49, errors.New("retry"),
+		))
+		stored, err := GetRoutingOperationContext(context.Background(), operation.ID)
+		require.NoError(t, err)
+		assert.Equal(t, futureTimeMs, stored.UpdatedTimeMs)
+		assert.Equal(t, futureTimeMs+50, stored.NextRetryMs)
+	})
+
+	t.Run("finish", func(t *testing.T) {
+		db := openRoutingSQLiteTestDB(t)
+		withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+		require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
+
+		operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+		require.NoError(t, err)
+		futureTimeMs := operation.CreatedTimeMs + 1
+		require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", operation.ID).Updates(map[string]any{
+			"created_time_ms": futureTimeMs,
+			"updated_time_ms": futureTimeMs,
+		}).Error)
+		claimed, err := ClaimRoutingOperationContext(
+			context.Background(), operation.OperationType, futureTimeMs-1, 1_000,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		result := RoutingOperationResult{Revision: 12, ActivationID: 22, OutboxID: 32}
+		require.NoError(t, SucceedRoutingOperationContext(
+			context.Background(), claimed.ID, claimed.ClaimToken, futureTimeMs-1, result,
+		))
+		stored, err := GetRoutingOperationContext(context.Background(), operation.ID)
+		require.NoError(t, err)
+		assert.Equal(t, futureTimeMs, stored.UpdatedTimeMs)
+		assert.Equal(t, futureTimeMs, stored.CompletedTimeMs)
+	})
+}
+
+func TestRoutingOperationLogicalClockOverflowDoesNotMutateClaim(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&RoutingOperation{}))
+
+	operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&RoutingOperation{}).Where("id = ?", operation.ID).Updates(map[string]any{
+		"created_time_ms": int64(math.MaxInt64),
+		"updated_time_ms": int64(math.MaxInt64),
+	}).Error)
+
+	claimed, err := ClaimRoutingOperationContext(
+		context.Background(), operation.OperationType, 1, 1,
+	)
+	assert.ErrorIs(t, err, ErrRoutingOperationInvalid)
+	assert.Nil(t, claimed)
+	stored, err := GetRoutingOperationContext(context.Background(), operation.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingOperationStatusPending, stored.Status)
+	assert.Equal(t, int64(math.MaxInt64), stored.UpdatedTimeMs)
 }
 
 func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
@@ -636,41 +853,43 @@ func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
 
 	operation, _, err := CreateRoutingOperationContext(context.Background(), routingOperationSpecForTest())
 	require.NoError(t, err)
+	baseTimeMs := operation.CreatedTimeMs
 	runnable, err := HasRunnableRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs,
 	)
 	require.NoError(t, err)
 	assert.True(t, runnable)
 	claimed, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_000, 200,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs, 200,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.NoError(t, RetryRoutingOperationContext(
-		context.Background(), operation.ID, claimed.ClaimToken, 1_050, 1_100, errors.New("transient"),
+		context.Background(), operation.ID, claimed.ClaimToken,
+		baseTimeMs+50, baseTimeMs+100, errors.New("transient"),
 	))
 
 	runnable, err = HasRunnableRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_099,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+99,
 	)
 	require.NoError(t, err)
 	assert.False(t, runnable)
 	notDue, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_099, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+99, 100,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, notDue)
 	due, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 1_100, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+100, 100,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, due)
 	assert.Equal(t, 2, due.Attempts)
 	require.NoError(t, FailRoutingOperationContext(
-		context.Background(), due.ID, due.ClaimToken, 1_150, errors.New("permanent"),
+		context.Background(), due.ID, due.ClaimToken, baseTimeMs+150, errors.New("permanent"),
 	))
 	runnable, err = HasRunnableRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 2_000,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+1_000,
 	)
 	require.NoError(t, err)
 	assert.False(t, runnable)
@@ -680,27 +899,30 @@ func TestRoutingOperationRetryAndTerminalTransitionsAreCAS(t *testing.T) {
 	assert.Equal(t, RoutingOperationStatusFailed, failed.Status)
 	assert.Equal(t, "permanent", failed.LastError)
 	assert.Empty(t, failed.ClaimToken)
-	assert.Equal(t, int64(1_150), failed.CompletedTimeMs)
+	assert.Equal(t, baseTimeMs+150, failed.CompletedTimeMs)
 
-	err = FailRoutingOperationContext(context.Background(), due.ID, due.ClaimToken, 1_151, errors.New("again"))
+	err = FailRoutingOperationContext(
+		context.Background(), due.ID, due.ClaimToken, baseTimeMs+151, errors.New("again"),
+	)
 	assert.ErrorIs(t, err, ErrRoutingOperationClaimLost)
 	terminal, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 2_000, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, baseTimeMs+1_000, 100,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, terminal)
 
 	supersedeSpec := routingOperationSpecForTest()
 	supersedeSpec.EvaluationHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	_, _, err = CreateRoutingOperationContext(context.Background(), supersedeSpec)
+	supersedeOperation, _, err := CreateRoutingOperationContext(context.Background(), supersedeSpec)
 	require.NoError(t, err)
+	supersedeBaseTimeMs := supersedeOperation.CreatedTimeMs
 	superseded, err := ClaimRoutingOperationContext(
-		context.Background(), RoutingOperationTypeCanaryAutoRollback, 2_100, 100,
+		context.Background(), RoutingOperationTypeCanaryAutoRollback, supersedeBaseTimeMs, 100,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, superseded)
 	require.NoError(t, SupersedeRoutingOperationContext(
-		context.Background(), superseded.ID, superseded.ClaimToken, 2_150, "head changed",
+		context.Background(), superseded.ID, superseded.ClaimToken, supersedeBaseTimeMs+50, "head changed",
 	))
 	var storedSuperseded RoutingOperation
 	require.NoError(t, db.First(&storedSuperseded, superseded.ID).Error)

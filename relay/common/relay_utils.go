@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -83,14 +84,75 @@ func validatePrompt(prompt string) *dto.TaskError {
 // overflow quota calculation into a negative charge.
 const MaxTaskDurationSeconds = 3600
 
-func validateTaskDurationBounds(req TaskSubmitReq) *dto.TaskError {
-	seconds := req.Duration
-	if seconds == 0 && req.Seconds != "" {
-		seconds, _ = strconv.Atoi(req.Seconds)
+func validateTaskDurationBounds(req *TaskSubmitReq) *dto.TaskError {
+	if req == nil {
+		return createTaskError(fmt.Errorf("task duration is unavailable"), "invalid_seconds", http.StatusBadRequest, true)
 	}
-	if seconds < 0 || seconds > MaxTaskDurationSeconds {
+	if req.DurationPresent && req.Duration <= 0 {
 		return createTaskError(fmt.Errorf("seconds must be between 1 and %d", MaxTaskDurationSeconds), "invalid_seconds", http.StatusBadRequest, true)
 	}
+	if req.Duration < 0 || req.Duration > MaxTaskDurationSeconds {
+		return createTaskError(fmt.Errorf("seconds must be between 1 and %d", MaxTaskDurationSeconds), "invalid_seconds", http.StatusBadRequest, true)
+	}
+	if strings.TrimSpace(req.Seconds) == "" {
+		req.Seconds = ""
+		return nil
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(req.Seconds), 10, 0)
+	if err != nil || seconds <= 0 || seconds > MaxTaskDurationSeconds {
+		return createTaskError(fmt.Errorf("seconds must be an integer between 1 and %d", MaxTaskDurationSeconds), "invalid_seconds", http.StatusBadRequest, true)
+	}
+	if req.Duration > 0 {
+		seconds = int64(req.Duration)
+	} else {
+		req.Duration = int(seconds)
+	}
+	req.Seconds = strconv.FormatInt(seconds, 10)
+	return nil
+}
+
+func ValidateTaskRequestForRouting(c *gin.Context, info *RelayInfo) *dto.TaskError {
+	if c == nil || info == nil {
+		return createTaskError(fmt.Errorf("task request context is unavailable"), "invalid_request", http.StatusBadRequest, true)
+	}
+	var (
+		req TaskSubmitReq
+		err error
+	)
+	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
+		req, err = validateMultipartTaskRequest(c, info, info.Action)
+	} else {
+		err = common.UnmarshalBodyReusable(c, &req)
+	}
+	if err != nil {
+		code := "invalid_request"
+		if errors.Is(err, ErrInvalidTaskDuration) {
+			code = "invalid_seconds"
+		}
+		return createTaskError(err, code, http.StatusBadRequest, true)
+	}
+	if req.InputReference != "" {
+		req.Images = []string{req.InputReference}
+	} else if len(req.Images) == 0 && strings.TrimSpace(req.Image) != "" {
+		req.Images = []string{strings.TrimSpace(req.Image)}
+	}
+	if taskErr := validatePrompt(req.Prompt); taskErr != nil {
+		return taskErr
+	}
+	if taskErr := validateTaskDurationBounds(&req); taskErr != nil {
+		return taskErr
+	}
+	if strings.TrimSpace(req.Model) == "" && strings.TrimSpace(info.OriginModelName) == "" {
+		return createTaskError(fmt.Errorf("model field is required"), "missing_model", http.StatusBadRequest, true)
+	}
+	action := info.Action
+	if action == "" {
+		action = constant.TaskActionTextGenerate
+		if req.HasImage() {
+			action = constant.TaskActionGenerate
+		}
+	}
+	storeTaskRequest(c, info, action, req)
 	return nil
 }
 
@@ -102,22 +164,35 @@ func validateMultipartTaskRequest(c *gin.Context, info *RelayInfo, action string
 
 	formData := c.Request.PostForm
 	req = TaskSubmitReq{
-		Prompt:   formData.Get("prompt"),
-		Model:    formData.Get("model"),
-		Mode:     formData.Get("mode"),
-		Image:    formData.Get("image"),
-		Size:     formData.Get("size"),
-		Metadata: make(map[string]interface{}),
+		Prompt:         formData.Get("prompt"),
+		Model:          formData.Get("model"),
+		Mode:           formData.Get("mode"),
+		Image:          formData.Get("image"),
+		Size:           formData.Get("size"),
+		Seconds:        formData.Get("seconds"),
+		InputReference: formData.Get("input_reference"),
+		Metadata:       make(map[string]interface{}),
 	}
 
-	if durationStr := formData.Get("seconds"); durationStr != "" {
-		if duration, err := strconv.Atoi(durationStr); err == nil {
-			req.Duration = duration
+	if values, present := formData["duration"]; present {
+		req.DurationPresent = true
+		if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
+			return req, fmt.Errorf("%w: duration must be an integer", ErrInvalidTaskDuration)
 		}
+		duration, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 0)
+		if err != nil {
+			return req, fmt.Errorf("%w: duration must be an integer: %v", ErrInvalidTaskDuration, err)
+		}
+		req.Duration = int(duration)
 	}
 
 	if images := formData["images"]; len(images) > 0 {
 		req.Images = images
+	}
+	if req.InputReference != "" {
+		req.Images = []string{req.InputReference}
+	} else if len(req.Images) == 0 && strings.TrimSpace(req.Image) != "" {
+		req.Images = []string{strings.TrimSpace(req.Image)}
 	}
 
 	for key, values := range formData {
@@ -143,16 +218,16 @@ func ValidateMultipartDirect(c *gin.Context, info *RelayInfo) *dto.TaskError {
 
 	var req TaskSubmitReq
 	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
-		return createTaskError(err, "invalid_json", http.StatusBadRequest, true)
+		code := "invalid_json"
+		if errors.Is(err, ErrInvalidTaskDuration) {
+			code = "invalid_seconds"
+		}
+		return createTaskError(err, code, http.StatusBadRequest, true)
 	}
 
 	prompt = req.Prompt
 	model = req.Model
 	size = req.Size
-	seconds, _ = strconv.Atoi(req.Seconds)
-	if seconds == 0 {
-		seconds = req.Duration
-	}
 	if req.InputReference != "" {
 		req.Images = []string{req.InputReference}
 	} else if len(req.Images) == 0 && strings.TrimSpace(req.Image) != "" {
@@ -172,9 +247,10 @@ func ValidateMultipartDirect(c *gin.Context, info *RelayInfo) *dto.TaskError {
 		return taskErr
 	}
 
-	if taskErr := validateTaskDurationBounds(req); taskErr != nil {
+	if taskErr := validateTaskDurationBounds(&req); taskErr != nil {
 		return taskErr
 	}
+	seconds = req.Duration
 
 	action := constant.TaskActionTextGenerate
 	if hasInputReference {
@@ -213,6 +289,7 @@ func isKnownTaskField(field string) bool {
 		"images":          true,
 		"size":            true,
 		"duration":        true,
+		"seconds":         true,
 		"input_reference": true, // Sora 特有字段
 	}
 	return knownFields[field]
@@ -230,14 +307,18 @@ func ValidateBasicTaskRequest(c *gin.Context, info *RelayInfo, action string) *d
 	}
 	// 为了metadata字段的兼容性，统一UnmarshalBodyReusable
 	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
-		return createTaskError(err, "invalid_request", http.StatusBadRequest, true)
+		code := "invalid_request"
+		if errors.Is(err, ErrInvalidTaskDuration) {
+			code = "invalid_seconds"
+		}
+		return createTaskError(err, code, http.StatusBadRequest, true)
 	}
 
 	if taskErr := validatePrompt(req.Prompt); taskErr != nil {
 		return taskErr
 	}
 
-	if taskErr := validateTaskDurationBounds(req); taskErr != nil {
+	if taskErr := validateTaskDurationBounds(&req); taskErr != nil {
 		return taskErr
 	}
 

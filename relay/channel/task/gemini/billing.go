@@ -4,30 +4,14 @@ import (
 	"strconv"
 	"strings"
 
+	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 )
 
 // ParseVeoDurationSeconds extracts durationSeconds from metadata.
 // Returns 8 (Veo default) when not specified or invalid.
-func ParseVeoDurationSeconds(metadata map[string]any) int {
-	if metadata == nil {
-		return 8
-	}
-	v, ok := metadata["durationSeconds"]
-	if !ok {
-		return 8
-	}
-	switch n := v.(type) {
-	case float64:
-		if int(n) > 0 {
-			return int(n)
-		}
-	case int:
-		if n > 0 {
-			return n
-		}
-	}
-	return 8
+func ParseVeoDurationSeconds(metadata map[string]any) (int, bool, error) {
+	return taskcommon.NormalizeMetadataInt(metadata, "durationSeconds", 1, relaycommon.MaxTaskDurationSeconds)
 }
 
 // ParseVeoResolution extracts resolution from metadata.
@@ -50,21 +34,29 @@ func ParseVeoResolution(metadata map[string]any) string {
 // Priority: metadata["durationSeconds"] > stdDuration > stdSeconds > default (8).
 // The result is capped because it is used as a billing multiplier and the
 // metadata path bypasses standard request validation.
-func ResolveVeoDuration(metadata map[string]any, stdDuration int, stdSeconds string) int {
-	if metadata != nil {
-		if _, exists := metadata["durationSeconds"]; exists {
-			if d := ParseVeoDurationSeconds(metadata); d > 0 {
-				return min(d, relaycommon.MaxTaskDurationSeconds)
-			}
-		}
+func ResolveVeoDuration(metadata map[string]any, stdDuration int, stdSeconds string) (int, error) {
+	if duration, present, err := ParseVeoDurationSeconds(metadata); err != nil {
+		return 0, err
+	} else if present {
+		return duration, nil
 	}
 	if stdDuration > 0 {
-		return min(stdDuration, relaycommon.MaxTaskDurationSeconds)
+		if stdDuration > relaycommon.MaxTaskDurationSeconds {
+			return 0, strconv.ErrRange
+		}
+		return stdDuration, nil
 	}
-	if s, err := strconv.Atoi(stdSeconds); err == nil && s > 0 {
-		return min(s, relaycommon.MaxTaskDurationSeconds)
+	if strings.TrimSpace(stdSeconds) != "" {
+		seconds, err := strconv.ParseInt(strings.TrimSpace(stdSeconds), 10, 0)
+		if err != nil || seconds <= 0 || seconds > relaycommon.MaxTaskDurationSeconds {
+			if err != nil {
+				return 0, err
+			}
+			return 0, strconv.ErrRange
+		}
+		return int(seconds), nil
 	}
-	return 8
+	return 8, nil
 }
 
 // ResolveVeoResolution returns the effective resolution string (lowercase).

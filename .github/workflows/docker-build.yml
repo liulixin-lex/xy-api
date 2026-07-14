@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag or version to build (e.g., v0.0.1)'
+        description: 'Existing stable tag to publish (e.g., v0.0.1)'
         required: true
         type: string
       confirm_tag:
@@ -16,13 +16,123 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-container-publish-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
 jobs:
+  prepare:
+    name: Validate stable release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    permissions:
+      contents: read
+    steps:
+      - name: Validate release request
+        env:
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Stable Docker tags must use lowercase v semver. Current value: $RELEASE_TAG"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ] && [ "$CONFIRM_TAG" != "$RELEASE_TAG" ]; then
+            echo '::error::confirm_tag must exactly match tag before publishing a stable Docker image.'
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ] && [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Manual stable releases must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
+            exit 1
+          fi
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
+
+      - name: Validate tag, VERSION, and main ancestry
+        id: release
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Stable Docker tags must use lowercase v semver. Current value: $tag"
+            exit 1
+          fi
+
+          if ! cmp -s VERSION <(printf '%s\n' "$tag"); then
+            echo "::error::VERSION must contain exactly $tag followed by one newline."
+            exit 1
+          fi
+
+          release_sha=$(git rev-parse HEAD)
+          tag_sha=$(git rev-list -n 1 "refs/tags/$tag")
+          if [ "$tag_sha" != "$release_sha" ]; then
+            echo "::error::Tag $tag does not resolve to the checked-out commit."
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$release_sha" origin/main; then
+            echo "::error::Release commit $release_sha is not an ancestor of origin/main."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "Validated $tag at $release_sha"
+
+      - name: Test release verification scripts
+        run: |
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-resolve-stable-architecture.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-resolve-stable-latest.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-release-attestations.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-stable-architecture.sh"
+          "$RELEASE_CI_ROOT/.github/scripts/tests/test-verify-stable-reuse-handoff.sh"
+
   build_single_arch:
-    name: Build & push (${{ matrix.arch }})
+    name: Build, smoke, and sign (${{ matrix.arch }})
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -34,232 +144,1041 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
+    timeout-minutes: 90
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
-
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
       id-token: write
 
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - name: Check out validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
-          fetch-depth: 1
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
 
-      - name: Resolve tag & write VERSION
-        id: version
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
-          TAG="$RELEASE_TAG"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.confirm_tag }}" != "$TAG" ]; then
-            echo "::error::confirm_tag must exactly match tag before publishing a stable Docker image."
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
             exit 1
           fi
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Docker release tags must use lowercase v semver, for example v0.0.1. Current value: $TAG"
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
             exit 1
           fi
-          echo "TAG=${TAG}" >> $GITHUB_ENV
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "${TAG}" > VERSION
-          echo "Building tag: ${TAG} for ${{ matrix.arch }}"
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
 
-      - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Set release environment
+        run: |
+          echo "TAG=${{ needs.prepare.outputs.tag }}" >> "$GITHUB_ENV"
+          echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Validate optional Docker Hub configuration
+        run: |
+          set -euo pipefail
+          configured=0
+          for value in "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" "$DOCKERHUB_REPOSITORY"; do
+            if [ -n "$value" ]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [ "$configured" -ne 0 ] && [ "$configured" -ne 3 ]; then
+            echo '::error::Docker Hub publishing requires username, token, and repository together.'
+            exit 1
+          fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (labels)
+      - name: Resolve existing immutable architecture
+        id: immutable_arch
+        run: |
+          set -euo pipefail
+          args=(
+            --repository "ghcr.io/${GHCR_REPOSITORY}"
+            --tag "$TAG"
+            --arch "${{ matrix.arch }}"
+            --output "$GITHUB_OUTPUT"
+          )
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            args+=(--secondary-repository "$DOCKERHUB_REPOSITORY")
+          fi
+          "$RELEASE_CI_ROOT/.github/scripts/resolve-stable-architecture.sh" "${args[@]}"
+
+      - name: Extract immutable image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: |
-            ghcr.io/${{ env.GHCR_REPOSITORY }}
+          images: ghcr.io/${{ env.GHCR_REPOSITORY }}
+          tags: type=raw,value=${{ needs.prepare.outputs.tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
 
-      - name: Prepare image tags
+      - name: Prepare architecture staging tags
         id: tags
         run: |
           {
-            echo "tags<<EOF"
-            echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${{ matrix.arch }}"
-            echo "ghcr.io/${GHCR_REPOSITORY}:latest-${{ matrix.arch }}"
+            echo 'tags<<EOF'
+            echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${{ matrix.arch }}-build-${GITHUB_RUN_ID}"
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-              echo "${DOCKERHUB_REPOSITORY}:${TAG}-${{ matrix.arch }}"
-              echo "${DOCKERHUB_REPOSITORY}:latest-${{ matrix.arch }}"
+              echo "${DOCKERHUB_REPOSITORY}:${TAG}-${{ matrix.arch }}-build-${GITHUB_RUN_ID}"
             fi
-            echo "EOF"
+            echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build & push
+      - name: Build and push immutable architecture image
         id: build
-        uses: docker/build-push-action@v6
+        if: steps.immutable_arch.outputs.reuse_existing != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=stable-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=stable-${{ matrix.arch }}
           provenance: mode=max
           sbom: true
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image with cosign
+      - name: Select architecture digest
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.immutable_arch.outputs.digest }}
+          REUSE_EXISTING: ${{ steps.immutable_arch.outputs.reuse_existing }}
         run: |
-          sign_with_retry() {
-            local target="$1"
-            local attempt
-            for attempt in 1 2 3 4 5; do
+          set -euo pipefail
+          case "$REUSE_EXISTING" in
+            true)
+              [ -n "$EXISTING_DIGEST" ] || {
+                echo '::error::Architecture reuse was selected without an existing digest.'
+                exit 1
+              }
+              [ -z "$BUILT_DIGEST" ] || {
+                echo '::error::Architecture reuse unexpectedly produced a new build digest.'
+                exit 1
+              }
+              digest=$EXISTING_DIGEST
+              ;;
+            false)
+              [ -z "$EXISTING_DIGEST" ] || {
+                echo '::error::A fresh architecture build unexpectedly selected an existing digest.'
+                exit 1
+              }
+              [ -n "$BUILT_DIGEST" ] || {
+                echo '::error::Fresh architecture build did not return a digest.'
+                exit 1
+              }
+              digest=$BUILT_DIGEST
+              ;;
+            *)
+              echo "::error::Invalid architecture reuse decision: $REUSE_EXISTING"
+              exit 1
+              ;;
+          esac
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "BUILD_REUSED=$REUSE_EXISTING" >> "$GITHUB_ENV"
+
+      - name: Validate build digest
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Selected architecture digest is invalid: $IMAGE_DIGEST"
+            exit 1
+          fi
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Verify reused immutable architecture before use
+        if: steps.immutable_arch.outputs.reuse_existing == 'true'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          verify_repository() {
+            local repository=$1
+            local evidence_name=$2
+            "$RELEASE_CI_ROOT/.github/scripts/verify-stable-architecture.sh" \
+              --repository "$repository" \
+              --digest "$IMAGE_DIGEST" \
+              --platform "$PLATFORM" \
+              --version "$TAG" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --output-dir "$RUNNER_TEMP/stable-verification/${{ matrix.arch }}/${evidence_name}"
+          }
+
+          verify_repository "ghcr.io/${GHCR_REPOSITORY}" ghcr
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            verify_repository "$DOCKERHUB_REPOSITORY" dockerhub
+          fi
+
+      - name: Smoke test version and server startup
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/${GHCR_REPOSITORY}@${IMAGE_DIGEST}"
+          actual_version=$(docker run --rm --platform "$PLATFORM" "$image" --version | tail -n 1 | tr -d '\r')
+          if [ "$actual_version" != "$TAG" ]; then
+            echo "::error::Container version $actual_version does not match $TAG."
+            exit 1
+          fi
+
+          container="xy-api-release-smoke-${{ matrix.arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d \
+            --name "$container" \
+            --platform "$PLATFORM" \
+            -e "CRYPTO_SECRET=release-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.arch }}" \
+            -p 127.0.0.1::3000 \
+            "$image" >/dev/null
+
+          port=$(docker port "$container" 3000/tcp | awk -F: 'NR == 1 { print $NF }')
+          if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+            echo '::error::Could not resolve the smoke-test container port.'
+            docker logs "$container" || true
+            exit 1
+          fi
+
+          ready=false
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error "http://127.0.0.1:${port}/api/status" -o "$RUNNER_TEMP/status.json"; then
+              ready=true
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "$container")" != 'true' ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != 'true' ]; then
+            echo '::error::Container did not become ready within 60 seconds.'
+            docker logs "$container" || true
+            exit 1
+          fi
+          jq -e --arg version "$TAG" '.success == true and .data.version == $version' "$RUNNER_TEMP/status.json" >/dev/null
+
+      - name: Revalidate release source before architecture signing
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          current_tag_sha=$(git rev-list -n 1 "refs/tags/${TAG}")
+          if [ "$current_tag_sha" != '${{ needs.prepare.outputs.sha }}' ]; then
+            echo "::error::Release tag $TAG moved during the architecture build; refusing to sign."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$current_tag_sha" origin/main; then
+            echo "::error::Release commit $current_tag_sha is no longer an ancestor of origin/main."
+            exit 1
+          fi
+
+      - name: Sign new and verify architecture image by digest
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          sign_with_backoff() {
+            target=$1
+            for attempt in 1 2 3; do
               if cosign sign --yes "$target"; then
                 return 0
               fi
-              if [ "$attempt" -eq 5 ]; then
-                break
+              if [ "$attempt" -eq 3 ]; then
+                return 1
               fi
-              sleep $((attempt * 15))
+              sleep $((2 ** attempt + RANDOM % 5))
             done
-            return 1
           }
 
-          sign_with_retry ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            sign_with_retry ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
+          verify_fresh_repository() {
+            local repository=$1
+            local evidence_name=$2
+            "$RELEASE_CI_ROOT/.github/scripts/verify-stable-architecture.sh" \
+              --repository "$repository" \
+              --digest "$IMAGE_DIGEST" \
+              --platform "$PLATFORM" \
+              --version "$TAG" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --output-dir "$RUNNER_TEMP/stable-verification/${{ matrix.arch }}/${evidence_name}"
+          }
+
+          if [ "$BUILD_REUSED" != 'true' ]; then
+            ghcr_ref="ghcr.io/${GHCR_REPOSITORY}@${IMAGE_DIGEST}"
+            sign_with_backoff "$ghcr_ref"
+            verify_fresh_repository "ghcr.io/${GHCR_REPOSITORY}" ghcr
           fi
 
-      - name: Image summary
-        run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "${DOCKERHUB_REPOSITORY}:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          if [ "$BUILD_REUSED" != 'true' ] && \
+            [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            dockerhub_ref="${DOCKERHUB_REPOSITORY}@${IMAGE_DIGEST}"
+            sign_with_backoff "$dockerhub_ref"
+            verify_fresh_repository "$DOCKERHUB_REPOSITORY" dockerhub
           fi
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Export architecture digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/stable-digest"
+          cp -R \
+            "$RUNNER_TEMP/stable-verification/${ARCH}" \
+            "$RUNNER_TEMP/stable-digest/${ARCH}-verification"
+          jq '{success: .success, version: .data.version}' \
+            "$RUNNER_TEMP/status.json" > "$RUNNER_TEMP/stable-digest/${ARCH}-status.json"
+          certificate_identity=$(jq -r '.signature.certificate_identity' \
+            "$RUNNER_TEMP/stable-verification/${ARCH}/ghcr/verification.json")
+          reuse_mode=$(jq -r '.reuse_policy.mode' \
+            "$RUNNER_TEMP/stable-verification/${ARCH}/ghcr/verification.json")
+          jq -n \
+            --arg arch "$ARCH" \
+            --arg platform "$PLATFORM" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg version "$TAG" \
+            --arg source_sha "${{ needs.prepare.outputs.sha }}" \
+            --arg certificate_identity "$certificate_identity" \
+            --arg build_reused "$BUILD_REUSED" \
+            --arg reuse_mode "$reuse_mode" \
+            '{arch: $arch, platform: $platform, digest: $digest, version: $version, source_sha: $source_sha, smoke_tested: true, signature_verified: true, signature_created: ($build_reused != "true"), certificate_identity: $certificate_identity, reuse_mode: $reuse_mode, reused_immutable_tag: ($build_reused == "true")}' \
+            > "$RUNNER_TEMP/stable-digest/${ARCH}.json"
+
+      - name: Upload architecture digest evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stable-image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/stable-digest
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+      - name: Architecture summary
+        run: |
+          set -euo pipefail
+          image_tag="${TAG}-${{ matrix.arch }}-build-${GITHUB_RUN_ID}"
+          if [ "$BUILD_REUSED" = 'true' ]; then
+            image_tag="${TAG}-${{ matrix.arch }}"
+          fi
+          {
+            echo '### Signed architecture image'
+            echo '```text'
+            echo "ghcr.io/${GHCR_REPOSITORY}:${image_tag}"
+            echo "$IMAGE_DIGEST"
+            echo "Reused immutable architecture tag: $BUILD_REUSED"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   create_manifests:
-    name: Create multi-arch manifests
-    needs: [build_single_arch]
+    name: Verify, sign, and promote stable manifests
+    needs: [prepare, build_single_arch]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    outputs:
+      ghcr_digest: ${{ steps.verify_candidates.outputs.ghcr_digest }}
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
       id-token: write
 
     steps:
-      - name: Set version
-        run: echo "TAG=${{ needs.build_single_arch.outputs.tag }}" >> $GITHUB_ENV
+      - name: Set release environment
+        run: |
+          {
+            echo "TAG=${{ needs.prepare.outputs.tag }}"
+            echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}"
+            echo "CANDIDATE_TAG=${{ needs.prepare.outputs.tag }}-candidate-${GITHUB_RUN_ID}"
+          } >> "$GITHUB_ENV"
 
-      - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Validate optional Docker Hub configuration
+        run: |
+          set -euo pipefail
+          configured=0
+          for value in "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" "$DOCKERHUB_REPOSITORY"; do
+            if [ -n "$value" ]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [ "$configured" -ne 0 ] && [ "$configured" -ne 3 ]; then
+            echo '::error::Docker Hub publishing requires username, token, and repository together.'
+            exit 1
+          fi
+          if [ "$configured" -eq 3 ]; then
+            echo 'DOCKERHUB_ENABLED=true' >> "$GITHUB_ENV"
+          else
+            echo 'DOCKERHUB_ENABLED=false' >> "$GITHUB_ENV"
+          fi
+
+      - name: Check out validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Stage trusted release workflow tooling
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The trusted workflow SHA is invalid.'
+            exit 1
+          fi
+          if ! git cat-file -e "${TRUSTED_WORKFLOW_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$TRUSTED_WORKFLOW_SHA"
+          fi
+          if [ "$(git rev-parse "${TRUSTED_WORKFLOW_SHA}^{commit}")" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo '::error::Could not resolve the exact trusted workflow commit.'
+            exit 1
+          fi
+          trusted_root="$RUNNER_TEMP/release-ci"
+          mkdir -p "$trusted_root"
+          git archive --format=tar "$TRUSTED_WORKFLOW_SHA" .github | tar -xf - -C "$trusted_root"
+          [ -x "$trusted_root/.github/scripts/verify-release-attestations.sh" ] || {
+            echo '::error::Trusted release workflow tooling is incomplete.'
+            exit 1
+          }
+          echo "RELEASE_CI_ROOT=$trusted_root" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver: docker
+
+      - name: Download architecture digest evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: stable-image-digest-*
+          path: ${{ runner.temp }}/stable-digests
+          merge-multiple: true
+
+      - name: Validate architecture digest handoff
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+          mkdir -p "$evidence_dir/smoke"
+          for arch in amd64 arm64; do
+            file="$RUNNER_TEMP/stable-digests/${arch}.json"
+            status_file="$RUNNER_TEMP/stable-digests/${arch}-status.json"
+            if [ ! -f "$file" ] || [ ! -f "$status_file" ]; then
+              echo "::error::Missing digest evidence for $arch."
+              exit 1
+            fi
+            jq -e \
+              --arg arch "$arch" \
+              --arg platform "linux/$arch" \
+              --arg version "${{ needs.prepare.outputs.tag }}" \
+              --arg source_sha "${{ needs.prepare.outputs.sha }}" \
+              '.arch == $arch and
+               .platform == $platform and
+               .version == $version and
+               .source_sha == $source_sha and
+               .smoke_tested == true and
+               .signature_verified == true and
+               .signature_created == (.reused_immutable_tag | not) and
+               (.certificate_identity | type == "string" and startswith("https://github.com/")) and
+               (.reuse_mode == "same_run" or .reuse_mode == "canonical_tag_run") and
+               (.digest | test("^sha256:[0-9a-f]{64}$"))' \
+              "$file" >/dev/null
+            jq -e \
+              --arg version "${{ needs.prepare.outputs.tag }}" \
+              '.success == true and .version == $version' \
+              "$status_file" >/dev/null
+            registries=(ghcr)
+            if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+              registries+=(dockerhub)
+            fi
+            for registry in "${registries[@]}"; do
+              verification_file="$RUNNER_TEMP/stable-digests/${arch}-verification/${registry}/verification.json"
+              cosign_file="$RUNNER_TEMP/stable-digests/${arch}-verification/${registry}/cosign.json"
+              if [ ! -f "$verification_file" ] || [ ! -f "$cosign_file" ]; then
+                echo "::error::Missing trusted architecture evidence for $arch in $registry."
+                exit 1
+              fi
+              repository="ghcr.io/${GHCR_REPOSITORY}"
+              if [ "$registry" = dockerhub ]; then
+                repository=$DOCKERHUB_REPOSITORY
+              fi
+              "$RELEASE_CI_ROOT/.github/scripts/verify-stable-reuse-handoff.sh" \
+                --verification "$verification_file" \
+                --cosign "$cosign_file" \
+                --source-repository "$GITHUB_REPOSITORY" \
+                --source-sha "${{ needs.prepare.outputs.sha }}" \
+                --version "${{ needs.prepare.outputs.tag }}" \
+                --run-id "$GITHUB_RUN_ID" \
+                --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --workflow-ref "$GITHUB_WORKFLOW_REF" \
+                --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+                --repository "$repository" \
+                --digest "$(jq -r '.digest' "$file")" \
+                --platform "linux/$arch"
+              jq -e \
+                --slurpfile verification "$verification_file" '
+                .certificate_identity == $verification[0].signature.certificate_identity and
+                .reuse_mode == $verification[0].reuse_policy.mode and
+                (if .reused_immutable_tag then true else .reuse_mode == "same_run" end)
+              ' "$file" >/dev/null
+            done
+            if [ "$DOCKERHUB_ENABLED" = 'true' ] && ! jq -n -e \
+              --slurpfile ghcr "$RUNNER_TEMP/stable-digests/${arch}-verification/ghcr/verification.json" \
+              --slurpfile dockerhub "$RUNNER_TEMP/stable-digests/${arch}-verification/dockerhub/verification.json" \
+              --arg platform "linux/$arch" \
+              '$ghcr[0].attested_runs[$platform] == $dockerhub[0].attested_runs[$platform] and
+               $ghcr[0].reuse_policy.mode == $dockerhub[0].reuse_policy.mode' >/dev/null; then
+              echo "::error::Registry architecture evidence disagrees for $arch."
+              exit 1
+            fi
+            cp -R \
+              "$RUNNER_TEMP/stable-digests/${arch}-verification" \
+              "$evidence_dir/smoke/${arch}-verification"
+            cp "$file" "$evidence_dir/smoke/${arch}.json"
+            cp "$status_file" "$evidence_dir/smoke/${arch}-status.json"
+          done
+          echo "AMD64_DIGEST=$(jq -r '.digest' "$RUNNER_TEMP/stable-digests/amd64.json")" >> "$GITHUB_ENV"
+          echo "ARM64_DIGEST=$(jq -r '.digest' "$RUNNER_TEMP/stable-digests/arm64.json")" >> "$GITHUB_ENV"
+          jq -n \
+            --slurpfile amd64 "$RUNNER_TEMP/stable-digests/amd64-verification/ghcr/verification.json" \
+            --slurpfile arm64 "$RUNNER_TEMP/stable-digests/arm64-verification/ghcr/verification.json" '
+            def handoff($evidence; $platform):
+              $evidence.attested_runs[$platform] |
+              {run_id, run_attempt, workflow_ref, workflow_sha, mode};
+            {
+              "linux/amd64": handoff($amd64[0]; "linux/amd64"),
+              "linux/arm64": handoff($arm64[0]; "linux/arm64")
+            }
+          ' > "$evidence_dir/attested-runs.json"
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create & push manifest (GHCR version)
+      - name: Create GHCR candidate from immutable digests
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${TAG} \
-            ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:${CANDIDATE_TAG}" \
+            "ghcr.io/${GHCR_REPOSITORY}@${AMD64_DIGEST}" \
+            "ghcr.io/${GHCR_REPOSITORY}@${ARM64_DIGEST}"
 
-      - name: Create & push manifest (GHCR latest)
-        run: |
-          docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:latest \
-            ghcr.io/${GHCR_REPOSITORY}:latest-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:latest-arm64
-
-      - name: Create & push manifest (Docker Hub version)
+      - name: Create Docker Hub candidate from immutable digests
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${TAG} \
-            ${DOCKERHUB_REPOSITORY}:${TAG}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${TAG}-arm64
+            -t "${DOCKERHUB_REPOSITORY}:${CANDIDATE_TAG}" \
+            "${DOCKERHUB_REPOSITORY}@${AMD64_DIGEST}" \
+            "${DOCKERHUB_REPOSITORY}@${ARM64_DIGEST}"
 
-      - name: Create & push manifest (Docker Hub latest)
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
+      - name: Verify candidate manifests, labels, and attestations
+        id: verify_candidates
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
-          docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:latest \
-            ${DOCKERHUB_REPOSITORY}:latest-amd64 \
-            ${DOCKERHUB_REPOSITORY}:latest-arm64
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+          mkdir -p "$evidence_dir/attestations"
+
+          verify_candidate() {
+            local repository=$1
+            local evidence_prefix=$2
+            local reference="${repository}:${CANDIDATE_TAG}"
+            local manifest_file="$evidence_dir/${evidence_prefix}-candidate-manifest.json"
+            local image_file="$evidence_dir/${evidence_prefix}-candidate-images.json"
+            local amd64_source_file="$evidence_dir/${evidence_prefix}-amd64-source-manifest.json"
+            local arm64_source_file="$evidence_dir/${evidence_prefix}-arm64-source-manifest.json"
+            local immutable_reference
+            local digest
+
+            docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' > "$manifest_file"
+            docker buildx imagetools inspect "${repository}@${AMD64_DIGEST}" --format '{{json .Manifest}}' > "$amd64_source_file"
+            docker buildx imagetools inspect "${repository}@${ARM64_DIGEST}" --format '{{json .Manifest}}' > "$arm64_source_file"
+
+            jq -e \
+              --slurpfile amd64_source "$amd64_source_file" \
+              --slurpfile arm64_source "$arm64_source_file" \
+              --arg amd64_digest "$AMD64_DIGEST" \
+              --arg arm64_digest "$ARM64_DIGEST" '
+              def valid_source($source; $architecture; $expected_digest):
+                $source.mediaType == "application/vnd.oci.image.index.v1+json" and
+                $source.digest == $expected_digest and
+                ($source.manifests | length) == 2 and
+                all($source.manifests[];
+                  .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                  (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  .size > 0) and
+                ([$source.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | length) == 1 and
+                ([$source.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length) == 1 and
+                ([$source.manifests[] | select(.platform.os == "linux") | .digest] ==
+                  [$source.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .annotations["vnd.docker.reference.digest"]]);
+
+              valid_source($amd64_source[0]; "amd64"; $amd64_digest) and
+              valid_source($arm64_source[0]; "arm64"; $arm64_digest) and
+              .mediaType == "application/vnd.oci.image.index.v1+json" and
+              (.manifests | length) == 4 and
+              all(.manifests[];
+                .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+                (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                .size > 0) and
+              ([.manifests[] | select(.platform.os == "linux") | .platform.architecture] | sort) == ["amd64", "arm64"] and
+              ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length) == 2 and
+              ([.manifests[] | select(.platform.os == "linux") | .digest] | sort) ==
+                ([.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .annotations["vnd.docker.reference.digest"]] | sort) and
+              (.manifests | sort_by(.digest)) ==
+                (($amd64_source[0].manifests + $arm64_source[0].manifests) | sort_by(.digest))
+            ' "$manifest_file" >/dev/null
+
+            digest=$(jq -r '.digest' "$manifest_file")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Candidate $reference returned an invalid digest: $digest"
+              exit 1
+            fi
+            immutable_reference="${repository}@${digest}"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .Image}}' > "$image_file"
+
+            jq -e \
+              --arg version "$TAG" \
+              --arg revision "$SOURCE_SHA" \
+              '(keys | sort) == ["linux/amd64", "linux/arm64"] and
+               all(.[];
+                 .config.Labels["org.opencontainers.image.version"] == $version and
+                 .config.Labels["org.opencontainers.image.revision"] == $revision)' \
+              "$image_file" >/dev/null
+
+            while IFS= read -r attestation_digest; do
+              local attestation_file="$evidence_dir/attestations/${evidence_prefix}-${attestation_digest#sha256:}.json"
+              docker buildx imagetools inspect --raw "${repository}@${attestation_digest}" > "$attestation_file"
+              jq -e '
+                [.layers[].annotations["in-toto.io/predicate-type"]] as $types |
+                all(.layers[];
+                  .mediaType == "application/vnd.in-toto+json" and
+                  (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                  .size > 0) and
+                ($types | index("https://spdx.dev/Document")) != null and
+                ($types | index("https://slsa.dev/provenance/v1")) != null
+              ' "$attestation_file" >/dev/null
+            done < <(jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$manifest_file")
+
+            local sbom_file="$evidence_dir/attestations/${evidence_prefix}-sbom.json"
+            local provenance_file="$evidence_dir/attestations/${evidence_prefix}-provenance.json"
+            local verification_file="$evidence_dir/attestations/${evidence_prefix}-verification.json"
+            local verification_base_file="$evidence_dir/attestations/${evidence_prefix}-verification-base.json"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .SBOM}}' > "$sbom_file"
+            docker buildx imagetools inspect "$immutable_reference" --format '{{json .Provenance}}' > "$provenance_file"
+            "$RELEASE_CI_ROOT/.github/scripts/verify-release-attestations.sh" \
+              --sbom "$sbom_file" \
+              --provenance "$provenance_file" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$SOURCE_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --workflow-ref "$GITHUB_WORKFLOW_REF" \
+              --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+              --attested-runs "$evidence_dir/attested-runs.json" \
+              --release-tag "$TAG" \
+              --image-reference "$immutable_reference" \
+              --output "$verification_base_file"
+            jq \
+              --arg immutable_reference "$immutable_reference" \
+              --arg digest "$digest" '
+              . + {
+                retrieval_binding: {
+                  immutable_reference: $immutable_reference,
+                  requested_digest: $digest,
+                  resolved_manifest_digest: $digest,
+                  sbom_and_provenance_retrieved_by_digest: true
+                }
+              } |
+              .checks.immutable_retrieval_binding = true
+            ' "$verification_base_file" > "$verification_file"
+            rm -f "$verification_base_file"
+
+            printf '%s\n' "$digest" > "$evidence_dir/${evidence_prefix}-candidate.digest"
+          }
+
+          verify_candidate "ghcr.io/${GHCR_REPOSITORY}" ghcr
+          ghcr_digest=$(cat "$evidence_dir/ghcr-candidate.digest")
+          dockerhub_digest=''
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            verify_candidate "$DOCKERHUB_REPOSITORY" dockerhub
+            dockerhub_digest=$(cat "$evidence_dir/dockerhub-candidate.digest")
+            if [ "$dockerhub_digest" != "$ghcr_digest" ]; then
+              echo "::error::Registry candidate digest mismatch: $ghcr_digest vs $dockerhub_digest"
+              exit 1
+            fi
+          fi
+
+          echo "GHCR_CANDIDATE_DIGEST=$ghcr_digest" >> "$GITHUB_ENV"
+          echo "DOCKERHUB_CANDIDATE_DIGEST=$dockerhub_digest" >> "$GITHUB_ENV"
+          echo "ghcr_digest=$ghcr_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Revalidate release source before candidate signing
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          current_tag_sha=$(git rev-list -n 1 "refs/tags/${TAG}")
+          if [ "$current_tag_sha" != '${{ needs.prepare.outputs.sha }}' ]; then
+            echo "::error::Release tag $TAG moved during candidate verification; refusing to sign."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$current_tag_sha" origin/main; then
+            echo "::error::Release commit $current_tag_sha is no longer an ancestor of origin/main."
+            exit 1
+          fi
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Sign manifests with cosign
+      - name: Sign and verify candidates before stable promotion
         run: |
-          sign_with_retry() {
-            local target="$1"
-            local attempt
-            for attempt in 1 2 3 4 5; do
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+
+          sign_with_backoff() {
+            target=$1
+            for attempt in 1 2 3; do
               if cosign sign --yes "$target"; then
                 return 0
               fi
-              if [ "$attempt" -eq 5 ]; then
-                break
+              if [ "$attempt" -eq 3 ]; then
+                return 1
               fi
-              sleep $((attempt * 15))
+              sleep $((2 ** attempt + RANDOM % 5))
             done
-            return 1
           }
 
-          sign_with_retry ghcr.io/${GHCR_REPOSITORY}:${TAG}
-          sign_with_retry ghcr.io/${GHCR_REPOSITORY}:latest
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            sign_with_retry ${DOCKERHUB_REPOSITORY}:${TAG}
-            sign_with_retry ${DOCKERHUB_REPOSITORY}:latest
+          ghcr_ref="ghcr.io/${GHCR_REPOSITORY}@${GHCR_CANDIDATE_DIGEST}"
+          sign_with_backoff "$ghcr_ref"
+          cosign verify \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            --output json \
+            "$ghcr_ref" > "$evidence_dir/cosign-ghcr.json"
+
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            dockerhub_ref="${DOCKERHUB_REPOSITORY}@${DOCKERHUB_CANDIDATE_DIGEST}"
+            sign_with_backoff "$dockerhub_ref"
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --output json \
+              "$dockerhub_ref" > "$evidence_dir/cosign-dockerhub.json"
           fi
+
+      - name: Enforce immutable version tags
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          current_tag_sha=$(git rev-list -n 1 "refs/tags/${TAG}")
+          if [ "$current_tag_sha" != '${{ needs.prepare.outputs.sha }}' ]; then
+            echo "::error::Release tag $TAG moved during the workflow; refusing stable promotion."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$current_tag_sha" origin/main; then
+            echo "::error::Release commit $current_tag_sha is no longer an ancestor of origin/main."
+            exit 1
+          fi
+
+          inspect_optional_manifest() {
+            local reference=$1
+            local output_file=$2
+            local error_file="${output_file}.error"
+            if docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' > "$output_file" 2> "$error_file"; then
+              rm -f "$error_file"
+              return 0
+            fi
+            if grep -Eiq 'manifest unknown|not found|no such manifest|name unknown' "$error_file"; then
+              rm -f "$output_file" "$error_file"
+              return 1
+            fi
+            cat "$error_file" >&2
+            echo "::error::Could not safely determine whether $reference already exists."
+            exit 1
+          }
+
+          assert_immutable_tag() {
+            local reference=$1
+            local expected_digest=$2
+            local evidence_name=$3
+            local manifest_file="$evidence_dir/preflight-${evidence_name}.json"
+            if inspect_optional_manifest "$reference" "$manifest_file"; then
+              local actual_digest
+              actual_digest=$(jq -r '.digest' "$manifest_file")
+              if [ "$actual_digest" != "$expected_digest" ]; then
+                echo "::error::Refusing to overwrite immutable version tag $reference ($actual_digest != $expected_digest)."
+                exit 1
+              fi
+            fi
+          }
+
+          assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" ghcr-amd64
+          assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" ghcr-arm64
+          assert_immutable_tag "ghcr.io/${GHCR_REPOSITORY}:${TAG}" "$GHCR_CANDIDATE_DIGEST" ghcr-version
+
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-amd64" "$AMD64_DIGEST" dockerhub-amd64
+            assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}-arm64" "$ARM64_DIGEST" dockerhub-arm64
+            assert_immutable_tag "${DOCKERHUB_REPOSITORY}:${TAG}" "$DOCKERHUB_CANDIDATE_DIGEST" dockerhub-version
+          fi
+
+      - name: Publish signed immutable version tags
+        run: |
+          set -euo pipefail
+
+          publish_registry() {
+            local repository=$1
+            local manifest_digest=$2
+            docker buildx imagetools create \
+              -t "${repository}:${TAG}-amd64" \
+              "${repository}@${AMD64_DIGEST}"
+            docker buildx imagetools create \
+              -t "${repository}:${TAG}-arm64" \
+              "${repository}@${ARM64_DIGEST}"
+            docker buildx imagetools create \
+              -t "${repository}:${TAG}" \
+              "${repository}@${manifest_digest}"
+          }
+
+          publish_registry "ghcr.io/${GHCR_REPOSITORY}" "$GHCR_CANDIDATE_DIGEST"
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            publish_registry "$DOCKERHUB_REPOSITORY" "$DOCKERHUB_CANDIDATE_DIGEST"
+          fi
+
+      - name: Verify immutable version tags and signatures
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+
+          verify_promoted_registry() {
+            local repository=$1
+            local expected_version_digest=$2
+            local evidence_prefix=$3
+            local version_file="$evidence_dir/${evidence_prefix}-version-manifest.json"
+            local version_digest
+            local amd64_digest
+            local arm64_digest
+
+            docker buildx imagetools inspect "${repository}:${TAG}" --format '{{json .Manifest}}' > "$version_file"
+            version_digest=$(jq -r '.digest' "$version_file")
+            amd64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-amd64" --format '{{.Manifest.Digest}}')
+            arm64_digest=$(docker buildx imagetools inspect "${repository}:${TAG}-arm64" --format '{{.Manifest.Digest}}')
+            if [ "$version_digest" != "$expected_version_digest" ]; then
+              echo "::error::Promoted $repository version digest does not match the signed candidate."
+              exit 1
+            fi
+            if [ "$amd64_digest" != "$AMD64_DIGEST" ] || [ "$arm64_digest" != "$ARM64_DIGEST" ]; then
+              echo "::error::Promoted $repository architecture tag digest mismatch."
+              exit 1
+            fi
+
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --output json \
+              "${repository}@${expected_version_digest}" > "$evidence_dir/cosign-${evidence_prefix}-stable.json"
+            amd64_identity=$(jq -r '.signature.certificate_identity' \
+              "$RUNNER_TEMP/stable-digests/amd64-verification/${evidence_prefix}/verification.json")
+            arm64_identity=$(jq -r '.signature.certificate_identity' \
+              "$RUNNER_TEMP/stable-digests/arm64-verification/${evidence_prefix}/verification.json")
+            cosign verify \
+              --certificate-identity "$amd64_identity" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --output json \
+              "${repository}@${AMD64_DIGEST}" > "$evidence_dir/cosign-${evidence_prefix}-amd64.json"
+            cosign verify \
+              --certificate-identity "$arm64_identity" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              --output json \
+              "${repository}@${ARM64_DIGEST}" > "$evidence_dir/cosign-${evidence_prefix}-arm64.json"
+          }
+
+          verify_promoted_registry \
+            "ghcr.io/${GHCR_REPOSITORY}" \
+            "$GHCR_CANDIDATE_DIGEST" \
+            ghcr
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            verify_promoted_registry \
+              "$DOCKERHUB_REPOSITORY" \
+              "$DOCKERHUB_CANDIDATE_DIGEST" \
+              dockerhub
+          fi
+
+      - name: Write release evidence
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/stable-release-evidence"
+          attestation_evidence="$evidence_dir/attestation-verification.json"
+          if [ "$DOCKERHUB_ENABLED" = 'true' ]; then
+            jq -n \
+              --slurpfile ghcr "$evidence_dir/attestations/ghcr-verification.json" \
+              --slurpfile dockerhub "$evidence_dir/attestations/dockerhub-verification.json" \
+              '{ghcr: $ghcr[0], dockerhub: $dockerhub[0]}' > "$attestation_evidence"
+          else
+            jq -n \
+              --slurpfile ghcr "$evidence_dir/attestations/ghcr-verification.json" \
+              '{ghcr: $ghcr[0], dockerhub: null}' > "$attestation_evidence"
+          fi
+
+          jq -n \
+            --slurpfile attestations "$attestation_evidence" \
+            --arg tag "$TAG" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg source_sha "${{ needs.prepare.outputs.sha }}" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg event_name "$GITHUB_EVENT_NAME" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg created_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg workflow_ref "${{ github.workflow_ref }}" \
+            --arg workflow_sha "${{ github.workflow_sha }}" \
+            --arg ghcr_digest "$GHCR_CANDIDATE_DIGEST" \
+            --arg dockerhub_digest "$DOCKERHUB_CANDIDATE_DIGEST" \
+            --arg amd64_digest "$AMD64_DIGEST" \
+            --arg arm64_digest "$ARM64_DIGEST" \
+            '{
+              tag: $tag,
+              candidate_tag: $candidate_tag,
+              source_sha: $source_sha,
+              repository: $repository,
+              actor: $actor,
+              event_name: $event_name,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              created_at: $created_at,
+              workflow_ref: $workflow_ref,
+              workflow_sha: $workflow_sha,
+              ghcr_digest: $ghcr_digest,
+              dockerhub_digest: (if $dockerhub_digest == "" then null else $dockerhub_digest end),
+              architecture_digests: {
+                amd64: $amd64_digest,
+                arm64: $arm64_digest
+              },
+              attestations: $attestations[0],
+              controls: {
+                stable_version_immutable: true,
+                latest_deferred_to_shared_finalizer: true,
+                tag_revalidated: true,
+                signatures_verified: true,
+                attestation_contents_verified: true,
+                trusted_workflow_tooling: true,
+                immutable_attestation_retrieval: true
+              }
+            }' \
+            > "$evidence_dir/release.json"
+
+      - name: Upload stable release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stable-release-evidence-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/stable-release-evidence
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
 
       - name: Manifest summary
         run: |
-          echo "### Multi-arch Manifest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:${TAG} >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "---" >> $GITHUB_STEP_SUMMARY
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:${TAG} >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo '### Verified stable multi-arch image'
+            echo '```text'
+            echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}"
+            echo "$GHCR_CANDIDATE_DIGEST"
+            echo 'Platforms: linux/amd64, linux/arm64'
+            echo 'Attestations: verified SPDX-2.3 packages and BuildKit SLSA source identity'
+            echo 'Cosign: signed and verified before immutable version publication'
+            echo 'Latest: deferred until the shared finalizer verifies all 10 Release assets'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  finalize_stable_release:
+    name: Finalize stable release across registries and assets
+    needs: [prepare, create_manifests]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/finalize-stable-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      source_sha: ${{ needs.prepare.outputs.sha }}
+      default_branch: ${{ github.event.repository.default_branch }}
+      dockerhub_repository: ${{ vars.DOCKERHUB_REPOSITORY }}
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}

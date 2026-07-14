@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -11,14 +12,10 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
-	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
-	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/service/channelrouting"
-	"github.com/QuantumNous/new-api/setting/config"
-	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -30,88 +27,105 @@ type routingCredentialRequest struct {
 	Sub2APIEmail      *string `json:"sub2api_email"`
 	Sub2APIPassword   *string `json:"sub2api_password"`
 	Sub2APIToken      *string `json:"sub2api_token"`
+	CustomCAPEM       *string `json:"custom_ca_pem"`
 }
 
 type routingBindingRequest struct {
-	ChannelID        int                      `json:"channel_id"`
-	UpstreamType     string                   `json:"upstream_type"`
-	BaseURL          string                   `json:"base_url"`
-	UpstreamGroup    string                   `json:"upstream_group"`
-	ServesClaudeCode bool                     `json:"serves_claude_code"`
-	NewAPIUserID     *int                     `json:"new_api_user_id"`
-	Enabled          *bool                    `json:"enabled"`
-	Credentials      routingCredentialRequest `json:"credentials"`
+	ChannelID                 int                      `json:"channel_id"`
+	UpstreamType              string                   `json:"upstream_type"`
+	BaseURL                   string                   `json:"base_url"`
+	UpstreamGroup             string                   `json:"upstream_group"`
+	ServesClaudeCode          bool                     `json:"serves_claude_code"`
+	EgressAllowedPrivateCIDRs []string                 `json:"egress_allowed_private_cidrs"`
+	NewAPIUserID              *int                     `json:"new_api_user_id"`
+	Enabled                   *bool                    `json:"enabled"`
+	Credentials               routingCredentialRequest `json:"credentials"`
+}
+
+type routingBindingValidationError struct {
+	Field  string
+	Reason string
+}
+
+func (err routingBindingValidationError) Error() string {
+	return "invalid routing binding"
+}
+
+func routingBindingFieldError(field, reason string) error {
+	return routingBindingValidationError{Field: field, Reason: reason}
 }
 
 type routingCredentialMasks struct {
-	NewAPIAccessToken string `json:"new_api_access_token,omitempty"`
-	GatewayAPIKey     string `json:"gateway_api_key,omitempty"`
-	Sub2APIEmail      string `json:"sub2api_email,omitempty"`
-	Sub2APIPassword   string `json:"sub2api_password,omitempty"`
-	Sub2APIToken      string `json:"sub2api_token,omitempty"`
+	NewAPIAccessToken  string `json:"new_api_access_token,omitempty"`
+	GatewayAPIKey      string `json:"gateway_api_key,omitempty"`
+	Sub2APIEmail       string `json:"sub2api_email,omitempty"`
+	Sub2APIPassword    string `json:"sub2api_password,omitempty"`
+	Sub2APIToken       string `json:"sub2api_token,omitempty"`
+	CustomCAConfigured bool   `json:"custom_ca_configured"`
 }
 
 type routingBindingView struct {
-	ID               int                    `json:"id"`
-	ChannelID        int                    `json:"channel_id"`
-	UpstreamType     string                 `json:"upstream_type"`
-	BaseURL          string                 `json:"base_url"`
-	UpstreamGroup    string                 `json:"upstream_group"`
-	ServesClaudeCode bool                   `json:"serves_claude_code"`
-	NewAPIUserID     *int                   `json:"new_api_user_id,omitempty"`
-	Enabled          bool                   `json:"enabled"`
-	SyncFailureCount int                    `json:"sync_failure_count"`
-	SyncBackoffUntil int64                  `json:"sync_backoff_until"`
-	LastSyncError    *string                `json:"last_sync_error,omitempty"`
-	CredentialMasks  routingCredentialMasks `json:"credential_masks"`
-	CredentialError  string                 `json:"credential_error,omitempty"`
-	CreatedTime      int64                  `json:"created_time"`
-	UpdatedTime      int64                  `json:"updated_time"`
+	ID                        int                    `json:"id"`
+	ChannelID                 int                    `json:"channel_id"`
+	ChannelName               string                 `json:"channel_name,omitempty"`
+	ETag                      string                 `json:"etag"`
+	UpstreamType              string                 `json:"upstream_type"`
+	BaseURL                   string                 `json:"base_url"`
+	UpstreamGroup             string                 `json:"upstream_group"`
+	ServesClaudeCode          bool                   `json:"serves_claude_code"`
+	EgressAllowedPrivateCIDRs []string               `json:"egress_allowed_private_cidrs"`
+	NewAPIUserID              *int                   `json:"new_api_user_id,omitempty"`
+	Enabled                   bool                   `json:"enabled"`
+	SyncFailureCount          int                    `json:"sync_failure_count"`
+	SyncBackoffUntil          int64                  `json:"sync_backoff_until"`
+	LastSyncError             *string                `json:"last_sync_error,omitempty"`
+	CredentialMasks           routingCredentialMasks `json:"credential_masks"`
+	CredentialError           string                 `json:"credential_error,omitempty"`
+	EgressPolicyError         string                 `json:"egress_policy_error,omitempty"`
+	CreatedTime               int64                  `json:"created_time"`
+	UpdatedTime               int64                  `json:"updated_time"`
 }
 
+const legacySmartRoutingBindingLimit = 500
+
 func GetSmartRoutingSettings(c *gin.Context) {
-	common.ApiSuccess(c, smart_routing_setting.GetSetting())
+	getChannelRoutingRuntimeSettings(c, true)
 }
 
 func UpdateSmartRoutingSettings(c *gin.Context) {
-	var request smart_routing_setting.SmartRoutingSetting
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-		common.ApiErrorMsg(c, "invalid smart routing settings")
-		return
-	}
-	normalized := smart_routing_setting.Normalize(request)
-	values, err := config.ConfigToMap(normalized)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	persisted := make(map[string]string, len(values))
-	for key, value := range values {
-		persisted["smart_routing_setting."+key] = value
-	}
-	if err = model.UpdateOptionsBulk(persisted); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	effective := smart_routing_setting.GetSetting()
-	syncRoutingBreakerConfigFromSetting(effective)
-	common.ApiSuccess(c, effective)
+	updateChannelRoutingRuntimeSettings(c, true)
 }
 
 func ListSmartRoutingBindings(c *gin.Context) {
-	var bindings []model.RoutingChannelBinding
-	if err := model.DB.Order("channel_id asc").Find(&bindings).Error; err != nil {
+	bindingIDs := make([]int, 0, legacySmartRoutingBindingLimit+1)
+	if err := model.DB.Model(&model.RoutingChannelBinding{}).
+		Order("channel_id asc").
+		Limit(legacySmartRoutingBindingLimit+1).
+		Pluck("id", &bindingIDs).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	views := make([]routingBindingView, 0, len(bindings))
-	for _, binding := range bindings {
-		view, err := routingBindingViewWithStoredCredentials(binding)
-		if err != nil {
-			view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-			view.CredentialError = common.SanitizeErrorMessage(err.Error())
+	if len(bindingIDs) > legacySmartRoutingBindingLimit {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"success":   false,
+			"code":      "legacy_result_too_large",
+			"message":   "legacy routing bindings endpoint supports at most 500 records",
+			"successor": "/api/channel-routing/v2/cost-bindings",
+		})
+		return
+	}
+
+	bindings := make([]model.RoutingChannelBinding, 0, len(bindingIDs))
+	if len(bindingIDs) > 0 {
+		if err := model.DB.Where("id IN ?", bindingIDs).Order("channel_id asc").Find(&bindings).Error; err != nil {
+			common.ApiError(c, err)
+			return
 		}
-		views = append(views, view)
+	}
+	views, err := channelRoutingCostBindingViews(c.Request.Context(), bindings)
+	if err != nil {
+		writeChannelRoutingCostBindingError(c, http.StatusInternalServerError, "cost_binding_list_failed", "failed to load routing bindings", err)
+		return
 	}
 	common.ApiSuccess(c, views)
 }
@@ -121,213 +135,128 @@ func GetSmartRoutingBinding(c *gin.Context) {
 	if !ok {
 		return
 	}
-	view, err := routingBindingViewWithStoredCredentials(*binding)
+	views, err := channelRoutingCostBindingViews(c.Request.Context(), []model.RoutingChannelBinding{*binding})
 	if err != nil {
-		view = buildRoutingBindingView(*binding, model.RoutingCredentials{})
-		view.CredentialError = common.SanitizeErrorMessage(err.Error())
+		writeChannelRoutingCostBindingError(c, http.StatusInternalServerError, "cost_binding_load_failed", "failed to load routing binding", err)
+		return
 	}
+	view := views[0]
+	c.Header("ETag", view.ETag)
 	common.ApiSuccess(c, view)
 }
 
 func CreateSmartRoutingBinding(c *gin.Context) {
-	var request routingBindingRequest
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-		common.ApiErrorMsg(c, "invalid routing binding")
-		return
-	}
-	if err := validateRoutingBindingRequest(request, true); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	binding := routingBindingFromRequest(request)
-	if hasRoutingCredentials(request.Credentials) {
-		if err := binding.SetCredentials(buildRoutingCredentials(request)); err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	}
-	requestContext := c.Request.Context()
-	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	err := model.DB.WithContext(requestContext).Create(&binding).Error
-	smartRoutingRuntimeStateMu.Unlock()
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	view, err := routingBindingViewWithStoredCredentials(binding)
-	if err != nil {
-		view = buildRoutingBindingView(binding, model.RoutingCredentials{})
-		view.CredentialError = common.SanitizeErrorMessage(err.Error())
-	}
-	common.ApiSuccess(c, view)
+	CreateChannelRoutingCostBinding(c)
 }
 
 func UpdateSmartRoutingBinding(c *gin.Context) {
-	binding, ok := loadRoutingBinding(c)
-	if !ok {
-		return
+	UpdateChannelRoutingCostBinding(c)
+}
+
+func DeleteSmartRoutingBinding(c *gin.Context) {
+	DeleteChannelRoutingCostBinding(c)
+}
+
+func createRoutingBindingContext(ctx context.Context, request routingBindingRequest, actorID int) (model.RoutingChannelBinding, error) {
+	binding, err := routingBindingFromRequest(request)
+	if err != nil {
+		return model.RoutingChannelBinding{}, err
 	}
-	var request routingBindingRequest
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
-		common.ApiErrorMsg(c, "invalid routing binding")
-		return
-	}
-	request.ChannelID = binding.ChannelID
-	if err := validateRoutingBindingRequest(request, false); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	updated := routingBindingFromRequest(request)
-	updated.ID = binding.ID
-	updated.ChannelID = binding.ChannelID
-	updated.CreatedTime = binding.CreatedTime
-	updated.EncCredentials = binding.EncCredentials
-	updated.KeyVersion = binding.KeyVersion
-	oldSub2APIAuthKey := newRoutingSub2APIAuthKey(*binding, model.RoutingCredentials{})
-	retireOldSub2APIAuth := binding.UpstreamType == model.RoutingUpstreamTypeSub2API &&
-		updated.UpstreamType != model.RoutingUpstreamTypeSub2API
 	if hasRoutingCredentials(request.Credentials) {
-		existingCredentials, err := binding.GetCredentials()
-		if err != nil {
-			common.ApiError(c, err)
-			return
+		if err := binding.SetCredentials(buildRoutingCredentials(request)); err != nil {
+			return model.RoutingChannelBinding{}, err
 		}
-		updatedCredentials := buildRoutingCredentials(request, existingCredentials)
-		if err := updated.SetCredentials(updatedCredentials); err != nil {
-			common.ApiError(c, err)
-			return
+	}
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return model.RoutingChannelBinding{}, err
+	}
+	defer smartRoutingRuntimeStateMu.Unlock()
+	if err := model.CreateRoutingChannelBindingWithAuditContext(ctx, &binding, actorID); err != nil {
+		return model.RoutingChannelBinding{}, err
+	}
+	return binding, nil
+}
+
+func updateRoutingBindingContext(
+	ctx context.Context,
+	expected model.RoutingChannelBinding,
+	request routingBindingRequest,
+	actorID int,
+) (model.RoutingChannelBinding, error) {
+	updated, err := routingBindingFromRequest(request)
+	if err != nil {
+		return model.RoutingChannelBinding{}, err
+	}
+	updated.ID = expected.ID
+	updated.ChannelID = expected.ChannelID
+	updated.CreatedTime = expected.CreatedTime
+	updated.EncCredentials = expected.EncCredentials
+	updated.KeyVersion = expected.KeyVersion
+	oldSub2APIAuthKey := newRoutingSub2APIAuthKey(expected, model.RoutingCredentials{})
+	retireOldSub2APIAuth := expected.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+		updated.UpstreamType != model.RoutingUpstreamTypeSub2API
+	providerChanged := expected.UpstreamType != updated.UpstreamType
+	if providerChanged || hasRoutingCredentials(request.Credentials) {
+		credentials, err := routingBindingCredentialsForUpdate(expected, updated, request)
+		if err != nil {
+			return model.RoutingChannelBinding{}, err
+		}
+		if err := updated.SetCredentials(credentials); err != nil {
+			return model.RoutingChannelBinding{}, err
 		}
 	}
 	newSub2APIAuthKey := newRoutingSub2APIAuthKey(updated, model.RoutingCredentials{})
 	authKeyChanged := oldSub2APIAuthKey != newSub2APIAuthKey
-	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+	if expected.UpstreamType == model.RoutingUpstreamTypeSub2API &&
 		updated.UpstreamType == model.RoutingUpstreamTypeSub2API && authKeyChanged {
 		retireOldSub2APIAuth = true
 	}
 	activateNewSub2APIAuth := updated.UpstreamType == model.RoutingUpstreamTypeSub2API &&
-		(binding.UpstreamType != model.RoutingUpstreamTypeSub2API || authKeyChanged)
-	requestContext := c.Request.Context()
-	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
-		common.ApiError(c, err)
-		return
+		(expected.UpstreamType != model.RoutingUpstreamTypeSub2API || authKeyChanged)
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return model.RoutingChannelBinding{}, err
 	}
+	defer smartRoutingRuntimeStateMu.Unlock()
 	activationFence := routingSub2APIJWTActivationFence{}
 	if activateNewSub2APIAuth {
 		var err error
-		activationFence, err = prepareRoutingSub2APIJWTActivation(requestContext, updated)
+		activationFence, err = prepareRoutingSub2APIJWTActivation(ctx, updated)
 		if err != nil {
-			smartRoutingRuntimeStateMu.Unlock()
-			common.ApiError(c, err)
-			return
+			return model.RoutingChannelBinding{}, err
 		}
 	}
-	err := model.UpdateRoutingChannelBindingAndInvalidateCostContext(requestContext, *binding, &updated)
-	if err == nil {
-		routinghotcache.ClearCostChannel(updated.ChannelID)
-		if retireOldSub2APIAuth {
-			invalidateRoutingSub2APIJWT(requestContext, *binding)
-		}
-		if activateNewSub2APIAuth {
-			activateRoutingSub2APIJWT(requestContext, activationFence)
-		}
+	if err := model.UpdateRoutingChannelBindingAndInvalidateCostWithAuditContext(ctx, expected, &updated, actorID); err != nil {
+		return model.RoutingChannelBinding{}, err
 	}
-	smartRoutingRuntimeStateMu.Unlock()
-	if err != nil {
-		common.ApiError(c, err)
-		return
+	routinghotcache.ClearCostChannel(updated.ChannelID)
+	if retireOldSub2APIAuth {
+		invalidateRoutingSub2APIJWT(ctx, expected)
 	}
-	view, err := routingBindingViewWithStoredCredentials(updated)
-	if err != nil {
-		view = buildRoutingBindingView(updated, model.RoutingCredentials{})
-		view.CredentialError = common.SanitizeErrorMessage(err.Error())
+	if activateNewSub2APIAuth {
+		activateRoutingSub2APIJWT(ctx, activationFence)
 	}
-	common.ApiSuccess(c, view)
+	return updated, nil
 }
 
-func DeleteSmartRoutingBinding(c *gin.Context) {
-	channelID, ok := parseRoutingChannelID(c)
-	if !ok {
-		return
-	}
-	requestContext := c.Request.Context()
-	if err := smartRoutingRuntimeStateMu.LockContext(requestContext); err != nil {
-		common.ApiError(c, err)
-		return
+func deleteRoutingBindingContext(ctx context.Context, expected model.RoutingChannelBinding, actorID int) error {
+	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+		return err
 	}
 	defer smartRoutingRuntimeStateMu.Unlock()
-	deletedBinding := model.RoutingChannelBinding{ChannelID: channelID}
-	if err := model.DB.WithContext(requestContext).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("channel_id = ?", channelID).Take(&deletedBinding).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelBinding{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingCostSnapshot{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingBreakerState{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelMetric{}).Error; err != nil {
-			return err
-		}
-		return tx.Where("channel_id = ?", channelID).Delete(&model.RoutingChannelHealthState{}).Error
-	}); err != nil {
-		common.ApiError(c, err)
-		return
+	if err := model.DeleteRoutingChannelBindingAndInvalidateCostWithAuditContext(ctx, expected, actorID); err != nil {
+		return err
 	}
-	invalidateRoutingSub2APIJWT(requestContext, deletedBinding)
-	routingmetrics.ClearChannel(channelID)
-	routingbreaker.ClearDefaultChannelWithCache(channelID, routinghotcache.ClearChannel)
-	common.ApiSuccess(c, nil)
+	invalidateRoutingSub2APIJWT(ctx, expected)
+	routinghotcache.ClearCostChannel(expected.ChannelID)
+	return nil
 }
 
 func TestSmartRoutingBinding(c *gin.Context) {
-	binding, ok := routingBindingForAction(c)
-	if !ok {
-		return
-	}
-	payload, err := fetchRoutingPricingPayload(c.Request.Context(), *binding)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	common.ApiSuccess(c, gin.H{
-		"channel_id":       binding.ChannelID,
-		"upstream_type":    binding.UpstreamType,
-		"credential_ready": binding.EncCredentials != nil && *binding.EncCredentials != "",
-		"groups":           routingPricingGroups(payload),
-		"model_count":      len(payload.Data),
-		"pricing_version":  payload.PricingVersion,
-	})
+	TestChannelRoutingCostBinding(c)
 }
 
 func LoadSmartRoutingBindingGroups(c *gin.Context) {
-	binding, ok := routingBindingForAction(c)
-	if !ok {
-		return
-	}
-	payload, err := fetchRoutingPricingPayload(c.Request.Context(), *binding)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	common.ApiSuccess(c, gin.H{
-		"channel_id":      binding.ChannelID,
-		"upstream_type":   binding.UpstreamType,
-		"upstream_group":  binding.UpstreamGroup,
-		"groups":          routingPricingGroups(payload),
-		"requires_sync":   false,
-		"sync_task_type":  model.SystemTaskTypeRoutingCostSync,
-		"serves_claude":   binding.ServesClaudeCode,
-		"credential_test": binding.EncCredentials != nil && *binding.EncCredentials != "",
-		"model_count":     len(payload.Data),
-		"pricing_version": payload.PricingVersion,
-	})
+	LoadChannelRoutingCostBindingGroups(c)
 }
 
 func ListSmartRoutingMetrics(c *gin.Context) {
@@ -534,6 +463,7 @@ func RejectSmartRoutingAgentRecommendation(c *gin.Context) {
 }
 
 func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) routingBindingView {
+	credentials = credentials.ForUpstream(binding.UpstreamType)
 	var lastSyncError *string
 	if binding.LastSyncError != nil {
 		message := common.SanitizeErrorMessage(*binding.LastSyncError, routingCredentialSecrets(credentials)...)
@@ -542,51 +472,81 @@ func buildRoutingBindingView(binding model.RoutingChannelBinding, credentials mo
 		}
 		lastSyncError = &message
 	}
-	return routingBindingView{
-		ID:               binding.ID,
-		ChannelID:        binding.ChannelID,
-		UpstreamType:     binding.UpstreamType,
-		BaseURL:          binding.BaseURL,
-		UpstreamGroup:    binding.UpstreamGroup,
-		ServesClaudeCode: binding.ServesClaudeCode,
-		NewAPIUserID:     binding.NewAPIUserID,
-		Enabled:          binding.Enabled,
-		SyncFailureCount: binding.SyncFailureCount,
-		SyncBackoffUntil: binding.SyncBackoffUntil,
-		LastSyncError:    lastSyncError,
+	egressCIDRs, egressErr := binding.GetEgressAllowedPrivateCIDRs()
+	view := routingBindingView{
+		ID:                        binding.ID,
+		ChannelID:                 binding.ChannelID,
+		ETag:                      channelRoutingCostBindingETag(binding),
+		UpstreamType:              binding.UpstreamType,
+		BaseURL:                   binding.BaseURL,
+		UpstreamGroup:             binding.UpstreamGroup,
+		ServesClaudeCode:          binding.ServesClaudeCode,
+		EgressAllowedPrivateCIDRs: egressCIDRs,
+		NewAPIUserID:              binding.NewAPIUserID,
+		Enabled:                   binding.Enabled,
+		SyncFailureCount:          binding.SyncFailureCount,
+		SyncBackoffUntil:          binding.SyncBackoffUntil,
+		LastSyncError:             lastSyncError,
 		CredentialMasks: routingCredentialMasks{
-			NewAPIAccessToken: maskRoutingToken(credentials.NewAPIAccessToken),
-			GatewayAPIKey:     maskRoutingToken(credentials.GatewayAPIKey),
-			Sub2APIEmail:      maskRoutingEmail(credentials.Sub2APIEmail),
-			Sub2APIPassword:   maskRoutingPassword(credentials.Sub2APIPassword),
-			Sub2APIToken:      maskRoutingToken(credentials.Sub2APIToken),
+			NewAPIAccessToken:  maskRoutingToken(credentials.NewAPIAccessToken),
+			GatewayAPIKey:      maskRoutingToken(credentials.GatewayAPIKey),
+			Sub2APIEmail:       maskRoutingEmail(credentials.Sub2APIEmail),
+			Sub2APIPassword:    maskRoutingPassword(credentials.Sub2APIPassword),
+			Sub2APIToken:       maskRoutingToken(credentials.Sub2APIToken),
+			CustomCAConfigured: strings.TrimSpace(credentials.CustomCAPEM) != "",
 		},
 		CreatedTime: binding.CreatedTime,
 		UpdatedTime: binding.UpdatedTime,
 	}
+	if egressErr != nil {
+		view.EgressPolicyError = common.SanitizeErrorMessage(egressErr.Error())
+	}
+	return view
 }
 
 func buildRoutingCredentials(request routingBindingRequest, base ...model.RoutingCredentials) model.RoutingCredentials {
 	credentials := model.RoutingCredentials{}
 	if len(base) > 0 {
-		credentials = base[0]
+		credentials = base[0].ForUpstream(request.UpstreamType)
 	}
-	if request.Credentials.NewAPIAccessToken != nil {
+	if request.UpstreamType == model.RoutingUpstreamTypeNewAPI && request.Credentials.NewAPIAccessToken != nil {
 		credentials.NewAPIAccessToken = strings.TrimSpace(*request.Credentials.NewAPIAccessToken)
 	}
 	if request.Credentials.GatewayAPIKey != nil {
 		credentials.GatewayAPIKey = strings.TrimSpace(*request.Credentials.GatewayAPIKey)
 	}
-	if request.Credentials.Sub2APIEmail != nil {
+	if request.UpstreamType == model.RoutingUpstreamTypeSub2API && request.Credentials.Sub2APIEmail != nil {
 		credentials.Sub2APIEmail = strings.TrimSpace(*request.Credentials.Sub2APIEmail)
 	}
-	if request.Credentials.Sub2APIPassword != nil {
+	if request.UpstreamType == model.RoutingUpstreamTypeSub2API && request.Credentials.Sub2APIPassword != nil {
 		credentials.Sub2APIPassword = *request.Credentials.Sub2APIPassword
 	}
-	if request.Credentials.Sub2APIToken != nil {
+	if request.UpstreamType == model.RoutingUpstreamTypeSub2API && request.Credentials.Sub2APIToken != nil {
 		credentials.Sub2APIToken = strings.TrimSpace(*request.Credentials.Sub2APIToken)
 	}
-	return credentials
+	if request.Credentials.CustomCAPEM != nil {
+		credentials.CustomCAPEM = strings.TrimSpace(*request.Credentials.CustomCAPEM)
+	}
+	return credentials.ForUpstream(request.UpstreamType)
+}
+
+func routingBindingCredentialsForUpdate(
+	expected model.RoutingChannelBinding,
+	updated model.RoutingChannelBinding,
+	request routingBindingRequest,
+) (model.RoutingCredentials, error) {
+	replacement := buildRoutingCredentials(request)
+	if expected.UpstreamType != updated.UpstreamType {
+		return replacement, nil
+	}
+	existing, err := expected.GetCredentials()
+	if err == nil {
+		return buildRoutingCredentials(request, existing), nil
+	}
+	if replacement.ReadyForUpstream(updated.UpstreamType) {
+		return replacement, nil
+	}
+	return model.RoutingCredentials{}, err
 }
 
 func routingBindingViewWithStoredCredentials(binding model.RoutingChannelBinding) (routingBindingView, error) {
@@ -597,7 +557,7 @@ func routingBindingViewWithStoredCredentials(binding model.RoutingChannelBinding
 	return buildRoutingBindingView(binding, credentials), nil
 }
 
-func routingBindingFromRequest(request routingBindingRequest) model.RoutingChannelBinding {
+func routingBindingFromRequest(request routingBindingRequest) (model.RoutingChannelBinding, error) {
 	enabled := true
 	if request.Enabled != nil {
 		enabled = *request.Enabled
@@ -610,7 +570,7 @@ func routingBindingFromRequest(request routingBindingRequest) model.RoutingChann
 	if request.UpstreamType != model.RoutingUpstreamTypeNewAPI {
 		newAPIUserID = nil
 	}
-	return model.RoutingChannelBinding{
+	binding := model.RoutingChannelBinding{
 		ChannelID:        request.ChannelID,
 		UpstreamType:     strings.TrimSpace(request.UpstreamType),
 		BaseURL:          strings.TrimSpace(request.BaseURL),
@@ -619,25 +579,44 @@ func routingBindingFromRequest(request routingBindingRequest) model.RoutingChann
 		NewAPIUserID:     newAPIUserID,
 		Enabled:          enabled,
 	}
+	normalizedCIDRs, err := service.NormalizeRoutingCostEgressCIDRs(request.EgressAllowedPrivateCIDRs)
+	if err != nil {
+		return model.RoutingChannelBinding{}, err
+	}
+	if err := binding.SetEgressAllowedPrivateCIDRs(normalizedCIDRs); err != nil {
+		return model.RoutingChannelBinding{}, err
+	}
+	return binding, nil
 }
 
 func validateRoutingBindingRequest(request routingBindingRequest, requireChannelID bool) error {
 	if requireChannelID && request.ChannelID <= 0 {
-		return errors.New("channel_id is required")
+		return routingBindingFieldError("channel_id", "required")
 	}
 	switch request.UpstreamType {
 	case model.RoutingUpstreamTypeNewAPI, model.RoutingUpstreamTypeSub2API:
 	default:
-		return errors.New("invalid upstream_type")
+		return routingBindingFieldError("upstream_type", "unsupported")
 	}
 	if strings.TrimSpace(request.BaseURL) == "" {
-		return errors.New("base_url is required")
+		return routingBindingFieldError("base_url", "required")
 	}
-	if err := validateRoutingBaseURL(request.BaseURL); err != nil {
+	normalizedCIDRs, err := service.NormalizeRoutingCostEgressCIDRs(request.EgressAllowedPrivateCIDRs)
+	if err != nil {
+		return routingBindingFieldError("egress_allowed_private_cidrs", "invalid")
+	}
+	if err := validateRoutingBaseURL(request.BaseURL, normalizedCIDRs); err != nil {
 		return err
 	}
+	customCAPEM := ""
+	if request.Credentials.CustomCAPEM != nil {
+		customCAPEM = *request.Credentials.CustomCAPEM
+	}
+	if _, err := service.WithRoutingCostEgressPolicy(context.Background(), normalizedCIDRs, customCAPEM); err != nil {
+		return routingBindingFieldError("custom_ca_pem", "invalid")
+	}
 	if strings.TrimSpace(request.UpstreamGroup) == "" {
-		return errors.New("upstream_group is required")
+		return routingBindingFieldError("upstream_group", "required")
 	}
 	return nil
 }
@@ -647,19 +626,20 @@ func hasRoutingCredentials(credentials routingCredentialRequest) bool {
 		credentials.GatewayAPIKey != nil ||
 		credentials.Sub2APIEmail != nil ||
 		credentials.Sub2APIPassword != nil ||
-		credentials.Sub2APIToken != nil
+		credentials.Sub2APIToken != nil ||
+		credentials.CustomCAPEM != nil
 }
 
-func validateRoutingBaseURL(value string) error {
+func validateRoutingBaseURL(value string, allowedPrivateCIDRs []string) error {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return errors.New("invalid base_url")
+		return routingBindingFieldError("base_url", "invalid")
 	}
 	if parsed.Scheme != "https" {
-		return errors.New("base_url must use https")
+		return routingBindingFieldError("base_url", "insecure_scheme")
 	}
 	if parsed.User != nil {
-		return errors.New("base_url must not contain credentials")
+		return routingBindingFieldError("base_url", "credentials_not_allowed")
 	}
 	for key := range parsed.Query() {
 		normalized := strings.ToLower(strings.TrimSpace(key))
@@ -668,11 +648,11 @@ func validateRoutingBaseURL(value string) error {
 			strings.Contains(normalized, "secret") ||
 			strings.Contains(normalized, "password") ||
 			strings.Contains(normalized, "authorization") {
-			return errors.New("base_url must not contain sensitive query parameters")
+			return routingBindingFieldError("base_url", "sensitive_query_not_allowed")
 		}
 	}
-	if err = service.ValidateRoutingCostURL(parsed.String()); err != nil {
-		return err
+	if err = service.ValidateRoutingCostURLWithEgressPolicy(parsed.String(), allowedPrivateCIDRs); err != nil {
+		return routingBindingFieldError("base_url", "unsafe_target")
 	}
 	return nil
 }
@@ -798,7 +778,11 @@ func hasInlineRoutingBindingRequest(request routingBindingRequest) bool {
 }
 
 func routingBindingFromInlineRequest(c *gin.Context, request routingBindingRequest) (*model.RoutingChannelBinding, bool) {
-	binding := routingBindingFromRequest(request)
+	binding, err := routingBindingFromRequest(request)
+	if err != nil {
+		common.ApiError(c, err)
+		return nil, false
+	}
 	if hasRoutingCredentials(request.Credentials) {
 		if err := binding.SetCredentials(buildRoutingCredentials(request)); err != nil {
 			common.ApiError(c, err)

@@ -78,3 +78,34 @@ func TestHandleTTSWebSocketResponseStopsOnRequestCancel(t *testing.T) {
 		require.Fail(t, "volcengine TTS upstream connection stayed open after request cancellation")
 	}
 }
+
+func TestHandleTTSWebSocketResponsePreservesHandshakeStatus(t *testing.T) {
+	statusCodes := []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusPaymentRequired,
+		http.StatusTooManyRequests,
+	}
+	for _, statusCode := range statusCodes {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+			}))
+			t.Cleanup(server.Close)
+
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/speech", nil)
+			_, apiErr := handleTTSWebSocketResponse(
+				c,
+				"ws"+strings.TrimPrefix(server.URL, "http"),
+				VolcengineTTSRequest{},
+				&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "app|token"}},
+				"mp3",
+			)
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, statusCode, apiErr.SourceStatusCode())
+		})
+	}
+}

@@ -34,6 +34,8 @@ type TaskAdaptor struct {
 	baseURL     string
 }
 
+var geminiTaskHTTPClientFactory = service.GetStatefulFetchHTTPClient
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.ChannelType = info.ChannelType
 	a.baseURL = info.ChannelBaseUrl
@@ -42,7 +44,18 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionTextGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionTextGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	c.Set("task_request", req)
+	return nil
 }
 
 // BuildRequestURL constructs the Gemini API predictLongRunning endpoint for Veo.
@@ -91,9 +104,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, params); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
-	if params.DurationSeconds == 0 && req.Duration > 0 {
-		params.DurationSeconds = req.Duration
+	seconds, err := ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve duration failed")
 	}
+	params.DurationSeconds = seconds
 	if params.Resolution == "" && req.Size != "" {
 		params.Resolution = SizeToVeoResolution(req.Size)
 	}
@@ -122,7 +137,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		return "", nil, service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 	}
@@ -169,7 +184,10 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		return nil
 	}
 
-	seconds := ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	seconds, err := ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	if err != nil {
+		return nil
+	}
 	resolution := ResolveVeoResolution(req.Metadata, req.Size)
 	resRatio := VeoResolutionRatio(info.UpstreamModelName, resolution)
 
@@ -202,11 +220,11 @@ func (a *TaskAdaptor) FetchTask(ctx context.Context, baseUrl, key string, body m
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-goog-api-key", key)
 
-	client, err := service.GetHttpClientWithProxy(proxy)
+	client, err := geminiTaskHTTPClientFactory(proxy)
 	if err != nil {
-		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+		return nil, fmt.Errorf("new stateful task client failed: %w", err)
 	}
-	return client.Do(req)
+	return service.DoStatefulFetch(client, req)
 }
 
 func (a *TaskAdaptor) ParseTaskResult(_ context.Context, respBody []byte) (*relaycommon.TaskInfo, error) {
@@ -265,6 +283,9 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 		video.CompletedAt = task.FinishTime
 	} else if task.UpdatedAt > 0 {
 		video.CompletedAt = task.UpdatedAt
+	}
+	if resultURL := task.GetResultURL(); resultURL != "" {
+		video.SetMetadata("url", resultURL)
 	}
 
 	return common.Marshal(video)

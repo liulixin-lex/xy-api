@@ -148,6 +148,24 @@ func TestRedeemCreditsQuotaExactlyOnce(t *testing.T) {
 	assert.Equal(t, 500, user.Quota)
 }
 
+func TestRedeemCommitsAndKeepsDurableCacheSyncWhenRedisIsUnavailable(t *testing.T) {
+	useUnavailableRedisForMutationTest(t)
+	userId, key := setupRedeemFixture(t, 700)
+
+	quota, err := Redeem(key, userId)
+	require.NoError(t, err)
+	assert.Equal(t, 700, quota)
+
+	var user User
+	require.NoError(t, DB.First(&user, userId).Error)
+	assert.Equal(t, 700, user.Quota)
+
+	var pending IdentityCacheSync
+	require.NoError(t, DB.Where("subject_key = ?", getUserCacheKey(userId)).First(&pending).Error)
+	assert.Positive(t, pending.Version)
+	assert.Positive(t, pending.Attempts)
+}
+
 // Exactly one of several concurrent redeems of the same code may win, and
 // quota must be credited exactly once.
 func TestRedeemConcurrentSingleSuccess(t *testing.T) {

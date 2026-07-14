@@ -210,6 +210,7 @@ func completeRoutingSerialAttemptAudit(
 	success bool,
 	apiErr *types.NewAPIError,
 	classification routingerror.Classification,
+	upstreamSent bool,
 	clientCommitted bool,
 	willRetry bool,
 ) error {
@@ -220,7 +221,7 @@ func completeRoutingSerialAttemptAudit(
 	completion := model.RoutingHedgeAttemptCompleteSpec{
 		Result:          model.RoutingHedgeAttemptResultUpstreamError,
 		Winner:          success,
-		UpstreamSent:    true,
+		UpstreamSent:    upstreamSent,
 		ClientCommitted: clientCommitted,
 		WillRetry:       willRetry,
 		FinalAttempt:    !willRetry,
@@ -230,6 +231,9 @@ func completeRoutingSerialAttemptAudit(
 		completion.Result = model.RoutingHedgeAttemptResultSuccess
 		completion.HTTPStatus = http.StatusOK
 	} else {
+		if !upstreamSent {
+			completion.Result = model.RoutingHedgeAttemptResultInternalError
+		}
 		completion.HTTPStatus = sourceRoutingHedgeStatus(apiErr)
 		completion.ErrorClassification = classification.Rule
 		completion.ErrorResponsibility = string(classification.Responsibility)

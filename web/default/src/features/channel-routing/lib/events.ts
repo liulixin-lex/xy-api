@@ -27,10 +27,13 @@ export const channelRoutingEventNames = [
   'routing.policy.applied',
   'routing.cost_sync.queued',
   'routing.cost_sync.completed',
+  'routing.cost_binding.changed',
   'routing.probe.completed',
   'routing.audit_export.ready',
   'routing.error_budget.changed',
   'routing.breaker.reset',
+  'routing.breaker.opened',
+  'routing.breaker.recovered',
   'reset',
   'policy.published',
   'policy.rolled_back',
@@ -48,6 +51,7 @@ export type ChannelRoutingEventResource =
   | 'channels'
   | 'endpoints'
   | 'costs'
+  | 'cost-bindings'
   | 'probes'
   | 'decisions'
   | 'policy-drafts'
@@ -199,10 +203,26 @@ export function getChannelRoutingEventResources(
       return ['operations']
     case 'routing.cost_sync.completed':
     case 'cost_sync.completed':
-      return ['overview', 'channels', 'costs', 'operations']
+      return [
+        'overview',
+        'groups',
+        'channels',
+        'costs',
+        'cost-bindings',
+        'operations',
+      ]
+    case 'routing.cost_binding.changed':
+      return ['overview', 'groups', 'channels', 'costs', 'cost-bindings']
     case 'routing.probe.completed':
     case 'probe.completed':
-      return ['probes', 'endpoints']
+      return [
+        'overview',
+        'groups',
+        'channels',
+        'endpoints',
+        'probes',
+        'operations',
+      ]
     case 'routing.audit_export.ready':
     case 'audit_export.ready':
       return ['audit-exports', 'operations']
@@ -210,7 +230,17 @@ export function getChannelRoutingEventResources(
     case 'error_budget.changed':
       return ['overview', 'groups']
     case 'routing.breaker.reset':
-      return ['overview', 'groups', 'endpoints', 'probes', 'operations']
+      return [
+        'overview',
+        'groups',
+        'channels',
+        'endpoints',
+        'probes',
+        'operations',
+      ]
+    case 'routing.breaker.opened':
+    case 'routing.breaker.recovered':
+      return ['overview', 'groups', 'channels', 'endpoints', 'probes']
     default:
       return []
   }

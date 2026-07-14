@@ -17,6 +17,34 @@ func registerSystemSettingsRoutes(apiRouter *gin.RouterGroup) {
 			route.handler,
 		)
 	}
+	for _, route := range asyncBillingReviewPermissionRoutes {
+		apiRouter.Handle(route.method, route.path,
+			middleware.AdminAuth(),
+			middleware.RequirePermission(route.permission),
+			route.handler,
+		)
+	}
+	for _, route := range billingProjectionOpsPermissionRoutes {
+		apiRouter.Handle(route.method, route.path,
+			middleware.AdminAuth(),
+			middleware.RequirePermission(route.permission),
+			route.handler,
+		)
+	}
+}
+
+var asyncBillingReviewPermissionRoutes = []permissionRoute{
+	{method: http.MethodGet, path: "/system-info/async-billing/manual-review", permission: authz.BillingReviewRead, handler: controller.ListAsyncBillingManualReviews},
+	{method: http.MethodPost, path: "/system-info/async-billing/manual-review/:id/resolve", permission: authz.BillingReviewResolve, handler: controller.ResolveAsyncBillingManualReview},
+}
+
+var billingProjectionOpsPermissionRoutes = []permissionRoute{
+	{method: http.MethodGet, path: "/system-info/billing-projections/stats/failed", permission: authz.BillingProjectionRead, handler: controller.ListFailedBillingStatsProjections},
+	{method: http.MethodPost, path: "/system-info/billing-projections/stats/failed/:id/requeue", permission: authz.BillingProjectionRequeue, handler: controller.RequeueFailedBillingStatsProjection},
+	{method: http.MethodGet, path: "/system-info/billing-projections/logs/failed", permission: authz.BillingProjectionRead, handler: controller.ListFailedBillingLogProjections},
+	{method: http.MethodPost, path: "/system-info/billing-projections/logs/failed/:id/requeue", permission: authz.BillingProjectionRequeue, handler: controller.RequeueFailedBillingLogProjection},
+	{method: http.MethodGet, path: "/system-info/billing-projections/log-sink-conflicts/open", permission: authz.BillingProjectionRead, handler: controller.ListOpenBillingLogSinkConflicts},
+	{method: http.MethodPost, path: "/system-info/billing-projections/log-sink-conflicts/:id/resolve-requeue", permission: authz.BillingProjectionResolve, handler: controller.ResolveAndRequeueBillingLogSinkConflict},
 }
 
 var systemSettingsPermissionRoutes = []permissionRoute{

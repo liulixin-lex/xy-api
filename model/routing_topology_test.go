@@ -195,6 +195,48 @@ func TestReconcileLegacyRoutingTopologyRejectsDifferentPersistentSecret(t *testi
 	assert.True(t, refs[0].Active)
 }
 
+func TestReconcileLegacyRoutingTopologyIsolatesRecreatedChannelCredentials(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(
+		&Channel{},
+		&RoutingTopologyMetadata{},
+		&RoutingPool{},
+		&RoutingPoolMember{},
+		&RoutingCredentialRef{},
+	))
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-generation-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	original := Channel{Id: 205, Name: "original", Key: "same-key", Group: "default"}
+	require.NoError(t, DB.Create(&original).Error)
+	_, err := ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	var originalCredential RoutingCredentialRef
+	require.NoError(t, DB.Where("channel_id = ? AND active = ?", original.Id, true).First(&originalCredential).Error)
+	require.Equal(t, original.RoutingGeneration, originalCredential.ChannelGeneration)
+
+	require.NoError(t, DB.Delete(&Channel{}, original.Id).Error)
+	replacement := Channel{Id: original.Id, Name: "replacement", Key: original.Key, Group: original.Group}
+	require.NoError(t, DB.Create(&replacement).Error)
+	require.NotEqual(t, original.RoutingGeneration, replacement.RoutingGeneration)
+	_, err = ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+
+	var credentials []RoutingCredentialRef
+	require.NoError(t, DB.Where("channel_id = ?", original.Id).Order("id asc").Find(&credentials).Error)
+	require.Len(t, credentials, 2)
+	assert.Equal(t, originalCredential.ID, credentials[0].ID)
+	assert.False(t, credentials[0].Active)
+	assert.Equal(t, original.RoutingGeneration, credentials[0].ChannelGeneration)
+	assert.True(t, credentials[1].Active)
+	assert.NotEqual(t, originalCredential.ID, credentials[1].ID)
+	assert.Equal(t, replacement.RoutingGeneration, credentials[1].ChannelGeneration)
+	assert.NotEqual(t, credentials[0].Fingerprint, credentials[1].Fingerprint)
+}
+
 func TestReconcileLegacyRoutingTopologyKeepsCaseDistinctGroups(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
@@ -277,11 +319,13 @@ func loadRoutingMembersForTest(t *testing.T) map[routingMemberTestKey]RoutingPoo
 
 func loadRoutingCredentialsForTest(t *testing.T, channelID int) map[string]RoutingCredentialRef {
 	t.Helper()
+	var channel Channel
+	require.NoError(t, DB.Select("id", "routing_generation").Where("id = ?", channelID).First(&channel).Error)
 	var refs []RoutingCredentialRef
 	require.NoError(t, DB.Where("channel_id = ?", channelID).Order("id asc").Find(&refs).Error)
 	result := make(map[string]RoutingCredentialRef, len(refs))
 	for _, key := range []string{"key-a", "key-b", "key-c"} {
-		fingerprint, err := RoutingCredentialFingerprint(channelID, key)
+		fingerprint, err := RoutingCredentialFingerprint(channelID, channel.RoutingGeneration, key)
 		require.NoError(t, err)
 		for _, ref := range refs {
 			if ref.Fingerprint == fingerprint {

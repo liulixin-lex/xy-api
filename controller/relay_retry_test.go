@@ -88,7 +88,7 @@ func TestCommitRoutingCapacityAttemptFailsClosedBeforeUpstream(t *testing.T) {
 	require.NoError(t, service.CommitRoutingCapacityReservation(ctx))
 }
 
-func TestCommitRoutingCapacityAttemptReleasesCommittedReservationWhenOutcomeRegistrationFails(t *testing.T) {
+func TestRoutingSendBoundaryRejectsOverlappingCanaryAttemptWithoutClaimingUpstreamSend(t *testing.T) {
 	tracker, err := channelrouting.NewCapacityTracker(channelrouting.CapacityConfig{
 		MaxEntries: 4,
 		IdleTTL:    time.Hour,
@@ -110,10 +110,11 @@ func TestCommitRoutingCapacityAttemptReleasesCommittedReservationWhenOutcomeRegi
 	require.NoError(t, service.SetRoutingCapacityReservation(ctx, reservation))
 
 	apiErr := commitRoutingCapacityAttempt(ctx)
-
-	require.NotNil(t, apiErr)
-	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
-	assert.True(t, types.IsSkipRetryError(apiErr))
+	require.Nil(t, apiErr)
+	sendState := bindRoutingUpstreamAttempt(ctx, nil, nil, nil)
+	assert.Error(t, relaycommon.MarkRoutingUpstreamSent(ctx))
+	assert.False(t, sendState.Sent())
+	releaseRoutingCapacityReservation(ctx)
 	snapshot, ok := tracker.Snapshot(key)
 	require.True(t, ok)
 	assert.Zero(t, snapshot.PendingReservations)
@@ -298,7 +299,7 @@ func TestCanaryFaultInjectionMatrixRetriesOnlyBeforeClientCommit(t *testing.T) {
 		},
 		{name: "401", apiErr: types.NewErrorWithStatusCode(errors.New("unauthorized"), types.ErrorCodeBadResponseStatusCode, 401), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
 		{name: "403", apiErr: types.NewErrorWithStatusCode(errors.New("forbidden"), types.ErrorCodeBadResponseStatusCode, 403), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
-		{name: "402", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, 402), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
+		{name: "402", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, 402), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeAccount},
 		{name: "429", apiErr: types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, 429), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
 		{name: "529", apiErr: types.NewErrorWithStatusCode(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, 529), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
 		{name: "5xx", apiErr: types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, 500), responsibility: routingerror.ResponsibilityProvider, scope: routingerror.ScopePoolMember},
@@ -355,6 +356,11 @@ func TestTaskErrorToAPIErrorPreservesOriginalCodeCauseAndRetryAfter(t *testing.T
 	require.ErrorAs(t, apiErr, &extracted)
 	assert.Same(t, dnsErr, extracted)
 	assert.Equal(t, 2500*time.Millisecond, retryAfterFromAPIError(apiErr, time.Minute))
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	respondTaskError(ctx, taskErr)
+	assert.Equal(t, "3", recorder.Header().Get("Retry-After"))
 }
 
 func TestTaskErrorToAPIErrorNormalizesEmptyTaskErrorFacts(t *testing.T) {

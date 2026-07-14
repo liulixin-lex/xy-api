@@ -46,6 +46,13 @@ func Can(userID int, systemRole int, permission Permission) bool {
 // RequiresFreshPolicy identifies high-risk permissions whose revocation must
 // take effect immediately across all application nodes.
 func RequiresFreshPolicy(permission Permission) bool {
+	if permission.Resource == ResourceBillingReview && permission.Action == ActionBillingReviewResolve {
+		return true
+	}
+	if permission.Resource == ResourceBillingProjectionOps {
+		return permission.Action == ActionBillingProjectionRequeue ||
+			permission.Action == ActionBillingProjectionResolve
+	}
 	if permission.Resource != ResourceChannelRouting {
 		return false
 	}

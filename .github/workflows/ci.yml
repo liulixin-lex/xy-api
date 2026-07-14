@@ -13,6 +13,57 @@ on:
   workflow_dispatch:
 
 jobs:
+  workflow-lint:
+    name: Workflow supply-chain checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pinned workflow linters
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz' \
+            --output "$archive"
+          printf '%s  %s\n' \
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y shellcheck yamllint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Lint workflows and enforce immutable action references
+        run: |
+          set -euo pipefail
+          actionlint
+          shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
+          yamllint \
+            -d '{extends: default, rules: {document-start: disable, line-length: disable, truthy: disable, comments: disable}}' \
+            .github/workflows .github/dependabot.yml
+          if rg -n \
+            '^\s*(?:-\s+)?uses:\s*[^#[:space:]]+@(?![0-9a-f]{40}(?:\s|$))' \
+            .github --glob '*.yml' --glob '*.yaml' -P; then
+            echo '::error::Every external GitHub Action must be pinned to a full commit SHA.'
+            exit 1
+          fi
+          .github/scripts/tests/test-prepare-release-assets.sh
+          .github/scripts/tests/test-ensure-release-latest.sh
+          .github/scripts/tests/test-finalize-release-assets.sh
+          .github/scripts/tests/test-finalize-stable-release.sh
+          .github/scripts/tests/test-release-workflow-coordination.sh
+          .github/scripts/tests/test-publish-gitee-release.sh
+          .github/scripts/tests/test-pinned-container-toolchain.sh
+          .github/scripts/tests/test-resolve-stable-architecture.sh
+          .github/scripts/tests/test-resolve-stable-latest.sh
+          .github/scripts/tests/test-verify-release-attestations.sh
+          .github/scripts/tests/test-verify-stable-architecture.sh
+          .github/scripts/tests/test-verify-stable-reuse-handoff.sh
+
   backend:
     name: Backend tests
     runs-on: ubuntu-latest
@@ -34,14 +85,32 @@ jobs:
 
       - name: Validate release version format
         run: |
-          VERSION=$(cat VERSION)
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          VERSION=$(< VERSION)
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::VERSION must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+            exit 1
+          fi
+          if ! cmp -s VERSION <(printf '%s\n' "$VERSION"); then
+            echo '::error::VERSION must contain exactly one semver line and a final newline.'
             exit 1
           fi
 
       - name: Run backend tests
-        run: go list ./... | grep -v '/node_modules/' | xargs go test
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          mapfile -t discovered_packages <<< "$package_list"
+          packages=()
+          for package in "${discovered_packages[@]}"; do
+            if [ -n "$package" ] && [[ "$package" != */node_modules/* ]]; then
+              packages+=("$package")
+            fi
+          done
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo '::error::go list returned no testable backend packages.'
+            exit 1
+          fi
+          go test "${packages[@]}"
 
   frontend-default:
     name: Default frontend build

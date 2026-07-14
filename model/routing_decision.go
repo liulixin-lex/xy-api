@@ -23,7 +23,9 @@ const (
 	RoutingDecisionExclusionMaxReasons    = 32
 	RoutingDecisionExclusionMaxBytes      = 8 << 10
 	RoutingDecisionAlgorithmCanaryV1      = "channel-routing-canary-v1"
+	RoutingDecisionAlgorithmCanaryV2      = "channel-routing-canary-v2"
 	RoutingDecisionAlgorithmBalancedV1    = "channel-routing-balanced-v1"
+	RoutingDecisionAlgorithmBalancedV2    = "channel-routing-balanced-v2"
 	RoutingDecisionCohortControl          = "control"
 	RoutingDecisionCohortCanary           = "canary"
 	RoutingDecisionReservationLocalSoft   = "local_soft"
@@ -474,7 +476,8 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 		audit.ReservationCostNanoUSD != 0 || audit.ReservationLimitTotalTPM != 0 ||
 		audit.ReservationLimitCostNanoUSD != 0 || audit.ReservationLeaseExpiresMs != 0 ||
 		audit.ReservationPoolSharesJSON != ""
-	if audit.AlgorithmVersion == RoutingDecisionAlgorithmBalancedV1 {
+	if audit.AlgorithmVersion == RoutingDecisionAlgorithmBalancedV1 ||
+		audit.AlgorithmVersion == RoutingDecisionAlgorithmBalancedV2 {
 		if audit.ActivationID <= 0 || audit.ActivationStage != RoutingDeploymentStageActive ||
 			audit.TrafficBasisPoints != 0 || audit.CanaryBucket != 0 || audit.RolloutKey != "" || audit.Cohort != "" ||
 			audit.SelectedMemberID < 0 || audit.SelectedCredentialID < 0 ||
@@ -490,7 +493,8 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 	if !hasCanaryMetadata {
 		return !hasSelectedIdentity && !hasReservation
 	}
-	if audit.AlgorithmVersion != RoutingDecisionAlgorithmCanaryV1 || audit.ActivationID <= 0 ||
+	if (audit.AlgorithmVersion != RoutingDecisionAlgorithmCanaryV1 &&
+		audit.AlgorithmVersion != RoutingDecisionAlgorithmCanaryV2) || audit.ActivationID <= 0 ||
 		audit.ActivationStage != RoutingDeploymentStageCanary ||
 		audit.TrafficBasisPoints < RoutingPolicyCanaryMinBasisPoints ||
 		audit.TrafficBasisPoints > RoutingPolicyCanaryMaxBasisPoints || audit.CanaryBucket < 0 ||

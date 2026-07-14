@@ -129,8 +129,17 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	// Use the standard validation method for TaskSubmitReq
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := a.convertToRequestPayload(&req, info); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	return nil
 }
 
 // BuildRequestURL constructs the upstream URL.
@@ -190,7 +199,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
@@ -291,6 +300,11 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, &r); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
+	duration, err := strconv.Atoi(strings.TrimSpace(r.Duration))
+	if err != nil || (duration != 5 && duration != 10) {
+		return nil, fmt.Errorf("duration must be 5 or 10 seconds")
+	}
+	r.Duration = strconv.Itoa(duration)
 	return &r, nil
 }
 
@@ -397,17 +411,17 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 
 	if len(klingResp.Data.TaskResult.Videos) > 0 {
 		video := klingResp.Data.TaskResult.Videos[0]
-		if video.Url != "" {
-			openAIVideo.SetMetadata("url", video.Url)
-		}
 		if video.Duration != "" {
 			openAIVideo.Seconds = video.Duration
 		}
 	}
+	if resultURL := originTask.GetResultURL(); resultURL != "" {
+		openAIVideo.SetMetadata("url", resultURL)
+	}
 
 	if klingResp.Code != 0 && klingResp.Message != "" {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: klingResp.Message,
+			Message: common.SanitizeErrorMessage(klingResp.Message),
 			Code:    fmt.Sprintf("%d", klingResp.Code),
 		}
 	}
@@ -415,7 +429,7 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	// https://app.klingai.com/cn/dev/document-api/apiReference/model/textToVideo
 	if data := klingResp.Data; data.TaskStatus == "failed" {
 		openAIVideo.Error = &dto.OpenAIVideoError{
-			Message: data.TaskStatusMsg,
+			Message: common.SanitizeErrorMessage(data.TaskStatusMsg),
 		}
 	}
 	return common.Marshal(openAIVideo)

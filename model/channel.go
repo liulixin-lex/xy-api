@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -23,6 +24,7 @@ import (
 
 type Channel struct {
 	Id                 int     `json:"id"`
+	RoutingGeneration  string  `json:"-" gorm:"column:routing_generation;type:varchar(32)"`
 	Type               int     `json:"type" gorm:"default:0"`
 	Key                string  `json:"key" gorm:"not null"`
 	OpenAIOrganization *string `json:"openai_organization"`
@@ -58,6 +60,175 @@ type Channel struct {
 
 	// cache info
 	Keys []string `json:"-" gorm:"-"`
+}
+
+var ErrChannelHasStatefulReferences = errors.New("channel has stateful task references; disable it instead of changing its upstream identity")
+
+func (channel *Channel) BeforeCreate(_ *gorm.DB) error {
+	channel.RoutingGeneration = common.GetUUID()
+	return nil
+}
+
+func EnsureChannelRoutingGenerations(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("database is required")
+	}
+	const batchSize = 200
+	for {
+		var channels []Channel
+		if err := db.Select("id").
+			Where("routing_generation IS NULL OR routing_generation = ?", "").
+			Order("id asc").Limit(batchSize).Find(&channels).Error; err != nil {
+			return err
+		}
+		if len(channels) == 0 {
+			return nil
+		}
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			for i := range channels {
+				result := tx.Model(&Channel{}).
+					Where("id = ? AND (routing_generation IS NULL OR routing_generation = ?)", channels[i].Id, "").
+					Update("routing_generation", common.GetUUID())
+				if result.Error != nil {
+					return result.Error
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+func channelKeyMultisetContains(candidate, required []string) bool {
+	counts := make(map[string]int, len(candidate))
+	for _, key := range candidate {
+		counts[key]++
+	}
+	for _, key := range required {
+		if counts[key] == 0 {
+			return false
+		}
+		counts[key]--
+	}
+	return true
+}
+
+func HasStatefulChannelReferencesTx(tx *gorm.DB, channelID int) (bool, error) {
+	if tx == nil || channelID <= 0 {
+		return false, errors.New("channel reference check is invalid")
+	}
+	hasReference := func(modelValue any, where string, args ...any) (bool, error) {
+		if !tx.Migrator().HasTable(modelValue) {
+			return false, nil
+		}
+		var count int64
+		if err := tx.Model(modelValue).Where(where, args...).Limit(1).Count(&count).Error; err != nil {
+			return false, err
+		}
+		return count > 0, nil
+	}
+	checks := []struct {
+		model any
+		where string
+		args  []any
+	}{
+		{&AsyncBillingAttempt{}, "channel_id = ? AND state = ?", []any{
+			channelID, AsyncBillingAttemptStateAuthorized,
+		}},
+		{&AsyncBillingReservation{}, "accepted_projection_channel_id = ? AND accepted_projection_state IN ?", []any{
+			channelID, []string{AsyncBillingAcceptedProjectionPending, AsyncBillingAcceptedProjectionLogPending},
+		}},
+		{&TaskBillingOperation{}, "channel_id = ? AND (state != ? OR log_state NOT IN ?)", []any{
+			channelID, TaskBillingOperationStateCompleted,
+			[]string{TaskBillingOperationLogWritten, TaskBillingOperationLogNotRequired},
+		}},
+		{&MidjourneyBillingOperation{}, "channel_id = ? AND (state != ? OR log_state NOT IN ?)", []any{
+			channelID, TaskBillingOperationStateCompleted,
+			[]string{TaskBillingOperationLogWritten, TaskBillingOperationLogNotRequired},
+		}},
+		{&BillingStatsProjection{}, "channel_id = ? AND state IN ?", []any{channelID, []string{
+			BillingStatsProjectionStatePending, BillingStatsProjectionStateRunning, BillingStatsProjectionStateFailed,
+		}}},
+	}
+	for _, check := range checks {
+		exists, err := hasReference(check.model, check.where, check.args...)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	if exists, err := hasReference(&Task{}, "channel_id = ? AND status NOT IN ?", channelID,
+		[]TaskStatus{TaskStatusSuccess, TaskStatusFailure}); err != nil || exists {
+		return exists, err
+	}
+	if tx.Migrator().HasTable(&Task{}) {
+		const batchSize = 256
+		var cursor int64
+		for {
+			var tasks []Task
+			query := tx.Where("channel_id = ? AND id > ? AND status IN ?", channelID, cursor,
+				[]TaskStatus{TaskStatusSuccess, TaskStatusFailure})
+			if tx.Migrator().HasTable(&TaskBillingOperation{}) {
+				query = query.Where("NOT EXISTS (SELECT 1 FROM task_billing_operations WHERE "+
+					"task_billing_operations.task_id = tasks.id AND task_billing_operations.state = ? AND "+
+					"task_billing_operations.log_state IN ?)", TaskBillingOperationStateCompleted,
+					[]string{TaskBillingOperationLogWritten, TaskBillingOperationLogNotRequired})
+			}
+			if err := query.Order("id asc").Limit(batchSize).Find(&tasks).Error; err != nil {
+				return false, err
+			}
+			for index := range tasks {
+				version := tasks[index].PrivateData.BillingProtocolVersion
+				if version != TaskBillingHistoricalProtocolVersion && SupportsDurableTaskBillingProtocol(version) {
+					return true, nil
+				}
+			}
+			if len(tasks) < batchSize {
+				break
+			}
+			cursor = tasks[len(tasks)-1].ID
+		}
+	}
+	if exists, err := hasReference(&Midjourney{}, "channel_id = ? AND (progress != ? OR status NOT IN ?)",
+		channelID, "100%", []string{"SUCCESS", "FAILURE"}); err != nil || exists {
+		return exists, err
+	}
+	if tx.Migrator().HasTable(&Midjourney{}) {
+		query := tx.Model(&Midjourney{}).Where(
+			"channel_id = ? AND progress = ? AND status IN ? AND billing_protocol_version BETWEEN ? AND ?",
+			channelID, "100%", []string{"SUCCESS", "FAILURE"},
+			TaskBillingLegacyProtocolVersion, TaskBillingProtocolVersion,
+		)
+		if tx.Migrator().HasTable(&MidjourneyBillingOperation{}) {
+			query = query.Where("NOT EXISTS (SELECT 1 FROM midjourney_billing_operations WHERE "+
+				"midjourney_billing_operations.midjourney_id = midjourneys.id AND "+
+				"midjourney_billing_operations.state = ? AND midjourney_billing_operations.log_state IN ?)",
+				TaskBillingOperationStateCompleted,
+				[]string{TaskBillingOperationLogWritten, TaskBillingOperationLogNotRequired})
+		}
+		var count int64
+		if err := query.Limit(1).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func EnsureNoStatefulChannelReferencesTx(tx *gorm.DB, channelID int) error {
+	hasReferences, err := HasStatefulChannelReferencesTx(tx, channelID)
+	if err != nil {
+		return err
+	}
+	if hasReferences {
+		return ErrChannelHasStatefulReferences
+	}
+	return nil
 }
 
 type ChannelInfo struct {
@@ -572,6 +743,17 @@ func BatchDeleteChannels(ids []int) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
+	var channels []Channel
+	if err := lockForUpdate(tx).Where("id IN ?", ids).Order("id asc").Find(&channels).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	for index := range channels {
+		if err := EnsureNoStatefulChannelReferencesTx(tx, channels[index].Id); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
 	for _, chunk := range lo.Chunk(ids, 200) {
 		if err := tx.Where("id in (?)", chunk).Delete(&Channel{}).Error; err != nil {
 			tx.Rollback()
@@ -685,11 +867,45 @@ func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 	credentialChanged := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var current Channel
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "key").
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", channel.Id).First(&current).Error; err != nil {
 			return err
 		}
-		credentialChanged = channel.Key != "" && channel.Key != current.Key
+		effectiveKey := channel.Key
+		if effectiveKey == "" {
+			effectiveKey = current.Key
+		}
+		credentialChanged = effectiveKey != current.Key
+		endpointChanged := channel.Type != current.Type ||
+			!reflect.DeepEqual(channel.OpenAIOrganization, current.OpenAIOrganization) ||
+			!reflect.DeepEqual(channel.BaseURL, current.BaseURL) ||
+			channel.Other != current.Other || channel.OtherInfo != current.OtherInfo ||
+			!reflect.DeepEqual(channel.Setting, current.Setting) ||
+			!reflect.DeepEqual(channel.ParamOverride, current.ParamOverride) ||
+			!reflect.DeepEqual(channel.HeaderOverride, current.HeaderOverride) ||
+			channel.OtherSettings != current.OtherSettings
+		credentialModeChanged := channel.ChannelInfo.IsMultiKey != current.ChannelInfo.IsMultiKey ||
+			channel.ChannelInfo.MultiKeyMode != current.ChannelInfo.MultiKeyMode
+		keysRemoved := credentialChanged && !channelKeyMultisetContains(
+			(&Channel{Key: effectiveKey}).GetKeys(), current.GetKeys(),
+		)
+		identityChanged := endpointChanged || credentialChanged || credentialModeChanged
+		if identityChanged {
+			hasReferences, err := HasStatefulChannelReferencesTx(tx, channel.Id)
+			if err != nil {
+				return err
+			}
+			if hasReferences && (endpointChanged || credentialModeChanged || keysRemoved) {
+				return ErrChannelHasStatefulReferences
+			}
+			if !hasReferences {
+				channel.RoutingGeneration = common.GetUUID()
+			} else {
+				channel.RoutingGeneration = current.RoutingGeneration
+			}
+		} else {
+			channel.RoutingGeneration = current.RoutingGeneration
+		}
 		if err := tx.Model(channel).Updates(channel).Error; err != nil {
 			return err
 		}
@@ -713,6 +929,102 @@ func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 	return credentialChanged, err
 }
 
+func RotateSingleChannelCredentialContinuity(
+	ctx context.Context,
+	channelID int,
+	expectedGeneration string,
+	expectedKey string,
+	newKey string,
+) (*Channel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	expectedGeneration = strings.TrimSpace(expectedGeneration)
+	if channelID <= 0 || expectedGeneration == "" || expectedKey == "" || newKey == "" || expectedKey == newKey {
+		return nil, errors.New("channel credential continuity rotation is invalid")
+	}
+	var rotated Channel
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("id = ?", channelID).First(&rotated).Error; err != nil {
+			return err
+		}
+		if rotated.ChannelInfo.IsMultiKey || rotated.RoutingGeneration != expectedGeneration || rotated.Key != expectedKey {
+			return ErrChannelHasStatefulReferences
+		}
+		hasReferences, err := HasStatefulChannelReferencesTx(tx, channelID)
+		if err != nil {
+			return err
+		}
+		if tx.Migrator().HasTable(&RoutingCredentialRef{}) {
+			oldFingerprint, fingerprintErr := RoutingCredentialFingerprint(channelID, expectedGeneration, expectedKey)
+			if fingerprintErr != nil {
+				if hasReferences {
+					return fingerprintErr
+				}
+			} else {
+				newFingerprint, fingerprintErr := RoutingCredentialFingerprint(channelID, expectedGeneration, newKey)
+				if fingerprintErr != nil {
+					return fingerprintErr
+				}
+				var ref RoutingCredentialRef
+				refErr := lockForUpdate(tx).Where(
+					"channel_id = ? AND channel_generation = ? AND fingerprint = ? AND active = ?",
+					channelID, expectedGeneration, oldFingerprint, true,
+				).First(&ref).Error
+				if errors.Is(refErr, gorm.ErrRecordNotFound) {
+					if hasReferences {
+						return ErrChannelHasStatefulReferences
+					}
+				} else if refErr != nil {
+					return refErr
+				} else {
+					now := common.GetTimestamp()
+					updated := tx.Model(&RoutingCredentialRef{}).Where(
+						"id = ? AND fingerprint = ? AND channel_generation = ? AND active = ?",
+						ref.ID, oldFingerprint, expectedGeneration, true,
+					).Updates(map[string]any{
+						"fingerprint": newFingerprint, "updated_time": now,
+					})
+					if updated.Error != nil {
+						return updated.Error
+					}
+					if updated.RowsAffected != 1 {
+						return ErrChannelHasStatefulReferences
+					}
+				}
+			}
+		} else if hasReferences {
+			return ErrChannelHasStatefulReferences
+		}
+		updated := tx.Model(&Channel{}).
+			Where("id = ? AND routing_generation = ?", channelID, expectedGeneration).
+			Where(map[string]any{"key": expectedKey}).
+			Update("key", newKey)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrChannelHasStatefulReferences
+		}
+		if tx.Migrator().HasTable(&RoutingChannelHealthState{}) {
+			if err := tx.Model(&RoutingChannelHealthState{}).Where("channel_id = ?", channelID).
+				Updates(map[string]any{
+					"auth_failure": false, "auth_failure_reason": "", "auth_failure_until": int64(0),
+					"updated_time": common.GetTimestamp(),
+				}).Error; err != nil {
+				return err
+			}
+		}
+		rotated.Key = newKey
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	NotifyRoutingTopologyChanged()
+	return &rotated, nil
+}
+
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
 	err := DB.Model(channel).Select("response_time", "test_time").Updates(Channel{
 		TestTime:     common.GetTimestamp(),
@@ -734,13 +1046,25 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
+	if channel == nil || channel.Id <= 0 {
+		return errors.New("channel ID is 0")
 	}
-	err = channel.DeleteAbilities()
-	NotifyRoutingTopologyChanged()
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).Where("id = ?", channel.Id).First(&current).Error; err != nil {
+			return err
+		}
+		if err := EnsureNoStatefulChannelReferencesTx(tx, current.Id); err != nil {
+			return err
+		}
+		if err := tx.Where("channel_id = ?", current.Id).Delete(&Ability{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&current).Error
+	})
+	if err == nil {
+		NotifyRoutingTopologyChanged()
+	}
 	return err
 }
 
@@ -979,7 +1303,30 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	statefulEgressChange := paramOverride != nil || headerOverride != nil
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if statefulEgressChange {
+			var channels []Channel
+			if err := lockForUpdate(tx).Where("tag = ?", tag).Order("id asc").Find(&channels).Error; err != nil {
+				return err
+			}
+			for index := range channels {
+				changed := (paramOverride != nil && !reflect.DeepEqual(channels[index].ParamOverride, paramOverride)) ||
+					(headerOverride != nil && !reflect.DeepEqual(channels[index].HeaderOverride, headerOverride))
+				if !changed {
+					continue
+				}
+				if err := EnsureNoStatefulChannelReferencesTx(tx, channels[index].Id); err != nil {
+					return err
+				}
+				if err := tx.Model(&Channel{}).Where("id = ?", channels[index].Id).
+					Update("routing_generation", common.GetUUID()).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return tx.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	})
 	if err != nil {
 		return err
 	}
@@ -1019,19 +1366,49 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	if result.Error == nil && result.RowsAffected > 0 {
-		NotifyRoutingTopologyChanged()
-	}
-	return result.RowsAffected, result.Error
+	return deleteChannelsByStatuses([]int64{status})
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	if result.Error == nil && result.RowsAffected > 0 {
+	return deleteChannelsByStatuses([]int64{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled})
+}
+
+func deleteChannelsByStatuses(statuses []int64) (int64, error) {
+	if len(statuses) == 0 {
+		return 0, nil
+	}
+	var deleted int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("status IN ?", statuses).Order("id asc").Find(&channels).Error; err != nil {
+			return err
+		}
+		if len(channels) == 0 {
+			return nil
+		}
+		ids := make([]int, 0, len(channels))
+		for index := range channels {
+			if err := EnsureNoStatefulChannelReferencesTx(tx, channels[index].Id); err != nil {
+				return err
+			}
+			ids = append(ids, channels[index].Id)
+		}
+		for _, chunk := range lo.Chunk(ids, 200) {
+			if err := tx.Where("channel_id IN ?", chunk).Delete(&Ability{}).Error; err != nil {
+				return err
+			}
+			result := tx.Where("id IN ?", chunk).Delete(&Channel{})
+			if result.Error != nil {
+				return result.Error
+			}
+			deleted += result.RowsAffected
+		}
+		return nil
+	})
+	if err == nil && deleted > 0 {
 		NotifyRoutingTopologyChanged()
 	}
-	return result.RowsAffected, result.Error
+	return deleted, err
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {

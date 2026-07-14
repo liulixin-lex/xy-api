@@ -131,7 +131,13 @@ func fetchCodexChannelWhamData(
 
 			encoded, encErr := common.Marshal(oauthKey)
 			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
+				if _, rotateErr := model.RotateSingleChannelCredentialContinuity(
+					c.Request.Context(), ch.Id, ch.RoutingGeneration, ch.Key, string(encoded),
+				); rotateErr != nil {
+					common.SysError(logPrefix + " credential continuity update: " + rotateErr.Error())
+					c.JSON(http.StatusOK, gin.H{"success": false, "message": userMessage})
+					return
+				}
 				model.InitChannelCache()
 				service.ResetProxyClientCache()
 			}

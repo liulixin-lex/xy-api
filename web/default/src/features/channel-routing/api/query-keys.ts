@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export const channelRoutingQueryKeys = {
   all: ['channel-routing'] as const,
   overview: () => [...channelRoutingQueryKeys.all, 'overview'] as const,
@@ -46,6 +45,12 @@ export const channelRoutingQueryKeys = {
   costsRoot: () => [...channelRoutingQueryKeys.all, 'costs'] as const,
   costs: (params: object) =>
     [...channelRoutingQueryKeys.costsRoot(), params] as const,
+  costBindingsRoot: () =>
+    [...channelRoutingQueryKeys.all, 'cost-bindings'] as const,
+  costBindings: (params: object) =>
+    [...channelRoutingQueryKeys.costBindingsRoot(), params] as const,
+  costBinding: (channelId: number) =>
+    [...channelRoutingQueryKeys.costBindingsRoot(), channelId] as const,
   costDetail: (poolId: number, memberId: number, model: string) =>
     [
       ...channelRoutingQueryKeys.costsRoot(),
@@ -92,6 +97,18 @@ export const channelRoutingQueryKeys = {
   policyRollbackApprovals: (revision: number, params: object) =>
     [
       ...channelRoutingQueryKeys.policyRollbackApprovalsRoot(revision),
+      params,
+    ] as const,
+  billingReviewsRoot: () =>
+    [...channelRoutingQueryKeys.all, 'billing-reviews'] as const,
+  billingReviews: (params: object) =>
+    [...channelRoutingQueryKeys.billingReviewsRoot(), params] as const,
+  billingProjectionsRoot: () =>
+    [...channelRoutingQueryKeys.all, 'billing-projections'] as const,
+  billingProjections: (dataset: string, params: object) =>
+    [
+      ...channelRoutingQueryKeys.billingProjectionsRoot(),
+      dataset,
       params,
     ] as const,
   operationsRoot: () => [...channelRoutingQueryKeys.all, 'operations'] as const,

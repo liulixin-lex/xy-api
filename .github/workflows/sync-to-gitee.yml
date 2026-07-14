@@ -10,6 +10,14 @@ on:
         description: 'Release Tag to sync (e.g. v1.0.0)'
         required: true
         type: string
+      confirm_tag:
+        description: 'Type the same tag again to confirm the external release sync'
+        required: true
+        type: string
+
+concurrency:
+  group: gitee-release-sync-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
   GITEE_OWNER: ${{ vars.GITEE_OWNER }}
@@ -18,7 +26,29 @@ env:
 jobs:
   sync-to-gitee:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
+      - name: Validate sync request
+        env:
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Gitee release sync must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Gitee sync only accepts stable lowercase v semver tags. Current value: $TAG_NAME"
+            exit 1
+          fi
+          if [ "$CONFIRM_TAG" != "$TAG_NAME" ]; then
+            echo '::error::confirm_tag must exactly match tag_name before syncing an external release.'
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -26,63 +56,74 @@ jobs:
 
       - name: Validate Gitee target
         run: |
-          if [ -z "$GITEE_OWNER" ] || [ -z "$GITEE_REPO" ]; then
-            echo "::error::Set repository variables GITEE_OWNER and GITEE_REPO before syncing to Gitee."
+          if [[ ! "$GITEE_OWNER" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ ! "$GITEE_REPO" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Set valid repository variables GITEE_OWNER and GITEE_REPO before syncing to Gitee."
             exit 1
           fi
 
       - name: Get Release Info
-        id: release_info
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.event.inputs.tag_name }}
         run: |
-          # 获取 release 信息
-          RELEASE_INFO=$(gh release view "$TAG_NAME" --json name,body,tagName,targetCommitish)
+          set -euo pipefail
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Gitee sync only accepts stable lowercase v semver tags. Current value: $TAG_NAME"
+            exit 1
+          fi
 
-          RELEASE_NAME=$(echo "$RELEASE_INFO" | jq -r '.name')
-          TARGET_COMMITISH=$(echo "$RELEASE_INFO" | jq -r '.targetCommitish')
+          release_info_file="$RUNNER_TEMP/gitee-release-info.json"
+          release_name_file="$RUNNER_TEMP/gitee-release-name.txt"
+          release_body_file="$RUNNER_TEMP/gitee-release-body.txt"
+          target_commitish_file="$RUNNER_TEMP/gitee-target-commitish.txt"
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          git fetch --no-tags origin main
+          tag_sha=$(git rev-list -n 1 "refs/tags/${TAG_NAME}")
+          if [[ ! "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve $TAG_NAME to one immutable Git commit."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_sha" origin/main; then
+            echo "::error::Release commit $tag_sha is not an ancestor of origin/main."
+            exit 1
+          fi
+          if ! git show "${tag_sha}:VERSION" | cmp -s - <(printf '%s\n' "$TAG_NAME"); then
+            echo "::error::VERSION at $TAG_NAME does not exactly match the release tag."
+            exit 1
+          fi
 
-          # 使用多行字符串输出
-          {
-            echo "release_name=$RELEASE_NAME"
-            echo "target_commitish=$TARGET_COMMITISH"
-            echo "release_body<<EOF"
-            echo "$RELEASE_INFO" | jq -r '.body'
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+          gh release view "$TAG_NAME" --json name,body,tagName,isDraft,isPrerelease,assets > "$release_info_file"
+          jq -e --arg tag "$TAG_NAME" '
+            .tagName == $tag and
+            .isDraft == false and
+            .isPrerelease == false and
+            (.assets | type) == "array"
+          ' "$release_info_file" >/dev/null
+          jq -rj 'if (.name // "") == "" then .tagName else .name end' "$release_info_file" > "$release_name_file"
+          jq -rj 'if (.body // "") == "" then "-" else .body end' "$release_info_file" > "$release_body_file"
+          printf '%s' "$tag_sha" > "$target_commitish_file"
 
-          # 下载 release 的所有附件
-          gh release download "$TAG_NAME" --dir ./release_assets || echo "No assets to download"
+          .github/scripts/finalize-release-assets.sh \
+            --tag "$TAG_NAME" \
+            --verify-only \
+            --download-dir release_assets
 
-          # 列出下载的文件
-          ls -la ./release_assets/ || echo "No assets directory"
-
-      - name: Create Gitee Release
-        id: create_release
-        uses: nICEnnnnnnnLee/action-gitee-release@v2.0.0
-        with:
-          gitee_action: create_release
-          gitee_owner: ${{ env.GITEE_OWNER }}
-          gitee_repo: ${{ env.GITEE_REPO }}
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          gitee_tag_name: ${{ github.event.inputs.tag_name }}
-          gitee_release_name: ${{ steps.release_info.outputs.release_name }}
-          gitee_release_body: ${{ steps.release_info.outputs.release_body }}
-          gitee_target_commitish: ${{ steps.release_info.outputs.target_commitish }}
-
-      - name: Upload Assets to Gitee
-        if: hashFiles('release_assets/*') != ''
-        uses: nICEnnnnnnnLee/action-gitee-release@v2.0.0
-        with:
-          gitee_action: upload_asset
-          gitee_owner: ${{ env.GITEE_OWNER }}
-          gitee_repo: ${{ env.GITEE_REPO }}
-          gitee_token: ${{ secrets.GITEE_TOKEN }}
-          gitee_release_id: ${{ steps.create_release.outputs.release-id }}
-          gitee_upload_retry_times: 3
-          gitee_files: |
-            release_assets/*
+      - name: Publish verified release to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG_NAME: ${{ github.event.inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          args=(
+            --owner "$GITEE_OWNER"
+            --repository "$GITEE_REPO"
+            --tag "$TAG_NAME"
+            --name-file "$RUNNER_TEMP/gitee-release-name.txt"
+            --body-file "$RUNNER_TEMP/gitee-release-body.txt"
+            --target-file "$RUNNER_TEMP/gitee-target-commitish.txt"
+            --assets-dir release_assets
+          )
+          .github/scripts/publish-gitee-release.sh "${args[@]}"
 
       - name: Cleanup
         if: always()
@@ -91,6 +132,8 @@ jobs:
 
       - name: Summary
         if: success()
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag_name }}
         run: |
-          echo "✅ Successfully synced release ${{ github.event.inputs.tag_name }} to Gitee!"
-          echo "🔗 Gitee Release URL: https://gitee.com/${{ env.GITEE_OWNER }}/${{ env.GITEE_REPO }}/releases/tag/${{ github.event.inputs.tag_name }}"
+          echo "Successfully synced release $TAG_NAME to Gitee."
+          echo "Gitee Release URL: https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/releases/tag/${TAG_NAME}"

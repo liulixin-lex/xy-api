@@ -333,6 +333,8 @@ docker run --name new-api -d --restart always \
 
 📖 **Complete configuration:** [Environment Variables Documentation](https://docs.newapi.pro/en/docs/installation/config-maintenance/environment-variables)
 
+📘 **Channel routing 2.0 rollout:** [Operations and rolling-upgrade runbook](docs/channel/channel-routing-v2-operations.md)
+
 </details>
 
 ### 🔧 Deployment Methods

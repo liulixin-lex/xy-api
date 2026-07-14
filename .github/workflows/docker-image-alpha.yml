@@ -10,24 +10,46 @@ on:
         description: "reason"
         required: false
 
+permissions:
+  contents: read
+
+concurrency:
+  group: rolling-container-publish-alpha-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   prepare_version:
     name: Prepare alpha version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
+      sha: ${{ steps.version.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
     steps:
+      - name: Validate manual alpha request
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Manual alpha builds must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+
       - name: Check out (shallow)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/alpha' || github.sha }}
 
       - name: Determine alpha version
         id: version
         run: |
           VERSION="alpha-$(date +'%Y%m%d')-$(git rev-parse --short HEAD)"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Prepared alpha version: $VERSION"
 
@@ -45,10 +67,13 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
@@ -58,21 +83,25 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
+          ref: ${{ needs.prepare_version.outputs.sha }}
 
       - name: Determine alpha version
         id: version
         run: |
           VERSION="${{ needs.prepare_version.outputs.version }}"
           echo "$VERSION" > VERSION
-          echo "value=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Publishing version: $VERSION for ${{ matrix.arch }}"
 
       - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
@@ -86,7 +115,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (labels)
         id: meta
@@ -126,43 +155,65 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Sign image with cosign
+      - name: Sign and verify image with cosign
         run: |
-          cosign sign --yes ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.build.outputs.digest }}
+          ghcr_ref="ghcr.io/${{ env.GHCR_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "$ghcr_ref"
+          cosign verify \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+            "$ghcr_ref" >/dev/null
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
+            dockerhub_ref="${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}"
+            cosign sign --yes "$dockerhub_ref"
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "$dockerhub_ref" >/dev/null
           fi
 
       - name: Output digest
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "ghcr.io/${{ env.GHCR_REPOSITORY }}:alpha-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "${DOCKERHUB_REPOSITORY}:alpha-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Docker Image Digest (${{ matrix.arch }})"
+            echo '```'
+            echo "ghcr.io/${{ env.GHCR_REPOSITORY }}:alpha-${{ matrix.arch }}"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo "${DOCKERHUB_REPOSITORY}:alpha-${{ matrix.arch }}"
+            fi
+            echo "${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   create_manifests:
     name: Create multi-arch manifests
     needs: [prepare_version, build_single_arch]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      COSIGN_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
     permissions:
       packages: write
       contents: read
+      id-token: write
     steps:
       - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set alpha version
         run: |
           VERSION="${{ needs.prepare_version.outputs.version }}"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up pinned Docker Buildx client
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver: docker
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
@@ -175,46 +226,75 @@ jobs:
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:alpha \
-            ${DOCKERHUB_REPOSITORY}:alpha-amd64 \
-            ${DOCKERHUB_REPOSITORY}:alpha-arm64
+            -t "${DOCKERHUB_REPOSITORY}:alpha" \
+            "${DOCKERHUB_REPOSITORY}:alpha-amd64" \
+            "${DOCKERHUB_REPOSITORY}:alpha-arm64"
 
       - name: Create & push manifest (Docker Hub - versioned alpha)
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${VERSION} \
-            ${DOCKERHUB_REPOSITORY}:${VERSION}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${VERSION}-arm64
+            -t "${DOCKERHUB_REPOSITORY}:${VERSION}" \
+            "${DOCKERHUB_REPOSITORY}:${VERSION}-amd64" \
+            "${DOCKERHUB_REPOSITORY}:${VERSION}-arm64"
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create & push manifest (GHCR - alpha)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:alpha \
-            ghcr.io/${GHCR_REPOSITORY}:alpha-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:alpha-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:alpha" \
+            "ghcr.io/${GHCR_REPOSITORY}:alpha-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:alpha-arm64"
 
       - name: Create & push manifest (GHCR - versioned alpha)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${VERSION} \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:${VERSION}" \
+            "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:${VERSION}-arm64"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign and verify multi-arch manifests by digest
+        run: |
+          set -euo pipefail
+
+          sign_and_verify() {
+            local repository=$1
+            local digest
+            digest=$(docker buildx imagetools inspect "${repository}:${VERSION}" --format '{{.Manifest.Digest}}')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid alpha manifest digest for $repository: $digest"
+              exit 1
+            fi
+            cosign sign --yes "${repository}@${digest}"
+            cosign verify \
+              --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_CERTIFICATE_OIDC_ISSUER" \
+              "${repository}@${digest}" >/dev/null
+          }
+
+          sign_and_verify "ghcr.io/${GHCR_REPOSITORY}"
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            sign_and_verify "$DOCKERHUB_REPOSITORY"
+          fi
 
       - name: Output manifest digest
         run: |
-          echo "### Multi-arch Manifest Digests" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:alpha >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "---" >> $GITHUB_STEP_SUMMARY
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:alpha >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo '### Multi-arch Manifest Digests'
+            echo '```'
+            docker buildx imagetools inspect "ghcr.io/${GHCR_REPOSITORY}:alpha"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo '---'
+              docker buildx imagetools inspect "${DOCKERHUB_REPOSITORY}:alpha"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -185,9 +185,8 @@ func TestOpenaiRealtimeHandlerFirstMessageTimeoutReturnsRetryableError(t *testin
 	t.Cleanup(func() { _ = targetConn.Close() })
 
 	type handlerResult struct {
-		err         *types.NewAPIError
-		elapsed     time.Duration
-		replayCount int
+		err     *types.NewAPIError
+		elapsed time.Duration
 	}
 	resultCh := make(chan handlerResult, 1)
 	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +213,7 @@ func TestOpenaiRealtimeHandlerFirstMessageTimeoutReturnsRetryableError(t *testin
 		}
 
 		apiErr, _ := OpenaiRealtimeHandler(c, info)
-		resultCh <- handlerResult{err: apiErr, elapsed: time.Since(start), replayCount: len(info.RealtimeReplayMessages)}
+		resultCh <- handlerResult{err: apiErr, elapsed: time.Since(start)}
 	}))
 	t.Cleanup(clientServer.Close)
 
@@ -247,7 +246,76 @@ func TestOpenaiRealtimeHandlerFirstMessageTimeoutReturnsRetryableError(t *testin
 	require.NotNil(t, result.err)
 	assert.Equal(t, http.StatusGatewayTimeout, result.err.StatusCode)
 	assert.Less(t, result.elapsed, 100*time.Millisecond)
-	assert.Equal(t, 1, result.replayCount)
+}
+
+func TestOpenaiRealtimeHandlerForwardsSessionCreatedBeforeClientMessage(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	gin.SetMode(gin.TestMode)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	targetRelease := make(chan struct{})
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+		message, err := common.Marshal(dto.RealtimeEvent{
+			Type:    dto.RealtimeEventTypeSessionCreated,
+			Session: &dto.RealtimeSession{},
+		})
+		require.NoError(t, err)
+		require.NoError(t, conn.WriteMessage(websocket.TextMessage, message))
+		<-targetRelease
+	}))
+	t.Cleanup(func() {
+		close(targetRelease)
+		targetServer.Close()
+	})
+
+	targetConn, _, err := websocket.DefaultDialer.Dial("ws"+targetServer.URL[len("http"):], nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = targetConn.Close() })
+	resultCh := make(chan *types.NewAPIError, 1)
+	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientConn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer clientConn.Close()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = r
+		start := time.Now()
+		info := &relaycommon.RelayInfo{
+			ClientWs:          clientConn,
+			TargetWs:          targetConn,
+			RelayFormat:       types.RelayFormatOpenAIRealtime,
+			IsStream:          true,
+			StartTime:         start,
+			FirstResponseTime: start.Add(-time.Second),
+			OriginModelName:   "gpt-realtime",
+			UsingGroup:        "default",
+			ChannelMeta:       &relaycommon.ChannelMeta{ChannelId: 19},
+		}
+		apiErr, _ := OpenaiRealtimeHandler(c, info)
+		resultCh <- apiErr
+	}))
+	t.Cleanup(clientServer.Close)
+
+	clientConn, _, err := websocket.DefaultDialer.Dial("ws"+clientServer.URL[len("http"):], nil)
+	require.NoError(t, err)
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(time.Second)))
+	_, message, err := clientConn.ReadMessage()
+	require.NoError(t, err, "server must not wait for an initial client session.update")
+	var event dto.RealtimeEvent
+	require.NoError(t, common.Unmarshal(message, &event))
+	assert.Equal(t, dto.RealtimeEventTypeSessionCreated, event.Type)
+	require.NoError(t, clientConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+	require.NoError(t, clientConn.Close())
+
+	select {
+	case apiErr := <-resultCh:
+		assert.Nil(t, apiErr)
+	case <-time.After(time.Second):
+		require.Fail(t, "realtime handler did not stop after client close")
+	}
 }
 
 func TestOpenaiRealtimeHandlerTargetCloseBeforeFirstMessageReturnsRetryableError(t *testing.T) {
@@ -281,9 +349,8 @@ func TestOpenaiRealtimeHandlerTargetCloseBeforeFirstMessageReturnsRetryableError
 	t.Cleanup(func() { _ = targetConn.Close() })
 
 	type handlerResult struct {
-		err         *types.NewAPIError
-		replayCount int
-		endReason   relaycommon.StreamEndReason
+		err       *types.NewAPIError
+		endReason relaycommon.StreamEndReason
 	}
 	resultCh := make(chan handlerResult, 1)
 	clientServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -308,7 +375,7 @@ func TestOpenaiRealtimeHandlerTargetCloseBeforeFirstMessageReturnsRetryableError
 		}
 
 		apiErr, _ := OpenaiRealtimeHandler(c, info)
-		resultCh <- handlerResult{err: apiErr, replayCount: len(info.RealtimeReplayMessages), endReason: info.StreamStatus.EndReason}
+		resultCh <- handlerResult{err: apiErr, endReason: info.StreamStatus.EndReason}
 	}))
 	t.Cleanup(clientServer.Close)
 
@@ -341,7 +408,6 @@ func TestOpenaiRealtimeHandlerTargetCloseBeforeFirstMessageReturnsRetryableError
 	assert.Equal(t, "upstream realtime failed before first response", result.err.Error())
 	require.Error(t, result.err.Cause())
 	assert.Contains(t, result.err.Cause().Error(), "error reading from target")
-	assert.Equal(t, 1, result.replayCount)
 	assert.Equal(t, relaycommon.StreamEndReasonScannerErr, result.endReason)
 }
 

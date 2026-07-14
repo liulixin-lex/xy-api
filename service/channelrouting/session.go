@@ -20,12 +20,15 @@ var (
 )
 
 const (
-	ExclusionReasonRequestFailed        = "request_failed"
-	ExclusionReasonChannelNotAllowed    = "channel_not_allowed"
-	ExclusionReasonLocalCapacity        = "local_capacity_exhausted"
-	ExclusionReasonHalfOpenProbe        = "half_open_probe_unavailable"
-	ExclusionReasonMultiKeyUnsupported  = "multi_key_unsupported"
-	ExclusionReasonSlowStartUnavailable = "slow_start_unavailable"
+	ExclusionReasonRequestFailed         = "request_failed"
+	ExclusionReasonChannelNotAllowed     = "channel_not_allowed"
+	ExclusionReasonLocalCapacity         = "local_capacity_exhausted"
+	ExclusionReasonHalfOpenProbe         = "half_open_probe_unavailable"
+	ExclusionReasonMultiKeyUnsupported   = "multi_key_unsupported"
+	ExclusionReasonCredentialUnavailable = "credential_unavailable"
+	ExclusionReasonCredentialRequest     = "credential_request_excluded"
+	ExclusionReasonUpstreamAccount       = "upstream_account_unavailable"
+	ExclusionReasonSlowStartUnavailable  = "slow_start_unavailable"
 )
 
 type RequestRoutingSession struct {
@@ -54,9 +57,12 @@ type RequestRoutingPlanInput struct {
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
 	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
+	Profile                 *RequestProfile                  `json:"-"`
 	// A nil allowed list means unrestricted. A non-nil empty list fails closed.
 	AllowedChannelIDs          []int
 	ExcludedChannelIDs         []int
+	ExcludedCredentialIDs      []int
+	RequiredCredentialID       int
 	CapacityExcludedChannelIDs []int
 	ProbeExcludedChannelIDs    []int
 	SlowStartFactor            func(SlowStartKey) (float64, error)
@@ -70,6 +76,7 @@ type RequestRoutingCostInput struct {
 	PromptTokenEstimate     int
 	CompletionTokenEstimate int
 	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
+	Profile                 *RequestProfile                  `json:"-"`
 }
 
 type RequestRoutingPlan struct {
@@ -238,7 +245,8 @@ func (session *RequestRoutingSession) CostEstimateForChannel(
 	if !exists || memberID <= 0 {
 		return ShadowCostInput{}, false, ErrRoutingSessionInvalid
 	}
-	profile, err := NewRequestProfile(
+	profile, err := resolveRequestProfile(
+		input.Profile,
 		input.RequestPath,
 		session.groupName,
 		input.ModelName,
@@ -294,6 +302,9 @@ func (session *RequestRoutingSession) Gate() (CanaryGate, bool, error) {
 }
 
 func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (RequestRoutingPlan, bool, error) {
+	if input.RequiredCredentialID < 0 {
+		return RequestRoutingPlan{}, false, ErrRoutingSessionInvalid
+	}
 	if session == nil || session.snapshot == nil || session.poolIndex < 0 || session.poolIndex >= len(session.snapshot.view.Pools) {
 		return RequestRoutingPlan{}, false, ErrRoutingSessionInvalid
 	}
@@ -311,7 +322,8 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		return plan, true, nil
 	}
 
-	profile, err := NewRequestProfile(
+	profile, err := resolveRequestProfile(
+		input.Profile,
 		input.RequestPath,
 		session.groupName,
 		input.ModelName,
@@ -329,6 +341,10 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		return RequestRoutingPlan{}, true, err
 	}
 	excludedChannels, _, err := routingSessionChannelSet(input.ExcludedChannelIDs)
+	if err != nil {
+		return RequestRoutingPlan{}, true, err
+	}
+	excludedCredentials, _, err := routingSessionChannelSet(input.ExcludedCredentialIDs)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
@@ -392,33 +408,55 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				region    string
 			}{authority: authority, region: region}
 		}
-		switch {
-		case routingSessionChannelContains(excludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonRequestFailed
-		case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
-		case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
-		case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):
-			candidate.RequestExclusionReason = ExclusionReasonChannelNotAllowed
-		case member.MultiKey || channel.MultiKey || member.CredentialsTruncated || len(member.CredentialIDs) > 1:
-			candidate.RequestExclusionReason = ExclusionReasonMultiKeyUnsupported
-		case input.SlowStartFactor != nil:
-			factor, factorErr := session.slowStartFactor(SlowStartKey{
-				PoolID: pool.ID, MemberID: member.ID, Model: profile.ModelName,
-			}, input.SlowStartFactor)
-			if factorErr != nil || math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 0 || factor > 1 {
-				return RequestRoutingPlan{}, true, fmt.Errorf("%w: slow start factor", ErrRoutingSessionInvalid)
-			}
-			if factor == 0 {
-				candidate.RequestExclusionReason = ExclusionReasonSlowStartUnavailable
-			} else {
-				candidate.SlowStartFactor = factor
+		credentialID, credentialReason := snapshot.selectCredential(
+			member, profile.ModelName, seed, excludedCredentials, input.RequiredCredentialID, now,
+		)
+		candidate.CredentialID = credentialID
+		if candidate.RequestExclusionReason == "" {
+			switch credentialReason {
+			case credentialExclusionRequest:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialRequest
+			case credentialExclusionUnavailable:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialUnavailable
 			}
 		}
-		identity := Identity{SnapshotRevision: snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}
-		if len(member.CredentialIDs) == 1 {
-			identity.CredentialID = member.CredentialIDs[0]
+		if candidate.RequestExclusionReason == "" && observation.upstreamAccountID > 0 {
+			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, now); blocked {
+				candidate.RequestExclusionReason = ExclusionReasonUpstreamAccount
+			}
+		}
+		if candidate.RequestExclusionReason == "" {
+			switch {
+			case routingSessionChannelContains(excludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonRequestFailed
+			case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
+			case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonLocalCapacity
+			case allowedRestricted && !routingSessionChannelContains(allowedChannels, member.ChannelID):
+				candidate.RequestExclusionReason = ExclusionReasonChannelNotAllowed
+			case member.CredentialsTruncated:
+				candidate.RequestExclusionReason = ExclusionReasonCredentialUnavailable
+			case input.SlowStartFactor != nil:
+				factor, factorErr := session.slowStartFactor(SlowStartKey{
+					PoolID: pool.ID, MemberID: member.ID, Model: profile.ModelName,
+				}, input.SlowStartFactor)
+				if factorErr != nil || math.IsNaN(factor) || math.IsInf(factor, 0) || factor < 0 || factor > 1 {
+					return RequestRoutingPlan{}, true, fmt.Errorf("%w: slow start factor", ErrRoutingSessionInvalid)
+				}
+				if factor == 0 {
+					candidate.RequestExclusionReason = ExclusionReasonSlowStartUnavailable
+				} else {
+					candidate.SlowStartFactor = factor
+				}
+			}
+		}
+		identity := Identity{
+			SnapshotRevision:  snapshot.view.Revision,
+			PoolID:            pool.ID,
+			MemberID:          member.ID,
+			CredentialID:      credentialID,
+			UpstreamAccountID: observation.upstreamAccountID,
 		}
 		identities[member.ID] = identity
 		candidates = append(candidates, candidate)

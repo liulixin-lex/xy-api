@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 /**
  * Build metadata helper.
  *
@@ -63,10 +62,10 @@ declare global {
 
 function readEnvRevision(): string | undefined {
   try {
-    const env = (
-      import.meta as unknown as { env?: Record<string, string | undefined> }
-    ).env
-    const raw = env?.VITE_REACT_APP_VERSION
+    // Keep this as a direct static member access. Rsbuild's single-key define
+    // replaces this exact expression without exposing any other environment
+    // variables to the browser bundle.
+    const raw = import.meta.env.VITE_REACT_APP_VERSION
     if (typeof raw === 'string' && raw.length > 0) return raw
   } catch {
     // import.meta may be unavailable in some test environments.

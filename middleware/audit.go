@@ -47,9 +47,12 @@ var auditRouteActions = map[string]string{
 	"DELETE /api/user/:id/oauth/bindings/:provider_id": "user.oauth_unbind",
 
 	// 系统设置（root）
-	"POST /api/option/payment_compliance":       "option.payment_compliance",
-	"POST /api/option/rest_model_ratio":         "option.reset_ratio",
-	"DELETE /api/option/channel_affinity_cache": "option.clear_affinity_cache",
+	"POST /api/option/payment_compliance":                                              "option.payment_compliance",
+	"POST /api/option/rest_model_ratio":                                                "option.reset_ratio",
+	"DELETE /api/option/channel_affinity_cache":                                        "option.clear_affinity_cache",
+	"POST /api/system-info/billing-projections/stats/failed/:id/requeue":               "billing_projection.stats_requeue",
+	"POST /api/system-info/billing-projections/logs/failed/:id/requeue":                "billing_projection.log_requeue",
+	"POST /api/system-info/billing-projections/log-sink-conflicts/:id/resolve-requeue": "billing_projection.conflict_resolve_requeue",
 
 	// 自定义 OAuth（root）
 	"POST /api/custom-oauth-provider/":      "custom_oauth.create",

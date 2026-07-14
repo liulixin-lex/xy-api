@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -747,8 +748,8 @@ func UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	if err := model.InvalidateUserCache(updatedUser.Id); err != nil {
-		common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", updatedUser.Id, err.Error()))
+	if err := model.SyncUserCacheAfterCommit(c.Request.Context(), updatedUser.Id, time.Now()); err != nil {
+		common.SysLog(fmt.Sprintf("user cache sync pending for user %d: %s", updatedUser.Id, err.Error()))
 	}
 	recordManageAuditFor(c, updatedUser.Id, "user.update", map[string]interface{}{
 		"username": originUser.Username,
@@ -1170,7 +1171,7 @@ func ManageUser(c *gin.Context) {
 			})
 		case "override":
 			oldQuota := user.Quota
-			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
+			if err := model.SetUserQuota(user.Id, req.Value); err != nil {
 				common.ApiError(c, err)
 				return
 			}
@@ -1213,13 +1214,11 @@ func ManageUser(c *gin.Context) {
 			return
 		}
 	}
-	// 禁用 / 角色调整后，强制失效用户缓存与其全部令牌缓存，
-	// 避免在 Redis TTL 过期前仍使用旧状态（尤其是禁用后仍可发起请求的问题）。
-	// InvalidateUserCache 会让下一次 GetUserCache 从数据库重新加载，
-	// InvalidateUserTokensCache 则确保令牌侧的缓存也同步刷新。
+	// 禁用 / 角色调整后，同步用户的持久失效记录，并清理其令牌缓存。
+	// 用户缓存同步失败会由恢复任务重试，避免 Redis 短暂故障留下旧状态。
 	if req.Action == "disable" || req.Action == "promote" || req.Action == "demote" {
-		if err := model.InvalidateUserCache(user.Id); err != nil {
-			common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", user.Id, err.Error()))
+		if err := model.SyncUserCacheAfterCommit(c.Request.Context(), user.Id, time.Now()); err != nil {
+			common.SysLog(fmt.Sprintf("user cache sync pending for user %d: %s", user.Id, err.Error()))
 		}
 		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
 			common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))

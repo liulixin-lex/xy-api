@@ -83,6 +83,9 @@ func AutoRollbackRoutingCanaryPoolContext(
 			}
 			return err
 		}
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return err
+		}
 		if operation.Status != RoutingOperationStatusRunning ||
 			operation.ClaimToken != request.Operation.ClaimToken || operation.ClaimUntilMs <= request.NowMs {
 			return ErrRoutingOperationClaimLost
@@ -412,37 +415,66 @@ func finishRoutingCanaryRollbackOperationGroupTx(
 		RoutingOperationStatusPending,
 		RoutingOperationStatusRunning,
 	}
-	query := tx.WithContext(ctx).Model(&RoutingOperation{}).
+	query := lockForUpdate(tx.WithContext(ctx)).
 		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
 			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,
 		).
 		Where("status IN ?", nonterminalStatuses)
-	var operationCount int64
-	if err := query.Count(&operationCount).Error; err != nil {
+	var operations []RoutingOperation
+	if err := query.Find(&operations).Error; err != nil {
 		return RoutingOperation{}, err
 	}
-	if operationCount <= 0 {
+	if len(operations) == 0 {
 		return RoutingOperation{}, ErrRoutingOperationClaimLost
 	}
+	transitionTimeMs := nowMs
+	operationIDs := make([]int64, len(operations))
+	for index := range operations {
+		if err := validateStoredRoutingOperation(operations[index]); err != nil {
+			return RoutingOperation{}, err
+		}
+		operationIDs[index] = operations[index].ID
+		transitionTimeMs = max(
+			transitionTimeMs,
+			operations[index].CreatedTimeMs,
+			operations[index].UpdatedTimeMs,
+		)
+	}
+	operationCount := int64(len(operations))
+	updates := routingOperationTerminalUpdates(status, lastError, result, transitionTimeMs)
+	updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
 	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
 			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,
 		).
 		Where("status IN ?", nonterminalStatuses).
-		Updates(routingOperationTerminalUpdates(status, lastError, result, nowMs))
+		Updates(updates)
 	if updated.Error != nil {
 		return RoutingOperation{}, updated.Error
 	}
 	if updated.RowsAffected != operationCount {
 		return RoutingOperation{}, ErrRoutingOperationClaimLost
 	}
-	var claimed RoutingOperation
-	if err := tx.WithContext(ctx).Where("id = ?", claimedOperationID).First(&claimed).Error; err != nil {
+	var storedOperations []RoutingOperation
+	if err := tx.WithContext(ctx).Where("id IN ?", operationIDs).Find(&storedOperations).Error; err != nil {
 		return RoutingOperation{}, err
 	}
-	if claimed.Status != status || claimed.LastError != lastError ||
+	if len(storedOperations) != len(operations) {
+		return RoutingOperation{}, ErrRoutingOperationClaimLost
+	}
+	var claimed RoutingOperation
+	for index := range storedOperations {
+		operation := storedOperations[index]
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return RoutingOperation{}, err
+		}
+		if operation.ID == claimedOperationID {
+			claimed = operation
+		}
+	}
+	if claimed.ID == 0 || claimed.Status != status || claimed.LastError != lastError ||
 		claimed.ResultRevision != result.Revision || claimed.ResultActivationID != result.ActivationID ||
-		claimed.ResultOutboxID != result.OutboxID || claimed.CompletedTimeMs != nowMs {
+		claimed.ResultOutboxID != result.OutboxID || claimed.CompletedTimeMs != transitionTimeMs {
 		return RoutingOperation{}, ErrRoutingCanaryAutoRollbackInvalid
 	}
 	return claimed, nil

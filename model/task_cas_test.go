@@ -103,19 +103,88 @@ func insertTask(t *testing.T, task *Task) {
 	require.NoError(t, DB.Create(task).Error)
 }
 
+func TestTaskLookupFailsClosedForAmbiguousPublicIdentity(t *testing.T) {
+	truncateTables(t)
+	insertTask(t, &Task{TaskID: "task_duplicate_user", UserId: 11, Status: TaskStatusInProgress})
+	insertTask(t, &Task{TaskID: "task_duplicate_user", UserId: 11, Status: TaskStatusInProgress})
+	insertTask(t, &Task{TaskID: "task_duplicate_global", UserId: 21, Status: TaskStatusInProgress})
+	insertTask(t, &Task{TaskID: "task_duplicate_global", UserId: 22, Status: TaskStatusInProgress})
+	insertTask(t, &Task{TaskID: "task_unique", UserId: 11, Status: TaskStatusInProgress})
+
+	_, exists, err := GetByTaskId(11, "task_duplicate_user")
+	assert.ErrorIs(t, err, ErrTaskIdentityAmbiguous)
+	assert.False(t, exists)
+	_, exists, err = GetByOnlyTaskId("task_duplicate_global")
+	assert.ErrorIs(t, err, ErrTaskIdentityAmbiguous)
+	assert.False(t, exists)
+	_, err = GetByTaskIds(11, []any{"task_duplicate_user", "task_unique"})
+	assert.ErrorIs(t, err, ErrTaskIdentityAmbiguous)
+
+	unique, exists, err := GetByTaskId(11, "task_unique")
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, "task_unique", unique.TaskID)
+}
+
+func TestTaskRestoreV2PrivateDataMergesOnlyLegacyTerminalResultFields(t *testing.T) {
+	truncateTables(t)
+	task := &Task{
+		TaskID: "task_old_poller_result", UserId: 71, Status: TaskStatusSuccess, Progress: "100%",
+		PrivateData: TaskPrivateData{
+			BillingProtocolVersion: TaskBillingProtocolVersion, AsyncBillingReservationID: 91001,
+			RoutingCredentialID: 83, RoutingChannelGeneration: "generation-7",
+			UpstreamTaskID: "provider-task-91001", BillingSource: TaskBillingSourceWallet,
+			TokenId: 71, NodeName: "submit-node",
+			BillingContext: &TaskBillingContext{
+				OriginModelName: "video-model", ModelPrice: 2, GroupRatio: 1, ModelRatio: 1,
+			},
+		},
+	}
+	require.NoError(t, task.IsolateV2BillingFromLegacyPollers(120))
+	insertTask(t, task)
+	originalDurableHash := task.DurablePrivateDataHash
+
+	legacyPrivateData := `{
+		"key":"must-not-merge",
+		"result_url":"https://provider.example/result-91001.mp4",
+		"billing_source":"subscription",
+		"subscription_id":999,
+		"token_id":999,
+		"billing_context":{"origin_model_name":"tampered-model","model_price":999}
+	}`
+	require.NoError(t, DB.Exec("UPDATE tasks SET private_data = ? WHERE id = ?", []byte(legacyPrivateData), task.ID).Error)
+
+	var restored Task
+	require.NoError(t, DB.First(&restored, task.ID).Error)
+	assert.Equal(t, "https://provider.example/result-91001.mp4", restored.PrivateData.ResultURL)
+	assert.Equal(t, "https://provider.example/result-91001.mp4", restored.GetUpstreamResultURL())
+	assert.Equal(t, TaskBillingProtocolVersion, restored.PrivateData.BillingProtocolVersion)
+	assert.Equal(t, int64(91001), restored.PrivateData.AsyncBillingReservationID)
+	assert.Equal(t, 83, restored.PrivateData.RoutingCredentialID)
+	assert.Equal(t, "generation-7", restored.PrivateData.RoutingChannelGeneration)
+	assert.Equal(t, "provider-task-91001", restored.PrivateData.UpstreamTaskID)
+	assert.Equal(t, TaskBillingSourceWallet, restored.PrivateData.BillingSource)
+	assert.Equal(t, 71, restored.PrivateData.TokenId)
+	assert.Empty(t, restored.PrivateData.Key)
+	require.NotNil(t, restored.PrivateData.DurableBillingContext)
+	assert.Equal(t, "video-model", restored.PrivateData.DurableBillingContext.OriginModelName)
+	assert.Equal(t, 120, restored.EffectiveBillingQuota())
+	assert.Equal(t, originalDurableHash, restored.DurablePrivateDataHash)
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot / Equal — pure logic tests (no DB)
 // ---------------------------------------------------------------------------
 
 func TestSnapshotEqual_Same(t *testing.T) {
 	s := taskSnapshot{
-		Status:     TaskStatusInProgress,
-		Progress:   "50%",
-		StartTime:  1000,
-		FinishTime: 0,
-		FailReason: "",
-		ResultURL:  "",
-		Data:       json.RawMessage(`{"key":"value"}`),
+		Status:            TaskStatusInProgress,
+		Progress:          "50%",
+		StartTime:         1000,
+		FinishTime:        0,
+		FailReason:        "",
+		UpstreamResultURL: "",
+		Data:              json.RawMessage(`{"key":"value"}`),
 	}
 	assert.True(t, s.Equal(s))
 }
@@ -153,7 +222,7 @@ func TestSnapshot_Roundtrip(t *testing.T) {
 		FinishTime: 5678,
 		FailReason: "timeout",
 		PrivateData: TaskPrivateData{
-			ResultURL: "https://example.com/result.mp4",
+			UpstreamResultURL: "https://example.com/result.mp4",
 		},
 		Data: json.RawMessage(`{"model":"test-model"}`),
 	}
@@ -163,7 +232,7 @@ func TestSnapshot_Roundtrip(t *testing.T) {
 	assert.Equal(t, task.StartTime, snap.StartTime)
 	assert.Equal(t, task.FinishTime, snap.FinishTime)
 	assert.Equal(t, task.FailReason, snap.FailReason)
-	assert.Equal(t, task.PrivateData.ResultURL, snap.ResultURL)
+	assert.Equal(t, task.PrivateData.UpstreamResultURL, snap.UpstreamResultURL)
 	assert.JSONEq(t, string(task.Data), string(snap.Data))
 }
 

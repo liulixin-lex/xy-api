@@ -124,7 +124,9 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	routingbreaker.ReleaseDefaultHalfOpenProbe(probeKey)
 	identity, ok := GetSelectedRoutingIdentity(ctx, 102)
 	require.True(t, ok)
-	assert.Equal(t, SelectedRoutingIdentity{ChannelID: 102, SnapshotRevision: 11, PoolID: 29, MemberID: 2}, identity)
+	assert.Equal(t, SelectedRoutingIdentity{
+		ChannelID: 102, SnapshotRevision: 11, PoolID: 29, MemberID: 2, CredentialID: 1002,
+	}, identity)
 	reservation, ok := routingCapacityReservationFromContext(ctx)
 	require.True(t, ok)
 	assert.Equal(t, routingCapacityReservationPending, reservation.state)

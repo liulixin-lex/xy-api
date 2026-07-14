@@ -89,7 +89,10 @@ func TestCreateRoutingDecisionAuditsValidatesCanaryMetadataAndLegacyRows(t *test
 		DecisionID: "legacy", PoolID: 7, GroupName: "default", ModelName: "gpt-test",
 		SnapshotRevision: 10, CandidatesJSON: `{"candidates":[]}`, CreatedTime: 9,
 	}
-	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{control, legacy}))
+	controlV2 := control
+	controlV2.DecisionID = "control-v2"
+	controlV2.AlgorithmVersion = RoutingDecisionAlgorithmCanaryV2
+	require.NoError(t, CreateRoutingDecisionAuditsContext(context.Background(), []RoutingDecisionAudit{control, controlV2, legacy}))
 
 	partial := legacy
 	partial.DecisionID = "partial"

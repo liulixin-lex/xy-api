@@ -4,24 +4,62 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch name to build, for example alpha or nightly'
+        description: 'Feature branch to build; alpha and nightly use their dedicated workflows'
         required: true
         type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-branch-container-publish-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
     name: Prepare Docker tags
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
-      branch: ${{ steps.version.outputs.branch }}
       sha: ${{ steps.version.outputs.sha }}
       tag_prefix: ${{ steps.version.outputs.tag_prefix }}
       version: ${{ steps.version.outputs.version }}
     permissions:
       contents: read
     steps:
+      - name: Validate branch and reserved tag namespaces
+        id: namespace
+        env:
+          BRANCH_NAME: ${{ inputs.branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_REF" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Manual branch images must run from the default branch (${DEFAULT_BRANCH})."
+            exit 1
+          fi
+          if ! git check-ref-format --branch "$BRANCH_NAME" >/dev/null; then
+            echo '::error::The requested branch name is not a valid Git branch.'
+            exit 1
+          fi
+
+          tag_prefix=$(printf '%s' "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')
+          tag_prefix=${tag_prefix:0:105}
+          tag_prefix=$(printf '%s' "$tag_prefix" | sed -E 's/[.-]+$//')
+          if [ -z "$tag_prefix" ]; then
+            echo '::error::The branch name cannot be converted to a valid Docker tag prefix.'
+            exit 1
+          fi
+          if [[ "$tag_prefix" =~ ^(alpha|nightly|latest)(-|$) ]] || \
+             [[ "$tag_prefix" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-|$) ]]; then
+            echo "::error::Docker tag prefix $tag_prefix is reserved for a protected release workflow."
+            exit 1
+          fi
+          echo "tag_prefix=$tag_prefix" >> "$GITHUB_OUTPUT"
+
       - name: Check out branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
           ref: ${{ inputs.branch }}
@@ -31,23 +69,24 @@ jobs:
         env:
           BRANCH_NAME: ${{ inputs.branch }}
         run: |
-          TAG_PREFIX=$(printf '%s' "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')
-          TAG_PREFIX=${TAG_PREFIX:0:105}
-          TAG_PREFIX=$(printf '%s' "$TAG_PREFIX" | sed -E 's/[.-]+$//')
-          if [ -z "$TAG_PREFIX" ]; then
-            echo "::error::Branch '$BRANCH_NAME' cannot be converted to a valid Docker tag prefix"
+          set -euo pipefail
+          tag_prefix="${{ steps.namespace.outputs.tag_prefix }}"
+          sha=$(git rev-parse HEAD)
+          remote_sha=$(git ls-remote --heads origin "refs/heads/${BRANCH_NAME}" | awk 'NR == 1 { print $1 }')
+          if [ -z "$remote_sha" ] || [ "$remote_sha" != "$sha" ]; then
+            echo '::error::The requested branch did not resolve to one exact remote branch commit.'
             exit 1
           fi
 
-          SHA=$(git rev-parse HEAD)
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          VERSION="${TAG_PREFIX}-$(date +'%Y%m%d')-${SHORT_SHA}"
+          short_sha=$(git rev-parse --short HEAD)
+          version="${tag_prefix}-$(date +'%Y%m%d')-${short_sha}"
 
-          echo "branch=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "tag_prefix=$TAG_PREFIX" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Prepared Docker tags for $BRANCH_NAME at $SHORT_SHA"
+          {
+            echo "sha=$sha"
+            echo "tag_prefix=$tag_prefix"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Prepared Docker tags for $BRANCH_NAME at $short_sha"
 
   build_single_arch:
     name: Build & push (${{ matrix.arch }})
@@ -63,6 +102,7 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -73,7 +113,7 @@ jobs:
       id-token: write
     steps:
       - name: Check out branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 1
           ref: ${{ needs.prepare.outputs.sha }}
@@ -87,25 +127,28 @@ jobs:
         run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
 
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ghcr.io/${{ env.GHCR_REPOSITORY }}
@@ -126,7 +169,7 @@ jobs:
 
       - name: Build & push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -139,32 +182,35 @@ jobs:
           sbom: true
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign image with cosign
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}
+          cosign sign --yes "ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}"
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
+            cosign sign --yes "${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}"
           fi
 
       - name: Image summary
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Docker Image Digest (${{ matrix.arch }})"
+            echo '```'
+            echo "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}"
+            echo "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}"
+              echo "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}"
+            fi
+            echo "${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   create_manifests:
     name: Create multi-arch manifests
     needs: [prepare, build_single_arch]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -177,73 +223,81 @@ jobs:
       - name: Normalize GHCR repository
         run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
+      - name: Set up pinned Docker Buildx client
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.35.0
+          driver: docker
+
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create & push manifest (GHCR branch)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }} \
-            ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}" \
+            "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-arm64"
 
       - name: Create & push manifest (GHCR versioned)
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }} \
-            ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-arm64
+            -t "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}" \
+            "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-amd64" \
+            "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}-arm64"
 
       - name: Create & push manifest (Docker Hub branch)
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }} \
-            ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-arm64
+            -t "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}" \
+            "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-amd64" \
+            "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}-arm64"
 
       - name: Create & push manifest (Docker Hub versioned)
         if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
         run: |
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }} \
-            ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-arm64
+            -t "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}" \
+            "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-amd64" \
+            "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}-arm64"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign manifests with cosign
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}
+          cosign sign --yes "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}"
+          cosign sign --yes "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}"
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}
+            cosign sign --yes "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}"
+            cosign sign --yes "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}"
           fi
 
       - name: Manifest summary
         run: |
-          echo "### Multi-arch Manifest Digests" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }} >> "$GITHUB_STEP_SUMMARY"
-          echo "---" >> "$GITHUB_STEP_SUMMARY"
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }} >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "---" >> "$GITHUB_STEP_SUMMARY"
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }} >> "$GITHUB_STEP_SUMMARY"
-            echo "---" >> "$GITHUB_STEP_SUMMARY"
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }} >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Multi-arch Manifest Digests'
+            echo '```'
+            docker buildx imagetools inspect "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}"
+            echo '---'
+            docker buildx imagetools inspect "ghcr.io/${GHCR_REPOSITORY}:${{ needs.prepare.outputs.version }}"
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo '---'
+              docker buildx imagetools inspect "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.tag_prefix }}"
+              echo '---'
+              docker buildx imagetools inspect "${DOCKERHUB_REPOSITORY}:${{ needs.prepare.outputs.version }}"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

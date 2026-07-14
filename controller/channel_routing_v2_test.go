@@ -850,6 +850,7 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(
 		&channelRoutingPermissionUserForTest{},
 		&model.CasbinRule{},
+		&model.Option{},
 		&model.Channel{},
 		&model.RoutingTopologyMetadata{},
 		&model.RoutingPool{},
@@ -881,6 +882,8 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingMetricRollup{},
 		&model.RoutingTelemetryReceipt{},
 		&model.RoutingUpstreamAccount{},
+		&model.RoutingRuntimeSettingsState{},
+		&model.RoutingControlAudit{},
 		&model.RoutingCostSnapshotVersion{},
 		&model.RoutingProbeResult{},
 		&model.SystemTask{},

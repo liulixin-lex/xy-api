@@ -110,6 +110,13 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 	assert.True(t, Can(42, common.RoleAdminUser, ChannelSensitiveWrite))
 	assert.False(t, Can(42, common.RoleAdminUser, ChannelWrite))
 	assert.Equal(t, PermissionsMap{
+		ResourceBillingProjectionOps: {
+			ActionBillingProjectionRead: true, ActionBillingProjectionRequeue: false,
+			ActionBillingProjectionResolve: false,
+		},
+		ResourceBillingReview: {
+			ActionBillingReviewRead: true, ActionBillingReviewResolve: false,
+		},
 		ResourceChannel: {
 			ActionRead:           true,
 			ActionOperate:        true,
@@ -149,6 +156,13 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 	}}))
 	assert.False(t, Can(42, common.RoleAdminUser, ChannelSensitiveWrite))
 	assert.Equal(t, PermissionsMap{
+		ResourceBillingProjectionOps: {
+			ActionBillingProjectionRead: true, ActionBillingProjectionRequeue: false,
+			ActionBillingProjectionResolve: false,
+		},
+		ResourceBillingReview: {
+			ActionBillingReviewRead: true, ActionBillingReviewResolve: false,
+		},
 		ResourceChannel: {
 			ActionRead:           true,
 			ActionOperate:        true,
@@ -267,6 +281,9 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.False(t, capabilities[ResourceChannelRouting][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannelRouting][ActionAuditExport])
 	assert.False(t, capabilities[ResourceSystemSetting][ActionManage])
+	assert.True(t, capabilities[ResourceBillingProjectionOps][ActionBillingProjectionRead])
+	assert.False(t, capabilities[ResourceBillingProjectionOps][ActionBillingProjectionRequeue])
+	assert.False(t, capabilities[ResourceBillingProjectionOps][ActionBillingProjectionResolve])
 }
 
 func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
@@ -283,6 +300,74 @@ func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
 	}))
 
 	assert.True(t, Can(2, common.RoleAdminUser, SystemSettingManage))
+}
+
+func TestBillingReviewReadDefaultsToAdminButResolveRequiresFreshExplicitGrant(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+	require.NoError(t, db.Create(&[]authzUserForTest{
+		{Id: 1, Role: common.RoleRootUser, Status: common.UserStatusEnabled},
+		{Id: 42, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+	}).Error)
+
+	assert.True(t, Can(1, common.RoleRootUser, BillingReviewRead))
+	assert.True(t, Can(1, common.RoleRootUser, BillingReviewResolve))
+	assert.True(t, Can(42, common.RoleAdminUser, BillingReviewRead))
+	assert.False(t, Can(42, common.RoleAdminUser, BillingReviewResolve))
+
+	require.NoError(t, SetUserPermissions(42, PermissionsMap{
+		ResourceBillingReview: {ActionBillingReviewResolve: true},
+	}))
+	allowed, err := CanCurrent(context.Background(), 42, common.RoleAdminUser, BillingReviewResolve)
+	require.NoError(t, err)
+	assert.True(t, allowed)
+
+	require.NoError(t, db.Where(
+		"ptype = ? AND v0 = ? AND v1 = ? AND v2 = ?",
+		"p", UserSubject(42), ResourceBillingReview, ActionBillingReviewResolve,
+	).Delete(&model.CasbinRule{}).Error)
+	assert.True(t, Can(42, common.RoleAdminUser, BillingReviewResolve), "local policy remains stale until reload")
+	allowed, err = CanCurrent(context.Background(), 42, common.RoleAdminUser, BillingReviewResolve)
+	require.NoError(t, err)
+	assert.False(t, allowed, "resolve revocation must take effect immediately")
+}
+
+func TestBillingProjectionReadDefaultsToAdminButMutationsRequireFreshExplicitGrants(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+	require.NoError(t, db.Create(&[]authzUserForTest{
+		{Id: 1, Role: common.RoleRootUser, Status: common.UserStatusEnabled},
+		{Id: 42, Role: common.RoleAdminUser, Status: common.UserStatusEnabled},
+	}).Error)
+
+	assert.True(t, Can(1, common.RoleRootUser, BillingProjectionRead))
+	assert.True(t, Can(1, common.RoleRootUser, BillingProjectionRequeue))
+	assert.True(t, Can(1, common.RoleRootUser, BillingProjectionResolve))
+	assert.True(t, Can(42, common.RoleAdminUser, BillingProjectionRead))
+	assert.False(t, Can(42, common.RoleAdminUser, BillingProjectionRequeue))
+	assert.False(t, Can(42, common.RoleAdminUser, BillingProjectionResolve))
+
+	require.NoError(t, SetUserPermissions(42, PermissionsMap{
+		ResourceBillingProjectionOps: {
+			ActionBillingProjectionRequeue: true,
+			ActionBillingProjectionResolve: true,
+		},
+	}))
+	for _, permission := range []Permission{BillingProjectionRequeue, BillingProjectionResolve} {
+		allowed, err := CanCurrent(context.Background(), 42, common.RoleAdminUser, permission)
+		require.NoError(t, err)
+		assert.True(t, allowed)
+	}
+
+	require.NoError(t, db.Where(
+		"ptype = ? AND v0 = ? AND v1 = ?", "p", UserSubject(42), ResourceBillingProjectionOps,
+	).Delete(&model.CasbinRule{}).Error)
+	assert.True(t, Can(42, common.RoleAdminUser, BillingProjectionRequeue), "local policy remains stale until reload")
+	for _, permission := range []Permission{BillingProjectionRequeue, BillingProjectionResolve} {
+		allowed, err := CanCurrent(context.Background(), 42, common.RoleAdminUser, permission)
+		require.NoError(t, err)
+		assert.False(t, allowed, "mutation revocation must take effect immediately")
+	}
 }
 
 func TestCanCurrentRejectsARevokedGrantBeforePolicyReload(t *testing.T) {
@@ -389,4 +474,7 @@ func TestRequiresFreshPolicyIsLimitedToHighRiskChannelRoutingActions(t *testing.
 	assert.False(t, RequiresFreshPolicy(ChannelRoutingOperate))
 	assert.False(t, RequiresFreshPolicy(ChannelRoutingWrite))
 	assert.False(t, RequiresFreshPolicy(ChannelSensitiveWrite))
+	assert.False(t, RequiresFreshPolicy(BillingProjectionRead))
+	assert.True(t, RequiresFreshPolicy(BillingProjectionRequeue))
+	assert.True(t, RequiresFreshPolicy(BillingProjectionResolve))
 }

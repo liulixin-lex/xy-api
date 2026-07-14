@@ -91,7 +91,10 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 		return nil, nil, err
 	}
 
-	if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
+	rotated, err := model.RotateSingleChannelCredentialContinuity(
+		ctx, ch.Id, ch.RoutingGeneration, ch.Key, string(encoded),
+	)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -100,5 +103,5 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 		ResetProxyClientCache()
 	}
 
-	return oauthKey, ch, nil
+	return oauthKey, rotated, nil
 }

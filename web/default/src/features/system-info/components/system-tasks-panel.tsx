@@ -19,9 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useQuery } from '@tanstack/react-query'
 import { ListChecks, RefreshCw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { toIntlLocale } from '@/i18n/languages'
-import { formatTimestampRelative, formatTimestampToDate } from '@/lib/format'
-import { cn } from '@/lib/utils'
+
 import { ErrorState } from '@/components/error-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -40,6 +38,9 @@ import type {
   SystemTask,
   SystemTaskStatus,
 } from '@/features/system-settings/types'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatTimestampRelative, formatTimestampToDate } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 const TASK_LIMIT = 20
 const ACTIVE_POLL_INTERVAL_MS = 8000
@@ -52,7 +53,8 @@ const STATUS_VARIANT: Record<SystemTaskStatus, 'secondary' | 'destructive'> = {
 }
 
 const STATUS_CLASS_NAME: Record<SystemTaskStatus, string> = {
-  pending: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  pending:
+    'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
   running:
     'bg-sky-50 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300 [&_span]:bg-sky-500',
   succeeded:
@@ -82,6 +84,7 @@ const TYPE_LABEL: Record<string, string> = {
   model_update: 'Batch upstream model update',
   midjourney_poll: 'Drawing task polling',
   async_task_poll: 'Async task polling',
+  billing_log_audit: 'Billing log integrity audit',
 }
 
 const TYPE_DISPLAY_ID: Record<string, string> = {
@@ -174,11 +177,11 @@ function SystemTasksTable(props: SystemTasksTableProps) {
                     </span>
                   </div>
                 </TableCell>
-                <TableCell className='text-muted-foreground max-w-[280px] truncate py-3 font-mono text-xs align-middle'>
+                <TableCell className='text-muted-foreground max-w-[280px] truncate py-3 align-middle font-mono text-xs'>
                   {task.locked_by || '-'}
                 </TableCell>
                 <TableCell
-                  className='text-muted-foreground py-3 text-xs whitespace-nowrap align-middle'
+                  className='text-muted-foreground py-3 align-middle text-xs whitespace-nowrap'
                   title={formatTimestampToDate(task.updated_at)}
                 >
                   {formatTimestampRelative(
@@ -188,7 +191,7 @@ function SystemTasksTable(props: SystemTasksTableProps) {
                   )}
                 </TableCell>
                 <TableCell
-                  className='text-destructive max-w-[220px] truncate py-3 pr-4 text-xs align-middle'
+                  className='text-destructive max-w-[220px] truncate py-3 pr-4 align-middle text-xs'
                   title={task.error || undefined}
                 >
                   {task.error || '-'}
@@ -284,7 +287,9 @@ export function SystemTasksPanel() {
       <ErrorState
         title={t('We could not load system tasks.')}
         description={
-          tasksQuery.error instanceof Error ? tasksQuery.error.message : undefined
+          tasksQuery.error instanceof Error
+            ? tasksQuery.error.message
+            : undefined
         }
         onRetry={() => {
           void tasksQuery.refetch()
@@ -362,9 +367,7 @@ export function SystemTasksPanel() {
         </div>
       </div>
 
-      <div aria-busy={tasksQuery.isFetching}>
-        {tasksContent}
-      </div>
+      <div aria-busy={tasksQuery.isFetching}>{tasksContent}</div>
     </section>
   )
 }

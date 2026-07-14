@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { AxiosError } from 'axios'
 import {
   ClockAlert,
@@ -40,12 +39,17 @@ import {
 } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 
-export function ChannelRoutingLoadingState(props: { rows?: number }) {
+export function ChannelRoutingLoadingState(props: {
+  rows?: number
+  label?: string
+}) {
   const { t } = useTranslation()
   const rows = props.rows ?? 6
   return (
     <div className='space-y-2' aria-busy='true' aria-live='polite'>
-      <span className='sr-only'>{t('Loading channel routing data')}</span>
+      <span className='sr-only'>
+        {props.label ?? t('Loading channel routing data')}
+      </span>
       <Skeleton className='h-9 w-full motion-reduce:animate-none' />
       {Array.from({ length: rows }, (_, index) => (
         <Skeleton
@@ -82,6 +86,7 @@ export function ChannelRoutingEmptyState(props: {
 export function ChannelRoutingErrorState(props: {
   error: unknown
   onRetry: () => void
+  scope?: 'channel-routing' | 'billing-review'
 }) {
   const { t } = useTranslation()
   const status =
@@ -101,34 +106,57 @@ export function ChannelRoutingErrorState(props: {
   const permissionDenied = status === 403
   const rateLimited = status === 429
   const snapshotInitializing = status === 503
+  const billingReviewScope = props.scope === 'billing-review'
   let Icon = TriangleAlert
-  let title = t('Could not load channel routing data')
-  let description = t('The request failed. Check the service and try again.')
+  let title = billingReviewScope
+    ? t('Billing review queue unavailable')
+    : t('Could not load channel routing data')
+  let description = billingReviewScope
+    ? t(
+        'The billing review request failed. No decision was changed. Try again.'
+      )
+    : t('The request failed. Check the service and try again.')
   if (offline) {
     Icon = WifiOff
     title = t('You are offline')
-    description = t(
-      'Reconnect to the network, then retry to refresh channel routing data.'
-    )
+    description = billingReviewScope
+      ? t('Reconnect to the network, then retry the billing review queue.')
+      : t(
+          'Reconnect to the network, then retry to refresh channel routing data.'
+        )
   } else if (timedOut) {
     Icon = ClockAlert
-    title = t('Channel routing request timed out')
-    description = t(
-      'The server did not respond in time. Existing routing state was not changed.'
-    )
+    title = billingReviewScope
+      ? t('Billing review request timed out')
+      : t('Channel routing request timed out')
+    description = billingReviewScope
+      ? t(
+          'The billing review request failed. No decision was changed. Try again.'
+        )
+      : t(
+          'The server did not respond in time. Existing routing state was not changed.'
+        )
   } else if (unauthorized) {
     Icon = LockKeyhole
     title = t('Your session has expired')
-    description = t('Sign in again to access channel routing data.')
+    description = billingReviewScope
+      ? t('Sign in again to access billing reviews.')
+      : t('Sign in again to access channel routing data.')
   } else if (permissionDenied) {
     Icon = ShieldAlert
-    title = t('Channel routing permission required')
-    description = t('Your role cannot access this channel routing view.')
+    title = billingReviewScope
+      ? t('Billing review read permission required')
+      : t('Channel routing permission required')
+    description = billingReviewScope
+      ? t('Your role cannot view the billing review queue.')
+      : t('Your role cannot access this channel routing view.')
   } else if (rateLimited) {
     Icon = ClockAlert
-    title = t('Too many channel routing requests')
+    title = billingReviewScope
+      ? t('Too many billing review requests')
+      : t('Too many channel routing requests')
     description = t('Wait briefly, then retry the request.')
-  } else if (snapshotInitializing) {
+  } else if (snapshotInitializing && !billingReviewScope) {
     title = t('Routing snapshot is initializing')
     description = t(
       'The control plane is available, but this node has not loaded a routing snapshot yet.'

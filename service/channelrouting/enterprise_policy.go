@@ -73,6 +73,12 @@ type strictCapacityPlan struct {
 	LeaseTTL   time.Duration
 }
 
+type strictCapacityPlanKey struct {
+	memberID     int
+	credentialID int
+	model        string
+}
+
 func resolveEnterprisePoolPolicy(profile string, policyJSON json.RawMessage) (EnterprisePoolPolicy, error) {
 	policy := defaultEnterprisePoolPolicy(profile)
 	capacity, exists, err := enterpriseCapacityOverridesFromDocument(policyJSON)
@@ -260,9 +266,9 @@ func (snapshot *runtimeSnapshot) compileStrictCapacityPlans() error {
 	if snapshot == nil {
 		return ErrRoutingSessionInvalid
 	}
-	snapshot.strictCapacityPlans = make(map[memberModelKey]strictCapacityPlan)
+	snapshot.strictCapacityPlans = make(map[strictCapacityPlanKey]strictCapacityPlan)
 	type seed struct {
-		key      memberModelKey
+		key      strictCapacityPlanKey
 		resource StrictCapacityKey
 		policy   EnterpriseCapacityPolicy
 		poolID   int
@@ -304,10 +310,6 @@ func (snapshot *runtimeSnapshot) compileStrictCapacityPlans() error {
 			if memberPolicy.Capacity.Mode != CapacityModeRedisStrict && memberPolicy.Capacity.Mode != CapacityModeRedisBlock {
 				continue
 			}
-			credentialID := 0
-			if len(member.CredentialIDs) == 1 {
-				credentialID = member.CredentialIDs[0]
-			}
 			for modelIndex := range member.Models {
 				observation := &member.Models[modelIndex]
 				mappingModelName := observation.ModelName
@@ -322,53 +324,65 @@ func (snapshot *runtimeSnapshot) compileStrictCapacityPlans() error {
 				if accountID == 0 {
 					accountID = observation.upstreamAccountID
 				}
-				resource := StrictCapacityKey{AccountID: accountID, CredentialID: credentialID, Model: upstreamModel}
-				switch memberPolicy.Capacity.Scope {
-				case EnterpriseCapacityScopeAuto:
-					if resource.AccountID > 0 {
-						resource.CredentialID = 0
-					} else {
-						resource.AccountID = 0
-					}
-				case EnterpriseCapacityScopeAccount:
-					resource.CredentialID = 0
-				case EnterpriseCapacityScopeCredential:
-					resource.AccountID = 0
+				credentialIDs := append([]int(nil), member.CredentialIDs...)
+				if len(credentialIDs) == 0 {
+					credentialIDs = []int{0}
 				}
-				if (resource.AccountID <= 0 && resource.CredentialID <= 0) ||
-					(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAccount && resource.AccountID <= 0) ||
-					(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeCredential && resource.CredentialID <= 0) ||
-					(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAccountCredential &&
-						(resource.AccountID <= 0 || resource.CredentialID <= 0)) {
+				if member.CredentialsTruncated &&
+					(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeCredential ||
+						memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAccountCredential ||
+						(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAuto && accountID <= 0)) {
 					return ErrEnterpriseCapacityIdentity
 				}
-				config := resources[resource]
-				if config == nil {
-					config = &resourceConfig{
-						mode: memberPolicy.Capacity.Mode, limit: memberPolicy.Capacity.Limit,
-						leaseTTL: memberPolicy.Capacity.LeaseTTL,
-						shares:   make(map[int]StrictCapacityPoolShare), guaranteeConfigured: make(map[int]bool),
+				for _, credentialID := range credentialIDs {
+					resource := StrictCapacityKey{AccountID: accountID, CredentialID: credentialID, Model: upstreamModel}
+					switch memberPolicy.Capacity.Scope {
+					case EnterpriseCapacityScopeAuto:
+						if resource.AccountID > 0 {
+							resource.CredentialID = 0
+						} else {
+							resource.AccountID = 0
+						}
+					case EnterpriseCapacityScopeAccount:
+						resource.CredentialID = 0
+					case EnterpriseCapacityScopeCredential:
+						resource.AccountID = 0
 					}
-					resources[resource] = config
-				} else if config.mode != memberPolicy.Capacity.Mode || config.limit != memberPolicy.Capacity.Limit ||
-					config.leaseTTL != memberPolicy.Capacity.LeaseTTL {
-					return ErrStrictCapacityConflict
-				}
-				share := StrictCapacityPoolShare{
-					PoolID: pool.ID, GuaranteedBasisPoints: poolPolicy.Capacity.GuaranteedBasisPoints,
-					MaximumBasisPoints: poolPolicy.Capacity.MaximumBasisPoints,
-				}
-				if existing, exists := config.shares[pool.ID]; exists {
-					if existing != share || config.guaranteeConfigured[pool.ID] != poolPolicy.Capacity.guaranteeConfigured {
+					if (resource.AccountID <= 0 && resource.CredentialID <= 0) ||
+						(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAccount && resource.AccountID <= 0) ||
+						(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeCredential && resource.CredentialID <= 0) ||
+						(memberPolicy.Capacity.Scope == EnterpriseCapacityScopeAccountCredential &&
+							(resource.AccountID <= 0 || resource.CredentialID <= 0)) {
+						return ErrEnterpriseCapacityIdentity
+					}
+					config := resources[resource]
+					if config == nil {
+						config = &resourceConfig{
+							mode: memberPolicy.Capacity.Mode, limit: memberPolicy.Capacity.Limit,
+							leaseTTL: memberPolicy.Capacity.LeaseTTL,
+							shares:   make(map[int]StrictCapacityPoolShare), guaranteeConfigured: make(map[int]bool),
+						}
+						resources[resource] = config
+					} else if config.mode != memberPolicy.Capacity.Mode || config.limit != memberPolicy.Capacity.Limit ||
+						config.leaseTTL != memberPolicy.Capacity.LeaseTTL {
 						return ErrStrictCapacityConflict
 					}
+					share := StrictCapacityPoolShare{
+						PoolID: pool.ID, GuaranteedBasisPoints: poolPolicy.Capacity.GuaranteedBasisPoints,
+						MaximumBasisPoints: poolPolicy.Capacity.MaximumBasisPoints,
+					}
+					if existing, exists := config.shares[pool.ID]; exists {
+						if existing != share || config.guaranteeConfigured[pool.ID] != poolPolicy.Capacity.guaranteeConfigured {
+							return ErrStrictCapacityConflict
+						}
+					}
+					config.shares[pool.ID] = share
+					config.guaranteeConfigured[pool.ID] = poolPolicy.Capacity.guaranteeConfigured
+					seeds = append(seeds, seed{
+						key:      strictCapacityPlanKey{memberID: member.ID, credentialID: credentialID, model: observation.ModelName},
+						resource: resource, policy: memberPolicy.Capacity, poolID: pool.ID,
+					})
 				}
-				config.shares[pool.ID] = share
-				config.guaranteeConfigured[pool.ID] = poolPolicy.Capacity.guaranteeConfigured
-				seeds = append(seeds, seed{
-					key: memberModelKey{memberID: member.ID, model: observation.ModelName}, resource: resource,
-					policy: memberPolicy.Capacity, poolID: pool.ID,
-				})
 			}
 		}
 	}
@@ -449,7 +463,9 @@ func (session *RequestRoutingSession) StrictCapacityRequest(
 	}
 	modelName = strings.TrimSpace(modelName)
 	upstreamModelName = strings.TrimSpace(upstreamModelName)
-	plan, exists := session.snapshot.strictCapacityPlans[memberModelKey{memberID: identity.MemberID, model: modelName}]
+	plan, exists := session.snapshot.strictCapacityPlans[strictCapacityPlanKey{
+		memberID: identity.MemberID, credentialID: identity.CredentialID, model: modelName,
+	}]
 	if !exists {
 		poolIndex := session.poolIndex
 		if poolIndex >= 0 && poolIndex < len(session.snapshot.view.Pools) &&

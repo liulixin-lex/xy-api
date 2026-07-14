@@ -69,6 +69,11 @@ type TaskAdaptor struct {
 	baseURL     string
 }
 
+var (
+	vertexTaskHTTPClientFactory = service.GetStatefulFetchHTTPClient
+	vertexTaskAccessToken       = vertexcore.AcquireAccessToken
+)
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.ChannelType = info.ChannelType
 	a.baseURL = info.ChannelBaseUrl
@@ -77,8 +82,18 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 
 // ValidateRequestAndSetAction parses body, validates fields and sets default action.
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) (taskErr *dto.TaskError) {
-	// Use the standard validation method for TaskSubmitReq
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionTextGenerate)
+	if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionTextGenerate); taskErr != nil {
+		return taskErr
+	}
+	req, err := relaycommon.GetTaskRequest(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if _, err := geminitask.ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_seconds", http.StatusBadRequest)
+	}
+	c.Set("task_request", req)
+	return nil
 }
 
 // BuildRequestURL constructs the upstream URL.
@@ -113,6 +128,9 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
 	if info != nil {
 		proxy = info.ChannelSetting.Proxy
 	}
+	// Token exchange is preparatory and cannot create the user's task. The
+	// billing/send boundary is crossed later by DoTaskApiRequest immediately
+	// before the predictLongRunning request.
 	token, err := vertexcore.AcquireAccessToken(c.Request.Context(), *adc, proxy)
 	if err != nil {
 		return fmt.Errorf("failed to acquire access token: %w", err)
@@ -130,7 +148,10 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 	}
 	req := v.(relaycommon.TaskSubmitReq)
 
-	seconds := geminitask.ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	seconds, err := geminitask.ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	if err != nil {
+		return nil
+	}
 	resolution := geminitask.ResolveVeoResolution(req.Metadata, req.Size)
 	resRatio := geminitask.VeoResolutionRatio(info.UpstreamModelName, resolution)
 
@@ -162,9 +183,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, params); err != nil {
 		return nil, fmt.Errorf("unmarshal metadata failed: %w", err)
 	}
-	if params.DurationSeconds == 0 && req.Duration > 0 {
-		params.DurationSeconds = req.Duration
+	seconds, err := geminitask.ResolveVeoDuration(req.Metadata, req.Duration, req.Seconds)
+	if err != nil {
+		return nil, fmt.Errorf("resolve duration failed: %w", err)
 	}
+	params.DurationSeconds = seconds
 	if params.Resolution == "" && req.Size != "" {
 		params.Resolution = geminitask.SizeToVeoResolution(req.Size)
 	}
@@ -193,7 +216,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 
 // DoResponse handles upstream response, returns taskID etc.
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := service.ReadUpstreamResponseBody(resp.Body, service.DefaultMaxUpstreamResponseBytes)
 	if err != nil {
 		return "", nil, service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 	}
@@ -265,7 +288,7 @@ func (a *TaskAdaptor) FetchTask(ctx context.Context, baseUrl, key string, body m
 	if err := common.Unmarshal([]byte(key), adc); err != nil {
 		return nil, fmt.Errorf("failed to decode credentials: %w", err)
 	}
-	token, err := vertexcore.AcquireAccessToken(ctx, *adc, proxy)
+	token, err := vertexTaskAccessToken(ctx, *adc, proxy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire access token: %w", err)
 	}
@@ -277,11 +300,11 @@ func (a *TaskAdaptor) FetchTask(ctx context.Context, baseUrl, key string, body m
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("x-goog-user-project", adc.ProjectID)
-	client, err := service.GetHttpClientWithProxy(proxy)
+	client, err := vertexTaskHTTPClientFactory(proxy)
 	if err != nil {
-		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+		return nil, fmt.Errorf("new stateful task client failed: %w", err)
 	}
-	return client.Do(req)
+	return service.DoStatefulFetch(client, req)
 }
 
 func (a *TaskAdaptor) ParseTaskResult(_ context.Context, respBody []byte) (*relaycommon.TaskInfo, error) {
@@ -368,7 +391,7 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	v.SetProgressStr(task.Progress)
 	v.CreatedAt = task.CreatedAt
 	v.CompletedAt = task.UpdatedAt
-	if resultURL := task.GetResultURL(); strings.HasPrefix(resultURL, "data:") && len(resultURL) > 0 {
+	if resultURL := task.GetResultURL(); resultURL != "" {
 		v.SetMetadata("url", resultURL)
 	}
 

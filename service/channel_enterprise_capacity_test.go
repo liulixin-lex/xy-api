@@ -162,7 +162,7 @@ func TestRoutingStrictCapacityCostUsesCapacityUpperBounds(t *testing.T) {
 	}
 
 	worstCase, known, err := routingStrictCapacityCost(
-		session, 401, param,
+		session, "enterprise-cost", 401, param,
 		channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionBoundedKnown, Tokens: 100},
 		channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionBoundedKnown, Tokens: 4_096},
 	)

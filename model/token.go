@@ -1,15 +1,18 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
+
+var ErrTokenQuotaInsufficient = errors.New("token quota is insufficient")
 
 type Token struct {
 	Id                 int            `json:"id"`
@@ -249,22 +252,24 @@ func GetTokenById(id int) (*Token, error) {
 	token := Token{Id: id}
 	var err error = nil
 	err = DB.First(&token, "id = ?", id).Error
-	if shouldUpdateRedis(true, err) {
-		gopool.Go(func() {
-			if err := cacheSetToken(token); err != nil {
-				common.SysLog("failed to update user status cache: " + err.Error())
-			}
-		})
-	}
 	return &token, err
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if fromDB && common.RedisEnabled {
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		}
+	}
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) && token != nil {
-			gopool.Go(func() {
-				if err := cacheSetToken(*token); err != nil {
+		if shouldUpdateRedis(fromDB, err) && token != nil && cacheEpochReady {
+			cached := *token
+			runAsyncCacheBackfill(func() {
+				if err := cacheSetTokenIfEpoch(cached, cacheEpoch); err != nil {
 					common.SysLog("failed to update user status cache: " + err.Error())
 				}
 			})
@@ -277,6 +282,10 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 			return token, nil
 		}
 		// Don't return error - fall through to DB
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		}
 	}
 	fromDB = true
 	keyCol := commonKeyCol
@@ -295,49 +304,72 @@ func (token *Token) Insert() error {
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	defer func() {
-		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
-				}
-			})
+	now := time.Now()
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+			"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry").Updates(token).Error; err != nil {
+			return err
 		}
-	}()
-	err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry").Updates(token).Error
-	return err
+		if common.RedisEnabled {
+			_, err := queueTokenCacheSyncTx(tx, token.Key, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	syncTokenCacheAfterCommitBestEffort(token.Key, "token update")
+	return nil
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	defer func() {
-		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
-				}
-			})
+	now := time.Now()
+	// This can update zero values.
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(token).Select("accessed_time", "status").Updates(token).Error; err != nil {
+			return err
 		}
-	}()
-	// This can update zero values
-	return DB.Model(token).Select("accessed_time", "status").Updates(token).Error
+		if common.RedisEnabled {
+			_, err := queueTokenCacheSyncTx(tx, token.Key, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	syncTokenCacheAfterCommitBestEffort(token.Key, "token status update")
+	return nil
 }
 
 func (token *Token) Delete() (err error) {
-	defer func() {
-		if shouldUpdateRedis(true, err) {
-			gopool.Go(func() {
-				err := cacheDeleteToken(token.Key)
-				if err != nil {
-					common.SysLog("failed to delete token cache: " + err.Error())
-				}
-			})
+	if token == nil || token.Id <= 0 || token.UserId <= 0 {
+		return errors.New("id 或 userId 为空！")
+	}
+	var persisted Token
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ? AND user_id = ?", token.Id, token.UserId).
+			First(&persisted).Error; err != nil {
+			return err
 		}
-	}()
-	err = DB.Delete(token).Error
-	return err
+		if common.RedisEnabled {
+			if _, err := queueTokenCacheSyncTx(tx, persisted.Key, time.Now()); err != nil {
+				return err
+			}
+		}
+		if persisted.DeletedAt.Valid {
+			return nil
+		}
+		return tx.Delete(&persisted).Error
+	})
+	if err != nil {
+		return err
+	}
+	token.Key = persisted.Key
+	token.DeletedAt = persisted.DeletedAt
+	syncTokenCacheAfterCommitBestEffort(persisted.Key, "token deletion")
+	return nil
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -375,31 +407,195 @@ func DeleteTokenById(id int, userId int) (err error) {
 	if id == 0 || userId == 0 {
 		return errors.New("id 或 userId 为空！")
 	}
-	token := Token{Id: id, UserId: userId}
-	err = DB.Where(token).First(&token).Error
-	if err != nil {
-		return err
-	}
-	return token.Delete()
+	return (&Token{Id: id, UserId: userId}).Delete()
 }
 
 func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	var cacheEpoch int64
+	cacheEpochReady := false
 	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheIncrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to increase token quota: " + err.Error())
-			}
-		})
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("token quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
 	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
+	now := time.Now()
+	var cacheSyncVersion int64
+	if err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Token{}).Where("id = ?", tokenId).Updates(
+			map[string]interface{}{
+				"remain_quota":  gorm.Expr("remain_quota + ?", quota),
+				"used_quota":    gorm.Expr("used_quota - ?", quota),
+				"accessed_time": common.GetTimestamp(),
+			},
+		).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var queueErr error
+			cacheSyncVersion, queueErr = queueTokenCacheSyncTx(tx, key, now)
+			return queueErr
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheIncrTokenQuota(key, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getTokenCacheKey(key), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("token quota increase committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+func preConsumeTokenQuotaTx(tx *gorm.DB, tokenID int, userID int, key string, quota int) error {
+	if tx == nil || tokenID <= 0 || userID < 0 || strings.TrimSpace(key) == "" || quota <= 0 || quota > common.MaxQuota {
+		return errors.New("invalid token quota pre-consume")
+	}
+	query := tx.Model(&Token{}).
+		Where(map[string]interface{}{"id": tokenID, "key": key}).
+		Where("used_quota <= ? AND remain_quota >= ? "+
+			"AND (unlimited_quota = ? OR remain_quota >= ?)",
+			common.MaxQuota-quota, common.MinQuota+quota, true, quota)
+	if userID > 0 {
+		query = query.Where("user_id = ?", userID)
+	}
+	result := query.
+		Updates(map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
+			"used_quota":    gorm.Expr("used_quota + ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTokenQuotaInsufficient
+	}
+	return nil
+}
+
+func refundTokenQuotaTx(tx *gorm.DB, tokenID int, key string, quota int) error {
+	if tx == nil || tokenID <= 0 || strings.TrimSpace(key) == "" || quota <= 0 || quota > common.MaxQuota {
+		return errors.New("invalid token quota refund")
+	}
+	result := tx.Model(&Token{}).
+		Where(map[string]interface{}{"id": tokenID, "key": key}).
+		Where("remain_quota <= ? AND used_quota >= ?", common.MaxQuota-quota, quota).
+		Updates(map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
+			"used_quota":    gorm.Expr("used_quota - ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrQuotaRefundOutOfRange
+	}
+	return nil
+}
+
+// PreConsumeTokenQuota atomically reserves token quota. Finite tokens refuse
+// insufficient balance; unlimited tokens may continue below zero.
+func PreConsumeTokenQuota(tokenID int, key string, quota int) error {
+	if quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid token quota pre-consume")
+	}
+	if quota == 0 {
 		return nil
 	}
-	return increaseTokenQuota(tokenId, quota)
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		var err error
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("token quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
+	}
+	now := time.Now()
+	var cacheSyncVersion int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := preConsumeTokenQuotaTx(tx, tokenID, 0, key, quota); err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var err error
+			cacheSyncVersion, err = queueTokenCacheSyncTx(tx, key, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheDecrTokenQuota(key, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getTokenCacheKey(key), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("token quota pre-consume committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
+}
+
+// RefundTokenQuota restores a previous token reservation without overflowing
+// remain_quota or driving used_quota below zero.
+func RefundTokenQuota(tokenID int, key string, quota int) error {
+	if quota < 0 || quota > common.MaxQuota {
+		return errors.New("invalid token quota refund")
+	}
+	if quota == 0 {
+		return nil
+	}
+	var cacheEpoch int64
+	cacheEpochReady := false
+	if common.RedisEnabled {
+		var err error
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("token quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
+	}
+	now := time.Now()
+	var cacheSyncVersion int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := refundTokenQuotaTx(tx, tokenID, key, quota); err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var err error
+			cacheSyncVersion, err = queueTokenCacheSyncTx(tx, key, now)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheIncrTokenQuota(key, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getTokenCacheKey(key), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("token quota refund committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
 }
 
 func increaseTokenQuota(id int, quota int) (err error) {
@@ -417,19 +613,46 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	var cacheEpoch int64
+	cacheEpochReady := false
 	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheDecrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to decrease token quota: " + err.Error())
-			}
-		})
+		cacheEpoch, err = common.RedisReadCacheEpoch(getTokenCacheEpochKey(key))
+		if err == nil {
+			cacheEpochReady = true
+		} else {
+			common.SysLog("token quota cache epoch unavailable; durable invalidation queued: " + err.Error())
+		}
 	}
-	if common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
+	now := time.Now()
+	var cacheSyncVersion int64
+	if err = DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Token{}).Where("id = ?", id).Updates(
+			map[string]interface{}{
+				"remain_quota":  gorm.Expr("remain_quota - ?", quota),
+				"used_quota":    gorm.Expr("used_quota + ?", quota),
+				"accessed_time": common.GetTimestamp(),
+			},
+		).Error; err != nil {
+			return err
+		}
+		if common.RedisEnabled {
+			var queueErr error
+			cacheSyncVersion, queueErr = queueTokenCacheSyncTx(tx, key, now)
+			return queueErr
+		}
 		return nil
+	}); err != nil {
+		return err
 	}
-	return decreaseTokenQuota(id, quota)
+	if common.RedisEnabled && cacheEpochReady {
+		cacheErr := cacheDecrTokenQuota(key, int64(quota), cacheEpoch)
+		if syncErr := completeIdentityCacheSyncAfterMutation(
+			context.Background(), getTokenCacheKey(key), cacheSyncVersion, now, cacheErr,
+		); syncErr != nil {
+			common.SysError("token quota decrease committed but durable cache sync is pending: " + syncErr.Error())
+		}
+	}
+	return nil
 }
 
 func decreaseTokenQuota(id int, quota int) (err error) {
@@ -452,36 +675,49 @@ func CountUserTokens(userId int) (int64, error) {
 
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
 func BatchDeleteTokens(ids []int, userId int) (int, error) {
-	if len(ids) == 0 {
+	if len(ids) == 0 || userId <= 0 {
 		return 0, errors.New("ids 不能为空！")
 	}
-
-	tx := DB.Begin()
-
 	var tokens []Token
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
-	}
-
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			for _, t := range tokens {
-				_ = cacheDeleteToken(t.Key)
+	deleted := 0
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx.Unscoped()).Where("user_id = ? AND id IN ?", userId, ids).
+			Order("id asc").Find(&tokens).Error; err != nil {
+			return err
+		}
+		activeIDs := make([]int, 0, len(tokens))
+		for index := range tokens {
+			if common.RedisEnabled {
+				if _, err := queueTokenCacheSyncTx(tx, tokens[index].Key, time.Now()); err != nil {
+					return err
+				}
 			}
-		})
+			if !tokens[index].DeletedAt.Valid {
+				activeIDs = append(activeIDs, tokens[index].Id)
+			}
+		}
+		if len(activeIDs) == 0 {
+			return nil
+		}
+		result := tx.Where("user_id = ? AND id IN ?", userId, activeIDs).Delete(&Token{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(activeIDs)) {
+			return errors.New("令牌删除并发冲突")
+		}
+		deleted = len(activeIDs)
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-
-	return len(tokens), nil
+	keys := make([]string, 0, len(tokens))
+	for index := range tokens {
+		keys = append(keys, tokens[index].Key)
+	}
+	syncTokenCachesAfterCommitBestEffort(keys, "token batch deletion")
+	return deleted, nil
 }
 
 func GetTokenKeysByIds(ids []int, userId int) ([]Token, error) {
@@ -519,4 +755,26 @@ func InvalidateUserTokensCache(userId int) error {
 		}
 	}
 	return firstErr
+}
+
+func InvalidateTokenCacheByID(tokenID int, userID int) error {
+	if !common.RedisEnabled || tokenID <= 0 {
+		return nil
+	}
+	if userID <= 0 {
+		return errors.New("userId 无效")
+	}
+	var token Token
+	err := DB.Unscoped().Select("id", commonKeyCol).
+		Where("id = ? AND user_id = ?", tokenID, userID).First(&token).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return InvalidateUserTokensCache(userID)
+	}
+	if err != nil {
+		return err
+	}
+	if token.Key == "" {
+		return InvalidateUserTokensCache(userID)
+	}
+	return cacheDeleteToken(token.Key)
 }

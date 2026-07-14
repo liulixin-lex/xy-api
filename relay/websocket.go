@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/QuantumNous/new-api/dto"
@@ -31,6 +32,10 @@ func wssHelperWithAdaptor(c *gin.Context, info *relaycommon.RelayInfo, adaptor c
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 	resp, err := adaptor.DoRequest(c, info, nil)
 	if err != nil {
+		var upstreamErr *types.NewAPIError
+		if errors.As(err, &upstreamErr) {
+			return upstreamErr
+		}
 		return types.NewError(err, types.ErrorCodeDoRequestFailed)
 	}
 

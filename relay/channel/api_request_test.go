@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -895,4 +896,38 @@ func TestDoWssRequestUsesFirstByteTimeoutBeforeUpstreamHandshake(t *testing.T) {
 	assert.Less(t, time.Since(start), 80*time.Millisecond)
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonFirstByteTimeout, info.StreamStatus.EndReason)
+}
+
+func TestDoWssRequestPreservesRejectedHandshakeStatus(t *testing.T) {
+	statusCodes := []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusPaymentRequired,
+		http.StatusTooManyRequests,
+	}
+	for _, statusCode := range statusCodes {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+				_, _ = w.Write([]byte("sensitive upstream diagnostic"))
+			}))
+			t.Cleanup(server.Close)
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			conn, err := DoWssRequest(
+				testWssAdaptor{url: "ws" + server.URL[len("http"):]},
+				ctx,
+				&relaycommon.RelayInfo{},
+				nil,
+			)
+
+			require.Nil(t, conn)
+			var apiErr *types.NewAPIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, statusCode, apiErr.SourceStatusCode())
+			assert.NotContains(t, apiErr.Error(), "sensitive upstream diagnostic")
+		})
+	}
 }

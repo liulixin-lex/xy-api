@@ -238,12 +238,17 @@ func TestRuntimeRetentionRunsIndependentlyFromFlushFailure(t *testing.T) {
 		ResetRoutingTelemetryTransportForTest()
 	})
 	retentionRan := make(chan struct{}, 1)
+	flushRan := make(chan struct{}, 1)
 	runtime := newRuntime(context.Background(), runtimeDeps{
 		getSetting: func() smart_routing_setting.SmartRoutingSetting {
 			return smart_routing_setting.SmartRoutingSetting{Enabled: true, RetentionDays: 7}
 		},
 		refresh: func(context.Context, smart_routing_setting.SmartRoutingSetting) error { return nil },
 		flush: func(context.Context, smart_routing_setting.SmartRoutingSetting) error {
+			select {
+			case flushRan <- struct{}{}:
+			default:
+			}
 			return errors.New("persistent flush failure")
 		},
 		retention: func(context.Context, int) (int64, error) {
@@ -263,6 +268,11 @@ func TestRuntimeRetentionRunsIndependentlyFromFlushFailure(t *testing.T) {
 	case <-retentionRan:
 	case <-time.After(time.Second):
 		t.Fatal("retention was blocked by flush failure")
+	}
+	select {
+	case <-flushRan:
+	case <-time.After(time.Second):
+		t.Fatal("flush worker did not record its independent failure")
 	}
 	runtime.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

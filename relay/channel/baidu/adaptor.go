@@ -146,7 +146,11 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 		return nil, errors.New("baidu request context is unavailable")
 	}
 	a.accessToken = ""
-	accessToken, err := getBaiduAccessToken(c.Request.Context(), info.ApiKey)
+	accessToken, err := getBaiduAccessToken(
+		c.Request.Context(),
+		info.ApiKey,
+		func() error { return relaycommon.MarkRoutingUpstreamSent(c) },
+	)
 	if err != nil {
 		return nil, err
 	}

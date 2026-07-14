@@ -227,6 +227,9 @@ func loadOptionsFromDatabase() {
 	}
 
 	common.OptionMapRWMutex.Lock()
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string, len(values))
+	}
 	for key, value := range values {
 		common.OptionMap[key] = value
 	}
@@ -248,6 +251,14 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	optionPublishRevision.Add(1)
+}
+
+// RefreshOptionsFromDatabase republishes committed option truth through the
+// same revision gate used by the background synchronizer. It is used after a
+// larger control-plane transaction writes Option rows atomically with its own
+// revision and audit records.
+func RefreshOptionsFromDatabase() {
+	loadOptionsFromDatabase()
 }
 
 func SyncOptions(frequency int) {

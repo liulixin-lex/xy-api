@@ -50,7 +50,9 @@ const (
 	ContextKeyRoutingPoolID              ContextKey = "routing_pool_id"
 	ContextKeyRoutingMemberID            ContextKey = "routing_member_id"
 	ContextKeyRoutingCredentialID        ContextKey = "routing_credential_id"
+	ContextKeyRoutingUpstreamAccountID   ContextKey = "routing_upstream_account_id"
 	ContextKeyRoutingExcludedChannels    ContextKey = "routing_excluded_channels"
+	ContextKeyRoutingExcludedCredentials ContextKey = "routing_excluded_credentials"
 	ContextKeyRoutingSwitchCount         ContextKey = "routing_switch_count"
 	ContextKeyRoutingAutoGroupIndex      ContextKey = "routing_auto_group_index"
 	ContextKeyRoutingHalfOpenProbes      ContextKey = "routing_half_open_probes"
@@ -67,6 +69,8 @@ const (
 	ContextKeyRoutingCapacityOutputKnown ContextKey = "routing_capacity_output_known"
 	ContextKeyRoutingCapacityOutputState ContextKey = "routing_capacity_output_state"
 	ContextKeyRoutingCostProfile         ContextKey = "routing_cost_profile"
+	ContextKeyRoutingRequestProfile      ContextKey = "routing_request_profile"
+	ContextKeyRoutingSelectionDeferred   ContextKey = "routing_selection_deferred"
 	ContextKeyRoutingSelectedIdentity    ContextKey = "routing_selected_identity"
 	ContextKeyRoutingCapacityReserve     ContextKey = "routing_capacity_reservation"
 	ContextKeyRoutingCapacityFailure     ContextKey = "routing_capacity_failure"
@@ -76,6 +80,7 @@ const (
 	ContextKeyRoutingRegion              ContextKey = "routing_region"
 	ContextKeyRoutingSessionSet          ContextKey = "routing_session_set"
 	ContextKeyRoutingCanaryOutcome       ContextKey = "routing_canary_outcome"
+	ContextKeyRoutingUpstreamSend        ContextKey = "routing_upstream_send"
 
 	/* user related keys */
 	ContextKeyUserId      ContextKey = "id"

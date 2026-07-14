@@ -83,11 +83,30 @@ func TestClickHouseLogCreateTableSQL(t *testing.T) {
 	assert.Contains(t, withoutTTL, "ENGINE = MergeTree()")
 	assert.Contains(t, withoutTTL, "PARTITION BY toYYYYMM(toDateTime(created_at))")
 	assert.Contains(t, withoutTTL, "ORDER BY (created_at, request_id)")
+	assert.Contains(t, withoutTTL, "billing_operation_key Nullable(String) DEFAULT NULL")
+	assert.Contains(t, withoutTTL, "billing_payload_hash String DEFAULT ''")
+	assert.Contains(t, withoutTTL, "billing_payload_protocol UInt16 DEFAULT 0")
+	assert.Contains(t, withoutTTL, "billing_sink_written_at Int64 DEFAULT 0")
 	assert.NotContains(t, withoutTTL, "TTL ")
 
 	withTTL := clickHouseLogCreateTableSQL(30)
 	assert.Contains(t, withTTL, "ORDER BY (created_at, request_id)")
 	assert.Contains(t, withTTL, "TTL toDateTime(created_at) + INTERVAL 30 DAY DELETE")
+}
+
+func TestClickHouseBillingLogMigrationAndVisibleView(t *testing.T) {
+	migrations := clickHouseBillingLogColumnMigrations()
+	require.Len(t, migrations, 4)
+	assert.Contains(t, migrations[0], "ADD COLUMN IF NOT EXISTS billing_operation_key Nullable(String)")
+	assert.Contains(t, migrations[1], "ADD COLUMN IF NOT EXISTS billing_payload_hash String")
+	assert.Contains(t, migrations[2], "ADD COLUMN IF NOT EXISTS billing_payload_protocol UInt16")
+	assert.Contains(t, migrations[3], "ADD COLUMN IF NOT EXISTS billing_sink_written_at Int64")
+
+	viewSQL := clickHouseVisibleLogsViewSQL()
+	assert.Contains(t, viewSQL, "CREATE OR REPLACE VIEW "+clickHouseVisibleLogsView)
+	assert.Contains(t, viewSQL, "HAVING uniqExact(tuple(billing_payload_protocol, billing_payload_hash)) = 1")
+	assert.Contains(t, viewSQL, "LIMIT 1 BY billing_operation_key")
+	assert.Contains(t, viewSQL, "billing_operation_key IS NULL")
 }
 
 func TestClickHouseCreateTableHasTTL(t *testing.T) {

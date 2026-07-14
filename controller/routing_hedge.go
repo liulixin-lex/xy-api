@@ -59,6 +59,7 @@ type routingHedgeBranch struct {
 	cancel   context.CancelCauseFunc
 	lease    *channelrouting.HedgeAttemptLease
 	audit    *channelrouting.HedgeAttemptAuditReservation
+	send     *relaycommon.RoutingUpstreamSendState
 }
 
 type routingHedgeBranchResult struct {
@@ -202,20 +203,7 @@ func maybeExecuteRoutingHedge(
 		), true
 	}
 	prepareRoutingRelayAttempt(primary.info)
-	if attemptLease != nil {
-		if err := attemptLease.MarkSent(); err != nil {
-			releaseRoutingCapacityReservation(primary.ctx)
-			finishRoutingCanaryAttempt(primary.ctx)
-			primaryHedgeLease.Finish()
-			attemptLease.Finish()
-			apiErr := routingHedgeInternalError("primary attempt state transition", err)
-			classification, _ := classifyRoutingRelayAttemptWithContext(primary.ctx, apiErr, primary.info)
-			return finishRoutingHedgeFailure(
-				c, baseInfo, retryParam, apiErr, classification,
-				func(willRetry bool) { completeRoutingHedgeAdmissionFailure(primary, apiErr, willRetry, !willRetry) },
-			), true
-		}
-	}
+	primary.send = bindRoutingUpstreamAttempt(primary.ctx, primary.info, primary.channel, attemptLease)
 	defer attemptLease.Finish()
 	defer common.SetContextKey(c, constant.ContextKeyRoutingCapacityFailure, nil)
 
@@ -266,11 +254,13 @@ func maybeExecuteRoutingHedge(
 		return finishSingleRoutingHedgeResult(c, baseInfo, retryParam, attemptLease, result)
 	}
 	prepareRoutingRelayAttempt(secondary.info)
+	secondary.send = bindRoutingUpstreamAttempt(secondary.ctx, secondary.info, secondary.channel, nil)
 
 	select {
 	case result := <-primaryResults:
 		releaseRoutingCapacityReservation(secondary.ctx)
-		finishRoutingCanaryAttempt(secondary.ctx)
+		finishRoutingCanaryAttempt(secondary.ctx, secondary.send)
+		relaycommon.ClearRoutingUpstreamSendState(secondary.ctx)
 		completeRoutingHedgeBranchAsLost(secondary, time.Now().UnixMilli())
 		secondary.lease.Finish()
 		return finishSingleRoutingHedgeResult(c, baseInfo, retryParam, attemptLease, result)
@@ -278,7 +268,12 @@ func maybeExecuteRoutingHedge(
 	}
 	addUsedChannel(secondary.ctx, secondary.channel.Id)
 	mergeRoutingHedgeUsedChannels(c, secondary.ctx)
-	service.MarkRoutingTried(c, secondary.channel.Id)
+	service.MarkRoutingTargetTried(
+		c,
+		secondary.channel.Id,
+		common.GetContextKeyInt(secondary.ctx, constant.ContextKeyRoutingCredentialID),
+		common.GetContextKeyBool(secondary.ctx, constant.ContextKeyChannelIsMultiKey),
+	)
 	secondaryResults := make(chan routingHedgeBranchResult, 1)
 	go func() {
 		secondaryResults <- executeRoutingHedgeBranch(secondary)
@@ -367,6 +362,9 @@ func routingHedgeEligible(
 	setting smart_routing_setting.SmartRoutingSetting,
 	policy channelrouting.EnterpriseHedgePolicy,
 ) bool {
+	if requestPolicy, ok := service.ChannelRoutingRequestAttemptPolicy(c); ok && !requestPolicy.HedgeAllowed {
+		return false
+	}
 	if c == nil || c.Request == nil || info == nil || channel == nil || retryParam == nil ||
 		!setting.Enabled || setting.Mode != smart_routing_setting.ModeEnterpriseSLO ||
 		!setting.HedgeEnabled || !policy.Enabled || !policy.Explicit || policy.CrossRegion ||
@@ -761,7 +759,8 @@ func executeRoutingHedgeBranch(branch *routingHedgeBranch) routingHedgeBranchRes
 	releaseInflight := routingmetrics.BeginInflight(branch.ctx, branch.info, branch.channel.Id)
 	defer releaseInflight()
 	defer releaseRoutingCapacityReservation(branch.ctx)
-	defer finishRoutingCanaryAttempt(branch.ctx)
+	defer finishRoutingCanaryAttempt(branch.ctx, branch.send)
+	defer relaycommon.ClearRoutingUpstreamSendState(branch.ctx)
 	defer service.ReleaseRoutingHalfOpenProbe(
 		branch.ctx, branch.channel.Id, branch.info.OriginModelName, branch.info.UsingGroup,
 	)
@@ -789,6 +788,12 @@ func executeRoutingHedgeBranch(branch *routingHedgeBranch) routingHedgeBranchRes
 	// The branch writer is an internal buffer. Nothing is client-committed until
 	// commitRoutingHedgeWinner copies the selected response to the real writer.
 	controlErr := relayAttemptControlErrorWithClientCommit(apiErr, branch.info, false)
+	if controlErr == nil && !routingHedgeBranchSent(branch) {
+		controlErr = routingHedgeInternalError(
+			"upstream send boundary",
+			errors.New("hedge branch completed without crossing the upstream send boundary"),
+		)
+	}
 	classificationErr := apiErr
 	if classificationErr == nil {
 		classificationErr = controlErr
@@ -1074,7 +1079,8 @@ func completeRoutingHedgeBranchAsLost(branch *routingHedgeBranch, completedAtMs 
 		return
 	}
 	err := branch.audit.Complete(model.RoutingHedgeAttemptCompleteSpec{
-		Result: model.RoutingHedgeAttemptResultHedgeLost, CompletedTimeMs: completedAtMs,
+		Result: model.RoutingHedgeAttemptResultHedgeLost, UpstreamSent: routingHedgeBranchSent(branch),
+		CompletedTimeMs: completedAtMs,
 	})
 	if err != nil {
 		logger.LogError(branch.ctx, fmt.Sprintf("channel routing hedge neutral audit completion failed: %v", err))
@@ -1108,7 +1114,7 @@ func completeRoutingHedgeResultAudit(
 		completedAtMs = disposition.completedAtMs
 	}
 	completion := model.RoutingHedgeAttemptCompleteSpec{
-		Winner: isWinner, UpstreamSent: true,
+		Winner: isWinner, UpstreamSent: routingHedgeBranchSent(result.branch),
 		ClientCommitted: isSelected && disposition.clientCommitted,
 		WillRetry:       isSelected && disposition.willRetry,
 		FinalAttempt:    isSelected && disposition.finalAttempt,
@@ -1173,6 +1179,7 @@ func recordRoutingHedgeAttemptEffects(
 	winner *routingHedgeBranchResult,
 ) {
 	if result.branch == nil || errors.Is(result.cause, channelrouting.ErrHedgeLost) ||
+		!routingHedgeBranchSent(result.branch) ||
 		(result.success && (winner == nil || winner.branch != result.branch)) {
 		return
 	}
@@ -1194,6 +1201,10 @@ func recordRoutingHedgeAttemptEffects(
 		apiErr,
 		result.classification,
 	)
+}
+
+func routingHedgeBranchSent(branch *routingHedgeBranch) bool {
+	return branch != nil && branch.send != nil && branch.send.Sent()
 }
 
 func commitRoutingHedgeWinner(

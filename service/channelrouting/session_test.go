@@ -265,6 +265,7 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 		ExcludedChannelIDs: []int{
 			102,
 		},
+		ExcludedCredentialIDs: []int{1_004, 1_005},
 		SlowStartFactor: func(key SlowStartKey) (float64, error) {
 			slowStartKeys = append(slowStartKeys, key)
 			return 0.25, nil
@@ -279,7 +280,7 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	assert.Equal(t, 0.25, plan.Replay.Candidates[0].SlowStartFactor)
 	assert.Equal(t, ExclusionReasonRequestFailed, plan.Replay.Candidates[1].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonLocalCapacity, plan.Replay.Candidates[2].RequestExclusionReason)
-	assert.Equal(t, ExclusionReasonMultiKeyUnsupported, plan.Replay.Candidates[3].RequestExclusionReason)
+	assert.Equal(t, ExclusionReasonCredentialRequest, plan.Replay.Candidates[3].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonHalfOpenProbe, plan.Replay.Candidates[4].RequestExclusionReason)
 
 	assert.Equal(t, 101, plan.Result.SelectedChannelID)
@@ -298,6 +299,27 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	assert.Equal(t, ExclusionReasonHalfOpenProbe, candidates[105].ExclusionReason)
 	_, crossedPool := candidates[999]
 	assert.False(t, crossedPool)
+
+	pinned, active, err := session.Plan(RequestRoutingPlanInput{
+		ModelName:            "gpt-test",
+		AllowedChannelIDs:    []int{104},
+		RequiredCredentialID: 1_005,
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Equal(t, 104, pinned.Result.SelectedChannelID)
+	assert.Equal(t, 1_005, pinned.SelectedIdentity.CredentialID)
+
+	unavailable, active, err := session.Plan(RequestRoutingPlanInput{
+		ModelName:            "gpt-test",
+		AllowedChannelIDs:    []int{104},
+		RequiredCredentialID: 9_999,
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Zero(t, unavailable.Result.SelectedChannelID)
+	require.Len(t, unavailable.Replay.Candidates, 5)
+	assert.Equal(t, ExclusionReasonCredentialUnavailable, unavailable.Replay.Candidates[3].RequestExclusionReason)
 }
 
 func TestRequestRoutingSessionPlanRejectsInvalidBoundedInputs(t *testing.T) {

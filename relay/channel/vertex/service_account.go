@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"fmt"
 	"time"
 )
+
+const vertexAccessTokenResponseMaxBytes = 1 << 20
 
 type Credentials struct {
 	ProjectID    string `json:"project_id"`
@@ -38,23 +41,25 @@ var Cache = asynccache.NewAsyncCache(asynccache.Options{
 	},
 })
 
-func getAccessToken(ctx context.Context, a *Adaptor, info *relaycommon.RelayInfo) (string, error) {
-	var cacheKey string
-	if info.ChannelIsMultiKey {
-		cacheKey = fmt.Sprintf("access-token-%d-%d", info.ChannelId, info.ChannelMultiKeyIndex)
-	} else {
-		cacheKey = fmt.Sprintf("access-token-%d", info.ChannelId)
+var vertexTokenHTTPClientFactory = service.GetStatefulFetchHTTPClient
+
+func getAccessToken(ctx context.Context, a *Adaptor, info *relaycommon.RelayInfo, beforeSend func() error) (string, error) {
+	cacheKey, err := vertexAccessTokenCacheKey(info)
+	if err != nil {
+		return "", err
 	}
 	val, err := Cache.Get(cacheKey)
 	if err == nil {
-		return val.(string), nil
+		if token, ok := val.(string); ok && strings.TrimSpace(token) != "" {
+			return token, nil
+		}
 	}
 
 	signedJWT, err := createSignedJWT(a.AccountCredentials.ClientEmail, a.AccountCredentials.PrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to create signed JWT: %w", err)
 	}
-	newToken, err := exchangeJwtForAccessToken(ctx, signedJWT, info)
+	newToken, err := exchangeJwtForAccessToken(ctx, signedJWT, info, beforeSend)
 	if err != nil {
 		return "", fmt.Errorf("failed to exchange JWT for access token: %w", err)
 	}
@@ -62,6 +67,19 @@ func getAccessToken(ctx context.Context, a *Adaptor, info *relaycommon.RelayInfo
 		return newToken, nil
 	}
 	return newToken, nil
+}
+
+func vertexAccessTokenCacheKey(info *relaycommon.RelayInfo) (string, error) {
+	if info == nil || info.ChannelId <= 0 {
+		return "", errors.New("Vertex channel identity is unavailable")
+	}
+	if info.RoutingCredentialID > 0 {
+		return fmt.Sprintf("access-token-channel-%d-credential-%d", info.ChannelId, info.RoutingCredentialID), nil
+	}
+	if info.ChannelIsMultiKey {
+		return "", errors.New("Vertex multi-key credential identity is unavailable")
+	}
+	return fmt.Sprintf("access-token-channel-%d-created-%d", info.ChannelId, info.ChannelCreateTime), nil
 }
 
 func createSignedJWT(email, privateKeyPEM string) (string, error) {
@@ -105,70 +123,53 @@ func createSignedJWT(email, privateKeyPEM string) (string, error) {
 	return signedToken, nil
 }
 
-func exchangeJwtForAccessToken(ctx context.Context, signedJWT string, info *relaycommon.RelayInfo) (string, error) {
-
-	authURL := "https://www.googleapis.com/oauth2/v4/token"
-	data := url.Values{}
-	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
-	data.Set("assertion", signedJWT)
-
-	var client *http.Client
-	var err error
-	if info.ChannelSetting.Proxy != "" {
-		client, err = service.NewProxyHttpClient(info.ChannelSetting.Proxy)
-		if err != nil {
-			return "", fmt.Errorf("new proxy http client failed: %w", err)
-		}
-	} else {
-		client = service.GetHttpClient()
+func exchangeJwtForAccessToken(
+	ctx context.Context,
+	signedJWT string,
+	info *relaycommon.RelayInfo,
+	beforeSend func() error,
+) (string, error) {
+	if info == nil {
+		return "", errors.New("Vertex relay info is unavailable")
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	if err := common.DecodeJson(resp.Body, &result); err != nil {
-		return "", err
-	}
-
-	if accessToken, ok := result["access_token"].(string); ok {
-		return accessToken, nil
-	}
-
-	return "", fmt.Errorf("failed to get access token: %v", result)
+	return exchangeJwtForAccessTokenWithProxy(ctx, signedJWT, info.ChannelSetting.Proxy, beforeSend)
 }
 
 func AcquireAccessToken(ctx context.Context, creds Credentials, proxy string) (string, error) {
+	return acquireAccessToken(ctx, creds, proxy, nil)
+}
+
+func AcquireAccessTokenForRelay(
+	ctx context.Context,
+	creds Credentials,
+	proxy string,
+	beforeSend func() error,
+) (string, error) {
+	return acquireAccessToken(ctx, creds, proxy, beforeSend)
+}
+
+func acquireAccessToken(ctx context.Context, creds Credentials, proxy string, beforeSend func() error) (string, error) {
 	signedJWT, err := createSignedJWT(creds.ClientEmail, creds.PrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to create signed JWT: %w", err)
 	}
-	return exchangeJwtForAccessTokenWithProxy(ctx, signedJWT, proxy)
+	return exchangeJwtForAccessTokenWithProxy(ctx, signedJWT, proxy, beforeSend)
 }
 
-func exchangeJwtForAccessTokenWithProxy(ctx context.Context, signedJWT string, proxy string) (string, error) {
+func exchangeJwtForAccessTokenWithProxy(
+	ctx context.Context,
+	signedJWT string,
+	proxy string,
+	beforeSend func() error,
+) (string, error) {
 	authURL := "https://www.googleapis.com/oauth2/v4/token"
 	data := url.Values{}
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
 	data.Set("assertion", signedJWT)
 
-	var client *http.Client
-	var err error
-	if proxy != "" {
-		client, err = service.NewProxyHttpClient(proxy)
-		if err != nil {
-			return "", fmt.Errorf("new proxy http client failed: %w", err)
-		}
-	} else {
-		client = service.GetHttpClient()
+	client, err := vertexTokenHTTPClientFactory(proxy)
+	if err != nil {
+		return "", fmt.Errorf("new stateful token client failed: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(data.Encode()))
@@ -176,19 +177,36 @@ func exchangeJwtForAccessTokenWithProxy(ctx context.Context, signedJWT string, p
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := client.Do(req)
+	if beforeSend != nil {
+		if err := beforeSend(); err != nil {
+			return "", fmt.Errorf("mark Vertex token request sent: %w", err)
+		}
+	}
+	resp, err := service.DoStatefulFetch(client, req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-
+	if resp.ContentLength > vertexAccessTokenResponseMaxBytes {
+		return "", errors.New("Vertex token response is too large")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, vertexAccessTokenResponseMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read Vertex token response: %w", err)
+	}
+	if len(body) > vertexAccessTokenResponseMaxBytes {
+		return "", errors.New("Vertex token response is too large")
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("Vertex token endpoint returned status %d", resp.StatusCode)
+	}
 	var result map[string]interface{}
-	if err := common.DecodeJson(resp.Body, &result); err != nil {
-		return "", err
+	if err := common.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode Vertex token response: %w", err)
 	}
 
-	if accessToken, ok := result["access_token"].(string); ok {
+	if accessToken, ok := result["access_token"].(string); ok && strings.TrimSpace(accessToken) != "" {
 		return accessToken, nil
 	}
-	return "", fmt.Errorf("failed to get access token: %v", result)
+	return "", errors.New("Vertex token response did not contain an access token")
 }
