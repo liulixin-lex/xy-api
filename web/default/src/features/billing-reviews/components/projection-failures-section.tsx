@@ -251,7 +251,7 @@ function FailedProjectionList(props: {
 
   useEffect(() => {
     if (getBillingProjectionOperationApiError(query.error).status === 403) {
-      void onPermissionRevoked()
+      void onPermissionRevoked().catch(() => undefined)
     }
   }, [onPermissionRevoked, query.error])
 
@@ -351,7 +351,7 @@ function BillingConflictList(props: {
 
   useEffect(() => {
     if (getBillingProjectionOperationApiError(query.error).status === 403) {
-      void onPermissionRevoked()
+      void onPermissionRevoked().catch(() => undefined)
     }
   }, [onPermissionRevoked, query.error])
 

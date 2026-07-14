@@ -65,10 +65,7 @@ describe('channel routing event contract', () => {
       ['routing.reset', ['all']],
       ['reset', ['all']],
       ['routing.policy_draft.changed', ['policy-drafts']],
-      [
-        'routing.policy_simulation.completed',
-        ['policy-drafts', 'operations'],
-      ],
+      ['routing.policy_simulation.completed', ['policy-drafts', 'operations']],
       [
         'routing.policy.published',
         ['overview', 'groups', 'policy-drafts', 'policies', 'operations'],
@@ -126,25 +123,11 @@ describe('channel routing event contract', () => {
       ],
       [
         'routing.probe.completed',
-        [
-          'overview',
-          'groups',
-          'channels',
-          'endpoints',
-          'probes',
-          'operations',
-        ],
+        ['overview', 'groups', 'channels', 'endpoints', 'probes', 'operations'],
       ],
       [
         'probe.completed',
-        [
-          'overview',
-          'groups',
-          'channels',
-          'endpoints',
-          'probes',
-          'operations',
-        ],
+        ['overview', 'groups', 'channels', 'endpoints', 'probes', 'operations'],
       ],
       ['routing.audit_export.ready', ['audit-exports', 'operations']],
       ['audit_export.ready', ['audit-exports', 'operations']],
@@ -152,14 +135,7 @@ describe('channel routing event contract', () => {
       ['error_budget.changed', ['overview', 'groups']],
       [
         'routing.breaker.reset',
-        [
-          'overview',
-          'groups',
-          'channels',
-          'endpoints',
-          'probes',
-          'operations',
-        ],
+        ['overview', 'groups', 'channels', 'endpoints', 'probes', 'operations'],
       ],
       [
         'routing.breaker.opened',
@@ -171,7 +147,10 @@ describe('channel routing event contract', () => {
       ],
     ])
 
-    assert.deepEqual([...channelRoutingEventNames].sort(), [...expected.keys()].sort())
+    assert.deepEqual(
+      [...channelRoutingEventNames].sort(),
+      [...expected.keys()].sort()
+    )
     for (const [eventType, resources] of expected) {
       assert.deepEqual(getChannelRoutingEventResources(eventType), resources)
     }
