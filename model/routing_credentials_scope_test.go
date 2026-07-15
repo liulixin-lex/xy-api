@@ -35,8 +35,14 @@ func TestRoutingCredentialsAreScopedToUpstreamType(t *testing.T) {
 func TestRoutingCredentialReadinessRequiresProviderAuthentication(t *testing.T) {
 	assert.False(t, (RoutingCredentials{CustomCAPEM: "certificate"}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
 	assert.False(t, (RoutingCredentials{Sub2APIToken: "wrong-provider"}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
-	assert.True(t, (RoutingCredentials{NewAPIAccessToken: "token"}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
+	assert.False(t, (RoutingCredentials{GatewayAPIKey: "gateway-only"}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
+	assert.False(t, (RoutingCredentials{NewAPIAccessToken: "token"}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
+	assert.True(t, (RoutingCredentials{
+		NewAPIAccessToken: "token",
+		GatewayAPIKey:     "gateway-token",
+	}).ReadyForUpstream(RoutingUpstreamTypeNewAPI))
 	assert.False(t, (RoutingCredentials{Sub2APIEmail: "operator@example.com"}).ReadyForUpstream(RoutingUpstreamTypeSub2API))
+	assert.False(t, (RoutingCredentials{GatewayAPIKey: "gateway-only"}).ReadyForUpstream(RoutingUpstreamTypeSub2API))
 	assert.True(t, (RoutingCredentials{
 		Sub2APIEmail: "operator@example.com", Sub2APIPassword: "password",
 	}).ReadyForUpstream(RoutingUpstreamTypeSub2API))

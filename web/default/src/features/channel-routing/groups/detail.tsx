@@ -58,6 +58,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -192,7 +193,6 @@ export function ChannelRoutingGroupDetailPage() {
         model_limit: modelLimit,
         credential_limit: credentialLimit,
       }),
-    placeholderData: (previous) => previous,
   })
 
   const breadcrumb = (
@@ -231,7 +231,7 @@ export function ChannelRoutingGroupDetailPage() {
       </ChannelRoutingPageFrame>
     )
   }
-  if (query.isError || !query.data) {
+  if (!query.data) {
     return (
       <ChannelRoutingPageFrame
         activeSection='groups'
@@ -249,6 +249,7 @@ export function ChannelRoutingGroupDetailPage() {
   const data = query.data
   const group = data.group
   const summary = data.summary
+  const operationsAvailable = canOperate && !query.isRefetchError
   const policyProfile =
     summary.policy_profile === 'enterprise_slo'
       ? t('Enterprise SLO')
@@ -286,7 +287,7 @@ export function ChannelRoutingGroupDetailPage() {
                 }
               />
             </Button>
-            {canOperate ? (
+            {operationsAvailable ? (
               <Button
                 size='sm'
                 className='max-sm:size-11 max-sm:p-0'
@@ -302,6 +303,13 @@ export function ChannelRoutingGroupDetailPage() {
         }
       >
         <div className='space-y-4 pb-2'>
+          {query.isRefetchError ? (
+            <ChannelRoutingRefetchErrorAlert
+              isFetching={query.isFetching}
+              onRetry={() => void query.refetch()}
+            />
+          ) : null}
+
           <section className='bg-border grid grid-cols-2 gap-px overflow-hidden rounded-lg border lg:grid-cols-6'>
             {[
               [t('Policy profile'), policyProfile],
@@ -331,7 +339,7 @@ export function ChannelRoutingGroupDetailPage() {
 
           <ChannelRoutingGroupReplayRankingSection
             poolId={poolId}
-            canOperate={canOperate}
+            canOperate={operationsAvailable}
             onSimulate={() => setSimulationOpen(true)}
           />
 
@@ -382,7 +390,7 @@ export function ChannelRoutingGroupDetailPage() {
                               poolId={poolId}
                               memberId={member.id}
                               models={member.models}
-                              canOperate={canOperate}
+                              canOperate={operationsAvailable}
                             />
                           </TableCell>
                           <TableCell className='align-top'>
@@ -472,7 +480,7 @@ export function ChannelRoutingGroupDetailPage() {
                       poolId={poolId}
                       memberId={member.id}
                       models={member.models}
-                      canOperate={canOperate}
+                      canOperate={operationsAvailable}
                     />
                   </div>
                 ))}
@@ -484,6 +492,7 @@ export function ChannelRoutingGroupDetailPage() {
             page={page}
             pageSize={pageSize}
             total={group.member_count}
+            disabled={query.isRefetchError}
             onPageChange={(nextPage) =>
               void navigate({
                 search: (previous) => ({ ...previous, page: nextPage }),

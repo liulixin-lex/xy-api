@@ -50,6 +50,11 @@ func (snapshot *runtimeSnapshot) compileBalancedPools() error {
 			if err != nil {
 				return err
 			}
+			// Compile a superset. Request sessions apply the authoritative class.
+			profile.TrafficClass = RequestTrafficClassClaudeCode
+			if err := profile.Validate(); err != nil {
+				return err
+			}
 			settings := policy.settings(now, 1, 0, preferTTFT)
 			candidates := make([]routingselector.BalancedCandidate, 0, len(memberIndexes))
 			for _, memberIndex := range memberIndexes {
@@ -119,7 +124,10 @@ func balancedCandidateFromSnapshot(
 	if member.CredentialsTruncated || (channel.CredentialRequired && len(member.CredentialIDs) == 0) {
 		candidate.HardExclusionReason = routingselector.BalancedExclusionCredentialUnavailable
 	}
-	if pool.CapabilityRoutingEnabled {
+	if candidate.HardExclusionReason == "" {
+		candidate.HardExclusionReason = requestTrafficExclusionReason(profile, channel)
+	}
+	if candidate.HardExclusionReason == "" && pool.CapabilityRoutingEnabled {
 		if reason := requestCapabilityExclusionReason(profile, observation); reason != "" {
 			candidate.HardExclusionReason = reason
 		}

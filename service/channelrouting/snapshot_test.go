@@ -46,9 +46,9 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 		Balance: 12.5, BalanceUpdatedTime: 100,
 	}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelBinding{
-		ChannelID: 301, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+		ChannelID: 301, UpstreamType: model.RoutingUpstreamTypeSub2API,
 		BaseURL: "https://cost.example", UpstreamGroup: "vip", Enabled: true,
-		SyncFailureCount: 2, SyncBackoffUntil: 999,
+		ServesClaudeCode: true, SyncFailureCount: 2, SyncBackoffUntil: 999,
 	}).Error)
 
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
@@ -87,6 +87,8 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	assert.Equal(t, "https://example.com", view.Channels[0].Endpoint)
 	assert.NotContains(t, view.Channels[0].Endpoint, "secret")
 	assert.True(t, view.Channels[0].CostConnectorEnabled)
+	assert.False(t, view.Channels[0].BalanceKnown)
+	assert.True(t, view.Channels[0].ServesClaudeCode)
 	assert.Equal(t, 2, view.Channels[0].CostSyncFailures)
 	assert.Equal(t, float64(1), view.Stats.TelemetryCoverage)
 	assert.Equal(t, float64(1), view.Stats.CredentialCoverage)
@@ -118,6 +120,60 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	assert.Equal(t, view.Revision, refreshed.Revision)
 	assert.Equal(t, view.PolicyHash, refreshed.PolicyHash)
 	assert.Greater(t, refreshed.RuntimeGeneration, view.RuntimeGeneration)
+}
+
+func TestSnapshotUsesOnlyConnectorBalanceForEnabledCostBindings(t *testing.T) {
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+	})
+
+	channels := []model.Channel{
+		{Id: 311, Name: "subscription", Key: "key-311", Group: "vip", Models: "gpt-test", Balance: 9, BalanceUpdatedTime: 100},
+		{Id: 312, Name: "unknown-standard", Key: "key-312", Group: "vip", Models: "gpt-test", Balance: 8, BalanceUpdatedTime: 100},
+		{Id: 313, Name: "connector-balance", Key: "key-313", Group: "vip", Models: "gpt-test", Balance: 7, BalanceUpdatedTime: 100},
+		{Id: 314, Name: "disabled-connector", Key: "key-314", Group: "vip", Models: "gpt-test", Balance: 6, BalanceUpdatedTime: 100},
+		{Id: 315, Name: "legacy", Key: "key-315", Group: "vip", Models: "gpt-test", Balance: 5, BalanceUpdatedTime: 100},
+	}
+	for index := range channels {
+		require.NoError(t, db.Create(&channels[index]).Error)
+	}
+	bindings := []model.RoutingChannelBinding{
+		{ChannelID: 311, UpstreamType: model.RoutingUpstreamTypeSub2API, BaseURL: "https://sub2api.example", UpstreamGroup: "subscription", Enabled: true},
+		{ChannelID: 312, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: "https://newapi.example", UpstreamGroup: "standard", Enabled: true},
+		{ChannelID: 313, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: "https://newapi.example", UpstreamGroup: "standard", Enabled: true},
+		{ChannelID: 314, UpstreamType: model.RoutingUpstreamTypeNewAPI, BaseURL: "https://newapi.example", UpstreamGroup: "standard", Enabled: false},
+	}
+	for index := range bindings {
+		require.NoError(t, db.Create(&bindings[index]).Error)
+	}
+	routinghotcache.SetBalanceForTest(313, routinghotcache.BalanceSnapshot{
+		Known: true, Balance: 3, UpdatedUnix: 200,
+	})
+
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	view, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+
+	byID := make(map[int]ChannelSnapshot, len(view.Channels))
+	for _, channel := range view.Channels {
+		byID[channel.ID] = channel
+	}
+	assert.False(t, byID[311].BalanceKnown, "subscription connectors must not inherit legacy wallet balance")
+	assert.False(t, byID[312].BalanceKnown, "unknown connector balance must not be replaced by legacy data")
+	assert.True(t, byID[313].BalanceKnown)
+	assert.Equal(t, 3.0, byID[313].Balance)
+	assert.Equal(t, int64(200), byID[313].BalanceUpdatedAt)
+	assert.True(t, byID[314].BalanceKnown, "disabled connectors retain legacy channel compatibility")
+	assert.Equal(t, 6.0, byID[314].Balance)
+	assert.True(t, byID[315].BalanceKnown, "channels without a connector retain legacy balance compatibility")
+	assert.Equal(t, 5.0, byID[315].Balance)
 }
 
 func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides(t *testing.T) {

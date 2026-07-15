@@ -28,6 +28,7 @@ export function ChannelRoutingPagination(props: {
   page: number
   pageSize: number
   total: number
+  disabled?: boolean
   onPageChange: (page: number) => void
   onPageSizeChange: (pageSize: number) => void
 }) {
@@ -44,6 +45,7 @@ export function ChannelRoutingPagination(props: {
           size='sm'
           value={String(props.pageSize)}
           aria-label={t('Rows per page')}
+          disabled={props.disabled}
           onChange={(event) =>
             props.onPageSizeChange(Number(event.target.value))
           }
@@ -64,7 +66,7 @@ export function ChannelRoutingPagination(props: {
           size='icon-sm'
           variant='outline'
           aria-label={t('Previous page')}
-          disabled={props.page <= 1}
+          disabled={props.disabled || props.page <= 1}
           onClick={() => props.onPageChange(props.page - 1)}
         >
           <ChevronLeft aria-hidden='true' />
@@ -73,7 +75,7 @@ export function ChannelRoutingPagination(props: {
           size='icon-sm'
           variant='outline'
           aria-label={t('Next page')}
-          disabled={props.page >= totalPages}
+          disabled={props.disabled || props.page >= totalPages}
           onClick={() => props.onPageChange(props.page + 1)}
         >
           <ChevronRight aria-hidden='true' />
@@ -86,6 +88,7 @@ export function ChannelRoutingPagination(props: {
 export function ChannelRoutingCursorPagination(props: {
   cursor: number
   nextCursor: number | string
+  disabled?: boolean
   onCursorChange: (cursor: number) => void
 }) {
   const { t } = useTranslation()
@@ -95,7 +98,7 @@ export function ChannelRoutingCursorPagination(props: {
       <Button
         size='sm'
         variant='outline'
-        disabled={props.cursor <= 0}
+        disabled={props.disabled || props.cursor <= 0}
         onClick={() => props.onCursorChange(0)}
       >
         <ChevronsLeft aria-hidden='true' />
@@ -104,7 +107,7 @@ export function ChannelRoutingCursorPagination(props: {
       <Button
         size='sm'
         variant='outline'
-        disabled={!Number.isFinite(next) || next <= 0}
+        disabled={props.disabled || !Number.isFinite(next) || next <= 0}
         onClick={() => props.onCursorChange(next)}
       >
         {t('Next page')}

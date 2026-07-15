@@ -75,6 +75,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
@@ -521,38 +522,14 @@ export function ChannelRoutingOverviewPage() {
           </Alert>
         ) : null}
         {overviewQuery.isRefetchError ? (
-          <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
-            <TriangleAlert
-              className='text-amber-700 dark:text-amber-300'
-              aria-hidden='true'
-            />
-            <AlertTitle>
-              {t('Live refresh is temporarily unavailable')}
-            </AlertTitle>
-            <AlertDescription>
-              {t(
-                'Showing the last successful routing snapshot. Automatic refresh will retry with backoff.'
-              )}
-            </AlertDescription>
-            <AlertAction>
-              <Button
-                size='sm'
-                variant='outline'
-                disabled={overviewQuery.isFetching}
-                onClick={() => void overviewQuery.refetch()}
-              >
-                <RefreshCw
-                  aria-hidden='true'
-                  className={
-                    overviewQuery.isFetching
-                      ? 'animate-spin motion-reduce:animate-none'
-                      : undefined
-                  }
-                />
-                {t('Retry')}
-              </Button>
-            </AlertAction>
-          </Alert>
+          <ChannelRoutingRefetchErrorAlert
+            title={t('Live refresh is temporarily unavailable')}
+            description={t(
+              'Showing the last successful routing snapshot. Automatic refresh will retry with backoff.'
+            )}
+            isFetching={overviewQuery.isFetching}
+            onRetry={() => void overviewQuery.refetch()}
+          />
         ) : null}
         <ManualBillingReviewSummary enabled={canReadBillingReviews} />
         <section
@@ -685,6 +662,10 @@ export function ChannelRoutingOverviewPage() {
           }
           canOperate={canOperate}
           loading={endpointsQuery.isLoading}
+          fetching={endpointsQuery.isFetching}
+          refetchError={
+            endpointsQuery.isRefetchError && endpointsQuery.data != null
+          }
           error={endpointsQuery.error}
           onRetry={() => void endpointsQuery.refetch()}
         />
@@ -736,7 +717,7 @@ export function ChannelRoutingOverviewPage() {
             {overview.risk_groups_available && riskGroups.length > 0 ? (
               <>
                 <div className='hidden overflow-hidden rounded-lg border md:block'>
-                  <Table>
+                  <Table scrollAreaLabel={t('Risk groups')}>
                     <TableHeader>
                       <TableRow>
                         <TableHead>{t('Group')}</TableHead>
@@ -805,6 +786,7 @@ export function ChannelRoutingOverviewPage() {
                           <ChannelRoutingIdentityText
                             text={group.display_name || group.group_name}
                             className='text-sm font-medium'
+                            withinInteractive
                           />
                           <div className='text-muted-foreground truncate text-xs'>
                             {group.group_name}
@@ -874,34 +856,41 @@ export function ChannelRoutingOverviewPage() {
               />
             ) : null}
             {overview.recent_events_available && recentEvents.length > 0 ? (
-              <div className='divide-y rounded-lg border'>
-                {recentEvents.map((event) => (
-                  <div
-                    key={event.id}
-                    className='flex min-w-0 items-start gap-3 px-3 py-3'
-                  >
-                    <Activity
-                      className='text-muted-foreground mt-0.5 size-4 shrink-0'
-                      aria-hidden='true'
-                    />
-                    <span className='min-w-0 flex-1'>
-                      <span className='block truncate text-sm font-medium'>
-                        {routingEventTitle(event.type, t)}
-                      </span>
-                      <ChannelRoutingIdentityText
-                        text={routingEventDetail(
-                          event.payload,
-                          event.revision,
-                          t
-                        )}
-                        className='text-muted-foreground mt-0.5 text-xs'
+              <div
+                role='log'
+                aria-labelledby='recent-events-title'
+                aria-relevant='additions'
+                aria-busy={overviewQuery.isFetching}
+                tabIndex={0}
+                className='focus-visible:ring-ring max-h-[min(28rem,55dvh)] [scrollbar-gutter:stable] overflow-y-auto overscroll-contain rounded-lg border focus-visible:ring-2 focus-visible:outline-none focus-visible:ring-inset'
+              >
+                <ol className='divide-y'>
+                  {recentEvents.map((event) => (
+                    <li
+                      key={event.id}
+                      className='grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 px-3 py-3 sm:grid-cols-[auto_minmax(0,1fr)_auto]'
+                    >
+                      <Activity
+                        className='text-muted-foreground mt-0.5 size-4 shrink-0'
+                        aria-hidden='true'
                       />
-                    </span>
-                    <span className='text-muted-foreground shrink-0 text-xs'>
-                      {format.timestamp(event.created_time_ms)}
-                    </span>
-                  </div>
-                ))}
+                      <div className='min-w-0'>
+                        <div className='text-sm font-medium [overflow-wrap:anywhere]'>
+                          {routingEventTitle(event.type, t)}
+                        </div>
+                        <div className='text-muted-foreground mt-0.5 text-xs [overflow-wrap:anywhere]'>
+                          {routingEventDetail(event.payload, event.revision, t)}
+                        </div>
+                      </div>
+                      <time
+                        dateTime={new Date(event.created_time_ms).toISOString()}
+                        className='text-muted-foreground col-start-2 text-xs whitespace-nowrap sm:col-start-3 sm:row-start-1'
+                      >
+                        {format.timestamp(event.created_time_ms)}
+                      </time>
+                    </li>
+                  ))}
+                </ol>
               </div>
             ) : null}
           </section>

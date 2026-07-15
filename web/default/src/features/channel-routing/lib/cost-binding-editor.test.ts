@@ -20,9 +20,11 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import type { RoutingCostBinding } from '../types'
-import { costBindingFormValues } from './cost-binding'
+import { costBindingFormValues, costBindingRequest } from './cost-binding'
 import {
+  costBindingAccountPreviewMatchesRequest,
   costBindingServerFieldError,
+  costBindingTestPreviewMatchesRequest,
   CostBindingEditorSessionManager,
   mergeCostBindingConflictDraft,
 } from './cost-binding-editor'
@@ -58,6 +60,121 @@ function deferred<T>() {
 }
 
 describe('cost binding editor concurrency', () => {
+  test('uses account identity for groups and the complete target for tests', () => {
+    const values = costBindingFormValues(binding)
+    values.newApiAccessToken = 'access-token'
+    values.gatewayApiKey = 'gateway-key'
+    values.customCaPem = 'ca-one'
+    const previous = costBindingRequest(values)
+
+    for (const mutate of [
+      (draft: typeof values) => {
+        draft.upstreamType = 'sub2api'
+      },
+      (draft: typeof values) => {
+        draft.baseUrl = 'https://other.example.com'
+      },
+      (draft: typeof values) => {
+        draft.egressAllowedPrivateCidrs = '10.30.0.0/16'
+      },
+      (draft: typeof values) => {
+        draft.newApiUserId = '9'
+      },
+      (draft: typeof values) => {
+        draft.newApiAccessToken = 'rotated-access-token'
+      },
+      (draft: typeof values) => {
+        draft.gatewayApiKey = 'rotated-gateway-key'
+      },
+      (draft: typeof values) => {
+        draft.customCaPem = 'ca-two'
+      },
+      (draft: typeof values) => {
+        draft.clearNewApiAccessToken = true
+      },
+      (draft: typeof values) => {
+        draft.clearGatewayApiKey = true
+      },
+      (draft: typeof values) => {
+        draft.clearCustomCaPem = true
+      },
+    ]) {
+      const draft = { ...values }
+      mutate(draft)
+      const request = costBindingRequest(draft)
+      assert.equal(
+        costBindingAccountPreviewMatchesRequest(previous, request),
+        false
+      )
+      assert.equal(
+        costBindingTestPreviewMatchesRequest(previous, request),
+        false
+      )
+    }
+
+    const groupOnly = { ...values, upstreamGroup: 'enterprise' }
+    const groupRequest = costBindingRequest(groupOnly)
+    assert.equal(
+      costBindingAccountPreviewMatchesRequest(previous, groupRequest),
+      true
+    )
+    assert.equal(
+      costBindingTestPreviewMatchesRequest(previous, groupRequest),
+      false
+    )
+    const sub2apiValues = {
+      ...values,
+      upstreamType: 'sub2api' as const,
+      newApiAccessToken: '',
+      sub2apiEmail: 'owner@example.com',
+      sub2apiPassword: 'password-one',
+      sub2apiToken: 'jwt-one',
+    }
+    const sub2apiPrevious = costBindingRequest(sub2apiValues)
+    const claudeOnly = { ...sub2apiValues, servesClaudeCode: true }
+    const claudeRequest = costBindingRequest(claudeOnly)
+    assert.equal(
+      costBindingAccountPreviewMatchesRequest(sub2apiPrevious, claudeRequest),
+      true
+    )
+    assert.equal(
+      costBindingTestPreviewMatchesRequest(sub2apiPrevious, claudeRequest),
+      false
+    )
+    for (const mutate of [
+      (draft: typeof sub2apiValues) => {
+        draft.sub2apiEmail = 'other@example.com'
+      },
+      (draft: typeof sub2apiValues) => {
+        draft.sub2apiPassword = 'password-two'
+      },
+      (draft: typeof sub2apiValues) => {
+        draft.sub2apiToken = 'jwt-two'
+      },
+      (draft: typeof sub2apiValues) => {
+        draft.clearSub2apiEmail = true
+      },
+      (draft: typeof sub2apiValues) => {
+        draft.clearSub2apiPassword = true
+      },
+      (draft: typeof sub2apiValues) => {
+        draft.clearSub2apiToken = true
+      },
+    ]) {
+      const draft = { ...sub2apiValues }
+      mutate(draft)
+      const request = costBindingRequest(draft)
+      assert.equal(
+        costBindingAccountPreviewMatchesRequest(sub2apiPrevious, request),
+        false
+      )
+      assert.equal(
+        costBindingTestPreviewMatchesRequest(sub2apiPrevious, request),
+        false
+      )
+    }
+  })
+
   test('invalidates deferred save, test, and groups callbacks after subject rotation', async () => {
     const manager = new CostBindingEditorSessionManager()
     const oldSession = manager.activate('binding:42:old')
@@ -80,6 +197,52 @@ describe('cost binding editor concurrency', () => {
 
     assert.deepEqual(applied, [])
     assert.equal(manager.isCurrent(currentSession, 'binding:77:new'), true)
+  })
+
+  test('keeps deferred group loads but drops tests after the target changes', async () => {
+    const values = {
+      ...costBindingFormValues(binding),
+      upstreamType: 'sub2api' as const,
+      upstreamGroup: '44',
+      sub2apiToken: 'jwt-one',
+    }
+    const request = costBindingRequest(values)
+
+    for (const mutate of [
+      (draft: typeof values) => {
+        draft.upstreamGroup = 'subscription-plan'
+      },
+      (draft: typeof values) => {
+        draft.servesClaudeCode = true
+      },
+    ]) {
+      const current = { ...values }
+      mutate(current)
+      const currentRequest = costBindingRequest(current)
+      const groups = deferred<string>()
+      const testResult = deferred<string>()
+      const applied: string[] = []
+      const completions = [
+        groups.promise.then((value) => {
+          if (
+            costBindingAccountPreviewMatchesRequest(request, currentRequest)
+          ) {
+            applied.push(value)
+          }
+        }),
+        testResult.promise.then((value) => {
+          if (costBindingTestPreviewMatchesRequest(request, currentRequest)) {
+            applied.push(value)
+          }
+        }),
+      ]
+
+      groups.resolve('groups')
+      testResult.resolve('test')
+      await Promise.all(completions)
+
+      assert.deepEqual(applied, ['groups'])
+    }
   })
 
   test('keeps dirty draft values and new credentials on top of the latest ETag', () => {
@@ -144,6 +307,10 @@ describe('cost binding editor concurrency', () => {
         'sensitive_query_not_allowed',
         'HTTPS is required. Do not place tokens or passwords in the URL.',
       ],
+      [
+        'query_or_fragment_not_allowed',
+        'Enter a Base URL without query parameters or a fragment.',
+      ],
       ['unsafe_target', 'This target is blocked by the network trust policy.'],
       ['invalid_json', 'Enter a valid value.'],
       ['invalid_type', 'Enter a valid value.'],
@@ -180,6 +347,56 @@ describe('cost binding editor concurrency', () => {
         translate
       ),
       null
+    )
+  })
+
+  test('maps management authentication failures to provider credentials', () => {
+    const translate = (key: string) => `translated:${key}`
+    const failure = {
+      field: 'credentials',
+      reason: 'management_auth_required',
+    }
+
+    assert.deepEqual(
+      costBindingServerFieldError(failure, translate, 'newapi'),
+      {
+        name: 'newApiAccessToken',
+        message:
+          'translated:New API account access requires both an Access Token and user ID. A separate Gateway API Key verifies which models the channel can serve.',
+      }
+    )
+    assert.deepEqual(
+      costBindingServerFieldError(failure, translate, 'sub2api'),
+      {
+        name: 'sub2apiToken',
+        message:
+          'translated:Sub2API account access requires a JWT or both email and password. Gateway API Key is kept separate and does not authorize account balance access.',
+      }
+    )
+    assert.equal(
+      costBindingServerFieldError(
+        { field: 'credentials', reason: 'invalid' },
+        translate,
+        'sub2api'
+      ),
+      null
+    )
+  })
+
+  test('maps serving authentication failures to the gateway key field', () => {
+    const translate = (key: string) => `translated:${key}`
+
+    assert.deepEqual(
+      costBindingServerFieldError(
+        { field: 'gateway_api_key', reason: 'serving_auth_required' },
+        translate,
+        'newapi'
+      ),
+      {
+        name: 'gatewayApiKey',
+        message:
+          'translated:Gateway API Key is required to verify which models the channel can serve.',
+      }
     )
   })
 })

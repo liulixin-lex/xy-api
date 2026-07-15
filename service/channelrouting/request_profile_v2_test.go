@@ -79,6 +79,85 @@ func TestRequestProfileV2CanonicalWhitelistAndV1HashCompatibility(t *testing.T) 
 	assert.Equal(t, firstHash, secondHash)
 }
 
+func TestRequestTrafficClassKeepsLegacyHashAndValidatesNewProfiles(t *testing.T) {
+	legacy, err := NewRequestProfile("/v1/messages", "default", "claude-test", true, 0, 100, 20)
+	require.NoError(t, err)
+	legacyHash, err := legacy.Hash()
+	require.NoError(t, err)
+	legacyJSON, err := common.Marshal(legacy)
+	require.NoError(t, err)
+	assert.NotContains(t, string(legacyJSON), "traffic_class")
+
+	standard := legacy
+	standard.TrafficClass = RequestTrafficClassStandard
+	require.NoError(t, standard.Validate())
+	standardHash, err := standard.Hash()
+	require.NoError(t, err)
+	assert.NotEqual(t, legacyHash, standardHash)
+
+	unknown := legacy
+	unknown.TrafficClass = RequestTrafficClassUnknown
+	require.NoError(t, unknown.Validate())
+	unknownJSON, err := common.Marshal(unknown)
+	require.NoError(t, err)
+	assert.Contains(t, string(unknownJSON), `"traffic_class":"unknown"`)
+
+	invalid := legacy
+	invalid.TrafficClass = "custom"
+	assert.ErrorIs(t, invalid.Validate(), ErrShadowReplayInvalid)
+}
+
+func TestClaudeCodeOnlyTrafficExclusionIsConsistentAcrossSelectors(t *testing.T) {
+	policy, err := normalizeBalancedPoolPolicy(defaultBalancedPoolPolicy(model.RoutingPolicyProfileBalanced))
+	require.NoError(t, err)
+	pool := PoolSnapshot{
+		ID: 1, GroupName: "default", SelectorPolicy: defaultPoolSelectorPolicy(model.RoutingPolicyProfileBalanced),
+		BalancedPolicy: policy,
+	}
+	member := PoolMemberSnapshot{
+		ID: 11, PoolID: 1, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
+		LegacyPriority: 100, LegacyWeight: 100,
+	}
+	observation := ModelSnapshot{ModelName: "claude-test"}
+	restricted := ChannelSnapshot{ID: 101, Status: common.ChannelStatusEnabled, ServesClaudeCode: true}
+	ordinary := ChannelSnapshot{ID: 101, Status: common.ChannelStatusEnabled}
+	shadowSettings := pool.SelectorPolicy.selectorSettings(1_000, 1_000_000, 7, false)
+	balancedSettings := pool.BalancedPolicy.settings(time.Unix(1_000, 0), 7, 0, false)
+
+	for _, test := range []struct {
+		name    string
+		class   RequestTrafficClass
+		channel ChannelSnapshot
+		want    string
+	}{
+		{name: "legacy unknown fails closed", class: RequestTrafficClassLegacy, channel: restricted, want: ExclusionReasonClaudeCodeOnly},
+		{name: "explicit unknown fails closed", class: RequestTrafficClassUnknown, channel: restricted, want: ExclusionReasonClaudeCodeOnly},
+		{name: "standard fails closed", class: RequestTrafficClassStandard, channel: restricted, want: ExclusionReasonClaudeCodeOnly},
+		{name: "Claude Code uses restricted channel", class: RequestTrafficClassClaudeCode, channel: restricted},
+		{name: "Claude Code uses ordinary channel", class: RequestTrafficClassClaudeCode, channel: ordinary},
+		{name: "standard uses ordinary channel", class: RequestTrafficClassStandard, channel: ordinary},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			profile, profileErr := NewRequestProfile("/v1/messages", "default", "claude-test", false, 0, 1, 1)
+			require.NoError(t, profileErr)
+			profile.TrafficClass = test.class
+			require.NoError(t, profile.Validate())
+
+			shadowCandidate, _, candidateErr := shadowCandidateFromSnapshot(
+				pool, member, observation, test.channel, profile, shadowSettings,
+			)
+			require.NoError(t, candidateErr)
+			assert.Equal(t, test.want, shadowCandidate.RequestExclusionReason)
+
+			balancedCandidate, candidateErr := balancedCandidateFromSnapshot(
+				pool, member, observation, test.channel, profile, balancedSettings,
+			)
+			require.NoError(t, candidateErr)
+			assert.Equal(t, test.want, balancedCandidate.HardExclusionReason)
+		})
+	}
+}
+
 func TestRequestProfileV2RejectsNonCanonicalOrUnsafeValues(t *testing.T) {
 	base := RequestProfileV2Input{
 		GroupName:    "default",

@@ -376,7 +376,7 @@ func TestFetchRoutingSub2APICostSnapshotsReloginsOnceAfterManagedJWTRejection(t 
 	setupModelListControllerTestDB(t)
 
 	loginCount := 0
-	usageAuthorizations := make([]string, 0, 3)
+	profileAuthorizations := make([]string, 0, 3)
 	groupAuthorizations := make([]string, 0, 3)
 	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(request *http.Request) (*http.Response, error) {
 		authorization := request.Header.Get("Authorization")
@@ -385,22 +385,22 @@ func TestFetchRoutingSub2APICostSnapshotsReloginsOnceAfterManagedJWTRejection(t 
 			loginCount++
 			token := fmt.Sprintf("jwt-%d", loginCount)
 			return routingSub2APITestJSONResponse(fmt.Sprintf(`{"code":0,"data":{"token":%q,"expires_in":86400}}`, token)), nil
-		case "/v1/usage":
-			usageAuthorizations = append(usageAuthorizations, authorization)
-			return routingSub2APITestJSONResponse(`{"code":0,"data":{}}`), nil
-		case "/api/v1/groups/available":
-			groupAuthorizations = append(groupAuthorizations, authorization)
+		case "/api/v1/auth/me":
+			profileAuthorizations = append(profileAuthorizations, authorization)
 			if authorization == "Bearer jwt-1" {
 				response := routingSub2APITestJSONResponse(`{"code":401,"message":"expired token"}`)
 				response.StatusCode = http.StatusUnauthorized
 				response.Status = "401 Unauthorized"
 				return response, nil
 			}
-			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"id":"vip","rate_multiplier":1}]}`), nil
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"id":1,"balance":1}}`), nil
+		case "/api/v1/groups/available":
+			groupAuthorizations = append(groupAuthorizations, authorization)
+			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"id":10,"name":"vip","platform":"openai","subscription_type":"standard","rate_multiplier":1}]}`), nil
 		case "/api/v1/groups/rates":
-			return routingSub2APITestJSONResponse(`{"code":0,"data":{"vip":1}}`), nil
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"10":1}}`), nil
 		case "/api/v1/channels/available":
-			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"models":["gpt-test"],"input_price":1,"output_price":2}]}`), nil
+			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"name":"primary","platforms":[{"platform":"openai","groups":[{"id":10,"name":"vip","platform":"openai","subscription_type":"standard","rate_multiplier":1}],"supported_models":[{"name":"gpt-test","platform":"openai","pricing":{"billing_mode":"token","input_price":0.000001,"output_price":0.000002,"cache_write_price":0,"cache_read_price":0,"image_output_price":0,"intervals":[]}}]}]}]}`), nil
 		default:
 			return routingSub2APITestJSONResponse(`{"code":404,"message":"not found"}`), nil
 		}
@@ -415,6 +415,7 @@ func TestFetchRoutingSub2APICostSnapshotsReloginsOnceAfterManagedJWTRejection(t 
 	credentials := model.RoutingCredentials{
 		Sub2APIEmail:    "admin@example.com",
 		Sub2APIPassword: "password",
+		GatewayAPIKey:   "supplemental-gateway-key",
 	}
 
 	firstSnapshots, err := fetchRoutingSub2APICostSnapshots(context.Background(), binding, credentials)
@@ -425,8 +426,8 @@ func TestFetchRoutingSub2APICostSnapshotsReloginsOnceAfterManagedJWTRejection(t 
 	require.Len(t, secondSnapshots, 1)
 
 	assert.Equal(t, 2, loginCount)
-	assert.Equal(t, []string{"Bearer jwt-1", "Bearer jwt-2", "Bearer jwt-2"}, usageAuthorizations)
-	assert.Equal(t, []string{"Bearer jwt-1", "Bearer jwt-2", "Bearer jwt-2"}, groupAuthorizations)
+	assert.Equal(t, []string{"Bearer jwt-1", "Bearer jwt-2", "Bearer jwt-2"}, profileAuthorizations)
+	assert.Equal(t, []string{"Bearer jwt-2", "Bearer jwt-2"}, groupAuthorizations)
 }
 
 func TestFetchRoutingSub2APICostSnapshotsDoesNotRetryExplicitToken(t *testing.T) {
@@ -439,8 +440,8 @@ func TestFetchRoutingSub2APICostSnapshotsDoesNotRetryExplicitToken(t *testing.T)
 		case "/api/v1/auth/login":
 			loginCount++
 			return routingSub2APITestJSONResponse(`{"code":0,"data":{"token":"unexpected"}}`), nil
-		case "/v1/usage":
-			return routingSub2APITestJSONResponse(`{"code":0,"data":{}}`), nil
+		case "/api/v1/auth/me":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"id":1}}`), nil
 		case "/api/v1/groups/available":
 			groupCount++
 			response := routingSub2APITestJSONResponse(`{"code":403,"message":"forbidden"}`)
@@ -460,8 +461,48 @@ func TestFetchRoutingSub2APICostSnapshotsDoesNotRetryExplicitToken(t *testing.T)
 	}, model.RoutingCredentials{Sub2APIToken: "configured-token"})
 
 	require.Error(t, err)
-	assert.True(t, routingUpstreamAuthError(err))
+	assert.False(t, routingUpstreamAuthError(err))
 	assert.Zero(t, loginCount)
+	assert.Equal(t, 1, groupCount)
+}
+
+func TestFetchRoutingSub2APICostSnapshotsDoesNotReloginManagedJWTOnCapabilityForbidden(t *testing.T) {
+	setupRoutingSub2APIFencingTest(t)
+
+	loginCount := 0
+	groupCount := 0
+	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/api/v1/auth/login":
+			loginCount++
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"token":"managed-jwt","expires_in":86400}}`), nil
+		case "/api/v1/auth/me":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"id":1}}`), nil
+		case "/api/v1/groups/available":
+			groupCount++
+			response := routingSub2APITestJSONResponse(`{"code":403,"message":"Backend mode is active. User self-service is disabled."}`)
+			response.StatusCode = http.StatusForbidden
+			response.Status = "403 Forbidden"
+			return response, nil
+		default:
+			return routingSub2APITestJSONResponse(`{"code":404,"message":"not found"}`), nil
+		}
+	}))
+
+	_, err := fetchRoutingSub2APICostSnapshots(context.Background(), model.RoutingChannelBinding{
+		ChannelID:     710,
+		UpstreamType:  model.RoutingUpstreamTypeSub2API,
+		BaseURL:       "https://routing.example.com",
+		UpstreamGroup: "vip",
+	}, model.RoutingCredentials{
+		Sub2APIEmail:    "admin@example.com",
+		Sub2APIPassword: "password",
+	})
+
+	require.Error(t, err)
+	assert.False(t, routingUpstreamAuthError(err))
+	assert.Contains(t, err.Error(), "Backend mode")
+	assert.Equal(t, 1, loginCount)
 	assert.Equal(t, 1, groupCount)
 }
 

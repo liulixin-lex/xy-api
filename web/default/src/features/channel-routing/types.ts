@@ -438,6 +438,14 @@ export type RoutingCostBindingPage = {
   page_size: number
 }
 
+export type RoutingCostBindingGroupMetadata = {
+  id: string
+  name: string
+  platform?: string
+  subscription_type?: string
+  claude_code_only: boolean
+}
+
 export type RoutingCostBindingActionResult = {
   channel_id: number
   upstream_type: RoutingCostBindingUpstreamType
@@ -445,6 +453,7 @@ export type RoutingCostBindingActionResult = {
   credential_ready?: boolean
   credential_test?: boolean
   groups: string[]
+  group_meta?: Record<string, RoutingCostBindingGroupMetadata>
   groups_truncated?: boolean
   groups_total?: number
   model_count: number

@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -94,6 +95,33 @@ func TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly(t *testi
 	assert.Equal(t, 1, snapshot.HalfOpenInflight)
 	snapshot = routingbreaker.ReleaseDefaultHalfOpenProbe(breakerKey)
 	assert.Zero(t, snapshot.HalfOpenInflight)
+}
+
+func TestSetupContextForSelectedChannelBlocksTrafficClassBypass(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	routinghotcache.ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
+		{ChannelID: 9301, ServesClaudeCode: true},
+	}, time.Now().Unix())
+	channel := &model.Channel{Id: 9301, Name: "Claude Code only"}
+
+	standard, _ := gin.CreateTestContext(httptest.NewRecorder())
+	standard.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	common.SetContextKey(standard, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+		TrafficClass: channelrouting.RequestTrafficClassStandard,
+	})
+	setupErr := SetupContextForSelectedChannelMetadata(standard, channel, "claude-test")
+	require.NotNil(t, setupErr)
+	assert.Equal(t, http.StatusForbidden, setupErr.StatusCode)
+	assert.Equal(t, types.ErrorCodeAccessDenied, setupErr.GetErrorCode())
+
+	claudeCode, _ := gin.CreateTestContext(httptest.NewRecorder())
+	claudeCode.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	common.SetContextKey(claudeCode, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+		TrafficClass: channelrouting.RequestTrafficClassClaudeCode,
+	})
+	require.Nil(t, SetupContextForSelectedChannelMetadata(claudeCode, channel, "claude-test"))
 }
 
 func TestSetupContextForSelectedChannelResetsSingleKeyMetadata(t *testing.T) {
@@ -476,6 +504,13 @@ func TestMiddlewareCostProfileKeepsHedgeDependencyChecksFailClosed(t *testing.T)
 				profile.RequestInputKnown = false
 			},
 		},
+	}
+	newAPIExtras, err := common.Marshal(map[string]any{
+		"catalog_scope": model.RoutingCostCatalogScopeNewAPIPricing,
+	})
+	require.NoError(t, err)
+	for index := range tests {
+		tests[index].pricing.Extras = newAPIExtras
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

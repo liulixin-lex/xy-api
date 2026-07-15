@@ -102,7 +102,7 @@ export function ChannelRoutingOperationSheet(props: {
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName(
-          'max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-3xl'
+          'channel-routing-touch-surface max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-3xl'
         )}
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
@@ -186,7 +186,7 @@ export function ChannelRoutingOperationSheet(props: {
               {displayStatus === 'partial' ? (
                 <p
                   role='status'
-                  className='rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-200'
+                  className='border-warning/30 bg-warning/10 text-warning-foreground rounded-lg border p-3 text-sm'
                 >
                   {t(
                     'This operation completed with partial results. Review its result and error details.'

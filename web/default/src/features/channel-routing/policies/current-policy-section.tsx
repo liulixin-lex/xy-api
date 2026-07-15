@@ -26,6 +26,7 @@ import { Button } from '@/components/ui/button'
 import {
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
@@ -34,6 +35,7 @@ import type { CurrentRoutingPolicy } from '../types'
 export function ChannelRoutingCurrentPolicySection(props: {
   current: CurrentRoutingPolicy | undefined
   isLoading: boolean
+  isFetching: boolean
   error: Error | null
   canDeploy: boolean
   onRetry: () => void
@@ -69,7 +71,6 @@ export function ChannelRoutingCurrentPolicySection(props: {
               <Button
                 size='sm'
                 variant='destructive'
-                className='text-red-700 dark:text-red-300'
                 onClick={props.onRollback}
               >
                 <RotateCcw aria-hidden='true' />
@@ -81,8 +82,14 @@ export function ChannelRoutingCurrentPolicySection(props: {
       </div>
 
       {props.isLoading ? <ChannelRoutingLoadingState rows={2} /> : null}
-      {props.error ? (
+      {props.error && !props.current ? (
         <ChannelRoutingErrorState error={props.error} onRetry={props.onRetry} />
+      ) : null}
+      {props.error && props.current ? (
+        <ChannelRoutingRefetchErrorAlert
+          isFetching={props.isFetching}
+          onRetry={props.onRetry}
+        />
       ) : null}
       {props.current ? (
         <div className='border-y py-4'>

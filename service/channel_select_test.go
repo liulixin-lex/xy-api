@@ -21,6 +21,7 @@ import (
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
@@ -901,6 +902,125 @@ func TestReleaseAllRoutingHalfOpenProbesReleasesReservedProbe(t *testing.T) {
 	assert.Empty(t, probes)
 }
 
+func TestRoutingHalfOpenRedisLeaseRenewalIsOwnerFenced(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	previousRedisEnabled := common.RedisEnabled
+	previousRedis := common.RDB
+	common.RedisEnabled = true
+	common.RDB = client
+	t.Cleanup(func() {
+		_ = client.Close()
+		common.RDB = previousRedis
+		common.RedisEnabled = previousRedisEnabled
+	})
+
+	const redisKey = "routing:halfopen:test-owner-fence"
+	const firstOwner = "first-owner"
+	const replacementOwner = "replacement-owner"
+	require.NoError(t, client.Set(context.Background(), redisKey, firstOwner, routingHalfOpenRedisLeaseTTL).Err())
+	server.FastForward(20 * time.Second)
+
+	renewed, err := renewRoutingHalfOpenRedisLease(redisKey, firstOwner)
+	require.NoError(t, err)
+	require.True(t, renewed)
+	server.FastForward(20 * time.Second)
+	value, err := server.Get(redisKey)
+	require.NoError(t, err)
+	assert.Equal(t, firstOwner, value)
+
+	server.Set(redisKey, replacementOwner)
+	renewed, err = renewRoutingHalfOpenRedisLease(redisKey, firstOwner)
+	require.NoError(t, err)
+	assert.False(t, renewed)
+	releaseRoutingHalfOpenRedisLease(redisKey, firstOwner)
+	value, err = server.Get(redisKey)
+	require.NoError(t, err)
+	assert.Equal(t, replacementOwner, value)
+}
+
+func TestReleaseRoutingHalfOpenProbeStopsOnlyMatchingLease(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	previousRedisEnabled := common.RedisEnabled
+	previousRedis := common.RDB
+	common.RedisEnabled = true
+	common.RDB = client
+	t.Cleanup(func() {
+		_ = client.Close()
+		common.RDB = previousRedis
+		common.RedisEnabled = previousRedisEnabled
+	})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	memberA := routingbreaker.Key{
+		ChannelID: 501, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model: "model-a", Group: "group-a",
+	}
+	memberB := routingbreaker.Key{
+		ChannelID: 501, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model: "model-b", Group: "group-b",
+	}
+	endpoint := routingbreaker.NewEndpointKey("https://endpoint.example.test", "region-a")
+	keys := map[routingbreaker.Key]string{
+		memberA:  "routing:halfopen:test-member-a",
+		memberB:  "routing:halfopen:test-member-b",
+		endpoint: "routing:halfopen:test-endpoint",
+	}
+	owners := map[routingbreaker.Key]routingHalfOpenProbeOwner{
+		memberA:  {ChannelID: 501, Model: "model-a", Group: "group-a"},
+		memberB:  {ChannelID: 501, Model: "model-b", Group: "group-b"},
+		endpoint: {ChannelID: 502, Model: "model-c", Group: "group-c"},
+	}
+	probes := make(map[routingbreaker.Key]struct{}, len(keys))
+	leases := make(map[routingbreaker.Key]*routingHalfOpenRedisLease, len(keys))
+	for key, redisKey := range keys {
+		owner := "owner-" + redisKey
+		server.Set(redisKey, owner)
+		server.SetTTL(redisKey, routingHalfOpenRedisLeaseTTL)
+		probes[key] = struct{}{}
+		leases[key] = startRoutingHalfOpenRedisLeaseRenewal(ctx, redisKey, owner)
+	}
+	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenProbes, probes)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenProbeOwners, owners)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingHalfOpenLeases, leases)
+	memberALease := leases[memberA]
+	memberBLease := leases[memberB]
+	endpointLease := leases[endpoint]
+
+	ReleaseRoutingHalfOpenProbe(ctx, 501, "model-a", "group-a")
+	assert.False(t, server.Exists(keys[memberA]))
+	assert.True(t, server.Exists(keys[memberB]))
+	assert.True(t, server.Exists(keys[endpoint]))
+	select {
+	case <-memberALease.done:
+	default:
+		require.Fail(t, "matching lease renewal did not stop")
+	}
+	select {
+	case <-memberBLease.done:
+		require.Fail(t, "different model lease was stopped")
+	default:
+	}
+	select {
+	case <-endpointLease.done:
+		require.Fail(t, "different endpoint lease was stopped")
+	default:
+	}
+
+	ReleaseRoutingHalfOpenProbe(ctx, 502, "model-c", "group-c")
+	assert.False(t, server.Exists(keys[endpoint]))
+	assert.True(t, server.Exists(keys[memberB]))
+	ReleaseAllRoutingHalfOpenProbes(ctx)
+	assert.False(t, server.Exists(keys[memberB]))
+	select {
+	case <-memberBLease.done:
+	default:
+		require.Fail(t, "release-all did not stop the remaining renewal")
+	}
+}
+
 func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
@@ -1103,6 +1223,128 @@ func TestRoutingCostForRequestUsesPerRequestPrice(t *testing.T) {
 	require.NotNil(t, cost)
 	assert.True(t, cost.Known)
 	assert.Equal(t, 0.375, cost.Cost)
+}
+
+func TestRoutingCostForRequestPreservesExplicitFreeGroupRatio(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	pricingJSON := `{"quota_type":1,"billing_mode":"per_request","currency":"USD","unit":"request","group_ratio":0,"model_price":0.25,"per_request_cost":0.25,"tiers":{},"extras":{}}`
+	routinghotcache.LoadCostSnapshots([]model.RoutingCostSnapshot{{
+		ChannelID: 999, ModelName: "free-model", SnapshotTS: common.GetTimestamp(),
+		Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0, ModelPrice: 0.25,
+		PricingHash: strings.Repeat("f", 64), PricingJSON: &pricingJSON,
+	}})
+	snapshot, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 999, Model: "free-model"})
+	require.True(t, ok)
+
+	cost := routingCostForRequest(ctx, snapshot)
+
+	require.NotNil(t, cost)
+	assert.True(t, cost.Known)
+	assert.Zero(t, cost.Cost)
+}
+
+func TestRoutingCostForRequestPreservesExplicitZeroCompletionRatio(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPromptProxy, 1_000)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEstimatedOutput, 200)
+	groupRatio := 1.0
+	baseRatio := 2.0
+	completionRatio := 0.0
+	inputCost := 4.0
+	outputCost := 0.0
+
+	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
+		Known:           true,
+		Confidence:      model.RoutingCostConfidenceFull,
+		QuotaType:       0,
+		GroupRatio:      groupRatio,
+		BaseRatio:       baseRatio,
+		CompletionRatio: completionRatio,
+		UpdatedUnix:     common.GetTimestamp(),
+		PricingKnown:    true,
+		Pricing: model.RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD", GroupRatio: &groupRatio,
+			BaseRatio: &baseRatio, CompletionRatio: &completionRatio,
+			InputCostPerMillion: &inputCost, OutputCostPerMillion: &outputCost,
+		},
+	})
+
+	require.NotNil(t, cost)
+	assert.True(t, cost.Known)
+	assert.InDelta(t, 0.004, cost.Cost, 1e-12)
+}
+
+func TestRoutingCostForRequestDoesNotInheritExplicitZeroCachePrice(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	groupRatio := 1.0
+	inputCost := 4.0
+	cacheReadCost := 0.0
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCostProfile, &model.RoutingCostRequestProfile{
+		CacheReadTokens:        1_000,
+		MaxAttempts:            1,
+		KnowledgeSpecified:     true,
+		InputTokensKnown:       true,
+		MaximumCompletionKnown: true,
+		CacheTokensKnown:       true,
+		MediaDimensionsKnown:   true,
+		RequestInputKnown:      true,
+	})
+
+	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
+		Known:        true,
+		Confidence:   model.RoutingCostConfidenceFull,
+		QuotaType:    0,
+		GroupRatio:   groupRatio,
+		BaseRatio:    2,
+		UpdatedUnix:  common.GetTimestamp(),
+		PricingKnown: true,
+		Pricing: model.RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD", GroupRatio: &groupRatio,
+			InputCostPerMillion: &inputCost, CacheReadCostPerMillion: &cacheReadCost,
+		},
+	})
+
+	require.NotNil(t, cost)
+	assert.True(t, cost.Known)
+	assert.Zero(t, cost.Cost)
+}
+
+func TestRoutingCostForRequestFailsClosedForLegacyConnectorPricingWithoutContractMetadata(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingCostProfile, &model.RoutingCostRequestProfile{
+		PromptTokens: 1_000, MaximumPromptTokens: 1_000,
+		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		MediaDimensionsKnown: true, RequestInputKnown: true,
+		RequestPricingFeaturesKnown: true,
+	})
+	groupRatio := 1.0
+	inputCost := 2.0
+	outputCost := 10.0
+	for _, sourceType := range []string{
+		model.RoutingUpstreamTypeNewAPI,
+		model.RoutingUpstreamTypeSub2API,
+	} {
+		t.Run(sourceType, func(t *testing.T) {
+			cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
+				Known: true, Confidence: model.RoutingCostConfidenceFull,
+				UpdatedUnix: common.GetTimestamp(), PricingKnown: true,
+				AccountSourceType: sourceType,
+				Pricing: model.RoutingNormalizedPricing{
+					QuotaType: 0, BillingMode: "token", Currency: "USD",
+					GroupRatio: &groupRatio, InputCostPerMillion: &inputCost,
+					OutputCostPerMillion: &outputCost,
+				},
+			})
+
+			require.NotNil(t, cost)
+			assert.False(t, cost.Known)
+			assert.Zero(t, cost.Cost)
+		})
+	}
 }
 
 func TestMarkRoutingTriedTracksExcludedChannelsAndSwitchCount(t *testing.T) {

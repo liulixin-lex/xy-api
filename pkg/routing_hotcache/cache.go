@@ -3,6 +3,7 @@ package routinghotcache
 import (
 	"math"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/model"
@@ -110,6 +111,21 @@ type BalanceSnapshot struct {
 	UpdatedUnix int64
 }
 
+type ChannelTrafficPolicy struct {
+	ClaudeCodeOnly bool
+}
+
+type channelTrafficPolicyOverride struct {
+	ClaudeCodeOnly bool
+	UpdatedAtUnix  int64
+}
+
+type ChannelTrafficPolicyState struct {
+	Initialized        bool
+	LoadedAtUnix       int64
+	RestrictedChannels int
+}
+
 type Limits struct {
 	MaxMetrics           int
 	MaxCosts             int
@@ -148,6 +164,10 @@ var cache = struct {
 	capacityCooldowns map[Key]CapacityCooldownSnapshot
 	authFailures      map[int]HealthMarker
 	balances          map[int]BalanceSnapshot
+	channelPolicies   map[int]ChannelTrafficPolicy
+	channelOverrides  map[int]channelTrafficPolicyOverride
+	policiesLoadedAt  int64
+	policiesReady     bool
 	limits            Limits
 	evictions         int64
 }{
@@ -158,6 +178,8 @@ var cache = struct {
 	capacityCooldowns: map[Key]CapacityCooldownSnapshot{},
 	authFailures:      map[int]HealthMarker{},
 	balances:          map[int]BalanceSnapshot{},
+	channelPolicies:   map[int]ChannelTrafficPolicy{},
+	channelOverrides:  map[int]channelTrafficPolicyOverride{},
 	limits:            defaultLimits,
 }
 
@@ -233,6 +255,79 @@ func GetBalance(channelID int) (BalanceSnapshot, bool) {
 	defer cache.RUnlock()
 	snapshot, ok := cache.balances[channelID]
 	return snapshot, ok
+}
+
+func GetChannelTrafficPolicy(channelID int) (ChannelTrafficPolicy, bool) {
+	cache.RLock()
+	defer cache.RUnlock()
+	if !cache.policiesReady || channelID <= 0 {
+		return ChannelTrafficPolicy{}, false
+	}
+	return cache.channelPolicies[channelID], true
+}
+
+func ChannelTrafficPoliciesState() ChannelTrafficPolicyState {
+	cache.RLock()
+	defer cache.RUnlock()
+	return ChannelTrafficPolicyState{
+		Initialized:        cache.policiesReady,
+		LoadedAtUnix:       cache.policiesLoadedAt,
+		RestrictedChannels: len(cache.channelPolicies),
+	}
+}
+
+func ReplaceChannelTrafficPolicies(bindings []model.RoutingChannelBinding, loadedAtUnix int64) {
+	policies := make(map[int]ChannelTrafficPolicy)
+	for _, binding := range bindings {
+		if binding.ChannelID > 0 && binding.ServesClaudeCode {
+			policies[binding.ChannelID] = ChannelTrafficPolicy{ClaudeCodeOnly: true}
+		}
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	loadedAtUnix = max(loadedAtUnix, int64(0))
+	if cache.policiesReady && loadedAtUnix < cache.policiesLoadedAt {
+		return
+	}
+	for channelID, override := range cache.channelOverrides {
+		// A database refresh is timestamped before its reads begin. Preserve a
+		// targeted mutation that happened during or after that refresh so an
+		// older snapshot cannot roll the local policy back. A later refresh is
+		// authoritative and retires the temporary override.
+		if override.UpdatedAtUnix >= loadedAtUnix {
+			if override.ClaudeCodeOnly {
+				policies[channelID] = ChannelTrafficPolicy{ClaudeCodeOnly: true}
+			} else {
+				delete(policies, channelID)
+			}
+			continue
+		}
+		delete(cache.channelOverrides, channelID)
+	}
+	cache.channelPolicies = policies
+	cache.policiesLoadedAt = loadedAtUnix
+	cache.policiesReady = true
+}
+
+func SetChannelTrafficPolicy(channelID int, claudeCodeOnly bool, updatedAtUnix int64) {
+	if channelID <= 0 {
+		return
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	cache.channelOverrides[channelID] = channelTrafficPolicyOverride{
+		ClaudeCodeOnly: claudeCodeOnly,
+		UpdatedAtUnix:  max(updatedAtUnix, int64(0)),
+	}
+	if claudeCodeOnly {
+		cache.channelPolicies[channelID] = ChannelTrafficPolicy{ClaudeCodeOnly: true}
+	} else {
+		delete(cache.channelPolicies, channelID)
+	}
+}
+
+func DeleteChannelTrafficPolicy(channelID int, updatedAtUnix int64) {
+	SetChannelTrafficPolicy(channelID, false, updatedAtUnix)
 }
 
 func RuntimeStats() Stats {
@@ -418,6 +513,15 @@ func SetBalance(channelID int, snapshot BalanceSnapshot) {
 	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
 }
 
+func ClearBalance(channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	delete(cache.balances, channelID)
+}
+
 func ClearChannel(channelID int) {
 	if channelID <= 0 {
 		return
@@ -490,6 +594,31 @@ func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
 	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 }
 
+// ReplaceCostSnapshotsForChannel makes one successful upstream sync
+// authoritative for that channel without disturbing its balance or serving
+// reliability state.
+func ReplaceCostSnapshotsForChannel(channelID int, snapshots []model.RoutingCostSnapshot) {
+	if channelID <= 0 {
+		return
+	}
+	cache.Lock()
+	defer cache.Unlock()
+	cache.limits = normalizedLimits(cache.limits)
+	for key := range cache.costs {
+		if key.ChannelID == channelID {
+			delete(cache.costs, key)
+		}
+	}
+	filtered := make([]model.RoutingCostSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.ChannelID == channelID {
+			filtered = append(filtered, snapshot)
+		}
+	}
+	mergeCostSnapshots(cache.costs, filtered, nil)
+	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
+}
+
 type CostConnectorReconcileSnapshot struct {
 	CachedCostKeys        []CostKey
 	RecentCosts           []model.RoutingCostSnapshot
@@ -544,10 +673,35 @@ func mergeCostSnapshots(costs map[CostKey]CostSnapshot, snapshots []model.Routin
 				continue
 			}
 		}
-		pricing, pricingKnown, _ := model.DecodeRoutingCostSnapshotPricing(snapshot)
+		pricing, pricingKnown, pricingErr := model.DecodeRoutingCostSnapshotPricing(snapshot)
+		known := routingSnapshotCostKnown(snapshot, cost)
+		if pricingErr != nil || (strings.TrimSpace(snapshot.PricingHash) != "" && !pricingKnown) {
+			known = false
+		}
+		if pricingKnown {
+			groupRatio := 1.0
+			if pricing.GroupRatio != nil {
+				groupRatio = *pricing.GroupRatio
+			}
+			switch {
+			case pricing.ModelPrice != nil:
+				cost = groupRatio * *pricing.ModelPrice
+			case pricing.PerRequestCost != nil:
+				cost = groupRatio * *pricing.PerRequestCost
+			case pricing.BaseRatio != nil:
+				cost = groupRatio * *pricing.BaseRatio
+			case pricing.InputCostPerMillion != nil:
+				cost = groupRatio * *pricing.InputCostPerMillion
+			}
+			if routingNormalizedPricingHasExplicitCost(pricing) &&
+				snapshot.Confidence != model.RoutingCostConfidenceUnknown &&
+				snapshot.VersionConfidence != model.RoutingCostConfidenceUnknown {
+				known = true
+			}
+		}
 		costs[key] = CostSnapshot{
 			AccountID:           snapshot.AccountID,
-			Known:               routingSnapshotCostKnown(snapshot, cost),
+			Known:               known,
 			Cost:                cost,
 			Confidence:          snapshot.Confidence,
 			QuotaType:           snapshot.QuotaType,
@@ -583,6 +737,33 @@ func mergeCostSnapshots(costs map[CostKey]CostSnapshot, snapshots []model.Routin
 			AccountSyncError:    snapshot.AccountSyncError,
 		}
 	}
+}
+
+func routingNormalizedPricingHasExplicitCost(pricing model.RoutingNormalizedPricing) bool {
+	if pricing.GroupRatio != nil && *pricing.GroupRatio == 0 {
+		return true
+	}
+	for _, value := range []*float64{
+		pricing.BaseRatio,
+		pricing.ModelPrice,
+		pricing.InputCostPerMillion,
+		pricing.OutputCostPerMillion,
+		pricing.CacheReadCostPerMillion,
+		pricing.CacheWriteCostPerMillion,
+		pricing.CacheWrite1hCostPerMillion,
+		pricing.ImageInputCostPerMillion,
+		pricing.ImageOutputCostPerMillion,
+		pricing.ImageCost,
+		pricing.PerImageCost,
+		pricing.AudioInputCostPerMillion,
+		pricing.AudioOutputCostPerMillion,
+		pricing.PerRequestCost,
+	} {
+		if value != nil {
+			return true
+		}
+	}
+	return strings.TrimSpace(pricing.BillingExpression) != ""
 }
 
 func mergeBalanceSnapshots(balances map[int]BalanceSnapshot, snapshots []model.RoutingChannelHealthState, excluded map[int]struct{}) {
@@ -921,6 +1102,10 @@ func ResetForTest() {
 	cache.capacityCooldowns = map[Key]CapacityCooldownSnapshot{}
 	cache.authFailures = map[int]HealthMarker{}
 	cache.balances = map[int]BalanceSnapshot{}
+	cache.channelPolicies = map[int]ChannelTrafficPolicy{}
+	cache.channelOverrides = map[int]channelTrafficPolicyOverride{}
+	cache.policiesLoadedAt = 0
+	cache.policiesReady = false
 	cache.limits = defaultLimits
 	cache.evictions = 0
 }

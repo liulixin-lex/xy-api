@@ -47,6 +47,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -228,18 +229,14 @@ export function ManualBillingReviewsSection(props: {
         ) : null}
 
         {reviewsQuery.isRefetchError && page ? (
-          <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
-            <TriangleAlert
-              className='text-amber-700 dark:text-amber-300'
-              aria-hidden='true'
-            />
-            <AlertTitle>{t('Billing review refresh failed')}</AlertTitle>
-            <AlertDescription>
-              {t(
-                'Showing the last confirmed queue page. Retry before making a decision.'
-              )}
-            </AlertDescription>
-          </Alert>
+          <ChannelRoutingRefetchErrorAlert
+            title={t('Billing review refresh failed')}
+            description={t(
+              'Showing the last confirmed queue page. Retry before making a decision.'
+            )}
+            isFetching={reviewsQuery.isFetching}
+            onRetry={() => void reviewsQuery.refetch()}
+          />
         ) : null}
         {reviewsQuery.isLoading ? (
           <ChannelRoutingLoadingState
@@ -343,6 +340,7 @@ export function ManualBillingReviewsSection(props: {
                         <Button
                           size='icon-sm'
                           variant='ghost'
+                          disabled={reviewsQuery.isRefetchError}
                           aria-label={t('Open billing review #{{id}}', {
                             id: review.reservation_id,
                           })}
@@ -362,7 +360,8 @@ export function ManualBillingReviewsSection(props: {
                 <button
                   key={review.reservation_id}
                   type='button'
-                  className='hover:bg-muted/40 focus-visible:bg-muted/40 flex w-full min-w-0 items-start justify-between gap-3 p-3 text-left focus-visible:outline-none'
+                  className='hover:bg-muted/40 focus-visible:bg-muted/40 flex w-full min-w-0 items-start justify-between gap-3 p-3 text-left focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50'
+                  disabled={reviewsQuery.isRefetchError}
                   aria-label={t('Open billing review #{{id}}', {
                     id: review.reservation_id,
                   })}
@@ -416,14 +415,8 @@ export function ManualBillingReviewsSection(props: {
             </div>
 
             {paginationUnavailable ? (
-              <Alert
-                role='status'
-                className='border-amber-500/30 bg-amber-500/5'
-              >
-                <TriangleAlert
-                  className='text-amber-700 dark:text-amber-300'
-                  aria-hidden='true'
-                />
+              <Alert role='status' className='border-warning/30 bg-warning/5'>
+                <TriangleAlert className='text-warning' aria-hidden='true' />
                 <AlertTitle>
                   {t('Billing review pagination is unavailable')}
                 </AlertTitle>
@@ -438,6 +431,7 @@ export function ManualBillingReviewsSection(props: {
             <ChannelRoutingCursorPagination
               cursor={cursor}
               nextCursor={nextCursor}
+              disabled={reviewsQuery.isRefetchError}
               onCursorChange={props.onCursorChange}
             />
           </>

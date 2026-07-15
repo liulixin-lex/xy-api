@@ -180,6 +180,160 @@ func TestChannelRoutingCostBindingAPIUsesPagingMaskedViewsAndETagCAS(t *testing.
 	assert.NotContains(t, audits[0].SummaryJSON+audits[1].SummaryJSON, "secret")
 }
 
+func TestEnabledChannelRoutingCostBindingsRejectIncompleteProviderCredentials(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 720, Name: "newapi-gateway-only", Key: "serving-720", Status: common.ChannelStatusEnabled},
+		{Id: 721, Name: "sub2api-gateway-only", Key: "serving-721", Status: common.ChannelStatusEnabled},
+		{Id: 722, Name: "provider-switch", Key: "serving-722", Status: common.ChannelStatusEnabled},
+		{Id: 724, Name: "newapi-access-only", Key: "serving-724", Status: common.ChannelStatusEnabled},
+	}).Error)
+
+	tests := []struct {
+		name       string
+		body       string
+		wantField  string
+		wantReason string
+	}{
+		{
+			name:       "newapi gateway key is not access token",
+			body:       `{"channel_id":720,"upstream_type":"newapi","base_url":"https://newapi.example","upstream_group":"default","new_api_user_id":42,"enabled":true,"credentials":{"gateway_api_key":"gateway-only"}}`,
+			wantField:  "new_api_access_token",
+			wantReason: "management_auth_required",
+		},
+		{
+			name:       "newapi access token is not gateway key",
+			body:       `{"channel_id":724,"upstream_type":"newapi","base_url":"https://newapi.example","upstream_group":"default","new_api_user_id":42,"enabled":true,"credentials":{"new_api_access_token":"access-only"}}`,
+			wantField:  "gateway_api_key",
+			wantReason: "serving_auth_required",
+		},
+		{
+			name:       "sub2api gateway key is not JWT",
+			body:       `{"channel_id":721,"upstream_type":"sub2api","base_url":"https://sub2api.example","upstream_group":"default","enabled":true,"credentials":{"gateway_api_key":"gateway-only"}}`,
+			wantField:  "credentials",
+			wantReason: "management_auth_required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest(http.MethodPost, "/api/channel-routing/v2/cost-bindings", strings.NewReader(tt.body))
+			context.Set("id", 10)
+
+			CreateChannelRoutingCostBinding(context)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), `"code":"invalid_cost_binding"`)
+			assert.Contains(t, recorder.Body.String(), `"field":"`+tt.wantField+`"`)
+			assert.Contains(t, recorder.Body.String(), `"reason":"`+tt.wantReason+`"`)
+		})
+	}
+
+	existing := model.RoutingChannelBinding{
+		ChannelID: 722, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://newapi.example", UpstreamGroup: "default", NewAPIUserID: common.GetPointer(42), Enabled: true,
+	}
+	require.NoError(t, existing.SetCredentials(model.RoutingCredentials{NewAPIAccessToken: "access-token"}))
+	require.NoError(t, db.Create(&existing).Error)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "channelId", Value: "722"}}
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/channel-routing/v2/cost-bindings/722", strings.NewReader(
+		`{"upstream_type":"sub2api","base_url":"https://sub2api.example","upstream_group":"default","enabled":true,"credentials":{"gateway_api_key":"gateway-only"}}`,
+	))
+	context.Request.Header.Set("If-Match", channelRoutingCostBindingETag(existing))
+	context.Set("id", 10)
+
+	UpdateChannelRoutingCostBinding(context)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), `"field":"credentials"`)
+	stored, err := model.GetRoutingChannelBindingContext(context.Request.Context(), 722)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoutingUpstreamTypeNewAPI, stored.UpstreamType)
+}
+
+func TestSavedCostBindingTestRejectsMissingBoundGroupBeforeUpstreamRequest(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 723, Name: "missing-bound-group", Key: "serving-723", Status: common.ChannelStatusEnabled,
+	}).Error)
+	binding := model.RoutingChannelBinding{
+		ChannelID: 723, UpstreamType: model.RoutingUpstreamTypeSub2API,
+		BaseURL: "https://sub2api.example", UpstreamGroup: "", Enabled: true,
+	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{Sub2APIToken: "jwt-token"}))
+	require.NoError(t, db.Create(&binding).Error)
+
+	requestCount := 0
+	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(request *http.Request) (*http.Response, error) {
+		requestCount++
+		return routingSub2APITestJSONResponse(`{"code":0,"data":{}}`), nil
+	}))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "channelId", Value: "723"}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel-routing/v2/cost-bindings/723/test", nil)
+
+	TestChannelRoutingCostBinding(context)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), `"field":"upstream_group"`)
+	assert.Contains(t, recorder.Body.String(), `"reason":"required"`)
+	assert.Zero(t, requestCount)
+}
+
+func TestChannelRoutingCostBindingTestReturnsSub2APIGroupMetadata(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 725, Name: "sub2api-test-meta", Key: "serving-725", Status: common.ChannelStatusEnabled,
+	}).Error)
+	setRoutingCryptoSecretForTest(t)
+	binding := model.RoutingChannelBinding{
+		ChannelID: 725, UpstreamType: model.RoutingUpstreamTypeSub2API,
+		BaseURL: "https://sub2api.example", UpstreamGroup: "vip", Enabled: true,
+	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{Sub2APIToken: "jwt-token"}))
+	require.NoError(t, db.Create(&binding).Error)
+	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/api/v1/auth/me":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"id":1,"balance":5}}`), nil
+		case "/api/v1/groups/available":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"id":10,"name":"other","platform":"anthropic","subscription_type":"standard","rate_multiplier":1},{"id":20,"name":"vip","platform":"anthropic","subscription_type":"subscription","rate_multiplier":1}]}`), nil
+		case "/api/v1/groups/rates":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":{"10":"invalid","20":1}}`), nil
+		case "/api/v1/channels/available":
+			return routingSub2APITestJSONResponse(`{"code":0,"data":[{"name":"primary","platforms":[{"platform":"anthropic","groups":[{"id":10,"name":"other","platform":"anthropic","subscription_type":"subscription"},{"id":20,"name":"vip","platform":"anthropic","subscription_type":"subscription","rate_multiplier":1}],"supported_models":[{"name":"claude-test","platform":"anthropic","pricing":{"billing_mode":"token","input_price":0.000002,"output_price":0.000004,"cache_write_price":0,"cache_read_price":0,"image_output_price":0,"intervals":[]}}]}]}]}`), nil
+		default:
+			return routingSub2APITestJSONResponse(`{"code":404,"message":"not found"}`), nil
+		}
+	}))
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "channelId", Value: "725"}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel-routing/v2/cost-bindings/725/test", nil)
+
+	TestChannelRoutingCostBinding(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var response struct {
+		Data struct {
+			GroupMeta map[string]routingSub2APIGroupMetadata `json:"group_meta"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Contains(t, response.Data.GroupMeta, "vip")
+	assert.Equal(t, "20", response.Data.GroupMeta["vip"].ID)
+	assert.Equal(t, "subscription", response.Data.GroupMeta["vip"].SubscriptionType)
+	assert.Equal(t, "anthropic", response.Data.GroupMeta["vip"].Platform)
+}
+
 func TestDeleteChannelRoutingCostBindingPreservesServingStateAndImmutableHistory(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
@@ -407,8 +561,9 @@ func TestChannelRoutingCostBindingUpdateCanReplaceUnreadableCredentials(t *testi
 		"upstream_type":"newapi",
 		"base_url":"https://cost-repair.example",
 		"upstream_group":"default",
+		"new_api_user_id":42,
 		"enabled":true,
-		"credentials":{"gateway_api_key":"replacement-gateway-key"}
+		"credentials":{"new_api_access_token":"replacement-access-token","gateway_api_key":"replacement-gateway-key"}
 	}`)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
@@ -424,5 +579,40 @@ func TestChannelRoutingCostBindingUpdateCanReplaceUnreadableCredentials(t *testi
 	require.NoError(t, err)
 	credentials, err := stored.GetCredentials()
 	require.NoError(t, err)
+	assert.Equal(t, "replacement-access-token", credentials.NewAPIAccessToken)
 	assert.Equal(t, "replacement-gateway-key", credentials.GatewayAPIKey)
+}
+
+func TestChannelRoutingCostBindingCanDisableUnreadableCredentials(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	require.NoError(t, db.AutoMigrate(&model.RoutingCostSnapshot{}, &model.RoutingChannelHealthState{}))
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 703, Name: "cost-disable-broken", Key: "serving-key", Status: common.ChannelStatusEnabled,
+	}).Error)
+	invalidEnvelope := `{"version":2,"key_id":"missing","nonce":"AA==","ciphertext":"AA=="}`
+	binding := model.RoutingChannelBinding{
+		ChannelID: 703, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://cost-disable-broken.example", UpstreamGroup: "default", Enabled: true,
+		KeyVersion: model.RoutingCredentialKeyVersion, EncCredentials: &invalidEnvelope,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/channel-routing/v2/cost-bindings/703", strings.NewReader(
+		`{"upstream_type":"newapi","base_url":"https://cost-disable-broken.example","upstream_group":"default","enabled":false}`,
+	))
+	context.Request.Header.Set("If-Match", channelRoutingCostBindingETag(binding))
+	context.Params = gin.Params{{Key: "channelId", Value: "703"}}
+	context.Set("id", 10)
+
+	UpdateChannelRoutingCostBinding(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	stored, err := model.GetRoutingChannelBindingContext(context.Request.Context(), 703)
+	require.NoError(t, err)
+	assert.False(t, stored.Enabled)
+	require.NotNil(t, stored.EncCredentials)
+	assert.Equal(t, invalidEnvelope, *stored.EncCredentials)
 }

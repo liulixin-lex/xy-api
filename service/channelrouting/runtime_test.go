@@ -457,12 +457,7 @@ func TestRuntimeFinalFlushRetriesPendingTelemetryEnvelope(t *testing.T) {
 
 	deps := defaultRuntimeDeps()
 	runtime := &Runtime{deps: deps, finalDone: make(chan struct{})}
-	runtime.startFinalFlush(context.Background())
-	select {
-	case <-runtime.finalDone:
-	case <-time.After(time.Second):
-		t.Fatal("pending-only final flush did not finish")
-	}
+	waitForRuntimeFinalFlush(t, runtime)
 	runtime.finalMu.Lock()
 	finalErr := runtime.finalErr
 	runtime.finalMu.Unlock()
@@ -491,12 +486,7 @@ func TestRuntimeFinalFlushDrainsMoreThanOneTelemetryBudget(t *testing.T) {
 
 	deps := defaultRuntimeDeps()
 	runtime := &Runtime{deps: deps, finalDone: make(chan struct{})}
-	runtime.startFinalFlush(context.Background())
-	select {
-	case <-runtime.finalDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("multi-budget final flush did not finish")
-	}
+	waitForRuntimeFinalFlush(t, runtime)
 	runtime.finalMu.Lock()
 	finalErr := runtime.finalErr
 	runtime.finalMu.Unlock()
@@ -533,12 +523,7 @@ func TestRuntimeFinalFlushRetriesTransientFailure(t *testing.T) {
 		},
 		finalDone: make(chan struct{}),
 	}
-	runtime.startFinalFlush(context.Background())
-	select {
-	case <-runtime.finalDone:
-	case <-time.After(time.Second):
-		t.Fatal("transient final flush retry did not finish")
-	}
+	waitForRuntimeFinalFlush(t, runtime)
 	runtime.finalMu.Lock()
 	finalErr := runtime.finalErr
 	runtime.finalMu.Unlock()
@@ -602,6 +587,17 @@ func openRuntimeTestDB(t *testing.T) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/runtime.db"), &gorm.Config{})
 	require.NoError(t, err)
 	return db
+}
+
+func waitForRuntimeFinalFlush(t *testing.T, runtime *Runtime) {
+	t.Helper()
+	parent, cancel := context.WithCancel(context.Background())
+	runtime.startFinalFlush(parent)
+	t.Cleanup(func() {
+		cancel()
+		<-runtime.finalDone
+	})
+	<-runtime.finalDone
 }
 
 func TestRuntimeCanceledParentDoesNotStartWorkers(t *testing.T) {

@@ -45,6 +45,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -99,7 +100,6 @@ export function ChannelRoutingOperationsSection(props: {
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.operations(params),
     queryFn: () => listChannelRoutingOperations(params),
-    placeholderData: (previous) => previous,
   })
 
   return (
@@ -214,9 +214,15 @@ export function ChannelRoutingOperationsSection(props: {
       </div>
 
       {query.isLoading ? <ChannelRoutingLoadingState rows={4} /> : null}
-      {query.isError ? (
+      {query.isError && !query.data ? (
         <ChannelRoutingErrorState
           error={query.error}
+          onRetry={() => void query.refetch()}
+        />
+      ) : null}
+      {query.isRefetchError && query.data ? (
+        <ChannelRoutingRefetchErrorAlert
+          isFetching={query.isFetching}
           onRetry={() => void query.refetch()}
         />
       ) : null}
@@ -230,7 +236,7 @@ export function ChannelRoutingOperationsSection(props: {
       {query.data && query.data.items.length > 0 ? (
         <>
           <div className='hidden overflow-hidden rounded-lg border md:block'>
-            <Table>
+            <Table scrollAreaLabel={t('Recent operations')}>
               <TableHeader>
                 <TableRow>
                   <TableHead>{t('Operation')}</TableHead>
@@ -311,6 +317,7 @@ export function ChannelRoutingOperationsSection(props: {
                     <ChannelRoutingIdentityText
                       text={t(channelRoutingOperationTypeLabel(operation.type))}
                       className='text-muted-foreground text-xs'
+                      withinInteractive
                     />
                   </div>
                   <ChannelRoutingStatusBadge
@@ -330,6 +337,7 @@ export function ChannelRoutingOperationsSection(props: {
           <ChannelRoutingCursorPagination
             cursor={props.cursor}
             nextCursor={query.data.next_cursor}
+            disabled={query.isRefetchError}
             onCursorChange={(operationCursor) =>
               props.onSearchChange({ operationCursor })
             }

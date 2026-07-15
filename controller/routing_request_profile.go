@@ -165,6 +165,7 @@ func buildRoutingRequestProfileTemplate(
 		VideoMillis:      channelrouting.NotApplicableRequestQuantity(),
 		Region:           channelrouting.RoutingRegion(),
 		TenantTier:       channelrouting.RequestTenantTierStandard,
+		TrafficClass:     channelrouting.RequestTrafficClassStandard,
 	}
 	if input.GroupName == "" {
 		input.GroupName = "default"
@@ -246,6 +247,7 @@ func buildRoutingRequestProfileTemplate(
 		if !ok {
 			return channelrouting.RequestProfileV2Input{}, errors.New("invalid Claude routing request")
 		}
+		input.TrafficClass = classifyRoutingRequestTraffic(c, relayFormat, claudeRequest)
 		if len(claudeRequest.GetTools()) > 0 || routingJSONPresent(claudeRequest.McpServers) {
 			input.RequiredCapabilities |= channelrouting.RequestCapabilityTools
 		}

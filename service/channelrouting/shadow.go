@@ -107,6 +107,7 @@ type RequestProfile struct {
 	IdempotencyKeyPresent    bool                  `json:"idempotency_key_present,omitempty"`
 	TenantTier               RequestTenantTier     `json:"tenant_tier,omitempty"`
 	CostBudgetNanoUSD        int64                 `json:"cost_budget_nano_usd,omitempty"`
+	TrafficClass             RequestTrafficClass   `json:"traffic_class,omitempty"`
 	costProfile              *model.RoutingCostRequestProfile
 	costAtUnix               int64
 }
@@ -612,7 +613,8 @@ func shadowCandidateFromSnapshot(
 		Priority:     member.LegacyPriority,
 		Weight:       uint(member.LegacyWeight),
 	}
-	if pool.CapabilityRoutingEnabled {
+	candidate.RequestExclusionReason = requestTrafficExclusionReason(profile, channel)
+	if candidate.RequestExclusionReason == "" && pool.CapabilityRoutingEnabled {
 		candidate.RequestExclusionReason = requestCapabilityExclusionReason(profile, observation)
 	}
 	if observation.MetricKnown || observation.Inflight > 0 {
@@ -689,6 +691,7 @@ func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*Sha
 		version := model.RoutingCostSnapshotVersion{
 			PricingHash:      observation.CostPricingHash,
 			PricingVersion:   observation.CostPricingVersion,
+			SourceType:       observation.CostAccountSourceType,
 			ObservedTime:     observation.CostObservedTime,
 			EffectiveTime:    observation.CostEffectiveTime,
 			ExpiresTime:      observation.CostExpiresTime,

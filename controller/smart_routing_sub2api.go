@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,60 +35,178 @@ const (
 	routingSub2APIDefaultMaxJWTEntries = 4_096
 	routingSub2APIDefaultMaxJWTBytes   = 16 << 20
 	routingSub2APIDefaultMaxRetired    = 4_096
+	routingSub2APIMaxPricingIntervals  = 64
 )
 
 type routingSub2APIEnvelope struct {
-	Code    int             `json:"code"`
+	Code    *int            `json:"code"`
 	Success *bool           `json:"success,omitempty"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
 }
 
+// routingSub2APIID matches the numeric int64 IDs in Sub2API's public wire DTOs.
+type routingSub2APIID string
+
+func (id *routingSub2APIID) UnmarshalJSON(data []byte) error {
+	if common.GetJsonType(data) != "number" {
+		return errors.New("invalid sub2api ID")
+	}
+	value := strings.TrimSpace(string(data))
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return errors.New("invalid sub2api ID")
+	}
+	*id = routingSub2APIID(strconv.FormatInt(parsed, 10))
+	return nil
+}
+
 type routingSub2APIGroup struct {
-	ID               string  `json:"id"`
-	Name             string  `json:"name"`
-	Group            string  `json:"group"`
-	RateMultiplier   float64 `json:"rate_multiplier"`
-	Ratio            float64 `json:"ratio"`
-	ClaudeCodeOnly   bool    `json:"claude_code_only"`
-	ServesClaudeCode bool    `json:"serves_claude_code"`
+	ID                           routingSub2APIID `json:"id"`
+	Name                         string           `json:"name"`
+	Description                  string           `json:"description"`
+	Platform                     string           `json:"platform"`
+	SubscriptionType             string           `json:"subscription_type"`
+	RateMultiplier               float64          `json:"rate_multiplier"`
+	Ratio                        float64          `json:"ratio"`
+	IsExclusive                  bool             `json:"is_exclusive"`
+	Status                       string           `json:"status"`
+	DailyLimitUSD                *float64         `json:"daily_limit_usd"`
+	WeeklyLimitUSD               *float64         `json:"weekly_limit_usd"`
+	MonthlyLimitUSD              *float64         `json:"monthly_limit_usd"`
+	AllowImageGeneration         bool             `json:"allow_image_generation"`
+	AllowBatchImageGeneration    bool             `json:"allow_batch_image_generation"`
+	ImageRateIndependent         bool             `json:"image_rate_independent"`
+	ImageRateMultiplier          float64          `json:"image_rate_multiplier"`
+	BatchImageDiscountMultiplier float64          `json:"batch_image_discount_multiplier"`
+	BatchImageHoldMultiplier     float64          `json:"batch_image_hold_multiplier"`
+	VideoRateIndependent         bool             `json:"video_rate_independent"`
+	VideoRateMultiplier          float64          `json:"video_rate_multiplier"`
+	PeakRateEnabled              bool             `json:"peak_rate_enabled"`
+	PeakStart                    string           `json:"peak_start"`
+	PeakEnd                      string           `json:"peak_end"`
+	PeakRateMultiplier           float64          `json:"peak_rate_multiplier"`
+	ImagePrice1K                 *float64         `json:"image_price_1k"`
+	ImagePrice2K                 *float64         `json:"image_price_2k"`
+	ImagePrice4K                 *float64         `json:"image_price_4k"`
+	VideoPrice480P               *float64         `json:"video_price_480p"`
+	VideoPrice720P               *float64         `json:"video_price_720p"`
+	VideoPrice1080P              *float64         `json:"video_price_1080p"`
+	WebSearchPricePerCall        *float64         `json:"web_search_price_per_call"`
+	ClaudeCodeOnly               bool             `json:"claude_code_only"`
+	ServesClaudeCode             bool             `json:"serves_claude_code"`
+	FallbackGroupID              *int64           `json:"fallback_group_id"`
+	FallbackGroupIDOnInvalid     *int64           `json:"fallback_group_id_on_invalid_request"`
+	AllowMessagesDispatch        bool             `json:"allow_messages_dispatch"`
+	RequireOAuthOnly             bool             `json:"require_oauth_only"`
+	RequirePrivacySet            bool             `json:"require_privacy_set"`
+	RPMLimit                     int              `json:"rpm_limit"`
+	contractError                string
+}
+
+type routingSub2APIGroupMetadata struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Platform         string `json:"platform,omitempty"`
+	SubscriptionType string `json:"subscription_type,omitempty"`
+	ClaudeCodeOnly   bool   `json:"claude_code_only"`
+}
+
+type routingSub2APIPricingInterval struct {
+	MinTokens       int      `json:"min_tokens"`
+	MaxTokens       *int     `json:"max_tokens"`
+	TierLabel       string   `json:"tier_label"`
+	InputPrice      *float64 `json:"input_price"`
+	OutputPrice     *float64 `json:"output_price"`
+	CacheWritePrice *float64 `json:"cache_write_price"`
+	CacheReadPrice  *float64 `json:"cache_read_price"`
+	PerRequestPrice *float64 `json:"per_request_price"`
 }
 
 type routingSub2APIChannel struct {
-	Model            string   `json:"model"`
-	ModelName        string   `json:"model_name"`
-	Name             string   `json:"name"`
-	Models           []string `json:"models"`
-	Group            string   `json:"group"`
-	Groups           []string `json:"groups"`
-	ClaudeCodeOnly   bool     `json:"claude_code_only"`
-	ServesClaudeCode bool     `json:"serves_claude_code"`
-	BillingMode      string   `json:"billing_mode"`
+	Model            string                      `json:"model"`
+	ModelName        string                      `json:"model_name"`
+	Name             string                      `json:"name"`
+	Models           []string                    `json:"models"`
+	Platform         string                      `json:"platform"`
+	Group            string                      `json:"group"`
+	Groups           []string                    `json:"groups"`
+	ClaudeCodeOnly   bool                        `json:"claude_code_only"`
+	ServesClaudeCode bool                        `json:"serves_claude_code"`
+	BillingMode      string                      `json:"billing_mode"`
+	PerTokenPrices   bool                        `json:"per_token_prices,omitempty"`
+	OfficialPricing  *routingSub2APIModelPricing `json:"official_pricing,omitempty"`
 
-	InputPrice      float64 `json:"input_price"`
-	OutputPrice     float64 `json:"output_price"`
-	CachePrice      float64 `json:"cache_price"`
-	PerRequestPrice float64 `json:"per_request_price"`
-	ImagePrice      float64 `json:"image_price"`
-	Price           float64 `json:"price"`
-	Rate            float64 `json:"rate"`
-	Ratio           float64 `json:"ratio"`
-	Input           float64 `json:"input"`
-	Output          float64 `json:"output"`
-	Cache           float64 `json:"cache"`
-	PerRequest      float64 `json:"per_request"`
-	Image           float64 `json:"image"`
+	InputPrice       float64                         `json:"input_price"`
+	OutputPrice      float64                         `json:"output_price"`
+	CachePrice       float64                         `json:"cache_price"`
+	CacheWritePrice  float64                         `json:"cache_write_price"`
+	CacheReadPrice   float64                         `json:"cache_read_price"`
+	PerRequestPrice  float64                         `json:"per_request_price"`
+	ImagePrice       float64                         `json:"image_price"`
+	ImageOutputPrice float64                         `json:"image_output_price"`
+	Price            float64                         `json:"price"`
+	Rate             float64                         `json:"rate"`
+	Ratio            float64                         `json:"ratio"`
+	Input            float64                         `json:"input"`
+	Output           float64                         `json:"output"`
+	Cache            float64                         `json:"cache"`
+	PerRequest       float64                         `json:"per_request"`
+	Image            float64                         `json:"image"`
+	Intervals        []routingSub2APIPricingInterval `json:"intervals"`
+}
+
+type routingSub2APIAvailableChannel struct {
+	Name        string                          `json:"name"`
+	Description string                          `json:"description"`
+	Platforms   []routingSub2APIPlatformSection `json:"platforms"`
+}
+
+type routingSub2APIPlatformSection struct {
+	Platform        string                         `json:"platform"`
+	Groups          []routingSub2APIGroup          `json:"groups"`
+	SupportedModels []routingSub2APISupportedModel `json:"supported_models"`
+}
+
+type routingSub2APISupportedModel struct {
+	Name     string                      `json:"name"`
+	Platform string                      `json:"platform"`
+	Pricing  *routingSub2APIModelPricing `json:"pricing"`
+}
+
+type routingSub2APIModelPricing struct {
+	BillingMode      string                          `json:"billing_mode"`
+	InputPrice       *float64                        `json:"input_price"`
+	OutputPrice      *float64                        `json:"output_price"`
+	CacheWritePrice  *float64                        `json:"cache_write_price"`
+	CacheReadPrice   *float64                        `json:"cache_read_price"`
+	ImageOutputPrice *float64                        `json:"image_output_price"`
+	PerRequestPrice  *float64                        `json:"per_request_price"`
+	Intervals        []routingSub2APIPricingInterval `json:"intervals"`
 }
 
 type routingSub2APIAccountPricing struct {
 	Groups           map[string]routingSub2APIGroup
 	Rates            map[string]float64
 	Channels         []routingSub2APIChannel
+	Profile          routingSub2APIUserProfile
 	BalanceKnown     bool
 	Balance          float64
 	BalanceUpdatedAt int64
 	SyncStatus       string
 	SyncError        string
+}
+
+type routingSub2APIUserProfile struct {
+	ID       int64
+	Email    string
+	Username string
+	Balance  *float64
+}
+
+type routingSub2APIProfileObservation struct {
+	Profile    routingSub2APIUserProfile
+	ObservedAt int64
 }
 
 func (pricing routingSub2APIAccountPricing) VersionMaterial() any {
@@ -161,23 +280,32 @@ var routingSub2APILoginCoordinator = struct {
 }
 
 func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) ([]model.RoutingCostSnapshot, error) {
-	pricing, err := fetchRoutingSub2APIAccountPricing(ctx, binding, credentials)
+	pricing, err := fetchRoutingSub2APIAccountPricingForGroups(
+		ctx,
+		binding,
+		credentials,
+		[]string{binding.UpstreamGroup},
+	)
 	if err != nil {
 		return nil, err
 	}
-	if pricing.BalanceKnown {
-		if err := persistRoutingBalance(ctx, binding, pricing.Balance, pricing.BalanceUpdatedAt); err != nil && routingUpstreamAuthError(err) {
-			return nil, err
-		}
-	}
 	groupInfo, groupFound := pricing.Groups[binding.UpstreamGroup]
-	groupRatio := routingSub2APIGroupRatio(groupInfo)
-	if groupRatio <= 0 {
-		groupRatio = 1
+	if !groupFound {
+		return nil, errors.New("sub2api bound group is not available to the account")
 	}
-	if ratio, ok := pricing.Rates[binding.UpstreamGroup]; ok && ratio > 0 {
+	if groupFound && groupInfo.PeakRateEnabled {
+		return nil, errors.New("sub2api peak group pricing requires unavailable server timezone context")
+	}
+	groupRatio := routingSub2APIGroupRatio(groupInfo)
+	if ratio, ok := routingSub2APIResolvedGroupRate(pricing.Groups, pricing.Rates, binding.UpstreamGroup); ok {
+		if !routingCostNonNegativeFinite(ratio) || ratio <= 0 {
+			return nil, errors.New("sub2api returned an invalid group ratio")
+		}
 		groupRatio = ratio
 		groupFound = true
+	}
+	if !routingCostNonNegativeFinite(groupRatio) || groupRatio <= 0 {
+		return nil, errors.New("sub2api returned an invalid group ratio")
 	}
 
 	now := common.GetTimestamp()
@@ -194,75 +322,314 @@ func fetchRoutingSub2APICostSnapshots(ctx context.Context, binding model.Routing
 			if localName, ok := modelNameMap[modelName]; ok {
 				modelName = localName
 			}
-			snapshot := routingSub2APIChannelSnapshot(binding.ChannelID, modelName, groupRatio, groupFound, channel, now)
+			snapshot, snapshotErr := routingSub2APIChannelSnapshot(binding.ChannelID, modelName, groupRatio, groupFound, channel, now)
+			if snapshotErr != nil {
+				return nil, fmt.Errorf("invalid sub2api price for model %s: %w", modelName, snapshotErr)
+			}
 			snapshots = append(snapshots, snapshot)
 		}
+	}
+	if len(snapshots) == 0 {
+		return nil, errors.New("sub2api returned no pricing for the bound group")
 	}
 	return snapshots, nil
 }
 
 func fetchRoutingSub2APIAccountPricing(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (routingSub2APIAccountPricing, error) {
+	return fetchRoutingSub2APIAccountPricingForGroups(ctx, binding, credentials, nil)
+}
+
+func fetchRoutingSub2APIAccountPricingForGroups(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	requestedGroups []string,
+) (routingSub2APIAccountPricing, error) {
+	return fetchRoutingSub2APIAccountPricingForGroupsWithProfile(
+		ctx,
+		binding,
+		credentials,
+		nil,
+		requestedGroups,
+	)
+}
+
+func fetchRoutingSub2APIAccountPricingForGroupsWithProfile(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	preloadedProfile *routingSub2APIProfileObservation,
+	requestedGroups []string,
+) (routingSub2APIAccountPricing, error) {
+	usePreloadedProfile := preloadedProfile != nil
+	return fetchRoutingSub2APIWithJWTRetry(
+		ctx,
+		binding,
+		credentials,
+		func(
+			ctx context.Context,
+			binding model.RoutingChannelBinding,
+			credentials model.RoutingCredentials,
+			jwt string,
+		) (routingSub2APIAccountPricing, bool, error) {
+			profile := preloadedProfile
+			if !usePreloadedProfile {
+				profile = nil
+			}
+			usePreloadedProfile = false
+			return fetchRoutingSub2APIAccountPricingWithJWTAndProfile(
+				ctx,
+				binding,
+				credentials,
+				jwt,
+				profile,
+				requestedGroups,
+			)
+		},
+	)
+}
+
+func fetchRoutingSub2APIGroupDiscoveryPayload(ctx context.Context, binding model.RoutingChannelBinding) (_ routingPricingResponse, err error) {
+	credentials, err := binding.GetCredentials()
+	if err != nil {
+		return routingPricingResponse{}, routingSafeErrorWithCredentials(err, model.RoutingCredentials{})
+	}
+	defer func() {
+		if err != nil {
+			err = routingSafeErrorWithCredentials(err, credentials)
+		}
+	}()
+
+	groups, err := fetchRoutingSub2APIAccountGroups(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	uniqueGroups := make(map[string]routingSub2APIGroup)
+	for _, group := range groups {
+		identity := strings.TrimSpace(string(group.ID))
+		if identity != "" {
+			uniqueGroups[identity] = group
+		}
+	}
+	groupIDs := make([]string, 0, len(uniqueGroups))
+	for groupID := range uniqueGroups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	sort.Strings(groupIDs)
+	usableGroup := make(map[string]string, len(groupIDs))
+	groupMeta := make(map[string]routingSub2APIGroupMetadata, len(groupIDs))
+	for _, groupID := range groupIDs {
+		group := uniqueGroups[groupID]
+		groupName := strings.TrimSpace(group.Name)
+		if groupName == "" {
+			groupName = groupID
+		}
+		usableGroup[groupName] = groupID
+		groupMeta[groupName] = routingSub2APIGroupMetadata{
+			ID:               groupID,
+			Name:             groupName,
+			Platform:         strings.TrimSpace(group.Platform),
+			SubscriptionType: strings.ToLower(strings.TrimSpace(group.SubscriptionType)),
+			ClaudeCodeOnly:   group.ClaudeCodeOnly,
+		}
+	}
+	return routingPricingResponse{
+		Success: true, UsableGroup: usableGroup, Sub2APIGroupMeta: groupMeta,
+	}, nil
+}
+
+func fetchRoutingSub2APIAccountGroups(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (map[string]routingSub2APIGroup, error) {
+	return fetchRoutingSub2APIWithJWTRetry(ctx, binding, credentials, fetchRoutingSub2APIAccountGroupsWithJWT)
+}
+
+func fetchRoutingSub2APIAccountProfile(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) (routingSub2APIUserProfile, error) {
+	return fetchRoutingSub2APIWithJWTRetry(ctx, binding, credentials, fetchRoutingSub2APIAccountProfileWithJWT)
+}
+
+func fetchRoutingSub2APIWithJWTRetry[T any](
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	fetch func(context.Context, model.RoutingChannelBinding, model.RoutingCredentials, string) (T, bool, error),
+) (T, error) {
+	var zero T
 	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
 	if err != nil {
-		return routingSub2APIAccountPricing{}, err
+		return zero, err
 	}
 	managedJWT := strings.TrimSpace(credentials.Sub2APIToken) == ""
 	authKey := newRoutingSub2APIAuthKey(binding, credentials)
 	for attempt := 0; attempt < 2; attempt++ {
 		jwt, err := routingSub2APIJWT(ctx, binding, credentials)
 		if err != nil {
-			return routingSub2APIAccountPricing{}, err
+			return zero, err
 		}
-		pricing, managedJWTRejected, err := fetchRoutingSub2APIAccountPricingWithJWT(ctx, binding, credentials, jwt)
+		result, managedJWTRejected, err := fetch(ctx, binding, credentials, jwt)
 		if err == nil {
-			return pricing, nil
+			return result, nil
 		}
 		if !managedJWT || !managedJWTRejected || attempt > 0 {
-			return routingSub2APIAccountPricing{}, err
+			return zero, err
 		}
 		evictRoutingSub2APIJWT(ctx, authKey, jwt)
 	}
-	return routingSub2APIAccountPricing{}, errors.New("sub2api fetch retry exhausted")
+	return zero, errors.New("sub2api fetch retry exhausted")
 }
 
-func fetchRoutingSub2APIAccountPricingWithJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) (routingSub2APIAccountPricing, bool, error) {
-	balance, balanceKnown, balanceErr := fetchRoutingSub2APIBalanceValue(ctx, binding, credentials, jwt)
-	if balanceErr != nil && routingUpstreamAuthError(balanceErr) {
-		return routingSub2APIAccountPricing{}, strings.TrimSpace(credentials.GatewayAPIKey) == "", balanceErr
+func fetchRoutingSub2APIAccountGroupsWithJWT(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) (map[string]routingSub2APIGroup, bool, error) {
+	if _, err := fetchRoutingSub2APIUserProfile(ctx, binding, credentials, jwt); err != nil {
+		return nil, routingUpstreamAuthError(err), err
+	}
+	groupsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/available", jwt, nil)
+	if err != nil {
+		return nil, routingUpstreamAuthError(err), err
+	}
+	groups, err := parseRoutingSub2APIGroups(groupsRaw)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(groups) == 0 {
+		return nil, false, errors.New("sub2api returned no available groups")
+	}
+	if err := validateRoutingSub2APIGroupContract(groups); err != nil {
+		return nil, false, err
+	}
+	return groups, false, nil
+}
+
+func fetchRoutingSub2APIAccountProfileWithJWT(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	jwt string,
+) (routingSub2APIUserProfile, bool, error) {
+	profile, err := fetchRoutingSub2APIUserProfile(ctx, binding, credentials, jwt)
+	if err != nil {
+		return routingSub2APIUserProfile{}, routingUpstreamAuthError(err), err
+	}
+	return profile, false, nil
+}
+
+func fetchRoutingSub2APIAccountPricingWithJWT(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	jwt string,
+	requestedGroups []string,
+) (routingSub2APIAccountPricing, bool, error) {
+	return fetchRoutingSub2APIAccountPricingWithJWTAndProfile(
+		ctx,
+		binding,
+		credentials,
+		jwt,
+		nil,
+		requestedGroups,
+	)
+}
+
+func fetchRoutingSub2APIAccountPricingWithJWTAndProfile(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	jwt string,
+	preloadedProfile *routingSub2APIProfileObservation,
+	requestedGroups []string,
+) (routingSub2APIAccountPricing, bool, error) {
+	profile := routingSub2APIUserProfile{}
+	profileObservedAt := int64(0)
+	if preloadedProfile != nil && preloadedProfile.ObservedAt > 0 {
+		profile = preloadedProfile.Profile
+		profileObservedAt = preloadedProfile.ObservedAt
+	} else {
+		var profileErr error
+		profile, profileErr = fetchRoutingSub2APIUserProfile(ctx, binding, credentials, jwt)
+		if profileErr != nil {
+			return routingSub2APIAccountPricing{}, routingUpstreamAuthError(profileErr), profileErr
+		}
+		profileObservedAt = common.GetTimestamp()
+	}
+	balance := 0.0
+	balanceKnown := profile.Balance != nil
+	if balanceKnown {
+		balance = *profile.Balance
 	}
 
 	groupsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/available", jwt, nil)
 	if err != nil {
 		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
 	}
-	groups := parseRoutingSub2APIGroups(groupsRaw)
+	groups, err := parseRoutingSub2APIGroups(groupsRaw)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
+	if len(groups) == 0 {
+		return routingSub2APIAccountPricing{}, false, errors.New("sub2api returned no available groups")
+	}
+	if len(requestedGroups) > 0 {
+		groups, err = selectRoutingSub2APIGroups(groups, requestedGroups)
+		if err != nil {
+			return routingSub2APIAccountPricing{}, false, err
+		}
+	} else if err := validateRoutingSub2APIGroupContract(groups); err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
 
 	ratesRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/groups/rates", jwt, nil)
 	if err != nil {
 		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
 	}
-	rates := parseRoutingSub2APIRates(ratesRaw)
+	var rates map[string]float64
+	if len(requestedGroups) > 0 {
+		rates, err = parseRoutingSub2APIRatesForGroups(ratesRaw, groups)
+	} else {
+		rates, err = parseRoutingSub2APIRates(ratesRaw)
+	}
+	if err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
 
 	channelsRaw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/channels/available", jwt, nil)
 	if err != nil {
 		return routingSub2APIAccountPricing{}, routingUpstreamAuthError(err), err
 	}
-	channels := parseRoutingSub2APIChannels(channelsRaw)
+	availableChannels, err := parseRoutingSub2APIAvailableChannels(channelsRaw)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
+	if len(requestedGroups) > 0 {
+		availableChannels, err = selectRoutingSub2APIAvailableChannels(groups, availableChannels)
+	} else {
+		err = validateRoutingSub2APIAvailableChannelGroups(groups, availableChannels)
+	}
+	if err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
+	channels, err := routingSub2APIChannelsFromAvailable(availableChannels)
+	if err != nil {
+		return routingSub2APIAccountPricing{}, false, err
+	}
+	if len(channels) == 0 {
+		if len(requestedGroups) > 0 {
+			return routingSub2APIAccountPricing{}, false, errors.New("sub2api returned no pricing for the bound group")
+		}
+		return routingSub2APIAccountPricing{}, false, errors.New("sub2api available channels returned no usable model pricing")
+	}
 	pricing := routingSub2APIAccountPricing{
 		Groups:           groups,
 		Rates:            rates,
 		Channels:         channels,
+		Profile:          profile,
 		BalanceKnown:     balanceKnown,
 		Balance:          balance,
-		BalanceUpdatedAt: common.GetTimestamp(),
+		BalanceUpdatedAt: profileObservedAt,
 		SyncStatus:       model.RoutingUpstreamSyncStatusSuccess,
 	}
 	if !balanceKnown {
 		pricing.BalanceUpdatedAt = 0
-	}
-	if balanceErr != nil {
-		pricing.SyncStatus = model.RoutingUpstreamSyncStatusPartial
-		pricing.SyncError = common.SanitizeErrorMessage(balanceErr.Error(), routingCredentialSecrets(credentials)...)
 	}
 	return pricing, false, nil
 }
@@ -489,7 +856,21 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 		return nil, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+	if response.StatusCode == http.StatusUnauthorized {
+		return nil, routingAuthErrorf("sub2api endpoint %s returned %s", path, response.Status)
+	}
+	if response.StatusCode == http.StatusForbidden {
+		if routingSub2APIJWTManagementEndpoint(path) {
+			bodyBytes, readErr := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+			if readErr == nil {
+				var envelope routingSub2APIEnvelope
+				if common.Unmarshal(bodyBytes, &envelope) == nil && strings.TrimSpace(envelope.Message) != "" {
+					message := routingCleanCredentialErrorMessage(envelope.Message, credentials, bearer)
+					return nil, fmt.Errorf("sub2api management capability unavailable: %s", message)
+				}
+			}
+			return nil, fmt.Errorf("sub2api management capability unavailable: endpoint %s returned %s", path, response.Status)
+		}
 		return nil, routingAuthErrorf("sub2api endpoint %s returned %s", path, response.Status)
 	}
 	if response.StatusCode != http.StatusOK {
@@ -504,12 +885,15 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 	if err = common.Unmarshal(bodyBytes, &envelope); err != nil {
 		return nil, errors.New("invalid sub2api response")
 	}
-	if (envelope.Success != nil && !*envelope.Success) || envelope.Code != 0 {
+	if envelope.Code == nil {
+		return nil, errors.New("invalid sub2api response")
+	}
+	if (envelope.Success != nil && !*envelope.Success) || *envelope.Code != 0 {
 		message := envelope.Message
 		if strings.TrimSpace(message) == "" {
 			message = "sub2api endpoint returned code != 0"
 		}
-		authFailure := routingSub2APIEnvelopeAuthFailure(envelope)
+		authFailure := routingSub2APIEnvelopeAuthFailure(path, envelope)
 		message = routingCleanCredentialErrorMessage(message, credentials, bearer)
 		if authFailure {
 			return nil, routingAuthErrorf("%s", message)
@@ -519,9 +903,12 @@ func routingSub2APIRequest(ctx context.Context, binding model.RoutingChannelBind
 	return envelope.Data, nil
 }
 
-func routingSub2APIEnvelopeAuthFailure(envelope routingSub2APIEnvelope) bool {
-	if envelope.Code == http.StatusUnauthorized || envelope.Code == http.StatusForbidden {
+func routingSub2APIEnvelopeAuthFailure(path string, envelope routingSub2APIEnvelope) bool {
+	if envelope.Code != nil && *envelope.Code == http.StatusUnauthorized {
 		return true
+	}
+	if envelope.Code != nil && *envelope.Code == http.StatusForbidden {
+		return !routingSub2APIJWTManagementEndpoint(path)
 	}
 	normalized := strings.ToLower(strings.TrimSpace(envelope.Message))
 	if normalized == "" {
@@ -557,6 +944,18 @@ func routingSub2APIEnvelopeAuthFailure(envelope routingSub2APIEnvelope) bool {
 	return false
 }
 
+func routingSub2APIJWTManagementEndpoint(path string) bool {
+	switch path {
+	case "/api/v1/auth/me",
+		"/api/v1/groups/available",
+		"/api/v1/groups/rates",
+		"/api/v1/channels/available":
+		return true
+	default:
+		return false
+	}
+}
+
 func fetchRoutingSub2APIBalance(ctx context.Context, binding model.RoutingChannelBinding, credentials model.RoutingCredentials, jwt string) error {
 	balance, known, err := fetchRoutingSub2APIBalanceValue(ctx, binding, credentials, jwt)
 	if err != nil || !known {
@@ -571,161 +970,671 @@ func fetchRoutingSub2APIBalanceValue(
 	credentials model.RoutingCredentials,
 	jwt string,
 ) (float64, bool, error) {
-	token := strings.TrimSpace(credentials.GatewayAPIKey)
-	if token == "" {
-		token = strings.TrimSpace(jwt)
-	}
-	if token == "" {
+	jwt = strings.TrimSpace(jwt)
+	if jwt == "" {
 		return 0, false, nil
 	}
-	raw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/v1/usage", token, nil)
+	profile, err := fetchRoutingSub2APIUserProfile(ctx, binding, credentials, jwt)
 	if err != nil {
 		return 0, false, err
 	}
-	if balance, ok := parseRoutingSub2APIBalance(raw); ok {
-		return balance, true, nil
+	if profile.Balance != nil {
+		return *profile.Balance, true, nil
 	}
 	return 0, false, nil
 }
 
+func fetchRoutingSub2APIUserProfile(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	jwt string,
+) (routingSub2APIUserProfile, error) {
+	jwt = strings.TrimSpace(jwt)
+	if jwt == "" {
+		return routingSub2APIUserProfile{}, errors.New("sub2api JWT is required for account profile")
+	}
+	raw, err := routingSub2APIRequest(ctx, binding, credentials, http.MethodGet, "/api/v1/auth/me", jwt, nil)
+	if err != nil {
+		return routingSub2APIUserProfile{}, err
+	}
+	return parseRoutingSub2APIUserProfile(raw)
+}
+
+func parseRoutingSub2APIUserProfile(raw json.RawMessage) (routingSub2APIUserProfile, error) {
+	if len(raw) == 0 || common.GetJsonType(raw) != "object" {
+		return routingSub2APIUserProfile{}, errors.New("sub2api returned an invalid account profile")
+	}
+	var profile struct {
+		ID       routingSub2APIID `json:"id"`
+		Email    string           `json:"email"`
+		Username string           `json:"username"`
+		Balance  *float64         `json:"balance"`
+	}
+	if err := common.Unmarshal(raw, &profile); err != nil ||
+		(profile.Balance != nil && (math.IsNaN(*profile.Balance) || math.IsInf(*profile.Balance, 0))) {
+		return routingSub2APIUserProfile{}, errors.New("sub2api returned an invalid account profile")
+	}
+	userID, err := strconv.ParseInt(strings.TrimSpace(string(profile.ID)), 10, 64)
+	if err != nil || userID <= 0 {
+		return routingSub2APIUserProfile{}, errors.New("sub2api account profile is missing a valid user ID")
+	}
+	return routingSub2APIUserProfile{
+		ID:       userID,
+		Email:    strings.TrimSpace(profile.Email),
+		Username: strings.TrimSpace(profile.Username),
+		Balance:  profile.Balance,
+	}, nil
+}
+
 func parseRoutingSub2APIBalance(raw json.RawMessage) (float64, bool) {
-	if len(raw) == 0 {
-		return 0, false
-	}
-	var data map[string]float64
-	if err := common.Unmarshal(raw, &data); err == nil {
-		for _, key := range []string{"balance", "remaining", "remaining_balance", "available_balance"} {
-			if value, ok := data[key]; ok && !math.IsNaN(value) && !math.IsInf(value, 0) {
-				return value, true
-			}
-		}
-		quota, hasQuota := data["quota"]
-		usedQuota, hasUsedQuota := data["used_quota"]
-		if hasQuota && hasUsedQuota {
-			return (quota - usedQuota) / common.QuotaPerUnit, true
-		}
-	}
-	var wrapper struct {
-		Usage map[string]float64 `json:"usage"`
-	}
-	if err := common.Unmarshal(raw, &wrapper); err == nil && wrapper.Usage != nil {
-		data, encodedErr := common.Marshal(wrapper.Usage)
-		if encodedErr == nil {
-			return parseRoutingSub2APIBalance(data)
-		}
+	profile, err := parseRoutingSub2APIUserProfile(raw)
+	if err == nil && profile.Balance != nil {
+		return *profile.Balance, true
 	}
 	return 0, false
 }
 
-func parseRoutingSub2APIGroups(raw json.RawMessage) map[string]routingSub2APIGroup {
-	groups := map[string]routingSub2APIGroup{}
-	parseRoutingSub2APIGroupArray(raw, groups)
-	if len(groups) > 0 {
-		return groups
-	}
-
-	var wrapper struct {
-		Groups json.RawMessage `json:"groups"`
-		Items  json.RawMessage `json:"items"`
-		List   json.RawMessage `json:"list"`
-	}
-	if err := common.Unmarshal(raw, &wrapper); err == nil {
-		for _, nested := range []json.RawMessage{wrapper.Groups, wrapper.Items, wrapper.List} {
-			parseRoutingSub2APIGroupArray(nested, groups)
-			if len(groups) > 0 {
-				return groups
-			}
-		}
-	}
-
-	var ratios map[string]float64
-	if err := common.Unmarshal(raw, &ratios); err == nil {
-		for group, ratio := range ratios {
-			groups[group] = routingSub2APIGroup{ID: group, RateMultiplier: ratio}
-		}
-	}
-	return groups
-}
-
-func parseRoutingSub2APIGroupArray(raw json.RawMessage, groups map[string]routingSub2APIGroup) {
-	if len(raw) == 0 {
-		return
+func parseRoutingSub2APIGroups(raw json.RawMessage) (map[string]routingSub2APIGroup, error) {
+	if len(raw) == 0 || common.GetJsonType(raw) != "array" {
+		return nil, errors.New("invalid sub2api groups response")
 	}
 	var items []routingSub2APIGroup
 	if err := common.Unmarshal(raw, &items); err != nil {
-		return
+		return nil, errors.New("invalid sub2api groups response")
 	}
+	canonical := make(map[string]routingSub2APIGroup, len(items))
+	conflictedIDs := make(map[string]struct{})
 	for _, item := range items {
-		key := routingSub2APIGroupName(item)
-		if key == "" {
+		groupID := strings.TrimSpace(string(item.ID))
+		if groupID == "" {
+			return nil, errors.New("sub2api group is missing a valid ID")
+		}
+		if existing, exists := canonical[groupID]; exists {
+			if !routingSub2APIGroupMetadataEqual(existing, item) {
+				conflictedIDs[groupID] = struct{}{}
+			}
+		} else {
+			canonical[groupID] = item
+		}
+	}
+	groups := make(map[string]routingSub2APIGroup, len(items)*2)
+	nameOwners := make(map[string]map[string]struct{}, len(canonical))
+	for groupID, group := range canonical {
+		if _, conflicted := conflictedIDs[groupID]; conflicted {
+			group.contractError = "sub2api group metadata is inconsistent"
+		}
+		canonical[groupID] = group
+		groups[groupID] = group
+		groupName := strings.TrimSpace(group.Name)
+		if groupName != "" {
+			if nameOwners[groupName] == nil {
+				nameOwners[groupName] = make(map[string]struct{}, 1)
+			}
+			nameOwners[groupName][groupID] = struct{}{}
+		}
+	}
+	for groupName, owners := range nameOwners {
+		if len(owners) != 1 {
 			continue
 		}
-		groups[key] = item
+		ownerID := ""
+		for groupID := range owners {
+			ownerID = groupID
+		}
+		if canonicalGroup, exists := canonical[groupName]; exists &&
+			strings.TrimSpace(string(canonicalGroup.ID)) != ownerID {
+			continue
+		}
+		groups[groupName] = canonical[ownerID]
 	}
+	return groups, nil
 }
 
-func parseRoutingSub2APIRates(raw json.RawMessage) map[string]float64 {
-	rates := map[string]float64{}
-	if len(raw) == 0 {
-		return rates
-	}
-	if err := common.Unmarshal(raw, &rates); err == nil && len(rates) > 0 {
-		return rates
-	}
-	var wrapper struct {
-		Rates  json.RawMessage `json:"rates"`
-		Groups json.RawMessage `json:"groups"`
-	}
-	if err := common.Unmarshal(raw, &wrapper); err == nil {
-		for _, nested := range []json.RawMessage{wrapper.Rates, wrapper.Groups} {
-			if err = common.Unmarshal(nested, &rates); err == nil && len(rates) > 0 {
-				return rates
-			}
-		}
-	}
-	var items []routingSub2APIGroup
-	if err := common.Unmarshal(raw, &items); err == nil {
-		for _, item := range items {
-			key := routingSub2APIGroupName(item)
-			if key != "" {
-				rates[key] = routingSub2APIGroupRatio(item)
-			}
-		}
-	}
-	return rates
+func routingSub2APIGroupMetadataEqual(left routingSub2APIGroup, right routingSub2APIGroup) bool {
+	left.ID = routingSub2APIID(strings.TrimSpace(string(left.ID)))
+	right.ID = routingSub2APIID(strings.TrimSpace(string(right.ID)))
+	left.Name = strings.TrimSpace(left.Name)
+	right.Name = strings.TrimSpace(right.Name)
+	left.Platform = strings.ToLower(strings.TrimSpace(left.Platform))
+	right.Platform = strings.ToLower(strings.TrimSpace(right.Platform))
+	left.SubscriptionType = strings.ToLower(strings.TrimSpace(left.SubscriptionType))
+	right.SubscriptionType = strings.ToLower(strings.TrimSpace(right.SubscriptionType))
+	left.PeakStart = strings.TrimSpace(left.PeakStart)
+	right.PeakStart = strings.TrimSpace(right.PeakStart)
+	left.PeakEnd = strings.TrimSpace(left.PeakEnd)
+	right.PeakEnd = strings.TrimSpace(right.PeakEnd)
+	return reflect.DeepEqual(left, right)
 }
 
-func parseRoutingSub2APIChannels(raw json.RawMessage) []routingSub2APIChannel {
-	if len(raw) == 0 {
-		return nil
+func validateRoutingSub2APIGroupContract(groups map[string]routingSub2APIGroup) error {
+	canonical := make(map[string]routingSub2APIGroup)
+	for _, group := range groups {
+		groupID := strings.TrimSpace(string(group.ID))
+		if err := validateRoutingSub2APIGroupMetadata(group); err != nil {
+			return err
+		}
+		name := strings.TrimSpace(group.Name)
+		platform := strings.TrimSpace(group.Platform)
+		subscriptionType := strings.ToLower(strings.TrimSpace(group.SubscriptionType))
+		if existing, exists := canonical[groupID]; exists {
+			if strings.TrimSpace(existing.Name) != name ||
+				!strings.EqualFold(strings.TrimSpace(existing.Platform), platform) ||
+				!strings.EqualFold(strings.TrimSpace(existing.SubscriptionType), subscriptionType) {
+				return errors.New("sub2api group metadata is inconsistent")
+			}
+			continue
+		}
+		group.Name = name
+		group.Platform = platform
+		group.SubscriptionType = subscriptionType
+		canonical[groupID] = group
 	}
-	var channels []routingSub2APIChannel
-	if err := common.Unmarshal(raw, &channels); err == nil {
-		return channels
+	if len(canonical) == 0 {
+		return errors.New("sub2api returned no canonical group metadata")
 	}
-	var wrapper struct {
-		Channels json.RawMessage `json:"channels"`
-		Models   json.RawMessage `json:"models"`
-		Items    json.RawMessage `json:"items"`
-		List     json.RawMessage `json:"list"`
+	return nil
+}
+
+func validateRoutingSub2APIGroupMetadata(group routingSub2APIGroup) error {
+	if group.contractError != "" {
+		return errors.New(group.contractError)
 	}
-	if err := common.Unmarshal(raw, &wrapper); err == nil {
-		for _, nested := range []json.RawMessage{wrapper.Channels, wrapper.Models, wrapper.Items, wrapper.List} {
-			if err = common.Unmarshal(nested, &channels); err == nil && len(channels) > 0 {
-				return channels
+	groupID := strings.TrimSpace(string(group.ID))
+	name := strings.TrimSpace(group.Name)
+	platform := strings.TrimSpace(group.Platform)
+	parsedID, idErr := strconv.ParseInt(groupID, 10, 64)
+	if idErr != nil || parsedID <= 0 || name == "" || platform == "" {
+		return errors.New("sub2api group metadata is missing id, name, or platform")
+	}
+	subscriptionType := strings.ToLower(strings.TrimSpace(group.SubscriptionType))
+	if subscriptionType != "standard" && subscriptionType != "subscription" {
+		return errors.New("sub2api group metadata contains an invalid subscription_type")
+	}
+	return nil
+}
+
+func selectRoutingSub2APIGroups(
+	groups map[string]routingSub2APIGroup,
+	requestedGroups []string,
+) (map[string]routingSub2APIGroup, error) {
+	available := make(map[string]routingSub2APIGroup)
+	for key, group := range groups {
+		groupID := strings.TrimSpace(string(group.ID))
+		if groupID != "" && strings.TrimSpace(key) == groupID {
+			available[groupID] = group
+		}
+	}
+	canonical := make(map[string]routingSub2APIGroup, len(requestedGroups))
+	for _, requestedGroup := range requestedGroups {
+		requestedGroup = strings.TrimSpace(requestedGroup)
+		matches := make(map[string]routingSub2APIGroup, 2)
+		for groupID, group := range available {
+			if requestedGroup == groupID || requestedGroup == strings.TrimSpace(group.Name) {
+				matches[groupID] = group
+			}
+		}
+		if requestedGroup == "" || len(matches) == 0 {
+			return nil, errors.New("sub2api bound group is not available to the account")
+		}
+		if len(matches) > 1 {
+			return nil, errors.New("sub2api bound group is ambiguous")
+		}
+		var group routingSub2APIGroup
+		for _, matched := range matches {
+			group = matched
+		}
+		if err := validateRoutingSub2APIGroupMetadata(group); err != nil {
+			return nil, err
+		}
+		canonical[strings.TrimSpace(string(group.ID))] = group
+	}
+	selected := make(map[string]routingSub2APIGroup, len(canonical)*2)
+	nameOwners := make(map[string][]string, len(canonical))
+	for groupID, group := range canonical {
+		selected[groupID] = group
+		groupName := strings.TrimSpace(group.Name)
+		if groupName != "" {
+			nameOwners[groupName] = append(nameOwners[groupName], groupID)
+		}
+	}
+	for groupName, owners := range nameOwners {
+		if len(owners) != 1 {
+			continue
+		}
+		ownerID := owners[0]
+		if _, canonicalCollision := canonical[groupName]; canonicalCollision && groupName != ownerID {
+			continue
+		}
+		selected[groupName] = canonical[ownerID]
+	}
+	return selected, nil
+}
+
+func validateRoutingSub2APIChannelGroupContract(
+	groups map[string]routingSub2APIGroup,
+	raw json.RawMessage,
+) error {
+	available, err := parseRoutingSub2APIAvailableChannels(raw)
+	if err != nil {
+		return err
+	}
+	return validateRoutingSub2APIAvailableChannelGroups(groups, available)
+}
+
+func validateRoutingSub2APIAvailableChannelGroups(
+	groups map[string]routingSub2APIGroup,
+	available []routingSub2APIAvailableChannel,
+) error {
+	canonical := make(map[string]routingSub2APIGroup)
+	for _, group := range groups {
+		groupID := strings.TrimSpace(string(group.ID))
+		if groupID != "" {
+			canonical[groupID] = group
+		}
+	}
+	for _, channel := range available {
+		for _, section := range channel.Platforms {
+			for _, group := range section.Groups {
+				groupID := strings.TrimSpace(string(group.ID))
+				expected, exists := canonical[groupID]
+				if !exists {
+					return errors.New("sub2api channel group is missing from available groups")
+				}
+				if err := validateRoutingSub2APIAvailableChannelGroup(section.Platform, expected, group); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	return channels
+	return nil
+}
+
+func selectRoutingSub2APIAvailableChannels(
+	groups map[string]routingSub2APIGroup,
+	available []routingSub2APIAvailableChannel,
+) ([]routingSub2APIAvailableChannel, error) {
+	canonical := make(map[string]routingSub2APIGroup)
+	for _, group := range groups {
+		canonical[strings.TrimSpace(string(group.ID))] = group
+	}
+	selectedChannels := make([]routingSub2APIAvailableChannel, 0, len(available))
+	for _, channel := range available {
+		selectedPlatforms := make([]routingSub2APIPlatformSection, 0, len(channel.Platforms))
+		for _, section := range channel.Platforms {
+			selectedGroups := make([]routingSub2APIGroup, 0, len(section.Groups))
+			for _, group := range section.Groups {
+				expected, exists := canonical[strings.TrimSpace(string(group.ID))]
+				if !exists {
+					continue
+				}
+				if err := validateRoutingSub2APIAvailableChannelGroup(section.Platform, expected, group); err != nil {
+					return nil, err
+				}
+				selectedGroups = append(selectedGroups, group)
+			}
+			if len(selectedGroups) == 0 {
+				continue
+			}
+			section.Groups = selectedGroups
+			selectedPlatforms = append(selectedPlatforms, section)
+		}
+		if len(selectedPlatforms) == 0 {
+			continue
+		}
+		channel.Platforms = selectedPlatforms
+		selectedChannels = append(selectedChannels, channel)
+	}
+	return selectedChannels, nil
+}
+
+func validateRoutingSub2APIAvailableChannelGroup(
+	sectionPlatform string,
+	expected routingSub2APIGroup,
+	actual routingSub2APIGroup,
+) error {
+	name := strings.TrimSpace(actual.Name)
+	platform := strings.TrimSpace(actual.Platform)
+	sectionPlatform = strings.TrimSpace(sectionPlatform)
+	if sectionPlatform != "" && platform != "" && !strings.EqualFold(sectionPlatform, platform) {
+		return errors.New("sub2api channel group platform is inconsistent")
+	}
+	subscriptionType := strings.ToLower(strings.TrimSpace(actual.SubscriptionType))
+	if name == "" || name != strings.TrimSpace(expected.Name) ||
+		platform == "" ||
+		!strings.EqualFold(platform, strings.TrimSpace(expected.Platform)) ||
+		subscriptionType != strings.ToLower(strings.TrimSpace(expected.SubscriptionType)) {
+		return errors.New("sub2api channel group metadata does not match available groups")
+	}
+	return nil
+}
+
+func parseRoutingSub2APIAvailableChannels(raw json.RawMessage) ([]routingSub2APIAvailableChannel, error) {
+	if len(raw) == 0 || common.GetJsonType(raw) != "array" {
+		return nil, errors.New("invalid sub2api channels response")
+	}
+	var available []routingSub2APIAvailableChannel
+	if err := common.Unmarshal(raw, &available); err != nil {
+		return nil, errors.New("invalid sub2api channels response")
+	}
+	var shape []struct {
+		Platforms json.RawMessage `json:"platforms"`
+	}
+	if err := common.Unmarshal(raw, &shape); err != nil {
+		return nil, errors.New("invalid sub2api channels response")
+	}
+	for _, channel := range shape {
+		if common.GetJsonType(channel.Platforms) != "array" {
+			return nil, errors.New("sub2api channels response does not match the official nested contract")
+		}
+	}
+	return available, nil
+}
+
+func parseRoutingSub2APIRates(raw json.RawMessage) (map[string]float64, error) {
+	return parseRoutingSub2APIRatesForGroups(raw, nil)
+}
+
+func parseRoutingSub2APIRatesForGroups(
+	raw json.RawMessage,
+	groups map[string]routingSub2APIGroup,
+) (map[string]float64, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || common.GetJsonType(trimmed) != "object" {
+		return nil, errors.New("invalid sub2api group rates response")
+	}
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(trimmed, &fields); err != nil {
+		return nil, errors.New("invalid sub2api group rates response")
+	}
+	selectedGroupIDs := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		selectedGroupIDs[strings.TrimSpace(string(group.ID))] = struct{}{}
+	}
+	rates := make(map[string]float64, len(fields))
+	for key, rawRate := range fields {
+		groupID, err := strconv.ParseInt(key, 10, 64)
+		if err != nil || groupID <= 0 || strconv.FormatInt(groupID, 10) != key {
+			return nil, errors.New("invalid sub2api group rates response")
+		}
+		if len(selectedGroupIDs) > 0 {
+			if _, selected := selectedGroupIDs[key]; !selected {
+				continue
+			}
+		}
+		var rate float64
+		if common.Unmarshal(rawRate, &rate) != nil || !routingCostNonNegativeFinite(rate) || rate <= 0 {
+			return nil, errors.New("invalid sub2api group rates response")
+		}
+		rates[key] = rate
+	}
+	return rates, nil
+}
+
+func parseRoutingSub2APIChannels(raw json.RawMessage) ([]routingSub2APIChannel, error) {
+	if len(raw) == 0 || common.GetJsonType(raw) != "array" {
+		return nil, errors.New("invalid sub2api channels response")
+	}
+	available, err := parseRoutingSub2APIAvailableChannels(raw)
+	if err != nil {
+		return nil, err
+	}
+	return routingSub2APIChannelsFromAvailable(available)
+}
+
+func routingSub2APIChannelsFromAvailable(available []routingSub2APIAvailableChannel) ([]routingSub2APIChannel, error) {
+	channels := make([]routingSub2APIChannel, 0)
+	for _, availableChannel := range available {
+		for _, section := range availableChannel.Platforms {
+			platform := strings.TrimSpace(section.Platform)
+			if len(section.SupportedModels) > 0 && len(section.Groups) == 0 {
+				return nil, errors.New("sub2api channel platform has models without groups")
+			}
+			groupSet := make(map[string]struct{})
+			for _, group := range section.Groups {
+				for _, alias := range routingSub2APIGroupAliases(group) {
+					groupSet[alias] = struct{}{}
+				}
+			}
+			groupAliases := make([]string, 0, len(groupSet))
+			for alias := range groupSet {
+				groupAliases = append(groupAliases, alias)
+			}
+			sort.Strings(groupAliases)
+
+			for _, supportedModel := range section.SupportedModels {
+				modelName := strings.TrimSpace(supportedModel.Name)
+				if modelName == "" {
+					return nil, errors.New("sub2api channel returned an empty model name")
+				}
+				modelPlatform := strings.TrimSpace(supportedModel.Platform)
+				if platform != "" && modelPlatform != "" && platform != modelPlatform {
+					return nil, errors.New("sub2api channel returned inconsistent model platform")
+				}
+				if modelPlatform == "" {
+					modelPlatform = platform
+				}
+				channel := routingSub2APIChannel{
+					Models:          []string{modelName},
+					Platform:        modelPlatform,
+					Groups:          append([]string(nil), groupAliases...),
+					PerTokenPrices:  true,
+					OfficialPricing: supportedModel.Pricing,
+				}
+				if supportedModel.Pricing != nil {
+					pricing := supportedModel.Pricing
+					channel.BillingMode = pricing.BillingMode
+					channel.InputPrice = routingSub2APIPointerValue(pricing.InputPrice)
+					channel.OutputPrice = routingSub2APIPointerValue(pricing.OutputPrice)
+					channel.CacheWritePrice = routingSub2APIPointerValue(pricing.CacheWritePrice)
+					channel.CacheReadPrice = routingSub2APIPointerValue(pricing.CacheReadPrice)
+					channel.ImageOutputPrice = routingSub2APIPointerValue(pricing.ImageOutputPrice)
+					channel.PerRequestPrice = routingSub2APIPointerValue(pricing.PerRequestPrice)
+					channel.Intervals = append([]routingSub2APIPricingInterval(nil), pricing.Intervals...)
+				}
+				channels = append(channels, channel)
+			}
+		}
+	}
+	return channels, nil
+}
+
+func routingSub2APIPointerValue(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func routingSub2APITokenPricingExpression(pricing routingSub2APIModelPricing) (string, bool, error) {
+	allPrices := []*float64{
+		pricing.InputPrice,
+		pricing.OutputPrice,
+		pricing.CacheWritePrice,
+		pricing.CacheReadPrice,
+		pricing.ImageOutputPrice,
+		pricing.PerRequestPrice,
+	}
+	for _, interval := range pricing.Intervals {
+		allPrices = append(allPrices,
+			interval.InputPrice,
+			interval.OutputPrice,
+			interval.CacheWritePrice,
+			interval.CacheReadPrice,
+			interval.PerRequestPrice,
+		)
+	}
+	for _, price := range allPrices {
+		if price != nil && !routingCostNonNegativeFinite(*price) {
+			return "", false, model.ErrRoutingCostV2Invalid
+		}
+	}
+
+	if len(pricing.Intervals) == 0 {
+		// Flat channel overrides inherit missing token dimensions from Sub2API's
+		// private global catalog. That fallback is not exposed by this endpoint,
+		// so a partial flat price cannot be mapped without guessing.
+		if pricing.InputPrice == nil || pricing.OutputPrice == nil ||
+			pricing.CacheWritePrice == nil || pricing.CacheReadPrice == nil {
+			return "", false, errors.New("sub2api flat token pricing omits inherited price dimensions")
+		}
+		expression, _, err := routingSub2APITokenTierExpression(
+			"flat",
+			*pricing.InputPrice,
+			*pricing.OutputPrice,
+			*pricing.CacheWritePrice,
+			*pricing.CacheReadPrice,
+			routingSub2APIPointerValue(pricing.ImageOutputPrice),
+		)
+		if err != nil {
+			return "", false, err
+		}
+		return expression, true, nil
+	}
+
+	if len(pricing.Intervals) > routingSub2APIMaxPricingIntervals {
+		return "", false, errors.New("sub2api pricing interval count exceeds limit")
+	}
+	intervals := make([]routingSub2APIPricingInterval, 0, len(pricing.Intervals))
+	for _, interval := range pricing.Intervals {
+		if interval.InputPrice == nil && interval.OutputPrice == nil &&
+			interval.CacheWritePrice == nil && interval.CacheReadPrice == nil &&
+			interval.PerRequestPrice == nil {
+			continue
+		}
+		intervals = append(intervals, interval)
+	}
+	if len(intervals) == 0 {
+		return "", false, errors.New("sub2api token pricing intervals contain no prices")
+	}
+	sort.SliceStable(intervals, func(left int, right int) bool {
+		return intervals[left].MinTokens < intervals[right].MinTokens
+	})
+	for index := range intervals {
+		interval := intervals[index]
+		if interval.MinTokens < 0 || (interval.MaxTokens != nil && *interval.MaxTokens <= interval.MinTokens) {
+			return "", false, errors.New("sub2api returned an invalid token pricing interval")
+		}
+		if index > 0 {
+			previous := intervals[index-1]
+			if previous.MaxTokens == nil || *previous.MaxTokens > interval.MinTokens {
+				return "", false, errors.New("sub2api token pricing intervals overlap")
+			}
+		}
+	}
+
+	expression := fmt.Sprintf("tier(%s, 0)", strconv.Quote(model.RoutingCostSub2APIIntervalUnmatchedTier))
+	known := false
+	// Official Sub2API channel pricing treats a nil image_output_price as an
+	// explicit zero once a channel override exists; it must not fall back to
+	// the ordinary output price. Keeping img_o in the expression preserves
+	// that contract, while a non-nil value (including 0) remains explicit.
+	imageOutputPrice := routingSub2APIPointerValue(pricing.ImageOutputPrice)
+	for index := len(intervals) - 1; index >= 0; index-- {
+		interval := intervals[index]
+		label := fmt.Sprintf("ctx_gt_%d", interval.MinTokens)
+		condition := fmt.Sprintf("len > %d", interval.MinTokens)
+		if interval.MaxTokens != nil {
+			label = fmt.Sprintf("ctx_%d_%d", interval.MinTokens, *interval.MaxTokens)
+			condition += fmt.Sprintf(" && len <= %d", *interval.MaxTokens)
+		}
+		tierExpression, tierKnown, err := routingSub2APITokenTierExpression(
+			label,
+			routingSub2APIPointerValue(interval.InputPrice),
+			routingSub2APIPointerValue(interval.OutputPrice),
+			routingSub2APIPointerValue(interval.CacheWritePrice),
+			routingSub2APIPointerValue(interval.CacheReadPrice),
+			imageOutputPrice,
+		)
+		if err != nil {
+			return "", false, err
+		}
+		// A selected Sub2API token interval starts from zero and applies each
+		// explicitly configured dimension. Presence, including an explicit 0,
+		// therefore makes that tier known; numerical positivity does not.
+		tierKnown = tierKnown || interval.InputPrice != nil || interval.OutputPrice != nil ||
+			interval.CacheWritePrice != nil || interval.CacheReadPrice != nil
+		known = known || tierKnown
+		expression = fmt.Sprintf("%s ? %s : (%s)", condition, tierExpression, expression)
+	}
+	if len(expression) > 16_384 {
+		return "", false, errors.New("sub2api pricing expression exceeds size limit")
+	}
+	return expression, known, nil
+}
+
+func routingSub2APITokenTierExpression(label string, inputPrice float64, outputPrice float64, cacheWritePrice float64, cacheReadPrice float64, imageOutputPrice float64) (string, bool, error) {
+	inputPerMillion := inputPrice * 1_000_000
+	outputPerMillion := outputPrice * 1_000_000
+	cacheWritePerMillion := cacheWritePrice * 1_000_000
+	cacheReadPerMillion := cacheReadPrice * 1_000_000
+	imageOutputPerMillion := imageOutputPrice * 1_000_000
+	for _, scaled := range []float64{
+		inputPerMillion,
+		outputPerMillion,
+		cacheWritePerMillion,
+		cacheReadPerMillion,
+		imageOutputPerMillion,
+	} {
+		if !routingCostNonNegativeFinite(scaled) {
+			return "", false, errors.New("sub2api token price overflows normalized units")
+		}
+	}
+	known := inputPerMillion > 0 || outputPerMillion > 0 || cacheWritePerMillion > 0 ||
+		cacheReadPerMillion > 0 || imageOutputPerMillion > 0
+	return fmt.Sprintf(
+		"tier(%s, p * %s + c * %s + cr * %s + cc * %s + cc1h * %s + img_o * %s)",
+		strconv.Quote(label),
+		strconv.FormatFloat(inputPerMillion, 'g', -1, 64),
+		strconv.FormatFloat(outputPerMillion, 'g', -1, 64),
+		strconv.FormatFloat(cacheReadPerMillion, 'g', -1, 64),
+		strconv.FormatFloat(cacheWritePerMillion, 'g', -1, 64),
+		strconv.FormatFloat(cacheWritePerMillion, 'g', -1, 64),
+		strconv.FormatFloat(imageOutputPerMillion, 'g', -1, 64),
+	), known, nil
 }
 
 func routingSub2APIGroupName(group routingSub2APIGroup) string {
-	for _, value := range []string{group.ID, group.Group, group.Name} {
+	for _, value := range []string{string(group.ID), group.Name} {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			return trimmed
 		}
 	}
 	return ""
+}
+
+func routingSub2APIGroupAliases(group routingSub2APIGroup) []string {
+	aliases := make([]string, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	for _, value := range []string{string(group.ID), group.Name} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		aliases = append(aliases, value)
+	}
+	return aliases
+}
+
+func routingSub2APIResolvedGroupRate(groups map[string]routingSub2APIGroup, rates map[string]float64, groupKey string) (float64, bool) {
+	groupKey = strings.TrimSpace(groupKey)
+	if ratio, ok := rates[groupKey]; ok {
+		return ratio, true
+	}
+	group, ok := groups[groupKey]
+	if !ok {
+		return 0, false
+	}
+	for _, alias := range routingSub2APIGroupAliases(group) {
+		if ratio, exists := rates[alias]; exists {
+			return ratio, true
+		}
+	}
+	return 0, false
 }
 
 func routingSub2APIGroupRatio(group routingSub2APIGroup) float64 {
@@ -736,6 +1645,10 @@ func routingSub2APIGroupRatio(group routingSub2APIGroup) float64 {
 		return group.Ratio
 	}
 	return 0
+}
+
+func routingSub2APIGroupUsesSubscription(group routingSub2APIGroup) bool {
+	return strings.EqualFold(strings.TrimSpace(group.SubscriptionType), "subscription")
 }
 
 func routingSub2APIChannelServesBinding(channel routingSub2APIChannel, binding model.RoutingChannelBinding) bool {
@@ -776,53 +1689,61 @@ func routingSub2APIChannelModels(channel routingSub2APIChannel) []string {
 	return models
 }
 
-func routingSub2APIChannelSnapshot(channelID int, modelName string, groupRatio float64, groupFound bool, channel routingSub2APIChannel, now int64) model.RoutingCostSnapshot {
-	baseRatio := firstPositiveFloat(channel.InputPrice, channel.Input, channel.Price, channel.Rate, channel.Ratio)
-	outputPrice := firstPositiveFloat(channel.OutputPrice, channel.Output)
-	completionRatio := 1.0
-	if baseRatio > 0 && outputPrice > 0 {
-		completionRatio = outputPrice / baseRatio
+func routingSub2APIChannelSnapshot(channelID int, modelName string, groupRatio float64, groupFound bool, channel routingSub2APIChannel, now int64) (model.RoutingCostSnapshot, error) {
+	pricing, confidence, _, err := routingSub2APINormalizedPricing(channel, groupRatio, groupFound)
+	if err != nil {
+		return model.RoutingCostSnapshot{}, err
 	}
-	confidence := model.RoutingCostConfidenceFull
-	if !groupFound || baseRatio <= 0 {
-		confidence = model.RoutingCostConfidenceGroupOnly
+	if confidence == model.RoutingCostConfidenceUnknown {
+		return model.RoutingCostSnapshot{}, errors.New("sub2api returned no usable pricing")
 	}
-	if baseRatio <= 0 {
-		baseRatio = 1
+	legacyConfidence := model.RoutingCostConfidenceGroupOnly
+	if confidence == model.RoutingCostConfidenceExact {
+		legacyConfidence = model.RoutingCostConfidenceFull
+	} else if confidence == model.RoutingCostConfidenceUnknown {
+		legacyConfidence = model.RoutingCostConfidenceUnknown
 	}
-
-	extras := map[string]float64{}
-	if outputPrice > 0 {
-		extras["output_price"] = outputPrice
+	baseRatio := 0.0
+	if pricing.BaseRatio != nil && *pricing.BaseRatio > 0 {
+		baseRatio = *pricing.BaseRatio
 	}
-	if value := firstPositiveFloat(channel.CachePrice, channel.Cache); value > 0 {
-		extras["cache_price"] = value
-	}
-	if value := firstPositiveFloat(channel.PerRequestPrice, channel.PerRequest); value > 0 {
-		extras["per_request_price"] = value
-	}
-	if value := firstPositiveFloat(channel.ImagePrice, channel.Image); value > 0 {
-		extras["image_price"] = value
+	completionRatio := 0.0
+	if pricing.CompletionRatio != nil && *pricing.CompletionRatio > 0 {
+		completionRatio = *pricing.CompletionRatio
 	}
 	var extrasJSON *string
-	if len(extras) > 0 {
-		if data, err := common.Marshal(extras); err == nil {
-			encoded := string(data)
-			extrasJSON = &encoded
-		}
+	if len(pricing.Extras) > 0 && string(pricing.Extras) != "{}" {
+		encoded := string(pricing.Extras)
+		extrasJSON = &encoded
 	}
-
+	var tiersJSON *string
+	if len(pricing.Tiers) > 0 && string(pricing.Tiers) != "{}" {
+		encoded := string(pricing.Tiers)
+		tiersJSON = &encoded
+	}
+	if pricing.BillingExpression != "" {
+		legacyConfidence = model.RoutingCostConfidenceUnknown
+	}
+	modelPrice := 0.0
+	if pricing.ModelPrice != nil {
+		modelPrice = *pricing.ModelPrice
+	} else if pricing.PerRequestCost != nil {
+		modelPrice = *pricing.PerRequestCost
+	}
 	return model.RoutingCostSnapshot{
 		ChannelID:       channelID,
 		ModelName:       modelName,
+		QuotaType:       pricing.QuotaType,
 		GroupRatio:      groupRatio,
 		BaseRatio:       baseRatio,
 		CompletionRatio: completionRatio,
-		BillingMode:     strings.TrimSpace(channel.BillingMode),
+		ModelPrice:      modelPrice,
+		BillingMode:     pricing.BillingMode,
+		TiersJSON:       tiersJSON,
 		ExtrasJSON:      extrasJSON,
-		Confidence:      confidence,
+		Confidence:      legacyConfidence,
 		SnapshotTS:      now,
-	}
+	}, nil
 }
 
 func firstPositiveFloat(values ...float64) float64 {

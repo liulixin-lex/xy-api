@@ -19,7 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlignLeft, FilePlus2, History, Save } from 'lucide-react'
+import { AxiosError } from 'axios'
+import {
+  AlignLeft,
+  FilePlus2,
+  History,
+  RefreshCw,
+  Save,
+  ShieldCheck,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -32,6 +40,7 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -62,6 +71,7 @@ import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
@@ -74,7 +84,16 @@ import {
   starterPolicyDocumentText,
   type PolicyDocumentIssue,
 } from '../lib/policy-document'
-import type { PolicyDocument, PolicyDraftSummary } from '../types'
+import {
+  policyDraftDetailBlocksEditor,
+  policyDraftDetailIdentity,
+  policyDraftDetailUpdate,
+} from '../lib/policy-draft-editor'
+import type {
+  PolicyDocument,
+  PolicyDraftDetail,
+  PolicyDraftSummary,
+} from '../types'
 
 type PolicyDraftFormValues = {
   baseRevision: number
@@ -194,11 +213,23 @@ export function ChannelRoutingPolicyDraftSheet(props: {
   const format = useChannelRoutingFormatters()
   const queryClient = useQueryClient()
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
+  const handledEditorFocusRequestRef = useRef(0)
+  const editorSubjectRef = useRef('closed')
   const [cursor, setCursor] = useState({ line: 1, column: 1 })
+  const [authority, setAuthority] = useState<PolicyDraftDetail | null>(null)
+  const [pendingRemote, setPendingRemote] = useState<PolicyDraftDetail | null>(
+    null
+  )
+  const [preservedDocument, setPreservedDocument] = useState<string | null>(
+    null
+  )
+  const [restoredDraft, setRestoredDraft] = useState(false)
+  const [editorFocusRequest, setEditorFocusRequest] = useState(0)
   const isEditing = props.draft != null
   const detailQuery = useQuery({
     queryKey: channelRoutingQueryKeys.policyDraft(props.draft?.id ?? 0),
-    queryFn: () => getChannelRoutingPolicyDraft(props.draft?.id ?? 0),
+    queryFn: ({ signal }) =>
+      getChannelRoutingPolicyDraft(props.draft?.id ?? 0, signal),
     enabled: props.open && isEditing,
   })
   const schema = useMemo(
@@ -238,16 +269,25 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     [documentValue]
   )
   const saveDraft = useMutation({
-    mutationFn: async (values: PolicyDraftFormValues) => {
-      const analyzed = analyzePolicyDocument(values.document)
+    mutationFn: async (payload: {
+      values: PolicyDraftFormValues
+      authority: PolicyDraftDetail | null
+    }) => {
+      const analyzed = analyzePolicyDocument(payload.values.document)
       if (!analyzed.document) {
         throw new Error('invalid channel routing policy document')
       }
       if (props.draft) {
-        return updateChannelRoutingPolicyDraft(props.draft, analyzed.document)
+        if (!payload.authority) {
+          throw new Error('policy draft authority is unavailable')
+        }
+        return updateChannelRoutingPolicyDraft(
+          payload.authority,
+          analyzed.document
+        )
       }
       return createChannelRoutingPolicyDraft({
-        base_revision: values.baseRevision,
+        base_revision: payload.values.baseRevision,
         document: analyzed.document,
       })
     },
@@ -261,10 +301,29 @@ export function ChannelRoutingPolicyDraftSheet(props: {
       toast.success(message)
       props.onOpenChange(false)
     },
+    onError: (error) => {
+      const status =
+        error instanceof AxiosError ? error.response?.status : undefined
+      if (status === 409 || status === 412) {
+        void detailQuery.refetch()
+      }
+    },
   })
   const resetSaveDraft = saveDraft.reset
+  let editorSubject = 'closed'
+  if (props.open) {
+    editorSubject = props.draft ? `draft:${props.draft.id}` : 'draft:new'
+  }
 
   useEffect(() => {
+    if (editorSubjectRef.current === editorSubject) return
+    editorSubjectRef.current = editorSubject
+    setAuthority(null)
+    setPendingRemote(null)
+    setPreservedDocument(null)
+    setRestoredDraft(false)
+    resetSaveDraft()
+
     if (!props.open) return
     if (!props.draft) {
       form.reset({
@@ -274,19 +333,9 @@ export function ChannelRoutingPolicyDraftSheet(props: {
           : starterPolicyDocumentText(),
       })
       setCursor({ line: 1, column: 1 })
-      resetSaveDraft()
-      return
-    }
-    if (detailQuery.data) {
-      form.reset({
-        baseRevision: detailQuery.data.base_revision,
-        document: policyDocumentText(detailQuery.data.document),
-      })
-      setCursor({ line: 1, column: 1 })
-      resetSaveDraft()
     }
   }, [
-    detailQuery.data,
+    editorSubject,
     form,
     props.baseRevision,
     props.currentDocument,
@@ -295,8 +344,82 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     resetSaveDraft,
   ])
 
-  const immutable = props.draft?.status === 'published'
+  const formDirty = form.formState.isDirty
+  useEffect(() => {
+    if (handledEditorFocusRequestRef.current === editorFocusRequest) return
+    handledEditorFocusRequestRef.current = editorFocusRequest
+    if (props.open) editorRef.current?.focus()
+  }, [editorFocusRequest, props.open])
+
+  useEffect(() => {
+    const incoming = detailQuery.data
+    if (
+      !props.open ||
+      !props.draft ||
+      !incoming ||
+      editorSubjectRef.current !== editorSubject
+    ) {
+      return
+    }
+    const update = policyDraftDetailUpdate(authority, incoming, formDirty)
+    if (update === 'ignore') return
+    if (update === 'defer') {
+      if (
+        policyDraftDetailIdentity(pendingRemote) !==
+        policyDraftDetailIdentity(incoming)
+      ) {
+        setPendingRemote(incoming)
+      }
+      return
+    }
+    setAuthority(incoming)
+    setPendingRemote(null)
+    setRestoredDraft(false)
+    form.reset({
+      baseRevision: incoming.base_revision,
+      document: policyDocumentText(incoming.document),
+    })
+    setCursor({ line: 1, column: 1 })
+    resetSaveDraft()
+  }, [
+    authority,
+    detailQuery.data,
+    editorSubject,
+    form,
+    formDirty,
+    pendingRemote,
+    props.draft,
+    props.open,
+    resetSaveDraft,
+  ])
+
+  const activeDraft = authority ?? props.draft
+  const immutable = activeDraft?.status === 'published'
   const writable = props.canWrite && !immutable
+  const loadAuthoritativeDetail = (detail: PolicyDraftDetail) => {
+    setPreservedDocument(form.getValues('document'))
+    setAuthority(detail)
+    setPendingRemote(null)
+    setRestoredDraft(false)
+    form.reset({
+      baseRevision: detail.base_revision,
+      document: policyDocumentText(detail.document),
+    })
+    setCursor({ line: 1, column: 1 })
+    resetSaveDraft()
+    setEditorFocusRequest((request) => request + 1)
+  }
+  const restorePreservedDocument = () => {
+    if (preservedDocument == null) return
+    form.setValue('document', preservedDocument, {
+      shouldDirty: true,
+      shouldTouch: true,
+      shouldValidate: true,
+    })
+    setPreservedDocument(null)
+    setRestoredDraft(true)
+    setEditorFocusRequest((request) => request + 1)
+  }
   const replaceDocument = (value: string) => {
     form.setValue('document', value, {
       shouldDirty: true,
@@ -304,7 +427,7 @@ export function ChannelRoutingPolicyDraftSheet(props: {
       shouldValidate: true,
     })
     setCursor({ line: 1, column: 1 })
-    window.requestAnimationFrame(() => editorRef.current?.focus())
+    setEditorFocusRequest((request) => request + 1)
   }
   const focusIssue = (issue: PolicyDocumentIssue) => {
     const editor = editorRef.current
@@ -353,12 +476,20 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     (issue) => issue.kind === 'syntax'
   )
   const currentDocument = props.currentDocument
+  const blockingDetailError = policyDraftDetailBlocksEditor({
+    editing: isEditing,
+    isError: detailQuery.isError,
+    hasCachedData: detailQuery.data != null,
+    hasAuthority: authority != null,
+  })
+  const waitingForDetail = isEditing && !blockingDetailError && !authority
+  const editorReady = !isEditing || authority != null
 
   return (
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName(
-          'max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-4xl'
+          'channel-routing-touch-surface max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-4xl'
         )}
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
@@ -370,8 +501,8 @@ export function ChannelRoutingPolicyDraftSheet(props: {
           <SheetDescription>
             {isEditing
               ? t('Revision {{version}} · {{status}}', {
-                  version: props.draft?.version,
-                  status: props.draft?.status,
+                  version: activeDraft?.version,
+                  status: activeDraft?.status,
                 })
               : t(
                   'Create an immutable policy change candidate from a base revision.'
@@ -379,12 +510,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
           </SheetDescription>
         </SheetHeader>
 
-        {detailQuery.isLoading ? (
+        {waitingForDetail ? (
           <div className='px-4'>
             <ChannelRoutingLoadingState rows={6} />
           </div>
         ) : null}
-        {detailQuery.isError ? (
+        {blockingDetailError ? (
           <div className='px-4'>
             <ChannelRoutingErrorState
               error={detailQuery.error}
@@ -392,13 +523,95 @@ export function ChannelRoutingPolicyDraftSheet(props: {
             />
           </div>
         ) : null}
-        {!detailQuery.isLoading && !detailQuery.isError ? (
+        {editorReady && !blockingDetailError ? (
           <Form {...form}>
             <form
               id='channel-routing-policy-draft-form'
               className={sideDrawerFormClassName('gap-5')}
-              onSubmit={form.handleSubmit((values) => saveDraft.mutate(values))}
+              onSubmit={form.handleSubmit((values) => {
+                saveDraft.mutate({ values, authority })
+              })}
             >
+              {detailQuery.isRefetchError && detailQuery.data ? (
+                <ChannelRoutingRefetchErrorAlert
+                  title={t('Policy draft refresh failed')}
+                  description={t(
+                    'Showing the loaded draft. Your unsaved changes are preserved.'
+                  )}
+                  isFetching={detailQuery.isFetching}
+                  onRetry={() => void detailQuery.refetch()}
+                />
+              ) : null}
+
+              {pendingRemote ? (
+                <Alert role='status' className='border-warning/30 bg-warning/5'>
+                  <History className='text-warning' aria-hidden='true' />
+                  <AlertTitle>{t('Policy draft changed elsewhere')}</AlertTitle>
+                  <AlertDescription className='flex flex-col items-start gap-3'>
+                    <p>
+                      {t(
+                        'Your draft is still available. Load the latest version, review it, then apply your changes again.'
+                      )}
+                    </p>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='outline'
+                      onClick={() => loadAuthoritativeDetail(pendingRemote)}
+                    >
+                      <RefreshCw aria-hidden='true' />
+                      {t('Load latest version')}
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+
+              {preservedDocument != null && !restoredDraft ? (
+                <Alert role='status'>
+                  <ShieldCheck aria-hidden='true' />
+                  <AlertTitle>{t('Latest version loaded')}</AlertTitle>
+                  <AlertDescription className='flex flex-col items-start gap-3'>
+                    <p>
+                      {t(
+                        'Your previous policy document is preserved until this sheet closes.'
+                      )}
+                    </p>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='outline'
+                      onClick={restorePreservedDocument}
+                    >
+                      <History aria-hidden='true' />
+                      {t('Restore my draft')}
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+
+              {restoredDraft ? (
+                <Alert role='status'>
+                  <ShieldCheck aria-hidden='true' />
+                  <AlertTitle>
+                    {t('Draft preserved on latest version')}
+                  </AlertTitle>
+                  <AlertDescription className='flex flex-col items-start gap-3'>
+                    <p>{t('Review these fields before saving again.')}</p>
+                    {authority ? (
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='outline'
+                        onClick={() => loadAuthoritativeDetail(authority)}
+                      >
+                        <RefreshCw aria-hidden='true' />
+                        {t('Load latest version')}
+                      </Button>
+                    ) : null}
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+
               <FormField
                 control={form.control}
                 name='baseRevision'
@@ -597,12 +810,17 @@ export function ChannelRoutingPolicyDraftSheet(props: {
           </Form>
         ) : null}
 
-        {writable && !detailQuery.isLoading && !detailQuery.isError ? (
+        {writable && editorReady && !blockingDetailError ? (
           <SheetFooter className={sideDrawerFooterClassName()}>
             <Button
               type='submit'
               form='channel-routing-policy-draft-form'
-              disabled={saveDraft.isPending || !analysis.valid}
+              disabled={
+                saveDraft.isPending ||
+                !analysis.valid ||
+                pendingRemote != null ||
+                (isEditing && authority == null)
+              }
             >
               <Save aria-hidden='true' />
               {saveDraft.isPending ? t('Saving') : t('Save draft')}

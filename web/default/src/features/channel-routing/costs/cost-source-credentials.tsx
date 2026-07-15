@@ -62,7 +62,7 @@ const credentialRows: Array<{
   { key: 'gateway_api_key', label: 'Gateway API Key' },
   { key: 'sub2api_email', label: 'Sub2API Email' },
   { key: 'sub2api_password', label: 'Sub2API Password' },
-  { key: 'sub2api_token', label: 'Sub2API Token' },
+  { key: 'sub2api_token', label: 'Sub2API JWT' },
   { key: 'custom_ca_configured', label: 'Custom CA' },
 ]
 
@@ -107,11 +107,8 @@ export function CostSourceCredentialSummary(props: {
 export function CostSourceCredentialRecoveryAlert(props: { canEdit: boolean }) {
   const { t } = useTranslation()
   return (
-    <Alert className='border-amber-500/30 bg-amber-500/5' role='alert'>
-      <TriangleAlert
-        className='text-amber-700 dark:text-amber-300'
-        aria-hidden='true'
-      />
+    <Alert className='border-warning/30 bg-warning/5' role='alert'>
+      <TriangleAlert className='text-warning' aria-hidden='true' />
       <AlertTitle>{t('Credentials need to be re-entered')}</AlertTitle>
       <AlertDescription>
         {props.canEdit
@@ -126,7 +123,10 @@ export function CostSourceCredentialRecoveryAlert(props: { canEdit: boolean }) {
   )
 }
 
-export function CostSourceCustomCAField(props: { configured: boolean }) {
+export function CostSourceCustomCAField(props: {
+  configured: boolean
+  onPreviewIdentityChange: () => void
+}) {
   const { t } = useTranslation()
   const form = useFormContext<CostBindingFormValues>()
   const clear = Boolean(
@@ -154,6 +154,10 @@ export function CostSourceCustomCAField(props: { configured: boolean }) {
                   ? t('Leave blank to keep the saved value')
                   : t('Paste a PEM-encoded CA certificate')
               }
+              onChange={(event) => {
+                field.onChange(event)
+                props.onPreviewIdentityChange()
+              }}
             />
           </FormControl>
           <FormDescription>
@@ -171,9 +175,10 @@ export function CostSourceCustomCAField(props: { configured: boolean }) {
                 <label className='text-foreground flex min-h-11 cursor-pointer items-center gap-2 text-sm'>
                   <Checkbox
                     checked={clearField.value}
-                    onCheckedChange={(checked) =>
+                    onCheckedChange={(checked) => {
                       clearField.onChange(Boolean(checked))
-                    }
+                      props.onPreviewIdentityChange()
+                    }}
                   />
                   <span>{t('Clear the saved custom CA')}</span>
                 </label>
@@ -192,8 +197,10 @@ function CredentialField(props: {
   clearName: CredentialClearName
   label: string
   mask?: string
+  placeholder?: string
   type?: 'text' | 'password' | 'email'
   autoComplete?: string
+  onPreviewIdentityChange: () => void
 }) {
   const { t } = useTranslation()
   const form = useFormContext<CostBindingFormValues>()
@@ -218,8 +225,12 @@ function CredentialField(props: {
               placeholder={
                 props.mask
                   ? t('Leave blank to keep the saved value')
-                  : t('Optional')
+                  : t(props.placeholder ?? 'Optional')
               }
+              onChange={(event) => {
+                field.onChange(event)
+                props.onPreviewIdentityChange()
+              }}
             />
           </FormControl>
           {props.mask ? (
@@ -236,9 +247,10 @@ function CredentialField(props: {
                   <label className='text-foreground flex min-h-11 cursor-pointer items-center gap-2 text-sm'>
                     <Checkbox
                       checked={clearField.value}
-                      onCheckedChange={(checked) =>
+                      onCheckedChange={(checked) => {
                         clearField.onChange(Boolean(checked))
-                      }
+                        props.onPreviewIdentityChange()
+                      }}
                     />
                     <span>{t('Clear the saved credential')}</span>
                   </label>
@@ -260,15 +272,29 @@ function CredentialField(props: {
 export function CostSourceCredentialFields(props: {
   upstreamType: RoutingCostBindingUpstreamType
   binding: RoutingCostBinding | null
+  onPreviewIdentityChange: () => void
 }) {
+  const { t } = useTranslation()
+
   return (
     <div className='grid gap-4 sm:grid-cols-2'>
+      <p className='text-muted-foreground text-sm sm:col-span-2'>
+        {props.upstreamType === 'newapi'
+          ? t(
+              'New API account access requires both an Access Token and user ID. A separate Gateway API Key verifies which models the channel can serve.'
+            )
+          : t(
+              'Sub2API account access requires a JWT or both email and password. Gateway API Key is kept separate and does not authorize account balance access.'
+            )}
+      </p>
       {props.upstreamType === 'newapi' ? (
         <CredentialField
           valueName='newApiAccessToken'
           clearName='clearNewApiAccessToken'
           label='New API Access Token'
           mask={props.binding?.credential_masks.new_api_access_token}
+          placeholder='Required while this source is enabled'
+          onPreviewIdentityChange={props.onPreviewIdentityChange}
         />
       ) : null}
       <CredentialField
@@ -276,6 +302,12 @@ export function CostSourceCredentialFields(props: {
         clearName='clearGatewayApiKey'
         label='Gateway API Key'
         mask={props.binding?.credential_masks.gateway_api_key}
+        placeholder={
+          props.upstreamType === 'newapi'
+            ? 'Required while this source is enabled'
+            : undefined
+        }
+        onPreviewIdentityChange={props.onPreviewIdentityChange}
       />
       {props.upstreamType === 'sub2api' ? (
         <>
@@ -286,18 +318,21 @@ export function CostSourceCredentialFields(props: {
             mask={props.binding?.credential_masks.sub2api_email}
             type='email'
             autoComplete='off'
+            onPreviewIdentityChange={props.onPreviewIdentityChange}
           />
           <CredentialField
             valueName='sub2apiPassword'
             clearName='clearSub2apiPassword'
             label='Sub2API Password'
             mask={props.binding?.credential_masks.sub2api_password}
+            onPreviewIdentityChange={props.onPreviewIdentityChange}
           />
           <CredentialField
             valueName='sub2apiToken'
             clearName='clearSub2apiToken'
-            label='Sub2API Token'
+            label='Sub2API JWT'
             mask={props.binding?.credential_masks.sub2api_token}
+            onPreviewIdentityChange={props.onPreviewIdentityChange}
           />
         </>
       ) : null}

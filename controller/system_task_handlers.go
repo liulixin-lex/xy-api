@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -917,22 +918,59 @@ func routingCostSyncExecutionState(summary map[string]any) (string, error) {
 }
 
 type routingPricingResponse struct {
-	Success        bool                 `json:"success"`
-	Data           []routingPricingItem `json:"data"`
-	GroupRatio     map[string]float64   `json:"group_ratio"`
-	UsableGroup    map[string]string    `json:"usable_group"`
-	PricingVersion string               `json:"pricing_version"`
-	ObservedTime   int64                `json:"observed_time"`
-	EffectiveTime  int64                `json:"effective_time"`
-	ExpiresTime    int64                `json:"expires_time"`
-	Message        string               `json:"message"`
+	Success              bool                                   `json:"success"`
+	Data                 []routingPricingItem                   `json:"data"`
+	GroupRatio           map[string]float64                     `json:"group_ratio"`
+	UsableGroup          map[string]string                      `json:"usable_group"`
+	PricingVersion       string                                 `json:"pricing_version"`
+	ObservedTime         int64                                  `json:"observed_time"`
+	EffectiveTime        int64                                  `json:"effective_time"`
+	ExpiresTime          int64                                  `json:"expires_time"`
+	Message              string                                 `json:"message"`
+	AccountGroupErrors   map[string]string                      `json:"-"`
+	Sub2APIGroupMeta     map[string]routingSub2APIGroupMetadata `json:"-"`
+	QuotaPerUnit         float64                                `json:"-"`
+	CatalogAuthenticated bool                                   `json:"-"`
+}
+
+type routingNewAPIStatusResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		QuotaPerUnit *float64 `json:"quota_per_unit"`
+	} `json:"data"`
+	Message string `json:"message"`
 }
 
 type routingUserSelfResponse struct {
 	Success bool `json:"success"`
 	Data    struct {
-		Quota     float64 `json:"quota"`
-		UsedQuota float64 `json:"used_quota"`
+		Quota     *float64 `json:"quota"`
+		UsedQuota float64  `json:"used_quota"`
+	} `json:"data"`
+	Message string `json:"message"`
+}
+
+type routingNewAPIUserGroup struct {
+	Ratio json.RawMessage `json:"ratio"`
+	Desc  string          `json:"desc"`
+}
+
+type routingNewAPIUserGroupsResponse struct {
+	Success bool                              `json:"success"`
+	Data    map[string]routingNewAPIUserGroup `json:"data"`
+	Message string                            `json:"message"`
+}
+
+type routingNewAPIUserModelsResponse struct {
+	Success bool     `json:"success"`
+	Data    []string `json:"data"`
+	Message string   `json:"message"`
+}
+
+type routingNewAPIGatewayModelsResponse struct {
+	Success *bool `json:"success"`
+	Data    []struct {
+		ID string `json:"id"`
 	} `json:"data"`
 	Message string `json:"message"`
 }
@@ -940,9 +978,9 @@ type routingUserSelfResponse struct {
 type routingPricingItem struct {
 	ModelName            string          `json:"model_name"`
 	QuotaType            int             `json:"quota_type"`
-	ModelRatio           float64         `json:"model_ratio"`
-	ModelPrice           float64         `json:"model_price"`
-	CompletionRatio      float64         `json:"completion_ratio"`
+	ModelRatio           *float64        `json:"model_ratio"`
+	ModelPrice           *float64        `json:"model_price"`
+	CompletionRatio      *float64        `json:"completion_ratio"`
 	CacheRatio           *float64        `json:"cache_ratio"`
 	CreateCacheRatio     *float64        `json:"create_cache_ratio"`
 	ImageRatio           *float64        `json:"image_ratio"`
@@ -965,17 +1003,23 @@ type routingCostAccountIdentity struct {
 }
 
 type routingCostBindingSource struct {
-	Binding     model.RoutingChannelBinding
-	Credentials model.RoutingCredentials
+	Binding                  model.RoutingChannelBinding
+	Credentials              model.RoutingCredentials
+	ServingModels            map[string]struct{}
+	Sub2APIProfile           *routingSub2APIProfileObservation
+	Sub2APIAuthFingerprint   [32]byte
+	AccountIdentityConfirmed bool
 }
 
 type routingCostAccountGroup struct {
-	Identity routingCostAccountIdentity
-	Sources  []routingCostBindingSource
+	Identity       routingCostAccountIdentity
+	Sources        []routingCostBindingSource
+	BackoffSources []model.RoutingChannelBinding
 }
 
 type routingCostAccountPayload struct {
 	SourceType       string
+	AccountIdentity  *routingCostAccountIdentity
 	ObservedTime     int64
 	EffectiveTime    int64
 	ExpiresTime      int64
@@ -1455,6 +1499,14 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 	if err := model.DB.WithContext(ctx).Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
 		return summary, err
 	}
+	var trafficBindings []model.RoutingChannelBinding
+	if model.DB.Migrator().HasTable(&model.RoutingChannelBinding{}) {
+		if err := model.DB.WithContext(ctx).
+			Select("channel_id", "serves_claude_code").
+			Find(&trafficBindings).Error; err != nil {
+			return summary, err
+		}
+	}
 	cachedCostKeys, cachedBalanceChannels := routinghotcache.CostConnectorCachedState()
 	cachedCosts := make([]model.RoutingCostSnapshot, 0, len(cachedCostKeys))
 	const costReconcileBatchSize = 200
@@ -1498,6 +1550,7 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 		return summary, err
 	}
 	routinghotcache.LoadHealthSnapshots(healthStates, now)
+	routinghotcache.ReplaceChannelTrafficPolicies(trafficBindings, now)
 	routinghotcache.ReconcileCostConnectorSnapshots(routinghotcache.CostConnectorReconcileSnapshot{
 		CachedCostKeys:        cachedCostKeys,
 		RecentCosts:           costs,
@@ -1580,10 +1633,12 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	}
 	now := deps.now()
 	eligibleBindings := make([]model.RoutingChannelBinding, 0, len(bindings))
+	backoffBindings := make([]model.RoutingChannelBinding, 0, len(bindings))
 	skippedBackoff := 0
 	for _, binding := range bindings {
 		if binding.SyncBackoffUntil > now {
 			skippedBackoff++
+			backoffBindings = append(backoffBindings, binding)
 			continue
 		}
 		eligibleBindings = append(eligibleBindings, binding)
@@ -1596,13 +1651,19 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	syncErrors := 0
 	staleBindings := 0
 	accountGroups := make(map[string]*routingCostAccountGroup)
+	type routingSub2APIProfilePreflight struct {
+		profile routingSub2APIProfileObservation
+		err     error
+	}
+	sub2APIProfileByAuth := make(map[[32]byte]routingSub2APIProfilePreflight)
+	sub2APIAccountKeyByAuth := make(map[[32]byte]string)
 	for _, binding := range eligibleBindings {
 		if err := ctx.Err(); err != nil {
 			return summary, err
 		}
 		credentials, err := binding.GetCredentials()
 		if err != nil {
-			stale, updateErr := recordRoutingCostSyncFailure(ctx, binding, credentials, err, deps)
+			_, stale, _, updateErr := recordRoutingCostSyncFailure(ctx, binding, credentials, err, deps, nil, nil)
 			if updateErr != nil {
 				return summary, updateErr
 			}
@@ -1613,9 +1674,36 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 			}
 			continue
 		}
-		identity, err := routingUpstreamAccountIdentity(binding, credentials)
+		if _, _, err = canonicalRoutingUpstreamBaseURL(binding.BaseURL); err == nil {
+			_, err = withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+		}
+		var identity routingCostAccountIdentity
+		var sub2APIProfile *routingSub2APIProfileObservation
+		var sub2APIAuthFingerprint [32]byte
+		if err == nil && binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
+			sub2APIAuthFingerprint, err = routingSub2APIAccountAuthFingerprint(binding, credentials)
+			if err == nil {
+				preflight, exists := sub2APIProfileByAuth[sub2APIAuthFingerprint]
+				if !exists {
+					preflight.profile.Profile, preflight.err = fetchRoutingSub2APIAccountProfile(ctx, binding, credentials)
+					if preflight.err == nil {
+						preflight.profile.ObservedAt = common.GetTimestamp()
+					}
+					sub2APIProfileByAuth[sub2APIAuthFingerprint] = preflight
+				}
+				if preflight.err != nil {
+					err = preflight.err
+				} else {
+					profile := preflight.profile
+					sub2APIProfile = &profile
+					identity, err = routingSub2APIProfileAccountIdentity(binding, profile.Profile)
+				}
+			}
+		} else if err == nil {
+			identity, err = routingUpstreamAccountIdentity(binding, credentials)
+		}
 		if err != nil {
-			stale, updateErr := recordRoutingCostSyncFailure(ctx, binding, credentials, err, deps)
+			_, stale, _, updateErr := recordRoutingCostSyncFailure(ctx, binding, credentials, err, deps, nil, nil)
 			if updateErr != nil {
 				return summary, updateErr
 			}
@@ -1625,13 +1713,90 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 				syncErrors++
 			}
 			continue
+		}
+		binding, err = model.ApplyRoutingCostAccountKeyContext(ctx, binding, identity.AccountKey)
+		if err != nil {
+			if errors.Is(err, model.ErrRoutingBindingChanged) {
+				staleBindings++
+				continue
+			}
+			return summary, fmt.Errorf("persist routing upstream account association: %w", err)
 		}
 		group := accountGroups[identity.AccountKey]
 		if group == nil {
 			group = &routingCostAccountGroup{Identity: identity}
 			accountGroups[identity.AccountKey] = group
 		}
-		group.Sources = append(group.Sources, routingCostBindingSource{Binding: binding, Credentials: credentials})
+		group.Sources = append(group.Sources, routingCostBindingSource{
+			Binding:                  binding,
+			Credentials:              credentials,
+			Sub2APIProfile:           sub2APIProfile,
+			Sub2APIAuthFingerprint:   sub2APIAuthFingerprint,
+			AccountIdentityConfirmed: sub2APIProfile != nil,
+		})
+		if sub2APIProfile != nil {
+			sub2APIAccountKeyByAuth[sub2APIAuthFingerprint] = identity.AccountKey
+		}
+	}
+	backoffAccountKeyByChannel := make(map[int]string, len(backoffBindings))
+	if len(backoffBindings) > 0 {
+		channelIDs := make([]int, 0, len(backoffBindings))
+		for _, binding := range backoffBindings {
+			channelIDs = append(channelIDs, binding.ChannelID)
+		}
+		ambiguousChannels := make(map[int]struct{})
+		const accountLookupBatchSize = 500
+		for start := 0; start < len(channelIDs); start += accountLookupBatchSize {
+			end := min(start+accountLookupBatchSize, len(channelIDs))
+			var accountRows []struct {
+				ChannelID      int
+				AccountKeyHash string
+			}
+			if err := model.DB.WithContext(ctx).
+				Model(&model.RoutingCostSnapshot{}).
+				Select("channel_id, account_key_hash").
+				Where("channel_id IN ? AND account_key_hash <> ?", channelIDs[start:end], "").
+				Find(&accountRows).Error; err != nil {
+				return summary, err
+			}
+			for _, row := range accountRows {
+				accountKey := strings.TrimSpace(row.AccountKeyHash)
+				if accountKey == "" {
+					continue
+				}
+				if existing, exists := backoffAccountKeyByChannel[row.ChannelID]; exists && existing != accountKey {
+					delete(backoffAccountKeyByChannel, row.ChannelID)
+					ambiguousChannels[row.ChannelID] = struct{}{}
+					continue
+				}
+				if _, ambiguous := ambiguousChannels[row.ChannelID]; !ambiguous {
+					backoffAccountKeyByChannel[row.ChannelID] = accountKey
+				}
+			}
+		}
+	}
+	for _, binding := range backoffBindings {
+		accountKey := strings.TrimSpace(binding.AccountKeyHash)
+		if binding.UpstreamType == model.RoutingUpstreamTypeNewAPI {
+			identity, identityErr := routingUpstreamAccountIdentity(binding, model.RoutingCredentials{})
+			if identityErr == nil {
+				accountKey = identity.AccountKey
+			}
+		} else if accountKey == "" {
+			accountKey = backoffAccountKeyByChannel[binding.ChannelID]
+			if accountKey == "" {
+				credentials, credentialErr := binding.GetCredentials()
+				if credentialErr == nil {
+					fingerprint, fingerprintErr := routingSub2APIAccountAuthFingerprint(binding, credentials)
+					if fingerprintErr == nil {
+						accountKey = sub2APIAccountKeyByAuth[fingerprint]
+					}
+				}
+			}
+		}
+		if group := accountGroups[accountKey]; group != nil {
+			group.BackoffSources = append(group.BackoffSources, binding)
+		}
 	}
 
 	accountKeys := make([]string, 0, len(accountGroups))
@@ -1644,128 +1809,385 @@ func runRoutingCostSyncTaskWithDeps(ctx context.Context, deps routingCostSyncDep
 	partialAccounts := 0
 	for _, accountKey := range accountKeys {
 		group := accountGroups[accountKey]
-		representative := group.Sources[0]
-		payload, err := fetchRoutingCostAccountPayload(ctx, representative.Binding, representative.Credentials, setting)
-		if err != nil {
-			if ctx.Err() != nil {
-				return summary, ctx.Err()
-			}
-			safeErr := routingSafeErrorWithCredentials(err, representative.Credentials)
-			_, accountErr := model.UpsertRoutingUpstreamAccountContext(ctx, model.RoutingUpstreamAccountSpec{
-				SourceType:      routingCostConnectorSourceType(representative.Binding.UpstreamType),
-				StableIdentity:  group.Identity.StableIdentity,
-				MaskedIdentity:  group.Identity.MaskedIdentity,
-				Status:          model.RoutingUpstreamAccountStatusDegraded,
-				PreserveBalance: true,
-				LastSyncStatus:  model.RoutingUpstreamSyncStatusFailed,
-				LastSyncError:   safeErr.Error(),
-			})
-			if accountErr != nil {
-				return summary, fmt.Errorf("persist routing upstream account failure: %w", accountErr)
-			}
+		accountIdentity := group.Identity
+		accountConfirmationFences := make([]model.RoutingChannelBinding, 0, len(group.Sources))
+		if routingCostConnectorSourceType(group.Sources[0].Binding.UpstreamType) == model.RoutingUpstreamTypeSub2API {
 			for _, source := range group.Sources {
-				stale, updateErr := recordRoutingCostSyncFailure(ctx, source.Binding, source.Credentials, err, deps)
-				if updateErr != nil {
-					return summary, updateErr
-				}
-				if stale {
-					staleBindings++
-				} else {
-					syncErrors++
+				if source.AccountIdentityConfirmed {
+					accountConfirmationFences = append(accountConfirmationFences, source.Binding)
 				}
 			}
-			continue
 		}
-		if payload.SyncStatus == model.RoutingUpstreamSyncStatusPartial {
-			partialAccounts++
+		accountIdentityConfirmed := len(accountConfirmationFences) > 0
+		type routingCostSourceFailure struct {
+			source routingCostBindingSource
+			err    error
 		}
-		accountSucceeded := false
-		accountMappingPartial := false
-		accountMappingError := ""
+		type routingCostSyncBatch struct {
+			sources                 []routingCostBindingSource
+			preloadedGroups         *routingNewAPIUserGroupsResponse
+			preloadedSub2APIProfile *routingSub2APIProfileObservation
+		}
+		failures := make([]routingCostSourceFailure, 0)
+		batches := make([]routingCostSyncBatch, 0, len(group.Sources))
 
-		for _, source := range group.Sources {
-			writes, mapErr := routingCostVersionWritesForBinding(ctx, source.Binding, payload)
-			if mapErr != nil {
-				accountMappingPartial = true
-				if accountMappingError == "" {
-					accountMappingError = common.SanitizeErrorMessage(mapErr.Error(), routingCredentialSecrets(source.Credentials)...)
+		if routingCostConnectorSourceType(group.Sources[0].Binding.UpstreamType) == model.RoutingUpstreamTypeNewAPI {
+			type authPreflightResult struct {
+				groups routingNewAPIUserGroupsResponse
+				err    error
+			}
+			type servingPreflightResult struct {
+				models map[string]struct{}
+				err    error
+			}
+			preflightByCredential := make(map[[32]byte]authPreflightResult, len(group.Sources))
+			servingPreflightByCredential := make(map[[32]byte]servingPreflightResult, len(group.Sources))
+			batchIndexByCredential := make(map[[32]byte]int, len(group.Sources))
+			for _, source := range group.Sources {
+				credentials := source.Credentials.ForUpstream(source.Binding.UpstreamType)
+				egressPolicy := ""
+				if source.Binding.EgressPolicyJSON != nil {
+					egressPolicy = *source.Binding.EgressPolicyJSON
 				}
-				stale, updateErr := recordRoutingCostSyncFailure(ctx, source.Binding, source.Credentials, mapErr, deps)
-				if updateErr != nil {
-					return summary, updateErr
+				fingerprint := sha256.Sum256([]byte(strings.Join([]string{
+					strings.TrimSpace(source.Binding.BaseURL),
+					credentials.NewAPIAccessToken,
+					credentials.CustomCAPEM,
+					egressPolicy,
+				}, "\x00")))
+				preflight, exists := preflightByCredential[fingerprint]
+				if !exists {
+					if credentials.NewAPIAccessToken == "" {
+						preflight.err = routingAuthErrorf("newapi access token is required for management endpoints")
+					} else {
+						preflight.groups, preflight.err = fetchRoutingNewAPIUserGroups(
+							ctx, source.Binding, source.Credentials,
+						)
+					}
+					preflightByCredential[fingerprint] = preflight
 				}
-				if stale {
-					staleBindings++
+				if preflight.err != nil {
+					failures = append(failures, routingCostSourceFailure{source: source, err: preflight.err})
+					continue
+				}
+				source.AccountIdentityConfirmed = true
+				accountConfirmationFences = append(accountConfirmationFences, source.Binding)
+				accountIdentityConfirmed = true
+				servingFingerprint := sha256.Sum256([]byte(strings.Join([]string{
+					strings.TrimSpace(source.Binding.BaseURL),
+					credentials.GatewayAPIKey,
+					credentials.CustomCAPEM,
+					egressPolicy,
+				}, "\x00")))
+				servingPreflight, exists := servingPreflightByCredential[servingFingerprint]
+				if !exists {
+					servingPreflight.models, servingPreflight.err = fetchRoutingNewAPIGatewayModels(
+						ctx,
+						source.Binding,
+						source.Credentials,
+					)
+					servingPreflightByCredential[servingFingerprint] = servingPreflight
+				}
+				if servingPreflight.err != nil {
+					failures = append(failures, routingCostSourceFailure{source: source, err: servingPreflight.err})
+					continue
+				}
+				source.ServingModels = servingPreflight.models
+				if batchIndex, exists := batchIndexByCredential[fingerprint]; exists {
+					batches[batchIndex].sources = append(batches[batchIndex].sources, source)
 				} else {
-					syncErrors++
-				}
-				continue
-			}
-			accountStatus := model.RoutingUpstreamAccountStatusActive
-			if payload.SyncStatus == model.RoutingUpstreamSyncStatusPartial {
-				accountStatus = model.RoutingUpstreamAccountStatusDegraded
-			}
-			accountSpec := model.RoutingUpstreamAccountSpec{
-				SourceType:       routingCostConnectorSourceType(source.Binding.UpstreamType),
-				StableIdentity:   group.Identity.StableIdentity,
-				MaskedIdentity:   group.Identity.MaskedIdentity,
-				Status:           accountStatus,
-				PreserveBalance:  !payload.BalanceKnown,
-				BalanceKnown:     payload.BalanceKnown,
-				Balance:          payload.Balance,
-				BalanceUpdatedAt: payload.BalanceUpdatedAt,
-				LastSyncStatus:   payload.SyncStatus,
-				LastSyncError:    payload.SyncError,
-			}
-
-			if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
-				return summary, err
-			}
-			persisted, persistErr := model.CompleteRoutingCostVersionSyncContext(ctx, source.Binding, accountSpec, writes)
-			if persistErr == nil {
-				routinghotcache.LoadCostSnapshots(persisted.Latest)
-				if payload.BalanceKnown {
-					routinghotcache.SetBalance(source.Binding.ChannelID, routinghotcache.BalanceSnapshot{
-						Known:       true,
-						Balance:     payload.Balance,
-						UpdatedUnix: payload.BalanceUpdatedAt,
+					groups := preflight.groups
+					batchIndexByCredential[fingerprint] = len(batches)
+					batches = append(batches, routingCostSyncBatch{
+						sources:         []routingCostBindingSource{source},
+						preloadedGroups: &groups,
 					})
 				}
 			}
-			smartRoutingRuntimeStateMu.Unlock()
-			if persistErr != nil {
-				if errors.Is(persistErr, model.ErrRoutingBindingChanged) {
-					staleBindings++
+		} else {
+			type sub2APIBatchKey struct {
+				authFingerprint [32]byte
+				upstreamGroup   string
+			}
+			batchIndexByCredential := make(map[sub2APIBatchKey]int, len(group.Sources))
+			for _, source := range group.Sources {
+				batchKey := sub2APIBatchKey{
+					authFingerprint: source.Sub2APIAuthFingerprint,
+					upstreamGroup:   strings.TrimSpace(source.Binding.UpstreamGroup),
+				}
+				if batchIndex, exists := batchIndexByCredential[batchKey]; exists {
+					batches[batchIndex].sources = append(batches[batchIndex].sources, source)
 					continue
 				}
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return summary, ctxErr
-				}
-				return summary, fmt.Errorf("persist routing cost versions: %w", persistErr)
-			}
-			syncedSnapshots += len(writes)
-			accountSucceeded = true
-			for _, version := range persisted.Versions {
-				if version.Created {
-					createdVersions++
-				}
+				batchIndexByCredential[batchKey] = len(batches)
+				batches = append(batches, routingCostSyncBatch{
+					sources:                 []routingCostBindingSource{source},
+					preloadedSub2APIProfile: source.Sub2APIProfile,
+				})
 			}
 		}
-		if accountMappingPartial {
-			if payload.SyncStatus != model.RoutingUpstreamSyncStatusPartial {
-				partialAccounts++
+
+		type mappedRoutingCostSource struct {
+			source  routingCostBindingSource
+			payload routingCostAccountPayload
+			writes  []model.RoutingCostSnapshotVersionWrite
+		}
+		mappedSources := make([]mappedRoutingCostSource, 0, len(group.Sources))
+		payloadWasSuccessful := false
+		payloadWasPartial := false
+		payloadSyncError := ""
+		for _, batch := range batches {
+			representative := batch.sources[0]
+			requestedGroups := make([]string, 0, len(batch.sources))
+			seenGroups := make(map[string]struct{}, len(batch.sources))
+			for _, source := range batch.sources {
+				upstreamGroup := strings.TrimSpace(source.Binding.UpstreamGroup)
+				if upstreamGroup == "" {
+					continue
+				}
+				if _, exists := seenGroups[upstreamGroup]; exists {
+					continue
+				}
+				seenGroups[upstreamGroup] = struct{}{}
+				requestedGroups = append(requestedGroups, upstreamGroup)
 			}
-			if _, err := model.UpsertRoutingUpstreamAccountContext(ctx, model.RoutingUpstreamAccountSpec{
-				SourceType:      routingCostConnectorSourceType(representative.Binding.UpstreamType),
-				StableIdentity:  group.Identity.StableIdentity,
-				MaskedIdentity:  group.Identity.MaskedIdentity,
-				Status:          model.RoutingUpstreamAccountStatusDegraded,
-				PreserveBalance: true,
-				LastSyncStatus:  model.RoutingUpstreamSyncStatusPartial,
-				LastSyncError:   accountMappingError,
-			}); err != nil {
-				return summary, fmt.Errorf("persist routing upstream account partial status: %w", err)
+			sort.Strings(requestedGroups)
+			payload, err := fetchRoutingCostAccountPayloadWithSub2APIProfile(
+				ctx, representative.Binding, representative.Credentials, setting,
+				batch.preloadedGroups, batch.preloadedSub2APIProfile, requestedGroups...,
+			)
+			if err == nil && payload.AccountIdentity != nil &&
+				payload.AccountIdentity.AccountKey != group.Identity.AccountKey {
+				err = errors.New("sub2api authenticated account changed during cost sync")
 			}
+			if err != nil {
+				if ctx.Err() != nil {
+					return summary, ctx.Err()
+				}
+				for _, source := range batch.sources {
+					failures = append(failures, routingCostSourceFailure{source: source, err: err})
+				}
+				continue
+			}
+			payloadWasSuccessful = true
+			if payload.AccountIdentity != nil {
+				accountIdentity = *payload.AccountIdentity
+			}
+			if payload.SyncStatus == model.RoutingUpstreamSyncStatusPartial {
+				payloadWasPartial = true
+				if payloadSyncError == "" {
+					payloadSyncError = common.SanitizeErrorMessage(payload.SyncError, routingCredentialSecrets(representative.Credentials)...)
+				}
+			}
+			for _, source := range batch.sources {
+				writes, mapErr := routingCostVersionWritesForBinding(ctx, source.Binding, payload)
+				if mapErr == nil && source.Binding.UpstreamType == model.RoutingUpstreamTypeNewAPI {
+					writes, mapErr = filterRoutingNewAPIWritesByServingModels(writes, source.ServingModels)
+				}
+				if mapErr != nil {
+					failures = append(failures, routingCostSourceFailure{source: source, err: mapErr})
+					continue
+				}
+				mappedSources = append(mappedSources, mappedRoutingCostSource{
+					source:  source,
+					payload: payload,
+					writes:  writes,
+				})
+			}
+		}
+
+		type appliedRoutingCostFailure struct {
+			fence   model.RoutingChannelBinding
+			message string
+		}
+		appliedFailures := make([]appliedRoutingCostFailure, 0, len(failures)+len(group.BackoffSources))
+		for _, binding := range group.BackoffSources {
+			message := "routing cost sync remains in backoff"
+			if binding.LastSyncError != nil {
+				if sanitized := common.SanitizeErrorMessage(*binding.LastSyncError); sanitized != "" {
+					message = sanitized
+				}
+			}
+			appliedFailures = append(appliedFailures, appliedRoutingCostFailure{
+				fence:   binding,
+				message: message,
+			})
+		}
+		failureSyncStatus := model.RoutingUpstreamSyncStatusFailed
+		if payloadWasSuccessful {
+			failureSyncStatus = model.RoutingUpstreamSyncStatusPartial
+		}
+		failureAccountStatusApplied := false
+		for _, failure := range failures {
+			message := common.SanitizeErrorMessage(
+				failure.err.Error(),
+				routingCredentialSecrets(failure.source.Credentials)...,
+			)
+			if message == "" {
+				message = "routing cost sync failed"
+			}
+			var failureAccountSpec *model.RoutingUpstreamAccountSpec
+			failureConfirmationFences := accountConfirmationFences
+			if accountIdentityConfirmed {
+				if failure.source.AccountIdentityConfirmed {
+					failureConfirmationFences = []model.RoutingChannelBinding{failure.source.Binding}
+				}
+				spec := model.RoutingUpstreamAccountSpec{
+					SourceType:      routingCostConnectorSourceType(failure.source.Binding.UpstreamType),
+					StableIdentity:  accountIdentity.StableIdentity,
+					MaskedIdentity:  accountIdentity.MaskedIdentity,
+					Status:          model.RoutingUpstreamAccountStatusDegraded,
+					PreserveBalance: true,
+					LastSyncStatus:  failureSyncStatus,
+					LastSyncError:   message,
+				}
+				failureAccountSpec = &spec
+			}
+			updatedBinding, stale, accountStatusApplied, updateErr := recordRoutingCostSyncFailure(
+				ctx,
+				failure.source.Binding,
+				failure.source.Credentials,
+				failure.err,
+				deps,
+				failureConfirmationFences,
+				failureAccountSpec,
+			)
+			if updateErr != nil {
+				return summary, updateErr
+			}
+			if stale {
+				staleBindings++
+			} else {
+				if failure.source.AccountIdentityConfirmed {
+					for index := range accountConfirmationFences {
+						if accountConfirmationFences[index].ID == failure.source.Binding.ID {
+							accountConfirmationFences[index] = updatedBinding
+							break
+						}
+					}
+				}
+				failureAccountStatusApplied = failureAccountStatusApplied || accountStatusApplied
+				syncErrors++
+				appliedFailures = append(appliedFailures, appliedRoutingCostFailure{
+					fence:   updatedBinding,
+					message: message,
+				})
+			}
+		}
+
+		accountSucceeded := false
+		accountWasPartial := payloadWasPartial || failureAccountStatusApplied || len(group.BackoffSources) > 0
+		for _, mapped := range mappedSources {
+			source := mapped.source
+			payload := mapped.payload
+			channelBalanceNotApplicable := false
+			if source.Binding.UpstreamType == model.RoutingUpstreamTypeSub2API && payload.Sub2API != nil {
+				group, found := payload.Sub2API.Groups[strings.TrimSpace(source.Binding.UpstreamGroup)]
+				channelBalanceNotApplicable = found && routingSub2APIGroupUsesSubscription(group)
+			}
+
+			maxAttempts := len(appliedFailures) + 1
+			for attempts := 0; attempts <= maxAttempts; attempts++ {
+				failureFences := make([]model.RoutingChannelBinding, 0, len(appliedFailures))
+				failureSyncError := payloadSyncError
+				if accountIdentityConfirmed {
+					for _, failure := range appliedFailures {
+						failureFences = append(failureFences, failure.fence)
+						if failureSyncError == "" {
+							failureSyncError = failure.message
+						}
+					}
+				}
+				accountPartial := payloadWasPartial || len(failureFences) > 0
+				accountStatus := model.RoutingUpstreamAccountStatusActive
+				accountSyncStatus := model.RoutingUpstreamSyncStatusSuccess
+				if accountPartial {
+					accountStatus = model.RoutingUpstreamAccountStatusDegraded
+					accountSyncStatus = model.RoutingUpstreamSyncStatusPartial
+				}
+				accountSpec := model.RoutingUpstreamAccountSpec{
+					SourceType:                  routingCostConnectorSourceType(source.Binding.UpstreamType),
+					StableIdentity:              accountIdentity.StableIdentity,
+					MaskedIdentity:              accountIdentity.MaskedIdentity,
+					Status:                      accountStatus,
+					PreserveBalance:             !payload.BalanceKnown,
+					BalanceKnown:                payload.BalanceKnown,
+					Balance:                     payload.Balance,
+					BalanceUpdatedAt:            payload.BalanceUpdatedAt,
+					ChannelBalanceNotApplicable: channelBalanceNotApplicable,
+					LastSyncStatus:              accountSyncStatus,
+					LastSyncError:               failureSyncError,
+				}
+
+				if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
+					return summary, err
+				}
+				persisted, persistErr := model.CompleteRoutingCostVersionSyncWithAccountFencesContext(
+					ctx,
+					source.Binding,
+					failureFences,
+					accountSpec,
+					mapped.writes,
+				)
+				if persistErr == nil {
+					routinghotcache.ReplaceCostSnapshotsForChannel(source.Binding.ChannelID, persisted.Latest)
+					if accountSpec.ChannelBalanceNotApplicable {
+						routinghotcache.ClearBalance(source.Binding.ChannelID)
+					} else if payload.BalanceKnown {
+						routinghotcache.SetBalance(source.Binding.ChannelID, routinghotcache.BalanceSnapshot{
+							Known:       true,
+							Balance:     payload.Balance,
+							UpdatedUnix: payload.BalanceUpdatedAt,
+						})
+					}
+				}
+				smartRoutingRuntimeStateMu.Unlock()
+				if persistErr == nil {
+					syncedSnapshots += len(mapped.writes)
+					accountSucceeded = true
+					accountWasPartial = accountPartial
+					for _, version := range persisted.Versions {
+						if version.Created {
+							createdVersions++
+						}
+					}
+					break
+				}
+				if !errors.Is(persistErr, model.ErrRoutingBindingChanged) {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return summary, ctxErr
+					}
+					return summary, fmt.Errorf("persist routing cost versions: %w", persistErr)
+				}
+
+				sourceMatches, matchErr := model.RoutingChannelBindingMatchesSyncContext(ctx, source.Binding)
+				if matchErr != nil {
+					return summary, matchErr
+				}
+				if !sourceMatches {
+					staleBindings++
+					break
+				}
+				currentFailures := make([]appliedRoutingCostFailure, 0, len(appliedFailures))
+				for _, failure := range appliedFailures {
+					matches, failureMatchErr := model.RoutingChannelBindingMatchesSyncContext(ctx, failure.fence)
+					if failureMatchErr != nil {
+						return summary, failureMatchErr
+					}
+					if matches {
+						currentFailures = append(currentFailures, failure)
+					}
+				}
+				if len(currentFailures) == len(appliedFailures) {
+					staleBindings++
+					break
+				}
+				staleBindings += len(appliedFailures) - len(currentFailures)
+				appliedFailures = currentFailures
+			}
+		}
+		if accountWasPartial {
+			partialAccounts++
 		}
 		if accountSucceeded {
 			successfulAccounts++
@@ -1786,9 +2208,11 @@ func recordRoutingCostSyncFailure(
 	credentials model.RoutingCredentials,
 	syncErr error,
 	deps routingCostSyncDeps,
-) (bool, error) {
+	accountFences []model.RoutingChannelBinding,
+	accountSpec *model.RoutingUpstreamAccountSpec,
+) (model.RoutingChannelBinding, bool, bool, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
+		return model.RoutingChannelBinding{}, false, false, ctxErr
 	}
 	failureCount := binding.SyncFailureCount
 	if failureCount < 0 {
@@ -1821,58 +2245,114 @@ func recordRoutingCostSyncFailure(
 			message = "routing cost sync failed"
 		}
 	}
-	if err := model.UpdateRoutingCostSyncFailureContext(ctx, binding, failureCount, backoffUntil, message); err != nil {
-		if errors.Is(err, model.ErrRoutingBindingChanged) {
-			return true, nil
+	var updated model.RoutingChannelBinding
+	var err error
+	accountStatusApplied := false
+	if accountSpec == nil {
+		updated, err = model.ApplyRoutingCostSyncFailureContext(ctx, binding, failureCount, backoffUntil, message)
+	} else {
+		for _, confirmationFence := range accountFences {
+			updated, err = model.ApplyRoutingCostSyncFailureWithAccountFencesContext(
+				ctx,
+				binding,
+				failureCount,
+				backoffUntil,
+				message,
+				[]model.RoutingChannelBinding{confirmationFence},
+				*accountSpec,
+			)
+			if err == nil {
+				accountStatusApplied = true
+				break
+			}
+			if !errors.Is(err, model.ErrRoutingBindingChanged) {
+				break
+			}
+			bindingMatches, matchErr := model.RoutingChannelBindingMatchesSyncContext(ctx, binding)
+			if matchErr != nil {
+				return model.RoutingChannelBinding{}, false, false, matchErr
+			}
+			if !bindingMatches {
+				return model.RoutingChannelBinding{}, true, false, nil
+			}
+			confirmationMatches, fenceErr := model.RoutingChannelBindingMatchesSyncContext(ctx, confirmationFence)
+			if fenceErr != nil {
+				return model.RoutingChannelBinding{}, false, false, fenceErr
+			}
+			if confirmationMatches {
+				break
+			}
 		}
-		return false, fmt.Errorf("persist routing cost sync failure state: %w", err)
+		if !accountStatusApplied && (err == nil || errors.Is(err, model.ErrRoutingBindingChanged)) {
+			updated, err = model.ApplyRoutingCostSyncFailureContext(
+				ctx, binding, failureCount, backoffUntil, message,
+			)
+		}
 	}
-	return false, nil
+	if err != nil {
+		if errors.Is(err, model.ErrRoutingBindingChanged) {
+			return model.RoutingChannelBinding{}, true, false, nil
+		}
+		return model.RoutingChannelBinding{}, false, false, fmt.Errorf("persist routing cost sync failure state: %w", err)
+	}
+	return updated, false, accountStatusApplied, nil
 }
 
 func routingUpstreamAccountIdentity(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) (routingCostAccountIdentity, error) {
-	parsed, err := url.Parse(strings.TrimSpace(binding.BaseURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return routingCostAccountIdentity{}, errors.New("invalid routing upstream account base URL")
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	parsed.Host = strings.ToLower(parsed.Host)
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	canonicalBase := parsed.String()
-	hostLabel := strings.ToLower(parsed.Hostname())
-	if hostLabel == "" {
-		hostLabel = "upstream"
-	}
-
 	sourceType := routingCostConnectorSourceType(binding.UpstreamType)
-	identityParts := []string{"routing-upstream-identity:v1", sourceType, canonicalBase}
-	maskedIdentity := hostLabel
+	identitySubject := ""
+	maskedSubject := ""
 	switch sourceType {
 	case model.RoutingUpstreamTypeNewAPI:
-		if binding.NewAPIUserID != nil && *binding.NewAPIUserID > 0 {
-			identityParts = append(identityParts, fmt.Sprintf("user:%d", *binding.NewAPIUserID))
-			maskedIdentity += fmt.Sprintf(" / user %d", *binding.NewAPIUserID)
-		} else {
-			token := routingBearerToken(binding.UpstreamType, credentials)
-			identityParts = append(identityParts, "token:"+token)
-			maskedIdentity += " / " + maskRoutingToken(token)
+		if binding.NewAPIUserID == nil || *binding.NewAPIUserID <= 0 {
+			return routingCostAccountIdentity{}, errors.New("newapi upstream account identity requires a valid user ID")
 		}
+		identitySubject = fmt.Sprintf("user:%d", *binding.NewAPIUserID)
+		maskedSubject = fmt.Sprintf("user %d", *binding.NewAPIUserID)
 	case model.RoutingUpstreamTypeSub2API:
-		email := strings.ToLower(strings.TrimSpace(credentials.Sub2APIEmail))
-		if email != "" {
-			identityParts = append(identityParts, "email:"+email)
-			maskedIdentity += " / " + maskRoutingEmail(email)
-		} else {
-			token := strings.TrimSpace(credentials.Sub2APIToken)
-			if token == "" {
-				token = strings.TrimSpace(credentials.GatewayAPIKey)
-			}
-			identityParts = append(identityParts, "token:"+token)
-			maskedIdentity += " / " + maskRoutingToken(token)
-		}
+		return routingCostAccountIdentity{}, errors.New("sub2api upstream account identity requires an authenticated user profile")
 	}
+	return routingUpstreamAccountIdentityForSubject(binding, sourceType, identitySubject, maskedSubject)
+}
+
+func routingSub2APIProfileAccountIdentity(
+	binding model.RoutingChannelBinding,
+	profile routingSub2APIUserProfile,
+) (routingCostAccountIdentity, error) {
+	if profile.ID <= 0 {
+		return routingCostAccountIdentity{}, errors.New("sub2api account profile does not contain a stable user ID")
+	}
+	maskedSubject := fmt.Sprintf("user %d", profile.ID)
+	return routingUpstreamAccountIdentityForSubject(
+		binding,
+		model.RoutingUpstreamTypeSub2API,
+		fmt.Sprintf("user:%d", profile.ID),
+		maskedSubject,
+	)
+}
+
+func routingUpstreamAccountIdentityForSubject(
+	binding model.RoutingChannelBinding,
+	sourceType string,
+	identitySubject string,
+	maskedSubject string,
+) (routingCostAccountIdentity, error) {
+	canonicalBase, hostLabel, err := canonicalRoutingUpstreamBaseURL(binding.BaseURL)
+	if err != nil {
+		return routingCostAccountIdentity{}, err
+	}
+
+	identitySubject = strings.TrimSpace(identitySubject)
+	maskedSubject = strings.TrimSpace(maskedSubject)
+	if identitySubject == "" || maskedSubject == "" {
+		return routingCostAccountIdentity{}, errors.New("invalid routing upstream account identity")
+	}
+	identityVersion := "routing-upstream-identity:v1"
+	if sourceType == model.RoutingUpstreamTypeSub2API {
+		identityVersion = "routing-upstream-identity:sub2api:v2"
+	}
+	identityParts := []string{identityVersion, sourceType, canonicalBase, identitySubject}
+	maskedIdentity := hostLabel + " / " + maskedSubject
 	identityHash := sha256.Sum256([]byte(strings.Join(identityParts, "\x00")))
 	stableIdentity := fmt.Sprintf("%x", identityHash[:])
 	return routingCostAccountIdentity{
@@ -1882,6 +2362,43 @@ func routingUpstreamAccountIdentity(binding model.RoutingChannelBinding, credent
 	}, nil
 }
 
+func canonicalRoutingUpstreamBaseURL(value string) (string, string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" ||
+		!strings.EqualFold(parsed.Scheme, "https") || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", "", errors.New("invalid routing upstream account base URL")
+	}
+	hostname := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if hostname == "" {
+		return "", "", errors.New("invalid routing upstream account base URL")
+	}
+	port := parsed.Port()
+	if port == "443" {
+		port = ""
+	}
+	host := hostname
+	if strings.Contains(hostname, ":") {
+		if port == "" {
+			host = "[" + hostname + "]"
+		} else {
+			host = net.JoinHostPort(hostname, port)
+		}
+	} else if port != "" {
+		host = net.JoinHostPort(hostname, port)
+	}
+	parsed.Scheme = "https"
+	parsed.Host = host
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = strings.TrimRight(parsed.RawPath, "/")
+	canonicalBase := parsed.String()
+	hostLabel := parsed.Host + parsed.EscapedPath()
+	if len(hostLabel) > 192 {
+		hostLabel = hostLabel[:192]
+	}
+	return canonicalBase, hostLabel, nil
+}
+
 func routingCostConnectorSourceType(upstreamType string) string {
 	if upstreamType == model.RoutingUpstreamTypeSub2API {
 		return model.RoutingUpstreamTypeSub2API
@@ -1889,12 +2406,76 @@ func routingCostConnectorSourceType(upstreamType string) string {
 	return model.RoutingUpstreamTypeNewAPI
 }
 
+func routingSub2APIAccountAuthFingerprint(
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) ([32]byte, error) {
+	canonicalBase, _, err := canonicalRoutingUpstreamBaseURL(binding.BaseURL)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	credentials = credentials.ForUpstream(model.RoutingUpstreamTypeSub2API)
+	authMode := "managed"
+	authIdentity := strings.Join([]string{credentials.Sub2APIEmail, credentials.Sub2APIPassword}, "\x00")
+	if credentials.Sub2APIToken != "" {
+		authMode = "token"
+		authIdentity = credentials.Sub2APIToken
+	}
+	egressPolicy := ""
+	if binding.EgressPolicyJSON != nil {
+		egressPolicy = *binding.EgressPolicyJSON
+	}
+	return sha256.Sum256([]byte(strings.Join([]string{
+		canonicalBase,
+		authMode,
+		authIdentity,
+		credentials.CustomCAPEM,
+		egressPolicy,
+	}, "\x00"))), nil
+}
+
 func fetchRoutingCostAccountPayload(
 	ctx context.Context,
 	binding model.RoutingChannelBinding,
 	credentials model.RoutingCredentials,
 	setting smart_routing_setting.SmartRoutingSetting,
+	preloadedNewAPIGroups *routingNewAPIUserGroupsResponse,
+	requestedGroups ...string,
 ) (routingCostAccountPayload, error) {
+	return fetchRoutingCostAccountPayloadWithSub2APIProfile(
+		ctx,
+		binding,
+		credentials,
+		setting,
+		preloadedNewAPIGroups,
+		nil,
+		requestedGroups...,
+	)
+}
+
+func fetchRoutingCostAccountPayloadWithSub2APIProfile(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	setting smart_routing_setting.SmartRoutingSetting,
+	preloadedNewAPIGroups *routingNewAPIUserGroupsResponse,
+	preloadedSub2APIProfile *routingSub2APIProfileObservation,
+	requestedGroups ...string,
+) (routingCostAccountPayload, error) {
+	credentials = credentials.ForUpstream(binding.UpstreamType)
+	switch routingCostConnectorSourceType(binding.UpstreamType) {
+	case model.RoutingUpstreamTypeNewAPI:
+		if binding.NewAPIUserID == nil || *binding.NewAPIUserID <= 0 {
+			return routingCostAccountPayload{}, routingAuthErrorf("newapi user ID is required for management endpoints")
+		}
+		if credentials.NewAPIAccessToken == "" {
+			return routingCostAccountPayload{}, routingAuthErrorf("newapi access token is required for management endpoints")
+		}
+	case model.RoutingUpstreamTypeSub2API:
+		if !credentials.ReadyForUpstream(model.RoutingUpstreamTypeSub2API) {
+			return routingCostAccountPayload{}, routingAuthErrorf("sub2api JWT or email and password are required for management endpoints")
+		}
+	}
 	observedTime := common.GetTimestamp()
 	intervalMinutes := setting.SyncIntervalMin
 	if intervalMinutes < 1 {
@@ -1912,11 +2493,30 @@ func fetchRoutingCostAccountPayload(
 
 	switch payload.SourceType {
 	case model.RoutingUpstreamTypeNewAPI:
-		balance, balanceKnown, balanceErr := fetchRoutingUpstreamBalanceValue(ctx, binding, credentials)
+		if len(requestedGroups) == 0 && strings.TrimSpace(binding.UpstreamGroup) != "" {
+			requestedGroups = []string{strings.TrimSpace(binding.UpstreamGroup)}
+		}
+		upstreamQuotaPerUnit, err := fetchRoutingNewAPIQuotaPerUnit(ctx, binding, credentials)
+		if err != nil {
+			return routingCostAccountPayload{}, err
+		}
+		balance, balanceKnown, balanceErr := fetchRoutingNewAPIBalanceValue(
+			ctx,
+			binding,
+			credentials,
+			upstreamQuotaPerUnit,
+		)
 		if balanceErr != nil && routingUpstreamAuthError(balanceErr) {
 			return routingCostAccountPayload{}, balanceErr
 		}
-		pricing, err := fetchRoutingNewAPIPricingPayload(ctx, binding, credentials)
+		pricing, err := fetchRoutingNewAPIAccountPricingPayloadWithQuotaPerUnit(
+			ctx,
+			binding,
+			credentials,
+			requestedGroups,
+			upstreamQuotaPerUnit,
+			preloadedNewAPIGroups,
+		)
 		if err != nil {
 			return routingCostAccountPayload{}, err
 		}
@@ -1948,11 +2548,22 @@ func fetchRoutingCostAccountPayload(
 			payload.PricingVersion = routingCostContentVersion("newapi", pricing)
 		}
 	case model.RoutingUpstreamTypeSub2API:
-		pricing, err := fetchRoutingSub2APIAccountPricing(ctx, binding, credentials)
+		pricing, err := fetchRoutingSub2APIAccountPricingForGroupsWithProfile(
+			ctx,
+			binding,
+			credentials,
+			preloadedSub2APIProfile,
+			requestedGroups,
+		)
 		if err != nil {
 			return routingCostAccountPayload{}, err
 		}
 		payload.Sub2API = &pricing
+		accountIdentity, err := routingSub2APIProfileAccountIdentity(binding, pricing.Profile)
+		if err != nil {
+			return routingCostAccountPayload{}, err
+		}
+		payload.AccountIdentity = &accountIdentity
 		payload.BalanceKnown = pricing.BalanceKnown
 		payload.Balance = pricing.Balance
 		payload.BalanceUpdatedAt = pricing.BalanceUpdatedAt
@@ -2002,14 +2613,15 @@ func routingNewAPICostVersionWrites(
 	payload routingCostAccountPayload,
 ) ([]model.RoutingCostSnapshotVersionWrite, error) {
 	pricingPayload := payload.NewAPI
-	groupRatio := 1.0
-	groupRatioKnown := false
-	if ratio, ok := pricingPayload.GroupRatio[binding.UpstreamGroup]; ok {
-		if !routingCostNonNegativeFinite(ratio) || ratio <= 0 {
-			return nil, errors.New("newapi returned an invalid group ratio")
-		}
-		groupRatio = ratio
-		groupRatioKnown = true
+	if message := strings.TrimSpace(pricingPayload.AccountGroupErrors[binding.UpstreamGroup]); message != "" {
+		return nil, errors.New(message)
+	}
+	groupRatio, groupRatioKnown := pricingPayload.GroupRatio[binding.UpstreamGroup]
+	if !groupRatioKnown {
+		return nil, errors.New("newapi bound group is not available to the account")
+	}
+	if !routingCostNonNegativeFinite(groupRatio) {
+		return nil, errors.New("newapi returned an invalid group ratio")
 	}
 	items := append([]routingPricingItem(nil), pricingPayload.Data...)
 	sort.SliceStable(items, func(left int, right int) bool {
@@ -2031,9 +2643,17 @@ func routingNewAPICostVersionWrites(
 		}
 		seenModels[localModel] = struct{}{}
 
-		pricing, confidence, confidenceScore, err := routingNewAPINormalizedPricing(item, groupRatio, groupRatioKnown)
+		pricing, confidence, confidenceScore, err := routingNewAPINormalizedPricing(
+			item,
+			groupRatio,
+			true,
+			pricingPayload.QuotaPerUnit,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("invalid newapi price for model %s: %w", upstreamModel, err)
+		}
+		if confidence == model.RoutingCostConfidenceUnknown {
+			return nil, fmt.Errorf("newapi returned model %s without usable pricing", upstreamModel)
 		}
 		effectiveTime := payload.EffectiveTime
 		if item.EffectiveTime > 0 {
@@ -2068,19 +2688,47 @@ func routingNewAPICostVersionWrites(
 			Pricing:          pricing,
 		})
 	}
+	if len(writes) == 0 {
+		return nil, errors.New("newapi returned no priced models for the bound group")
+	}
 	return writes, nil
+}
+
+func filterRoutingNewAPIWritesByServingModels(
+	writes []model.RoutingCostSnapshotVersionWrite,
+	servingModels map[string]struct{},
+) ([]model.RoutingCostSnapshotVersionWrite, error) {
+	if len(servingModels) == 0 {
+		return nil, errors.New("newapi serving model contract is unavailable")
+	}
+	filtered := make([]model.RoutingCostSnapshotVersionWrite, 0, len(writes))
+	for _, write := range writes {
+		if _, available := servingModels[strings.TrimSpace(write.UpstreamModel)]; available {
+			filtered = append(filtered, write)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, errors.New("newapi gateway API key exposes none of the priced account models for the bound group")
+	}
+	return filtered, nil
 }
 
 func routingNewAPINormalizedPricing(
 	item routingPricingItem,
 	groupRatio float64,
 	groupRatioKnown bool,
+	upstreamQuotaPerUnit float64,
 ) (model.RoutingNormalizedPricing, string, float64, error) {
-	if item.QuotaType < 0 || item.QuotaType > 1 || !routingCostNonNegativeFinite(item.ModelRatio) ||
-		!routingCostNonNegativeFinite(item.ModelPrice) || !routingCostNonNegativeFinite(item.CompletionRatio) {
+	if !routingCostNonNegativeFinite(groupRatio) ||
+		!routingCostNonNegativeFinite(upstreamQuotaPerUnit) || upstreamQuotaPerUnit <= 0 ||
+		!routingCostNonNegativeFinite(common.QuotaPerUnit) || common.QuotaPerUnit <= 0 ||
+		item.QuotaType < 0 || item.QuotaType > 1 {
 		return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
 	}
 	for _, value := range []*float64{
+		item.ModelRatio,
+		item.ModelPrice,
+		item.CompletionRatio,
 		item.CacheRatio,
 		item.CreateCacheRatio,
 		item.ImageRatio,
@@ -2092,10 +2740,6 @@ func routingNewAPINormalizedPricing(
 			return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
 		}
 	}
-	completionRatio := item.CompletionRatio
-	if completionRatio == 0 {
-		completionRatio = 1
-	}
 	billingMode := strings.ToLower(strings.TrimSpace(item.BillingMode))
 	if billingMode == "" {
 		if item.QuotaType == 1 {
@@ -2104,48 +2748,98 @@ func routingNewAPINormalizedPricing(
 			billingMode = "token"
 		}
 	}
+	billingExpression := strings.TrimSpace(item.BillingExpr)
+	if billingMode == "token" && billingExpression == "" && item.CompletionRatio == nil {
+		return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
+	}
+	completionRatio := 1.0
+	if item.CompletionRatio != nil {
+		completionRatio = *item.CompletionRatio
+	}
 	perRequestCost := item.ModelPrice
 	if item.PerRequestPrice != nil {
-		perRequestCost = *item.PerRequestPrice
+		perRequestCost = item.PerRequestPrice
 	}
-	inputCostPerMillion := item.ModelRatio * 1_000_000 / common.QuotaPerUnit
+	modelRatio := 0.0
+	if item.ModelRatio != nil {
+		modelRatio = *item.ModelRatio
+	}
+	baseRatio := modelRatio * common.QuotaPerUnit / upstreamQuotaPerUnit
+	inputCostPerMillion := modelRatio * 1_000_000 / upstreamQuotaPerUnit
 	outputCostPerMillion := inputCostPerMillion * completionRatio
+	if item.ModelRatio != nil && (!routingCostNonNegativeFinite(baseRatio) ||
+		!routingCostNonNegativeFinite(inputCostPerMillion) ||
+		!routingCostNonNegativeFinite(outputCostPerMillion)) {
+		return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
+	}
 	pricing := model.RoutingNormalizedPricing{
 		QuotaType:         item.QuotaType,
 		BillingMode:       billingMode,
 		Currency:          "USD",
 		GroupRatio:        routingCostFloatPointer(groupRatio),
-		CompletionRatio:   routingCostFloatPointer(completionRatio),
 		Tiers:             item.Tiers,
-		BillingExpression: strings.TrimSpace(item.BillingExpr),
+		BillingExpression: billingExpression,
 	}
-	if item.ModelRatio > 0 {
-		pricing.BaseRatio = routingCostFloatPointer(item.ModelRatio)
+	if item.CompletionRatio != nil {
+		pricing.CompletionRatio = routingCostFloatPointer(completionRatio)
+	}
+	if item.ModelRatio != nil {
+		pricing.BaseRatio = routingCostFloatPointer(baseRatio)
 		pricing.InputCostPerMillion = routingCostFloatPointer(inputCostPerMillion)
 		pricing.OutputCostPerMillion = routingCostFloatPointer(outputCostPerMillion)
 	}
-	if item.ModelPrice > 0 {
-		pricing.ModelPrice = routingCostFloatPointer(item.ModelPrice)
+	if item.ModelPrice != nil {
+		pricing.ModelPrice = routingCostFloatPointer(*item.ModelPrice)
 	}
-	if perRequestCost > 0 {
-		pricing.PerRequestCost = routingCostFloatPointer(perRequestCost)
+	if perRequestCost != nil {
+		pricing.PerRequestCost = routingCostFloatPointer(*perRequestCost)
 	}
-	if item.CacheRatio != nil && inputCostPerMillion > 0 {
+	if item.CacheRatio != nil && item.ModelRatio != nil && item.QuotaType == 0 {
 		pricing.CacheReadCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.CacheRatio)
 	}
-	if item.CreateCacheRatio != nil && inputCostPerMillion > 0 {
-		pricing.CacheWriteCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.CreateCacheRatio)
+	if item.ModelRatio != nil && item.QuotaType == 0 {
+		createCacheRatio := 1.25
+		if item.CreateCacheRatio != nil {
+			createCacheRatio = *item.CreateCacheRatio
+		}
+		cacheWriteCostPerMillion := inputCostPerMillion * createCacheRatio
+		pricing.CacheWriteCostPerMillion = routingCostFloatPointer(cacheWriteCostPerMillion)
+		pricing.CacheWrite1hCostPerMillion = routingCostFloatPointer(cacheWriteCostPerMillion * (6.0 / 3.75))
 	}
-	if item.ImageRatio != nil && inputCostPerMillion > 0 {
+	if item.ImageRatio != nil && item.ModelRatio != nil && item.QuotaType == 0 {
 		pricing.ImageInputCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.ImageRatio)
 	}
-	if item.AudioRatio != nil && inputCostPerMillion > 0 {
-		pricing.AudioInputCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.AudioRatio)
+	if item.ModelRatio != nil && item.QuotaType == 0 {
+		audioRatio := 1.0
+		if item.AudioRatio != nil {
+			audioRatio = *item.AudioRatio
+		}
+		audioCompletionRatio := 1.0
+		if item.AudioCompletionRatio != nil {
+			audioCompletionRatio = *item.AudioCompletionRatio
+		}
+		audioInputCostPerMillion := inputCostPerMillion * audioRatio
+		pricing.AudioInputCostPerMillion = routingCostFloatPointer(audioInputCostPerMillion)
+		pricing.AudioOutputCostPerMillion = routingCostFloatPointer(audioInputCostPerMillion * audioCompletionRatio)
 	}
-	if item.AudioCompletionRatio != nil && inputCostPerMillion > 0 {
-		pricing.AudioOutputCostPerMillion = routingCostFloatPointer(inputCostPerMillion * *item.AudioCompletionRatio)
+	for _, value := range []*float64{
+		pricing.CacheReadCostPerMillion,
+		pricing.CacheWriteCostPerMillion,
+		pricing.CacheWrite1hCostPerMillion,
+		pricing.ImageInputCostPerMillion,
+		pricing.AudioInputCostPerMillion,
+		pricing.AudioOutputCostPerMillion,
+	} {
+		if value != nil && !routingCostNonNegativeFinite(*value) {
+			return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
+		}
 	}
-	extras := map[string]any{}
+	extras := map[string]any{
+		"catalog_scope": model.RoutingCostCatalogScopeNewAPIPricing,
+		"always_uncatalogued_surcharge": strings.HasSuffix(
+			strings.ToLower(strings.TrimSpace(item.ModelName)), "search-preview",
+		),
+	}
 	if item.ImageRatio != nil {
 		extras["image_ratio"] = *item.ImageRatio
 	}
@@ -2175,7 +2869,10 @@ func routingNewAPINormalizedPricing(
 		}
 		pricing.Tiers = encoded
 	}
-	known := item.ModelRatio > 0 || perRequestCost > 0 || pricing.BillingExpression != "" ||
+	if groupRatioKnown && groupRatio == 0 {
+		return pricing, model.RoutingCostConfidenceExact, 1, nil
+	}
+	known := item.ModelRatio != nil || perRequestCost != nil || pricing.BillingExpression != "" ||
 		len(strings.TrimSpace(string(pricing.Tiers))) > 0
 	if !known {
 		return pricing, model.RoutingCostConfidenceUnknown, 0, nil
@@ -2193,24 +2890,37 @@ func routingSub2APICostVersionWrites(
 ) ([]model.RoutingCostSnapshotVersionWrite, error) {
 	pricingPayload := payload.Sub2API
 	groupInfo, groupFound := pricingPayload.Groups[binding.UpstreamGroup]
+	if !groupFound {
+		return nil, errors.New("sub2api bound group is not available to the account")
+	}
+	if groupInfo.ClaudeCodeOnly && !binding.ServesClaudeCode {
+		return nil, errors.New("sub2api bound group is restricted to Claude Code traffic")
+	}
+	if groupFound && groupInfo.PeakRateEnabled {
+		return nil, errors.New("sub2api peak group pricing requires unavailable server timezone context")
+	}
 	groupRatio := routingSub2APIGroupRatio(groupInfo)
-	if ratio, ok := pricingPayload.Rates[binding.UpstreamGroup]; ok {
+	if ratio, ok := routingSub2APIResolvedGroupRate(pricingPayload.Groups, pricingPayload.Rates, binding.UpstreamGroup); ok {
 		if !routingCostNonNegativeFinite(ratio) || ratio <= 0 {
 			return nil, errors.New("sub2api returned an invalid group ratio")
 		}
 		groupRatio = ratio
 		groupFound = true
 	}
-	if groupRatio <= 0 {
-		groupRatio = 1
+	if !routingCostNonNegativeFinite(groupRatio) || groupRatio <= 0 {
+		return nil, errors.New("sub2api returned an invalid group ratio")
 	}
 	channels := append([]routingSub2APIChannel(nil), pricingPayload.Channels...)
 	sort.SliceStable(channels, func(left int, right int) bool {
-		return strings.Join(routingSub2APIChannelModels(channels[left]), "\x00") <
-			strings.Join(routingSub2APIChannelModels(channels[right]), "\x00")
+		leftModels := strings.Join(routingSub2APIChannelModels(channels[left]), "\x00")
+		rightModels := strings.Join(routingSub2APIChannelModels(channels[right]), "\x00")
+		if leftModels != rightModels {
+			return leftModels < rightModels
+		}
+		return channels[left].Platform < channels[right].Platform
 	})
 	writes := make([]model.RoutingCostSnapshotVersionWrite, 0, len(channels))
-	seenModels := make(map[string]struct{})
+	seenModels := make(map[string][sha256.Size]byte)
 	for _, channel := range channels {
 		if !routingSub2APIChannelServesBinding(channel, binding) {
 			continue
@@ -2219,18 +2929,46 @@ func routingSub2APICostVersionWrites(
 		if err != nil {
 			return nil, fmt.Errorf("invalid sub2api channel pricing: %w", err)
 		}
+		if confidence == model.RoutingCostConfidenceUnknown {
+			return nil, errors.New("sub2api returned a model without usable pricing")
+		}
 		if payload.SyncStatus == model.RoutingUpstreamSyncStatusPartial && confidenceScore > 0.8 {
 			confidenceScore = 0.8
 		}
+		pricingForFingerprint := pricing
+		if len(pricingForFingerprint.Extras) > 0 {
+			var extras map[string]any
+			if err := common.Unmarshal(pricingForFingerprint.Extras, &extras); err != nil {
+				return nil, fmt.Errorf("invalid sub2api pricing metadata: %w", err)
+			}
+			delete(extras, "platform")
+			if len(extras) == 0 {
+				pricingForFingerprint.Extras = nil
+			} else {
+				encoded, err := common.Marshal(extras)
+				if err != nil {
+					return nil, err
+				}
+				pricingForFingerprint.Extras = encoded
+			}
+		}
+		pricingMaterial, err := common.Marshal(pricingForFingerprint)
+		if err != nil {
+			return nil, err
+		}
+		pricingFingerprint := sha256.Sum256(pricingMaterial)
 		for _, upstreamModel := range routingSub2APIChannelModels(channel) {
 			localModel := upstreamModel
 			if mapped, ok := modelNameMap[upstreamModel]; ok {
 				localModel = mapped
 			}
-			if _, duplicate := seenModels[localModel]; duplicate {
-				return nil, fmt.Errorf("sub2api returned duplicate pricing for local model %s", localModel)
+			if previousFingerprint, duplicate := seenModels[localModel]; duplicate {
+				if previousFingerprint != pricingFingerprint {
+					return nil, fmt.Errorf("sub2api returned conflicting pricing for local model %s", localModel)
+				}
+				continue
 			}
-			seenModels[localModel] = struct{}{}
+			seenModels[localModel] = pricingFingerprint
 			writes = append(writes, model.RoutingCostSnapshotVersionWrite{
 				ChannelID:        binding.ChannelID,
 				UpstreamGroup:    binding.UpstreamGroup,
@@ -2250,6 +2988,9 @@ func routingSub2APICostVersionWrites(
 			})
 		}
 	}
+	if len(writes) == 0 {
+		return nil, errors.New("sub2api returned no pricing for the bound group")
+	}
 	return writes, nil
 }
 
@@ -2258,6 +2999,9 @@ func routingSub2APINormalizedPricing(
 	groupRatio float64,
 	groupFound bool,
 ) (model.RoutingNormalizedPricing, string, float64, error) {
+	if channel.PerTokenPrices {
+		return routingSub2APIOfficialNormalizedPricing(channel, groupRatio, groupFound)
+	}
 	values := []float64{
 		channel.InputPrice,
 		channel.OutputPrice,
@@ -2351,6 +3095,117 @@ func routingSub2APINormalizedPricing(
 	return pricing, model.RoutingCostConfidenceGroupOnly, 0.7, nil
 }
 
+func routingSub2APIOfficialNormalizedPricing(
+	channel routingSub2APIChannel,
+	groupRatio float64,
+	groupFound bool,
+) (model.RoutingNormalizedPricing, string, float64, error) {
+	if channel.OfficialPricing == nil {
+		return model.RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			GroupRatio: routingCostFloatPointer(groupRatio),
+		}, model.RoutingCostConfidenceUnknown, 0, nil
+	}
+	pricingPayload := *channel.OfficialPricing
+	billingMode := strings.ToLower(strings.TrimSpace(pricingPayload.BillingMode))
+	if billingMode == "" {
+		billingMode = "token"
+	}
+	pricing := model.RoutingNormalizedPricing{
+		QuotaType:   0,
+		BillingMode: billingMode,
+		Currency:    "USD",
+		GroupRatio:  routingCostFloatPointer(groupRatio),
+	}
+	confidence := model.RoutingCostConfidenceGroupOnly
+	confidenceScore := 0.7
+	if groupFound {
+		confidence = model.RoutingCostConfidenceExact
+		confidenceScore = 1
+	}
+
+	switch billingMode {
+	case "token":
+		expression, known, err := routingSub2APITokenPricingExpression(pricingPayload)
+		if err != nil {
+			return model.RoutingNormalizedPricing{}, "", 0, err
+		}
+		if !known {
+			return pricing, model.RoutingCostConfidenceUnknown, 0, nil
+		}
+		pricing.BillingExpression = expression
+		encoded, err := common.Marshal(map[string]string{"type": "expr", "expr": expression})
+		if err != nil {
+			return model.RoutingNormalizedPricing{}, "", 0, err
+		}
+		pricing.Tiers = encoded
+		if len(pricingPayload.Intervals) > 0 {
+			pricing.BillingMode = "tiered_expr"
+			if confidence == model.RoutingCostConfidenceExact {
+				confidence = model.RoutingCostConfidenceDerived
+				confidenceScore = 0.9
+			}
+		} else {
+			inputPrice := routingSub2APIPointerValue(pricingPayload.InputPrice)
+			outputPrice := routingSub2APIPointerValue(pricingPayload.OutputPrice)
+			pricing.BaseRatio = routingCostFloatPointer(inputPrice * common.QuotaPerUnit)
+			if inputPrice > 0 {
+				completionRatio := outputPrice / inputPrice
+				if !routingCostNonNegativeFinite(completionRatio) {
+					return model.RoutingNormalizedPricing{}, "", 0, errors.New("sub2api completion ratio overflows normalized units")
+				}
+				pricing.CompletionRatio = routingCostFloatPointer(completionRatio)
+			}
+			pricing.InputCostPerMillion = routingCostFloatPointer(inputPrice * 1_000_000)
+			pricing.OutputCostPerMillion = routingCostFloatPointer(outputPrice * 1_000_000)
+			pricing.CacheWriteCostPerMillion = routingCostFloatPointer(routingSub2APIPointerValue(pricingPayload.CacheWritePrice) * 1_000_000)
+			pricing.CacheReadCostPerMillion = routingCostFloatPointer(routingSub2APIPointerValue(pricingPayload.CacheReadPrice) * 1_000_000)
+			pricing.ImageOutputCostPerMillion = routingCostFloatPointer(routingSub2APIPointerValue(pricingPayload.ImageOutputPrice) * 1_000_000)
+			// The user-facing channels contract does not expose Sub2API's private
+			// long-context and priority-service-tier overrides, so flat prices are
+			// useful but cannot be represented as exact for every request shape.
+			if confidence == model.RoutingCostConfidenceExact {
+				confidence = model.RoutingCostConfidenceDerived
+				confidenceScore = 0.8
+			}
+		}
+	case "image":
+		return model.RoutingNormalizedPricing{}, "", 0, errors.New("sub2api image pricing requires group-specific size and multiplier semantics")
+	case "per_request":
+		if len(pricingPayload.Intervals) > 0 {
+			return model.RoutingNormalizedPricing{}, "", 0, errors.New("sub2api per-request tier labels cannot be mapped safely")
+		}
+		if pricingPayload.PerRequestPrice == nil {
+			return pricing, model.RoutingCostConfidenceUnknown, 0, nil
+		}
+		if !routingCostNonNegativeFinite(*pricingPayload.PerRequestPrice) {
+			return model.RoutingNormalizedPricing{}, "", 0, model.ErrRoutingCostV2Invalid
+		}
+		pricing.QuotaType = 1
+		pricing.ModelPrice = routingCostFloatPointer(*pricingPayload.PerRequestPrice)
+		pricing.PerRequestCost = routingCostFloatPointer(*pricingPayload.PerRequestPrice)
+	default:
+		return model.RoutingNormalizedPricing{}, "", 0, errors.New("sub2api returned an unsupported billing mode")
+	}
+
+	priceUnit := "usd_per_token"
+	if billingMode == "per_request" {
+		priceUnit = "usd_per_request"
+	}
+	extras, err := common.Marshal(map[string]any{
+		"platform":            channel.Platform,
+		"source_billing_mode": billingMode,
+		"price_unit":          priceUnit,
+		"sub2api_contract":    model.RoutingCostSub2APIDisplayContractV1,
+		"has_intervals":       len(pricingPayload.Intervals) > 0,
+	})
+	if err != nil {
+		return model.RoutingNormalizedPricing{}, "", 0, err
+	}
+	pricing.Extras = extras
+	return pricing, confidence, confidenceScore, nil
+}
+
 func routingCostNonNegativeFinite(value float64) bool {
 	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
@@ -2379,13 +3234,13 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 
 	now := common.GetTimestamp()
 	groupRatio, hasGroupRatio := payload.GroupRatio[binding.UpstreamGroup]
-	if !hasGroupRatio || groupRatio <= 0 {
-		groupRatio = 1
+	if !hasGroupRatio {
+		return nil, errors.New("newapi bound group is not available to the account")
+	}
+	if !routingCostNonNegativeFinite(groupRatio) {
+		return nil, errors.New("newapi returned an invalid group ratio")
 	}
 	confidence := model.RoutingCostConfidenceFull
-	if !hasGroupRatio {
-		confidence = model.RoutingCostConfidenceGroupOnly
-	}
 	modelNameMap, err := routingModelReverseMapping(ctx, binding.ChannelID)
 	if err != nil {
 		return nil, err
@@ -2400,14 +3255,26 @@ func fetchRoutingCostSnapshots(ctx context.Context, binding model.RoutingChannel
 		if localName, ok := modelNameMap[modelName]; ok {
 			modelName = localName
 		}
+		baseRatio := 0.0
+		if item.ModelRatio != nil {
+			baseRatio = *item.ModelRatio
+		}
+		completionRatio := 1.0
+		if item.CompletionRatio != nil {
+			completionRatio = *item.CompletionRatio
+		}
+		modelPrice := 0.0
+		if item.ModelPrice != nil {
+			modelPrice = *item.ModelPrice
+		}
 		snapshot := model.RoutingCostSnapshot{
 			ChannelID:       binding.ChannelID,
 			ModelName:       modelName,
 			QuotaType:       item.QuotaType,
 			GroupRatio:      groupRatio,
-			BaseRatio:       item.ModelRatio,
-			CompletionRatio: item.CompletionRatio,
-			ModelPrice:      item.ModelPrice,
+			BaseRatio:       baseRatio,
+			CompletionRatio: completionRatio,
+			ModelPrice:      modelPrice,
 			BillingMode:     item.BillingMode,
 			Confidence:      confidence,
 			SnapshotTS:      now,
@@ -2491,37 +3358,254 @@ func fetchRoutingPricingPayload(ctx context.Context, binding model.RoutingChanne
 		return routingPricingResponse{}, err
 	}
 	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API {
-		snapshots, err := fetchRoutingSub2APICostSnapshots(ctx, binding, credentials)
+		upstreamGroup := strings.TrimSpace(binding.UpstreamGroup)
+		if upstreamGroup == "" {
+			return routingPricingResponse{}, errors.New("sub2api bound group is required for pricing test")
+		}
+		pricing, err := fetchRoutingSub2APIAccountPricingForGroups(
+			ctx,
+			binding,
+			credentials,
+			[]string{upstreamGroup},
+		)
 		if err != nil {
 			return routingPricingResponse{}, err
 		}
-		items := make([]routingPricingItem, 0, len(snapshots))
-		groupRatio := map[string]float64{binding.UpstreamGroup: 1}
-		for _, snapshot := range snapshots {
-			groupRatio[binding.UpstreamGroup] = snapshot.GroupRatio
-			items = append(items, routingPricingItem{
-				ModelName:       snapshot.ModelName,
-				QuotaType:       0,
-				ModelRatio:      snapshot.BaseRatio,
-				ModelPrice:      snapshot.ModelPrice,
-				CompletionRatio: snapshot.CompletionRatio,
-				EnableGroups:    []string{binding.UpstreamGroup},
-				BillingMode:     snapshot.BillingMode,
-			})
+		pricingVersion := routingCostContentVersion("sub2api", pricing.VersionMaterial())
+		groupRatio := make(map[string]float64)
+		usableGroup := make(map[string]string)
+		groupMeta := make(map[string]routingSub2APIGroupMetadata)
+		uniqueGroups := make(map[string]routingSub2APIGroup)
+		for _, group := range pricing.Groups {
+			identity := strings.TrimSpace(string(group.ID))
+			if identity != "" {
+				uniqueGroups[identity] = group
+			}
 		}
-		return routingPricingResponse{
-			Success:     true,
-			Data:        items,
-			GroupRatio:  groupRatio,
-			UsableGroup: map[string]string{binding.UpstreamGroup: binding.UpstreamGroup},
-		}, nil
-	}
-	if binding.UpstreamType == model.RoutingUpstreamTypeNewAPI {
-		if err = fetchRoutingUpstreamBalance(ctx, binding, credentials); err != nil && routingUpstreamAuthError(err) {
-			return routingPricingResponse{}, err
+		groupIDs := make([]string, 0, len(uniqueGroups))
+		for groupID := range uniqueGroups {
+			groupIDs = append(groupIDs, groupID)
 		}
+		sort.Strings(groupIDs)
+		for _, groupID := range groupIDs {
+			group := uniqueGroups[groupID]
+			groupName := strings.TrimSpace(group.Name)
+			if groupName == "" {
+				groupName = groupID
+			}
+			usableGroup[groupName] = groupID
+			groupMeta[groupName] = routingSub2APIGroupMetadata{
+				ID:               groupID,
+				Name:             groupName,
+				Platform:         strings.TrimSpace(group.Platform),
+				SubscriptionType: strings.ToLower(strings.TrimSpace(group.SubscriptionType)),
+				ClaudeCodeOnly:   group.ClaudeCodeOnly,
+			}
+			ratio := routingSub2APIGroupRatio(group)
+			if resolved, ok := routingSub2APIResolvedGroupRate(pricing.Groups, pricing.Rates, groupName); ok {
+				ratio = resolved
+			}
+			if routingCostNonNegativeFinite(ratio) && ratio > 0 {
+				groupRatio[groupName] = ratio
+			}
+		}
+		response := routingPricingResponse{
+			Success:          true,
+			GroupRatio:       groupRatio,
+			UsableGroup:      usableGroup,
+			Sub2APIGroupMeta: groupMeta,
+			PricingVersion:   pricingVersion,
+		}
+		if strings.TrimSpace(binding.UpstreamGroup) == "" {
+			modelSet := make(map[string]struct{})
+			for _, channel := range pricing.Channels {
+				if channel.OfficialPricing == nil {
+					continue
+				}
+				for _, modelName := range routingSub2APIChannelModels(channel) {
+					modelSet[modelName] = struct{}{}
+				}
+			}
+			modelNames := make([]string, 0, len(modelSet))
+			for modelName := range modelSet {
+				modelNames = append(modelNames, modelName)
+			}
+			sort.Strings(modelNames)
+			response.Data = make([]routingPricingItem, 0, len(modelNames))
+			for _, modelName := range modelNames {
+				response.Data = append(response.Data, routingPricingItem{ModelName: modelName})
+			}
+			return response, nil
+		}
+
+		modelNameMap, mapErr := routingModelReverseMapping(ctx, binding.ChannelID)
+		if mapErr != nil {
+			return routingPricingResponse{}, mapErr
+		}
+		now := common.GetTimestamp()
+		writes, writeErr := routingSub2APICostVersionWrites(binding, modelNameMap, routingCostAccountPayload{
+			SourceType:   model.RoutingUpstreamTypeSub2API,
+			ObservedTime: now, EffectiveTime: now, ExpiresTime: now + 3_600,
+			PricingVersion: pricingVersion, SyncStatus: pricing.SyncStatus,
+			SyncError: pricing.SyncError, Sub2API: &pricing,
+		})
+		if writeErr != nil {
+			return routingPricingResponse{}, writeErr
+		}
+		response.Data = make([]routingPricingItem, 0, len(writes))
+		for _, write := range writes {
+			item := routingPricingItem{
+				ModelName: write.LocalModel, QuotaType: write.Pricing.QuotaType,
+				EnableGroups: []string{binding.UpstreamGroup}, BillingMode: write.Pricing.BillingMode,
+				BillingExpr: write.Pricing.BillingExpression, Tiers: write.Pricing.Tiers,
+				PricingVersion: pricingVersion,
+			}
+			if write.Pricing.BaseRatio != nil {
+				item.ModelRatio = routingCostFloatPointer(*write.Pricing.BaseRatio)
+			}
+			if write.Pricing.CompletionRatio != nil {
+				item.CompletionRatio = routingCostFloatPointer(*write.Pricing.CompletionRatio)
+			}
+			if write.Pricing.ModelPrice != nil {
+				item.ModelPrice = routingCostFloatPointer(*write.Pricing.ModelPrice)
+			} else if write.Pricing.PerRequestCost != nil {
+				item.ModelPrice = routingCostFloatPointer(*write.Pricing.PerRequestCost)
+			}
+			response.Data = append(response.Data, item)
+		}
+		return response, nil
 	}
-	return fetchRoutingNewAPIPricingPayload(ctx, binding, credentials)
+	if binding.UpstreamType != model.RoutingUpstreamTypeNewAPI {
+		return routingPricingResponse{}, errors.New("unsupported routing upstream account type")
+	}
+	requestedGroups := []string(nil)
+	if strings.TrimSpace(binding.UpstreamGroup) != "" {
+		requestedGroups = []string{strings.TrimSpace(binding.UpstreamGroup)}
+	}
+	if len(requestedGroups) == 0 {
+		return fetchRoutingNewAPIAccountPricingPayload(ctx, binding, credentials, nil)
+	}
+	servingModels, err := fetchRoutingNewAPIGatewayModels(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	upstreamQuotaPerUnit, err := fetchRoutingNewAPIQuotaPerUnit(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	if _, _, balanceErr := fetchRoutingNewAPIBalanceValue(
+		ctx,
+		binding,
+		credentials,
+		upstreamQuotaPerUnit,
+	); balanceErr != nil && routingUpstreamAuthError(balanceErr) {
+		return routingPricingResponse{}, balanceErr
+	}
+	pricing, err := fetchRoutingNewAPIAccountPricingPayloadWithQuotaPerUnit(
+		ctx,
+		binding,
+		credentials,
+		requestedGroups,
+		upstreamQuotaPerUnit,
+		nil,
+	)
+	if err != nil {
+		return pricing, err
+	}
+	modelNameMap, err := routingModelReverseMapping(ctx, binding.ChannelID)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	now := common.GetTimestamp()
+	writes, err := routingNewAPICostVersionWrites(binding, modelNameMap, routingCostAccountPayload{
+		SourceType: model.RoutingUpstreamTypeNewAPI, ObservedTime: now,
+		EffectiveTime: now, ExpiresTime: now + 3_600, PricingVersion: pricing.PricingVersion,
+		SyncStatus: model.RoutingUpstreamSyncStatusSuccess, NewAPI: &pricing,
+	})
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	writes, err = filterRoutingNewAPIWritesByServingModels(writes, servingModels)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	pricing.Data = make([]routingPricingItem, 0, len(writes))
+	for _, write := range writes {
+		item := routingPricingItem{
+			ModelName: write.LocalModel, QuotaType: write.Pricing.QuotaType,
+			EnableGroups: []string{binding.UpstreamGroup}, BillingMode: write.Pricing.BillingMode,
+			BillingExpr: write.Pricing.BillingExpression, Tiers: write.Pricing.Tiers,
+			PricingVersion: pricing.PricingVersion,
+		}
+		if write.Pricing.BaseRatio != nil {
+			item.ModelRatio = routingCostFloatPointer(*write.Pricing.BaseRatio)
+		}
+		if write.Pricing.CompletionRatio != nil {
+			item.CompletionRatio = routingCostFloatPointer(*write.Pricing.CompletionRatio)
+		}
+		if write.Pricing.ModelPrice != nil {
+			item.ModelPrice = routingCostFloatPointer(*write.Pricing.ModelPrice)
+		} else if write.Pricing.PerRequestCost != nil {
+			item.ModelPrice = routingCostFloatPointer(*write.Pricing.PerRequestCost)
+		}
+		pricing.Data = append(pricing.Data, item)
+	}
+	return pricing, nil
+}
+
+func fetchRoutingNewAPIQuotaPerUnit(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) (float64, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return 0, err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		strings.TrimRight(binding.BaseURL, "/")+"/api/status",
+		nil,
+	)
+	if err != nil {
+		return 0, err
+	}
+	applyRoutingAuthHeaders(request, binding, credentials)
+
+	response, err := routingCostHTTPDoer.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return 0, routingAuthErrorf("status endpoint returned %s", response.Status)
+	}
+	if response.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("status endpoint returned %s", response.Status)
+	}
+
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return 0, err
+	}
+	var payload routingNewAPIStatusResponse
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return 0, errors.New("invalid newapi status response")
+	}
+	if !payload.Success {
+		message := strings.TrimSpace(payload.Message)
+		if message == "" {
+			message = "status endpoint returned success=false"
+		}
+		return 0, errors.New(routingCleanCredentialErrorMessage(message, credentials))
+	}
+	if payload.Data.QuotaPerUnit == nil ||
+		!routingCostNonNegativeFinite(*payload.Data.QuotaPerUnit) ||
+		*payload.Data.QuotaPerUnit <= 0 {
+		return 0, errors.New("newapi status response contains an invalid quota_per_unit")
+	}
+	return *payload.Data.QuotaPerUnit, nil
 }
 
 func fetchRoutingNewAPIPricingPayload(
@@ -2545,8 +3629,20 @@ func fetchRoutingNewAPIPricingPayload(
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		if response.StatusCode == http.StatusUnauthorized {
 			return routingPricingResponse{}, routingAuthErrorf("pricing endpoint returned %s", response.Status)
+		}
+		if response.StatusCode == http.StatusForbidden {
+			message := "pricing endpoint is unavailable"
+			if body, readErr := readRoutingCostJSON(response, defaultRoutingJSONLimits); readErr == nil {
+				var errorPayload struct {
+					Message string `json:"message"`
+				}
+				if common.Unmarshal(body, &errorPayload) == nil && strings.TrimSpace(errorPayload.Message) != "" {
+					message = routingCleanCredentialErrorMessage(errorPayload.Message, credentials)
+				}
+			}
+			return routingPricingResponse{}, errors.New(message)
 		}
 		return routingPricingResponse{}, fmt.Errorf("pricing endpoint returned %s", response.Status)
 	}
@@ -2560,16 +3656,458 @@ func fetchRoutingNewAPIPricingPayload(
 		return routingPricingResponse{}, errors.New("invalid routing pricing response")
 	}
 	if !payload.Success {
-		if payload.Message == "" {
-			payload.Message = "pricing endpoint returned success=false"
+		return routingPricingResponse{}, routingNewAPISuccessFalseError(
+			response,
+			payload.Message,
+			"pricing endpoint returned success=false",
+			credentials,
+		)
+	}
+	payload.CatalogAuthenticated = strings.TrimSpace(response.Header.Get("Auth-Version")) != ""
+	return payload, nil
+}
+
+func fetchRoutingNewAPIAccountPricingPayload(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	requestedGroups []string,
+) (routingPricingResponse, error) {
+	requiresPricing := false
+	for _, groupName := range requestedGroups {
+		if strings.TrimSpace(groupName) != "" {
+			requiresPricing = true
+			break
 		}
-		return routingPricingResponse{}, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
+	}
+	if !requiresPricing {
+		return fetchRoutingNewAPIAccountPricingPayloadWithQuotaPerUnit(
+			ctx,
+			binding,
+			credentials,
+			requestedGroups,
+			0,
+			nil,
+		)
+	}
+	upstreamQuotaPerUnit, err := fetchRoutingNewAPIQuotaPerUnit(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	return fetchRoutingNewAPIAccountPricingPayloadWithQuotaPerUnit(
+		ctx,
+		binding,
+		credentials,
+		requestedGroups,
+		upstreamQuotaPerUnit,
+		nil,
+	)
+}
+
+func fetchRoutingNewAPIAccountPricingPayloadWithQuotaPerUnit(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	requestedGroups []string,
+	upstreamQuotaPerUnit float64,
+	preloadedGroups *routingNewAPIUserGroupsResponse,
+) (routingPricingResponse, error) {
+	groupsPayload := routingNewAPIUserGroupsResponse{}
+	if preloadedGroups != nil {
+		groupsPayload = *preloadedGroups
+	} else {
+		var err error
+		groupsPayload, err = fetchRoutingNewAPIUserGroups(ctx, binding, credentials)
+		if err != nil {
+			return routingPricingResponse{}, err
+		}
+	}
+	groupRatio := make(map[string]float64, len(groupsPayload.Data))
+	usableGroup := make(map[string]string, len(groupsPayload.Data))
+	for groupName, group := range groupsPayload.Data {
+		groupName = strings.TrimSpace(groupName)
+		if groupName == "" || common.GetJsonType(group.Ratio) != "number" {
+			continue
+		}
+		var ratio float64
+		if err := common.Unmarshal(group.Ratio, &ratio); err != nil || !routingCostNonNegativeFinite(ratio) {
+			continue
+		}
+		groupRatio[groupName] = ratio
+		usableGroup[groupName] = strings.TrimSpace(group.Desc)
+	}
+	if len(groupRatio) == 0 {
+		return routingPricingResponse{}, errors.New("newapi returned no account groups with stable pricing ratios")
+	}
+
+	normalizedGroups := make([]string, 0, len(requestedGroups))
+	seenGroups := make(map[string]struct{}, len(requestedGroups))
+	for _, groupName := range requestedGroups {
+		groupName = strings.TrimSpace(groupName)
+		if groupName == "" {
+			continue
+		}
+		if _, exists := seenGroups[groupName]; exists {
+			continue
+		}
+		seenGroups[groupName] = struct{}{}
+		normalizedGroups = append(normalizedGroups, groupName)
+	}
+	sort.Strings(normalizedGroups)
+	groupErrors := make(map[string]string)
+	validGroups := make([]string, 0, len(normalizedGroups))
+	for _, groupName := range normalizedGroups {
+		_, exists := groupsPayload.Data[groupName]
+		if !exists {
+			groupErrors[groupName] = fmt.Sprintf("newapi bound group %s is not available to the account", groupName)
+			continue
+		}
+		if _, valid := groupRatio[groupName]; !valid {
+			groupErrors[groupName] = fmt.Sprintf("newapi bound group %s has no stable numeric ratio", groupName)
+			continue
+		}
+		validGroups = append(validGroups, groupName)
+	}
+
+	result := routingPricingResponse{
+		Success:            true,
+		GroupRatio:         groupRatio,
+		UsableGroup:        usableGroup,
+		AccountGroupErrors: groupErrors,
+		QuotaPerUnit:       upstreamQuotaPerUnit,
+	}
+	if len(normalizedGroups) == 0 {
+		result.PricingVersion = routingCostContentVersion("newapi-account-groups", struct {
+			GroupRatio  map[string]float64 `json:"group_ratio"`
+			UsableGroup map[string]string  `json:"usable_group"`
+		}{GroupRatio: groupRatio, UsableGroup: usableGroup})
+		return result, nil
+	}
+	if len(validGroups) == 0 {
+		result.PricingVersion = routingCostContentVersion("newapi-account-groups", struct {
+			GroupRatio  map[string]float64 `json:"group_ratio"`
+			UsableGroup map[string]string  `json:"usable_group"`
+		}{GroupRatio: groupRatio, UsableGroup: usableGroup})
+		return result, nil
+	}
+	if !routingCostNonNegativeFinite(upstreamQuotaPerUnit) || upstreamQuotaPerUnit <= 0 {
+		return routingPricingResponse{}, errors.New("newapi status response contains an invalid quota_per_unit")
+	}
+
+	catalog, err := fetchRoutingNewAPIPricingPayload(ctx, binding, credentials)
+	if err != nil {
+		return routingPricingResponse{}, err
+	}
+	catalogByModel := make(map[string]routingPricingItem, len(catalog.Data))
+	for _, item := range catalog.Data {
+		modelName := strings.TrimSpace(item.ModelName)
+		if modelName == "" {
+			continue
+		}
+		if _, duplicate := catalogByModel[modelName]; duplicate {
+			return routingPricingResponse{}, fmt.Errorf("newapi pricing directory returned duplicate model %s", modelName)
+		}
+		item.ModelName = modelName
+		catalogByModel[modelName] = item
+	}
+
+	modelsByGroup := make(map[string][]string, len(validGroups))
+	groupsByModel := make(map[string][]string)
+	for _, groupName := range validGroups {
+		models, err := fetchRoutingNewAPIUserModels(ctx, binding, credentials, groupName)
+		if err != nil {
+			if routingUpstreamAuthError(err) {
+				return routingPricingResponse{}, err
+			}
+			groupErrors[groupName] = routingCleanCredentialErrorMessage(err.Error(), credentials)
+			continue
+		}
+		if len(models) == 0 {
+			groupErrors[groupName] = fmt.Sprintf("newapi account returned no models for bound group %s", groupName)
+			continue
+		}
+		modelsByGroup[groupName] = models
+		missingPrice := ""
+		for _, modelName := range models {
+			if _, priced := catalogByModel[modelName]; !priced {
+				missingPrice = modelName
+				break
+			}
+		}
+		if missingPrice != "" {
+			if !catalog.CatalogAuthenticated {
+				groupErrors[groupName] = fmt.Sprintf(
+					"newapi pricing directory has no reliable price for account model %s in group %s; catalog scope may be anonymous, configure upstream pricing.requireAuth=true",
+					missingPrice, groupName,
+				)
+			} else {
+				groupErrors[groupName] = fmt.Sprintf(
+					"newapi authenticated pricing directory has no reliable price for account model %s in group %s",
+					missingPrice, groupName,
+				)
+			}
+			continue
+		}
+		for _, modelName := range models {
+			groupsByModel[modelName] = append(groupsByModel[modelName], groupName)
+		}
+	}
+
+	modelNames := make([]string, 0, len(groupsByModel))
+	for modelName := range groupsByModel {
+		modelNames = append(modelNames, modelName)
+	}
+	sort.Strings(modelNames)
+	result.Data = make([]routingPricingItem, 0, len(modelNames))
+	for _, modelName := range modelNames {
+		item := catalogByModel[modelName]
+		item.EnableGroups = append([]string(nil), groupsByModel[modelName]...)
+		item.PricingVersion = ""
+		result.Data = append(result.Data, item)
+	}
+	result.ObservedTime = catalog.ObservedTime
+	result.EffectiveTime = catalog.EffectiveTime
+	result.ExpiresTime = catalog.ExpiresTime
+	result.PricingVersion = routingCostContentVersion("newapi-account-pricing", struct {
+		CatalogVersion string               `json:"catalog_version"`
+		QuotaPerUnit   float64              `json:"quota_per_unit"`
+		GroupRatio     map[string]float64   `json:"group_ratio"`
+		ModelsByGroup  map[string][]string  `json:"models_by_group"`
+		Data           []routingPricingItem `json:"data"`
+	}{
+		CatalogVersion: strings.TrimSpace(catalog.PricingVersion),
+		QuotaPerUnit:   upstreamQuotaPerUnit,
+		GroupRatio:     groupRatio,
+		ModelsByGroup:  modelsByGroup,
+		Data:           result.Data,
+	})
+	return result, nil
+}
+
+func fetchRoutingNewAPIUserGroups(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) (routingNewAPIUserGroupsResponse, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return routingNewAPIUserGroupsResponse{}, err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx, http.MethodGet, strings.TrimRight(binding.BaseURL, "/")+"/api/user/self/groups", nil,
+	)
+	if err != nil {
+		return routingNewAPIUserGroupsResponse{}, err
+	}
+	applyRoutingAuthHeaders(request, binding, credentials)
+	response, err := routingCostHTTPDoer.Do(request)
+	if err != nil {
+		return routingNewAPIUserGroupsResponse{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return routingNewAPIUserGroupsResponse{}, routingAuthErrorf("user groups endpoint returned %s", response.Status)
+	}
+	if response.StatusCode != http.StatusOK {
+		return routingNewAPIUserGroupsResponse{}, fmt.Errorf("user groups endpoint returned %s", response.Status)
+	}
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return routingNewAPIUserGroupsResponse{}, err
+	}
+	var payload routingNewAPIUserGroupsResponse
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return routingNewAPIUserGroupsResponse{}, errors.New("invalid newapi user groups response")
+	}
+	if !payload.Success {
+		return routingNewAPIUserGroupsResponse{}, routingNewAPISuccessFalseError(
+			response,
+			payload.Message,
+			"user groups endpoint returned success=false",
+			credentials,
+		)
+	}
+	if payload.Data == nil {
+		return routingNewAPIUserGroupsResponse{}, errors.New("newapi user groups response is missing data")
 	}
 	return payload, nil
 }
 
+func fetchRoutingNewAPIUserModels(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	groupName string,
+) ([]string, error) {
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(binding.BaseURL, "/") + "/api/user/models"
+	if strings.TrimSpace(groupName) != "" {
+		endpoint += "?" + url.Values{"group": []string{strings.TrimSpace(groupName)}}.Encode()
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyRoutingAuthHeaders(request, binding, credentials)
+	response, err := routingCostHTTPDoer.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, routingAuthErrorf("user models endpoint returned %s", response.Status)
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("user models endpoint returned %s", response.Status)
+	}
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return nil, err
+	}
+	var payload routingNewAPIUserModelsResponse
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return nil, errors.New("invalid newapi user models response")
+	}
+	if !payload.Success {
+		return nil, routingNewAPISuccessFalseError(
+			response,
+			payload.Message,
+			"user models endpoint returned success=false",
+			credentials,
+		)
+	}
+	modelSet := make(map[string]struct{}, len(payload.Data))
+	for _, modelName := range payload.Data {
+		modelName = strings.TrimSpace(modelName)
+		if modelName != "" {
+			modelSet[modelName] = struct{}{}
+		}
+	}
+	models := make([]string, 0, len(modelSet))
+	for modelName := range modelSet {
+		models = append(models, modelName)
+	}
+	sort.Strings(models)
+	return models, nil
+}
+
+func fetchRoutingNewAPIGatewayModels(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+) (map[string]struct{}, error) {
+	credentials = credentials.ForUpstream(model.RoutingUpstreamTypeNewAPI)
+	gatewayAPIKey := strings.TrimSpace(credentials.GatewayAPIKey)
+	if gatewayAPIKey == "" {
+		return nil, errors.New("newapi gateway API key is required to verify serving models")
+	}
+	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		strings.TrimRight(binding.BaseURL, "/")+"/v1/models",
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+gatewayAPIKey)
+	response, err := routingCostHTTPDoer.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, errors.New("newapi gateway API key was rejected by models endpoint")
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("newapi gateway models endpoint returned %s", response.Status)
+	}
+	body, err := readRoutingCostJSON(response, defaultRoutingJSONLimits)
+	if err != nil {
+		return nil, err
+	}
+	var payload routingNewAPIGatewayModelsResponse
+	if err := common.Unmarshal(body, &payload); err != nil {
+		return nil, errors.New("invalid newapi gateway models response")
+	}
+	if payload.Success == nil || !*payload.Success {
+		message := routingCleanCredentialErrorMessage(payload.Message, credentials)
+		if message == "" {
+			message = "newapi gateway models endpoint returned success=false"
+		}
+		return nil, errors.New(message)
+	}
+	models := make(map[string]struct{}, len(payload.Data))
+	for _, item := range payload.Data {
+		modelName := strings.TrimSpace(item.ID)
+		if modelName != "" {
+			models[modelName] = struct{}{}
+		}
+	}
+	if len(models) == 0 {
+		return nil, errors.New("newapi gateway models endpoint returned no serving models")
+	}
+	return models, nil
+}
+
 type routingAuthError struct {
 	message string
+}
+
+func routingNewAPISuccessFalseError(
+	response *http.Response,
+	message string,
+	fallback string,
+	credentials model.RoutingCredentials,
+) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = fallback
+	}
+	message = routingCleanCredentialErrorMessage(message, credentials)
+	if response != nil && strings.TrimSpace(response.Header.Get("Auth-Version")) != "" {
+		return errors.New(message)
+	}
+	if routingNewAPIMessageIndicatesAuthFailure(message) {
+		return routingAuthErrorf("%s", message)
+	}
+	return errors.New(message)
+}
+
+func routingNewAPIMessageIndicatesAuthFailure(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	for _, marker := range []string{
+		"unauthorized",
+		"not logged in",
+		"invalid access token",
+		"invalid token",
+		"access token invalid",
+		"new-api-user",
+		"user has been banned",
+		"insufficient privilege",
+		"未登录",
+		"access token 无效",
+		"access token 無效",
+		"用户已被封禁",
+		"使用者已被封禁",
+		"用户信息无效",
+		"使用者資訊無效",
+		"权限不足",
+		"權限不足",
+		"未提供 new-api-user",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (err routingAuthError) Error() string {
@@ -2618,6 +4156,22 @@ func fetchRoutingUpstreamBalanceValue(
 	binding model.RoutingChannelBinding,
 	credentials model.RoutingCredentials,
 ) (float64, bool, error) {
+	upstreamQuotaPerUnit, err := fetchRoutingNewAPIQuotaPerUnit(ctx, binding, credentials)
+	if err != nil {
+		return 0, false, err
+	}
+	return fetchRoutingNewAPIBalanceValue(ctx, binding, credentials, upstreamQuotaPerUnit)
+}
+
+func fetchRoutingNewAPIBalanceValue(
+	ctx context.Context,
+	binding model.RoutingChannelBinding,
+	credentials model.RoutingCredentials,
+	upstreamQuotaPerUnit float64,
+) (float64, bool, error) {
+	if !routingCostNonNegativeFinite(upstreamQuotaPerUnit) || upstreamQuotaPerUnit <= 0 {
+		return 0, false, errors.New("newapi status response contains an invalid quota_per_unit")
+	}
 	ctx, err := withRoutingCostBindingEgressPolicy(ctx, binding, credentials)
 	if err != nil {
 		return 0, false, err
@@ -2649,14 +4203,20 @@ func fetchRoutingUpstreamBalanceValue(
 		return 0, false, errors.New("invalid routing user response")
 	}
 	if !payload.Success {
-		if payload.Message == "" {
-			payload.Message = "user self endpoint returned success=false"
-		}
-		return 0, false, routingAuthErrorf("%s", routingCleanCredentialErrorMessage(payload.Message, credentials))
+		return 0, false, routingNewAPISuccessFalseError(
+			response,
+			payload.Message,
+			"user self endpoint returned success=false",
+			credentials,
+		)
 	}
 
-	balanceQuota := payload.Data.Quota - payload.Data.UsedQuota
-	balance := balanceQuota / common.QuotaPerUnit
+	// NewAPI quota is the remaining balance; used_quota is cumulative usage and
+	// must not be subtracted from it a second time.
+	if payload.Data.Quota == nil {
+		return 0, false, nil
+	}
+	balance := *payload.Data.Quota / upstreamQuotaPerUnit
 	if math.IsNaN(balance) || math.IsInf(balance, 0) {
 		return 0, false, errors.New("invalid routing upstream balance")
 	}
@@ -2722,7 +4282,7 @@ func routingBearerToken(upstreamType string, credentials model.RoutingCredential
 			return credentials.Sub2APIToken
 		}
 	}
-	return credentials.GatewayAPIKey
+	return ""
 }
 
 func routingPricingItemServesGroup(enableGroups []string, group string) bool {

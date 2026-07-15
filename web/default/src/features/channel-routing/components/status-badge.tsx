@@ -58,8 +58,7 @@ function statusPresentation(status: string | number) {
   ) {
     return {
       icon: CheckCircle2,
-      className:
-        'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+      className: 'border-success/40 bg-success/15 text-foreground',
     }
   }
   if (
@@ -71,8 +70,7 @@ function statusPresentation(status: string | number) {
   ) {
     return {
       icon: AlertCircle,
-      className:
-        'border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300',
+      className: 'border-warning/40 bg-warning/15 text-foreground',
     }
   }
   if (
@@ -90,8 +88,7 @@ function statusPresentation(status: string | number) {
   ) {
     return {
       icon: Clock3,
-      className:
-        'border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300',
+      className: 'border-warning/40 bg-warning/15 text-foreground',
     }
   }
   if (
@@ -109,8 +106,7 @@ function statusPresentation(status: string | number) {
   ) {
     return {
       icon: XCircle,
-      className:
-        'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300',
+      className: 'border-destructive/40 bg-destructive/10 text-foreground',
     }
   }
   if (
@@ -121,8 +117,7 @@ function statusPresentation(status: string | number) {
   ) {
     return {
       icon: CircleDashed,
-      className:
-        'border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+      className: 'border-info/40 bg-info/15 text-foreground',
     }
   }
   return {

@@ -110,6 +110,53 @@ func TestRoutingRequestProfileV2DefaultsOff(t *testing.T) {
 	assert.Nil(t, profile)
 }
 
+func TestRoutingRequestProfileCarriesTrafficClassWhenV2ScoringIsDisabled(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	setting := smart_routing_setting.GetSetting()
+	setting.Enabled = true
+	setting.RequestProfileV2Enabled = false
+	smart_routing_setting.UpdateSetting(setting)
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+		RequestPath:  "/v1/messages",
+		ModelName:    "claude-test",
+		IsStream:     true,
+		TrafficClass: channelrouting.RequestTrafficClassClaudeCode,
+	})
+
+	profile, err := routingRequestProfile(ctx, "default", 1, 100, 20)
+	require.NoError(t, err)
+	require.NotNil(t, profile)
+	assert.Equal(t, channelrouting.RequestProfileSchemaV1, profile.SchemaVersion)
+	assert.Equal(t, channelrouting.RequestTrafficClassClaudeCode, profile.TrafficClass)
+	assert.Equal(t, 100, profile.PromptTokenEstimate)
+	assert.Equal(t, 20, profile.CompletionTokenEstimate)
+}
+
+func TestRoutingAttemptPolicyRemainsActiveWhenProfileScoringIsDisabled(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+		RequestKind:              channelrouting.RequestKindImage,
+		RetrySafety:              channelrouting.RequestRetrySafetyUnsafe,
+		RetryAllowed:             false,
+		CrossChannelRetryAllowed: false,
+		HedgeAllowed:             false,
+	})
+
+	policy, ok := ChannelRoutingRequestAttemptPolicy(ctx)
+	require.True(t, ok)
+	assert.False(t, policy.RetryAllowed)
+	assert.False(t, policy.CrossChannelRetryAllowed)
+	assert.False(t, policy.HedgeAllowed)
+}
+
 func enableRoutingRequestProfileV2ForTest(t *testing.T) {
 	t.Helper()
 	smart_routing_setting.ResetForTest()

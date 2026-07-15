@@ -60,11 +60,8 @@ export function ManualBillingReviewFinancialOutcomes(props: {
       />
 
       {manualBillingReviewIsOverage(props.review.review_kind) ? (
-        <Alert className='border-amber-500/30 bg-amber-500/5'>
-          <ShieldAlert
-            className='text-amber-700 dark:text-amber-300'
-            aria-hidden='true'
-          />
+        <Alert className='border-warning/30 bg-warning/5'>
+          <ShieldAlert className='text-warning' aria-hidden='true' />
           <AlertTitle>{t('Overage billing decision')}</AlertTitle>
           <AlertDescription>
             {t(
@@ -104,7 +101,7 @@ export function ManualBillingReviewFinancialOutcomes(props: {
             data-outcome={row.outcome}
             className={cn(
               'grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2.5 text-sm',
-              row.outcome === 'accept' && 'bg-emerald-500/[0.04]',
+              row.outcome === 'accept' && 'bg-success/5',
               row.outcome === 'reject' && 'bg-destructive/[0.025]'
             )}
           >

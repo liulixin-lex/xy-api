@@ -8,7 +8,11 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service/channelrouting"
+	routingselector "github.com/QuantumNous/new-api/service/routing"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/gin-gonic/gin"
@@ -203,6 +207,185 @@ func TestReservePinnedChannelRoutingAttemptKeepsExactIdentityAndCapacity(t *test
 	require.ErrorIs(t, err, ErrPinnedRoutingIdentityUnavailable)
 	assert.True(t, active)
 	assert.Nil(t, selected)
+}
+
+func TestChannelRoutingBalancedUsesLiveSingleKeyBreakerAndCapacityCooldown(t *testing.T) {
+	truncate(t)
+	channelrouting.ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	previousRuntime := channelRoutingCanaryRuntime
+	common.MemoryCacheEnabled = true
+	var err error
+	channelRoutingCanaryRuntime, err = newChannelRoutingCanaryRuntimeManager(nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		channelRoutingCanaryRuntime = previousRuntime
+		channelrouting.ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(100)
+	for _, channelID := range []int{301, 302} {
+		require.NoError(t, model.DB.Create(&model.Channel{
+			Id: channelID, Name: "balanced-live", Status: common.ChannelStatusEnabled,
+			Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight,
+		}).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{
+			Group: "default", Model: "gpt-test", ChannelId: channelID,
+			Enabled: true, Priority: &priority, Weight: weight,
+		}).Error)
+	}
+	model.InitChannelCache()
+
+	now := time.Now()
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 3, PolicyHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		RuntimeGeneration: 3, ActivationID: 3,
+		ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now.Unix(),
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
+			PolicyProfile:  model.RoutingPolicyProfileBalanced,
+			BalancedPolicy: channelRoutingBalancedPolicyForTest(0),
+			CanaryPolicy:   model.DefaultRoutingCanaryPolicy(),
+			Members: []channelrouting.PoolMemberSnapshot{
+				channelRoutingBalancedMemberForTest(31, 301, 1.5, now.Unix()),
+				channelRoutingBalancedMemberForTest(32, 302, 0.5, now.Unix()),
+			},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{
+			{ID: 301, Name: "fallback", Status: common.ChannelStatusEnabled},
+			{ID: 302, Name: "preferred", Status: common.ChannelStatusEnabled},
+		},
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true})
+	key := routinghotcache.Key{
+		ChannelID: 302, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model: "gpt-test", Group: "default",
+	}
+	routinghotcache.SetBreakerForTest(key, routinghotcache.BreakerSnapshot{
+		State: routingselector.BreakerStateOpen, CooldownUntilUnix: now.Add(time.Minute).Unix(),
+		UpdatedUnix: now.Unix(),
+	})
+
+	breakerCtx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(breakerCtx, common.RequestIdKey, "balanced-live-breaker")
+	common.SetContextKey(breakerCtx, constant.ContextKeyRoutingCapacityInput, 1)
+	common.SetContextKey(breakerCtx, constant.ContextKeyRoutingCapacityInputKnown, true)
+	common.SetContextKey(breakerCtx, constant.ContextKeyRoutingCapacityOutput, 1)
+	common.SetContextKey(breakerCtx, constant.ContextKeyRoutingCapacityOutputKnown, true)
+	selected, _, err := CacheGetRandomSatisfiedChannel(&RetryParam{
+		Ctx: breakerCtx, TokenGroup: "default", ModelName: "gpt-test",
+		RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, 301, selected.Id, "a live breaker must override the still-healthy frozen snapshot")
+	require.NoError(t, CancelRoutingCapacityReservation(breakerCtx))
+
+	routinghotcache.ClearBreaker(key)
+	routinghotcache.SetCapacityCooldownForTest(key, routinghotcache.CapacityCooldownSnapshot{
+		SourceStatusCode: 429, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli: now.UnixMilli(),
+	})
+	capacityCtx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(capacityCtx, common.RequestIdKey, "balanced-live-capacity")
+	common.SetContextKey(capacityCtx, constant.ContextKeyRoutingCapacityInput, 1)
+	common.SetContextKey(capacityCtx, constant.ContextKeyRoutingCapacityInputKnown, true)
+	common.SetContextKey(capacityCtx, constant.ContextKeyRoutingCapacityOutput, 1)
+	common.SetContextKey(capacityCtx, constant.ContextKeyRoutingCapacityOutputKnown, true)
+	selected, _, err = CacheGetRandomSatisfiedChannel(&RetryParam{
+		Ctx: capacityCtx, TokenGroup: "default", ModelName: "gpt-test",
+		RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, 301, selected.Id, "a live capacity cooldown must override the frozen snapshot")
+	require.NoError(t, CancelRoutingCapacityReservation(capacityCtx))
+}
+
+func TestChannelRoutingBalancedLiveRuntimePreservesMultiKeyIsolation(t *testing.T) {
+	channelrouting.ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	routingmetrics.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		channelrouting.ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+		routingmetrics.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true})
+
+	now := time.Now()
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 4, PolicyHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		RuntimeGeneration: 4, ActivationID: 4,
+		ActivationStage: model.RoutingDeploymentStageActive, BuiltAtUnix: now.Unix(),
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageActive,
+			PolicyProfile:  model.RoutingPolicyProfileBalanced,
+			BalancedPolicy: channelRoutingBalancedPolicyForTest(0),
+			CanaryPolicy:   model.DefaultRoutingCanaryPolicy(),
+			Members: []channelrouting.PoolMemberSnapshot{
+				channelRoutingBalancedMemberForTest(41, 401, 1, now.Unix()),
+				channelRoutingBalancedMemberForTest(42, 402, 1, now.Unix()),
+			},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{
+			{ID: 401, Name: "single", Status: common.ChannelStatusEnabled},
+			{ID: 402, Name: "multi", Status: common.ChannelStatusEnabled, MultiKey: true},
+		},
+	})
+	session, err := channelrouting.NewRequestRoutingSession("balanced-live-runtime", "default")
+	require.NoError(t, err)
+
+	keyFor := func(channelID int) routinghotcache.Key {
+		return routinghotcache.Key{
+			ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model: "gpt-test", Group: "default",
+		}
+	}
+	for _, channelID := range []int{401, 402} {
+		key := keyFor(channelID)
+		routinghotcache.SetBreakerForTest(key, routinghotcache.BreakerSnapshot{
+			State: routingselector.BreakerStateOpen, CooldownUntilUnix: now.Add(time.Minute).Unix(),
+			UpdatedUnix: now.Unix(),
+		})
+		routinghotcache.SetCapacityCooldownForTest(key, routinghotcache.CapacityCooldownSnapshot{
+			SourceStatusCode: 429, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+			UpdatedUnixMilli: now.UnixMilli(),
+		})
+	}
+	releaseInflight := routingmetrics.BeginInflight(nil, &relaycommon.RelayInfo{
+		OriginModelName: "gpt-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 401, RoutingPoolID: 1, RoutingMemberID: 41,
+			RoutingSnapshotRevision: 4,
+		},
+	}, 401)
+	t.Cleanup(releaseInflight)
+
+	runtimeByChannelID := channelRoutingBalancedRuntimeByChannelID(session, map[int]*model.Channel{
+		401: {Id: 401},
+		402: {Id: 402, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+		999: {Id: 999},
+	}, "gpt-test", "default")
+
+	require.Contains(t, runtimeByChannelID, 401)
+	single := runtimeByChannelID[401]
+	assert.True(t, single.HasInflight)
+	assert.Equal(t, int64(1), single.Inflight)
+	require.NotNil(t, single.Breaker)
+	assert.Equal(t, routingselector.BreakerStateOpen, single.Breaker.State)
+	require.NotNil(t, single.CooldownUntilUnixMilli)
+	assert.Greater(t, *single.CooldownUntilUnixMilli, now.UnixMilli())
+	assert.NotContains(t, runtimeByChannelID, 402, "aggregate multi-key runtime must not poison credential routing")
+	assert.NotContains(t, runtimeByChannelID, 999, "channels outside the pinned pool snapshot must be ignored")
 }
 
 func channelRoutingBalancedPolicyForTest(protectionBand int) channelrouting.BalancedPoolPolicy {

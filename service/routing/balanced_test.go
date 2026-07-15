@@ -665,6 +665,26 @@ func TestPreparedBalancedAffinityDropsRuntimeDegradedCandidate(t *testing.T) {
 	assert.False(t, decision.AffinityUsed)
 }
 
+func TestPreparedBalancedLiveInflightBreaksTiedP2CSelection(t *testing.T) {
+	settings := balancedSettingsForTest()
+	prepared, err := PrepareBalanced([]BalancedCandidate{
+		balancedCandidateForTest(1, 100, 20, 0, 1),
+		balancedCandidateForTest(2, 100, 20, 0, 1),
+	}, settings)
+	require.NoError(t, err)
+
+	decision, err := prepared.Select(BalancedRequest{
+		RandomSeed: 3,
+		RuntimeByChannelID: map[int]BalancedRuntimeState{
+			1: {Inflight: 9, HasInflight: true},
+			2: {Inflight: 0, HasInflight: true},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2}, decision.SampledChannelIDs)
+	assert.Equal(t, 2, decision.SelectedChannelID)
+}
+
 func TestPreparedBalancedRejectsMalformedRuntimeOverrides(t *testing.T) {
 	settings := balancedSettingsForTest()
 	prepared, err := PrepareBalanced(

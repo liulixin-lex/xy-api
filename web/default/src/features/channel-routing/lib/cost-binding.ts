@@ -22,7 +22,9 @@ import type {
   RoutingCostBinding,
   RoutingCostBindingActionResult,
   RoutingCostBindingCredentials,
+  RoutingCostBindingGroupMetadata,
   RoutingCostBindingRequest,
+  RoutingCostBindingUpstreamType,
 } from '../types'
 
 type Translate = (key: string, options?: Record<string, unknown>) => string
@@ -81,12 +83,10 @@ function isPositiveInteger(value: string): boolean {
 
 function isValidRoutingCostBaseUrl(value: string): boolean {
   try {
+    if (value.includes('?') || value.includes('#')) return false
     const url = new URL(value)
     if (url.protocol !== 'https:' || !url.hostname) return false
     if (url.username || url.password) return false
-    for (const key of url.searchParams.keys()) {
-      if (/(token|key|secret|password|authorization)/i.test(key)) return false
-    }
     return true
   } catch {
     return false
@@ -139,7 +139,7 @@ function isAllowedPrivateCidr(value: string): boolean {
 }
 
 export function createCostBindingSchema(t: Translate) {
-  return z.object({
+  const schema = z.object({
     channelId: z
       .string()
       .trim()
@@ -153,7 +153,9 @@ export function createCostBindingSchema(t: Translate) {
       .max(512, t('Base URL must be 512 characters or fewer'))
       .refine(
         isValidRoutingCostBaseUrl,
-        t('Enter a valid HTTPS URL without credentials or secret query values')
+        t(
+          'Enter a valid HTTPS URL without credentials, query parameters, or a fragment.'
+        )
       ),
     upstreamGroup: z
       .string()
@@ -203,6 +205,20 @@ export function createCostBindingSchema(t: Translate) {
     clearSub2apiPassword: z.boolean(),
     clearSub2apiToken: z.boolean(),
     clearCustomCaPem: z.boolean(),
+  })
+
+  return schema.superRefine((values, context) => {
+    if (
+      values.enabled &&
+      values.upstreamType === 'newapi' &&
+      values.newApiUserId.trim() === ''
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['newApiUserId'],
+        message: t('New API user ID is required'),
+      })
+    }
   })
 }
 
@@ -336,6 +352,24 @@ export function costBindingCredentialCount(
 
 export const COST_BINDING_GROUP_DOM_LIMIT = 100
 
+export function costBindingGroupUsesSubscription(
+  metadata: RoutingCostBindingGroupMetadata | null | undefined
+): boolean {
+  return metadata?.subscription_type?.trim().toLowerCase() === 'subscription'
+}
+
+export function costBindingGroupMetadataForValue(
+  groupMeta: Record<string, RoutingCostBindingGroupMetadata> | undefined,
+  groupValue: string
+): RoutingCostBindingGroupMetadata | undefined {
+  const value = groupValue.trim()
+  if (!value || groupMeta == null) return undefined
+  if (Object.hasOwn(groupMeta, value)) return groupMeta[value]
+  return Object.values(groupMeta).find(
+    (metadata) => metadata.id === value || metadata.name === value
+  )
+}
+
 export function boundedCostBindingGroups(
   result: RoutingCostBindingActionResult
 ): RoutingCostBindingActionResult {
@@ -362,11 +396,70 @@ export function boundedCostBindingGroups(
     Boolean(result.groups_truncated) ||
     groupsTotal > groups.length ||
     rawGroups.length > groups.length
+  const groupMeta: Record<string, RoutingCostBindingGroupMetadata> = {}
+
+  for (const group of groups) {
+    if (result.group_meta == null || !Object.hasOwn(result.group_meta, group)) {
+      continue
+    }
+    const rawMetadata = result.group_meta[group]
+    if (rawMetadata == null || typeof rawMetadata !== 'object') continue
+    const id = typeof rawMetadata.id === 'string' ? rawMetadata.id.trim() : ''
+    const name =
+      typeof rawMetadata.name === 'string' ? rawMetadata.name.trim() : ''
+    const platform =
+      typeof rawMetadata.platform === 'string'
+        ? rawMetadata.platform.trim()
+        : ''
+    const subscriptionType =
+      typeof rawMetadata.subscription_type === 'string'
+        ? rawMetadata.subscription_type.trim()
+        : ''
+    if (
+      !id ||
+      id.length > 128 ||
+      !name ||
+      name.length > 128 ||
+      platform.length > 128 ||
+      subscriptionType.length > 128
+    ) {
+      continue
+    }
+    groupMeta[group] = {
+      id,
+      name,
+      ...(platform ? { platform } : {}),
+      ...(subscriptionType ? { subscription_type: subscriptionType } : {}),
+      claude_code_only: rawMetadata.claude_code_only === true,
+    }
+  }
 
   return {
     ...result,
     groups,
+    group_meta: Object.keys(groupMeta).length > 0 ? groupMeta : undefined,
     groups_total: groupsTotal,
     groups_truncated: groupsTruncated,
   }
+}
+
+export function costBindingRequiresClaudeCodeDeclaration(input: {
+  result: RoutingCostBindingActionResult | null
+  upstreamType: RoutingCostBindingUpstreamType
+  upstreamGroup: string
+  servesClaudeCode: boolean
+}): boolean {
+  if (
+    input.upstreamType !== 'sub2api' ||
+    input.servesClaudeCode ||
+    input.result?.group_meta == null
+  ) {
+    return false
+  }
+  return (
+    costBindingGroupMetadataForValue(
+      input.result.group_meta,
+      input.upstreamGroup
+    )?.claude_code_only === true
+  )
 }

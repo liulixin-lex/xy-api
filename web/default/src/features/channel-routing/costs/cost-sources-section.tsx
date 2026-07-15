@@ -18,14 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import {
-  Plus,
-  RefreshCw,
-  Search,
-  ShieldAlert,
-  TriangleAlert,
-  X,
-} from 'lucide-react'
+import { Plus, Search, ShieldAlert, X } from 'lucide-react'
 import {
   useCallback,
   useEffect,
@@ -55,6 +48,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { costBindingUpdateRequest } from '../lib/cost-binding'
@@ -90,6 +84,7 @@ export function ChannelRoutingCostSourcesSection(props: {
   const enabled = search.sourceEnabled ?? 'all'
   const sourceSearch = search.sourceSearch ?? ''
   const [sheetOpen, setSheetOpen] = useState(false)
+  const [sheetStartedFresh, setSheetStartedFresh] = useState(true)
   const [selectedBinding, setSelectedBinding] =
     useState<RoutingCostBinding | null>(null)
   const [sheetNotice, setSheetNotice] = useState('')
@@ -148,6 +143,7 @@ export function ChannelRoutingCostSourcesSection(props: {
   const openBinding = (binding: RoutingCostBinding, notice = '') => {
     setSelectedBinding(binding)
     setSheetNotice(notice)
+    setSheetStartedFresh(!query.isRefetchError)
     setSheetOpen(true)
   }
 
@@ -284,13 +280,14 @@ export function ChannelRoutingCostSourcesSection(props: {
         {t('Clear filters')}
       </Button>
     )
-  } else if (props.canSensitiveWrite) {
+  } else if (props.canSensitiveWrite && !query.isRefetchError) {
     emptyAction = (
       <Button
         type='button'
         onClick={() => {
           setSelectedBinding(null)
           setSheetNotice('')
+          setSheetStartedFresh(true)
           setSheetOpen(true)
         }}
       >
@@ -393,7 +390,7 @@ export function ChannelRoutingCostSourcesSection(props: {
               {t('Clear')}
             </Button>
           ) : null}
-          {props.canSensitiveWrite ? (
+          {props.canSensitiveWrite && !query.isRefetchError ? (
             <Button
               type='button'
               size='sm'
@@ -401,6 +398,7 @@ export function ChannelRoutingCostSourcesSection(props: {
               onClick={() => {
                 setSelectedBinding(null)
                 setSheetNotice('')
+                setSheetStartedFresh(true)
                 setSheetOpen(true)
               }}
             >
@@ -419,37 +417,14 @@ export function ChannelRoutingCostSourcesSection(props: {
         />
       ) : null}
       {query.isRefetchError && query.data ? (
-        <Alert role='status' className='border-amber-500/30 bg-amber-500/5'>
-          <TriangleAlert
-            className='text-amber-700 dark:text-amber-300'
-            aria-hidden='true'
-          />
-          <AlertTitle>{t('Cost source refresh failed')}</AlertTitle>
-          <AlertDescription className='space-y-2'>
-            <p>
-              {t(
-                'Showing the last confirmed cost source page. Retry before changing a connector.'
-              )}
-            </p>
-            <Button
-              type='button'
-              size='sm'
-              variant='outline'
-              disabled={query.isFetching}
-              onClick={() => void query.refetch()}
-            >
-              <RefreshCw
-                aria-hidden='true'
-                className={
-                  query.isFetching
-                    ? 'animate-spin motion-reduce:animate-none'
-                    : undefined
-                }
-              />
-              {t('Retry')}
-            </Button>
-          </AlertDescription>
-        </Alert>
+        <ChannelRoutingRefetchErrorAlert
+          title={t('Cost source refresh failed')}
+          description={t(
+            'Showing the last confirmed cost source page. Retry before changing a connector.'
+          )}
+          isFetching={query.isFetching}
+          onRetry={() => void query.refetch()}
+        />
       ) : null}
       {query.data && items.length === 0 ? (
         <ChannelRoutingEmptyState
@@ -462,8 +437,8 @@ export function ChannelRoutingCostSourcesSection(props: {
       {items.length > 0 ? (
         <CostSourceList
           items={items}
-          canOperate={props.canOperate}
-          canSensitiveWrite={props.canSensitiveWrite}
+          canOperate={props.canOperate && !query.isRefetchError}
+          canSensitiveWrite={props.canSensitiveWrite && !query.isRefetchError}
           testingChannelId={
             testMutation.isPending
               ? testMutation.variables?.channel_id
@@ -485,6 +460,7 @@ export function ChannelRoutingCostSourcesSection(props: {
           page={page}
           pageSize={pageSize}
           total={query.data.total}
+          disabled={query.isRefetchError}
           onPageChange={(nextPage) => updateSearch({ sourcePage: nextPage })}
           onPageSizeChange={(nextSize) =>
             updateSearch({ sourcePage: 1, sourcePageSize: nextSize })
@@ -495,19 +471,21 @@ export function ChannelRoutingCostSourcesSection(props: {
       <ChannelRoutingCostSourceSheet
         open={sheetOpen}
         binding={selectedBinding}
-        canOperate={props.canOperate}
-        canSensitiveWrite={props.canSensitiveWrite}
+        canOperate={props.canOperate && sheetStartedFresh}
+        canSensitiveWrite={props.canSensitiveWrite && sheetStartedFresh}
         notice={sheetNotice}
         onOpenChange={(open) => {
           setSheetOpen(open)
           if (!open) {
             setSelectedBinding(null)
             setSheetNotice('')
+            setSheetStartedFresh(true)
           }
         }}
         onSaved={() => {
           setSelectedBinding(null)
           setSheetNotice('')
+          setSheetStartedFresh(true)
         }}
       />
 
@@ -533,6 +511,7 @@ export function ChannelRoutingCostSourcesSection(props: {
         }
         confirmText={t('Delete cost source')}
         destructive
+        disabled={query.isRefetchError}
         isLoading={deleteMutation.isPending}
         handleConfirm={() => {
           if (pendingDelete) deleteMutation.mutate(pendingDelete)

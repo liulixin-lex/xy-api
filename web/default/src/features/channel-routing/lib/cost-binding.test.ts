@@ -24,6 +24,9 @@ import {
   boundedCostBindingGroups,
   COST_BINDING_GROUP_DOM_LIMIT,
   costBindingFormValues,
+  costBindingGroupMetadataForValue,
+  costBindingGroupUsesSubscription,
+  costBindingRequiresClaudeCodeDeclaration,
   costBindingRequest,
   costBindingUpdateRequest,
   createCostBindingSchema,
@@ -154,7 +157,7 @@ describe('channel routing cost binding form contract', () => {
     assert.equal(costBindingRequest(values).new_api_user_id, undefined)
   })
 
-  test('rejects insecure or secret-bearing endpoint URLs', () => {
+  test('rejects endpoint URLs outside the canonical Base URL contract', () => {
     const schema = createCostBindingSchema(translate)
     const values = costBindingFormValues(binding)
 
@@ -176,6 +179,17 @@ describe('channel routing cost binding form contract', () => {
       }).success,
       false
     )
+    for (const baseUrl of [
+      'https://example.com?region=us',
+      'https://example.com?',
+      'https://example.com#admin',
+    ]) {
+      assert.equal(
+        schema.safeParse({ ...values, baseUrl }).success,
+        false,
+        baseUrl
+      )
+    }
     assert.equal(schema.safeParse(values).success, true)
   })
 
@@ -253,6 +267,95 @@ describe('channel routing cost binding form contract', () => {
     assert.equal(result.groups.includes(''), false)
     assert.equal(
       result.groups.some((group) => group.length > 128),
+      false
+    )
+  })
+
+  test('preserves bounded Sub2API group restrictions and blocks undeclared Claude Code use', () => {
+    const result = boundedCostBindingGroups({
+      channel_id: 42,
+      upstream_type: 'sub2api',
+      groups: ['general', 'claude-code', 'invalid'],
+      group_meta: {
+        general: {
+          id: '1',
+          name: 'general',
+          platform: 'anthropic',
+          subscription_type: ' subscription ',
+          claude_code_only: false,
+        },
+        'claude-code': {
+          id: '2',
+          name: 'claude-code',
+          platform: 'anthropic',
+          claude_code_only: true,
+        },
+        invalid: {
+          id: '',
+          name: 'invalid',
+          claude_code_only: true,
+        },
+        ignored: {
+          id: '4',
+          name: 'ignored',
+          claude_code_only: true,
+        },
+      },
+      model_count: 12,
+    })
+
+    assert.deepEqual(result.group_meta, {
+      general: {
+        id: '1',
+        name: 'general',
+        platform: 'anthropic',
+        subscription_type: 'subscription',
+        claude_code_only: false,
+      },
+      'claude-code': {
+        id: '2',
+        name: 'claude-code',
+        platform: 'anthropic',
+        claude_code_only: true,
+      },
+    })
+    assert.equal(
+      costBindingGroupUsesSubscription(result.group_meta?.general),
+      true
+    )
+    assert.equal(
+      costBindingGroupUsesSubscription(result.group_meta?.['claude-code']),
+      false
+    )
+    assert.equal(
+      costBindingGroupMetadataForValue(result.group_meta, '1')?.name,
+      'general'
+    )
+    assert.equal(
+      costBindingRequiresClaudeCodeDeclaration({
+        result,
+        upstreamType: 'sub2api',
+        upstreamGroup: '2',
+        servesClaudeCode: false,
+      }),
+      true
+    )
+    assert.equal(
+      costBindingRequiresClaudeCodeDeclaration({
+        result,
+        upstreamType: 'sub2api',
+        upstreamGroup: 'claude-code',
+        servesClaudeCode: true,
+      }),
+      false
+    )
+    assert.equal(
+      costBindingRequiresClaudeCodeDeclaration({
+        result,
+        upstreamType: 'sub2api',
+        upstreamGroup: 'general',
+        servesClaudeCode: false,
+      }),
       false
     )
   })

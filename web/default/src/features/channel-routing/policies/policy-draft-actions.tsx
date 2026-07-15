@@ -40,6 +40,7 @@ export function ChannelRoutingPolicyDraftActions(props: {
   canWrite: boolean
   canDeploy: boolean
   validating: boolean
+  mutationsDisabled?: boolean
   onValidate: () => void
   onSimulate: () => void
   onApprove: () => void
@@ -60,7 +61,7 @@ export function ChannelRoutingPolicyDraftActions(props: {
                 size='icon-sm'
                 variant='ghost'
                 aria-label={t('Validate draft')}
-                disabled={props.validating}
+                disabled={props.mutationsDisabled || props.validating}
                 onClick={props.onValidate}
               />
             }
@@ -78,6 +79,7 @@ export function ChannelRoutingPolicyDraftActions(props: {
                 size='icon-sm'
                 variant='ghost'
                 aria-label={t('Simulate policy')}
+                disabled={props.mutationsDisabled}
                 onClick={props.onSimulate}
               />
             }
@@ -96,6 +98,7 @@ export function ChannelRoutingPolicyDraftActions(props: {
                   size='icon-sm'
                   variant='ghost'
                   aria-label={t('Approve deployment')}
+                  disabled={props.mutationsDisabled}
                   onClick={props.onApprove}
                 />
               }
@@ -111,6 +114,7 @@ export function ChannelRoutingPolicyDraftActions(props: {
                   size='icon-sm'
                   variant='ghost'
                   aria-label={t('Publish policy')}
+                  disabled={props.mutationsDisabled}
                   onClick={props.onPublish}
                 />
               }

@@ -51,6 +51,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -139,7 +140,6 @@ export function ChannelRoutingPoliciesPage() {
         cursor: cursor || undefined,
         limit,
       }),
-    placeholderData: (previous) => previous,
   })
   const currentPolicyQuery = useQuery({
     queryKey: channelRoutingQueryKeys.currentPolicy(),
@@ -166,7 +166,13 @@ export function ChannelRoutingPoliciesPage() {
     setActivationDraft(draft)
     setActivationIntent(intent)
   }
-  const canCreateDraft = canWrite && currentPolicyQuery.data != null
+  const canCreateDraft =
+    canWrite &&
+    currentPolicyQuery.data != null &&
+    !currentPolicyQuery.isRefetchError &&
+    !draftsQuery.isRefetchError
+  const draftMutationsDisabled =
+    draftsQuery.isRefetchError || currentPolicyQuery.isRefetchError
 
   return (
     <>
@@ -243,8 +249,9 @@ export function ChannelRoutingPoliciesPage() {
           <ChannelRoutingCurrentPolicySection
             current={currentPolicyQuery.data}
             isLoading={currentPolicyQuery.isLoading}
+            isFetching={currentPolicyQuery.isFetching}
             error={currentPolicyQuery.error}
-            canDeploy={canDeploy}
+            canDeploy={canDeploy && !currentPolicyQuery.isRefetchError}
             onRetry={() => void currentPolicyQuery.refetch()}
             onRollback={() => setRollbackOpen(true)}
           />
@@ -275,9 +282,15 @@ export function ChannelRoutingPoliciesPage() {
               </div>
             ) : null}
             {draftsQuery.isLoading ? <ChannelRoutingLoadingState /> : null}
-            {draftsQuery.isError ? (
+            {draftsQuery.isError && !draftsQuery.data ? (
               <ChannelRoutingErrorState
                 error={draftsQuery.error}
+                onRetry={() => void draftsQuery.refetch()}
+              />
+            ) : null}
+            {draftsQuery.isRefetchError && draftsQuery.data ? (
+              <ChannelRoutingRefetchErrorAlert
+                isFetching={draftsQuery.isFetching}
                 onRetry={() => void draftsQuery.refetch()}
               />
             ) : null}
@@ -303,7 +316,7 @@ export function ChannelRoutingPoliciesPage() {
             {draftsQuery.data && draftsQuery.data.items.length > 0 ? (
               <>
                 <div className='hidden overflow-hidden rounded-lg border md:block'>
-                  <Table>
+                  <Table scrollAreaLabel={t('Policy drafts')}>
                     <TableHeader>
                       <TableRow>
                         <TableHead>{t('Draft')}</TableHead>
@@ -323,7 +336,8 @@ export function ChannelRoutingPoliciesPage() {
                           <TableCell>
                             <button
                               type='button'
-                              className='text-left font-medium hover:underline'
+                              className='text-left font-medium hover:underline disabled:cursor-not-allowed disabled:opacity-50'
+                              disabled={draftsQuery.isRefetchError}
                               onClick={() => openEditor(draft)}
                             >
                               #{draft.id}
@@ -351,6 +365,7 @@ export function ChannelRoutingPoliciesPage() {
                               draft={draft}
                               canWrite={canWrite}
                               canDeploy={canDeploy}
+                              mutationsDisabled={draftMutationsDisabled}
                               validating={
                                 validateDraft.isPending &&
                                 validateDraft.variables?.id === draft.id
@@ -393,6 +408,7 @@ export function ChannelRoutingPoliciesPage() {
                           draft={draft}
                           canWrite={canWrite}
                           canDeploy={canDeploy}
+                          mutationsDisabled={draftMutationsDisabled}
                           validating={
                             validateDraft.isPending &&
                             validateDraft.variables?.id === draft.id
@@ -411,6 +427,7 @@ export function ChannelRoutingPoliciesPage() {
                 <ChannelRoutingCursorPagination
                   cursor={cursor}
                   nextCursor={draftsQuery.data.next_cursor}
+                  disabled={draftsQuery.isRefetchError}
                   onCursorChange={(draftCursor) =>
                     void navigate({
                       search: (previous) => ({

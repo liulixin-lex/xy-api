@@ -49,6 +49,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -109,7 +110,6 @@ export function ChannelRoutingDecisionsPage() {
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.decisions(queryParams),
     queryFn: () => listChannelRoutingDecisions(queryParams),
-    placeholderData: (previous) => previous,
   })
 
   const updateSearch = (
@@ -346,9 +346,15 @@ export function ChannelRoutingDecisionsPage() {
           </div>
 
           {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-          {query.isError ? (
+          {query.isError && !query.data ? (
             <ChannelRoutingErrorState
               error={query.error}
+              onRetry={() => void query.refetch()}
+            />
+          ) : null}
+          {query.isRefetchError && query.data ? (
+            <ChannelRoutingRefetchErrorAlert
+              isFetching={query.isFetching}
               onRetry={() => void query.refetch()}
             />
           ) : null}
@@ -362,7 +368,7 @@ export function ChannelRoutingDecisionsPage() {
           {query.data && query.data.items.length > 0 ? (
             <>
               <div className='hidden overflow-hidden rounded-lg border lg:block'>
-                <Table>
+                <Table scrollAreaLabel={t('Decision audit')}>
                   <TableHeader>
                     <TableRow>
                       <TableHead>{t('Request')}</TableHead>
@@ -453,11 +459,13 @@ export function ChannelRoutingDecisionsPage() {
                         <ChannelRoutingIdentityText
                           text={`${decision.group_name} · ${decision.model_name}`}
                           className='text-sm font-medium'
+                          withinInteractive
                         />
                         <ChannelRoutingIdentityText
                           text={decision.request_id}
                           className='text-muted-foreground font-mono text-xs'
                           breakAll
+                          withinInteractive
                         />
                       </div>
                       <ChannelRoutingStatusBadge
@@ -485,6 +493,7 @@ export function ChannelRoutingDecisionsPage() {
               <ChannelRoutingCursorPagination
                 cursor={cursor}
                 nextCursor={query.data.next_cursor}
+                disabled={query.isRefetchError}
                 onCursorChange={(nextCursor) =>
                   updateSearch({ cursor: nextCursor })
                 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -82,9 +83,9 @@ func (credentials RoutingCredentials) ReadyForUpstream(upstreamType string) bool
 	credentials = credentials.ForUpstream(upstreamType)
 	switch strings.ToLower(strings.TrimSpace(upstreamType)) {
 	case RoutingUpstreamTypeNewAPI:
-		return credentials.NewAPIAccessToken != "" || credentials.GatewayAPIKey != ""
+		return credentials.NewAPIAccessToken != "" && credentials.GatewayAPIKey != ""
 	case RoutingUpstreamTypeSub2API:
-		return credentials.Sub2APIToken != "" || credentials.GatewayAPIKey != "" ||
+		return credentials.Sub2APIToken != "" ||
 			(credentials.Sub2APIEmail != "" && credentials.Sub2APIPassword != "")
 	default:
 		return false
@@ -116,6 +117,7 @@ type RoutingChannelBinding struct {
 	KeyVersion       int     `json:"key_version"`
 	NewAPIUserID     *int    `json:"new_api_user_id"`
 	Enabled          bool    `json:"enabled"`
+	AccountKeyHash   string  `json:"-" gorm:"type:char(64);index"`
 	SyncFailureCount int     `json:"sync_failure_count"`
 	SyncBackoffUntil int64   `json:"sync_backoff_until" gorm:"bigint"`
 	LastSyncError    *string `json:"last_sync_error" gorm:"type:text"`
@@ -395,19 +397,24 @@ func CompleteRoutingCostSyncContext(ctx context.Context, expected RoutingChannel
 			return err
 		}
 
+		authoritativeModelKeys := make([]string, 0, len(snapshots))
 		for i := range snapshots {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if snapshots[i].ChannelID != expected.ChannelID {
+			if snapshots[i].ChannelID != expected.ChannelID || strings.TrimSpace(snapshots[i].ModelName) == "" {
 				return fmt.Errorf("routing cost snapshot channel does not match binding")
 			}
 			if err := upsertRoutingCostSnapshot(tx, &snapshots[i]); err != nil {
 				return err
 			}
+			authoritativeModelKeys = append(authoritativeModelKeys, RoutingCostModelKey(snapshots[i].ModelName))
+		}
+		if err := reconcileRoutingCostLatestModels(tx, expected.ChannelID, authoritativeModelKeys); err != nil {
+			return err
 		}
 
-		result := tx.Model(&RoutingChannelBinding{}).Where("id = ?", expected.ID).Updates(map[string]any{
+		result := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).Updates(map[string]any{
 			"last_sync_error":    nil,
 			"sync_failure_count": 0,
 			"sync_backoff_until": 0,
@@ -432,6 +439,90 @@ func CompleteRoutingCostSyncContext(ctx context.Context, expected RoutingChannel
 	})
 }
 
+// reconcileRoutingCostLatestModels makes one channel's compatibility/latest
+// rows match the authoritative model set returned by a successful sync. The
+// immutable version table is intentionally outside this operation.
+func reconcileRoutingCostLatestModels(tx *gorm.DB, channelID int, modelKeys []string) error {
+	if tx == nil || channelID <= 0 {
+		return ErrRoutingBindingChanged
+	}
+	query := tx.Where("channel_id = ?", channelID)
+	if len(modelKeys) == 0 {
+		return query.Delete(&RoutingCostSnapshot{}).Error
+	}
+
+	uniqueModelKeys := make([]string, 0, len(modelKeys))
+	seen := make(map[string]struct{}, len(modelKeys))
+	for _, modelKey := range modelKeys {
+		if modelKey == "" {
+			continue
+		}
+		if _, exists := seen[modelKey]; exists {
+			continue
+		}
+		seen[modelKey] = struct{}{}
+		uniqueModelKeys = append(uniqueModelKeys, modelKey)
+	}
+	if len(uniqueModelKeys) == 0 {
+		return query.Delete(&RoutingCostSnapshot{}).Error
+	}
+	return query.Where("model_key IS NULL OR model_key NOT IN ?", uniqueModelKeys).
+		Delete(&RoutingCostSnapshot{}).Error
+}
+
+// ApplyRoutingCostAccountKeyContext records the provider-authoritative account
+// associated with a binding while fencing every configuration and sync field
+// used to obtain that identity. The opaque hash lets later backoff-only runs
+// aggregate account status without reusing or persisting credentials.
+func ApplyRoutingCostAccountKeyContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	accountKey string,
+) (RoutingChannelBinding, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accountKey = strings.TrimSpace(accountKey)
+	if len(accountKey) != 64 {
+		return RoutingChannelBinding{}, ErrRoutingCostV2Invalid
+	}
+	for _, character := range accountKey {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return RoutingChannelBinding{}, ErrRoutingCostV2Invalid
+			}
+		}
+	}
+
+	var updated RoutingChannelBinding
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := currentRoutingBindingForSync(tx, expected)
+		if err != nil {
+			return err
+		}
+		if current.AccountKeyHash == accountKey {
+			updated = current
+			return nil
+		}
+		updatedTime := nextRoutingBindingUpdatedTime(current.UpdatedTime)
+		result := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).Updates(map[string]any{
+			"account_key_hash": accountKey,
+			"updated_time":     updatedTime,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrRoutingBindingChanged
+		}
+		updated = current
+		updated.AccountKeyHash = accountKey
+		updated.UpdatedTime = updatedTime
+		return nil
+	})
+	return updated, err
+}
+
 func UpdateRoutingCostSyncFailureContext(
 	ctx context.Context,
 	expected RoutingChannelBinding,
@@ -439,20 +530,124 @@ func UpdateRoutingCostSyncFailureContext(
 	backoffUntil int64,
 	message string,
 ) error {
-	query := routingBindingSyncSourceQuery(DB.WithContext(ctx).Model(&RoutingChannelBinding{}), expected)
-	result := query.Updates(map[string]any{
-		"last_sync_error":    &message,
-		"sync_failure_count": failureCount,
-		"sync_backoff_until": backoffUntil,
-		"updated_time":       nextRoutingBindingUpdatedTime(expected.UpdatedTime),
+	_, err := ApplyRoutingCostSyncFailureContext(ctx, expected, failureCount, backoffUntil, message)
+	return err
+}
+
+func ApplyRoutingCostSyncFailureContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	failureCount int,
+	backoffUntil int64,
+	message string,
+) (RoutingChannelBinding, error) {
+	return applyRoutingCostSyncFailureContext(
+		ctx,
+		expected,
+		failureCount,
+		backoffUntil,
+		message,
+		nil,
+		nil,
+	)
+}
+
+// ApplyRoutingCostSyncFailureWithAccountContext atomically records a binding
+// failure and the provider-authoritative account degradation derived from it.
+func ApplyRoutingCostSyncFailureWithAccountContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	failureCount int,
+	backoffUntil int64,
+	message string,
+	accountSpec RoutingUpstreamAccountSpec,
+) (RoutingChannelBinding, error) {
+	return ApplyRoutingCostSyncFailureWithAccountFencesContext(
+		ctx,
+		expected,
+		failureCount,
+		backoffUntil,
+		message,
+		nil,
+		accountSpec,
+	)
+}
+
+// ApplyRoutingCostSyncFailureWithAccountFencesContext additionally fences the
+// authenticated binding evidence used to associate an otherwise unconfirmed
+// failure with a shared upstream account.
+func ApplyRoutingCostSyncFailureWithAccountFencesContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	failureCount int,
+	backoffUntil int64,
+	message string,
+	accountFences []RoutingChannelBinding,
+	accountSpec RoutingUpstreamAccountSpec,
+) (RoutingChannelBinding, error) {
+	return applyRoutingCostSyncFailureContext(
+		ctx,
+		expected,
+		failureCount,
+		backoffUntil,
+		message,
+		accountFences,
+		&accountSpec,
+	)
+}
+
+func applyRoutingCostSyncFailureContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	failureCount int,
+	backoffUntil int64,
+	message string,
+	accountFences []RoutingChannelBinding,
+	accountSpec *RoutingUpstreamAccountSpec,
+) (RoutingChannelBinding, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var updated RoutingChannelBinding
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		fences := []RoutingChannelBinding{expected}
+		if accountSpec != nil {
+			fences = append(fences, accountFences...)
+		}
+		currentFences, err := currentRoutingBindingsForSync(tx, fences)
+		if err != nil {
+			return err
+		}
+		current, exists := currentFences[expected.ID]
+		if !exists {
+			return ErrRoutingBindingChanged
+		}
+		updatedTime := nextRoutingBindingUpdatedTime(current.UpdatedTime)
+		result := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).Updates(map[string]any{
+			"last_sync_error":    &message,
+			"sync_failure_count": failureCount,
+			"sync_backoff_until": backoffUntil,
+			"updated_time":       updatedTime,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrRoutingBindingChanged
+		}
+		updated = current
+		updated.LastSyncError = &message
+		updated.SyncFailureCount = failureCount
+		updated.SyncBackoffUntil = backoffUntil
+		updated.UpdatedTime = updatedTime
+		if accountSpec != nil {
+			if _, err := upsertRoutingUpstreamAccount(tx, *accountSpec); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return ErrRoutingBindingChanged
-	}
-	return nil
+	return updated, err
 }
 
 func UpdateRoutingChannelBindingAndInvalidateCostContext(ctx context.Context, expected RoutingChannelBinding, updated *RoutingChannelBinding) error {
@@ -482,6 +677,7 @@ func updateRoutingChannelBindingAndInvalidateCostContext(
 	if err := prepareRoutingCredentialReencryptionForBindingUpdate(expected, updated); err != nil {
 		return err
 	}
+	updated.AccountKeyHash = ""
 	updated.UpdatedTime = nextRoutingBindingUpdatedTime(expected.UpdatedTime)
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).Updates(map[string]any{
@@ -494,6 +690,7 @@ func updateRoutingChannelBindingAndInvalidateCostContext(
 			"key_version":        updated.KeyVersion,
 			"new_api_user_id":    updated.NewAPIUserID,
 			"enabled":            updated.Enabled,
+			"account_key_hash":   "",
 			"sync_failure_count": 0,
 			"sync_backoff_until": 0,
 			"last_sync_error":    nil,
@@ -616,6 +813,11 @@ func routingBindingSyncSourceQuery(query *gorm.DB, expected RoutingChannelBindin
 	} else {
 		query = query.Where("sync_failure_count = ?", expected.SyncFailureCount)
 	}
+	if expected.AccountKeyHash == "" {
+		query = query.Where("(account_key_hash = ? OR account_key_hash IS NULL)", "")
+	} else {
+		query = query.Where("account_key_hash = ?", expected.AccountKeyHash)
+	}
 	if expected.EncCredentials == nil {
 		query = query.Where("enc_credentials IS NULL")
 	} else {
@@ -653,7 +855,10 @@ func routingBindingSyncSourceEqual(current RoutingChannelBinding, expected Routi
 		current.ServesClaudeCode != expected.ServesClaudeCode ||
 		current.Enabled != expected.Enabled ||
 		current.KeyVersion != expected.KeyVersion ||
-		current.UpdatedTime != expected.UpdatedTime {
+		current.UpdatedTime != expected.UpdatedTime ||
+		current.AccountKeyHash != expected.AccountKeyHash ||
+		current.SyncFailureCount != expected.SyncFailureCount ||
+		current.SyncBackoffUntil != expected.SyncBackoffUntil {
 		return false
 	}
 	if (current.EncCredentials == nil) != (expected.EncCredentials == nil) ||
@@ -668,6 +873,42 @@ func routingBindingSyncSourceEqual(current RoutingChannelBinding, expected Routi
 		return false
 	}
 	return current.NewAPIUserID == nil || *current.NewAPIUserID == *expected.NewAPIUserID
+}
+
+func currentRoutingBindingsForSync(
+	tx *gorm.DB,
+	expected []RoutingChannelBinding,
+) (map[int]RoutingChannelBinding, error) {
+	if tx == nil || len(expected) == 0 {
+		return nil, ErrRoutingBindingChanged
+	}
+	ordered := append([]RoutingChannelBinding(nil), expected...)
+	sort.Slice(ordered, func(left int, right int) bool {
+		if ordered[left].ID == ordered[right].ID {
+			return ordered[left].ChannelID < ordered[right].ChannelID
+		}
+		return ordered[left].ID < ordered[right].ID
+	})
+	current := make(map[int]RoutingChannelBinding, len(ordered))
+	expectedByID := make(map[int]RoutingChannelBinding, len(ordered))
+	for _, binding := range ordered {
+		if binding.ID <= 0 || binding.ChannelID <= 0 {
+			return nil, ErrRoutingBindingChanged
+		}
+		if existing, exists := expectedByID[binding.ID]; exists {
+			if !routingBindingSyncSourceEqual(existing, binding) {
+				return nil, ErrRoutingBindingChanged
+			}
+			continue
+		}
+		expectedByID[binding.ID] = binding
+		locked, err := currentRoutingBindingForSync(tx, binding)
+		if err != nil {
+			return nil, err
+		}
+		current[binding.ID] = locked
+	}
+	return current, nil
 }
 
 func currentRoutingBindingForSync(tx *gorm.DB, expected RoutingChannelBinding) (RoutingChannelBinding, error) {
@@ -686,6 +927,17 @@ func currentRoutingBindingForSync(tx *gorm.DB, expected RoutingChannelBinding) (
 		return RoutingChannelBinding{}, ErrRoutingBindingChanged
 	}
 	return current, nil
+}
+
+func RoutingChannelBindingMatchesSyncContext(ctx context.Context, expected RoutingChannelBinding) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := currentRoutingBindingForSync(DB.WithContext(ctx), expected)
+	if errors.Is(err, ErrRoutingBindingChanged) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 type RoutingChannelMetric struct {
@@ -1338,6 +1590,23 @@ func UpsertRoutingChannelBalanceContext(ctx context.Context, channelID int, bala
 		_, err := upsertRoutingChannelBalance(db, channelID, balance, updatedTime)
 		return err
 	})
+}
+
+func clearRoutingChannelBalance(db *gorm.DB, channelID int, updatedTime int64) error {
+	if db == nil || channelID <= 0 {
+		return nil
+	}
+	if updatedTime <= 0 {
+		updatedTime = common.GetTimestamp()
+	}
+	return db.Model(&RoutingChannelHealthState{}).
+		Where("channel_id = ?", channelID).
+		Updates(map[string]any{
+			"balance_known":        false,
+			"balance":              0,
+			"balance_updated_time": 0,
+			"updated_time":         updatedTime,
+		}).Error
 }
 
 func UpdateRoutingChannelBalanceForBindingContext(ctx context.Context, expected RoutingChannelBinding, balance float64, updatedTime int64) (bool, error) {

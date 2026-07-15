@@ -612,3 +612,18 @@ For commercial licensing, please contact support@quantumnous.com
     animation: none !important;
   }
 }
+
+/* Channel routing keeps dense desktop controls while preserving touch targets. */
+@media (pointer: coarse), (max-width: 63.999rem) {
+  .channel-routing-touch-surface [data-slot='input'],
+  .channel-routing-touch-surface [data-slot='native-select'],
+  .channel-routing-touch-surface
+    input[data-slot='form-control']:not([type='hidden']),
+  .channel-routing-touch-surface select[data-slot='form-control'] {
+    min-height: 2.75rem;
+  }
+
+  .channel-routing-touch-surface [data-slot='switch']::after {
+    inset-block: -0.8rem;
+  }
+}

@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -107,10 +108,70 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 }
 
 func GetChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+	return GetChannelWithEligibility(group, model, retry, requestPath, nil)
+}
+
+func GetChannelWithEligibility(
+	group string,
+	modelName string,
+	retry int,
+	requestPath string,
+	eligible ChannelEligibility,
+) (*Channel, error) {
+	if eligible != nil {
+		channels, err := GetRankedChannels(group, modelName, requestPath)
+		if err != nil {
+			return nil, err
+		}
+		filtered := make([]*Channel, 0, len(channels))
+		for _, channel := range channels {
+			if channel != nil && eligible(channel) {
+				filtered = append(filtered, channel)
+			}
+		}
+		if len(filtered) == 0 {
+			return nil, nil
+		}
+		priorities := make(map[int64]struct{})
+		for _, channel := range filtered {
+			priorities[channel.GetPriority()] = struct{}{}
+		}
+		sortedPriorities := make([]int64, 0, len(priorities))
+		for priority := range priorities {
+			sortedPriorities = append(sortedPriorities, priority)
+		}
+		sort.Slice(sortedPriorities, func(left int, right int) bool {
+			return sortedPriorities[left] > sortedPriorities[right]
+		})
+		if retry < 0 {
+			retry = 0
+		}
+		if retry >= len(sortedPriorities) {
+			retry = len(sortedPriorities) - 1
+		}
+		targetPriority := sortedPriorities[retry]
+		targets := make([]*Channel, 0, len(filtered))
+		weightSum := 0
+		for _, channel := range filtered {
+			if channel.GetPriority() == targetPriority {
+				targets = append(targets, channel)
+				weightSum += channel.GetWeight() + 10
+			}
+		}
+		weight := common.GetRandomInt(weightSum)
+		for _, channel := range targets {
+			weight -= channel.GetWeight() + 10
+			if weight <= 0 {
+				return channel, nil
+			}
+		}
+		return nil, errors.New("channel not found")
+	}
+
 	var abilities []Ability
 
 	var err error = nil
-	channelQuery, err := getChannelQuery(group, model, retry)
+	channelQuery, err := getChannelQuery(group, modelName, retry)
 	if err != nil {
 		return nil, err
 	}
