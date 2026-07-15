@@ -28,6 +28,12 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import {
+  Alert,
+  AlertAction,
+  AlertDescription,
+  AlertTitle,
+} from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Empty,
@@ -58,6 +64,49 @@ export function ChannelRoutingLoadingState(props: {
         />
       ))}
     </div>
+  )
+}
+
+export function ChannelRoutingRefetchErrorAlert(props: {
+  isFetching: boolean
+  onRetry: () => void
+  title?: string
+  description?: string
+}) {
+  const { t } = useTranslation()
+
+  return (
+    <Alert
+      role='status'
+      className='border-warning/30 bg-warning/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
+    >
+      <TriangleAlert className='text-warning' aria-hidden='true' />
+      <AlertTitle>{props.title ?? t('Refresh failed')}</AlertTitle>
+      <AlertDescription>
+        {props.description ??
+          t(
+            'Showing the last confirmed page. Refresh before starting a new operation.'
+          )}
+      </AlertDescription>
+      <AlertAction className='static col-span-full mt-2 justify-self-start sm:absolute sm:col-auto sm:mt-0'>
+        <Button
+          size='sm'
+          variant='outline'
+          disabled={props.isFetching}
+          onClick={props.onRetry}
+        >
+          <RefreshCw
+            aria-hidden='true'
+            className={
+              props.isFetching
+                ? 'animate-spin motion-reduce:animate-none'
+                : undefined
+            }
+          />
+          {t('Retry')}
+        </Button>
+      </AlertAction>
+    </Alert>
   )
 }
 

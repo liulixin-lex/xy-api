@@ -107,6 +107,54 @@ func TestRoutingChannelBindingCredentialsDetectKeyMismatch(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrCredentialKeyMismatch))
 }
 
+func TestRoutingChannelBindingAccountAssociationIsFencedAndClearedOnConfigurationChange(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(
+		&RoutingChannelBinding{},
+		&RoutingCostSnapshot{},
+		&RoutingChannelHealthState{},
+	))
+
+	binding := RoutingChannelBinding{
+		ChannelID:     1005,
+		UpstreamType:  RoutingUpstreamTypeSub2API,
+		BaseURL:       "https://association.example",
+		UpstreamGroup: "vip",
+		Enabled:       true,
+	}
+	require.NoError(t, DB.Create(&binding).Error)
+	accountKey := strings.Repeat("a", 64)
+
+	associated, err := ApplyRoutingCostAccountKeyContext(context.Background(), binding, accountKey)
+	require.NoError(t, err)
+	assert.Equal(t, accountKey, associated.AccountKeyHash)
+	assert.Greater(t, associated.UpdatedTime, binding.UpdatedTime)
+
+	unchanged, err := ApplyRoutingCostAccountKeyContext(context.Background(), associated, accountKey)
+	require.NoError(t, err)
+	assert.Equal(t, associated.UpdatedTime, unchanged.UpdatedTime)
+	_, err = ApplyRoutingCostAccountKeyContext(
+		context.Background(),
+		binding,
+		strings.Repeat("b", 64),
+	)
+	require.ErrorIs(t, err, ErrRoutingBindingChanged)
+	_, err = ApplyRoutingCostAccountKeyContext(context.Background(), associated, "not-a-hash")
+	require.ErrorIs(t, err, ErrRoutingCostV2Invalid)
+
+	configured := associated
+	configured.BaseURL = "https://association-updated.example"
+	require.NoError(t, UpdateRoutingChannelBindingAndInvalidateCostContext(
+		context.Background(),
+		associated,
+		&configured,
+	))
+	var persisted RoutingChannelBinding
+	require.NoError(t, DB.Where("id = ?", binding.ID).First(&persisted).Error)
+	assert.Empty(t, persisted.AccountKeyHash)
+}
+
 func TestRoutingModelsAutoMigrateAndMetricUpsert(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	runRoutingMigrationAndUpsertContract(t, db, common.DatabaseTypeSQLite)

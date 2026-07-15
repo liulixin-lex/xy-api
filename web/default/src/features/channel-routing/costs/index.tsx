@@ -58,7 +58,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Tabs, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsTrigger } from '@/components/ui/tabs'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -79,6 +79,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingScrollableTabsList } from '../components/scrollable-tabs-list'
@@ -178,7 +179,6 @@ export function ChannelRoutingCostsPage() {
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.costs(queryParams),
     queryFn: () => listChannelRoutingCosts(queryParams),
-    placeholderData: (previous) => previous,
     enabled: costView === 'snapshots',
     meta: { handleErrorLocally: true },
   })
@@ -336,7 +336,7 @@ export function ChannelRoutingCostsPage() {
             {costView === 'snapshots' && canOperate ? (
               <Button
                 size='sm'
-                disabled={costSyncActive}
+                disabled={costSyncActive || query.isRefetchError}
                 onClick={() => costSync.mutate()}
               >
                 <RefreshCw
@@ -356,6 +356,7 @@ export function ChannelRoutingCostsPage() {
         <div className='space-y-3 pb-2'>
           <Tabs
             value={costView}
+            className='gap-3'
             onValueChange={(value) =>
               updateSearch({
                 costView: value === 'sources' ? 'sources' : 'snapshots',
@@ -372,9 +373,7 @@ export function ChannelRoutingCostsPage() {
                 {t('Cost sources')}
               </TabsTrigger>
             </ChannelRoutingScrollableTabsList>
-          </Tabs>
-          {costView === 'snapshots' ? (
-            <>
+            <TabsContent value='snapshots' className='space-y-3'>
               {trackedCostSync ? (
                 <Alert
                   role={costSyncStatus === 'failed' ? 'alert' : 'status'}
@@ -514,9 +513,15 @@ export function ChannelRoutingCostsPage() {
               </div>
 
               {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-              {query.isError ? (
+              {query.isError && !query.data ? (
                 <ChannelRoutingErrorState
                   error={query.error}
+                  onRetry={() => void query.refetch()}
+                />
+              ) : null}
+              {query.isRefetchError && query.data ? (
+                <ChannelRoutingRefetchErrorAlert
+                  isFetching={query.isFetching}
                   onRetry={() => void query.refetch()}
                 />
               ) : null}
@@ -740,21 +745,23 @@ export function ChannelRoutingCostsPage() {
                   page={page}
                   pageSize={pageSize}
                   total={query.data.total}
+                  disabled={query.isRefetchError}
                   onPageChange={(nextPage) => updateSearch({ page: nextPage })}
                   onPageSizeChange={(nextSize) =>
                     updateSearch({ page: 1, pageSize: nextSize })
                   }
                 />
               ) : null}
-            </>
-          ) : (
-            <Suspense fallback={<ChannelRoutingLoadingState />}>
-              <LazyChannelRoutingCostSourcesSection
-                canOperate={canOperate}
-                canSensitiveWrite={canSensitiveWrite}
-              />
-            </Suspense>
-          )}
+            </TabsContent>
+            <TabsContent value='sources'>
+              <Suspense fallback={<ChannelRoutingLoadingState />}>
+                <LazyChannelRoutingCostSourcesSection
+                  canOperate={canOperate}
+                  canSensitiveWrite={canSensitiveWrite}
+                />
+              </Suspense>
+            </TabsContent>
+          </Tabs>
         </div>
       </ChannelRoutingPageFrame>
       <ChannelRoutingCostDetailsSheet

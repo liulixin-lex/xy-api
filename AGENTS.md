@@ -94,6 +94,12 @@ Do NOT directly import or call `encoding/json` in business code. `json.RawMessag
 - Preserve explicit zero values in upstream relay request DTOs: absent client JSON fields must become `nil` and be omitted, while explicit `0`, `0.0`, or `false` values must remain non-`nil` and be sent upstream.
 - Avoid non-pointer scalars with `omitempty` for optional request parameters, because zero values will be silently dropped during marshal.
 
+**Upstream account connectors:** Before changing NewAPI/Sub2API cost-source connectors, management authentication, account/group/balance synchronization, or upstream pricing normalization, MUST read `.agent/channel-routing-upstream-account-connectors.md` first and keep its official-contract baseline and acceptance criteria current.
+
+- NewAPI management access uses an Access Token together with `New-Api-User`; Sub2API management access uses a JWT or an email/password login that yields a JWT. A gateway API key is model-serving authentication and MUST NOT be used as either provider's management credential.
+- Account wallet balance, gateway-key quota, public/display pricing catalogs, and effective provider billing are separate data sources. Do not merge them or infer one from another.
+- Protocol drift, missing pricing dimensions, ambiguous account identity, or stale synchronization work must fail closed and preserve the last valid snapshot. Binding mutation, disable, or deletion must fence stale jobs before any account, health, balance, or cost write.
+
 **Billing expression system:** When working on tiered/dynamic billing (expression-based pricing), MUST read `pkg/billingexpr/expr.md` first. It documents the design philosophy, expression language, full architecture, token normalization rules, quota conversion, and expression versioning. All billing expression changes must follow that document.
 
 **Billing safety invariants:** Quota/billing code MUST never produce a negative charge (a credit) from arithmetic overflow or unvalidated input. Apply defense in depth:

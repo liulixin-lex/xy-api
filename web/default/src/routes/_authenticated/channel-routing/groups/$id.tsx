@@ -21,10 +21,16 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { ChannelRoutingGroupDetailPage } from '@/features/channel-routing/groups/detail'
+import { isChannelRoutingPageSize } from '@/features/channel-routing/lib/pagination'
 
 const searchSchema = z.object({
   page: z.number().int().min(1).optional().catch(1),
-  pageSize: z.number().int().min(1).max(100).optional().catch(20),
+  pageSize: z
+    .number()
+    .int()
+    .refine(isChannelRoutingPageSize)
+    .optional()
+    .catch(20),
   modelLimit: z.number().int().min(1).max(100).optional().catch(20),
   credentialLimit: z.number().int().min(1).max(100).optional().catch(20),
 })

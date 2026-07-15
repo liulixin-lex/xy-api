@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 
 	"github.com/gin-gonic/gin"
@@ -167,6 +166,15 @@ func createRoutingBindingContext(ctx context.Context, request routingBindingRequ
 			return model.RoutingChannelBinding{}, err
 		}
 	}
+	if binding.Enabled {
+		credentials, credentialErr := binding.GetCredentials()
+		if credentialErr != nil {
+			return model.RoutingChannelBinding{}, credentialErr
+		}
+		if credentialErr = validateRoutingBindingManagementReadiness(binding, credentials); credentialErr != nil {
+			return model.RoutingChannelBinding{}, credentialErr
+		}
+	}
 	if err := smartRoutingRuntimeStateMu.LockContext(ctx); err != nil {
 		return model.RoutingChannelBinding{}, err
 	}
@@ -174,6 +182,7 @@ func createRoutingBindingContext(ctx context.Context, request routingBindingRequ
 	if err := model.CreateRoutingChannelBindingWithAuditContext(ctx, &binding, actorID); err != nil {
 		return model.RoutingChannelBinding{}, err
 	}
+	routinghotcache.SetChannelTrafficPolicy(binding.ChannelID, binding.ServesClaudeCode, common.GetTimestamp())
 	return binding, nil
 }
 
@@ -205,6 +214,15 @@ func updateRoutingBindingContext(
 			return model.RoutingChannelBinding{}, err
 		}
 	}
+	if updated.Enabled {
+		credentials, credentialErr := updated.GetCredentials()
+		if credentialErr != nil {
+			return model.RoutingChannelBinding{}, credentialErr
+		}
+		if credentialErr = validateRoutingBindingManagementReadiness(updated, credentials); credentialErr != nil {
+			return model.RoutingChannelBinding{}, credentialErr
+		}
+	}
 	newSub2APIAuthKey := newRoutingSub2APIAuthKey(updated, model.RoutingCredentials{})
 	authKeyChanged := oldSub2APIAuthKey != newSub2APIAuthKey
 	if expected.UpstreamType == model.RoutingUpstreamTypeSub2API &&
@@ -229,6 +247,7 @@ func updateRoutingBindingContext(
 		return model.RoutingChannelBinding{}, err
 	}
 	routinghotcache.ClearCostChannel(updated.ChannelID)
+	routinghotcache.SetChannelTrafficPolicy(updated.ChannelID, updated.ServesClaudeCode, common.GetTimestamp())
 	if retireOldSub2APIAuth {
 		invalidateRoutingSub2APIJWT(ctx, expected)
 	}
@@ -236,6 +255,38 @@ func updateRoutingBindingContext(
 		activateRoutingSub2APIJWT(ctx, activationFence)
 	}
 	return updated, nil
+}
+
+func validateRoutingBindingManagementReadiness(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) error {
+	if err := validateRoutingBindingAccountManagementReadiness(binding, credentials); err != nil {
+		return err
+	}
+	credentials = credentials.ForUpstream(binding.UpstreamType)
+	if binding.Enabled && binding.UpstreamType == model.RoutingUpstreamTypeNewAPI && credentials.GatewayAPIKey == "" {
+		return routingBindingFieldError("gateway_api_key", "serving_auth_required")
+	}
+	return nil
+}
+
+func validateRoutingBindingAccountManagementReadiness(binding model.RoutingChannelBinding, credentials model.RoutingCredentials) error {
+	if !binding.Enabled {
+		return nil
+	}
+	credentials = credentials.ForUpstream(binding.UpstreamType)
+	if binding.UpstreamType == model.RoutingUpstreamTypeNewAPI {
+		if binding.NewAPIUserID == nil || *binding.NewAPIUserID <= 0 {
+			return routingBindingFieldError("new_api_user_id", "required")
+		}
+		if credentials.NewAPIAccessToken == "" {
+			return routingBindingFieldError("new_api_access_token", "management_auth_required")
+		}
+		return nil
+	}
+	if binding.UpstreamType == model.RoutingUpstreamTypeSub2API &&
+		!credentials.ReadyForUpstream(model.RoutingUpstreamTypeSub2API) {
+		return routingBindingFieldError("credentials", "management_auth_required")
+	}
+	return nil
 }
 
 func deleteRoutingBindingContext(ctx context.Context, expected model.RoutingChannelBinding, actorID int) error {
@@ -248,6 +299,7 @@ func deleteRoutingBindingContext(ctx context.Context, expected model.RoutingChan
 	}
 	invalidateRoutingSub2APIJWT(ctx, expected)
 	routinghotcache.ClearCostChannel(expected.ChannelID)
+	routinghotcache.DeleteChannelTrafficPolicy(expected.ChannelID, common.GetTimestamp())
 	return nil
 }
 
@@ -589,7 +641,7 @@ func routingBindingFromRequest(request routingBindingRequest) (model.RoutingChan
 	return binding, nil
 }
 
-func validateRoutingBindingRequest(request routingBindingRequest, requireChannelID bool) error {
+func validateRoutingBindingRequest(request routingBindingRequest, requireChannelID bool, requireUpstreamGroup bool) error {
 	if requireChannelID && request.ChannelID <= 0 {
 		return routingBindingFieldError("channel_id", "required")
 	}
@@ -615,7 +667,7 @@ func validateRoutingBindingRequest(request routingBindingRequest, requireChannel
 	if _, err := service.WithRoutingCostEgressPolicy(context.Background(), normalizedCIDRs, customCAPEM); err != nil {
 		return routingBindingFieldError("custom_ca_pem", "invalid")
 	}
-	if strings.TrimSpace(request.UpstreamGroup) == "" {
+	if requireUpstreamGroup && strings.TrimSpace(request.UpstreamGroup) == "" {
 		return routingBindingFieldError("upstream_group", "required")
 	}
 	return nil
@@ -641,15 +693,8 @@ func validateRoutingBaseURL(value string, allowedPrivateCIDRs []string) error {
 	if parsed.User != nil {
 		return routingBindingFieldError("base_url", "credentials_not_allowed")
 	}
-	for key := range parsed.Query() {
-		normalized := strings.ToLower(strings.TrimSpace(key))
-		if strings.Contains(normalized, "token") ||
-			strings.Contains(normalized, "key") ||
-			strings.Contains(normalized, "secret") ||
-			strings.Contains(normalized, "password") ||
-			strings.Contains(normalized, "authorization") {
-			return routingBindingFieldError("base_url", "sensitive_query_not_allowed")
-		}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return routingBindingFieldError("base_url", "query_or_fragment_not_allowed")
 	}
 	if err = service.ValidateRoutingCostURLWithEgressPolicy(parsed.String(), allowedPrivateCIDRs); err != nil {
 		return routingBindingFieldError("base_url", "unsafe_target")
@@ -732,7 +777,7 @@ func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool
 		if !requireRoutingSensitiveWriteForInline(c) {
 			return nil, false
 		}
-		if err := validateRoutingBindingRequest(request, true); err != nil {
+		if err := validateRoutingBindingRequest(request, true, true); err != nil {
 			common.ApiError(c, err)
 			return nil, false
 		}
@@ -751,7 +796,7 @@ func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool
 			return nil, false
 		}
 		request.ChannelID = channelID
-		if err := validateRoutingBindingRequest(request, true); err != nil {
+		if err := validateRoutingBindingRequest(request, true, true); err != nil {
 			common.ApiError(c, err)
 			return nil, false
 		}
@@ -762,11 +807,7 @@ func routingBindingForAction(c *gin.Context) (*model.RoutingChannelBinding, bool
 }
 
 func requireRoutingSensitiveWriteForInline(c *gin.Context) bool {
-	if authz.Can(c.GetInt("id"), c.GetInt("role"), authz.ChannelSensitiveWrite) {
-		return true
-	}
-	c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "insufficient privilege"})
-	return false
+	return requireChannelRoutingSensitiveWriteCurrent(c)
 }
 
 func hasInlineRoutingBindingRequest(request routingBindingRequest) bool {

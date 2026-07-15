@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -37,6 +38,23 @@ const (
 	RoutingCostFreshnessStale   = "stale"
 	RoutingCostFreshnessExpired = "expired"
 	RoutingCostFreshnessUnknown = "unknown"
+
+	// RoutingCostSub2APIIntervalUnmatchedTier marks request profiles that fall
+	// outside the interval prices exposed by Sub2API. The upstream falls back to
+	// a private base catalog in that case, so routing must treat the cost as
+	// unknown instead of accepting the expression's zero placeholder.
+	RoutingCostSub2APIIntervalUnmatchedTier = "__routing_cost_sub2api_interval_unmatched_v1__"
+
+	// These scopes identify upstream price directories that intentionally omit
+	// request-dependent billing dimensions. The estimator keeps their useful
+	// base prices and fails closed only when the current request needs a missing
+	// dimension.
+	RoutingCostCatalogScopeNewAPIPricing = "newapi_pricing_v1"
+	// RoutingCostSub2APIDisplayContractV1 identifies pricing derived from
+	// Sub2API's user-facing channels directory. That directory intentionally
+	// omits parts of the effective BillingService contract, so request-specific
+	// safety checks must run before the snapshot can be treated as known.
+	RoutingCostSub2APIDisplayContractV1 = "display_v1"
 
 	routingCostSnapshotVersionSchema = 1
 	routingCostJSONMaxBytes          = 60 << 10
@@ -74,16 +92,17 @@ func (RoutingUpstreamAccount) TableName() string {
 }
 
 type RoutingUpstreamAccountSpec struct {
-	SourceType       string
-	StableIdentity   string
-	MaskedIdentity   string
-	Status           string
-	PreserveBalance  bool
-	BalanceKnown     bool
-	Balance          float64
-	BalanceUpdatedAt int64
-	LastSyncStatus   string
-	LastSyncError    string
+	SourceType                  string
+	StableIdentity              string
+	MaskedIdentity              string
+	Status                      string
+	PreserveBalance             bool
+	BalanceKnown                bool
+	Balance                     float64
+	BalanceUpdatedAt            int64
+	ChannelBalanceNotApplicable bool
+	LastSyncStatus              string
+	LastSyncError               string
 }
 
 type RoutingCostSnapshotVersion struct {
@@ -159,31 +178,35 @@ type RoutingNormalizedPricing struct {
 // needed; HedgeProbability is the chance of one concurrent hedge. These
 // values never participate in user quota or settlement.
 type RoutingCostRequestProfile struct {
-	PromptTokens             int64
-	MaximumPromptTokens      int64
-	ExpectedCompletionTokens int64
-	MaximumCompletionTokens  int64
-	CacheReadTokens          int64
-	CacheWriteTokens         int64
-	CacheWriteOneHourTokens  int64
-	ImageInputTokens         int64
-	ImageOutputTokens        int64
-	AudioInputTokens         int64
-	AudioOutputTokens        int64
-	ImageUnits               float64
-	MaxAttempts              int
-	RetryProbability         float64
-	HedgeProbability         float64
-	HedgeAllowed             bool
-	KnowledgeSpecified       bool
-	InputTokensKnown         bool
-	MaximumCompletionKnown   bool
-	CacheTokensKnown         bool
-	MediaDimensionsKnown     bool
-	RequestInputKnown        bool
-	Request                  billingexpr.RequestInput `json:"-"`
-	ActualUsage              *RoutingCostActualUsage  `json:"-"`
-	actualTokenParams        *billingexpr.TokenParams
+	PromptTokens                  int64
+	MaximumPromptTokens           int64
+	ExpectedCompletionTokens      int64
+	MaximumCompletionTokens       int64
+	CacheReadTokens               int64
+	CacheWriteTokens              int64
+	CacheWriteOneHourTokens       int64
+	ImageInputTokens              int64
+	ImageOutputTokens             int64
+	AudioInputTokens              int64
+	AudioOutputTokens             int64
+	ImageUnits                    float64
+	MaxAttempts                   int
+	RetryProbability              float64
+	HedgeProbability              float64
+	HedgeAllowed                  bool
+	KnowledgeSpecified            bool
+	InputTokensKnown              bool
+	MaximumCompletionKnown        bool
+	CacheTokensKnown              bool
+	CacheReadTokensKnown          bool
+	CacheWriteTokensKnown         bool
+	MediaDimensionsKnown          bool
+	RequestInputKnown             bool
+	RequestPricingFeaturesKnown   bool
+	UncataloguedSurchargePossible bool
+	Request                       billingexpr.RequestInput `json:"-"`
+	ActualUsage                   *RoutingCostActualUsage  `json:"-"`
+	actualTokenParams             *billingexpr.TokenParams
 }
 
 type RoutingCostActualUsage struct {
@@ -277,6 +300,155 @@ func UpsertRoutingUpstreamAccountContext(ctx context.Context, spec RoutingUpstre
 		ctx = context.Background()
 	}
 	return upsertRoutingUpstreamAccount(DB.WithContext(ctx), spec)
+}
+
+// UpsertRoutingUpstreamAccountStatusForBindingContext creates or updates an
+// account only while the binding that authenticated its stable identity is
+// still current. Callers must derive StableIdentity from provider-authoritative
+// account data before using this on failure or partial-status paths.
+func UpsertRoutingUpstreamAccountStatusForBindingContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	spec RoutingUpstreamAccountSpec,
+) (RoutingUpstreamAccount, error) {
+	return UpsertRoutingUpstreamAccountStatusForBindingsContext(
+		ctx,
+		[]RoutingChannelBinding{expected},
+		spec,
+	)
+}
+
+// UpsertRoutingUpstreamAccountStatusForBindingsContext applies one account
+// status only when every binding that contributed to that status is still
+// current in the same transaction.
+func UpsertRoutingUpstreamAccountStatusForBindingsContext(
+	ctx context.Context,
+	expected []RoutingChannelBinding,
+	spec RoutingUpstreamAccountSpec,
+) (RoutingUpstreamAccount, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(expected) == 0 {
+		return RoutingUpstreamAccount{}, ErrRoutingBindingChanged
+	}
+	if !spec.PreserveBalance || spec.BalanceKnown {
+		return RoutingUpstreamAccount{}, ErrRoutingCostV2Invalid
+	}
+	ordered := append([]RoutingChannelBinding(nil), expected...)
+	sort.Slice(ordered, func(left int, right int) bool {
+		if ordered[left].ID == ordered[right].ID {
+			return ordered[left].ChannelID < ordered[right].ChannelID
+		}
+		return ordered[left].ID < ordered[right].ID
+	})
+	var account RoutingUpstreamAccount
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		seen := make(map[int]struct{}, len(ordered))
+		for _, binding := range ordered {
+			if binding.ID <= 0 || binding.ChannelID <= 0 {
+				return ErrRoutingBindingChanged
+			}
+			if _, exists := seen[binding.ID]; exists {
+				continue
+			}
+			seen[binding.ID] = struct{}{}
+			if _, err := currentRoutingBindingForSync(tx, binding); err != nil {
+				return err
+			}
+		}
+		var err error
+		account, err = upsertRoutingUpstreamAccount(tx, spec)
+		return err
+	})
+	return account, err
+}
+
+// UpdateRoutingUpstreamAccountStatusForBindingContext updates an existing
+// account only while the binding used by the sync is still current. Failure
+// and partial-status paths use this instead of upsert so a stale sync cannot
+// create an account or degrade one after credentials or topology changed.
+func UpdateRoutingUpstreamAccountStatusForBindingContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	spec RoutingUpstreamAccountSpec,
+) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if expected.ID <= 0 || expected.ChannelID <= 0 {
+		return false, ErrRoutingBindingChanged
+	}
+	spec.SourceType = strings.TrimSpace(spec.SourceType)
+	spec.StableIdentity = strings.TrimSpace(spec.StableIdentity)
+	spec.MaskedIdentity = strings.TrimSpace(spec.MaskedIdentity)
+	spec.Status = strings.TrimSpace(spec.Status)
+	spec.LastSyncStatus = strings.TrimSpace(spec.LastSyncStatus)
+	if !spec.PreserveBalance || spec.BalanceKnown ||
+		!validRoutingCostText(spec.SourceType, 32) ||
+		!validRoutingCostText(spec.StableIdentity, 512) ||
+		!validRoutingCostText(spec.MaskedIdentity, 256) ||
+		spec.SourceType == "" || spec.StableIdentity == "" || spec.MaskedIdentity == "" ||
+		spec.MaskedIdentity == spec.StableIdentity || !validRoutingUpstreamType(spec.SourceType) ||
+		!validRoutingUpstreamAccountStatus(spec.Status) ||
+		!validRoutingUpstreamSyncStatus(spec.LastSyncStatus) {
+		return false, ErrRoutingCostV2Invalid
+	}
+
+	accountKey := RoutingUpstreamAccountKey(spec.SourceType, spec.StableIdentity)
+	lastSyncError := truncateRoutingCostText(
+		common.SanitizeErrorMessage(spec.LastSyncError, spec.StableIdentity),
+		1_024,
+	)
+	applied := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := currentRoutingBindingForSync(tx, expected); err != nil {
+			return err
+		}
+
+		var account RoutingUpstreamAccount
+		if err := tx.Where("account_key = ? AND source_type = ?", accountKey, spec.SourceType).
+			First(&account).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		now := common.GetTimestamp()
+		updates := map[string]any{
+			"masked_identity":  spec.MaskedIdentity,
+			"status":           spec.Status,
+			"last_sync_status": spec.LastSyncStatus,
+			"last_sync_error":  lastSyncError,
+			"updated_time":     now,
+		}
+		updated := tx.Model(&RoutingUpstreamAccount{}).
+			Where("id = ? AND account_key = ?", account.ID, accountKey).
+			Updates(updates)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		account.MaskedIdentity = spec.MaskedIdentity
+		account.Status = spec.Status
+		account.LastSyncStatus = spec.LastSyncStatus
+		account.LastSyncError = lastSyncError
+		account.UpdatedTime = now
+		if tx.Migrator().HasTable(&RoutingCostSnapshot{}) {
+			if err := tx.Model(&RoutingCostSnapshot{}).Where("account_id = ?", account.ID).Updates(map[string]any{
+				"account_source_type": account.SourceType,
+				"account_key_hash":    account.AccountKey,
+				"account_masked_id":   account.MaskedIdentity,
+				"account_status":      account.Status,
+				"account_sync_status": account.LastSyncStatus,
+				"account_sync_error":  account.LastSyncError,
+			}).Error; err != nil {
+				return err
+			}
+		}
+		applied = true
+		return nil
+	})
+	return applied, err
 }
 
 func upsertRoutingUpstreamAccount(db *gorm.DB, spec RoutingUpstreamAccountSpec) (RoutingUpstreamAccount, error) {
@@ -508,10 +680,29 @@ func CompleteRoutingCostVersionSyncContext(
 	accountSpec RoutingUpstreamAccountSpec,
 	writes []RoutingCostSnapshotVersionWrite,
 ) (RoutingCostVersionSyncResult, error) {
+	return CompleteRoutingCostVersionSyncWithAccountFencesContext(
+		ctx,
+		expected,
+		nil,
+		accountSpec,
+		writes,
+	)
+}
+
+// CompleteRoutingCostVersionSyncWithAccountFencesContext atomically applies a
+// successful binding sync while fencing every current failure/backoff binding
+// that contributed to the account status written in the same transaction.
+func CompleteRoutingCostVersionSyncWithAccountFencesContext(
+	ctx context.Context,
+	expected RoutingChannelBinding,
+	accountFences []RoutingChannelBinding,
+	accountSpec RoutingUpstreamAccountSpec,
+	writes []RoutingCostSnapshotVersionWrite,
+) (RoutingCostVersionSyncResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if expected.ID <= 0 || expected.ChannelID <= 0 || len(writes) > 4_096 {
+	if expected.ID <= 0 || expected.ChannelID <= 0 || len(writes) > 4_096 || len(accountFences) > 4_096 {
 		return RoutingCostVersionSyncResult{}, ErrRoutingBindingChanged
 	}
 	if err := ctx.Err(); err != nil {
@@ -523,9 +714,14 @@ func CompleteRoutingCostVersionSyncContext(
 		Latest:   make([]RoutingCostSnapshot, 0, len(writes)),
 	}
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		current, err := currentRoutingBindingForSync(tx, expected)
+		fences := append([]RoutingChannelBinding{expected}, accountFences...)
+		currentFences, err := currentRoutingBindingsForSync(tx, fences)
 		if err != nil {
 			return err
+		}
+		current, exists := currentFences[expected.ID]
+		if !exists {
+			return ErrRoutingBindingChanged
 		}
 		account, err := upsertRoutingUpstreamAccount(tx, accountSpec)
 		if err != nil {
@@ -538,7 +734,8 @@ func CompleteRoutingCostVersionSyncContext(
 				return err
 			}
 			write := writes[index]
-			if write.ChannelID != 0 && write.ChannelID != expected.ChannelID {
+			if write.ChannelID != 0 && write.ChannelID != expected.ChannelID ||
+				strings.TrimSpace(write.UpstreamGroup) != strings.TrimSpace(expected.UpstreamGroup) {
 				return ErrRoutingBindingChanged
 			}
 			write.AccountID = account.ID
@@ -552,13 +749,24 @@ func CompleteRoutingCostVersionSyncContext(
 				result.Latest = append(result.Latest, version.Latest)
 			}
 		}
+		authoritativeModelKeys := make([]string, 0, len(result.Versions))
+		for index := range result.Versions {
+			authoritativeModelKeys = append(authoritativeModelKeys, result.Versions[index].Version.LocalModelKey)
+		}
+		if err := reconcileRoutingCostLatestModels(tx, expected.ChannelID, authoritativeModelKeys); err != nil {
+			return err
+		}
 
-		if accountSpec.BalanceKnown {
+		if accountSpec.ChannelBalanceNotApplicable {
+			if err := clearRoutingChannelBalance(tx, expected.ChannelID, accountSpec.BalanceUpdatedAt); err != nil {
+				return err
+			}
+		} else if accountSpec.BalanceKnown {
 			if _, err := upsertRoutingChannelBalance(tx, expected.ChannelID, accountSpec.Balance, accountSpec.BalanceUpdatedAt); err != nil {
 				return err
 			}
 		}
-		update := tx.Model(&RoutingChannelBinding{}).Where("id = ?", expected.ID).Updates(map[string]any{
+		update := routingBindingSyncSourceQuery(tx.Model(&RoutingChannelBinding{}), expected).Updates(map[string]any{
 			"last_sync_error":    nil,
 			"sync_failure_count": 0,
 			"sync_backoff_until": 0,
@@ -746,13 +954,26 @@ func EstimateRoutingCostSnapshot(
 		!routingNormalizedPricingHasKnownCost(pricing) {
 		return estimate, nil
 	}
+	if pricing.GroupRatio != nil && *pricing.GroupRatio == 0 {
+		estimate.Known = true
+		estimate.ExpectedKnown = true
+		estimate.WorstCaseKnown = true
+		estimate.ExpectedEffectiveKnown = true
+		return estimate, nil
+	}
+	if !routingCostCatalogCoversRequest(version.SourceType, pricing, profile) {
+		return estimate, nil
+	}
 
 	dependencies := routingCostPricingDependencies(pricing)
+	cacheReadTokensKnown := profile.CacheTokensKnown || profile.CacheReadTokensKnown
+	cacheWriteTokensKnown := profile.CacheTokensKnown || profile.CacheWriteTokensKnown
 	expectedKnown := true
 	worstKnown := true
 	if profile.KnowledgeSpecified {
 		if dependencies.request && !profile.RequestInputKnown ||
-			dependencies.cache && !profile.CacheTokensKnown ||
+			dependencies.cacheRead && !cacheReadTokensKnown ||
+			dependencies.cacheWrite && !cacheWriteTokensKnown ||
 			dependencies.media && !profile.MediaDimensionsKnown {
 			expectedKnown = false
 			worstKnown = false
@@ -769,14 +990,18 @@ func EstimateRoutingCostSnapshot(
 		}
 	}
 	if expectedKnown {
-		expected, breakdown, err := routingCostSingleAttempt(pricing, profile, profile.ExpectedCompletionTokens)
+		expected, breakdown, known, err := routingCostSingleAttempt(
+			version.SourceType, pricing, profile, profile.ExpectedCompletionTokens,
+		)
 		if err != nil {
 			return RoutingCostEstimate{}, err
 		}
-		estimate.ExpectedKnown = true
-		estimate.ExpectedEffectiveKnown = true
-		estimate.ExpectedCost = expected
-		estimate.ExpectedBreakdown = breakdown
+		if known {
+			estimate.ExpectedKnown = true
+			estimate.ExpectedEffectiveKnown = true
+			estimate.ExpectedCost = expected
+			estimate.ExpectedBreakdown = breakdown
+		}
 	}
 
 	maxAttempts := profile.MaxAttempts
@@ -805,13 +1030,17 @@ func EstimateRoutingCostSnapshot(
 		}
 		worstProfile := profile
 		worstProfile.PromptTokens = profile.MaximumPromptTokens
-		worstSingle, breakdown, err := routingCostSingleAttempt(pricing, worstProfile, maximumCompletion)
+		worstSingle, breakdown, known, err := routingCostSingleAttempt(
+			version.SourceType, pricing, worstProfile, maximumCompletion,
+		)
 		if err != nil {
 			return RoutingCostEstimate{}, err
 		}
-		estimate.WorstCaseKnown = true
-		estimate.WorstCaseCost = worstSingle * float64(worstAttemptCount)
-		estimate.WorstCaseSingleBreakdown = breakdown
+		if known {
+			estimate.WorstCaseKnown = true
+			estimate.WorstCaseCost = worstSingle * float64(worstAttemptCount)
+			estimate.WorstCaseSingleBreakdown = breakdown
+		}
 	}
 	estimate.Known = estimate.ExpectedKnown
 	if !routingCostFinite(estimate.ExpectedCost) || !routingCostFinite(estimate.WorstCaseCost) ||
@@ -820,6 +1049,36 @@ func EstimateRoutingCostSnapshot(
 		return RoutingCostEstimate{}, ErrRoutingCostV2Invalid
 	}
 	return estimate, nil
+}
+
+type routingCostCatalogMetadata struct {
+	CatalogScope                string `json:"catalog_scope"`
+	AlwaysUncataloguedSurcharge bool   `json:"always_uncatalogued_surcharge"`
+}
+
+func routingCostCatalogCoversRequest(
+	sourceType string,
+	pricing RoutingNormalizedPricing,
+	profile RoutingCostRequestProfile,
+) bool {
+	requiresNewAPIContract := strings.TrimSpace(sourceType) == RoutingUpstreamTypeNewAPI
+	if len(pricing.Extras) == 0 || common.GetJsonType(pricing.Extras) != "object" {
+		return !requiresNewAPIContract
+	}
+	var metadata routingCostCatalogMetadata
+	if err := common.Unmarshal(pricing.Extras, &metadata); err != nil {
+		return false
+	}
+	catalogScope := strings.TrimSpace(metadata.CatalogScope)
+	if requiresNewAPIContract && catalogScope != RoutingCostCatalogScopeNewAPIPricing {
+		return false
+	}
+	switch catalogScope {
+	case RoutingCostCatalogScopeNewAPIPricing:
+		return profile.KnowledgeSpecified && profile.RequestPricingFeaturesKnown &&
+			!profile.UncataloguedSurchargePossible && !metadata.AlwaysUncataloguedSurcharge
+	}
+	return true
 }
 
 func validateRoutingCostRequestProfile(profile RoutingCostRequestProfile) error {
@@ -867,85 +1126,98 @@ func routingCostFreshnessAt(version RoutingCostSnapshotVersion, atUnix int64) fl
 }
 
 func routingCostSingleAttempt(
+	sourceType string,
 	pricing RoutingNormalizedPricing,
 	profile RoutingCostRequestProfile,
 	completionTokens int64,
-) (float64, RoutingCostBreakdown, error) {
-	groupRatio := routingCostPointerValue(pricing.GroupRatio)
-	if groupRatio <= 0 {
-		groupRatio = 1
+) (float64, RoutingCostBreakdown, bool, error) {
+	groupRatio := 1.0
+	if pricing.GroupRatio != nil {
+		groupRatio = *pricing.GroupRatio
+	}
+	params := billingexpr.TokenParams{
+		P:    float64(profile.PromptTokens),
+		C:    float64(completionTokens),
+		Len:  float64(profile.PromptTokens + profile.CacheReadTokens + profile.CacheWriteTokens + profile.CacheWriteOneHourTokens),
+		CR:   float64(profile.CacheReadTokens),
+		CC:   float64(profile.CacheWriteTokens),
+		CC1h: float64(profile.CacheWriteOneHourTokens),
+		Img:  float64(profile.ImageInputTokens),
+		ImgO: float64(profile.ImageOutputTokens),
+		AI:   float64(profile.AudioInputTokens),
+		AO:   float64(profile.AudioOutputTokens),
+	}
+	if profile.actualTokenParams != nil {
+		params = *profile.actualTokenParams
+	}
+	if !routingCostSub2APIDisplayPricingKnownForRequest(sourceType, pricing, profile, params) {
+		return 0, RoutingCostBreakdown{}, false, nil
 	}
 	expression := strings.TrimSpace(pricing.BillingExpression)
 	if expression == "" {
 		expression = routingCostTierExpression(pricing.Tiers)
 	}
 	if expression != "" {
-		params := billingexpr.TokenParams{
-			P:    float64(profile.PromptTokens),
-			C:    float64(completionTokens),
-			Len:  float64(profile.PromptTokens + profile.CacheReadTokens + profile.CacheWriteTokens + profile.CacheWriteOneHourTokens),
-			CR:   float64(profile.CacheReadTokens),
-			CC:   float64(profile.CacheWriteTokens),
-			CC1h: float64(profile.CacheWriteOneHourTokens),
-			Img:  float64(profile.ImageInputTokens),
-			ImgO: float64(profile.ImageOutputTokens),
-			AI:   float64(profile.AudioInputTokens),
-			AO:   float64(profile.AudioOutputTokens),
-		}
-		if profile.actualTokenParams != nil {
-			params = *profile.actualTokenParams
-		}
-		raw, _, err := billingexpr.RunExprWithRequest(expression, params, profile.Request)
+		raw, trace, err := billingexpr.RunExprWithRequest(expression, params, profile.Request)
 		if err != nil || !routingCostFinite(raw) || raw < 0 {
-			return 0, RoutingCostBreakdown{}, ErrRoutingCostV2Invalid
+			return 0, RoutingCostBreakdown{}, false, ErrRoutingCostV2Invalid
+		}
+		if trace.MatchedTier == RoutingCostSub2APIIntervalUnmatchedTier &&
+			(params.P > 0 || params.C > 0 || params.CR > 0 || params.CC > 0 ||
+				params.CC1h > 0 || params.Img > 0 || params.ImgO > 0 ||
+				params.AI > 0 || params.AO > 0) {
+			return 0, RoutingCostBreakdown{}, false, nil
 		}
 		cost := raw / 1_000_000 * groupRatio
-		return cost, RoutingCostBreakdown{Expression: cost, Total: cost}, nil
+		return cost, RoutingCostBreakdown{Expression: cost, Total: cost}, true, nil
 	}
 
-	inputRate := routingCostPointerValue(pricing.InputCostPerMillion)
-	if inputRate == 0 && pricing.BaseRatio != nil {
+	inputRate := 0.0
+	if pricing.InputCostPerMillion != nil {
+		inputRate = *pricing.InputCostPerMillion
+	} else if pricing.BaseRatio != nil {
 		inputRate = *pricing.BaseRatio * 1_000_000 / common.QuotaPerUnit
 	}
-	outputRate := routingCostPointerValue(pricing.OutputCostPerMillion)
-	if outputRate == 0 {
-		outputRate = inputRate * routingCostPointerValue(pricing.CompletionRatio)
-		if outputRate == 0 {
-			outputRate = inputRate
-		}
+	outputRate := inputRate
+	if pricing.OutputCostPerMillion != nil {
+		outputRate = *pricing.OutputCostPerMillion
+	} else if pricing.CompletionRatio != nil {
+		outputRate = inputRate * *pricing.CompletionRatio
 	}
-	cacheReadRate := routingCostPointerValue(pricing.CacheReadCostPerMillion)
-	if cacheReadRate == 0 {
-		cacheReadRate = inputRate
+	cacheReadRate := inputRate
+	if pricing.CacheReadCostPerMillion != nil {
+		cacheReadRate = *pricing.CacheReadCostPerMillion
 	}
-	cacheWriteRate := routingCostPointerValue(pricing.CacheWriteCostPerMillion)
-	if cacheWriteRate == 0 {
-		cacheWriteRate = inputRate
+	cacheWriteRate := inputRate
+	if pricing.CacheWriteCostPerMillion != nil {
+		cacheWriteRate = *pricing.CacheWriteCostPerMillion
 	}
-	cacheWriteOneHourRate := routingCostPointerValue(pricing.CacheWrite1hCostPerMillion)
-	if cacheWriteOneHourRate == 0 {
-		cacheWriteOneHourRate = cacheWriteRate
+	cacheWriteOneHourRate := cacheWriteRate
+	if pricing.CacheWrite1hCostPerMillion != nil {
+		cacheWriteOneHourRate = *pricing.CacheWrite1hCostPerMillion
 	}
-	imageInputRate := routingCostPointerValue(pricing.ImageInputCostPerMillion)
-	if imageInputRate == 0 {
-		imageInputRate = inputRate
+	imageInputRate := inputRate
+	if pricing.ImageInputCostPerMillion != nil {
+		imageInputRate = *pricing.ImageInputCostPerMillion
 	}
-	imageOutputRate := routingCostPointerValue(pricing.ImageOutputCostPerMillion)
-	if imageOutputRate == 0 {
-		imageOutputRate = outputRate
+	imageOutputRate := outputRate
+	if pricing.ImageOutputCostPerMillion != nil {
+		imageOutputRate = *pricing.ImageOutputCostPerMillion
 	}
-	audioInputRate := routingCostPointerValue(pricing.AudioInputCostPerMillion)
-	if audioInputRate == 0 {
-		audioInputRate = inputRate
+	audioInputRate := inputRate
+	if pricing.AudioInputCostPerMillion != nil {
+		audioInputRate = *pricing.AudioInputCostPerMillion
 	}
-	audioOutputRate := routingCostPointerValue(pricing.AudioOutputCostPerMillion)
-	if audioOutputRate == 0 {
-		audioOutputRate = outputRate
+	audioOutputRate := outputRate
+	if pricing.AudioOutputCostPerMillion != nil {
+		audioOutputRate = *pricing.AudioOutputCostPerMillion
 	}
 
-	perImageRate := routingCostPointerValue(pricing.PerImageCost)
-	if perImageRate == 0 {
-		perImageRate = routingCostPointerValue(pricing.ImageCost)
+	perImageRate := 0.0
+	if pricing.PerImageCost != nil {
+		perImageRate = *pricing.PerImageCost
+	} else if pricing.ImageCost != nil {
+		perImageRate = *pricing.ImageCost
 	}
 	breakdown := RoutingCostBreakdown{
 		Input:        float64(profile.PromptTokens) * inputRate / 1_000_000,
@@ -961,7 +1233,124 @@ func routingCostSingleAttempt(
 		PerRequest:   routingCostPointerValue(pricing.PerRequestCost),
 	}
 	breakdown = scaleRoutingCostBreakdown(breakdown, groupRatio)
-	return breakdown.Total, breakdown, nil
+	return breakdown.Total, breakdown, true, nil
+}
+
+// routingCostSub2APIDisplayPricingKnownForRequest enforces the information
+// boundary of Sub2API's /api/v1/channels/available response. Flat display
+// prices do not expose priority, 1h cache-write, or long-context overrides;
+// interval prices are explicit channel prices and cover priority semantics.
+func routingCostSub2APIDisplayPricingKnownForRequest(
+	sourceType string,
+	pricing RoutingNormalizedPricing,
+	profile RoutingCostRequestProfile,
+	params billingexpr.TokenParams,
+) bool {
+	requiresSub2APIContract := strings.TrimSpace(sourceType) == RoutingUpstreamTypeSub2API
+	if requiresSub2APIContract && (!profile.KnowledgeSpecified ||
+		!profile.RequestPricingFeaturesKnown || profile.UncataloguedSurchargePossible) {
+		return false
+	}
+	billingMode := strings.ToLower(strings.TrimSpace(pricing.BillingMode))
+	if !requiresSub2APIContract && billingMode != "token" && billingMode != "tiered_expr" {
+		return true
+	}
+	if len(pricing.Extras) == 0 || common.GetJsonType(pricing.Extras) != "object" {
+		return !requiresSub2APIContract
+	}
+
+	var rawMetadata map[string]json.RawMessage
+	if err := common.Unmarshal(pricing.Extras, &rawMetadata); err != nil {
+		return false
+	}
+	contractJSON, exists := rawMetadata["sub2api_contract"]
+	if !exists {
+		return !requiresSub2APIContract
+	}
+	var contract string
+	if err := common.Unmarshal(contractJSON, &contract); err != nil ||
+		strings.TrimSpace(contract) != RoutingCostSub2APIDisplayContractV1 {
+		return false
+	}
+	if billingMode != "token" && billingMode != "tiered_expr" {
+		return true
+	}
+	var metadata struct {
+		Platform          string `json:"platform"`
+		SourceBillingMode string `json:"source_billing_mode"`
+		HasIntervals      *bool  `json:"has_intervals"`
+	}
+	if err := common.Unmarshal(pricing.Extras, &metadata); err != nil ||
+		strings.ToLower(strings.TrimSpace(metadata.SourceBillingMode)) != "token" ||
+		metadata.HasIntervals == nil || !profile.RequestInputKnown {
+		return false
+	}
+
+	serviceTier := ""
+	if len(profile.Request.Body) > 0 {
+		var request map[string]json.RawMessage
+		if err := common.Unmarshal(profile.Request.Body, &request); err != nil {
+			return false
+		}
+		if serviceTierJSON, found := request["service_tier"]; found {
+			if err := common.Unmarshal(serviceTierJSON, &serviceTier); err != nil {
+				return false
+			}
+			serviceTier = strings.ToLower(strings.TrimSpace(serviceTier))
+		}
+	}
+	platform := strings.ToLower(strings.TrimSpace(metadata.Platform))
+	if platform == "" {
+		return false
+	}
+	if platform == "openai" {
+		for key, value := range profile.Request.Headers {
+			if !strings.EqualFold(strings.TrimSpace(key), "anthropic-beta") {
+				continue
+			}
+			for _, token := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(token), "fast-mode-2026-02-01") {
+					serviceTier = "priority"
+					break
+				}
+			}
+		}
+	}
+
+	hasIntervals := *metadata.HasIntervals
+	switch serviceTier {
+	case "", "standard", "auto", "default", "scale":
+	case "priority", "fast":
+		if !hasIntervals {
+			return false
+		}
+	case "flex":
+		// Sub2API applies a 0.5 multiplier that display expressions do not yet
+		// encode. Keep both flat and interval estimates unknown for accuracy.
+		return false
+	default:
+		return false
+	}
+	if hasIntervals {
+		if !profile.InputTokensKnown {
+			return false
+		}
+		return true
+	}
+	if params.CC1h > 0 {
+		return false
+	}
+	switch platform {
+	case "openai":
+		// The display contract omits account/catalog long-context policies.
+		return profile.InputTokensKnown && params.Len <= 272_000
+	case "gemini":
+		// Gemini bills the input plus cache-read portion above 200K using a
+		// hidden long-context rule when no explicit channel interval exists.
+		return profile.InputTokensKnown && params.P+params.CR <= 200_000
+	default:
+		return true
+	}
 }
 
 func normalizeRoutingActualCostProfile(
@@ -1072,17 +1461,20 @@ func normalizeRoutingActualCostProfile(
 	profile.InputTokensKnown = true
 	profile.MaximumCompletionKnown = true
 	profile.CacheTokensKnown = true
+	profile.CacheReadTokensKnown = true
+	profile.CacheWriteTokensKnown = true
 	profile.MediaDimensionsKnown = true
 	profile.RequestInputKnown = true
 	return profile, nil
 }
 
 type routingCostDependencies struct {
-	input   bool
-	output  bool
-	cache   bool
-	media   bool
-	request bool
+	input      bool
+	output     bool
+	cacheRead  bool
+	cacheWrite bool
+	media      bool
+	request    bool
 }
 
 func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCostDependencies {
@@ -1093,26 +1485,38 @@ func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCos
 	if expression != "" {
 		used := billingexpr.UsedVars(expression)
 		return routingCostDependencies{
-			input:   used["p"] || used["len"],
-			output:  used["c"],
-			cache:   used["cr"] || used["cc"] || used["cc1h"],
-			media:   used["img"] || used["img_o"] || used["ai"] || used["ao"],
-			request: used["header"] || used["param"],
+			input:      used["p"] || used["len"],
+			output:     used["c"],
+			cacheRead:  used["cr"],
+			cacheWrite: used["cc"] || used["cc1h"],
+			media:      used["img"] || used["img_o"] || used["ai"] || used["ao"],
+			request:    used["header"] || used["param"],
 		}
 	}
-	inputRateKnown := routingCostPointerValue(pricing.InputCostPerMillion) > 0 ||
-		routingCostPointerValue(pricing.BaseRatio) > 0
+	inputRate := 0.0
+	if pricing.InputCostPerMillion != nil {
+		inputRate = *pricing.InputCostPerMillion
+	} else if pricing.BaseRatio != nil {
+		inputRate = *pricing.BaseRatio * 1_000_000 / common.QuotaPerUnit
+	}
+	outputRate := inputRate
+	if pricing.OutputCostPerMillion != nil {
+		outputRate = *pricing.OutputCostPerMillion
+	} else if pricing.CompletionRatio != nil {
+		outputRate = inputRate * *pricing.CompletionRatio
+	}
 	return routingCostDependencies{
-		input:  inputRateKnown,
-		output: routingCostPointerValue(pricing.OutputCostPerMillion) > 0 || inputRateKnown,
-		cache: routingCostPointerValue(pricing.CacheReadCostPerMillion) > 0 ||
-			routingCostPointerValue(pricing.CacheWriteCostPerMillion) > 0 ||
-			routingCostPointerValue(pricing.CacheWrite1hCostPerMillion) > 0,
-		media: routingCostPointerValue(pricing.ImageInputCostPerMillion) > 0 ||
-			routingCostPointerValue(pricing.ImageOutputCostPerMillion) > 0 ||
-			routingCostPointerValue(pricing.PerImageCost) > 0 || routingCostPointerValue(pricing.ImageCost) > 0 ||
-			routingCostPointerValue(pricing.AudioInputCostPerMillion) > 0 ||
-			routingCostPointerValue(pricing.AudioOutputCostPerMillion) > 0,
+		input:  inputRate > 0,
+		output: outputRate > 0,
+		// Missing subtype prices inherit p/c and therefore need no separate
+		// quantity. Pointer presence, including an explicit free price, opts the
+		// subtype into separate accounting.
+		cacheRead: pricing.CacheReadCostPerMillion != nil,
+		cacheWrite: pricing.CacheWriteCostPerMillion != nil ||
+			pricing.CacheWrite1hCostPerMillion != nil,
+		media: pricing.ImageInputCostPerMillion != nil || pricing.ImageOutputCostPerMillion != nil ||
+			pricing.PerImageCost != nil || pricing.ImageCost != nil ||
+			pricing.AudioInputCostPerMillion != nil || pricing.AudioOutputCostPerMillion != nil,
 	}
 }
 
@@ -1361,11 +1765,6 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 			return RoutingNormalizedPricing{}, nil, ErrRoutingCostV2Invalid
 		}
 	}
-	for _, multiplier := range []*float64{pricing.GroupRatio, pricing.CompletionRatio} {
-		if multiplier != nil && *multiplier <= 0 {
-			return RoutingNormalizedPricing{}, nil, ErrRoutingCostV2Invalid
-		}
-	}
 	var err error
 	pricing.Tiers, err = normalizeRoutingCostJSON(pricing.Tiers)
 	if err != nil {
@@ -1578,6 +1977,9 @@ func routingCostVersionMatches(existing RoutingCostSnapshotVersion, candidate Ro
 }
 
 func routingNormalizedPricingHasKnownCost(pricing RoutingNormalizedPricing) bool {
+	if pricing.GroupRatio != nil && *pricing.GroupRatio == 0 {
+		return true
+	}
 	for _, value := range []*float64{
 		pricing.BaseRatio,
 		pricing.ModelPrice,
@@ -1594,7 +1996,7 @@ func routingNormalizedPricingHasKnownCost(pricing RoutingNormalizedPricing) bool
 		pricing.AudioOutputCostPerMillion,
 		pricing.PerRequestCost,
 	} {
-		if value != nil && *value > 0 {
+		if value != nil {
 			return true
 		}
 	}

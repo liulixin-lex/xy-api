@@ -77,7 +77,7 @@ func routingRequestProfile(
 		return nil, nil
 	}
 	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || !setting.RequestProfileV2Enabled {
+	if !setting.Enabled {
 		return nil, nil
 	}
 	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
@@ -95,6 +95,25 @@ func routingRequestProfile(
 	}
 	if !ok {
 		return nil, nil
+	}
+	if !setting.RequestProfileV2Enabled {
+		profile, err := channelrouting.NewRequestProfile(
+			template.RequestPath,
+			group,
+			template.ModelName,
+			template.IsStream,
+			retryIndex,
+			max(promptTokens, 0),
+			max(completionTokens, 0),
+		)
+		if err != nil {
+			return nil, err
+		}
+		profile.TrafficClass = template.TrafficClass
+		if err := profile.Validate(); err != nil {
+			return nil, err
+		}
+		return &profile, nil
 	}
 	template.GroupName = group
 	template.RetryIndex = retryIndex
@@ -121,10 +140,6 @@ type RoutingRequestAttemptPolicy struct {
 
 func ChannelRoutingRequestAttemptPolicy(c *gin.Context) (RoutingRequestAttemptPolicy, bool) {
 	if c == nil {
-		return RoutingRequestAttemptPolicy{}, false
-	}
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || !setting.RequestProfileV2Enabled {
 		return RoutingRequestAttemptPolicy{}, false
 	}
 	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](

@@ -43,7 +43,12 @@ const triStateSearchSchema = z
 
 const searchSchema = z.object({
   page: z.number().int().min(1).optional().catch(1),
-  pageSize: z.number().int().min(1).max(100).optional().catch(20),
+  pageSize: z
+    .number()
+    .int()
+    .refine(isChannelRoutingPageSize)
+    .optional()
+    .catch(20),
   search: z.string().max(256).optional().catch(''),
   status: z.number().int().optional().catch(undefined),
   type: z.number().int().optional().catch(undefined),
@@ -71,7 +76,12 @@ const searchSchema = z.object({
   fromTime: z.number().int().min(1).optional().catch(undefined),
   toTime: z.number().int().min(1).optional().catch(undefined),
   endpointPage: z.number().int().min(1).optional().catch(1),
-  endpointPageSize: z.number().int().min(1).max(100).optional().catch(20),
+  endpointPageSize: z
+    .number()
+    .int()
+    .refine(isChannelRoutingPageSize)
+    .optional()
+    .catch(20),
   operationCursor: z.number().int().min(0).optional().catch(0),
   billingReviewCursor: z
     .number()

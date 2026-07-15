@@ -101,7 +101,7 @@ func CreateChannelRoutingCostBinding(c *gin.Context) {
 		return
 	}
 	request = normalizeChannelRoutingCostBindingRequest(request)
-	if err = validateChannelRoutingCostBindingRequest(request, true); err != nil {
+	if err = validateChannelRoutingCostBindingRequest(request, true, true); err != nil {
 		writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
 		return
 	}
@@ -123,6 +123,11 @@ func CreateChannelRoutingCostBinding(c *gin.Context) {
 	}
 	binding, err := createRoutingBindingContext(c.Request.Context(), request, c.GetInt("id"))
 	if err != nil {
+		var validationErr routingBindingValidationError
+		if errors.As(err, &validationErr) {
+			writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
+			return
+		}
 		if _, lookupErr := model.GetRoutingChannelBindingContext(c.Request.Context(), request.ChannelID); lookupErr == nil {
 			writeChannelRoutingCostBindingError(c, http.StatusConflict, "cost_binding_exists", "cost binding already exists", model.ErrRoutingBindingChanged)
 			return
@@ -162,7 +167,7 @@ func UpdateChannelRoutingCostBinding(c *gin.Context) {
 		return
 	}
 	request.ChannelID = expected.ChannelID
-	if err = validateChannelRoutingCostBindingRequest(request, false); err != nil {
+	if err = validateChannelRoutingCostBindingRequest(request, false, true); err != nil {
 		writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
 		return
 	}
@@ -172,6 +177,11 @@ func UpdateChannelRoutingCostBinding(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		var validationErr routingBindingValidationError
+		if errors.As(err, &validationErr) {
+			writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
+			return
+		}
 		writeChannelRoutingCostBindingError(c, http.StatusInternalServerError, "cost_binding_update_failed", "failed to update cost binding", err)
 		return
 	}
@@ -210,7 +220,7 @@ func DeleteChannelRoutingCostBinding(c *gin.Context) {
 }
 
 func TestChannelRoutingCostBinding(c *gin.Context) {
-	binding, ok := channelRoutingCostBindingForAction(c)
+	binding, ok := channelRoutingCostBindingForAction(c, true)
 	if !ok {
 		return
 	}
@@ -221,34 +231,46 @@ func TestChannelRoutingCostBinding(c *gin.Context) {
 	}
 	credentials, _ := binding.GetCredentials()
 	groups, groupsTotal := routingPricingGroups(payload)
-	common.ApiSuccess(c, gin.H{
+	result := gin.H{
 		"channel_id": binding.ChannelID, "upstream_type": binding.UpstreamType,
 		"credential_ready": credentials.ReadyForUpstream(binding.UpstreamType),
 		"groups":           groups, "groups_total": groupsTotal,
 		"groups_truncated": groupsTotal > len(groups), "model_count": len(payload.Data),
 		"pricing_version": payload.PricingVersion,
-	})
+	}
+	if len(payload.Sub2APIGroupMeta) > 0 {
+		result["group_meta"] = payload.Sub2APIGroupMeta
+	}
+	common.ApiSuccess(c, result)
 }
 
 func LoadChannelRoutingCostBindingGroups(c *gin.Context) {
-	binding, ok := channelRoutingCostBindingForAction(c)
+	binding, ok := channelRoutingCostBindingForAction(c, false)
 	if !ok {
 		return
 	}
-	payload, err := fetchRoutingPricingPayload(c.Request.Context(), binding)
+	discoveryBinding := binding
+	discoveryBinding.UpstreamGroup = ""
+	var payload routingPricingResponse
+	var err error
+	if discoveryBinding.UpstreamType == model.RoutingUpstreamTypeSub2API {
+		payload, err = fetchRoutingSub2APIGroupDiscoveryPayload(c.Request.Context(), discoveryBinding)
+	} else {
+		payload, err = fetchRoutingPricingPayload(c.Request.Context(), discoveryBinding)
+	}
 	if err != nil {
 		writeChannelRoutingCostBindingActionError(c, binding, "cost_binding_groups_failed", "failed to load upstream groups", err)
 		return
 	}
-	credentials, _ := binding.GetCredentials()
 	groups, groupsTotal := routingPricingGroups(payload)
 	common.ApiSuccess(c, gin.H{
 		"channel_id": binding.ChannelID, "upstream_type": binding.UpstreamType,
 		"upstream_group": binding.UpstreamGroup, "groups": groups,
+		"group_meta":   payload.Sub2APIGroupMeta,
 		"groups_total": groupsTotal, "groups_truncated": groupsTotal > len(groups),
 		"requires_sync": false, "sync_task_type": model.SystemTaskTypeRoutingCostSync,
 		"serves_claude":   binding.ServesClaudeCode,
-		"credential_test": credentials.ReadyForUpstream(binding.UpstreamType),
+		"credential_test": true,
 		"model_count":     len(payload.Data), "pricing_version": payload.PricingVersion,
 	})
 }
@@ -440,9 +462,13 @@ func normalizeChannelRoutingCostBindingRequest(request routingBindingRequest) ro
 	return request
 }
 
-func validateChannelRoutingCostBindingRequest(request routingBindingRequest, requireChannelID bool) error {
-	if err := validateRoutingBindingRequest(request, requireChannelID); err != nil {
+func validateChannelRoutingCostBindingRequest(request routingBindingRequest, requireChannelID bool, requireUpstreamGroup bool) error {
+	if err := validateRoutingBindingRequest(request, requireChannelID, requireUpstreamGroup); err != nil {
 		return err
+	}
+	enabled := request.Enabled == nil || *request.Enabled
+	if enabled && request.UpstreamType == model.RoutingUpstreamTypeNewAPI && request.NewAPIUserID == nil {
+		return routingBindingFieldError("new_api_user_id", "required")
 	}
 	if !utf8.ValidString(request.BaseURL) {
 		return routingBindingFieldError("base_url", "invalid")
@@ -495,7 +521,7 @@ func channelRoutingCostBindingChannelExists(ctx context.Context, channelID int) 
 	return count == 1, err
 }
 
-func channelRoutingCostBindingForAction(c *gin.Context) (model.RoutingChannelBinding, bool) {
+func channelRoutingCostBindingForAction(c *gin.Context, requireUpstreamGroup bool) (model.RoutingChannelBinding, bool) {
 	request, fields, err := decodeChannelRoutingCostBindingRequest(c.Request.Body, true)
 	if err != nil {
 		writeChannelRoutingCostBindingDecodeError(c, err)
@@ -504,7 +530,15 @@ func channelRoutingCostBindingForAction(c *gin.Context) (model.RoutingChannelBin
 	rawChannelID := strings.TrimSpace(c.Param("channelId"))
 	inline := rawChannelID == "new" || len(fields) > 0
 	if !inline {
-		return loadChannelRoutingCostBinding(c)
+		binding, ok := loadChannelRoutingCostBinding(c)
+		if !ok {
+			return model.RoutingChannelBinding{}, false
+		}
+		if err := validateChannelRoutingCostBindingActionReadiness(binding, requireUpstreamGroup); err != nil {
+			writeChannelRoutingCostBindingActionReadinessError(c, err)
+			return model.RoutingChannelBinding{}, false
+		}
+		return binding, true
 	}
 	if !requireChannelRoutingSensitiveWriteCurrent(c) {
 		return model.RoutingChannelBinding{}, false
@@ -532,7 +566,7 @@ func channelRoutingCostBindingForAction(c *gin.Context) (model.RoutingChannelBin
 		}
 		request.ChannelID = channelID
 	}
-	if err := validateChannelRoutingCostBindingRequest(request, true); err != nil {
+	if err := validateChannelRoutingCostBindingRequest(request, true, requireUpstreamGroup); err != nil {
 		writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
 		return model.RoutingChannelBinding{}, false
 	}
@@ -571,7 +605,49 @@ func channelRoutingCostBindingForAction(c *gin.Context) (model.RoutingChannelBin
 			return model.RoutingChannelBinding{}, false
 		}
 	}
+	if err := validateChannelRoutingCostBindingActionReadiness(candidate, requireUpstreamGroup); err != nil {
+		writeChannelRoutingCostBindingActionReadinessError(c, err)
+		return model.RoutingChannelBinding{}, false
+	}
 	return candidate, true
+}
+
+func validateChannelRoutingCostBindingActionReadiness(
+	binding model.RoutingChannelBinding,
+	requireUpstreamGroup bool,
+) error {
+	if requireUpstreamGroup && strings.TrimSpace(binding.UpstreamGroup) == "" {
+		return routingBindingFieldError("upstream_group", "required")
+	}
+	allowedPrivateCIDRs, err := binding.GetEgressAllowedPrivateCIDRs()
+	if err != nil {
+		return routingBindingFieldError("egress_allowed_private_cidrs", "invalid")
+	}
+	if err := validateRoutingBaseURL(binding.BaseURL, allowedPrivateCIDRs); err != nil {
+		return err
+	}
+	credentials, err := binding.GetCredentials()
+	if err != nil {
+		return err
+	}
+	actionBinding := binding
+	actionBinding.Enabled = true
+	if !requireUpstreamGroup {
+		return validateRoutingBindingAccountManagementReadiness(actionBinding, credentials)
+	}
+	return validateRoutingBindingManagementReadiness(actionBinding, credentials)
+}
+
+func writeChannelRoutingCostBindingActionReadinessError(c *gin.Context, err error) {
+	var validationErr routingBindingValidationError
+	if errors.As(err, &validationErr) {
+		writeChannelRoutingCostBindingError(c, http.StatusBadRequest, "invalid_cost_binding", "invalid cost binding", err)
+		return
+	}
+	writeChannelRoutingCostBindingError(
+		c, http.StatusConflict, "cost_binding_credentials_unavailable",
+		"stored cost binding credentials are unavailable", err,
+	)
 }
 
 func parseChannelRoutingCostBindingChannelID(raw string) (int, error) {

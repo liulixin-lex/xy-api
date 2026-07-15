@@ -346,7 +346,9 @@ func TestValidateRoutingBindingRequestRejectsUnsafeBaseURL(t *testing.T) {
 	}{
 		{name: "plain http", baseURL: "http://example.com"},
 		{name: "userinfo", baseURL: "https://token@example.com"},
-		{name: "sensitive query", baseURL: "https://example.com?access_token=secret"},
+		{name: "query", baseURL: "https://example.com?tenant=example"},
+		{name: "empty query", baseURL: "https://example.com?"},
+		{name: "fragment", baseURL: "https://example.com#tenant"},
 		{name: "loopback", baseURL: "https://127.0.0.1"},
 		{name: "private network", baseURL: "https://10.0.0.1"},
 		{name: "metadata", baseURL: "https://169.254.169.254"},
@@ -360,7 +362,7 @@ func TestValidateRoutingBindingRequestRejectsUnsafeBaseURL(t *testing.T) {
 				UpstreamType:  model.RoutingUpstreamTypeNewAPI,
 				BaseURL:       tt.baseURL,
 				UpstreamGroup: "vip",
-			}, true)
+			}, true, true)
 
 			require.Error(t, err)
 		})
@@ -380,6 +382,7 @@ func TestUpdateSmartRoutingBindingMergesOnlyProviderCompatibleCredentialFields(t
 		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
 		BaseURL:       "https://upstream.example.com",
 		UpstreamGroup: "vip",
+		NewAPIUserID:  common.GetPointer(42),
 		Enabled:       true,
 	}
 	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{
@@ -392,6 +395,7 @@ func TestUpdateSmartRoutingBindingMergesOnlyProviderCompatibleCredentialFields(t
 		"upstream_type":"newapi",
 		"base_url":"https://upstream.example.com",
 		"upstream_group":"vip",
+		"new_api_user_id":42,
 		"credentials":{"gateway_api_key":"new-gateway-key"}
 	}`)
 	recorder := httptest.NewRecorder()
@@ -415,6 +419,10 @@ func TestUpdateSmartRoutingBindingMergesOnlyProviderCompatibleCredentialFields(t
 func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelHealthState{}))
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-invalidate-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
 
@@ -423,8 +431,13 @@ func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
 		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
 		BaseURL:       "https://old.example.com",
 		UpstreamGroup: "old-group",
+		NewAPIUserID:  common.GetPointer(42),
 		Enabled:       true,
 	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{
+		NewAPIAccessToken: "access-token",
+		GatewayAPIKey:     "gateway-key",
+	}))
 	require.NoError(t, db.Create(&binding).Error)
 	require.NoError(t, db.Create(&model.RoutingCostSnapshot{ChannelID: binding.ChannelID, ModelName: "gpt-old", SnapshotTS: common.GetTimestamp()}).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelHealthState{
@@ -448,6 +461,7 @@ func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
 		"upstream_type":"newapi",
 		"base_url":"https://new.example.com",
 		"upstream_group":"new-group",
+		"new_api_user_id":42,
 		"enabled":true
 	}`)
 	recorder := httptest.NewRecorder()
@@ -481,14 +495,23 @@ func TestUpdateSmartRoutingBindingInvalidatesCostState(t *testing.T) {
 func TestUpdateSmartRoutingBindingDoesNotReviveDeletedBinding(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelBinding{}, &model.RoutingCostSnapshot{}, &model.RoutingChannelHealthState{}))
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "stable-routing-delete-race-secret"
+	t.Setenv("CRYPTO_SECRET", common.CryptoSecret)
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
 
 	binding := model.RoutingChannelBinding{
 		ChannelID:     57,
 		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
 		BaseURL:       "https://old.example.com",
 		UpstreamGroup: "old-group",
+		NewAPIUserID:  common.GetPointer(42),
 		Enabled:       true,
 	}
+	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{
+		NewAPIAccessToken: "access-token",
+		GatewayAPIKey:     "gateway-key",
+	}))
 	require.NoError(t, db.Create(&binding).Error)
 
 	require.NoError(t, smartRoutingRuntimeStateMu.LockContext(context.Background()))
@@ -516,6 +539,7 @@ func TestUpdateSmartRoutingBindingDoesNotReviveDeletedBinding(t *testing.T) {
 		"upstream_type":"newapi",
 		"base_url":"https://new.example.com",
 		"upstream_group":"new-group",
+		"new_api_user_id":42,
 		"enabled":true
 	}`)
 	recorder := httptest.NewRecorder()
@@ -568,10 +592,16 @@ func TestLoadSmartRoutingBindingGroupsAcceptsInlineCreateBinding(t *testing.T) {
 		assert.Equal(t, "42", r.Header.Get("New-Api-User"))
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/api/status":
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"quota_per_unit":%g}}`, common.QuotaPerUnit)
 		case "/api/user/self":
 			_, _ = fmt.Fprint(w, `{"success":true,"data":{"quota":1000000,"used_quota":0}}`)
+		case "/api/user/self/groups":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":{"vip":{"ratio":1}}}`)
+		case "/api/user/models":
+			_, _ = fmt.Fprint(w, `{"success":true,"data":["gpt-test"]}`)
 		case "/api/pricing":
-			_, _ = fmt.Fprint(w, `{"success":true,"data":[{"model_name":"gpt-test","enable_groups":["vip"]}],"group_ratio":{"vip":1}}`)
+			_, _ = fmt.Fprint(w, `{"success":true,"data":[{"model_name":"gpt-test","quota_type":0,"model_ratio":1,"completion_ratio":1,"enable_groups":["vip"]}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -631,15 +661,17 @@ func TestRoutingCostAPIErrorsDoNotExposeUpstreamSecrets(t *testing.T) {
 		UpstreamType:  model.RoutingUpstreamTypeNewAPI,
 		BaseURL:       "https://routing.example.com",
 		UpstreamGroup: "vip",
+		NewAPIUserID:  common.GetPointer(42),
 		Enabled:       true,
 	}
 	require.NoError(t, binding.SetCredentials(model.RoutingCredentials{
 		NewAPIAccessToken: "sk-secret",
+		GatewayAPIKey:     "gw-secret",
 		Sub2APIPassword:   "pw-secret",
 	}))
 	require.NoError(t, db.Create(&binding).Error)
 	restoreRoutingCostHTTPDoerForTest(t, routingCostDoerFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("Authorization: Bearer sk-secret\r\nCookie: session=cookie-secret\r\npassword=pw-secret https://api.example.com/path?token=query-secret")
+		return nil, errors.New("Authorization: Bearer sk-secret\r\nX-Api-Key: gw-secret\r\nCookie: session=cookie-secret\r\npassword=pw-secret https://api.example.com/path?token=query-secret")
 	}))
 
 	tests := []struct {
@@ -659,7 +691,7 @@ func TestRoutingCostAPIErrorsDoNotExposeUpstreamSecrets(t *testing.T) {
 			tt.handler(ctx)
 
 			body := recorder.Body.String()
-			for _, secret := range []string{"sk-secret", "pw-secret", "cookie-secret", "query-secret", "api.example.com"} {
+			for _, secret := range []string{"sk-secret", "gw-secret", "pw-secret", "cookie-secret", "query-secret", "api.example.com"} {
 				assert.NotContains(t, body, secret)
 			}
 			assert.NotContains(t, body, `\r`)

@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { ArrowRight, RefreshCw, TriangleAlert } from 'lucide-react'
+import { ArrowRight, TriangleAlert } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -32,6 +32,7 @@ import { Button } from '@/components/ui/button'
 
 import { listManualBillingReviews } from '../api/billing-reviews'
 import { channelRoutingQueryKeys } from '../api/query-keys'
+import { ChannelRoutingRefetchErrorAlert } from '../components/page-state'
 import { useChannelRoutingFormatters } from '../lib/format'
 import { getManualBillingReviewKindDisplay } from '../lib/manual-billing-review'
 
@@ -71,39 +72,14 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
 
   if (reviewsQuery.isError && !reviewsQuery.data) {
     return (
-      <Alert
-        role='status'
-        className='border-amber-500/30 bg-amber-500/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
-      >
-        <TriangleAlert
-          className='text-amber-700 dark:text-amber-300'
-          aria-hidden='true'
-        />
-        <AlertTitle>{t('Billing review queue unavailable')}</AlertTitle>
-        <AlertDescription>
-          {t(
-            'The routing snapshot is available, but billing reviews could not be loaded.'
-          )}
-        </AlertDescription>
-        <AlertAction className='static col-span-full mt-2 justify-self-start sm:absolute sm:col-auto sm:mt-0'>
-          <Button
-            size='sm'
-            variant='outline'
-            disabled={reviewsQuery.isFetching}
-            onClick={() => void reviewsQuery.refetch()}
-          >
-            <RefreshCw
-              aria-hidden='true'
-              className={
-                reviewsQuery.isFetching
-                  ? 'animate-spin motion-reduce:animate-none'
-                  : undefined
-              }
-            />
-            {t('Retry')}
-          </Button>
-        </AlertAction>
-      </Alert>
+      <ChannelRoutingRefetchErrorAlert
+        title={t('Billing review queue unavailable')}
+        description={t(
+          'The routing snapshot is available, but billing reviews could not be loaded.'
+        )}
+        isFetching={reviewsQuery.isFetching}
+        onRetry={() => void reviewsQuery.refetch()}
+      />
     )
   }
 
@@ -113,7 +89,7 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
   return (
     <Alert
       role='status'
-      className='border-amber-500/35 bg-amber-500/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
+      className='border-warning/35 bg-warning/5 [&>svg]:text-warning has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
     >
       <TriangleAlert aria-hidden='true' />
       <AlertTitle className='flex flex-wrap items-center gap-2'>

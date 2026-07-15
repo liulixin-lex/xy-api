@@ -100,11 +100,11 @@ func cacheGetChannelRoutingCanary(
 						return nil, group, true, err
 					}
 				} else {
-					channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
+					channel, _ = getRandomSatisfiedChannelForRequest(param, group, priorityRetry)
 				}
 			}
 		} else if !inCanary {
-			channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
+			channel, _ = getRandomSatisfiedChannelForRequest(param, group, priorityRetry)
 			if outcomeErr := enqueueChannelRoutingControlDecision(param, group, channel); outcomeErr != nil {
 				return nil, group, true, outcomeErr
 			}
@@ -156,6 +156,10 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	}
 
 	allowedChannels, err := model.GetRankedSatisfiedChannels(group, param.ModelName, param.RequestPath)
+	if err != nil {
+		return nil, true, true, err
+	}
+	allowedChannels, err = filterRoutingTrafficAdmissibleChannels(param.Ctx, allowedChannels)
 	if err != nil {
 		return nil, true, true, err
 	}
@@ -276,7 +280,12 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
 		}
 		probeAcquired, probeErr := acquireRoutingHalfOpenProbeForKey(
-			param.Ctx, probeKey, selectedBreaker, probeSettings, true,
+			param.Ctx,
+			probeKey,
+			routingHalfOpenProbeOwner{ChannelID: selected.Id, Model: param.ModelName, Group: group},
+			selectedBreaker,
+			probeSettings,
+			true,
 		)
 		if !probeAcquired {
 			probeExcluded = append(probeExcluded, selected.Id)
@@ -472,6 +481,13 @@ func GetAdmissibleAffinityChannelWithRoutingGate(
 			}
 		}
 		if !preferredAllowed {
+			continue
+		}
+		trafficAdmissible, trafficErr := ChannelRoutingTrafficAdmissible(c, preferredID)
+		if trafficErr != nil {
+			return nil, group, true, trafficErr
+		}
+		if !trafficAdmissible {
 			continue
 		}
 		if stage, exists := channelrouting.CurrentPoolDeploymentStage(group); exists && stage == model.RoutingDeploymentStageActive {

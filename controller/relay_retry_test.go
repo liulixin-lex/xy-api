@@ -168,6 +168,41 @@ func TestShouldRetryStillRetriesBeforeAnyResponse(t *testing.T) {
 	assert.True(t, shouldRetry(ctx, info, apiErr, classification, 1))
 }
 
+func TestShouldRetryEnforcesAttemptSafetyWhenProfileScoringIsDisabled(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	unsafeProfile := channelrouting.RequestProfileV2Input{
+		RequestKind:              channelrouting.RequestKindImage,
+		RetrySafety:              channelrouting.RequestRetrySafetyUnsafe,
+		RetryAllowed:             false,
+		CrossChannelRetryAllowed: false,
+		HedgeAllowed:             false,
+	}
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, unsafeProfile)
+	apiErr := types.NewErrorWithStatusCode(
+		errors.New("upstream failed"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+	classification := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
+
+	assert.False(t, shouldRetry(ctx, &relaycommon.RelayInfo{}, apiErr, classification, 1))
+	assert.False(t, shouldRetryTaskRelay(ctx, &dto.TaskError{
+		Code: string(types.ErrorCodeBadResponseStatusCode), StatusCode: http.StatusBadGateway,
+		Error: errors.New("task upstream failed"),
+	}, classification, 1))
+
+	safeProfile := unsafeProfile
+	safeProfile.RequestKind = channelrouting.RequestKindChatCompletions
+	safeProfile.RetrySafety = channelrouting.RequestRetrySafetySafe
+	safeProfile.RetryAllowed = true
+	safeProfile.CrossChannelRetryAllowed = true
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, safeProfile)
+	assert.True(t, shouldRetry(ctx, &relaycommon.RelayInfo{}, apiErr, classification, 1))
+}
+
 func TestRelayAttemptControlErrorFirstByteTimeoutUsesActualClientCommit(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

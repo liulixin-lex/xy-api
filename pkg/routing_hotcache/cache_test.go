@@ -54,6 +54,133 @@ func TestHotcacheLoadsVersionedNormalizedPricing(t *testing.T) {
 	assert.Equal(t, strings.Repeat("b", 64), cost.AccountKeyHash)
 }
 
+func TestReplaceCostSnapshotsForChannelRemovesModelsOutsideAuthoritativeSet(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	LoadCostSnapshots([]model.RoutingCostSnapshot{
+		{ChannelID: 31, ModelName: "retained", GroupRatio: 1, BaseRatio: 1, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 100},
+		{ChannelID: 31, ModelName: "removed", GroupRatio: 1, BaseRatio: 2, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 100},
+		{ChannelID: 32, ModelName: "other-channel", GroupRatio: 1, BaseRatio: 3, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 100},
+	})
+	SetBalanceForTest(31, BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: 100})
+
+	ReplaceCostSnapshotsForChannel(31, []model.RoutingCostSnapshot{
+		{ChannelID: 31, ModelName: "retained", GroupRatio: 1, BaseRatio: 4, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
+		{ChannelID: 32, ModelName: "must-not-cross-channel", GroupRatio: 1, BaseRatio: 5, Confidence: model.RoutingCostConfidenceFull, SnapshotTS: 200},
+	})
+
+	retained, ok := GetCost(CostKey{ChannelID: 31, Model: "retained"})
+	require.True(t, ok)
+	assert.Equal(t, 4.0, retained.Cost)
+	_, removed := GetCost(CostKey{ChannelID: 31, Model: "removed"})
+	assert.False(t, removed)
+	_, other := GetCost(CostKey{ChannelID: 32, Model: "other-channel"})
+	assert.True(t, other)
+	_, crossed := GetCost(CostKey{ChannelID: 32, Model: "must-not-cross-channel"})
+	assert.False(t, crossed)
+	balance, ok := GetBalance(31)
+	require.True(t, ok)
+	assert.Equal(t, 9.0, balance.Balance)
+}
+
+func TestClearBalanceRemovesOnlyChannelBalance(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	SetBalanceForTest(31, BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: 100})
+	SetBalanceForTest(32, BalanceSnapshot{Known: true, Balance: 7, UpdatedUnix: 100})
+	SetAuthFailureForTest(31, HealthMarker{Marked: true, UpdatedUnix: 100})
+
+	ClearBalance(31)
+
+	_, found := GetBalance(31)
+	assert.False(t, found)
+	other, found := GetBalance(32)
+	require.True(t, found)
+	assert.Equal(t, 7.0, other.Balance)
+	auth, found := GetAuthFailure(31)
+	require.True(t, found)
+	assert.True(t, auth.Marked)
+}
+
+func TestHotcacheTreatsExplicitZeroPerRequestPriceAsKnown(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	pricingJSON := `{"quota_type":1,"billing_mode":"per_request","currency":"USD","unit":"request","group_ratio":1,"model_price":0,"per_request_cost":0,"tiers":{},"extras":{}}`
+
+	LoadCostSnapshots([]model.RoutingCostSnapshot{{
+		ChannelID: 33, ModelName: "free-request", SnapshotTS: 100,
+		Confidence: model.RoutingCostConfidenceFull, PricingJSON: &pricingJSON,
+	}})
+
+	cost, ok := GetCost(CostKey{ChannelID: 33, Model: "free-request"})
+	require.True(t, ok)
+	assert.True(t, cost.PricingKnown)
+	assert.True(t, cost.Known)
+	assert.Zero(t, cost.Cost)
+}
+
+func TestHotcachePreservesExplicitFreeGroupAndFailsClosedOnCorruptPricing(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	freePricingJSON := `{"quota_type":0,"billing_mode":"token","currency":"USD","unit":"mixed","group_ratio":0,"tiers":{},"extras":{}}`
+	nilGroupPricingJSON := `{"quota_type":0,"billing_mode":"token","currency":"USD","unit":"mixed","group_ratio":null,"base_ratio":2,"tiers":{},"extras":{}}`
+	corruptPricingJSON := `{"group_ratio":`
+	LoadCostSnapshots([]model.RoutingCostSnapshot{
+		{
+			ChannelID: 20, ModelName: "free-model", SnapshotTS: 100,
+			Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0,
+			PricingJSON: &freePricingJSON,
+		},
+		{
+			ChannelID: 21, ModelName: "corrupt-model", SnapshotTS: 100,
+			Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0, ModelPrice: 0.25,
+			PricingHash: strings.Repeat("c", 64), PricingJSON: &corruptPricingJSON,
+		},
+		{
+			ChannelID: 22, ModelName: "missing-pricing-model", SnapshotTS: 100,
+			Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0, ModelPrice: 0.25,
+			PricingHash: strings.Repeat("d", 64),
+		},
+		{
+			ChannelID: 23, ModelName: "unknown-free-model", SnapshotTS: 100,
+			Confidence: model.RoutingCostConfidenceUnknown, GroupRatio: 0,
+			PricingJSON: &freePricingJSON,
+		},
+		{
+			ChannelID: 24, ModelName: "nil-group-model", SnapshotTS: 100,
+			Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0, BaseRatio: 2,
+			PricingJSON: &nilGroupPricingJSON,
+		},
+	})
+
+	freeCost, ok := GetCost(CostKey{ChannelID: 20, Model: "free-model"})
+	require.True(t, ok)
+	assert.True(t, freeCost.PricingKnown)
+	assert.True(t, freeCost.Known)
+	assert.Zero(t, freeCost.Cost)
+
+	corruptCost, ok := GetCost(CostKey{ChannelID: 21, Model: "corrupt-model"})
+	require.True(t, ok)
+	assert.False(t, corruptCost.PricingKnown)
+	assert.False(t, corruptCost.Known)
+
+	missingCost, ok := GetCost(CostKey{ChannelID: 22, Model: "missing-pricing-model"})
+	require.True(t, ok)
+	assert.False(t, missingCost.PricingKnown)
+	assert.False(t, missingCost.Known)
+
+	unknownFreeCost, ok := GetCost(CostKey{ChannelID: 23, Model: "unknown-free-model"})
+	require.True(t, ok)
+	assert.True(t, unknownFreeCost.PricingKnown)
+	assert.False(t, unknownFreeCost.Known)
+
+	nilGroupCost, ok := GetCost(CostKey{ChannelID: 24, Model: "nil-group-model"})
+	require.True(t, ok)
+	assert.True(t, nilGroupCost.PricingKnown)
+	assert.True(t, nilGroupCost.Known)
+	assert.Equal(t, 2.0, nilGroupCost.Cost)
+}
+
 func TestHotcacheResetClearsSnapshots(t *testing.T) {
 	key := Key{ChannelID: 12, APIKeyIndex: -1, Model: "gpt-test", Group: "default"}
 	SetMetricForTest(key, MetricSnapshot{RequestCount: 1})
@@ -61,6 +188,76 @@ func TestHotcacheResetClearsSnapshots(t *testing.T) {
 
 	_, ok := GetMetric(key)
 	assert.False(t, ok)
+}
+
+func TestChannelTrafficPoliciesAreAuthoritativeAndResettable(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	_, initialized := GetChannelTrafficPolicy(41)
+	assert.False(t, initialized)
+	ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
+		{ChannelID: 41, ServesClaudeCode: true},
+		{ChannelID: 42, ServesClaudeCode: false},
+	}, 100)
+
+	policy, initialized := GetChannelTrafficPolicy(41)
+	require.True(t, initialized)
+	assert.True(t, policy.ClaudeCodeOnly)
+	policy, initialized = GetChannelTrafficPolicy(42)
+	require.True(t, initialized)
+	assert.False(t, policy.ClaudeCodeOnly)
+	assert.Equal(t, ChannelTrafficPolicyState{Initialized: true, LoadedAtUnix: 100, RestrictedChannels: 1}, ChannelTrafficPoliciesState())
+
+	SetChannelTrafficPolicy(42, true, 101)
+	policy, initialized = GetChannelTrafficPolicy(42)
+	require.True(t, initialized)
+	assert.True(t, policy.ClaudeCodeOnly)
+	assert.Equal(t, int64(100), ChannelTrafficPoliciesState().LoadedAtUnix)
+	DeleteChannelTrafficPolicy(41, 102)
+	policy, initialized = GetChannelTrafficPolicy(41)
+	require.True(t, initialized)
+	assert.False(t, policy.ClaudeCodeOnly)
+
+	ResetForTest()
+	_, initialized = GetChannelTrafficPolicy(42)
+	assert.False(t, initialized)
+}
+
+func TestChannelTrafficPolicyRefreshCannotOverwriteNewerTargetedMutation(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	// The targeted mutation may arrive while the first database refresh is in
+	// flight. It must be retained even though the cache is not initialized yet.
+	SetChannelTrafficPolicy(51, true, 101)
+	ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
+		{ChannelID: 51, ServesClaudeCode: false},
+	}, 100)
+	policy, initialized := GetChannelTrafficPolicy(51)
+	require.True(t, initialized)
+	assert.True(t, policy.ClaudeCodeOnly)
+	assert.Equal(t, int64(100), ChannelTrafficPoliciesState().LoadedAtUnix)
+
+	// A later authoritative refresh retires the local override and may publish
+	// the durable database value.
+	ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
+		{ChannelID: 51, ServesClaudeCode: false},
+	}, 102)
+	policy, initialized = GetChannelTrafficPolicy(51)
+	require.True(t, initialized)
+	assert.False(t, policy.ClaudeCodeOnly)
+	assert.Equal(t, int64(102), ChannelTrafficPoliciesState().LoadedAtUnix)
+
+	// A slower refresh that started before the authoritative one cannot move
+	// the cache generation backwards or republish its older contents.
+	ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
+		{ChannelID: 51, ServesClaudeCode: true},
+	}, 101)
+	policy, initialized = GetChannelTrafficPolicy(51)
+	require.True(t, initialized)
+	assert.False(t, policy.ClaudeCodeOnly)
+	assert.Equal(t, int64(102), ChannelTrafficPoliciesState().LoadedAtUnix)
 }
 
 func TestHotcachePruneRemovesStaleSnapshotsAcrossAllMaps(t *testing.T) {

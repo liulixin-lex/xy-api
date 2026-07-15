@@ -27,8 +27,9 @@ import {
   ShieldAlert,
   ShieldCheck,
   TriangleAlert,
+  WalletCards,
 } from 'lucide-react'
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -80,13 +81,18 @@ import {
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   costBindingFormValues,
+  costBindingGroupMetadataForValue,
+  costBindingGroupUsesSubscription,
   costBindingRequest,
   boundedCostBindingGroups,
+  costBindingRequiresClaudeCodeDeclaration,
   createCostBindingSchema,
   type CostBindingFormValues,
 } from '../lib/cost-binding'
 import {
+  costBindingAccountPreviewMatchesRequest,
   costBindingServerFieldError,
+  costBindingTestPreviewMatchesRequest,
   CostBindingEditorSessionManager,
   mergeCostBindingConflictDraft,
   type CostBindingEditorSession,
@@ -94,6 +100,7 @@ import {
 import type {
   RoutingCostBinding,
   RoutingCostBindingActionResult,
+  RoutingCostBindingUpstreamType,
 } from '../types'
 import {
   CostSourceCredentialFields,
@@ -164,10 +171,15 @@ function actionErrorMessage(
   return t('Could not contact the upstream cost source. Try again.')
 }
 
-function serverFieldError(error: unknown, t: (key: string) => string) {
+function serverFieldError(
+  error: unknown,
+  t: (key: string) => string,
+  upstreamType: RoutingCostBindingUpstreamType
+) {
   return costBindingServerFieldError(
     getChannelRoutingCostBindingApiError(error),
-    t
+    t,
+    upstreamType
   )
 }
 
@@ -189,12 +201,22 @@ export function ChannelRoutingCostSourceSheet(props: {
     useState<RoutingCostBinding | null>(props.binding)
   const [conflict, setConflict] =
     useState<ChannelRoutingCostBindingConflictError | null>(null)
-  const [groups, setGroups] = useState<string[]>([])
+  const [loadedGroupResult, setLoadedGroupResult] =
+    useState<RoutingCostBindingActionResult | null>(null)
   const [actionResult, setActionResult] = useState<{
     kind: 'test' | 'groups'
     result: RoutingCostBindingActionResult
   } | null>(null)
   const [actionError, setActionError] = useState('')
+  const clearActionPreview = useCallback(() => {
+    setLoadedGroupResult(null)
+    setActionResult(null)
+    setActionError('')
+  }, [])
+  const clearTestPreview = useCallback(() => {
+    setActionResult((current) => (current?.kind === 'test' ? null : current))
+    setActionError('')
+  }, [])
   const [conflictMerge, setConflictMerge] = useState<{
     serverChangedLabels: string[]
     overlappingLabels: string[]
@@ -222,7 +244,51 @@ export function ChannelRoutingCostSourceSheet(props: {
     name: 'upstreamType',
   })
   const channelId = useWatch({ control: form.control, name: 'channelId' })
-  const readOnly = workingBinding != null && !props.canSensitiveWrite
+  const upstreamGroup = useWatch({
+    control: form.control,
+    name: 'upstreamGroup',
+  })
+  const servesClaudeCode = useWatch({
+    control: form.control,
+    name: 'servesClaudeCode',
+  })
+  const previewGroupResult = useMemo(() => {
+    const result = actionResult?.result ?? loadedGroupResult
+    if (!result) return null
+    const groupMeta = {
+      ...loadedGroupResult?.group_meta,
+      ...actionResult?.result.group_meta,
+    }
+    return {
+      ...result,
+      group_meta: Object.keys(groupMeta).length > 0 ? groupMeta : undefined,
+    }
+  }, [actionResult, loadedGroupResult])
+  const groups = loadedGroupResult?.groups ?? []
+  const requiresClaudeCodeDeclaration =
+    costBindingRequiresClaudeCodeDeclaration({
+      result: previewGroupResult,
+      upstreamType,
+      upstreamGroup,
+      servesClaudeCode,
+    })
+  const selectedGroupMetadata =
+    upstreamType === 'sub2api'
+      ? costBindingGroupMetadataForValue(
+          previewGroupResult?.group_meta,
+          upstreamGroup
+        )
+      : undefined
+  const selectedGroupUsesSubscription = costBindingGroupUsesSubscription(
+    selectedGroupMetadata
+  )
+  const claudeCodeGroupError = requiresClaudeCodeDeclaration
+    ? t(
+        'This group accepts only Claude Code traffic. Enable Serves Claude Code before testing or saving.'
+      )
+    : ''
+  const writeDisabled = !props.canSensitiveWrite
+  const readOnly = workingBinding != null && writeDisabled
   const providerChanged =
     workingBinding != null && upstreamType !== workingBinding.upstream_type
 
@@ -230,7 +296,7 @@ export function ChannelRoutingCostSourceSheet(props: {
     queryKey: [...channelRoutingQueryKeys.channelsRoot(), 'cost-source-picker'],
     queryFn: () =>
       listChannelRoutingChannels({ page: 1, page_size: 100, search: '' }),
-    enabled: props.open && workingBinding == null && props.canSensitiveWrite,
+    enabled: props.open && workingBinding == null && !writeDisabled,
     staleTime: 30_000,
     meta: { handleErrorLocally: true },
   })
@@ -248,12 +314,17 @@ export function ChannelRoutingCostSourceSheet(props: {
     setWorkingBinding(props.binding)
     setConflict(null)
     setConflictMerge(null)
-    setGroups([])
-    setActionResult(null)
-    setActionError('')
+    clearActionPreview()
     form.reset(costBindingFormValues(props.binding))
     return () => sessionManager.deactivate()
-  }, [editorSubject, form, props.binding, props.open, sessionManager])
+  }, [
+    clearActionPreview,
+    editorSubject,
+    form,
+    props.binding,
+    props.open,
+    sessionManager,
+  ])
 
   const isCurrentSession = (session: CostBindingEditorSession) =>
     sessionManager.isCurrent(session, editorSubjectRef.current)
@@ -269,7 +340,7 @@ export function ChannelRoutingCostSourceSheet(props: {
       binding: RoutingCostBinding | null
       session: CostBindingEditorSession
     }) => {
-      if (!props.canSensitiveWrite) {
+      if (writeDisabled) {
         throw new Error('Cost source write permission is unavailable')
       }
       const request = costBindingRequest(payload.values)
@@ -301,7 +372,7 @@ export function ChannelRoutingCostSourceSheet(props: {
         return
       }
       const failure = getChannelRoutingCostBindingApiError(error)
-      const fieldError = serverFieldError(error, t)
+      const fieldError = serverFieldError(error, t, payload.values.upstreamType)
       const message = saveErrorMessage(error, t)
       if (fieldError) {
         form.setError(fieldError.name, { message: fieldError.message })
@@ -322,6 +393,7 @@ export function ChannelRoutingCostSourceSheet(props: {
       channelId: number | 'new'
       request?: ReturnType<typeof costBindingRequest>
       session: CostBindingEditorSession
+      upstreamType: RoutingCostBindingUpstreamType
     }) =>
       testChannelRoutingCostBinding(
         payload.channelId,
@@ -329,7 +401,16 @@ export function ChannelRoutingCostSourceSheet(props: {
         payload.session.signal
       ),
     onSuccess: (result, payload) => {
-      if (!isCurrentSession(payload.session)) return
+      if (
+        !isCurrentSession(payload.session) ||
+        (payload.request != null &&
+          !costBindingTestPreviewMatchesRequest(
+            payload.request,
+            costBindingRequest(form.getValues())
+          ))
+      ) {
+        return
+      }
       const boundedResult = boundedCostBindingGroups(result)
       setActionError('')
       setActionResult({ kind: 'test', result: boundedResult })
@@ -340,8 +421,17 @@ export function ChannelRoutingCostSourceSheet(props: {
       )
     },
     onError: (error, payload) => {
-      if (!isCurrentSession(payload.session)) return
-      const fieldError = serverFieldError(error, t)
+      if (
+        !isCurrentSession(payload.session) ||
+        (payload.request != null &&
+          !costBindingTestPreviewMatchesRequest(
+            payload.request,
+            costBindingRequest(form.getValues())
+          ))
+      ) {
+        return
+      }
+      const fieldError = serverFieldError(error, t, payload.upstreamType)
       if (fieldError) {
         form.setError(fieldError.name, { message: fieldError.message })
       }
@@ -354,6 +444,7 @@ export function ChannelRoutingCostSourceSheet(props: {
       channelId: number | 'new'
       request?: ReturnType<typeof costBindingRequest>
       session: CostBindingEditorSession
+      upstreamType: RoutingCostBindingUpstreamType
     }) =>
       loadChannelRoutingCostBindingGroups(
         payload.channelId,
@@ -361,10 +452,19 @@ export function ChannelRoutingCostSourceSheet(props: {
         payload.session.signal
       ),
     onSuccess: (result, payload) => {
-      if (!isCurrentSession(payload.session)) return
+      if (
+        !isCurrentSession(payload.session) ||
+        (payload.request != null &&
+          !costBindingAccountPreviewMatchesRequest(
+            payload.request,
+            costBindingRequest(form.getValues())
+          ))
+      ) {
+        return
+      }
       const boundedResult = boundedCostBindingGroups(result)
       setActionError('')
-      setGroups(boundedResult.groups)
+      setLoadedGroupResult(boundedResult)
       setActionResult({ kind: 'groups', result: boundedResult })
       if (
         boundedResult.groups.length > 0 &&
@@ -382,8 +482,17 @@ export function ChannelRoutingCostSourceSheet(props: {
       )
     },
     onError: (error, payload) => {
-      if (!isCurrentSession(payload.session)) return
-      const fieldError = serverFieldError(error, t)
+      if (
+        !isCurrentSession(payload.session) ||
+        (payload.request != null &&
+          !costBindingAccountPreviewMatchesRequest(
+            payload.request,
+            costBindingRequest(form.getValues())
+          ))
+      ) {
+        return
+      }
+      const fieldError = serverFieldError(error, t, payload.upstreamType)
       if (fieldError) {
         form.setError(fieldError.name, { message: fieldError.message })
       }
@@ -399,18 +508,42 @@ export function ChannelRoutingCostSourceSheet(props: {
 
   const runAction = async (kind: 'test' | 'groups') => {
     if (!props.canOperate) return
+    if (kind === 'test' && requiresClaudeCodeDeclaration) {
+      form.setError('upstreamGroup', { message: claudeCodeGroupError })
+      return
+    }
     const session = sessionManager.activate(editorSubjectRef.current)
     setActionError('')
     let request: ReturnType<typeof costBindingRequest> | undefined
     if (workingBinding == null || props.canSensitiveWrite) {
-      const valid = await form.trigger()
+      const valid =
+        kind === 'groups'
+          ? await form.trigger([
+              'channelId',
+              'upstreamType',
+              'baseUrl',
+              'servesClaudeCode',
+              'egressAllowedPrivateCidrs',
+              'newApiUserId',
+              'enabled',
+              'newApiAccessToken',
+              'gatewayApiKey',
+              'sub2apiEmail',
+              'sub2apiPassword',
+              'sub2apiToken',
+              'customCaPem',
+            ])
+          : await form.trigger()
       if (!valid || !isCurrentSession(session)) return
+      if (kind === 'groups') form.clearErrors('upstreamGroup')
       request = costBindingRequest(form.getValues())
     }
     const payload = {
       channelId: workingBinding?.channel_id ?? ('new' as const),
       request,
       session,
+      upstreamType:
+        request?.upstream_type ?? workingBinding?.upstream_type ?? upstreamType,
     }
     if (kind === 'test') {
       testMutation.mutate(payload)
@@ -443,9 +576,7 @@ export function ChannelRoutingCostSourceSheet(props: {
       overlappingLabels: merged.overlappingLabels,
     })
     form.clearErrors('root.server')
-    setGroups([])
-    setActionResult(null)
-    setActionError('')
+    clearActionPreview()
   }
 
   let title = t('Create cost source')
@@ -514,7 +645,7 @@ export function ChannelRoutingCostSourceSheet(props: {
     <Sheet open={props.open} onOpenChange={handleOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName(
-          'max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-2xl'
+          'channel-routing-touch-surface max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-2xl'
         )}
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
@@ -532,6 +663,12 @@ export function ChannelRoutingCostSourceSheet(props: {
             tabIndex={0}
             aria-label={t('Cost source details')}
             onSubmit={form.handleSubmit((values) => {
+              if (requiresClaudeCodeDeclaration) {
+                form.setError('upstreamGroup', {
+                  message: claudeCodeGroupError,
+                })
+                return
+              }
               const session = sessionManager.activate(editorSubjectRef.current)
               saveMutation.mutate({
                 values,
@@ -703,6 +840,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                                   shouldDirty: true,
                                 })
                               }
+                              clearActionPreview()
                             }
                             field.onChange(nextProvider)
                           }}
@@ -747,11 +885,15 @@ export function ChannelRoutingCostSourceSheet(props: {
                           autoComplete='url'
                           disabled={readOnly}
                           placeholder='https://api.example.com'
+                          onChange={(event) => {
+                            field.onChange(event)
+                            clearActionPreview()
+                          }}
                         />
                       </FormControl>
                       <FormDescription>
                         {t(
-                          'HTTPS is required. Do not place tokens or passwords in the URL.'
+                          'Enter a valid HTTPS URL without credentials, query parameters, or a fragment.'
                         )}
                       </FormDescription>
                       <FormMessage />
@@ -771,13 +913,41 @@ export function ChannelRoutingCostSourceSheet(props: {
                           list={groupListId}
                           disabled={readOnly}
                           autoComplete='off'
+                          onChange={(event) => {
+                            field.onChange(event)
+                            clearTestPreview()
+                          }}
                         />
                       </FormControl>
                       <CostSourceGroupDatalist
                         id={groupListId}
                         groups={groups}
+                        groupMeta={previewGroupResult?.group_meta}
+                        claudeCodeOnlyLabel={t('Claude Code only')}
+                        subscriptionLabel={t('Subscription')}
+                        walletBalanceNotUsedLabel={t('Wallet balance not used')}
                       />
                       <FormDescription>{groupDescription}</FormDescription>
+                      {selectedGroupUsesSubscription ? (
+                        <Alert role='status'>
+                          <WalletCards aria-hidden='true' />
+                          <AlertTitle>{t('Subscription')}</AlertTitle>
+                          <AlertDescription>
+                            {t(
+                              'This Sub2API group is subscription-based. Account wallet balance is not used to decide routing availability for this group.'
+                            )}
+                          </AlertDescription>
+                        </Alert>
+                      ) : null}
+                      {requiresClaudeCodeDeclaration ? (
+                        <Alert variant='destructive' role='alert'>
+                          <ShieldAlert aria-hidden='true' />
+                          <AlertTitle>{t('Claude Code only')}</AlertTitle>
+                          <AlertDescription>
+                            {claudeCodeGroupError}
+                          </AlertDescription>
+                        </Alert>
+                      ) : null}
                       <FormMessage />
                     </FormItem>
                   )}
@@ -796,7 +966,13 @@ export function ChannelRoutingCostSourceSheet(props: {
                             inputMode='numeric'
                             pattern='[0-9]*'
                             disabled={readOnly}
-                            placeholder={t('Optional')}
+                            placeholder={t(
+                              'Required while this source is enabled'
+                            )}
+                            onChange={(event) => {
+                              field.onChange(event)
+                              clearActionPreview()
+                            }}
                           />
                         </FormControl>
                         <FormMessage />
@@ -851,7 +1027,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                           </div>
                           <p className='text-muted-foreground mt-1 text-xs'>
                             {t(
-                              'Mark this Sub2API account as eligible for Claude Code routing.'
+                              'Automatically restricts this channel to requests classified as Claude Code. A dedicated routing pool adds stronger isolation.'
                             )}
                           </p>
                         </div>
@@ -859,7 +1035,11 @@ export function ChannelRoutingCostSourceSheet(props: {
                           checked={field.value}
                           disabled={readOnly}
                           aria-label={t('Serves Claude Code')}
-                          onCheckedChange={field.onChange}
+                          onCheckedChange={(checked) => {
+                            field.onChange(checked)
+                            clearTestPreview()
+                            if (checked) form.clearErrors('upstreamGroup')
+                          }}
                         />
                       </div>
                     )}
@@ -931,6 +1111,10 @@ export function ChannelRoutingCostSourceSheet(props: {
                             spellCheck={false}
                             className='min-h-24 resize-y font-mono text-xs'
                             placeholder='10.20.30.0/24'
+                            onChange={(event) => {
+                              field.onChange(event)
+                              clearActionPreview()
+                            }}
                           />
                         </FormControl>
                         <FormDescription>
@@ -947,6 +1131,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                       !providerChanged &&
                       workingBinding?.credential_masks.custom_ca_configured
                     )}
+                    onPreviewIdentityChange={clearActionPreview}
                   />
                 </div>
               )}
@@ -964,7 +1149,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                 <Button
                   type='button'
                   variant='outline'
-                  disabled={actionDisabled}
+                  disabled={actionDisabled || requiresClaudeCodeDeclaration}
                   onClick={() => void runAction('test')}
                 >
                   <CheckCircle2 aria-hidden='true' />
@@ -1036,7 +1221,18 @@ export function ChannelRoutingCostSourceSheet(props: {
                             variant='secondary'
                             className='max-w-full min-w-0'
                           >
-                            <span className='truncate'>{group}</span>
+                            <span className='truncate'>
+                              {group}
+                              {actionResult.result.group_meta?.[group]
+                                ?.claude_code_only
+                                ? ` · ${t('Claude Code only')}`
+                                : ''}
+                              {costBindingGroupUsesSubscription(
+                                actionResult.result.group_meta?.[group]
+                              )
+                                ? ` · ${t('Subscription')}`
+                                : ''}
+                            </span>
                           </Badge>
                         ))}
                         {actionResult.result.groups.length > 8 ? (
@@ -1077,6 +1273,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                   <CostSourceCredentialFields
                     upstreamType={upstreamType}
                     binding={providerChanged ? null : workingBinding}
+                    onPreviewIdentityChange={clearActionPreview}
                   />
                 </div>
               )}
@@ -1093,7 +1290,7 @@ export function ChannelRoutingCostSourceSheet(props: {
           >
             {readOnly ? t('Close') : t('Cancel')}
           </Button>
-          {props.canSensitiveWrite ? (
+          {!writeDisabled ? (
             <Button
               type='submit'
               form='channel-routing-cost-source-form'
@@ -1101,6 +1298,7 @@ export function ChannelRoutingCostSourceSheet(props: {
                 saveMutation.isPending ||
                 actionPending ||
                 conflict != null ||
+                requiresClaudeCodeDeclaration ||
                 (props.binding != null && workingBinding == null)
               }
             >

@@ -15,18 +15,30 @@ import (
 )
 
 type routingCapacityTokenEstimate struct {
-	Input       channelrouting.CapacityDimensionEstimate
-	Output      channelrouting.CapacityDimensionEstimate
-	Stream      bool
-	StreamKnown bool
-	RemoteState bool
-	HasMedia    bool
+	Input                         channelrouting.CapacityDimensionEstimate
+	Output                        channelrouting.CapacityDimensionEstimate
+	Stream                        bool
+	StreamKnown                   bool
+	RemoteState                   bool
+	HasMedia                      bool
+	CacheWriteTokensKnown         bool
+	RequestPricingFeaturesKnown   bool
+	UncataloguedSurchargePossible bool
+}
+
+type routingRequestPricingFeatureState struct {
+	Known                         bool
+	HasCacheControl               bool
+	UncataloguedSurchargePossible bool
 }
 
 func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityTokenEstimate {
+	pricingFeatures := inspectRoutingRequestPricingFeatures(path, body)
 	estimate := routingCapacityTokenEstimate{
-		Input:  channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionApplicableUnknown},
-		Output: channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionApplicableUnknown},
+		Input:                         channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionApplicableUnknown},
+		Output:                        channelrouting.CapacityDimensionEstimate{State: channelrouting.CapacityDimensionApplicableUnknown},
+		RequestPricingFeaturesKnown:   pricingFeatures.Known,
+		UncataloguedSurchargePossible: pricingFeatures.UncataloguedSurchargePossible,
 	}
 	lowerPath := strings.ToLower(path)
 	if strings.HasPrefix(path, "/v1/realtime") {
@@ -55,6 +67,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 
 	var request dto.Request
 	inputDependsOnRemoteState := false
+	cacheEnvelopeRecognized := false
 	switch {
 	case strings.Contains(path, ":batchEmbedContents"):
 		parsed := &dto.GeminiBatchEmbeddingRequest{}
@@ -63,6 +76,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		estimate.StreamKnown = true
+		cacheEnvelopeRecognized = true
 	case strings.Contains(path, ":embedContent"):
 		parsed := &dto.GeminiEmbeddingRequest{}
 		if common.Unmarshal(body, parsed) != nil {
@@ -70,6 +84,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		estimate.StreamKnown = true
+		cacheEnvelopeRecognized = true
 	case strings.HasPrefix(path, "/v1/embeddings") || strings.HasSuffix(path, "embeddings"):
 		parsed := &dto.EmbeddingRequest{}
 		if common.Unmarshal(body, parsed) != nil {
@@ -77,6 +92,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		estimate.StreamKnown = true
+		cacheEnvelopeRecognized = true
 	case strings.HasPrefix(path, "/v1/responses/compact"):
 		parsed := &dto.OpenAIResponsesCompactionRequest{}
 		if common.Unmarshal(body, parsed) != nil {
@@ -84,6 +100,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		inputDependsOnRemoteState = parsed.PreviousResponseID != ""
+		cacheEnvelopeRecognized = true
 	case strings.HasPrefix(path, "/v1/responses"):
 		parsed := &dto.OpenAIResponsesRequest{}
 		if common.Unmarshal(body, parsed) != nil {
@@ -91,6 +108,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		inputDependsOnRemoteState = parsed.PreviousResponseID != "" || len(parsed.Conversation) > 0
+		cacheEnvelopeRecognized = true
 		if parsed.Stream != nil {
 			estimate.Stream = *parsed.Stream
 			estimate.StreamKnown = true
@@ -102,6 +120,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		inputDependsOnRemoteState = len(parsed.Container) > 0
+		cacheEnvelopeRecognized = true
 		if parsed.Stream != nil {
 			estimate.Stream = *parsed.Stream
 			estimate.StreamKnown = true
@@ -113,6 +132,7 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 		request = parsed
 		inputDependsOnRemoteState = parsed.CachedContent != "" || len(parsed.Requests) > 0
+		cacheEnvelopeRecognized = true
 		estimate.Stream = strings.Contains(path, ":streamGenerateContent")
 		estimate.StreamKnown = true
 	default:
@@ -121,10 +141,15 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 			return estimate
 		}
 		request = parsed
+		cacheEnvelopeRecognized = strings.HasPrefix(lowerPath, "/v1/chat/completions") ||
+			strings.HasPrefix(lowerPath, "/v1/completions")
 		if parsed.Stream != nil {
 			estimate.Stream = *parsed.Stream
 			estimate.StreamKnown = true
 		}
+	}
+	if cacheEnvelopeRecognized && !inputDependsOnRemoteState && pricingFeatures.Known && !pricingFeatures.HasCacheControl {
+		estimate.CacheWriteTokensKnown = true
 	}
 
 	meta := request.GetTokenCountMeta()
@@ -161,6 +186,101 @@ func estimateRoutingCapacityTokens(path string, body []byte) routingCapacityToke
 		}
 	}
 	return estimate
+}
+
+func inspectRoutingRequestPricingFeatures(path string, body []byte) routingRequestPricingFeatureState {
+	state := routingRequestPricingFeatureState{}
+	normalizedPath := strings.ToLower(path)
+	if separator := strings.IndexAny(normalizedPath, "?#"); separator >= 0 {
+		normalizedPath = normalizedPath[:separator]
+	}
+	normalizedPath = strings.TrimRight(normalizedPath, "/")
+	recognizedProtocolEnvelope := normalizedPath == "/v1/chat/completions" ||
+		normalizedPath == "/pg/chat/completions" ||
+		normalizedPath == "/v1/completions" ||
+		normalizedPath == "/v1/embeddings" ||
+		normalizedPath == "/v1/messages" ||
+		normalizedPath == "/v1/responses" ||
+		normalizedPath == "/v1/responses/compact" ||
+		normalizedPath == "/v1/moderations" ||
+		normalizedPath == "/v1/rerank" ||
+		normalizedPath == "/v1/audio/speech" ||
+		(strings.HasPrefix(normalizedPath, "/v1/engines/") && strings.HasSuffix(normalizedPath, "/embeddings")) ||
+		((strings.HasPrefix(normalizedPath, "/v1beta/models/") ||
+			strings.HasPrefix(normalizedPath, "/v1/models/")) &&
+			(strings.HasSuffix(normalizedPath, ":generatecontent") ||
+				strings.HasSuffix(normalizedPath, ":streamgeneratecontent") ||
+				strings.HasSuffix(normalizedPath, ":embedcontent") ||
+				strings.HasSuffix(normalizedPath, ":batchembedcontents")))
+	if strings.HasSuffix(normalizedPath, "/alpha/search") {
+		state.Known = true
+		state.UncataloguedSurchargePossible = true
+	}
+	if normalizedPath == "/v1/edits" || normalizedPath == "/v1/images/generations" ||
+		normalizedPath == "/v1/images/edits" {
+		state.Known = true
+		state.UncataloguedSurchargePossible = true
+	}
+	if !state.Known && !recognizedProtocolEnvelope {
+		return state
+	}
+	if len(body) == 0 {
+		return state
+	}
+	var payload map[string]any
+	if common.Unmarshal(body, &payload) != nil || payload == nil {
+		return state
+	}
+	if recognizedProtocolEnvelope {
+		state.Known = true
+	}
+	for _, key := range []string{"web_search_options", "web_search"} {
+		if value, exists := payload[key]; exists && value != nil {
+			state.UncataloguedSurchargePossible = true
+		}
+	}
+	if tools, ok := payload["tools"].([]any); ok {
+		for _, value := range tools {
+			tool, objectOK := value.(map[string]any)
+			if !objectOK {
+				continue
+			}
+			toolType, _ := tool["type"].(string)
+			toolType = strings.ToLower(strings.TrimSpace(toolType))
+			if strings.Contains(toolType, "web_search") || toolType == "file_search" ||
+				toolType == "image_generation" {
+				state.UncataloguedSurchargePossible = true
+			}
+		}
+	}
+	stack := []any{payload}
+	const maxJSONNodes = 16_384
+	visited := 0
+	for len(stack) > 0 {
+		visited++
+		if visited > maxJSONNodes {
+			return routingRequestPricingFeatureState{}
+		}
+		last := len(stack) - 1
+		value := stack[last]
+		stack = stack[:last]
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				normalizedKey := strings.ToLower(strings.ReplaceAll(key, "_", ""))
+				if normalizedKey == "cachecontrol" ||
+					normalizedKey == "promptcachekey" ||
+					normalizedKey == "promptcacheoptions" ||
+					normalizedKey == "promptcacheretention" {
+					state.HasCacheControl = true
+				}
+				stack = append(stack, child)
+			}
+		case []any:
+			stack = append(stack, typed...)
+		}
+	}
+	return state
 }
 
 func saturatingRoutingTokenProduct(left int, right int) int {
@@ -217,18 +337,22 @@ func buildRoutingCostRequestProfile(
 		requestHeaders[key] = values[0]
 	}
 	return &model.RoutingCostRequestProfile{
-		PromptTokens:             int64(max(profilePromptTokens, 0)),
-		MaximumPromptTokens:      int64(max(maximumPromptTokens, 0)),
-		ExpectedCompletionTokens: int64(max(profileCompletionTokens, 0)),
-		MaximumCompletionTokens:  int64(max(maximumCompletionTokens, 0)),
-		ImageUnits:               imageUnits,
-		MaxAttempts:              1,
-		KnowledgeSpecified:       true,
-		InputTokensKnown:         estimate.Input.Known() && !estimate.RemoteState,
-		MaximumCompletionKnown:   estimate.Output.Known(),
-		CacheTokensKnown:         false,
-		MediaDimensionsKnown:     !mediaRequest,
-		RequestInputKnown:        len(body) > 0,
+		PromptTokens:                  int64(max(profilePromptTokens, 0)),
+		MaximumPromptTokens:           int64(max(maximumPromptTokens, 0)),
+		ExpectedCompletionTokens:      int64(max(profileCompletionTokens, 0)),
+		MaximumCompletionTokens:       int64(max(maximumCompletionTokens, 0)),
+		ImageUnits:                    imageUnits,
+		MaxAttempts:                   1,
+		KnowledgeSpecified:            true,
+		InputTokensKnown:              estimate.Input.Known() && !estimate.RemoteState,
+		MaximumCompletionKnown:        estimate.Output.Known(),
+		CacheTokensKnown:              false,
+		CacheReadTokensKnown:          false,
+		CacheWriteTokensKnown:         estimate.CacheWriteTokensKnown,
+		MediaDimensionsKnown:          !mediaRequest,
+		RequestInputKnown:             len(body) > 0,
+		RequestPricingFeaturesKnown:   estimate.RequestPricingFeaturesKnown,
+		UncataloguedSurchargePossible: estimate.UncataloguedSurchargePossible,
 		Request: billingexpr.RequestInput{
 			Headers: requestHeaders,
 			Body:    append([]byte(nil), body...),

@@ -16,6 +16,9 @@
 - `docs/superpowers/specs/2026-07-10-channel-routing-v2-design.md`
 - `docs/superpowers/plans/2026-07-10-channel-routing-phase0-runtime-safety.md`
 - `docs/superpowers/plans/2026-07-10-channel-routing-phase0b-error-capacity-multikey.md`
+- `.agent/channel-routing-upstream-account-connectors.md`
+  - NewAPI 官方审计基线：`a63364d156cf2a64f1c3d1ee4923d73d5f3222a1`
+  - Sub2API 官方审计基线：`30df3f68e4ea6ce493af1d6651d3f668201c14dd`
 - 根 `AGENTS.md` 与 `web/default/AGENTS.md`
 
 架构已经批准，不重新访谈或改变总体方向。当前事实与旧行号冲突时，以当前代码和实际测试为准增量适配。
@@ -23,12 +26,13 @@
 ## Context and Orientation
 
 - 主仓库与当前交付工作树：`/opt/xy-api`
-- 分支：`fix/channel-routing-v0.1.11`
-- 当前代码候选及本地候选镜像的源码基线：`6ca75bda2695bef3116c8c138f54356200862d10`；基线 `origin/main` 为 `b0d70139ff1ccbf01b8627cfb39367a79fc87241`（`v0.1.10`）。最终发布 SHA 以 PR 合入后的精确 merge SHA 为准。
+- 当前修复分支：`fix/channel-routing-v0.1.12`，从 `main` / `origin/main` 的 `505496280b019d48589b981c9be47dd8fc89c713` 创建；`v0.1.11` 正式 tag 精确指向 `9a89fdf12bde37ceabfb1bf80aad52ee2124307f`。
+- `v0.1.11` 已完成 PR、main、tag、Release 与多架构镜像闭环；本轮 `v0.1.12` 只做发布后渠道路由审计修复，不改写上一版本的历史候选证据。
 - durable async billing、accepted/terminal 投影、Cost Sources、Manual Reviews、Projection Operations、发布供应链和 SQLite 旧卷升级修复均已集成到当前分支。不得 reset、checkout、stash、rebase、amend 或覆盖并行改动。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
+- 当前项目原本已有 NewAPI / Sub2API 上游账号连接器；v0.1.12 只修正官方协议漂移、管理凭据边界、成本失败语义和只读预览行为，不新建重复模块。
 - 正式 `web/default` 工作区已合并；Typecheck、Lint、七语 i18n、`bun test`（176 pass、0 fail、48 files）、production build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。RU/FR 320px Cursor 分页及运行时 `<html lang>` 已完成 8/8 真浏览器回归。
-- 基于 `6ca75bda` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过。当前只剩远端发布闭环：推送分支、合入现有 PR #21、打 `v0.1.11` tag，并核验正式多架构镜像及供应链资产。
+- 基于 `6ca75bda` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过；随后 PR #20、#21、#22 依次合入，`v0.1.11` 正式发布和供应链终验均已完成。
 
 ## Progress
 
@@ -48,7 +52,11 @@
 - [x] 计费投影：accepted/terminal 统计、外部日志、缓存同步各自独立幂等与故障恢复已完成，三数据库并发/崩溃点证据已补齐。
 - [x] Cost Sources 前端：独立实现已集成，Impeccable、七语 i18n、浏览器矩阵、无障碍和 production build 已复验。
 - [x] 最终实现验证：当前实现候选已完成全量 Go、SQLite/MySQL 5.7/PostgreSQL 9.6、Redis/ClickHouse 高风险定向契约、定向 race、vet/build、故障矩阵、benchmark、前端和仓库审计；候选镜像真实旧卷升级也已作为独立发布门禁通过。
-- [ ] Git/发布：推送分支、创建 PR、同步最新 main、复验、合入 main，发布并核验 `v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 Release。
+- [x] Git/发布：PR #20、#21、#22 已合入 main；`v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 10 项 Release 资产已完成正式核验。
+- [ ] v0.1.12 上游账号连接器核心审计与实现：NewAPI 账号分组/按组模型/价格目录/Gateway `/v1/models` 四方交叉、上游 QPU、cache/audio 官方默认、免费组与 auto、按凭据/按组失败隔离；Sub2API 官方 JWT/数字分组/嵌套展示价格、独立分组发现、`/auth/me` 稳定账号身份、订阅组余额不适用、单位与 interval 未命中语义；Test/加载分组只读预览、成功模型缩集、Base URL canonical 校验和 pricing-disabled 错误分类主体已完成，正按独立审查收口 binding-fenced 账号状态和动作身份一致性。
+- [x] v0.1.12 请求计费完整性：NewAPI 未公开工具/search-preview/固定图片附加费，以及 Sub2API display pricing 的 flat priority/flex、1h cache write、OpenAI/Gemini 长上下文和远程 interval 上下文均在请求估算阶段条件降为 unknown。
+- [x] v0.1.12 Claude Code 数据面边界：按 Sub2API 官方指纹生成 `standard`/`unknown`/`claude_code`，V1/V2 均携带分类；所有智能、传统、指定与最终 Setup 选路出口在抽样前排除非 Claude Code 流量，策略缓存独立且失败关闭。
+- [ ] v0.1.12 最终门禁：等待最新工作树完成相关契约与 Race、`./controller`、全仓测试、Vet/Build、前端矩阵和仓库审计；随后按用户授权提交、同步 main、创建并合入 PR、发布 `v0.1.12`。
 
 ## Requirement Traceability Matrix
 
@@ -70,7 +78,8 @@
 | CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
 | CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步与异步链均已覆盖；Task/MJ durable reservation、终态结算、恢复、manual review 和 accepted/terminal 独立投影已集成并通过跨库验证 | PASS |
-| CR-GIT | PR、同步 main、合入、镜像构建 | 供应链、候选镜像和真实旧卷升级已验证；推送、PR、tag 和正式发布仍待完成 | PENDING |
+| CR-UPSTREAM-0.1.12 | NewAPI/Sub2API 账号权限、分组、模型、价格、余额和预览行为符合官方契约 | 核心账号/分组/余额/稳定身份/单位/interval/动作契约、请求级 knownness 与 Claude Code 数据面准入已实现 | IMPLEMENTED；等待最新候选全量门禁与发布证据 |
+| CR-GIT | PR、同步 main、合入、镜像构建 | PR #20/#21/#22、tag `v0.1.11`、Release、GHCR、Cosign、SBOM、SLSA 与最终 verifier 均完成 | PASS |
 
 ## Plan of Work
 
@@ -84,7 +93,10 @@
 8. [完成] 发布终审实现：durable async billing、独立投影、恢复/manual review、Cost Sources、供应链门禁和 SQLite `v0.1.10` 日志表兼容迁移已集成。
 9. [完成] 最终实现验证：后端全量与跨库矩阵、前端 production release-final、性能、安全、格式和仓库审计已完成。
 10. [完成] 候选镜像与真实升级：基于 `6ca75bda` 构建候选镜像，用全新隔离卷从固定 digest 的正式 `v0.1.10` 初始化；升级、重启幂等、marker/旧日志、新 schema、索引行为、版本、默认前端与日志健康均通过。
-11. [待完成] Git 与正式发布：推送分支、更新 PR #21、同步 main、通过 required checks、合入、对精确 merge SHA 打 `v0.1.11` tag，并终验 Release/GHCR/Cosign/SBOM/SLSA。
+11. [完成] Git 与正式发布：PR #20/#21/#22 已合入；`v0.1.11` tag 精确指向 PR #21 merge SHA，Release/GHCR/Cosign/SBOM/SLSA 已由正式 verifier 终验。
+12. [进行中] v0.1.12 官方连接器核心实现：以 NewAPI `self`/`self/groups`/`user/models`/价格目录/Gateway `/v1/models` 四方交叉为权威；以 Sub2API JWT 管理端点、数字分组和嵌套展示目录为账号能力来源；失败关闭、免费组、分组隔离、QPU/cache/audio、订阅组余额不适用、只读预览和安全 Base URL 已进入正式规范与实现；剩余独立审查项正在收口。
+13. [完成] v0.1.12 请求计费与账号连续性：NewAPI 未公开附加费、Sub2API display-only 缺失维度、远程上下文、`/auth/me` 稳定身份、JWT 轮换和匿名 catalog scope 提示已收口。
+14. [进行中] v0.1.12 Claude Code 与最终验证：官方请求分类和全选路出口准入已实现；串行完成后端/前端/仓库门禁后，按用户授权提交分支、同步最新 main、创建并合入 PR，再发布和终验 `v0.1.12`。
 
 ### Phase 2 implementation slices
 
@@ -131,16 +143,16 @@
 - JSON wrapper、Testify、受保护标识与 `git diff --check` 审计：均无新增违规。
 - 全量 `service -race` 仍会命中既有 `task_polling/logger/model.Task` 竞态；本次相关 service 定向 race 与阶段要求的 race 包均通过，未把既有竞态误报为 Phase 0C 成功证据。
 
-### Release completion evidence（candidate complete; remote pending）
+### Release completion evidence（candidate and remote complete）
 
 - 代码候选：`6ca75bda2695bef3116c8c138f54356200862d10`。后端全量 `go test ./... -count=1`、`go vet ./...`、`go build ./...` PASS；Go test 日志 SHA-256 为 `af34581f10cd646292fa057e2e24217e20b8513e3ecfdc651677d944f1cdf884`。前端 `bun test` 为 176 pass、0 fail、48 files，Typecheck、Default/Classic production build 和目标文件 format/lint 均 PASS。
 - 前端终验：RU/FR 320px 在 Manual Reviews 与三类 Projection Cursor 页面共 8/8 PASS；document/body 宽度均为 320，按钮无越界，`<html lang>` 与存储语言均精确为 `ru`/`fr`。浏览器报告 SHA-256 为 `16f2f30f7dcef116a028be621ea1e8ca935d1654be299ac85cf1f45cdd248148`。
 - 候选镜像：`xy-api:v0.1.11-candidate-6ca75bda`，本地 image ID 为 `sha256:49e205864cd5b7ac4faa19d8f87026b3a477cdd088b8eb16c9cb4bd19f893818`；OCI labels 精确绑定 version `v0.1.11`、revision `6ca75bda2695bef3116c8c138f54356200862d10` 和受保护仓库 source，容器 `--version` 为 `v0.1.11`。构建日志 SHA-256 为 `31d713dcac4e2b8dd4890e1be44e497e4b710360610929f94b52d8c923505699`。
 - 真实升级：固定正式旧镜像 `ghcr.io/liulixin-lex/xy-api@sha256:40b1650c134ec9fe7afad833f2c3b635bf0818ca534e5d12e4ee0f429a80b12d` 初始化全新 SQLite 卷；候选首次启动和重启均通过。marker、旧日志、默认前端、核心表/列、两个唯一索引的结构与实际 NULL/重复行为、前端 build descriptor 和精确迁移日志门禁全部 PASS，容器与卷清理 PASS。升级日志 SHA-256 为 `be67bc480e5e94f90e2bece8b8671093366f429a866cb345a281dd2df741d8e5`，保留阶段证据聚合 SHA-256 为 `f72a37b6577ef1c0d91cbf3cc28ebdf66fa95569014c85bafdde6bab0739658f`。
-- Git（pending）：推送分支；Backend、Default frontend、Classic frontend、Workflow supply-chain checks、pr-quality 全部通过；同步最新 main、解决讨论、合入，并确保 `v0.1.11` tag 精确指向 main 上的 merge SHA 且该提交的 `VERSION` 为 `v0.1.11`。
-- Release（pending）：GitHub Release 必须为非 draft、非 prerelease且严格包含 10 个资产；四份 checksum 必须完整覆盖其余六个载荷并通过 `sha256sum --check --strict`。至少一个 finalizer 日志必须明确输出 stable release complete，不能只依据三条顶层 workflow 绿灯。
-- GHCR（pending）：`v0.1.11` 与 `latest` 必须同 digest；OCI index 精确包含 amd64、arm64 和两份 attestation manifest；多架构及子架构 Cosign 签名、双平台非空 SPDX-2.3 SBOM、SLSA v1 provenance、OCI version/revision labels、容器 `--version`、`/api/status` 和前端 build revision 均需终验。若发布时配置了 Docker Hub，再额外验证其 digest 与 GHCR 一致。
-- 正式只读 verifier：`/opt/临时/verify-v0.1.11-release.sh`，SHA-256 `8f5bd170651d5c81b34b165e903f309739f71b74147546918378981e1c5a22bd`；已通过 `bash -n`、ShellCheck 与正负 fixtures，tag 推送后必须实跑并保留完整输出。
+- Git（complete）：PR #20 合入 `a6bb1ff4`，PR #21 合入 `9a89fdf1` 并成为 `v0.1.11` tag 目标，PR #22 合入 `50549628` 修复 GHCR release auth；当前 main 与 origin/main 均为 `505496280b019d48589b981c9be47dd8fc89c713`。
+- Release（complete）：GitHub Release 为非 draft、非 prerelease，严格包含 10 个资产；checksum、版本、revision 与 finalizer 的 stable release complete 门禁均通过。
+- GHCR（complete）：`v0.1.11` 与 `latest` 同指向 `sha256:b338fcb52844681c2b03d491a7ef634b10dc5d1204124907e1cdc29c99471ef0`；amd64/arm64、Cosign、双平台 SPDX-2.3 SBOM、SLSA v1 provenance、OCI labels、容器版本、状态接口和前端 revision 均通过终验。
+- 正式只读 verifier：脚本 `/opt/临时/verify-v0.1.11-release.sh` 的 SHA-256 为 `8f5bd170651d5c81b34b165e903f309739f71b74147546918378981e1c5a22bd`；最终日志 `/opt/临时/verify-v0.1.11-release-final-mainfix.log` 的 SHA-256 为 `24538bd38f9ec0a473c0de3e418d18c238fba45d30711e5f7e6d6ecae0d248f0`。
 
 ### Gate 2 fresh evidence（2026-07-12）
 
@@ -203,7 +215,45 @@
 - 前端 Typecheck、Lint 0 error、`bun test`（176 pass、0 fail、48 files）、changed-scope oxfmt、七语 i18n missing/extras/untranslated 全 0 和 `VITE_REACT_APP_VERSION=v0.1.11 bun run build` 均 PASS。
 - production release-final 浏览器证据覆盖投影页 18/18、Operations 12/12 的 320/768/1440 明暗矩阵和边界态 3+4；所有布局无文本/横向溢出，Axe 0。额外 RU/FR 320px 8/8 回归确认共享 Cursor 分页无越界、页面宽度稳定且 `<html lang>` 正确；键盘、200% 等效缩放、reduced-motion 和权限状态均通过。
 - 发布供应链实现已集成：Release/Electron 资产不可覆盖、跨工作流串行上传、旧版本不得倒退 `latest`、同版本不同 digest fail closed、子架构及最终 manifest 签名；Action SHA、actionlint、yamllint、shellcheck 和脚本测试均 PASS。
-- 所有早期 `e86f24c4`/`4c4acfc3` 候选证据均已被 `6ca75bda` 的干净代码候选、镜像与真实升级证据取代。分支尚未推送最新提交，PR #21、main 合入、`v0.1.11` tag、正式镜像和 Release 均未完成，不能把本节实现验证写成正式发布完成。
+- 所有早期 `e86f24c4`/`4c4acfc3` 候选证据均已被 `6ca75bda` 的干净代码候选、镜像与真实升级证据取代；随后 PR #21 完成 main 合入与 `v0.1.11` tag，PR #22 完成正式镜像发布认证修复，远端发布闭环已由上述 final verifier 证明。
+
+### v0.1.12 upstream account connector audit / acceptance checkpoint（2026-07-15）
+
+本节只记录 `fix/channel-routing-v0.1.12` 的发布后审计修复，不替换、不追溯修改上方 `v0.1.11` 的正式发布证据。
+
+- 官方审计基线固定为 NewAPI `a63364d156cf2a64f1c3d1ee4923d73d5f3222a1` 与 Sub2API `30df3f68e4ea6ce493af1d6651d3f668201c14dd`；Sub2API 自初始审计点 `da85cc7e47882090b115d664afe8e39b37aa7417` 起账号/分组/余额契约未漂移，最新 Alpha Search 变更只调整失败转移状态。详细长期规范见 `.agent/channel-routing-upstream-account-connectors.md`。
+- 当前模块不是空白实现：已有 provider-scoped 加密凭据、NewAPI Access Token + User ID、Sub2API JWT/邮箱密码登录、Redis JWT cache/singleflight/fencing、成本同步、余额、分组发现、Test、SSRF/TLS/CA/大小限制和正式前端表单。
+- NewAPI 权威链改为：`GET /api/user/self` 读取余额，`GET /api/user/self/groups` 决定账号分组和实际倍率，`GET /api/user/models?group=` 决定该组账号模型，`GET /api/pricing` 只提供价格目录，Gateway API Key 的 `GET /v1/models` 只验证实际可服务模型。最终快照取四方交集。默认公开 pricing 中间件只读取 Dashboard session，不会把 Bearer Access Token 变成账号视图，因此其 `group_ratio`、`usable_group` 和 `enable_groups` 一律不能用于账号授权判断。Gateway `/v1/models` 不公开 token group，只能证明 Key 可服务模型，不能自动证明其 group 与 binding `upstream_group` 一致。
+- NewAPI 每个实例的 `GET /api/status.data.quota_per_unit` 是该上游额度换算权威；余额使用 `quota / upstreamQPU`，token 美元价和本地 `BaseRatio` 使用 `upstreamQPU/localQPU` 显式换算。Groups discovery 不依赖 status，Test/同步缺失或非法 QPU 失败关闭。
+- NewAPI HTTP 200 `success=false` 以 `Auth-Version` 作为 UserAuth 是否已通过的证据：认证后的业务错误不误标 token 失败，模型业务错误按组隔离，余额业务错误降为 partial。
+- NewAPI `ratio=0` 是官方免费组，成本引擎保留显式零倍率并把 token/per-request/expression 结果视为已知零成本；`auto` 分组返回字符串倍率且没有稳定具体倍率，必须失败关闭。缺组、空模型、缺目录价格和非法倍率均不得回退 `1x`。
+- NewAPI ratio 模式按官方补齐 cache read、5m/1h cache write 和 audio input/output；请求画像拆分 cache read/write known，结构化识别 `cache_control` 与 `prompt_cache_*`，避免默认 cache-write 价格让普通请求全部 unknown，也不把自动 cache read 伪装成已知。
+- NewAPI pricing 模块关闭的 403 已按配置/能力错误处理，不再误标 Access Token；Base URL 现拒绝任意 query、空 query marker 和 fragment，并为七语前端提供明确错误。
+- NewAPI 同账号聚合按 Access Token + 自定义 CA + 出站策略分批完整取数，不同管理令牌不再由排序最前的 representative 代表；Gateway `/v1/models` 则按 Gateway Key + CA + 出站策略独立去重。轮换中的失效令牌或坏 Gateway Key 只退避对应 binding，至少一个健康凭据时继续同步共享账号；单个坏组同样只隔离对应 binding。缺 User ID 不再回退 token 派生账号。
+- Sub2API 正式契约固定为 JWT `/api/v1/auth/me`、`/groups/available`、`/groups/rates`、`/channels/available`；数字分组 ID、嵌套 `platforms[].groups[]/supported_models[].pricing`、USD/token、USD/request、左开右闭 token interval 和未命中 unknown 均按官方实现处理。旧扁平 shape、JWT `/v1/usage`、空渠道零价格和未知 image/per-request tier 均失败关闭。
+- 同账号 Sub2API 网络响应允许共享取数，但元数据一致性校验、目标渠道裁剪和成本展开必须按 binding 分组执行；可识别的坏分组只隔离引用它的 binding，健康分组继续更新。只有 envelope/顶层类型或无法归属到具体分组的结构损坏才允许账号级拒绝。
+- Sub2API `/auth/me` 先按 canonical Base URL + 管理凭据 + CA + egress 等价类聚合并复用 profile；目录再按目标分组分批，同组同等价类共享请求，不同组隔离。托管 JWT 重登重试会重新确认 profile。选定分组的倍率 value 单独验证，未选分组的坏 value 不再拖垮健康组；数字名称与另一分组 ID 的 alias 冲突只在真正命中该输入时判 ambiguous，无法归属的非法 map key 仍失败关闭。
+- 官方确认 `/channels/available` 是展示目录而非完整 BillingService 契约；现已用 display contract 元数据按请求门控 flat priority/flex、1h cache write、OpenAI/Gemini 长上下文和远程 interval 上下文，NewAPI 未公开工具/search-preview/图片附加费也通过 catalog scope 条件 unknown。历史来源快照缺少对应 contract metadata 时，主选路和 shadow replay 均失败关闭。
+- Sub2API `web_search_price_per_call` 缺失时官方默认 `$0.01/call`、显式 `0` 免费，并乘分组倍率；该字段只属于实际 Alpha Search 调用，不能写成所有模型请求共享的固定 `PerRequestCost`。`/v1/alpha/search`、`/alpha/search`、`/backend-api/codex/alpha/search` 及合法基础路径前缀现统一进入未编目附加费门控并返回 unknown，尾斜杠命中且相似路径不误判。
+- Sub2API `/auth/me` 的官方正整数用户 ID 已成为同步和所有预览动作的前置身份；canonical Base URL + user ID 在账号分组前合并不同 JWT，认证/非法 profile 失败不创建凭据派生账号。binding 保存官方确认后的不可逆 account-key hash，配置变更清空；因此无历史快照的 backoff 也能精确回连账号。身份已确认后的 groups/pricing 失败与账号 degraded 状态同事务提交；健康 sibling 的快照/账号状态同时 fence 全部当前 failure/backoff，不能出现先 active 后降级的窗口。NewAPI 未认证失败必须由自身或仍当前的已认证 sibling 提供最小确认 fence，stale 确认不能间接建账/降级。旧 token/email 派生历史不做破坏性自动合并。
+- Sub2API 官方 JWT 认证失败使用 401；合法 JWT 在 backend mode 下由用户端点 guard 返回 403。后者必须作为 capability/configuration 错误保留旧快照，不得清 JWT cache、触发托管登录或提示更换凭据。
+- Sub2API `claude_code_only` 与 `subscription_type` 只在 `/groups/available` 暴露，Groups 动作通过 `group_meta` 保留两者，正式同步按绑定组关联。订阅组使用订阅限额而非账号钱包判定 serving eligibility，因此定时同步保留账号级钱包信息，但清理该渠道的 serving balance 与热缓存，前端必须对管理员解释该语义。快照重建时，已启用成本连接器的 subscription/unknown balance 都禁止回退 legacy `Channel.Balance`，只有 disabled/no-binding 旧渠道保留兼容。`claude_code_only` binding 未声明用途时仍拒绝成本同步；数据面按官方 User-Agent、system/billing block、必需 headers、metadata 及 count-tokens/haiku 探测规则分类，`standard`/`unknown`/`legacy` 在所有选路出口排除专用渠道。
+- Sub2API Groups 动作只依赖 `/auth/me` 和 `/groups/available`，不要求专属倍率或可选的 `/channels/available` 已可读取；Test/定时同步继续要求 `/groups/rates` 与完整价格。成功同步会原子 reconcile 当前 channel 的 latest 与成本热缓存，删除权威集合中消失的模型并保留 immutable versions；失败路径保留旧集合。
+- Test 与加载分组统一执行 action readiness；Test 要求绑定组并只校验该目标组，加载分组允许空组并走账号级 discovery。Sub2API 两类动作都必须实际解析 `/auth/me` 并验证正整数官方 ID，不能展示“Test 成功”但定时同步必失败，也不能让未绑定坏组拖垮健康 binding 的 Test。两类动作可以读取真实余额验证账号响应，但不写数据库余额、健康状态或热缓存；正式定时同步继续以 binding version/fencing 原子提交余额和价格。
+- 阶段性后端证据曾完成相关 NewAPI/Sub2API controller/model 定向测试、Sub2API interval unknown 定向 Race、`go vet ./...` 和 `go build ./...`；阶段性前端证据完成 TypeScript、Oxlint 0 error、渠道路由 12 files / 68 tests、production build、七语 i18n 0 missing/extras/untranslated，以及 320/768/1440、明暗主题、Axe 0、console/page error 0 的浏览器矩阵。
+- 上述阶段性证据之后又收口了 NewAPI 账号权威端点与按组隔离，因此最终候选必须在最新工作树上重新串行刷新。此前 `go test ./... -count=1` 约 6 分钟后被 SIGTERM 终止，另一次 `go test ./controller -count=1` 在并发审查期间触发 10 分钟 timeout，二者都不算通过；全仓 Race 没有成功证据，也不得宣称 clean。
+
+v0.1.12 最终验收必须同时满足：
+
+1. NewAPI 契约测试证明所有账号端点发送 Access Token + `New-Api-User`，Gateway `/v1/models` 只发送 Gateway API Key，特殊字符分组正确 URL 编码，匿名 pricing 与账号视图冲突时仍只接受账号分组/按组模型/目录价格/Gateway 可服务模型四方交集。
+2. NewAPI 免费组、auto、缺组、空模型、目录缺价、目录额外模型、Gateway 不可服务模型、错误顶层倍率、同账号坏令牌轮换和好坏分组隔离均有 fail-closed/zero-cost 精确回归；不同 Access Token 与不同 Gateway Key 分别完整验证，失败 binding 不覆盖旧快照。
+3. NewAPI QPU、cache 5m/1h、audio 默认/显式零、cache read/write known 拆分和 pricing-disabled 403 分类有精确回归；未公开工具/search-preview/图片附加费请求必须 unknown，匿名私有目录缺价提示 `pricing.requireAuth=true`。
+4. Sub2API 显式 JWT、邮箱密码登录、401 单次重登、backend-mode 403 不清 JWT/不重登、`/auth/me` 正整数稳定身份/JWT 轮换、身份确认后降级建账、stale failure 不汇总、canonical Base URL 请求前拒绝、严格官方 wire DTO、数字 ID/名称 binding、订阅组余额不适用、enabled connector 的 legacy balance 回退禁止、正式嵌套渠道、`image_output_price` 与 nil 语义、单位换算、interval 边界/空白/gap/有界末段/未命中、冲突指纹、空能力和 `/v1/usage` 隔离均有契约回归。string ID、旧 wrapper alias、rates array/null 和扁平 shape 必须失败关闭。
+5. Sub2API display pricing 请求门控覆盖 flat priority/fast、flex 透传不确定、1h cache write、OpenAI/Gemini 长上下文、远程 interval 上下文和 Alpha Search 按次费用；Claude Code 分类、V1/V2 兼容、所有选路出口与缓存失效语义有精确回归。专用 pool 是可选的纵深防御，不再是兼容性准入的发布阻塞。
+6. 内联与已保存 binding 的 Test/加载分组在 `/auth/me` 返回正整数 ID 和真实 `balance` 时仍成功，并对 binding 的余额、健康状态、成本快照和余额热缓存保持只读；`/auth/me` 缺/非法 ID 时两类动作都失败。历史空组 Test 在上游请求前被拒绝，空组加载分组仍可发现全部分组并保留 `subscription_type`/`claude_code_only` 元数据。
+7. Base URL query/fragment 拒绝、七语错误提示、SSRF/TLS/CA/重定向与凭据脱敏回归通过。
+8. 串行运行相关 controller/model 定向测试与相关包 Race、`go test ./controller -count=1`、`go test ./... -count=1`、`go vet ./...`、`go build ./...`；只记录真实 exit 0，过宽全仓 Race 不作为本版本要求或成功证据。
+9. 前端 typecheck、lint、渠道路由测试、production build、i18n 与浏览器证据保持通过；最后执行 `git diff --check`、JSON wrapper、凭据/敏感信息、临时文件和无关改动审计。
 
 ## Surprises & Discoveries
 
@@ -226,6 +276,13 @@
 - 流式 race 暴露日志器 `logCount/setupLogWorking` 的既有并发读写；最终使用原子计数和 CAS 门闩，异步轮换任务自行释放门闩，日志格式与轮换阈值不变。
 - 主动探测 Operation 测试在全仓高负载下偶发 SQLite 共享缓存锁错误；测试不验证多连接锁竞争，因此把该专用夹具限制为单连接。真实并发契约继续由 MySQL/PostgreSQL、Redis 和专门 lease/race 用例承担。
 - 真实旧卷升级发现 SQLite 不允许 `ALTER TABLE ... ADD COLUMN ... UNIQUE`；开发期全新库 AutoMigrate 不会暴露这一兼容风险。最终采用“两阶段迁移”：先增加 nullable 普通列，再由正式模型创建唯一索引，同时用旧日志保留和重启幂等回归保护三条迁移入口。
+- v0.1.12 官方审计发现 NewAPI `/api/pricing` 默认走公开 `TryUserAuth`，该中间件只读取 Dashboard session，不解析连接器发送的 Bearer Access Token；因此旧实现看到的 `group_ratio`/`usable_group` 可能只是匿名目录视图，不能代表上游账号权限。
+- NewAPI `/api/user/self/groups` 的 `ratio` 是 number|string：数值 `0` 是真实免费组，字符串“自动”代表动态 `auto`。把两者都当成“缺倍率并回退 1”会分别造成免费组高估和动态组伪精确成本。
+- Sub2API 的正式用户渠道契约已经变为数字分组 ID 与 `channels[].platforms[].groups[]/supported_models[].pricing`；同时 `/v1/usage` 是 Gateway API Key 自身额度，不是 JWT 账号钱包。预览动作若在读取余额后立即持久化，还会让新建 binding 因 ID=0 fencing 失败并污染已保存 binding 状态。
+- Sub2API `/channels/available` 明确是展示目录：flat JSON 无法区分显式渠道价与展示 fallback，也不包含 priority、1h cache write、长上下文和账号开关；把它降为 `derived` 仍会成为 known，不能作为完整性修复。
+- NewAPI `/api/pricing` 同样不公开 web/file search、image-generation call 和固定图片请求倍率。价格来源置信度与当前请求收费维度完整性是两条独立轴。
+- Sub2API `/auth/me` 同时提供官方用户 ID 和钱包余额；JWT 只是可轮换会话凭据。用 JWT 内容派生持久化账号会割裂余额、健康和历史，因此成功同步改为 Base URL + 官方用户 ID，失败前不创建凭据派生账号。
+- Sub2API flat 缺字段会继承未公开基础价，不能猜；命中 interval 后缺字段按官方构造为零，渠道 override 缺 `image_output_price` 也是显式零。这三种 nil 语义必须分别保留。
 
 ## Decision Log
 
@@ -247,6 +304,14 @@
 - 2026-07-14：SQLite 旧表新增唯一字段必须使用“普通 nullable 列 + 独立命名唯一索引”的两阶段兼容迁移；真实 `v0.1.10` 卷升级是候选镜像进入 PR 前的强制门禁。
 - 2026-07-14：Operation 的资格、租约过期和 CAS 使用调用方同一次 `observedNowMs`，持久化时间以 `max(observedNowMs, created, updated)` 单调推进；创建保持宿主时钟，避免嵌套 SQLite 事务增加 read-before-write 锁升级窗口。
 - 2026-07-14：早期 `e86f24c4`/`4c4acfc3` 候选已废弃；`6ca75bda` 候选以固定正式 `v0.1.10` digest 完成首次升级与重启门禁。只有 PR 合入、精确 tag 和全部正式供应链终验完成后才可结束 Goal。
+- 2026-07-15：NewAPI 账号权限权威固定为 `/api/user/self/groups` 与按组 `/api/user/models`，`/api/pricing` 永远只作为价格目录；即使上游把 pricing 配为 requireAuth，也不改变这层信任边界。
+- 2026-07-15：NewAPI 显式零倍率保留免费组语义，`auto` 因缺少稳定具体分组上下文失败关闭；同账号 binding 采用按组失败隔离，不能让坏组阻断健康组。
+- 2026-07-15：NewAPI 同账号不同管理令牌先独立预检再聚合；旧令牌 401 只退避自身 binding，健康令牌继续同步。NewAPI/Sub2API 历史快照缺当前来源 contract metadata 时统一返回 unknown。
+- 2026-07-15：Test/加载分组统一为只读预览；只有正式同步事务可以持久化余额和价格。Sub2API 管理 JWT 与 Gateway API Key 继续分栏，JWT 不探测 `/v1/usage`。
+- 2026-07-15：NewAPI/Sub2API 展示目录只保存基础价格与来源契约；请求级 surcharge/service tier/cache TTL/长上下文/remote interval 完整性由估算层单独判定，不能靠 `confidence=derived` 代替 fail-closed。
+- 2026-07-15：Sub2API 持久化账号优先使用 `/auth/me` 用户 ID，显式 JWT 轮换只改变认证 cache/fencing，不改变 AccountID；旧凭据派生历史不做破坏性自动合并。
+- 2026-07-15：Sub2API `/auth/me` 按认证/CA/egress 等价类合批并复用到目录请求；分组 alias 冲突在 binding 选择阶段局部判歧义，Test 只验证目标组；账号恢复必须等待同账号当前 backoff 失败解除。未知/custom 请求协议不再声明计费特征完整。
+- 2026-07-15：Sub2API Alpha Search 的按次费用不进入普通模型固定快照；在请求画像能无损表达搜索调用次数和重试计费前，独立 `/alpha/search` 路径统一按未编目附加费返回 unknown。
 
 ## Idempotence and Recovery
 
@@ -258,4 +323,6 @@
 
 ## Outcomes & Retrospective
 
-Phase 0–5 控制面/数据面、正式前端、Task/MJ durable async billing、独立投影、Cost Sources、人工复核、供应链门禁、SQLite `v0.1.10` 兼容修复、候选镜像和真实旧卷双启动升级均已完成并通过最终实现矩阵。当前只剩远端发布闭环：推送、PR、同步 main、复验、合入和发布；只有 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本和 GitHub Release 全部核验通过，完整 Goal 才能结束。
+Phase 0–5 控制面/数据面、正式前端、Task/MJ durable async billing、独立投影、Cost Sources、人工复核、供应链门禁、SQLite `v0.1.10` 兼容修复、候选镜像和真实旧卷双启动升级均已完成并通过最终实现矩阵。PR #20/#21/#22、`v0.1.11` tag、10 项 Release 资产以及 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本均已正式核验；本轮在 `fix/channel-routing-v0.1.12` 上继续处理发布后审计发现，不追溯改写上述发布结论。
+
+v0.1.12 已把 NewAPI/Sub2API 上游账号连接器的官方信任边界、分组/模型交叉验证、稳定账号身份、余额来源、QPU/cache/audio、免费组/auto、按组失败隔离、Sub2API 正式嵌套展示目录、请求级价格完整性、只读预览、安全 Base URL 和 Claude Code 自动兼容性准入写入实现与长期规范。当前剩余发布边界是最新工作树的串行门禁、PR 合入和正式供应链终验；这些完成前不形成发布完成结论。

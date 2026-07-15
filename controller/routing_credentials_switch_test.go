@@ -42,7 +42,8 @@ func TestUpdateRoutingBindingClearsCredentialsWhenProviderChanges(t *testing.T) 
 	context.Request = httptest.NewRequest(http.MethodPut, "/api/smart-routing/bindings/57", bytes.NewBufferString(`{
 		"upstream_type":"newapi",
 		"base_url":"https://newapi.example.com",
-		"upstream_group":"default"
+		"upstream_group":"default",
+		"enabled":false
 	}`))
 	setSmartRoutingBindingIfMatchForTest(t, context, binding.ChannelID)
 
@@ -52,6 +53,7 @@ func TestUpdateRoutingBindingClearsCredentialsWhenProviderChanges(t *testing.T) 
 	var stored model.RoutingChannelBinding
 	require.NoError(t, db.Where("channel_id = ?", binding.ChannelID).First(&stored).Error)
 	assert.Equal(t, model.RoutingUpstreamTypeNewAPI, stored.UpstreamType)
+	assert.False(t, stored.Enabled)
 	assert.Nil(t, stored.EncCredentials)
 	assert.Zero(t, stored.KeyVersion)
 	credentials, err := stored.GetCredentials()

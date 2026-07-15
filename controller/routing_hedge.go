@@ -562,6 +562,7 @@ func newRoutingHedgeBranch(
 	}
 	common.SetContextKey(branchContext, constant.ContextKeyRoutingCapacityFailure, nil)
 	common.SetContextKey(branchContext, constant.ContextKeyRoutingHalfOpenProbes, nil)
+	common.SetContextKey(branchContext, constant.ContextKeyRoutingHalfOpenProbeOwners, nil)
 	common.SetContextKey(branchContext, constant.ContextKeyRoutingHalfOpenLeases, nil)
 	if secondary {
 		common.SetContextKey(branchContext, constant.ContextKeyRoutingCapacityReserve, nil)

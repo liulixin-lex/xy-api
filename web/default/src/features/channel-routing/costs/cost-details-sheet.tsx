@@ -110,7 +110,7 @@ export function ChannelRoutingCostDetailsSheet(props: {
     <Sheet open={props.open} onOpenChange={props.onOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName(
-          'max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-3xl'
+          'channel-routing-touch-surface max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-3xl'
         )}
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>

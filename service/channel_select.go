@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -245,7 +246,7 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(autoGroup, param.ModelName, priorityRetry, param.RequestPath)
+			channel, _ = getRandomSatisfiedChannelForRequest(param, autoGroup, priorityRetry)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -283,7 +284,7 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.GetRetry(), param.RequestPath)
+		channel, err = getRandomSatisfiedChannelForRequest(param, param.TokenGroup, param.GetRetry())
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}
@@ -579,7 +580,14 @@ func acquireRoutingHalfOpenProbe(
 		Model:       modelName,
 		Group:       group,
 	}
-	acquired, _ := acquireRoutingHalfOpenProbeForKey(c, key, candidate.Candidate.Breaker, settings, false)
+	acquired, _ := acquireRoutingHalfOpenProbeForKey(
+		c,
+		key,
+		routingHalfOpenProbeOwner{ChannelID: candidate.Channel.Id, Model: modelName, Group: group},
+		candidate.Candidate.Breaker,
+		settings,
+		false,
+	)
 	return acquired
 }
 
@@ -588,6 +596,7 @@ var errRoutingHalfOpenProbeCoordinator = errors.New("routing half-open probe coo
 func acquireRoutingHalfOpenProbeForKey(
 	c *gin.Context,
 	key routingbreaker.Key,
+	probeOwner routingHalfOpenProbeOwner,
 	breaker *routingselector.BreakerSnapshot,
 	settings routingselector.Settings,
 	failClosedOnRedisError bool,
@@ -620,12 +629,18 @@ func acquireRoutingHalfOpenProbeForKey(
 		}
 		probes[key] = struct{}{}
 		common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, probes)
+		owners, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenProbeOwner](c, constant.ContextKeyRoutingHalfOpenProbeOwners)
+		if owners == nil {
+			owners = map[routingbreaker.Key]routingHalfOpenProbeOwner{}
+		}
+		owners[key] = probeOwner
+		common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbeOwners, owners)
 		if redisAcquired {
-			leases, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
+			leases, _ := common.GetContextKeyType[map[routingbreaker.Key]*routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
 			if leases == nil {
-				leases = map[routingbreaker.Key]routingHalfOpenRedisLease{}
+				leases = map[routingbreaker.Key]*routingHalfOpenRedisLease{}
 			}
-			leases[key] = routingHalfOpenRedisLease{Key: redisKey, Owner: redisOwner}
+			leases[key] = startRoutingHalfOpenRedisLeaseRenewal(c, redisKey, redisOwner)
 			common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenLeases, leases)
 		}
 	}
@@ -644,9 +659,30 @@ func routingHalfOpenProbeHeld(c *gin.Context, key routingbreaker.Key) bool {
 	return held
 }
 
+type routingHalfOpenProbeOwner struct {
+	ChannelID int
+	Model     string
+	Group     string
+}
+
+func (owner routingHalfOpenProbeOwner) matches(channelID int, modelName string, group string) bool {
+	return owner.ChannelID == channelID &&
+		(modelName == "" || owner.Model == modelName) &&
+		(group == "" || owner.Group == group)
+}
+
+const (
+	routingHalfOpenRedisLeaseTTL       = 30 * time.Second
+	routingHalfOpenRedisRenewInterval  = 10 * time.Second
+	routingHalfOpenRedisCommandTimeout = 200 * time.Millisecond
+)
+
 type routingHalfOpenRedisLease struct {
-	Key   string
-	Owner string
+	Key      string
+	Owner    string
+	cancel   context.CancelFunc
+	done     <-chan struct{}
+	stopOnce sync.Once
 }
 
 func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, bool, error) {
@@ -662,22 +698,88 @@ func acquireRoutingHalfOpenRedisLease(key routingbreaker.Key) (string, string, b
 		redisKey = fmt.Sprintf("routing:halfopen:endpoint:%x", digest[:])
 	}
 	owner := common.GetRandomString(32)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), routingHalfOpenRedisCommandTimeout)
 	defer cancel()
-	acquired, err := common.RDB.SetNX(ctx, redisKey, owner, 30*time.Second).Result()
+	acquired, err := common.RDB.SetNX(ctx, redisKey, owner, routingHalfOpenRedisLeaseTTL).Result()
 	if err != nil {
 		return redisKey, owner, false, err
 	}
 	return redisKey, owner, acquired, nil
 }
 
+func startRoutingHalfOpenRedisLeaseRenewal(c *gin.Context, redisKey string, owner string) *routingHalfOpenRedisLease {
+	parent := context.Background()
+	if c != nil && c.Request != nil {
+		parent = c.Request.Context()
+	}
+	renewContext, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	lease := &routingHalfOpenRedisLease{Key: redisKey, Owner: owner, cancel: cancel, done: done}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(routingHalfOpenRedisRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewContext.Done():
+				return
+			case <-ticker.C:
+				renewed, err := renewRoutingHalfOpenRedisLease(redisKey, owner)
+				if err != nil {
+					logger.LogWarn(parent, fmt.Sprintf("channel routing half-open Redis lease renewal failed: %v", err))
+					continue
+				}
+				if !renewed {
+					logger.LogWarn(parent, "channel routing half-open Redis lease ownership was lost")
+					return
+				}
+			}
+		}
+	}()
+	return lease
+}
+
+func renewRoutingHalfOpenRedisLease(redisKey string, owner string) (bool, error) {
+	if redisKey == "" || owner == "" || !common.RedisEnabled || common.RDB == nil {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), routingHalfOpenRedisCommandTimeout)
+	defer cancel()
+	result, err := common.RDB.Eval(
+		ctx,
+		`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) else return 0 end`,
+		[]string{redisKey},
+		owner,
+		routingHalfOpenRedisLeaseTTL.Milliseconds(),
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
 func releaseRoutingHalfOpenRedisLease(redisKey string, owner string) {
 	if redisKey == "" || owner == "" || !common.RedisEnabled || common.RDB == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), routingHalfOpenRedisCommandTimeout)
 	defer cancel()
 	_ = common.RDB.Eval(ctx, `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`, []string{redisKey}, owner).Err()
+}
+
+func (lease *routingHalfOpenRedisLease) stop() {
+	if lease == nil {
+		return
+	}
+	lease.stopOnce.Do(func() {
+		if lease.cancel != nil {
+			lease.cancel()
+		}
+		if lease.done != nil {
+			<-lease.done
+		}
+		releaseRoutingHalfOpenRedisLease(lease.Key, lease.Owner)
+	})
 }
 
 func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string, group string) {
@@ -689,15 +791,22 @@ func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string
 	if !ok {
 		return
 	}
-	leases, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
+	owners, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenProbeOwner](c, constant.ContextKeyRoutingHalfOpenProbeOwners)
+	leases, _ := common.GetContextKeyType[map[routingbreaker.Key]*routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
 	released := false
 	for key := range probes {
-		if key.ChannelID != channelID && !key.IsEndpointScoped() {
+		if owner, exists := owners[key]; exists {
+			if !owner.matches(channelID, infoModel, group) {
+				continue
+			}
+		} else if key.IsEndpointScoped() || key.ChannelID != channelID ||
+			(infoModel != "" && key.Model != infoModel) || (group != "" && key.Group != group) {
 			continue
 		}
 		delete(probes, key)
+		delete(owners, key)
 		if lease, exists := leases[key]; exists {
-			releaseRoutingHalfOpenRedisLease(lease.Key, lease.Owner)
+			lease.stop()
 			delete(leases, key)
 		}
 		routingbreaker.ReleaseDefaultHalfOpenProbe(key)
@@ -707,6 +816,7 @@ func ReleaseRoutingHalfOpenProbe(c *gin.Context, channelID int, infoModel string
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, probes)
+	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbeOwners, owners)
 	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenLeases, leases)
 }
 
@@ -715,18 +825,19 @@ func ReleaseAllRoutingHalfOpenProbes(c *gin.Context) {
 		return
 	}
 	clearRoutingSlowStartProbe(c, 0)
-	probes, ok := common.GetContextKeyType[map[routingbreaker.Key]struct{}](c, constant.ContextKeyRoutingHalfOpenProbes)
-	if !ok || len(probes) == 0 {
+	probes, _ := common.GetContextKeyType[map[routingbreaker.Key]struct{}](c, constant.ContextKeyRoutingHalfOpenProbes)
+	leases, _ := common.GetContextKeyType[map[routingbreaker.Key]*routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
+	if len(probes) == 0 && len(leases) == 0 {
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbes, map[routingbreaker.Key]struct{}{})
-	leases, _ := common.GetContextKeyType[map[routingbreaker.Key]routingHalfOpenRedisLease](c, constant.ContextKeyRoutingHalfOpenLeases)
-	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenLeases, map[routingbreaker.Key]routingHalfOpenRedisLease{})
+	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenProbeOwners, map[routingbreaker.Key]routingHalfOpenProbeOwner{})
+	common.SetContextKey(c, constant.ContextKeyRoutingHalfOpenLeases, map[routingbreaker.Key]*routingHalfOpenRedisLease{})
 	for key := range probes {
 		routingbreaker.ReleaseDefaultHalfOpenProbe(key)
 	}
 	for _, lease := range leases {
-		releaseRoutingHalfOpenRedisLease(lease.Key, lease.Owner)
+		lease.stop()
 	}
 }
 
@@ -768,6 +879,13 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 	candidates := make([]routingselector.Candidate, 0, len(channels))
 	for _, channel := range channels {
 		if channel == nil {
+			continue
+		}
+		trafficAdmissible, trafficErr := ChannelRoutingTrafficAdmissible(param.Ctx, channel.Id)
+		if trafficErr != nil {
+			return nil, trafficErr
+		}
+		if !trafficAdmissible {
 			continue
 		}
 		cacheKey := routinghotcache.Key{
@@ -845,6 +963,15 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 func routingCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot) *routingselector.CostSnapshot {
 	cost := snapshot.Cost
 	known := snapshot.Known
+	if known && snapshot.PricingKnown {
+		if normalizedCost, normalizedKnown, attempted := routingNormalizedCostForRequest(c, snapshot); attempted {
+			return &routingselector.CostSnapshot{
+				Known:       normalizedKnown,
+				Cost:        normalizedCost,
+				UpdatedUnix: snapshot.UpdatedUnix,
+			}
+		}
+	}
 	if known {
 		switch routingBillingMode(snapshot) {
 		case "per_request":
@@ -869,6 +996,54 @@ func routingCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot
 		Cost:        cost,
 		UpdatedUnix: snapshot.UpdatedUnix,
 	}
+}
+
+func routingNormalizedCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot) (float64, bool, bool) {
+	profile := routingCostRequestProfile(c)
+	if profile == nil {
+		promptTokens := 0
+		completionTokens := 0
+		if c != nil {
+			promptTokens = max(common.GetContextKeyInt(c, constant.ContextKeyRoutingPromptProxy), 0)
+			completionTokens = max(common.GetContextKeyInt(c, constant.ContextKeyRoutingEstimatedOutput), 0)
+		}
+		perRequest := snapshot.Pricing.PerRequestCost != nil ||
+			strings.EqualFold(strings.TrimSpace(snapshot.Pricing.BillingMode), "per_request")
+		freeGroup := snapshot.Pricing.GroupRatio != nil && *snapshot.Pricing.GroupRatio == 0
+		if promptTokens == 0 && !perRequest && !freeGroup {
+			return 0, false, false
+		}
+		if promptTokens > 0 && completionTokens == 0 {
+			completionTokens = int(math.Min(float64(promptTokens)*1.5, 512))
+		}
+		profile = &model.RoutingCostRequestProfile{
+			PromptTokens:             int64(promptTokens),
+			MaximumPromptTokens:      int64(promptTokens),
+			ExpectedCompletionTokens: int64(completionTokens),
+			MaximumCompletionTokens:  int64(completionTokens),
+			MaxAttempts:              1,
+		}
+	}
+
+	atUnix := snapshot.UpdatedUnix
+	if atUnix <= 0 {
+		atUnix = common.GetTimestamp()
+	}
+	estimate, err := model.EstimateRoutingCostSnapshot(model.RoutingCostSnapshotVersion{
+		SourceType:      snapshot.AccountSourceType,
+		ObservedTime:    atUnix - 1,
+		EffectiveTime:   atUnix - 1,
+		ExpiresTime:     atUnix + 3_600,
+		Confidence:      model.RoutingCostConfidenceFull,
+		ConfidenceScore: 1,
+		Freshness:       model.RoutingCostFreshnessFresh,
+		FreshnessScore:  1,
+	}, snapshot.Pricing, *profile, atUnix)
+	if err != nil || !estimate.ExpectedKnown || estimate.ExpectedCost < 0 ||
+		math.IsNaN(estimate.ExpectedCost) || math.IsInf(estimate.ExpectedCost, 0) {
+		return 0, false, true
+	}
+	return estimate.ExpectedCost, true, true
 }
 
 func routingCapacityForKey(key routinghotcache.Key) *routingselector.CapacityCooldownSnapshot {
@@ -1118,6 +1293,10 @@ func admissibleAffinityChannelLegacy(c *gin.Context, preferredID int, modelName 
 	preferred, err := model.CacheGetChannel(preferredID)
 	if err != nil || preferred == nil || preferred.Status != common.ChannelStatusEnabled ||
 		!channelSupportsSmartRoutingRequestPath(preferred, requestPath) || !AffinityAdmissible(preferred.Id) {
+		return nil, "", false
+	}
+	trafficAdmissible, trafficErr := ChannelRoutingTrafficAdmissible(c, preferred.Id)
+	if trafficErr != nil || !trafficAdmissible {
 		return nil, "", false
 	}
 	if usingGroup == "auto" {

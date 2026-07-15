@@ -94,10 +94,25 @@ describe('cost source credential summary', () => {
           { length: COST_BINDING_GROUP_DOM_LIMIT + 500 },
           (_, index) => `group-${index}`
         ),
+        groupMeta: {
+          'group-2': {
+            id: '2',
+            name: 'group-2',
+            subscription_type: 'subscription',
+            claude_code_only: true,
+          },
+        },
+        claudeCodeOnlyLabel: 'Claude Code only',
+        subscriptionLabel: 'Subscription',
+        walletBalanceNotUsedLabel: 'Wallet balance not used',
       })
     )
 
     assert.equal((html.match(/<option/g) ?? []).length, 100)
     assert.doesNotMatch(html, /group-100"/)
+    assert.match(
+      html,
+      /value="group-2" label="Claude Code only · Subscription · Wallet balance not used"/
+    )
   })
 })

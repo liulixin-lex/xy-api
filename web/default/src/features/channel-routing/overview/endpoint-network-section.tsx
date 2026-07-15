@@ -39,6 +39,7 @@ import {
 
 import { ChannelRoutingBreakerResetDialog } from '../components/breaker-reset-dialog'
 import { ChannelRoutingIdentityText } from '../components/identity-text'
+import { ChannelRoutingRefetchErrorAlert } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
@@ -78,6 +79,8 @@ export function ChannelRoutingEndpointNetworkSection(props: {
   quorumEligible: boolean
   canOperate: boolean
   loading: boolean
+  fetching?: boolean
+  refetchError?: boolean
   error: unknown
   onRetry: () => void
   page?: number
@@ -87,6 +90,7 @@ export function ChannelRoutingEndpointNetworkSection(props: {
 }) {
   const { t } = useTranslation()
   const format = useChannelRoutingFormatters()
+  const blockingError = props.error != null && !props.refetchError
 
   return (
     <section aria-labelledby='endpoint-network-title'>
@@ -129,7 +133,14 @@ export function ChannelRoutingEndpointNetworkSection(props: {
         </div>
       ) : null}
 
-      {props.error ? (
+      {props.refetchError ? (
+        <ChannelRoutingRefetchErrorAlert
+          isFetching={props.fetching ?? false}
+          onRetry={props.onRetry}
+        />
+      ) : null}
+
+      {blockingError ? (
         <div
           className='border-destructive/30 bg-destructive/5 text-destructive flex flex-wrap items-center gap-3 rounded-lg border p-3 text-sm'
           role='alert'
@@ -145,13 +156,13 @@ export function ChannelRoutingEndpointNetworkSection(props: {
         </div>
       ) : null}
 
-      {!props.loading && !props.error && props.endpoints.length === 0 ? (
+      {!props.loading && !blockingError && props.endpoints.length === 0 ? (
         <div className='text-muted-foreground rounded-lg border px-4 py-8 text-center text-sm'>
           {t('No endpoint breaker evidence is available yet.')}
         </div>
       ) : null}
 
-      {!props.loading && !props.error && props.endpoints.length > 0 ? (
+      {!props.loading && !blockingError && props.endpoints.length > 0 ? (
         <>
           <div className='hidden overflow-hidden rounded-lg border xl:block'>
             <Table
@@ -259,7 +270,7 @@ export function ChannelRoutingEndpointNetworkSection(props: {
                       {format.timestamp(endpoint.effective.updated_at)}
                     </TableCell>
                     <TableCell>
-                      {props.canOperate ? (
+                      {props.canOperate && !props.refetchError ? (
                         <ChannelRoutingBreakerResetDialog
                           compact
                           request={{
@@ -342,7 +353,7 @@ export function ChannelRoutingEndpointNetworkSection(props: {
                     </dd>
                   </div>
                 </dl>
-                {props.canOperate ? (
+                {props.canOperate && !props.refetchError ? (
                   <div className='mt-3 flex justify-end'>
                     <ChannelRoutingBreakerResetDialog
                       request={{
@@ -366,6 +377,7 @@ export function ChannelRoutingEndpointNetworkSection(props: {
               page={props.page}
               pageSize={props.pageSize}
               total={props.total}
+              disabled={props.refetchError}
               onPageChange={props.onPageChange}
               onPageSizeChange={props.onPageSizeChange}
             />

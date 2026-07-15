@@ -555,11 +555,15 @@ export async function listChannelRoutingPolicyDrafts(params: {
 }
 
 export async function getChannelRoutingPolicyDraft(
-  id: number
+  id: number,
+  signal?: AbortSignal
 ): Promise<PolicyDraftDetail> {
   const response = await api.get<
     ApiEnvelope<Omit<PolicyDraftDetail, 'server_etag'>>
-  >(`/api/channel-routing/v2/policy-drafts/${id}`, requestConfig)
+  >(`/api/channel-routing/v2/policy-drafts/${id}`, {
+    ...requestConfig,
+    signal,
+  })
   return {
     ...unwrap(response.data),
     server_etag: response.headers.etag || '',
@@ -578,12 +582,18 @@ export async function createChannelRoutingPolicyDraft(payload: {
   return unwrap(response.data)
 }
 
-function policyDraftIfMatch(draft: PolicyDraftSummary): string {
+type PolicyDraftWriteAuthority = PolicyDraftSummary & {
+  server_etag?: string
+}
+
+function policyDraftIfMatch(draft: PolicyDraftWriteAuthority): string {
+  const responseETag = draft.server_etag?.trim()
+  if (responseETag) return responseETag
   return `"crd.${draft.id}.${draft.version}.${draft.etag}"`
 }
 
 export async function updateChannelRoutingPolicyDraft(
-  draft: PolicyDraftSummary,
+  draft: PolicyDraftWriteAuthority,
   document: PolicyDocument
 ): Promise<PolicyDraftSummary> {
   const response = await api.put<ApiEnvelope<PolicyDraftSummary>>(

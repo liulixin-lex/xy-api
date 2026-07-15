@@ -62,3 +62,37 @@ func TestGetRankedSatisfiedChannelsUsesNormalizedModelFallback(t *testing.T) {
 	require.Len(t, channels, 1)
 	assert.Equal(t, 4, channels[0].Id)
 }
+
+func TestGetRandomSatisfiedChannelWithEligibilityFiltersBeforePriority(t *testing.T) {
+	previousMemoryCache := common.MemoryCacheEnabled
+	previousGroupMap := group2model2channels
+	previousChannels := channelsIDM
+	common.MemoryCacheEnabled = true
+	high := int64(100)
+	low := int64(10)
+	weight := uint(100)
+	group2model2channels = map[string]map[string][]int{
+		"default": {"claude-test": {1, 2}},
+	}
+	channelsIDM = map[int]*Channel{
+		1: {Id: 1, Name: "restricted-high", Priority: &high, Weight: &weight},
+		2: {Id: 2, Name: "ordinary-low", Priority: &low, Weight: &weight},
+	}
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		group2model2channels = previousGroupMap
+		channelsIDM = previousChannels
+	})
+
+	channel, err := GetRandomSatisfiedChannelWithEligibility(
+		"default",
+		"claude-test",
+		0,
+		"/v1/messages",
+		func(channel *Channel) bool { return channel.Id != 1 },
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, channel)
+	assert.Equal(t, 2, channel.Id)
+}

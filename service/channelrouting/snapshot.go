@@ -251,6 +251,7 @@ type ChannelSnapshot struct {
 	CostSyncFailures     int      `json:"cost_sync_failures"`
 	CostSyncBackoffUntil int64    `json:"cost_sync_backoff_until"`
 	CostSyncError        string   `json:"cost_sync_error,omitempty"`
+	ServesClaudeCode     bool     `json:"serves_claude_code,omitempty"`
 }
 
 type Identity struct {
@@ -1086,7 +1087,7 @@ metricPages:
 	for len(bindings) <= limits.MaxChannels {
 		var page []model.RoutingChannelBinding
 		query := db.WithContext(ctx).
-			Select("channel_id", "enabled", "sync_failure_count", "sync_backoff_until", "last_sync_error").
+			Select("channel_id", "enabled", "serves_claude_code", "sync_failure_count", "sync_backoff_until", "last_sync_error").
 			Order("channel_id asc").Limit(500)
 		if lastBindingChannelID > 0 {
 			query = query.Where("channel_id > ?", lastBindingChannelID)
@@ -1160,6 +1161,8 @@ metricPages:
 	channelViewByID := make(map[int]ChannelSnapshot, len(channels))
 	invalidNumericValues := 0
 	for _, channel := range channels {
+		binding, hasBinding := bindingByChannel[channel.Id]
+		hasEnabledCostConnector := hasBinding && binding.Enabled
 		view := ChannelSnapshot{
 			ID:                 channel.Id,
 			RoutingGeneration:  channel.RoutingGeneration,
@@ -1185,7 +1188,7 @@ metricPages:
 			} else if balance.Known {
 				invalidNumericValues++
 			}
-		} else if channel.BalanceUpdatedTime > 0 {
+		} else if !hasEnabledCostConnector && channel.BalanceUpdatedTime > 0 {
 			if finiteNumber(channel.Balance) {
 				view.BalanceKnown = true
 				view.Balance = channel.Balance
@@ -1194,8 +1197,9 @@ metricPages:
 				invalidNumericValues++
 			}
 		}
-		if binding, ok := bindingByChannel[channel.Id]; ok {
+		if hasBinding {
 			view.CostConnectorEnabled = binding.Enabled
+			view.ServesClaudeCode = binding.ServesClaudeCode
 			view.CostSyncFailures = binding.SyncFailureCount
 			view.CostSyncBackoffUntil = binding.SyncBackoffUntil
 			if binding.LastSyncError != nil {

@@ -701,6 +701,23 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
+	trafficAdmissible, trafficErr := service.ChannelRoutingTrafficAdmissible(c, channel.Id)
+	if trafficErr != nil {
+		return types.NewErrorWithStatusCode(
+			trafficErr,
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if !trafficAdmissible {
+		return types.NewErrorWithStatusCode(
+			service.ErrRoutingChannelTrafficRestricted,
+			types.ErrorCodeAccessDenied,
+			http.StatusForbidden,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
 	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)

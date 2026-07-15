@@ -66,11 +66,7 @@ export function ChannelRoutingScrollableTabsList(props: {
 
   return (
     <div ref={viewportRef} className='overflow-x-auto pb-1'>
-      <TabsList
-        activateOnFocus
-        variant='line'
-        className='min-w-max justify-start'
-      >
+      <TabsList variant='line' className='min-w-max justify-start'>
         {props.children}
         <span
           aria-hidden='true'

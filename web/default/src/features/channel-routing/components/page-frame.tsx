@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useNavigate } from '@tanstack/react-router'
+import { Link } from '@tanstack/react-router'
 import {
   Activity,
   Coins,
@@ -26,15 +26,14 @@ import {
   ShieldCheck,
   WifiOff,
 } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
-import { Tabs, TabsTrigger } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 
 import { useChannelRoutingRealtimeStatus } from '../shell/realtime-state'
 import type { ChannelRoutingSection } from '../types'
-import { ChannelRoutingScrollableTabsList } from './scrollable-tabs-list'
 
 const sections: Array<{
   id: ChannelRoutingSection
@@ -56,9 +55,56 @@ export function ChannelRoutingPageFrame(props: {
   breadcrumb?: ReactNode
   children: ReactNode
 }) {
-  const { t } = useTranslation()
-  const navigate = useNavigate()
+  const { i18n, t } = useTranslation()
   const realtimeStatus = useChannelRoutingRealtimeStatus()
+  const navigationRef = useRef<HTMLElement>(null)
+  const language = i18n.resolvedLanguage || i18n.language
+
+  useEffect(() => {
+    const navigation = navigationRef.current
+    if (!navigation) return
+
+    let animationFrame = 0
+    const revealActiveLink = () => {
+      window.cancelAnimationFrame(animationFrame)
+      animationFrame = window.requestAnimationFrame(() => {
+        const activeLink = navigation.querySelector<HTMLElement>(
+          '[aria-current="page"]'
+        )
+        if (!activeLink) return
+
+        const navigationRect = navigation.getBoundingClientRect()
+        const activeRect = activeLink.getBoundingClientRect()
+        const navigationStyle = window.getComputedStyle(navigation)
+        const inlineStartPadding = Number.parseFloat(
+          navigationStyle.paddingInlineStart
+        )
+        navigation.scrollTo({
+          behavior: 'auto',
+          left:
+            navigation.scrollLeft +
+            activeRect.left -
+            navigationRect.left -
+            (Number.isFinite(inlineStartPadding) ? inlineStartPadding : 0),
+        })
+      })
+    }
+
+    revealActiveLink()
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.cancelAnimationFrame(animationFrame)
+    }
+
+    const resizeObserver = new ResizeObserver(revealActiveLink)
+    resizeObserver.observe(navigation)
+    const links = navigation.firstElementChild
+    if (links) resizeObserver.observe(links)
+
+    return () => {
+      resizeObserver.disconnect()
+      window.cancelAnimationFrame(animationFrame)
+    }
+  }, [language, props.activeSection])
 
   return (
     <SectionPageLayout as='div' fixedContent headingAs='h1'>
@@ -80,32 +126,39 @@ export function ChannelRoutingPageFrame(props: {
         </SectionPageLayout.Actions>
       ) : null}
       <SectionPageLayout.Content>
-        <div className='flex h-full min-h-0 flex-col gap-3 max-lg:[&_[data-slot=button]]:min-h-11 max-lg:[&_[data-slot=button]]:min-w-11 max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11'>
-          <Tabs
-            value={props.activeSection}
-            onValueChange={(value) => {
-              void navigate({
-                to: '/channel-routing/$section',
-                params: { section: value as ChannelRoutingSection },
-              })
-            }}
+        <div className='channel-routing-touch-surface flex h-full min-h-0 flex-col gap-3 max-lg:[&_[data-slot=button]]:min-h-11 max-lg:[&_[data-slot=button]]:min-w-11 max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11'>
+          <nav
+            ref={navigationRef}
+            aria-label={t('Channel Routing')}
+            className='overflow-x-auto p-1'
           >
-            <ChannelRoutingScrollableTabsList activeValue={props.activeSection}>
+            <div className='flex min-w-max items-center gap-1 border-b'>
               {sections.map((section) => {
                 const Icon = section.icon
+                const active = section.id === props.activeSection
                 return (
-                  <TabsTrigger
+                  <Link
                     key={section.id}
-                    value={section.id}
-                    className='max-lg:min-h-11'
+                    to='/channel-routing/$section'
+                    params={{ section: section.id }}
+                    aria-current={active ? 'page' : undefined}
+                    className={cn(
+                      'text-foreground/60 hover:text-foreground focus-visible:ring-ring/50 relative inline-flex min-h-8 items-center justify-center gap-1.5 rounded-md px-1.5 py-0.5 text-sm font-medium whitespace-nowrap transition-colors after:absolute after:inset-x-0 after:-bottom-1 after:h-0.5 after:bg-foreground after:opacity-0 after:transition-opacity focus-visible:ring-[3px] focus-visible:outline-1 max-lg:min-h-11 dark:text-muted-foreground dark:hover:text-foreground',
+                      active &&
+                        'text-foreground after:opacity-100 dark:text-foreground'
+                    )}
                   >
-                    <Icon aria-hidden='true' />
+                    <Icon className='size-4' aria-hidden='true' />
                     {t(section.label)}
-                  </TabsTrigger>
+                  </Link>
                 )
               })}
-            </ChannelRoutingScrollableTabsList>
-          </Tabs>
+              <span
+                aria-hidden='true'
+                className='w-[calc(100dvw-10rem)] max-w-[28rem] min-w-8 shrink-0 lg:hidden'
+              />
+            </div>
+          </nav>
           {realtimeStatus === 'polling' ? (
             <div
               role='status'

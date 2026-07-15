@@ -300,6 +300,25 @@ func (tier RequestTenantTier) valid() bool {
 	}
 }
 
+type RequestTrafficClass string
+
+const (
+	RequestTrafficClassLegacy     RequestTrafficClass = ""
+	RequestTrafficClassUnknown    RequestTrafficClass = "unknown"
+	RequestTrafficClassStandard   RequestTrafficClass = "standard"
+	RequestTrafficClassClaudeCode RequestTrafficClass = "claude_code"
+)
+
+func (class RequestTrafficClass) valid() bool {
+	switch class {
+	case RequestTrafficClassLegacy, RequestTrafficClassUnknown,
+		RequestTrafficClassStandard, RequestTrafficClassClaudeCode:
+		return true
+	default:
+		return false
+	}
+}
+
 type RequestProfileV2Input struct {
 	RequestPath              string
 	GroupName                string
@@ -327,6 +346,7 @@ type RequestProfileV2Input struct {
 	IdempotencyKeyPresent    bool
 	TenantTier               RequestTenantTier
 	CostBudgetNanoUSD        int64
+	TrafficClass             RequestTrafficClass
 }
 
 func NewRequestProfileV2(input RequestProfileV2Input) (RequestProfile, error) {
@@ -364,6 +384,7 @@ func NewRequestProfileV2(input RequestProfileV2Input) (RequestProfile, error) {
 		IdempotencyKeyPresent:    input.IdempotencyKeyPresent,
 		TenantTier:               input.TenantTier,
 		CostBudgetNanoUSD:        input.CostBudgetNanoUSD,
+		TrafficClass:             input.TrafficClass,
 	}
 	if inputTokens.State == RequestQuantityKnown {
 		profile.PromptTokenEstimate = int(inputTokens.Value)
@@ -381,7 +402,7 @@ func validateRequestProfile(profile RequestProfile) error {
 	if profile.GroupName == "" || profile.ModelName == "" || profile.RetryIndex < 0 ||
 		profile.PromptTokenEstimate < 0 || profile.CompletionTokenEstimate < 0 ||
 		!validShadowText(profile.RequestPath, 512) || !validShadowText(profile.GroupName, 64) ||
-		!validShadowText(profile.ModelName, 128) {
+		!validShadowText(profile.ModelName, 128) || !profile.TrafficClass.valid() {
 		return ErrShadowReplayInvalid
 	}
 	switch profile.SchemaVersion {

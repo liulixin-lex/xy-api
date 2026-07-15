@@ -66,6 +66,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -189,7 +190,6 @@ export function ChannelRoutingChannelsPage() {
         status: search.status,
         type: search.type,
       }),
-    placeholderData: (previous) => previous,
   })
   const endpointsQuery = useQuery({
     queryKey: channelRoutingQueryKeys.endpoints({
@@ -203,7 +203,6 @@ export function ChannelRoutingChannelsPage() {
         page_size: endpointPageSize,
         search: search.search || undefined,
       }),
-    placeholderData: (previous) => previous,
   })
 
   const updateSearch = (patch: Record<string, string | number | undefined>) => {
@@ -360,9 +359,15 @@ export function ChannelRoutingChannelsPage() {
           </div>
 
           {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-          {query.isError ? (
+          {query.isError && !query.data ? (
             <ChannelRoutingErrorState
               error={query.error}
+              onRetry={() => void query.refetch()}
+            />
+          ) : null}
+          {query.isRefetchError && query.data ? (
+            <ChannelRoutingRefetchErrorAlert
+              isFetching={query.isFetching}
               onRetry={() => void query.refetch()}
             />
           ) : null}
@@ -593,6 +598,7 @@ export function ChannelRoutingChannelsPage() {
                 page={page}
                 pageSize={pageSize}
                 total={query.data.total}
+                disabled={query.isRefetchError}
                 onPageChange={(nextPage) => updateSearch({ page: nextPage })}
                 onPageSizeChange={(nextSize) =>
                   updateSearch({ page: 1, pageSize: nextSize })
@@ -612,6 +618,10 @@ export function ChannelRoutingChannelsPage() {
           }
           canOperate={canOperate}
           loading={endpointsQuery.isLoading}
+          fetching={endpointsQuery.isFetching}
+          refetchError={
+            endpointsQuery.isRefetchError && endpointsQuery.data != null
+          }
           error={endpointsQuery.error}
           onRetry={() => void endpointsQuery.refetch()}
           page={endpointPage}

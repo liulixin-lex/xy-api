@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { RoutingCostBinding } from '../types'
+import type {
+  RoutingCostBinding,
+  RoutingCostBindingRequest,
+  RoutingCostBindingUpstreamType,
+} from '../types'
 import {
   costBindingFormValues,
   type CostBindingFormValues,
@@ -81,6 +85,59 @@ export class CostBindingEditorSessionManager {
   }
 }
 
+const previewCredentialKeys = [
+  'new_api_access_token',
+  'gateway_api_key',
+  'sub2api_email',
+  'sub2api_password',
+  'sub2api_token',
+  'custom_ca_pem',
+] as const
+
+export function costBindingAccountPreviewMatchesRequest(
+  previous: RoutingCostBindingRequest,
+  current: RoutingCostBindingRequest
+): boolean {
+  if (
+    previous.upstream_type !== current.upstream_type ||
+    previous.base_url !== current.base_url ||
+    previous.new_api_user_id !== current.new_api_user_id ||
+    previous.egress_allowed_private_cidrs.length !==
+      current.egress_allowed_private_cidrs.length
+  ) {
+    return false
+  }
+
+  for (
+    let index = 0;
+    index < previous.egress_allowed_private_cidrs.length;
+    index += 1
+  ) {
+    if (
+      previous.egress_allowed_private_cidrs[index] !==
+      current.egress_allowed_private_cidrs[index]
+    ) {
+      return false
+    }
+  }
+
+  for (const key of previewCredentialKeys) {
+    if (previous.credentials[key] !== current.credentials[key]) return false
+  }
+  return true
+}
+
+export function costBindingTestPreviewMatchesRequest(
+  previous: RoutingCostBindingRequest,
+  current: RoutingCostBindingRequest
+): boolean {
+  return (
+    costBindingAccountPreviewMatchesRequest(previous, current) &&
+    previous.upstream_group === current.upstream_group &&
+    previous.serves_claude_code === current.serves_claude_code
+  )
+}
+
 type CostBindingDirtyFields = Partial<
   Record<keyof CostBindingFormValues, boolean>
 >
@@ -132,7 +189,7 @@ const credentialFields = [
     value: 'sub2apiToken',
     clear: 'clearSub2apiToken',
     mask: 'sub2api_token',
-    label: 'Sub2API Token',
+    label: 'Sub2API JWT',
   },
   {
     value: 'customCaPem',
@@ -212,7 +269,6 @@ const serverFieldNames = {
   sub2api_password: 'sub2apiPassword',
   sub2api_token: 'sub2apiToken',
   custom_ca_pem: 'customCaPem',
-  credentials: 'gatewayApiKey',
 } as const satisfies Record<string, keyof CostBindingFormValues>
 
 const serverReasonKeys: Record<string, string> = {
@@ -226,18 +282,24 @@ const serverReasonKeys: Record<string, string> = {
   too_long: 'This value is too long.',
   out_of_range: 'This value is outside the allowed range.',
   credential_required: 'Enter the required credential.',
+  management_auth_required: 'Enter the required credential.',
+  serving_auth_required:
+    'Gateway API Key is required to verify which models the channel can serve.',
   insecure_scheme:
     'HTTPS is required. Do not place tokens or passwords in the URL.',
   credentials_not_allowed:
     'HTTPS is required. Do not place tokens or passwords in the URL.',
   sensitive_query_not_allowed:
     'HTTPS is required. Do not place tokens or passwords in the URL.',
+  query_or_fragment_not_allowed:
+    'Enter a Base URL without query parameters or a fragment.',
   unsafe_target: 'This target is blocked by the network trust policy.',
 }
 
 export function costBindingServerFieldError(
   failure: { field?: string; reason?: string },
-  t: (key: string) => string
+  t: (key: string) => string,
+  upstreamType?: RoutingCostBindingUpstreamType
 ): { name: keyof CostBindingFormValues; message: string } | null {
   const rawField = failure.field
     ?.trim()
@@ -245,13 +307,35 @@ export function costBindingServerFieldError(
     .replace(/^credentials\[/, '')
     .replace(/\]$/, '')
   if (!rawField) return null
-  const name = serverFieldNames[rawField as keyof typeof serverFieldNames]
-  if (!name) return null
 
   const reason = failure.reason
     ?.trim()
     .toLowerCase()
     .replaceAll(/[\s-]+/g, '_')
+
+  if (rawField === 'credentials') {
+    if (reason !== 'management_auth_required') return null
+    if (upstreamType === 'newapi') {
+      return {
+        name: 'newApiAccessToken',
+        message: t(
+          'New API account access requires both an Access Token and user ID. A separate Gateway API Key verifies which models the channel can serve.'
+        ),
+      }
+    }
+    if (upstreamType === 'sub2api') {
+      return {
+        name: 'sub2apiToken',
+        message: t(
+          'Sub2API account access requires a JWT or both email and password. Gateway API Key is kept separate and does not authorize account balance access.'
+        ),
+      }
+    }
+    return null
+  }
+
+  const name = serverFieldNames[rawField as keyof typeof serverFieldNames]
+  if (!name) return null
   const messageKey =
     (reason ? serverReasonKeys[reason] : undefined) ??
     'The server rejected this value. Review it and try again.'

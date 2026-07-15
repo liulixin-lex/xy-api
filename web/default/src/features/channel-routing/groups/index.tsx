@@ -42,6 +42,7 @@ import {
   ChannelRoutingEmptyState,
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
@@ -68,7 +69,6 @@ export function ChannelRoutingGroupsPage() {
         page_size: pageSize,
         search: search.search || undefined,
       }),
-    placeholderData: (previous) => previous,
   })
 
   const updateSearch = (
@@ -150,9 +150,15 @@ export function ChannelRoutingGroupsPage() {
         </form>
 
         {query.isLoading ? <ChannelRoutingLoadingState /> : null}
-        {query.isError ? (
+        {query.isError && !query.data ? (
           <ChannelRoutingErrorState
             error={query.error}
+            onRetry={() => void query.refetch()}
+          />
+        ) : null}
+        {query.isRefetchError && query.data ? (
+          <ChannelRoutingRefetchErrorAlert
+            isFetching={query.isFetching}
             onRetry={() => void query.refetch()}
           />
         ) : null}
@@ -166,7 +172,7 @@ export function ChannelRoutingGroupsPage() {
         {query.data && query.data.items.length > 0 ? (
           <>
             <div className='hidden overflow-hidden rounded-lg border md:block'>
-              <Table>
+              <Table scrollAreaLabel={t('Routing groups')}>
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('Group')}</TableHead>
@@ -221,7 +227,7 @@ export function ChannelRoutingGroupsPage() {
                           {group.open_models}
                         </span>
                         <span className='text-muted-foreground px-1'>/</span>
-                        <span className='text-amber-700 tabular-nums dark:text-amber-300'>
+                        <span className='text-warning tabular-nums'>
                           {group.degraded_models}
                         </span>
                       </TableCell>
@@ -259,6 +265,7 @@ export function ChannelRoutingGroupsPage() {
                       <ChannelRoutingIdentityText
                         text={group.display_name || group.group_name}
                         className='text-sm font-medium'
+                        withinInteractive
                       />
                       <div className='text-muted-foreground truncate text-xs'>
                         {group.group_name} · {group.policy_profile}
@@ -298,6 +305,7 @@ export function ChannelRoutingGroupsPage() {
               page={page}
               pageSize={pageSize}
               total={query.data.total}
+              disabled={query.isRefetchError}
               onPageChange={(nextPage) => updateSearch({ page: nextPage })}
               onPageSizeChange={(nextSize) =>
                 updateSearch({ page: 1, pageSize: nextSize })

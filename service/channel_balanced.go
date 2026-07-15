@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
+	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
 	globalsetting "github.com/QuantumNous/new-api/setting"
@@ -88,7 +90,7 @@ func cacheGetChannelRoutingBalanced(
 					return nil, group, true, err
 				}
 			} else {
-				channel, _ = model.GetRandomSatisfiedChannel(group, param.ModelName, priorityRetry, param.RequestPath)
+				channel, _ = getRandomSatisfiedChannelForRequest(param, group, priorityRetry)
 			}
 		}
 		if channel == nil {
@@ -153,6 +155,10 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 		return nil, true, err
 	}
 	allowedChannels, err := model.GetRankedSatisfiedChannels(group, param.ModelName, param.RequestPath)
+	if err != nil {
+		return nil, true, err
+	}
+	allowedChannels, err = filterRoutingTrafficAdmissibleChannels(param.Ctx, allowedChannels)
 	if err != nil {
 		return nil, true, err
 	}
@@ -229,6 +235,9 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 				},
 			},
 			PreferredChannelID: preferredChannelID,
+			RuntimeByChannelID: channelRoutingBalancedRuntimeByChannelID(
+				session, channelByID, param.ModelName, group,
+			),
 		})
 		if planErr != nil {
 			return nil, true, planErr
@@ -277,7 +286,12 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
 		}
 		probeAcquired, probeErr := acquireRoutingHalfOpenProbeForKey(
-			param.Ctx, probeKey, plan.SelectedBreaker, probeSettings, true,
+			param.Ctx,
+			probeKey,
+			routingHalfOpenProbeOwner{ChannelID: selected.Id, Model: param.ModelName, Group: group},
+			plan.SelectedBreaker,
+			probeSettings,
+			true,
 		)
 		if !probeAcquired {
 			probeExcluded = append(probeExcluded, selected.Id)
@@ -430,6 +444,50 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 		return selected, true, nil
 	}
 	return nil, true, nil
+}
+
+func channelRoutingBalancedRuntimeByChannelID(
+	session *channelrouting.RequestRoutingSession,
+	channels map[int]*model.Channel,
+	modelName string,
+	group string,
+) map[int]routingselector.BalancedRuntimeState {
+	runtimeByChannelID := make(map[int]routingselector.BalancedRuntimeState, len(channels))
+	for channelID, channel := range channels {
+		if channelID <= 0 || channel == nil || channel.Id != channelID || channel.ChannelInfo.IsMultiKey {
+			continue
+		}
+		identity, exists := session.IdentityForChannel(channelID)
+		if !exists || identity.MemberID <= 0 {
+			continue
+		}
+		key := routinghotcache.Key{
+			ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model: modelName, Group: group,
+		}
+		state := routingselector.BalancedRuntimeState{
+			Inflight: routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
+				PoolMemberID: identity.MemberID,
+				CredentialID: identity.CredentialID,
+				Model:        modelName,
+			}),
+			HasInflight: true,
+		}
+		if capacity, ok := routinghotcache.GetCapacityCooldown(key); ok {
+			cooldownUntil := max(capacity.CooldownUntilUnixMilli, int64(0))
+			state.CooldownUntilUnixMilli = &cooldownUntil
+		}
+		if breaker, ok := routinghotcache.GetBreaker(key); ok {
+			state.Breaker = &routingselector.BreakerSnapshot{
+				State: breaker.State, Reason: breaker.Reason,
+				CooldownUntilUnix: breaker.CooldownUntilUnix,
+				HalfOpenInflight:  breaker.HalfOpenInflight,
+				UpdatedUnix:       breaker.UpdatedUnix,
+			}
+		}
+		runtimeByChannelID[channelID] = state
+	}
+	return runtimeByChannelID
 }
 
 func setChannelRoutingBalancedAffinity(c *gin.Context, group string, channelID int) {

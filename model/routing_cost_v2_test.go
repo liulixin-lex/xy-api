@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -151,6 +152,462 @@ func TestRoutingCostVersionDualWriteIsAtomic(t *testing.T) {
 	var latestCount int64
 	require.NoError(t, DB.Model(&RoutingCostSnapshot{}).Count(&latestCount).Error)
 	assert.Zero(t, latestCount)
+}
+
+func TestCompleteRoutingCostVersionSyncReconcilesLatestModelsAtomicallyAndByChannel(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}))
+	require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+
+	vipBinding := RoutingChannelBinding{
+		ChannelID: 601, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://shared-upstream.example", UpstreamGroup: "vip", Enabled: true,
+	}
+	basicBinding := RoutingChannelBinding{
+		ChannelID: 602, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://shared-upstream.example", UpstreamGroup: "basic", Enabled: true,
+	}
+	require.NoError(t, DB.Create(&vipBinding).Error)
+	require.NoError(t, DB.Create(&basicBinding).Error)
+	accountSpec := RoutingUpstreamAccountSpec{
+		SourceType:     RoutingUpstreamTypeNewAPI,
+		StableIdentity: "shared-upstream-account",
+		MaskedIdentity: "shared-***-account",
+		Status:         RoutingUpstreamAccountStatusActive,
+		LastSyncStatus: RoutingUpstreamSyncStatusSuccess,
+	}
+
+	vipInitial, err := CompleteRoutingCostVersionSyncContext(
+		context.Background(),
+		vipBinding,
+		accountSpec,
+		[]RoutingCostSnapshotVersionWrite{
+			routingCostVersionSyncWriteForTest(vipBinding, "model-a", 0.5),
+			routingCostVersionSyncWriteForTest(vipBinding, "model-b", 0.6),
+		},
+	)
+	require.NoError(t, err)
+	basicInitial, err := CompleteRoutingCostVersionSyncContext(
+		context.Background(),
+		basicBinding,
+		accountSpec,
+		[]RoutingCostSnapshotVersionWrite{
+			routingCostVersionSyncWriteForTest(basicBinding, "model-a", 0.7),
+			routingCostVersionSyncWriteForTest(basicBinding, "model-b", 0.8),
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, vipInitial.Account.ID, basicInitial.Account.ID)
+
+	var removedVersion RoutingCostSnapshotVersion
+	for _, result := range vipInitial.Versions {
+		if result.Version.LocalModel == "model-b" {
+			removedVersion = result.Version
+			break
+		}
+	}
+	require.NotZero(t, removedVersion.ID)
+
+	var currentVIPBinding RoutingChannelBinding
+	require.NoError(t, DB.Where("id = ?", vipBinding.ID).First(&currentVIPBinding).Error)
+	updatedA := routingCostVersionSyncWriteForTest(currentVIPBinding, "model-a", 0.9)
+	updatedA.ObservedTime += 10
+	updatedA.ExpiresTime += 10
+	wrongGroupB := routingCostVersionSyncWriteForTest(currentVIPBinding, "model-b", 1.0)
+	wrongGroupB.UpstreamGroup = basicBinding.UpstreamGroup
+
+	var versionCountBeforeFailure int64
+	require.NoError(t, DB.Model(&RoutingCostSnapshotVersion{}).Count(&versionCountBeforeFailure).Error)
+	_, err = CompleteRoutingCostVersionSyncContext(
+		context.Background(),
+		currentVIPBinding,
+		accountSpec,
+		[]RoutingCostSnapshotVersionWrite{updatedA, wrongGroupB},
+	)
+	require.ErrorIs(t, err, ErrRoutingBindingChanged)
+
+	var vipLatestAfterFailure []RoutingCostSnapshot
+	require.NoError(t, DB.Where("channel_id = ?", vipBinding.ChannelID).
+		Order("model_name asc").Find(&vipLatestAfterFailure).Error)
+	require.Len(t, vipLatestAfterFailure, 2)
+	assert.Equal(t, "model-a", vipLatestAfterFailure[0].ModelName)
+	assert.Equal(t, "model-b", vipLatestAfterFailure[1].ModelName)
+	var versionCountAfterFailure int64
+	require.NoError(t, DB.Model(&RoutingCostSnapshotVersion{}).Count(&versionCountAfterFailure).Error)
+	assert.Equal(t, versionCountBeforeFailure, versionCountAfterFailure)
+
+	vipShrunk, err := CompleteRoutingCostVersionSyncContext(
+		context.Background(), currentVIPBinding, accountSpec, []RoutingCostSnapshotVersionWrite{updatedA},
+	)
+	require.NoError(t, err)
+	require.Len(t, vipShrunk.Latest, 1)
+	assert.Equal(t, "model-a", vipShrunk.Latest[0].ModelName)
+
+	var vipLatest []RoutingCostSnapshot
+	require.NoError(t, DB.Where("channel_id = ?", vipBinding.ChannelID).
+		Order("model_name asc").Find(&vipLatest).Error)
+	require.Len(t, vipLatest, 1)
+	assert.Equal(t, "model-a", vipLatest[0].ModelName)
+
+	var basicLatest []RoutingCostSnapshot
+	require.NoError(t, DB.Where("channel_id = ?", basicBinding.ChannelID).
+		Order("model_name asc").Find(&basicLatest).Error)
+	require.Len(t, basicLatest, 2)
+	assert.Equal(t, "model-a", basicLatest[0].ModelName)
+	assert.Equal(t, "model-b", basicLatest[1].ModelName)
+	assert.Equal(t, basicBinding.UpstreamGroup, basicLatest[0].UpstreamGroup)
+	assert.Equal(t, basicBinding.UpstreamGroup, basicLatest[1].UpstreamGroup)
+
+	var retainedVersion RoutingCostSnapshotVersion
+	require.NoError(t, DB.Where("id = ?", removedVersion.ID).First(&retainedVersion).Error)
+	assert.Equal(t, removedVersion.PricingHash, retainedVersion.PricingHash)
+	assert.Equal(t, "model-b", retainedVersion.LocalModel)
+}
+
+func TestCompleteRoutingCostVersionSyncClearsSubscriptionChannelBalanceAndKeepsAccountWallet(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}, &RoutingChannelHealthState{}))
+	require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+
+	binding := RoutingChannelBinding{
+		ChannelID: 603, UpstreamType: RoutingUpstreamTypeSub2API,
+		BaseURL: "https://subscription.example", UpstreamGroup: "vip", Enabled: true,
+	}
+	require.NoError(t, DB.Create(&binding).Error)
+	require.NoError(t, DB.Create(&RoutingChannelHealthState{
+		ChannelID: binding.ChannelID, AuthFailure: true, AuthFailureReason: "serving-auth",
+		AuthFailureUntil: 999, BalanceKnown: true, Balance: 0.25,
+		BalanceUpdatedTime: 100, UpdatedTime: 100,
+	}).Error)
+
+	result, err := CompleteRoutingCostVersionSyncContext(
+		context.Background(),
+		binding,
+		RoutingUpstreamAccountSpec{
+			SourceType: RoutingUpstreamTypeSub2API, StableIdentity: "subscription-account",
+			MaskedIdentity: "subscription-***", Status: RoutingUpstreamAccountStatusActive,
+			BalanceKnown: true, Balance: 9.25, BalanceUpdatedAt: 200,
+			ChannelBalanceNotApplicable: true,
+			LastSyncStatus:              RoutingUpstreamSyncStatusSuccess,
+		},
+		[]RoutingCostSnapshotVersionWrite{
+			routingCostVersionSyncWriteForTest(binding, "claude-subscription", 0.5),
+		},
+	)
+
+	require.NoError(t, err)
+	assert.True(t, result.Account.BalanceKnown)
+	assert.Equal(t, 9.25, result.Account.Balance)
+	assert.Equal(t, int64(200), result.Account.BalanceUpdatedAt)
+
+	var health RoutingChannelHealthState
+	require.NoError(t, DB.Where("channel_id = ?", binding.ChannelID).First(&health).Error)
+	assert.True(t, health.AuthFailure)
+	assert.Equal(t, "serving-auth", health.AuthFailureReason)
+	assert.False(t, health.BalanceKnown)
+	assert.Zero(t, health.Balance)
+	assert.Zero(t, health.BalanceUpdatedTime)
+}
+
+func TestUpdateRoutingUpstreamAccountStatusForBindingIsFencedAndNeverCreates(t *testing.T) {
+	newFixture := func(t *testing.T, createAccount bool) (RoutingChannelBinding, RoutingUpstreamAccountSpec) {
+		t.Helper()
+		db := openRoutingSQLiteTestDB(t)
+		withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+		require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}))
+		require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+		userID := 42
+		binding := RoutingChannelBinding{
+			ChannelID: 604, UpstreamType: RoutingUpstreamTypeNewAPI,
+			BaseURL: "https://fenced.example", UpstreamGroup: "vip",
+			NewAPIUserID: &userID, Enabled: true,
+		}
+		require.NoError(t, DB.Create(&binding).Error)
+		spec := RoutingUpstreamAccountSpec{
+			SourceType: RoutingUpstreamTypeNewAPI, StableIdentity: "fenced-account",
+			MaskedIdentity: "fenced-***", Status: RoutingUpstreamAccountStatusDegraded,
+			PreserveBalance: true, LastSyncStatus: RoutingUpstreamSyncStatusFailed,
+			LastSyncError: "sync failed",
+		}
+		if createAccount {
+			_, err := UpsertRoutingUpstreamAccountContext(context.Background(), RoutingUpstreamAccountSpec{
+				SourceType: RoutingUpstreamTypeNewAPI, StableIdentity: spec.StableIdentity,
+				MaskedIdentity: spec.MaskedIdentity, Status: RoutingUpstreamAccountStatusActive,
+				BalanceKnown: true, Balance: 8.5, BalanceUpdatedAt: 100,
+				LastSyncStatus: RoutingUpstreamSyncStatusSuccess,
+			})
+			require.NoError(t, err)
+		}
+		return binding, spec
+	}
+
+	t.Run("current binding updates existing account and preserves balance", func(t *testing.T) {
+		binding, spec := newFixture(t, true)
+		applied, err := UpdateRoutingUpstreamAccountStatusForBindingContext(
+			context.Background(), binding, spec,
+		)
+		require.NoError(t, err)
+		assert.True(t, applied)
+		var account RoutingUpstreamAccount
+		require.NoError(t, DB.First(&account).Error)
+		assert.Equal(t, RoutingUpstreamAccountStatusDegraded, account.Status)
+		assert.Equal(t, RoutingUpstreamSyncStatusFailed, account.LastSyncStatus)
+		assert.True(t, account.BalanceKnown)
+		assert.Equal(t, 8.5, account.Balance)
+	})
+
+	t.Run("current binding does not create missing account", func(t *testing.T) {
+		binding, spec := newFixture(t, false)
+		applied, err := UpdateRoutingUpstreamAccountStatusForBindingContext(
+			context.Background(), binding, spec,
+		)
+		require.NoError(t, err)
+		assert.False(t, applied)
+		var count int64
+		require.NoError(t, DB.Model(&RoutingUpstreamAccount{}).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(*testing.T, RoutingChannelBinding)
+	}{
+		{
+			name: "rotated binding",
+			mutate: func(t *testing.T, binding RoutingChannelBinding) {
+				require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+					Where("id = ?", binding.ID).
+					Updates(map[string]any{"base_url": "https://rotated.example", "updated_time": binding.UpdatedTime + 1}).Error)
+			},
+		},
+		{
+			name: "deleted binding",
+			mutate: func(t *testing.T, binding RoutingChannelBinding) {
+				require.NoError(t, DB.Delete(&RoutingChannelBinding{}, binding.ID).Error)
+			},
+		},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			binding, spec := newFixture(t, true)
+			mutation.mutate(t, binding)
+			applied, err := UpdateRoutingUpstreamAccountStatusForBindingContext(
+				context.Background(), binding, spec,
+			)
+			require.ErrorIs(t, err, ErrRoutingBindingChanged)
+			assert.False(t, applied)
+			var account RoutingUpstreamAccount
+			require.NoError(t, DB.First(&account).Error)
+			assert.Equal(t, RoutingUpstreamAccountStatusActive, account.Status)
+			assert.Equal(t, RoutingUpstreamSyncStatusSuccess, account.LastSyncStatus)
+		})
+	}
+}
+
+func TestUpsertRoutingUpstreamAccountStatusForBindingIsFenced(t *testing.T) {
+	newFixture := func(t *testing.T, createAccount bool) (RoutingChannelBinding, RoutingUpstreamAccountSpec) {
+		t.Helper()
+		db := openRoutingSQLiteTestDB(t)
+		withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+		require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}))
+		require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+		userID := 42
+		binding := RoutingChannelBinding{
+			ChannelID: 605, UpstreamType: RoutingUpstreamTypeNewAPI,
+			BaseURL: "https://fenced-upsert.example", UpstreamGroup: "vip",
+			NewAPIUserID: &userID, Enabled: true,
+		}
+		require.NoError(t, DB.Create(&binding).Error)
+		spec := RoutingUpstreamAccountSpec{
+			SourceType: RoutingUpstreamTypeNewAPI, StableIdentity: "fenced-upsert-account",
+			MaskedIdentity: "fenced-upsert-***", Status: RoutingUpstreamAccountStatusDegraded,
+			PreserveBalance: true, LastSyncStatus: RoutingUpstreamSyncStatusFailed,
+			LastSyncError: "sync failed",
+		}
+		if createAccount {
+			_, err := UpsertRoutingUpstreamAccountContext(context.Background(), RoutingUpstreamAccountSpec{
+				SourceType: RoutingUpstreamTypeNewAPI, StableIdentity: spec.StableIdentity,
+				MaskedIdentity: spec.MaskedIdentity, Status: RoutingUpstreamAccountStatusActive,
+				BalanceKnown: true, Balance: 8.5, BalanceUpdatedAt: 100,
+				LastSyncStatus: RoutingUpstreamSyncStatusSuccess,
+			})
+			require.NoError(t, err)
+		}
+		return binding, spec
+	}
+
+	t.Run("current binding creates an account from authoritative identity", func(t *testing.T) {
+		binding, spec := newFixture(t, false)
+		account, err := UpsertRoutingUpstreamAccountStatusForBindingContext(
+			context.Background(), binding, spec,
+		)
+		require.NoError(t, err)
+		assert.NotZero(t, account.ID)
+		assert.Equal(t, RoutingUpstreamAccountStatusDegraded, account.Status)
+		assert.Equal(t, RoutingUpstreamSyncStatusFailed, account.LastSyncStatus)
+		assert.False(t, account.BalanceKnown)
+	})
+
+	t.Run("current binding degrades an existing account and preserves balance", func(t *testing.T) {
+		binding, spec := newFixture(t, true)
+		account, err := UpsertRoutingUpstreamAccountStatusForBindingContext(
+			context.Background(), binding, spec,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, RoutingUpstreamAccountStatusDegraded, account.Status)
+		assert.Equal(t, RoutingUpstreamSyncStatusFailed, account.LastSyncStatus)
+		assert.True(t, account.BalanceKnown)
+		assert.Equal(t, 8.5, account.Balance)
+	})
+
+	t.Run("status-only API rejects balance mutation", func(t *testing.T) {
+		binding, spec := newFixture(t, false)
+		spec.PreserveBalance = false
+		_, err := UpsertRoutingUpstreamAccountStatusForBindingContext(
+			context.Background(), binding, spec,
+		)
+		require.ErrorIs(t, err, ErrRoutingCostV2Invalid)
+		var count int64
+		require.NoError(t, DB.Model(&RoutingUpstreamAccount{}).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	mutations := []struct {
+		name   string
+		mutate func(*testing.T, RoutingChannelBinding)
+	}{
+		{
+			name: "rotated binding",
+			mutate: func(t *testing.T, binding RoutingChannelBinding) {
+				require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+					Where("id = ?", binding.ID).
+					Updates(map[string]any{"base_url": "https://rotated.example", "updated_time": binding.UpdatedTime + 1}).Error)
+			},
+		},
+		{
+			name: "deleted binding",
+			mutate: func(t *testing.T, binding RoutingChannelBinding) {
+				require.NoError(t, DB.Delete(&RoutingChannelBinding{}, binding.ID).Error)
+			},
+		},
+		{
+			name: "disabled binding",
+			mutate: func(t *testing.T, binding RoutingChannelBinding) {
+				require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+					Where("id = ?", binding.ID).
+					Updates(map[string]any{"enabled": false, "updated_time": binding.UpdatedTime + 1}).Error)
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		for _, accountExists := range []bool{false, true} {
+			caseName := "does not create"
+			if accountExists {
+				caseName = "does not degrade"
+			}
+			t.Run(mutation.name+" "+caseName, func(t *testing.T) {
+				binding, spec := newFixture(t, accountExists)
+				mutation.mutate(t, binding)
+				_, err := UpsertRoutingUpstreamAccountStatusForBindingContext(
+					context.Background(), binding, spec,
+				)
+				require.ErrorIs(t, err, ErrRoutingBindingChanged)
+				var accounts []RoutingUpstreamAccount
+				require.NoError(t, DB.Find(&accounts).Error)
+				if !accountExists {
+					assert.Empty(t, accounts)
+					return
+				}
+				require.Len(t, accounts, 1)
+				assert.Equal(t, RoutingUpstreamAccountStatusActive, accounts[0].Status)
+				assert.Equal(t, RoutingUpstreamSyncStatusSuccess, accounts[0].LastSyncStatus)
+			})
+		}
+	}
+}
+
+func TestRoutingCostFailureAndSuccessfulSiblingAccountStatusAreAtomic(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, DB.AutoMigrate(&RoutingChannelBinding{}))
+	require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+
+	failed := RoutingChannelBinding{
+		ChannelID: 606, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://atomic-account.example", UpstreamGroup: "bad", Enabled: true,
+	}
+	healthy := RoutingChannelBinding{
+		ChannelID: 607, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://atomic-account.example", UpstreamGroup: "healthy", Enabled: true,
+	}
+	require.NoError(t, DB.Create(&failed).Error)
+	require.NoError(t, DB.Create(&healthy).Error)
+
+	degradedSpec := RoutingUpstreamAccountSpec{
+		SourceType: RoutingUpstreamTypeNewAPI, StableIdentity: "atomic-account",
+		MaskedIdentity: "atomic-***", Status: RoutingUpstreamAccountStatusDegraded,
+		PreserveBalance: true, LastSyncStatus: RoutingUpstreamSyncStatusPartial,
+		LastSyncError: "bad group unavailable",
+	}
+	invalidSpec := degradedSpec
+	invalidSpec.MaskedIdentity = invalidSpec.StableIdentity
+	_, err := ApplyRoutingCostSyncFailureWithAccountContext(
+		context.Background(), failed, 1, 1_000, "bad group unavailable", invalidSpec,
+	)
+	require.ErrorIs(t, err, ErrRoutingCostV2Invalid)
+	var unchanged RoutingChannelBinding
+	require.NoError(t, DB.Where("id = ?", failed.ID).First(&unchanged).Error)
+	assert.Zero(t, unchanged.SyncFailureCount)
+	assert.Zero(t, unchanged.SyncBackoffUntil)
+
+	failedFence, err := ApplyRoutingCostSyncFailureWithAccountContext(
+		context.Background(), failed, 1, 1_000, "bad group unavailable", degradedSpec,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, failedFence.SyncFailureCount)
+	assert.Equal(t, int64(1_000), failedFence.SyncBackoffUntil)
+
+	healthyResult, err := CompleteRoutingCostVersionSyncWithAccountFencesContext(
+		context.Background(),
+		healthy,
+		[]RoutingChannelBinding{failedFence},
+		degradedSpec,
+		[]RoutingCostSnapshotVersionWrite{routingCostVersionSyncWriteForTest(healthy, "gpt-atomic", 1)},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingUpstreamAccountStatusDegraded, healthyResult.Account.Status)
+	assert.Equal(t, RoutingUpstreamSyncStatusPartial, healthyResult.Account.LastSyncStatus)
+
+	staleFence := failedFence
+	require.NoError(t, DB.Model(&RoutingChannelBinding{}).
+		Where("id = ?", failedFence.ID).
+		Updates(map[string]any{"enabled": false, "updated_time": failedFence.UpdatedTime + 1}).Error)
+	secondHealthy := RoutingChannelBinding{
+		ChannelID: 608, UpstreamType: RoutingUpstreamTypeNewAPI,
+		BaseURL: "https://atomic-account.example", UpstreamGroup: "other", Enabled: true,
+	}
+	require.NoError(t, DB.Create(&secondHealthy).Error)
+	activeSpec := degradedSpec
+	activeSpec.Status = RoutingUpstreamAccountStatusActive
+	activeSpec.LastSyncStatus = RoutingUpstreamSyncStatusSuccess
+	activeSpec.LastSyncError = ""
+	_, err = CompleteRoutingCostVersionSyncWithAccountFencesContext(
+		context.Background(),
+		secondHealthy,
+		[]RoutingChannelBinding{staleFence},
+		activeSpec,
+		[]RoutingCostSnapshotVersionWrite{routingCostVersionSyncWriteForTest(secondHealthy, "gpt-stale", 1)},
+	)
+	require.ErrorIs(t, err, ErrRoutingBindingChanged)
+	var staleSnapshotCount int64
+	require.NoError(t, DB.Model(&RoutingCostSnapshot{}).
+		Where("channel_id = ?", secondHealthy.ChannelID).
+		Count(&staleSnapshotCount).Error)
+	assert.Zero(t, staleSnapshotCount)
+	var account RoutingUpstreamAccount
+	require.NoError(t, DB.First(&account).Error)
+	assert.Equal(t, RoutingUpstreamAccountStatusDegraded, account.Status)
 }
 
 func TestRoutingCostVersionCompactsRepeatedContentAndPreservesPriceChanges(t *testing.T) {
@@ -476,6 +933,490 @@ func TestRoutingCostEstimateDefinesExpectedWorstAndEffectivePlatformCost(t *test
 	assert.Zero(t, expired.FreshnessScore)
 }
 
+func TestRoutingCostEstimatePreservesExplicitFreeGroupRatio(t *testing.T) {
+	observed := common.GetTimestamp()
+	groupRatio := 0.0
+	inputRate := 3.0
+	outputRate := 15.0
+	perRequest := 0.08
+	version := RoutingCostSnapshotVersion{
+		Confidence: RoutingCostConfidenceExact, ConfidenceScore: 1,
+		Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+		ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+	}
+	profile := RoutingCostRequestProfile{
+		PromptTokens: 1_000, ExpectedCompletionTokens: 500, MaximumCompletionTokens: 500,
+		KnowledgeSpecified: true,
+	}
+	tests := []struct {
+		name    string
+		pricing RoutingNormalizedPricing
+	}{
+		{
+			name: "token",
+			pricing: RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD",
+				GroupRatio: &groupRatio, InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			},
+		},
+		{
+			name: "per request",
+			pricing: RoutingNormalizedPricing{
+				QuotaType: 1, BillingMode: "per_request", Currency: "USD",
+				GroupRatio: &groupRatio, PerRequestCost: &perRequest,
+			},
+		},
+		{
+			name: "expression",
+			pricing: RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+				GroupRatio:        &groupRatio,
+				BillingExpression: `len > 0 ? tier("` + RoutingCostSub2APIIntervalUnmatchedTier + `", 0) : tier("empty", 0)`,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			estimate, err := EstimateRoutingCostSnapshot(version, test.pricing, profile, observed)
+
+			require.NoError(t, err)
+			assert.True(t, estimate.Known)
+			assert.True(t, estimate.ExpectedKnown)
+			assert.True(t, estimate.WorstCaseKnown)
+			assert.Zero(t, estimate.ExpectedCost)
+			assert.Zero(t, estimate.WorstCaseCost)
+		})
+	}
+}
+
+func TestRoutingCostVersionRoundTripsNilAndExplicitZeroGroupRatio(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingCostV2ModelsForTest(db))
+	account := createRoutingUpstreamAccountForTest(t)
+
+	write := routingCostVersionWriteForTest(account.ID, "gpt-group-ratio-semantics", 3)
+	write.Pricing.GroupRatio = routingCostFloatForTest(0)
+	zeroResult, err := WriteRoutingCostSnapshotVersionContext(context.Background(), write)
+	require.NoError(t, err)
+
+	write.Pricing.GroupRatio = nil
+	nilResult, err := WriteRoutingCostSnapshotVersionContext(context.Background(), write)
+	require.NoError(t, err)
+	assert.NotEqual(t, zeroResult.Version.PricingHash, nilResult.Version.PricingHash)
+
+	_, zeroPricing, err := LoadRoutingCostSnapshotVersionContext(
+		context.Background(), zeroResult.Version.PricingHash,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, zeroPricing.GroupRatio)
+	assert.Zero(t, *zeroPricing.GroupRatio)
+
+	_, nilPricing, err := LoadRoutingCostSnapshotVersionContext(
+		context.Background(), nilResult.Version.PricingHash,
+	)
+	require.NoError(t, err)
+	assert.Nil(t, nilPricing.GroupRatio)
+
+	var latest RoutingCostSnapshot
+	require.NoError(t, DB.Where(
+		"channel_id = ? AND model_key = ?", write.ChannelID, RoutingCostModelKey(write.LocalModel),
+	).First(&latest).Error)
+	latestPricing, known, err := DecodeRoutingCostSnapshotPricing(latest)
+	require.NoError(t, err)
+	assert.True(t, known)
+	assert.Nil(t, latestPricing.GroupRatio)
+}
+
+func TestRoutingCostEstimateTreatsUnmatchedSub2APIIntervalsAsUnknown(t *testing.T) {
+	observed := common.GetTimestamp()
+	version := RoutingCostSnapshotVersion{
+		Confidence: RoutingCostConfidenceDerived, ConfidenceScore: 0.9,
+		Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+		ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+	}
+	pricing := RoutingNormalizedPricing{
+		QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+		BillingExpression: `len > 0 ? tier("priced", p * 3 + c * 15 + cr * 0.3 + cc * 3.75 + cc1h * 3.75 + img_o * 30 + ao * 40) : tier("` +
+			RoutingCostSub2APIIntervalUnmatchedTier + `", 0)`,
+	}
+	tests := []struct {
+		name    string
+		profile RoutingCostRequestProfile
+		known   bool
+	}{
+		{
+			name: "output without input context",
+			profile: RoutingCostRequestProfile{
+				ExpectedCompletionTokens: 10, MaximumCompletionTokens: 10,
+			},
+		},
+		{
+			name: "image output without input context",
+			profile: RoutingCostRequestProfile{
+				ImageOutputTokens: 1,
+			},
+		},
+		{
+			name: "audio output without input context",
+			profile: RoutingCostRequestProfile{
+				AudioOutputTokens: 1,
+			},
+		},
+		{
+			name: "actual output without input context",
+			profile: RoutingCostRequestProfile{
+				ActualUsage: &RoutingCostActualUsage{CompletionTokens: 10},
+			},
+		},
+		{
+			name:    "empty request has a known zero cost",
+			profile: RoutingCostRequestProfile{},
+			known:   true,
+		},
+		{
+			name: "positive context matches a priced interval",
+			profile: RoutingCostRequestProfile{
+				PromptTokens: 1, ExpectedCompletionTokens: 1, MaximumCompletionTokens: 1,
+			},
+			known: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			estimate, err := EstimateRoutingCostSnapshot(version, pricing, test.profile, observed)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.known, estimate.ExpectedKnown)
+			assert.Equal(t, test.known, estimate.WorstCaseKnown)
+			assert.Equal(t, test.known, estimate.Known)
+			if !test.known {
+				assert.Zero(t, estimate.ExpectedCost)
+				assert.Zero(t, estimate.WorstCaseCost)
+			}
+		})
+	}
+
+	ordinaryZero := pricing
+	ordinaryZero.BillingExpression = `len > 0 ? tier("priced", p) : tier("ordinary_zero", 0)`
+	estimate, err := EstimateRoutingCostSnapshot(version, ordinaryZero, RoutingCostRequestProfile{}, observed)
+	require.NoError(t, err)
+	assert.True(t, estimate.Known)
+	assert.Zero(t, estimate.ExpectedCost)
+}
+
+func TestRoutingCostEstimateEnforcesSub2APIDisplayContractPerRequest(t *testing.T) {
+	observed := common.GetTimestamp()
+	version := RoutingCostSnapshotVersion{
+		SourceType: RoutingUpstreamTypeSub2API,
+		Confidence: RoutingCostConfidenceDerived, ConfidenceScore: 0.8,
+		Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+		ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+	}
+	baseProfile := RoutingCostRequestProfile{
+		PromptTokens: 1_000, MaximumPromptTokens: 1_000,
+		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		MediaDimensionsKnown: true, RequestInputKnown: true,
+		RequestPricingFeaturesKnown: true,
+		Request:                     billingexpr.RequestInput{Body: []byte(`{}`)},
+	}
+	tests := []struct {
+		name         string
+		platform     string
+		hasIntervals bool
+		body         string
+		headers      map[string]string
+		mutate       func(*RoutingCostRequestProfile)
+		known        bool
+	}{
+		{name: "flat standard", platform: "anthropic", body: `{"service_tier":"standard"}`, known: true},
+		{
+			name: "request pricing features unavailable", platform: "anthropic", body: `{}`,
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.RequestPricingFeaturesKnown = false
+			},
+		},
+		{
+			name: "request knowledge unspecified", platform: "anthropic", body: `{}`,
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.KnowledgeSpecified = false
+			},
+		},
+		{
+			name: "flat web search surcharge", platform: "openai", body: `{}`,
+			mutate: func(profile *RoutingCostRequestProfile) { profile.UncataloguedSurchargePossible = true },
+		},
+		{
+			name: "interval file search surcharge", platform: "openai", hasIntervals: true, body: `{}`,
+			mutate: func(profile *RoutingCostRequestProfile) { profile.UncataloguedSurchargePossible = true },
+		},
+		{
+			name: "interval image generation surcharge", platform: "openai", hasIntervals: true, body: `{}`,
+			mutate: func(profile *RoutingCostRequestProfile) { profile.UncataloguedSurchargePossible = true },
+		},
+		{name: "flat priority", platform: "openai", body: `{"service_tier":"priority"}`},
+		{name: "flat fast alias", platform: "openai", body: `{"service_tier":"fast"}`},
+		{name: "flat flex", platform: "openai", body: `{"service_tier":"flex"}`},
+		{name: "interval priority", platform: "openai", hasIntervals: true, body: `{"service_tier":"priority"}`, known: true},
+		{name: "interval fast header", platform: "openai", hasIntervals: true, headers: map[string]string{"Anthropic-Beta": "context-1m-2025-08-07, fast-mode-2026-02-01"}, known: true},
+		{name: "interval flex", platform: "openai", hasIntervals: true, body: `{"service_tier":"flex"}`},
+		{
+			name: "interval remote context", platform: "openai", hasIntervals: true,
+			mutate: func(profile *RoutingCostRequestProfile) { profile.InputTokensKnown = false },
+		},
+		{
+			name: "flat one hour cache write", platform: "anthropic",
+			mutate: func(profile *RoutingCostRequestProfile) { profile.CacheWriteOneHourTokens = 1 },
+		},
+		{
+			name: "interval one hour cache write", platform: "anthropic", hasIntervals: true, known: true,
+			mutate: func(profile *RoutingCostRequestProfile) { profile.CacheWriteOneHourTokens = 1 },
+		},
+		{
+			name: "flat openai at threshold", platform: "openai", known: true,
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.PromptTokens = 272_000
+				profile.MaximumPromptTokens = 272_000
+			},
+		},
+		{
+			name: "flat openai above threshold", platform: "openai",
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.PromptTokens = 272_001
+				profile.MaximumPromptTokens = 272_001
+			},
+		},
+		{
+			name: "flat openai remote context", platform: "openai",
+			mutate: func(profile *RoutingCostRequestProfile) { profile.InputTokensKnown = false },
+		},
+		{
+			name: "interval openai above threshold", platform: "openai", hasIntervals: true, known: true,
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.PromptTokens = 272_001
+				profile.MaximumPromptTokens = 272_001
+			},
+		},
+		{
+			name: "flat gemini at threshold", platform: "gemini", known: true,
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.PromptTokens = 199_000
+				profile.MaximumPromptTokens = 199_000
+				profile.CacheReadTokens = 1_000
+			},
+		},
+		{
+			name: "flat gemini above threshold", platform: "gemini",
+			mutate: func(profile *RoutingCostRequestProfile) {
+				profile.PromptTokens = 199_000
+				profile.MaximumPromptTokens = 199_000
+				profile.CacheReadTokens = 1_001
+			},
+		},
+		{
+			name: "flat gemini remote context", platform: "gemini",
+			mutate: func(profile *RoutingCostRequestProfile) { profile.InputTokensKnown = false },
+		},
+		{name: "unknown service tier", platform: "openai", body: `{"service_tier":"turbo"}`},
+		{name: "missing platform fails closed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := baseProfile
+			if test.body != "" {
+				profile.Request.Body = []byte(test.body)
+			}
+			profile.Request.Headers = test.headers
+			if test.mutate != nil {
+				test.mutate(&profile)
+			}
+			extras, err := common.Marshal(map[string]any{
+				"platform":            test.platform,
+				"source_billing_mode": "token",
+				"sub2api_contract":    RoutingCostSub2APIDisplayContractV1,
+				"has_intervals":       test.hasIntervals,
+			})
+			require.NoError(t, err)
+			pricing := RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+				BillingExpression: `tier("base", p * 2 + c * 10 + cr * 0.2 + cc * 2.5 + cc1h * 2.5)`,
+				Extras:            extras,
+			}
+
+			estimate, err := EstimateRoutingCostSnapshot(version, pricing, profile, observed)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.known, estimate.ExpectedKnown)
+			assert.Equal(t, test.known, estimate.WorstCaseKnown)
+			assert.Equal(t, test.known, estimate.Known)
+		})
+	}
+}
+
+func TestRoutingCostEstimateEnforcesNewAPIPricingCatalogScope(t *testing.T) {
+	observed := common.GetTimestamp()
+	version := RoutingCostSnapshotVersion{
+		SourceType: RoutingUpstreamTypeNewAPI,
+		Confidence: RoutingCostConfidenceExact, ConfidenceScore: 1,
+		Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+		ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+	}
+	inputRate := 2.0
+	outputRate := 10.0
+	groupRatio := 1.0
+	baseProfile := RoutingCostRequestProfile{
+		PromptTokens: 1_000, MaximumPromptTokens: 1_000,
+		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		MediaDimensionsKnown: true, RequestInputKnown: true,
+		RequestPricingFeaturesKnown: true,
+	}
+	tests := []struct {
+		name            string
+		featuresKnown   bool
+		potentialCharge bool
+		alwaysCharge    bool
+		actualUsage     bool
+		known           bool
+	}{
+		{name: "ordinary request", featuresKnown: true, known: true},
+		{name: "request features unavailable"},
+		{name: "tool or fixed image surcharge", featuresKnown: true, potentialCharge: true},
+		{name: "search preview model surcharge", featuresKnown: true, alwaysCharge: true},
+		{name: "actual usage retains request surcharge boundary", featuresKnown: true, potentialCharge: true, actualUsage: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			extras, err := common.Marshal(map[string]any{
+				"catalog_scope":                 RoutingCostCatalogScopeNewAPIPricing,
+				"always_uncatalogued_surcharge": test.alwaysCharge,
+			})
+			require.NoError(t, err)
+			pricing := RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD",
+				GroupRatio: &groupRatio, InputCostPerMillion: &inputRate,
+				OutputCostPerMillion: &outputRate, Extras: extras,
+			}
+			profile := baseProfile
+			profile.RequestPricingFeaturesKnown = test.featuresKnown
+			profile.UncataloguedSurchargePossible = test.potentialCharge
+			if test.actualUsage {
+				profile.ActualUsage = &RoutingCostActualUsage{PromptTokens: 1_000, CompletionTokens: 100}
+			}
+
+			estimate, err := EstimateRoutingCostSnapshot(version, pricing, profile, observed)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.known, estimate.ExpectedKnown)
+			assert.Equal(t, test.known, estimate.WorstCaseKnown)
+			assert.Equal(t, test.known, estimate.Known)
+		})
+	}
+
+	freeGroup := 0.0
+	extras, err := common.Marshal(map[string]any{
+		"catalog_scope":                 RoutingCostCatalogScopeNewAPIPricing,
+		"always_uncatalogued_surcharge": true,
+	})
+	require.NoError(t, err)
+	freeEstimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+		QuotaType: 0, BillingMode: "token", Currency: "USD",
+		GroupRatio: &freeGroup, InputCostPerMillion: &inputRate,
+		OutputCostPerMillion: &outputRate, Extras: extras,
+	}, baseProfile, observed)
+	require.NoError(t, err)
+	assert.True(t, freeEstimate.Known)
+	assert.Zero(t, freeEstimate.ExpectedCost)
+}
+
+func TestRoutingCostEstimateFailsClosedForHistoricalProviderSnapshotsWithoutContractMetadata(t *testing.T) {
+	observed := common.GetTimestamp()
+	inputRate := 2.0
+	outputRate := 10.0
+	perRequestRate := 0.05
+	groupRatio := 1.0
+	newAPIExtras, err := common.Marshal(map[string]any{
+		"catalog_scope":                 RoutingCostCatalogScopeNewAPIPricing,
+		"always_uncatalogued_surcharge": false,
+	})
+	require.NoError(t, err)
+	sub2APIExtras, err := common.Marshal(map[string]any{
+		"platform":            "anthropic",
+		"source_billing_mode": "token",
+		"sub2api_contract":    RoutingCostSub2APIDisplayContractV1,
+		"has_intervals":       false,
+	})
+	require.NoError(t, err)
+	sub2APIPerRequestExtras, err := common.Marshal(map[string]any{
+		"sub2api_contract": RoutingCostSub2APIDisplayContractV1,
+	})
+	require.NoError(t, err)
+
+	profile := RoutingCostRequestProfile{
+		PromptTokens: 1_000, MaximumPromptTokens: 1_000,
+		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
+		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		MediaDimensionsKnown: true, RequestInputKnown: true,
+		RequestPricingFeaturesKnown: true,
+		Request:                     billingexpr.RequestInput{Body: []byte(`{}`)},
+	}
+	tests := []struct {
+		name        string
+		sourceType  string
+		extras      []byte
+		perRequest  bool
+		expectKnown bool
+	}{
+		{name: "untyped legacy snapshot remains compatible", expectKnown: true},
+		{name: "newapi legacy snapshot without extras", sourceType: RoutingUpstreamTypeNewAPI},
+		{name: "newapi unrelated extras are not a contract", sourceType: RoutingUpstreamTypeNewAPI, extras: []byte(`{"platform":"openai"}`)},
+		{name: "newapi declared catalog remains known", sourceType: RoutingUpstreamTypeNewAPI, extras: newAPIExtras, expectKnown: true},
+		{name: "sub2api legacy flat snapshot without extras", sourceType: RoutingUpstreamTypeSub2API},
+		{name: "sub2api unrelated extras are not a contract", sourceType: RoutingUpstreamTypeSub2API, extras: []byte(`{"input_price":2}`)},
+		{name: "sub2api declared flat contract remains known", sourceType: RoutingUpstreamTypeSub2API, extras: sub2APIExtras, expectKnown: true},
+		{name: "sub2api legacy per-request snapshot without extras", sourceType: RoutingUpstreamTypeSub2API, perRequest: true},
+		{name: "sub2api declared per-request contract remains known", sourceType: RoutingUpstreamTypeSub2API, extras: sub2APIPerRequestExtras, perRequest: true, expectKnown: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pricing := RoutingNormalizedPricing{
+				QuotaType: 0, BillingMode: "token", Currency: "USD",
+				GroupRatio: &groupRatio, InputCostPerMillion: &inputRate,
+				OutputCostPerMillion: &outputRate, Extras: test.extras,
+			}
+			if test.perRequest {
+				pricing = RoutingNormalizedPricing{
+					QuotaType: 1, BillingMode: "per_request", Currency: "USD",
+					GroupRatio: &groupRatio, PerRequestCost: &perRequestRate, Extras: test.extras,
+				}
+			}
+			version := RoutingCostSnapshotVersion{
+				SourceType: test.sourceType,
+				Confidence: RoutingCostConfidenceDerived, ConfidenceScore: 0.8,
+				Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+				ObservedTime: observed, EffectiveTime: observed, ExpiresTime: observed + 3_600,
+			}
+
+			estimate, err := EstimateRoutingCostSnapshot(version, pricing, profile, observed)
+
+			require.NoError(t, err)
+			assert.Equal(t, test.expectKnown, estimate.ExpectedKnown)
+			assert.Equal(t, test.expectKnown, estimate.WorstCaseKnown)
+			assert.Equal(t, test.expectKnown, estimate.Known)
+			if test.expectKnown {
+				assert.Positive(t, estimate.ExpectedCost)
+			} else {
+				assert.Zero(t, estimate.ExpectedCost)
+				assert.Zero(t, estimate.WorstCaseCost)
+			}
+		})
+	}
+}
+
 func TestRoutingCostEstimateUsesConservativeMaximumPromptOnlyForWorstCase(t *testing.T) {
 	observed := common.GetTimestamp()
 	inputRate := 2.0
@@ -535,6 +1476,103 @@ func TestRoutingCostEstimateFailsClosedForUnknownRequestDimensions(t *testing.T)
 		assert.True(t, estimate.ExpectedKnown)
 		assert.False(t, estimate.WorstCaseKnown)
 		assert.InDelta(t, 0.6, estimate.ConfidenceScore, 1e-12)
+	})
+
+	t.Run("inherited subtype prices do not require separate quantities", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheTokensKnown = false
+		profile.MediaDimensionsKnown = false
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.True(t, estimate.ExpectedKnown)
+		assert.True(t, estimate.WorstCaseKnown)
+	})
+
+	t.Run("explicit free cache price requires cache quantity", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheTokensKnown = false
+		freeCacheRate := 0.0
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			CacheReadCostPerMillion: &freeCacheRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.False(t, estimate.ExpectedKnown)
+		assert.False(t, estimate.WorstCaseKnown)
+	})
+
+	t.Run("known cache write zero keeps write-only pricing estimable", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheTokensKnown = false
+		profile.CacheReadTokensKnown = false
+		profile.CacheWriteTokensKnown = true
+		cacheWriteRate := 2.5
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			CacheWriteCostPerMillion: &cacheWriteRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.True(t, estimate.ExpectedKnown)
+		assert.True(t, estimate.WorstCaseKnown)
+	})
+
+	t.Run("unknown automatic cache read still fails closed", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheTokensKnown = false
+		profile.CacheReadTokensKnown = false
+		profile.CacheWriteTokensKnown = true
+		cacheReadRate := 0.2
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			CacheReadCostPerMillion: &cacheReadRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.False(t, estimate.ExpectedKnown)
+		assert.False(t, estimate.WorstCaseKnown)
+	})
+
+	t.Run("legacy combined cache knowledge remains compatible", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheReadTokensKnown = false
+		profile.CacheWriteTokensKnown = false
+		cacheReadRate := 0.2
+		cacheWriteRate := 2.5
+		estimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "token", Currency: "USD",
+			InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
+			CacheReadCostPerMillion: &cacheReadRate, CacheWriteCostPerMillion: &cacheWriteRate,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.True(t, estimate.ExpectedKnown)
+		assert.True(t, estimate.WorstCaseKnown)
+	})
+
+	t.Run("cache expression dependencies are split by direction", func(t *testing.T) {
+		profile := baseProfile
+		profile.CacheTokensKnown = false
+		profile.CacheReadTokensKnown = false
+		profile.CacheWriteTokensKnown = true
+		writeEstimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+			BillingExpression: `tier("write", p * 2 + cc * 2.5 + cc1h * 4)`,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.True(t, writeEstimate.ExpectedKnown)
+		assert.True(t, writeEstimate.WorstCaseKnown)
+
+		readEstimate, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
+			QuotaType: 0, BillingMode: "tiered_expr", Currency: "USD",
+			BillingExpression: `tier("read", p * 2 + cr * 0.2)`,
+		}, profile, observed)
+		require.NoError(t, err)
+		assert.False(t, readEstimate.ExpectedKnown)
+		assert.False(t, readEstimate.WorstCaseKnown)
 	})
 
 	tests := []struct {
@@ -684,6 +1722,17 @@ func routingCostVersionWriteForTest(accountID int, model string, inputCost float
 			OutputCostPerMillion: routingCostFloatForTest(inputCost * 2),
 		},
 	}
+}
+
+func routingCostVersionSyncWriteForTest(
+	binding RoutingChannelBinding,
+	model string,
+	inputCost float64,
+) RoutingCostSnapshotVersionWrite {
+	write := routingCostVersionWriteForTest(0, model, inputCost)
+	write.ChannelID = binding.ChannelID
+	write.UpstreamGroup = binding.UpstreamGroup
+	return write
 }
 
 func routingCostFloatForTest(value float64) *float64 {

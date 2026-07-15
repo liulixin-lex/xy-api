@@ -64,6 +64,50 @@ func TestRequestProfileNeverSerializesCostRequestBodyOrHeaders(t *testing.T) {
 	assert.NotContains(t, string(encoded), "private")
 }
 
+func TestShadowExpectedCostFailsClosedForLegacyConnectorPricingWithoutContractMetadata(t *testing.T) {
+	now := time.Now().Unix()
+	groupRatio := 1.0
+	inputCost := 2.0
+	outputCost := 10.0
+	profile := RequestProfile{
+		PromptTokenEstimate: 1_000, CompletionTokenEstimate: 100,
+		costAtUnix: now,
+		costProfile: &model.RoutingCostRequestProfile{
+			PromptTokens: 1_000, MaximumPromptTokens: 1_000,
+			ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
+			MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
+			MaximumCompletionKnown: true, CacheTokensKnown: true,
+			MediaDimensionsKnown: true, RequestInputKnown: true,
+			RequestPricingFeaturesKnown: true,
+		},
+	}
+	for _, sourceType := range []string{
+		model.RoutingUpstreamTypeNewAPI,
+		model.RoutingUpstreamTypeSub2API,
+	} {
+		t.Run(sourceType, func(t *testing.T) {
+			cost, err := shadowExpectedCost(ModelSnapshot{
+				CostPricing: &model.RoutingNormalizedPricing{
+					QuotaType: 0, BillingMode: "token", Currency: "USD",
+					GroupRatio: &groupRatio, InputCostPerMillion: &inputCost,
+					OutputCostPerMillion: &outputCost,
+				},
+				CostAccountSourceType: sourceType,
+				CostObservedTime:      now - 1, CostEffectiveTime: now - 1,
+				CostExpiresTime:       now + 3_600,
+				CostVersionConfidence: model.RoutingCostConfidenceExact,
+				CostConfidenceScore:   1, CostFreshness: model.RoutingCostFreshnessFresh,
+				CostFreshnessScore: 1,
+			}, profile)
+
+			require.NoError(t, err)
+			require.NotNil(t, cost)
+			assert.False(t, cost.Known)
+			assert.Zero(t, cost.Cost)
+		})
+	}
+}
+
 func TestShadowSeedAndProfileHashAreStableAndScoped(t *testing.T) {
 	profile, err := NewRequestProfile("/v1/responses", "vip", "gpt-test", false, 0, 100, 20)
 	require.NoError(t, err)

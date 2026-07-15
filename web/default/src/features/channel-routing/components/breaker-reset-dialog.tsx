@@ -283,7 +283,7 @@ export function ChannelRoutingBreakerResetDialog(props: {
         <RotateCcw aria-hidden='true' />
         {!props.compact ? t('Reset breaker') : null}
       </AlertDialogTrigger>
-      <AlertDialogContent className='max-h-[min(88dvh,44rem)] w-[calc(100vw-1.5rem)] overflow-y-auto sm:max-w-md'>
+      <AlertDialogContent className='channel-routing-touch-surface max-h-[min(88dvh,44rem)] w-[calc(100vw-1.5rem)] overflow-y-auto sm:max-w-md'>
         <AlertDialogHeader>
           <AlertDialogMedia className='bg-destructive/10 text-destructive'>
             <ShieldAlert aria-hidden='true' />
@@ -404,7 +404,7 @@ export function ChannelRoutingBreakerResetDialog(props: {
           {completed ? (
             <div className='flex items-start gap-2 text-sm' role='status'>
               <CheckCircle2
-                className='mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300'
+                className='text-success mt-0.5 size-4 shrink-0'
                 aria-hidden='true'
               />
               <span>

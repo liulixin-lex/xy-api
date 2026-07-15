@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -44,7 +45,8 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	testNameHash := sha256.Sum256([]byte(t.Name()))
+	dsn := fmt.Sprintf("file:model_list_%x?mode=memory&cache=shared", testNameHash[:8])
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	model.DB = db
@@ -82,7 +84,8 @@ func initModelListColumnNames(t *testing.T) {
 	}()
 
 	common.IsMasterNode = true
-	common.SQLitePath = fmt.Sprintf("file:%s_init?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	testNameHash := sha256.Sum256([]byte(t.Name()))
+	common.SQLitePath = fmt.Sprintf("file:model_list_init_%x?mode=memory&cache=shared", testNameHash[:8])
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	require.NoError(t, os.Setenv("SQL_DSN", "local"))
 

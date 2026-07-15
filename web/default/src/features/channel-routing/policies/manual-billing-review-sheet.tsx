@@ -538,7 +538,7 @@ export function ManualBillingReviewSheet(props: {
       >
         <SheetContent
           className={sideDrawerContentClassName(
-            'w-full sm:max-w-xl lg:max-w-2xl'
+            'channel-routing-touch-surface w-full sm:max-w-xl lg:max-w-2xl'
           )}
           showCloseButton={!isSubmitting}
           aria-busy={isSubmitting}
@@ -589,7 +589,7 @@ export function ManualBillingReviewSheet(props: {
                 className={cn(
                   'focus-visible:ring-ring/50 focus-visible:ring-2 focus-visible:outline-none *:data-[slot=alert-description]:text-foreground',
                   requestErrorIsWarning &&
-                    'border-amber-500/30 bg-amber-500/5 [&>svg]:text-amber-700 dark:[&>svg]:text-amber-300'
+                    'border-warning/30 bg-warning/5 [&>svg]:text-warning'
                 )}
               >
                 <ShieldAlert aria-hidden='true' />
@@ -675,7 +675,7 @@ export function ManualBillingReviewSheet(props: {
                             >
                               <label
                                 className={cn(
-                                  'border-input bg-background hover:bg-accent/40 has-data-checked:border-emerald-600 has-data-checked:bg-emerald-500/5 flex min-w-0 cursor-pointer items-start gap-3 rounded-md border p-3 text-sm',
+                                  'border-input bg-background hover:bg-accent/40 has-data-checked:border-success has-data-checked:bg-success/5 flex min-w-0 cursor-pointer items-start gap-3 rounded-md border p-3 text-sm',
                                   !acceptDecisionAvailable &&
                                     'cursor-not-allowed opacity-50'
                                 )}
@@ -688,7 +688,7 @@ export function ManualBillingReviewSheet(props: {
                                 <span className='min-w-0'>
                                   <span className='flex items-center gap-1.5 font-medium'>
                                     <CheckCircle2
-                                      className='size-4 text-emerald-700 dark:text-emerald-300'
+                                      className='text-success size-4'
                                       aria-hidden='true'
                                     />
                                     {t('Accept')}
@@ -946,7 +946,7 @@ export function ManualBillingReviewSheet(props: {
               'font-medium',
               confirmationReview != null &&
                 manualBillingReviewIsOverage(confirmationReview.review_kind) &&
-                'text-amber-800 dark:text-amber-200'
+                'text-warning'
             )}
           >
             {confirmationImpact}
