@@ -53,12 +53,18 @@ func configureRoutingBreakerAttemptTest(t *testing.T, enabled bool) {
 	routinghotcache.ResetForTest()
 	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 	resetRoutingBreakerConfigIdentityForTest()
+	resetChannelBalanceRefreshForTest()
+	runChannelBalanceRefresh = func(refresh func()) { refresh() }
+	loadChannelForBalanceRefresh = func(channelID int) (*model.Channel, error) {
+		return &model.Channel{Id: channelID, ChannelInfo: model.ChannelInfo{IsMultiKey: true}}, nil
+	}
 
 	t.Cleanup(func() {
 		smart_routing_setting.ResetForTest()
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 		resetRoutingBreakerConfigIdentityForTest()
+		resetChannelBalanceRefreshForTest()
 	})
 }
 
@@ -173,7 +179,7 @@ func TestShouldRetryEnforcesAttemptSafetyWhenProfileScoringIsDisabled(t *testing
 	t.Cleanup(smart_routing_setting.ResetForTest)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	unsafeProfile := channelrouting.RequestProfileV2Input{
+	unsafeProfile := channelrouting.RequestProfileInput{
 		RequestKind:              channelrouting.RequestKindImage,
 		RetrySafety:              channelrouting.RequestRetrySafetyUnsafe,
 		RetryAllowed:             false,
@@ -334,7 +340,7 @@ func TestCanaryFaultInjectionMatrixRetriesOnlyBeforeClientCommit(t *testing.T) {
 		},
 		{name: "401", apiErr: types.NewErrorWithStatusCode(errors.New("unauthorized"), types.ErrorCodeBadResponseStatusCode, 401), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
 		{name: "403", apiErr: types.NewErrorWithStatusCode(errors.New("forbidden"), types.ErrorCodeBadResponseStatusCode, 403), responsibility: routingerror.ResponsibilityCredential, scope: routingerror.ScopeCredential},
-		{name: "402", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, 402), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeAccount},
+		{name: "402", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, 402), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeChannel},
 		{name: "429", apiErr: types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponseStatusCode, 429), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
 		{name: "529", apiErr: types.NewErrorWithStatusCode(errors.New("overloaded"), types.ErrorCodeBadResponseStatusCode, 529), responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopePoolMember},
 		{name: "5xx", apiErr: types.NewErrorWithStatusCode(errors.New("upstream failed"), types.ErrorCodeBadResponseStatusCode, 500), responsibility: routingerror.ResponsibilityProvider, scope: routingerror.ScopePoolMember},
@@ -920,10 +926,11 @@ func TestRecordRoutingAttemptEffectsMatrix(t *testing.T) {
 		capacity          routingerror.CapacityEffect
 		wantReliability   bool
 		wantCapacity      bool
+		wantChannelSignal bool
 		wantBreakerReason string
 		wantEndpointState string
 	}{
-		{name: "402 is capacity only", sourceStatus: 402, responseStatus: 402, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
+		{name: "402 is channel capacity only", sourceStatus: 402, responseStatus: 402, responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeChannel, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantChannelSignal: true, wantEndpointState: string(routingbreaker.StateHealthy)},
 		{name: "mapped 429 is capacity only", sourceStatus: 429, responseStatus: 503, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
 		{name: "529 is capacity only", sourceStatus: 529, responseStatus: 529, responsibility: routingerror.ResponsibilityCapacity, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown, wantCapacity: true, wantEndpointState: string(routingbreaker.StateHealthy)},
 		{name: "502 is reliability only", sourceStatus: 502, responseStatus: 502, responsibility: routingerror.ResponsibilityProvider, health: routingerror.HealthDegrade, capacity: routingerror.CapacityNone, wantReliability: true, wantBreakerReason: "5xx", wantEndpointState: string(routingbreaker.StateHealthy)},
@@ -963,6 +970,8 @@ func TestRecordRoutingAttemptEffectsMatrix(t *testing.T) {
 					assert.Equal(t, tt.retryAfterMs, capacity.RetryAfterMs)
 				}
 			}
+			_, hasChannelSignal := routinghotcache.GetChannelBalanceUnavailable(71)
+			assert.Equal(t, tt.wantChannelSignal, hasChannelSignal)
 			breaker, hasBreaker := routinghotcache.GetBreaker(key)
 			assert.Equal(t, tt.wantReliability, hasBreaker)
 			if tt.wantBreakerReason != "" && hasBreaker {
@@ -1023,6 +1032,32 @@ func TestRecordRoutingAttemptEffectsDoesNothingWhenDisabled(t *testing.T) {
 	_, hasCapacity := routinghotcache.GetCapacityCooldown(key)
 	assert.False(t, hasBreaker)
 	assert.False(t, hasCapacity)
+}
+
+func TestRecordRoutingAttemptEffectsKeepsChannel402SignalWhenDisabledAndMultiKey(t *testing.T) {
+	configureRoutingBreakerAttemptTest(t, false)
+	ctx, info := singleKeyRoutingAttemptFixture(t, 35)
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
+	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, 2)
+	apiErr := types.NewErrorWithStatusCode(
+		errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, http.StatusPaymentRequired,
+	)
+	classification := routingerror.ClassifyAPIError(apiErr, routingerror.Context{
+		Component: routingerror.ComponentServing,
+		Operation: routingerror.OperationRelay,
+	})
+
+	recordRoutingAttemptEffects(ctx, info, 35, false, apiErr, classification)
+
+	signal, found := routinghotcache.GetChannelBalanceUnavailable(35)
+	require.True(t, found)
+	assert.Equal(t, http.StatusPaymentRequired, signal.SourceStatusCode)
+	assert.Equal(t, routinghotcache.ChannelBalanceUnavailableReason, signal.Reason)
+	assert.Greater(t, signal.CooldownUntilUnixMilli, signal.UpdatedUnixMilli)
+	_, aggregate := routinghotcache.GetCapacityCooldown(routinghotcache.Key{
+		ChannelID: 35, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip",
+	})
+	assert.False(t, aggregate)
 }
 
 func TestRecordRoutingAttemptEffectsIgnoresCurrentMultiKeyWithStaleSingleKeyMeta(t *testing.T) {

@@ -479,6 +479,9 @@ func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument
 	document := RoutingPolicyDocument{
 		SchemaVersion: RoutingPolicySchemaVersion,
 		Pools:         make([]RoutingPolicyPoolContent, len(stages)),
+		ExtensionFields: map[string]json.RawMessage{
+			"root_extension": json.RawMessage(`{"owner":"routing-platform"}`),
+		},
 	}
 	for index, stage := range stages {
 		document.Pools[index] = RoutingPolicyPoolContent{
@@ -488,6 +491,9 @@ func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument
 			DeploymentStage: stage,
 			PolicyProfile:   RoutingPolicyProfileBalanced,
 			Policy:          json.RawMessage(`{"z":2,"nested":{"b":2,"a":1},"a":1}`),
+			ExtensionFields: map[string]json.RawMessage{
+				"pool_extension": json.RawMessage(`{"kind":"canary"}`),
+			},
 			Members: []RoutingPolicyMemberContent{{
 				MemberID:      1_001 + index,
 				ChannelID:     2_001 + index,
@@ -496,6 +502,9 @@ func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument
 				Weight:        int64(100 + index),
 				CredentialIDs: []int{3_002 + index*2, 3_001 + index*2},
 				Overrides:     json.RawMessage(`{"timeout_ms":900,"headers":{"z":"last","a":"first"}}`),
+				ExtensionFields: map[string]json.RawMessage{
+					"member_extension": json.RawMessage(`{"enabled":true}`),
+				},
 			}},
 		}
 	}

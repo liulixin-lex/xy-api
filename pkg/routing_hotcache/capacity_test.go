@@ -62,7 +62,7 @@ func TestCapacityCooldownRespectsHardLimitStatsAndStableEviction(t *testing.T) {
 	ResetForTest()
 	t.Cleanup(ResetForTest)
 	cache.Lock()
-	cache.limits = Limits{MaxMetrics: 1, MaxCosts: 1, MaxBreakers: 1, MaxHealth: 1, MaxCapacityCooldowns: 2}
+	cache.limits = Limits{MaxMetrics: 1, MaxBreakers: 1, MaxHealth: 1, MaxCapacityCooldowns: 2}
 	cache.Unlock()
 
 	for _, channelID := range []int{3, 1, 2} {

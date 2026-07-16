@@ -697,9 +697,17 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
-	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
+	common.SetContextKey(c, constant.ContextKeyRoutingFailureDomainHash, "")
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	if _, blocked := channelrouting.ChannelBalanceRuntimeBlocked(channel.Id, time.Now()); blocked {
+		return types.NewErrorWithStatusCode(
+			errors.New(channelrouting.ExclusionReasonChannelBalance),
+			types.ErrorCodeGetChannelFailed,
+			http.StatusServiceUnavailable,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	trafficAdmissible, trafficErr := service.ChannelRoutingTrafficAdmissible(c, channel.Id)
 	if trafficErr != nil {
@@ -744,11 +752,19 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 			routingGroup = selectedGroup
 		}
 	}
-	if selected, ok := service.GetSelectedRoutingIdentity(c, channel.Id); ok {
-		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selected.SnapshotRevision)
-		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selected.PoolID)
-		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selected.MemberID)
+	selectedIdentity, selected := service.GetSelectedRoutingIdentity(c, channel.Id)
+	if selected {
+		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selectedIdentity.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selectedIdentity.PoolID)
+		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selectedIdentity.MemberID)
 	}
+	failureDomainHash := selectedIdentity.FailureDomainHash
+	if failureDomainHash == "" {
+		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, ""); ok {
+			failureDomainHash = identity.FailureDomainHash
+		}
+	}
+	common.SetContextKey(c, constant.ContextKeyRoutingFailureDomainHash, failureDomainHash)
 	channelBaseURL := channel.GetBaseURL()
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channelBaseURL)
 	common.SetContextKey(c, constant.ContextKeyRoutingEndpointHost, channelrouting.EndpointHost(channelBaseURL, channel.Id))
@@ -784,7 +800,6 @@ func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *ty
 	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
 	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
 	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
-	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
 	if channel == nil {
 		service.ClearSelectedRoutingIdentity(c)
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
@@ -835,16 +850,8 @@ func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *ty
 			selected.CredentialID = identity.CredentialID
 		}
 	}
-	if planned && selected.UpstreamAccountID == 0 {
-		if accountID, known := channelrouting.ResolveUpstreamAccountID(
-			routingGroup, channel.Id, common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
-		); known {
-			selected.UpstreamAccountID = accountID
-		}
-	}
 	if planned {
 		common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, selected.CredentialID)
-		common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, selected.UpstreamAccountID)
 		service.ClearSelectedRoutingIdentity(c)
 	} else if smart_routing_setting.Enabled() {
 		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
@@ -852,9 +859,6 @@ func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *ty
 			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
 			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
 			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
-			if accountID, known := channelrouting.ResolveUpstreamAccountID(routingGroup, channel.Id, common.GetContextKeyString(c, constant.ContextKeyOriginalModel)); known {
-				common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, accountID)
-			}
 		}
 	}
 	return nil
@@ -872,7 +876,6 @@ func CommitTaskChannelCredential(c *gin.Context, channel *model.Channel, credent
 	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
 	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
 	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
-	common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, 0)
 	key := ""
 	index := model.RoutingMetricSingleKeyIndex
 	if credentialID > 0 {
@@ -924,13 +927,6 @@ func CommitTaskChannelCredential(c *gin.Context, channel *model.Channel, credent
 			credentialID = identity.CredentialID
 			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, credentialID)
 		}
-	}
-	if accountID, known := channelrouting.ResolveUpstreamAccountID(
-		routingGroup,
-		channel.Id,
-		common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
-	); known {
-		common.SetContextKey(c, constant.ContextKeyRoutingUpstreamAccountID, accountID)
 	}
 	return nil
 }

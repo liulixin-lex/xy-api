@@ -16,10 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import { FlaskConicalIcon, PlayIcon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FlaskConical, Play } from 'lucide-react'
 import { useEffect, useMemo, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -202,7 +202,12 @@ export function ChannelRoutingPolicySimulationSheet(props: {
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
           <SheetTitle className='flex items-center gap-2'>
-            <FlaskConical className='size-4' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={FlaskConicalIcon}
+              className='size-4'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
             {t('Simulate policy draft #{{id}}', { id: props.draft?.id })}
           </SheetTitle>
           <SheetDescription>
@@ -334,7 +339,12 @@ export function ChannelRoutingPolicySimulationSheet(props: {
             form='channel-routing-policy-simulation-form'
             disabled={simulation.isPending || detailQuery.isLoading}
           >
-            <Play aria-hidden='true' />
+            <HugeiconsIcon
+              icon={PlayIcon}
+              data-icon='inline-start'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
             {simulation.isPending
               ? t('Running simulation')
               : t('Run simulation')}

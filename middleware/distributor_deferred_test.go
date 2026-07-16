@@ -5,11 +5,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	projecti18n "github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -42,6 +44,8 @@ func TestDistributeDeferredLeavesSelectionUntilValidatedHandler(t *testing.T) {
 
 func TestSelectedChannelMetadataDoesNotRequireOrAdvanceCredential(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
 	channel := &model.Channel{
@@ -55,6 +59,9 @@ func TestSelectedChannelMetadataDoesNotRequireOrAdvanceCredential(t *testing.T) 
 			},
 		},
 	}
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: channel.Id, TrafficClass: model.RoutingChannelTrafficClassAll},
+	}, time.Now().Unix())
 
 	require.Nil(t, SetupContextForSelectedChannelMetadata(ctx, channel, "sora-test"))
 	assert.Equal(t, channel.Id, common.GetContextKeyInt(ctx, constant.ContextKeyChannelId))

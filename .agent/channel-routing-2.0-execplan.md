@@ -1,10 +1,23 @@
-# 渠道路由 2.0 ExecPlan
+# 渠道路由 2.0 ExecPlan（历史归档）
+
+> **归档声明（2026-07-15）**
+>
+> 本文保留 Phase 0–5 和旧 NewAPI/Sub2API 成本连接器的历史实施记录，不再是当前渠道路由的接口、连接器或发布真源。当前结论由用户批准的“Routing v2 完整退场方案”、`docs/channel/channel-routing-operations.md`、当前工作树和最新实际验证证据共同约束：
+>
+> - 正式后端 API 统一为 `/api/channel-routing/*`；`/api/channel-routing/v2/*` 不注册、不重定向、不代理。
+> - `/api/smart-routing/*` 不再注册；前端 `/smart-routing` 仅保留到 `/channel-routing/overview` 的书签重定向。
+> - NewAPI/Sub2API 路由管理连接器和自动成本同步已经退役；`/api/channel-routing/cost-bindings*` 与 `/api/channel-routing/costs/sync` 只返回 `410 Gone`。
+> - 当前平台成本使用“系统定价 × 渠道倍率”，旧账号、绑定、成本版本和 Operation 仅按迁移或不可变历史边界保留。
+>
+> 下文凡与这些结论冲突的描述均为历史状态，不得用于恢复旧 API、旧 Worker、旧管理凭据或旧连接器。
 
 ## Purpose / Big Picture
 
 把现有“智能路由 Beta”增量演进为已批准的“版本化控制平面 + 进程内确定性数据平面 + 分组成员模型 + 分层健康状态 + 分布式容量协调”的渠道路由 2.0。仓库级交付必须覆盖 Phase 0–5、后端/API/数据库/安全/成本同步/多节点机制、正式 `web/default` 工作区、兼容迁移、测试与发布证据；生产 SSH、真实流量、真实凭证和生产数据库操作不属于实现验证范围。
 
-## Authoritative Inputs
+## 历史时期的 Authoritative Inputs
+
+以下输入只说明本文形成时的设计背景；当前恢复入口见本文件顶部归档声明和 `.agent/PLANS.md`。
 
 - `/opt/临时/渠道路由-企业级重构最终方案.md`
   - 期望 SHA-256：`e46728b64adbadcde7d3942c192431f83e79f4e5434856c8b7a8bc1852b70fab`
@@ -30,7 +43,7 @@
 - `v0.1.11` 已完成 PR、main、tag、Release 与多架构镜像闭环；本轮 `v0.1.12` 只做发布后渠道路由审计修复，不改写上一版本的历史候选证据。
 - durable async billing、accepted/terminal 投影、Cost Sources、Manual Reviews、Projection Operations、发布供应链和 SQLite 旧卷升级修复均已集成到当前分支。不得 reset、checkout、stash、rebase、amend 或覆盖并行改动。
 - `.agent/` 与阶段计划属于交付台账，提交时需强制纳入版本控制。
-- 当前项目原本已有 NewAPI / Sub2API 上游账号连接器；v0.1.12 只修正官方协议漂移、管理凭据边界、成本失败语义和只读预览行为，不新建重复模块。
+- **历史状态，已被退场方案覆盖：** 当时项目仍有 NewAPI / Sub2API 上游账号连接器，v0.1.12 计划只修正其协议和安全边界。当前连接器已退役，不得据此恢复管理凭据、账号同步或自动成本同步。
 - 正式 `web/default` 工作区已合并；Typecheck、Lint、七语 i18n、`bun test`（176 pass、0 fail、48 files）、production build、Playwright、Axe、键盘、缩放、响应式和明暗主题验收均已完成。RU/FR 320px Cursor 分页及运行时 `<html lang>` 已完成 8/8 真浏览器回归。
 - 基于 `6ca75bda` 的候选镜像与正式 `v0.1.10` SQLite 隔离卷双启动升级门禁均已通过；随后 PR #20、#21、#22 依次合入，`v0.1.11` 正式发布和供应链终验均已完成。
 
@@ -50,10 +63,10 @@
 - [x] Gate 7 前端：七个深链页面、七语 i18n、SSE/轮询降级、A11y、320/768/1440、200% 缩放、明暗主题、深链、权限与错误恢复已验收并合入。
 - [x] 发布终审硬化：Task/MJ durable async billing 的 reservation、send-authorized、accepted handoff、terminal settlement、恢复、manual review、滚动升级门禁和保留期已完成并集成。
 - [x] 计费投影：accepted/terminal 统计、外部日志、缓存同步各自独立幂等与故障恢复已完成，三数据库并发/崩溃点证据已补齐。
-- [x] Cost Sources 前端：独立实现已集成，Impeccable、七语 i18n、浏览器矩阵、无障碍和 production build 已复验。
+- [x] **历史交付记录：** Cost Sources 前端曾完成集成与验证；当前无版本退场方案已删除该正式前端，并以渠道倍率与生效成本取代。
 - [x] 最终实现验证：当前实现候选已完成全量 Go、SQLite/MySQL 5.7/PostgreSQL 9.6、Redis/ClickHouse 高风险定向契约、定向 race、vet/build、故障矩阵、benchmark、前端和仓库审计；候选镜像真实旧卷升级也已作为独立发布门禁通过。
 - [x] Git/发布：PR #20、#21、#22 已合入 main；`v0.1.11` 与 `latest` 多架构镜像、Cosign、SBOM、provenance 和 10 项 Release 资产已完成正式核验。
-- [ ] v0.1.12 上游账号连接器核心审计与实现：NewAPI 账号分组/按组模型/价格目录/Gateway `/v1/models` 四方交叉、上游 QPU、cache/audio 官方默认、免费组与 auto、按凭据/按组失败隔离；Sub2API 官方 JWT/数字分组/嵌套展示价格、独立分组发现、`/auth/me` 稳定账号身份、订阅组余额不适用、单位与 interval 未命中语义；Test/加载分组只读预览、成功模型缩集、Base URL canonical 校验和 pricing-disabled 错误分类主体已完成，正按独立审查收口 binding-fenced 账号状态和动作身份一致性。
+- [ ] **历史未完成项，现已取消：** v0.1.12 曾计划继续完善 NewAPI/Sub2API 上游账号连接器；当前退场方案不再继续该实现，验收改为确认连接器不可调用、管理凭据已清除且普通渠道余额仍正常。
 - [x] v0.1.12 请求计费完整性：NewAPI 未公开工具/search-preview/固定图片附加费，以及 Sub2API display pricing 的 flat priority/flex、1h cache write、OpenAI/Gemini 长上下文和远程 interval 上下文均在请求估算阶段条件降为 unknown。
 - [x] v0.1.12 Claude Code 数据面边界：按 Sub2API 官方指纹生成 `standard`/`unknown`/`claude_code`，V1/V2 均携带分类；所有智能、传统、指定与最终 Setup 选路出口在抽样前排除非 Claude Code 流量，策略缓存独立且失败关闭。
 - [ ] v0.1.12 最终门禁：等待最新工作树完成相关契约与 Race、`./controller`、全仓测试、Vet/Build、前端矩阵和仓库审计；随后按用户授权提交、同步 main、创建并合入 PR、发布 `v0.1.12`。
@@ -75,10 +88,10 @@
 | CR-4 | Balanced 选择器、主动探测、首字前切换、策略发布/回滚 | 真实 Balanced、Replay、Probe、Attempt Coordinator、草稿仿真/发布/回滚 Operation、SSE 与兼容入口 | PASS |
 | CR-5 | Enterprise SLO、严格租约、多区域、RBAC/双人审批、Burn、Hedging | strict/local/adaptive capacity、region scope、approval/authz、error budget、audit export、真实预算 hedge | PASS |
 | CR-FE | 渠道路由工作区、七语、SSE/A11y/响应式/视觉 | production release-final：投影 18/18、Operations 12/12 响应式明暗矩阵，边界态 3+4，Axe 0；RU/FR 320px Cursor 分页 8/8 无越界且 `<html lang>` 正确 | PASS |
-| CR-COMPAT | `/smart-routing`、旧 API/配置键保留并给迁移提示 | 旧路径/API/配置保留，新工作区和 v2 API 正式接管；Classic 前端构建通过 | PASS |
+| CR-COMPAT | **历史兼容要求，已被直接切换取代** | 当前仅保留前端 `/smart-routing` 书签重定向；`/api/smart-routing/*` 与 `/api/channel-routing/v2/*` 均不注册 | ARCHIVED |
 | CR-SEC | SSRF/DNS rebinding/重定向/TLS/大小/脱敏/凭证轮换 | 受保护 fetch、Probe/Cost 出站约束、错误脱敏、RBAC fail-closed、审计 admin-only 信息和凭证 fencing | PASS |
 | CR-BILL | 用户只结算一次；逐 attempt 平台成本审计；未知价格非零 | 同步与异步链均已覆盖；Task/MJ durable reservation、终态结算、恢复、manual review 和 accepted/terminal 独立投影已集成并通过跨库验证 | PASS |
-| CR-UPSTREAM-0.1.12 | NewAPI/Sub2API 账号权限、分组、模型、价格、余额和预览行为符合官方契约 | 核心账号/分组/余额/稳定身份/单位/interval/动作契约、请求级 knownness 与 Claude Code 数据面准入已实现 | IMPLEMENTED；等待最新候选全量门禁与发布证据 |
+| CR-UPSTREAM-0.1.12 | **历史连接器要求，已取消** | 当前验收为连接器退役、凭据清除、账号健康不再参与运行时、普通渠道余额保持可用 | ARCHIVED |
 | CR-GIT | PR、同步 main、合入、镜像构建 | PR #20/#21/#22、tag `v0.1.11`、Release、GHCR、Cosign、SBOM、SLSA 与最终 verifier 均完成 | PASS |
 
 ## Plan of Work
@@ -94,7 +107,7 @@
 9. [完成] 最终实现验证：后端全量与跨库矩阵、前端 production release-final、性能、安全、格式和仓库审计已完成。
 10. [完成] 候选镜像与真实升级：基于 `6ca75bda` 构建候选镜像，用全新隔离卷从固定 digest 的正式 `v0.1.10` 初始化；升级、重启幂等、marker/旧日志、新 schema、索引行为、版本、默认前端与日志健康均通过。
 11. [完成] Git 与正式发布：PR #20/#21/#22 已合入；`v0.1.11` tag 精确指向 PR #21 merge SHA，Release/GHCR/Cosign/SBOM/SLSA 已由正式 verifier 终验。
-12. [进行中] v0.1.12 官方连接器核心实现：以 NewAPI `self`/`self/groups`/`user/models`/价格目录/Gateway `/v1/models` 四方交叉为权威；以 Sub2API JWT 管理端点、数字分组和嵌套展示目录为账号能力来源；失败关闭、免费组、分组隔离、QPU/cache/audio、订阅组余额不适用、只读预览和安全 Base URL 已进入正式规范与实现；剩余独立审查项正在收口。
+12. [已取消/归档] v0.1.12 官方连接器核心实现；当前不得继续读取或调用 NewAPI/Sub2API 管理端点，替代方案见顶部退场结论。
 13. [完成] v0.1.12 请求计费与账号连续性：NewAPI 未公开附加费、Sub2API display-only 缺失维度、远程上下文、`/auth/me` 稳定身份、JWT 轮换和匿名 catalog scope 提示已收口。
 14. [进行中] v0.1.12 Claude Code 与最终验证：官方请求分类和全选路出口准入已实现；串行完成后端/前端/仓库门禁后，按用户授权提交分支、同步最新 main、创建并合入 PR，再发布和终验 `v0.1.12`。
 
@@ -325,4 +338,4 @@ v0.1.12 最终验收必须同时满足：
 
 Phase 0–5 控制面/数据面、正式前端、Task/MJ durable async billing、独立投影、Cost Sources、人工复核、供应链门禁、SQLite `v0.1.10` 兼容修复、候选镜像和真实旧卷双启动升级均已完成并通过最终实现矩阵。PR #20/#21/#22、`v0.1.11` tag、10 项 Release 资产以及 GHCR `v0.1.11`/`latest` 的 amd64/arm64、digest、Cosign、SBOM、provenance、容器版本均已正式核验；本轮在 `fix/channel-routing-v0.1.12` 上继续处理发布后审计发现，不追溯改写上述发布结论。
 
-v0.1.12 已把 NewAPI/Sub2API 上游账号连接器的官方信任边界、分组/模型交叉验证、稳定账号身份、余额来源、QPU/cache/audio、免费组/auto、按组失败隔离、Sub2API 正式嵌套展示目录、请求级价格完整性、只读预览、安全 Base URL 和 Claude Code 自动兼容性准入写入实现与长期规范。当前剩余发布边界是最新工作树的串行门禁、PR 合入和正式供应链终验；这些完成前不形成发布完成结论。
+**历史结果说明：** v0.1.12 当时曾把 NewAPI/Sub2API 上游账号连接器的官方信任边界写入实现与长期规范。该结果现已被无版本退场方案覆盖：连接器及自动成本同步不得恢复，当前剩余发布边界必须按 `docs/channel/channel-routing-operations.md` 和退场方案第 13/14 节重新验证，不能沿用本文的旧发布结论。

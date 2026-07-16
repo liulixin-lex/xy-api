@@ -66,7 +66,7 @@ func applyValidatedRoutingTokenEstimate(
 	inputTokens int,
 	outputTokens int,
 	outputKnown bool,
-	profile channelrouting.RequestProfileV2Input,
+	profile channelrouting.RequestProfileInput,
 ) {
 	if c == nil {
 		return
@@ -144,13 +144,13 @@ func buildRoutingRequestProfileTemplate(
 	relayFormat types.RelayFormat,
 	request dto.Request,
 	modelName string,
-) (channelrouting.RequestProfileV2Input, error) {
+) (channelrouting.RequestProfileInput, error) {
 	modelName = strings.TrimSpace(modelName)
 	if c == nil || c.Request == nil || request == nil || modelName == "" {
-		return channelrouting.RequestProfileV2Input{}, errors.New("channel routing request profile is incomplete")
+		return channelrouting.RequestProfileInput{}, errors.New("channel routing request profile is incomplete")
 	}
 
-	input := channelrouting.RequestProfileV2Input{
+	input := channelrouting.RequestProfileInput{
 		RequestPath:      c.Request.URL.Path,
 		GroupName:        common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		ModelName:        modelName,
@@ -182,7 +182,7 @@ func buildRoutingRequestProfileTemplate(
 		input.SourceFormat = channelrouting.RequestSourceFormatOpenAI
 		openAIRequest, ok := request.(*dto.GeneralOpenAIRequest)
 		if !ok {
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid OpenAI routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid OpenAI routing request")
 		}
 		if len(openAIRequest.Tools) > 0 || routingJSONPresent(openAIRequest.Functions) {
 			input.RequiredCapabilities |= channelrouting.RequestCapabilityTools
@@ -207,7 +207,7 @@ func buildRoutingRequestProfileTemplate(
 		input.SourceFormat = channelrouting.RequestSourceFormatOpenAIResponses
 		responsesRequest, ok := request.(*dto.OpenAIResponsesRequest)
 		if !ok {
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid Responses routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid Responses routing request")
 		}
 		if routingJSONPresent(responsesRequest.Tools) {
 			input.RequiredCapabilities |= channelrouting.RequestCapabilityTools
@@ -235,7 +235,7 @@ func buildRoutingRequestProfileTemplate(
 		input.SourceFormat = channelrouting.RequestSourceFormatOpenAIResponsesCompaction
 		compactionRequest, ok := request.(*dto.OpenAIResponsesCompactionRequest)
 		if !ok {
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid Responses compaction routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid Responses compaction routing request")
 		}
 		if compactionRequest.PreviousResponseID != "" {
 			input.RequiredCapabilities |= channelrouting.RequestCapabilityStateful
@@ -245,7 +245,7 @@ func buildRoutingRequestProfileTemplate(
 		input.SourceFormat = channelrouting.RequestSourceFormatClaude
 		claudeRequest, ok := request.(*dto.ClaudeRequest)
 		if !ok {
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid Claude routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid Claude routing request")
 		}
 		input.TrafficClass = classifyRoutingRequestTraffic(c, relayFormat, claudeRequest)
 		if len(claudeRequest.GetTools()) > 0 || routingJSONPresent(claudeRequest.McpServers) {
@@ -284,7 +284,7 @@ func buildRoutingRequestProfileTemplate(
 			input.OutputTokens = channelrouting.NotApplicableRequestQuantity()
 			input.CachedTokens = channelrouting.NotApplicableRequestQuantity()
 		default:
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid Gemini routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid Gemini routing request")
 		}
 	case types.RelayFormatOpenAIImage:
 		input.RequestKind = channelrouting.RequestKindImage
@@ -298,7 +298,7 @@ func buildRoutingRequestProfileTemplate(
 		input.VideoMillis = channelrouting.NotApplicableRequestQuantity()
 		imageRequest, ok := request.(*dto.ImageRequest)
 		if !ok {
-			return channelrouting.RequestProfileV2Input{}, errors.New("invalid image routing request")
+			return channelrouting.RequestProfileInput{}, errors.New("invalid image routing request")
 		}
 		input.ImageUnits = channelrouting.KnownRequestQuantity(int64(lo.FromPtrOr(imageRequest.N, uint(1))))
 		if relayconstant.Path2RelayMode(c.Request.URL.Path) == relayconstant.RelayModeImagesEdits ||
@@ -337,7 +337,7 @@ func buildRoutingRequestProfileTemplate(
 		input.RequiredCapabilities = channelrouting.RequestCapabilityRealtime | channelrouting.RequestCapabilityStateful
 		input.AudioMillis = channelrouting.UnknownRequestQuantity()
 	default:
-		return channelrouting.RequestProfileV2Input{}, errors.New("unsupported channel routing request format")
+		return channelrouting.RequestProfileInput{}, errors.New("unsupported channel routing request format")
 	}
 
 	input.RetrySafety = channelrouting.RequestRetrySafetySafe
@@ -371,11 +371,11 @@ func buildRoutingRequestProfileTemplate(
 func buildTaskRoutingRequestProfileTemplate(
 	c *gin.Context,
 	info *relaycommon.RelayInfo,
-) (channelrouting.RequestProfileV2Input, error) {
+) (channelrouting.RequestProfileInput, error) {
 	if c == nil || c.Request == nil || info == nil || strings.TrimSpace(info.OriginModelName) == "" {
-		return channelrouting.RequestProfileV2Input{}, errors.New("channel routing task profile is incomplete")
+		return channelrouting.RequestProfileInput{}, errors.New("channel routing task profile is incomplete")
 	}
-	input := channelrouting.RequestProfileV2Input{
+	input := channelrouting.RequestProfileInput{
 		RequestPath:          c.Request.URL.Path,
 		GroupName:            common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		ModelName:            strings.TrimSpace(info.OriginModelName),
@@ -426,7 +426,7 @@ func buildTaskRoutingRequestProfileTemplate(
 	input.SourceFormat = channelrouting.RequestSourceFormatTask
 	request, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
-		return channelrouting.RequestProfileV2Input{}, err
+		return channelrouting.RequestProfileInput{}, err
 	}
 	if request.HasImage() || strings.TrimSpace(request.InputReference) != "" {
 		input.InputModalities |= channelrouting.RequestModalityImage
@@ -450,12 +450,12 @@ func buildMidjourneyRoutingRequestProfileTemplate(
 	c *gin.Context,
 	modelName string,
 	relayMode int,
-) (channelrouting.RequestProfileV2Input, error) {
+) (channelrouting.RequestProfileInput, error) {
 	modelName = strings.TrimSpace(modelName)
 	if c == nil || c.Request == nil || modelName == "" {
-		return channelrouting.RequestProfileV2Input{}, errors.New("channel routing Midjourney profile is incomplete")
+		return channelrouting.RequestProfileInput{}, errors.New("channel routing Midjourney profile is incomplete")
 	}
-	input := channelrouting.RequestProfileV2Input{
+	input := channelrouting.RequestProfileInput{
 		RequestPath:          c.Request.URL.Path,
 		GroupName:            common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		ModelName:            modelName,
@@ -510,7 +510,7 @@ func buildMidjourneyRoutingRequestProfileTemplate(
 	return input, nil
 }
 
-func applyOpenAIMediaProfile(input *channelrouting.RequestProfileV2Input, mediaType string) {
+func applyOpenAIMediaProfile(input *channelrouting.RequestProfileInput, mediaType string) {
 	if input == nil {
 		return
 	}
@@ -530,7 +530,7 @@ func applyOpenAIMediaProfile(input *channelrouting.RequestProfileV2Input, mediaT
 	}
 }
 
-func applyGeminiRoutingProfile(input *channelrouting.RequestProfileV2Input, request *dto.GeminiChatRequest) {
+func applyGeminiRoutingProfile(input *channelrouting.RequestProfileInput, request *dto.GeminiChatRequest) {
 	if input == nil || request == nil {
 		return
 	}
@@ -585,7 +585,7 @@ func applyGeminiRoutingProfile(input *channelrouting.RequestProfileV2Input, requ
 	}
 }
 
-func applyRoutingOutputModality(input *channelrouting.RequestProfileV2Input, modality string) {
+func applyRoutingOutputModality(input *channelrouting.RequestProfileInput, modality string) {
 	if input == nil {
 		return
 	}

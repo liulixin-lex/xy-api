@@ -324,13 +324,10 @@ func lockOriginTaskCredential(c *gin.Context, info *relaycommon.RelayInfo, chann
 		return "", service.TaskErrorWrapperLocal(errTaskCredentialUnavailable, "task_credential_unavailable", http.StatusServiceUnavailable)
 	}
 	if resolved {
-		if accountID, known := channelrouting.ResolveUpstreamAccountID(group, channel.Id, info.OriginModelName); known {
-			identity.UpstreamAccountID = accountID
-		}
 		service.SetSelectedRoutingIdentity(c, service.SelectedRoutingIdentity{
 			ChannelID: channel.Id, SnapshotRevision: identity.SnapshotRevision,
 			PoolID: identity.PoolID, MemberID: identity.MemberID,
-			CredentialID: identity.CredentialID, UpstreamAccountID: identity.UpstreamAccountID,
+			CredentialID: identity.CredentialID,
 		})
 		if _, planned := service.GetSelectedRoutingIdentity(c, channel.Id); !planned {
 			return "", service.TaskErrorWrapperLocal(errTaskCredentialUnavailable, "task_credential_unavailable", http.StatusServiceUnavailable)
@@ -383,16 +380,12 @@ func lockOriginTaskCredentialWithResolvers(
 	if !resolved || identity.CredentialID != credentialID {
 		return "", service.TaskErrorWrapperLocal(errTaskCredentialUnavailable, "task_credential_unavailable", http.StatusServiceUnavailable)
 	}
-	if accountID, known := channelrouting.ResolveUpstreamAccountID(group, channel.Id, info.OriginModelName); known {
-		identity.UpstreamAccountID = accountID
-	}
 	service.SetSelectedRoutingIdentity(c, service.SelectedRoutingIdentity{
-		ChannelID:         channel.Id,
-		SnapshotRevision:  identity.SnapshotRevision,
-		PoolID:            identity.PoolID,
-		MemberID:          identity.MemberID,
-		CredentialID:      identity.CredentialID,
-		UpstreamAccountID: identity.UpstreamAccountID,
+		ChannelID:        channel.Id,
+		SnapshotRevision: identity.SnapshotRevision,
+		PoolID:           identity.PoolID,
+		MemberID:         identity.MemberID,
+		CredentialID:     identity.CredentialID,
 	})
 	if _, planned := service.GetSelectedRoutingIdentity(c, channel.Id); !planned {
 		return "", service.TaskErrorWrapperLocal(errTaskCredentialUnavailable, "task_credential_unavailable", http.StatusServiceUnavailable)

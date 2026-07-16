@@ -16,8 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
-import { ChevronRight } from 'lucide-react'
+import { ArrowRight01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -174,8 +174,12 @@ export function ChannelRoutingHistoricalSimulationResults(props: {
             disabled={props.pending}
             onClick={() => props.onNextBatch(props.result.next_cursor)}
           >
+            <HugeiconsIcon
+              icon={ArrowRight01Icon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {t('Continue next batch')}
-            <ChevronRight aria-hidden='true' />
           </Button>
         </div>
       ) : null}

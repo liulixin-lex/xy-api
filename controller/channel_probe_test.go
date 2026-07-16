@@ -50,7 +50,7 @@ func TestChannelRoutingProbeExecutionClassifiesOperationalFailures(t *testing.T)
 		},
 		{
 			name: "payment", apiErr: types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponse, http.StatusPaymentRequired), statusCode: http.StatusPaymentRequired,
-			responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeAccount, health: routingerror.HealthOpen, capacity: routingerror.CapacityNone,
+			responsibility: routingerror.ResponsibilityCapacity, scope: routingerror.ScopeChannel, health: routingerror.HealthIgnore, capacity: routingerror.CapacityCooldown,
 		},
 		{
 			name: "rate limit", apiErr: types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeBadResponse, http.StatusTooManyRequests), statusCode: http.StatusTooManyRequests,

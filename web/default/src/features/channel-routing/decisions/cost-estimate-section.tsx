@@ -16,10 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useTranslation } from 'react-i18next'
 
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
+import {
+  hasCurrentChannelCostAudit,
+  routingCostUnknownReasonLabel,
+} from '../lib/cost-audit'
 import { useChannelRoutingFormatters } from '../lib/format'
 import type { RoutingCostEstimate } from '../types'
 
@@ -32,6 +35,7 @@ function RoutingCostEstimateColumn(props: {
   const estimate = props.estimate
   const currency = estimate.currency || ''
   const unit = estimate.unit || ''
+  const hasChannelCostAudit = hasCurrentChannelCostAudit(estimate)
   const value = (known: boolean | undefined, amount: number | undefined) =>
     known && typeof amount === 'number' && Number.isFinite(amount)
       ? t('{{currency}} {{cost}}', {
@@ -82,6 +86,32 @@ function RoutingCostEstimateColumn(props: {
             {value(estimate.effective_known, estimate.effective_cost)}
           </dd>
         </div>
+        {hasChannelCostAudit ? (
+          <>
+            <div>
+              <dt className='text-muted-foreground text-xs'>
+                {t('1× baseline expected cost')}
+              </dt>
+              <dd className='mt-1 font-medium'>
+                {value(
+                  estimate.baseline_expected_known,
+                  estimate.baseline_expected_cost
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground text-xs'>
+                {t('1× baseline worst-case cost')}
+              </dt>
+              <dd className='mt-1 font-medium'>
+                {value(
+                  estimate.baseline_worst_case_known,
+                  estimate.baseline_worst_case_cost
+                )}
+              </dd>
+            </div>
+          </>
+        ) : null}
       </dl>
 
       <dl className='grid grid-cols-2 gap-x-4 gap-y-2 border-t pt-3 text-xs'>
@@ -100,15 +130,28 @@ function RoutingCostEstimateColumn(props: {
             {estimate.pricing_basis || t('Unknown')}
           </dd>
         </div>
-        <div className='min-w-0'>
-          <dt className='text-muted-foreground'>{t('Pricing version')}</dt>
-          <dd
-            className='mt-0.5 truncate font-medium'
-            title={estimate.pricing_version}
-          >
-            {estimate.pricing_version || t('Unknown')}
-          </dd>
-        </div>
+        {estimate.pricing_version !== estimate.pricing_identity ? (
+          <div className='min-w-0'>
+            <dt className='text-muted-foreground'>{t('Pricing version')}</dt>
+            <dd
+              className='mt-0.5 truncate font-medium'
+              title={estimate.pricing_version}
+            >
+              {estimate.pricing_version || t('Unknown')}
+            </dd>
+          </div>
+        ) : null}
+        {hasChannelCostAudit ? (
+          <div className='min-w-0'>
+            <dt className='text-muted-foreground'>{t('Pricing identity')}</dt>
+            <dd
+              className='mt-0.5 truncate font-medium'
+              title={estimate.pricing_identity}
+            >
+              {format.shortHash(estimate.pricing_identity)}
+            </dd>
+          </div>
+        ) : null}
         <div className='min-w-0'>
           <dt className='text-muted-foreground'>{t('Pricing hash')}</dt>
           <dd
@@ -142,27 +185,49 @@ function RoutingCostEstimateColumn(props: {
             {format.timestamp(estimate.expires_time)}
           </dd>
         </div>
-        <div className='min-w-0'>
-          <dt className='text-muted-foreground'>{t('Source sync')}</dt>
-          <dd
-            className='mt-0.5 truncate font-medium'
-            title={estimate.source_sync_status}
-          >
-            {estimate.source_sync_status || t('Unknown')}
-          </dd>
-        </div>
-        <div className='min-w-0'>
-          <dt className='text-muted-foreground'>{t('Account reference')}</dt>
-          <dd
-            className='mt-0.5 truncate font-medium'
-            title={estimate.account_key_hash}
-          >
-            {estimate.account_source_type
-              ? `${estimate.account_source_type} · ${format.shortHash(estimate.account_key_hash)}`
-              : t('Unknown')}
-          </dd>
-        </div>
+        {hasChannelCostAudit ? (
+          <>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('Configuration revision')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {(estimate.configuration_revision ?? 0) > 0
+                  ? format.number(estimate.configuration_revision ?? 0)
+                  : t('Unknown')}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('Channel multiplier')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {Number.isFinite(estimate.upstream_cost_multiplier)
+                  ? `${format.cost(estimate.upstream_cost_multiplier)}×`
+                  : t('Unknown')}
+              </dd>
+            </div>
+          </>
+        ) : null}
+        {estimate.unknown_reason ? (
+          <div className='col-span-full min-w-0'>
+            <dt className='text-muted-foreground'>{t('Unknown reason')}</dt>
+            <dd
+              className='mt-0.5 font-medium break-words'
+              title={estimate.unknown_reason}
+            >
+              {routingCostUnknownReasonLabel(estimate.unknown_reason, t)}
+            </dd>
+          </div>
+        ) : null}
       </dl>
+      {!hasChannelCostAudit ? (
+        <p className='text-muted-foreground border-t pt-3 text-xs'>
+          {t(
+            'Channel multiplier audit was not recorded for this historical decision.'
+          )}
+        </p>
+      ) : null}
     </div>
   )
 }

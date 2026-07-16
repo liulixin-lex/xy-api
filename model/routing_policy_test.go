@@ -634,6 +634,38 @@ func TestRoutingPolicyMigrationIsIdempotentAndRevisionSurvivesRestart(t *testing
 	assertRoutingPolicyRowCounts(t, 2, 2, 2, 2, 2)
 }
 
+func TestLoadRoutingPolicyRevisionAcceptsLegacyRowsWithoutExtensions(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+	published, err := PublishRoutingPolicyRevisionContext(
+		context.Background(),
+		0,
+		routingPolicyDocumentForTest(10),
+		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 100},
+	)
+	require.NoError(t, err)
+
+	for _, table := range []string{
+		(RoutingPolicyRevision{}).TableName(),
+		(RoutingPolicyPoolRevision{}).TableName(),
+		(RoutingPolicyMemberRevision{}).TableName(),
+	} {
+		require.NoError(t, db.Exec("UPDATE "+table+" SET extensions_json = NULL").Error)
+	}
+
+	document, revision, err := LoadRoutingPolicyRevisionContext(
+		context.Background(),
+		published.Revision.Revision,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, published.Revision.ContentHash, revision.ContentHash)
+	expected, _, err := NormalizeRoutingPolicyDocument(routingPolicyDocumentForTest(10))
+	require.NoError(t, err)
+	assert.Equal(t, expected, document)
+}
+
 func TestRoutingConfigOutboxClaimReleaseAndPublishLifecycle(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
@@ -685,33 +717,33 @@ func TestRoutingRuntimeCheckpointIsMonotonicAndCollisionSafe(t *testing.T) {
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
 
-	first, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "routing:v2:config", 1, 10, map[string]any{"cursor": "1-0"}, 100, 200)
+	first, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "channel-routing:config", 1, 10, map[string]any{"cursor": "1-0"}, 100, 200)
 	require.NoError(t, err)
 	stored, err := UpsertRoutingRuntimeCheckpointContext(context.Background(), first)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), stored.PolicyRevision)
 	assert.Equal(t, int64(10), stored.Sequence)
 
-	older, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "routing:v2:config", 0, 99, map[string]any{"cursor": "0-9"}, 101, 201)
+	older, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "channel-routing:config", 0, 99, map[string]any{"cursor": "0-9"}, 101, 201)
 	require.NoError(t, err)
 	stored, err = UpsertRoutingRuntimeCheckpointContext(context.Background(), older)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), stored.PolicyRevision)
 	assert.Equal(t, int64(10), stored.Sequence)
 
-	collision, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "routing:v2:config", 1, 10, map[string]any{"cursor": "different"}, 102, 202)
+	collision, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "channel-routing:config", 1, 10, map[string]any{"cursor": "different"}, 102, 202)
 	require.NoError(t, err)
 	_, err = UpsertRoutingRuntimeCheckpointContext(context.Background(), collision)
 	assert.ErrorIs(t, err, ErrRoutingRuntimeCheckpointInvalid)
 
-	newer, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "routing:v2:config", 2, 11, map[string]any{"cursor": "2-0"}, 103, 203)
+	newer, err := NewRoutingRuntimeCheckpoint("node-a", "config_stream", "channel-routing:config", 2, 11, map[string]any{"cursor": "2-0"}, 103, 203)
 	require.NoError(t, err)
 	stored, err = UpsertRoutingRuntimeCheckpointContext(context.Background(), newer)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), stored.PolicyRevision)
 	assert.Equal(t, int64(11), stored.Sequence)
 
-	loaded, err := GetRoutingRuntimeCheckpointContext(context.Background(), "node-a", "config_stream", "routing:v2:config")
+	loaded, err := GetRoutingRuntimeCheckpointContext(context.Background(), "node-a", "config_stream", "channel-routing:config")
 	require.NoError(t, err)
 	assert.Equal(t, stored.PayloadHash, loaded.PayloadHash)
 }

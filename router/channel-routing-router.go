@@ -11,7 +11,7 @@ import (
 )
 
 func registerChannelRoutingRoutes(apiRouter *gin.RouterGroup) {
-	route := apiRouter.Group("/channel-routing/v2")
+	route := apiRouter.Group("/channel-routing")
 	route.Use(middleware.AdminAuth())
 	for _, item := range channelRoutingReadRoutes {
 		route.Handle(item.method, item.path, middleware.RequirePermission(item.permission), item.handler)
@@ -31,11 +31,13 @@ var channelRoutingReadRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/groups/:id/replay-profiles", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingGroupReplayProfiles},
 	{method: http.MethodGet, path: "/groups/:id/error-budget", permission: authz.ChannelRoutingRead, handler: controller.GetChannelRoutingGroupErrorBudget},
 	{method: http.MethodGet, path: "/channels", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingChannels},
+	{method: http.MethodGet, path: "/channel-configurations", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingChannelConfigurations},
+	{method: http.MethodGet, path: "/channel-configurations/:channelId", permission: authz.ChannelRoutingRead, handler: controller.GetChannelRoutingChannelConfiguration},
 	{method: http.MethodGet, path: "/endpoints", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingEndpoints},
 	{method: http.MethodGet, path: "/costs", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingCosts},
 	{method: http.MethodGet, path: "/costs/:pool_id/:member_id", permission: authz.ChannelRoutingRead, handler: controller.GetChannelRoutingCost},
-	{method: http.MethodGet, path: "/cost-bindings", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingCostBindings},
-	{method: http.MethodGet, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingRead, handler: controller.GetChannelRoutingCostBinding},
+	{method: http.MethodGet, path: "/cost-bindings", permission: authz.ChannelRoutingRead, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodGet, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingRead, handler: controller.ChannelRoutingCostConnectorRetired},
 	{method: http.MethodGet, path: "/probes", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingProbes},
 	{method: http.MethodGet, path: "/decisions", permission: authz.ChannelRoutingRead, handler: controller.ListChannelRoutingDecisions},
 	{method: http.MethodGet, path: "/decisions/:id", permission: authz.ChannelRoutingRead, handler: controller.GetChannelRoutingDecision},
@@ -53,14 +55,15 @@ var channelRoutingReadRoutes = []permissionRoute{
 
 var channelRoutingWriteRoutes = []permissionRoute{
 	{method: http.MethodPut, path: "/runtime-settings", permission: authz.ChannelRoutingDeploy, handler: controller.UpdateChannelRoutingRuntimeSettings},
+	{method: http.MethodPut, path: "/channel-configurations/:channelId", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.UpdateChannelRoutingChannelConfiguration},
 	{method: http.MethodPost, path: "/decisions/:id/replay", permission: authz.ChannelRoutingOperate, handler: controller.ReplayChannelRoutingDecision},
 	{method: http.MethodPost, path: "/groups/:id/simulations", permission: authz.ChannelRoutingOperate, handler: controller.SimulateChannelRoutingGroup},
-	{method: http.MethodPost, path: "/costs/sync", permission: authz.ChannelRoutingOperate, handler: controller.SyncChannelRoutingCosts},
-	{method: http.MethodPost, path: "/cost-bindings", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.CreateChannelRoutingCostBinding},
-	{method: http.MethodPut, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.UpdateChannelRoutingCostBinding},
-	{method: http.MethodDelete, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.DeleteChannelRoutingCostBinding},
-	{method: http.MethodPost, path: "/cost-bindings/:channelId/test", permission: authz.ChannelRoutingOperate, handler: controller.TestChannelRoutingCostBinding},
-	{method: http.MethodPost, path: "/cost-bindings/:channelId/groups", permission: authz.ChannelRoutingOperate, handler: controller.LoadChannelRoutingCostBindingGroups},
+	{method: http.MethodPost, path: "/costs/sync", permission: authz.ChannelRoutingOperate, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodPost, path: "/cost-bindings", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodPut, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodDelete, path: "/cost-bindings/:channelId", permission: authz.ChannelRoutingSensitiveWrite, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodPost, path: "/cost-bindings/:channelId/test", permission: authz.ChannelRoutingOperate, handler: controller.ChannelRoutingCostConnectorRetired},
+	{method: http.MethodPost, path: "/cost-bindings/:channelId/groups", permission: authz.ChannelRoutingOperate, handler: controller.ChannelRoutingCostConnectorRetired},
 	{method: http.MethodPost, path: "/probes/run", permission: authz.ChannelRoutingOperate, handler: controller.RunChannelRoutingActiveProbe},
 	{method: http.MethodPost, path: "/breakers/reset", permission: authz.ChannelRoutingOperate, handler: controller.ResetChannelRoutingBreaker},
 	{method: http.MethodPost, path: "/audit-exports", permission: authz.ChannelRoutingAuditExport, handler: controller.CreateChannelRoutingAuditExport},

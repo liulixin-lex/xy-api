@@ -1,8 +1,10 @@
-# 渠道路由 2.0 设计说明
+# 渠道路由 2.0 设计说明（历史归档）
 
 ## 文档地位
 
-本文将用户已批准的 `/opt/临时/渠道路由-企业级重构最终方案.md` 固化为仓库内的实施设计。若本文与该最终方案存在冲突，以最终方案为准，并在实施前修正本文和对应实施计划。
+本文保存渠道路由 2.0 初始建设阶段的历史设计，不再是当前接口、兼容策略或成本连接器的实施依据。当前发布与切换结论以用户批准的“Routing v2 完整退场方案”、`docs/channel/channel-routing-operations.md`、当前代码和最新实际验证为准。
+
+当前覆盖结论：正式后端 API 为 `/api/channel-routing/*`，`/api/channel-routing/v2/*` 与 `/api/smart-routing/*` 均不注册兼容路由；NewAPI/Sub2API 路由管理连接器和自动成本同步已退役，旧成本绑定与同步接口只返回 `410 Gone`；当前成本来源为系统定价与渠道倍率合成。下文冲突内容仅用于解释历史迁移来源，不得据此恢复旧行为。
 
 本轮目标不是继续扩展“智能路由 Beta”，而是完成“版本化控制平面 + 进程内确定性数据平面 + 分组成员模型 + 分层健康状态 + 分布式容量协调”的渠道路由 2.0。实施按 Phase 0 至 Phase 5 分阶段完成，每个阶段都必须能独立验证、回滚，并为下一阶段提供稳定契约。
 
@@ -231,7 +233,9 @@ Draft → Validate → Replay/Simulation → Shadow → Canary → Approval → 
 
 所有后台组件必须可取消、可关闭、可观测，不得使用无退出 Context 的永久 `time.Sleep` 循环。所有 Map、队列和事件缓冲具有 TTL、最大条目数、丢弃策略和 Eviction 指标。
 
-## 成本同步与出站安全
+## 成本同步与出站安全（历史方案）
+
+> 本节描述已退役连接器的历史要求。当前实现不得读取或调用 NewAPI/Sub2API 管理凭据、账号同步或自动成本同步；旧数据只允许用于一次性迁移、不可变历史与退场清理。
 
 New API 按 UpstreamAccount 合并同步 `/api/pricing` 与 `/api/user/self`，完整接收 Group、Model、Completion、Cache、Image、Audio、Per-request、Billing Expression/Tier、Pricing Version 和余额。
 
@@ -249,7 +253,11 @@ Sub2API 使用 groups、rates、channels、usage 接口。JWT 使用 Singlefligh
 - 统一凭证脱敏、密钥版本与轮换。
 - Per-host 并发/限速、共享 HTTP Client、分阶段超时、指数退避和 Full Jitter。
 
-## API、权限与兼容
+## API、权限与兼容（历史方案）
+
+> **当前覆盖结论：** 正式 API 使用 `/api/channel-routing/*`；`/api/channel-routing/v2/*` 不注册、不重定向、不代理；`/api/smart-routing/*` 不再注册。前端 `/smart-routing` 仅保留书签重定向。`/api/channel-routing/cost-bindings*` 与 `/api/channel-routing/costs/sync` 返回 `410 Gone`，替代入口为 `/api/channel-routing/channel-configurations`。完整切换约束见 `docs/channel/channel-routing-operations.md`。
+>
+> 以下内容是初始 2.0 设计原文，已失效并仅作历史留档。
 
 新 API 使用 `/api/channel-routing/v2`，至少提供 overview、groups、group detail/simulations、channels、decisions、cost-bindings、policy-drafts、rollback、operations 和 events。
 

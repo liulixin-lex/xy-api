@@ -44,6 +44,9 @@ func TestSetupContextForSelectedChannelUsesOperationalMultiKeyStateOnly(t *testi
 		Mode:             smart_routing_setting.ModeBalanced,
 		SnapshotStaleSec: 300,
 	})
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 9201, TrafficClass: model.RoutingChannelTrafficClassAll},
+	}, time.Now().Unix())
 
 	now := time.Now()
 	for _, apiKeyIndex := range []int{model.RoutingMetricSingleKeyIndex, 1} {
@@ -101,14 +104,14 @@ func TestSetupContextForSelectedChannelBlocksTrafficClassBypass(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
-	routinghotcache.ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
-		{ChannelID: 9301, ServesClaudeCode: true},
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 9301, TrafficClass: model.RoutingChannelTrafficClassClaudeCodeOnly},
 	}, time.Now().Unix())
 	channel := &model.Channel{Id: 9301, Name: "Claude Code only"}
 
 	standard, _ := gin.CreateTestContext(httptest.NewRecorder())
 	standard.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	common.SetContextKey(standard, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(standard, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		TrafficClass: channelrouting.RequestTrafficClassStandard,
 	})
 	setupErr := SetupContextForSelectedChannelMetadata(standard, channel, "claude-test")
@@ -118,7 +121,7 @@ func TestSetupContextForSelectedChannelBlocksTrafficClassBypass(t *testing.T) {
 
 	claudeCode, _ := gin.CreateTestContext(httptest.NewRecorder())
 	claudeCode.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	common.SetContextKey(claudeCode, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(claudeCode, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		TrafficClass: channelrouting.RequestTrafficClassClaudeCode,
 	})
 	require.Nil(t, SetupContextForSelectedChannelMetadata(claudeCode, channel, "claude-test"))
@@ -126,6 +129,11 @@ func TestSetupContextForSelectedChannelBlocksTrafficClassBypass(t *testing.T) {
 
 func TestSetupContextForSelectedChannelResetsSingleKeyMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 9202, TrafficClass: model.RoutingChannelTrafficClassAll},
+	}, time.Now().Unix())
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(ctx, constant.ContextKeyChannelKey, "stale-key")
 	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
@@ -142,6 +150,11 @@ func TestSetupContextForSelectedChannelResetsSingleKeyMetadata(t *testing.T) {
 
 func TestSetupContextForSelectedChannelClearsRoutingIdentityWhenKeySelectionFails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 9204, TrafficClass: model.RoutingChannelTrafficClassAll},
+	}, time.Now().Unix())
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(ctx, constant.ContextKeyChannelKey, "stale-key")
 	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
@@ -252,11 +265,13 @@ func TestSetupContextForSelectedChannelPreservesPinnedRoutingIdentity(t *testing
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "vip")
+	failureDomainHash := strings.Repeat("f", 64)
 	service.SetSelectedRoutingIdentity(ctx, service.SelectedRoutingIdentity{
-		ChannelID:        9210,
-		SnapshotRevision: currentIdentity.SnapshotRevision + 10,
-		PoolID:           currentIdentity.PoolID,
-		MemberID:         currentIdentity.MemberID,
+		ChannelID:         9210,
+		SnapshotRevision:  currentIdentity.SnapshotRevision + 10,
+		PoolID:            currentIdentity.PoolID,
+		MemberID:          currentIdentity.MemberID,
+		FailureDomainHash: failureDomainHash,
 	})
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: false})
 	errResult := SetupContextForSelectedChannel(ctx, &model.Channel{
@@ -268,6 +283,7 @@ func TestSetupContextForSelectedChannelPreservesPinnedRoutingIdentity(t *testing
 	assert.Equal(t, currentIdentity.PoolID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingPoolID))
 	assert.Equal(t, currentIdentity.MemberID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingMemberID))
 	assert.Equal(t, currentIdentity.CredentialID, common.GetContextKeyInt(ctx, constant.ContextKeyRoutingCredentialID))
+	assert.Equal(t, failureDomainHash, common.GetContextKeyString(ctx, constant.ContextKeyRoutingFailureDomainHash))
 }
 
 func TestSetupContextForSelectedChannelLocksPlannedCredentialAcrossKeyReordering(t *testing.T) {
@@ -317,6 +333,8 @@ func openDistributorRoutingIdentityDB(t *testing.T) *gorm.DB {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.Channel{},
+		&model.RoutingConfigurationEpoch{},
+		&model.RoutingChannelConfiguration{},
 		&model.RoutingTopologyMetadata{},
 		&model.RoutingPool{},
 		&model.RoutingPoolMember{},
@@ -330,6 +348,7 @@ func openDistributorRoutingIdentityDB(t *testing.T) *gorm.DB {
 		&model.RoutingPolicyActivation{},
 		&model.RoutingConfigOutbox{},
 	))
+	require.NoError(t, model.EnsureRoutingConfigurationEpoch(db))
 	return db
 }
 
@@ -347,12 +366,14 @@ func withDistributorRoutingIdentityState(t *testing.T, db *gorm.DB) {
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true, Mode: smart_routing_setting.ModeObserve,
 	})
+	routinghotcache.ResetForTest()
 	channelrouting.ResetSnapshotForTest()
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.SetDatabaseTypes(previousMainType, previousLogType)
 		common.CryptoSecret = previousSecret
 		smart_routing_setting.ResetForTest()
+		routinghotcache.ResetForTest()
 		channelrouting.ResetSnapshotForTest()
 	})
 }
@@ -536,14 +557,13 @@ func TestMiddlewareCostProfileKeepsHedgeDependencyChecksFailClosed(t *testing.T)
 						ID: 11, PoolID: 29, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
 						LegacyPriority: 10, LegacyWeight: 10, CredentialIDs: []int{1_001},
 						Models: []channelrouting.ModelSnapshot{{
-							ModelName: "gpt-test", CostPricing: &test.pricing,
+							ModelName: "gpt-test", ChannelConfigurationRevision: 1, CostPricing: &test.pricing,
 							CostPricingHash: strings.Repeat("b", 64), CostPricingVersion: "middleware-v1",
-							CostObservedTime: now, CostEffectiveTime: now, CostExpiresTime: now + 3_600,
+							CostPricingIdentity:    "billing:" + strings.Repeat("b", 64) + ":channel-config:1",
+							CostUpstreamMultiplier: 1,
+							CostObservedTime:       now, CostEffectiveTime: now, CostExpiresTime: now + 3_600,
 							CostVersionConfidence: model.RoutingCostConfidenceExact, CostConfidenceScore: 1,
 							CostFreshness: model.RoutingCostFreshnessFresh, CostFreshnessScore: 1,
-							CostSourceSyncStatus:  model.RoutingUpstreamSyncStatusSuccess,
-							CostAccountSourceType: model.RoutingUpstreamTypeNewAPI,
-							CostAccountKeyHash:    strings.Repeat("c", 64),
 						}},
 					}},
 				}},
@@ -618,4 +638,25 @@ func TestSetRoutingPromptCostProxyAltSSEAndRealtimeCapacitySemantics(t *testing.
 		assert.Equal(t, channelrouting.CapacityDimensionApplicableUnknown, outputState)
 		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyIsStream))
 	})
+}
+
+func TestSetupContextForSelectedChannelRejectsActiveChannelBalanceSignal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	routinghotcache.ResetForTest()
+	t.Cleanup(routinghotcache.ResetForTest)
+	now := time.Now()
+	routinghotcache.SetChannelBalanceUnavailableForTest(901, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
+		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       now.UnixMilli(),
+	})
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	apiErr := SetupContextForSelectedChannelMetadata(ctx, &model.Channel{Id: 901}, "gpt-test")
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.Equal(t, types.ErrorCodeGetChannelFailed, apiErr.GetErrorCode())
+	assert.Contains(t, apiErr.Error(), channelrouting.ExclusionReasonChannelBalance)
 }

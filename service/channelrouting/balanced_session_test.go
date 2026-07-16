@@ -1,6 +1,8 @@
 package channelrouting
 
 import (
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +18,11 @@ import (
 
 func TestRequestRoutingSessionPlanBalancedUsesExactRequestCostAndPinnedSnapshot(t *testing.T) {
 	ResetSnapshotForTest()
-	t.Cleanup(ResetSnapshotForTest)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+	})
 	now := time.Now().Unix()
 	view := balancedActiveSnapshotForTest(t, now)
 	SetSnapshotForTest(view)
@@ -42,6 +48,100 @@ func TestRequestRoutingSessionPlanBalancedUsesExactRequestCostAndPinnedSnapshot(
 	assert.Equal(t, 12, plan.SelectedIdentity.MemberID)
 	assert.True(t, plan.SelectedCostKnown)
 	assert.InDelta(t, 0.5, plan.SelectedCost, 1e-9)
+}
+
+func TestRequestRoutingSessionPlanBalancedExcludesChannelBalanceSignal(t *testing.T) {
+	ResetSnapshotForTest()
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+	})
+	now := time.Now()
+	view := balancedActiveSnapshotForTest(t, now.Unix())
+	// Keep the fallback member inside the policy's hard cost budget so this
+	// regression isolates the channel-level 402 exclusion signal.
+	view.Pools[0].Members[0].Models[0].CostBaseRatio = 1.5
+	SetSnapshotForTest(view)
+	routinghotcache.SetChannelBalanceUnavailableForTest(102, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 ExclusionReasonChannelBalance,
+		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       now.UnixMilli(),
+	})
+	session, err := NewRequestRoutingSession("balanced-channel-balance", "default")
+	require.NoError(t, err)
+
+	plan, active, err := session.PlanBalanced(BalancedRoutingPlanInput{
+		RequestRoutingPlanInput: RequestRoutingPlanInput{
+			RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+			PromptTokenEstimate: int(common.QuotaPerUnit),
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Equal(t, 101, plan.SelectedChannelID)
+	for _, candidate := range plan.Replay.Candidates {
+		if candidate.ChannelID == 102 {
+			assert.Equal(t, ExclusionReasonChannelBalance, candidate.HardExclusionReason)
+			return
+		}
+	}
+	t.Fatal("channel 102 replay candidate not found")
+}
+
+func TestRequestRoutingSessionPlanBalancedExcludesFailedTargetIdentities(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	now := time.Now().Unix()
+	view := balancedActiveSnapshotForTest(t, now)
+	view.Pools[0].Members = nil
+	view.Channels = nil
+	for index, channelID := range []int{101, 102, 103, 104, 105} {
+		member := balancedSessionMemberForTest(11+index, channelID, 0.5, now)
+		member.CredentialIDs = []int{1_001 + index}
+		view.Pools[0].Members = append(view.Pools[0].Members, member)
+		view.Channels = append(view.Channels, ChannelSnapshot{
+			ID: channelID, Name: "candidate", Status: common.ChannelStatusEnabled,
+			CredentialRequired: true, CredentialIDs: []int{1_001 + index},
+		})
+	}
+	view.Channels[2].Endpoint = "https://failed-endpoint.example.test/v1"
+	view.Channels[3].FailureDomainHash = strings.Repeat("f", 64)
+	SetSnapshotForTest(view)
+	session, err := NewRequestRoutingSession("balanced-request-exclusions", "default")
+	require.NoError(t, err)
+
+	plan, active, err := session.PlanBalanced(BalancedRoutingPlanInput{
+		RequestRoutingPlanInput: RequestRoutingPlanInput{
+			RequestPath: "/v1/chat/completions", ModelName: "gpt-test",
+			PromptTokenEstimate:   int(common.QuotaPerUnit),
+			ExcludedChannelIDs:    []int{101},
+			ExcludedCredentialIDs: []int{1_002},
+			ExcludedEndpointIdentities: []RequestEndpointIdentity{{
+				EndpointAuthority: "https://failed-endpoint.example.test:443",
+				Region:            RoutingRegion(),
+			}},
+			ExcludedFailureDomainHashes: []string{strings.Repeat("f", 64)},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Equal(t, 105, plan.SelectedChannelID)
+
+	reasons := make(map[int]string, len(plan.Replay.Candidates))
+	for _, candidate := range plan.Replay.Candidates {
+		reasons[candidate.ChannelID] = candidate.HardExclusionReason
+	}
+	assert.Equal(t, ExclusionReasonCredentialRequest, reasons[102])
+	assert.Equal(t, ExclusionReasonEndpointRequest, reasons[103])
+	assert.Equal(t, ExclusionReasonFailureDomainRequest, reasons[104])
+	for _, candidate := range plan.Candidates {
+		if candidate.ChannelID == 101 {
+			assert.False(t, candidate.Eligible)
+			assert.Equal(t, ExclusionReasonRequestFailed, candidate.ExclusionReason)
+		}
+	}
 }
 
 func TestRequestRoutingSessionPlanBalancedScopesEndpointBreakerByRegion(t *testing.T) {

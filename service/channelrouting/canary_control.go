@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	routingCanaryEvaluatorLeaseName  = "routing-v2-canary-evaluator"
-	routingCanaryOperationLeaseName  = "routing-v2-canary-operations"
+	routingCanaryEvaluatorLeaseName  = "channel-routing-canary-evaluator"
+	routingCanaryOperationLeaseName  = "channel-routing-canary-operations"
 	canaryControlLeaseTTL            = 2 * time.Minute
 	canaryOperationClaimTTL          = time.Minute
 	canaryEvaluatorSettleDelay       = 5 * time.Second
@@ -80,6 +80,9 @@ func evaluateRoutingCanaryControlContext(
 	ctx context.Context,
 	setting smart_routing_setting.SmartRoutingSetting,
 ) error {
+	if !smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() {
+		return nil
+	}
 	snapshot := currentSnapshot.Load()
 	if snapshot == nil || snapshot.view.ActivationStage != model.RoutingDeploymentStageCanary {
 		return nil
@@ -754,8 +757,11 @@ func ensureCanaryRollbackOperationContext(
 
 func executeRoutingCanaryOperationContext(
 	ctx context.Context,
-	_ smart_routing_setting.SmartRoutingSetting,
+	setting smart_routing_setting.SmartRoutingSetting,
 ) error {
+	if !smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() {
+		return nil
+	}
 	now := time.Now()
 	operationLease, acquired, err := model.TryAcquireRoutingControlLeaseContext(
 		ctx,

@@ -13,7 +13,7 @@ type SelectedRoutingIdentity struct {
 	PoolID            int
 	MemberID          int
 	CredentialID      int
-	UpstreamAccountID int
+	FailureDomainHash string
 }
 
 func SetSelectedRoutingIdentity(c *gin.Context, identity SelectedRoutingIdentity) {

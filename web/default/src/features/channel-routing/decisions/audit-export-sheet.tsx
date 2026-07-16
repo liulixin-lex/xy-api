@@ -16,10 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import { Download01Icon, FileCodeIcon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Download, FileJson } from 'lucide-react'
 import { useEffect, useMemo, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -218,7 +218,11 @@ export function ChannelRoutingAuditExportSheet(props: {
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
           <SheetTitle className='flex items-center gap-2'>
-            <FileJson className='size-4' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={FileCodeIcon}
+              className='size-4'
+              aria-hidden='true'
+            />
             {t('Export decision audit')}
           </SheetTitle>
           <SheetDescription>
@@ -342,7 +346,11 @@ export function ChannelRoutingAuditExportSheet(props: {
                     downloadExport.mutate(createExport.data.export.export_id)
                   }
                 >
-                  <Download aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={Download01Icon}
+                    data-icon='inline-start'
+                    aria-hidden='true'
+                  />
                   {downloadExport.isPending
                     ? t('Downloading')
                     : t('Download JSON')}
@@ -358,7 +366,11 @@ export function ChannelRoutingAuditExportSheet(props: {
             form='channel-routing-audit-export-form'
             disabled={!props.canAuditExport || createExport.isPending}
           >
-            <FileJson aria-hidden='true' />
+            <HugeiconsIcon
+              icon={FileCodeIcon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {createExport.isPending ? t('Creating export') : t('Create export')}
           </Button>
         </SheetFooter>

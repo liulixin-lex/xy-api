@@ -16,10 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import {
+  ArrowRight01Icon,
+  Cancel01Icon,
+  RefreshIcon,
+  Search01Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi, Link } from '@tanstack/react-router'
-import { ArrowRight, RefreshCw, Search, X } from 'lucide-react'
 import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -102,7 +107,8 @@ export function ChannelRoutingGroupsPage() {
           disabled={query.isFetching}
           onClick={() => void query.refetch()}
         >
-          <RefreshCw
+          <HugeiconsIcon
+            icon={RefreshIcon}
             aria-hidden='true'
             className={
               query.isFetching
@@ -120,7 +126,8 @@ export function ChannelRoutingGroupsPage() {
           onSubmit={handleSearch}
         >
           <div className='relative min-w-56 flex-1 sm:max-w-md'>
-            <Search
+            <HugeiconsIcon
+              icon={Search01Icon}
               className='text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2'
               aria-hidden='true'
             />
@@ -133,7 +140,11 @@ export function ChannelRoutingGroupsPage() {
             />
           </div>
           <Button type='submit' size='sm' variant='outline'>
-            <Search aria-hidden='true' />
+            <HugeiconsIcon
+              icon={Search01Icon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {t('Search')}
           </Button>
           {search.search ? (
@@ -143,7 +154,11 @@ export function ChannelRoutingGroupsPage() {
               variant='ghost'
               onClick={() => updateSearch({ page: 1, search: '' })}
             >
-              <X aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Cancel01Icon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {t('Clear')}
             </Button>
           ) : null}
@@ -184,6 +199,9 @@ export function ChannelRoutingGroupsPage() {
                     </TableHead>
                     <TableHead className='text-right'>
                       {t('Model health')}
+                    </TableHead>
+                    <TableHead className='text-right'>
+                      {t('Known costs')}
                     </TableHead>
                     <TableHead className='w-10'>
                       <span className='sr-only'>{t('Actions')}</span>
@@ -231,6 +249,24 @@ export function ChannelRoutingGroupsPage() {
                           {group.degraded_models}
                         </span>
                       </TableCell>
+                      <TableCell className='text-right tabular-nums'>
+                        <div className='font-medium'>
+                          {group.known_cost_models}
+                          <span className='text-muted-foreground px-1'>/</span>
+                          {group.known_cost_models + group.unknown_cost_models}
+                        </div>
+                        <div className='text-muted-foreground text-xs'>
+                          {format.percent(
+                            group.known_cost_models +
+                              group.unknown_cost_models >
+                              0
+                              ? group.known_cost_models /
+                                  (group.known_cost_models +
+                                    group.unknown_cost_models)
+                              : undefined
+                          )}
+                        </div>
+                      </TableCell>
                       <TableCell>
                         <Button
                           size='icon-sm'
@@ -243,7 +279,10 @@ export function ChannelRoutingGroupsPage() {
                             />
                           }
                         >
-                          <ArrowRight aria-hidden='true' />
+                          <HugeiconsIcon
+                            icon={ArrowRight01Icon}
+                            aria-hidden='true'
+                          />
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -275,7 +314,7 @@ export function ChannelRoutingGroupsPage() {
                       status={group.deployment_stage}
                     />
                   </div>
-                  <dl className='mt-3 grid grid-cols-3 gap-3 text-xs'>
+                  <dl className='mt-3 grid grid-cols-2 gap-3 text-xs sm:grid-cols-4'>
                     <div>
                       <dt className='text-muted-foreground'>{t('Members')}</dt>
                       <dd className='mt-1 font-medium'>{group.member_count}</dd>
@@ -294,6 +333,15 @@ export function ChannelRoutingGroupsPage() {
                       </dt>
                       <dd className='mt-1 font-medium'>
                         {group.open_models} / {group.degraded_models}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className='text-muted-foreground'>
+                        {t('Known costs')}
+                      </dt>
+                      <dd className='mt-1 font-medium'>
+                        {group.known_cost_models} /{' '}
+                        {group.known_cost_models + group.unknown_cost_models}
                       </dd>
                     </div>
                   </dl>

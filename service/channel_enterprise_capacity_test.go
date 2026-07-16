@@ -78,7 +78,10 @@ func TestChannelRoutingEnterpriseActiveUsesStrictCapacityAndAuditsAdmission(t *t
 			{ID: 302, Name: "second", Status: common.ChannelStatusEnabled, ModelMapping: modelMapping, CredentialIDs: []int{3_002}},
 		},
 	})
-	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true,
+		Mode:    smart_routing_setting.ModeEnterpriseSLO,
+	})
 
 	ctx, _ := gin.CreateTestContext(nil)
 	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -109,7 +112,7 @@ func TestChannelRoutingEnterpriseActiveUsesStrictCapacityAndAuditsAdmission(t *t
 	require.NoError(t, err)
 	require.Equal(t, 1, flushed)
 	var audit model.RoutingDecisionAudit
-	require.NoError(t, model.DB.Where("algorithm_version = ?", channelrouting.DecisionAlgorithmBalancedV1).
+	require.NoError(t, model.DB.Where("algorithm_version = ?", channelrouting.DecisionAlgorithmBalanced).
 		Order("id desc").First(&audit).Error)
 	assert.Equal(t, model.RoutingDecisionReservationRedisBlock, audit.ReservationMode)
 	assert.Equal(t, int64(150), audit.ReservationTotalTPM)
@@ -148,7 +151,7 @@ func TestRoutingStrictCapacityCostUsesCapacityUpperBounds(t *testing.T) {
 					CostPricingVersion: "strict-v1", CostObservedTime: now, CostEffectiveTime: now - 60,
 					CostExpiresTime: now + 3_600, CostVersionConfidence: model.RoutingCostConfidenceExact,
 					CostConfidenceScore: 1, CostFreshness: model.RoutingCostFreshnessFresh,
-					CostFreshnessScore: 1, CostSourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
+					CostFreshnessScore: 1,
 				}},
 			}},
 		}},
@@ -202,7 +205,7 @@ func (fake *enterpriseStrictCapacityRedis) Eval(
 	_ []string,
 	args ...interface{},
 ) *redis.Cmd {
-	if strings.Contains(script, "strict_capacity_reserve_v2") {
+	if strings.Contains(script, "strict_capacity_reserve") {
 		fake.reserveCalls++
 		now := time.Now().UnixMilli()
 		lease, _ := args[1].(int64)

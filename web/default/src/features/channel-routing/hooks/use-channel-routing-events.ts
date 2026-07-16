@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useQueryClient, type QueryKey } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { SSE } from 'sse.js'
@@ -47,6 +46,10 @@ function eventResourceQueryKey(
   switch (resource) {
     case 'overview':
       return channelRoutingQueryKeys.overview()
+    case 'runtime-settings':
+      return channelRoutingQueryKeys.runtimeSettingsRoot()
+    case 'control-audits':
+      return channelRoutingQueryKeys.controlAuditsRoot()
     case 'nodes':
       return channelRoutingQueryKeys.nodesRoot()
     case 'groups':
@@ -57,8 +60,8 @@ function eventResourceQueryKey(
       return channelRoutingQueryKeys.endpointsRoot()
     case 'costs':
       return channelRoutingQueryKeys.costsRoot()
-    case 'cost-bindings':
-      return channelRoutingQueryKeys.costBindingsRoot()
+    case 'channel-configurations':
+      return channelRoutingQueryKeys.channelConfigurationsRoot()
     case 'probes':
       return channelRoutingQueryKeys.probesRoot()
     case 'decisions':
@@ -84,7 +87,7 @@ export function useChannelRoutingEvents(): ChannelRoutingRealtimeStatus {
     let flushTimer: number | undefined
     let pollingTimer: number | undefined
     const pendingResources = new Set<ChannelRoutingEventResource>()
-    const source = new SSE('/api/channel-routing/v2/events', {
+    const source = new SSE('/api/channel-routing/events', {
       headers: getCommonHeaders(),
       withCredentials: true,
       autoReconnect: true,

@@ -426,7 +426,7 @@ func TestBuildMidjourneyRoutingRequestProfileUsesOperationSemantics(t *testing.T
 func TestApplyValidatedRoutingTokenEstimatePreservesUnknownSemantics(t *testing.T) {
 	previousCountToken := constant.CountToken
 	t.Cleanup(func() { constant.CountToken = previousCountToken })
-	profile := channelrouting.RequestProfileV2Input{
+	profile := channelrouting.RequestProfileInput{
 		InputTokens:  channelrouting.UnknownRequestQuantity(),
 		OutputTokens: channelrouting.UnknownRequestQuantity(),
 	}

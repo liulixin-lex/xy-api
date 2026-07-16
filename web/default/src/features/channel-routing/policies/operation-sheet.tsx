@@ -16,9 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import { Activity01Icon, Download01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Activity, Download } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -107,7 +107,12 @@ export function ChannelRoutingOperationSheet(props: {
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
           <SheetTitle className='flex items-center gap-2'>
-            <Activity className='size-4' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={Activity01Icon}
+              className='size-4'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
             {t('Operation #{{id}}', { id: props.operationId })}
           </SheetTitle>
           <SheetDescription>
@@ -202,7 +207,12 @@ export function ChannelRoutingOperationSheet(props: {
                   disabled={downloadExport.isPending}
                   onClick={() => downloadExport.mutate(auditExportId)}
                 >
-                  <Download aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={Download01Icon}
+                    data-icon='inline-start'
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
                   {downloadExport.isPending
                     ? t('Downloading')
                     : t('Download JSON')}

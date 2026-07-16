@@ -41,8 +41,11 @@ type canaryNodePresencePayload struct {
 
 func persistRoutingCanaryNodePresenceContext(
 	ctx context.Context,
-	_ smart_routing_setting.SmartRoutingSetting,
+	setting smart_routing_setting.SmartRoutingSetting,
 ) error {
+	if !smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() {
+		return nil
+	}
 	return persistRoutingCanaryNodePresenceAtContext(ctx, time.Now())
 }
 

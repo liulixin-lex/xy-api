@@ -30,6 +30,133 @@ export type ApiEnvelope<T> = {
   data: T
 }
 
+export type SmartRoutingMode =
+  | 'observe'
+  | 'shadow'
+  | 'balanced'
+  | 'enterprise_slo'
+
+export type SmartRoutingSetting = {
+  enabled: boolean
+  request_profile_enabled: boolean
+  mode: SmartRoutingMode
+  weight_availability: number
+  weight_latency: number
+  weight_throughput: number
+  weight_cost: number
+  availability_floor: number
+  min_volume: number
+  top_k: number
+  consecutive_5xx: number
+  failure_rate_pct: number
+  base_cooldown_sec: number
+  max_cooldown_sec: number
+  max_ejected_pct: number
+  half_open_probes: number
+  max_switches: number
+  retry_token_capacity: number
+  retry_token_refill_per_sec: number
+  failover_deadline_ms: number
+  retry_extra_cost_multiplier: number
+  backoff_base_ms_5xx: number
+  backoff_base_ms_429: number
+  backoff_cap_ms: number
+  first_byte_failover_enabled: boolean
+  first_byte_min_ms: number
+  first_byte_cap_ms: number
+  first_byte_p95_multiplier: number
+  hedge_enabled: boolean
+  hedge_max_concurrent: number
+  hedge_max_response_bytes: number
+  hedge_max_buffered_bytes: number
+  hedge_ratio_window_sec: number
+  hedge_max_extra_basis_points: number
+  hedge_audit_retention_days: number
+  snapshot_live_sec: number
+  snapshot_stale_sec: number
+  balance_margin_usd: number
+  sync_interval_min: number
+  hotcache_refresh_sec: number
+  metric_bucket_sec: number
+  flush_interval_min: number
+  retention_days: number
+  active_probe_enabled: boolean
+  active_probe_healthy_sec: number
+  active_probe_degraded_sec: number
+  active_probe_open_sec: number
+  active_probe_timeout_ms: number
+  active_probe_max_targets: number
+  active_probe_concurrency: number
+  active_probe_per_host: number
+  active_probe_token_budget: number
+  active_probe_cost_budget_usd: number
+  agent_enabled: boolean
+  agent_auto_apply: boolean
+  agent_model: string
+}
+
+export type SmartRoutingSettingField = keyof SmartRoutingSetting
+
+export type ChannelRoutingRuntimeSettings = {
+  settings: SmartRoutingSetting
+  stored_settings: SmartRoutingSetting
+  revision: number
+  document_hash: string
+  updated_by: number
+  updated_time_ms: number
+  etag: string
+}
+
+export type ChannelRoutingControlAuditSubject =
+  | 'runtime_settings'
+  | 'channel_configuration'
+  | 'cost_binding'
+
+export type ChannelRoutingControlAudit = {
+  id: number
+  subject_type: ChannelRoutingControlAuditSubject
+  subject_id: number
+  action: 'bootstrap' | 'reconcile' | 'create' | 'update' | 'delete' | string
+  actor_id: number
+  before_hash?: string
+  after_hash?: string
+  summary: Record<string, unknown>
+  created_time_ms: number
+}
+
+export type ChannelRoutingControlAuditPage = {
+  items: ChannelRoutingControlAudit[]
+  next_before_id: number
+}
+
+export type ChannelRoutingNode = {
+  node_id: string
+  policy_revision: number
+  policy_hash?: string
+  revision_lag: number
+  revision_ahead: number
+  observed_time: number
+  expires_time: number
+  status:
+    | 'converged'
+    | 'lagging'
+    | 'ahead'
+    | 'conflict'
+    | 'stale'
+    | 'unknown'
+    | string
+  stale: boolean
+  current: boolean
+}
+
+export type ChannelRoutingNodePage = {
+  items: ChannelRoutingNode[]
+  next_cursor: string
+  limit: number
+  control_plane_available: boolean
+  control_plane_revision: number
+}
+
 export type ChannelRoutingTelemetry = {
   status: string
   reason?: string
@@ -70,9 +197,9 @@ export type RuntimeWorkerStats = {
 }
 
 export type ChannelRoutingOverview = {
-  api_version: string
   enabled: boolean
   legacy_mode: string
+  effective_mode: 'legacy' | SmartRoutingMode
   deployment_stage: string
   control_plane_available: boolean
   control_plane_revision: number
@@ -322,10 +449,15 @@ export type ChannelSnapshot = {
   balance_known: boolean
   balance: number
   balance_updated_at: number
-  cost_connector_enabled: boolean
-  cost_sync_failures: number
-  cost_sync_backoff_until: number
-  cost_sync_error?: string
+  upstream_cost_multiplier: number
+  cost_source: RoutingChannelConfigurationCostSource
+  cost_confirmed: boolean
+  cost_basis_available: boolean
+  effective_model_count: number
+  traffic_class: RoutingChannelConfigurationTrafficClass
+  failure_domain_status: RoutingChannelFailureDomainStatus
+  failure_domain_label: string
+  configuration_revision: number
 }
 
 export type CostSnapshotSummary = {
@@ -349,6 +481,10 @@ export type CostSnapshotSummary = {
   unit?: string
   version?: string
   pricing_version?: string
+  pricing_identity?: string
+  unknown_reason?: string
+  configuration_revision: number
+  upstream_cost_multiplier: number
   upstream_group?: string
   upstream_model?: string
   observed_time?: number
@@ -358,10 +494,7 @@ export type CostSnapshotSummary = {
   confidence_score: number
   freshness: string
   freshness_score: number
-  source_sync_status: string
-  source_sync_error?: string
   snapshot_time: number
-  account?: RoutingCostAccount
 }
 
 export type CostSnapshot = Omit<
@@ -377,90 +510,48 @@ export type ChannelRoutingCostDetailResponse = {
   snapshot_built_at: number
 }
 
-export type RoutingCostBindingUpstreamType = 'newapi' | 'sub2api'
+export type RoutingChannelConfigurationCostSource =
+  | 'manual'
+  | 'legacy_migrated'
+  | 'defaulted'
 
-export type RoutingCostBindingCredentialMasks = {
-  new_api_access_token?: string
-  gateway_api_key?: string
-  sub2api_email?: string
-  sub2api_password?: string
-  sub2api_token?: string
-  custom_ca_configured?: boolean
-}
+export type RoutingChannelConfigurationTrafficClass = 'all' | 'claude_code_only'
 
-export type RoutingCostBindingCredentials = {
-  new_api_access_token?: string
-  gateway_api_key?: string
-  sub2api_email?: string
-  sub2api_password?: string
-  sub2api_token?: string
-  custom_ca_pem?: string
-}
+export type RoutingChannelFailureDomainStatus =
+  | 'configured'
+  | 'historical_migrated'
+  | 'unconfigured'
 
-export type RoutingCostBinding = {
-  id: number
+export type RoutingChannelConfiguration = {
   channel_id: number
-  channel_name?: string
-  etag: string
-  upstream_type: RoutingCostBindingUpstreamType
-  base_url: string
-  upstream_group: string
-  serves_claude_code: boolean
-  egress_allowed_private_cidrs?: string[] | null
-  new_api_user_id?: number
-  enabled: boolean
-  sync_failure_count: number
-  sync_backoff_until: number
-  last_sync_error?: string
-  credential_masks: RoutingCostBindingCredentialMasks
-  credential_error?: string
-  egress_policy_error?: string
+  channel_name: string
+  upstream_cost_multiplier: number
+  cost_source: RoutingChannelConfigurationCostSource
+  cost_confirmed: boolean
+  traffic_class: RoutingChannelConfigurationTrafficClass
+  failure_domain_status: RoutingChannelFailureDomainStatus
+  failure_domain_label: string
+  effective_model_count: number
+  cost_basis_available: boolean
+  revision: number
+  updated_by: number
   created_time: number
   updated_time: number
+  etag: string
 }
 
-export type RoutingCostBindingRequest = {
-  channel_id: number
-  upstream_type: RoutingCostBindingUpstreamType
-  base_url: string
-  upstream_group: string
-  serves_claude_code: boolean
-  egress_allowed_private_cidrs: string[]
-  new_api_user_id?: number
-  enabled: boolean
-  credentials: RoutingCostBindingCredentials
+export type RoutingChannelConfigurationUpdate = {
+  upstream_cost_multiplier: number
+  traffic_class: RoutingChannelConfigurationTrafficClass
+  failure_domain_label: string
+  clear_failure_domain: boolean
 }
 
-export type RoutingCostBindingPage = {
-  items: RoutingCostBinding[]
+export type RoutingChannelConfigurationPage = {
+  items: RoutingChannelConfiguration[]
   total: number
   page: number
   page_size: number
-}
-
-export type RoutingCostBindingGroupMetadata = {
-  id: string
-  name: string
-  platform?: string
-  subscription_type?: string
-  claude_code_only: boolean
-}
-
-export type RoutingCostBindingActionResult = {
-  channel_id: number
-  upstream_type: RoutingCostBindingUpstreamType
-  upstream_group?: string
-  credential_ready?: boolean
-  credential_test?: boolean
-  groups: string[]
-  group_meta?: Record<string, RoutingCostBindingGroupMetadata>
-  groups_truncated?: boolean
-  groups_total?: number
-  model_count: number
-  pricing_version?: string
-  requires_sync?: boolean
-  sync_task_type?: string
-  serves_claude?: boolean
 }
 
 export type RoutingNormalizedPricing = {
@@ -487,18 +578,6 @@ export type RoutingNormalizedPricing = {
   billing_expression: string
   tiers: unknown
   extras: unknown
-}
-
-export type RoutingCostAccount = {
-  id: number
-  source_type: string
-  masked_identity: string
-  status: string
-  balance_known: boolean
-  balance?: number
-  balance_updated_at?: number
-  last_sync_status: string
-  last_sync_error?: string
 }
 
 export type RoutingCostBreakdown = {
@@ -529,14 +608,19 @@ export type RoutingCostEstimate = {
   pricing_basis?: string
   pricing_hash?: string
   pricing_version?: string
+  pricing_identity?: string
+  unknown_reason?: string
+  configuration_revision?: number
+  upstream_cost_multiplier: number
+  baseline_expected_known?: boolean
+  baseline_expected_cost?: number
+  baseline_worst_case_known?: boolean
+  baseline_worst_case_cost?: number
   observed_time?: number
   effective_time?: number
   expires_time?: number
   version_confidence?: string
   freshness?: string
-  source_sync_status?: string
-  account_source_type?: string
-  account_key_hash?: string
   confidence_score?: number
   freshness_score?: number
   expected_breakdown?: RoutingCostBreakdown
@@ -726,6 +810,15 @@ export type RoutingAttempt = {
   effective_cost?: number
   cost_currency?: string
   cost_unit?: string
+  pricing_basis?: string
+  pricing_identity?: string
+  unknown_reason?: string
+  configuration_revision?: number
+  upstream_cost_multiplier?: number
+  baseline_expected_known?: boolean
+  baseline_expected_cost?: number
+  baseline_worst_case_known?: boolean
+  baseline_worst_case_cost?: number
   actual_cost_known: boolean
   actual_cost?: number
   actual_prompt_tokens?: number
@@ -784,9 +877,17 @@ export type RoutingAttemptTimeline = {
 export type RoutingHedgeAttempt = RoutingAttempt
 export type RoutingHedgeDecisionAudit = RoutingAttemptTimeline
 
+export type RoutingProbeOutcome =
+  | 'success'
+  | 'failure'
+  | 'timeout'
+  | 'canceled'
+  | 'local_error'
+
 export type RoutingProbeResult = {
   id: number
   probe_id: string
+  target_key: string
   probe_type: string
   snapshot_revision: number
   pool_id: number
@@ -799,20 +900,26 @@ export type RoutingProbeResult = {
   endpoint_authority?: string
   region?: string
   breaker_scope?: string
-  evidence_count?: number
-  node_count?: number
+  evidence_count: number
+  node_count: number
   breaker_state: string
-  breaker_reason?: string
-  breaker_cooldown_until?: number
-  breaker_updated_at?: number
-  outcome: string
+  outcome: RoutingProbeOutcome
   responsibility: string
+  scope: string
+  retryability: string
+  health_effect: string
+  capacity_effect: string
+  classification_rule: string
   status_code: number
   error_code: string
   error_message: string
+  prompt_tokens: number
+  completion_tokens: number
+  cost_nano_usd: number
   latency_ms: number
   started_time_ms: number
   finished_time_ms: number
+  lease_fencing_token: number
   node_epoch_id: string
   created_time: number
 }
@@ -1003,29 +1110,6 @@ export type RoutingOperation<Result = unknown> = {
   updated_time_ms: number
   completed_time_ms: number
   result?: Result
-}
-
-export type ChannelRoutingCostSyncSummary = {
-  bindings: number
-  accounts: number
-  snapshots: number
-  versions_created: number
-  metrics: number
-  breakers: number
-  loaded_breakers: number
-  errors: number
-  partial_accounts: number
-  skipped_backoff: number
-  stale_bindings: number
-}
-
-export type ChannelRoutingCostSyncResult = {
-  system_task_id: string
-  system_task_type: string
-  task_status: string
-  created?: boolean
-  execution_state: 'completed' | 'partial' | string
-  summary?: Partial<ChannelRoutingCostSyncSummary>
 }
 
 export type ChannelRoutingBreakerResetRequest =

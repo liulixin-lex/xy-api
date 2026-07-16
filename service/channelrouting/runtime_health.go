@@ -19,19 +19,15 @@ const (
 	runtimeHealthMaintenanceInterval = 15 * time.Minute
 	runtimeHealthMaintenanceRetry    = 30 * time.Second
 	runtimeHealthMaintenanceLeaseTTL = time.Minute
-	runtimeHealthMaintenanceLease    = "routing-v2-runtime-health-maintenance"
+	runtimeHealthMaintenanceLease    = "channel-routing-runtime-health-maintenance"
 )
 
 type RuntimeHealthStats struct {
 	CredentialEntries       int    `json:"credential_entries"`
-	AccountEntries          int    `json:"account_entries"`
 	CredentialDirty         int    `json:"credential_dirty"`
-	AccountDirty            int    `json:"account_dirty"`
 	Evictions               int64  `json:"evictions"`
 	CredentialOverflow      bool   `json:"credential_overflow"`
-	AccountOverflow         bool   `json:"account_overflow"`
 	CredentialOverflowDrops int64  `json:"credential_overflow_drops"`
-	AccountOverflowDrops    int64  `json:"account_overflow_drops"`
 	MaintenanceRuns         int64  `json:"maintenance_runs"`
 	MaintenanceFailures     int64  `json:"maintenance_failures"`
 	MaintenanceLastUnix     int64  `json:"maintenance_last_at"`
@@ -42,15 +38,11 @@ var runtimeHealth = struct {
 	sync.RWMutex
 	flushMu                sync.Mutex
 	credentials            map[int]model.RoutingCredentialHealthState
-	accounts               map[int]model.RoutingUpstreamAccountHealthState
 	dirtyCredentials       map[int]model.RoutingCredentialHealthState
-	dirtyAccounts          map[int]model.RoutingUpstreamAccountHealthState
 	limit                  int
 	evictions              int64
 	credentialOverflow     bool
-	accountOverflow        bool
 	credentialOverflowDrop int64
-	accountOverflowDrop    int64
 	maintenanceNextMs      int64
 	maintenanceRuns        int64
 	maintenanceFailures    int64
@@ -58,9 +50,7 @@ var runtimeHealth = struct {
 	maintenanceLastError   string
 }{
 	credentials:      make(map[int]model.RoutingCredentialHealthState),
-	accounts:         make(map[int]model.RoutingUpstreamAccountHealthState),
 	dirtyCredentials: make(map[int]model.RoutingCredentialHealthState),
-	dirtyAccounts:    make(map[int]model.RoutingUpstreamAccountHealthState),
 	limit:            runtimeHealthMaxEntries,
 }
 
@@ -71,16 +61,6 @@ func CredentialRuntimeHealth(credentialID int) (model.RoutingCredentialHealthSta
 	runtimeHealth.RLock()
 	defer runtimeHealth.RUnlock()
 	state, ok := runtimeHealth.credentials[credentialID]
-	return state, ok
-}
-
-func UpstreamAccountRuntimeHealth(accountID int) (model.RoutingUpstreamAccountHealthState, bool) {
-	if accountID <= 0 {
-		return model.RoutingUpstreamAccountHealthState{}, false
-	}
-	runtimeHealth.RLock()
-	defer runtimeHealth.RUnlock()
-	state, ok := runtimeHealth.accounts[accountID]
 	return state, ok
 }
 
@@ -109,32 +89,6 @@ func CredentialRuntimeBlocked(credentialID int, now time.Time) (string, bool) {
 		return "credential_capacity_cooldown", true
 	}
 	return "", false
-}
-
-func UpstreamAccountRuntimeBlocked(accountID int, now time.Time) (string, bool) {
-	if accountID <= 0 {
-		return "", false
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	runtimeHealth.RLock()
-	state, ok := runtimeHealth.accounts[accountID]
-	overflow := runtimeHealth.accountOverflow
-	runtimeHealth.RUnlock()
-	if !ok {
-		if overflow {
-			return "upstream_account_runtime_health_overflow", true
-		}
-		return "", false
-	}
-	if !state.ServingUnavailable {
-		return "", false
-	}
-	if state.UnavailableUntilMs > 0 && state.UnavailableUntilMs <= now.UnixMilli() {
-		return "", false
-	}
-	return "upstream_account_unavailable", true
 }
 
 func RecordCredentialAuthFailure(credentialID int, channelID int, reason string, until time.Time, now time.Time) {
@@ -257,68 +211,6 @@ func ClearCredentialCapacityCooldown(credentialID int, channelID int, now time.T
 	runtimeHealth.dirtyCredentials[credentialID] = state
 }
 
-func RecordUpstreamAccountUnavailable(accountID int, statusCode int, reason string, until time.Time, now time.Time) {
-	if accountID <= 0 || statusCode < 1 || statusCode > 599 {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	untilMs, ok := runtimeHealthUntilMillis(until, true)
-	if !ok {
-		return
-	}
-	runtimeHealth.Lock()
-	defer runtimeHealth.Unlock()
-	state, ok := accountRuntimeHealthForMutationLocked(accountID, now)
-	if !ok {
-		return
-	}
-	version, ok := nextRuntimeHealthVersion(state.StateVersion, now)
-	if !ok {
-		markAccountRuntimeHealthOverflowLocked()
-		return
-	}
-	state.ServingUnavailable = true
-	state.StatusCode = statusCode
-	state.Reason = boundedRuntimeHealthReason(reason)
-	state.UnavailableUntilMs = untilMs
-	state.StateVersion = version
-	state.StateUpdatedTimeMs = max(state.StateUpdatedTimeMs, positiveRuntimeHealthTimeMs(now))
-	state.UpdatedTimeMs = max(state.UpdatedTimeMs, state.StateUpdatedTimeMs)
-	runtimeHealth.accounts[accountID] = state
-	runtimeHealth.dirtyAccounts[accountID] = state
-}
-
-func ClearUpstreamAccountUnavailable(accountID int, now time.Time) {
-	if accountID <= 0 {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	runtimeHealth.Lock()
-	defer runtimeHealth.Unlock()
-	state, ok := accountRuntimeHealthForMutationLocked(accountID, now)
-	if !ok {
-		return
-	}
-	version, ok := nextRuntimeHealthVersion(state.StateVersion, now)
-	if !ok {
-		markAccountRuntimeHealthOverflowLocked()
-		return
-	}
-	state.ServingUnavailable = false
-	state.StatusCode = 0
-	state.Reason = ""
-	state.UnavailableUntilMs = 0
-	state.StateVersion = version
-	state.StateUpdatedTimeMs = max(state.StateUpdatedTimeMs, positiveRuntimeHealthTimeMs(now))
-	state.UpdatedTimeMs = max(state.UpdatedTimeMs, state.StateUpdatedTimeMs)
-	runtimeHealth.accounts[accountID] = state
-	runtimeHealth.dirtyAccounts[accountID] = state
-}
-
 func RefreshRuntimeHealthContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -342,19 +234,8 @@ func RefreshRuntimeHealthContext(ctx context.Context) error {
 		}
 		return err
 	}
-	accountStates, err := model.ListRoutingUpstreamAccountHealthStatesContext(ctx, limit)
-	if err != nil {
-		if errors.Is(err, model.ErrRoutingRuntimeHealthLimitExceeded) {
-			runtimeHealth.Lock()
-			runtimeHealth.accountOverflow = true
-			runtimeHealth.Unlock()
-		}
-		return err
-	}
-
 	runtimeHealth.Lock()
 	rebuildCredentialRuntimeHealthLocked(credentialStates)
-	rebuildAccountRuntimeHealthLocked(accountStates)
 	runtimeHealth.Unlock()
 	return ctx.Err()
 }
@@ -391,7 +272,7 @@ func maintainRuntimeHealthContext(ctx context.Context, now time.Time) error {
 		return nil
 	}
 
-	maintenanceErr := model.PruneRoutingRuntimeHealthStatesContext(ctx)
+	maintenanceErr := model.PruneRoutingCredentialHealthStatesContext(ctx)
 	finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if maintenanceErr != nil {
@@ -438,19 +319,13 @@ func FlushRuntimeHealthContext(ctx context.Context) error {
 	for _, state := range runtimeHealth.dirtyCredentials {
 		credentials = append(credentials, state)
 	}
-	accounts := make([]model.RoutingUpstreamAccountHealthState, 0, len(runtimeHealth.dirtyAccounts))
-	for _, state := range runtimeHealth.dirtyAccounts {
-		accounts = append(accounts, state)
-	}
 	runtimeHealth.RUnlock()
 
 	sort.Slice(credentials, func(i, j int) bool { return credentials[i].CredentialID < credentials[j].CredentialID })
-	sort.Slice(accounts, func(i, j int) bool { return accounts[i].AccountID < accounts[j].AccountID })
-	if err := model.FlushRoutingRuntimeHealthStatesContext(ctx, credentials, accounts); err != nil {
+	if err := model.UpsertRoutingCredentialHealthStatesContext(ctx, credentials); err != nil {
 		return err
 	}
 	acknowledgeFlushedCredentialHealth(credentials)
-	acknowledgeFlushedAccountHealth(accounts)
 	return ctx.Err()
 }
 
@@ -459,14 +334,10 @@ func RuntimeHealthRuntimeStats() RuntimeHealthStats {
 	defer runtimeHealth.RUnlock()
 	return RuntimeHealthStats{
 		CredentialEntries:       len(runtimeHealth.credentials),
-		AccountEntries:          len(runtimeHealth.accounts),
 		CredentialDirty:         len(runtimeHealth.dirtyCredentials),
-		AccountDirty:            len(runtimeHealth.dirtyAccounts),
 		Evictions:               runtimeHealth.evictions,
 		CredentialOverflow:      runtimeHealth.credentialOverflow,
-		AccountOverflow:         runtimeHealth.accountOverflow,
 		CredentialOverflowDrops: runtimeHealth.credentialOverflowDrop,
-		AccountOverflowDrops:    runtimeHealth.accountOverflowDrop,
 		MaintenanceRuns:         runtimeHealth.maintenanceRuns,
 		MaintenanceFailures:     runtimeHealth.maintenanceFailures,
 		MaintenanceLastUnix:     runtimeHealth.maintenanceLastUnix,
@@ -490,17 +361,6 @@ func credentialRuntimeHealthForMutationLocked(credentialID int, channelID int, n
 	return model.RoutingCredentialHealthState{CredentialID: credentialID, ChannelID: channelID}, true
 }
 
-func accountRuntimeHealthForMutationLocked(accountID int, now time.Time) (model.RoutingUpstreamAccountHealthState, bool) {
-	if state, exists := runtimeHealth.accounts[accountID]; exists {
-		return state, true
-	}
-	if !reserveAccountRuntimeHealthSlotLocked(now) {
-		markAccountRuntimeHealthOverflowLocked()
-		return model.RoutingUpstreamAccountHealthState{}, false
-	}
-	return model.RoutingUpstreamAccountHealthState{AccountID: accountID}, true
-}
-
 func reserveCredentialRuntimeHealthSlotLocked(now time.Time) bool {
 	if len(runtimeHealth.credentials) < runtimeHealth.limit {
 		return true
@@ -513,22 +373,6 @@ func reserveCredentialRuntimeHealthSlotLocked(now time.Time) bool {
 	runtimeHealth.evictions++
 	if unsafe {
 		runtimeHealth.credentialOverflow = true
-	}
-	return true
-}
-
-func reserveAccountRuntimeHealthSlotLocked(now time.Time) bool {
-	if len(runtimeHealth.accounts) < runtimeHealth.limit {
-		return true
-	}
-	accountID, unsafe := accountRuntimeHealthEvictionCandidateLocked(now)
-	if accountID == 0 {
-		return false
-	}
-	delete(runtimeHealth.accounts, accountID)
-	runtimeHealth.evictions++
-	if unsafe {
-		runtimeHealth.accountOverflow = true
 	}
 	return true
 }
@@ -559,32 +403,6 @@ func credentialRuntimeHealthEvictionCandidateLocked(now time.Time) (int, bool) {
 	return unsafeID, unsafeID != 0
 }
 
-func accountRuntimeHealthEvictionCandidateLocked(now time.Time) (int, bool) {
-	var safeID, unsafeID int
-	var safeUpdated, unsafeUpdated int64 = math.MaxInt64, math.MaxInt64
-	for accountID, state := range runtimeHealth.accounts {
-		if _, dirty := runtimeHealth.dirtyAccounts[accountID]; dirty {
-			continue
-		}
-		updated := max(state.UpdatedTimeMs, state.StateUpdatedTimeMs)
-		if accountStateBlocksAt(state, now) {
-			if updated < unsafeUpdated || (updated == unsafeUpdated && (unsafeID == 0 || accountID < unsafeID)) {
-				unsafeID = accountID
-				unsafeUpdated = updated
-			}
-			continue
-		}
-		if updated < safeUpdated || (updated == safeUpdated && (safeID == 0 || accountID < safeID)) {
-			safeID = accountID
-			safeUpdated = updated
-		}
-	}
-	if safeID != 0 {
-		return safeID, false
-	}
-	return unsafeID, unsafeID != 0
-}
-
 func acknowledgeFlushedCredentialHealth(states []model.RoutingCredentialHealthState) {
 	if len(states) == 0 {
 		return
@@ -596,21 +414,6 @@ func acknowledgeFlushedCredentialHealth(states []model.RoutingCredentialHealthSt
 		current, ok := runtimeHealth.dirtyCredentials[flushed.CredentialID]
 		if ok && current.AuthVersion <= flushed.AuthVersion && current.CapacityVersion <= flushed.CapacityVersion {
 			delete(runtimeHealth.dirtyCredentials, flushed.CredentialID)
-		}
-	}
-}
-
-func acknowledgeFlushedAccountHealth(states []model.RoutingUpstreamAccountHealthState) {
-	if len(states) == 0 {
-		return
-	}
-	runtimeHealth.Lock()
-	defer runtimeHealth.Unlock()
-	for index := range states {
-		flushed := states[index]
-		current, ok := runtimeHealth.dirtyAccounts[flushed.AccountID]
-		if ok && current.StateVersion <= flushed.StateVersion {
-			delete(runtimeHealth.dirtyAccounts, flushed.AccountID)
 		}
 	}
 }
@@ -652,39 +455,6 @@ func rebuildCredentialRuntimeHealthLocked(states []model.RoutingCredentialHealth
 	runtimeHealth.credentialOverflow = overflow
 }
 
-func rebuildAccountRuntimeHealthLocked(states []model.RoutingUpstreamAccountHealthState) {
-	next := make(map[int]model.RoutingUpstreamAccountHealthState, min(runtimeHealth.limit, len(states)+len(runtimeHealth.dirtyAccounts)))
-	overflow := false
-	dirtyIDs := make([]int, 0, len(runtimeHealth.dirtyAccounts))
-	for accountID := range runtimeHealth.dirtyAccounts {
-		dirtyIDs = append(dirtyIDs, accountID)
-	}
-	sort.Ints(dirtyIDs)
-	for _, accountID := range dirtyIDs {
-		if len(next) >= runtimeHealth.limit {
-			runtimeHealth.accountOverflowDrop++
-			overflow = true
-			break
-		}
-		next[accountID] = runtimeHealth.dirtyAccounts[accountID]
-	}
-	for index := range states {
-		state := states[index]
-		if current, ok := next[state.AccountID]; ok {
-			next[state.AccountID] = mergeAccountRuntimeHealth(current, state)
-			continue
-		}
-		if len(next) >= runtimeHealth.limit {
-			overflow = true
-			runtimeHealth.evictions++
-			continue
-		}
-		next[state.AccountID] = state
-	}
-	runtimeHealth.accounts = next
-	runtimeHealth.accountOverflow = overflow
-}
-
 func mergeCredentialRuntimeHealth(current model.RoutingCredentialHealthState, incoming model.RoutingCredentialHealthState) model.RoutingCredentialHealthState {
 	if incoming.AuthVersion > current.AuthVersion {
 		current.AuthFailure = incoming.AuthFailure
@@ -704,27 +474,10 @@ func mergeCredentialRuntimeHealth(current model.RoutingCredentialHealthState, in
 	return current
 }
 
-func mergeAccountRuntimeHealth(current model.RoutingUpstreamAccountHealthState, incoming model.RoutingUpstreamAccountHealthState) model.RoutingUpstreamAccountHealthState {
-	if incoming.StateVersion > current.StateVersion {
-		current.ServingUnavailable = incoming.ServingUnavailable
-		current.StatusCode = incoming.StatusCode
-		current.Reason = incoming.Reason
-		current.UnavailableUntilMs = incoming.UnavailableUntilMs
-		current.StateVersion = incoming.StateVersion
-		current.StateUpdatedTimeMs = incoming.StateUpdatedTimeMs
-	}
-	current.UpdatedTimeMs = max(current.UpdatedTimeMs, current.StateUpdatedTimeMs)
-	return current
-}
-
 func credentialStateBlocksAt(state model.RoutingCredentialHealthState, now time.Time) bool {
 	nowMs := now.UnixMilli()
 	return state.AuthFailure && (state.AuthFailureUntilMs <= 0 || state.AuthFailureUntilMs > nowMs) ||
 		state.CapacityLimited && state.CapacityCooldownUntilMs > nowMs
-}
-
-func accountStateBlocksAt(state model.RoutingUpstreamAccountHealthState, now time.Time) bool {
-	return state.ServingUnavailable && (state.UnavailableUntilMs <= 0 || state.UnavailableUntilMs > now.UnixMilli())
 }
 
 func nextRuntimeHealthVersion(current int64, now time.Time) (int64, bool) {
@@ -787,11 +540,6 @@ func markCredentialRuntimeHealthOverflowLocked() {
 	runtimeHealth.credentialOverflowDrop++
 }
 
-func markAccountRuntimeHealthOverflowLocked() {
-	runtimeHealth.accountOverflow = true
-	runtimeHealth.accountOverflowDrop++
-}
-
 func setRuntimeHealthLimitForTest(limit int) {
 	runtimeHealth.Lock()
 	defer runtimeHealth.Unlock()
@@ -807,15 +555,11 @@ func resetRuntimeHealthForTest() {
 	runtimeHealth.Lock()
 	defer runtimeHealth.Unlock()
 	runtimeHealth.credentials = make(map[int]model.RoutingCredentialHealthState)
-	runtimeHealth.accounts = make(map[int]model.RoutingUpstreamAccountHealthState)
 	runtimeHealth.dirtyCredentials = make(map[int]model.RoutingCredentialHealthState)
-	runtimeHealth.dirtyAccounts = make(map[int]model.RoutingUpstreamAccountHealthState)
 	runtimeHealth.limit = runtimeHealthMaxEntries
 	runtimeHealth.evictions = 0
 	runtimeHealth.credentialOverflow = false
-	runtimeHealth.accountOverflow = false
 	runtimeHealth.credentialOverflowDrop = 0
-	runtimeHealth.accountOverflowDrop = 0
 	runtimeHealth.maintenanceNextMs = 0
 	runtimeHealth.maintenanceRuns = 0
 	runtimeHealth.maintenanceFailures = 0

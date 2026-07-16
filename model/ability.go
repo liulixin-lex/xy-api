@@ -67,7 +67,7 @@ func getPriority(group string, model string, retry int) (int, error) {
 	var priorities []int
 	err := DB.Model(&Ability{}).
 		Select("DISTINCT(priority)").
-		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).
+		Where(commonGroupCol+" = ? and model = ? and enabled = ? and weight > ?", group, model, true, 0).
 		Order("priority DESC").              // 按优先级降序排序
 		Pluck("priority", &priorities).Error // Pluck用于将查询的结果直接扫描到一个切片中
 
@@ -93,14 +93,14 @@ func getPriority(group string, model string, retry int) (int, error) {
 }
 
 func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
-	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
-	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = (?)", group, model, true, maxPrioritySubQuery)
+	maxPrioritySubQuery := DB.Model(&Ability{}).Select("MAX(priority)").Where(commonGroupCol+" = ? and model = ? and enabled = ? and weight > ?", group, model, true, 0)
+	channelQuery := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and weight > ? and priority = (?)", group, model, true, 0, maxPrioritySubQuery)
 	if retry != 0 {
 		priority, err := getPriority(group, model, retry)
 		if err != nil {
 			return nil, err
 		} else {
-			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and priority = ?", group, model, true, priority)
+			channelQuery = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and weight > ? and priority = ?", group, model, true, 0, priority)
 		}
 	}
 
@@ -125,7 +125,7 @@ func GetChannelWithEligibility(
 		}
 		filtered := make([]*Channel, 0, len(channels))
 		for _, channel := range channels {
-			if channel != nil && eligible(channel) {
+			if channel != nil && channel.GetWeight() > 0 && eligible(channel) {
 				filtered = append(filtered, channel)
 			}
 		}
@@ -155,12 +155,12 @@ func GetChannelWithEligibility(
 		for _, channel := range filtered {
 			if channel.GetPriority() == targetPriority {
 				targets = append(targets, channel)
-				weightSum += channel.GetWeight() + 10
+				weightSum += channel.GetWeight()
 			}
 		}
 		weight := common.GetRandomInt(weightSum)
 		for _, channel := range targets {
-			weight -= channel.GetWeight() + 10
+			weight -= channel.GetWeight()
 			if weight <= 0 {
 				return channel, nil
 			}
@@ -189,12 +189,12 @@ func GetChannelWithEligibility(
 		// Randomly choose one
 		weightSum := uint(0)
 		for _, ability_ := range abilities {
-			weightSum += ability_.Weight + 10
+			weightSum += ability_.Weight
 		}
 		// Randomly choose one
 		weight := common.GetRandomInt(int(weightSum))
 		for _, ability_ := range abilities {
-			weight -= int(ability_.Weight) + 10
+			weight -= int(ability_.Weight)
 			//log.Printf("weight: %d, ability weight: %d", weight, *ability_.Weight)
 			if weight <= 0 {
 				channel.Id = ability_.ChannelId
@@ -249,7 +249,7 @@ func GetRankedChannels(group string, modelName string, requestPath string) ([]*C
 
 func getRankedAbilities(group string, modelName string, requestPath string) ([]Ability, error) {
 	var abilities []Ability
-	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, modelName, true).
+	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ? and weight > ?", group, modelName, true, 0).
 		Order("priority DESC").
 		Order("weight DESC").
 		Find(&abilities).Error

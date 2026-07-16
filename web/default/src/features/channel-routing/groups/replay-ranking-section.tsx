@@ -16,9 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import { FlaskConicalIcon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { FlaskConical } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -94,7 +94,11 @@ export function ChannelRoutingGroupReplayRankingSection(props: {
         action={
           props.canOperate ? (
             <Button type='button' onClick={props.onSimulate}>
-              <FlaskConical aria-hidden='true' />
+              <HugeiconsIcon
+                icon={FlaskConicalIcon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {t('Run simulation')}
             </Button>
           ) : null

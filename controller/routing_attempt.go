@@ -21,16 +21,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const routingAttemptCostUnknownReason = "request_cost_unknown"
+
 type routingAttemptGuard struct {
 	mu          sync.Mutex
 	policy      channelrouting.AttemptPolicy
 	coordinator *channelrouting.AttemptCoordinator
 	bypass      bool
+
+	backoffBase5xx time.Duration
+	backoffBase429 time.Duration
+	backoffCap     time.Duration
+	now            func() time.Time
+	jitter         common.JitterFunc
 }
 
 func newRoutingAttemptGuard(c *gin.Context, info *relaycommon.RelayInfo) *routingAttemptGuard {
 	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || (setting.Mode != smart_routing_setting.ModeBalanced && setting.Mode != smart_routing_setting.ModeEnterpriseSLO) {
+	if !smart_routing_setting.ResolveEffectiveMode(setting).AllowsAttemptControl() {
 		return nil
 	}
 
@@ -47,13 +55,20 @@ func newRoutingAttemptGuard(c *gin.Context, info *relaycommon.RelayInfo) *routin
 		requestContext = c.Request.Context()
 	}
 	baselineCost := routingAttemptCostUnits(info)
-	return &routingAttemptGuard{policy: channelrouting.AttemptPolicy{
-		MaxAttempts:          maxRetries + 1,
-		Deadline:             channelrouting.AttemptDeadline(requestContext, now, time.Duration(setting.FailoverDeadlineMs)*time.Millisecond),
-		ExtraCostBudgetUnits: channelrouting.AttemptExtraCostBudget(baselineCost, setting.RetryExtraCostMultiplier),
-		RetryTokenCapacity:   setting.RetryTokenCapacity,
-		RetryTokenRefill:     setting.RetryTokenRefillPerSec,
-	}}
+	return &routingAttemptGuard{
+		policy: channelrouting.AttemptPolicy{
+			MaxAttempts:          maxRetries + 1,
+			Deadline:             channelrouting.AttemptDeadline(requestContext, now, time.Duration(setting.FailoverDeadlineMs)*time.Millisecond),
+			ExtraCostBudgetUnits: channelrouting.AttemptExtraCostBudget(baselineCost, setting.RetryExtraCostMultiplier),
+			RetryTokenCapacity:   setting.RetryTokenCapacity,
+			RetryTokenRefill:     setting.RetryTokenRefillPerSec,
+		},
+		backoffBase5xx: time.Duration(setting.BackoffBaseMs5xx) * time.Millisecond,
+		backoffBase429: time.Duration(setting.BackoffBaseMs429) * time.Millisecond,
+		backoffCap:     time.Duration(setting.BackoffCapMs) * time.Millisecond,
+		now:            time.Now,
+		jitter:         common.FullJitter,
+	}
 }
 
 func (guard *routingAttemptGuard) Begin(c *gin.Context, info *relaycommon.RelayInfo) (*channelrouting.AttemptLease, error) {
@@ -102,6 +117,81 @@ func (guard *routingAttemptGuard) Complete() {
 	if coordinator != nil {
 		coordinator.Complete()
 	}
+}
+
+func (guard *routingAttemptGuard) WaitBeforeRetry(
+	c *gin.Context,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+	retryIndex int,
+) error {
+	delay, err := guard.retryDelay(apiErr, classification, retryIndex)
+	if err != nil || delay <= 0 {
+		return err
+	}
+
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (guard *routingAttemptGuard) retryDelay(
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+	retryIndex int,
+) (time.Duration, error) {
+	if guard == nil {
+		return 0, nil
+	}
+
+	guard.mu.Lock()
+	bypass := guard.bypass
+	guard.mu.Unlock()
+	if bypass {
+		return 0, nil
+	}
+
+	base := guard.backoffBase5xx
+	if apiErr != nil && apiErr.SourceStatusCode() == http.StatusTooManyRequests {
+		base = guard.backoffBase429
+	}
+	if base <= 0 || guard.backoffCap <= 0 {
+		return 0, nil
+	}
+	if classification.Retryability != routingerror.RetryBeforeCommit {
+		return 0, nil
+	}
+
+	delay := common.CappedExponentialBackoff(retryIndex+1, base, guard.backoffCap, guard.jitter)
+	if apiErr != nil && apiErr.SourceStatusCode() == http.StatusTooManyRequests {
+		if retryAfter := retryAfterFromAPIError(apiErr, guard.backoffCap); retryAfter > delay {
+			delay = retryAfter
+		}
+	}
+	if delay <= 0 {
+		return 0, nil
+	}
+
+	now := time.Now
+	if guard.now != nil {
+		now = guard.now
+	}
+	if !guard.policy.Deadline.IsZero() {
+		remaining := guard.policy.Deadline.Sub(now())
+		if remaining <= 0 || delay >= remaining {
+			return 0, channelrouting.ErrAttemptDeadlineExceeded
+		}
+	}
+	return delay, nil
 }
 
 func routingAttemptCostUnits(info *relaycommon.RelayInfo) int64 {
@@ -173,7 +263,7 @@ func reserveRoutingSerialAttemptAudit(
 	stableNodeID, stableNodeKnown := channelrouting.StableNodeID()
 	algorithmVersion := common.GetContextKeyString(c, constant.ContextKeyRoutingAlgorithmVersion)
 	if algorithmVersion == "" {
-		algorithmVersion = channelrouting.DecisionAlgorithmBalancedV1
+		algorithmVersion = channelrouting.DecisionAlgorithmBalanced
 	}
 	startedAt := info.RoutingAttemptStartTime()
 	if startedAt.IsZero() {
@@ -276,19 +366,34 @@ func routingAttemptAuditCostSpec(
 	cost channelrouting.ShadowCostInput,
 	known bool,
 ) model.RoutingHedgeAttemptCostSpec {
-	if !known {
-		return model.RoutingHedgeAttemptCostSpec{}
+	unknownReason := cost.UnknownReason
+	if known {
+		unknownReason = ""
+	} else if unknownReason == "" {
+		unknownReason = routingAttemptCostUnknownReason
 	}
-	return model.RoutingHedgeAttemptCostSpec{
-		Known:        true,
-		ExpectedCost: cost.Cost, WorstCaseCost: cost.WorstCaseCost,
-		EffectiveCost: cost.EffectiveCost, Currency: cost.Currency, Unit: cost.Unit,
+	spec := model.RoutingHedgeAttemptCostSpec{
+		Known: known, Currency: cost.Currency, Unit: cost.Unit,
 		PricingBasis: cost.PricingBasis, PricingHash: cost.PricingHash,
-		PricingVersion: cost.PricingVersion, ConfidenceScore: cost.ConfidenceScore,
-		FreshnessScore: cost.FreshnessScore, ExpectedBreakdown: cost.ExpectedBreakdown,
+		PricingVersion: cost.PricingVersion, PricingIdentity: cost.PricingIdentity,
+		UnknownReason: unknownReason, ConfigurationRevision: cost.ConfigurationRevision,
+		UpstreamCostMultiplier: cost.UpstreamCostMultiplier,
+		BaselineExpectedKnown:  cost.BaselineExpectedKnown,
+		BaselineExpectedCost:   cost.BaselineExpectedCost,
+		BaselineWorstCaseKnown: cost.BaselineWorstCaseKnown,
+		BaselineWorstCaseCost:  cost.BaselineWorstCaseCost,
+		ConfidenceScore:        cost.ConfidenceScore,
+		FreshnessScore:         cost.FreshnessScore, ExpectedBreakdown: cost.ExpectedBreakdown,
 		WorstSingleBreakdown: cost.WorstSingleBreakdown, ObservedTime: cost.ObservedTime,
 		EffectiveTime: cost.EffectiveTime, ExpiresTime: cost.ExpiresTime,
-		SourceSyncStatus: cost.SourceSyncStatus, AccountSourceType: cost.AccountSourceType,
-		AccountReferenceHash: cost.AccountKeyHash,
 	}
+	if known {
+		spec.ExpectedCost = cost.Cost
+		spec.WorstCaseCost = cost.WorstCaseCost
+		spec.EffectiveCost = cost.EffectiveCost
+	} else {
+		spec.ExpectedBreakdown = model.RoutingCostBreakdown{}
+		spec.WorstSingleBreakdown = model.RoutingCostBreakdown{}
+	}
+	return spec
 }

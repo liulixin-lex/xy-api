@@ -13,12 +13,13 @@ import (
 )
 
 const (
-	routingV2SchemaComponent    = "channel-routing-v2"
-	routingV2SchemaVersion      = "channel-routing-v2-phase5-20260714.9"
-	routingV2SchemaPollInterval = 100 * time.Millisecond
+	routingSchemaComponent       = "channel-routing"
+	routingLegacySchemaComponent = "channel-routing-v2"
+	routingSchemaVersion         = "channel-routing-20260715.5"
+	routingSchemaPollInterval    = 100 * time.Millisecond
 )
 
-var ErrRoutingV2SchemaNotReady = errors.New("channel routing v2 schema is not ready")
+var ErrRoutingSchemaNotReady = errors.New("channel routing schema is not ready")
 
 type RoutingSchemaVersion struct {
 	Component     string `json:"component" gorm:"type:varchar(64);primaryKey"`
@@ -30,7 +31,7 @@ func (RoutingSchemaVersion) TableName() string {
 	return "routing_schema_versions"
 }
 
-func routingV2RequiredSchemaModels() []any {
+func routingRequiredSchemaModels() []any {
 	return []any{
 		&RoutingSchemaVersion{},
 		&RoutingTopologyMetadata{},
@@ -63,13 +64,12 @@ func routingV2RequiredSchemaModels() []any {
 		&RoutingAuditExport{},
 		&RoutingAuditExportChunk{},
 		&RoutingHedgeAttemptAudit{},
-		&RoutingUpstreamAccount{},
-		&RoutingUpstreamAccountHealthState{},
 		&RoutingRuntimeSettingsState{},
 		&RoutingControlAudit{},
 		&RoutingCostSnapshotVersion{},
-		&RoutingChannelBinding{},
-		&RoutingCostSnapshot{},
+		&RoutingConfigurationEpoch{},
+		&RoutingChannelConfiguration{},
+		&RoutingChannelConfigurationOutbox{},
 		&RoutingChannelMetric{},
 		&RoutingMetricRollup{},
 		&RoutingTelemetryReceipt{},
@@ -92,23 +92,26 @@ func routingV2RequiredSchemaModels() []any {
 	}
 }
 
-func invalidateRoutingV2SchemaVersion(db *gorm.DB) error {
+func invalidateRoutingSchemaVersion(db *gorm.DB) error {
 	if db == nil || db.Dialector == nil {
-		return ErrRoutingV2SchemaNotReady
+		return ErrRoutingSchemaNotReady
 	}
 	if !db.Migrator().HasTable(&RoutingSchemaVersion{}) {
 		return nil
 	}
-	return db.Where("component = ?", routingV2SchemaComponent).Delete(&RoutingSchemaVersion{}).Error
+	return db.Where("component IN ?", []string{
+		routingSchemaComponent,
+		routingLegacySchemaComponent,
+	}).Delete(&RoutingSchemaVersion{}).Error
 }
 
-func publishRoutingV2SchemaVersion(db *gorm.DB) error {
-	ready, err := routingV2PhysicalSchemaReady(db)
+func publishRoutingSchemaVersion(db *gorm.DB) error {
+	ready, err := routingPhysicalSchemaReady(db)
 	if err != nil {
 		return err
 	}
 	if !ready {
-		return ErrRoutingV2SchemaNotReady
+		return ErrRoutingSchemaNotReady
 	}
 	nowMs, err := routingDatabaseNowMs(db)
 	if err != nil {
@@ -117,37 +120,37 @@ func publishRoutingV2SchemaVersion(db *gorm.DB) error {
 	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "component"}},
 		DoUpdates: clause.Assignments(map[string]any{
-			"version": routingV2SchemaVersion, "updated_time_ms": nowMs,
+			"version": routingSchemaVersion, "updated_time_ms": nowMs,
 		}),
 	}).Create(&RoutingSchemaVersion{
-		Component: routingV2SchemaComponent, Version: routingV2SchemaVersion, UpdatedTimeMs: nowMs,
+		Component: routingSchemaComponent, Version: routingSchemaVersion, UpdatedTimeMs: nowMs,
 	}).Error
 }
 
-func RoutingV2SchemaReady(db *gorm.DB) (bool, error) {
+func RoutingSchemaReady(db *gorm.DB) (bool, error) {
 	if db == nil || db.Dialector == nil {
-		return false, ErrRoutingV2SchemaNotReady
+		return false, ErrRoutingSchemaNotReady
 	}
 	if !db.Migrator().HasTable(&RoutingSchemaVersion{}) {
 		return false, nil
 	}
 	var marker RoutingSchemaVersion
-	err := db.Select("component", "version").Where("component = ?", routingV2SchemaComponent).First(&marker).Error
+	err := db.Select("component", "version").Where("component = ?", routingSchemaComponent).First(&marker).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if marker.Version != routingV2SchemaVersion {
+	if marker.Version != routingSchemaVersion {
 		return false, nil
 	}
-	return routingV2PhysicalSchemaReady(db)
+	return routingPhysicalSchemaReady(db)
 }
 
-func WaitRoutingV2SchemaReady(ctx context.Context, db *gorm.DB, maxWait time.Duration) error {
+func WaitRoutingSchemaReady(ctx context.Context, db *gorm.DB, maxWait time.Duration) error {
 	if db == nil || db.Dialector == nil || maxWait < 0 {
-		return ErrRoutingV2SchemaNotReady
+		return ErrRoutingSchemaNotReady
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -160,7 +163,7 @@ func WaitRoutingV2SchemaReady(ctx context.Context, db *gorm.DB, maxWait time.Dur
 	defer deadline.Stop()
 	var lastErr error
 	for {
-		ready, err := RoutingV2SchemaReady(db.WithContext(ctx))
+		ready, err := RoutingSchemaReady(db.WithContext(ctx))
 		if ready {
 			return nil
 		}
@@ -169,12 +172,12 @@ func WaitRoutingV2SchemaReady(ctx context.Context, db *gorm.DB, maxWait time.Dur
 		}
 		if maxWait == 0 {
 			if lastErr != nil {
-				return fmt.Errorf("%w: %v", ErrRoutingV2SchemaNotReady, lastErr)
+				return fmt.Errorf("%w: %v", ErrRoutingSchemaNotReady, lastErr)
 			}
-			return ErrRoutingV2SchemaNotReady
+			return ErrRoutingSchemaNotReady
 		}
 
-		poll := time.NewTimer(routingV2SchemaPollInterval)
+		poll := time.NewTimer(routingSchemaPollInterval)
 		select {
 		case <-ctx.Done():
 			if !poll.Stop() {
@@ -186,20 +189,20 @@ func WaitRoutingV2SchemaReady(ctx context.Context, db *gorm.DB, maxWait time.Dur
 				<-poll.C
 			}
 			if lastErr != nil {
-				return fmt.Errorf("%w: %v", ErrRoutingV2SchemaNotReady, lastErr)
+				return fmt.Errorf("%w: %v", ErrRoutingSchemaNotReady, lastErr)
 			}
-			return ErrRoutingV2SchemaNotReady
+			return ErrRoutingSchemaNotReady
 		case <-poll.C:
 		}
 	}
 }
 
-func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
+func routingPhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if db == nil || db.Dialector == nil {
-		return false, ErrRoutingV2SchemaNotReady
+		return false, ErrRoutingSchemaNotReady
 	}
-	for _, requiredModel := range routingV2RequiredSchemaModels() {
-		ready, err := routingV2ModelSchemaReady(db, requiredModel)
+	for _, requiredModel := range routingRequiredSchemaModels() {
+		ready, err := routingModelSchemaReady(db, requiredModel)
 		if err != nil || !ready {
 			return ready, err
 		}
@@ -212,7 +215,7 @@ func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !errorBudgetReady {
 		return errorBudgetReady, err
 	}
-	operationIndexReady, err := routingV2CriticalIndexReady(
+	operationIndexReady, err := routingCriticalIndexReady(
 		db,
 		(RoutingOperation{}).TableName(),
 		routingOperationRequestKeyUniqueIndex,
@@ -221,7 +224,7 @@ func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !operationIndexReady {
 		return operationIndexReady, err
 	}
-	canaryIndexReady, err := routingV2CriticalIndexReady(
+	canaryIndexReady, err := routingCriticalIndexReady(
 		db,
 		(RoutingCanaryEvaluation{}).TableName(),
 		routingCanaryEvaluationWindowUniqueIndex,
@@ -230,7 +233,7 @@ func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !canaryIndexReady {
 		return canaryIndexReady, err
 	}
-	approvalIndexReady, err := routingV2CriticalIndexReady(
+	approvalIndexReady, err := routingCriticalIndexReady(
 		db,
 		(RoutingPolicyApproval{}).TableName(),
 		routingPolicyApprovalIntentActorUniqueIndex,
@@ -239,7 +242,7 @@ func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !approvalIndexReady {
 		return approvalIndexReady, err
 	}
-	rollbackApprovalIndexReady, err := routingV2CriticalIndexReady(
+	rollbackApprovalIndexReady, err := routingCriticalIndexReady(
 		db,
 		(RoutingPolicyRollbackApproval{}).TableName(),
 		routingPolicyRollbackApprovalIntentActorUniqueIndex,
@@ -251,7 +254,7 @@ func routingV2PhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	return true, nil
 }
 
-func routingV2ModelSchemaReady(db *gorm.DB, value any) (bool, error) {
+func routingModelSchemaReady(db *gorm.DB, value any) (bool, error) {
 	statement := &gorm.Statement{DB: db}
 	if err := statement.Parse(value); err != nil {
 		return false, err
@@ -275,20 +278,20 @@ func routingV2ModelSchemaReady(db *gorm.DB, value any) (bool, error) {
 	return true, nil
 }
 
-func routingV2CriticalIndexReady(
+func routingCriticalIndexReady(
 	db *gorm.DB,
 	tableName string,
 	indexName string,
 	expectedColumns []string,
 ) (bool, error) {
-	columns, unique, exists, err := routingV2CriticalIndexDefinition(db, tableName, indexName)
+	columns, unique, exists, err := routingCriticalIndexDefinition(db, tableName, indexName)
 	if err != nil {
 		return false, err
 	}
-	return exists && unique && routingV2IndexColumnsEqual(columns, expectedColumns), nil
+	return exists && unique && routingIndexColumnsEqual(columns, expectedColumns), nil
 }
 
-func routingV2CriticalIndexDefinition(
+func routingCriticalIndexDefinition(
 	db *gorm.DB,
 	tableName string,
 	indexName string,
@@ -299,7 +302,7 @@ func routingV2CriticalIndexDefinition(
 		tableName == (RoutingPolicyRollbackApproval{}).TableName() &&
 			indexName == routingPolicyRollbackApprovalIntentActorUniqueIndex
 	if db == nil || db.Dialector == nil || !allowed {
-		return nil, false, false, ErrRoutingV2SchemaNotReady
+		return nil, false, false, ErrRoutingSchemaNotReady
 	}
 
 	switch db.Dialector.Name() {
@@ -390,7 +393,7 @@ func routingV2CriticalIndexDefinition(
 	}
 }
 
-func routingV2IndexColumnsEqual(actual []string, expected []string) bool {
+func routingIndexColumnsEqual(actual []string, expected []string) bool {
 	if len(actual) != len(expected) {
 		return false
 	}

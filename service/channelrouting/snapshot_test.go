@@ -15,6 +15,7 @@ import (
 	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/glebarez/sqlite"
@@ -48,8 +49,11 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	require.NoError(t, db.Create(&model.RoutingChannelBinding{
 		ChannelID: 301, UpstreamType: model.RoutingUpstreamTypeSub2API,
 		BaseURL: "https://cost.example", UpstreamGroup: "vip", Enabled: true,
-		ServesClaudeCode: true, SyncFailureCount: 2, SyncBackoffUntil: 999,
+		SyncFailureCount: 2, SyncBackoffUntil: 999,
 	}).Error)
+	require.NoError(t, db.Model(&model.RoutingChannelConfiguration{}).
+		Where("channel_id = ?", 301).
+		Update("traffic_class", model.RoutingChannelTrafficClassClaudeCodeOnly).Error)
 
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
@@ -60,10 +64,6 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 		RequestCount: 10, SuccessCount: 9, ReliabilityRequestCount: 9, ReliabilityFailureCount: 1,
 		P95LatencyMs: 1200, P95TTFTMs: 300, OutputTokens: 900, GenerationMs: 3000, TPS: 300, UpdatedUnix: 123,
 	})
-	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 301, Model: "gpt-a"}, routinghotcache.CostSnapshot{
-		Known: true, Cost: 0.0012, Confidence: model.RoutingCostConfidenceFull, UpdatedUnix: 124,
-	})
-
 	view, err := RefreshSnapshotContext(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), view.Revision)
@@ -75,21 +75,24 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	member := view.Pools[0].Members[0]
 	assert.Equal(t, int64(11), member.LegacyPriority)
 	assert.Equal(t, int64(23), member.LegacyWeight)
+	assert.InDelta(t, 1.0, member.NormalizedWeight, 1e-12)
+	assert.False(t, member.AutomaticTrafficPaused)
 	assert.True(t, member.TelemetryKnown)
 	require.Len(t, member.Models, 2)
 	assert.Equal(t, "gpt-a", member.Models[0].ModelName)
 	assert.True(t, member.Models[0].MetricKnown)
 	assert.Equal(t, float64(300), member.Models[0].OutputTokensPerSecond)
 	assert.Equal(t, "legacy_compat", member.Models[0].MetricSource)
-	assert.True(t, member.Models[0].CostKnown)
+	assert.False(t, member.Models[0].CostKnown, "request cost is resolved from system pricing when a request profile is available")
 
 	require.Len(t, view.Channels, 1)
 	assert.Equal(t, "https://example.com", view.Channels[0].Endpoint)
 	assert.NotContains(t, view.Channels[0].Endpoint, "secret")
-	assert.True(t, view.Channels[0].CostConnectorEnabled)
-	assert.False(t, view.Channels[0].BalanceKnown)
-	assert.True(t, view.Channels[0].ServesClaudeCode)
-	assert.Equal(t, 2, view.Channels[0].CostSyncFailures)
+	assert.True(t, view.Channels[0].BalanceKnown)
+	assert.Equal(t, 12.5, view.Channels[0].Balance)
+	assert.Equal(t, int64(100), view.Channels[0].BalanceUpdatedAt)
+	assert.Equal(t, model.RoutingChannelTrafficClassClaudeCodeOnly, view.Channels[0].TrafficClass)
+	assert.Equal(t, 1.0, view.Channels[0].UpstreamCostMultiplier)
 	assert.Equal(t, float64(1), view.Stats.TelemetryCoverage)
 	assert.Equal(t, float64(1), view.Stats.CredentialCoverage)
 
@@ -122,7 +125,7 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	assert.Greater(t, refreshed.RuntimeGeneration, view.RuntimeGeneration)
 }
 
-func TestSnapshotUsesOnlyConnectorBalanceForEnabledCostBindings(t *testing.T) {
+func TestSnapshotUsesChannelBalanceWithoutConnectorOverrides(t *testing.T) {
 	db := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, db)
 	withSnapshotSecret(t)
@@ -152,9 +155,9 @@ func TestSnapshotUsesOnlyConnectorBalanceForEnabledCostBindings(t *testing.T) {
 	for index := range bindings {
 		require.NoError(t, db.Create(&bindings[index]).Error)
 	}
-	routinghotcache.SetBalanceForTest(313, routinghotcache.BalanceSnapshot{
-		Known: true, Balance: 3, UpdatedUnix: 200,
-	})
+	routinghotcache.LoadHealthSnapshots([]model.RoutingChannelHealthState{{
+		ChannelID: 313, UpdatedTime: 200,
+	}}, 200)
 
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
@@ -165,15 +168,13 @@ func TestSnapshotUsesOnlyConnectorBalanceForEnabledCostBindings(t *testing.T) {
 	for _, channel := range view.Channels {
 		byID[channel.ID] = channel
 	}
-	assert.False(t, byID[311].BalanceKnown, "subscription connectors must not inherit legacy wallet balance")
-	assert.False(t, byID[312].BalanceKnown, "unknown connector balance must not be replaced by legacy data")
-	assert.True(t, byID[313].BalanceKnown)
-	assert.Equal(t, 3.0, byID[313].Balance)
-	assert.Equal(t, int64(200), byID[313].BalanceUpdatedAt)
-	assert.True(t, byID[314].BalanceKnown, "disabled connectors retain legacy channel compatibility")
-	assert.Equal(t, 6.0, byID[314].Balance)
-	assert.True(t, byID[315].BalanceKnown, "channels without a connector retain legacy balance compatibility")
-	assert.Equal(t, 5.0, byID[315].Balance)
+	for _, channel := range channels {
+		assert.True(t, byID[channel.Id].BalanceKnown)
+		assert.Equal(t, channel.Balance, byID[channel.Id].Balance)
+		assert.Equal(t, channel.BalanceUpdatedTime, byID[channel.Id].BalanceUpdatedAt)
+	}
+	assert.Equal(t, 7.0, byID[313].Balance, "retired connector cache must not override Channel.Balance")
+	assert.Equal(t, int64(100), byID[313].BalanceUpdatedAt)
 }
 
 func TestSnapshotPublishesVersionedPoolSelectorPolicyWithoutEnvironmentOverrides(t *testing.T) {
@@ -702,8 +703,11 @@ func runSnapshotExternalContract(t *testing.T, db *gorm.DB, dbType common.Databa
 		&model.RoutingDecisionAudit{},
 		&model.RoutingDecisionReplayChunk{},
 		&model.RoutingChannelBinding{},
+		&model.RoutingChannelConfiguration{},
+		&model.RoutingConfigurationEpoch{},
 		&model.RoutingMetricRollup{},
 	))
+	require.NoError(t, model.EnsureRoutingConfigurationEpoch(db))
 	require.NoError(t, db.Create(&[]model.Channel{
 		{Id: 501, Name: "shared", Key: "key-a\nkey-b", Group: "VIP,vip", Models: "Model-X,model-x", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 		{Id: 502, Name: "keyless", Group: "local", Models: "keyless-model"},
@@ -976,6 +980,8 @@ func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testin
 	ResetSnapshotForTest()
 	routinghotcache.ResetForTest()
 	routingmetrics.ResetForTest()
+	restoreSystemRoutingRatioSettings(t)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"current":1.25}`))
 	t.Cleanup(func() {
 		ResetSnapshotForTest()
 		routinghotcache.ResetForTest()
@@ -1042,10 +1048,6 @@ func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testin
 	require.NoError(t, model.UpsertRoutingMetricRollupsContext(context.Background(), []model.RoutingMetricRollup{
 		snapshotTTFTRollup(t, member.MemberID, document.Pools[0].PoolID, 612, selectedCredential, "current", now-1, 20, next.Revision.Revision),
 	}))
-	routinghotcache.SetCostForTest(routinghotcache.CostKey{ChannelID: 612, Model: "current"}, routinghotcache.CostSnapshot{
-		Known: true, Cost: 1.25, Confidence: model.RoutingCostConfidenceFull, UpdatedUnix: now,
-	})
-
 	second, err := buildSnapshotContext(context.Background(), db, limits)
 	require.NoError(t, err)
 	secondView, err := publishRuntimeSnapshot(second)
@@ -1058,8 +1060,11 @@ func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testin
 	assert.False(t, observation.MetricKnown)
 	assert.False(t, observation.P95TTFTKnown)
 	assert.False(t, secondView.AggregateP95TTFTKnown)
-	assert.True(t, observation.CostKnown, "cost comes from an independent complete source")
-	assert.Equal(t, 1.25, observation.Cost)
+	assert.False(t, observation.CostKnown, "request cost is resolved only after a request profile is available")
+	require.NotNil(t, observation.CostPricing, "system pricing remains independent from telemetry availability")
+	require.NotNil(t, observation.CostPricing.PerRequestCost)
+	assert.Equal(t, 1.25, *observation.CostPricing.PerRequestCost)
+	assert.Empty(t, observation.CostUnknownReason)
 	current, ok := CurrentSnapshot()
 	require.True(t, ok)
 	assert.Equal(t, secondView.Revision, current.Revision)
@@ -1087,7 +1092,7 @@ func TestResolveIdentityKeepsPoolMemberForKeylessChannel(t *testing.T) {
 	assert.Zero(t, identity.CredentialID)
 }
 
-func TestSnapshotSanitizesNonFiniteTelemetryAndCostValues(t *testing.T) {
+func TestSnapshotSanitizesNonFiniteTelemetryAndBalanceValues(t *testing.T) {
 	db := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, db)
 	withSnapshotSecret(t)
@@ -1099,6 +1104,7 @@ func TestSnapshotSanitizesNonFiniteTelemetryAndCostValues(t *testing.T) {
 	})
 	require.NoError(t, db.Create(&model.Channel{
 		Id: 304, Name: "non-finite", Key: "key", Group: "default", Models: "gpt-test",
+		Balance: math.Inf(1), BalanceUpdatedTime: common.GetTimestamp(),
 	}).Error)
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
@@ -1108,13 +1114,6 @@ func TestSnapshotSanitizesNonFiniteTelemetryAndCostValues(t *testing.T) {
 	routinghotcache.SetMetricForTest(key, routinghotcache.MetricSnapshot{
 		RequestCount: 1, SuccessCount: 1, P95LatencyMs: math.NaN(), P95TTFTMs: math.Inf(1), TPS: math.Inf(-1),
 	})
-	routinghotcache.SetCostForTest(key.CostKey(), routinghotcache.CostSnapshot{
-		Known: true, Cost: math.NaN(), Confidence: model.RoutingCostConfidenceFull,
-	})
-	routinghotcache.SetBalanceForTest(304, routinghotcache.BalanceSnapshot{
-		Known: true, Balance: math.Inf(1), UpdatedUnix: common.GetTimestamp(),
-	})
-
 	view, err := RefreshSnapshotContext(context.Background())
 	require.NoError(t, err)
 	require.Len(t, view.Pools, 1)
@@ -1125,7 +1124,7 @@ func TestSnapshotSanitizesNonFiniteTelemetryAndCostValues(t *testing.T) {
 	assert.False(t, observation.CostKnown)
 	assert.Zero(t, observation.Cost)
 	assert.False(t, view.Channels[0].BalanceKnown)
-	assert.GreaterOrEqual(t, view.Stats.InvalidNumericValues, 5)
+	assert.GreaterOrEqual(t, view.Stats.InvalidNumericValues, 4)
 	_, err = common.Marshal(view)
 	require.NoError(t, err)
 }
@@ -1292,8 +1291,11 @@ func openSnapshotTestDB(t *testing.T) *gorm.DB {
 		&model.RoutingPolicyActivation{},
 		&model.RoutingConfigOutbox{},
 		&model.RoutingChannelBinding{},
+		&model.RoutingConfigurationEpoch{},
+		&model.RoutingChannelConfiguration{},
 		&model.RoutingMetricRollup{},
 	))
+	require.NoError(t, model.EnsureRoutingConfigurationEpoch(db))
 	return db
 }
 
@@ -1337,6 +1339,8 @@ func openSnapshotExternalTestDB(t *testing.T, dbType common.DatabaseType, dsn st
 	models := []any{
 		&model.RoutingMetricRollup{},
 		&model.RoutingChannelBinding{},
+		&model.RoutingChannelConfiguration{},
+		&model.RoutingConfigurationEpoch{},
 		&model.RoutingCredentialRef{},
 		&model.RoutingDecisionReplayChunk{},
 		&model.RoutingDecisionAudit{},

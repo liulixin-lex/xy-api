@@ -63,6 +63,10 @@ func TestMain(m *testing.M) {
 		&model.RoutingConfigOutbox{},
 		&model.RoutingRuntimeCheckpoint{},
 		&model.RoutingDecisionAudit{},
+		&model.RoutingChannelConfiguration{},
+		&model.RoutingConfigurationEpoch{},
+		&model.RoutingChannelConfigurationOutbox{},
+		&model.RoutingControlAudit{},
 		&model.RoutingChannelBinding{},
 		&model.RoutingCostSnapshot{},
 		&model.RoutingChannelMetric{},
@@ -87,6 +91,7 @@ func TestMain(m *testing.M) {
 
 func truncate(t *testing.T) {
 	t.Helper()
+	require.NoError(t, model.EnsureRoutingConfigurationEpoch(model.DB))
 	channelrouting.ResetDecisionAuditsForTest()
 	channelrouting.ResetSnapshotForTest()
 	routingmetrics.ResetForTest()
@@ -103,6 +108,10 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM subscription_billing_periods")
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM routing_decision_audits")
+		model.DB.Exec("DELETE FROM routing_channel_configuration_outbox")
+		model.DB.Exec("DELETE FROM routing_channel_configurations")
+		model.DB.Exec("DELETE FROM routing_configuration_epochs")
+		model.DB.Exec("DELETE FROM routing_control_audits")
 		model.DB.Exec("DELETE FROM routing_config_outbox")
 		model.DB.Exec("DELETE FROM routing_policy_activations")
 		model.DB.Exec("DELETE FROM routing_policy_member_revisions")

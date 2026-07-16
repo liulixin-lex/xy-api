@@ -16,17 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  Alert02Icon,
+  ArrowTurnBackwardIcon,
+  CheckmarkCircle02Icon,
+  Loading03Icon,
+  Shield02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AxiosError } from 'axios'
-import {
-  CheckCircle2,
-  LoaderCircle,
-  RotateCcw,
-  ShieldAlert,
-  TriangleAlert,
-} from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -280,13 +280,17 @@ export function ChannelRoutingBreakerResetDialog(props: {
           />
         }
       >
-        <RotateCcw aria-hidden='true' />
+        <HugeiconsIcon
+          icon={ArrowTurnBackwardIcon}
+          data-icon='inline-start'
+          aria-hidden='true'
+        />
         {!props.compact ? t('Reset breaker') : null}
       </AlertDialogTrigger>
       <AlertDialogContent className='channel-routing-touch-surface max-h-[min(88dvh,44rem)] w-[calc(100vw-1.5rem)] overflow-y-auto sm:max-w-md'>
         <AlertDialogHeader>
           <AlertDialogMedia className='bg-destructive/10 text-destructive'>
-            <ShieldAlert aria-hidden='true' />
+            <HugeiconsIcon icon={Shield02Icon} aria-hidden='true' />
           </AlertDialogMedia>
           <AlertDialogTitle>{t('Reset routing breaker?')}</AlertDialogTitle>
           <AlertDialogDescription className='text-left'>
@@ -362,7 +366,8 @@ export function ChannelRoutingBreakerResetDialog(props: {
               className='border-destructive/30 bg-destructive/5 text-destructive flex items-start gap-2 rounded-lg border p-3 text-sm'
               role='alert'
             >
-              <TriangleAlert
+              <HugeiconsIcon
+                icon={Alert02Icon}
                 className='mt-0.5 size-4 shrink-0'
                 aria-hidden='true'
               />
@@ -374,7 +379,11 @@ export function ChannelRoutingBreakerResetDialog(props: {
               className='border-destructive/30 bg-destructive/5 text-destructive flex flex-wrap items-center gap-2 rounded-lg border p-3 text-sm'
               role='alert'
             >
-              <TriangleAlert className='size-4 shrink-0' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Alert02Icon}
+                className='size-4 shrink-0'
+                aria-hidden='true'
+              />
               <span className='min-w-0 flex-1'>
                 {t('Could not refresh the breaker reset status.')}
               </span>
@@ -390,7 +399,8 @@ export function ChannelRoutingBreakerResetDialog(props: {
           ) : null}
           {active && operation ? (
             <div className='text-muted-foreground flex items-center gap-2 text-sm'>
-              <LoaderCircle
+              <HugeiconsIcon
+                icon={Loading03Icon}
                 className='size-4 animate-spin motion-reduce:animate-none'
                 aria-hidden='true'
               />
@@ -403,7 +413,8 @@ export function ChannelRoutingBreakerResetDialog(props: {
           ) : null}
           {completed ? (
             <div className='flex items-start gap-2 text-sm' role='status'>
-              <CheckCircle2
+              <HugeiconsIcon
+                icon={CheckmarkCircle02Icon}
                 className='text-success mt-0.5 size-4 shrink-0'
                 aria-hidden='true'
               />
@@ -419,7 +430,8 @@ export function ChannelRoutingBreakerResetDialog(props: {
               className='border-destructive/30 bg-destructive/5 text-destructive flex items-start gap-2 rounded-lg border p-3 text-sm'
               role='alert'
             >
-              <TriangleAlert
+              <HugeiconsIcon
+                icon={Alert02Icon}
                 className='mt-0.5 size-4 shrink-0'
                 aria-hidden='true'
               />
@@ -448,19 +460,29 @@ export function ChannelRoutingBreakerResetDialog(props: {
               disabled={reset.isPending}
             >
               {reset.isPending ? (
-                <LoaderCircle
+                <HugeiconsIcon
+                  icon={Loading03Icon}
+                  data-icon='inline-start'
                   className='animate-spin motion-reduce:animate-none'
                   aria-hidden='true'
                 />
               ) : (
-                <RotateCcw aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={ArrowTurnBackwardIcon}
+                  data-icon='inline-start'
+                  aria-hidden='true'
+                />
               )}
               {reset.isPending ? t('Submitting reset') : t('Confirm reset')}
             </Button>
           ) : null}
           {notApplied ? (
             <Button type='button' variant='outline' onClick={clearOperation}>
-              <RotateCcw aria-hidden='true' />
+              <HugeiconsIcon
+                icon={ArrowTurnBackwardIcon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {t('Prepare another reset')}
             </Button>
           ) : null}

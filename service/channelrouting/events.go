@@ -16,23 +16,21 @@ const (
 	routingEventPayloadMaximum    = 16 << 10
 	routingEventTypeMaximumBytes  = 64
 
-	RoutingEventTypeReady                  = "routing.ready"
-	RoutingEventTypeReset                  = "routing.reset"
-	RoutingEventTypePolicyDraftChanged     = "routing.policy_draft.changed"
-	RoutingEventTypePolicySimulation       = "routing.policy_simulation.completed"
-	RoutingEventTypePolicyPublished        = "routing.policy.published"
-	RoutingEventTypePolicyRolledBack       = "routing.policy.rolled_back"
-	RoutingEventTypePolicyApplied          = "routing.policy.applied"
-	RoutingEventTypeCostSyncQueued         = "routing.cost_sync.queued"
-	RoutingEventTypeCostSyncCompleted      = "routing.cost_sync.completed"
-	RoutingEventTypeCostBindingChanged     = "routing.cost_binding.changed"
-	RoutingEventTypeRuntimeSettingsChanged = "routing.runtime_settings.changed"
-	RoutingEventTypeProbeCompleted         = "routing.probe.completed"
-	RoutingEventTypeAuditExportReady       = "routing.audit_export.ready"
-	RoutingEventTypeErrorBudgetChanged     = "routing.error_budget.changed"
-	RoutingEventTypeBreakerReset           = "routing.breaker.reset"
-	RoutingEventTypeBreakerOpened          = "routing.breaker.opened"
-	RoutingEventTypeBreakerRecovered       = "routing.breaker.recovered"
+	RoutingEventTypeReady                       = "routing.ready"
+	RoutingEventTypeReset                       = "routing.reset"
+	RoutingEventTypePolicyDraftChanged          = "routing.policy_draft.changed"
+	RoutingEventTypePolicySimulation            = "routing.policy_simulation.completed"
+	RoutingEventTypePolicyPublished             = "routing.policy.published"
+	RoutingEventTypePolicyRolledBack            = "routing.policy.rolled_back"
+	RoutingEventTypePolicyApplied               = "routing.policy.applied"
+	RoutingEventTypeChannelConfigurationChanged = "routing.channel_configuration.changed"
+	RoutingEventTypeRuntimeSettingsChanged      = "routing.runtime_settings.changed"
+	RoutingEventTypeProbeCompleted              = "routing.probe.completed"
+	RoutingEventTypeAuditExportReady            = "routing.audit_export.ready"
+	RoutingEventTypeErrorBudgetChanged          = "routing.error_budget.changed"
+	RoutingEventTypeBreakerReset                = "routing.breaker.reset"
+	RoutingEventTypeBreakerOpened               = "routing.breaker.opened"
+	RoutingEventTypeBreakerRecovered            = "routing.breaker.recovered"
 )
 
 var (
@@ -329,4 +327,5 @@ func ResetRoutingEventsForTest() {
 	defaultRoutingEventHubMu.Lock()
 	defaultRoutingEventHub = newRoutingEventHub(routingEventBufferCapacity)
 	defaultRoutingEventHubMu.Unlock()
+	resetRoutingChannelConfigurationEventEpochForTest()
 }

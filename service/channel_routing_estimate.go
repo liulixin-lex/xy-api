@@ -80,12 +80,12 @@ func routingRequestProfile(
 	if !setting.Enabled {
 		return nil, nil
 	}
-	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
+	template, ok := common.GetContextKeyType[channelrouting.RequestProfileInput](
 		c,
 		constant.ContextKeyRoutingRequestProfile,
 	)
 	if !ok {
-		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileV2Input](
+		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileInput](
 			c,
 			constant.ContextKeyRoutingRequestProfile,
 		); pointerOK && pointer != nil {
@@ -96,8 +96,8 @@ func routingRequestProfile(
 	if !ok {
 		return nil, nil
 	}
-	if !setting.RequestProfileV2Enabled {
-		profile, err := channelrouting.NewRequestProfile(
+	if !setting.RequestProfileEnabled {
+		profile, err := channelrouting.NewLegacyRequestProfile(
 			template.RequestPath,
 			group,
 			template.ModelName,
@@ -125,7 +125,7 @@ func routingRequestProfile(
 		common.GetContextKeyBool(c, constant.ContextKeyRoutingOutputKnown) {
 		template.OutputTokens = channelrouting.KnownRequestQuantity(int64(max(completionTokens, 0)))
 	}
-	profile, err := channelrouting.NewRequestProfileV2(template)
+	profile, err := channelrouting.NewRequestProfile(template)
 	if err != nil {
 		return nil, err
 	}
@@ -142,12 +142,12 @@ func ChannelRoutingRequestAttemptPolicy(c *gin.Context) (RoutingRequestAttemptPo
 	if c == nil {
 		return RoutingRequestAttemptPolicy{}, false
 	}
-	template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
+	template, ok := common.GetContextKeyType[channelrouting.RequestProfileInput](
 		c,
 		constant.ContextKeyRoutingRequestProfile,
 	)
 	if !ok {
-		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileV2Input](
+		if pointer, pointerOK := common.GetContextKeyType[*channelrouting.RequestProfileInput](
 			c,
 			constant.ContextKeyRoutingRequestProfile,
 		); pointerOK && pointer != nil {

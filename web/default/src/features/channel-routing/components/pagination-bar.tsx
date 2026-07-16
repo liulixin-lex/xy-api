@@ -16,7 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { ChevronLeft, ChevronRight, ChevronsLeft } from 'lucide-react'
+import {
+  ArrowLeft01Icon,
+  ArrowRight01Icon,
+  ArrowTurnBackwardIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -69,7 +74,11 @@ export function ChannelRoutingPagination(props: {
           disabled={props.disabled || props.page <= 1}
           onClick={() => props.onPageChange(props.page - 1)}
         >
-          <ChevronLeft aria-hidden='true' />
+          <HugeiconsIcon
+            icon={ArrowLeft01Icon}
+            data-icon='inline-start'
+            aria-hidden='true'
+          />
         </Button>
         <Button
           size='icon-sm'
@@ -78,7 +87,11 @@ export function ChannelRoutingPagination(props: {
           disabled={props.disabled || props.page >= totalPages}
           onClick={() => props.onPageChange(props.page + 1)}
         >
-          <ChevronRight aria-hidden='true' />
+          <HugeiconsIcon
+            icon={ArrowRight01Icon}
+            data-icon='inline-start'
+            aria-hidden='true'
+          />
         </Button>
       </div>
     </div>
@@ -101,7 +114,11 @@ export function ChannelRoutingCursorPagination(props: {
         disabled={props.disabled || props.cursor <= 0}
         onClick={() => props.onCursorChange(0)}
       >
-        <ChevronsLeft aria-hidden='true' />
+        <HugeiconsIcon
+          icon={ArrowTurnBackwardIcon}
+          data-icon='inline-start'
+          aria-hidden='true'
+        />
         {t('First page')}
       </Button>
       <Button
@@ -110,8 +127,12 @@ export function ChannelRoutingCursorPagination(props: {
         disabled={props.disabled || !Number.isFinite(next) || next <= 0}
         onClick={() => props.onCursorChange(next)}
       >
+        <HugeiconsIcon
+          icon={ArrowRight01Icon}
+          data-icon='inline-start'
+          aria-hidden='true'
+        />
         {t('Next page')}
-        <ChevronRight aria-hidden='true' />
       </Button>
     </div>
   )

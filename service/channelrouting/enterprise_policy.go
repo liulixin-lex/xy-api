@@ -321,9 +321,6 @@ func (snapshot *runtimeSnapshot) compileStrictCapacityPlans() error {
 					return fmt.Errorf("resolve strict capacity upstream model: %w", errors.Join(ErrEnterprisePolicyInvalid, err))
 				}
 				accountID := memberPolicy.AccountID
-				if accountID == 0 {
-					accountID = observation.upstreamAccountID
-				}
 				credentialIDs := append([]int(nil), member.CredentialIDs...)
 				if len(credentialIDs) == 0 {
 					credentialIDs = []int{0}

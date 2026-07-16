@@ -16,9 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import {
+  ArrowLeft01Icon,
+  ArrowRight01Icon,
+  ChevronsLeftIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronLeft, ChevronRight, ChevronsLeft } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -311,7 +315,7 @@ function ChannelRoutingDecisionCandidatesContent(props: {
                 disabled={cursorHistory.length <= 1 || query.isFetching}
                 onClick={() => setCursorHistory([0])}
               >
-                <ChevronsLeft aria-hidden='true' />
+                <HugeiconsIcon icon={ChevronsLeftIcon} aria-hidden='true' />
               </Button>
               <Button
                 type='button'
@@ -323,7 +327,7 @@ function ChannelRoutingDecisionCandidatesContent(props: {
                   setCursorHistory((previous) => previous.slice(0, -1))
                 }
               >
-                <ChevronLeft aria-hidden='true' />
+                <HugeiconsIcon icon={ArrowLeft01Icon} aria-hidden='true' />
               </Button>
               <Button
                 type='button'
@@ -338,7 +342,7 @@ function ChannelRoutingDecisionCandidatesContent(props: {
                   ])
                 }
               >
-                <ChevronRight aria-hidden='true' />
+                <HugeiconsIcon icon={ArrowRight01Icon} aria-hidden='true' />
               </Button>
             </div>
           </div>

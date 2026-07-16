@@ -399,7 +399,10 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, acquired)
 	require.NoError(t, executeRoutingCanaryOperationContext(
-		context.Background(), smart_routing_setting.SmartRoutingSetting{Enabled: true},
+		context.Background(), smart_routing_setting.SmartRoutingSetting{
+			Enabled: true,
+			Mode:    smart_routing_setting.ModeEnterpriseSLO,
+		},
 	))
 	var operation model.RoutingOperation
 	require.NoError(t, db.First(&operation).Error)
@@ -407,7 +410,10 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 	require.NoError(t, model.ReleaseRoutingControlLeaseContext(context.Background(), evaluatorLease))
 
 	require.NoError(t, executeRoutingCanaryOperationContext(
-		context.Background(), smart_routing_setting.SmartRoutingSetting{Enabled: true},
+		context.Background(), smart_routing_setting.SmartRoutingSetting{
+			Enabled: true,
+			Mode:    smart_routing_setting.ModeEnterpriseSLO,
+		},
 	))
 	require.NoError(t, db.First(&operation).Error)
 	assert.Equal(t, model.RoutingOperationStatusSucceeded, operation.Status)

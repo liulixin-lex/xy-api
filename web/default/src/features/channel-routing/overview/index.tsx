@@ -16,24 +16,49 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import {
+  Activity01Icon,
+  Alert02Icon,
+  ArrowRight01Icon,
+  Clock03Icon,
+  Coins01Icon,
+  CpuIcon,
+  GitBranchIcon,
+  GitForkIcon,
+  Radar01Icon,
+  RefreshIcon,
+  Route01Icon,
+  Shield02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AxiosError } from 'axios'
 import {
-  Activity,
-  ArrowRight,
-  Clock3,
-  Coins,
-  Cpu,
-  GitBranch,
-  GitFork,
-  Radar,
-  RefreshCw,
-  Route,
-  ShieldCheck,
-  TriangleAlert,
-} from 'lucide-react'
-import { useEffect, useMemo, useRef, type ReactNode } from 'react'
+  useEffect,
+  useMemo,
+  useRef,
+  type ComponentProps,
+  type ReactNode,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -43,6 +68,7 @@ import {
   AlertDescription,
   AlertTitle,
 } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import {
@@ -65,6 +91,7 @@ import {
   createChannelRoutingIdempotencyKey,
   getChannelRoutingOperation,
   getChannelRoutingOverview,
+  getChannelRoutingRuntimeSettings,
   listChannelRoutingEndpoints,
   runChannelRoutingActiveProbe,
 } from '../api/client'
@@ -85,24 +112,78 @@ import {
   channelRoutingOperationIsActive,
 } from '../lib/operations'
 import type { ChannelRoutingActiveProbeResult } from '../types'
+import {
+  resolveActiveProbeGate,
+  type ActiveProbeGate,
+} from './active-probe-gate'
 import { ChannelRoutingEndpointNetworkSection } from './endpoint-network-section'
 import { ManualBillingReviewSummary } from './manual-billing-review-summary'
 
 const overviewRefreshIntervalMs = 15_000
 const overviewRefreshMaxBackoffMs = 120_000
 
+class ActiveProbeBlockedError extends Error {}
+
+function activeProbeModeLabel(
+  mode: 'legacy' | 'observe' | 'shadow' | 'balanced' | 'enterprise_slo',
+  translate: (key: string) => string
+): string {
+  switch (mode) {
+    case 'legacy':
+      return translate('Legacy routing')
+    case 'observe':
+      return translate('Observe')
+    case 'shadow':
+      return translate('Shadow')
+    case 'balanced':
+      return translate('Balanced')
+    case 'enterprise_slo':
+      return translate('Enterprise SLO')
+  }
+}
+
+function activeProbeGateDescription(
+  gate: ActiveProbeGate,
+  mode: 'legacy' | 'observe' | 'shadow' | 'balanced' | 'enterprise_slo',
+  translate: (key: string, options?: Record<string, unknown>) => string
+): string {
+  if (gate.allowed) return ''
+  switch (gate.reason) {
+    case 'routing_disabled':
+      return translate(
+        'Routing is disabled. Enable it in Runtime settings before running an active probe.'
+      )
+    case 'mode_unsupported':
+      return translate(
+        'Active probes require Balanced or Enterprise SLO mode. Current mode: {{mode}}.',
+        { mode: activeProbeModeLabel(mode, translate) }
+      )
+    case 'settings_loading':
+      return translate('Checking whether active probes are enabled.')
+    case 'settings_unavailable':
+      return translate(
+        'Active probe settings could not be verified. Review Runtime settings before retrying.'
+      )
+    case 'active_probe_disabled':
+      return translate('Active probes are disabled in Runtime settings.')
+  }
+}
+
 function MetricCell(props: {
-  icon: typeof Activity
+  icon: ComponentProps<typeof HugeiconsIcon>['icon']
   label: string
   value: ReactNode
   detail?: ReactNode
   className?: string
 }) {
-  const Icon = props.icon
   return (
     <div className={cn('min-w-0 px-3 py-3 sm:px-4', props.className)}>
       <div className='text-muted-foreground flex items-center gap-2 text-xs font-medium'>
-        <Icon className='size-3.5' aria-hidden='true' />
+        <HugeiconsIcon
+          icon={props.icon}
+          className='size-3.5'
+          aria-hidden='true'
+        />
         <span className='truncate'>{props.label}</span>
       </div>
       <div className='mt-2 min-w-0 text-xl font-semibold tabular-nums'>
@@ -126,8 +207,6 @@ function routingEventTitle(
       return translate('Breaker opened')
     case 'routing.breaker.recovered':
       return translate('Breaker recovered')
-    case 'routing.cost_sync.completed':
-      return translate('Cost sync completed')
     case 'routing.policy.published':
       return translate('Policy published')
     case 'routing.policy.rolled_back':
@@ -199,8 +278,29 @@ export function ChannelRoutingOverviewPage() {
     queryKey: channelRoutingQueryKeys.endpoints({ page: 1, page_size: 6 }),
     queryFn: () => listChannelRoutingEndpoints({ page: 1, page_size: 6 }),
   })
+  const runtimeSettingsQuery = useQuery({
+    queryKey: channelRoutingQueryKeys.runtimeSettings(),
+    queryFn: getChannelRoutingRuntimeSettings,
+    meta: { handleErrorLocally: true },
+  })
+  const activeProbeGate: ActiveProbeGate = overviewQuery.data
+    ? resolveActiveProbeGate({
+        overview: overviewQuery.data,
+        runtimeSettings: runtimeSettingsQuery.data,
+        runtimeSettingsLoading: runtimeSettingsQuery.isLoading,
+        runtimeSettingsError: runtimeSettingsQuery.isError,
+      })
+    : {
+        allowed: false,
+        reason: overviewQuery.isLoading
+          ? 'settings_loading'
+          : 'settings_unavailable',
+      }
   const activeProbe = useMutation({
     mutationFn: () => {
+      if (!activeProbeGate.allowed) {
+        throw new ActiveProbeBlockedError(activeProbeGate.reason)
+      }
       activeProbeKeyRef.current ??=
         createChannelRoutingIdempotencyKey('active-probe')
       return runChannelRoutingActiveProbe(activeProbeKeyRef.current)
@@ -214,7 +314,8 @@ export function ChannelRoutingOverviewPage() {
         queryKey: channelRoutingQueryKeys.operationsRoot(),
       })
     },
-    onError: () => {
+    onError: (error) => {
+      if (error instanceof ActiveProbeBlockedError) return
       toast.error(t('Could not run the active probe. Try again.'))
     },
   })
@@ -309,6 +410,17 @@ export function ChannelRoutingOverviewPage() {
     activeProbeButtonLabel = t('Queueing probe')
   } else if (activeProbeActive) {
     activeProbeButtonLabel = t('Probe in progress')
+  }
+  const activeProbeBlockedDescription = overviewQuery.data
+    ? activeProbeGateDescription(
+        activeProbeGate,
+        overviewQuery.data.effective_mode,
+        t
+      )
+    : ''
+  const requestActiveProbe = () => {
+    if (!activeProbeGate.allowed || activeProbeActive) return
+    activeProbe.mutate()
   }
 
   let activeProbeAlertTitle = t('Active probe')
@@ -426,7 +538,12 @@ export function ChannelRoutingOverviewPage() {
       title={
         <span className='flex min-w-0 flex-wrap items-center gap-2'>
           <span className='whitespace-normal'>{t('Channel Routing')}</span>
-          <ChannelRoutingStatusBadge status={overview.deployment_stage} />
+          <ChannelRoutingStatusBadge status={overview.effective_mode} />
+          <Badge variant='outline'>
+            {t('Policy stage: {{stage}}', {
+              stage: t(overview.deployment_stage),
+            })}
+          </Badge>
         </span>
       }
       actions={
@@ -435,11 +552,21 @@ export function ChannelRoutingOverviewPage() {
             <Button
               size='sm'
               aria-label={activeProbeButtonLabel}
+              aria-describedby={
+                activeProbeGate.allowed ? undefined : 'active-probe-capability'
+              }
+              title={
+                activeProbeGate.allowed
+                  ? activeProbeButtonLabel
+                  : activeProbeBlockedDescription
+              }
               className='max-sm:size-11 max-sm:p-0'
-              disabled={activeProbeActive}
-              onClick={() => activeProbe.mutate()}
+              disabled={activeProbeActive || !activeProbeGate.allowed}
+              onClick={requestActiveProbe}
             >
-              <Radar
+              <HugeiconsIcon
+                icon={Radar01Icon}
+                data-icon='inline-start'
                 aria-hidden='true'
                 className={
                   activeProbeActive
@@ -463,22 +590,56 @@ export function ChannelRoutingOverviewPage() {
               />
             }
           >
-            <ShieldCheck aria-hidden='true' />
+            <HugeiconsIcon
+              icon={Shield02Icon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             <span className='max-sm:hidden'>{t('Policies')}</span>
           </Button>
         </div>
       }
     >
       <div className='space-y-5 pb-2'>
+        {canOperate && !activeProbeGate.allowed ? (
+          <Alert id='active-probe-capability' role='status'>
+            <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
+            <AlertTitle>{t('Active probe unavailable')}</AlertTitle>
+            <AlertDescription>{activeProbeBlockedDescription}</AlertDescription>
+            <AlertAction>
+              <Button
+                size='sm'
+                variant='outline'
+                render={
+                  <Link
+                    to='/channel-routing/$section'
+                    params={{ section: 'policies' }}
+                    search={(previous) => ({
+                      ...previous,
+                      policyTab: 'runtime-settings',
+                    })}
+                  />
+                }
+              >
+                {t('Go to routing policies')}
+                <HugeiconsIcon
+                  icon={ArrowRight01Icon}
+                  data-icon='inline-end'
+                  aria-hidden='true'
+                />
+              </Button>
+            </AlertAction>
+          </Alert>
+        ) : null}
         {trackedActiveProbe ? (
           <Alert
             role={activeProbeStatus === 'failed' ? 'alert' : 'status'}
             variant={activeProbeStatus === 'failed' ? 'destructive' : 'default'}
           >
             {activeProbeStatus === 'failed' ? (
-              <TriangleAlert aria-hidden='true' />
+              <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
             ) : (
-              <Radar aria-hidden='true' />
+              <HugeiconsIcon icon={Radar01Icon} aria-hidden='true' />
             )}
             <AlertTitle className='flex flex-wrap items-center gap-2'>
               <span>{activeProbeAlertTitle}</span>
@@ -492,7 +653,11 @@ export function ChannelRoutingOverviewPage() {
                   variant='outline'
                   onClick={() => void activeProbeOperationQuery.refetch()}
                 >
-                  <RefreshCw aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={RefreshIcon}
+                    data-icon='inline-start'
+                    aria-hidden='true'
+                  />
                   {t('Retry status')}
                 </Button>
               </AlertAction>
@@ -501,7 +666,7 @@ export function ChannelRoutingOverviewPage() {
         ) : null}
         {activeProbe.isError && !trackedActiveProbe ? (
           <Alert role='alert' variant='destructive'>
-            <TriangleAlert aria-hidden='true' />
+            <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
             <AlertTitle>{t('Could not run the active probe')}</AlertTitle>
             <AlertDescription>
               {t(
@@ -512,10 +677,14 @@ export function ChannelRoutingOverviewPage() {
               <Button
                 size='sm'
                 variant='outline'
-                disabled={activeProbe.isPending}
-                onClick={() => activeProbe.mutate()}
+                disabled={activeProbe.isPending || !activeProbeGate.allowed}
+                onClick={requestActiveProbe}
               >
-                <RefreshCw aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={RefreshIcon}
+                  data-icon='inline-start'
+                  aria-hidden='true'
+                />
                 {t('Retry')}
               </Button>
             </AlertAction>
@@ -537,13 +706,13 @@ export function ChannelRoutingOverviewPage() {
           aria-label={t('Routing health summary')}
         >
           <MetricCell
-            icon={GitBranch}
+            icon={GitBranchIcon}
             label={t('Policy revision')}
             value={`r${overview.control_plane_revision || overview.snapshot_revision}`}
             detail={format.shortHash(overview.policy_hash)}
           />
           <MetricCell
-            icon={Route}
+            icon={Route01Icon}
             label={t('Configuration propagation')}
             value={
               <ChannelRoutingStatusBadge status={overview.propagation_status} />
@@ -559,7 +728,7 @@ export function ChannelRoutingOverviewPage() {
             }
           />
           <MetricCell
-            icon={Activity}
+            icon={Activity01Icon}
             label={t('Logical success rate')}
             value={format.percent(overview.telemetry.logical_success_rate)}
             detail={t('{{count}} observed requests', {
@@ -567,7 +736,7 @@ export function ChannelRoutingOverviewPage() {
             })}
           />
           <MetricCell
-            icon={Clock3}
+            icon={Clock03Icon}
             label={t('p95 TTFT')}
             value={format.milliseconds(overview.telemetry.p95_ttft_ms)}
             detail={
@@ -577,7 +746,7 @@ export function ChannelRoutingOverviewPage() {
             }
           />
           <MetricCell
-            icon={GitFork}
+            icon={GitForkIcon}
             label={t('Pre-commit failover success')}
             value={format.percent(
               preCommitFailoverKnown ? preCommitFailover.rate : undefined
@@ -592,7 +761,7 @@ export function ChannelRoutingOverviewPage() {
             }
           />
           <MetricCell
-            icon={Coins}
+            icon={Coins01Icon}
             label={t('Platform cost per request')}
             value={
               unitPlatformCostKnown
@@ -694,7 +863,11 @@ export function ChannelRoutingOverviewPage() {
                   }
                 >
                   {t('View all')}
-                  <ArrowRight aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={ArrowRight01Icon}
+                    data-icon='inline-end'
+                    aria-hidden='true'
+                  />
                 </Button>
               </div>
             </div>
@@ -870,7 +1043,8 @@ export function ChannelRoutingOverviewPage() {
                       key={event.id}
                       className='grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 px-3 py-3 sm:grid-cols-[auto_minmax(0,1fr)_auto]'
                     >
-                      <Activity
+                      <HugeiconsIcon
+                        icon={Activity01Icon}
                         className='text-muted-foreground mt-0.5 size-4 shrink-0'
                         aria-hidden='true'
                       />
@@ -934,7 +1108,11 @@ export function ChannelRoutingOverviewPage() {
             </div>
           </div>
           <div className='text-muted-foreground mt-3 flex items-center gap-2 text-xs'>
-            <Cpu className='size-3.5' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={CpuIcon}
+              className='size-3.5'
+              aria-hidden='true'
+            />
             <span>
               {t('Runtime generation {{generation}}', {
                 generation: overview.runtime_generation,

@@ -30,8 +30,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useChannelRoutingFormatters } from '@/features/channel-routing/lib/format'
 
+import { useBillingOperationsFormatters } from '../lib/format'
 import { getBillingProjectionCodeDisplay } from '../lib/projection-operations'
 import type {
   BillingLogSinkConflict,
@@ -118,7 +118,7 @@ export function FailedProjectionTable(props: {
   onRequeue: (projection: FailedBillingProjection) => void
 }) {
   const { t } = useTranslation()
-  const format = useChannelRoutingFormatters()
+  const format = useBillingOperationsFormatters()
 
   return (
     <>
@@ -339,7 +339,7 @@ export function BillingConflictTable(props: {
   onResolve: (conflict: BillingLogSinkConflict) => void
 }) {
   const { t } = useTranslation()
-  const format = useChannelRoutingFormatters()
+  const format = useBillingOperationsFormatters()
 
   return (
     <div className='divide-y overflow-hidden rounded-lg border'>

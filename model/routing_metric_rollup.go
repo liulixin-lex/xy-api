@@ -48,13 +48,13 @@ var (
 	ErrRoutingMetricRollupQueryTooLarge      = errors.New("routing metric rollup query exceeds limit")
 	ErrRoutingMetricRollupOverflow           = errors.New("routing metric rollup counter overflow")
 	ErrRoutingMetricRollupSchemaNotReady     = errors.New("routing metric rollup revision-key schema is not ready")
-	ErrRoutingMetricRollupAlphaDrainRequired = errors.New("routing metric rollup alpha-v2 writers and telemetry must be drained")
+	ErrRoutingMetricRollupAlphaDrainRequired = errors.New("legacy routing metric writers and telemetry must be drained")
 )
 
 type RoutingMetricRollupMigrationOptions struct {
-	// AlphaV2Drained must only be set after old writers have stopped and their
+	// AlphaDrained must only be set after old writers have stopped and their
 	// telemetry backlog has been fully drained.
-	AlphaV2Drained bool
+	AlphaDrained bool
 }
 
 // RoutingMetricRollup stores mergeable counters keyed by stable routing identities.
@@ -224,9 +224,9 @@ func MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
 	if err != nil {
 		return fmt.Errorf("inspect legacy routing metric rollup index: %w", lastErr)
 	}
-	legacyIndexIsV2 := legacyIndexExists && legacyIndexUnique &&
+	legacyIndexIsPreRevision := legacyIndexExists && legacyIndexUnique &&
 		routingMetricRollupIndexColumnsEqual(legacyIndexColumns, legacyColumns)
-	if legacyIndexExists && !legacyIndexIsV2 &&
+	if legacyIndexExists && !legacyIndexIsPreRevision &&
 		(!legacyIndexUnique || !routingMetricRollupIndexColumnsEqual(legacyIndexColumns, desiredColumns)) {
 		return fmt.Errorf("routing metric rollup index %s has unexpected definition", routingMetricRollupLegacyUniqueIndex)
 	}
@@ -245,10 +245,10 @@ func MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
 	if err != nil {
 		return fmt.Errorf("inspect routing metric rollup columns: %w", lastErr)
 	}
-	if legacyIndexIsV2 && !columnsReady && !options.AlphaV2Drained {
+	if legacyIndexIsPreRevision && !columnsReady && !options.AlphaDrained {
 		return ErrRoutingMetricRollupAlphaDrainRequired
 	}
-	if !legacyIndexIsV2 || !columnsReady {
+	if !legacyIndexIsPreRevision || !columnsReady {
 		columnsReady = false
 		for attempt := 0; attempt < routingMetricRollupMigrationMaxAttempts; attempt++ {
 			migrationErr := db.AutoMigrate(&RoutingMetricRollup{})
@@ -320,7 +320,7 @@ func MigrateRoutingMetricRollupRevisionKeyContextWithOptions(
 	if err != nil {
 		return err
 	}
-	if exists && unique && routingMetricRollupIndexColumnsEqual(columns, legacyColumns) && !options.AlphaV2Drained {
+	if exists && unique && routingMetricRollupIndexColumnsEqual(columns, legacyColumns) && !options.AlphaDrained {
 		return ErrRoutingMetricRollupAlphaDrainRequired
 	}
 

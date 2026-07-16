@@ -16,10 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import { BadgeCheckIcon, RocketIcon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { BadgeCheck, Rocket } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -331,9 +331,19 @@ export function ChannelRoutingPolicyActivationSheet(props: {
           <SheetHeader className={sideDrawerHeaderClassName()}>
             <SheetTitle className='flex items-center gap-2'>
               {isPublishing ? (
-                <Rocket className='size-4' aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={RocketIcon}
+                  className='size-4'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
               ) : (
-                <BadgeCheck className='size-4' aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={BadgeCheckIcon}
+                  className='size-4'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
               )}
               {isPublishing
                 ? t('Publish policy draft #{{id}}', { id: props.draft?.id })
@@ -531,9 +541,19 @@ export function ChannelRoutingPolicyActivationSheet(props: {
               }
             >
               {isPublishing ? (
-                <Rocket aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={RocketIcon}
+                  data-icon='inline-start'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
               ) : (
-                <BadgeCheck aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={BadgeCheckIcon}
+                  data-icon='inline-start'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
               )}
               {submitLabel}
             </Button>

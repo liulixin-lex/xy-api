@@ -24,13 +24,13 @@ func routingRequestTrafficClass(c *gin.Context) channelrouting.RequestTrafficCla
 	if c == nil {
 		return channelrouting.RequestTrafficClassLegacy
 	}
-	if template, ok := common.GetContextKeyType[channelrouting.RequestProfileV2Input](
+	if template, ok := common.GetContextKeyType[channelrouting.RequestProfileInput](
 		c,
 		constant.ContextKeyRoutingRequestProfile,
 	); ok {
 		return template.TrafficClass
 	}
-	if template, ok := common.GetContextKeyType[*channelrouting.RequestProfileV2Input](
+	if template, ok := common.GetContextKeyType[*channelrouting.RequestProfileInput](
 		c,
 		constant.ContextKeyRoutingRequestProfile,
 	); ok && template != nil {
@@ -56,15 +56,19 @@ func ensureRoutingChannelTrafficPolicies(ctx context.Context) error {
 		return nil
 	}
 
-	bindings := make([]model.RoutingChannelBinding, 0)
-	if model.DB != nil && model.DB.Migrator().HasTable(&model.RoutingChannelBinding{}) {
-		if err := model.DB.WithContext(ctx).
-			Select("channel_id", "serves_claude_code").
-			Find(&bindings).Error; err != nil {
-			return err
+	if model.DB == nil || !model.DB.Migrator().HasTable(&model.RoutingChannelConfiguration{}) {
+		return errors.New("channel traffic configuration is unavailable")
+	}
+	configurations := make([]model.RoutingChannelConfiguration, 0)
+	if err := model.DB.WithContext(ctx).Find(&configurations).Error; err != nil {
+		return err
+	}
+	for _, configuration := range configurations {
+		if !model.ValidRoutingChannelConfiguration(configuration) {
+			return model.ErrRoutingChannelConfigurationInvalid
 		}
 	}
-	routinghotcache.ReplaceChannelTrafficPolicies(bindings, now)
+	routinghotcache.ReplaceChannelTrafficConfigurations(configurations, now)
 	return nil
 }
 
@@ -117,8 +121,19 @@ func getRandomSatisfiedChannelForRequest(
 	if param == nil {
 		return nil, errors.New("routing param is nil")
 	}
+	now := time.Now()
 	if routingRequestTrafficClass(param.Ctx) == channelrouting.RequestTrafficClassClaudeCode {
-		return model.GetRandomSatisfiedChannel(group, param.ModelName, retry, param.RequestPath)
+		return model.GetRandomSatisfiedChannelWithEligibility(
+			group,
+			param.ModelName,
+			retry,
+			param.RequestPath,
+			func(channel *model.Channel) bool {
+				return channel != nil &&
+					!routinghotcache.ChannelBalanceUnavailableActive(channel.Id, now) &&
+					routingChannelRequestIdentityAdmissible(param.Ctx, group, channel)
+			},
+		)
 	}
 	var ctx context.Context
 	if param.Ctx != nil && param.Ctx.Request != nil {
@@ -128,17 +143,18 @@ func getRandomSatisfiedChannelForRequest(
 		return nil, err
 	}
 	state := routinghotcache.ChannelTrafficPoliciesState()
-	if state.RestrictedChannels == 0 {
-		return model.GetRandomSatisfiedChannel(group, param.ModelName, retry, param.RequestPath)
-	}
 	return model.GetRandomSatisfiedChannelWithEligibility(
 		group,
 		param.ModelName,
 		retry,
 		param.RequestPath,
 		func(channel *model.Channel) bool {
-			if channel == nil {
+			if channel == nil || routinghotcache.ChannelBalanceUnavailableActive(channel.Id, now) ||
+				!routingChannelRequestIdentityAdmissible(param.Ctx, group, channel) {
 				return false
+			}
+			if state.RestrictedChannels == 0 {
+				return true
 			}
 			policy, initialized := routinghotcache.GetChannelTrafficPolicy(channel.Id)
 			return initialized && !policy.ClaudeCodeOnly

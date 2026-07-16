@@ -246,6 +246,48 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 		assert.Empty(t, routingbreaker.DirtyEndpointSnapshots())
 	})
 
+	t.Run("success_moves_open_member_and_endpoint_breakers_to_half_open", func(t *testing.T) {
+		routinghotcache.ResetForTest()
+		probeNow := now
+		routingbreaker.ResetDefaultForTest(routingbreaker.Config{
+			Consecutive5xxThreshold: 1, FailureRateThreshold: 1, FailureRateMinSamples: 100, WindowSize: 100,
+			BaseCooldown: time.Minute, MaxCooldown: time.Minute, EntryTTL: time.Hour, MaxEntries: 64,
+			DegradedConsecutiveFailures: 1, DegradedFailureRateThreshold: 1, DegradedMinSamples: 100,
+			Now: func() time.Time { return probeNow },
+		})
+		target := targetForChannel(4_500)
+		target.CredentialID = 0
+		target.BreakerState = model.RoutingBreakerStateOpen
+		memberKey := routingbreaker.Key{
+			ChannelID: target.ChannelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model: target.ModelName, Group: target.GroupName,
+		}
+		endpointKey := routingbreaker.NewEndpointKey(target.EndpointAuthority, target.Region)
+		memberOpened := routingbreaker.RecordReliabilityFailure(memberKey, routingbreaker.FailureProvider5xx)
+		endpointOpened := routingbreaker.RecordReliabilityFailure(endpointKey, routingbreaker.FailureNetwork)
+		require.Equal(t, routingbreaker.StateOpen, memberOpened.State)
+		require.Equal(t, routingbreaker.StateOpen, endpointOpened.State)
+		require.Len(t, routingbreaker.DirtySnapshots(), 1)
+		require.Len(t, routingbreaker.DirtyEndpointSnapshots(), 1)
+
+		probeNow = probeNow.Add(time.Minute)
+		require.NoError(t, applyActiveProbeBreakerOutcome(
+			context.Background(), setting, target, ActiveProbeExecution{StatusCode: http.StatusOK},
+			model.RoutingProbeOutcomeSuccess, probeNow,
+		))
+
+		memberSnapshots := routingbreaker.DirtySnapshots()
+		require.Len(t, memberSnapshots, 1)
+		assert.Equal(t, routingbreaker.StateHalfOpen, memberSnapshots[0].State)
+		assert.Equal(t, memberOpened.Reason, memberSnapshots[0].Reason)
+		assert.Equal(t, memberOpened.WindowFailures, memberSnapshots[0].WindowFailures)
+		endpointSnapshots := routingbreaker.DirtyEndpointSnapshots()
+		require.Len(t, endpointSnapshots, 1)
+		assert.Equal(t, routingbreaker.StateHalfOpen, endpointSnapshots[0].State)
+		assert.Equal(t, endpointOpened.Reason, endpointSnapshots[0].Reason)
+		assert.Equal(t, endpointOpened.WindowFailures, endpointSnapshots[0].WindowFailures)
+	})
+
 	t.Run("success_clears_serving_markers_and_recovers_breaker", func(t *testing.T) {
 		resetEffects()
 		target := targetForChannel(5_000)

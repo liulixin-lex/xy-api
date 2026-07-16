@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { createContext, useContext } from 'react'
 
 import type { ChannelRoutingRealtimeStatus } from '../hooks/use-channel-routing-events'

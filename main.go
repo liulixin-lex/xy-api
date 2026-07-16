@@ -262,7 +262,7 @@ func main() {
 
 	routingFinalizeCtx, routingFinalizeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := routingRuntime.Wait(routingFinalizeCtx); err != nil {
-		common.SysError("failed to finalize smart routing runtime: " + common.SanitizeErrorMessage(err.Error()))
+		common.SysError("failed to finalize channel routing control runtime: " + common.SanitizeErrorMessage(err.Error()))
 	}
 	routingFinalizeCancel()
 

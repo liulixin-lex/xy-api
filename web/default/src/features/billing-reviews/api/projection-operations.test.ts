@@ -21,7 +21,6 @@ import { afterEach, describe, test } from 'node:test'
 
 import { AxiosHeaders, type InternalAxiosRequestConfig } from 'axios'
 
-import type { ApiEnvelope } from '@/features/channel-routing/types'
 import { api } from '@/lib/api'
 
 import type {
@@ -36,6 +35,12 @@ import {
   requeueFailedBillingProjection,
   resolveBillingLogSinkConflict,
 } from './projection-operations'
+
+type ApiEnvelope<T> = {
+  success: boolean
+  message?: string
+  data: T
+}
 
 const originalAdapter = api.defaults.adapter
 

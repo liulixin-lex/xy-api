@@ -57,7 +57,8 @@ func TestEnterpriseStrictCapacityCompilesSharedAccountFairShares(t *testing.T) {
 				Members: []PoolMemberSnapshot{{
 					ID: 11, PoolID: 1, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
 					LegacyWeight: 100, CredentialIDs: []int{1_001},
-					Models: []ModelSnapshot{{ModelName: clientModel, upstreamAccountID: 77}},
+					Models:           []ModelSnapshot{{ModelName: clientModel}},
+					enterprisePolicy: enterpriseMemberPolicy{AccountID: 77},
 				}},
 			},
 			{
@@ -67,7 +68,8 @@ func TestEnterpriseStrictCapacityCompilesSharedAccountFairShares(t *testing.T) {
 				Members: []PoolMemberSnapshot{{
 					ID: 22, PoolID: 2, ChannelID: 202, PhysicalStatus: common.ChannelStatusEnabled,
 					LegacyWeight: 100, CredentialIDs: []int{2_002},
-					Models: []ModelSnapshot{{ModelName: clientModel, upstreamAccountID: 77}},
+					Models:           []ModelSnapshot{{ModelName: clientModel}},
+					enterprisePolicy: enterpriseMemberPolicy{AccountID: 77},
 				}},
 			},
 		},
@@ -213,7 +215,9 @@ func TestEnterpriseStrictCapacityCompilesPartialGuaranteesDeterministically(t *t
 				CanaryPolicy: model.DefaultRoutingCanaryPolicy(),
 				Members: []PoolMemberSnapshot{{
 					ID: 11, PoolID: 1, ChannelID: 101, PhysicalStatus: common.ChannelStatusEnabled,
-					CredentialIDs: []int{1_001}, Models: []ModelSnapshot{{ModelName: "gpt-test", upstreamAccountID: 77}},
+					CredentialIDs:    []int{1_001},
+					Models:           []ModelSnapshot{{ModelName: "gpt-test"}},
+					enterprisePolicy: enterpriseMemberPolicy{AccountID: 77},
 				}},
 			},
 			{
@@ -222,7 +226,9 @@ func TestEnterpriseStrictCapacityCompilesPartialGuaranteesDeterministically(t *t
 				CanaryPolicy: model.DefaultRoutingCanaryPolicy(),
 				Members: []PoolMemberSnapshot{{
 					ID: 22, PoolID: 2, ChannelID: 202, PhysicalStatus: common.ChannelStatusEnabled,
-					CredentialIDs: []int{2_002}, Models: []ModelSnapshot{{ModelName: "gpt-test", upstreamAccountID: 77}},
+					CredentialIDs:    []int{2_002},
+					Models:           []ModelSnapshot{{ModelName: "gpt-test"}},
+					enterprisePolicy: enterpriseMemberPolicy{AccountID: 77},
 				}},
 			},
 		},

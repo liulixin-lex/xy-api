@@ -315,6 +315,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if !willRetry {
 				break
 			}
+			if waitErr := attemptGuard.WaitBeforeRetry(
+				c, newAPIError, hedgeOutcome.classification, retryParam.GetRetry(),
+			); waitErr != nil {
+				newAPIError = routingAttemptRejectionError(waitErr)
+				relayInfo.LastError = newAPIError
+				break
+			}
 			continue
 		}
 		if capacityErr := commitRoutingCapacityAttempt(c); capacityErr != nil {
@@ -411,6 +418,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		attemptLease.Finish()
 		if sendState.Sent() {
 			recordRoutingAttemptEffects(c, relayInfo, channel.Id, attemptSuccess, classificationAPIError, classification)
+			if !attemptSuccess {
+				service.MarkRoutingTargetFailure(c, channel.Id, classification.Scope)
+			}
 			if !attemptSuccess &&
 				(classification.Responsibility == routingerror.ResponsibilityProvider ||
 					classification.Responsibility == routingerror.ResponsibilityNetwork) {
@@ -433,6 +443,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if !willRetry {
+			break
+		}
+		if waitErr := attemptGuard.WaitBeforeRetry(
+			c, newAPIError, classification, retryParam.GetRetry(),
+		); waitErr != nil {
+			newAPIError = routingAttemptRejectionError(waitErr)
+			relayInfo.LastError = newAPIError
 			break
 		}
 	}
@@ -496,15 +513,25 @@ func recordRoutingAttemptEffects(
 	}
 	ttft := time.Duration(0)
 	attemptStart := info.RoutingAttemptStartTime()
+	now := time.Now()
 	if !attemptStart.IsZero() && info.FirstResponseTime.After(attemptStart) {
 		ttft = info.FirstResponseTime.Sub(attemptStart)
 	}
+	recordChannelBalanceAttemptEffect(
+		channelID,
+		success,
+		statusCode,
+		apiErr,
+		classification,
+		attemptStart,
+		now,
+	)
 	service.ObserveRoutingAdaptiveConcurrency(c, channelrouting.AdaptiveConcurrencySignal{
 		Success:          success,
 		StatusCode:       statusCode,
 		TTFT:             ttft,
 		FirstByteTimeout: relayAttemptStreamSignal(info) == routingerror.SignalFirstByteTimeout,
-		ObservedAt:       time.Now(),
+		ObservedAt:       now,
 	})
 	if err := service.ObserveRoutingSlowStartProbe(
 		c,
@@ -519,23 +546,15 @@ func recordRoutingAttemptEffects(
 	setting := smart_routing_setting.GetSetting()
 	syncRoutingBreakerConfigFromSetting(setting)
 	credentialID := common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID)
-	upstreamAccountID := common.GetContextKeyInt(c, constant.ContextKeyRoutingUpstreamAccountID)
 	if info.ChannelMeta != nil {
 		if credentialID <= 0 {
 			credentialID = info.ChannelMeta.RoutingCredentialID
 		}
-		if upstreamAccountID <= 0 {
-			upstreamAccountID = info.ChannelMeta.RoutingUpstreamAccountID
-		}
 	}
-	now := time.Now()
 	if success {
 		if credentialID > 0 {
 			channelrouting.ClearCredentialAuthFailure(credentialID, channelID, now)
 			channelrouting.ClearCredentialCapacityCooldown(credentialID, channelID, now)
-		}
-		if upstreamAccountID > 0 {
-			channelrouting.ClearUpstreamAccountUnavailable(upstreamAccountID, now)
 		}
 	} else {
 		switch {
@@ -543,11 +562,8 @@ func recordRoutingAttemptEffects(
 			channelrouting.RecordCredentialAuthFailure(
 				credentialID, channelID, classification.Rule, time.Time{}, now,
 			)
-		case statusCode == http.StatusPaymentRequired && upstreamAccountID > 0:
-			channelrouting.RecordUpstreamAccountUnavailable(
-				upstreamAccountID, statusCode, classification.Rule, time.Time{}, now,
-			)
 		case classification.Responsibility == routingerror.ResponsibilityCapacity &&
+			classification.Scope != routingerror.ScopeChannel &&
 			classification.CapacityEffect == routingerror.CapacityCooldown && credentialID > 0:
 			maxCooldown := time.Duration(setting.MaxCooldownSec) * time.Second
 			if maxCooldown <= 0 {
@@ -614,7 +630,7 @@ func recordRoutingAttemptEffects(
 		recordRoutingBreakerSuccess(c, key)
 		return
 	}
-	if classification.CapacityEffect == routingerror.CapacityCooldown {
+	if classification.CapacityEffect == routingerror.CapacityCooldown && classification.Scope != routingerror.ScopeChannel {
 		maxCooldown := time.Duration(setting.MaxCooldownSec) * time.Second
 		if maxCooldown <= 0 {
 			maxCooldown = routingbreaker.DefaultConfig().MaxCooldown
@@ -624,7 +640,7 @@ func recordRoutingAttemptEffects(
 			baseCooldown = time.Second
 		}
 		retryAfter := retryAfterFromAPIError(apiErr, maxCooldown)
-		routinghotcache.RecordCapacityCooldown(key.HotcacheKey(), apiErr.SourceStatusCode(), retryAfter, baseCooldown, maxCooldown, time.Now())
+		routinghotcache.RecordCapacityCooldown(key.HotcacheKey(), statusCode, retryAfter, baseCooldown, maxCooldown, now)
 	}
 	switch classification.Responsibility {
 	case routingerror.ResponsibilityProvider:
@@ -2092,6 +2108,9 @@ func RelayTask(c *gin.Context) {
 		canaryOutcomeClassification = classification
 		if sendState.Sent() {
 			recordRoutingAttemptEffects(c, relayInfo, channel.Id, taskErr == nil, taskAPIError, classification)
+			if taskErr != nil {
+				service.MarkRoutingTargetFailure(c, channel.Id, classification.Scope)
+			}
 			if taskErr != nil &&
 				(classification.Responsibility == routingerror.ResponsibilityProvider ||
 					classification.Responsibility == routingerror.ResponsibilityNetwork) {
@@ -2112,6 +2131,17 @@ func RelayTask(c *gin.Context) {
 		}
 
 		if !willRetry {
+			break
+		}
+		if waitErr := attemptGuard.WaitBeforeRetry(
+			c, taskAPIError, classification, retryParam.GetRetry(),
+		); waitErr != nil {
+			retryErr := routingAttemptRejectionError(waitErr)
+			taskErr = service.TaskErrorWrapperLocal(
+				retryErr.Err,
+				"routing_attempt_rejected",
+				retryErr.StatusCode,
+			)
 			break
 		}
 	}

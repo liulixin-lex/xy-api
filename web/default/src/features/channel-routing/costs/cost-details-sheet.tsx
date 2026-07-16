@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 
@@ -46,8 +45,13 @@ import { ChannelRoutingIdentityText } from '../components/identity-text'
 import {
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
+import {
+  isKnownZeroMultiplierCost,
+  routingCostUnknownReasonLabel,
+} from '../lib/cost-audit'
 import { useChannelRoutingFormatters } from '../lib/format'
 import type { CostSnapshotSummary, RoutingNormalizedPricing } from '../types'
 
@@ -68,9 +72,6 @@ const normalizedPricingFields: Array<{
   { key: 'audio_input_cost_per_million', label: 'Audio input / million' },
   { key: 'audio_output_cost_per_million', label: 'Audio output / million' },
   { key: 'per_request_cost', label: 'Per request' },
-  { key: 'group_ratio', label: 'Group ratio' },
-  { key: 'base_ratio', label: 'Base ratio' },
-  { key: 'completion_ratio', label: 'Completion ratio' },
 ]
 
 export function ChannelRoutingCostDetailsSheet(props: {
@@ -97,11 +98,26 @@ export function ChannelRoutingCostDetailsSheet(props: {
   })
   const cost = detailQuery.data?.item
   const pricing = cost?.pricing
+  const channelMultiplier =
+    cost && Number.isFinite(cost.upstream_cost_multiplier)
+      ? cost.upstream_cost_multiplier
+      : undefined
+  const zeroMultiplierCost = cost ? isKnownZeroMultiplierCost(cost) : false
   const pricingRows = pricing
     ? normalizedPricingFields.flatMap((field) => {
         const value = pricing[field.key]
         return typeof value === 'number' && Number.isFinite(value)
-          ? [{ ...field, value }]
+          ? [
+              {
+                ...field,
+                baseline: value,
+                effective:
+                  channelMultiplier != null &&
+                  Number.isFinite(value * channelMultiplier)
+                    ? value * channelMultiplier
+                    : undefined,
+              },
+            ]
           : []
       })
     : []
@@ -131,7 +147,7 @@ export function ChannelRoutingCostDetailsSheet(props: {
           </div>
         ) : null}
 
-        {detailQuery.isError ? (
+        {detailQuery.isError && !detailQuery.data ? (
           <div className='min-h-0 flex-1 overflow-auto px-4 pb-4'>
             <ChannelRoutingErrorState
               error={detailQuery.error}
@@ -142,6 +158,12 @@ export function ChannelRoutingCostDetailsSheet(props: {
 
         {cost && detailQuery.data ? (
           <div className='min-h-0 flex-1 space-y-5 overflow-auto px-4 pb-4'>
+            {detailQuery.isRefetchError ? (
+              <ChannelRoutingRefetchErrorAlert
+                isFetching={detailQuery.isFetching}
+                onRetry={() => void detailQuery.refetch()}
+              />
+            ) : null}
             <p className='text-muted-foreground text-xs'>
               {t('Snapshot r{{revision}} · built {{time}}', {
                 revision: detailQuery.data.snapshot_revision,
@@ -156,13 +178,27 @@ export function ChannelRoutingCostDetailsSheet(props: {
                 status={cost.confidence || 'unknown'}
               />
               <ChannelRoutingStatusBadge status={cost.freshness || 'unknown'} />
-              <ChannelRoutingStatusBadge
-                status={cost.source_sync_status || 'unknown'}
-              />
             </div>
+            {cost.unknown_reason ? (
+              <div
+                className='border-warning/30 bg-warning/5 rounded-lg border p-3 text-sm'
+                role='status'
+              >
+                <p className='font-medium'>{t('Unknown reason')}</p>
+                <p
+                  className='text-muted-foreground mt-1 text-xs break-words'
+                  title={cost.unknown_reason}
+                >
+                  {routingCostUnknownReasonLabel(cost.unknown_reason, t)}
+                </p>
+              </div>
+            ) : null}
 
-            <section aria-labelledby='cost-source-title'>
-              <h3 id='cost-source-title' className='mb-2 text-sm font-semibold'>
+            <section aria-labelledby='pricing-source-title'>
+              <h3
+                id='pricing-source-title'
+                className='mb-2 text-sm font-semibold'
+              >
                 {t('Pricing source')}
               </h3>
               <dl className='bg-border grid grid-cols-2 gap-px overflow-hidden rounded-lg border sm:grid-cols-3'>
@@ -180,7 +216,21 @@ export function ChannelRoutingCostDetailsSheet(props: {
                   ],
                   [t('Unit'), pricing?.unit || cost.unit || t('Unknown')],
                   [t('Pricing version'), cost.pricing_version || t('Unknown')],
+                  [
+                    t('Pricing identity'),
+                    cost.pricing_identity || t('Unknown'),
+                  ],
                   [t('Pricing hash'), format.shortHash(cost.version)],
+                  [
+                    t('Configuration revision'),
+                    format.number(cost.configuration_revision),
+                  ],
+                  [
+                    t('Channel multiplier'),
+                    channelMultiplier != null
+                      ? `${format.cost(channelMultiplier)}×`
+                      : t('Unknown'),
+                  ],
                   [t('Snapshot time'), format.timestamp(cost.snapshot_time)],
                 ].map(([label, value]) => (
                   <div key={label} className='bg-background min-w-0 p-3'>
@@ -244,20 +294,7 @@ export function ChannelRoutingCostDetailsSheet(props: {
                     {format.timestamp(cost.expires_time)}
                   </dd>
                 </div>
-                <div>
-                  <dt className='text-muted-foreground text-xs'>
-                    {t('Source sync')}
-                  </dt>
-                  <dd className='mt-1 font-medium break-words'>
-                    {cost.source_sync_status || t('Unknown')}
-                  </dd>
-                </div>
               </dl>
-              {cost.source_sync_error ? (
-                <p className='border-destructive/30 bg-destructive/5 text-destructive mt-3 rounded-lg border p-3 text-sm break-words'>
-                  {cost.source_sync_error}
-                </p>
-              ) : null}
             </section>
 
             <section aria-labelledby='normalized-pricing-title'>
@@ -265,8 +302,26 @@ export function ChannelRoutingCostDetailsSheet(props: {
                 id='normalized-pricing-title'
                 className='mb-2 text-sm font-semibold'
               >
-                {t('Normalized pricing')}
+                {t('System baseline and effective cost')}
               </h3>
+              {zeroMultiplierCost && pricingRows.length === 0 ? (
+                <dl className='bg-border grid grid-cols-2 gap-px overflow-hidden rounded-lg border'>
+                  <div className='bg-background min-w-0 p-3'>
+                    <dt className='text-muted-foreground text-xs'>
+                      {t('1× system baseline')}
+                    </dt>
+                    <dd className='mt-1 text-sm font-medium'>
+                      {t('Not required')}
+                    </dd>
+                  </div>
+                  <div className='bg-background min-w-0 p-3 text-right'>
+                    <dt className='text-muted-foreground text-xs'>
+                      {t('Effective cost')}
+                    </dt>
+                    <dd className='mt-1 text-sm font-medium'>{t('Free 0×')}</dd>
+                  </div>
+                </dl>
+              ) : null}
               {pricingRows.length > 0 ? (
                 <div className='overflow-hidden rounded-lg border'>
                   <Table>
@@ -274,7 +329,10 @@ export function ChannelRoutingCostDetailsSheet(props: {
                       <TableRow>
                         <TableHead>{t('Rate')}</TableHead>
                         <TableHead className='text-right'>
-                          {t('Value')}
+                          {t('1× system baseline')}
+                        </TableHead>
+                        <TableHead className='text-right'>
+                          {t('Effective cost')}
                         </TableHead>
                       </TableRow>
                     </TableHeader>
@@ -283,106 +341,28 @@ export function ChannelRoutingCostDetailsSheet(props: {
                         <TableRow key={row.key}>
                           <TableCell>{t(row.label)}</TableCell>
                           <TableCell className='text-right font-mono text-xs'>
-                            {format.cost(row.value)}
+                            {format.cost(row.baseline)}
+                          </TableCell>
+                          <TableCell className='text-right font-mono text-xs'>
+                            {row.effective != null
+                              ? format.cost(row.effective)
+                              : t('Unknown')}
                           </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
                   </Table>
                 </div>
-              ) : (
+              ) : null}
+              {!zeroMultiplierCost && pricingRows.length === 0 ? (
                 <p className='text-muted-foreground text-sm'>
                   {pricing?.billing_expression
-                    ? t('Pricing is calculated by a billing expression.')
+                    ? t(
+                        'Pricing is calculated by a billing expression, then the channel multiplier is applied.'
+                      )
                     : t('No normalized rate fields are available.')}
                 </p>
-              )}
-            </section>
-
-            <section
-              className='border-t pt-4'
-              aria-labelledby='cost-account-title'
-            >
-              <h3
-                id='cost-account-title'
-                className='mb-2 text-sm font-semibold'
-              >
-                {t('Upstream account')}
-              </h3>
-              {cost.account ? (
-                <dl className='grid gap-x-5 gap-y-3 text-sm sm:grid-cols-2'>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Account')}
-                    </dt>
-                    <dd className='mt-1 font-mono text-xs break-all'>
-                      {cost.account.masked_identity || `#${cost.account.id}`}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Source type')}
-                    </dt>
-                    <dd className='mt-1 font-medium'>
-                      {cost.account.source_type || t('Unknown')}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Account status')}
-                    </dt>
-                    <dd className='mt-1'>
-                      <ChannelRoutingStatusBadge
-                        status={cost.account.status || 'unknown'}
-                      />
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Balance')}
-                    </dt>
-                    <dd className='mt-1 font-medium'>
-                      {cost.account.balance_known &&
-                      typeof cost.account.balance === 'number'
-                        ? t('{{currency}} {{amount}}', {
-                            currency: pricing?.currency || cost.currency || '',
-                            amount: format.cost(cost.account.balance),
-                          })
-                        : t('Unknown')}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Balance updated')}
-                    </dt>
-                    <dd className='mt-1 font-medium'>
-                      {format.timestamp(cost.account.balance_updated_at)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className='text-muted-foreground text-xs'>
-                      {t('Last sync')}
-                    </dt>
-                    <dd className='mt-1 font-medium break-words'>
-                      {cost.account.last_sync_status || t('Unknown')}
-                    </dd>
-                  </div>
-                  {cost.account.last_sync_error ? (
-                    <div className='sm:col-span-2'>
-                      <dt className='text-muted-foreground text-xs'>
-                        {t('Last sync error')}
-                      </dt>
-                      <dd className='text-destructive mt-1 break-words'>
-                        {cost.account.last_sync_error}
-                      </dd>
-                    </div>
-                  ) : null}
-                </dl>
-              ) : (
-                <p className='text-muted-foreground text-sm'>
-                  {t('No upstream account metadata is available.')}
-                </p>
-              )}
+              ) : null}
             </section>
           </div>
         ) : null}

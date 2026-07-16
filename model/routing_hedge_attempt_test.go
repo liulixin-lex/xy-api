@@ -55,6 +55,15 @@ func runRoutingHedgeAttemptAuditContract(t *testing.T, db *gorm.DB, dbType commo
 	assert.Equal(t, "https://api.example.test:443", audit.EndpointAuthority)
 	assert.False(t, audit.CrossRegion)
 	assert.True(t, audit.CostKnown)
+	assert.Equal(t, "system_pricing_x_channel_multiplier", audit.PricingBasis)
+	assert.Equal(t, spec.Cost.PricingIdentity, audit.PricingIdentity)
+	assert.Equal(t, spec.Cost.ConfigurationRevision, audit.ConfigurationRevision)
+	assert.Equal(t, spec.Cost.UpstreamCostMultiplier, audit.UpstreamCostMultiplier)
+	assert.Equal(t, spec.Cost.BaselineExpectedCost, audit.BaselineExpectedCost)
+	assert.Equal(t, spec.Cost.BaselineWorstCaseCost, audit.BaselineWorstCaseCost)
+	assert.Empty(t, audit.CostSourceSyncStatus)
+	assert.Empty(t, audit.AccountSourceType)
+	assert.Empty(t, audit.AccountReferenceHash)
 	assert.Equal(t, RoutingHedgeAttemptStateStarted, audit.State)
 	assert.Equal(t, RoutingHedgeAttemptResultPending, audit.Result)
 	assert.NotContains(t, audit.CostBreakdownJSON, spec.RequestID)
@@ -79,6 +88,41 @@ func runRoutingHedgeAttemptAuditContract(t *testing.T, db *gorm.DB, dbType commo
 		Result: RoutingHedgeAttemptResultHedgeLost, HTTPStatus: 0, CompletedTimeMs: 1_060,
 	})
 	assert.ErrorIs(t, err, ErrRoutingHedgeAttemptTransition)
+}
+
+func TestRoutingHedgeAttemptAuditAcceptsCurrentSystemPricingForSerialAndHedge(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(&RoutingHedgeAttemptAudit{}))
+
+	tests := []struct {
+		name          string
+		executionMode string
+		role          string
+	}{
+		{name: "serial", executionMode: RoutingAttemptExecutionSerial, role: RoutingAttemptRoleSerial},
+		{name: "hedge", executionMode: RoutingAttemptExecutionHedge, role: RoutingHedgeAttemptRolePrimary},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := routingHedgeAttemptStartSpecForTest(
+				"current-system-pricing-"+test.name,
+				test.role,
+				201+index,
+				1_000+int64(index),
+			)
+			spec.ExecutionMode = test.executionMode
+			audit, err := StartRoutingHedgeAttemptAuditContext(context.Background(), spec)
+			require.NoError(t, err)
+			assert.Equal(t, RoutingHedgeAttemptAuditSchemaVersion, audit.SchemaVersion)
+			assert.Equal(t, RoutingHedgeCostAuditSchemaVersion, audit.CostSchemaVersion)
+			assert.Equal(t, test.executionMode, audit.ExecutionMode)
+			assert.Equal(t, test.role, audit.Role)
+			assert.True(t, audit.CostKnown)
+			assert.Equal(t, spec.Cost.PricingIdentity, audit.PricingIdentity)
+			assert.Equal(t, spec.Cost.ConfigurationRevision, audit.ConfigurationRevision)
+		})
+	}
 }
 
 func TestRoutingHedgeAttemptAuditRejectsSensitiveEndpointAndUnknownCost(t *testing.T) {
@@ -253,14 +297,16 @@ func routingHedgeAttemptStartSpecForTest(
 		Cost: RoutingHedgeAttemptCostSpec{
 			Known:        true,
 			ExpectedCost: 0.001, WorstCaseCost: 0.002, EffectiveCost: 0.0012,
-			Currency: "USD", Unit: "request", PricingBasis: "token",
+			Currency: "USD", Unit: "request", PricingBasis: "system_pricing_x_channel_multiplier",
 			PricingHash: routingHedgeAuditHash("pricing", "v1"), PricingVersion: "pricing-v1",
+			PricingIdentity:       "billing:" + routingHedgeAuditHash("pricing", "v1") + ":channel-config:7",
+			ConfigurationRevision: 7, UpstreamCostMultiplier: 1.5,
+			BaselineExpectedKnown: true, BaselineExpectedCost: 0.0005,
+			BaselineWorstCaseKnown: true, BaselineWorstCaseCost: 0.001,
 			ConfidenceScore: 1, FreshnessScore: 1,
 			ExpectedBreakdown:    RoutingCostBreakdown{Input: 0.0004, Output: 0.0006, Total: 0.001},
 			WorstSingleBreakdown: RoutingCostBreakdown{Input: 0.0008, Output: 0.0012, Total: 0.002},
 			ObservedTime:         900, EffectiveTime: 900, ExpiresTime: 2_000,
-			SourceSyncStatus: RoutingUpstreamSyncStatusSuccess, AccountSourceType: "gateway",
-			AccountReferenceHash: routingHedgeAuditHash("account", "masked"),
 		},
 	}
 }

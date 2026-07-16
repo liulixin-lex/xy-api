@@ -19,7 +19,7 @@ func TestDecisionCandidateDetailsPageReplaysBeyondStoredSummaryLimit(t *testing.
 	requestID := "candidate-page-replay"
 	seed, err := DeriveDecisionSeed(requestID, 7, 0)
 	require.NoError(t, err)
-	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", true, 0, 10, 10)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", true, 0, 10, 10)
 	require.NoError(t, err)
 	candidates := make([]ShadowCandidateInput, candidateCount)
 	for index := range candidates {
@@ -43,7 +43,7 @@ func TestDecisionCandidateDetailsPageReplaysBeyondStoredSummaryLimit(t *testing.
 	require.NoError(t, err)
 	decisionID, err := EnqueueDecision(DecisionInput{
 		RequestID: requestID, PoolID: 1, GroupName: profile.GroupName, ModelName: profile.ModelName,
-		SnapshotRevision: 7, AlgorithmVersion: DecisionAlgorithmShadowV1, IsStream: true,
+		SnapshotRevision: 7, AlgorithmVersion: DecisionAlgorithmShadow, IsStream: true,
 		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
 		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
 		Candidates: replay.Candidates, ReplayInput: &input,

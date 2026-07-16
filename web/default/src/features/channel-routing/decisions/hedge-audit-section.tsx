@@ -16,19 +16,23 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import {
-  Clock3,
-  Coins,
-  GitFork,
-  MapPin,
-  Network,
-  Server,
-  Trophy,
-} from 'lucide-react'
+  Award01Icon,
+  Clock3Icon,
+  Coins01Icon,
+  GitForkIcon,
+  InternetIcon,
+  MapPinIcon,
+  ServerStack01Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon, type IconSvgElement } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
+import {
+  hasCurrentRoutingAttemptCostAudit,
+  routingCostUnknownReasonLabel,
+} from '../lib/cost-audit'
 import { useChannelRoutingFormatters } from '../lib/format'
 import type { RoutingAttempt, RoutingAttemptTimeline } from '../types'
 
@@ -128,6 +132,7 @@ function AttemptTimelineRow(props: {
     Boolean(attempt.error_responsibility) ||
     Boolean(attempt.error_retryability) ||
     Boolean(attempt.error_code)
+  const hasChannelCostAudit = hasCurrentRoutingAttemptCostAudit(attempt)
 
   return (
     <li className='grid min-w-0 grid-cols-[2rem_minmax(0,1fr)] gap-3 p-3 sm:p-4'>
@@ -152,13 +157,21 @@ function AttemptTimelineRow(props: {
             </p>
             <div className='text-muted-foreground mt-1 flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-xs'>
               <span className='inline-flex min-w-0 items-center gap-1'>
-                <Network className='size-3 shrink-0' aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={InternetIcon}
+                  className='size-3 shrink-0'
+                  aria-hidden='true'
+                />
                 <span className='break-all'>
                   {attempt.endpoint_authority || t('Endpoint unavailable')}
                 </span>
               </span>
               <span className='inline-flex min-w-0 items-center gap-1'>
-                <Server className='size-3 shrink-0' aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={ServerStack01Icon}
+                  className='size-3 shrink-0'
+                  aria-hidden='true'
+                />
                 <span className='break-all'>
                   {attempt.stable_node_known
                     ? attempt.stable_node_id || attempt.node_epoch_id
@@ -261,6 +274,89 @@ function AttemptTimelineRow(props: {
           </div>
         </dl>
 
+        {hasChannelCostAudit ? (
+          <dl className='grid grid-cols-2 gap-x-4 gap-y-2 border-t pt-3 text-xs sm:grid-cols-3 lg:grid-cols-6'>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('1× baseline expected cost')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {cost(
+                  attempt.baseline_expected_known === true,
+                  attempt.baseline_expected_cost
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('1× baseline worst-case cost')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {cost(
+                  attempt.baseline_worst_case_known === true,
+                  attempt.baseline_worst_case_cost
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('Channel multiplier')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {typeof attempt.upstream_cost_multiplier === 'number' &&
+                Number.isFinite(attempt.upstream_cost_multiplier)
+                  ? `${format.cost(attempt.upstream_cost_multiplier)}×`
+                  : t('Unknown')}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground'>
+                {t('Configuration revision')}
+              </dt>
+              <dd className='mt-0.5 font-medium'>
+                {(attempt.configuration_revision ?? 0) > 0
+                  ? format.number(attempt.configuration_revision ?? 0)
+                  : t('Unknown')}
+              </dd>
+            </div>
+            <div className='min-w-0'>
+              <dt className='text-muted-foreground'>{t('Pricing basis')}</dt>
+              <dd
+                className='mt-0.5 truncate font-medium'
+                title={attempt.pricing_basis}
+              >
+                {attempt.pricing_basis || t('Unknown')}
+              </dd>
+            </div>
+            <div className='min-w-0'>
+              <dt className='text-muted-foreground'>{t('Pricing identity')}</dt>
+              <dd
+                className='mt-0.5 truncate font-medium'
+                title={attempt.pricing_identity}
+              >
+                {format.shortHash(attempt.pricing_identity)}
+              </dd>
+            </div>
+            {attempt.unknown_reason ? (
+              <div className='col-span-full min-w-0'>
+                <dt className='text-muted-foreground'>{t('Unknown reason')}</dt>
+                <dd
+                  className='mt-0.5 font-medium break-words'
+                  title={attempt.unknown_reason}
+                >
+                  {routingCostUnknownReasonLabel(attempt.unknown_reason, t)}
+                </dd>
+              </div>
+            ) : null}
+          </dl>
+        ) : (
+          <p className='text-muted-foreground border-t pt-3 text-xs'>
+            {t(
+              'Channel multiplier audit was not recorded for this historical decision.'
+            )}
+          </p>
+        )}
+
         {hasTokenAudit ? (
           <dl className='grid grid-cols-2 gap-x-4 gap-y-2 border-t pt-3 text-xs sm:grid-cols-3 lg:grid-cols-6'>
             {[
@@ -356,12 +452,12 @@ export function ChannelRoutingAttemptTimelineSection(props: {
       : formatted
   }
   const summary: Array<{
-    icon: typeof Coins
+    icon: IconSvgElement
     label: string
     value: string
   }> = [
     {
-      icon: Coins,
+      icon: Coins01Icon,
       label: t('Estimated total'),
       value: cost(
         timeline.estimated_total_cost_known,
@@ -369,7 +465,7 @@ export function ChannelRoutingAttemptTimelineSection(props: {
       ),
     },
     {
-      icon: Coins,
+      icon: Coins01Icon,
       label: t('Worst-case total'),
       value: cost(
         timeline.worst_case_total_cost_known,
@@ -377,7 +473,7 @@ export function ChannelRoutingAttemptTimelineSection(props: {
       ),
     },
     {
-      icon: Trophy,
+      icon: Award01Icon,
       label: t('Actual total'),
       value: cost(timeline.actual_total_cost_known, timeline.actual_total_cost),
     },
@@ -389,7 +485,7 @@ export function ChannelRoutingAttemptTimelineSection(props: {
     timeline.duplicate_actual_cost_known
   ) {
     summary.push({
-      icon: GitFork,
+      icon: GitForkIcon,
       label: t('Duplicate expected'),
       value: cost(
         timeline.duplicate_expected_cost_known,
@@ -397,7 +493,7 @@ export function ChannelRoutingAttemptTimelineSection(props: {
       ),
     })
     summary.push({
-      icon: GitFork,
+      icon: GitForkIcon,
       label: t('Duplicate worst-case'),
       value: cost(
         timeline.duplicate_worst_case_cost_known,
@@ -405,7 +501,7 @@ export function ChannelRoutingAttemptTimelineSection(props: {
       ),
     })
     summary.push({
-      icon: Trophy,
+      icon: Award01Icon,
       label: t('Duplicate actual'),
       value: cost(
         timeline.duplicate_actual_cost_known,
@@ -422,7 +518,11 @@ export function ChannelRoutingAttemptTimelineSection(props: {
             id='attempt-timeline-title'
             className='flex items-center gap-2 text-sm font-semibold'
           >
-            <GitFork className='size-4' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={GitForkIcon}
+              className='size-4'
+              aria-hidden='true'
+            />
             {props.title || t('Attempt timeline')}
           </h3>
           <p className='text-muted-foreground mt-0.5 text-xs'>
@@ -435,7 +535,11 @@ export function ChannelRoutingAttemptTimelineSection(props: {
           </p>
           {timeline.final_channel_id ? (
             <p className='text-muted-foreground mt-1 inline-flex items-center gap-1 text-xs'>
-              <MapPin className='size-3' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={MapPinIcon}
+                className='size-3'
+                aria-hidden='true'
+              />
               {t(
                 'Final route: member #{{member}} · channel #{{channel}} · {{region}}',
                 {
@@ -448,7 +552,11 @@ export function ChannelRoutingAttemptTimelineSection(props: {
           ) : null}
           {finalNode ? (
             <p className='text-muted-foreground mt-1 inline-flex min-w-0 items-center gap-1 text-xs'>
-              <Server className='size-3 shrink-0' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={ServerStack01Icon}
+                className='size-3 shrink-0'
+                aria-hidden='true'
+              />
               <span className='break-all'>
                 {t('Final node: {{node}}', { node: finalNode })}
               </span>
@@ -485,11 +593,14 @@ export function ChannelRoutingAttemptTimelineSection(props: {
 
       <dl className='bg-border grid grid-cols-2 gap-px overflow-hidden rounded-lg border lg:grid-cols-3'>
         {summary.map((item) => {
-          const Icon = item.icon
           return (
             <div key={item.label} className='bg-background min-w-0 p-3'>
               <dt className='text-muted-foreground flex items-center gap-1.5 text-xs'>
-                <Icon className='size-3.5' aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={item.icon}
+                  className='size-3.5'
+                  aria-hidden='true'
+                />
                 <span>{item.label}</span>
               </dt>
               <dd className='mt-1 font-medium break-words'>{item.value}</dd>
@@ -512,7 +623,11 @@ export function ChannelRoutingAttemptTimelineSection(props: {
         </ol>
       ) : (
         <div className='text-muted-foreground mt-3 flex items-center gap-2 rounded-lg border p-3 text-sm'>
-          <Clock3 className='size-4' aria-hidden='true' />
+          <HugeiconsIcon
+            icon={Clock3Icon}
+            className='size-4'
+            aria-hidden='true'
+          />
           {t('No retained attempts are available.')}
         </div>
       )}

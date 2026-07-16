@@ -191,8 +191,9 @@ func AutoRollbackRoutingCanaryPoolContext(
 		}
 
 		rollbackDocument := RoutingPolicyDocument{
-			SchemaVersion: document.SchemaVersion,
-			Pools:         make([]RoutingPolicyPoolContent, len(document.Pools)),
+			SchemaVersion:   document.SchemaVersion,
+			Pools:           make([]RoutingPolicyPoolContent, len(document.Pools)),
+			ExtensionFields: document.ExtensionFields,
 		}
 		targetsFound := 0
 		remainingCanary := false

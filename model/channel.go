@@ -69,6 +69,13 @@ func (channel *Channel) BeforeCreate(_ *gorm.DB) error {
 	return nil
 }
 
+func (channel *Channel) AfterCreate(tx *gorm.DB) error {
+	if channel == nil {
+		return ErrRoutingChannelConfigurationInvalid
+	}
+	return createDefaultRoutingChannelConfigurationTx(tx, channel.Id, channel.CreatedTime)
+}
+
 func EnsureChannelRoutingGenerations(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("database is required")
@@ -755,6 +762,12 @@ func BatchDeleteChannels(ids []int) error {
 		}
 	}
 	for _, chunk := range lo.Chunk(ids, 200) {
+		if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+			if err := tx.Where("channel_id in (?)", chunk).Delete(&RoutingChannelConfiguration{}).Error; err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
 		if err := tx.Where("id in (?)", chunk).Delete(&Channel{}).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -811,14 +824,20 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
-	var err error
-	err = DB.Create(channel).Error
+	if channel == nil {
+		return errors.New("channel is nil")
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(channel).Error; err != nil {
+			return err
+		}
+		return channel.AddAbilities(tx)
+	})
 	if err != nil {
 		return err
 	}
-	err = channel.AddAbilities(nil)
 	NotifyRoutingTopologyChanged()
-	return err
+	return nil
 }
 
 func (channel *Channel) Update() error {
@@ -1059,6 +1078,11 @@ func (channel *Channel) Delete() error {
 		}
 		if err := tx.Where("channel_id = ?", current.Id).Delete(&Ability{}).Error; err != nil {
 			return err
+		}
+		if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+			if err := tx.Where("channel_id = ?", current.Id).Delete(&RoutingChannelConfiguration{}).Error; err != nil {
+				return err
+			}
 		}
 		return tx.Delete(&current).Error
 	})
@@ -1396,6 +1420,11 @@ func deleteChannelsByStatuses(statuses []int64) (int64, error) {
 		for _, chunk := range lo.Chunk(ids, 200) {
 			if err := tx.Where("channel_id IN ?", chunk).Delete(&Ability{}).Error; err != nil {
 				return err
+			}
+			if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+				if err := tx.Where("channel_id IN ?", chunk).Delete(&RoutingChannelConfiguration{}).Error; err != nil {
+					return err
+				}
 			}
 			result := tx.Where("id IN ?", chunk).Delete(&Channel{})
 			if result.Error != nil {

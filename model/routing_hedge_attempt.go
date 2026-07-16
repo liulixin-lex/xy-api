@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	RoutingHedgeAttemptAuditSchemaVersion = 3
-	RoutingHedgeCostAuditSchemaVersion    = 1
+	RoutingHedgeAttemptAuditSchemaVersion = 4
+	RoutingHedgeCostAuditSchemaVersion    = 2
 
 	RoutingAttemptExecutionSerial = "serial"
 	RoutingAttemptExecutionHedge  = "hedge"
@@ -53,51 +53,60 @@ var (
 )
 
 type RoutingHedgeAttemptAudit struct {
-	ID                       int64   `json:"id" gorm:"primaryKey"`
-	AttemptKey               string  `json:"attempt_key" gorm:"type:char(64);uniqueIndex;not null"`
-	DecisionID               string  `json:"decision_id" gorm:"type:varchar(64);index"`
-	RequestKey               string  `json:"request_key" gorm:"type:char(64);index;not null"`
-	NodeEpochID              string  `json:"node_epoch_id" gorm:"type:char(32);index;not null"`
-	StableNodeID             string  `json:"stable_node_id,omitempty" gorm:"type:varchar(128);index;not null"`
-	StableNodeKnown          bool    `json:"stable_node_known" gorm:"not null"`
-	SchemaVersion            int     `json:"schema_version" gorm:"not null"`
-	PolicyRevision           int64   `json:"policy_revision" gorm:"bigint;index;not null"`
-	AlgorithmVersion         string  `json:"algorithm_version" gorm:"type:varchar(128);index;not null"`
-	PoolID                   int     `json:"pool_id" gorm:"index;not null"`
-	MemberID                 int     `json:"member_id" gorm:"index;not null"`
-	ChannelID                int     `json:"channel_id" gorm:"index;not null"`
-	CredentialReferenceHash  string  `json:"credential_reference_hash" gorm:"type:char(64);not null"`
-	ModelKey                 string  `json:"model_key" gorm:"type:char(64);index;not null"`
-	ExecutionMode            string  `json:"execution_mode" gorm:"type:varchar(16);index;not null"`
-	AttemptIndex             int     `json:"attempt_index" gorm:"index;not null"`
-	Role                     string  `json:"role" gorm:"type:varchar(16);index;not null"`
-	State                    string  `json:"state" gorm:"type:varchar(16);index;not null"`
-	Result                   string  `json:"result" gorm:"type:varchar(32);index;not null"`
-	Winner                   bool    `json:"winner" gorm:"not null"`
-	EndpointAuthority        string  `json:"endpoint_authority" gorm:"type:varchar(512);not null"`
-	EndpointAuthorityHash    string  `json:"endpoint_authority_hash" gorm:"type:char(64);index;not null"`
-	FailureDomainHash        string  `json:"failure_domain_hash" gorm:"type:char(64);index;not null"`
-	Region                   string  `json:"region" gorm:"type:varchar(64);index;not null"`
-	CrossRegion              bool    `json:"cross_region" gorm:"not null"`
-	CostSchemaVersion        int     `json:"cost_schema_version" gorm:"not null"`
-	CostKnown                bool    `json:"cost_known" gorm:"not null"`
-	ExpectedCost             float64 `json:"expected_cost" gorm:"not null"`
-	WorstCaseCost            float64 `json:"worst_case_cost" gorm:"not null"`
-	EffectiveCost            float64 `json:"effective_cost" gorm:"not null"`
-	CostCurrency             string  `json:"cost_currency" gorm:"type:varchar(16);not null"`
-	CostUnit                 string  `json:"cost_unit" gorm:"type:varchar(32);not null"`
-	PricingBasis             string  `json:"pricing_basis" gorm:"type:varchar(32);not null"`
-	PricingHash              string  `json:"pricing_hash" gorm:"type:char(64);index;not null"`
-	PricingVersion           string  `json:"pricing_version" gorm:"type:varchar(128);index;not null"`
-	CostConfidenceScore      float64 `json:"cost_confidence_score" gorm:"not null"`
-	CostFreshnessScore       float64 `json:"cost_freshness_score" gorm:"not null"`
-	CostBreakdownJSON        string  `json:"-" gorm:"type:text;not null"`
-	CostObservedTime         int64   `json:"cost_observed_time" gorm:"bigint;index;not null"`
-	CostEffectiveTime        int64   `json:"cost_effective_time" gorm:"bigint;not null"`
-	CostExpiresTime          int64   `json:"cost_expires_time" gorm:"bigint;index;not null"`
-	CostSourceSyncStatus     string  `json:"cost_source_sync_status" gorm:"type:varchar(32);not null"`
-	AccountSourceType        string  `json:"account_source_type" gorm:"type:varchar(32);not null"`
-	AccountReferenceHash     string  `json:"account_reference_hash" gorm:"type:char(64);index;not null"`
+	ID                      int64   `json:"id" gorm:"primaryKey"`
+	AttemptKey              string  `json:"attempt_key" gorm:"type:char(64);uniqueIndex;not null"`
+	DecisionID              string  `json:"decision_id" gorm:"type:varchar(64);index"`
+	RequestKey              string  `json:"request_key" gorm:"type:char(64);index;not null"`
+	NodeEpochID             string  `json:"node_epoch_id" gorm:"type:char(32);index;not null"`
+	StableNodeID            string  `json:"stable_node_id,omitempty" gorm:"type:varchar(128);index;not null"`
+	StableNodeKnown         bool    `json:"stable_node_known" gorm:"not null"`
+	SchemaVersion           int     `json:"schema_version" gorm:"not null"`
+	PolicyRevision          int64   `json:"policy_revision" gorm:"bigint;index;not null"`
+	AlgorithmVersion        string  `json:"algorithm_version" gorm:"type:varchar(128);index;not null"`
+	PoolID                  int     `json:"pool_id" gorm:"index;not null"`
+	MemberID                int     `json:"member_id" gorm:"index;not null"`
+	ChannelID               int     `json:"channel_id" gorm:"index;not null"`
+	CredentialReferenceHash string  `json:"credential_reference_hash" gorm:"type:char(64);not null"`
+	ModelKey                string  `json:"model_key" gorm:"type:char(64);index;not null"`
+	ExecutionMode           string  `json:"execution_mode" gorm:"type:varchar(16);index;not null"`
+	AttemptIndex            int     `json:"attempt_index" gorm:"index;not null"`
+	Role                    string  `json:"role" gorm:"type:varchar(16);index;not null"`
+	State                   string  `json:"state" gorm:"type:varchar(16);index;not null"`
+	Result                  string  `json:"result" gorm:"type:varchar(32);index;not null"`
+	Winner                  bool    `json:"winner" gorm:"not null"`
+	EndpointAuthority       string  `json:"endpoint_authority" gorm:"type:varchar(512);not null"`
+	EndpointAuthorityHash   string  `json:"endpoint_authority_hash" gorm:"type:char(64);index;not null"`
+	FailureDomainHash       string  `json:"failure_domain_hash" gorm:"type:char(64);index;not null"`
+	Region                  string  `json:"region" gorm:"type:varchar(64);index;not null"`
+	CrossRegion             bool    `json:"cross_region" gorm:"not null"`
+	CostSchemaVersion       int     `json:"cost_schema_version" gorm:"not null"`
+	CostKnown               bool    `json:"cost_known" gorm:"not null"`
+	ExpectedCost            float64 `json:"expected_cost" gorm:"not null"`
+	WorstCaseCost           float64 `json:"worst_case_cost" gorm:"not null"`
+	EffectiveCost           float64 `json:"effective_cost" gorm:"not null"`
+	CostCurrency            string  `json:"cost_currency" gorm:"type:varchar(16);not null"`
+	CostUnit                string  `json:"cost_unit" gorm:"type:varchar(32);not null"`
+	PricingBasis            string  `json:"pricing_basis" gorm:"type:varchar(64);not null"`
+	PricingHash             string  `json:"pricing_hash" gorm:"type:char(64);index;not null"`
+	PricingVersion          string  `json:"pricing_version" gorm:"type:varchar(128);index;not null"`
+	PricingIdentity         string  `json:"pricing_identity,omitempty" gorm:"type:varchar(128);index"`
+	CostUnknownReason       string  `json:"unknown_reason,omitempty" gorm:"type:varchar(128);index"`
+	ConfigurationRevision   int64   `json:"configuration_revision,omitempty" gorm:"bigint;index"`
+	UpstreamCostMultiplier  float64 `json:"upstream_cost_multiplier"`
+	BaselineExpectedKnown   bool    `json:"baseline_expected_known"`
+	BaselineExpectedCost    float64 `json:"baseline_expected_cost"`
+	BaselineWorstCaseKnown  bool    `json:"baseline_worst_case_known"`
+	BaselineWorstCaseCost   float64 `json:"baseline_worst_case_cost"`
+	CostConfidenceScore     float64 `json:"cost_confidence_score" gorm:"not null"`
+	CostFreshnessScore      float64 `json:"cost_freshness_score" gorm:"not null"`
+	CostBreakdownJSON       string  `json:"-" gorm:"type:text;not null"`
+	CostObservedTime        int64   `json:"cost_observed_time" gorm:"bigint;index;not null"`
+	CostEffectiveTime       int64   `json:"cost_effective_time" gorm:"bigint;not null"`
+	CostExpiresTime         int64   `json:"cost_expires_time" gorm:"bigint;index;not null"`
+	// Retained only so historical schema-v3 connector rows remain readable.
+	CostSourceSyncStatus     string  `json:"cost_source_sync_status,omitempty" gorm:"type:varchar(32);not null"`
+	AccountSourceType        string  `json:"account_source_type,omitempty" gorm:"type:varchar(32);not null"`
+	AccountReferenceHash     string  `json:"account_reference_hash,omitempty" gorm:"type:char(64);index;not null"`
 	HTTPStatus               int     `json:"http_status" gorm:"not null"`
 	ErrorClassification      string  `json:"error_classification" gorm:"type:varchar(64);index;not null"`
 	ErrorResponsibility      string  `json:"error_responsibility" gorm:"type:varchar(32);index;not null"`
@@ -128,25 +137,30 @@ func (RoutingHedgeAttemptAudit) TableName() string {
 }
 
 type RoutingHedgeAttemptCostSpec struct {
-	Known                bool
-	ExpectedCost         float64
-	WorstCaseCost        float64
-	EffectiveCost        float64
-	Currency             string
-	Unit                 string
-	PricingBasis         string
-	PricingHash          string
-	PricingVersion       string
-	ConfidenceScore      float64
-	FreshnessScore       float64
-	ExpectedBreakdown    RoutingCostBreakdown
-	WorstSingleBreakdown RoutingCostBreakdown
-	ObservedTime         int64
-	EffectiveTime        int64
-	ExpiresTime          int64
-	SourceSyncStatus     string
-	AccountSourceType    string
-	AccountReferenceHash string
+	Known                  bool
+	ExpectedCost           float64
+	WorstCaseCost          float64
+	EffectiveCost          float64
+	Currency               string
+	Unit                   string
+	PricingBasis           string
+	PricingHash            string
+	PricingVersion         string
+	PricingIdentity        string
+	UnknownReason          string
+	ConfigurationRevision  int64
+	UpstreamCostMultiplier float64
+	BaselineExpectedKnown  bool
+	BaselineExpectedCost   float64
+	BaselineWorstCaseKnown bool
+	BaselineWorstCaseCost  float64
+	ConfidenceScore        float64
+	FreshnessScore         float64
+	ExpectedBreakdown      RoutingCostBreakdown
+	WorstSingleBreakdown   RoutingCostBreakdown
+	ObservedTime           int64
+	EffectiveTime          int64
+	ExpiresTime            int64
 }
 
 type RoutingHedgeAttemptStartSpec struct {
@@ -221,6 +235,15 @@ type RoutingHedgeAttemptSummary struct {
 	EffectiveCost            float64 `json:"effective_cost,omitempty"`
 	CostCurrency             string  `json:"cost_currency,omitempty"`
 	CostUnit                 string  `json:"cost_unit,omitempty"`
+	PricingBasis             string  `json:"pricing_basis,omitempty"`
+	PricingIdentity          string  `json:"pricing_identity,omitempty"`
+	UnknownReason            string  `json:"unknown_reason,omitempty"`
+	ConfigurationRevision    int64   `json:"configuration_revision,omitempty"`
+	UpstreamCostMultiplier   float64 `json:"upstream_cost_multiplier"`
+	BaselineExpectedKnown    bool    `json:"baseline_expected_known"`
+	BaselineExpectedCost     float64 `json:"baseline_expected_cost,omitempty"`
+	BaselineWorstCaseKnown   bool    `json:"baseline_worst_case_known"`
+	BaselineWorstCaseCost    float64 `json:"baseline_worst_case_cost,omitempty"`
 	ActualCostKnown          bool    `json:"actual_cost_known"`
 	ActualCost               float64 `json:"actual_cost,omitempty"`
 	ActualPromptTokens       int64   `json:"actual_prompt_tokens,omitempty"`
@@ -388,13 +411,17 @@ func newRoutingHedgeAttemptAudit(spec RoutingHedgeAttemptStartSpec) (RoutingHedg
 		EffectiveCost: spec.Cost.EffectiveCost, CostCurrency: spec.Cost.Currency,
 		CostUnit: spec.Cost.Unit, PricingBasis: spec.Cost.PricingBasis,
 		PricingHash: spec.Cost.PricingHash, PricingVersion: spec.Cost.PricingVersion,
-		CostConfidenceScore: spec.Cost.ConfidenceScore, CostFreshnessScore: spec.Cost.FreshnessScore,
+		PricingIdentity: spec.Cost.PricingIdentity, CostUnknownReason: spec.Cost.UnknownReason,
+		ConfigurationRevision:  spec.Cost.ConfigurationRevision,
+		UpstreamCostMultiplier: spec.Cost.UpstreamCostMultiplier,
+		BaselineExpectedKnown:  spec.Cost.BaselineExpectedKnown,
+		BaselineExpectedCost:   spec.Cost.BaselineExpectedCost,
+		BaselineWorstCaseKnown: spec.Cost.BaselineWorstCaseKnown,
+		BaselineWorstCaseCost:  spec.Cost.BaselineWorstCaseCost,
+		CostConfidenceScore:    spec.Cost.ConfidenceScore, CostFreshnessScore: spec.Cost.FreshnessScore,
 		CostBreakdownJSON: string(breakdown), CostObservedTime: spec.Cost.ObservedTime,
 		CostEffectiveTime: spec.Cost.EffectiveTime, CostExpiresTime: spec.Cost.ExpiresTime,
-		CostSourceSyncStatus: spec.Cost.SourceSyncStatus,
-		AccountSourceType:    spec.Cost.AccountSourceType,
-		AccountReferenceHash: spec.Cost.AccountReferenceHash,
-		StartedTimeMs:        startedAt, CreatedTimeMs: startedAt, UpdatedTimeMs: startedAt,
+		StartedTimeMs: startedAt, CreatedTimeMs: startedAt, UpdatedTimeMs: startedAt,
 	}
 	return audit, nil
 }
@@ -819,6 +846,9 @@ func loadRoutingHedgeAttemptSummaries(query *gorm.DB, limit int) ([]RoutingHedge
 			"algorithm_version", "execution_mode", "attempt_index", "role", "state", "result", "winner",
 			"member_id", "channel_id", "region", "endpoint_authority", "failure_domain_hash",
 			"cost_known", "expected_cost", "worst_case_cost", "effective_cost", "cost_currency", "cost_unit",
+			"pricing_basis", "pricing_identity", "cost_unknown_reason AS unknown_reason", "configuration_revision",
+			"upstream_cost_multiplier", "baseline_expected_known", "baseline_expected_cost",
+			"baseline_worst_case_known", "baseline_worst_case_cost",
 			"actual_cost_known", "actual_cost", "actual_prompt_tokens", "actual_completion_tokens",
 			"actual_total_tokens", "actual_cache_read_tokens", "actual_cache_write_tokens",
 			"actual_cache_write_1h_tokens", "http_status", "error_classification", "error_retryability",
@@ -937,16 +967,9 @@ func validRoutingHedgeAttemptStartSpec(spec RoutingHedgeAttemptStartSpec) bool {
 }
 
 func validRoutingHedgeCostSpec(spec RoutingHedgeAttemptCostSpec) bool {
-	if !spec.Known {
-		return spec.ExpectedCost == 0 && spec.WorstCaseCost == 0 && spec.EffectiveCost == 0 &&
-			spec.Currency == "" && spec.Unit == "" && spec.PricingBasis == "" && spec.PricingHash == "" &&
-			spec.PricingVersion == "" && spec.ConfidenceScore == 0 && spec.FreshnessScore == 0 &&
-			spec.ExpectedBreakdown == (RoutingCostBreakdown{}) && spec.WorstSingleBreakdown == (RoutingCostBreakdown{}) &&
-			spec.ObservedTime == 0 && spec.EffectiveTime == 0 && spec.ExpiresTime == 0 &&
-			spec.SourceSyncStatus == "" && spec.AccountSourceType == "" && spec.AccountReferenceHash == ""
-	}
 	values := []float64{
 		spec.ExpectedCost, spec.WorstCaseCost, spec.EffectiveCost,
+		spec.UpstreamCostMultiplier, spec.BaselineExpectedCost, spec.BaselineWorstCaseCost,
 		spec.ConfidenceScore, spec.FreshnessScore,
 	}
 	for _, value := range values {
@@ -954,17 +977,44 @@ func validRoutingHedgeCostSpec(spec RoutingHedgeAttemptCostSpec) bool {
 			return false
 		}
 	}
-	return spec.WorstCaseCost >= spec.ExpectedCost &&
+	if spec.ConfigurationRevision < 0 || spec.UpstreamCostMultiplier > RoutingChannelUpstreamCostMultiplierMaximum ||
+		(!spec.BaselineExpectedKnown && spec.BaselineExpectedCost != 0) ||
+		(!spec.BaselineWorstCaseKnown && spec.BaselineWorstCaseCost != 0) ||
+		(spec.BaselineExpectedKnown && spec.BaselineWorstCaseKnown &&
+			spec.BaselineWorstCaseCost < spec.BaselineExpectedCost) ||
+		(spec.Currency != "" && !validRoutingHedgeAuditText(spec.Currency, 16)) ||
+		(spec.Unit != "" && !validRoutingHedgeAuditText(spec.Unit, 32)) ||
+		(spec.PricingBasis != "" && !validRoutingHedgeAuditText(spec.PricingBasis, 64)) ||
+		(spec.PricingHash != "" && !validRoutingHedgeAuditHash(spec.PricingHash)) ||
+		(spec.PricingVersion != "" && !validRoutingHedgeAuditText(spec.PricingVersion, 128)) ||
+		(spec.PricingIdentity != "" && !validRoutingHedgeAuditText(spec.PricingIdentity, 128)) ||
+		(spec.UnknownReason != "" && !validRoutingHedgeAuditText(spec.UnknownReason, 128)) ||
+		spec.ConfidenceScore > 1 || spec.FreshnessScore > 1 {
+		return false
+	}
+	timeMetadataPresent := spec.ObservedTime != 0 || spec.EffectiveTime != 0 || spec.ExpiresTime != 0
+	if timeMetadataPresent && (spec.ObservedTime <= 0 || spec.EffectiveTime <= 0 || spec.ExpiresTime < spec.EffectiveTime) {
+		return false
+	}
+	if !spec.Known {
+		if spec == (RoutingHedgeAttemptCostSpec{}) {
+			return true
+		}
+		return spec.ExpectedCost == 0 && spec.WorstCaseCost == 0 && spec.EffectiveCost == 0 &&
+			spec.ExpectedBreakdown == (RoutingCostBreakdown{}) && spec.WorstSingleBreakdown == (RoutingCostBreakdown{}) &&
+			strings.TrimSpace(spec.UnknownReason) != "" &&
+			(spec.PricingIdentity == "" || spec.ConfigurationRevision > 0)
+	}
+	return spec.WorstCaseCost >= spec.ExpectedCost && spec.UnknownReason == "" &&
 		validRoutingHedgeAuditText(spec.Currency, 16) && strings.TrimSpace(spec.Currency) != "" &&
 		validRoutingHedgeAuditText(spec.Unit, 32) && strings.TrimSpace(spec.Unit) != "" &&
-		validRoutingHedgeAuditText(spec.PricingBasis, 32) && strings.TrimSpace(spec.PricingBasis) != "" &&
+		validRoutingHedgeAuditText(spec.PricingBasis, 64) && strings.TrimSpace(spec.PricingBasis) != "" &&
 		validRoutingHedgeAuditHash(spec.PricingHash) &&
 		validRoutingHedgeAuditText(spec.PricingVersion, 128) && strings.TrimSpace(spec.PricingVersion) != "" &&
+		validRoutingHedgeAuditText(spec.PricingIdentity, 128) && strings.TrimSpace(spec.PricingIdentity) != "" &&
+		spec.ConfigurationRevision > 0 &&
 		spec.ConfidenceScore <= 1 && spec.FreshnessScore <= 1 && spec.ObservedTime > 0 &&
-		spec.EffectiveTime > 0 && spec.ExpiresTime >= spec.EffectiveTime &&
-		validRoutingHedgeAuditText(spec.SourceSyncStatus, 32) && strings.TrimSpace(spec.SourceSyncStatus) != "" &&
-		validRoutingHedgeAuditText(spec.AccountSourceType, 32) && strings.TrimSpace(spec.AccountSourceType) != "" &&
-		validRoutingHedgeAuditHash(spec.AccountReferenceHash)
+		spec.EffectiveTime > 0 && spec.ExpiresTime >= spec.EffectiveTime
 }
 
 func validRoutingHedgeAttemptCompleteSpec(spec RoutingHedgeAttemptCompleteSpec) bool {

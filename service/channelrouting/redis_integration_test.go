@@ -136,7 +136,7 @@ func TestRoutingEventsRealRedisPropagateAcrossThreeIndependentNodes(t *testing.T
 	assert.Equal(t, uint64(1), states[2].snapshot().Consumed)
 
 	second, err := hubs[1].publish(
-		RoutingEventTypeCostSyncCompleted, 11, []byte(`{"status":"succeeded"}`), time.Now(),
+		RoutingEventTypePolicyRolledBack, 12, []byte(`{"revision":12}`), time.Now(),
 	)
 	require.NoError(t, err)
 	require.NoError(t, broadcastRoutingEventContext(
@@ -161,7 +161,7 @@ func TestRoutingEventsRealRedisPropagateAcrossThreeIndependentNodes(t *testing.T
 	defer cancel()
 	require.Len(t, replay.Events, 2)
 	assert.Equal(t, RoutingEventTypePolicyPublished, replay.Events[0].Type)
-	assert.Equal(t, RoutingEventTypeCostSyncCompleted, replay.Events[1].Type)
+	assert.Equal(t, RoutingEventTypePolicyRolledBack, replay.Events[1].Type)
 }
 
 func TestRoutingTelemetryRealRedisCommitBeforeAckRedeliveryIsIdempotent(t *testing.T) {

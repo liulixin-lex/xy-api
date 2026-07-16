@@ -19,8 +19,8 @@ import (
 func TestChannelRoutingTrafficAdmissibleFailsClosedForClaudeCodeOnlyChannels(t *testing.T) {
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
-	routinghotcache.ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
-		{ChannelID: 11, ServesClaudeCode: true},
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 11, TrafficClass: model.RoutingChannelTrafficClassClaudeCodeOnly},
 	}, time.Now().Unix())
 	gin.SetMode(gin.TestMode)
 
@@ -39,7 +39,7 @@ func TestChannelRoutingTrafficAdmissibleFailsClosedForClaudeCodeOnlyChannels(t *
 		t.Run(test.name, func(t *testing.T) {
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
-			common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+			common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 				TrafficClass: test.class,
 			})
 			admissible, err := ChannelRoutingTrafficAdmissible(ctx, test.channelID)
@@ -52,13 +52,13 @@ func TestChannelRoutingTrafficAdmissibleFailsClosedForClaudeCodeOnlyChannels(t *
 func TestFilterRoutingTrafficAdmissibleChannelsUsesLivePolicy(t *testing.T) {
 	routinghotcache.ResetForTest()
 	t.Cleanup(routinghotcache.ResetForTest)
-	routinghotcache.ReplaceChannelTrafficPolicies([]model.RoutingChannelBinding{
-		{ChannelID: 21, ServesClaudeCode: true},
+	routinghotcache.ReplaceChannelTrafficConfigurations([]model.RoutingChannelConfiguration{
+		{ChannelID: 21, TrafficClass: model.RoutingChannelTrafficClassClaudeCodeOnly},
 	}, time.Now().Unix())
 	channels := []*model.Channel{{Id: 21}, {Id: 22}}
 
 	standard, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(standard, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(standard, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		TrafficClass: channelrouting.RequestTrafficClassStandard,
 	})
 	filtered, err := filterRoutingTrafficAdmissibleChannels(standard, channels)
@@ -67,7 +67,7 @@ func TestFilterRoutingTrafficAdmissibleChannelsUsesLivePolicy(t *testing.T) {
 	assert.Equal(t, 22, filtered[0].Id)
 
 	claudeCode, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(claudeCode, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(claudeCode, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		TrafficClass: channelrouting.RequestTrafficClassClaudeCode,
 	})
 	filtered, err = filterRoutingTrafficAdmissibleChannels(claudeCode, channels)

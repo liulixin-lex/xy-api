@@ -17,12 +17,12 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
-	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 	"github.com/QuantumNous/new-api/types"
 
@@ -52,11 +52,18 @@ func TestRoutingHedgeRealRedisSecondaryWinsWithOneSettlementAndTwoAudits(t *test
 	releaseSecondary := make(chan struct{})
 	releasePrimaryHandler := make(chan struct{})
 	primaryHandlerExited := make(chan struct{})
+	primaryExecutionReturned := make(chan struct{})
+	releasePrimaryExecution := make(chan struct{})
 	t.Cleanup(func() {
 		select {
 		case <-releasePrimaryHandler:
 		default:
 			close(releasePrimaryHandler)
+		}
+		select {
+		case <-releasePrimaryExecution:
+		default:
+			close(releasePrimaryExecution)
 		}
 	})
 	var upstreamCalls atomic.Int64
@@ -73,14 +80,27 @@ func TestRoutingHedgeRealRedisSecondaryWinsWithOneSettlementAndTwoAudits(t *test
 	})
 
 	var settlements atomic.Int64
+	previousExecute := routingHedgeExecuteText
 	previousFinalize := routingHedgeFinalizeText
 	previousLimiter := routingHedgeProcessLimiter
+	routingHedgeExecuteText = func(
+		ctx *gin.Context,
+		info *relaycommon.RelayInfo,
+	) (*relay.TextResponseCapture, *types.NewAPIError) {
+		capture, apiErr := previousExecute(ctx, info)
+		if common.GetContextKeyInt(ctx, constant.ContextKeyChannelId) == fixture.primary.Id {
+			close(primaryExecutionReturned)
+			<-releasePrimaryExecution
+		}
+		return capture, apiErr
+	}
 	routingHedgeFinalizeText = func(*gin.Context, *relaycommon.RelayInfo, *relay.TextResponseCapture) error {
 		settlements.Add(1)
 		return nil
 	}
 	routingHedgeProcessLimiter = &channelrouting.HedgeLimiter{}
 	t.Cleanup(func() {
+		routingHedgeExecuteText = previousExecute
 		routingHedgeFinalizeText = previousFinalize
 		routingHedgeProcessLimiter = previousLimiter
 	})
@@ -115,6 +135,11 @@ func TestRoutingHedgeRealRedisSecondaryWinsWithOneSettlementAndTwoAudits(t *test
 	assert.Equal(t, int64(2), upstreamCalls.Load())
 	assert.Equal(t, http.StatusOK, fixture.recorder.Code)
 	assert.Contains(t, fixture.recorder.Body.String(), `"id":"hedge-secondary"`)
+	select {
+	case <-primaryExecutionReturned:
+	case <-time.After(3 * time.Second):
+		require.FailNow(t, "routing hedge primary execution did not return after cancellation")
+	}
 
 	stats := fixture.strict.Stats()
 	assert.Equal(t, int64(2), stats.Allowed)
@@ -128,6 +153,7 @@ func TestRoutingHedgeRealRedisSecondaryWinsWithOneSettlementAndTwoAudits(t *test
 	case <-time.After(3 * time.Second):
 		require.FailNow(t, "routing hedge primary handler did not exit")
 	}
+	close(releasePrimaryExecution)
 	require.Eventually(t, func() bool {
 		return fixture.strict.Stats().Released == 2
 	}, 3*time.Second, 5*time.Millisecond)
@@ -281,7 +307,7 @@ func TestRoutingHedgeSameEndpointAndAccountCannotStartSecondary(t *testing.T) {
 		fixture.ctx, fixture.primary.Id, fixture.info.OriginModelName, fixture.retry.RequestPath, fixture.retry.GetRetry(),
 	)
 	require.NoError(t, err)
-	require.True(t, known)
+	require.True(t, known, "%+v", primaryCost)
 	policy, active, err := service.ChannelRoutingEnterpriseHedgePolicy(fixture.ctx)
 	require.NoError(t, err)
 	require.True(t, active)
@@ -350,7 +376,6 @@ func newRoutingHedgeIntegrationFixture(
 	sqlDB.SetMaxIdleConns(1)
 	require.NoError(t, db.AutoMigrate(
 		&model.Ability{},
-		&model.RoutingCostSnapshot{},
 		&model.RoutingHedgeAttemptAudit{},
 	))
 	withChannelRoutingControllerState(t, db)
@@ -363,6 +388,11 @@ func newRoutingHedgeIntegrationFixture(
 	t.Cleanup(func() {
 		*model_setting.GetGlobalSettings() = globalModelSetting
 		common.AutomaticDisableChannelEnabled = previousAutomaticDisable
+	})
+	previousModelRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-hedge-integration":1}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousModelRatios))
 	})
 
 	setting := smart_routing_setting.GetSetting()
@@ -464,37 +494,6 @@ func newRoutingHedgeIntegrationFixture(
 	)
 	require.NoError(t, err)
 
-	now := time.Now().Unix()
-	inputRate := 2.0
-	outputRate := 10.0
-	account, err := model.UpsertRoutingUpstreamAccountContext(context.Background(), model.RoutingUpstreamAccountSpec{
-		SourceType:     model.RoutingUpstreamTypeNewAPI,
-		StableIdentity: "hedge-integration-account",
-		MaskedIdentity: "hedge-***-account",
-		Status:         model.RoutingUpstreamAccountStatusActive,
-		LastSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
-	})
-	require.NoError(t, err)
-	for _, channel := range channels {
-		result, writeErr := model.WriteRoutingCostSnapshotVersionContext(
-			context.Background(),
-			model.RoutingCostSnapshotVersionWrite{
-				AccountID: account.ID, ChannelID: channel.Id,
-				UpstreamGroup: "hedge-enterprise", UpstreamModel: "gpt-hedge-integration",
-				LocalModel: "gpt-hedge-integration", ObservedTime: now, EffectiveTime: now - 1,
-				ExpiresTime: now + 3_600, PricingVersion: "hedge-integration-v1",
-				Confidence: model.RoutingCostConfidenceExact, ConfidenceScore: 1,
-				Freshness: model.RoutingCostFreshnessFresh, FreshnessScore: 1,
-				SourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
-				Pricing: model.RoutingNormalizedPricing{
-					QuotaType: 0, BillingMode: "token", Currency: "USD", Unit: "million_tokens",
-					InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
-				},
-			},
-		)
-		require.NoError(t, writeErr)
-		routinghotcache.LoadCostSnapshots([]model.RoutingCostSnapshot{result.Latest})
-	}
 	view, err := channelrouting.RefreshSnapshotContext(context.Background())
 	require.NoError(t, err)
 	pricedMembers := 0
@@ -505,7 +504,9 @@ func newRoutingHedgeIntegrationFixture(
 		for _, member := range snapshotPool.Members {
 			require.Len(t, member.Models, 1)
 			require.NotNil(t, member.Models[0].CostPricing)
-			require.Equal(t, account.AccountKey, member.Models[0].CostAccountKeyHash)
+			assert.Equal(t, channelrouting.SystemRoutingPricingBasis, member.Models[0].CostPricing.BillingMode)
+			assert.Equal(t, float64(1), member.Models[0].CostUpstreamMultiplier)
+			assert.Contains(t, member.Models[0].CostPricingIdentity, ":channel-config:1")
 			pricedMembers++
 		}
 	}
@@ -531,7 +532,9 @@ func newRoutingHedgeIntegrationFixture(
 		PromptTokens: 10, MaximumPromptTokens: int64(len(body)),
 		ExpectedCompletionTokens: 5, MaximumCompletionTokens: 10, MaxAttempts: 1,
 		KnowledgeSpecified: true, InputTokensKnown: true, MaximumCompletionKnown: true,
-		CacheTokensKnown: false, MediaDimensionsKnown: true, RequestInputKnown: true,
+		CacheTokensKnown: false, CacheWriteTokensKnown: true,
+		MediaDimensionsKnown: true, RequestInputKnown: true,
+		RequestPricingFeaturesKnown: true,
 	})
 
 	retry := &service.RetryParam{

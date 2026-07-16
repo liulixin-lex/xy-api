@@ -46,9 +46,9 @@ func TestClassifyAPIErrorMatrix(t *testing.T) {
 			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopePoolMember, Retryability: RetryBeforeCommit, HealthEffect: HealthIgnore, CapacityEffect: CapacityCooldown, Component: ComponentServing, Rule: "capacity_status"},
 		},
 		{
-			name: "upstream account balance exhausted",
+			name: "channel balance unavailable",
 			err:  types.NewErrorWithStatusCode(errors.New("payment required"), types.ErrorCodeBadResponseStatusCode, http.StatusPaymentRequired),
-			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopeAccount, Retryability: RetryBeforeCommit, HealthEffect: HealthOpen, CapacityEffect: CapacityNone, Component: ComponentServing, Rule: "upstream_account_balance"},
+			want: Classification{Responsibility: ResponsibilityCapacity, Scope: ScopeChannel, Retryability: RetryBeforeCommit, HealthEffect: HealthIgnore, CapacityEffect: CapacityCooldown, Component: ComponentServing, Rule: "channel_balance_unavailable"},
 		},
 		{
 			name: "provider overload 529",
@@ -79,12 +79,6 @@ func TestClassifyAPIErrorMatrix(t *testing.T) {
 			name: "local gateway error",
 			err:  types.NewError(errors.New("db failed"), types.ErrorCodeQueryDataError),
 			want: Classification{Responsibility: ResponsibilityGateway, Scope: ScopeRequest, Retryability: RetryNever, HealthEffect: HealthIgnore, CapacityEffect: CapacityNone, Component: ComponentServing, Rule: "gateway_code"},
-		},
-		{
-			name: "cost connector credential does not affect serving",
-			err:  types.NewErrorWithStatusCode(errors.New("unauthorized"), types.ErrorCodeBadResponseStatusCode, http.StatusUnauthorized),
-			ctx:  Context{Component: ComponentCostConnector, Operation: OperationSync},
-			want: Classification{Responsibility: ResponsibilityCredential, Scope: ScopeCredential, Retryability: RetryBeforeCommit, HealthEffect: HealthOpen, CapacityEffect: CapacityNone, Component: ComponentCostConnector, Rule: "cost_connector_credential"},
 		},
 	}
 

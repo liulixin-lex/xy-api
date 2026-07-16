@@ -1,9 +1,7 @@
 package routinghotcache
 
 import (
-	"math"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/model"
@@ -19,11 +17,6 @@ type Key struct {
 	Region            string
 }
 
-type CostKey struct {
-	ChannelID int
-	Model     string
-}
-
 type MetricSnapshot struct {
 	RequestCount            int64
 	SuccessCount            int64
@@ -35,44 +28,6 @@ type MetricSnapshot struct {
 	GenerationMs            int64
 	TPS                     float64
 	UpdatedUnix             int64
-}
-
-type CostSnapshot struct {
-	AccountID           int
-	Known               bool
-	Cost                float64
-	Confidence          string
-	QuotaType           int
-	GroupRatio          float64
-	BaseRatio           float64
-	CompletionRatio     float64
-	ModelPrice          float64
-	BillingMode         string
-	UpdatedUnix         int64
-	PricingKnown        bool
-	Pricing             model.RoutingNormalizedPricing
-	PricingHash         string
-	PricingVersion      string
-	UpstreamGroup       string
-	UpstreamModel       string
-	ObservedTime        int64
-	EffectiveTime       int64
-	ExpiresTime         int64
-	VersionConfidence   string
-	ConfidenceScore     float64
-	Freshness           string
-	FreshnessScore      float64
-	SourceSyncStatus    string
-	SourceSyncError     string
-	AccountSourceType   string
-	AccountKeyHash      string
-	AccountMaskedID     string
-	AccountStatus       string
-	AccountBalanceKnown bool
-	AccountBalance      float64
-	AccountBalanceAt    int64
-	AccountSyncStatus   string
-	AccountSyncError    string
 }
 
 type BreakerSnapshot struct {
@@ -105,12 +60,6 @@ type HealthMarker struct {
 	UpdatedUnix int64
 }
 
-type BalanceSnapshot struct {
-	Known       bool
-	Balance     float64
-	UpdatedUnix int64
-}
-
 type ChannelTrafficPolicy struct {
 	ClaudeCodeOnly bool
 }
@@ -128,7 +77,6 @@ type ChannelTrafficPolicyState struct {
 
 type Limits struct {
 	MaxMetrics           int
-	MaxCosts             int
 	MaxBreakers          int
 	MaxSharedEndpoints   int
 	MaxHealth            int
@@ -136,19 +84,17 @@ type Limits struct {
 }
 
 type Stats struct {
-	Metrics           int
-	Costs             int
-	Breakers          int
-	SharedEndpoints   int
-	CapacityCooldowns int
-	AuthFailures      int
-	Balances          int
-	Evictions         int64
+	Metrics                   int
+	Breakers                  int
+	SharedEndpoints           int
+	CapacityCooldowns         int
+	ChannelBalanceUnavailable int
+	AuthFailures              int
+	Evictions                 int64
 }
 
 var defaultLimits = Limits{
 	MaxMetrics:           20_000,
-	MaxCosts:             10_000,
 	MaxBreakers:          20_000,
 	MaxSharedEndpoints:   20_000,
 	MaxHealth:            10_000,
@@ -157,47 +103,34 @@ var defaultLimits = Limits{
 
 var cache = struct {
 	sync.RWMutex
-	metrics           map[Key]MetricSnapshot
-	costs             map[CostKey]CostSnapshot
-	breakers          map[Key]BreakerSnapshot
-	sharedEndpoints   map[Key]SharedEndpointBreakerSnapshot
-	capacityCooldowns map[Key]CapacityCooldownSnapshot
-	authFailures      map[int]HealthMarker
-	balances          map[int]BalanceSnapshot
-	channelPolicies   map[int]ChannelTrafficPolicy
-	channelOverrides  map[int]channelTrafficPolicyOverride
-	policiesLoadedAt  int64
-	policiesReady     bool
-	limits            Limits
-	evictions         int64
+	metrics                   map[Key]MetricSnapshot
+	breakers                  map[Key]BreakerSnapshot
+	sharedEndpoints           map[Key]SharedEndpointBreakerSnapshot
+	capacityCooldowns         map[Key]CapacityCooldownSnapshot
+	channelBalanceUnavailable map[int]ChannelBalanceUnavailableSnapshot
+	authFailures              map[int]HealthMarker
+	channelPolicies           map[int]ChannelTrafficPolicy
+	channelOverrides          map[int]channelTrafficPolicyOverride
+	policiesLoadedAt          int64
+	policiesReady             bool
+	limits                    Limits
+	evictions                 int64
 }{
-	metrics:           map[Key]MetricSnapshot{},
-	costs:             map[CostKey]CostSnapshot{},
-	breakers:          map[Key]BreakerSnapshot{},
-	sharedEndpoints:   map[Key]SharedEndpointBreakerSnapshot{},
-	capacityCooldowns: map[Key]CapacityCooldownSnapshot{},
-	authFailures:      map[int]HealthMarker{},
-	balances:          map[int]BalanceSnapshot{},
-	channelPolicies:   map[int]ChannelTrafficPolicy{},
-	channelOverrides:  map[int]channelTrafficPolicyOverride{},
-	limits:            defaultLimits,
-}
-
-func (key Key) CostKey() CostKey {
-	return CostKey{ChannelID: key.ChannelID, Model: key.Model}
+	metrics:                   map[Key]MetricSnapshot{},
+	breakers:                  map[Key]BreakerSnapshot{},
+	sharedEndpoints:           map[Key]SharedEndpointBreakerSnapshot{},
+	capacityCooldowns:         map[Key]CapacityCooldownSnapshot{},
+	channelBalanceUnavailable: map[int]ChannelBalanceUnavailableSnapshot{},
+	authFailures:              map[int]HealthMarker{},
+	channelPolicies:           map[int]ChannelTrafficPolicy{},
+	channelOverrides:          map[int]channelTrafficPolicyOverride{},
+	limits:                    defaultLimits,
 }
 
 func GetMetric(key Key) (MetricSnapshot, bool) {
 	cache.RLock()
 	defer cache.RUnlock()
 	snapshot, ok := cache.metrics[key]
-	return snapshot, ok
-}
-
-func GetCost(key CostKey) (CostSnapshot, bool) {
-	cache.RLock()
-	defer cache.RUnlock()
-	snapshot, ok := cache.costs[key]
 	return snapshot, ok
 }
 
@@ -250,13 +183,6 @@ func GetAuthFailure(channelID int) (HealthMarker, bool) {
 	return snapshot, ok
 }
 
-func GetBalance(channelID int) (BalanceSnapshot, bool) {
-	cache.RLock()
-	defer cache.RUnlock()
-	snapshot, ok := cache.balances[channelID]
-	return snapshot, ok
-}
-
 func GetChannelTrafficPolicy(channelID int) (ChannelTrafficPolicy, bool) {
 	cache.RLock()
 	defer cache.RUnlock()
@@ -276,13 +202,18 @@ func ChannelTrafficPoliciesState() ChannelTrafficPolicyState {
 	}
 }
 
-func ReplaceChannelTrafficPolicies(bindings []model.RoutingChannelBinding, loadedAtUnix int64) {
+func ReplaceChannelTrafficConfigurations(configurations []model.RoutingChannelConfiguration, loadedAtUnix int64) {
 	policies := make(map[int]ChannelTrafficPolicy)
-	for _, binding := range bindings {
-		if binding.ChannelID > 0 && binding.ServesClaudeCode {
-			policies[binding.ChannelID] = ChannelTrafficPolicy{ClaudeCodeOnly: true}
+	for _, configuration := range configurations {
+		if configuration.ChannelID > 0 &&
+			configuration.TrafficClass == model.RoutingChannelTrafficClassClaudeCodeOnly {
+			policies[configuration.ChannelID] = ChannelTrafficPolicy{ClaudeCodeOnly: true}
 		}
 	}
+	replaceChannelTrafficPolicies(policies, loadedAtUnix)
+}
+
+func replaceChannelTrafficPolicies(policies map[int]ChannelTrafficPolicy, loadedAtUnix int64) {
 	cache.Lock()
 	defer cache.Unlock()
 	loadedAtUnix = max(loadedAtUnix, int64(0))
@@ -334,14 +265,13 @@ func RuntimeStats() Stats {
 	cache.RLock()
 	defer cache.RUnlock()
 	return Stats{
-		Metrics:           len(cache.metrics),
-		Costs:             len(cache.costs),
-		Breakers:          len(cache.breakers),
-		SharedEndpoints:   len(cache.sharedEndpoints),
-		CapacityCooldowns: len(cache.capacityCooldowns),
-		AuthFailures:      len(cache.authFailures),
-		Balances:          len(cache.balances),
-		Evictions:         cache.evictions,
+		Metrics:                   len(cache.metrics),
+		Breakers:                  len(cache.breakers),
+		SharedEndpoints:           len(cache.sharedEndpoints),
+		CapacityCooldowns:         len(cache.capacityCooldowns),
+		ChannelBalanceUnavailable: len(cache.channelBalanceUnavailable),
+		AuthFailures:              len(cache.authFailures),
+		Evictions:                 cache.evictions,
 	}
 }
 
@@ -355,12 +285,6 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 		for key, snapshot := range cache.metrics {
 			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
 				delete(cache.metrics, key)
-				deleted++
-			}
-		}
-		for key, snapshot := range cache.costs {
-			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
-				delete(cache.costs, key)
 				deleted++
 			}
 		}
@@ -382,12 +306,6 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 				deleted++
 			}
 		}
-		for channelID, snapshot := range cache.balances {
-			if snapshot.UpdatedUnix > 0 && snapshot.UpdatedUnix < cutoff {
-				delete(cache.balances, channelID)
-				deleted++
-			}
-		}
 	}
 	deadline := nowUnix * 1000
 	for key, snapshot := range cache.capacityCooldowns {
@@ -396,15 +314,20 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 			deleted++
 		}
 	}
+	for channelID, snapshot := range cache.channelBalanceUnavailable {
+		if snapshot.CooldownUntilUnixMilli <= deadline {
+			delete(cache.channelBalanceUnavailable, channelID)
+			deleted++
+		}
+	}
 
 	cache.limits = normalizedLimits(cache.limits)
 	deleted += trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess)
-	deleted += trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess)
 	deleted += trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.sharedEndpoints, cache.limits.MaxSharedEndpoints, sharedEndpointUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.capacityCooldowns, cache.limits.MaxCapacityCooldowns, capacityUpdatedUnixMilli, keyLess)
+	deleted += trimBoundedMap(cache.channelBalanceUnavailable, cache.limits.MaxHealth, channelBalanceUnavailableUpdatedUnixMilli, intLess)
 	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess)
-	deleted += trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess)
 	cache.evictions += int64(deleted)
 	return deleted
 }
@@ -419,18 +342,6 @@ func SetMetric(key Key, snapshot MetricSnapshot) {
 	cache.metrics[key] = snapshot
 	cache.limits = normalizedLimits(cache.limits)
 	cache.evictions += int64(trimBoundedMap(cache.metrics, cache.limits.MaxMetrics, metricUpdatedUnix, keyLess))
-}
-
-func SetCostForTest(key CostKey, snapshot CostSnapshot) {
-	SetCost(key, snapshot)
-}
-
-func SetCost(key CostKey, snapshot CostSnapshot) {
-	cache.Lock()
-	defer cache.Unlock()
-	cache.costs[key] = snapshot
-	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
 }
 
 func SetBreakerForTest(key Key, snapshot BreakerSnapshot) {
@@ -498,30 +409,6 @@ func ClearAuthFailure(channelID int) {
 	delete(cache.authFailures, channelID)
 }
 
-func SetBalanceForTest(channelID int, snapshot BalanceSnapshot) {
-	SetBalance(channelID, snapshot)
-}
-
-func SetBalance(channelID int, snapshot BalanceSnapshot) {
-	if channelID <= 0 {
-		return
-	}
-	cache.Lock()
-	defer cache.Unlock()
-	cache.balances[channelID] = snapshot
-	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
-}
-
-func ClearBalance(channelID int) {
-	if channelID <= 0 {
-		return
-	}
-	cache.Lock()
-	defer cache.Unlock()
-	delete(cache.balances, channelID)
-}
-
 func ClearChannel(channelID int) {
 	if channelID <= 0 {
 		return
@@ -531,11 +418,6 @@ func ClearChannel(channelID int) {
 	for key := range cache.metrics {
 		if key.ChannelID == channelID {
 			delete(cache.metrics, key)
-		}
-	}
-	for key := range cache.costs {
-		if key.ChannelID == channelID {
-			delete(cache.costs, key)
 		}
 	}
 	for key := range cache.breakers {
@@ -548,242 +430,8 @@ func ClearChannel(channelID int) {
 			delete(cache.capacityCooldowns, key)
 		}
 	}
+	delete(cache.channelBalanceUnavailable, channelID)
 	delete(cache.authFailures, channelID)
-	delete(cache.balances, channelID)
-}
-
-// ClearCostChannel removes only cost-connector state. Serving reliability,
-// capacity, and credential health remain scoped to their own signals.
-func ClearCostChannel(channelID int) {
-	if channelID <= 0 {
-		return
-	}
-	cache.Lock()
-	defer cache.Unlock()
-	for key := range cache.costs {
-		if key.ChannelID == channelID {
-			delete(cache.costs, key)
-		}
-	}
-	delete(cache.balances, channelID)
-}
-
-// CostConnectorCachedState returns bounded snapshots of the exact cached cost
-// keys and balance channels. The source maps are hard-capped by MaxCosts and
-// MaxHealth respectively.
-func CostConnectorCachedState() ([]CostKey, []int) {
-	cache.RLock()
-	defer cache.RUnlock()
-
-	costKeys := make([]CostKey, 0, len(cache.costs))
-	for key := range cache.costs {
-		costKeys = append(costKeys, key)
-	}
-	balanceChannels := make([]int, 0, len(cache.balances))
-	for channelID := range cache.balances {
-		balanceChannels = append(balanceChannels, channelID)
-	}
-	return costKeys, balanceChannels
-}
-
-func LoadCostSnapshots(snapshots []model.RoutingCostSnapshot) {
-	cache.Lock()
-	defer cache.Unlock()
-	cache.limits = normalizedLimits(cache.limits)
-	mergeCostSnapshots(cache.costs, snapshots, nil)
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
-}
-
-// ReplaceCostSnapshotsForChannel makes one successful upstream sync
-// authoritative for that channel without disturbing its balance or serving
-// reliability state.
-func ReplaceCostSnapshotsForChannel(channelID int, snapshots []model.RoutingCostSnapshot) {
-	if channelID <= 0 {
-		return
-	}
-	cache.Lock()
-	defer cache.Unlock()
-	cache.limits = normalizedLimits(cache.limits)
-	for key := range cache.costs {
-		if key.ChannelID == channelID {
-			delete(cache.costs, key)
-		}
-	}
-	filtered := make([]model.RoutingCostSnapshot, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		if snapshot.ChannelID == channelID {
-			filtered = append(filtered, snapshot)
-		}
-	}
-	mergeCostSnapshots(cache.costs, filtered, nil)
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
-}
-
-type CostConnectorReconcileSnapshot struct {
-	CachedCostKeys        []CostKey
-	RecentCosts           []model.RoutingCostSnapshot
-	CachedCosts           []model.RoutingCostSnapshot
-	CachedBalanceChannels []int
-	RecentHealth          []model.RoutingChannelHealthState
-	CachedHealth          []model.RoutingChannelHealthState
-}
-
-// ReconcileCostConnectorSnapshots adds recent database rows while making the
-// bounded exact lookup authoritative for keys and channels already cached.
-// Serving metrics, breakers, capacity, and authentication health remain
-// untouched.
-func ReconcileCostConnectorSnapshots(snapshot CostConnectorReconcileSnapshot) {
-	cache.Lock()
-	defer cache.Unlock()
-	cache.limits = normalizedLimits(cache.limits)
-
-	cachedCostKeys := make(map[CostKey]struct{}, len(snapshot.CachedCostKeys))
-	for _, key := range snapshot.CachedCostKeys {
-		cachedCostKeys[key] = struct{}{}
-		delete(cache.costs, key)
-	}
-	mergeCostSnapshots(cache.costs, snapshot.RecentCosts, cachedCostKeys)
-	mergeCostSnapshots(cache.costs, snapshot.CachedCosts, nil)
-
-	cachedBalanceChannels := make(map[int]struct{}, len(snapshot.CachedBalanceChannels))
-	for _, channelID := range snapshot.CachedBalanceChannels {
-		cachedBalanceChannels[channelID] = struct{}{}
-		delete(cache.balances, channelID)
-	}
-	mergeBalanceSnapshots(cache.balances, snapshot.RecentHealth, cachedBalanceChannels)
-	mergeBalanceSnapshots(cache.balances, snapshot.CachedHealth, nil)
-
-	cache.evictions += int64(trimBoundedMap(cache.costs, cache.limits.MaxCosts, costUpdatedUnix, costKeyLess))
-	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
-}
-
-func mergeCostSnapshots(costs map[CostKey]CostSnapshot, snapshots []model.RoutingCostSnapshot, excluded map[CostKey]struct{}) {
-	for _, snapshot := range snapshots {
-		if snapshot.ChannelID <= 0 || snapshot.ModelName == "" {
-			continue
-		}
-		cost := routingSnapshotCost(snapshot)
-		key := CostKey{ChannelID: snapshot.ChannelID, Model: snapshot.ModelName}
-		if _, skip := excluded[key]; skip {
-			continue
-		}
-		if existing, ok := costs[key]; ok {
-			if existing.UpdatedUnix > snapshot.SnapshotTS ||
-				(existing.UpdatedUnix == snapshot.SnapshotTS && existing.AccountID > 0 && snapshot.AccountID == 0) {
-				continue
-			}
-		}
-		pricing, pricingKnown, pricingErr := model.DecodeRoutingCostSnapshotPricing(snapshot)
-		known := routingSnapshotCostKnown(snapshot, cost)
-		if pricingErr != nil || (strings.TrimSpace(snapshot.PricingHash) != "" && !pricingKnown) {
-			known = false
-		}
-		if pricingKnown {
-			groupRatio := 1.0
-			if pricing.GroupRatio != nil {
-				groupRatio = *pricing.GroupRatio
-			}
-			switch {
-			case pricing.ModelPrice != nil:
-				cost = groupRatio * *pricing.ModelPrice
-			case pricing.PerRequestCost != nil:
-				cost = groupRatio * *pricing.PerRequestCost
-			case pricing.BaseRatio != nil:
-				cost = groupRatio * *pricing.BaseRatio
-			case pricing.InputCostPerMillion != nil:
-				cost = groupRatio * *pricing.InputCostPerMillion
-			}
-			if routingNormalizedPricingHasExplicitCost(pricing) &&
-				snapshot.Confidence != model.RoutingCostConfidenceUnknown &&
-				snapshot.VersionConfidence != model.RoutingCostConfidenceUnknown {
-				known = true
-			}
-		}
-		costs[key] = CostSnapshot{
-			AccountID:           snapshot.AccountID,
-			Known:               known,
-			Cost:                cost,
-			Confidence:          snapshot.Confidence,
-			QuotaType:           snapshot.QuotaType,
-			GroupRatio:          snapshot.GroupRatio,
-			BaseRatio:           snapshot.BaseRatio,
-			CompletionRatio:     snapshot.CompletionRatio,
-			ModelPrice:          snapshot.ModelPrice,
-			BillingMode:         snapshot.BillingMode,
-			UpdatedUnix:         snapshot.SnapshotTS,
-			PricingKnown:        pricingKnown,
-			Pricing:             pricing,
-			PricingHash:         snapshot.PricingHash,
-			PricingVersion:      snapshot.PricingVersion,
-			UpstreamGroup:       snapshot.UpstreamGroup,
-			UpstreamModel:       snapshot.UpstreamModel,
-			ObservedTime:        snapshot.ObservedTime,
-			EffectiveTime:       snapshot.EffectiveTime,
-			ExpiresTime:         snapshot.ExpiresTime,
-			VersionConfidence:   snapshot.VersionConfidence,
-			ConfidenceScore:     snapshot.ConfidenceScore,
-			Freshness:           snapshot.Freshness,
-			FreshnessScore:      snapshot.FreshnessScore,
-			SourceSyncStatus:    snapshot.SourceSyncStatus,
-			SourceSyncError:     snapshot.SourceSyncError,
-			AccountSourceType:   snapshot.AccountSourceType,
-			AccountKeyHash:      snapshot.AccountKeyHash,
-			AccountMaskedID:     snapshot.AccountMaskedID,
-			AccountStatus:       snapshot.AccountStatus,
-			AccountBalanceKnown: snapshot.AccountBalanceKnown,
-			AccountBalance:      snapshot.AccountBalance,
-			AccountBalanceAt:    snapshot.AccountBalanceAt,
-			AccountSyncStatus:   snapshot.AccountSyncStatus,
-			AccountSyncError:    snapshot.AccountSyncError,
-		}
-	}
-}
-
-func routingNormalizedPricingHasExplicitCost(pricing model.RoutingNormalizedPricing) bool {
-	if pricing.GroupRatio != nil && *pricing.GroupRatio == 0 {
-		return true
-	}
-	for _, value := range []*float64{
-		pricing.BaseRatio,
-		pricing.ModelPrice,
-		pricing.InputCostPerMillion,
-		pricing.OutputCostPerMillion,
-		pricing.CacheReadCostPerMillion,
-		pricing.CacheWriteCostPerMillion,
-		pricing.CacheWrite1hCostPerMillion,
-		pricing.ImageInputCostPerMillion,
-		pricing.ImageOutputCostPerMillion,
-		pricing.ImageCost,
-		pricing.PerImageCost,
-		pricing.AudioInputCostPerMillion,
-		pricing.AudioOutputCostPerMillion,
-		pricing.PerRequestCost,
-	} {
-		if value != nil {
-			return true
-		}
-	}
-	return strings.TrimSpace(pricing.BillingExpression) != ""
-}
-
-func mergeBalanceSnapshots(balances map[int]BalanceSnapshot, snapshots []model.RoutingChannelHealthState, excluded map[int]struct{}) {
-	for _, snapshot := range snapshots {
-		if snapshot.ChannelID <= 0 || !snapshot.BalanceKnown {
-			continue
-		}
-		if _, skip := excluded[snapshot.ChannelID]; skip {
-			continue
-		}
-		incoming := BalanceSnapshot{
-			Known:       true,
-			Balance:     snapshot.Balance,
-			UpdatedUnix: snapshot.BalanceUpdatedTime,
-		}
-		if existing, ok := balances[snapshot.ChannelID]; ok && existing.UpdatedUnix >= incoming.UpdatedUnix {
-			continue
-		}
-		balances[snapshot.ChannelID] = incoming
-	}
 }
 
 func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, _ int) {
@@ -932,44 +580,13 @@ func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix in
 		} else {
 			delete(cache.authFailures, snapshot.ChannelID)
 		}
-		if snapshot.BalanceKnown {
-			cache.balances[snapshot.ChannelID] = BalanceSnapshot{
-				Known:       true,
-				Balance:     snapshot.Balance,
-				UpdatedUnix: snapshot.BalanceUpdatedTime,
-			}
-		}
 	}
 	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
-	cache.evictions += int64(trimBoundedMap(cache.balances, cache.limits.MaxHealth, balanceUpdatedUnix, intLess))
-}
-
-func routingSnapshotCost(snapshot model.RoutingCostSnapshot) float64 {
-	if snapshot.ModelPrice > 0 {
-		return snapshot.ModelPrice
-	}
-	return snapshot.GroupRatio * snapshot.BaseRatio
-}
-
-func routingSnapshotCostKnown(snapshot model.RoutingCostSnapshot, cost float64) bool {
-	if snapshot.Confidence == model.RoutingCostConfidenceUnknown || math.IsNaN(cost) || math.IsInf(cost, 0) {
-		return false
-	}
-	if snapshot.QuotaType == 1 {
-		return snapshot.ModelPrice > 0
-	}
-	if snapshot.BaseRatio <= 0 && snapshot.ModelPrice <= 0 {
-		return false
-	}
-	return true
 }
 
 func normalizedLimits(value Limits) Limits {
 	if value.MaxMetrics <= 0 {
 		value.MaxMetrics = defaultLimits.MaxMetrics
-	}
-	if value.MaxCosts <= 0 {
-		value.MaxCosts = defaultLimits.MaxCosts
 	}
 	if value.MaxBreakers <= 0 {
 		value.MaxBreakers = defaultLimits.MaxBreakers
@@ -1035,10 +652,6 @@ func metricUpdatedUnix(snapshot MetricSnapshot) int64 {
 	return snapshot.UpdatedUnix
 }
 
-func costUpdatedUnix(snapshot CostSnapshot) int64 {
-	return snapshot.UpdatedUnix
-}
-
 func breakerUpdatedUnix(snapshot BreakerSnapshot) int64 {
 	return snapshot.UpdatedUnix
 }
@@ -1051,12 +664,12 @@ func capacityUpdatedUnixMilli(snapshot CapacityCooldownSnapshot) int64 {
 	return snapshot.UpdatedUnixMilli
 }
 
-func healthUpdatedUnix(marker HealthMarker) int64 {
-	return marker.UpdatedUnix
+func channelBalanceUnavailableUpdatedUnixMilli(snapshot ChannelBalanceUnavailableSnapshot) int64 {
+	return snapshot.UpdatedUnixMilli
 }
 
-func balanceUpdatedUnix(snapshot BalanceSnapshot) int64 {
-	return snapshot.UpdatedUnix
+func healthUpdatedUnix(marker HealthMarker) int64 {
+	return marker.UpdatedUnix
 }
 
 func keyLess(left Key, right Key) bool {
@@ -1081,13 +694,6 @@ func keyLess(left Key, right Key) bool {
 	return left.Group < right.Group
 }
 
-func costKeyLess(left CostKey, right CostKey) bool {
-	if left.ChannelID != right.ChannelID {
-		return left.ChannelID < right.ChannelID
-	}
-	return left.Model < right.Model
-}
-
 func intLess(left int, right int) bool {
 	return left < right
 }
@@ -1096,12 +702,11 @@ func ResetForTest() {
 	cache.Lock()
 	defer cache.Unlock()
 	cache.metrics = map[Key]MetricSnapshot{}
-	cache.costs = map[CostKey]CostSnapshot{}
 	cache.breakers = map[Key]BreakerSnapshot{}
 	cache.sharedEndpoints = map[Key]SharedEndpointBreakerSnapshot{}
 	cache.capacityCooldowns = map[Key]CapacityCooldownSnapshot{}
+	cache.channelBalanceUnavailable = map[int]ChannelBalanceUnavailableSnapshot{}
 	cache.authFailures = map[int]HealthMarker{}
-	cache.balances = map[int]BalanceSnapshot{}
 	cache.channelPolicies = map[int]ChannelTrafficPolicy{}
 	cache.channelOverrides = map[int]channelTrafficPolicyOverride{}
 	cache.policiesLoadedAt = 0

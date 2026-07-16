@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -78,6 +79,85 @@ func TestChannelRoutingCanaryOutcomeTracksAttemptsCostAndClientTTFT(t *testing.T
 	assert.Equal(t, int64(1), payload.Canary.CostKnownRequests)
 	assert.Equal(t, int64(3_000), payload.Canary.ExpectedPlatformCostNanoUSD)
 	assert.Equal(t, int64(1), payload.Canary.TTFTSampleCount)
+}
+
+func TestChannelRoutingCanaryOutcomeDistinguishesKnownZeroFromUnknownAndOverflowingCosts(t *testing.T) {
+	tests := []struct {
+		name                  string
+		selections            []ChannelRoutingCanarySelection
+		wantCostKnownRequests int64
+	}{
+		{
+			name: "known zero cost",
+			selections: []ChannelRoutingCanarySelection{
+				{ExpectedCostKnown: true, ExpectedCostUSD: 0},
+			},
+			wantCostKnownRequests: 1,
+		},
+		{
+			name: "explicit unknown cost",
+			selections: []ChannelRoutingCanarySelection{
+				{ExpectedCostKnown: false, ExpectedCostUSD: 1},
+			},
+		},
+		{
+			name: "non-finite known cost fails closed",
+			selections: []ChannelRoutingCanarySelection{
+				{ExpectedCostKnown: true, ExpectedCostUSD: math.NaN()},
+			},
+		},
+		{
+			name: "attempt cost sum overflow fails closed",
+			selections: []ChannelRoutingCanarySelection{
+				{ExpectedCostKnown: true, ExpectedCostUSD: 5_000_000_000},
+				{ExpectedCostKnown: true, ExpectedCostUSD: 5_000_000_000},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncate(t)
+			clock := &canaryOutcomeTestClock{now: time.Now().Truncate(time.Second)}
+			aggregator, err := channelrouting.NewCanaryWindowAggregator(channelrouting.CanaryWindowAggregatorConfig{
+				MaxEntries: 4, Shards: 2, TTL: 2 * time.Hour, Clock: clock,
+			})
+			require.NoError(t, err)
+			channelrouting.ResetCanaryWindowAggregatorForTest(aggregator)
+			t.Cleanup(func() { channelrouting.ResetCanaryWindowAggregatorForTest() })
+			require.NoError(t, model.DB.AutoMigrate(&model.RoutingRuntimeCheckpoint{}))
+
+			gate := channelrouting.CanaryGate{
+				PoolID: 29, ActivationID: 401, PolicyRevision: 11, TrafficBasisPoints: 100,
+				Bucket: 0, InCanary: true, RolloutKey: channelrouting.RolloutKey(strings.Repeat("a", 64)),
+			}
+			ctx, _ := gin.CreateTestContext(nil)
+			for _, selection := range test.selections {
+				selection.Gate = gate
+				selection.WindowSeconds = 60
+				selection.LatenessSeconds = 5
+				require.NoError(t, PrepareChannelRoutingCanarySelection(ctx, selection))
+				require.NoError(t, MarkChannelRoutingCanaryAttemptStarted(ctx))
+				require.NoError(t, FinishChannelRoutingCanaryAttempt(ctx))
+			}
+			require.NoError(t, FinishChannelRoutingCanaryOutcome(ctx, true, true, false, 0, clock.Now()))
+
+			clock.Advance(2 * time.Minute)
+			flushed, err := channelrouting.FlushCanaryOutcomeCheckpointsContext(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, 1, flushed)
+			var stored model.RoutingRuntimeCheckpoint
+			require.NoError(t, model.DB.Where(
+				"checkpoint_kind = ?", channelrouting.CanaryCohortWindowCheckpointKind,
+			).First(&stored).Error)
+			payload, err := channelrouting.DecodeCanaryCohortWindowCheckpoint(stored)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), payload.Canary.LogicalRequests)
+			assert.Equal(t, int64(1), payload.Canary.Successes)
+			assert.Equal(t, int64(len(test.selections)), payload.Canary.Attempts)
+			assert.Equal(t, test.wantCostKnownRequests, payload.Canary.CostKnownRequests)
+			assert.Zero(t, payload.Canary.ExpectedPlatformCostNanoUSD)
+		})
+	}
 }
 
 func TestChannelRoutingCanaryOutcomeCrossUnitPreservesAttemptAndRoutingFailureSemantics(t *testing.T) {

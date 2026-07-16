@@ -116,10 +116,10 @@ func ChannelRoutingHedgeCostEstimate(
 	}
 	known := estimate.Known && estimate.WorstCaseKnown && estimate.EffectiveKnown &&
 		estimate.Currency != "" && estimate.Unit != "" && estimate.PricingBasis != "" &&
-		estimate.PricingHash != "" && estimate.PricingVersion != "" &&
+		estimate.PricingHash != "" && estimate.PricingVersion != "" && estimate.PricingIdentity != "" &&
+		estimate.ConfigurationRevision > 0 && estimate.UpstreamCostMultiplier >= 0 &&
 		estimate.ObservedTime > 0 && estimate.EffectiveTime > 0 &&
-		estimate.ExpiresTime >= estimate.EffectiveTime && estimate.SourceSyncStatus != "" &&
-		estimate.AccountSourceType != "" && estimate.AccountKeyHash != "" &&
+		estimate.ExpiresTime >= estimate.EffectiveTime &&
 		estimate.ConfidenceScore >= 0 && estimate.ConfidenceScore <= 1 &&
 		estimate.FreshnessScore >= 0 && estimate.FreshnessScore <= 1 &&
 		estimate.WorstCaseCost >= estimate.Cost

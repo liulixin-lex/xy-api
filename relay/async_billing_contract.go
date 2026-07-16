@@ -288,9 +288,6 @@ func buildAsyncBillingAcceptanceIntent(
 		if revision, ok := common.GetContextKeyType[uint64](c, constant.ContextKeyRoutingSnapshotRevision); ok {
 			adminInfo["routing_snapshot_revision"] = revision
 		}
-		if accountID := common.GetContextKeyInt(c, constant.ContextKeyRoutingUpstreamAccountID); accountID > 0 {
-			adminInfo["routing_upstream_account_id"] = accountID
-		}
 	}
 	var userGroupRatio *float64
 	if info.PriceData.GroupRatioInfo.HasSpecialRatio {

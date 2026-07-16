@@ -17,14 +17,12 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestRoutingRuntimeHealthUsesStableScopeAndMonotonicUpdates(t *testing.T) {
+func TestRoutingRuntimeHealthUsesStableCredentialScopeAndMonotonicUpdates(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/runtime-health.db"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&RoutingCredentialRef{},
-		&RoutingUpstreamAccount{},
 		&RoutingCredentialHealthState{},
-		&RoutingUpstreamAccountHealthState{},
 	))
 	previousDB := DB
 	previousType := common.MainDatabaseType()
@@ -38,11 +36,6 @@ func TestRoutingRuntimeHealthUsesStableScopeAndMonotonicUpdates(t *testing.T) {
 
 	require.NoError(t, db.Create(&RoutingCredentialRef{
 		ID: 101, ChannelID: 11, Fingerprint: "credential-fingerprint", FingerprintVersion: 1, Active: true,
-	}).Error)
-	require.NoError(t, db.Create(&RoutingUpstreamAccount{
-		ID: 201, AccountKey: "account-key", SourceType: RoutingUpstreamTypeNewAPI,
-		MaskedIdentity: "acct-***", Status: RoutingUpstreamAccountStatusActive,
-		LastSyncStatus: RoutingUpstreamSyncStatusSuccess, CreatedTime: 1, UpdatedTime: 1,
 	}).Error)
 
 	require.NoError(t, UpsertRoutingCredentialHealthStatesContext(context.Background(), []RoutingCredentialHealthState{{
@@ -70,61 +63,6 @@ func TestRoutingRuntimeHealthUsesStableScopeAndMonotonicUpdates(t *testing.T) {
 	var missingCount int64
 	require.NoError(t, db.Model(&RoutingCredentialHealthState{}).Where("credential_id = ?", 999).Count(&missingCount).Error)
 	assert.Zero(t, missingCount)
-
-	require.NoError(t, UpsertRoutingUpstreamAccountHealthStatesContext(context.Background(), []RoutingUpstreamAccountHealthState{{
-		AccountID: 201, ServingUnavailable: true, StatusCode: 402, Reason: "payment_required",
-		UnavailableUntilMs: 9_000, UpdatedTimeMs: 2_000,
-	}}))
-	require.NoError(t, UpsertRoutingUpstreamAccountHealthStatesContext(context.Background(), []RoutingUpstreamAccountHealthState{{
-		AccountID: 201, ServingUnavailable: false, UpdatedTimeMs: 1_000,
-	}}))
-	var accountState RoutingUpstreamAccountHealthState
-	require.NoError(t, db.First(&accountState, "account_id = ?", 201).Error)
-	assert.True(t, accountState.ServingUnavailable)
-	assert.Equal(t, http.StatusPaymentRequired, accountState.StatusCode)
-	assert.Equal(t, int64(2_000), accountState.UpdatedTimeMs)
-
-	require.NoError(t, UpsertRoutingUpstreamAccountHealthStatesContext(context.Background(), []RoutingUpstreamAccountHealthState{{
-		AccountID: 201, ServingUnavailable: false, UpdatedTimeMs: 3_000,
-	}}))
-	require.NoError(t, db.First(&accountState, "account_id = ?", 201).Error)
-	assert.False(t, accountState.ServingUnavailable)
-	assert.Equal(t, int64(3_000), accountState.UpdatedTimeMs)
-}
-
-func TestFlushRoutingRuntimeHealthStatesIsAtomicAcrossScopes(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/runtime-health-atomic.db"), &gorm.Config{})
-	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(
-		&RoutingCredentialRef{},
-		&RoutingUpstreamAccount{},
-		&RoutingCredentialHealthState{},
-		&RoutingUpstreamAccountHealthState{},
-	))
-	previousDB := DB
-	DB = db
-	t.Cleanup(func() { DB = previousDB })
-	require.NoError(t, db.Create(&RoutingCredentialRef{
-		ID: 102, ChannelID: 12, Fingerprint: "credential-102", FingerprintVersion: 1, Active: true,
-	}).Error)
-
-	err = FlushRoutingRuntimeHealthStatesContext(
-		context.Background(),
-		[]RoutingCredentialHealthState{{
-			CredentialID: 102, ChannelID: 12, AuthFailure: true,
-			AuthFailureReason: "serving_401", AuthFailureUntilMs: 9_000,
-			AuthVersion: 100, AuthUpdatedTimeMs: 1_000, UpdatedTimeMs: 1_000,
-		}},
-		[]RoutingUpstreamAccountHealthState{{
-			AccountID: 202, ServingUnavailable: true,
-			StateVersion: 100, StateUpdatedTimeMs: 1_000, UpdatedTimeMs: 1_000,
-		}},
-	)
-	require.ErrorIs(t, err, ErrRoutingRuntimeHealthInvalid)
-
-	var count int64
-	require.NoError(t, db.Model(&RoutingCredentialHealthState{}).Count(&count).Error)
-	assert.Zero(t, count, "credential state must roll back when the account scope fails validation")
 }
 
 func TestRoutingRuntimeHealthNormalizesReasonsAndRejectsInvalidBounds(t *testing.T) {
@@ -191,27 +129,16 @@ func runRoutingRuntimeHealthDimensionContract(t *testing.T) {
 	t.Helper()
 	require.NoError(t, DB.AutoMigrate(
 		&RoutingCredentialRef{},
-		&RoutingUpstreamAccount{},
 		&RoutingCredentialHealthState{},
-		&RoutingUpstreamAccountHealthState{},
 	))
-	require.NoError(t, DB.Create(&RoutingCredentialRef{
-		ID: 301, ChannelID: 31, Fingerprint: "credential-301", FingerprintVersion: 1, Active: true,
-	}).Error)
-	require.NoError(t, DB.Create(&RoutingCredentialRef{
-		ID: 302, ChannelID: 32, Fingerprint: "credential-302", FingerprintVersion: 1, Active: true,
-	}).Error)
-	require.NoError(t, DB.Create(&RoutingCredentialRef{
-		ID: 303, ChannelID: 33, Fingerprint: "credential-303", FingerprintVersion: 1, Active: true,
-	}).Error)
-	require.NoError(t, DB.Create(&RoutingCredentialRef{
-		ID: 304, ChannelID: 34, Fingerprint: "credential-304", FingerprintVersion: 1, Active: true,
-	}).Error)
-	require.NoError(t, DB.Create(&RoutingUpstreamAccount{
-		ID: 401, AccountKey: "account-401", SourceType: RoutingUpstreamTypeNewAPI,
-		MaskedIdentity: "acct-***", Status: RoutingUpstreamAccountStatusActive,
-		LastSyncStatus: RoutingUpstreamSyncStatusSuccess, CreatedTime: 1, UpdatedTime: 1,
-	}).Error)
+	for _, ref := range []RoutingCredentialRef{
+		{ID: 301, ChannelID: 31, Fingerprint: "credential-301", FingerprintVersion: 1, Active: true},
+		{ID: 302, ChannelID: 32, Fingerprint: "credential-302", FingerprintVersion: 1, Active: true},
+		{ID: 304, ChannelID: 34, Fingerprint: "credential-304", FingerprintVersion: 1, Active: true},
+	} {
+		ref := ref
+		require.NoError(t, DB.Create(&ref).Error)
+	}
 
 	require.NoError(t, UpsertRoutingCredentialHealthStatesContext(context.Background(), []RoutingCredentialHealthState{
 		{
@@ -305,53 +232,13 @@ func runRoutingRuntimeHealthDimensionContract(t *testing.T) {
 	assert.True(t, upgradedLegacyCredential.CapacityLimited, "the pre-migration capacity state is newer than the incoming capacity revision")
 	assert.Zero(t, upgradedLegacyCredential.CapacityVersion)
 
-	err := FlushRoutingRuntimeHealthStatesContext(
-		context.Background(),
-		[]RoutingCredentialHealthState{{
-			CredentialID: 303, ChannelID: 33,
-			AuthFailure: true, AuthFailureReason: "serving_401", AuthFailureUntilMs: 60_000,
-			AuthVersion: 800, AuthUpdatedTimeMs: 8_000, UpdatedTimeMs: 8_000,
-		}},
-		[]RoutingUpstreamAccountHealthState{{
-			AccountID: 999, ServingUnavailable: true,
-			StateVersion: 800, StateUpdatedTimeMs: 8_000, UpdatedTimeMs: 8_000,
-		}},
-	)
-	require.ErrorIs(t, err, ErrRoutingRuntimeHealthInvalid)
-	var rolledBackCount int64
-	require.NoError(t, DB.Model(&RoutingCredentialHealthState{}).Where("credential_id = ?", 303).Count(&rolledBackCount).Error)
-	assert.Zero(t, rolledBackCount)
-
-	require.NoError(t, UpsertRoutingUpstreamAccountHealthStatesContext(context.Background(), []RoutingUpstreamAccountHealthState{
-		{
-			AccountID: 401, ServingUnavailable: true, StatusCode: http.StatusPaymentRequired,
-			Reason: "payment_required", UnavailableUntilMs: 30_000,
-			StateVersion: 500, StateUpdatedTimeMs: 2_000, UpdatedTimeMs: 2_000,
-		},
-		{
-			AccountID: 401, ServingUnavailable: false,
-			StateVersion: 499, StateUpdatedTimeMs: 9_000, UpdatedTimeMs: 9_000,
-		},
-	}))
-	var account RoutingUpstreamAccountHealthState
-	require.NoError(t, DB.First(&account, "account_id = ?", 401).Error)
-	assert.True(t, account.ServingUnavailable)
-	assert.Equal(t, int64(500), account.StateVersion)
-	assert.Equal(t, int64(2_000), account.UpdatedTimeMs, "a stale account write must not advance row freshness")
-
-	require.NoError(t, DB.Model(&RoutingCredentialRef{}).Where("id IN ?", []int{301, 302, 304}).Update("active", false).Error)
-	require.NoError(t, DB.Delete(&RoutingUpstreamAccount{}, 401).Error)
+	require.NoError(t, DB.Model(&RoutingCredentialRef{}).
+		Where("id IN ?", []int{301, 302, 304}).Update("active", false).Error)
 	credentialStates, err := ListRoutingCredentialHealthStatesContext(context.Background(), 10)
 	require.NoError(t, err)
 	assert.Empty(t, credentialStates)
-	accountStates, err := ListRoutingUpstreamAccountHealthStatesContext(context.Background(), 10)
-	require.NoError(t, err)
-	assert.Empty(t, accountStates)
-	require.NoError(t, PruneRoutingRuntimeHealthStatesContext(context.Background()))
+	require.NoError(t, PruneRoutingCredentialHealthStatesContext(context.Background()))
 	var credentialCount int64
 	require.NoError(t, DB.Model(&RoutingCredentialHealthState{}).Count(&credentialCount).Error)
 	assert.Zero(t, credentialCount)
-	var accountCount int64
-	require.NoError(t, DB.Model(&RoutingUpstreamAccountHealthState{}).Count(&accountCount).Error)
-	assert.Zero(t, accountCount)
 }

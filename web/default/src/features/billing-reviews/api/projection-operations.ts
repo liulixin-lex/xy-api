@@ -18,7 +18,6 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { isAxiosError } from 'axios'
 
-import type { ApiEnvelope } from '@/features/channel-routing/types'
 import { api } from '@/lib/api'
 
 import type {
@@ -29,6 +28,12 @@ import type {
   FailedBillingProjection,
   FailedBillingProjectionDataset,
 } from '../projection-types'
+
+type ApiEnvelope<T> = {
+  success: boolean
+  message?: string
+  data: T
+}
 
 const requestConfig = {
   skipBusinessError: true,

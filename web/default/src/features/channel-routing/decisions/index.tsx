@@ -16,10 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import {
+  Cancel01Icon,
+  EyeIcon,
+  FileCodeIcon,
+  RefreshIcon,
+  Search01Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
-import { Eye, FileJson, RefreshCw, Search, X } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -54,6 +60,7 @@ import {
 import { ChannelRoutingCursorPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
+import { ChannelRoutingAlgorithmIdentity } from './algorithm-identity'
 import { ChannelRoutingAuditExportSheet } from './audit-export-sheet'
 import { ChannelRoutingDecisionSheet } from './decision-sheet'
 
@@ -165,7 +172,8 @@ export function ChannelRoutingDecisionsPage() {
               disabled={query.isFetching}
               onClick={() => void query.refetch()}
             >
-              <RefreshCw
+              <HugeiconsIcon
+                icon={RefreshIcon}
                 aria-hidden='true'
                 className={
                   query.isFetching
@@ -176,7 +184,11 @@ export function ChannelRoutingDecisionsPage() {
             </Button>
             {canAuditExport ? (
               <Button size='sm' onClick={() => setAuditExportOpen(true)}>
-                <FileJson aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={FileCodeIcon}
+                  data-icon='inline-start'
+                  aria-hidden='true'
+                />
                 {t('Export audit')}
               </Button>
             ) : null}
@@ -262,7 +274,11 @@ export function ChannelRoutingDecisionsPage() {
               />
             </div>
             <Button type='submit' size='sm' variant='outline'>
-              <Search aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Search01Icon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {t('Apply filters')}
             </Button>
           </form>
@@ -339,7 +355,11 @@ export function ChannelRoutingDecisionsPage() {
                   })
                 }
               >
-                <X aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={Cancel01Icon}
+                  data-icon='inline-start'
+                  aria-hidden='true'
+                />
                 {t('Clear')}
               </Button>
             ) : null}
@@ -402,9 +422,10 @@ export function ChannelRoutingDecisionsPage() {
                           </div>
                         </TableCell>
                         <TableCell>
-                          <div className='text-xs'>
-                            {decision.algorithm_version}
-                          </div>
+                          <ChannelRoutingAlgorithmIdentity
+                            algorithm={decision.algorithm_version}
+                            compact
+                          />
                           <div className='text-muted-foreground text-xs'>
                             r{decision.snapshot_revision}
                           </div>
@@ -437,7 +458,7 @@ export function ChannelRoutingDecisionsPage() {
                               setSelectedDecision(decision.decision_id)
                             }
                           >
-                            <Eye aria-hidden='true' />
+                            <HugeiconsIcon icon={EyeIcon} aria-hidden='true' />
                           </Button>
                         </TableCell>
                       </TableRow>
@@ -482,7 +503,10 @@ export function ChannelRoutingDecisionsPage() {
                       />
                     </div>
                     <div className='text-muted-foreground mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs'>
-                      <span>{decision.algorithm_version}</span>
+                      <ChannelRoutingAlgorithmIdentity
+                        algorithm={decision.algorithm_version}
+                        compact
+                      />
                       <span>r{decision.snapshot_revision}</span>
                       <span>{format.timestamp(decision.created_time)}</span>
                     </div>

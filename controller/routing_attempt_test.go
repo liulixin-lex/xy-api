@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +78,59 @@ func TestRoutingAttemptGuardStopsAfterClientCommit(t *testing.T) {
 	assert.ErrorIs(t, err, channelrouting.ErrAttemptClientCommitted)
 }
 
+func TestRoutingAttemptGuardKeepsGlobalBudgetAcrossConcreteAutoGroups(t *testing.T) {
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(smart_routing_setting.ResetForTest)
+	channelrouting.ResetDefaultRetryTokenBudgetForTest(8, time.Minute)
+	t.Cleanup(func() { channelrouting.ResetDefaultRetryTokenBudgetForTest(4_096, 30*time.Minute) })
+	previousRetryTimes := common.RetryTimes
+	common.RetryTimes = 1
+	t.Cleanup(func() { common.RetryTimes = previousRetryTimes })
+	setting := smart_routing_setting.GetSetting()
+	setting.Enabled = true
+	setting.Mode = smart_routing_setting.ModeBalanced
+	setting.MaxSwitches = 1
+	setting.RetryTokenCapacity = 1
+	setting.RetryTokenRefillPerSec = 0.000_001
+	setting.RetryExtraCostMultiplier = 2
+	smart_routing_setting.UpdateSetting(setting)
+
+	ctx := routingAttemptContextForTest()
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "auto")
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroup, "default")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 7)
+	info := &relaycommon.RelayInfo{}
+	info.PriceData.QuotaToPreConsume = 5
+	guard := newRoutingAttemptGuard(ctx, info)
+	require.NotNil(t, guard)
+	defer guard.Complete()
+
+	first, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	first.Finish()
+
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroup, "vip")
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroupIndex, 1)
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroupRetryIndex, 1)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingPoolID, 8)
+	second, err := guard.Begin(ctx, info)
+	require.NoError(t, err)
+	second.Finish()
+
+	require.NotNil(t, guard.coordinator)
+	snapshot := guard.coordinator.Snapshot()
+	assert.Equal(t, 2, snapshot.AttemptsStarted)
+	assert.Equal(t, int64(5), snapshot.RetryCostUsedUnits)
+	assert.Equal(t, "vip", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
+	assert.Equal(t, 1, common.GetContextKeyInt(ctx, constant.ContextKeyAutoGroupRetryIndex))
+	stats := channelrouting.DefaultRetryTokenBudgetStats()
+	assert.Equal(t, int64(1), stats.Allowed, "the concrete-group switch must remain a retry")
+	assert.Equal(t, 1, stats.Pools)
+
+	_, err = guard.Begin(ctx, info)
+	assert.ErrorIs(t, err, channelrouting.ErrAttemptLimitExceeded)
+}
+
 func TestRoutingAttemptGuardPreservesLegacyRetryPath(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(smart_routing_setting.ResetForTest)
@@ -97,7 +152,7 @@ func TestRoutingAttemptGuardPreservesLegacyRetryPath(t *testing.T) {
 	assert.Nil(t, second)
 }
 
-func TestRoutingAttemptGuardBypassesRemainderAfterV2FallsBackToLegacy(t *testing.T) {
+func TestRoutingAttemptGuardBypassesRemainderAfterChannelRoutingFallsBackToLegacy(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(smart_routing_setting.ResetForTest)
 	setting := smart_routing_setting.GetSetting()
@@ -206,6 +261,82 @@ func TestRoutingAttemptRejectionReturnsTerminalErrorBeforeFirstSend(t *testing.T
 	assert.ErrorIs(t, budget.Err, channelrouting.ErrRetryTokenBudgetExhausted)
 }
 
+func TestRoutingRetryDelayUsesConfiguredExponentialFullJitterCeiling(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	guard := &routingAttemptGuard{
+		policy:         channelrouting.AttemptPolicy{Deadline: now.Add(time.Minute)},
+		backoffBase5xx: 50 * time.Millisecond,
+		backoffBase429: time.Second,
+		backoffCap:     1500 * time.Millisecond,
+		now:            func() time.Time { return now },
+		jitter:         func(maximum time.Duration) time.Duration { return maximum },
+	}
+	retryable := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
+	serverError := &types.NewAPIError{StatusCode: http.StatusServiceUnavailable}
+
+	delay, err := guard.retryDelay(serverError, retryable, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 50*time.Millisecond, delay)
+
+	delay, err = guard.retryDelay(serverError, retryable, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 100*time.Millisecond, delay)
+
+	delay, err = guard.retryDelay(serverError, retryable, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1500*time.Millisecond, delay)
+
+	delay, err = guard.retryDelay(serverError, routingerror.Classification{Retryability: routingerror.RetryNever}, 0)
+	require.NoError(t, err)
+	assert.Zero(t, delay)
+}
+
+func TestRoutingRetryDelayHonorsCappedRetryAfterAndRemainingDeadline(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	metadata, err := common.Marshal(map[string]any{"retry_after_ms": 10_000})
+	require.NoError(t, err)
+	retryable := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
+	tooManyRequests := &types.NewAPIError{
+		StatusCode: http.StatusTooManyRequests,
+		Metadata:   metadata,
+	}
+	guard := &routingAttemptGuard{
+		policy:         channelrouting.AttemptPolicy{Deadline: now.Add(3 * time.Second)},
+		backoffBase5xx: 50 * time.Millisecond,
+		backoffBase429: time.Second,
+		backoffCap:     2 * time.Second,
+		now:            func() time.Time { return now },
+		jitter:         func(maximum time.Duration) time.Duration { return maximum / 2 },
+	}
+
+	delay, err := guard.retryDelay(tooManyRequests, retryable, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Second, delay)
+
+	guard.policy.Deadline = now.Add(2 * time.Second)
+	_, err = guard.retryDelay(tooManyRequests, retryable, 0)
+	assert.ErrorIs(t, err, channelrouting.ErrAttemptDeadlineExceeded)
+}
+
+func TestRoutingRetryWaitStopsWhenRequestIsCanceled(t *testing.T) {
+	guard := &routingAttemptGuard{
+		backoffBase5xx: time.Second,
+		backoffBase429: time.Second,
+		backoffCap:     time.Second,
+		now:            time.Now,
+		jitter:         func(maximum time.Duration) time.Duration { return maximum },
+	}
+	retryable := routingerror.Classification{Retryability: routingerror.RetryBeforeCommit}
+	serverError := &types.NewAPIError{StatusCode: http.StatusServiceUnavailable}
+	ctx := routingAttemptContextForTest()
+	requestContext, cancel := context.WithCancel(ctx.Request.Context())
+	cancel()
+	ctx.Request = ctx.Request.WithContext(requestContext)
+
+	err := guard.WaitBeforeRetry(ctx, serverError, retryable, 0)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	previousDB := model.DB
@@ -222,7 +353,7 @@ func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
 	common.SetContextKey(ctx, constant.ContextKeyRoutingMemberID, 71)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCredentialID, 701)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingDecisionID, "serial-decision-1")
-	common.SetContextKey(ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmBalancedV1)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmBalanced)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointAuthority, "https://api.example.test:443")
 	common.SetContextKey(ctx, constant.ContextKeyRoutingRegion, "us-east-1")
 	channel := &model.Channel{Id: 101}
@@ -285,6 +416,56 @@ func TestRoutingSerialAttemptAuditRecordsRetryAndFinalOutcome(t *testing.T) {
 	assert.Equal(t, 101, summary.FinalChannelID)
 	assert.Equal(t, "us-east-1", summary.FinalRegion)
 	assert.NotEmpty(t, summary.FinalNodeEpochID)
+}
+
+func TestRoutingAttemptAuditCostSpecPreservesCurrentSystemPricingForSerialAndHedge(t *testing.T) {
+	pricingHash := strings.Repeat("a", 64)
+	cost := channelrouting.ShadowCostInput{
+		Known: true, Cost: 0.002, WorstCaseKnown: true, WorstCaseCost: 0.004,
+		EffectiveKnown: true, EffectiveCost: 0.0025,
+		Currency: "USD", Unit: "mixed", PricingBasis: channelrouting.SystemRoutingPricingBasis,
+		PricingHash: pricingHash, PricingVersion: "pricing-v1",
+		PricingIdentity:       "billing:" + pricingHash + ":channel-config:9",
+		ConfigurationRevision: 9, UpstreamCostMultiplier: 1.5,
+		BaselineExpectedKnown: true, BaselineExpectedCost: 0.001,
+		BaselineWorstCaseKnown: true, BaselineWorstCaseCost: 0.002,
+		ObservedTime: 900, EffectiveTime: 900, ExpiresTime: 2_000,
+		ConfidenceScore: 1, FreshnessScore: 1,
+	}
+	spec := routingAttemptAuditCostSpec(cost, true)
+	assert.True(t, spec.Known)
+	assert.Equal(t, channelrouting.SystemRoutingPricingBasis, spec.PricingBasis)
+	assert.Equal(t, cost.PricingIdentity, spec.PricingIdentity)
+	assert.Equal(t, cost.ConfigurationRevision, spec.ConfigurationRevision)
+	assert.Equal(t, cost.UpstreamCostMultiplier, spec.UpstreamCostMultiplier)
+	assert.Equal(t, cost.BaselineExpectedCost, spec.BaselineExpectedCost)
+	assert.Equal(t, cost.BaselineWorstCaseCost, spec.BaselineWorstCaseCost)
+
+	for _, attempt := range []struct {
+		mode string
+		role string
+	}{
+		{mode: model.RoutingAttemptExecutionSerial, role: model.RoutingAttemptRoleSerial},
+		{mode: model.RoutingAttemptExecutionHedge, role: model.RoutingHedgeAttemptRolePrimary},
+	} {
+		err := model.ValidateRoutingHedgeAttemptStartSpec(model.RoutingHedgeAttemptStartSpec{
+			RequestID: "system-pricing-audit", NodeEpochID: strings.Repeat("b", 32),
+			PolicyRevision: 7, AlgorithmVersion: channelrouting.DecisionAlgorithmBalanced,
+			PoolID: 3, MemberID: 11, ChannelID: 101, CredentialID: 121, ModelName: "gpt-test",
+			ExecutionMode: attempt.mode, Role: attempt.role, AttemptIndex: 0,
+			EndpointAuthority: "https://api.example.test:443", Region: "default",
+			StartedTimeMs: 1_000, Cost: spec,
+		})
+		require.NoError(t, err)
+	}
+
+	unknown := routingAttemptAuditCostSpec(channelrouting.ShadowCostInput{
+		PricingBasis:          channelrouting.SystemRoutingPricingBasis,
+		UnknownReason:         channelrouting.SystemRoutingPricingUnknownBaseline,
+		ConfigurationRevision: 10, UpstreamCostMultiplier: 2,
+	}, false)
+	assert.False(t, unknown.Known)
+	assert.Equal(t, channelrouting.SystemRoutingPricingUnknownBaseline, unknown.UnknownReason)
 }
 
 func routingAttemptContextForTest() *gin.Context {

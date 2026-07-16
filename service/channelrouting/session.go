@@ -27,7 +27,9 @@ const (
 	ExclusionReasonMultiKeyUnsupported   = "multi_key_unsupported"
 	ExclusionReasonCredentialUnavailable = "credential_unavailable"
 	ExclusionReasonCredentialRequest     = "credential_request_excluded"
-	ExclusionReasonUpstreamAccount       = "upstream_account_unavailable"
+	ExclusionReasonEndpointRequest       = "endpoint_request_excluded"
+	ExclusionReasonFailureDomainRequest  = "failure_domain_request_excluded"
+	ExclusionReasonChannelBalance        = "channel_balance_unavailable"
 	ExclusionReasonSlowStartUnavailable  = "slow_start_unavailable"
 )
 
@@ -49,6 +51,11 @@ type RequestRoutingSessionSet struct {
 	sessions     map[string]*RequestRoutingSession
 }
 
+type RequestEndpointIdentity struct {
+	EndpointAuthority string
+	Region            string
+}
+
 type RequestRoutingPlanInput struct {
 	RequestPath             string
 	ModelName               string
@@ -59,13 +66,15 @@ type RequestRoutingPlanInput struct {
 	CostProfile             *model.RoutingCostRequestProfile `json:"-"`
 	Profile                 *RequestProfile                  `json:"-"`
 	// A nil allowed list means unrestricted. A non-nil empty list fails closed.
-	AllowedChannelIDs          []int
-	ExcludedChannelIDs         []int
-	ExcludedCredentialIDs      []int
-	RequiredCredentialID       int
-	CapacityExcludedChannelIDs []int
-	ProbeExcludedChannelIDs    []int
-	SlowStartFactor            func(SlowStartKey) (float64, error)
+	AllowedChannelIDs           []int
+	ExcludedChannelIDs          []int
+	ExcludedCredentialIDs       []int
+	ExcludedEndpointIdentities  []RequestEndpointIdentity
+	ExcludedFailureDomainHashes []string
+	RequiredCredentialID        int
+	CapacityExcludedChannelIDs  []int
+	ProbeExcludedChannelIDs     []int
+	SlowStartFactor             func(SlowStartKey) (float64, error)
 }
 
 type RequestRoutingCostInput struct {
@@ -199,6 +208,9 @@ func (session *RequestRoutingSession) IdentityForChannel(channelID int) (Identit
 			continue
 		}
 		identity := Identity{SnapshotRevision: session.snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}
+		if channel, ok := session.snapshot.channelByID[channelID]; ok {
+			identity.FailureDomainHash = channel.FailureDomainHash
+		}
 		if len(member.CredentialIDs) == 1 {
 			identity.CredentialID = member.CredentialIDs[0]
 		}
@@ -348,6 +360,14 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
 	}
+	excludedEndpoints, err := routingSessionEndpointSet(input.ExcludedEndpointIdentities)
+	if err != nil {
+		return RequestRoutingPlan{}, true, err
+	}
+	excludedFailureDomains, err := routingSessionFailureDomainSet(input.ExcludedFailureDomainHashes)
+	if err != nil {
+		return RequestRoutingPlan{}, true, err
+	}
 	capacityExcludedChannels, _, err := routingSessionChannelSet(input.CapacityExcludedChannelIDs)
 	if err != nil {
 		return RequestRoutingPlan{}, true, err
@@ -420,15 +440,19 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 				candidate.RequestExclusionReason = ExclusionReasonCredentialUnavailable
 			}
 		}
-		if candidate.RequestExclusionReason == "" && observation.upstreamAccountID > 0 {
-			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, now); blocked {
-				candidate.RequestExclusionReason = ExclusionReasonUpstreamAccount
+		if candidate.RequestExclusionReason == "" {
+			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, now); blocked {
+				candidate.RequestExclusionReason = ExclusionReasonChannelBalance
 			}
 		}
 		if candidate.RequestExclusionReason == "" {
 			switch {
 			case routingSessionChannelContains(excludedChannels, member.ChannelID):
 				candidate.RequestExclusionReason = ExclusionReasonRequestFailed
+			case routingSessionEndpointExcluded(excludedEndpoints, channel):
+				candidate.RequestExclusionReason = ExclusionReasonEndpointRequest
+			case routingSessionFailureDomainExcluded(excludedFailureDomains, channel.FailureDomainHash):
+				candidate.RequestExclusionReason = ExclusionReasonFailureDomainRequest
 			case routingSessionChannelContains(probeExcludedChannels, member.ChannelID):
 				candidate.RequestExclusionReason = ExclusionReasonHalfOpenProbe
 			case routingSessionChannelContains(capacityExcludedChannels, member.ChannelID):
@@ -456,7 +480,7 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 			PoolID:            pool.ID,
 			MemberID:          member.ID,
 			CredentialID:      credentialID,
-			UpstreamAccountID: observation.upstreamAccountID,
+			FailureDomainHash: channel.FailureDomainHash,
 		}
 		identities[member.ID] = identity
 		candidates = append(candidates, candidate)
@@ -560,5 +584,65 @@ func routingSessionChannelSet(channelIDs []int) (map[int]struct{}, bool, error) 
 
 func routingSessionChannelContains(channelIDs map[int]struct{}, channelID int) bool {
 	_, exists := channelIDs[channelID]
+	return exists
+}
+
+func routingSessionEndpointSet(identities []RequestEndpointIdentity) (map[string]struct{}, error) {
+	if len(identities) > MaxShadowCandidates {
+		return nil, ErrRoutingSessionInvalid
+	}
+	result := make(map[string]struct{}, len(identities))
+	for _, identity := range identities {
+		key, ok := requestEndpointIdentityKey(identity.EndpointAuthority, identity.Region)
+		if !ok {
+			return nil, ErrRoutingSessionInvalid
+		}
+		result[key] = struct{}{}
+	}
+	return result, nil
+}
+
+func routingSessionFailureDomainSet(hashes []string) (map[string]struct{}, error) {
+	if len(hashes) > MaxShadowCandidates {
+		return nil, ErrRoutingSessionInvalid
+	}
+	result := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		hash = strings.ToLower(strings.TrimSpace(hash))
+		if !validShadowHash(hash) {
+			return nil, ErrRoutingSessionInvalid
+		}
+		result[hash] = struct{}{}
+	}
+	return result, nil
+}
+
+func requestEndpointIdentityKey(endpointAuthority string, region string) (string, bool) {
+	endpointAuthority = strings.ToLower(strings.TrimSpace(endpointAuthority))
+	region = normalizeRoutingRegion(region)
+	if endpointAuthority == "" || region == "" {
+		return "", false
+	}
+	return endpointAuthority + "\x00" + region, true
+}
+
+func routingSessionEndpointExcluded(excluded map[string]struct{}, channel ChannelSnapshot) bool {
+	if len(excluded) == 0 {
+		return false
+	}
+	key, ok := requestEndpointIdentityKey(EndpointAuthority(channel.Endpoint, channel.ID), RoutingRegion())
+	if !ok {
+		return false
+	}
+	_, exists := excluded[key]
+	return exists
+}
+
+func routingSessionFailureDomainExcluded(excluded map[string]struct{}, failureDomainHash string) bool {
+	failureDomainHash = strings.ToLower(strings.TrimSpace(failureDomainHash))
+	if failureDomainHash == "" || len(excluded) == 0 {
+		return false
+	}
+	_, exists := excluded[failureDomainHash]
 	return exists
 }

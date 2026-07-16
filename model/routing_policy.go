@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -50,6 +51,8 @@ const (
 	routingPolicyInsertBatchMaxBytes       = 1 << 20
 	routingPolicyReasonMaxRunes            = 512
 	routingPolicyCredentialIDsMaxBytes     = 60 << 10
+	routingPolicyJSONMaxDepth              = 64
+	routingPolicyJSONMaxNodes              = 8_192
 	routingConfigOutboxPayloadMaxBytes     = 60 << 10
 	routingCheckpointPayloadMaxBytes       = 60 << 10
 	routingControlPlaneRetentionBatch      = 500
@@ -107,16 +110,17 @@ func (RoutingPolicyHead) TableName() string {
 }
 
 type RoutingPolicyRevision struct {
-	Revision           int64  `json:"revision" gorm:"primaryKey;autoIncrement:false"`
-	ParentRevision     int64  `json:"parent_revision" gorm:"bigint;index;not null"`
-	RollbackOfRevision int64  `json:"rollback_of_revision" gorm:"bigint;index;not null"`
-	SchemaVersion      int    `json:"schema_version" gorm:"not null"`
-	ContentHash        string `json:"content_hash" gorm:"type:char(64);index;not null"`
-	PoolCount          int    `json:"pool_count" gorm:"not null"`
-	MemberCount        int    `json:"member_count" gorm:"not null"`
-	ActorID            int    `json:"actor_id" gorm:"index;not null"`
-	Reason             string `json:"reason" gorm:"type:varchar(512);not null"`
-	CreatedTime        int64  `json:"created_time" gorm:"bigint;index;not null"`
+	Revision           int64   `json:"revision" gorm:"primaryKey;autoIncrement:false"`
+	ParentRevision     int64   `json:"parent_revision" gorm:"bigint;index;not null"`
+	RollbackOfRevision int64   `json:"rollback_of_revision" gorm:"bigint;index;not null"`
+	SchemaVersion      int     `json:"schema_version" gorm:"not null"`
+	ContentHash        string  `json:"content_hash" gorm:"type:char(64);index;not null"`
+	ExtensionsJSON     *string `json:"-" gorm:"type:text"`
+	PoolCount          int     `json:"pool_count" gorm:"not null"`
+	MemberCount        int     `json:"member_count" gorm:"not null"`
+	ActorID            int     `json:"actor_id" gorm:"index;not null"`
+	Reason             string  `json:"reason" gorm:"type:varchar(512);not null"`
+	CreatedTime        int64   `json:"created_time" gorm:"bigint;index;not null"`
 }
 
 func (RoutingPolicyRevision) TableName() string {
@@ -132,15 +136,16 @@ func (*RoutingPolicyRevision) BeforeDelete(*gorm.DB) error {
 }
 
 type RoutingPolicyPoolRevision struct {
-	ID              int64  `json:"id" gorm:"primaryKey"`
-	Revision        int64  `json:"revision" gorm:"bigint;not null;uniqueIndex:idx_routing_policy_pool_revision,priority:1;index"`
-	PoolID          int    `json:"pool_id" gorm:"not null;uniqueIndex:idx_routing_policy_pool_revision,priority:2;index"`
-	GroupKey        string `json:"-" gorm:"type:char(64);not null;index"`
-	GroupName       string `json:"group_name" gorm:"type:varchar(64);not null"`
-	DisplayName     string `json:"display_name" gorm:"type:varchar(128);not null"`
-	DeploymentStage string `json:"deployment_stage" gorm:"type:varchar(16);not null;index"`
-	PolicyProfile   string `json:"policy_profile" gorm:"type:varchar(32);not null;index"`
-	PolicyJSON      string `json:"-" gorm:"type:text;not null"`
+	ID              int64   `json:"id" gorm:"primaryKey"`
+	Revision        int64   `json:"revision" gorm:"bigint;not null;uniqueIndex:idx_routing_policy_pool_revision,priority:1;index"`
+	PoolID          int     `json:"pool_id" gorm:"not null;uniqueIndex:idx_routing_policy_pool_revision,priority:2;index"`
+	GroupKey        string  `json:"-" gorm:"type:char(64);not null;index"`
+	GroupName       string  `json:"group_name" gorm:"type:varchar(64);not null"`
+	DisplayName     string  `json:"display_name" gorm:"type:varchar(128);not null"`
+	DeploymentStage string  `json:"deployment_stage" gorm:"type:varchar(16);not null;index"`
+	PolicyProfile   string  `json:"policy_profile" gorm:"type:varchar(32);not null;index"`
+	PolicyJSON      string  `json:"-" gorm:"type:text;not null"`
+	ExtensionsJSON  *string `json:"-" gorm:"type:text"`
 }
 
 func (RoutingPolicyPoolRevision) TableName() string {
@@ -156,16 +161,17 @@ func (*RoutingPolicyPoolRevision) BeforeDelete(*gorm.DB) error {
 }
 
 type RoutingPolicyMemberRevision struct {
-	ID                int64  `json:"id" gorm:"primaryKey"`
-	Revision          int64  `json:"revision" gorm:"bigint;not null;uniqueIndex:idx_routing_policy_member_revision,priority:1;uniqueIndex:idx_routing_policy_member_channel,priority:1;index:idx_routing_policy_member_pool,priority:1"`
-	PoolID            int    `json:"pool_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:2;index:idx_routing_policy_member_pool,priority:2"`
-	MemberID          int    `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_revision,priority:2;index"`
-	ChannelID         int    `json:"channel_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:3;index"`
-	Enabled           bool   `json:"enabled" gorm:"not null"`
-	Priority          int64  `json:"priority" gorm:"bigint;not null"`
-	Weight            int64  `json:"weight" gorm:"bigint;not null"`
-	CredentialIDsJSON string `json:"-" gorm:"type:text;not null"`
-	OverridesJSON     string `json:"-" gorm:"type:text;not null"`
+	ID                int64   `json:"id" gorm:"primaryKey"`
+	Revision          int64   `json:"revision" gorm:"bigint;not null;uniqueIndex:idx_routing_policy_member_revision,priority:1;uniqueIndex:idx_routing_policy_member_channel,priority:1;index:idx_routing_policy_member_pool,priority:1"`
+	PoolID            int     `json:"pool_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:2;index:idx_routing_policy_member_pool,priority:2"`
+	MemberID          int     `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_revision,priority:2;index"`
+	ChannelID         int     `json:"channel_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:3;index"`
+	Enabled           bool    `json:"enabled" gorm:"not null"`
+	Priority          int64   `json:"priority" gorm:"bigint;not null"`
+	Weight            int64   `json:"weight" gorm:"bigint;not null"`
+	CredentialIDsJSON string  `json:"-" gorm:"type:text;not null"`
+	OverridesJSON     string  `json:"-" gorm:"type:text;not null"`
+	ExtensionsJSON    *string `json:"-" gorm:"type:text"`
 }
 
 func (RoutingPolicyMemberRevision) TableName() string {
@@ -246,8 +252,9 @@ func (RoutingRuntimeCheckpoint) TableName() string {
 }
 
 type RoutingPolicyDocument struct {
-	SchemaVersion int                        `json:"schema_version"`
-	Pools         []RoutingPolicyPoolContent `json:"pools"`
+	SchemaVersion   int                        `json:"schema_version"`
+	Pools           []RoutingPolicyPoolContent `json:"pools"`
+	ExtensionFields map[string]json.RawMessage `json:"-"`
 }
 
 type RoutingPolicyPoolContent struct {
@@ -258,16 +265,214 @@ type RoutingPolicyPoolContent struct {
 	PolicyProfile   string                       `json:"policy_profile"`
 	Policy          json.RawMessage              `json:"policy"`
 	Members         []RoutingPolicyMemberContent `json:"members"`
+	ExtensionFields map[string]json.RawMessage   `json:"-"`
 }
 
 type RoutingPolicyMemberContent struct {
-	MemberID      int             `json:"member_id"`
-	ChannelID     int             `json:"channel_id"`
-	Enabled       bool            `json:"enabled"`
-	Priority      int64           `json:"priority"`
-	Weight        int64           `json:"weight"`
-	CredentialIDs []int           `json:"credential_ids"`
-	Overrides     json.RawMessage `json:"overrides"`
+	MemberID        int                        `json:"member_id"`
+	ChannelID       int                        `json:"channel_id"`
+	Enabled         bool                       `json:"enabled"`
+	Priority        int64                      `json:"priority"`
+	Weight          int64                      `json:"weight"`
+	CredentialIDs   []int                      `json:"credential_ids"`
+	Overrides       json.RawMessage            `json:"overrides"`
+	ExtensionFields map[string]json.RawMessage `json:"-"`
+}
+
+func (document RoutingPolicyDocument) MarshalJSON() ([]byte, error) {
+	type routingPolicyDocumentJSON RoutingPolicyDocument
+	known := routingPolicyDocumentJSON(document)
+	known.ExtensionFields = nil
+	return marshalRoutingPolicyObject(known, document.ExtensionFields, routingPolicyDocumentKnownField)
+}
+
+func (document *RoutingPolicyDocument) UnmarshalJSON(data []byte) error {
+	type routingPolicyDocumentJSON RoutingPolicyDocument
+	var decoded routingPolicyDocumentJSON
+	if err := common.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	extensions, err := routingPolicyUnknownFields(data, routingPolicyDocumentKnownField)
+	if err != nil {
+		return err
+	}
+	decoded.ExtensionFields = extensions
+	*document = RoutingPolicyDocument(decoded)
+	return nil
+}
+
+func (pool RoutingPolicyPoolContent) MarshalJSON() ([]byte, error) {
+	type routingPolicyPoolJSON RoutingPolicyPoolContent
+	known := routingPolicyPoolJSON(pool)
+	known.ExtensionFields = nil
+	return marshalRoutingPolicyObject(known, pool.ExtensionFields, routingPolicyPoolKnownField)
+}
+
+func (pool *RoutingPolicyPoolContent) UnmarshalJSON(data []byte) error {
+	type routingPolicyPoolJSON RoutingPolicyPoolContent
+	var decoded routingPolicyPoolJSON
+	if err := common.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	extensions, err := routingPolicyUnknownFields(data, routingPolicyPoolKnownField)
+	if err != nil {
+		return err
+	}
+	decoded.ExtensionFields = extensions
+	*pool = RoutingPolicyPoolContent(decoded)
+	return nil
+}
+
+func (member RoutingPolicyMemberContent) MarshalJSON() ([]byte, error) {
+	type routingPolicyMemberJSON RoutingPolicyMemberContent
+	known := routingPolicyMemberJSON(member)
+	known.ExtensionFields = nil
+	return marshalRoutingPolicyObject(known, member.ExtensionFields, routingPolicyMemberKnownField)
+}
+
+func (member *RoutingPolicyMemberContent) UnmarshalJSON(data []byte) error {
+	type routingPolicyMemberJSON RoutingPolicyMemberContent
+	var decoded routingPolicyMemberJSON
+	if err := common.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	extensions, err := routingPolicyUnknownFields(data, routingPolicyMemberKnownField)
+	if err != nil {
+		return err
+	}
+	decoded.ExtensionFields = extensions
+	*member = RoutingPolicyMemberContent(decoded)
+	return nil
+}
+
+func routingPolicyDocumentKnownField(key string) bool {
+	return key == "schema_version" || key == "pools"
+}
+
+func routingPolicyPoolKnownField(key string) bool {
+	switch key {
+	case "pool_id", "group_name", "display_name", "deployment_stage", "policy_profile", "policy", "members":
+		return true
+	default:
+		return false
+	}
+}
+
+func routingPolicyMemberKnownField(key string) bool {
+	switch key {
+	case "member_id", "channel_id", "enabled", "priority", "weight", "credential_ids", "overrides":
+		return true
+	default:
+		return false
+	}
+}
+
+func routingPolicyUnknownFields(
+	data []byte,
+	knownField func(string) bool,
+) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := common.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for key := range fields {
+		if knownField(key) {
+			delete(fields, key)
+		}
+	}
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	return fields, nil
+}
+
+func marshalRoutingPolicyObject(
+	known any,
+	extensions map[string]json.RawMessage,
+	knownField func(string) bool,
+) ([]byte, error) {
+	encodedKnown, err := common.Marshal(known)
+	if err != nil || len(encodedKnown) < 2 || encodedKnown[0] != '{' || encodedKnown[len(encodedKnown)-1] != '}' {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	normalizedExtensions, err := normalizeRoutingPolicyExtensionFields(extensions, knownField)
+	if err != nil {
+		return nil, err
+	}
+	if len(normalizedExtensions) == 0 {
+		return encodedKnown, nil
+	}
+	encodedExtensions, err := common.Marshal(normalizedExtensions)
+	if err != nil || len(encodedExtensions) < 2 || encodedExtensions[0] != '{' ||
+		encodedExtensions[len(encodedExtensions)-1] != '}' {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	encoded := make([]byte, 0, len(encodedKnown)+len(encodedExtensions))
+	encoded = append(encoded, encodedKnown[:len(encodedKnown)-1]...)
+	encoded = append(encoded, ',')
+	encoded = append(encoded, encodedExtensions[1:]...)
+	return encoded, nil
+}
+
+func normalizeRoutingPolicyExtensionFields(
+	extensions map[string]json.RawMessage,
+	knownField func(string) bool,
+) (map[string]json.RawMessage, error) {
+	if len(extensions) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]json.RawMessage, len(extensions))
+	for key, value := range extensions {
+		if key == "" || !validRoutingPolicyText(key, 128) || knownField(key) ||
+			len(bytes.TrimSpace(value)) == 0 || len(value) > routingPolicyMaxConfigBytes {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		nodes := 0
+		canonical, err := normalizeRoutingPolicyJSONValue(value, 0, &nodes)
+		if err != nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		normalized[key] = canonical
+	}
+	canonical, err := common.Marshal(normalized)
+	if err != nil || len(canonical) > routingPolicyMaxConfigBytes {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	return normalized, nil
+}
+
+func routingPolicyExtensionsJSON(
+	extensions map[string]json.RawMessage,
+	knownField func(string) bool,
+) (*string, error) {
+	normalized, err := normalizeRoutingPolicyExtensionFields(extensions, knownField)
+	if err != nil || len(normalized) == 0 {
+		return nil, err
+	}
+	encoded, err := common.Marshal(normalized)
+	if err != nil {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	value := string(encoded)
+	return &value, nil
+}
+
+func routingPolicyExtensionsFromJSON(
+	encoded *string,
+	knownField func(string) bool,
+) (map[string]json.RawMessage, error) {
+	if encoded == nil || strings.TrimSpace(*encoded) == "" {
+		return nil, nil
+	}
+	var extensions map[string]json.RawMessage
+	if err := common.UnmarshalJsonStr(*encoded, &extensions); err != nil || extensions == nil {
+		return nil, ErrRoutingPolicyContentCorrupt
+	}
+	normalized, err := normalizeRoutingPolicyExtensionFields(extensions, knownField)
+	if err != nil {
+		return nil, ErrRoutingPolicyContentCorrupt
+	}
+	return normalized, nil
 }
 
 type RoutingPolicyActivationSpec struct {
@@ -653,12 +858,27 @@ func LoadRoutingPolicyRevisionDBContext(ctx context.Context, db *gorm.DB, revisi
 		return RoutingPolicyDocument{}, RoutingPolicyRevision{}, fmt.Errorf("%w: row count mismatch", ErrRoutingPolicyContentCorrupt)
 	}
 
-	document := RoutingPolicyDocument{SchemaVersion: revision.SchemaVersion, Pools: make([]RoutingPolicyPoolContent, len(poolRows))}
+	documentExtensions, err := routingPolicyExtensionsFromJSON(
+		revision.ExtensionsJSON,
+		routingPolicyDocumentKnownField,
+	)
+	if err != nil {
+		return RoutingPolicyDocument{}, RoutingPolicyRevision{}, err
+	}
+	document := RoutingPolicyDocument{
+		SchemaVersion:   revision.SchemaVersion,
+		Pools:           make([]RoutingPolicyPoolContent, len(poolRows)),
+		ExtensionFields: documentExtensions,
+	}
 	poolIndexes := make(map[int]int, len(poolRows))
 	for index := range poolRows {
 		row := poolRows[index]
 		if row.GroupKey != routingGroupKey(row.GroupName) {
 			return RoutingPolicyDocument{}, RoutingPolicyRevision{}, fmt.Errorf("%w: group hash mismatch", ErrRoutingPolicyContentCorrupt)
+		}
+		extensions, err := routingPolicyExtensionsFromJSON(row.ExtensionsJSON, routingPolicyPoolKnownField)
+		if err != nil {
+			return RoutingPolicyDocument{}, RoutingPolicyRevision{}, err
 		}
 		poolIndexes[row.PoolID] = index
 		document.Pools[index] = RoutingPolicyPoolContent{
@@ -669,6 +889,7 @@ func LoadRoutingPolicyRevisionDBContext(ctx context.Context, db *gorm.DB, revisi
 			PolicyProfile:   row.PolicyProfile,
 			Policy:          json.RawMessage(row.PolicyJSON),
 			Members:         make([]RoutingPolicyMemberContent, 0),
+			ExtensionFields: extensions,
 		}
 	}
 	for index := range memberRows {
@@ -681,14 +902,19 @@ func LoadRoutingPolicyRevisionDBContext(ctx context.Context, db *gorm.DB, revisi
 		if err := common.UnmarshalJsonStr(row.CredentialIDsJSON, &credentialIDs); err != nil {
 			return RoutingPolicyDocument{}, RoutingPolicyRevision{}, fmt.Errorf("%w: credential ids", ErrRoutingPolicyContentCorrupt)
 		}
+		extensions, err := routingPolicyExtensionsFromJSON(row.ExtensionsJSON, routingPolicyMemberKnownField)
+		if err != nil {
+			return RoutingPolicyDocument{}, RoutingPolicyRevision{}, err
+		}
 		document.Pools[poolIndex].Members = append(document.Pools[poolIndex].Members, RoutingPolicyMemberContent{
-			MemberID:      row.MemberID,
-			ChannelID:     row.ChannelID,
-			Enabled:       row.Enabled,
-			Priority:      row.Priority,
-			Weight:        row.Weight,
-			CredentialIDs: credentialIDs,
-			Overrides:     json.RawMessage(row.OverridesJSON),
+			MemberID:        row.MemberID,
+			ChannelID:       row.ChannelID,
+			Enabled:         row.Enabled,
+			Priority:        row.Priority,
+			Weight:          row.Weight,
+			CredentialIDs:   credentialIDs,
+			Overrides:       json.RawMessage(row.OverridesJSON),
+			ExtensionFields: extensions,
 		})
 	}
 
@@ -1127,12 +1353,20 @@ func publishNormalizedRoutingPolicyRevisionTx(
 		return RoutingPolicyPublishResult{}, newRoutingPolicyRevisionConflict(expectedRevision, actual)
 	}
 
+	revisionExtensionsJSON, err := routingPolicyExtensionsJSON(
+		document.ExtensionFields,
+		routingPolicyDocumentKnownField,
+	)
+	if err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
 	revision := RoutingPolicyRevision{
 		Revision:           nextRevision,
 		ParentRevision:     expectedRevision,
 		RollbackOfRevision: rollbackOfRevision,
 		SchemaVersion:      document.SchemaVersion,
 		ContentHash:        contentHash,
+		ExtensionsJSON:     revisionExtensionsJSON,
 		PoolCount:          len(document.Pools),
 		MemberCount:        routingPolicyDocumentMemberCount(document),
 		ActorID:            activationSpec.ActorID,
@@ -1268,7 +1502,18 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 		return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 	}
 
-	normalized := RoutingPolicyDocument{SchemaVersion: document.SchemaVersion, Pools: make([]RoutingPolicyPoolContent, len(document.Pools))}
+	documentExtensions, err := normalizeRoutingPolicyExtensionFields(
+		document.ExtensionFields,
+		routingPolicyDocumentKnownField,
+	)
+	if err != nil {
+		return RoutingPolicyDocument{}, "", err
+	}
+	normalized := RoutingPolicyDocument{
+		SchemaVersion:   document.SchemaVersion,
+		Pools:           make([]RoutingPolicyPoolContent, len(document.Pools)),
+		ExtensionFields: documentExtensions,
+	}
 	poolIDs := make(map[int]struct{}, len(document.Pools))
 	groupNames := make(map[string]struct{}, len(document.Pools))
 	memberIDs := make(map[int]struct{})
@@ -1276,6 +1521,14 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 	totalCredentialRefs := 0
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
+		poolExtensions, err := normalizeRoutingPolicyExtensionFields(
+			pool.ExtensionFields,
+			routingPolicyPoolKnownField,
+		)
+		if err != nil {
+			return RoutingPolicyDocument{}, "", err
+		}
+		pool.ExtensionFields = poolExtensions
 		if pool.PoolID <= 0 || !validRoutingPolicyText(pool.GroupName, 64) || pool.GroupName == "" ||
 			!validRoutingPolicyText(pool.DisplayName, 128) || !validRoutingDeploymentStage(pool.DeploymentStage) ||
 			!validRoutingPolicyProfile(pool.PolicyProfile) {
@@ -1320,6 +1573,14 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 		channels := make(map[int]struct{}, len(pool.Members))
 		for memberIndex := range pool.Members {
 			member := &pool.Members[memberIndex]
+			memberExtensions, err := normalizeRoutingPolicyExtensionFields(
+				member.ExtensionFields,
+				routingPolicyMemberKnownField,
+			)
+			if err != nil {
+				return RoutingPolicyDocument{}, "", err
+			}
+			member.ExtensionFields = memberExtensions
 			if member.MemberID <= 0 || member.ChannelID <= 0 || member.Weight < 0 {
 				return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 			}
@@ -1456,18 +1717,97 @@ func normalizeRoutingPolicyJSONObject(value json.RawMessage) (json.RawMessage, e
 	if len(bytes.TrimSpace(value)) == 0 {
 		return json.RawMessage(`{}`), nil
 	}
-	if len(value) > routingPolicyMaxConfigBytes {
+	if len(value) > routingPolicyMaxConfigBytes || common.GetJsonType(value) != "object" {
 		return nil, ErrRoutingPolicyInvalid
 	}
-	var object map[string]any
-	if err := common.Unmarshal(value, &object); err != nil || object == nil {
-		return nil, ErrRoutingPolicyInvalid
-	}
-	canonical, err := common.Marshal(object)
+	nodes := 0
+	canonical, err := normalizeRoutingPolicyJSONValue(value, 0, &nodes)
 	if err != nil || len(canonical) > routingPolicyMaxConfigBytes {
 		return nil, ErrRoutingPolicyInvalid
 	}
-	return json.RawMessage(canonical), nil
+	return canonical, nil
+}
+
+func normalizeRoutingPolicyJSONValue(
+	value json.RawMessage,
+	depth int,
+	nodes *int,
+) (json.RawMessage, error) {
+	if nodes == nil || depth > routingPolicyJSONMaxDepth {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	(*nodes)++
+	if *nodes > routingPolicyJSONMaxNodes {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	trimmed := bytes.TrimSpace(value)
+	if len(trimmed) == 0 || len(trimmed) > routingPolicyMaxConfigBytes {
+		return nil, ErrRoutingPolicyInvalid
+	}
+
+	var encoded []byte
+	var err error
+	switch common.GetJsonType(trimmed) {
+	case "object":
+		var object map[string]json.RawMessage
+		if err := common.Unmarshal(trimmed, &object); err != nil || object == nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		normalized := make(map[string]json.RawMessage, len(object))
+		for key, child := range object {
+			if !utf8.ValidString(key) {
+				return nil, ErrRoutingPolicyInvalid
+			}
+			normalizedChild, err := normalizeRoutingPolicyJSONValue(child, depth+1, nodes)
+			if err != nil {
+				return nil, err
+			}
+			normalized[key] = normalizedChild
+		}
+		encoded, err = common.Marshal(normalized)
+	case "array":
+		var array []json.RawMessage
+		if err := common.Unmarshal(trimmed, &array); err != nil || array == nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		normalized := make([]json.RawMessage, len(array))
+		for index := range array {
+			normalized[index], err = normalizeRoutingPolicyJSONValue(array[index], depth+1, nodes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		encoded, err = common.Marshal(normalized)
+	case "string":
+		var decoded string
+		if err := common.Unmarshal(trimmed, &decoded); err != nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		encoded, err = common.Marshal(decoded)
+	case "boolean":
+		var decoded bool
+		if err := common.Unmarshal(trimmed, &decoded); err != nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		encoded, err = common.Marshal(decoded)
+	case "number":
+		var decoded json.Number
+		if err := common.Unmarshal(trimmed, &decoded); err != nil {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		encoded, err = common.Marshal(decoded)
+	case "null":
+		if !bytes.Equal(trimmed, []byte("null")) {
+			return nil, ErrRoutingPolicyInvalid
+		}
+		encoded = []byte("null")
+	default:
+		return nil, ErrRoutingPolicyInvalid
+	}
+	if err != nil || len(encoded) == 0 || len(encoded) > routingPolicyMaxConfigBytes {
+		return nil, ErrRoutingPolicyInvalid
+	}
+	return json.RawMessage(encoded), nil
 }
 
 func validateRoutingPolicyCanaryConfiguration(policy json.RawMessage) error {
@@ -1506,6 +1846,10 @@ func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) (
 	memberRows := make([]RoutingPolicyMemberRevision, 0, routingPolicyDocumentMemberCount(document))
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
+		poolExtensionsJSON, err := routingPolicyExtensionsJSON(pool.ExtensionFields, routingPolicyPoolKnownField)
+		if err != nil {
+			return nil, nil, err
+		}
 		poolRows = append(poolRows, RoutingPolicyPoolRevision{
 			Revision:        revision,
 			PoolID:          pool.PoolID,
@@ -1515,10 +1859,18 @@ func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) (
 			DeploymentStage: pool.DeploymentStage,
 			PolicyProfile:   pool.PolicyProfile,
 			PolicyJSON:      string(pool.Policy),
+			ExtensionsJSON:  poolExtensionsJSON,
 		})
 		for memberIndex := range pool.Members {
 			member := pool.Members[memberIndex]
 			credentialIDs, err := common.Marshal(member.CredentialIDs)
+			if err != nil {
+				return nil, nil, err
+			}
+			memberExtensionsJSON, err := routingPolicyExtensionsJSON(
+				member.ExtensionFields,
+				routingPolicyMemberKnownField,
+			)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1532,6 +1884,7 @@ func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) (
 				Weight:            member.Weight,
 				CredentialIDsJSON: string(credentialIDs),
 				OverridesJSON:     string(member.Overrides),
+				ExtensionsJSON:    memberExtensionsJSON,
 			})
 		}
 	}
@@ -1567,11 +1920,18 @@ func createRoutingPolicyRowsInBatches[T any](tx *gorm.DB, rows []T, maxRows int,
 
 func routingPolicyPoolRowEncodedSize(row RoutingPolicyPoolRevision) int {
 	return 256 + len(row.GroupKey) + len(row.GroupName) + len(row.DisplayName) +
-		len(row.DeploymentStage) + len(row.PolicyProfile) + len(row.PolicyJSON)
+		len(row.DeploymentStage) + len(row.PolicyProfile) + len(row.PolicyJSON) + routingPolicyOptionalTextSize(row.ExtensionsJSON)
 }
 
 func routingPolicyMemberRowEncodedSize(row RoutingPolicyMemberRevision) int {
-	return 256 + len(row.CredentialIDsJSON) + len(row.OverridesJSON)
+	return 256 + len(row.CredentialIDsJSON) + len(row.OverridesJSON) + routingPolicyOptionalTextSize(row.ExtensionsJSON)
+}
+
+func routingPolicyOptionalTextSize(value *string) int {
+	if value == nil {
+		return 0
+	}
+	return len(*value)
 }
 
 func routingPolicyDocumentMemberCount(document RoutingPolicyDocument) int {

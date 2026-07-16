@@ -428,10 +428,12 @@ func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord
 	cacheKey := routinghotcache.Key{ChannelID: channelID, APIKeyIndex: SingleAPIKeyIndex, Model: "clear-channel", Group: "default"}
 	RecordAttempt(key, false, http.StatusInternalServerError, 0)
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{UpdatedUnix: now.Unix()})
-	routinghotcache.SetCostForTest(cacheKey.CostKey(), routinghotcache.CostSnapshot{UpdatedUnix: now.Unix()})
 	routinghotcache.SetCapacityCooldownForTest(cacheKey, routinghotcache.CapacityCooldownSnapshot{CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
 	routinghotcache.SetAuthFailureForTest(channelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now.Unix()})
-	routinghotcache.SetBalanceForTest(channelID, routinghotcache.BalanceSnapshot{Known: true, UpdatedUnix: now.Unix()})
+	routinghotcache.SetChannelBalanceUnavailableForTest(channelID, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode: http.StatusPaymentRequired, Reason: routinghotcache.ChannelBalanceUnavailableReason,
+		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli(),
+	})
 	require.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
 
 	clearStarted := make(chan bool, 1)
@@ -489,15 +491,13 @@ func TestClearDefaultChannelWithCacheSerializesAllCacheClearWithConcurrentRecord
 	assert.Equal(t, 1, clearCalls)
 	assert.Equal(t, Stats{Entries: 1, Dirty: 1}, RuntimeStats())
 	_, metricOK := routinghotcache.GetMetric(cacheKey)
-	_, costOK := routinghotcache.GetCost(cacheKey.CostKey())
 	_, capacityOK := routinghotcache.GetCapacityCooldown(cacheKey)
 	_, authOK := routinghotcache.GetAuthFailure(channelID)
-	_, balanceOK := routinghotcache.GetBalance(channelID)
+	_, balanceUnavailableOK := routinghotcache.GetChannelBalanceUnavailable(channelID)
 	assert.False(t, metricOK)
-	assert.False(t, costOK)
 	assert.False(t, capacityOK)
 	assert.False(t, authOK)
-	assert.False(t, balanceOK)
+	assert.False(t, balanceUnavailableOK)
 	cached, ok := routinghotcache.GetBreaker(cacheKey)
 	require.True(t, ok)
 	assert.Equal(t, string(StateHealthy), cached.State)
@@ -757,6 +757,35 @@ func TestBreakerHalfOpenTransitions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestActiveProbeSuccessStopsOpenRecoveryAtHalfOpen(t *testing.T) {
+	breaker, clock, key := testBreaker(t)
+	breaker.config.Consecutive5xxThreshold = 1
+
+	opened := breaker.OnReliabilityFailure(key, FailureProvider5xx)
+	require.Equal(t, StateOpen, opened.State)
+	assert.Equal(t, "5xx", opened.Reason)
+
+	early := breaker.onActiveProbeSuccess(key).snapshot
+	require.Equal(t, StateOpen, early.State)
+	assert.Equal(t, opened.CooldownUntil, early.CooldownUntil)
+
+	clock.Advance(10 * time.Second)
+	halfOpen := breaker.onActiveProbeSuccess(key).snapshot
+	require.Equal(t, StateHalfOpen, halfOpen.State)
+	assert.Equal(t, opened.Reason, halfOpen.Reason)
+	assert.Equal(t, opened.ConsecutiveFailures, halfOpen.ConsecutiveFailures)
+	assert.Equal(t, opened.Consecutive5xx, halfOpen.Consecutive5xx)
+	assert.Equal(t, opened.EjectionCount, halfOpen.EjectionCount)
+	assert.Equal(t, opened.WindowRequests, halfOpen.WindowRequests)
+	assert.Equal(t, opened.WindowFailures, halfOpen.WindowFailures)
+
+	recovered := breaker.OnSuccess(key)
+	require.Equal(t, StateHealthy, recovered.State)
+	assert.Empty(t, recovered.Reason)
+	assert.Zero(t, recovered.EjectionCount)
+	assert.Zero(t, recovered.WindowFailures)
 }
 
 func TestBreakerCooldownIsCapped(t *testing.T) {

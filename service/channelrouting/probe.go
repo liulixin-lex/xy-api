@@ -52,7 +52,6 @@ type ActiveProbeTarget struct {
 	MemberID             int
 	ChannelID            int
 	CredentialID         int
-	UpstreamAccountID    int
 	GroupName            string
 	ModelName            string
 	EndpointHost         string
@@ -579,8 +578,7 @@ func validateActiveProbeTarget(target ActiveProbeTarget) error {
 		snapshot.memberByPoolChannel[poolChannelKey{PoolID: poolID, ChannelID: target.ChannelID}] != target.MemberID {
 		return ErrActiveProbeTargetStale
 	}
-	observation, exists := snapshot.modelByMemberModel[memberModelKey{memberID: target.MemberID, model: target.ModelName}]
-	if !exists || observation.upstreamAccountID != target.UpstreamAccountID {
+	if _, exists := snapshot.modelByMemberModel[memberModelKey{memberID: target.MemberID, model: target.ModelName}]; !exists {
 		return ErrActiveProbeTargetStale
 	}
 	channel, exists := snapshot.channelByID[target.ChannelID]
@@ -687,7 +685,6 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 						MemberID:             member.ID,
 						ChannelID:            member.ChannelID,
 						CredentialID:         credentialID,
-						UpstreamAccountID:    observation.upstreamAccountID,
 						GroupName:            pool.GroupName,
 						ModelName:            observation.ModelName,
 						EndpointHost:         EndpointHost(channel.Endpoint, member.ChannelID),
@@ -839,7 +836,7 @@ func applyActiveProbeBreakerOutcome(
 	if networkFailure {
 		routingbreaker.RecordReliabilityFailure(endpointKey, routingbreaker.FailureNetwork)
 	} else if endpointReachable {
-		routingbreaker.RecordReliabilitySuccess(endpointKey)
+		routingbreaker.RecordActiveProbeSuccess(endpointKey)
 	}
 	key := routingbreaker.Key{
 		ChannelID:   target.ChannelID,
@@ -851,9 +848,6 @@ func applyActiveProbeBreakerOutcome(
 		if target.CredentialID > 0 {
 			ClearCredentialAuthFailure(target.CredentialID, target.ChannelID, now)
 			ClearCredentialCapacityCooldown(target.CredentialID, target.ChannelID, now)
-		}
-		if target.UpstreamAccountID > 0 {
-			ClearUpstreamAccountUnavailable(target.UpstreamAccountID, now)
 		}
 		if target.MultiKey {
 			return nil
@@ -874,7 +868,7 @@ func applyActiveProbeBreakerOutcome(
 		routinghotcache.ClearCapacityCooldown(key.HotcacheKey())
 		if target.BreakerState == model.RoutingBreakerStateOpen || target.BreakerState == model.RoutingBreakerStateHalfOpen ||
 			target.BreakerState == model.RoutingBreakerStateDegraded {
-			routingbreaker.RecordReliabilitySuccess(key)
+			routingbreaker.RecordActiveProbeSuccess(key)
 		}
 		return nil
 	}
@@ -908,17 +902,6 @@ func applyActiveProbeBreakerOutcome(
 		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix})
 		return nil
 	}
-	if execution.StatusCode == http.StatusPaymentRequired && target.UpstreamAccountID > 0 {
-		RecordUpstreamAccountUnavailable(
-			target.UpstreamAccountID,
-			execution.StatusCode,
-			"active_probe_http_402",
-			time.Time{},
-			now,
-		)
-		return nil
-	}
-
 	if execution.Classification.CapacityEffect == routingerror.CapacityCooldown {
 		maxCooldownSeconds := int64(setting.MaxCooldownSec)
 		maximumDurationSeconds := int64(math.MaxInt64) / int64(time.Second)
@@ -941,7 +924,9 @@ func applyActiveProbeBreakerOutcome(
 		if maxCooldown > 0 && cooldown > maxCooldown {
 			cooldown = maxCooldown
 		}
-		if target.CredentialID > 0 && execution.Classification.Responsibility == routingerror.ResponsibilityCapacity {
+		if target.CredentialID > 0 &&
+			execution.Classification.Responsibility == routingerror.ResponsibilityCapacity &&
+			execution.Classification.Scope != routingerror.ScopeChannel {
 			RecordCredentialCapacityCooldown(
 				target.CredentialID, target.ChannelID, execution.StatusCode, now.Add(cooldown), now,
 			)
@@ -972,8 +957,8 @@ func applyActiveProbeBreakerOutcome(
 }
 
 func activeProbeEnabled(setting smart_routing_setting.SmartRoutingSetting) bool {
-	return setting.Enabled && setting.ActiveProbeEnabled &&
-		(setting.Mode == smart_routing_setting.ModeBalanced || setting.Mode == smart_routing_setting.ModeEnterpriseSLO)
+	return setting.ActiveProbeEnabled &&
+		smart_routing_setting.ResolveEffectiveMode(setting).AllowsActiveProbe()
 }
 
 func activeProbeTargetInterval(setting smart_routing_setting.SmartRoutingSetting, breakerState string) time.Duration {
@@ -1016,13 +1001,12 @@ func activeProbeCostBudgetNanoUSD(costUSD float64) int64 {
 
 func activeProbeTargetKey(target ActiveProbeTarget) string {
 	payload := fmt.Sprintf(
-		"routing-probe-target:v4\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		"routing-probe-target:v5\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
 		target.SnapshotRevision,
 		target.PoolID,
 		target.MemberID,
 		target.ChannelID,
 		target.CredentialID,
-		target.UpstreamAccountID,
 		target.GroupName,
 		target.ModelName,
 		target.EndpointHost,

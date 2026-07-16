@@ -194,7 +194,6 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.POST("/subscription/epay/return", anonymousRequestBodyLimit, controller.SubscriptionEpayReturn)
 		registerSystemSettingsRoutes(apiRouter)
 		registerChannelRoutes(apiRouter)
-		registerSmartRoutingRoutes(apiRouter)
 		registerChannelRoutingRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
 		tokenRoute := apiRouter.Group("/token")

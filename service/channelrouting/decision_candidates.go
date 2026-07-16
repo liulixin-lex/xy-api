@@ -70,7 +70,7 @@ func ListDecisionCandidateDetailsContext(
 	}
 	var details []DecisionCandidateDetail
 	switch audit.AlgorithmVersion {
-	case DecisionAlgorithmBalancedV1, DecisionAlgorithmBalancedV2:
+	case DecisionAlgorithmBalanced, DecisionAlgorithmBalancedV1, DecisionAlgorithmBalancedV2:
 		result, err := ReplayBalancedDecisionAuditContext(ctx, audit)
 		if err != nil {
 			return DecisionCandidatePage{}, err
@@ -103,7 +103,8 @@ func ListDecisionCandidateDetailsContext(
 			details = append(details, detail)
 		}
 		page.Source = "balanced_replay"
-	case DecisionAlgorithmShadowV1, DecisionAlgorithmCanaryV1, DecisionAlgorithmShadowV2, DecisionAlgorithmCanaryV2:
+	case DecisionAlgorithmShadow, DecisionAlgorithmCanary,
+		DecisionAlgorithmShadowV1, DecisionAlgorithmCanaryV1, DecisionAlgorithmShadowV2, DecisionAlgorithmCanaryV2:
 		result, err := ReplayDecisionAuditContext(ctx, audit)
 		if err != nil {
 			return DecisionCandidatePage{}, err

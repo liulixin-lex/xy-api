@@ -70,7 +70,7 @@ func runRoutingMetricRollupContract(t *testing.T, db *gorm.DB, dbType common.Dat
 	}
 	require.NoError(t, DB.Create(&legacyRows).Error)
 	require.NoError(t, MigrateRoutingMetricRollupRevisionKeyWithOptions(DB, RoutingMetricRollupMigrationOptions{
-		AlphaV2Drained: true,
+		AlphaDrained: true,
 	}))
 	require.NoError(t, MigrateRoutingMetricRollupRevisionKey(DB))
 	columns, unique, exists, err := routingMetricRollupIndexDefinition(DB, routingMetricRollupUniqueIndex)
@@ -440,7 +440,7 @@ func TestRoutingMetricRollupMigrationResumesFromEveryPhase(t *testing.T) {
 				assert.Equal(t, []string{"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision"}, columns)
 			}
 			require.NoError(t, MigrateRoutingMetricRollupRevisionKeyWithOptions(db, RoutingMetricRollupMigrationOptions{
-				AlphaV2Drained: true,
+				AlphaDrained: true,
 			}))
 			require.NoError(t, MigrateRoutingMetricRollupRevisionKey(db))
 			ready, err = RoutingMetricRollupRevisionKeySchemaReady(db)
@@ -526,7 +526,7 @@ func runRoutingMetricRollupConcurrentMigrationContract(t *testing.T, first *gorm
 			<-start
 			options := RoutingMetricRollupMigrationOptions{}
 			if legacy {
-				options.AlphaV2Drained = true
+				options.AlphaDrained = true
 			}
 			errorsByConnection <- MigrateRoutingMetricRollupRevisionKeyWithOptions(
 				connection,

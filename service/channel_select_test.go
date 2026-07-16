@@ -14,11 +14,13 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service/channelrouting"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
+	globalsetting "github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/alicebob/miniredis/v2"
@@ -100,8 +102,102 @@ func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *
 	assert.Equal(t, 102, channel.Id)
 }
 
+func TestRoutingTargetExclusionsFollowFailureScope(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyRoutingEndpointAuthority, "https://api.example.test:443")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRegion, "us-east-1")
+	common.SetContextKey(ctx, constant.ContextKeyRoutingFailureDomainHash, strings.Repeat("a", 64))
+
+	switchCount := MarkRoutingTargetTried(ctx, 41, 0, false)
+	assert.Zero(t, switchCount)
+	assert.Contains(t, smartRoutingExcludedChannelIDs(ctx), 41)
+	assert.Empty(t, smartRoutingExcludedCredentialIDs(ctx))
+	assert.Empty(t, smartRoutingExcludedEndpointIdentities(ctx))
+	assert.Empty(t, smartRoutingExcludedFailureDomainHashes(ctx))
+
+	MarkRoutingTargetFailure(ctx, 41, routingerror.ScopeEndpoint)
+	assert.Contains(
+		t,
+		smartRoutingExcludedEndpointIdentities(ctx),
+		routingRequestEndpointIdentityKey("https://api.example.test:443", "us-east-1"),
+	)
+	assert.Empty(t, smartRoutingExcludedFailureDomainHashes(ctx), "an endpoint failure must not eject an independent endpoint in the same account")
+
+	multiKeyCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(multiKeyCtx, constant.ContextKeyRoutingEndpointAuthority, "https://multi.example.test:443")
+	common.SetContextKey(multiKeyCtx, constant.ContextKeyRoutingRegion, "us-west-1")
+	common.SetContextKey(multiKeyCtx, constant.ContextKeyRoutingFailureDomainHash, strings.Repeat("b", 64))
+	switchCount = MarkRoutingTargetTried(multiKeyCtx, 42, 4_201, true)
+	assert.Zero(t, switchCount)
+	assert.Empty(t, smartRoutingExcludedChannelIDs(multiKeyCtx))
+	assert.Contains(t, smartRoutingExcludedCredentialIDs(multiKeyCtx), 4_201)
+	MarkRoutingTargetFailure(multiKeyCtx, 42, routingerror.ScopeCredential)
+	assert.Empty(t, smartRoutingExcludedEndpointIdentities(multiKeyCtx), "a credential failure must preserve healthy credentials on the endpoint")
+	assert.Empty(t, smartRoutingExcludedFailureDomainHashes(multiKeyCtx))
+
+	MarkRoutingTargetFailure(multiKeyCtx, 42, routingerror.ScopeAccount)
+	assert.Contains(t, smartRoutingExcludedFailureDomainHashes(multiKeyCtx), strings.Repeat("b", 64))
+	assert.Empty(t, smartRoutingExcludedChannelIDs(multiKeyCtx), "a configured account scope should use the durable failure domain")
+}
+
+func TestAutoGroupSwitchPreservesGlobalRetryIndex(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	channelrouting.ResetSnapshotForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	previousAutoGroups := globalsetting.AutoGroups2JsonString()
+	common.MemoryCacheEnabled = true
+	require.NoError(t, globalsetting.UpdateAutoGroupsByJsonString(`["default","vip"]`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		require.NoError(t, globalsetting.UpdateAutoGroupsByJsonString(previousAutoGroups))
+		routinghotcache.ResetForTest()
+		channelrouting.ResetSnapshotForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	for _, channel := range []model.Channel{
+		{Id: 51, Name: "default-target", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 52, Name: "vip-target", Status: common.ChannelStatusEnabled, Group: "vip", Models: "gpt-test", Priority: &priority, Weight: &weight},
+	} {
+		channel := channel
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{
+			Group: channel.Group, Model: "gpt-test", ChannelId: channel.Id,
+			Enabled: true, Priority: &priority, Weight: weight,
+		}).Error)
+	}
+	model.InitChannelCache()
+	setting := smart_routing_setting.SmartRoutingSetting{
+		Enabled: true, Mode: smart_routing_setting.ModeBalanced,
+		WeightAvailability: 1, TopK: 1, MaxSwitches: 2, MaxEjectedPct: 100,
+	}
+	smart_routing_setting.UpdateSetting(setting)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	retry := 1
+	param := &RetryParam{
+		Ctx: ctx, TokenGroup: "auto", ModelName: "gpt-test",
+		RequestPath: "/v1/chat/completions", Retry: &retry,
+	}
+	MarkRoutingTried(ctx, 51)
+
+	selected, group, err := CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, 52, selected.Id)
+	assert.Equal(t, "vip", group)
+	assert.Equal(t, 1, param.GetRetry(), "a concrete-group switch must not reset the logical retry index")
+	assert.Equal(t, 1, common.GetContextKeyInt(ctx, constant.ContextKeyAutoGroupRetryIndex))
+}
+
 func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMultiKey(t *testing.T) {
 	truncate(t)
+	channelrouting.ResetSnapshotForTest()
 	routinghotcache.ResetForTest()
 	routingmetrics.ResetForTest()
 	smart_routing_setting.ResetForTest()
@@ -109,6 +205,7 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 	common.MemoryCacheEnabled = true
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled = previousMemoryCache
+		channelrouting.ResetSnapshotForTest()
 		routinghotcache.ResetForTest()
 		routingmetrics.ResetForTest()
 		smart_routing_setting.ResetForTest()
@@ -131,6 +228,38 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 	model.InitChannelCache()
 
 	now := time.Now()
+	perRequestCost := 0.5
+	channelrouting.SetSnapshotForTest(channelrouting.SnapshotView{
+		Revision: 1,
+		Pools: []channelrouting.PoolSnapshot{{
+			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageObserve,
+			Members: []channelrouting.PoolMemberSnapshot{
+				{ID: 1, PoolID: 1, ChannelID: 141, Models: []channelrouting.ModelSnapshot{{ModelName: "gpt-test"}}},
+				{ID: 2, PoolID: 1, ChannelID: 142, Models: []channelrouting.ModelSnapshot{{
+					ModelName: "gpt-test",
+					CostPricing: &model.RoutingNormalizedPricing{
+						BillingMode:    channelrouting.SystemRoutingPricingBasis,
+						Currency:       "USD",
+						Unit:           "request",
+						PerRequestCost: &perRequestCost,
+					},
+					CostPricingHash:       strings.Repeat("a", 64),
+					CostPricingVersion:    "test-system-pricing",
+					CostObservedTime:      now.Unix(),
+					CostEffectiveTime:     now.Unix(),
+					CostExpiresTime:       now.Add(time.Hour).Unix(),
+					CostVersionConfidence: model.RoutingCostConfidenceExact,
+					CostConfidenceScore:   1,
+					CostFreshness:         model.RoutingCostFreshnessFresh,
+					CostFreshnessScore:    1,
+				}}},
+			},
+		}},
+		Channels: []channelrouting.ChannelSnapshot{
+			{ID: 141, Status: common.ChannelStatusEnabled},
+			{ID: 142, Status: common.ChannelStatusEnabled, MultiKey: true},
+		},
+	})
 	singleAggregate := routinghotcache.Key{ChannelID: 141, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	singlePositive := routinghotcache.Key{ChannelID: 141, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
 	multiAggregate := routinghotcache.Key{ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
@@ -148,8 +277,6 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 		routinghotcache.SetBreakerForTest(key, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateOpen, UpdatedUnix: now.Unix()})
 		routinghotcache.SetCapacityCooldownForTest(key, routinghotcache.CapacityCooldownSnapshot{SourceStatusCode: http.StatusTooManyRequests, CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(), UpdatedUnixMilli: now.UnixMilli()})
 	}
-	routinghotcache.SetCostForTest(multiAggregate.CostKey(), routinghotcache.CostSnapshot{Known: true, Confidence: model.RoutingCostConfidenceFull, BillingMode: "per_request", GroupRatio: 2, ModelPrice: 0.25, UpdatedUnix: now.Unix()})
-
 	legacyInflightRelease := routingmetrics.BeginInflight(nil, &relaycommon.RelayInfo{
 		UsingGroup:      "default",
 		OriginModelName: "gpt-test",
@@ -532,7 +659,7 @@ func TestModeShadowDoesNotChangeLegacyChannelGroupOrRetry(t *testing.T) {
 	var audit model.RoutingDecisionAudit
 	require.NoError(t, model.DB.Where("request_id = ?", "shadow-after").First(&audit).Error)
 	assert.True(t, audit.Replayable)
-	assert.Equal(t, channelrouting.DecisionAlgorithmShadowV1, audit.AlgorithmVersion)
+	assert.Equal(t, channelrouting.DecisionAlgorithmShadow, audit.AlgorithmVersion)
 	assert.Equal(t, 219, audit.ActualChannelID)
 	assert.Equal(t, 220, audit.ObservedChannelID)
 	assert.Equal(t, "ranking_difference", audit.DifferenceType)
@@ -686,7 +813,7 @@ func TestSmartRoutingFallsBackToLegacyWhenMemoryCacheDisabled(t *testing.T) {
 	}))
 }
 
-func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *testing.T) {
+func TestSmartRoutingCandidatesUseChannelBalanceSignalForMultiKeyChannel(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
@@ -702,8 +829,9 @@ func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *t
 	weight := uint(10)
 	for _, channel := range []model.Channel{
 		{Id: 301, Name: "authfail", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
-		{Id: 302, Name: "low-balance", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
+		{Id: 302, Name: "low-balance", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, Balance: 0.25, BalanceUpdatedTime: common.GetTimestamp(), ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 		{Id: 303, Name: "healthy", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 304, Name: "upstream-402", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 	} {
 		channel := channel
 		require.NoError(t, model.DB.Create(&channel).Error)
@@ -713,7 +841,12 @@ func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *t
 
 	now := common.GetTimestamp()
 	routinghotcache.SetAuthFailureForTest(301, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
-	routinghotcache.SetBalanceForTest(302, routinghotcache.BalanceSnapshot{Known: true, Balance: 0.25, UpdatedUnix: now})
+	routinghotcache.SetChannelBalanceUnavailableForTest(304, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
+		CooldownUntilUnixMilli: time.Now().Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       time.Now().UnixMilli(),
+	})
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:          true,
 		Mode:             smart_routing_setting.ModeBalanced,
@@ -733,7 +866,7 @@ func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *t
 	candidates, err := smartRoutingCandidatesForGroup(param, "default")
 
 	require.NoError(t, err)
-	require.Len(t, candidates, 3)
+	require.Len(t, candidates, 4)
 	byChannelID := make(map[int]routingselector.Candidate, len(candidates))
 	for _, candidate := range candidates {
 		byChannelID[candidate.Channel.Id] = candidate
@@ -742,6 +875,10 @@ func TestSmartRoutingCandidatesIgnoreLegacyAuthMarkerAndRetainBalanceMarker(t *t
 	require.NotNil(t, byChannelID[302].Breaker)
 	assert.Equal(t, routingselector.BreakerReasonBalance, byChannelID[302].Breaker.Reason)
 	assert.Nil(t, byChannelID[303].Breaker)
+	require.NotNil(t, byChannelID[304].Capacity)
+	assert.Equal(t, http.StatusPaymentRequired, byChannelID[304].Capacity.SourceStatusCode)
+	require.NotNil(t, byChannelID[304].Breaker)
+	assert.Equal(t, routingselector.BreakerReasonBalance, byChannelID[304].Breaker.Reason)
 }
 
 func TestSelectSmartChannelForGroupReservesHalfOpenProbe(t *testing.T) {
@@ -1108,7 +1245,7 @@ func TestObserveAuditRejectsEvaluationFromDifferentPool(t *testing.T) {
 	assert.Zero(t, channelrouting.DecisionAuditsStats().Entries)
 }
 
-func TestAffinityAdmissibleIgnoresLegacyAuthFailureAndStillFiltersLowBalance(t *testing.T) {
+func TestAffinityAdmissibleUsesOnlyChannelBalanceUnavailableSignal(t *testing.T) {
 	routinghotcache.ResetForTest()
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(func() {
@@ -1124,15 +1261,65 @@ func TestAffinityAdmissibleIgnoresLegacyAuthFailureAndStillFiltersLowBalance(t *
 
 	now := common.GetTimestamp()
 	routinghotcache.SetAuthFailureForTest(401, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
-	routinghotcache.SetBalanceForTest(402, routinghotcache.BalanceSnapshot{Known: true, Balance: 0.25, UpdatedUnix: now})
 	routinghotcache.SetAuthFailureForTest(403, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now - 600})
-	routinghotcache.SetBalanceForTest(404, routinghotcache.BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: now})
+	routinghotcache.SetChannelBalanceUnavailableForTest(405, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
+		CooldownUntilUnixMilli: time.Now().Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       time.Now().UnixMilli(),
+	})
 
 	assert.True(t, AffinityAdmissible(401))
-	assert.False(t, AffinityAdmissible(402))
+	assert.True(t, AffinityAdmissible(402))
 	assert.True(t, AffinityAdmissible(403))
 	assert.True(t, AffinityAdmissible(404))
-	assert.True(t, AffinityAdmissible(405))
+	assert.False(t, AffinityAdmissible(405))
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: false})
+	assert.False(t, AffinityAdmissible(405), "the channel-level 402 signal is independent of smart routing mode")
+}
+
+func TestLegacyRandomSelectionExcludesChannelBalanceSignal(t *testing.T) {
+	truncate(t)
+	routinghotcache.ResetForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		routinghotcache.ResetForTest()
+		smart_routing_setting.ResetForTest()
+	})
+
+	priority := int64(10)
+	weight := uint(10)
+	for _, channel := range []model.Channel{
+		{Id: 411, Name: "blocked", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+		{Id: 412, Name: "healthy", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
+	} {
+		channel := channel
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{
+			Group: "default", Model: "gpt-test", ChannelId: channel.Id,
+			Enabled: true, Priority: &priority, Weight: weight,
+		}).Error)
+	}
+	model.InitChannelCache()
+	now := time.Now()
+	routinghotcache.SetChannelBalanceUnavailableForTest(411, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
+		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       now.UnixMilli(),
+	})
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	selected, err := getRandomSatisfiedChannelForRequest(&RetryParam{
+		Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test", RequestPath: "/v1/chat/completions",
+	}, "default", 0)
+
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, 412, selected.Id)
 }
 
 func TestGetAdmissibleAffinityChannelRejectsPreferredFilteredBySmartRouting(t *testing.T) {
@@ -1188,165 +1375,6 @@ func TestGetAdmissibleAffinityChannelRejectsPreferredFilteredBySmartRouting(t *t
 	assert.Equal(t, "default", group)
 }
 
-func TestRoutingCostForRequestUsesPromptProxyAndEstimatedOutput(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(ctx, constant.ContextKeyRoutingPromptProxy, 1000)
-	common.SetContextKey(ctx, constant.ContextKeyRoutingEstimatedOutput, 200)
-
-	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
-		Known:           true,
-		Confidence:      model.RoutingCostConfidenceFull,
-		QuotaType:       0,
-		GroupRatio:      1.5,
-		BaseRatio:       2,
-		CompletionRatio: 3,
-		UpdatedUnix:     common.GetTimestamp(),
-	})
-
-	require.NotNil(t, cost)
-	assert.True(t, cost.Known)
-	assert.InDelta(t, 0.0096, cost.Cost, 0.000001)
-}
-
-func TestRoutingCostForRequestUsesPerRequestPrice(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-
-	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
-		Known:       true,
-		Confidence:  model.RoutingCostConfidenceFull,
-		QuotaType:   1,
-		GroupRatio:  1.5,
-		ModelPrice:  0.25,
-		UpdatedUnix: common.GetTimestamp(),
-	})
-
-	require.NotNil(t, cost)
-	assert.True(t, cost.Known)
-	assert.Equal(t, 0.375, cost.Cost)
-}
-
-func TestRoutingCostForRequestPreservesExplicitFreeGroupRatio(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	routinghotcache.ResetForTest()
-	t.Cleanup(routinghotcache.ResetForTest)
-	pricingJSON := `{"quota_type":1,"billing_mode":"per_request","currency":"USD","unit":"request","group_ratio":0,"model_price":0.25,"per_request_cost":0.25,"tiers":{},"extras":{}}`
-	routinghotcache.LoadCostSnapshots([]model.RoutingCostSnapshot{{
-		ChannelID: 999, ModelName: "free-model", SnapshotTS: common.GetTimestamp(),
-		Confidence: model.RoutingCostConfidenceFull, GroupRatio: 0, ModelPrice: 0.25,
-		PricingHash: strings.Repeat("f", 64), PricingJSON: &pricingJSON,
-	}})
-	snapshot, ok := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 999, Model: "free-model"})
-	require.True(t, ok)
-
-	cost := routingCostForRequest(ctx, snapshot)
-
-	require.NotNil(t, cost)
-	assert.True(t, cost.Known)
-	assert.Zero(t, cost.Cost)
-}
-
-func TestRoutingCostForRequestPreservesExplicitZeroCompletionRatio(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(ctx, constant.ContextKeyRoutingPromptProxy, 1_000)
-	common.SetContextKey(ctx, constant.ContextKeyRoutingEstimatedOutput, 200)
-	groupRatio := 1.0
-	baseRatio := 2.0
-	completionRatio := 0.0
-	inputCost := 4.0
-	outputCost := 0.0
-
-	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
-		Known:           true,
-		Confidence:      model.RoutingCostConfidenceFull,
-		QuotaType:       0,
-		GroupRatio:      groupRatio,
-		BaseRatio:       baseRatio,
-		CompletionRatio: completionRatio,
-		UpdatedUnix:     common.GetTimestamp(),
-		PricingKnown:    true,
-		Pricing: model.RoutingNormalizedPricing{
-			QuotaType: 0, BillingMode: "token", Currency: "USD", GroupRatio: &groupRatio,
-			BaseRatio: &baseRatio, CompletionRatio: &completionRatio,
-			InputCostPerMillion: &inputCost, OutputCostPerMillion: &outputCost,
-		},
-	})
-
-	require.NotNil(t, cost)
-	assert.True(t, cost.Known)
-	assert.InDelta(t, 0.004, cost.Cost, 1e-12)
-}
-
-func TestRoutingCostForRequestDoesNotInheritExplicitZeroCachePrice(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	groupRatio := 1.0
-	inputCost := 4.0
-	cacheReadCost := 0.0
-	common.SetContextKey(ctx, constant.ContextKeyRoutingCostProfile, &model.RoutingCostRequestProfile{
-		CacheReadTokens:        1_000,
-		MaxAttempts:            1,
-		KnowledgeSpecified:     true,
-		InputTokensKnown:       true,
-		MaximumCompletionKnown: true,
-		CacheTokensKnown:       true,
-		MediaDimensionsKnown:   true,
-		RequestInputKnown:      true,
-	})
-
-	cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
-		Known:        true,
-		Confidence:   model.RoutingCostConfidenceFull,
-		QuotaType:    0,
-		GroupRatio:   groupRatio,
-		BaseRatio:    2,
-		UpdatedUnix:  common.GetTimestamp(),
-		PricingKnown: true,
-		Pricing: model.RoutingNormalizedPricing{
-			QuotaType: 0, BillingMode: "token", Currency: "USD", GroupRatio: &groupRatio,
-			InputCostPerMillion: &inputCost, CacheReadCostPerMillion: &cacheReadCost,
-		},
-	})
-
-	require.NotNil(t, cost)
-	assert.True(t, cost.Known)
-	assert.Zero(t, cost.Cost)
-}
-
-func TestRoutingCostForRequestFailsClosedForLegacyConnectorPricingWithoutContractMetadata(t *testing.T) {
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(ctx, constant.ContextKeyRoutingCostProfile, &model.RoutingCostRequestProfile{
-		PromptTokens: 1_000, MaximumPromptTokens: 1_000,
-		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
-		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
-		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
-		RequestPricingFeaturesKnown: true,
-	})
-	groupRatio := 1.0
-	inputCost := 2.0
-	outputCost := 10.0
-	for _, sourceType := range []string{
-		model.RoutingUpstreamTypeNewAPI,
-		model.RoutingUpstreamTypeSub2API,
-	} {
-		t.Run(sourceType, func(t *testing.T) {
-			cost := routingCostForRequest(ctx, routinghotcache.CostSnapshot{
-				Known: true, Confidence: model.RoutingCostConfidenceFull,
-				UpdatedUnix: common.GetTimestamp(), PricingKnown: true,
-				AccountSourceType: sourceType,
-				Pricing: model.RoutingNormalizedPricing{
-					QuotaType: 0, BillingMode: "token", Currency: "USD",
-					GroupRatio: &groupRatio, InputCostPerMillion: &inputCost,
-					OutputCostPerMillion: &outputCost,
-				},
-			})
-
-			require.NotNil(t, cost)
-			assert.False(t, cost.Known)
-			assert.Zero(t, cost.Cost)
-		})
-	}
-}
-
 func TestMarkRoutingTriedTracksExcludedChannelsAndSwitchCount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -1365,21 +1393,25 @@ func TestMarkRoutingTriedTracksExcludedChannelsAndSwitchCount(t *testing.T) {
 }
 
 func TestFilterSmartRoutingExcludedCandidatesHonorsSwitchLimit(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	candidates := []routingselector.Candidate{
 		{Channel: &model.Channel{Id: 1}},
 		{Channel: &model.Channel{Id: 2}},
 		{Channel: &model.Channel{Id: 3}},
 	}
 
-	filtered := filterSmartRoutingExcludedCandidates(candidates, map[int]struct{}{1: {}}, 0, 2)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingExcludedChannels, map[int]struct{}{1: {}})
+	filtered := filterSmartRoutingExcludedCandidates(ctx, "default", candidates, 0, 2)
 	require.Len(t, filtered, 2)
 	assert.Equal(t, 2, filtered[0].Channel.Id)
 
-	filtered = filterSmartRoutingExcludedCandidates(candidates, map[int]struct{}{1: {}, 2: {}}, 1, 2)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingExcludedChannels, map[int]struct{}{1: {}, 2: {}})
+	filtered = filterSmartRoutingExcludedCandidates(ctx, "default", candidates, 1, 2)
 	require.Len(t, filtered, 1)
 	assert.Equal(t, 3, filtered[0].Channel.Id)
 
-	filtered = filterSmartRoutingExcludedCandidates(candidates, map[int]struct{}{1: {}, 2: {}, 3: {}}, 2, 2)
+	common.SetContextKey(ctx, constant.ContextKeyRoutingExcludedChannels, map[int]struct{}{1: {}, 2: {}, 3: {}})
+	filtered = filterSmartRoutingExcludedCandidates(ctx, "default", candidates, 2, 2)
 	assert.Empty(t, filtered)
 }
 

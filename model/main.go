@@ -33,9 +33,13 @@ var logKeyCol = "`key`"
 var logGroupCol = "`group`"
 
 const (
-	routingV2AlphaDrainedEnv         = "ROUTING_V2_ALPHA_DRAINED"
+	routingAlphaDrainedEnv           = "ROUTING_ALPHA_DRAINED"
 	routingSchemaReadyWaitSecondsEnv = "ROUTING_SCHEMA_READY_WAIT_SECONDS"
 	routingSchemaReadyWaitDefault    = 60
+)
+
+var ErrRoutingRetirementAlphaDrainRequired = errors.New(
+	"legacy routing alpha nodes, connector workers, and telemetry must be drained before retirement",
 )
 
 func initCol() {
@@ -190,9 +194,6 @@ func chooseDB(envName string, isLog bool) (*gorm.DB, common.DatabaseType, error)
 }
 
 func InitDB() (err error) {
-	if err := ValidateRoutingCredentialEncryptionConfiguration(); err != nil {
-		return err
-	}
 	db, dbType, err := chooseDB("SQL_DSN", false)
 	if err == nil {
 		common.SetMainDatabaseType(dbType)
@@ -219,7 +220,7 @@ func InitDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
-			if err := waitRoutingV2SchemaReady(DB); err != nil {
+			if err := waitRoutingSchemaReady(DB); err != nil {
 				return err
 			}
 			if err := waitAsyncBillingV2SchemaReadyFromEnv(); err != nil {
@@ -287,7 +288,7 @@ func InitLogDB() (err error) {
 }
 
 func migrateDB() error {
-	if err := invalidateRoutingV2SchemaVersion(DB); err != nil {
+	if err := invalidateRoutingSchemaVersion(DB); err != nil {
 		return err
 	}
 	// Migrate price_amount column from float/double to decimal for existing tables
@@ -375,13 +376,12 @@ func migrateDB() error {
 		&RoutingAuditExport{},
 		&RoutingAuditExportChunk{},
 		&RoutingHedgeAttemptAudit{},
-		&RoutingUpstreamAccount{},
-		&RoutingUpstreamAccountHealthState{},
 		&RoutingRuntimeSettingsState{},
 		&RoutingControlAudit{},
 		&RoutingCostSnapshotVersion{},
-		&RoutingChannelBinding{},
-		&RoutingCostSnapshot{},
+		&RoutingConfigurationEpoch{},
+		&RoutingChannelConfiguration{},
+		&RoutingChannelConfigurationOutbox{},
 		&RoutingChannelMetric{},
 		&RoutingTelemetryReceipt{},
 		&RoutingBreakerState{},
@@ -395,6 +395,9 @@ func migrateDB() error {
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := migrateRequestProfileEnabledOption(DB); err != nil {
 		return err
 	}
 	if err := ensureAsyncBillingManualResolutionUniqueIndex(DB); err != nil {
@@ -412,16 +415,13 @@ func migrateDB() error {
 	if err := EnsureChannelRoutingGenerations(DB); err != nil {
 		return err
 	}
-	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
+	if err := migrateRoutingDedicatedSchemas(DB); err != nil {
 		return err
 	}
 	if err := ensureRoutingOperationRequestKeyUniqueIndex(DB); err != nil {
 		return err
 	}
 	if err := EnsureRoutingPolicyHead(); err != nil {
-		return err
-	}
-	if err := migrateRoutingCostSnapshotModelKeys(DB); err != nil {
 		return err
 	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -433,11 +433,11 @@ func migrateDB() error {
 			return err
 		}
 	}
-	return publishRoutingV2SchemaVersion(DB)
+	return publishRoutingSchemaVersion(DB)
 }
 
 func migrateDBFast() error {
-	if err := invalidateRoutingV2SchemaVersion(DB); err != nil {
+	if err := invalidateRoutingSchemaVersion(DB); err != nil {
 		return err
 	}
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
@@ -524,13 +524,12 @@ func migrateDBFast() error {
 		{&RoutingAuditExport{}, "RoutingAuditExport"},
 		{&RoutingAuditExportChunk{}, "RoutingAuditExportChunk"},
 		{&RoutingHedgeAttemptAudit{}, "RoutingHedgeAttemptAudit"},
-		{&RoutingUpstreamAccount{}, "RoutingUpstreamAccount"},
-		{&RoutingUpstreamAccountHealthState{}, "RoutingUpstreamAccountHealthState"},
 		{&RoutingRuntimeSettingsState{}, "RoutingRuntimeSettingsState"},
 		{&RoutingControlAudit{}, "RoutingControlAudit"},
 		{&RoutingCostSnapshotVersion{}, "RoutingCostSnapshotVersion"},
-		{&RoutingChannelBinding{}, "RoutingChannelBinding"},
-		{&RoutingCostSnapshot{}, "RoutingCostSnapshot"},
+		{&RoutingConfigurationEpoch{}, "RoutingConfigurationEpoch"},
+		{&RoutingChannelConfiguration{}, "RoutingChannelConfiguration"},
+		{&RoutingChannelConfigurationOutbox{}, "RoutingChannelConfigurationOutbox"},
 		{&RoutingChannelMetric{}, "RoutingChannelMetric"},
 		{&RoutingTelemetryReceipt{}, "RoutingTelemetryReceipt"},
 		{&RoutingBreakerState{}, "RoutingBreakerState"},
@@ -564,6 +563,9 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := migrateRequestProfileEnabledOption(DB); err != nil {
+		return err
+	}
 	if err := ensureAsyncBillingManualResolutionUniqueIndex(DB); err != nil {
 		return err
 	}
@@ -579,16 +581,13 @@ func migrateDBFast() error {
 	if err := EnsureChannelRoutingGenerations(DB); err != nil {
 		return err
 	}
-	if err := migrateRoutingV2DedicatedSchemas(DB); err != nil {
+	if err := migrateRoutingDedicatedSchemas(DB); err != nil {
 		return err
 	}
 	if err := ensureRoutingOperationRequestKeyUniqueIndex(DB); err != nil {
 		return err
 	}
 	if err := EnsureRoutingPolicyHead(); err != nil {
-		return err
-	}
-	if err := migrateRoutingCostSnapshotModelKeys(DB); err != nil {
 		return err
 	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -600,49 +599,241 @@ func migrateDBFast() error {
 			return err
 		}
 	}
-	if err := publishRoutingV2SchemaVersion(DB); err != nil {
+	if err := publishRoutingSchemaVersion(DB); err != nil {
 		return err
 	}
 	common.SysLog("database migrated")
 	return nil
 }
 
-func migrateRoutingV2DedicatedSchemas(db *gorm.DB) error {
-	alphaV2Drained := common.GetEnvOrDefaultBool(routingV2AlphaDrainedEnv, false)
+func migrateRoutingDedicatedSchemas(db *gorm.DB) error {
+	alphaDrained := common.GetEnvOrDefaultBool(routingAlphaDrainedEnv, false)
+	// General schema preparation runs before this function, but every operation
+	// that can backfill, scrub, terminate, or contract retired routing state is
+	// fenced by this read-only preflight.
+	if err := validateRoutingRetirementCutover(db, alphaDrained); err != nil {
+		return routingMigrationError("routing retirement preflight", err)
+	}
+	if db.Migrator().HasTable(&Channel{}) && db.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+		if err := EnsureRoutingConfigurationEpoch(db); err != nil {
+			return routingMigrationError("routing configuration epoch", err)
+		}
+		if err := MigrateRoutingChannelConfigurations(db); err != nil {
+			return routingMigrationError("routing channel configurations", err)
+		}
+		if _, err := retireRoutingUpstreamAccountConnectorsDB(context.Background(), db); err != nil {
+			return routingMigrationError("retire routing upstream account connectors", err)
+		}
+	}
 	if err := migrateRoutingOperationStateInvariants(db); err != nil {
-		return routingV2MigrationError("routing operation invariants", err)
+		return routingMigrationError("routing operation invariants", err)
 	}
-	rollupOptions := RoutingMetricRollupMigrationOptions{AlphaV2Drained: alphaV2Drained}
+	if err := retireRoutingCostSyncWork(db); err != nil {
+		return routingMigrationError("retire routing cost sync work", err)
+	}
+	rollupOptions := RoutingMetricRollupMigrationOptions{AlphaDrained: alphaDrained}
 	if err := MigrateRoutingMetricRollupRevisionKeyWithOptions(db, rollupOptions); err != nil {
-		return routingV2MigrationError("routing metric rollup", err)
+		return routingMigrationError("routing metric rollup", err)
 	}
-	errorBudgetOptions := RoutingErrorBudgetMigrationOptions{AlphaV2Drained: alphaV2Drained}
+	errorBudgetOptions := RoutingErrorBudgetMigrationOptions{AlphaDrained: alphaDrained}
 	if err := MigrateRoutingErrorBudgetModelsWithOptions(db, errorBudgetOptions); err != nil {
-		return routingV2MigrationError("routing error budget", err)
+		return routingMigrationError("routing error budget", err)
 	}
 	if err := MigrateRoutingPolicyApprovalIntentIndexes(db); err != nil {
-		return routingV2MigrationError("routing policy approval indexes", err)
+		return routingMigrationError("routing policy approval indexes", err)
 	}
 	return nil
 }
 
-func waitRoutingV2SchemaReady(db *gorm.DB) error {
+// validateRoutingRetirementCutover is deliberately read-only. The drain flag
+// acknowledges a one-time cutover: once all legacy indexes and mutable
+// connector/work state have converged, later restarts do not need to keep it.
+func validateRoutingRetirementCutover(db *gorm.DB, alphaDrained bool) error {
+	if db == nil || db.Dialector == nil {
+		return ErrRoutingSchemaNotReady
+	}
+
+	drainReasons := make([]string, 0, 10)
+	legacyRollupColumns := []string{"member_id", "credential_id", "model_key", "bucket_ts"}
+	revisionRollupColumns := []string{
+		"member_id", "credential_id", "model_key", "bucket_ts", "last_snapshot_revision",
+	}
+	columns, unique, exists, err := routingMetricRollupIndexDefinition(db, routingMetricRollupLegacyUniqueIndex)
+	if err != nil {
+		return fmt.Errorf("inspect legacy routing metric rollup index: %w", err)
+	}
+	if exists {
+		switch {
+		case unique && routingMetricRollupIndexColumnsEqual(columns, legacyRollupColumns):
+			drainReasons = append(drainReasons, "legacy routing metric rollup writers")
+		case !unique || !routingMetricRollupIndexColumnsEqual(columns, revisionRollupColumns):
+			return fmt.Errorf(
+				"routing metric rollup index %s has unexpected definition",
+				routingMetricRollupLegacyUniqueIndex,
+			)
+		}
+	}
+
+	columns, unique, exists, err = routingErrorBudgetIndexDefinition(
+		db, (RoutingErrorBudgetState{}).TableName(), routingErrorBudgetLegacyPoolIndex,
+	)
+	if err != nil {
+		return fmt.Errorf("inspect legacy routing error budget index: %w", err)
+	}
+	if exists {
+		if !unique || !routingErrorBudgetIndexColumnsEqual(columns, []string{"pool_id"}) {
+			return fmt.Errorf(
+				"routing error budget index %s has unexpected definition",
+				routingErrorBudgetLegacyPoolIndex,
+			)
+		}
+		drainReasons = append(drainReasons, "legacy routing error budget writers")
+	}
+
+	for _, table := range []struct {
+		model   any
+		name    string
+		columns []retiredRoutingColumnScrub
+		reason  string
+	}{
+		{
+			model: &RoutingChannelBinding{}, name: (RoutingChannelBinding{}).TableName(),
+			columns: retiredRoutingChannelBindingScrubs(), reason: "active legacy routing channel bindings",
+		},
+		{
+			model: &RoutingUpstreamAccount{}, name: (RoutingUpstreamAccount{}).TableName(),
+			columns: retiredRoutingUpstreamAccountScrubs(), reason: "active legacy routing upstream accounts",
+		},
+		{
+			model: &RoutingChannelHealthState{}, name: (RoutingChannelHealthState{}).TableName(),
+			columns: retiredRoutingChannelBalanceScrubs(), reason: "legacy connector channel balance state",
+		},
+		{
+			model: &RoutingCostSnapshot{}, name: (RoutingCostSnapshot{}).TableName(),
+			columns: retiredRoutingCostSnapshotAccountScrubs(), reason: "legacy cost snapshot account state",
+		},
+	} {
+		if !db.Migrator().HasTable(table.name) {
+			continue
+		}
+		pending, err := routingRetirementTableNeedsScrub(db, table.model, table.name, table.columns)
+		if err != nil {
+			return fmt.Errorf("inspect %s retirement state: %w", table.name, err)
+		}
+		if pending {
+			drainReasons = append(drainReasons, table.reason)
+		}
+	}
+	if db.Migrator().HasTable(retiredRoutingUpstreamAccountHealthTable) {
+		var pendingHealth struct {
+			Present int `gorm:"column:present"`
+		}
+		if err := db.Table(retiredRoutingUpstreamAccountHealthTable).
+			Select("1 AS present").Limit(1).Scan(&pendingHealth).Error; err != nil {
+			return fmt.Errorf("inspect legacy routing upstream account health: %w", err)
+		}
+		if pendingHealth.Present == 1 {
+			drainReasons = append(drainReasons, "legacy routing upstream account health")
+		}
+	}
+
+	if db.Migrator().HasTable(&RoutingOperation{}) {
+		var operationIDs []int64
+		if err := db.Model(&RoutingOperation{}).
+			Where("operation_type = ? AND status IN ?", RoutingOperationTypeCostSync, []RoutingOperationStatus{
+				RoutingOperationStatusPending,
+				RoutingOperationStatusRunning,
+			}).Limit(1).Pluck("id", &operationIDs).Error; err != nil {
+			return fmt.Errorf("inspect legacy routing cost sync operations: %w", err)
+		}
+		if len(operationIDs) != 0 {
+			drainReasons = append(drainReasons, "active routing cost sync operations")
+		}
+	}
+	if db.Migrator().HasTable(&SystemTask{}) {
+		var taskIDs []int64
+		if err := db.Model(&SystemTask{}).
+			Where("type = ? AND status IN ?", SystemTaskTypeRoutingCostSync, []SystemTaskStatus{
+				SystemTaskStatusPending,
+				SystemTaskStatusRunning,
+			}).Limit(1).Pluck("id", &taskIDs).Error; err != nil {
+			return fmt.Errorf("inspect legacy routing cost sync tasks: %w", err)
+		}
+		if len(taskIDs) != 0 {
+			drainReasons = append(drainReasons, "active routing cost sync tasks")
+		}
+	}
+	if db.Migrator().HasTable(&SystemTaskLock{}) {
+		var lockTypes []string
+		if err := db.Model(&SystemTaskLock{}).
+			Where("type = ?", SystemTaskTypeRoutingCostSync).
+			Limit(1).Pluck("type", &lockTypes).Error; err != nil {
+			return fmt.Errorf("inspect legacy routing cost sync locks: %w", err)
+		}
+		if len(lockTypes) != 0 {
+			drainReasons = append(drainReasons, "routing cost sync task locks")
+		}
+	}
+
+	if !alphaDrained && len(drainReasons) != 0 {
+		return fmt.Errorf(
+			"%w: %s",
+			ErrRoutingRetirementAlphaDrainRequired,
+			strings.Join(drainReasons, ", "),
+		)
+	}
+	return nil
+}
+
+func routingRetirementTableNeedsScrub(
+	db *gorm.DB,
+	tableModel any,
+	tableName string,
+	columns []retiredRoutingColumnScrub,
+) (bool, error) {
+	if db == nil || db.Dialector == nil || tableModel == nil || tableName == "" {
+		return false, ErrRoutingSchemaNotReady
+	}
+	predicates := make([]string, 0, len(columns))
+	args := make([]any, 0, len(columns))
+	for _, column := range columns {
+		if column.column == "" || column.predicate == "" || !db.Migrator().HasColumn(tableModel, column.column) {
+			continue
+		}
+		predicates = append(predicates, "("+column.predicate+")")
+		args = append(args, column.args...)
+	}
+	if len(predicates) == 0 {
+		return false, nil
+	}
+	var pending struct {
+		Present int `gorm:"column:present"`
+	}
+	if err := db.Table(tableName).Select("1 AS present").
+		Where(strings.Join(predicates, " OR "), args...).Limit(1).Scan(&pending).Error; err != nil {
+		return false, err
+	}
+	return pending.Present == 1, nil
+}
+
+func waitRoutingSchemaReady(db *gorm.DB) error {
 	waitSeconds := common.GetEnvOrDefault(routingSchemaReadyWaitSecondsEnv, routingSchemaReadyWaitDefault)
 	if waitSeconds < 0 {
 		return fmt.Errorf("%s must be non-negative", routingSchemaReadyWaitSecondsEnv)
 	}
-	if err := WaitRoutingV2SchemaReady(context.Background(), db, time.Duration(waitSeconds)*time.Second); err != nil {
-		return fmt.Errorf("wait for channel routing v2 schema version %s: %w", routingV2SchemaVersion, err)
+	if err := WaitRoutingSchemaReady(context.Background(), db, time.Duration(waitSeconds)*time.Second); err != nil {
+		return fmt.Errorf("wait for channel routing schema version %s: %w", routingSchemaVersion, err)
 	}
 	return nil
 }
 
-func routingV2MigrationError(component string, err error) error {
-	if errors.Is(err, ErrRoutingMetricRollupAlphaDrainRequired) ||
+func routingMigrationError(component string, err error) error {
+	if errors.Is(err, ErrRoutingRetirementAlphaDrainRequired) ||
+		errors.Is(err, ErrRoutingMetricRollupAlphaDrainRequired) ||
 		errors.Is(err, ErrRoutingErrorBudgetAlphaDrainRequired) {
 		return fmt.Errorf(
-			"migrate %s: %w; stop all pre-v3 routing alpha nodes, drain Redis telemetry stream routing:v2:telemetry, then set %s=true",
-			component, err, routingV2AlphaDrainedEnv,
+			"migrate %s: %w; stop all legacy routing alpha nodes and connector workers, drain legacy Redis telemetry stream routing:v2:telemetry, then set %s=true",
+			component, err, routingAlphaDrainedEnv,
 		)
 	}
 	return fmt.Errorf("migrate %s: %w", component, err)
