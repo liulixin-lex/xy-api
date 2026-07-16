@@ -133,13 +133,13 @@ func GetRandomSatisfiedChannelWithEligibility(
 
 	// First, try to find channels with the exact model name.
 	channels := filterChannelsByRequestPath(group2model2channels[group][model], requestPath)
-	channels = eligibleChannelIDs(channels, eligible)
+	channels = automaticEligibleChannelIDs(channels, eligible)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.FormatMatchingModelName(model)
 		channels = filterChannelsByRequestPath(group2model2channels[group][normalizedModel], requestPath)
-		channels = eligibleChannelIDs(channels, eligible)
+		channels = automaticEligibleChannelIDs(channels, eligible)
 	}
 
 	if len(channels) == 0 {
@@ -190,16 +190,10 @@ func GetRandomSatisfiedChannelWithEligibility(
 		return nil, errors.New(fmt.Sprintf("no channel found, group: %s, model: %s, priority: %d", group, model, targetPriority))
 	}
 
-	// smoothing factor and adjustment
+	// Keep small positive weights distinguishable without ever reviving a
+	// channel whose administrator explicitly paused automatic traffic at 0.
 	smoothingFactor := 1
-	smoothingAdjustment := 0
-
-	if sumWeight == 0 {
-		// when all channels have weight 0, set sumWeight to the number of channels and set smoothing adjustment to 100
-		// each channel's effective weight = 100
-		sumWeight = len(targetChannels) * 100
-		smoothingAdjustment = 100
-	} else if sumWeight/len(targetChannels) < 10 {
+	if sumWeight/len(targetChannels) < 10 {
 		// when the average weight is less than 10, set smoothing factor to 100
 		smoothingFactor = 100
 	}
@@ -212,7 +206,7 @@ func GetRandomSatisfiedChannelWithEligibility(
 
 	// Find a channel based on its weight
 	for _, channel := range targetChannels {
-		randomWeight -= channel.GetWeight()*smoothingFactor + smoothingAdjustment
+		randomWeight -= channel.GetWeight() * smoothingFactor
 		if randomWeight < 0 {
 			return channel, nil
 		}
@@ -221,17 +215,24 @@ func GetRandomSatisfiedChannelWithEligibility(
 	return nil, errors.New("channel not found")
 }
 
-// eligibleChannelIDs must be called while channelSyncLock is read-locked.
-func eligibleChannelIDs(channelIDs []int, eligible ChannelEligibility) []int {
-	if eligible == nil || len(channelIDs) == 0 {
+// automaticEligibleChannelIDs must be called while channelSyncLock is
+// read-locked. A zero weight is an explicit pause for every automatic routing
+// mode; direct channel selection does not use this helper.
+func automaticEligibleChannelIDs(channelIDs []int, eligible ChannelEligibility) []int {
+	if len(channelIDs) == 0 {
 		return channelIDs
 	}
 	filtered := make([]int, 0, len(channelIDs))
 	for _, channelID := range channelIDs {
 		channel, ok := channelsIDM[channelID]
-		if !ok || eligible(channel) {
+		if !ok {
 			filtered = append(filtered, channelID)
+			continue
 		}
+		if channel.GetWeight() <= 0 || (eligible != nil && !eligible(channel)) {
+			continue
+		}
+		filtered = append(filtered, channelID)
 	}
 	return filtered
 }
@@ -259,7 +260,9 @@ func GetRankedSatisfiedChannels(group string, model string, requestPath string) 
 		if !ok {
 			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
 		}
-		result = append(result, channel)
+		if channel.GetWeight() > 0 {
+			result = append(result, channel)
+		}
 	}
 	return result, nil
 }

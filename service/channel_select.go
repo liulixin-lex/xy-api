@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	routingerror "github.com/QuantumNous/new-api/pkg/routing_error"
 	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	routingmetrics "github.com/QuantumNous/new-api/pkg/routing_metrics"
 	"github.com/QuantumNous/new-api/service/channelrouting"
@@ -59,6 +60,29 @@ func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
 }
 
+func autoGroupPriorityRetry(c *gin.Context, globalRetry int) int {
+	if globalRetry < 0 {
+		globalRetry = 0
+	}
+	if c == nil {
+		return globalRetry
+	}
+	startRetry := 0
+	if stored, exists := common.GetContextKey(c, constant.ContextKeyAutoGroupRetryIndex); exists {
+		if value, ok := stored.(int); ok && value >= 0 && value <= globalRetry {
+			startRetry = value
+		}
+	}
+	return globalRetry - startRetry
+}
+
+func beginAutoGroupAtRetry(c *gin.Context, globalRetry int) {
+	if c == nil {
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyAutoGroupRetryIndex, max(globalRetry, 0))
+}
+
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
 // 尝试获取一个满足要求的随机渠道。
 //
@@ -96,11 +120,16 @@ func (p *RetryParam) ResetRetryNextTry() {
 //	         分组B, 优先级1
 func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
 	smartSetting := smart_routing_setting.GetSetting()
-	if channel, selectGroup, handled, err := cacheGetChannelRoutingCanary(param, smartSetting); handled {
-		return channel, selectGroup, err
+	effectiveMode := smart_routing_setting.ResolveEffectiveMode(smartSetting)
+	if effectiveMode.AllowsEnterpriseFeatures() {
+		if channel, selectGroup, handled, err := cacheGetChannelRoutingCanary(param, smartSetting); handled {
+			return channel, selectGroup, err
+		}
 	}
-	if channel, selectGroup, handled, err := cacheGetChannelRoutingBalanced(param, smartSetting); handled {
-		return channel, selectGroup, err
+	if effectiveMode.AllowsBalancedDataPlane() {
+		if channel, selectGroup, handled, err := cacheGetChannelRoutingBalanced(param, smartSetting); handled {
+			return channel, selectGroup, err
+		}
 	}
 	if shouldActivateSmartRouting(smartSetting) {
 		channel, selectGroup, handled, err := cacheGetSmartSatisfiedChannel(param, smartSetting)
@@ -124,13 +153,15 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 
 func RecordChannelRoutingObserveSelection(param *RetryParam, actualGroup string, actual *model.Channel, retryIndex int) {
 	setting := smart_routing_setting.GetSetting()
-	if param == nil || !shouldObserveSmartRouting(setting) {
+	effectiveMode := smart_routing_setting.ResolveEffectiveMode(setting)
+	if param == nil || !common.MemoryCacheEnabled ||
+		(!effectiveMode.RecordsObserveDecision() && !effectiveMode.RecordsShadowDecision()) {
 		return
 	}
 	if param.Ctx != nil {
 		common.SetContextKey(param.Ctx, constant.ContextKeyRoutingObserveDecision, nil)
 	}
-	if recordChannelRoutingShadowAudit(param, actualGroup, actual, retryIndex) {
+	if effectiveMode.RecordsShadowDecision() && recordChannelRoutingShadowAudit(param, actualGroup, actual, retryIndex) {
 		return
 	}
 	if actual != nil && actualGroup != "" && actualGroup != "auto" {
@@ -238,10 +269,11 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 			autoGroup := autoGroups[i]
 			// Calculate priorityRetry for current group
 			// 计算当前分组的 priorityRetry
-			priorityRetry := param.GetRetry()
+			priorityRetry := autoGroupPriorityRetry(param.Ctx, param.GetRetry())
 			// If moved to a new group, reset priorityRetry and update startRetryIndex
 			// 如果切换到新分组，重置 priorityRetry 并更新 startRetryIndex
 			if i > startGroupIndex {
+				beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 				priorityRetry = 0
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
@@ -253,10 +285,7 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 				logger.LogDebug(param.Ctx, "No available channel in group %s for model %s at priorityRetry %d, trying next group", autoGroup, param.ModelName, priorityRetry)
 				// 重置状态以尝试下一个分组
 				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i+1)
-				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupRetryIndex, 0)
-				// Reset retry counter so outer loop can continue for next group
-				// 重置重试计数器，以便外层循环可以为下一个分组继续
-				param.SetRetry(0)
+				beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 				continue
 			}
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, autoGroup)
@@ -272,10 +301,7 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 				// 本次请求仍使用当前分组，但下次重试将使用下一个分组
 				logger.LogDebug(param.Ctx, "Current group %s retries exhausted (priorityRetry=%d >= RetryTimes=%d), preparing switch to next group for next retry", autoGroup, priorityRetry, common.RetryTimes)
 				common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, i+1)
-				// Reset retry counter so outer loop can continue for next group
-				// 重置重试计数器，以便外层循环可以为下一个分组继续
-				param.SetRetry(0)
-				param.ResetRetryNextTry()
+				beginAutoGroupAtRetry(param.Ctx, param.GetRetry()+1)
 			} else {
 				// Stay in current group, save current state
 				// 保持在当前分组，保存当前状态
@@ -293,23 +319,18 @@ func cacheGetRandomSatisfiedChannelLegacy(param *RetryParam) (*model.Channel, st
 }
 
 func shouldActivateSmartRouting(setting smart_routing_setting.SmartRoutingSetting) bool {
-	if !setting.Enabled {
-		return false
-	}
 	if !common.MemoryCacheEnabled {
 		return false
 	}
-	return setting.Mode == smart_routing_setting.ModeBalanced || setting.Mode == smart_routing_setting.ModeEnterpriseSLO
+	return smart_routing_setting.ResolveEffectiveMode(setting).AllowsBalancedDataPlane()
 }
 
 func shouldObserveSmartRouting(setting smart_routing_setting.SmartRoutingSetting) bool {
-	if !setting.Enabled {
-		return false
-	}
 	if !common.MemoryCacheEnabled {
 		return false
 	}
-	return setting.Mode == smart_routing_setting.ModeObserve || setting.Mode == smart_routing_setting.ModeShadow
+	mode := smart_routing_setting.ResolveEffectiveMode(setting)
+	return mode.RecordsObserveDecision() || mode.RecordsShadowDecision()
 }
 
 func recordSmartRoutingDecision(param *RetryParam, setting smart_routing_setting.SmartRoutingSetting) {
@@ -354,30 +375,30 @@ func cacheGetSmartSatisfiedChannel(param *RetryParam, smartSetting smart_routing
 
 	for i := startGroupIndex; i < len(autoGroups); i++ {
 		autoGroup := autoGroups[i]
-		priorityRetry := param.GetRetry()
+		priorityRetry := autoGroupPriorityRetry(param.Ctx, param.GetRetry())
 		if i > startGroupIndex {
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			priorityRetry = 0
 		}
-		logger.LogDebug(param.Ctx, "Smart routing auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
+		logger.LogDebug(param.Ctx, "Channel routing auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
 		channel, err := selectSmartChannelForGroup(param, autoGroup, smartSetting, true)
 		if err != nil {
 			return nil, autoGroup, true, err
 		}
 		if channel == nil {
-			logger.LogDebug(param.Ctx, "Smart routing found no available channel in group %s for model %s, trying next group", autoGroup, param.ModelName)
+			logger.LogDebug(param.Ctx, "Channel routing found no available channel in group %s for model %s, trying next group", autoGroup, param.ModelName)
 			common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAutoGroupIndex, i+1)
-			param.SetRetry(0)
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			continue
 		}
 
 		common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, autoGroup)
 		selectGroup = autoGroup
 		if crossGroupRetry && priorityRetry >= common.RetryTimes {
-			logger.LogDebug(param.Ctx, "Smart routing group %s retries exhausted (priorityRetry=%d >= RetryTimes=%d), preparing switch to next group", autoGroup, priorityRetry, common.RetryTimes)
+			logger.LogDebug(param.Ctx, "Channel routing group %s retries exhausted (priorityRetry=%d >= RetryTimes=%d), preparing switch to next group", autoGroup, priorityRetry, common.RetryTimes)
 			common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAutoGroupIndex, i+1)
-			param.SetRetry(0)
-			param.ResetRetryNextTry()
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry()+1)
 		} else {
 			common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAutoGroupIndex, i)
 		}
@@ -393,7 +414,9 @@ func selectSmartChannelForGroup(param *RetryParam, group string, setting smart_r
 		return nil, err
 	}
 
-	filtered := filterSmartRoutingExcludedCandidates(candidates, smartRoutingExcludedChannelIDs(param.Ctx), smartRoutingSwitchCount(param.Ctx), setting.MaxSwitches)
+	filtered := filterSmartRoutingExcludedCandidates(
+		param.Ctx, group, candidates, smartRoutingSwitchCount(param.Ctx), setting.MaxSwitches,
+	)
 	if len(filtered) == 0 {
 		return nil, nil
 	}
@@ -530,7 +553,7 @@ func recordChannelRoutingObserveAudit(param *RetryParam, actualGroup string, act
 		GroupName:         evaluation.Group,
 		ModelName:         param.ModelName,
 		SnapshotRevision:  identitySnapshot.SnapshotRevision,
-		AlgorithmVersion:  channelrouting.DecisionAlgorithmObserveV1,
+		AlgorithmVersion:  channelrouting.DecisionAlgorithmLegacy,
 		RetryIndex:        retryIndex,
 		IsStream:          common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 		ActualChannelID:   actualChannelID,
@@ -854,7 +877,7 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				refreshed := append([]routingselector.Candidate(nil), candidates...)
 				for i := range refreshed {
 					refreshed[i].Capacity = nil
-					if refreshed[i].Channel == nil || refreshed[i].Channel.ChannelInfo.IsMultiKey {
+					if refreshed[i].Channel == nil {
 						continue
 					}
 					cacheKey := routinghotcache.Key{
@@ -863,7 +886,10 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 						Model:       param.ModelName,
 						Group:       group,
 					}
-					refreshed[i].Capacity = routingCapacityForKey(cacheKey)
+					refreshed[i].Capacity = routingCapacityForKey(
+						cacheKey,
+						refreshed[i].Channel.ChannelInfo.IsMultiKey,
+					)
 				}
 				return refreshed, nil
 			}
@@ -895,10 +921,25 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 			Group:       group,
 		}
 		candidate := routingselector.Candidate{Channel: channel}
-		if cost, ok := routinghotcache.GetCost(cacheKey.CostKey()); ok {
-			candidate.Cost = routingCostForRequest(param.Ctx, cost)
+		candidate.Capacity = routingCapacityForKey(cacheKey, channel.ChannelInfo.IsMultiKey)
+		observation, _, observationKnown := channelrouting.ResolveObserveModelSnapshot(group, channel.Id, param.ModelName)
+		if observationKnown {
+			profile := routingCostRequestProfile(param.Ctx)
+			if profile == nil {
+				profile = &model.RoutingCostRequestProfile{MaxAttempts: 1}
+			}
+			estimate, exists, estimateErr := channelrouting.EstimateModelSnapshotRoutingCost(
+				observation, *profile, time.Now().Unix(),
+			)
+			if estimateErr != nil {
+				logger.LogWarn(param.Ctx, fmt.Sprintf("channel routing system cost unavailable for channel %d: %v", channel.Id, estimateErr))
+			} else if exists {
+				candidate.Cost = &routingselector.CostSnapshot{
+					Known: estimate.ExpectedKnown, Cost: estimate.ExpectedCost, UpdatedUnix: 0,
+				}
+			}
 		}
-		if observation, _, ok := channelrouting.ResolveObserveModelSnapshot(group, channel.Id, param.ModelName); useObserveSnapshot && ok && observation.MetricKnown {
+		if useObserveSnapshot && observationKnown && observation.MetricKnown {
 			candidate.Metric = &routingselector.MetricSnapshot{
 				RequestCount:            observation.RequestCount,
 				SuccessCount:            observation.SuccessCount,
@@ -923,7 +964,6 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 					}
 				}
 			}
-			candidate.Capacity = routingCapacityForKey(cacheKey)
 			inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
 				ChannelID:   channel.Id,
 				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
@@ -960,144 +1000,34 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 	return candidates, nil
 }
 
-func routingCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot) *routingselector.CostSnapshot {
-	cost := snapshot.Cost
-	known := snapshot.Known
-	if known && snapshot.PricingKnown {
-		if normalizedCost, normalizedKnown, attempted := routingNormalizedCostForRequest(c, snapshot); attempted {
-			return &routingselector.CostSnapshot{
-				Known:       normalizedKnown,
-				Cost:        normalizedCost,
-				UpdatedUnix: snapshot.UpdatedUnix,
-			}
-		}
+func routingCapacityForKey(
+	key routinghotcache.Key,
+	multiKey bool,
+) *routingselector.CapacityCooldownSnapshot {
+	capacity := routinghotcache.CapacityCooldownSnapshot{}
+	capacityKnown := false
+	if !multiKey {
+		capacity, capacityKnown = routinghotcache.GetCapacityCooldown(key)
 	}
-	if known {
-		switch routingBillingMode(snapshot) {
-		case "per_request":
-			if snapshot.ModelPrice > 0 {
-				cost = routingPositiveOrDefault(snapshot.GroupRatio, 1) * snapshot.ModelPrice
-			} else {
-				known = false
-			}
-		case "token", "":
-			cost = routingTokenCostForRequest(c, snapshot)
-			if cost <= 0 || math.IsNaN(cost) || math.IsInf(cost, 0) {
-				known = false
-			}
-		default:
-			if snapshot.GroupRatio > 0 {
-				cost = snapshot.GroupRatio
-			}
-		}
-	}
-	return &routingselector.CostSnapshot{
-		Known:       known,
-		Cost:        cost,
-		UpdatedUnix: snapshot.UpdatedUnix,
-	}
-}
-
-func routingNormalizedCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot) (float64, bool, bool) {
-	profile := routingCostRequestProfile(c)
-	if profile == nil {
-		promptTokens := 0
-		completionTokens := 0
-		if c != nil {
-			promptTokens = max(common.GetContextKeyInt(c, constant.ContextKeyRoutingPromptProxy), 0)
-			completionTokens = max(common.GetContextKeyInt(c, constant.ContextKeyRoutingEstimatedOutput), 0)
-		}
-		perRequest := snapshot.Pricing.PerRequestCost != nil ||
-			strings.EqualFold(strings.TrimSpace(snapshot.Pricing.BillingMode), "per_request")
-		freeGroup := snapshot.Pricing.GroupRatio != nil && *snapshot.Pricing.GroupRatio == 0
-		if promptTokens == 0 && !perRequest && !freeGroup {
-			return 0, false, false
-		}
-		if promptTokens > 0 && completionTokens == 0 {
-			completionTokens = int(math.Min(float64(promptTokens)*1.5, 512))
-		}
-		profile = &model.RoutingCostRequestProfile{
-			PromptTokens:             int64(promptTokens),
-			MaximumPromptTokens:      int64(promptTokens),
-			ExpectedCompletionTokens: int64(completionTokens),
-			MaximumCompletionTokens:  int64(completionTokens),
-			MaxAttempts:              1,
-		}
-	}
-
-	atUnix := snapshot.UpdatedUnix
-	if atUnix <= 0 {
-		atUnix = common.GetTimestamp()
-	}
-	estimate, err := model.EstimateRoutingCostSnapshot(model.RoutingCostSnapshotVersion{
-		SourceType:      snapshot.AccountSourceType,
-		ObservedTime:    atUnix - 1,
-		EffectiveTime:   atUnix - 1,
-		ExpiresTime:     atUnix + 3_600,
-		Confidence:      model.RoutingCostConfidenceFull,
-		ConfidenceScore: 1,
-		Freshness:       model.RoutingCostFreshnessFresh,
-		FreshnessScore:  1,
-	}, snapshot.Pricing, *profile, atUnix)
-	if err != nil || !estimate.ExpectedKnown || estimate.ExpectedCost < 0 ||
-		math.IsNaN(estimate.ExpectedCost) || math.IsInf(estimate.ExpectedCost, 0) {
-		return 0, false, true
-	}
-	return estimate.ExpectedCost, true, true
-}
-
-func routingCapacityForKey(key routinghotcache.Key) *routingselector.CapacityCooldownSnapshot {
-	capacity, ok := routinghotcache.GetCapacityCooldown(key)
-	if !ok {
+	channelCapacity, channelCapacityKnown := routinghotcache.GetChannelBalanceUnavailable(key.ChannelID)
+	if !capacityKnown && !channelCapacityKnown {
 		return nil
+	}
+	if channelCapacityKnown && (!capacityKnown ||
+		channelCapacity.CooldownUntilUnixMilli > capacity.CooldownUntilUnixMilli ||
+		(channelCapacity.CooldownUntilUnixMilli == capacity.CooldownUntilUnixMilli &&
+			channelCapacity.UpdatedUnixMilli >= capacity.UpdatedUnixMilli)) {
+		return &routingselector.CapacityCooldownSnapshot{
+			SourceStatusCode:       channelCapacity.SourceStatusCode,
+			CooldownUntilUnixMilli: channelCapacity.CooldownUntilUnixMilli,
+			UpdatedUnixMilli:       channelCapacity.UpdatedUnixMilli,
+		}
 	}
 	return &routingselector.CapacityCooldownSnapshot{
 		SourceStatusCode:       capacity.SourceStatusCode,
 		CooldownUntilUnixMilli: capacity.CooldownUntilUnixMilli,
 		UpdatedUnixMilli:       capacity.UpdatedUnixMilli,
 	}
-}
-
-func routingBillingMode(snapshot routinghotcache.CostSnapshot) string {
-	mode := strings.ToLower(strings.TrimSpace(snapshot.BillingMode))
-	if mode != "" {
-		return mode
-	}
-	if snapshot.QuotaType == 1 {
-		return "per_request"
-	}
-	return "token"
-}
-
-func routingTokenCostForRequest(c *gin.Context, snapshot routinghotcache.CostSnapshot) float64 {
-	groupRatio := routingPositiveOrDefault(snapshot.GroupRatio, 1)
-	if snapshot.BaseRatio <= 0 {
-		return groupRatio
-	}
-	promptProxy := common.GetContextKeyInt(c, constant.ContextKeyRoutingPromptProxy)
-	if promptProxy <= 0 {
-		return groupRatio
-	}
-	estimatedOutput := common.GetContextKeyInt(c, constant.ContextKeyRoutingEstimatedOutput)
-	if estimatedOutput <= 0 {
-		estimatedOutput = int(math.Min(float64(promptProxy)*1.5, 512))
-	}
-	if estimatedOutput < 0 {
-		estimatedOutput = 0
-	}
-	completionRatio := snapshot.CompletionRatio
-	if completionRatio <= 0 || math.IsNaN(completionRatio) || math.IsInf(completionRatio, 0) {
-		completionRatio = 1
-	}
-	rawCost := groupRatio * (float64(promptProxy)*snapshot.BaseRatio + float64(estimatedOutput)*snapshot.BaseRatio*completionRatio)
-	return rawCost / common.QuotaPerUnit
-}
-
-func routingPositiveOrDefault(value float64, fallback float64) float64 {
-	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return fallback
-	}
-	return value
 }
 
 func smartRoutingMemoKey(group string, modelName string, requestPath string) string {
@@ -1170,6 +1100,68 @@ func smartRoutingExcludedCredentialIDs(c *gin.Context) map[int]struct{} {
 	return excluded
 }
 
+func smartRoutingExcludedEndpointIdentities(c *gin.Context) map[string]channelrouting.RequestEndpointIdentity {
+	excluded := map[string]channelrouting.RequestEndpointIdentity{}
+	if c == nil {
+		return excluded
+	}
+	if stored, ok := common.GetContextKey(c, constant.ContextKeyRoutingExcludedEndpoints); ok {
+		if typed, valid := stored.(map[string]channelrouting.RequestEndpointIdentity); valid {
+			for key, identity := range typed {
+				if key != "" && identity.EndpointAuthority != "" && identity.Region != "" {
+					excluded[key] = identity
+				}
+			}
+		}
+	}
+	return excluded
+}
+
+func smartRoutingExcludedFailureDomainHashes(c *gin.Context) map[string]struct{} {
+	excluded := map[string]struct{}{}
+	if c == nil {
+		return excluded
+	}
+	if stored, ok := common.GetContextKey(c, constant.ContextKeyRoutingExcludedDomains); ok {
+		if typed, valid := stored.(map[string]struct{}); valid {
+			for hash := range typed {
+				hash = strings.ToLower(strings.TrimSpace(hash))
+				if hash != "" {
+					excluded[hash] = struct{}{}
+				}
+			}
+		}
+	}
+	return excluded
+}
+
+func smartRoutingExcludedEndpointList(c *gin.Context) []channelrouting.RequestEndpointIdentity {
+	set := smartRoutingExcludedEndpointIdentities(c)
+	result := make([]channelrouting.RequestEndpointIdentity, 0, len(set))
+	for _, identity := range set {
+		result = append(result, identity)
+	}
+	return result
+}
+
+func smartRoutingExcludedFailureDomainList(c *gin.Context) []string {
+	set := smartRoutingExcludedFailureDomainHashes(c)
+	result := make([]string, 0, len(set))
+	for hash := range set {
+		result = append(result, hash)
+	}
+	return result
+}
+
+func routingRequestEndpointIdentityKey(endpointAuthority string, region string) string {
+	endpointAuthority = strings.ToLower(strings.TrimSpace(endpointAuthority))
+	region = strings.ToLower(strings.TrimSpace(region))
+	if endpointAuthority == "" || region == "" {
+		return ""
+	}
+	return endpointAuthority + "\x00" + region
+}
+
 func smartRoutingSwitchCount(c *gin.Context) int {
 	if c == nil {
 		return 0
@@ -1196,18 +1188,87 @@ func MarkRoutingTargetTried(c *gin.Context, channelID int, credentialID int, mul
 	if c == nil || channelID <= 0 {
 		return 0
 	}
+	var switchCount int
 	if !multiKey || credentialID <= 0 {
+		switchCount = MarkRoutingTried(c, channelID)
+	} else {
+		excluded := smartRoutingExcludedCredentialIDs(c)
+		excluded[credentialID] = struct{}{}
+		common.SetContextKey(c, constant.ContextKeyRoutingExcludedCredentials, excluded)
+		switchCount = len(smartRoutingExcludedChannelIDs(c)) + len(excluded) - 1
+		if switchCount < 0 {
+			switchCount = 0
+		}
+		common.SetContextKey(c, constant.ContextKeyRoutingSwitchCount, switchCount)
+	}
+	return switchCount
+}
+
+func MarkRoutingTargetFailure(c *gin.Context, channelID int, scope routingerror.Scope) int {
+	if c == nil || channelID <= 0 {
+		return 0
+	}
+	switch scope {
+	case routingerror.ScopeEndpoint:
+		endpointAuthority := common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointAuthority)
+		region := common.GetContextKeyString(c, constant.ContextKeyRoutingRegion)
+		if endpointKey := routingRequestEndpointIdentityKey(endpointAuthority, region); endpointKey != "" {
+			excludedEndpoints := smartRoutingExcludedEndpointIdentities(c)
+			excludedEndpoints[endpointKey] = channelrouting.RequestEndpointIdentity{
+				EndpointAuthority: endpointAuthority,
+				Region:            region,
+			}
+			common.SetContextKey(c, constant.ContextKeyRoutingExcludedEndpoints, excludedEndpoints)
+		}
+	case routingerror.ScopeAccount:
+		failureDomainHash := strings.ToLower(strings.TrimSpace(
+			common.GetContextKeyString(c, constant.ContextKeyRoutingFailureDomainHash),
+		))
+		if failureDomainHash == "" {
+			return MarkRoutingTried(c, channelID)
+		}
+		excludedFailureDomains := smartRoutingExcludedFailureDomainHashes(c)
+		excludedFailureDomains[failureDomainHash] = struct{}{}
+		common.SetContextKey(c, constant.ContextKeyRoutingExcludedDomains, excludedFailureDomains)
+	case routingerror.ScopeChannel, routingerror.ScopePoolMember, routingerror.ScopeModel:
 		return MarkRoutingTried(c, channelID)
 	}
-	excluded := smartRoutingExcludedCredentialIDs(c)
-	excluded[credentialID] = struct{}{}
-	common.SetContextKey(c, constant.ContextKeyRoutingExcludedCredentials, excluded)
-	switchCount := len(smartRoutingExcludedChannelIDs(c)) + len(excluded) - 1
+	return smartRoutingSwitchCount(c)
+}
+
+func MergeRoutingTargetExclusions(target *gin.Context, source *gin.Context) {
+	if target == nil || source == nil {
+		return
+	}
+	channels := smartRoutingExcludedChannelIDs(target)
+	for channelID := range smartRoutingExcludedChannelIDs(source) {
+		channels[channelID] = struct{}{}
+	}
+	common.SetContextKey(target, constant.ContextKeyRoutingExcludedChannels, channels)
+
+	credentials := smartRoutingExcludedCredentialIDs(target)
+	for credentialID := range smartRoutingExcludedCredentialIDs(source) {
+		credentials[credentialID] = struct{}{}
+	}
+	common.SetContextKey(target, constant.ContextKeyRoutingExcludedCredentials, credentials)
+
+	endpoints := smartRoutingExcludedEndpointIdentities(target)
+	for key, identity := range smartRoutingExcludedEndpointIdentities(source) {
+		endpoints[key] = identity
+	}
+	common.SetContextKey(target, constant.ContextKeyRoutingExcludedEndpoints, endpoints)
+
+	failureDomains := smartRoutingExcludedFailureDomainHashes(target)
+	for hash := range smartRoutingExcludedFailureDomainHashes(source) {
+		failureDomains[hash] = struct{}{}
+	}
+	common.SetContextKey(target, constant.ContextKeyRoutingExcludedDomains, failureDomains)
+
+	switchCount := len(channels) + len(credentials) - 1
 	if switchCount < 0 {
 		switchCount = 0
 	}
-	common.SetContextKey(c, constant.ContextKeyRoutingSwitchCount, switchCount)
-	return switchCount
+	common.SetContextKey(target, constant.ContextKeyRoutingSwitchCount, switchCount)
 }
 
 func MarkRoutingChannelFailed(c *gin.Context, channelID int) int {
@@ -1218,11 +1279,7 @@ func AffinityAdmissible(channelID int) bool {
 	if channelID <= 0 {
 		return true
 	}
-	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled {
-		return true
-	}
-	if balance, ok := routinghotcache.GetBalance(channelID); ok && balance.Known && routingMarkerFresh(balance.UpdatedUnix, setting) && balance.Balance < setting.BalanceMarginUSD {
+	if routinghotcache.ChannelBalanceUnavailableActive(channelID, time.Now()) {
 		return false
 	}
 	return true
@@ -1265,7 +1322,7 @@ func admissibleAffinityChannelForSmartGroup(c *gin.Context, preferredID int, mod
 	if err != nil || len(candidates) == 0 {
 		return nil, false
 	}
-	filtered := filterSmartRoutingExcludedCandidates(candidates, smartRoutingExcludedChannelIDs(c), smartRoutingSwitchCount(c), setting.MaxSwitches)
+	filtered := filterSmartRoutingExcludedCandidates(c, group, candidates, smartRoutingSwitchCount(c), setting.MaxSwitches)
 	if len(filtered) == 0 {
 		return nil, false
 	}
@@ -1291,8 +1348,11 @@ func admissibleAffinityChannelForSmartGroup(c *gin.Context, preferredID int, mod
 
 func admissibleAffinityChannelLegacy(c *gin.Context, preferredID int, modelName string, usingGroup string, requestPath string) (*model.Channel, string, bool) {
 	preferred, err := model.CacheGetChannel(preferredID)
+	setting := smart_routing_setting.GetSetting()
 	if err != nil || preferred == nil || preferred.Status != common.ChannelStatusEnabled ||
-		!channelSupportsSmartRoutingRequestPath(preferred, requestPath) || !AffinityAdmissible(preferred.Id) {
+		!channelSupportsSmartRoutingRequestPath(preferred, requestPath) || !AffinityAdmissible(preferred.Id) ||
+		(smart_routing_setting.ResolveEffectiveMode(setting).AllowsAffinityRouting() &&
+			routingChannelBalanceBelowMargin(preferred, setting)) {
 		return nil, "", false
 	}
 	trafficAdmissible, trafficErr := ChannelRoutingTrafficAdmissible(c, preferred.Id)
@@ -1326,8 +1386,20 @@ func channelSupportsSmartRoutingRequestPath(channel *model.Channel, requestPath 
 	return config != nil && config.SupportsPath(requestPath)
 }
 
-func filterSmartRoutingExcludedCandidates(candidates []routingselector.Candidate, excluded map[int]struct{}, switchCount int, maxSwitches int) []routingselector.Candidate {
-	if len(candidates) == 0 || len(excluded) == 0 {
+func filterSmartRoutingExcludedCandidates(
+	c *gin.Context,
+	group string,
+	candidates []routingselector.Candidate,
+	switchCount int,
+	maxSwitches int,
+) []routingselector.Candidate {
+	if len(candidates) == 0 {
+		return candidates
+	}
+	excludedChannels := smartRoutingExcludedChannelIDs(c)
+	excludedEndpoints := smartRoutingExcludedEndpointIdentities(c)
+	excludedFailureDomains := smartRoutingExcludedFailureDomainHashes(c)
+	if len(excludedChannels) == 0 && len(excludedEndpoints) == 0 && len(excludedFailureDomains) == 0 {
 		return candidates
 	}
 	if maxSwitches >= 0 && switchCount >= maxSwitches {
@@ -1338,7 +1410,18 @@ func filterSmartRoutingExcludedCandidates(candidates []routingselector.Candidate
 		if candidate.Channel == nil {
 			continue
 		}
-		if _, found := excluded[candidate.Channel.Id]; found {
+		if _, found := excludedChannels[candidate.Channel.Id]; found {
+			continue
+		}
+		endpointKey := routingRequestEndpointIdentityKey(
+			channelrouting.EndpointAuthority(candidate.Channel.GetBaseURL(), candidate.Channel.Id),
+			channelrouting.RoutingRegion(),
+		)
+		if _, found := excludedEndpoints[endpointKey]; endpointKey != "" && found {
+			continue
+		}
+		identity, _ := channelrouting.ResolveIdentity(group, candidate.Channel.Id, "")
+		if _, found := excludedFailureDomains[strings.ToLower(strings.TrimSpace(identity.FailureDomainHash))]; found {
 			continue
 		}
 		filtered = append(filtered, candidate)
@@ -1346,17 +1429,55 @@ func filterSmartRoutingExcludedCandidates(candidates []routingselector.Candidate
 	return filtered
 }
 
+func routingChannelRequestIdentityAdmissible(c *gin.Context, group string, channel *model.Channel) bool {
+	if channel == nil || channel.Id <= 0 {
+		return false
+	}
+	if _, excluded := smartRoutingExcludedChannelIDs(c)[channel.Id]; excluded {
+		return false
+	}
+	endpointKey := routingRequestEndpointIdentityKey(
+		channelrouting.EndpointAuthority(channel.GetBaseURL(), channel.Id),
+		channelrouting.RoutingRegion(),
+	)
+	if _, excluded := smartRoutingExcludedEndpointIdentities(c)[endpointKey]; endpointKey != "" && excluded {
+		return false
+	}
+	identity, _ := channelrouting.ResolveIdentity(group, channel.Id, "")
+	failureDomainHash := strings.ToLower(strings.TrimSpace(identity.FailureDomainHash))
+	if _, excluded := smartRoutingExcludedFailureDomainHashes(c)[failureDomainHash]; failureDomainHash != "" && excluded {
+		return false
+	}
+	return true
+}
+
 func applyRoutingHealthMarkers(candidate *routingselector.Candidate, channelID int, setting smart_routing_setting.SmartRoutingSetting) {
-	if candidate == nil || channelID <= 0 {
+	if candidate == nil || candidate.Channel == nil || channelID <= 0 {
 		return
 	}
-	if balance, ok := routinghotcache.GetBalance(channelID); ok && balance.Known && routingMarkerFresh(balance.UpdatedUnix, setting) && balance.Balance < setting.BalanceMarginUSD {
+	if unavailable, ok := routinghotcache.GetChannelBalanceUnavailable(channelID); ok &&
+		unavailable.CooldownUntilUnixMilli > time.Now().UnixMilli() {
+		candidate.Breaker = &routingselector.BreakerSnapshot{
+			State:             routingselector.BreakerStateOpen,
+			Reason:            routingselector.BreakerReasonBalance,
+			CooldownUntilUnix: unavailable.CooldownUntilUnixMilli / int64(time.Second/time.Millisecond),
+			UpdatedUnix:       unavailable.UpdatedUnixMilli / int64(time.Second/time.Millisecond),
+		}
+		return
+	}
+	if routingChannelBalanceBelowMargin(candidate.Channel, setting) {
 		candidate.Breaker = &routingselector.BreakerSnapshot{
 			State:       routingselector.BreakerStateOpen,
 			Reason:      routingselector.BreakerReasonBalance,
-			UpdatedUnix: balance.UpdatedUnix,
+			UpdatedUnix: candidate.Channel.BalanceUpdatedTime,
 		}
 	}
+}
+
+func routingChannelBalanceBelowMargin(channel *model.Channel, setting smart_routing_setting.SmartRoutingSetting) bool {
+	return channel != nil && channel.BalanceUpdatedTime > 0 &&
+		!math.IsNaN(channel.Balance) && !math.IsInf(channel.Balance, 0) &&
+		routingMarkerFresh(channel.BalanceUpdatedTime, setting) && channel.Balance < setting.BalanceMarginUSD
 }
 
 func routingMarkerFresh(updatedUnix int64, setting smart_routing_setting.SmartRoutingSetting) bool {

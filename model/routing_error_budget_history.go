@@ -24,10 +24,10 @@ const (
 )
 
 type RoutingErrorBudgetMigrationOptions struct {
-	// AlphaV2Drained must only be set after old routing writers have stopped.
+	// AlphaDrained must only be set after old routing writers have stopped.
 	// Their pending telemetry must be drained before the pool-only identity is
 	// removed, otherwise a legacy writer can recreate incompatible state.
-	AlphaV2Drained bool
+	AlphaDrained bool
 }
 
 // RoutingErrorBudgetHistory is an immutable record of a state transition. It
@@ -311,7 +311,7 @@ func MigrateRoutingErrorBudgetModelsContextWithOptions(
 		if !legacyUnique || !routingErrorBudgetIndexColumnsEqual(legacyColumns, []string{"pool_id"}) {
 			return fmt.Errorf("routing error budget index %s has unexpected definition", routingErrorBudgetLegacyPoolIndex)
 		}
-		if !options.AlphaV2Drained {
+		if !options.AlphaDrained {
 			return ErrRoutingErrorBudgetAlphaDrainRequired
 		}
 	}
@@ -356,7 +356,7 @@ func MigrateRoutingErrorBudgetModelsContextWithOptions(
 		if readErr == nil && (!unique || !routingErrorBudgetIndexColumnsEqual(columns, []string{"pool_id"})) {
 			return fmt.Errorf("routing error budget index %s has unexpected definition", routingErrorBudgetLegacyPoolIndex)
 		}
-		if readErr == nil && !options.AlphaV2Drained {
+		if readErr == nil && !options.AlphaDrained {
 			return ErrRoutingErrorBudgetAlphaDrainRequired
 		}
 

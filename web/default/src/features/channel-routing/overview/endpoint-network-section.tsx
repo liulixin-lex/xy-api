@@ -16,14 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import {
-  MapPin,
-  Network,
-  RefreshCw,
-  ShieldCheck,
-  TriangleAlert,
-} from 'lucide-react'
+  Alert02Icon,
+  Location01Icon,
+  RefreshIcon,
+  Router01Icon,
+  Shield02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -100,7 +100,11 @@ export function ChannelRoutingEndpointNetworkSection(props: {
             id='endpoint-network-title'
             className='flex items-center gap-2 text-sm font-semibold'
           >
-            <Network className='size-4' aria-hidden='true' />
+            <HugeiconsIcon
+              icon={Router01Icon}
+              className='size-4'
+              aria-hidden='true'
+            />
             {t('Endpoint network breakers')}
           </h2>
           <p className='text-muted-foreground mt-0.5 text-xs'>
@@ -145,12 +149,20 @@ export function ChannelRoutingEndpointNetworkSection(props: {
           className='border-destructive/30 bg-destructive/5 text-destructive flex flex-wrap items-center gap-3 rounded-lg border p-3 text-sm'
           role='alert'
         >
-          <TriangleAlert className='size-4 shrink-0' aria-hidden='true' />
+          <HugeiconsIcon
+            icon={Alert02Icon}
+            className='size-4 shrink-0'
+            aria-hidden='true'
+          />
           <span className='min-w-0 flex-1'>
             {t('Could not load endpoint network health.')}
           </span>
           <Button size='sm' variant='outline' onClick={props.onRetry}>
-            <RefreshCw aria-hidden='true' />
+            <HugeiconsIcon
+              icon={RefreshIcon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {t('Retry')}
           </Button>
         </div>
@@ -200,7 +212,11 @@ export function ChannelRoutingEndpointNetworkSection(props: {
                       />
                       <div className='text-muted-foreground mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs'>
                         <span className='inline-flex items-center gap-1'>
-                          <MapPin className='size-3' aria-hidden='true' />
+                          <HugeiconsIcon
+                            icon={Location01Icon}
+                            className='size-3'
+                            aria-hidden='true'
+                          />
                           {endpoint.region || t('Unknown region')}
                         </span>
                       </div>
@@ -302,7 +318,11 @@ export function ChannelRoutingEndpointNetworkSection(props: {
                       breakAll
                     />
                     <div className='text-muted-foreground mt-1 inline-flex items-center gap-1 text-xs'>
-                      <MapPin className='size-3' aria-hidden='true' />
+                      <HugeiconsIcon
+                        icon={Location01Icon}
+                        className='size-3'
+                        aria-hidden='true'
+                      />
                       {endpoint.region || t('Unknown region')}
                     </div>
                   </div>
@@ -385,11 +405,19 @@ export function ChannelRoutingEndpointNetworkSection(props: {
 
           <div className='text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs'>
             <span className='inline-flex items-center gap-1'>
-              <MapPin className='size-3' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Location01Icon}
+                className='size-3'
+                aria-hidden='true'
+              />
               {t('Gateway region')}: {props.region || t('Unknown region')}
             </span>
             <span className='inline-flex min-w-0 items-center gap-1'>
-              <ShieldCheck className='size-3 shrink-0' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Shield02Icon}
+                className='size-3 shrink-0'
+                aria-hidden='true'
+              />
               <span className='truncate'>
                 {t('Stable node')}: {props.stableNodeId || t('Unavailable')}
               </span>

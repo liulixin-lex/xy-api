@@ -608,10 +608,8 @@ func FirstByteFailoverTimeout(info *relaycommon.RelayInfo) time.Duration {
 		return 0
 	}
 	setting := smart_routing_setting.GetSetting()
-	if !setting.Enabled || !setting.FirstByteFailoverEnabled {
-		return 0
-	}
-	if setting.Mode != smart_routing_setting.ModeBalanced && setting.Mode != smart_routing_setting.ModeEnterpriseSLO {
+	if !setting.FirstByteFailoverEnabled ||
+		!smart_routing_setting.ResolveEffectiveMode(setting).AllowsAttemptControl() {
 		return 0
 	}
 	minMs := setting.FirstByteMinMs

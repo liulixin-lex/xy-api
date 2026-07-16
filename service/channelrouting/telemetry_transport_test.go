@@ -143,6 +143,24 @@ func TestRoutingTelemetryPipelineStatsMarkRedisUnavailable(t *testing.T) {
 	assert.Contains(t, stats.PipelineLastError, "unavailable")
 }
 
+func TestRoutingTelemetryUsesUnversionedStreamAndConsumerGroup(t *testing.T) {
+	ResetRoutingTelemetryTransportForTest()
+	t.Cleanup(ResetRoutingTelemetryTransportForTest)
+	stub := &routingTelemetryRedisStub{}
+	withRoutingTelemetryRedis(t, stub)
+
+	envelope, err := newRoutingTelemetryEnvelope([]model.RoutingMetricRollup{testRoutingTelemetryRollup()}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, deliverRoutingTelemetryEnvelopeContext(context.Background(), envelope))
+	_, err = ConsumeRoutingTelemetryOnceContext(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, "channel-routing:telemetry", stub.addStream)
+	assert.Equal(t, "channel-routing:telemetry", stub.groupStream)
+	assert.Equal(t, "channel-routing-rollup", stub.groupName)
+	assert.Equal(t, "0", stub.groupStart)
+}
+
 func testRoutingTelemetryRollup() model.RoutingMetricRollup {
 	return model.RoutingMetricRollup{
 		MemberID: 1, CredentialID: 0, ModelName: "gpt-test", BucketTs: 60,
@@ -166,6 +184,10 @@ func withRoutingTelemetryRedis(t *testing.T, client routingTelemetryRedis) {
 
 type routingTelemetryRedisStub struct {
 	xAddErr             error
+	addStream           string
+	groupStream         string
+	groupName           string
+	groupStart          string
 	readMessages        []redis.XMessage
 	readCalls           int
 	pending             []redis.XPendingExt
@@ -188,11 +210,20 @@ func (stub *routingTelemetryRedisStub) Do(ctx context.Context, _ ...interface{})
 	}}, nil)
 }
 
-func (stub *routingTelemetryRedisStub) XAdd(context.Context, *redis.XAddArgs) *redis.StringCmd {
+func (stub *routingTelemetryRedisStub) XAdd(_ context.Context, args *redis.XAddArgs) *redis.StringCmd {
+	stub.addStream = args.Stream
 	return redis.NewStringResult("1-0", stub.xAddErr)
 }
 
-func (stub *routingTelemetryRedisStub) XGroupCreateMkStream(context.Context, string, string, string) *redis.StatusCmd {
+func (stub *routingTelemetryRedisStub) XGroupCreateMkStream(
+	_ context.Context,
+	stream string,
+	group string,
+	start string,
+) *redis.StatusCmd {
+	stub.groupStream = stream
+	stub.groupName = group
+	stub.groupStart = start
 	return redis.NewStatusResult("OK", nil)
 }
 

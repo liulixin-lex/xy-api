@@ -14,6 +14,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStrictCapacityRedisKeysUseUnversionedNamespace(t *testing.T) {
+	stateKey, leasesKey := strictCapacityRedisKeys(StrictCapacityKey{
+		AccountID: 17, CredentialID: 29, Model: "gpt-test",
+	})
+
+	assert.True(t, strings.HasPrefix(stateKey, "channel-routing:capacity:{"))
+	assert.True(t, strings.HasSuffix(stateKey, "}:state"))
+	assert.True(t, strings.HasPrefix(leasesKey, "channel-routing:capacity:{"))
+	assert.True(t, strings.HasSuffix(leasesKey, "}:leases"))
+	assert.NotContains(t, stateKey, ":v2:")
+	assert.NotContains(t, leasesKey, ":v2:")
+}
+
 func TestRedisBlockCapacityReusesNodeLeaseAndRefundsPendingAdmission(t *testing.T) {
 	clock := &routingTestClock{now: time.Unix(5_000, 0)}
 	fake := &blockCapacityRedis{now: clock.Now}
@@ -286,7 +299,7 @@ func (fake *blockCapacityRedis) Eval(
 	}
 	kind := "unknown"
 	for _, candidate := range []string{"reserve", "commit", "cancel", "release", "renew"} {
-		if strings.Contains(script, "strict_capacity_"+candidate+"_v2") {
+		if strings.Contains(script, "strict_capacity_"+candidate) {
 			kind = candidate
 			break
 		}

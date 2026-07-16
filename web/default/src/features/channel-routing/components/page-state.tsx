@@ -16,16 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { AxiosError } from 'axios'
 import {
-  ClockAlert,
-  Inbox,
-  LockKeyhole,
-  RefreshCw,
-  ShieldAlert,
-  TriangleAlert,
-  WifiOff,
-} from 'lucide-react'
+  Alert02Icon,
+  CircleLock02Icon,
+  ClockAlertIcon,
+  InboxIcon,
+  RefreshIcon,
+  Shield02Icon,
+  WifiOff02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
+import { AxiosError } from 'axios'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -80,7 +81,11 @@ export function ChannelRoutingRefetchErrorAlert(props: {
       role='status'
       className='border-warning/30 bg-warning/5 has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
     >
-      <TriangleAlert className='text-warning' aria-hidden='true' />
+      <HugeiconsIcon
+        icon={Alert02Icon}
+        className='text-warning'
+        aria-hidden='true'
+      />
       <AlertTitle>{props.title ?? t('Refresh failed')}</AlertTitle>
       <AlertDescription>
         {props.description ??
@@ -95,7 +100,9 @@ export function ChannelRoutingRefetchErrorAlert(props: {
           disabled={props.isFetching}
           onClick={props.onRetry}
         >
-          <RefreshCw
+          <HugeiconsIcon
+            icon={RefreshIcon}
+            data-icon='inline-start'
             aria-hidden='true'
             className={
               props.isFetching
@@ -120,7 +127,7 @@ export function ChannelRoutingEmptyState(props: {
     <Empty className='min-h-72 border'>
       <EmptyHeader>
         <EmptyMedia variant='icon'>
-          <Inbox aria-hidden='true' />
+          <HugeiconsIcon icon={InboxIcon} aria-hidden='true' />
         </EmptyMedia>
         <EmptyTitle>{props.title ?? t('No routing data')}</EmptyTitle>
         <EmptyDescription>
@@ -156,7 +163,7 @@ export function ChannelRoutingErrorState(props: {
   const rateLimited = status === 429
   const snapshotInitializing = status === 503
   const billingReviewScope = props.scope === 'billing-review'
-  let Icon = TriangleAlert
+  let icon = Alert02Icon
   let title = billingReviewScope
     ? t('Billing review queue unavailable')
     : t('Could not load channel routing data')
@@ -166,7 +173,7 @@ export function ChannelRoutingErrorState(props: {
       )
     : t('The request failed. Check the service and try again.')
   if (offline) {
-    Icon = WifiOff
+    icon = WifiOff02Icon
     title = t('You are offline')
     description = billingReviewScope
       ? t('Reconnect to the network, then retry the billing review queue.')
@@ -174,7 +181,7 @@ export function ChannelRoutingErrorState(props: {
           'Reconnect to the network, then retry to refresh channel routing data.'
         )
   } else if (timedOut) {
-    Icon = ClockAlert
+    icon = ClockAlertIcon
     title = billingReviewScope
       ? t('Billing review request timed out')
       : t('Channel routing request timed out')
@@ -186,13 +193,13 @@ export function ChannelRoutingErrorState(props: {
           'The server did not respond in time. Existing routing state was not changed.'
         )
   } else if (unauthorized) {
-    Icon = LockKeyhole
+    icon = CircleLock02Icon
     title = t('Your session has expired')
     description = billingReviewScope
       ? t('Sign in again to access billing reviews.')
       : t('Sign in again to access channel routing data.')
   } else if (permissionDenied) {
-    Icon = ShieldAlert
+    icon = Shield02Icon
     title = billingReviewScope
       ? t('Billing review read permission required')
       : t('Channel routing permission required')
@@ -200,7 +207,7 @@ export function ChannelRoutingErrorState(props: {
       ? t('Your role cannot view the billing review queue.')
       : t('Your role cannot access this channel routing view.')
   } else if (rateLimited) {
-    Icon = ClockAlert
+    icon = ClockAlertIcon
     title = billingReviewScope
       ? t('Too many billing review requests')
       : t('Too many channel routing requests')
@@ -216,7 +223,7 @@ export function ChannelRoutingErrorState(props: {
     <Empty className='min-h-72 border' role='alert' aria-live='assertive'>
       <EmptyHeader>
         <EmptyMedia variant='icon'>
-          <Icon aria-hidden='true' />
+          <HugeiconsIcon icon={icon} aria-hidden='true' />
         </EmptyMedia>
         <EmptyTitle>{title}</EmptyTitle>
         <EmptyDescription>{description}</EmptyDescription>
@@ -224,7 +231,11 @@ export function ChannelRoutingErrorState(props: {
       {!permissionDenied && !unauthorized ? (
         <EmptyContent>
           <Button variant='outline' onClick={props.onRetry}>
-            <RefreshCw aria-hidden='true' />
+            <HugeiconsIcon
+              icon={RefreshIcon}
+              data-icon='inline-start'
+              aria-hidden='true'
+            />
             {t('Retry')}
           </Button>
         </EmptyContent>

@@ -41,19 +41,14 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
-import { channelRoutingQueryKeys } from '@/features/channel-routing/api/query-keys'
-import {
-  ChannelRoutingEmptyState,
-  ChannelRoutingLoadingState,
-} from '@/features/channel-routing/components/page-state'
-import { ChannelRoutingCursorPagination } from '@/features/channel-routing/components/pagination-bar'
-import { useChannelRoutingFormatters } from '@/features/channel-routing/lib/format'
 
 import {
   getBillingProjectionOperationApiError,
   listFailedBillingProjections,
   listOpenBillingLogSinkConflicts,
 } from '../api/projection-operations'
+import { billingOperationsQueryKeys } from '../api/query-keys'
+import { useBillingOperationsFormatters } from '../lib/format'
 import {
   canMutateBillingProjectionPage,
   getBillingProjectionNextCursor,
@@ -64,6 +59,11 @@ import type {
   FailedBillingProjection,
   FailedBillingProjectionDataset,
 } from '../projection-types'
+import { BillingOperationsCursorPagination } from './cursor-pagination'
+import {
+  BillingOperationsEmptyState,
+  BillingOperationsLoadingState,
+} from './page-state'
 import {
   BillingConflictTable,
   FailedProjectionTable,
@@ -124,7 +124,7 @@ function ProjectionSectionHeader(props: {
   onRefresh: () => void
 }) {
   const { t } = useTranslation()
-  const format = useChannelRoutingFormatters()
+  const format = useBillingOperationsFormatters()
   return (
     <div className='flex flex-wrap items-start justify-between gap-3'>
       <div className='min-w-0'>
@@ -214,7 +214,7 @@ function FailedProjectionList(props: {
   const onCursorChange = props.onCursorChange
   const onPermissionRevoked = props.onPermissionRevoked
   const query = useQuery({
-    queryKey: channelRoutingQueryKeys.billingProjections(props.dataset, {
+    queryKey: billingOperationsQueryKeys.projections(props.dataset, {
       cursor,
       limit: projectionPageLimit,
     }),
@@ -265,7 +265,7 @@ function FailedProjectionList(props: {
       />
       {query.isRefetchError && page ? <StaleProjectionAlert /> : null}
       {query.isLoading ? (
-        <ChannelRoutingLoadingState
+        <BillingOperationsLoadingState
           rows={5}
           label={t('Loading failed billing projections')}
         />
@@ -277,7 +277,7 @@ function FailedProjectionList(props: {
         />
       ) : null}
       {page && page.items.length === 0 ? (
-        <ChannelRoutingEmptyState
+        <BillingOperationsEmptyState
           title={t('No failed projections')}
           description={t(
             'Failed projections will appear here after automated retries are exhausted.'
@@ -292,7 +292,7 @@ function FailedProjectionList(props: {
             onRequeue={props.onRequeue}
           />
           {invalidCursor ? <InvalidCursorAlert /> : null}
-          <ChannelRoutingCursorPagination
+          <BillingOperationsCursorPagination
             cursor={cursor}
             nextCursor={nextCursor}
             onCursorChange={props.onCursorChange}
@@ -315,7 +315,7 @@ function BillingConflictList(props: {
   const onCursorChange = props.onCursorChange
   const onPermissionRevoked = props.onPermissionRevoked
   const query = useQuery({
-    queryKey: channelRoutingQueryKeys.billingProjections('conflicts', {
+    queryKey: billingOperationsQueryKeys.projections('conflicts', {
       cursor,
       limit: projectionPageLimit,
     }),
@@ -365,7 +365,7 @@ function BillingConflictList(props: {
       />
       {query.isRefetchError && page ? <StaleProjectionAlert /> : null}
       {query.isLoading ? (
-        <ChannelRoutingLoadingState
+        <BillingOperationsLoadingState
           rows={5}
           label={t('Loading billing log conflicts')}
         />
@@ -377,7 +377,7 @@ function BillingConflictList(props: {
         />
       ) : null}
       {page && page.items.length === 0 ? (
-        <ChannelRoutingEmptyState
+        <BillingOperationsEmptyState
           title={t('No open sink conflicts')}
           description={t(
             'Quarantined receipt conflicts will appear here until verified and resolved.'
@@ -392,7 +392,7 @@ function BillingConflictList(props: {
             onResolve={props.onResolve}
           />
           {invalidCursor ? <InvalidCursorAlert /> : null}
-          <ChannelRoutingCursorPagination
+          <BillingOperationsCursorPagination
             cursor={cursor}
             nextCursor={nextCursor}
             onCursorChange={props.onCursorChange}
@@ -461,7 +461,7 @@ export function ProjectionFailuresSection(props: {
         onConflictTargetChange={setConflictTarget}
         onRefresh={async () => {
           await queryClient.invalidateQueries({
-            queryKey: channelRoutingQueryKeys.billingProjectionsRoot(),
+            queryKey: billingOperationsQueryKeys.projectionsRoot(),
           })
         }}
         onPermissionRevoked={props.onPermissionRevoked}

@@ -5,17 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/go-redis/redis/v8"
 )
 
 const (
-	routingEventRedisStream               = "routing:v2:events"
+	routingEventRedisStream               = "channel-routing:events"
 	routingEventRedisStreamMaxLen         = 10_000
 	routingEventRedisReadCount      int64 = 64
 	routingEventRedisReadBlock            = 2 * time.Second
@@ -67,6 +70,7 @@ var (
 		}
 		return common.RDB
 	}
+	refreshRoutingRuntimeSettingsOptions = model.RefreshOptionsFromDatabaseChecked
 )
 
 func newRoutingEventTransportState() *routingEventTransportState {
@@ -198,6 +202,37 @@ func consumeRoutingEventsOnceContext(
 					continue
 				}
 			}
+			if message.eventType == RoutingEventTypeChannelConfigurationChanged {
+				applied, applyErr := consumeRoutingChannelConfigurationEventPayload(ctx, message.payload)
+				if applyErr != nil {
+					if errors.Is(applyErr, model.ErrRoutingChannelConfigurationInvalid) {
+						state.markRejected(raw.ID, applyErr)
+						processed++
+						continue
+					}
+					state.markRetryableRejected(applyErr)
+					return processed, applyErr
+				}
+				if !applied {
+					state.markConsumed(raw.ID)
+					processed++
+					continue
+				}
+			}
+			if message.eventType == RoutingEventTypeRuntimeSettingsChanged {
+				applied, applyErr := consumeRoutingRuntimeSettingsEventPayloadContext(
+					ctx, message.revision, message.payload,
+				)
+				if applyErr != nil {
+					state.markRetryableRejected(applyErr)
+					return processed, applyErr
+				}
+				if !applied {
+					state.markConsumed(raw.ID)
+					processed++
+					continue
+				}
+			}
 			if _, publishErr := hub.publish(
 				message.eventType, message.revision, message.payload, time.UnixMilli(message.createdTimeMs),
 			); publishErr != nil {
@@ -210,6 +245,59 @@ func consumeRoutingEventsOnceContext(
 		}
 	}
 	return processed, nil
+}
+
+func consumeRoutingRuntimeSettingsEventPayloadContext(
+	ctx context.Context,
+	revision uint64,
+	payload []byte,
+) (bool, error) {
+	var event struct {
+		Revision     int64  `json:"revision"`
+		DocumentHash string `json:"document_hash"`
+	}
+	if revision == 0 || common.Unmarshal(payload, &event) != nil || event.Revision <= 0 ||
+		uint64(event.Revision) != revision || !validRoutingEventDocumentHash(event.DocumentHash) {
+		return false, ErrRoutingEventInvalid
+	}
+	if err := refreshRoutingRuntimeSettingsOptions(); err != nil {
+		return false, fmt.Errorf("refresh runtime settings options: %w", err)
+	}
+	state, err := model.GetRoutingRuntimeSettingsStateContext(ctx)
+	if err != nil {
+		return false, fmt.Errorf("load runtime settings state: %w", err)
+	}
+	document, err := common.Marshal(smart_routing_setting.GetStoredSetting())
+	if err != nil {
+		return false, fmt.Errorf("encode refreshed runtime settings: %w", err)
+	}
+	storedHash := model.RoutingRuntimeSettingsDocumentHash(document)
+	if storedHash != state.DocumentHash {
+		return false, model.ErrRoutingRuntimeSettingsInvalid
+	}
+	if state.Revision < event.Revision {
+		return false, model.ErrRoutingRuntimeSettingsConflict
+	}
+	if state.Revision > event.Revision {
+		return false, nil
+	}
+	if state.DocumentHash != event.DocumentHash {
+		return false, model.ErrRoutingRuntimeSettingsInvalid
+	}
+	return true, nil
+}
+
+func validRoutingEventDocumentHash(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for index := range value {
+		char := value[index]
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func initializeRoutingEventTransportContext(
@@ -420,6 +508,14 @@ func (state *routingEventTransportState) markRejected(cursor string, err error) 
 	state.mu.Unlock()
 }
 
+func (state *routingEventTransportState) markRetryableRejected(err error) {
+	state.mu.Lock()
+	state.stats.Available = false
+	state.stats.Rejected++
+	state.stats.LastError = common.SanitizeErrorMessage(err.Error())
+	state.mu.Unlock()
+}
+
 func (state *routingEventTransportState) markError(err error) {
 	state.mu.Lock()
 	state.stats.Available = false
@@ -435,4 +531,5 @@ func ResetRoutingEventTransportForTest() {
 		}
 		return common.RDB
 	}
+	refreshRoutingRuntimeSettingsOptions = model.RefreshOptionsFromDatabaseChecked
 }

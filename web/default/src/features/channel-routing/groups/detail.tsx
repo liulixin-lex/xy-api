@@ -16,10 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import {
+  FlaskConicalIcon,
+  Key01Icon,
+  Layers01Icon,
+  RefreshIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi, Link } from '@tanstack/react-router'
-import { FlaskConical, KeyRound, Layers3, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -63,12 +68,58 @@ import {
 import { ChannelRoutingPagination } from '../components/pagination-bar'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
-import type { ModelSnapshot } from '../types'
+import type { ModelSnapshot, PoolMemberSnapshot } from '../types'
 import { ChannelRoutingErrorBudgetSection } from './error-budget-section'
+import { ChannelRoutingGroupPolicySummary } from './policy-summary'
 import { ChannelRoutingGroupReplayRankingSection } from './replay-ranking-section'
 import { ChannelRoutingSimulationSheet } from './simulation-sheet'
 
 const route = getRouteApi('/_authenticated/channel-routing/groups/$id')
+
+type PoolMemberRoutingWeight = PoolMemberSnapshot & {
+  automatic_traffic_paused?: boolean
+  normalized_weight?: number
+}
+
+function ChannelRoutingMemberWeight(props: {
+  member: PoolMemberSnapshot
+  align?: 'start' | 'end'
+}) {
+  const { t } = useTranslation()
+  const format = useChannelRoutingFormatters()
+  const routingWeight = props.member as PoolMemberRoutingWeight
+  const automaticTrafficPaused =
+    routingWeight.automatic_traffic_paused || props.member.legacy_weight === 0
+
+  return (
+    <div className={props.align === 'end' ? 'text-right' : undefined}>
+      <div className='font-medium tabular-nums'>
+        {props.member.legacy_priority} / {props.member.legacy_weight}
+      </div>
+      {automaticTrafficPaused ? (
+        <div
+          className={
+            props.align === 'end'
+              ? 'mt-1 flex justify-end'
+              : 'mt-1 flex justify-start'
+          }
+        >
+          <ChannelRoutingStatusBadge
+            status='paused'
+            label={t('Paused for automatic traffic')}
+          />
+        </div>
+      ) : null}
+      {!automaticTrafficPaused && routingWeight.normalized_weight != null ? (
+        <div className='text-muted-foreground mt-1 text-xs'>
+          {t('Normalized {{value}}', {
+            value: format.percent(routingWeight.normalized_weight),
+          })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
 
 function ChannelRoutingModelMetrics(props: {
   poolId: number
@@ -278,7 +329,8 @@ export function ChannelRoutingGroupDetailPage() {
               disabled={query.isFetching}
               onClick={() => void query.refetch()}
             >
-              <RefreshCw
+              <HugeiconsIcon
+                icon={RefreshIcon}
                 aria-hidden='true'
                 className={
                   query.isFetching
@@ -295,7 +347,11 @@ export function ChannelRoutingGroupDetailPage() {
                 title={t('Simulate')}
                 onClick={() => setSimulationOpen(true)}
               >
-                <FlaskConical aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={FlaskConicalIcon}
+                  data-icon='inline-start'
+                  aria-hidden='true'
+                />
                 <span className='max-sm:hidden'>{t('Simulate')}</span>
               </Button>
             ) : null}
@@ -329,6 +385,8 @@ export function ChannelRoutingGroupDetailPage() {
               </div>
             ))}
           </section>
+
+          <ChannelRoutingGroupPolicySummary group={group} />
 
           {summary.policy_profile === 'enterprise_slo' ? (
             <ChannelRoutingErrorBudgetSection
@@ -400,11 +458,15 @@ export function ChannelRoutingGroupDetailPage() {
                             />
                           </TableCell>
                           <TableCell className='text-right align-top'>
-                            {member.legacy_priority} / {member.legacy_weight}
+                            <ChannelRoutingMemberWeight
+                              member={member}
+                              align='end'
+                            />
                           </TableCell>
                           <TableCell className='text-right align-top'>
                             <span className='inline-flex items-center gap-1'>
-                              <KeyRound
+                              <HugeiconsIcon
+                                icon={Key01Icon}
                                 className='text-muted-foreground size-3.5'
                                 aria-hidden='true'
                               />
@@ -413,7 +475,8 @@ export function ChannelRoutingGroupDetailPage() {
                           </TableCell>
                           <TableCell className='text-right align-top'>
                             <span className='inline-flex items-center gap-1'>
-                              <Layers3
+                              <HugeiconsIcon
+                                icon={Layers01Icon}
                                 className='text-muted-foreground size-3.5'
                                 aria-hidden='true'
                               />
@@ -457,8 +520,8 @@ export function ChannelRoutingGroupDetailPage() {
                         <dt className='text-muted-foreground'>
                           {t('Priority / weight')}
                         </dt>
-                        <dd className='mt-1 font-medium'>
-                          {member.legacy_priority} / {member.legacy_weight}
+                        <dd className='mt-1'>
+                          <ChannelRoutingMemberWeight member={member} />
                         </dd>
                       </div>
                       <div>

@@ -33,7 +33,7 @@ const (
 	canaryOperationPollInterval  = time.Second
 )
 
-const routingLegacyReconcileLeaseName = "routing-v2-legacy-reconcile"
+const routingLegacyReconcileLeaseName = "channel-routing-legacy-reconcile"
 
 var ErrRoutingLegacyReconcileBusy = errors.New("channel routing legacy reconcile is owned by another node")
 
@@ -228,17 +228,21 @@ func defaultRuntimeDeps() runtimeDeps {
 			return err
 		},
 		publishConfig: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
-			if !common.RedisEnabled || common.RDB == nil {
-				if !waitRuntime(ctx, observeDisabledPoll) {
-					return ctx.Err()
-				}
-				return nil
+			channelConfigurationPublished, err := PublishRoutingChannelConfigurationOutboxOnceContext(ctx)
+			if err != nil {
+				return err
 			}
-			published, err := PublishRoutingConfigOutboxOnceContext(ctx)
-			if err == nil && !published && !waitRuntime(ctx, time.Second) {
+			policyPublished := false
+			if common.RedisEnabled && common.RDB != nil {
+				policyPublished, err = PublishRoutingConfigOutboxOnceContext(ctx)
+				if err != nil {
+					return err
+				}
+			}
+			if !channelConfigurationPublished && !policyPublished && !waitRuntime(ctx, time.Second) {
 				return ctx.Err()
 			}
-			return err
+			return nil
 		},
 		consumeConfig: func(ctx context.Context, _ smart_routing_setting.SmartRoutingSetting) error {
 			if !common.RedisEnabled || common.RDB == nil {

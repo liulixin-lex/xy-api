@@ -196,12 +196,12 @@ func InitOptionMap() {
 	loadOptionsFromDatabase()
 }
 
-func loadOptionsFromDatabase() {
+func loadOptionsFromDatabase() error {
 	observedRevision := optionPublishRevision.Load()
 	options, err := AllOption()
 	if err != nil {
 		common.SysError("failed to load options from database: " + err.Error())
-		return
+		return err
 	}
 
 	optionCommitPublishMu.Lock()
@@ -212,7 +212,7 @@ func loadOptionsFromDatabase() {
 		options, err = AllOption()
 		if err != nil {
 			common.SysError("failed to reload options from database: " + err.Error())
-			return
+			return err
 		}
 	}
 
@@ -251,6 +251,7 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	optionPublishRevision.Add(1)
+	return nil
 }
 
 // RefreshOptionsFromDatabase republishes committed option truth through the
@@ -258,7 +259,14 @@ func loadOptionsFromDatabase() {
 // larger control-plane transaction writes Option rows atomically with its own
 // revision and audit records.
 func RefreshOptionsFromDatabase() {
-	loadOptionsFromDatabase()
+	_ = loadOptionsFromDatabase()
+}
+
+// RefreshOptionsFromDatabaseChecked refreshes committed option truth and
+// reports read failures so event consumers can retry without advancing their
+// durable cursor or publishing stale state to local subscribers.
+func RefreshOptionsFromDatabaseChecked() error {
+	return loadOptionsFromDatabase()
 }
 
 func SyncOptions(frequency int) {

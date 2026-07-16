@@ -322,13 +322,11 @@ func buildBalancedReplayInput(
 ) (BalancedReplayInput, error) {
 	profile = cloneRequestProfile(profile)
 	schemaVersion := balancedReplaySchemaVersionV1
-	algorithmVersion := DecisionAlgorithmBalancedV1
 	if profile.SchemaVersion == RequestProfileSchemaV2 {
 		schemaVersion = balancedReplaySchemaVersionV2
-		algorithmVersion = DecisionAlgorithmBalancedV2
 	}
 	input := BalancedReplayInput{
-		SchemaVersion: schemaVersion, AlgorithmVersion: algorithmVersion,
+		SchemaVersion: schemaVersion, AlgorithmVersion: DecisionAlgorithmBalanced,
 		PoolID: poolID, PolicyRevision: policyRevision, RuntimeGeneration: runtimeGeneration,
 		PolicyHash: policyHash, Profile: profile, Settings: settings,
 		Candidates:         append([]BalancedReplayCandidate(nil), candidates...),
@@ -408,21 +406,19 @@ func (input BalancedReplayInput) validateWithoutHash() error {
 }
 
 func balancedAlgorithmVersion(profile RequestProfile) string {
-	if profile.SchemaVersion == RequestProfileSchemaV2 {
-		return DecisionAlgorithmBalancedV2
-	}
-	return DecisionAlgorithmBalancedV1
+	return DecisionAlgorithmBalanced
 }
 
 func supportedBalancedAlgorithm(algorithmVersion string) bool {
-	return algorithmVersion == DecisionAlgorithmBalancedV1 || algorithmVersion == DecisionAlgorithmBalancedV2
+	return algorithmVersion == DecisionAlgorithmBalanced ||
+		algorithmVersion == DecisionAlgorithmBalancedV1 || algorithmVersion == DecisionAlgorithmBalancedV2
 }
 
 func validBalancedReplayVersion(schemaVersion int, algorithmVersion string, profileSchemaVersion int) bool {
 	return (schemaVersion == balancedReplaySchemaVersionV1 && profileSchemaVersion == RequestProfileSchemaV1 &&
-		algorithmVersion == DecisionAlgorithmBalancedV1) ||
+		(algorithmVersion == DecisionAlgorithmBalanced || algorithmVersion == DecisionAlgorithmBalancedV1)) ||
 		(schemaVersion == balancedReplaySchemaVersionV2 && profileSchemaVersion == RequestProfileSchemaV2 &&
-			algorithmVersion == DecisionAlgorithmBalancedV2)
+			(algorithmVersion == DecisionAlgorithmBalanced || algorithmVersion == DecisionAlgorithmBalancedV2))
 }
 
 func validBalancedReplayCandidate(candidate BalancedReplayCandidate) bool {
@@ -477,17 +473,21 @@ func validBalancedReplayCost(cost *ShadowCostInput) bool {
 	return cost == nil || (finiteShadowNumber(cost.Cost) && cost.Cost >= 0 &&
 		finiteShadowNumber(cost.WorstCaseCost) && cost.WorstCaseCost >= 0 &&
 		finiteShadowNumber(cost.EffectiveCost) && cost.EffectiveCost >= 0 &&
+		finiteShadowNumber(cost.UpstreamCostMultiplier) && cost.UpstreamCostMultiplier >= 0 &&
+		cost.UpstreamCostMultiplier <= model.RoutingChannelUpstreamCostMultiplierMaximum &&
+		finiteShadowNumber(cost.BaselineExpectedCost) && cost.BaselineExpectedCost >= 0 &&
+		finiteShadowNumber(cost.BaselineWorstCaseCost) && cost.BaselineWorstCaseCost >= 0 &&
 		finiteShadowNumber(cost.ConfidenceScore) && cost.ConfidenceScore >= 0 && cost.ConfidenceScore <= 1 &&
 		finiteShadowNumber(cost.FreshnessScore) && cost.FreshnessScore >= 0 && cost.FreshnessScore <= 1 &&
 		validRoutingCostBreakdown(cost.ExpectedBreakdown) && validRoutingCostBreakdown(cost.WorstSingleBreakdown) &&
 		cost.ObservedTime >= 0 && cost.EffectiveTime >= 0 && cost.ExpiresTime >= 0 && cost.UpdatedUnix >= 0 &&
 		validShadowText(cost.Currency, 8) && validShadowText(cost.Unit, 32) &&
-		validShadowText(cost.PricingBasis, 32) &&
-		validShadowText(cost.PricingVersion, 128) && validShadowText(cost.VersionConfidence, 32) &&
-		validShadowText(cost.Freshness, 32) && validShadowText(cost.SourceSyncStatus, 32) &&
-		validShadowText(cost.AccountSourceType, 32) &&
-		(cost.PricingHash == "" || validShadowHash(cost.PricingHash)) &&
-		(cost.AccountKeyHash == "" || validShadowHash(cost.AccountKeyHash)))
+		validShadowText(cost.PricingBasis, 64) &&
+		validShadowText(cost.PricingVersion, 128) && validShadowText(cost.PricingIdentity, 128) &&
+		validShadowText(cost.UnknownReason, 64) && cost.ConfigurationRevision >= 0 &&
+		validShadowText(cost.VersionConfidence, 32) &&
+		validShadowText(cost.Freshness, 32) &&
+		(cost.PricingHash == "" || validShadowHash(cost.PricingHash)))
 }
 
 func validBalancedReplayBreaker(breaker *ShadowBreakerInput) bool {

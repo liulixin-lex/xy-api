@@ -243,26 +243,6 @@ func ResolvePersistedCredentialID(ctx context.Context, channel *model.Channel, k
 	return credential.ID, nil
 }
 
-func ResolveUpstreamAccountID(group string, channelID int, modelName string) (int, bool) {
-	snapshot := currentSnapshot.Load()
-	if snapshot == nil || group == "" || channelID <= 0 || modelName == "" {
-		return 0, false
-	}
-	poolID, exists := snapshot.poolByGroup[group]
-	if !exists {
-		return 0, false
-	}
-	memberID, exists := snapshot.memberByPoolChannel[poolChannelKey{PoolID: poolID, ChannelID: channelID}]
-	if !exists {
-		return 0, false
-	}
-	observation, exists := snapshot.modelByMemberModel[memberModelKey{memberID: memberID, model: modelName}]
-	if !exists || observation.upstreamAccountID <= 0 {
-		return 0, false
-	}
-	return observation.upstreamAccountID, true
-}
-
 func channelCredentialIndexEnabled(channel *model.Channel, index int) bool {
 	if channel == nil || index < 0 {
 		return false

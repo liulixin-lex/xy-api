@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -93,6 +93,10 @@ export function RiskAcknowledgementDialog({
   const [checkedItems, setCheckedItems] = useState<boolean[]>([])
   const [typedText, setTypedText] = useState('')
   const [typedTextParts, setTypedTextParts] = useState<string[]>([])
+  const confirmationPromptId = useId()
+  const confirmationTextId = useId()
+  const confirmationInputId = useId()
+  const confirmationErrorId = useId()
 
   const normalizedRequiredTextParts = useMemo<
     NormalizedRequiredTextPart[]
@@ -186,7 +190,7 @@ export function RiskAcknowledgementDialog({
       <AlertDialogContent
         finalFocus={finalFocus}
         className={cn(
-          'flex max-h-[min(88dvh,760px)] w-[calc(100vw-1.5rem)] !max-w-[44rem] grid-rows-none flex-col gap-0 overflow-hidden !p-0 sm:w-[min(44rem,calc(100vw-3rem))]',
+          'admin-touch-surface flex max-h-[min(88dvh,760px)] w-[calc(100vw-1.5rem)] !max-w-[44rem] grid-rows-none flex-col gap-0 overflow-hidden !p-0 sm:w-[min(44rem,calc(100vw-3rem))]',
           className
         )}
       >
@@ -239,10 +243,21 @@ export function RiskAcknowledgementDialog({
 
           {requiredTextToDisplay ? (
             <div className='border-destructive/30 bg-destructive/5 space-y-3 rounded-lg border p-3 sm:p-4'>
-              <Label className='text-sm font-medium'>
+              <Label
+                id={confirmationPromptId}
+                htmlFor={
+                  hasSegmentedRequiredText ? undefined : confirmationInputId
+                }
+                className='text-sm font-medium'
+                data-risk-acknowledgement-prompt=''
+              >
                 {inputPrompt ?? t('Please type the following text to confirm:')}
               </Label>
-              <div className='bg-background border-border rounded-md border px-3 py-2 font-mono text-sm leading-6 break-words whitespace-pre-wrap'>
+              <div
+                id={confirmationTextId}
+                className='bg-background border-border rounded-md border px-3 py-2 font-mono text-sm leading-6 break-words whitespace-pre-wrap'
+                data-risk-acknowledgement-required-text=''
+              >
                 {requiredTextToDisplay}
               </div>
               {hasSegmentedRequiredText ? (
@@ -263,6 +278,7 @@ export function RiskAcknowledgementDialog({
                     ) : (
                       <Textarea
                         key={partKey}
+                        id={`${confirmationInputId}-${part.inputIndex ?? 0}`}
                         value={typedTextParts[part.inputIndex ?? 0] ?? ''}
                         onChange={(event) =>
                           handleTextPartChange(
@@ -279,14 +295,27 @@ export function RiskAcknowledgementDialog({
                         rows={getRequiredTextRows(part.text)}
                         autoFocus={open && part.inputIndex === 0}
                         wrap='soft'
+                        aria-labelledby={confirmationPromptId}
+                        aria-describedby={
+                          hasTypedRequiredText && !typedMatched
+                            ? `${confirmationTextId} ${confirmationErrorId}`
+                            : confirmationTextId
+                        }
+                        aria-errormessage={
+                          hasTypedRequiredText && !typedMatched
+                            ? confirmationErrorId
+                            : undefined
+                        }
                         aria-invalid={hasTypedRequiredText && !typedMatched}
                         className='min-h-10 resize-none overflow-hidden font-mono text-sm leading-6'
+                        data-risk-acknowledgement-input=''
                       />
                     )
                   })}
                 </div>
               ) : (
                 <Textarea
+                  id={confirmationInputId}
                   value={typedText}
                   onChange={(event) => setTypedText(event.target.value)}
                   placeholder={
@@ -295,12 +324,29 @@ export function RiskAcknowledgementDialog({
                   rows={getRequiredTextRows(requiredText)}
                   autoFocus={open}
                   wrap='soft'
+                  aria-labelledby={confirmationPromptId}
+                  aria-describedby={
+                    hasTypedRequiredText && !typedMatched
+                      ? `${confirmationTextId} ${confirmationErrorId}`
+                      : confirmationTextId
+                  }
+                  aria-errormessage={
+                    hasTypedRequiredText && !typedMatched
+                      ? confirmationErrorId
+                      : undefined
+                  }
                   aria-invalid={hasTypedRequiredText && !typedMatched}
                   className='min-h-16 resize-none overflow-hidden font-mono text-sm leading-6'
+                  data-risk-acknowledgement-input=''
                 />
               )}
               {hasTypedRequiredText && !typedMatched ? (
-                <p className='text-destructive text-xs'>
+                <p
+                  id={confirmationErrorId}
+                  role='alert'
+                  className='text-destructive text-xs'
+                  data-risk-acknowledgement-error=''
+                >
                   {mismatchHint ??
                     t('The entered text does not match the required text.')}
                 </p>

@@ -185,8 +185,9 @@ func buildLegacyRoutingPolicyDocumentContext(
 	}
 
 	document := model.RoutingPolicyDocument{
-		SchemaVersion: model.RoutingPolicySchemaVersion,
-		Pools:         make([]model.RoutingPolicyPoolContent, 0, len(pools)),
+		SchemaVersion:   model.RoutingPolicySchemaVersion,
+		Pools:           make([]model.RoutingPolicyPoolContent, 0, len(pools)),
+		ExtensionFields: current.ExtensionFields,
 	}
 	for index := range pools {
 		pool := pools[index]

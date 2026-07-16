@@ -16,17 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Link } from '@tanstack/react-router'
 import {
-  Activity,
-  Coins,
-  GitBranch,
-  RadioTower,
-  ScrollText,
-  ShieldCheck,
-  WifiOff,
-} from 'lucide-react'
-import { useEffect, useRef, type ReactNode } from 'react'
+  Activity01Icon,
+  Coins01Icon,
+  GitBranchIcon,
+  Radio01Icon,
+  Scroll01Icon,
+  Shield02Icon,
+  WifiOff02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
+import { Link } from '@tanstack/react-router'
+import { useEffect, useRef, type ComponentProps, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
@@ -38,14 +39,14 @@ import type { ChannelRoutingSection } from '../types'
 const sections: Array<{
   id: ChannelRoutingSection
   label: string
-  icon: typeof Activity
+  icon: ComponentProps<typeof HugeiconsIcon>['icon']
 }> = [
-  { id: 'overview', label: 'Overview', icon: Activity },
-  { id: 'groups', label: 'Routing groups', icon: GitBranch },
-  { id: 'channels', label: 'Channel health', icon: RadioTower },
-  { id: 'decisions', label: 'Decision audit', icon: ScrollText },
-  { id: 'costs', label: 'Upstream costs', icon: Coins },
-  { id: 'policies', label: 'Policies and changes', icon: ShieldCheck },
+  { id: 'overview', label: 'Overview', icon: Activity01Icon },
+  { id: 'groups', label: 'Routing groups', icon: GitBranchIcon },
+  { id: 'channels', label: 'Channel health', icon: Radio01Icon },
+  { id: 'decisions', label: 'Decision audit', icon: Scroll01Icon },
+  { id: 'costs', label: 'Upstream costs', icon: Coins01Icon },
+  { id: 'policies', label: 'Routing policies', icon: Shield02Icon },
 ]
 
 export function ChannelRoutingPageFrame(props: {
@@ -134,7 +135,6 @@ export function ChannelRoutingPageFrame(props: {
           >
             <div className='flex min-w-max items-center gap-1 border-b'>
               {sections.map((section) => {
-                const Icon = section.icon
                 const active = section.id === props.activeSection
                 return (
                   <Link
@@ -148,7 +148,11 @@ export function ChannelRoutingPageFrame(props: {
                         'text-foreground after:opacity-100 dark:text-foreground'
                     )}
                   >
-                    <Icon className='size-4' aria-hidden='true' />
+                    <HugeiconsIcon
+                      icon={section.icon}
+                      className='size-4'
+                      aria-hidden='true'
+                    />
                     {t(section.label)}
                   </Link>
                 )
@@ -165,7 +169,8 @@ export function ChannelRoutingPageFrame(props: {
               aria-live='polite'
               className='bg-muted/40 text-muted-foreground flex items-start gap-2 rounded-md border px-3 py-2 text-xs'
             >
-              <WifiOff
+              <HugeiconsIcon
+                icon={WifiOff02Icon}
                 className='mt-0.5 size-3.5 shrink-0'
                 aria-hidden='true'
               />

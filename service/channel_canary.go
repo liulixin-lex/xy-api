@@ -24,7 +24,9 @@ func cacheGetChannelRoutingCanary(
 	param *RetryParam,
 	setting smart_routing_setting.SmartRoutingSetting,
 ) (*model.Channel, string, bool, error) {
-	if param == nil || param.Ctx == nil || !setting.Enabled || !common.MemoryCacheEnabled {
+	if param == nil || param.Ctx == nil ||
+		!smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() ||
+		!common.MemoryCacheEnabled {
 		return nil, "", false, nil
 	}
 	if param.TokenGroup != "auto" {
@@ -78,8 +80,9 @@ func cacheGetChannelRoutingCanary(
 	crossGroupRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyTokenCrossGroupRetry)
 	for index := startGroupIndex; index < len(autoGroups); index++ {
 		group := autoGroups[index]
-		priorityRetry := param.GetRetry()
+		priorityRetry := autoGroupPriorityRetry(param.Ctx, param.GetRetry())
 		if index > startGroupIndex {
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			priorityRetry = 0
 		}
 
@@ -111,16 +114,14 @@ func cacheGetChannelRoutingCanary(
 		}
 		if channel == nil {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index+1)
-			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupRetryIndex, 0)
-			param.SetRetry(0)
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			continue
 		}
 
 		common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, group)
 		if crossGroupRetry && priorityRetry >= common.RetryTimes {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index+1)
-			param.SetRetry(0)
-			param.ResetRetryNextTry()
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry()+1)
 		} else {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index)
 		}
@@ -203,19 +204,21 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 	var lastProbeErr error
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, planActive, planErr := session.Plan(channelrouting.RequestRoutingPlanInput{
-			RequestPath:                param.RequestPath,
-			ModelName:                  param.ModelName,
-			IsStream:                   common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
-			RetryIndex:                 param.GetRetry(),
-			PromptTokenEstimate:        promptTokens,
-			CompletionTokenEstimate:    completionTokens,
-			CostProfile:                routingCostRequestProfile(param.Ctx),
-			Profile:                    profile,
-			AllowedChannelIDs:          allowedIDs,
-			ExcludedChannelIDs:         excludedIDs,
-			ExcludedCredentialIDs:      excludedCredentialIDs,
-			CapacityExcludedChannelIDs: capacityExcluded,
-			ProbeExcludedChannelIDs:    probeExcluded,
+			RequestPath:                 param.RequestPath,
+			ModelName:                   param.ModelName,
+			IsStream:                    common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+			RetryIndex:                  param.GetRetry(),
+			PromptTokenEstimate:         promptTokens,
+			CompletionTokenEstimate:     completionTokens,
+			CostProfile:                 routingCostRequestProfile(param.Ctx),
+			Profile:                     profile,
+			AllowedChannelIDs:           allowedIDs,
+			ExcludedChannelIDs:          excludedIDs,
+			ExcludedCredentialIDs:       excludedCredentialIDs,
+			ExcludedEndpointIdentities:  smartRoutingExcludedEndpointList(param.Ctx),
+			ExcludedFailureDomainHashes: smartRoutingExcludedFailureDomainList(param.Ctx),
+			CapacityExcludedChannelIDs:  capacityExcluded,
+			ProbeExcludedChannelIDs:     probeExcluded,
 			SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
 				return channelRoutingCanaryRuntime.slowStartFactor(gate.PolicyRevision, canaryPolicy, key)
 			},
@@ -384,7 +387,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			PoolID:            plan.SelectedIdentity.PoolID,
 			MemberID:          plan.SelectedIdentity.MemberID,
 			CredentialID:      plan.SelectedIdentity.CredentialID,
-			UpstreamAccountID: plan.SelectedIdentity.UpstreamAccountID,
+			FailureDomainHash: plan.SelectedIdentity.FailureDomainHash,
 		})
 		enqueueChannelRoutingCanaryDecision(param, group, plan, &admission)
 		return selected, true, true, nil
@@ -409,6 +412,10 @@ func channelRoutingSessionSet(c *gin.Context) (*channelrouting.RequestRoutingSes
 }
 
 func channelRoutingCanaryGate(c *gin.Context, group string) (channelrouting.CanaryGate, bool, error) {
+	if c == nil || strings.TrimSpace(group) == "" ||
+		!smart_routing_setting.CurrentEffectiveMode().AllowsEnterpriseFeatures() || !common.MemoryCacheEnabled {
+		return channelrouting.CanaryGate{}, false, nil
+	}
 	sessions, pinned := common.GetContextKeyType[*channelrouting.RequestRoutingSessionSet](c, constant.ContextKeyRoutingSessionSet)
 	if !pinned || sessions == nil {
 		stage, exists := channelrouting.CurrentPoolDeploymentStage(group)
@@ -436,7 +443,8 @@ func channelRoutingCanaryGate(c *gin.Context, group string) (channelrouting.Cana
 
 func ShouldBypassChannelRoutingAffinity(c *gin.Context, group string) (bool, error) {
 	setting := smart_routing_setting.GetSetting()
-	if c == nil || group == "" || group == "auto" || !setting.Enabled || !common.MemoryCacheEnabled {
+	mode := smart_routing_setting.ResolveEffectiveMode(setting)
+	if c == nil || group == "" || group == "auto" || !mode.AllowsAffinityRouting() || !common.MemoryCacheEnabled {
 		return false, nil
 	}
 	if stage, exists := channelrouting.CurrentPoolDeploymentStage(group); exists && stage == model.RoutingDeploymentStageActive {
@@ -457,8 +465,9 @@ func GetAdmissibleAffinityChannelWithRoutingGate(
 	requestPath string,
 ) (*model.Channel, string, bool, error) {
 	setting := smart_routing_setting.GetSetting()
+	mode := smart_routing_setting.ResolveEffectiveMode(setting)
 	if c == nil || preferredID <= 0 || modelName == "" || usingGroup == "" ||
-		!setting.Enabled || !common.MemoryCacheEnabled {
+		!mode.AllowsAffinityRouting() || !common.MemoryCacheEnabled {
 		channel, group, _ := GetAdmissibleAffinityChannel(c, preferredID, modelName, usingGroup, requestPath)
 		return channel, group, false, nil
 	}
@@ -647,7 +656,7 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 		GroupName:            group,
 		ModelName:            param.ModelName,
 		SnapshotRevision:     gate.PolicyRevision,
-		AlgorithmVersion:     channelrouting.DecisionAlgorithmCanaryV1,
+		AlgorithmVersion:     channelrouting.DecisionAlgorithmCanary,
 		RetryIndex:           param.GetRetry(),
 		IsStream:             common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
 		ActualChannelID:      channelID,
@@ -666,6 +675,6 @@ func enqueueChannelRoutingControlDecision(param *RetryParam, group string, selec
 		return nil
 	}
 	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingDecisionID, decisionID)
-	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmCanaryV1)
+	common.SetContextKey(param.Ctx, constant.ContextKeyRoutingAlgorithmVersion, channelrouting.DecisionAlgorithmCanary)
 	return nil
 }

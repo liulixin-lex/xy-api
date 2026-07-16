@@ -16,11 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  BadgeCheckIcon,
+  RefreshIcon,
+  Shield02Icon,
+  Undo02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AxiosError } from 'axios'
-import { BadgeCheck, RefreshCw, RotateCcw, ShieldCheck } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -390,7 +395,12 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
         >
           <SheetHeader className={sideDrawerHeaderClassName()}>
             <SheetTitle className='flex items-center gap-2'>
-              <RotateCcw className='size-4' aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Undo02Icon}
+                className='size-4'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
               {t('Rollback policy')}
             </SheetTitle>
             <SheetDescription>
@@ -580,7 +590,12 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                       id='rollback-approval-heading'
                       className='flex items-center gap-2 text-sm font-semibold'
                     >
-                      <ShieldCheck className='size-4' aria-hidden='true' />
+                      <HugeiconsIcon
+                        icon={Shield02Icon}
+                        className='size-4'
+                        strokeWidth={2}
+                        aria-hidden='true'
+                      />
                       {t('Rollback approval')}
                     </h3>
                     <p className='text-muted-foreground mt-1 text-xs'>
@@ -658,7 +673,12 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                     variant='outline'
                     onClick={() => void approvalsQuery.refetch()}
                   >
-                    <RefreshCw aria-hidden='true' />
+                    <HugeiconsIcon
+                      icon={RefreshIcon}
+                      data-icon='inline-start'
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
                     {t('Refresh approval status')}
                   </Button>
                 ) : null}
@@ -701,7 +721,12 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                 )()
               }
             >
-              <BadgeCheck aria-hidden='true' />
+              <HugeiconsIcon
+                icon={BadgeCheckIcon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
               {approveButtonLabel}
             </Button>
             <Button
@@ -717,7 +742,12 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                 (requiresApproval && !quorum)
               }
             >
-              <RotateCcw aria-hidden='true' />
+              <HugeiconsIcon
+                icon={Undo02Icon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
               {t('Execute rollback')}
             </Button>
           </SheetFooter>

@@ -219,18 +219,6 @@ func EnqueueSystemTask(taskType string, payload any) (*model.SystemTask, bool, e
 	return task, true, nil
 }
 
-func EnqueueRoutingCostSyncOperation(
-	ctx context.Context,
-	operationID int64,
-) (*model.SystemTask, bool, error) {
-	task, created, err := model.AttachRoutingCostSyncOperationContext(ctx, operationID)
-	if err != nil {
-		return nil, false, err
-	}
-	notifySystemTaskRunner()
-	return task, created, nil
-}
-
 // runSystemTaskClaimPass tries to claim one pending task per registered type
 // and dispatches each claimed task in its own goroutine so a long-running
 // handler (e.g. channel test) never blocks another type (e.g. log cleanup).

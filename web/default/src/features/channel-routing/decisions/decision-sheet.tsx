@@ -16,9 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import { RotateLeft01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { RotateCcw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -50,9 +50,11 @@ import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   ChannelRoutingErrorState,
   ChannelRoutingLoadingState,
+  ChannelRoutingRefetchErrorAlert,
 } from '../components/page-state'
 import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
+import { ChannelRoutingAlgorithmIdentity } from './algorithm-identity'
 import { ChannelRoutingDecisionCostSection } from './cost-estimate-section'
 import { ChannelRoutingDecisionCandidatesSection } from './decision-candidates-section'
 import { ChannelRoutingAttemptTimelineSection } from './hedge-audit-section'
@@ -105,7 +107,7 @@ export function ChannelRoutingDecisionSheet(props: {
           {decisionQuery.isLoading ? (
             <ChannelRoutingLoadingState rows={7} />
           ) : null}
-          {decisionQuery.isError ? (
+          {decisionQuery.isError && !decision ? (
             <ChannelRoutingErrorState
               error={decisionQuery.error}
               onRetry={() => void decisionQuery.refetch()}
@@ -114,6 +116,12 @@ export function ChannelRoutingDecisionSheet(props: {
 
           {decision ? (
             <div className='space-y-5'>
+              {decisionQuery.isRefetchError ? (
+                <ChannelRoutingRefetchErrorAlert
+                  isFetching={decisionQuery.isFetching}
+                  onRetry={() => void decisionQuery.refetch()}
+                />
+              ) : null}
               <div className='flex flex-wrap items-center gap-2'>
                 <ChannelRoutingStatusBadge
                   status={
@@ -137,13 +145,16 @@ export function ChannelRoutingDecisionSheet(props: {
                 ) : null}
               </div>
 
+              <ChannelRoutingAlgorithmIdentity
+                algorithm={decision.algorithm_version}
+              />
+
               <dl className='bg-border grid grid-cols-2 gap-px overflow-hidden rounded-lg border sm:grid-cols-4'>
                 {[
                   [t('Group'), decision.group_name],
                   [t('Model'), decision.model_name],
                   [t('Actual channel'), `#${decision.actual_channel_id}`],
                   [t('Selected channel'), `#${decision.observed_channel_id}`],
-                  [t('Algorithm'), decision.algorithm_version],
                   [t('Revision'), `r${decision.snapshot_revision}`],
                   [t('Retry index'), format.number(decision.retry_index)],
                   [t('Created'), format.timestamp(decision.created_time)],
@@ -240,10 +251,14 @@ export function ChannelRoutingDecisionSheet(props: {
           <SheetFooter className={sideDrawerFooterClassName()}>
             <Button
               variant='outline'
-              disabled={replay.isPending}
+              disabled={replay.isPending || decisionQuery.isRefetchError}
               onClick={() => replay.mutate()}
             >
-              <RotateCcw aria-hidden='true' />
+              <HugeiconsIcon
+                icon={RotateLeft01Icon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {replay.isPending ? t('Replaying') : t('Replay decision')}
             </Button>
           </SheetFooter>

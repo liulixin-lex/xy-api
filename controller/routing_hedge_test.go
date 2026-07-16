@@ -25,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestRoutingHedgeReplaySafeRequestExclusionMatrix(t *testing.T) {
@@ -362,47 +363,54 @@ func TestRoutingHedgeBufferedSafetyRejectionTakesPrecedenceOverSuccess(t *testin
 	}
 }
 
-func TestRoutingHedgeRequiresDistinctEndpointOrUpstreamAccountFailureDomain(t *testing.T) {
+func TestRoutingHedgeRequiresDistinctEndpointOrConfiguredFailureDomain(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
-		name                string
-		primaryAuthority    string
-		secondaryAuthority  string
-		primaryAccount      string
-		secondaryAccount    string
-		primaryCredential   int
-		secondaryCredential int
-		want                bool
+		name                   string
+		primaryAuthority       string
+		secondaryAuthority     string
+		primaryFailureDomain   string
+		secondaryFailureDomain string
+		primaryCredential      int
+		secondaryCredential    int
+		want                   bool
 	}{
 		{
 			name: "different endpoint", primaryAuthority: "https://api-a.example.test:443",
-			secondaryAuthority: "https://api-b.example.test:443", primaryAccount: strings.Repeat("a", 64),
-			secondaryAccount: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 12, want: true,
+			secondaryAuthority: "https://api-b.example.test:443", primaryFailureDomain: strings.Repeat("a", 64),
+			secondaryFailureDomain: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 12, want: true,
 		},
 		{
-			name: "different upstream account", primaryAuthority: "https://api.example.test:443",
-			secondaryAuthority: "https://api.example.test:443", primaryAccount: strings.Repeat("a", 64),
-			secondaryAccount: strings.Repeat("b", 64), primaryCredential: 11, secondaryCredential: 12, want: true,
+			name: "different configured failure domain", primaryAuthority: "https://api.example.test:443",
+			secondaryAuthority: "https://api.example.test:443", primaryFailureDomain: strings.Repeat("a", 64),
+			secondaryFailureDomain: strings.Repeat("b", 64), primaryCredential: 11, secondaryCredential: 12, want: true,
 		},
 		{
-			name: "same endpoint and account", primaryAuthority: "https://api.example.test:443",
-			secondaryAuthority: "https://api.example.test:443", primaryAccount: strings.Repeat("a", 64),
-			secondaryAccount: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 12,
+			name: "same endpoint and failure domain", primaryAuthority: "https://api.example.test:443",
+			secondaryAuthority: "https://api.example.test:443", primaryFailureDomain: strings.Repeat("a", 64),
+			secondaryFailureDomain: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 12,
 		},
 		{
 			name: "same credential", primaryAuthority: "https://api-a.example.test:443",
-			secondaryAuthority: "https://api-b.example.test:443", primaryAccount: strings.Repeat("a", 64),
-			secondaryAccount: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 11,
+			secondaryAuthority: "https://api-b.example.test:443", primaryFailureDomain: strings.Repeat("a", 64),
+			secondaryFailureDomain: strings.Repeat("a", 64), primaryCredential: 11, secondaryCredential: 11,
 		},
 		{
-			name: "unknown endpoint", secondaryAuthority: "https://api-b.example.test:443",
-			primaryAccount: strings.Repeat("a", 64), secondaryAccount: strings.Repeat("b", 64),
-			primaryCredential: 11, secondaryCredential: 12,
+			name:                 "configured failure domain proves independence when endpoint is unknown",
+			secondaryAuthority:   "https://api-b.example.test:443",
+			primaryFailureDomain: strings.Repeat("a", 64), secondaryFailureDomain: strings.Repeat("b", 64),
+			primaryCredential: 11, secondaryCredential: 12, want: true,
 		},
 		{
-			name: "unknown account", primaryAuthority: "https://api-a.example.test:443",
-			secondaryAuthority: "https://api-b.example.test:443", secondaryAccount: strings.Repeat("b", 64),
-			primaryCredential: 11, secondaryCredential: 12,
+			name:               "different endpoints prove independence when failure domain is unknown",
+			primaryAuthority:   "https://api-a.example.test:443",
+			secondaryAuthority: "https://api-b.example.test:443", secondaryFailureDomain: strings.Repeat("b", 64),
+			primaryCredential: 11, secondaryCredential: 12, want: true,
+		},
+		{
+			name:               "unknown endpoint and failure domain fails closed",
+			secondaryAuthority: "https://api.example.test:443",
+			primaryCredential:  11, secondaryCredential: 12,
 		},
 	}
 	for _, test := range tests {
@@ -417,13 +425,151 @@ func TestRoutingHedgeRequiresDistinctEndpointOrUpstreamAccountFailureDomain(t *t
 			actual := routingHedgeTargetsHaveDistinctFailureDomain(
 				primary,
 				secondary,
-				channelrouting.ShadowCostInput{AccountKeyHash: test.primaryAccount},
-				channelrouting.ShadowCostInput{AccountKeyHash: test.secondaryAccount},
+				channelrouting.ShadowCostInput{FailureDomainHash: test.primaryFailureDomain},
+				channelrouting.ShadowCostInput{FailureDomainHash: test.secondaryFailureDomain},
 			)
 
 			assert.Equal(t, test.want, actual)
 		})
 	}
+}
+
+func TestRoutingHedgeHistoricalFailureDomainMigrationSurvivesSnapshotAdmission(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	gin.SetMode(gin.TestMode)
+
+	now := common.GetTimestamp()
+	priority := int64(100)
+	weight := uint(100)
+	baseURL := "https://shared-upstream.example.test/v1"
+	channels := []model.Channel{
+		{
+			Id: 98_210, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Key: "serving-key-a1", Status: common.ChannelStatusEnabled, Name: "legacy-account-a1",
+			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
+			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,
+		},
+		{
+			Id: 98_211, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Key: "serving-key-a2", Status: common.ChannelStatusEnabled, Name: "legacy-account-a2",
+			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
+			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,
+		},
+		{
+			Id: 98_212, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Key: "serving-key-b", Status: common.ChannelStatusEnabled, Name: "legacy-account-b",
+			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
+			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,
+		},
+	}
+	require.NoError(t, db.Session(&gorm.Session{SkipHooks: true}).Create(&channels).Error)
+
+	legacyAccountA := strings.Repeat("a", 64)
+	legacyAccountB := strings.Repeat("b", 64)
+	require.NoError(t, db.Create(&[]model.RoutingUpstreamAccount{
+		{
+			AccountKey: legacyAccountA, SourceType: model.RoutingUpstreamTypeNewAPI,
+			MaskedIdentity: "legacy-account-a", Status: model.RoutingUpstreamAccountStatusActive,
+			LastSyncStatus: model.RoutingUpstreamSyncStatusSuccess, CreatedTime: now, UpdatedTime: now,
+		},
+		{
+			AccountKey: legacyAccountB, SourceType: model.RoutingUpstreamTypeNewAPI,
+			MaskedIdentity: "legacy-account-b", Status: model.RoutingUpstreamAccountStatusActive,
+			LastSyncStatus: model.RoutingUpstreamSyncStatusSuccess, CreatedTime: now, UpdatedTime: now,
+		},
+	}).Error)
+	require.NoError(t, db.Create(&[]model.RoutingChannelBinding{
+		{
+			ChannelID: channels[0].Id, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+			BaseURL: baseURL, UpstreamGroup: "legacy", Enabled: true,
+			AccountKeyHash: legacyAccountA, CreatedTime: now, UpdatedTime: now,
+		},
+		{
+			ChannelID: channels[1].Id, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+			BaseURL: baseURL, UpstreamGroup: "legacy", Enabled: true,
+			AccountKeyHash: legacyAccountA, CreatedTime: now, UpdatedTime: now,
+		},
+		{
+			ChannelID: channels[2].Id, UpstreamType: model.RoutingUpstreamTypeNewAPI,
+			BaseURL: baseURL, UpstreamGroup: "legacy", Enabled: true,
+			AccountKeyHash: legacyAccountB, CreatedTime: now, UpdatedTime: now,
+		},
+	}).Error)
+
+	require.NoError(t, model.MigrateRoutingChannelConfigurations(db))
+	configurations := make(map[int]model.RoutingChannelConfiguration, len(channels))
+	for _, channel := range channels {
+		configuration, err := model.GetRoutingChannelConfigurationContext(context.Background(), channel.Id)
+		require.NoError(t, err)
+		require.Equal(t, model.RoutingFailureDomainStatusHistoricalMigrated, configuration.FailureDomainStatus)
+		require.Len(t, configuration.FailureDomainHash, 64)
+		configurations[channel.Id] = configuration
+	}
+	assert.Equal(t, configurations[channels[0].Id].FailureDomainHash, configurations[channels[1].Id].FailureDomainHash)
+	assert.NotEqual(t, configurations[channels[0].Id].FailureDomainHash, configurations[channels[2].Id].FailureDomainHash)
+
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	_, err = channelrouting.RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+
+	observations := make([]channelrouting.ModelSnapshot, len(channels))
+	identities := make([]channelrouting.Identity, len(channels))
+	for index, channel := range channels {
+		observation, _, ok := channelrouting.ResolveObserveModelSnapshot(
+			"legacy-failure-domain", channel.Id, "gpt-legacy-domain",
+		)
+		require.True(t, ok)
+		require.Len(t, observation.FailureDomainHash, 64)
+		require.Equal(t, configurations[channel.Id].FailureDomainHash, observation.FailureDomainHash)
+		observations[index] = observation
+
+		identity, ok := channelrouting.ResolveIdentity("legacy-failure-domain", channel.Id, channel.Key)
+		require.True(t, ok)
+		require.Positive(t, identity.CredentialID)
+		identities[index] = identity
+	}
+	assert.Equal(t, observations[0].FailureDomainHash, observations[1].FailureDomainHash)
+	assert.NotEqual(t, observations[0].FailureDomainHash, observations[2].FailureDomainHash)
+	require.NotEqual(t, identities[0].CredentialID, identities[1].CredentialID)
+	require.NotEqual(t, identities[0].CredentialID, identities[2].CredentialID)
+
+	contexts := make([]*gin.Context, len(channels))
+	endpointAuthority := channelrouting.EndpointAuthority(baseURL, channels[0].Id)
+	require.NotEmpty(t, endpointAuthority)
+	for index := range channels {
+		contexts[index], _ = gin.CreateTestContext(httptest.NewRecorder())
+		require.Equal(t, endpointAuthority, channelrouting.EndpointAuthority(baseURL, channels[index].Id))
+		common.SetContextKey(contexts[index], constant.ContextKeyRoutingEndpointAuthority, endpointAuthority)
+		common.SetContextKey(contexts[index], constant.ContextKeyRoutingCredentialID, identities[index].CredentialID)
+	}
+	sameAccountDistinct := routingHedgeTargetsHaveDistinctFailureDomain(
+		contexts[0], contexts[1],
+		channelrouting.ShadowCostInput{FailureDomainHash: observations[0].FailureDomainHash},
+		channelrouting.ShadowCostInput{FailureDomainHash: observations[1].FailureDomainHash},
+	)
+	assert.False(t, sameAccountDistinct)
+	sameAccountCoordinator := newRoutingHedgeCoordinatorForTest(t)
+	sameAccountPrimary, err := sameAccountCoordinator.BeginPrimary()
+	require.NoError(t, err)
+	t.Cleanup(sameAccountPrimary.Finish)
+	_, err = sameAccountCoordinator.BeginSecondary(1, sameAccountDistinct)
+	assert.ErrorIs(t, err, channelrouting.ErrHedgeTargetNotDistinct)
+
+	differentAccountDistinct := routingHedgeTargetsHaveDistinctFailureDomain(
+		contexts[0], contexts[2],
+		channelrouting.ShadowCostInput{FailureDomainHash: observations[0].FailureDomainHash},
+		channelrouting.ShadowCostInput{FailureDomainHash: observations[2].FailureDomainHash},
+	)
+	assert.True(t, differentAccountDistinct)
+	differentAccountCoordinator := newRoutingHedgeCoordinatorForTest(t)
+	differentAccountPrimary, err := differentAccountCoordinator.BeginPrimary()
+	require.NoError(t, err)
+	t.Cleanup(differentAccountPrimary.Finish)
+	differentAccountSecondary, err := differentAccountCoordinator.BeginSecondary(1, differentAccountDistinct)
+	require.NoError(t, err)
+	t.Cleanup(differentAccountSecondary.Finish)
 }
 
 func TestRoutingHedgeResponseWriterEnforcesHardBound(t *testing.T) {
@@ -500,6 +646,60 @@ func TestRoutingHedgeBranchClonesRequestConversionAndOverrides(t *testing.T) {
 	assert.Equal(t, "original", base.RuntimeHeadersOverride["X-Test"])
 	assert.Equal(t, 0.5, common.GetContextKeyStringMap(source, constant.ContextKeyChannelParamOverride)["temperature"])
 	assert.Equal(t, types.RelayFormatOpenAI, base.RequestConversionChain[0])
+}
+
+func TestRoutingHedgeSecondaryRechecksPrimaryFailureIdentityAsAnOrCondition(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	source, _ := gin.CreateTestContext(httptest.NewRecorder())
+	source.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	primaryAuthority := "https://primary.example.test:443"
+	primaryRegion := "region-a"
+	primaryDomain := strings.Repeat("a", 64)
+	retainedDomain := strings.Repeat("b", 64)
+	common.SetContextKey(source, constant.ContextKeyRoutingEndpointAuthority, primaryAuthority)
+	common.SetContextKey(source, constant.ContextKeyRoutingRegion, primaryRegion)
+	common.SetContextKey(source, constant.ContextKeyRoutingFailureDomainHash, primaryDomain)
+	common.SetContextKey(source, constant.ContextKeyRoutingExcludedEndpoints, map[string]channelrouting.RequestEndpointIdentity{
+		"primary": {EndpointAuthority: primaryAuthority, Region: primaryRegion},
+		"earlier": {EndpointAuthority: "https://earlier.example.test:443", Region: "region-b"},
+	})
+	common.SetContextKey(source, constant.ContextKeyRoutingExcludedDomains, map[string]struct{}{
+		primaryDomain:  {},
+		retainedDomain: {},
+	})
+
+	branch, err := newRoutingHedgeBranch(
+		source,
+		&relaycommon.RelayInfo{Request: &dto.GeneralOpenAIRequest{Model: "gpt-test"}},
+		&model.Channel{Id: 1}, channelrouting.HedgeAttemptSecondary,
+		&channelrouting.HedgeAttemptLease{}, []byte(`{"model":"gpt-test"}`), 1<<20, true,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { branch.cancel(nil) })
+
+	branchEndpoints, ok := common.GetContextKeyType[map[string]channelrouting.RequestEndpointIdentity](
+		branch.ctx, constant.ContextKeyRoutingExcludedEndpoints,
+	)
+	require.True(t, ok)
+	assert.NotContains(t, branchEndpoints, "primary")
+	assert.Contains(t, branchEndpoints, "earlier")
+	branchDomains, ok := common.GetContextKeyType[map[string]struct{}](
+		branch.ctx, constant.ContextKeyRoutingExcludedDomains,
+	)
+	require.True(t, ok)
+	assert.NotContains(t, branchDomains, primaryDomain)
+	assert.Contains(t, branchDomains, retainedDomain)
+
+	sourceEndpoints, ok := common.GetContextKeyType[map[string]channelrouting.RequestEndpointIdentity](
+		source, constant.ContextKeyRoutingExcludedEndpoints,
+	)
+	require.True(t, ok)
+	assert.Contains(t, sourceEndpoints, "primary")
+	sourceDomains, ok := common.GetContextKeyType[map[string]struct{}](
+		source, constant.ContextKeyRoutingExcludedDomains,
+	)
+	require.True(t, ok)
+	assert.Contains(t, sourceDomains, primaryDomain)
 }
 
 func newRoutingHedgeCoordinatorForTest(t *testing.T) *channelrouting.HedgeCoordinator {

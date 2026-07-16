@@ -193,6 +193,10 @@ func RecordReliabilitySuccess(key Key) Snapshot {
 	return defaultBreakerForKey(key).onSuccess(key).snapshot
 }
 
+func RecordActiveProbeSuccess(key Key) Snapshot {
+	return defaultBreakerForKey(key).onActiveProbeSuccess(key).snapshot
+}
+
 func RecordReliabilityFailure(key Key, kind FailureKind) Snapshot {
 	return defaultBreakerForKey(key).onReliabilityFailure(key, kind).snapshot
 }
@@ -360,12 +364,29 @@ func (b *Breaker) RecordHTTPAttempt(key Key, success bool, statusCode int) Snaps
 }
 
 func (b *Breaker) onSuccess(key Key) mutationResult {
+	return b.recordSuccess(key, false)
+}
+
+func (b *Breaker) onActiveProbeSuccess(key Key) mutationResult {
+	return b.recordSuccess(key, true)
+}
+
+func (b *Breaker) recordSuccess(key Key, activeProbe bool) mutationResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.config.Now()
 	record, created := b.getOrCreate(key, now)
-	b.advanceOpen(record, now)
+	wasOpen := record.snapshot.State == StateOpen
+	advancedOpen := b.advanceOpen(record, now)
+	if activeProbe && wasOpen {
+		// One active observation may open the recovery gate, but it must not
+		// also erase the passive failure evidence that opened the breaker.
+		if advancedOpen {
+			b.markDirty(key)
+		}
+		return b.finishMutationLocked(record, created, now)
+	}
 
 	switch record.snapshot.State {
 	case StateOpen:

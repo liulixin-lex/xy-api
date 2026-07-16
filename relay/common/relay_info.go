@@ -70,7 +70,6 @@ type ChannelMeta struct {
 	RoutingPoolID            int
 	RoutingMemberID          int
 	RoutingCredentialID      int
-	RoutingUpstreamAccountID int
 	RoutingEndpointHost      string
 	RoutingEndpointAuthority string
 	RoutingRegion            string
@@ -292,7 +291,6 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		RoutingPoolID:            common.GetContextKeyInt(c, constant.ContextKeyRoutingPoolID),
 		RoutingMemberID:          common.GetContextKeyInt(c, constant.ContextKeyRoutingMemberID),
 		RoutingCredentialID:      common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),
-		RoutingUpstreamAccountID: common.GetContextKeyInt(c, constant.ContextKeyRoutingUpstreamAccountID),
 		RoutingEndpointHost:      common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointHost),
 		RoutingEndpointAuthority: common.GetContextKeyString(c, constant.ContextKeyRoutingEndpointAuthority),
 		RoutingRegion:            common.GetContextKeyString(c, constant.ContextKeyRoutingRegion),

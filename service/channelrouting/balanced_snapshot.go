@@ -46,7 +46,7 @@ func (snapshot *runtimeSnapshot) compileBalancedPools() error {
 			snapshot.view.Pools[poolIndex].BalancedPolicy = policy
 		}
 		for _, preferTTFT := range []bool{false, true} {
-			profile, err := NewRequestProfile("", pool.GroupName, key.model, preferTTFT, 0, 0, 0)
+			profile, err := NewLegacyRequestProfile("", pool.GroupName, key.model, preferTTFT, 0, 0, 0)
 			if err != nil {
 				return err
 			}

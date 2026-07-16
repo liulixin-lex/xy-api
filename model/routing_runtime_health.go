@@ -49,23 +49,6 @@ func (RoutingCredentialHealthState) TableName() string {
 	return "routing_credential_health_states"
 }
 
-// RoutingUpstreamAccountHealthState is deliberately separate from cost-sync
-// status. A serving 402 must not be confused with a pricing connector failure.
-type RoutingUpstreamAccountHealthState struct {
-	AccountID          int    `json:"account_id" gorm:"primaryKey"`
-	ServingUnavailable bool   `json:"serving_unavailable"`
-	StatusCode         int    `json:"status_code"`
-	Reason             string `json:"reason" gorm:"type:varchar(256)"`
-	UnavailableUntilMs int64  `json:"unavailable_until_ms" gorm:"bigint;index"`
-	StateVersion       int64  `json:"state_version" gorm:"bigint"`
-	StateUpdatedTimeMs int64  `json:"state_updated_time_ms" gorm:"bigint"`
-	UpdatedTimeMs      int64  `json:"updated_time_ms" gorm:"bigint;index;not null"`
-}
-
-func (RoutingUpstreamAccountHealthState) TableName() string {
-	return "routing_upstream_account_health_states"
-}
-
 func UpsertRoutingCredentialHealthStatesContext(ctx context.Context, states []RoutingCredentialHealthState) error {
 	if len(states) == 0 {
 		return nil
@@ -136,129 +119,29 @@ func upsertRoutingCredentialHealthStatesContext(ctx context.Context, db *gorm.DB
 	return ctx.Err()
 }
 
-func UpsertRoutingUpstreamAccountHealthStatesContext(ctx context.Context, states []RoutingUpstreamAccountHealthState) error {
-	if len(states) == 0 {
-		return nil
-	}
+// PruneRoutingCredentialHealthStatesContext removes credential health whose
+// stable serving identity no longer exists. Retired credentials are gone.
+func PruneRoutingCredentialHealthStatesContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if DB == nil {
 		return ErrRoutingRuntimeHealthInvalid
 	}
-	return upsertRoutingUpstreamAccountHealthStatesContext(ctx, DB.WithContext(ctx), states)
+	return pruneRoutingCredentialHealthStatesContext(ctx, DB.WithContext(ctx))
 }
 
-func upsertRoutingUpstreamAccountHealthStatesContext(ctx context.Context, db *gorm.DB, states []RoutingUpstreamAccountHealthState) error {
-	if len(states) == 0 {
-		return nil
-	}
-
-	merged := make(map[int]RoutingUpstreamAccountHealthState, len(states))
-	for index := range states {
-		state := states[index]
-		if err := normalizeRoutingUpstreamAccountHealthState(&state); err != nil {
-			return err
-		}
-		if current, ok := merged[state.AccountID]; ok {
-			state = mergeRoutingUpstreamAccountHealthState(current, state)
-		}
-		merged[state.AccountID] = state
-	}
-
-	accountIDs := make([]int, 0, len(merged))
-	for accountID := range merged {
-		accountIDs = append(accountIDs, accountID)
-	}
-	sort.Ints(accountIDs)
-
-	existingAccounts := make(map[int]struct{}, len(accountIDs))
-	for start := 0; start < len(accountIDs); start += routingRuntimeHealthWriteBatch {
-		end := min(start+routingRuntimeHealthWriteBatch, len(accountIDs))
-		var ids []int
-		if err := db.Model(&RoutingUpstreamAccount{}).
-			Where("id IN ?", accountIDs[start:end]).
-			Pluck("id", &ids).Error; err != nil {
-			return err
-		}
-		for _, accountID := range ids {
-			existingAccounts[accountID] = struct{}{}
-		}
-	}
-
-	valid := make([]RoutingUpstreamAccountHealthState, 0, len(existingAccounts))
-	for _, accountID := range accountIDs {
-		if _, ok := existingAccounts[accountID]; ok {
-			valid = append(valid, merged[accountID])
-		}
-	}
-	if len(valid) == 0 {
-		return ctx.Err()
-	}
-	if err := db.Clauses(routingUpstreamAccountHealthOnConflict(db)).
-		CreateInBatches(&valid, routingRuntimeHealthWriteBatch).Error; err != nil {
-		return err
-	}
-	return ctx.Err()
-}
-
-// FlushRoutingRuntimeHealthStatesContext persists both serving scopes in one
-// transaction. Callers can acknowledge their in-memory dirty snapshots only
-// after this returns nil, so a failure in either scope cannot expose a partial
-// checkpoint as fully flushed.
-func FlushRoutingRuntimeHealthStatesContext(
-	ctx context.Context,
-	credentialStates []RoutingCredentialHealthState,
-	accountStates []RoutingUpstreamAccountHealthState,
-) error {
-	if len(credentialStates) == 0 && len(accountStates) == 0 {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if DB == nil {
-		return ErrRoutingRuntimeHealthInvalid
-	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := upsertRoutingCredentialHealthStatesContext(ctx, tx, credentialStates); err != nil {
-			return err
-		}
-		if err := upsertRoutingUpstreamAccountHealthStatesContext(ctx, tx, accountStates); err != nil {
-			return err
-		}
-		return ctx.Err()
-	})
-}
-
-// PruneRoutingRuntimeHealthStatesContext removes health rows whose stable
-// serving identity no longer exists. Retired credentials are treated as gone.
-func PruneRoutingRuntimeHealthStatesContext(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if DB == nil {
-		return ErrRoutingRuntimeHealthInvalid
-	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(`DELETE FROM routing_credential_health_states
+func pruneRoutingCredentialHealthStatesContext(ctx context.Context, db *gorm.DB) error {
+	if err := db.Exec(`DELETE FROM routing_credential_health_states
 WHERE NOT EXISTS (
 	SELECT 1 FROM routing_credential_refs
 	WHERE routing_credential_refs.id = routing_credential_health_states.credential_id
 		AND routing_credential_refs.channel_id = routing_credential_health_states.channel_id
 		AND routing_credential_refs.active = ?
 )`, true).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec(`DELETE FROM routing_upstream_account_health_states
-WHERE NOT EXISTS (
-	SELECT 1 FROM routing_upstream_accounts
-	WHERE routing_upstream_accounts.id = routing_upstream_account_health_states.account_id
-)`).Error; err != nil {
-			return err
-		}
-		return ctx.Err()
-	})
+		return err
+	}
+	return ctx.Err()
 }
 
 func ListRoutingCredentialHealthStatesContext(ctx context.Context, limit int) ([]RoutingCredentialHealthState, error) {
@@ -286,35 +169,6 @@ func ListRoutingCredentialHealthStatesContext(ctx context.Context, limit int) ([
 	}
 	for index := range states {
 		if err := normalizeRoutingCredentialHealthState(&states[index]); err != nil {
-			return nil, err
-		}
-	}
-	return states, nil
-}
-
-func ListRoutingUpstreamAccountHealthStatesContext(ctx context.Context, limit int) ([]RoutingUpstreamAccountHealthState, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if DB == nil || limit < 1 || limit > routingTopologyMaxCredentials {
-		return nil, ErrRoutingRuntimeHealthInvalid
-	}
-	var states []RoutingUpstreamAccountHealthState
-	err := DB.WithContext(ctx).
-		Where(`EXISTS (
-			SELECT 1 FROM routing_upstream_accounts
-			WHERE routing_upstream_accounts.id = routing_upstream_account_health_states.account_id
-		)`).
-		Order("updated_time_ms desc").Order("account_id asc").
-		Limit(limit + 1).Find(&states).Error
-	if err != nil {
-		return nil, err
-	}
-	if len(states) > limit {
-		return nil, ErrRoutingRuntimeHealthLimitExceeded
-	}
-	for index := range states {
-		if err := normalizeRoutingUpstreamAccountHealthState(&states[index]); err != nil {
 			return nil, err
 		}
 	}
@@ -372,37 +226,6 @@ func normalizeRoutingCredentialHealthState(state *RoutingCredentialHealthState) 
 	return nil
 }
 
-func normalizeRoutingUpstreamAccountHealthState(state *RoutingUpstreamAccountHealthState) error {
-	if state == nil || state.AccountID <= 0 || state.StateVersion < 0 || state.StateUpdatedTimeMs < 0 ||
-		state.UnavailableUntilMs < 0 || state.StatusCode < 0 || state.StatusCode > 599 {
-		return ErrRoutingRuntimeHealthInvalid
-	}
-	if state.StateVersion == 0 {
-		if state.UpdatedTimeMs <= 0 {
-			return ErrRoutingRuntimeHealthInvalid
-		}
-		state.StateVersion = routingRuntimeHealthLegacyVersion(state.UpdatedTimeMs)
-		state.StateUpdatedTimeMs = state.UpdatedTimeMs
-	} else if state.StateUpdatedTimeMs == 0 {
-		state.StateUpdatedTimeMs = state.UpdatedTimeMs
-	}
-	if state.StateUpdatedTimeMs <= 0 {
-		return ErrRoutingRuntimeHealthInvalid
-	}
-	if state.ServingUnavailable && state.StatusCode == 0 {
-		return ErrRoutingRuntimeHealthInvalid
-	}
-
-	state.Reason = boundedRoutingRuntimeHealthReason(state.Reason)
-	if !state.ServingUnavailable {
-		state.StatusCode = 0
-		state.Reason = ""
-		state.UnavailableUntilMs = 0
-	}
-	state.UpdatedTimeMs = state.StateUpdatedTimeMs
-	return nil
-}
-
 func mergeRoutingCredentialHealthState(current RoutingCredentialHealthState, incoming RoutingCredentialHealthState) RoutingCredentialHealthState {
 	if current.CredentialID == 0 {
 		current.CredentialID = incoming.CredentialID
@@ -423,22 +246,6 @@ func mergeRoutingCredentialHealthState(current RoutingCredentialHealthState, inc
 		current.CapacityUpdatedTimeMs = incoming.CapacityUpdatedTimeMs
 	}
 	current.UpdatedTimeMs = max(current.UpdatedTimeMs, current.AuthUpdatedTimeMs, current.CapacityUpdatedTimeMs)
-	return current
-}
-
-func mergeRoutingUpstreamAccountHealthState(current RoutingUpstreamAccountHealthState, incoming RoutingUpstreamAccountHealthState) RoutingUpstreamAccountHealthState {
-	if current.AccountID == 0 {
-		current.AccountID = incoming.AccountID
-	}
-	if incoming.StateVersion > current.StateVersion {
-		current.ServingUnavailable = incoming.ServingUnavailable
-		current.StatusCode = incoming.StatusCode
-		current.Reason = incoming.Reason
-		current.UnavailableUntilMs = incoming.UnavailableUntilMs
-		current.StateVersion = incoming.StateVersion
-		current.StateUpdatedTimeMs = incoming.StateUpdatedTimeMs
-	}
-	current.UpdatedTimeMs = max(current.UpdatedTimeMs, current.StateUpdatedTimeMs)
 	return current
 }
 
@@ -494,20 +301,6 @@ func routingCredentialHealthVersionAssignment(
 			},
 		},
 	}
-}
-
-func routingUpstreamAccountHealthOnConflict(db *gorm.DB) clause.OnConflict {
-	updates := make(clause.Set, 0, 7)
-	for _, column := range []string{
-		"serving_unavailable", "status_code", "reason", "unavailable_until_ms", "state_updated_time_ms", "state_version",
-	} {
-		updates = append(updates, routingRuntimeHealthConditionalAssignment(
-			db, "routing_upstream_account_health_states", "state_version", "",
-			"updated_time_ms", "state_updated_time_ms", column,
-		))
-	}
-	updates = append(updates, routingUpstreamAccountHealthUpdatedTimeAssignment(db))
-	return clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: updates}
 }
 
 func routingRuntimeHealthConditionalAssignment(
@@ -639,47 +432,6 @@ func routingCredentialHealthUpdatedTimeCandidate(
 			clause.Column{Table: "excluded", Name: dimensionTimeColumn},
 			clause.Column{Table: "excluded", Name: dimensionTimeColumn},
 			clause.Column{Table: "routing_credential_health_states", Name: "updated_time_ms"},
-		},
-	}
-}
-
-func routingUpstreamAccountHealthUpdatedTimeAssignment(db *gorm.DB) clause.Assignment {
-	if db != nil && db.Dialector != nil && db.Dialector.Name() == string(common.DatabaseTypeMySQL) {
-		return clause.Assignment{
-			Column: clause.Column{Name: "updated_time_ms"},
-			Value: clause.Expr{
-				SQL: "GREATEST(?, COALESCE(?, 0))",
-				Vars: []any{
-					clause.Column{Name: "updated_time_ms"},
-					clause.Column{Name: "state_updated_time_ms"},
-				},
-			},
-		}
-	}
-	maximumFunction := "MAX"
-	if db != nil && db.Dialector != nil && db.Dialector.Name() == string(common.DatabaseTypePostgreSQL) {
-		maximumFunction = "GREATEST"
-	}
-	stateCandidate := clause.Expr{
-		SQL: "CASE WHEN (CASE WHEN ? > 0 THEN ? < ? ELSE ? < ? END) THEN ? ELSE ? END",
-		Vars: []any{
-			clause.Column{Table: "routing_upstream_account_health_states", Name: "state_version"},
-			clause.Column{Table: "routing_upstream_account_health_states", Name: "state_version"},
-			clause.Column{Table: "excluded", Name: "state_version"},
-			clause.Column{Table: "routing_upstream_account_health_states", Name: "updated_time_ms"},
-			clause.Column{Table: "excluded", Name: "state_updated_time_ms"},
-			clause.Column{Table: "excluded", Name: "state_updated_time_ms"},
-			clause.Column{Table: "routing_upstream_account_health_states", Name: "updated_time_ms"},
-		},
-	}
-	return clause.Assignment{
-		Column: clause.Column{Name: "updated_time_ms"},
-		Value: clause.Expr{
-			SQL: maximumFunction + "(?, ?)",
-			Vars: []any{
-				clause.Column{Table: "routing_upstream_account_health_states", Name: "updated_time_ms"},
-				stateCandidate,
-			},
 		},
 	}
 }

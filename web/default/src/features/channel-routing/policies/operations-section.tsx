@@ -16,9 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import { EyeIcon, RefreshIcon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { Eye, RefreshCw } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -128,7 +128,10 @@ export function ChannelRoutingOperationsSection(props: {
           disabled={query.isFetching}
           onClick={() => void query.refetch()}
         >
-          <RefreshCw
+          <HugeiconsIcon
+            icon={RefreshIcon}
+            data-icon='inline-start'
+            strokeWidth={2}
             aria-hidden='true'
             className={
               query.isFetching
@@ -290,7 +293,12 @@ export function ChannelRoutingOperationsSection(props: {
                             />
                           }
                         >
-                          <Eye aria-hidden='true' />
+                          <HugeiconsIcon
+                            icon={EyeIcon}
+                            data-icon='inline-start'
+                            strokeWidth={2}
+                            aria-hidden='true'
+                          />
                         </TooltipTrigger>
                         <TooltipContent>{t('View operation')}</TooltipContent>
                       </Tooltip>

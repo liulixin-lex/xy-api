@@ -645,13 +645,6 @@ func currentChannelRoutingActiveProbeTarget(target channelrouting.ActiveProbeTar
 			return nil, channelrouting.ErrActiveProbeTargetStale
 		}
 	}
-	if accountID, known := channelrouting.ResolveUpstreamAccountID(target.GroupName, target.ChannelID, target.ModelName); known {
-		if accountID != target.UpstreamAccountID {
-			return nil, channelrouting.ErrActiveProbeTargetStale
-		}
-	} else if target.UpstreamAccountID != 0 {
-		return nil, channelrouting.ErrActiveProbeTargetStale
-	}
 	return channel, nil
 }
 

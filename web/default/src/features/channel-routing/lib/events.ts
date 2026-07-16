@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export const channelRoutingEventNames = [
   'routing.ready',
   'routing.reset',
@@ -25,9 +24,8 @@ export const channelRoutingEventNames = [
   'routing.policy.published',
   'routing.policy.rolled_back',
   'routing.policy.applied',
-  'routing.cost_sync.queued',
-  'routing.cost_sync.completed',
-  'routing.cost_binding.changed',
+  'routing.runtime_settings.changed',
+  'routing.channel_configuration.changed',
   'routing.probe.completed',
   'routing.audit_export.ready',
   'routing.error_budget.changed',
@@ -37,7 +35,6 @@ export const channelRoutingEventNames = [
   'reset',
   'policy.published',
   'policy.rolled_back',
-  'cost_sync.completed',
   'probe.completed',
   'audit_export.ready',
   'error_budget.changed',
@@ -46,12 +43,14 @@ export const channelRoutingEventNames = [
 export type ChannelRoutingEventResource =
   | 'all'
   | 'overview'
+  | 'runtime-settings'
+  | 'control-audits'
   | 'nodes'
   | 'groups'
   | 'channels'
   | 'endpoints'
   | 'costs'
-  | 'cost-bindings'
+  | 'channel-configurations'
   | 'probes'
   | 'decisions'
   | 'policy-drafts'
@@ -199,20 +198,17 @@ export function getChannelRoutingEventResources(
         'costs',
         'policies',
       ]
-    case 'routing.cost_sync.queued':
-      return ['operations']
-    case 'routing.cost_sync.completed':
-    case 'cost_sync.completed':
+    case 'routing.runtime_settings.changed':
+      return ['overview', 'runtime-settings', 'control-audits']
+    case 'routing.channel_configuration.changed':
       return [
         'overview',
-        'groups',
         'channels',
         'costs',
-        'cost-bindings',
-        'operations',
+        'channel-configurations',
+        'decisions',
+        'control-audits',
       ]
-    case 'routing.cost_binding.changed':
-      return ['overview', 'groups', 'channels', 'costs', 'cost-bindings']
     case 'routing.probe.completed':
     case 'probe.completed':
       return [

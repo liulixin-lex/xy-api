@@ -16,9 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Alert02Icon, ArrowRight01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { ArrowRight, TriangleAlert } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import {
@@ -29,12 +30,12 @@ import {
 } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { listManualBillingReviews } from '@/features/billing-reviews/api/manual-reviews'
+import { billingOperationsQueryKeys } from '@/features/billing-reviews/api/query-keys'
+import { getManualBillingReviewKindDisplay } from '@/features/billing-reviews/lib/manual-review'
 
-import { listManualBillingReviews } from '../api/billing-reviews'
-import { channelRoutingQueryKeys } from '../api/query-keys'
 import { ChannelRoutingRefetchErrorAlert } from '../components/page-state'
 import { useChannelRoutingFormatters } from '../lib/format'
-import { getManualBillingReviewKindDisplay } from '../lib/manual-billing-review'
 
 function manualReviewAge(
   seconds: number,
@@ -60,7 +61,7 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
   const { t } = useTranslation()
   const format = useChannelRoutingFormatters()
   const reviewsQuery = useQuery({
-    queryKey: channelRoutingQueryKeys.billingReviews({ cursor: 0, limit: 3 }),
+    queryKey: billingOperationsQueryKeys.manualReviews({ cursor: 0, limit: 3 }),
     queryFn: ({ signal }) =>
       listManualBillingReviews({ cursor: 0, limit: 3 }, signal),
     enabled: props.enabled,
@@ -91,7 +92,7 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
       role='status'
       className='border-warning/35 bg-warning/5 [&>svg]:text-warning has-data-[slot=alert-action]:pr-2.5 sm:has-data-[slot=alert-action]:pr-18'
     >
-      <TriangleAlert aria-hidden='true' />
+      <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
       <AlertTitle className='flex flex-wrap items-center gap-2'>
         <span>{t('Manual billing review required')}</span>
         <Badge variant='outline' className='bg-background/80 tabular-nums'>
@@ -128,8 +129,12 @@ export function ManualBillingReviewSummary(props: { enabled: boolean }) {
           variant='outline'
           render={<Link to='/billing-reviews' search={{ cursor: 0 }} />}
         >
+          <HugeiconsIcon
+            icon={ArrowRight01Icon}
+            data-icon='inline-start'
+            aria-hidden='true'
+          />
           {t('Open review queue')}
-          <ArrowRight aria-hidden='true' />
         </Button>
       </AlertAction>
     </Alert>

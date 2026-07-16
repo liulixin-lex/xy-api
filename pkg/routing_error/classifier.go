@@ -48,8 +48,7 @@ const (
 	CapacityReduce   CapacityEffect = "reduce"
 	CapacityCooldown CapacityEffect = "cooldown"
 
-	ComponentServing       Component = "serving"
-	ComponentCostConnector Component = "cost_connector"
+	ComponentServing Component = "serving"
 
 	OperationRelay      Operation = "relay"
 	OperationTaskSubmit Operation = "task_submit"
@@ -128,14 +127,11 @@ func ClassifyAPIError(apiErr *types.NewAPIError, ctx Context) Classification {
 	}
 
 	statusCode := apiErr.SourceStatusCode()
-	if ctx.Component == ComponentCostConnector && (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) {
-		return finish(result(ctx, ResponsibilityCredential, ScopeCredential, RetryBeforeCommit, HealthOpen, CapacityNone, "cost_connector_credential"))
-	}
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
 		return finish(result(ctx, ResponsibilityCredential, ScopeCredential, RetryBeforeCommit, HealthOpen, CapacityNone, "serving_credential_status"))
 	}
 	if statusCode == http.StatusPaymentRequired {
-		return finish(result(ctx, ResponsibilityCapacity, ScopeAccount, RetryBeforeCommit, HealthOpen, CapacityNone, "upstream_account_balance"))
+		return finish(result(ctx, ResponsibilityCapacity, ScopeChannel, RetryBeforeCommit, HealthIgnore, CapacityCooldown, "channel_balance_unavailable"))
 	}
 	if statusCode == http.StatusTooManyRequests || statusCode == 529 {
 		return finish(result(ctx, ResponsibilityCapacity, ScopePoolMember, RetryBeforeCommit, HealthIgnore, CapacityCooldown, "capacity_status"))

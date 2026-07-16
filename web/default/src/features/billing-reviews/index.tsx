@@ -22,8 +22,6 @@ import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
 import { Tabs, TabsContent, TabsTrigger } from '@/components/ui/tabs'
-import { ChannelRoutingScrollableTabsList } from '@/features/channel-routing/components/scrollable-tabs-list'
-import { ManualBillingReviewsSection } from '@/features/channel-routing/policies/manual-billing-reviews-section'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -32,7 +30,9 @@ import {
 import { getSelf } from '@/lib/api'
 import { useAuthStore, type AuthUser } from '@/stores/auth-store'
 
+import { ManualBillingReviewsSection } from './components/manual-reviews-section'
 import { ProjectionFailuresSection } from './components/projection-failures-section'
+import { BillingScrollableTabsList } from './components/scrollable-tabs-list'
 import type { BillingProjectionDataset } from './projection-types'
 
 const route = getRouteApi('/_authenticated/billing-reviews/')
@@ -113,7 +113,7 @@ export function BillingReviewsPage() {
         {t('Billing operations')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Content>
-        <div className='flex h-full min-h-0 flex-col gap-3 overflow-hidden pb-2 max-lg:[&_[data-slot=button]]:min-h-11 max-lg:[&_[data-slot=button]]:min-w-11'>
+        <div className='admin-touch-surface flex h-full min-h-0 flex-col gap-3 overflow-hidden pb-2 max-lg:[&_[data-slot=button]]:min-h-11 max-lg:[&_[data-slot=button]]:min-w-11'>
           <Tabs
             value={activeTab}
             onValueChange={(value) => {
@@ -125,7 +125,7 @@ export function BillingReviewsPage() {
             }}
             className='min-h-0 flex-1'
           >
-            <ChannelRoutingScrollableTabsList activeValue={activeTab}>
+            <BillingScrollableTabsList activeValue={activeTab}>
               {canReadReviews ? (
                 <TabsTrigger value='reviews'>{t('Manual reviews')}</TabsTrigger>
               ) : null}
@@ -134,7 +134,7 @@ export function BillingReviewsPage() {
                   {t('Projection failures')}
                 </TabsTrigger>
               ) : null}
-            </ChannelRoutingScrollableTabsList>
+            </BillingScrollableTabsList>
 
             {canReadReviews ? (
               <TabsContent
@@ -175,9 +175,7 @@ export function BillingReviewsPage() {
                     })
                   }}
                 >
-                  <ChannelRoutingScrollableTabsList
-                    activeValue={projectionKind}
-                  >
+                  <BillingScrollableTabsList activeValue={projectionKind}>
                     <TabsTrigger value='stats'>
                       {t('Stats projections')}
                     </TabsTrigger>
@@ -187,7 +185,7 @@ export function BillingReviewsPage() {
                     <TabsTrigger value='conflicts'>
                       {t('Sink conflicts')}
                     </TabsTrigger>
-                  </ChannelRoutingScrollableTabsList>
+                  </BillingScrollableTabsList>
                   <TabsContent
                     key={projectionKind}
                     value={projectionKind}

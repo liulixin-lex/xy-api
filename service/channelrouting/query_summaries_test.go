@@ -30,12 +30,14 @@ func TestChannelAndCostSummaryQueriesKeepLargeDetailsOutOfLists(t *testing.T) {
 	pricingSentinel := "pricing-detail-must-not-appear-in-list"
 	displayRate := 4.5
 	models[0] = ModelSnapshot{
-		ModelName: modelNames[0], Cost: 0.25,
+		ModelName: modelNames[0], ChannelConfigurationRevision: 7, Cost: 0.25,
 		CostPricing: &model.RoutingNormalizedPricing{
 			BillingMode: "expression", Currency: "USD", Unit: "request", BillingExpression: pricingSentinel,
 			PerRequestCost: &displayRate,
 		},
-		CostPricingHash: strings.Repeat("a", 64), CostConfidence: model.RoutingCostConfidenceExact,
+		CostPricingHash:        strings.Repeat("a", 64),
+		CostPricingIdentity:    "billing:" + strings.Repeat("a", 64) + ":channel-config:7",
+		CostUpstreamMultiplier: 1.5, CostConfidence: model.RoutingCostConfidenceExact,
 		CostFreshness: model.RoutingCostFreshnessFresh,
 	}
 	SetSnapshotForTest(SnapshotView{
@@ -43,6 +45,11 @@ func TestChannelAndCostSummaryQueriesKeepLargeDetailsOutOfLists(t *testing.T) {
 		Channels: []ChannelSnapshot{{
 			ID: 101, Name: "provider-a", Status: common.ChannelStatusEnabled,
 			Endpoint: "https://api.example.test", CredentialIDs: credentialIDs, ModelNames: modelNames,
+			ConfigurationRevision: 7, UpstreamCostMultiplier: 1.5,
+			CostSource: model.RoutingChannelCostSourceManual, CostConfirmed: true,
+			CostBasisAvailable: true, EffectiveModelCount: len(modelNames),
+			FailureDomainLabel:  "provider-a/account-main",
+			FailureDomainStatus: model.RoutingFailureDomainStatusConfigured,
 		}},
 		Pools: []PoolSnapshot{{
 			ID: 7, GroupName: "vip", Members: []PoolMemberSnapshot{{
@@ -64,6 +71,10 @@ func TestChannelAndCostSummaryQueriesKeepLargeDetailsOutOfLists(t *testing.T) {
 	assert.Equal(t, len(modelNames), channels[0].ModelCount)
 	assert.True(t, channels[0].ModelsTruncated)
 	assert.Len(t, channels[0].Models, ChannelSummaryModelLimit)
+	assert.Equal(t, int64(7), channels[0].ConfigurationRevision)
+	assert.True(t, channels[0].CostBasisAvailable)
+	assert.Equal(t, len(modelNames), channels[0].EffectiveModelCount)
+	assert.Equal(t, "provider-a/account-main", channels[0].FailureDomainLabel)
 
 	costs, costTotal, _, ok := ListCostSnapshotSummaries("vip", modelNames[0], nil, 0, 10)
 	require.True(t, ok)
@@ -75,9 +86,14 @@ func TestChannelAndCostSummaryQueriesKeepLargeDetailsOutOfLists(t *testing.T) {
 	assert.Equal(t, displayRate, *costs[0].DisplayRate)
 	assert.Equal(t, "per_request", costs[0].DisplayRateBasis)
 	assert.True(t, costs[0].ExpressionPricing)
+	assert.Equal(t, "billing:"+strings.Repeat("a", 64)+":channel-config:7", costs[0].PricingIdentity)
+	assert.Equal(t, int64(7), costs[0].ConfigurationRevision)
+	assert.Equal(t, 1.5, costs[0].UpstreamCostMultiplier)
 	encoded, err := common.Marshal(costs[0])
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), pricingSentinel)
+	assert.NotContains(t, string(encoded), "source_sync_status")
+	assert.NotContains(t, string(encoded), "account_source_type")
 
 	detail, _, found := GetCostSnapshotDetail(7, 11, modelNames[0])
 	require.True(t, found)

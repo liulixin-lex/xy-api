@@ -41,7 +41,9 @@ func cacheGetChannelRoutingBalanced(
 	param *RetryParam,
 	setting smart_routing_setting.SmartRoutingSetting,
 ) (*model.Channel, string, bool, error) {
-	if param == nil || param.Ctx == nil || !setting.Enabled || !common.MemoryCacheEnabled {
+	if param == nil || param.Ctx == nil ||
+		!smart_routing_setting.ResolveEffectiveMode(setting).AllowsBalancedDataPlane() ||
+		!common.MemoryCacheEnabled {
 		return nil, "", false, nil
 	}
 	if param.TokenGroup != "auto" {
@@ -75,8 +77,9 @@ func cacheGetChannelRoutingBalanced(
 	crossGroupRetry := common.GetContextKeyBool(param.Ctx, constant.ContextKeyTokenCrossGroupRetry)
 	for index := startGroupIndex; index < len(autoGroups); index++ {
 		group := autoGroups[index]
-		priorityRetry := param.GetRetry()
+		priorityRetry := autoGroupPriorityRetry(param.Ctx, param.GetRetry())
 		if index > startGroupIndex {
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			priorityRetry = 0
 		}
 		channel, active, err := selectChannelRoutingBalancedForGroup(param, group)
@@ -95,15 +98,13 @@ func cacheGetChannelRoutingBalanced(
 		}
 		if channel == nil {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index+1)
-			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupRetryIndex, 0)
-			param.SetRetry(0)
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry())
 			continue
 		}
 		common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, group)
 		if crossGroupRetry && priorityRetry >= common.RetryTimes {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index+1)
-			param.SetRetry(0)
-			param.ResetRetryNextTry()
+			beginAutoGroupAtRetry(param.Ctx, param.GetRetry()+1)
 		} else {
 			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index)
 		}
@@ -138,6 +139,9 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 	group string,
 	requirement channelRoutingBalancedRequirement,
 ) (*model.Channel, bool, error) {
+	if !smart_routing_setting.CurrentEffectiveMode().AllowsBalancedDataPlane() || !common.MemoryCacheEnabled {
+		return nil, false, nil
+	}
 	stage, exists := channelrouting.CurrentPoolDeploymentStage(group)
 	if !exists || stage != model.RoutingDeploymentStageActive {
 		return nil, false, nil
@@ -216,20 +220,22 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 	for attempts := 0; attempts <= len(allowedIDs); attempts++ {
 		plan, active, planErr := session.PlanBalanced(channelrouting.BalancedRoutingPlanInput{
 			RequestRoutingPlanInput: channelrouting.RequestRoutingPlanInput{
-				RequestPath:                param.RequestPath,
-				ModelName:                  param.ModelName,
-				IsStream:                   common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
-				RetryIndex:                 param.GetRetry(),
-				PromptTokenEstimate:        promptTokens,
-				CompletionTokenEstimate:    completionTokens,
-				CostProfile:                routingCostRequestProfile(param.Ctx),
-				Profile:                    profile,
-				AllowedChannelIDs:          allowedIDs,
-				ExcludedChannelIDs:         excludedIDs,
-				ExcludedCredentialIDs:      excludedCredentialIDs,
-				RequiredCredentialID:       requirement.credentialID,
-				CapacityExcludedChannelIDs: capacityExcluded,
-				ProbeExcludedChannelIDs:    probeExcluded,
+				RequestPath:                 param.RequestPath,
+				ModelName:                   param.ModelName,
+				IsStream:                    common.GetContextKeyBool(param.Ctx, constant.ContextKeyIsStream),
+				RetryIndex:                  param.GetRetry(),
+				PromptTokenEstimate:         promptTokens,
+				CompletionTokenEstimate:     completionTokens,
+				CostProfile:                 routingCostRequestProfile(param.Ctx),
+				Profile:                     profile,
+				AllowedChannelIDs:           allowedIDs,
+				ExcludedChannelIDs:          excludedIDs,
+				ExcludedCredentialIDs:       excludedCredentialIDs,
+				ExcludedEndpointIdentities:  smartRoutingExcludedEndpointList(param.Ctx),
+				ExcludedFailureDomainHashes: smartRoutingExcludedFailureDomainList(param.Ctx),
+				RequiredCredentialID:        requirement.credentialID,
+				CapacityExcludedChannelIDs:  capacityExcluded,
+				ProbeExcludedChannelIDs:     probeExcluded,
 				SlowStartFactor: func(key channelrouting.SlowStartKey) (float64, error) {
 					return channelRoutingCanaryRuntime.slowStartFactor(policyRevision, capacityPolicy, key)
 				},
@@ -317,27 +323,32 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 			OutputTPM: localOutputDemand,
 			Inflight:  1,
 		}
-		strictCost, strictCostKnown, costErr := routingStrictCapacityCost(
-			session, group, selected.Id, param, capacityInput, capacityOutput,
-		)
-		if costErr != nil {
-			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
-			return nil, true, fmt.Errorf("channel routing strict capacity cost failed: %w", costErr)
-		}
-		strictRequest, strict, strictErr := session.StrictCapacityRequest(
-			plan.SelectedIdentity, param.ModelName, upstreamModelName,
-			capacityInput, capacityOutput,
-			strictCost, strictCostKnown,
-		)
-		if strictErr != nil {
-			ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
-			if errors.Is(strictErr, channelrouting.ErrStrictCapacityExhausted) ||
-				errors.Is(strictErr, channelrouting.ErrEnterpriseCapacityCostUnknown) {
-				lastCapacityErr = strictErr
-				capacityExcluded = append(capacityExcluded, selected.Id)
-				continue
+		var strictRequest channelrouting.StrictCapacityRequest
+		strict := false
+		if smart_routing_setting.CurrentEffectiveMode().AllowsEnterpriseFeatures() {
+			strictCost, strictCostKnown, costErr := routingStrictCapacityCost(
+				session, group, selected.Id, param, capacityInput, capacityOutput,
+			)
+			if costErr != nil {
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				return nil, true, fmt.Errorf("channel routing strict capacity cost failed: %w", costErr)
 			}
-			return nil, true, fmt.Errorf("channel routing strict capacity plan failed: %w", strictErr)
+			var strictErr error
+			strictRequest, strict, strictErr = session.StrictCapacityRequest(
+				plan.SelectedIdentity, param.ModelName, upstreamModelName,
+				capacityInput, capacityOutput,
+				strictCost, strictCostKnown,
+			)
+			if strictErr != nil {
+				ReleaseRoutingHalfOpenProbe(param.Ctx, selected.Id, param.ModelName, group)
+				if errors.Is(strictErr, channelrouting.ErrStrictCapacityExhausted) ||
+					errors.Is(strictErr, channelrouting.ErrEnterpriseCapacityCostUnknown) {
+					lastCapacityErr = strictErr
+					capacityExcluded = append(capacityExcluded, selected.Id)
+					continue
+				}
+				return nil, true, fmt.Errorf("channel routing strict capacity plan failed: %w", strictErr)
+			}
 		}
 		var strictRequestForAdaptive *channelrouting.StrictCapacityRequest
 		if strict {
@@ -435,7 +446,7 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 			ChannelID: selected.Id, SnapshotRevision: plan.SelectedIdentity.SnapshotRevision,
 			PoolID: plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID,
 			CredentialID:      plan.SelectedIdentity.CredentialID,
-			UpstreamAccountID: plan.SelectedIdentity.UpstreamAccountID,
+			FailureDomainHash: plan.SelectedIdentity.FailureDomainHash,
 		})
 		if plan.AffinityUsed {
 			MarkChannelAffinityUsed(param.Ctx, group, selected.Id)

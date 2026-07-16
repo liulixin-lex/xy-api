@@ -175,6 +175,88 @@ func TestRoutingPolicyDraftDetectsStoredDocumentTampering(t *testing.T) {
 	assert.ErrorIs(t, err, ErrRoutingPolicyDraftInvalid)
 }
 
+func TestRoutingPolicyDraftPreservesUnknownExtensionsAcrossCreateReadUpdateAndPublish(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+
+	var document RoutingPolicyDocument
+	require.NoError(t, common.Unmarshal([]byte(`{
+		"schema_version":1,
+		"pools":[{
+			"pool_id":11,
+			"group_name":"VIP",
+			"display_name":"VIP",
+			"deployment_stage":"shadow",
+			"policy_profile":"balanced",
+			"policy":{"future_policy":{"mode":"adaptive","revision":9007199254740993}},
+			"members":[{
+				"member_id":101,
+				"channel_id":1001,
+				"enabled":true,
+				"priority":1,
+				"weight":100,
+				"credential_ids":[201,202],
+				"overrides":{"future_override":{"enabled":true,"label":"blue","revision":9007199254740993}},
+				"member_extension":{"failure_domain":"zone-a","ordinal":9007199254740993}
+			}],
+			"pool_extension":{"owner":"operations","labels":["primary","llm"]}
+		}],
+		"root_extension":{"format":"vendor-next","revision":3}
+	}`), &document))
+	assertRoutingPolicyExtensionFixture(t, document, 100)
+
+	draft, err := CreateRoutingPolicyDraftContext(context.Background(), 0, document, 10)
+	require.NoError(t, err)
+	created, err := draft.Document()
+	require.NoError(t, err)
+	assertRoutingPolicyExtensionFixture(t, created, 100)
+
+	created.Pools[0].Members[0].Weight = 250
+	draft, err = UpdateRoutingPolicyDraftContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag, created, 10,
+	)
+	require.NoError(t, err)
+	updated, err := draft.Document()
+	require.NoError(t, err)
+	assertRoutingPolicyExtensionFixture(t, updated, 250)
+
+	draft, err = ValidateRoutingPolicyDraftContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag, 10,
+	)
+	require.NoError(t, err)
+	draft, published, err := PublishRoutingPolicyDraftContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag,
+		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 10, Reason: "extension round trip"},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, published.Revision.ExtensionsJSON)
+	assert.Contains(t, *published.Revision.ExtensionsJSON, `"root_extension"`)
+
+	publishedDocument, revision, err := LoadRoutingPolicyRevisionContext(
+		context.Background(), published.Revision.Revision,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, draft.DocumentHash, revision.ContentHash)
+	assertRoutingPolicyExtensionFixture(t, publishedDocument, 250)
+}
+
+func assertRoutingPolicyExtensionFixture(t *testing.T, document RoutingPolicyDocument, weight int64) {
+	t.Helper()
+	require.Len(t, document.Pools, 1)
+	require.Len(t, document.Pools[0].Members, 1)
+	assert.Equal(t, weight, document.Pools[0].Members[0].Weight)
+	assert.JSONEq(t, `{"format":"vendor-next","revision":3}`, string(document.ExtensionFields["root_extension"]))
+	assert.JSONEq(t, `{"owner":"operations","labels":["primary","llm"]}`, string(document.Pools[0].ExtensionFields["pool_extension"]))
+	assert.JSONEq(t, `{"failure_domain":"zone-a","ordinal":9007199254740993}`, string(document.Pools[0].Members[0].ExtensionFields["member_extension"]))
+	assert.Contains(t, string(document.Pools[0].Members[0].ExtensionFields["member_extension"]), "9007199254740993")
+	assert.JSONEq(t, `{"future_policy":{"mode":"adaptive","revision":9007199254740993}}`, string(document.Pools[0].Policy))
+	assert.JSONEq(t, `{"future_override":{"enabled":true,"label":"blue","revision":9007199254740993}}`, string(document.Pools[0].Members[0].Overrides))
+	assert.Contains(t, string(document.Pools[0].Policy), "9007199254740993")
+	assert.Contains(t, string(document.Pools[0].Members[0].Overrides), "9007199254740993")
+}
+
 func runRoutingPolicyDraftLifecycleContract(t *testing.T, db *gorm.DB, dbType common.DatabaseType) {
 	t.Helper()
 	withRoutingTestDB(t, db, dbType)

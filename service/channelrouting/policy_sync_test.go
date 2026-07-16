@@ -67,13 +67,22 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 	initialCredentialIDs := append([]int(nil), initialDocument.Pools[0].Members[0].CredentialIDs...)
 
 	manualDocument := initialDocument
+	manualDocument.ExtensionFields = map[string]json.RawMessage{
+		"root_extension": json.RawMessage(`{"owner":"routing-platform"}`),
+	}
 	manualDocument.Pools[0].DeploymentStage = model.RoutingDeploymentStageShadow
 	manualDocument.Pools[0].PolicyProfile = model.RoutingPolicyProfileCustom
 	manualDocument.Pools[0].Policy = json.RawMessage(`{"max_error_rate":0.05}`)
+	manualDocument.Pools[0].ExtensionFields = map[string]json.RawMessage{
+		"pool_extension": json.RawMessage(`{"tier":"critical"}`),
+	}
 	manualDocument.Pools[0].Members[0].Enabled = false
 	manualDocument.Pools[0].Members[0].Priority = 88
 	manualDocument.Pools[0].Members[0].Weight = 77
 	manualDocument.Pools[0].Members[0].Overrides = json.RawMessage(`{"region":"primary"}`)
+	manualDocument.Pools[0].Members[0].ExtensionFields = map[string]json.RawMessage{
+		"member_extension": json.RawMessage(`{"zone":"a"}`),
+	}
 	manual, err := model.PublishRoutingPolicyRevisionDBContext(
 		context.Background(),
 		db,
@@ -114,10 +123,13 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 		assert.Equal(t, model.RoutingDeploymentStageShadow, pool.DeploymentStage)
 		assert.Equal(t, model.RoutingPolicyProfileCustom, pool.PolicyProfile)
 		assert.JSONEq(t, `{"max_error_rate":0.05}`, string(pool.Policy))
+		assert.JSONEq(t, `{"owner":"routing-platform"}`, string(document.ExtensionFields["root_extension"]))
+		assert.JSONEq(t, `{"tier":"critical"}`, string(pool.ExtensionFields["pool_extension"]))
 		assert.False(t, member.Enabled)
 		assert.Equal(t, int64(88), member.Priority)
 		assert.Equal(t, int64(77), member.Weight)
 		assert.JSONEq(t, `{"region":"primary"}`, string(member.Overrides))
+		assert.JSONEq(t, `{"zone":"a"}`, string(member.ExtensionFields["member_extension"]))
 		require.Len(t, member.CredentialIDs, 1)
 		assert.NotEqual(t, initialCredentialIDs, member.CredentialIDs)
 		assert.Equal(t, legacyRoutingPolicyPreserveSyncReason, revision.Reason)

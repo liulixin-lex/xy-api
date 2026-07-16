@@ -20,6 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { ChannelRoutingSectionPage } from '@/features/channel-routing'
+import { CHANNEL_ROUTING_CHANNEL_TABS } from '@/features/channel-routing/channels/tabs'
 import { isChannelRoutingPageSize } from '@/features/channel-routing/lib/pagination'
 import type { ChannelRoutingSection } from '@/features/channel-routing/types'
 
@@ -52,20 +53,30 @@ const searchSchema = z.object({
   search: z.string().max(256).optional().catch(''),
   status: z.number().int().optional().catch(undefined),
   type: z.number().int().optional().catch(undefined),
+  channelTab: z
+    .enum(CHANNEL_ROUTING_CHANNEL_TABS)
+    .optional()
+    .catch('physical-channels'),
   group: z.string().max(64).optional().catch(''),
   model: z.string().max(128).optional().catch(''),
   known: triStateSearchSchema,
-  costView: z.enum(['snapshots', 'sources']).optional().catch('snapshots'),
-  sourcePage: z.number().int().min(1).optional().catch(1),
-  sourcePageSize: z
-    .number()
-    .int()
-    .refine(isChannelRoutingPageSize)
+  costTab: z
+    .enum(['channel-multipliers', 'effective-costs'])
     .optional()
-    .catch(20),
-  sourceSearch: z.string().max(256).optional().catch(''),
-  sourceType: z.enum(['all', 'newapi', 'sub2api']).optional().catch('all'),
-  sourceEnabled: triStateSearchSchema,
+    .catch('channel-multipliers'),
+  policyTab: z
+    .enum(['runtime-settings', 'versioned-policies', 'operations-audits'])
+    .optional()
+    .catch('runtime-settings'),
+  costConfirmed: triStateSearchSchema,
+  costSource: z
+    .enum(['all', 'manual', 'legacy_migrated', 'defaulted'])
+    .optional()
+    .catch('all'),
+  trafficClass: z
+    .enum(['any', 'all', 'claude_code_only'])
+    .optional()
+    .catch('any'),
   cursor: z.number().int().min(0).optional().catch(0),
   draftCursor: z.number().int().min(0).optional().catch(0),
   limit: z.number().int().min(1).max(100).optional().catch(20),
@@ -82,14 +93,21 @@ const searchSchema = z.object({
     .refine(isChannelRoutingPageSize)
     .optional()
     .catch(20),
-  operationCursor: z.number().int().min(0).optional().catch(0),
-  billingReviewCursor: z
+  endpointSearch: z.string().max(320).optional().catch(''),
+  endpointRegion: z.string().max(64).optional().catch(''),
+  probeCursor: z.number().int().min(0).optional().catch(0),
+  probeLimit: z
     .number()
     .int()
-    .min(0)
-    .max(Number.MAX_SAFE_INTEGER)
+    .refine(isChannelRoutingPageSize)
     .optional()
-    .catch(0),
+    .catch(20),
+  probeOutcome: z
+    .enum(['all', 'success', 'failure', 'timeout', 'canceled', 'local_error'])
+    .optional()
+    .catch('all'),
+  probeChannelId: z.number().int().min(1).optional().catch(undefined),
+  operationCursor: z.number().int().min(0).optional().catch(0),
   operationType: z
     .enum([
       '',

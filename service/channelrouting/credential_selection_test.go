@@ -60,13 +60,6 @@ func TestCredentialSelectionUsesStableHealthAndRequestExclusions(t *testing.T) {
 	selected, reason = snapshot.selectCredential(member, "gpt-test", 7, nil, 0, now.Add(3*time.Second))
 	assert.Equal(t, 1_001, selected)
 	assert.Empty(t, reason)
-
-	RecordUpstreamAccountUnavailable(301, 402, "payment_required", time.Time{}, now)
-	_, blocked := UpstreamAccountRuntimeBlocked(301, now.Add(time.Second))
-	assert.True(t, blocked)
-	ClearUpstreamAccountUnavailable(301, now.Add(2*time.Second))
-	_, blocked = UpstreamAccountRuntimeBlocked(301, now.Add(3*time.Second))
-	assert.False(t, blocked)
 }
 
 func TestResolveCredentialKeySurvivesReorderingAndRejectsDuplicates(t *testing.T) {
@@ -158,14 +151,12 @@ func TestResolvePersistedCredentialKeySurvivesReorderingAndRejectsChannelReplace
 	assert.ErrorIs(t, err, ErrPersistedCredentialUnavailable)
 }
 
-func TestRuntimeHealthFlushAndHydratePreservesServingScopes(t *testing.T) {
+func TestRuntimeHealthFlushAndHydratePreservesCredentialServingState(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(t.TempDir()+"/runtime-health.db"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingCredentialRef{},
-		&model.RoutingUpstreamAccount{},
 		&model.RoutingCredentialHealthState{},
-		&model.RoutingUpstreamAccountHealthState{},
 		&model.RoutingControlLease{},
 	))
 	previousDB := model.DB
@@ -174,36 +165,25 @@ func TestRuntimeHealthFlushAndHydratePreservesServingScopes(t *testing.T) {
 	require.NoError(t, db.Create(&model.RoutingCredentialRef{
 		ID: 501, ChannelID: 51, Fingerprint: "fingerprint", FingerprintVersion: 1, Active: true,
 	}).Error)
-	require.NoError(t, db.Create(&model.RoutingUpstreamAccount{
-		ID: 601, AccountKey: "account", SourceType: model.RoutingUpstreamTypeNewAPI,
-		MaskedIdentity: "acct-***", Status: model.RoutingUpstreamAccountStatusActive,
-		LastSyncStatus: model.RoutingUpstreamSyncStatusSuccess, CreatedTime: 1, UpdatedTime: 1,
-	}).Error)
 	resetRuntimeHealthForTest()
 	t.Cleanup(resetRuntimeHealthForTest)
 	now := time.Unix(20_000, 0)
 	RecordCredentialAuthFailure(501, 51, "serving_401", time.Time{}, now)
 	RecordCredentialCapacityCooldown(501, 51, 429, now.Add(time.Minute), now)
-	RecordUpstreamAccountUnavailable(601, 402, "payment_required", time.Time{}, now)
 	require.NoError(t, FlushRuntimeHealthContext(context.Background()))
 
 	resetRuntimeHealthForTest()
 	require.NoError(t, RefreshRuntimeHealthContext(context.Background()))
 	_, credentialBlocked := CredentialRuntimeBlocked(501, now.Add(time.Second))
-	_, accountBlocked := UpstreamAccountRuntimeBlocked(601, now.Add(time.Second))
 	assert.True(t, credentialBlocked)
-	assert.True(t, accountBlocked)
 
 	ClearCredentialAuthFailure(501, 51, now.Add(2*time.Second))
 	ClearCredentialCapacityCooldown(501, 51, now.Add(2*time.Second))
-	ClearUpstreamAccountUnavailable(601, now.Add(2*time.Second))
 	require.NoError(t, FlushRuntimeHealthContext(context.Background()))
 	resetRuntimeHealthForTest()
 	require.NoError(t, RefreshRuntimeHealthContext(context.Background()))
 	_, credentialBlocked = CredentialRuntimeBlocked(501, now.Add(3*time.Second))
-	_, accountBlocked = UpstreamAccountRuntimeBlocked(601, now.Add(3*time.Second))
 	assert.False(t, credentialBlocked)
-	assert.False(t, accountBlocked)
 }
 
 func TestRuntimeHealthSameTimestampKeepsIndependentCredentialDimensions(t *testing.T) {
@@ -211,9 +191,7 @@ func TestRuntimeHealthSameTimestampKeepsIndependentCredentialDimensions(t *testi
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingCredentialRef{},
-		&model.RoutingUpstreamAccount{},
 		&model.RoutingCredentialHealthState{},
-		&model.RoutingUpstreamAccountHealthState{},
 		&model.RoutingControlLease{},
 	))
 	previousDB := model.DB
@@ -269,20 +247,6 @@ func TestRuntimeHealthDirtyAcknowledgementKeepsConcurrentNewerState(t *testing.T
 	stats = RuntimeHealthRuntimeStats()
 	assert.Zero(t, stats.CredentialDirty)
 
-	flushedAccount := model.RoutingUpstreamAccountHealthState{AccountID: 901, StateVersion: 30}
-	newerAccount := flushedAccount
-	newerAccount.StateVersion = 31
-	runtimeHealth.Lock()
-	runtimeHealth.dirtyAccounts[901] = newerAccount
-	runtimeHealth.Unlock()
-
-	acknowledgeFlushedAccountHealth([]model.RoutingUpstreamAccountHealthState{flushedAccount})
-	stats = RuntimeHealthRuntimeStats()
-	assert.Equal(t, 1, stats.AccountDirty)
-
-	acknowledgeFlushedAccountHealth([]model.RoutingUpstreamAccountHealthState{newerAccount})
-	stats = RuntimeHealthRuntimeStats()
-	assert.Zero(t, stats.AccountDirty)
 }
 
 func TestRuntimeHealthSuccessfulRebuildClearsRecoveredOverflow(t *testing.T) {
@@ -297,42 +261,26 @@ func TestRuntimeHealthSuccessfulRebuildClearsRecoveredOverflow(t *testing.T) {
 		AuthFailureUntilMs: now.Add(time.Hour).UnixMilli(), AuthVersion: 1,
 		AuthUpdatedTimeMs: now.UnixMilli(), UpdatedTimeMs: now.UnixMilli(),
 	}
-	runtimeHealth.accounts[1] = model.RoutingUpstreamAccountHealthState{
-		AccountID: 1, ServingUnavailable: true, StatusCode: http.StatusPaymentRequired,
-		UnavailableUntilMs: now.Add(time.Hour).UnixMilli(), StateVersion: 1,
-		StateUpdatedTimeMs: now.UnixMilli(), UpdatedTimeMs: now.UnixMilli(),
-	}
 	runtimeHealth.Unlock()
 
 	RecordCredentialAuthFailure(2, 22, "serving_401", now.Add(time.Hour), now)
-	RecordUpstreamAccountUnavailable(2, http.StatusPaymentRequired, "payment_required", now.Add(time.Hour), now)
 	stats := RuntimeHealthRuntimeStats()
 	assert.True(t, stats.CredentialOverflow)
-	assert.True(t, stats.AccountOverflow)
 
 	setRuntimeHealthLimitForTest(2)
 	runtimeHealth.Lock()
 	runtimeHealth.dirtyCredentials = make(map[int]model.RoutingCredentialHealthState)
-	runtimeHealth.dirtyAccounts = make(map[int]model.RoutingUpstreamAccountHealthState)
 	rebuildCredentialRuntimeHealthLocked([]model.RoutingCredentialHealthState{{
 		CredentialID: 2, ChannelID: 22, AuthFailure: true,
 		AuthFailureUntilMs: now.Add(time.Hour).UnixMilli(), AuthVersion: 2,
 		AuthUpdatedTimeMs: now.UnixMilli(), UpdatedTimeMs: now.UnixMilli(),
 	}})
-	rebuildAccountRuntimeHealthLocked([]model.RoutingUpstreamAccountHealthState{{
-		AccountID: 2, ServingUnavailable: true, StatusCode: http.StatusPaymentRequired,
-		UnavailableUntilMs: now.Add(time.Hour).UnixMilli(), StateVersion: 2,
-		StateUpdatedTimeMs: now.UnixMilli(), UpdatedTimeMs: now.UnixMilli(),
-	}})
 	runtimeHealth.Unlock()
 
 	stats = RuntimeHealthRuntimeStats()
 	assert.False(t, stats.CredentialOverflow)
-	assert.False(t, stats.AccountOverflow)
-	assert.Equal(t, int64(2), stats.Evictions)
+	assert.Equal(t, int64(1), stats.Evictions)
 	_, blocked := CredentialRuntimeBlocked(99, now)
-	assert.False(t, blocked)
-	_, blocked = UpstreamAccountRuntimeBlocked(99, now)
 	assert.False(t, blocked)
 }
 
@@ -341,9 +289,7 @@ func TestRuntimeHealthMaintenanceIsLocallyThrottled(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&model.RoutingCredentialRef{},
-		&model.RoutingUpstreamAccount{},
 		&model.RoutingCredentialHealthState{},
-		&model.RoutingUpstreamAccountHealthState{},
 		&model.RoutingControlLease{},
 	))
 	previousDB := model.DB

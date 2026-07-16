@@ -160,13 +160,13 @@ func TestRunHistoricalSimulationReplaysBalancedDraftPolicyAgainstShadowHistory(t
 		PoolID: 5, Limit: 10, BalancedPolicy: &policy,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, DecisionAlgorithmBalancedV1, result.SimulatedAlgorithm)
+	assert.Equal(t, DecisionAlgorithmBalanced, result.SimulatedAlgorithm)
 	assert.Equal(t, 1, result.ScannedSamples)
 	assert.Equal(t, 1, result.EvaluatedSamples)
 	require.Len(t, result.Samples, 1)
 	sample := result.Samples[0]
-	assert.Equal(t, DecisionAlgorithmShadowV1, sample.AlgorithmVersion)
-	assert.Equal(t, DecisionAlgorithmBalancedV1, sample.SimulatedAlgorithm)
+	assert.Equal(t, DecisionAlgorithmShadow, sample.AlgorithmVersion)
+	assert.Equal(t, DecisionAlgorithmBalanced, sample.SimulatedAlgorithm)
 	assert.Equal(t, 101, sample.BaselineChannelID)
 	assert.Equal(t, 102, sample.SimulatedChannelID)
 	assert.True(t, sample.SelectionChanged)
@@ -208,7 +208,7 @@ func TestRunPolicyDocumentSimulationAppliesDraftMembership(t *testing.T) {
 
 	result, err := RunPolicyDocumentSimulation(context.Background(), document, 5, 0, 10)
 	require.NoError(t, err)
-	assert.Equal(t, DecisionAlgorithmBalancedV1, result.SimulatedAlgorithm)
+	assert.Equal(t, DecisionAlgorithmBalanced, result.SimulatedAlgorithm)
 	require.Len(t, result.Samples, 1)
 	assert.Equal(t, 102, result.Samples[0].SimulatedChannelID)
 	assert.True(t, result.Samples[0].SelectionChanged)
@@ -487,7 +487,7 @@ func TestBalancedSimulationRiskEvidenceUsesSelectedTTFTAndRuntimeCapacity(t *tes
 
 func enqueueHistoricalSimulationAudit(t *testing.T, poolID int, requestID string) string {
 	t.Helper()
-	profile, err := NewRequestProfile("/v1/chat/completions", "group-"+strconv.Itoa(poolID), "gpt-test", false, 0, 1_000, 200)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "group-"+strconv.Itoa(poolID), "gpt-test", false, 0, 1_000, 200)
 	require.NoError(t, err)
 	seed, err := DeriveShadowSeed(requestID, 7, profile.RetryIndex)
 	require.NoError(t, err)

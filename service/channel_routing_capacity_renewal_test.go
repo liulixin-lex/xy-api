@@ -112,7 +112,7 @@ func (*strictRenewalFailureRedis) Eval(
 	_ []string,
 	args ...interface{},
 ) *redis.Cmd {
-	if strings.Contains(script, "strict_capacity_reserve_v2") {
+	if strings.Contains(script, "strict_capacity_reserve") {
 		now := time.Now().UnixMilli()
 		lease, _ := args[1].(int64)
 		return redis.NewCmdResult([]interface{}{int64(1), now, now + lease}, nil)
@@ -137,7 +137,7 @@ func (fake *strictRenewalObservedRedis) Eval(
 	_ []string,
 	args ...interface{},
 ) *redis.Cmd {
-	if strings.Contains(script, "strict_capacity_reserve_v2") {
+	if strings.Contains(script, "strict_capacity_reserve") {
 		now := time.Now().UnixMilli()
 		lease, _ := args[1].(int64)
 		return redis.NewCmdResult([]interface{}{int64(1), now, now + lease}, nil)

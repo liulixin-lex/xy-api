@@ -19,24 +19,34 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { channelRoutingIntlLocale, formatChannelRoutingCost } from './format'
+import { resolveChannelRoutingTimestamp } from './format'
 
-describe('channel routing cost formatting', () => {
-  test('preserves meaningful digits for small non-zero costs', () => {
-    assert.equal(formatChannelRoutingCost(0.0000045, 'en-US'), '0.0000045')
-    assert.equal(formatChannelRoutingCost(0.0000061, 'en-US'), '0.0000061')
-    assert.notEqual(formatChannelRoutingCost(0.0000045, 'en-US'), '0')
+describe('channel routing timestamp resolution', () => {
+  test('supports second and millisecond timestamps', () => {
+    assert.deepEqual(resolveChannelRoutingTimestamp(1_700_000_000), {
+      kind: 'date',
+      milliseconds: 1_700_000_000_000,
+    })
+    assert.deepEqual(resolveChannelRoutingTimestamp(1_700_000_000_000), {
+      kind: 'date',
+      milliseconds: 1_700_000_000_000,
+    })
   })
 
-  test('keeps an explicit known zero distinct from an unknown value', () => {
-    assert.equal(formatChannelRoutingCost(0, 'en-US'), '0')
-    assert.equal(formatChannelRoutingCost(Number.NaN, 'en-US'), '')
+  test('treats the int64 no-expiry sentinel as never without constructing an invalid Date', () => {
+    assert.deepEqual(
+      resolveChannelRoutingTimestamp(9_223_372_036_854_776_000),
+      { kind: 'never' }
+    )
   })
 
-  test('maps internal Chinese locale codes to valid Intl locales', () => {
-    assert.equal(channelRoutingIntlLocale('zhCN'), 'zh-CN')
-    assert.equal(channelRoutingIntlLocale('zhTW'), 'zh-TW')
-    assert.doesNotThrow(() => formatChannelRoutingCost(12.5, 'zhCN'))
-    assert.doesNotThrow(() => formatChannelRoutingCost(12.5, 'zhTW'))
+  test('distinguishes corrupt timestamps from an absent timestamp', () => {
+    assert.deepEqual(resolveChannelRoutingTimestamp(0), { kind: 'never' })
+    assert.deepEqual(resolveChannelRoutingTimestamp(Number.NaN), {
+      kind: 'invalid',
+    })
+    assert.deepEqual(resolveChannelRoutingTimestamp(8_700_000_000_000_000), {
+      kind: 'invalid',
+    })
   })
 })

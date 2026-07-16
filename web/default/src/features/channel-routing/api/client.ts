@@ -26,13 +26,15 @@ import type {
   ChannelRoutingAuditExportResponse,
   ChannelRoutingBreakerResetRequest,
   ChannelRoutingBreakerResetResponse,
-  ChannelRoutingCostSyncResult,
+  ChannelRoutingControlAuditPage,
   ChannelRoutingCostDetailResponse,
   ChannelRoutingDecision,
   ChannelRoutingDecisionSummary,
   ChannelRoutingErrorBudgetResponse,
+  ChannelRoutingNodePage,
   ChannelRoutingOverview,
   ChannelRoutingReplayProfilesResponse,
+  ChannelRoutingRuntimeSettings,
   ChannelSnapshot,
   CostSnapshotSummary,
   CurrentRoutingPolicy,
@@ -55,13 +57,16 @@ import type {
   PolicySimulationResponse,
   PoolSnapshot,
   PoolSnapshotSummary,
+  RoutingChannelConfiguration,
+  RoutingChannelConfigurationCostSource,
+  RoutingChannelConfigurationPage,
+  RoutingChannelConfigurationTrafficClass,
+  RoutingChannelConfigurationUpdate,
   RoutingOperation,
-  RoutingCostBinding,
-  RoutingCostBindingActionResult,
-  RoutingCostBindingPage,
-  RoutingCostBindingRequest,
   RoutingPolicyRevisionDetail,
+  RoutingProbeOutcome,
   RoutingProbeResult,
+  SmartRoutingSetting,
 } from '../types'
 
 const requestConfig = {
@@ -77,19 +82,88 @@ function unwrap<T>(response: ApiEnvelope<T>): T {
   return response.data
 }
 
-type ChannelRoutingCostBindingErrorPayload = {
+type ChannelRoutingConfigurationErrorPayload = {
   code?: string
   message?: string
   detail?: string
   field?: string
   reason?: string
   conflict?: {
-    current?: RoutingCostBinding | null
+    current?: RoutingChannelConfiguration | null
     current_etag?: string
   }
 }
 
-export type ChannelRoutingCostBindingApiError = {
+type ChannelRoutingRuntimeSettingsErrorPayload = {
+  code?: string
+  message?: string
+  field?: string
+  reason?: string
+  field_errors?: Partial<Record<keyof SmartRoutingSetting, string>>
+  conflict?: {
+    current?: ChannelRoutingRuntimeSettings | null
+    current_etag?: string
+  }
+}
+
+export type ChannelRoutingRuntimeSettingsApiError = {
+  status?: number
+  code?: string
+  message?: string
+  field?: string
+  reason?: string
+  fieldErrors?: Partial<Record<keyof SmartRoutingSetting, string>>
+}
+
+export class ChannelRoutingRuntimeSettingsConflictError extends Error {
+  current: ChannelRoutingRuntimeSettings | null
+  currentETag: string
+
+  constructor(
+    current: ChannelRoutingRuntimeSettings | null,
+    currentETag: string
+  ) {
+    super('Channel routing runtime settings changed')
+    this.name = 'ChannelRoutingRuntimeSettingsConflictError'
+    this.current = current
+    this.currentETag = currentETag
+  }
+}
+
+export function getChannelRoutingRuntimeSettingsApiError(
+  error: unknown
+): ChannelRoutingRuntimeSettingsApiError {
+  if (!isAxiosError<ChannelRoutingRuntimeSettingsErrorPayload>(error)) return {}
+  return {
+    status: error.response?.status,
+    code: error.response?.data?.code,
+    message: error.response?.data?.message,
+    field: error.response?.data?.field,
+    reason: error.response?.data?.reason,
+    fieldErrors: error.response?.data?.field_errors,
+  }
+}
+
+function runtimeSettingsConflictFromError(
+  error: unknown
+): ChannelRoutingRuntimeSettingsConflictError | null {
+  if (!isAxiosError<ChannelRoutingRuntimeSettingsErrorPayload>(error)) {
+    return null
+  }
+  const response = error.response
+  if (
+    response?.status !== 409 ||
+    response.data?.code !== 'runtime_settings_conflict'
+  ) {
+    return null
+  }
+  const current = response.data.conflict?.current ?? null
+  const currentETag =
+    response.data.conflict?.current_etag || current?.etag || ''
+  return new ChannelRoutingRuntimeSettingsConflictError(current, currentETag)
+}
+
+export type ChannelRoutingConfigurationApiError = {
   status?: number
   code?: string
   message?: string
@@ -98,22 +172,25 @@ export type ChannelRoutingCostBindingApiError = {
   reason?: string
 }
 
-export class ChannelRoutingCostBindingConflictError extends Error {
-  current: RoutingCostBinding | null
+export class ChannelRoutingConfigurationConflictError extends Error {
+  current: RoutingChannelConfiguration | null
   currentETag: string
 
-  constructor(current: RoutingCostBinding | null, currentETag: string) {
-    super('Channel routing cost binding changed')
-    this.name = 'ChannelRoutingCostBindingConflictError'
+  constructor(
+    current: RoutingChannelConfiguration | null,
+    currentETag: string
+  ) {
+    super('Channel routing configuration changed')
+    this.name = 'ChannelRoutingConfigurationConflictError'
     this.current = current
     this.currentETag = currentETag
   }
 }
 
-export function getChannelRoutingCostBindingApiError(
+export function getChannelRoutingConfigurationApiError(
   error: unknown
-): ChannelRoutingCostBindingApiError {
-  if (!isAxiosError<ChannelRoutingCostBindingErrorPayload>(error)) return {}
+): ChannelRoutingConfigurationApiError {
+  if (!isAxiosError<ChannelRoutingConfigurationErrorPayload>(error)) return {}
   return {
     status: error.response?.status,
     code: error.response?.data?.code,
@@ -124,27 +201,87 @@ export function getChannelRoutingCostBindingApiError(
   }
 }
 
-function costBindingConflictFromError(
+function configurationConflictFromError(
   error: unknown
-): ChannelRoutingCostBindingConflictError | null {
-  if (!isAxiosError<ChannelRoutingCostBindingErrorPayload>(error)) return null
+): ChannelRoutingConfigurationConflictError | null {
+  if (!isAxiosError<ChannelRoutingConfigurationErrorPayload>(error)) {
+    return null
+  }
   const response = error.response
   if (
     response?.status !== 409 ||
-    response.data?.code !== 'cost_binding_conflict'
+    response.data?.code !== 'channel_configuration_conflict'
   ) {
     return null
   }
   const current = response.data.conflict?.current ?? null
   const currentETag =
     response.data.conflict?.current_etag || current?.etag || ''
-  return new ChannelRoutingCostBindingConflictError(current, currentETag)
+  return new ChannelRoutingConfigurationConflictError(current, currentETag)
 }
 
 export async function getChannelRoutingOverview(): Promise<ChannelRoutingOverview> {
   const response = await api.get<ApiEnvelope<ChannelRoutingOverview>>(
-    '/api/channel-routing/v2/overview',
+    '/api/channel-routing/overview',
     requestConfig
+  )
+  return unwrap(response.data)
+}
+
+export async function getChannelRoutingRuntimeSettings(): Promise<ChannelRoutingRuntimeSettings> {
+  const response = await api.get<ApiEnvelope<ChannelRoutingRuntimeSettings>>(
+    '/api/channel-routing/runtime-settings',
+    requestConfig
+  )
+  const settings = unwrap(response.data)
+  return { ...settings, etag: response.headers.etag || settings.etag }
+}
+
+export async function updateChannelRoutingRuntimeSettings(
+  current: Pick<ChannelRoutingRuntimeSettings, 'etag'>,
+  settings: SmartRoutingSetting,
+  signal?: AbortSignal
+): Promise<ChannelRoutingRuntimeSettings> {
+  try {
+    const response = await api.put<ApiEnvelope<ChannelRoutingRuntimeSettings>>(
+      '/api/channel-routing/runtime-settings',
+      settings,
+      {
+        ...requestConfig,
+        signal,
+        headers: { 'If-Match': current.etag },
+      }
+    )
+    const updated = unwrap(response.data)
+    return { ...updated, etag: response.headers.etag || updated.etag }
+  } catch (error) {
+    const conflict = runtimeSettingsConflictFromError(error)
+    if (conflict) throw conflict
+    throw error
+  }
+}
+
+export async function listChannelRoutingControlAudits(params: {
+  limit: number
+  before_id?: number
+  subject_type?: string
+  subject_id?: number
+  actor_id?: number
+}): Promise<ChannelRoutingControlAuditPage> {
+  const response = await api.get<ApiEnvelope<ChannelRoutingControlAuditPage>>(
+    '/api/channel-routing/control-audits',
+    { ...requestConfig, params }
+  )
+  return unwrap(response.data)
+}
+
+export async function listChannelRoutingNodes(params: {
+  limit: number
+  cursor?: string
+}): Promise<ChannelRoutingNodePage> {
+  const response = await api.get<ApiEnvelope<ChannelRoutingNodePage>>(
+    '/api/channel-routing/nodes',
+    { ...requestConfig, params }
   )
   return unwrap(response.data)
 }
@@ -156,7 +293,7 @@ export async function listChannelRoutingGroups(params: {
 }): Promise<PagedResponse<PoolSnapshotSummary>> {
   const response = await api.get<
     ApiEnvelope<PagedResponse<PoolSnapshotSummary>>
-  >('/api/channel-routing/v2/groups', { ...requestConfig, params })
+  >('/api/channel-routing/groups', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -193,7 +330,7 @@ export async function getChannelRoutingGroup(
       snapshot_revision: number
       snapshot_built_at: number
     }>
-  >(`/api/channel-routing/v2/groups/${id}`, { ...requestConfig, params })
+  >(`/api/channel-routing/groups/${id}`, { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -203,7 +340,7 @@ export async function listChannelRoutingGroupReplayProfiles(
 ): Promise<ChannelRoutingReplayProfilesResponse> {
   const response = await api.get<
     ApiEnvelope<ChannelRoutingReplayProfilesResponse>
-  >(`/api/channel-routing/v2/groups/${id}/replay-profiles`, {
+  >(`/api/channel-routing/groups/${id}/replay-profiles`, {
     ...requestConfig,
     params: { limit },
   })
@@ -215,7 +352,7 @@ export async function getChannelRoutingGroupErrorBudget(
 ): Promise<ChannelRoutingErrorBudgetResponse> {
   const response = await api.get<
     ApiEnvelope<ChannelRoutingErrorBudgetResponse>
-  >(`/api/channel-routing/v2/groups/${id}/error-budget`, requestConfig)
+  >(`/api/channel-routing/groups/${id}/error-budget`, requestConfig)
   return unwrap(response.data)
 }
 
@@ -227,7 +364,7 @@ export async function listChannelRoutingChannels(params: {
   type?: number
 }): Promise<PagedResponse<ChannelSnapshot>> {
   const response = await api.get<ApiEnvelope<PagedResponse<ChannelSnapshot>>>(
-    '/api/channel-routing/v2/channels',
+    '/api/channel-routing/channels',
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -240,7 +377,7 @@ export async function listChannelRoutingEndpoints(params: {
   region?: string
 }): Promise<EndpointBreakerPage> {
   const response = await api.get<ApiEnvelope<EndpointBreakerPage>>(
-    '/api/channel-routing/v2/endpoints',
+    '/api/channel-routing/endpoints',
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -252,7 +389,7 @@ export async function resetChannelRoutingBreaker(
 ): Promise<ChannelRoutingBreakerResetResponse> {
   const response = await api.post<
     ApiEnvelope<ChannelRoutingBreakerResetResponse>
-  >('/api/channel-routing/v2/breakers/reset', payload, {
+  >('/api/channel-routing/breakers/reset', payload, {
     ...requestConfig,
     headers: { 'Idempotency-Key': idempotencyKey },
   })
@@ -268,7 +405,7 @@ export async function listChannelRoutingCosts(params: {
 }): Promise<PagedResponse<CostSnapshotSummary>> {
   const response = await api.get<
     ApiEnvelope<PagedResponse<CostSnapshotSummary>>
-  >('/api/channel-routing/v2/costs', { ...requestConfig, params })
+  >('/api/channel-routing/costs', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -278,150 +415,75 @@ export async function getChannelRoutingCostDetail(
   model: string
 ): Promise<ChannelRoutingCostDetailResponse> {
   const response = await api.get<ApiEnvelope<ChannelRoutingCostDetailResponse>>(
-    `/api/channel-routing/v2/costs/${poolId}/${memberId}`,
+    `/api/channel-routing/costs/${poolId}/${memberId}`,
     { ...requestConfig, params: { model } }
   )
   return unwrap(response.data)
 }
 
-export async function syncChannelRoutingCosts(
-  idempotencyKey: string
-): Promise<RoutingOperation<ChannelRoutingCostSyncResult>> {
-  const response = await api.post<
-    ApiEnvelope<RoutingOperation<ChannelRoutingCostSyncResult>>
-  >('/api/channel-routing/v2/costs/sync', undefined, {
-    ...requestConfig,
-    headers: { 'Idempotency-Key': idempotencyKey },
-  })
-  return unwrap(response.data)
-}
-
-export async function listChannelRoutingCostBindings(params: {
+export async function listChannelRoutingConfigurations(params: {
   page: number
   page_size: number
   search?: string
-  upstream_type?: string
-  enabled?: boolean
-  channel_id?: number
-}): Promise<RoutingCostBindingPage> {
-  const response = await api.get<ApiEnvelope<RoutingCostBindingPage>>(
-    '/api/channel-routing/v2/cost-bindings',
+  cost_confirmed?: boolean
+  cost_source?: RoutingChannelConfigurationCostSource
+  traffic_class?: RoutingChannelConfigurationTrafficClass
+}): Promise<RoutingChannelConfigurationPage> {
+  const response = await api.get<ApiEnvelope<RoutingChannelConfigurationPage>>(
+    '/api/channel-routing/channel-configurations',
     { ...requestConfig, params }
   )
   return unwrap(response.data)
 }
 
-export async function getChannelRoutingCostBinding(
+export async function getChannelRoutingConfiguration(
   channelId: number
-): Promise<RoutingCostBinding> {
-  const response = await api.get<ApiEnvelope<RoutingCostBinding>>(
-    `/api/channel-routing/v2/cost-bindings/${channelId}`,
+): Promise<RoutingChannelConfiguration> {
+  const response = await api.get<ApiEnvelope<RoutingChannelConfiguration>>(
+    `/api/channel-routing/channel-configurations/${channelId}`,
     requestConfig
   )
-  const binding = unwrap(response.data)
-  return { ...binding, etag: response.headers.etag || binding.etag }
+  const configuration = unwrap(response.data)
+  return {
+    ...configuration,
+    etag: response.headers.etag || configuration.etag,
+  }
 }
 
-export async function createChannelRoutingCostBinding(
-  request: RoutingCostBindingRequest,
+export async function updateChannelRoutingConfiguration(
+  configuration: Pick<RoutingChannelConfiguration, 'channel_id' | 'etag'>,
+  request: RoutingChannelConfigurationUpdate,
   signal?: AbortSignal
-): Promise<RoutingCostBinding> {
-  const response = await api.post<ApiEnvelope<RoutingCostBinding>>(
-    '/api/channel-routing/v2/cost-bindings',
-    request,
-    { ...requestConfig, signal }
-  )
-  const binding = unwrap(response.data)
-  return { ...binding, etag: response.headers.etag || binding.etag }
-}
-
-export async function updateChannelRoutingCostBinding(
-  binding: Pick<RoutingCostBinding, 'channel_id' | 'etag'>,
-  request: RoutingCostBindingRequest,
-  signal?: AbortSignal
-): Promise<RoutingCostBinding> {
+): Promise<RoutingChannelConfiguration> {
   try {
-    const response = await api.put<ApiEnvelope<RoutingCostBinding>>(
-      `/api/channel-routing/v2/cost-bindings/${binding.channel_id}`,
+    const response = await api.put<ApiEnvelope<RoutingChannelConfiguration>>(
+      `/api/channel-routing/channel-configurations/${configuration.channel_id}`,
       request,
       {
         ...requestConfig,
         signal,
-        headers: { 'If-Match': binding.etag },
+        headers: { 'If-Match': configuration.etag },
       }
     )
     const updated = unwrap(response.data)
     return { ...updated, etag: response.headers.etag || updated.etag }
   } catch (error) {
-    const conflict = costBindingConflictFromError(error)
+    const conflict = configurationConflictFromError(error)
     if (conflict) throw conflict
     throw error
   }
-}
-
-export async function deleteChannelRoutingCostBinding(
-  binding: Pick<RoutingCostBinding, 'channel_id' | 'etag'>
-): Promise<{ channel_id: number }> {
-  try {
-    const response = await api.delete<ApiEnvelope<{ channel_id: number }>>(
-      `/api/channel-routing/v2/cost-bindings/${binding.channel_id}`,
-      {
-        ...requestConfig,
-        headers: { 'If-Match': binding.etag },
-      }
-    )
-    return unwrap(response.data)
-  } catch (error) {
-    const conflict = costBindingConflictFromError(error)
-    if (conflict) throw conflict
-    throw error
-  }
-}
-
-export async function testChannelRoutingCostBinding(
-  channelId: number | 'new',
-  request?: RoutingCostBindingRequest,
-  signal?: AbortSignal
-): Promise<RoutingCostBindingActionResult> {
-  const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
-    `/api/channel-routing/v2/cost-bindings/${channelId}/test`,
-    request,
-    {
-      ...requestConfig,
-      signal,
-      timeout: 30_000,
-    }
-  )
-  return unwrap(response.data)
-}
-
-export async function loadChannelRoutingCostBindingGroups(
-  channelId: number | 'new',
-  request?: RoutingCostBindingRequest,
-  signal?: AbortSignal
-): Promise<RoutingCostBindingActionResult> {
-  const response = await api.post<ApiEnvelope<RoutingCostBindingActionResult>>(
-    `/api/channel-routing/v2/cost-bindings/${channelId}/groups`,
-    request,
-    {
-      ...requestConfig,
-      signal,
-      timeout: 30_000,
-    }
-  )
-  return unwrap(response.data)
 }
 
 export async function listChannelRoutingProbes(params: {
   limit: number
   pool_id?: number
   channel_id?: number
-  outcome?: string
+  outcome?: RoutingProbeOutcome
   cursor?: number
 }): Promise<CursorResponse<RoutingProbeResult>> {
   const response = await api.get<
     ApiEnvelope<CursorResponse<RoutingProbeResult>>
-  >('/api/channel-routing/v2/probes', { ...requestConfig, params })
+  >('/api/channel-routing/probes', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -430,7 +492,7 @@ export async function runChannelRoutingActiveProbe(
 ): Promise<RoutingOperation<ChannelRoutingActiveProbeResult>> {
   const response = await api.post<
     ApiEnvelope<RoutingOperation<ChannelRoutingActiveProbeResult>>
-  >('/api/channel-routing/v2/probes/run', undefined, {
+  >('/api/channel-routing/probes/run', undefined, {
     ...requestConfig,
     headers: { 'Idempotency-Key': idempotencyKey },
   })
@@ -443,7 +505,7 @@ export async function createChannelRoutingAuditExport(
 ): Promise<ChannelRoutingAuditExportResponse> {
   const response = await api.post<
     ApiEnvelope<ChannelRoutingAuditExportResponse>
-  >('/api/channel-routing/v2/audit-exports', payload, {
+  >('/api/channel-routing/audit-exports', payload, {
     ...requestConfig,
     headers: { 'Idempotency-Key': idempotencyKey },
   })
@@ -454,7 +516,7 @@ export async function downloadChannelRoutingAuditExport(
   exportId: string
 ): Promise<void> {
   const response = await api.get<Blob>(
-    `/api/channel-routing/v2/audit-exports/${encodeURIComponent(exportId)}/download`,
+    `/api/channel-routing/audit-exports/${encodeURIComponent(exportId)}/download`,
     {
       ...requestConfig,
       responseType: 'blob',
@@ -488,7 +550,7 @@ export async function listChannelRoutingDecisions(params: {
 }): Promise<CursorResponse<ChannelRoutingDecisionSummary>> {
   const response = await api.get<
     ApiEnvelope<CursorResponse<ChannelRoutingDecisionSummary>>
-  >('/api/channel-routing/v2/decisions', { ...requestConfig, params })
+  >('/api/channel-routing/decisions', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -496,7 +558,7 @@ export async function getChannelRoutingDecision(
   id: string
 ): Promise<ChannelRoutingDecision> {
   const response = await api.get<ApiEnvelope<ChannelRoutingDecision>>(
-    `/api/channel-routing/v2/decisions/${encodeURIComponent(id)}`,
+    `/api/channel-routing/decisions/${encodeURIComponent(id)}`,
     requestConfig
   )
   return unwrap(response.data)
@@ -507,7 +569,7 @@ export async function listChannelRoutingDecisionCandidates(
   params: { cursor: number; limit: number }
 ): Promise<DecisionCandidatePage> {
   const response = await api.get<ApiEnvelope<DecisionCandidatePage>>(
-    `/api/channel-routing/v2/decisions/${encodeURIComponent(id)}/candidates`,
+    `/api/channel-routing/decisions/${encodeURIComponent(id)}/candidates`,
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -517,7 +579,7 @@ export async function replayChannelRoutingDecision(
   id: string
 ): Promise<DecisionReplayResult> {
   const response = await api.post<ApiEnvelope<DecisionReplayResult>>(
-    `/api/channel-routing/v2/decisions/${encodeURIComponent(id)}/replay`,
+    `/api/channel-routing/decisions/${encodeURIComponent(id)}/replay`,
     undefined,
     requestConfig
   )
@@ -534,7 +596,7 @@ export async function simulateChannelRoutingGroup(
   idempotencyKey: string
 ): Promise<HistoricalSimulationResponse> {
   const response = await api.post<ApiEnvelope<HistoricalSimulationResponse>>(
-    `/api/channel-routing/v2/groups/${id}/simulations`,
+    `/api/channel-routing/groups/${id}/simulations`,
     payload,
     {
       ...requestConfig,
@@ -550,7 +612,7 @@ export async function listChannelRoutingPolicyDrafts(params: {
 }): Promise<CursorResponse<PolicyDraftSummary>> {
   const response = await api.get<
     ApiEnvelope<CursorResponse<PolicyDraftSummary>>
-  >('/api/channel-routing/v2/policy-drafts', { ...requestConfig, params })
+  >('/api/channel-routing/policy-drafts', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
@@ -560,7 +622,7 @@ export async function getChannelRoutingPolicyDraft(
 ): Promise<PolicyDraftDetail> {
   const response = await api.get<
     ApiEnvelope<Omit<PolicyDraftDetail, 'server_etag'>>
-  >(`/api/channel-routing/v2/policy-drafts/${id}`, {
+  >(`/api/channel-routing/policy-drafts/${id}`, {
     ...requestConfig,
     signal,
   })
@@ -575,7 +637,7 @@ export async function createChannelRoutingPolicyDraft(payload: {
   document: PolicyDocument
 }): Promise<PolicyDraftSummary> {
   const response = await api.post<ApiEnvelope<PolicyDraftSummary>>(
-    '/api/channel-routing/v2/policy-drafts',
+    '/api/channel-routing/policy-drafts',
     payload,
     requestConfig
   )
@@ -597,7 +659,7 @@ export async function updateChannelRoutingPolicyDraft(
   document: PolicyDocument
 ): Promise<PolicyDraftSummary> {
   const response = await api.put<ApiEnvelope<PolicyDraftSummary>>(
-    `/api/channel-routing/v2/policy-drafts/${draft.id}`,
+    `/api/channel-routing/policy-drafts/${draft.id}`,
     { document },
     {
       ...requestConfig,
@@ -611,7 +673,7 @@ export async function validateChannelRoutingPolicyDraft(
   draft: PolicyDraftSummary
 ): Promise<PolicyDraftSummary> {
   const response = await api.post<ApiEnvelope<PolicyDraftSummary>>(
-    `/api/channel-routing/v2/policy-drafts/${draft.id}/validate`,
+    `/api/channel-routing/policy-drafts/${draft.id}/validate`,
     undefined,
     {
       ...requestConfig,
@@ -627,7 +689,7 @@ export async function simulateChannelRoutingPolicyDraft(
   idempotencyKey: string
 ): Promise<PolicySimulationResponse> {
   const response = await api.post<ApiEnvelope<PolicySimulationResponse>>(
-    `/api/channel-routing/v2/policy-drafts/${draft.id}/simulate`,
+    `/api/channel-routing/policy-drafts/${draft.id}/simulate`,
     payload,
     {
       ...requestConfig,
@@ -652,7 +714,7 @@ export async function listChannelRoutingPolicyApprovals(
       }
     : undefined
   const response = await api.get<ApiEnvelope<PolicyApprovalList>>(
-    `/api/channel-routing/v2/policy-drafts/${draftId}/approvals`,
+    `/api/channel-routing/policy-drafts/${draftId}/approvals`,
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -663,7 +725,7 @@ export async function approveChannelRoutingPolicyDraft(
   activation: PolicyActivationSpec
 ): Promise<PolicyApprovalResponse> {
   const response = await api.post<ApiEnvelope<PolicyApprovalResponse>>(
-    `/api/channel-routing/v2/policy-drafts/${draft.id}/approvals`,
+    `/api/channel-routing/policy-drafts/${draft.id}/approvals`,
     activation,
     {
       ...requestConfig,
@@ -679,7 +741,7 @@ export async function publishChannelRoutingPolicyDraft(
   idempotencyKey: string
 ): Promise<PolicyPublishResponse> {
   const response = await api.post<ApiEnvelope<PolicyPublishResponse>>(
-    `/api/channel-routing/v2/policy-drafts/${draft.id}/publish`,
+    `/api/channel-routing/policy-drafts/${draft.id}/publish`,
     activation,
     {
       ...requestConfig,
@@ -695,7 +757,7 @@ export async function publishChannelRoutingPolicyDraft(
 export async function getCurrentChannelRoutingPolicy(): Promise<CurrentRoutingPolicy> {
   const response = await api.get<
     ApiEnvelope<Omit<CurrentRoutingPolicy, 'server_etag'>>
-  >('/api/channel-routing/v2/policies/current', requestConfig)
+  >('/api/channel-routing/policies/current', requestConfig)
   return {
     ...unwrap(response.data),
     server_etag: response.headers.etag || '',
@@ -706,7 +768,7 @@ export async function getChannelRoutingPolicyRevision(
   revision: number
 ): Promise<RoutingPolicyRevisionDetail> {
   const response = await api.get<ApiEnvelope<RoutingPolicyRevisionDetail>>(
-    `/api/channel-routing/v2/policies/${revision}`,
+    `/api/channel-routing/policies/${revision}`,
     requestConfig
   )
   return unwrap(response.data)
@@ -730,7 +792,7 @@ export async function listChannelRoutingPolicyRollbackApprovals(
       }
     : undefined
   const response = await api.get<ApiEnvelope<PolicyRollbackApprovalList>>(
-    `/api/channel-routing/v2/policies/${sourceRevision}/rollback-approvals`,
+    `/api/channel-routing/policies/${sourceRevision}/rollback-approvals`,
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -742,7 +804,7 @@ export async function approveChannelRoutingPolicyRollback(
   activation: PolicyActivationSpec
 ): Promise<PolicyRollbackApprovalResponse> {
   const response = await api.post<ApiEnvelope<PolicyRollbackApprovalResponse>>(
-    `/api/channel-routing/v2/policies/${sourceRevision}/rollback-approvals`,
+    `/api/channel-routing/policies/${sourceRevision}/rollback-approvals`,
     activation,
     {
       ...requestConfig,
@@ -759,7 +821,7 @@ export async function rollbackChannelRoutingPolicy(
   idempotencyKey: string
 ): Promise<PolicyRollbackResponse> {
   const response = await api.post<ApiEnvelope<PolicyRollbackResponse>>(
-    `/api/channel-routing/v2/policies/${sourceRevision}/rollback`,
+    `/api/channel-routing/policies/${sourceRevision}/rollback`,
     activation,
     {
       ...requestConfig,
@@ -779,7 +841,7 @@ export async function listChannelRoutingOperations(params: {
   status?: string
 }): Promise<CursorResponse<RoutingOperation>> {
   const response = await api.get<ApiEnvelope<CursorResponse<RoutingOperation>>>(
-    '/api/channel-routing/v2/operations',
+    '/api/channel-routing/operations',
     { ...requestConfig, params }
   )
   return unwrap(response.data)
@@ -789,7 +851,7 @@ export async function getChannelRoutingOperation<Result = unknown>(
   id: number
 ): Promise<RoutingOperation<Result>> {
   const response = await api.get<ApiEnvelope<RoutingOperation<Result>>>(
-    `/api/channel-routing/v2/operations/${id}`,
+    `/api/channel-routing/operations/${id}`,
     requestConfig
   )
   return unwrap(response.data)

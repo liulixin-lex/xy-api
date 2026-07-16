@@ -674,135 +674,6 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 	}
 }
 
-func TestRefreshRoutingHotcacheReconcilesCostConnectorState(t *testing.T) {
-	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(
-		&model.RoutingChannelMetric{},
-		&model.RoutingBreakerState{},
-		&model.RoutingChannelHealthState{},
-		&model.RoutingCostSnapshot{},
-	))
-	routinghotcache.ResetForTest()
-	routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-	t.Cleanup(func() {
-		routinghotcache.ResetForTest()
-		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
-	})
-
-	now := common.GetTimestamp()
-	staleCostKey := routinghotcache.CostKey{ChannelID: 2201, Model: "stale-cost"}
-	outsideDetailCostKey := routinghotcache.CostKey{ChannelID: 2203, Model: "outside-detail-limit"}
-	outsideDetailUpdatedTime := now - 1
-	servingKey := routinghotcache.Key{
-		ChannelID:   2201,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       "serving-state",
-		Group:       "default",
-	}
-	routinghotcache.SetCostForTest(staleCostKey, routinghotcache.CostSnapshot{Known: true, Cost: 9, UpdatedUnix: now})
-	routinghotcache.SetBalanceForTest(2201, routinghotcache.BalanceSnapshot{Known: true, Balance: 9, UpdatedUnix: now})
-	routinghotcache.SetCostForTest(outsideDetailCostKey, routinghotcache.CostSnapshot{Known: true, Cost: 1, UpdatedUnix: outsideDetailUpdatedTime})
-	routinghotcache.SetBalanceForTest(2203, routinghotcache.BalanceSnapshot{Known: true, Balance: 1, UpdatedUnix: outsideDetailUpdatedTime})
-	routinghotcache.SetMetricForTest(servingKey, routinghotcache.MetricSnapshot{RequestCount: 1, UpdatedUnix: now})
-	routinghotcache.SetBreakerForTest(servingKey, routinghotcache.BreakerSnapshot{State: model.RoutingBreakerStateOpen, UpdatedUnix: now})
-	routinghotcache.SetAuthFailureForTest(2201, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
-
-	costs := []model.RoutingCostSnapshot{
-		{
-			ChannelID:  2202,
-			ModelName:  "current-cost",
-			GroupRatio: 1,
-			BaseRatio:  2,
-			Confidence: model.RoutingCostConfidenceFull,
-			SnapshotTS: now + 1,
-		},
-		{
-			ChannelID:  2203,
-			ModelName:  outsideDetailCostKey.Model,
-			GroupRatio: 1,
-			BaseRatio:  9,
-			Confidence: model.RoutingCostConfidenceFull,
-			SnapshotTS: outsideDetailUpdatedTime,
-		},
-	}
-	healthStates := []model.RoutingChannelHealthState{
-		{
-			ChannelID:        2201,
-			AuthFailure:      true,
-			AuthFailureUntil: now + 60,
-			BalanceKnown:     false,
-			UpdatedTime:      now + 2,
-		},
-		{
-			ChannelID:          2202,
-			BalanceKnown:       true,
-			Balance:            4,
-			BalanceUpdatedTime: now + 1,
-			UpdatedTime:        now + 1,
-		},
-		{
-			ChannelID:          2203,
-			BalanceKnown:       true,
-			Balance:            9,
-			BalanceUpdatedTime: outsideDetailUpdatedTime,
-			UpdatedTime:        outsideDetailUpdatedTime,
-		},
-	}
-	const recentDetailLimit = 5000
-	for i := 0; i < recentDetailLimit; i++ {
-		costs = append(costs, model.RoutingCostSnapshot{
-			ChannelID:  30_000 + i,
-			ModelName:  fmt.Sprintf("recent-cost-%04d", i),
-			GroupRatio: 1,
-			BaseRatio:  1,
-			Confidence: model.RoutingCostConfidenceFull,
-			SnapshotTS: now,
-		})
-		healthStates = append(healthStates, model.RoutingChannelHealthState{
-			ChannelID:          40_000 + i,
-			BalanceKnown:       true,
-			Balance:            1,
-			BalanceUpdatedTime: now,
-			UpdatedTime:        now,
-		})
-	}
-	require.NoError(t, db.CreateInBatches(costs, 500).Error)
-	require.NoError(t, db.CreateInBatches(healthStates, 500).Error)
-
-	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.SmartRoutingSetting{
-		MetricBucketSec:  60,
-		SnapshotStaleSec: 300,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, recentDetailLimit, summary["costs"])
-	assert.Equal(t, recentDetailLimit, summary["health"])
-
-	_, staleCostFound := routinghotcache.GetCost(staleCostKey)
-	_, staleBalanceFound := routinghotcache.GetBalance(2201)
-	assert.False(t, staleCostFound)
-	assert.False(t, staleBalanceFound)
-
-	currentCost, currentCostFound := routinghotcache.GetCost(routinghotcache.CostKey{ChannelID: 2202, Model: "current-cost"})
-	currentBalance, currentBalanceFound := routinghotcache.GetBalance(2202)
-	require.True(t, currentCostFound)
-	assert.Equal(t, 2.0, currentCost.Cost)
-	require.True(t, currentBalanceFound)
-	assert.Equal(t, 4.0, currentBalance.Balance)
-	outsideDetailCost, outsideDetailCostFound := routinghotcache.GetCost(outsideDetailCostKey)
-	outsideDetailBalance, outsideDetailBalanceFound := routinghotcache.GetBalance(2203)
-	require.True(t, outsideDetailCostFound)
-	assert.Equal(t, 9.0, outsideDetailCost.Cost)
-	require.True(t, outsideDetailBalanceFound)
-	assert.Equal(t, 9.0, outsideDetailBalance.Balance)
-
-	_, metricFound := routinghotcache.GetMetric(servingKey)
-	_, breakerFound := routinghotcache.GetBreaker(servingKey)
-	_, authFailureFound := routinghotcache.GetAuthFailure(2201)
-	assert.True(t, metricFound)
-	assert.True(t, breakerFound)
-	assert.True(t, authFailureFound)
-}
-
 func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
@@ -969,12 +840,12 @@ func TestRefreshRoutingHotcacheReturnsEligibilityLookupErrors(t *testing.T) {
 
 func TestRefreshRoutingHotcacheContextCancellationStopsDatabaseQuery(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
-	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}, &model.RoutingCostSnapshot{}))
+	require.NoError(t, db.AutoMigrate(&model.RoutingChannelMetric{}, &model.RoutingBreakerState{}, &model.RoutingChannelHealthState{}))
 
 	queryStarted := make(chan struct{}, 1)
-	const callbackName = "test:block_refresh_routing_cost_query"
+	const callbackName = "test:block_refresh_routing_metric_query"
 	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingCostSnapshot{}).TableName() {
+		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.RoutingChannelMetric{}).TableName() {
 			return
 		}
 		queryStarted <- struct{}{}

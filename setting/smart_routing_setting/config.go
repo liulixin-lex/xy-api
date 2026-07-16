@@ -22,11 +22,12 @@ const (
 	enterpriseWeightLatency      = 0.30
 	enterpriseWeightThroughput   = 0.10
 	enterpriseWeightCost         = 0.05
+	maxBackoffMilliseconds       = 600_000
 )
 
 type SmartRoutingSetting struct {
 	Enabled                  bool    `json:"enabled"`
-	RequestProfileV2Enabled  bool    `json:"request_profile_v2_enabled"`
+	RequestProfileEnabled    bool    `json:"request_profile_enabled"`
 	Mode                     string  `json:"mode"`
 	WeightAvailability       float64 `json:"weight_availability"`
 	WeightLatency            float64 `json:"weight_latency"`
@@ -85,7 +86,7 @@ type SmartRoutingSetting struct {
 
 var defaultSmartRoutingSetting = SmartRoutingSetting{
 	Enabled:                  false,
-	RequestProfileV2Enabled:  false,
+	RequestProfileEnabled:    false,
 	Mode:                     ModeObserve,
 	WeightAvailability:       0.45,
 	WeightLatency:            0.25,
@@ -201,9 +202,9 @@ func applyEnvOverrides(setting *SmartRoutingSetting) {
 	if value, ok := os.LookupEnv("SMART_ROUTING_MODE"); ok {
 		setting.Mode = value
 	}
-	if value, ok := os.LookupEnv("SMART_ROUTING_REQUEST_PROFILE_V2_ENABLED"); ok {
+	if value, ok := os.LookupEnv("SMART_ROUTING_REQUEST_PROFILE_ENABLED"); ok {
 		if parsed, err := strconv.ParseBool(value); err == nil {
-			setting.RequestProfileV2Enabled = parsed
+			setting.RequestProfileEnabled = parsed
 		}
 	}
 	if value, ok := os.LookupEnv("SMART_ROUTING_AGENT_ENABLED"); ok {
@@ -304,11 +305,26 @@ func normalize(setting *SmartRoutingSetting) {
 	if setting.BackoffBaseMs5xx < 1 {
 		setting.BackoffBaseMs5xx = defaultSmartRoutingSetting.BackoffBaseMs5xx
 	}
+	if setting.BackoffBaseMs5xx > maxBackoffMilliseconds {
+		setting.BackoffBaseMs5xx = maxBackoffMilliseconds
+	}
 	if setting.BackoffBaseMs429 < 1 {
 		setting.BackoffBaseMs429 = defaultSmartRoutingSetting.BackoffBaseMs429
 	}
+	if setting.BackoffBaseMs429 > maxBackoffMilliseconds {
+		setting.BackoffBaseMs429 = maxBackoffMilliseconds
+	}
 	if setting.BackoffCapMs < 1 {
 		setting.BackoffCapMs = defaultSmartRoutingSetting.BackoffCapMs
+	}
+	if setting.BackoffCapMs > maxBackoffMilliseconds {
+		setting.BackoffCapMs = maxBackoffMilliseconds
+	}
+	if setting.BackoffBaseMs5xx > setting.BackoffCapMs {
+		setting.BackoffBaseMs5xx = setting.BackoffCapMs
+	}
+	if setting.BackoffBaseMs429 > setting.BackoffCapMs {
+		setting.BackoffBaseMs429 = setting.BackoffCapMs
 	}
 	if setting.FirstByteMinMs < 1 {
 		setting.FirstByteMinMs = defaultSmartRoutingSetting.FirstByteMinMs

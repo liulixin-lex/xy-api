@@ -16,15 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { Outlet } from '@tanstack/react-router'
+
+import { TooltipProvider } from '@/components/ui/tooltip'
 
 import { ChannelRoutingRealtimeProvider } from './realtime-context'
 
 export function ChannelRoutingWorkspace() {
   return (
     <ChannelRoutingRealtimeProvider>
-      <Outlet />
+      <TooltipProvider delay={100}>
+        <Outlet />
+      </TooltipProvider>
     </ChannelRoutingRealtimeProvider>
   )
 }

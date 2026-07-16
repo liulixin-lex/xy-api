@@ -10,6 +10,8 @@ import (
 
 type SnapshotMetadata struct {
 	Revision              uint64        `json:"revision"`
+	ConfigurationEpoch    uint64        `json:"configuration_epoch"`
+	ConfigurationHash     string        `json:"configuration_hash"`
 	RuntimeGeneration     uint64        `json:"runtime_generation"`
 	PolicyHash            string        `json:"policy_hash"`
 	ActivationID          int64         `json:"activation_id"`
@@ -34,44 +36,33 @@ type TelemetryAggregate struct {
 }
 
 type CostSnapshotItem struct {
-	PoolID           int                             `json:"pool_id"`
-	GroupName        string                          `json:"group_name"`
-	MemberID         int                             `json:"member_id"`
-	ChannelID        int                             `json:"channel_id"`
-	ChannelName      string                          `json:"channel_name"`
-	ModelName        string                          `json:"model_name"`
-	Known            bool                            `json:"known"`
-	Cost             float64                         `json:"cost,omitempty"`
-	Currency         string                          `json:"currency,omitempty"`
-	Unit             string                          `json:"unit,omitempty"`
-	Version          string                          `json:"version,omitempty"`
-	PricingVersion   string                          `json:"pricing_version,omitempty"`
-	UpstreamGroup    string                          `json:"upstream_group,omitempty"`
-	UpstreamModel    string                          `json:"upstream_model,omitempty"`
-	ObservedTime     int64                           `json:"observed_time,omitempty"`
-	EffectiveTime    int64                           `json:"effective_time,omitempty"`
-	ExpiresTime      int64                           `json:"expires_time,omitempty"`
-	Confidence       string                          `json:"confidence"`
-	ConfidenceScore  float64                         `json:"confidence_score"`
-	Freshness        string                          `json:"freshness"`
-	FreshnessScore   float64                         `json:"freshness_score"`
-	SourceSyncStatus string                          `json:"source_sync_status"`
-	SourceSyncError  string                          `json:"source_sync_error,omitempty"`
-	SnapshotTime     int64                           `json:"snapshot_time"`
-	Pricing          *model.RoutingNormalizedPricing `json:"pricing,omitempty"`
-	Account          *CostSnapshotAccountItem        `json:"account,omitempty"`
-}
-
-type CostSnapshotAccountItem struct {
-	ID               int     `json:"id"`
-	SourceType       string  `json:"source_type"`
-	MaskedIdentity   string  `json:"masked_identity"`
-	Status           string  `json:"status"`
-	BalanceKnown     bool    `json:"balance_known"`
-	Balance          float64 `json:"balance,omitempty"`
-	BalanceUpdatedAt int64   `json:"balance_updated_at,omitempty"`
-	LastSyncStatus   string  `json:"last_sync_status"`
-	LastSyncError    string  `json:"last_sync_error,omitempty"`
+	PoolID                 int                             `json:"pool_id"`
+	GroupName              string                          `json:"group_name"`
+	MemberID               int                             `json:"member_id"`
+	ChannelID              int                             `json:"channel_id"`
+	ChannelName            string                          `json:"channel_name"`
+	ModelName              string                          `json:"model_name"`
+	Known                  bool                            `json:"known"`
+	Cost                   float64                         `json:"cost,omitempty"`
+	Currency               string                          `json:"currency,omitempty"`
+	Unit                   string                          `json:"unit,omitempty"`
+	Version                string                          `json:"version,omitempty"`
+	PricingVersion         string                          `json:"pricing_version,omitempty"`
+	PricingIdentity        string                          `json:"pricing_identity,omitempty"`
+	UnknownReason          string                          `json:"unknown_reason,omitempty"`
+	ConfigurationRevision  int64                           `json:"configuration_revision"`
+	UpstreamCostMultiplier float64                         `json:"upstream_cost_multiplier"`
+	UpstreamGroup          string                          `json:"upstream_group,omitempty"`
+	UpstreamModel          string                          `json:"upstream_model,omitempty"`
+	ObservedTime           int64                           `json:"observed_time,omitempty"`
+	EffectiveTime          int64                           `json:"effective_time,omitempty"`
+	ExpiresTime            int64                           `json:"expires_time,omitempty"`
+	Confidence             string                          `json:"confidence"`
+	ConfidenceScore        float64                         `json:"confidence_score"`
+	Freshness              string                          `json:"freshness"`
+	FreshnessScore         float64                         `json:"freshness_score"`
+	SnapshotTime           int64                           `json:"snapshot_time"`
+	Pricing                *model.RoutingNormalizedPricing `json:"pricing,omitempty"`
 }
 
 type PoolSnapshotSummary struct {
@@ -107,6 +98,8 @@ func snapshotMetadata(view SnapshotView) SnapshotMetadata {
 	}
 	return SnapshotMetadata{
 		Revision:              view.Revision,
+		ConfigurationEpoch:    view.ConfigurationEpoch,
+		ConfigurationHash:     view.ConfigurationHash,
 		RuntimeGeneration:     view.RuntimeGeneration,
 		PolicyHash:            view.PolicyHash,
 		ActivationID:          view.ActivationID,
@@ -357,28 +350,30 @@ func ListCostSnapshots(group string, modelFilter string, known *bool, offset int
 				}
 				if total >= offset && len(items) < limit {
 					item := CostSnapshotItem{
-						PoolID:           pool.ID,
-						GroupName:        pool.GroupName,
-						MemberID:         member.ID,
-						ChannelID:        member.ChannelID,
-						ChannelName:      member.ChannelName,
-						ModelName:        observation.ModelName,
-						Known:            costKnown,
-						Cost:             observation.Cost,
-						Confidence:       observation.CostConfidence,
-						SnapshotTime:     observation.CostUpdatedUnix,
-						Version:          observation.CostPricingHash,
-						PricingVersion:   observation.CostPricingVersion,
-						UpstreamGroup:    observation.CostUpstreamGroup,
-						UpstreamModel:    observation.CostUpstreamModel,
-						ObservedTime:     observation.CostObservedTime,
-						EffectiveTime:    observation.CostEffectiveTime,
-						ExpiresTime:      observation.CostExpiresTime,
-						ConfidenceScore:  observation.CostConfidenceScore,
-						Freshness:        observation.CostFreshness,
-						FreshnessScore:   observation.CostFreshnessScore,
-						SourceSyncStatus: observation.CostSourceSyncStatus,
-						SourceSyncError:  observation.CostSourceSyncError,
+						PoolID:                 pool.ID,
+						GroupName:              pool.GroupName,
+						MemberID:               member.ID,
+						ChannelID:              member.ChannelID,
+						ChannelName:            member.ChannelName,
+						ModelName:              observation.ModelName,
+						Known:                  costKnown,
+						Cost:                   observation.Cost,
+						Confidence:             observation.CostConfidence,
+						SnapshotTime:           observation.CostUpdatedUnix,
+						Version:                observation.CostPricingHash,
+						PricingVersion:         observation.CostPricingVersion,
+						PricingIdentity:        observation.CostPricingIdentity,
+						UnknownReason:          observation.CostUnknownReason,
+						ConfigurationRevision:  observation.ChannelConfigurationRevision,
+						UpstreamCostMultiplier: observation.CostUpstreamMultiplier,
+						UpstreamGroup:          observation.CostUpstreamGroup,
+						UpstreamModel:          observation.CostUpstreamModel,
+						ObservedTime:           observation.CostObservedTime,
+						EffectiveTime:          observation.CostEffectiveTime,
+						ExpiresTime:            observation.CostExpiresTime,
+						ConfidenceScore:        observation.CostConfidenceScore,
+						Freshness:              observation.CostFreshness,
+						FreshnessScore:         observation.CostFreshnessScore,
 					}
 					if observation.CostPricing != nil {
 						pricing := *observation.CostPricing
@@ -387,15 +382,6 @@ func ListCostSnapshots(group string, modelFilter string, known *bool, offset int
 						item.Unit = pricing.Unit
 						item.Confidence = observation.CostVersionConfidence
 						item.SnapshotTime = observation.CostObservedTime
-					}
-					if observation.upstreamAccountID > 0 {
-						item.Account = &CostSnapshotAccountItem{
-							ID: observation.upstreamAccountID, SourceType: observation.CostAccountSourceType,
-							MaskedIdentity: observation.CostAccountMaskedID, Status: observation.CostAccountStatus,
-							BalanceKnown: observation.CostAccountBalanceKnown, Balance: observation.CostAccountBalance,
-							BalanceUpdatedAt: observation.CostAccountBalanceUpdatedAt,
-							LastSyncStatus:   observation.CostAccountSyncStatus, LastSyncError: observation.CostAccountSyncError,
-						}
 					}
 					items = append(items, item)
 				}

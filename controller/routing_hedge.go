@@ -268,12 +268,7 @@ func maybeExecuteRoutingHedge(
 	}
 	addUsedChannel(secondary.ctx, secondary.channel.Id)
 	mergeRoutingHedgeUsedChannels(c, secondary.ctx)
-	service.MarkRoutingTargetTried(
-		c,
-		secondary.channel.Id,
-		common.GetContextKeyInt(secondary.ctx, constant.ContextKeyRoutingCredentialID),
-		common.GetContextKeyBool(secondary.ctx, constant.ContextKeyChannelIsMultiKey),
-	)
+	service.MergeRoutingTargetExclusions(c, secondary.ctx)
 	secondaryResults := make(chan routingHedgeBranchResult, 1)
 	go func() {
 		secondaryResults <- executeRoutingHedgeBranch(secondary)
@@ -294,6 +289,7 @@ func maybeExecuteRoutingHedge(
 		terminal := *collection.terminal
 		promoteRoutingHedgeRelayInfo(baseInfo, terminal.branch)
 		recordRoutingHedgeAttemptEffects(terminal, nil)
+		mergeRoutingHedgeTargetExclusions(c, terminal.branch)
 		finishRoutingHedgeLoserAsync(
 			collection.pending, collection.pendingBranch, nil, slot, bufferSlot, routingHedgeLoserCleanupTimeout,
 		)
@@ -321,6 +317,8 @@ func maybeExecuteRoutingHedge(
 	promoteRoutingHedgeRelayInfo(baseInfo, primaryResult.branch)
 	recordRoutingHedgeAttemptEffects(primaryResult, winner)
 	recordRoutingHedgeAttemptEffects(secondaryResult, winner)
+	mergeRoutingHedgeTargetExclusions(c, primaryResult.branch)
+	mergeRoutingHedgeTargetExclusions(c, secondaryResult.branch)
 	if winner != nil {
 		loser := primaryResult
 		if winner.branch == primaryResult.branch {
@@ -366,7 +364,7 @@ func routingHedgeEligible(
 		return false
 	}
 	if c == nil || c.Request == nil || info == nil || channel == nil || retryParam == nil ||
-		!setting.Enabled || setting.Mode != smart_routing_setting.ModeEnterpriseSLO ||
+		!smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() ||
 		!setting.HedgeEnabled || !policy.Enabled || !policy.Explicit || policy.CrossRegion ||
 		policy.Scope != channelrouting.EnterpriseHedgeScopeDistinctTarget || retryParam.GetRetry() != 0 ||
 		info.RelayFormat != types.RelayFormatOpenAI || info.IsStream ||
@@ -568,6 +566,39 @@ func newRoutingHedgeBranch(
 		common.SetContextKey(branchContext, constant.ContextKeyRoutingCapacityReserve, nil)
 		common.SetContextKey(branchContext, constant.ContextKeyRoutingAdaptiveConcurrency, nil)
 		common.SetContextKey(branchContext, constant.ContextKeyRoutingSelectedIdentity, nil)
+
+		primaryAuthority := strings.TrimSpace(common.GetContextKeyString(source, constant.ContextKeyRoutingEndpointAuthority))
+		primaryRegion := strings.TrimSpace(common.GetContextKeyString(source, constant.ContextKeyRoutingRegion))
+		retainedEndpoints := make(map[string]channelrouting.RequestEndpointIdentity)
+		if excludedEndpoints, ok := common.GetContextKeyType[map[string]channelrouting.RequestEndpointIdentity](
+			source, constant.ContextKeyRoutingExcludedEndpoints,
+		); ok {
+			for key, identity := range excludedEndpoints {
+				if strings.EqualFold(strings.TrimSpace(identity.EndpointAuthority), primaryAuthority) &&
+					strings.EqualFold(strings.TrimSpace(identity.Region), primaryRegion) {
+					continue
+				}
+				retainedEndpoints[key] = identity
+			}
+		}
+		common.SetContextKey(branchContext, constant.ContextKeyRoutingExcludedEndpoints, retainedEndpoints)
+
+		primaryFailureDomain := strings.ToLower(strings.TrimSpace(
+			common.GetContextKeyString(source, constant.ContextKeyRoutingFailureDomainHash),
+		))
+		retainedFailureDomains := make(map[string]struct{})
+		if excludedFailureDomains, ok := common.GetContextKeyType[map[string]struct{}](
+			source, constant.ContextKeyRoutingExcludedDomains,
+		); ok {
+			for hash := range excludedFailureDomains {
+				normalized := strings.ToLower(strings.TrimSpace(hash))
+				if normalized == "" || normalized == primaryFailureDomain {
+					continue
+				}
+				retainedFailureDomains[normalized] = struct{}{}
+			}
+		}
+		common.SetContextKey(branchContext, constant.ContextKeyRoutingExcludedDomains, retainedFailureDomains)
 	}
 	info, err := cloneRoutingHedgeRelayInfo(baseInfo)
 	if err != nil {
@@ -739,19 +770,21 @@ func routingHedgeTargetsHaveDistinctFailureDomain(
 	primaryCost channelrouting.ShadowCostInput,
 	secondaryCost channelrouting.ShadowCostInput,
 ) bool {
-	if primary == nil || secondary == nil || primaryCost.AccountKeyHash == "" ||
-		secondaryCost.AccountKeyHash == "" {
+	if primary == nil || secondary == nil {
 		return false
 	}
 	primaryAuthority := common.GetContextKeyString(primary, constant.ContextKeyRoutingEndpointAuthority)
 	secondaryAuthority := common.GetContextKeyString(secondary, constant.ContextKeyRoutingEndpointAuthority)
 	primaryCredentialID := service.RoutingHedgeCredentialID(primary)
 	secondaryCredentialID := service.RoutingHedgeCredentialID(secondary)
-	if primaryAuthority == "" || secondaryAuthority == "" ||
-		primaryCredentialID <= 0 || secondaryCredentialID <= 0 || primaryCredentialID == secondaryCredentialID {
+	if primaryCredentialID <= 0 || secondaryCredentialID <= 0 || primaryCredentialID == secondaryCredentialID {
 		return false
 	}
-	return primaryAuthority != secondaryAuthority || primaryCost.AccountKeyHash != secondaryCost.AccountKeyHash
+	if primaryAuthority != "" && secondaryAuthority != "" && primaryAuthority != secondaryAuthority {
+		return true
+	}
+	return primaryCost.FailureDomainHash != "" && secondaryCost.FailureDomainHash != "" &&
+		primaryCost.FailureDomainHash != secondaryCost.FailureDomainHash
 }
 
 func executeRoutingHedgeBranch(branch *routingHedgeBranch) routingHedgeBranchResult {
@@ -936,6 +969,7 @@ func finishSingleRoutingHedgeResult(
 		return finishRoutingHedgeWinnerResult(c, baseInfo, retryParam, attemptLease, result), true
 	}
 	recordRoutingHedgeAttemptEffects(result, nil)
+	mergeRoutingHedgeTargetExclusions(c, result.branch)
 	apiErr := result.apiErr
 	if apiErr == nil {
 		apiErr = routingHedgeInternalError("primary attempt failed without a relay error", errors.New("empty primary hedge failure"))
@@ -1027,7 +1061,7 @@ func startRoutingHedgeBranchAudit(
 	stableNodeID, stableNodeKnown := channelrouting.StableNodeID()
 	algorithmVersion := common.GetContextKeyString(branch.ctx, constant.ContextKeyRoutingAlgorithmVersion)
 	if algorithmVersion == "" {
-		algorithmVersion = channelrouting.DecisionAlgorithmBalancedV1
+		algorithmVersion = channelrouting.DecisionAlgorithmBalanced
 	}
 	return channelrouting.ReserveUpstreamAttemptAudit(model.RoutingHedgeAttemptStartSpec{
 		DecisionID:       common.GetContextKeyString(branch.ctx, constant.ContextKeyRoutingDecisionID),
@@ -1192,6 +1226,7 @@ func recordRoutingHedgeAttemptEffects(
 	if result.success || apiErr == nil {
 		return
 	}
+	service.MarkRoutingTargetFailure(result.branch.ctx, result.branch.channel.Id, result.classification.Scope)
 	channel := result.branch.channel
 	processChannelError(
 		result.branch.ctx,
@@ -1255,6 +1290,7 @@ func routingHedgePromoteContext(target *gin.Context, source *gin.Context) {
 		constant.ContextKeyChannelMultiKeyIndex, constant.ContextKeyChannelKey,
 		constant.ContextKeyRoutingSnapshotRevision, constant.ContextKeyRoutingPoolID,
 		constant.ContextKeyRoutingMemberID, constant.ContextKeyRoutingCredentialID,
+		constant.ContextKeyRoutingFailureDomainHash,
 		constant.ContextKeyRoutingEndpointHost, constant.ContextKeyRoutingEndpointAuthority,
 		constant.ContextKeyRoutingRegion, constant.ContextKeyRoutingAdaptiveConcurrency,
 		constant.ContextKeySystemPromptOverride,
@@ -1270,6 +1306,14 @@ func routingHedgePromoteContext(target *gin.Context, source *gin.Context) {
 		}
 	}
 	mergeRoutingHedgeUsedChannels(target, source)
+	service.MergeRoutingTargetExclusions(target, source)
+}
+
+func mergeRoutingHedgeTargetExclusions(target *gin.Context, branch *routingHedgeBranch) {
+	if branch == nil {
+		return
+	}
+	service.MergeRoutingTargetExclusions(target, branch.ctx)
 }
 
 func mergeRoutingHedgeUsedChannels(target *gin.Context, source *gin.Context) {

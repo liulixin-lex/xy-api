@@ -12,62 +12,68 @@ const (
 )
 
 type ChannelSnapshotSummary struct {
-	ID                   int                       `json:"id"`
-	Name                 string                    `json:"name"`
-	Type                 int                       `json:"type"`
-	Status               int                       `json:"status"`
-	Endpoint             string                    `json:"endpoint,omitempty"`
-	EndpointAuthority    string                    `json:"endpoint_authority"`
-	Region               string                    `json:"region"`
-	EndpointState        EndpointBreakerSourceView `json:"endpoint_state"`
-	MultiKey             bool                      `json:"multi_key"`
-	CredentialCount      int                       `json:"credential_count"`
-	CredentialsTruncated bool                      `json:"credentials_truncated"`
-	CredentialIDs        []int                     `json:"credential_ids"`
-	ModelCount           int                       `json:"model_count"`
-	ModelsTruncated      bool                      `json:"models_truncated"`
-	Models               []string                  `json:"models"`
-	AuthFailure          bool                      `json:"auth_failure"`
-	AuthFailureUpdatedAt int64                     `json:"auth_failure_updated_at"`
-	BalanceKnown         bool                      `json:"balance_known"`
-	Balance              float64                   `json:"balance"`
-	BalanceUpdatedAt     int64                     `json:"balance_updated_at"`
-	CostConnectorEnabled bool                      `json:"cost_connector_enabled"`
-	CostSyncFailures     int                       `json:"cost_sync_failures"`
-	CostSyncBackoffUntil int64                     `json:"cost_sync_backoff_until"`
-	CostSyncError        string                    `json:"cost_sync_error,omitempty"`
+	ID                     int                       `json:"id"`
+	Name                   string                    `json:"name"`
+	Type                   int                       `json:"type"`
+	Status                 int                       `json:"status"`
+	Endpoint               string                    `json:"endpoint,omitempty"`
+	EndpointAuthority      string                    `json:"endpoint_authority"`
+	Region                 string                    `json:"region"`
+	EndpointState          EndpointBreakerSourceView `json:"endpoint_state"`
+	MultiKey               bool                      `json:"multi_key"`
+	CredentialCount        int                       `json:"credential_count"`
+	CredentialsTruncated   bool                      `json:"credentials_truncated"`
+	CredentialIDs          []int                     `json:"credential_ids"`
+	ModelCount             int                       `json:"model_count"`
+	ModelsTruncated        bool                      `json:"models_truncated"`
+	Models                 []string                  `json:"models"`
+	AuthFailure            bool                      `json:"auth_failure"`
+	AuthFailureUpdatedAt   int64                     `json:"auth_failure_updated_at"`
+	BalanceKnown           bool                      `json:"balance_known"`
+	Balance                float64                   `json:"balance"`
+	BalanceUpdatedAt       int64                     `json:"balance_updated_at"`
+	ConfigurationRevision  int64                     `json:"configuration_revision"`
+	UpstreamCostMultiplier float64                   `json:"upstream_cost_multiplier"`
+	CostSource             string                    `json:"cost_source"`
+	CostConfirmed          bool                      `json:"cost_confirmed"`
+	CostBasisAvailable     bool                      `json:"cost_basis_available"`
+	EffectiveModelCount    int                       `json:"effective_model_count"`
+	TrafficClass           string                    `json:"traffic_class"`
+	FailureDomainLabel     string                    `json:"failure_domain_label"`
+	FailureDomainStatus    string                    `json:"failure_domain_status"`
 }
 
 type CostSnapshotSummary struct {
-	PoolID            int                      `json:"pool_id"`
-	GroupName         string                   `json:"group_name"`
-	MemberID          int                      `json:"member_id"`
-	ChannelID         int                      `json:"channel_id"`
-	ChannelName       string                   `json:"channel_name"`
-	ModelName         string                   `json:"model_name"`
-	Known             bool                     `json:"known"`
-	Cost              float64                  `json:"cost,omitempty"`
-	BillingMode       string                   `json:"billing_mode,omitempty"`
-	Currency          string                   `json:"currency,omitempty"`
-	Unit              string                   `json:"unit,omitempty"`
-	DisplayRate       *float64                 `json:"display_rate,omitempty"`
-	DisplayRateBasis  string                   `json:"display_rate_basis,omitempty"`
-	ExpressionPricing bool                     `json:"expression_pricing"`
-	Version           string                   `json:"version,omitempty"`
-	PricingVersion    string                   `json:"pricing_version,omitempty"`
-	UpstreamGroup     string                   `json:"upstream_group,omitempty"`
-	UpstreamModel     string                   `json:"upstream_model,omitempty"`
-	ObservedTime      int64                    `json:"observed_time,omitempty"`
-	EffectiveTime     int64                    `json:"effective_time,omitempty"`
-	ExpiresTime       int64                    `json:"expires_time,omitempty"`
-	Confidence        string                   `json:"confidence"`
-	ConfidenceScore   float64                  `json:"confidence_score"`
-	Freshness         string                   `json:"freshness"`
-	FreshnessScore    float64                  `json:"freshness_score"`
-	SourceSyncStatus  string                   `json:"source_sync_status"`
-	SourceSyncError   string                   `json:"source_sync_error,omitempty"`
-	SnapshotTime      int64                    `json:"snapshot_time"`
-	Account           *CostSnapshotAccountItem `json:"account,omitempty"`
+	PoolID                 int      `json:"pool_id"`
+	GroupName              string   `json:"group_name"`
+	MemberID               int      `json:"member_id"`
+	ChannelID              int      `json:"channel_id"`
+	ChannelName            string   `json:"channel_name"`
+	ModelName              string   `json:"model_name"`
+	Known                  bool     `json:"known"`
+	Cost                   float64  `json:"cost,omitempty"`
+	BillingMode            string   `json:"billing_mode,omitempty"`
+	Currency               string   `json:"currency,omitempty"`
+	Unit                   string   `json:"unit,omitempty"`
+	DisplayRate            *float64 `json:"display_rate,omitempty"`
+	DisplayRateBasis       string   `json:"display_rate_basis,omitempty"`
+	ExpressionPricing      bool     `json:"expression_pricing"`
+	Version                string   `json:"version,omitempty"`
+	PricingVersion         string   `json:"pricing_version,omitempty"`
+	PricingIdentity        string   `json:"pricing_identity,omitempty"`
+	UnknownReason          string   `json:"unknown_reason,omitempty"`
+	ConfigurationRevision  int64    `json:"configuration_revision"`
+	UpstreamCostMultiplier float64  `json:"upstream_cost_multiplier"`
+	UpstreamGroup          string   `json:"upstream_group,omitempty"`
+	UpstreamModel          string   `json:"upstream_model,omitempty"`
+	ObservedTime           int64    `json:"observed_time,omitempty"`
+	EffectiveTime          int64    `json:"effective_time,omitempty"`
+	ExpiresTime            int64    `json:"expires_time,omitempty"`
+	Confidence             string   `json:"confidence"`
+	ConfidenceScore        float64  `json:"confidence_score"`
+	Freshness              string   `json:"freshness"`
+	FreshnessScore         float64  `json:"freshness_score"`
+	SnapshotTime           int64    `json:"snapshot_time"`
 }
 
 func ListRiskPoolSnapshotSummaries(limit int) ([]PoolSnapshotSummary, SnapshotMetadata, bool) {
@@ -166,8 +172,13 @@ func ListChannelSnapshotSummaries(
 			Models:      append([]string(nil), channel.ModelNames[:modelEnd]...),
 			AuthFailure: channel.AuthFailure, AuthFailureUpdatedAt: channel.AuthFailureUpdatedAt,
 			BalanceKnown: channel.BalanceKnown, Balance: channel.Balance, BalanceUpdatedAt: channel.BalanceUpdatedAt,
-			CostConnectorEnabled: channel.CostConnectorEnabled, CostSyncFailures: channel.CostSyncFailures,
-			CostSyncBackoffUntil: channel.CostSyncBackoffUntil, CostSyncError: channel.CostSyncError,
+			ConfigurationRevision:  channel.ConfigurationRevision,
+			UpstreamCostMultiplier: channel.UpstreamCostMultiplier,
+			CostSource:             channel.CostSource, CostConfirmed: channel.CostConfirmed,
+			CostBasisAvailable:  channel.CostBasisAvailable,
+			EffectiveModelCount: channel.EffectiveModelCount,
+			TrafficClass:        channel.TrafficClass, FailureDomainLabel: channel.FailureDomainLabel,
+			FailureDomainStatus: channel.FailureDomainStatus,
 		})
 	}
 	return items, total, snapshotMetadata(snapshot.view), true
@@ -252,12 +263,14 @@ func costSnapshotSummary(pool PoolSnapshot, member PoolMemberSnapshot, observati
 		Known: observation.CostKnown || observation.CostPricing != nil, Cost: observation.Cost,
 		BillingMode: observation.CostBillingMode,
 		Version:     observation.CostPricingHash, PricingVersion: observation.CostPricingVersion,
-		UpstreamGroup: observation.CostUpstreamGroup, UpstreamModel: observation.CostUpstreamModel,
+		PricingIdentity: observation.CostPricingIdentity, UnknownReason: observation.CostUnknownReason,
+		ConfigurationRevision:  observation.ChannelConfigurationRevision,
+		UpstreamCostMultiplier: observation.CostUpstreamMultiplier,
+		UpstreamGroup:          observation.CostUpstreamGroup, UpstreamModel: observation.CostUpstreamModel,
 		ObservedTime: observation.CostObservedTime, EffectiveTime: observation.CostEffectiveTime,
 		ExpiresTime: observation.CostExpiresTime, Confidence: observation.CostConfidence,
 		ConfidenceScore: observation.CostConfidenceScore, Freshness: observation.CostFreshness,
-		FreshnessScore: observation.CostFreshnessScore, SourceSyncStatus: observation.CostSourceSyncStatus,
-		SourceSyncError: observation.CostSourceSyncError, SnapshotTime: observation.CostUpdatedUnix,
+		FreshnessScore: observation.CostFreshnessScore, SnapshotTime: observation.CostUpdatedUnix,
 	}
 	if observation.CostPricing != nil {
 		item.BillingMode = observation.CostPricing.BillingMode
@@ -283,15 +296,6 @@ func costSnapshotSummary(pool PoolSnapshot, member PoolMemberSnapshot, observati
 			}
 		}
 	}
-	if observation.upstreamAccountID > 0 {
-		item.Account = &CostSnapshotAccountItem{
-			ID: observation.upstreamAccountID, SourceType: observation.CostAccountSourceType,
-			MaskedIdentity: observation.CostAccountMaskedID, Status: observation.CostAccountStatus,
-			BalanceKnown: observation.CostAccountBalanceKnown, Balance: observation.CostAccountBalance,
-			BalanceUpdatedAt: observation.CostAccountBalanceUpdatedAt,
-			LastSyncStatus:   observation.CostAccountSyncStatus, LastSyncError: observation.CostAccountSyncError,
-		}
-	}
 	return item
 }
 
@@ -301,13 +305,14 @@ func costSnapshotDetail(pool PoolSnapshot, member PoolMemberSnapshot, observatio
 		PoolID: summary.PoolID, GroupName: summary.GroupName, MemberID: summary.MemberID,
 		ChannelID: summary.ChannelID, ChannelName: summary.ChannelName, ModelName: summary.ModelName,
 		Known: summary.Known, Cost: summary.Cost, Currency: summary.Currency, Unit: summary.Unit,
-		Version: summary.Version, PricingVersion: summary.PricingVersion, UpstreamGroup: summary.UpstreamGroup,
+		Version: summary.Version, PricingVersion: summary.PricingVersion,
+		PricingIdentity: summary.PricingIdentity, UnknownReason: summary.UnknownReason,
+		ConfigurationRevision:  summary.ConfigurationRevision,
+		UpstreamCostMultiplier: summary.UpstreamCostMultiplier, UpstreamGroup: summary.UpstreamGroup,
 		UpstreamModel: summary.UpstreamModel, ObservedTime: summary.ObservedTime,
 		EffectiveTime: summary.EffectiveTime, ExpiresTime: summary.ExpiresTime,
 		Confidence: summary.Confidence, ConfidenceScore: summary.ConfidenceScore,
-		Freshness: summary.Freshness, FreshnessScore: summary.FreshnessScore,
-		SourceSyncStatus: summary.SourceSyncStatus, SourceSyncError: summary.SourceSyncError,
-		SnapshotTime: summary.SnapshotTime, Account: summary.Account,
+		Freshness: summary.Freshness, FreshnessScore: summary.FreshnessScore, SnapshotTime: summary.SnapshotTime,
 	}
 	if observation.CostPricing != nil {
 		pricing := *observation.CostPricing

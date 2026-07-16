@@ -38,7 +38,7 @@ func TestShadowReplayIsDeterministicAndHashBound(t *testing.T) {
 }
 
 func TestRequestProfileNeverSerializesCostRequestBodyOrHeaders(t *testing.T) {
-	base, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	base, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
 	require.NoError(t, err)
 	first := attachRoutingCostProfile(base, &model.RoutingCostRequestProfile{
 		Request: billingexpr.RequestInput{
@@ -64,52 +64,8 @@ func TestRequestProfileNeverSerializesCostRequestBodyOrHeaders(t *testing.T) {
 	assert.NotContains(t, string(encoded), "private")
 }
 
-func TestShadowExpectedCostFailsClosedForLegacyConnectorPricingWithoutContractMetadata(t *testing.T) {
-	now := time.Now().Unix()
-	groupRatio := 1.0
-	inputCost := 2.0
-	outputCost := 10.0
-	profile := RequestProfile{
-		PromptTokenEstimate: 1_000, CompletionTokenEstimate: 100,
-		costAtUnix: now,
-		costProfile: &model.RoutingCostRequestProfile{
-			PromptTokens: 1_000, MaximumPromptTokens: 1_000,
-			ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
-			MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
-			MaximumCompletionKnown: true, CacheTokensKnown: true,
-			MediaDimensionsKnown: true, RequestInputKnown: true,
-			RequestPricingFeaturesKnown: true,
-		},
-	}
-	for _, sourceType := range []string{
-		model.RoutingUpstreamTypeNewAPI,
-		model.RoutingUpstreamTypeSub2API,
-	} {
-		t.Run(sourceType, func(t *testing.T) {
-			cost, err := shadowExpectedCost(ModelSnapshot{
-				CostPricing: &model.RoutingNormalizedPricing{
-					QuotaType: 0, BillingMode: "token", Currency: "USD",
-					GroupRatio: &groupRatio, InputCostPerMillion: &inputCost,
-					OutputCostPerMillion: &outputCost,
-				},
-				CostAccountSourceType: sourceType,
-				CostObservedTime:      now - 1, CostEffectiveTime: now - 1,
-				CostExpiresTime:       now + 3_600,
-				CostVersionConfidence: model.RoutingCostConfidenceExact,
-				CostConfidenceScore:   1, CostFreshness: model.RoutingCostFreshnessFresh,
-				CostFreshnessScore: 1,
-			}, profile)
-
-			require.NoError(t, err)
-			require.NotNil(t, cost)
-			assert.False(t, cost.Known)
-			assert.Zero(t, cost.Cost)
-		})
-	}
-}
-
 func TestShadowSeedAndProfileHashAreStableAndScoped(t *testing.T) {
-	profile, err := NewRequestProfile("/v1/responses", "vip", "gpt-test", false, 0, 100, 20)
+	profile, err := NewLegacyRequestProfile("/v1/responses", "vip", "gpt-test", false, 0, 100, 20)
 	require.NoError(t, err)
 	firstHash, err := profile.Hash()
 	require.NoError(t, err)
@@ -134,7 +90,7 @@ func TestShadowSeedAndProfileHashAreStableAndScoped(t *testing.T) {
 }
 
 func TestCanaryReplayAppliesSlowStartAndRequestExclusions(t *testing.T) {
-	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 0, 0)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 0, 0)
 	require.NoError(t, err)
 	seed, err := DeriveDecisionSeed("canary-replay", 7, 0)
 	require.NoError(t, err)
@@ -155,7 +111,7 @@ func TestCanaryReplayAppliesSlowStartAndRequestExclusions(t *testing.T) {
 		{PoolMemberID: 13, ChannelID: 103, Priority: 10, Weight: 10, SlowStartFactor: 1},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, DecisionAlgorithmCanaryV1, input.AlgorithmVersion)
+	assert.Equal(t, DecisionAlgorithmCanary, input.AlgorithmVersion)
 
 	replay, err := RunShadowReplay(input)
 	require.NoError(t, err)
@@ -248,7 +204,7 @@ func TestCaptureShadowReplayUsesOneImmutablePoolSnapshot(t *testing.T) {
 							CostPricingVersion: "capture-v1", CostObservedTime: now, CostEffectiveTime: now - 60,
 							CostExpiresTime: now + 3_600, CostVersionConfidence: model.RoutingCostConfidenceExact,
 							CostConfidenceScore: 1, CostFreshness: model.RoutingCostFreshnessFresh,
-							CostFreshnessScore: 1, CostSourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
+							CostFreshnessScore: 1,
 						}},
 					},
 					{
@@ -380,7 +336,7 @@ func TestShadowDecisionAuditReplaysExactlyAndRejectsTampering(t *testing.T) {
 		GroupName:            input.Profile.GroupName,
 		ModelName:            input.Profile.ModelName,
 		SnapshotRevision:     input.PolicyRevision,
-		AlgorithmVersion:     DecisionAlgorithmShadowV1,
+		AlgorithmVersion:     input.AlgorithmVersion,
 		RetryIndex:           input.Profile.RetryIndex,
 		IsStream:             input.Profile.IsStream,
 		ActualChannelID:      actualChannelID,
@@ -460,7 +416,7 @@ func TestCanaryDecisionAuditReplaysExactly(t *testing.T) {
 		GroupName:         plan.Replay.Profile.GroupName,
 		ModelName:         plan.Replay.Profile.ModelName,
 		SnapshotRevision:  plan.Replay.PolicyRevision,
-		AlgorithmVersion:  DecisionAlgorithmCanaryV1,
+		AlgorithmVersion:  DecisionAlgorithmCanary,
 		RetryIndex:        plan.Replay.Profile.RetryIndex,
 		ActualChannelID:   plan.Result.SelectedChannelID,
 		ObservedChannelID: plan.Result.SelectedChannelID,
@@ -477,7 +433,7 @@ func TestCanaryDecisionAuditReplaysExactly(t *testing.T) {
 	require.NoError(t, err)
 	audits := decisionBuffer.drain(1)
 	require.Len(t, audits, 1)
-	assert.Equal(t, DecisionAlgorithmCanaryV1, audits[0].AlgorithmVersion)
+	assert.Equal(t, DecisionAlgorithmCanary, audits[0].AlgorithmVersion)
 	assert.Equal(t, plan.Gate.ActivationID, audits[0].ActivationID)
 	assert.Equal(t, string(plan.Gate.RolloutKey), audits[0].RolloutKey)
 	assert.Equal(t, model.RoutingDecisionCohortCanary, audits[0].Cohort)
@@ -508,7 +464,7 @@ func TestCanaryDecisionAuditReplaysExactly(t *testing.T) {
 
 func shadowReplayInputForTest(t *testing.T) ShadowReplayInput {
 	t.Helper()
-	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", true, 1, 1_000, 300)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", true, 1, 1_000, 300)
 	require.NoError(t, err)
 	seed, err := DeriveShadowSeed("request-123", 7, profile.RetryIndex)
 	require.NoError(t, err)

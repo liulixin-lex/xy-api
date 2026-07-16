@@ -6,11 +6,14 @@ import (
 	"gorm.io/gorm"
 )
 
-const routingOperationInvariantMigrationBatch = 200
+const (
+	routingOperationInvariantMigrationBatch = 200
+	routingCostSyncRetiredReason            = "routing cost connector retired; use channel configurations"
+)
 
 func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 	if db == nil || db.Dialector == nil {
-		return ErrRoutingV2SchemaNotReady
+		return ErrRoutingSchemaNotReady
 	}
 	if !db.Migrator().HasTable(&RoutingOperation{}) {
 		return nil
@@ -192,4 +195,116 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+func retireRoutingCostSyncWork(db *gorm.DB) error {
+	if db == nil || db.Dialector == nil {
+		return ErrRoutingSchemaNotReady
+	}
+	nowMs, err := routingDatabaseNowMs(db)
+	if err != nil {
+		return err
+	}
+	now := nowMs / 1_000
+	if now <= 0 {
+		now = 1
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if tx.Migrator().HasTable(&RoutingOperation{}) {
+			for {
+				var operations []RoutingOperation
+				if err := lockForUpdate(tx).
+					Where("operation_type = ? AND status IN ?", RoutingOperationTypeCostSync, []RoutingOperationStatus{
+						RoutingOperationStatusPending,
+						RoutingOperationStatusRunning,
+					}).
+					Order("id asc").
+					Limit(routingOperationInvariantMigrationBatch).
+					Find(&operations).Error; err != nil {
+					return err
+				}
+				for index := range operations {
+					operation := operations[index]
+					transitionTimeMs := max(nowMs, operation.CreatedTimeMs, operation.UpdatedTimeMs)
+					updates := routingOperationTerminalUpdates(
+						RoutingOperationStatusSuperseded,
+						routingCostSyncRetiredReason,
+						RoutingOperationResult{},
+						transitionTimeMs,
+					)
+					updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
+					updated := tx.Model(&RoutingOperation{}).
+						Where("id = ? AND status IN ?", operation.ID, []RoutingOperationStatus{
+							RoutingOperationStatusPending,
+							RoutingOperationStatusRunning,
+						}).
+						Updates(updates)
+					if updated.Error != nil {
+						return updated.Error
+					}
+					if updated.RowsAffected != 1 {
+						return ErrRoutingOperationClaimLost
+					}
+					var stored RoutingOperation
+					if err := tx.Where("id = ?", operation.ID).First(&stored).Error; err != nil {
+						return err
+					}
+					if err := validateStoredRoutingOperation(stored); err != nil {
+						return err
+					}
+				}
+				if len(operations) < routingOperationInvariantMigrationBatch {
+					break
+				}
+			}
+		}
+
+		if tx.Migrator().HasTable(&SystemTask{}) {
+			for {
+				var tasks []SystemTask
+				if err := lockForUpdate(tx).
+					Where("type = ? AND status IN ?", SystemTaskTypeRoutingCostSync, []SystemTaskStatus{
+						SystemTaskStatusPending,
+						SystemTaskStatusRunning,
+					}).
+					Order("id asc").
+					Limit(routingOperationInvariantMigrationBatch).
+					Find(&tasks).Error; err != nil {
+					return err
+				}
+				for index := range tasks {
+					task := tasks[index]
+					transitionTime := max(now, task.CreatedAt, task.UpdatedAt)
+					updated := tx.Model(&SystemTask{}).
+						Where("id = ? AND type = ? AND status IN ?", task.ID, SystemTaskTypeRoutingCostSync, []SystemTaskStatus{
+							SystemTaskStatusPending,
+							SystemTaskStatusRunning,
+						}).
+						Updates(map[string]any{
+							"status":     SystemTaskStatusFailed,
+							"active_key": nil,
+							"error":      routingCostSyncRetiredReason,
+							"locked_by":  "",
+							"updated_at": transitionTime,
+						})
+					if updated.Error != nil {
+						return updated.Error
+					}
+					if updated.RowsAffected != 1 {
+						return ErrSystemTaskLockLost
+					}
+				}
+				if len(tasks) < routingOperationInvariantMigrationBatch {
+					break
+				}
+			}
+		}
+		if tx.Migrator().HasTable(&SystemTaskLock{}) {
+			if err := tx.Where("type = ?", SystemTaskTypeRoutingCostSync).
+				Delete(&SystemTaskLock{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

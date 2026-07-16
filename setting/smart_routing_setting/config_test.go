@@ -55,6 +55,9 @@ func TestNormalizeBoundsFailoverAndProbeBudgets(t *testing.T) {
 		RetryTokenRefillPerSec:   math.NaN(),
 		FailoverDeadlineMs:       0,
 		RetryExtraCostMultiplier: math.Inf(1),
+		BackoffBaseMs5xx:         700_000,
+		BackoffBaseMs429:         800_000,
+		BackoffCapMs:             900_000,
 		ActiveProbeHealthySec:    30,
 		ActiveProbeDegradedSec:   60,
 		ActiveProbeOpenSec:       90,
@@ -76,6 +79,9 @@ func TestNormalizeBoundsFailoverAndProbeBudgets(t *testing.T) {
 	assert.Equal(t, 10.0, normalized.RetryTokenRefillPerSec)
 	assert.Equal(t, 120_000, normalized.FailoverDeadlineMs)
 	assert.Equal(t, 2.0, normalized.RetryExtraCostMultiplier)
+	assert.Equal(t, 600_000, normalized.BackoffBaseMs5xx)
+	assert.Equal(t, 600_000, normalized.BackoffBaseMs429)
+	assert.Equal(t, 600_000, normalized.BackoffCapMs)
 	assert.Equal(t, 30, normalized.ActiveProbeHealthySec)
 	assert.Equal(t, 30, normalized.ActiveProbeDegradedSec)
 	assert.Equal(t, 30, normalized.ActiveProbeOpenSec)
@@ -99,6 +105,7 @@ func TestGetSettingDefaultsAndNormalizesWeights(t *testing.T) {
 	setting := GetSetting()
 
 	assert.False(t, setting.Enabled)
+	assert.False(t, setting.RequestProfileEnabled)
 	assert.Equal(t, ModeObserve, setting.Mode)
 	assert.Equal(t, 5, setting.Consecutive5xx)
 	assert.Equal(t, 50, setting.FailureRatePct)
@@ -137,6 +144,29 @@ func TestGetSettingAppliesEnvOverridesEveryRead(t *testing.T) {
 	assert.Equal(t, ModeObserve, setting.Mode)
 	assert.False(t, setting.AgentEnabled)
 	assert.False(t, setting.HedgeEnabled)
+}
+
+func TestGetSettingUsesUnversionedRequestProfileEnvironmentOnly(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	t.Setenv("SMART_ROUTING_REQUEST_PROFILE_V2_ENABLED", "true")
+	t.Setenv("SMART_ROUTING_REQUEST_PROFILE_ENABLED", "")
+
+	setting := GetSetting()
+	assert.False(t, setting.RequestProfileEnabled)
+
+	t.Setenv("SMART_ROUTING_REQUEST_PROFILE_ENABLED", "true")
+	setting = GetSetting()
+	assert.True(t, setting.RequestProfileEnabled)
+}
+
+func TestRequestProfileSettingExportsOnlyUnversionedKey(t *testing.T) {
+	values, err := config.ConfigToMap(SmartRoutingSetting{RequestProfileEnabled: false})
+	require.NoError(t, err)
+
+	assert.Equal(t, "false", values["request_profile_enabled"])
+	_, legacyPresent := values["request_profile_v2_enabled"]
+	assert.False(t, legacyPresent)
 }
 
 func TestUpdateSettingNormalizesAndStoresValues(t *testing.T) {
@@ -192,6 +222,18 @@ func TestUpdateSettingClampsBreakerAndRetryRanges(t *testing.T) {
 	assert.Equal(t, 300, updated.SnapshotLiveSec)
 	assert.Equal(t, 1800, updated.SnapshotStaleSec)
 	assert.Equal(t, 7, updated.RetentionDays)
+}
+
+func TestNormalizeKeepsRetryBackoffBasesWithinCap(t *testing.T) {
+	normalized := Normalize(SmartRoutingSetting{
+		BackoffBaseMs5xx: 500,
+		BackoffBaseMs429: 1_000,
+		BackoffCapMs:     100,
+	})
+
+	assert.Equal(t, 100, normalized.BackoffBaseMs5xx)
+	assert.Equal(t, 100, normalized.BackoffBaseMs429)
+	assert.Equal(t, 100, normalized.BackoffCapMs)
 }
 
 func TestEnterpriseSLOModeUsesEnterpriseWeights(t *testing.T) {

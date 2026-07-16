@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	routingTelemetryStream                 = "routing:v2:telemetry"
-	routingTelemetryConsumerGroup          = "routing-v2-rollup"
+	routingTelemetryStream                 = "channel-routing:telemetry"
+	routingTelemetryConsumerGroup          = "channel-routing-rollup"
 	routingTelemetryStreamMaxLen     int64 = 100_000
 	routingTelemetryEnvelopeMaxBytes       = 512 << 10
 	routingTelemetryPendingMaxItems        = 64

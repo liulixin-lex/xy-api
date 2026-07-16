@@ -200,14 +200,16 @@ func hedgeAttemptAuditSpecForTest(requestID string) model.RoutingHedgeAttemptSta
 		Cost: model.RoutingHedgeAttemptCostSpec{
 			Known:        true,
 			ExpectedCost: 0.001, WorstCaseCost: 0.002, EffectiveCost: 0.0012,
-			Currency: "USD", Unit: "request", PricingBasis: "token",
+			Currency: "USD", Unit: "request", PricingBasis: SystemRoutingPricingBasis,
 			PricingHash: fmt.Sprintf("%064x", 1), PricingVersion: "pricing-v1",
+			PricingIdentity:       "billing:" + fmt.Sprintf("%064x", 1) + ":channel-config:7",
+			ConfigurationRevision: 7, UpstreamCostMultiplier: 1.5,
+			BaselineExpectedKnown: true, BaselineExpectedCost: 0.0005,
+			BaselineWorstCaseKnown: true, BaselineWorstCaseCost: 0.001,
 			ConfidenceScore: 1, FreshnessScore: 1,
 			ExpectedBreakdown:    model.RoutingCostBreakdown{Input: 0.0004, Output: 0.0006, Total: 0.001},
 			WorstSingleBreakdown: model.RoutingCostBreakdown{Input: 0.0008, Output: 0.0012, Total: 0.002},
 			ObservedTime:         900, EffectiveTime: 900, ExpiresTime: 2_000,
-			SourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess, AccountSourceType: "gateway",
-			AccountReferenceHash: fmt.Sprintf("%064x", 2),
 		},
 	}
 }

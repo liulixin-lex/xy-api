@@ -16,14 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import {
-  AlertCircle,
-  CheckCircle2,
-  CircleDashed,
-  Clock3,
-  XCircle,
-} from 'lucide-react'
+  AlertCircleIcon,
+  CancelCircleIcon,
+  CheckmarkCircle02Icon,
+  CircleDashedIcon,
+  Clock03Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { Badge } from '@/components/ui/badge'
@@ -44,6 +44,8 @@ function statusPresentation(status: string | number) {
     normalized === 'success' ||
     normalized === 'succeeded' ||
     normalized === 'enabled' ||
+    normalized === 'balanced' ||
+    normalized === 'enterprise_slo' ||
     normalized === '1' ||
     normalized === 'known' ||
     normalized === 'validated' ||
@@ -57,7 +59,7 @@ function statusPresentation(status: string | number) {
     normalized === 'completed'
   ) {
     return {
-      icon: CheckCircle2,
+      icon: CheckmarkCircle02Icon,
       className: 'border-success/40 bg-success/15 text-foreground',
     }
   }
@@ -69,7 +71,7 @@ function statusPresentation(status: string | number) {
     normalized === 'group_only'
   ) {
     return {
-      icon: AlertCircle,
+      icon: AlertCircleIcon,
       className: 'border-warning/40 bg-warning/15 text-foreground',
     }
   }
@@ -87,7 +89,7 @@ function statusPresentation(status: string | number) {
     normalized === 'half_open'
   ) {
     return {
-      icon: Clock3,
+      icon: Clock03Icon,
       className: 'border-warning/40 bg-warning/15 text-foreground',
     }
   }
@@ -97,6 +99,7 @@ function statusPresentation(status: string | number) {
     normalized === 'failure' ||
     normalized === 'open' ||
     normalized === 'disabled' ||
+    normalized === 'legacy' ||
     normalized === '2' ||
     normalized === '3' ||
     normalized === 'breached' ||
@@ -105,7 +108,7 @@ function statusPresentation(status: string | number) {
     normalized === 'expired'
   ) {
     return {
-      icon: XCircle,
+      icon: CancelCircleIcon,
       className: 'border-destructive/40 bg-destructive/10 text-foreground',
     }
   }
@@ -116,12 +119,12 @@ function statusPresentation(status: string | number) {
     normalized === 'insufficient_data'
   ) {
     return {
-      icon: CircleDashed,
+      icon: CircleDashedIcon,
       className: 'border-info/40 bg-info/15 text-foreground',
     }
   }
   return {
-    icon: AlertCircle,
+    icon: AlertCircleIcon,
     className: 'border-border bg-muted/50 text-muted-foreground',
   }
 }
@@ -145,6 +148,8 @@ function statusLabel(
     disabled: 'Disabled',
     editing: 'Editing',
     enabled: 'Enabled',
+    balanced: 'Balanced',
+    enterprise_slo: 'Enterprise SLO',
     exact: 'Exact',
     expired: 'Expired',
     failed: 'Failed',
@@ -160,6 +165,7 @@ function statusLabel(
     insufficient_data: 'Insufficient data',
     known: 'Known',
     lagging: 'Lagging',
+    legacy: 'Legacy routing',
     local_error: 'Local error',
     observe: 'Observe',
     open: 'Open',
@@ -190,14 +196,13 @@ export function ChannelRoutingStatusBadge(
 ) {
   const { t } = useTranslation()
   const presentation = statusPresentation(props.status)
-  const Icon = presentation.icon
 
   return (
     <Badge
       variant='outline'
       className={cn(presentation.className, props.className)}
     >
-      <Icon aria-hidden='true' />
+      <HugeiconsIcon icon={presentation.icon} aria-hidden='true' />
       {props.label ?? statusLabel(props.status, t)}
     </Badge>
   )

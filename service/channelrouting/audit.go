@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	DecisionAlgorithmObserveV1 = "smart-routing-beta-observe-v1"
+	DecisionAlgorithmLegacy = "channel-routing-legacy"
 	// Policy pools may be larger; immutable audit/replay payloads are
 	// independently truncated to stay within the cross-database TEXT budget.
 	MaxDecisionCandidates = 64
@@ -141,7 +141,7 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 	}
 	algorithmVersion := input.AlgorithmVersion
 	if algorithmVersion == "" {
-		algorithmVersion = DecisionAlgorithmObserveV1
+		algorithmVersion = DecisionAlgorithmLegacy
 	}
 	algorithmVersion = truncateDecisionText(algorithmVersion, 64)
 	input.AlgorithmVersion = algorithmVersion
@@ -440,7 +440,8 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 			}
 			return fields, nil
 		}
-		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.AlgorithmVersion == DecisionAlgorithmCanaryV2 ||
+		if input.AlgorithmVersion == DecisionAlgorithmCanary ||
+			input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.AlgorithmVersion == DecisionAlgorithmCanaryV2 ||
 			input.SelectedIdentity != (Identity{}) || input.CapacityAdmission != nil {
 			return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 		}
@@ -455,7 +456,8 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 		gate.TrafficBasisPoints,
 	)
 	if err != nil || gate != expectedGate ||
-		(input.AlgorithmVersion != DecisionAlgorithmCanaryV1 && input.AlgorithmVersion != DecisionAlgorithmCanaryV2) ||
+		(input.AlgorithmVersion != DecisionAlgorithmCanary &&
+			input.AlgorithmVersion != DecisionAlgorithmCanaryV1 && input.AlgorithmVersion != DecisionAlgorithmCanaryV2) ||
 		gate.PoolID != input.PoolID || gate.PolicyRevision != input.SnapshotRevision {
 		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 	}

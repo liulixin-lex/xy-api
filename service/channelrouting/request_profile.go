@@ -319,7 +319,7 @@ func (class RequestTrafficClass) valid() bool {
 	}
 }
 
-type RequestProfileV2Input struct {
+type RequestProfileInput struct {
 	RequestPath              string
 	GroupName                string
 	ModelName                string
@@ -349,7 +349,7 @@ type RequestProfileV2Input struct {
 	TrafficClass             RequestTrafficClass
 }
 
-func NewRequestProfileV2(input RequestProfileV2Input) (RequestProfile, error) {
+func NewRequestProfile(input RequestProfileInput) (RequestProfile, error) {
 	inputTokens := input.InputTokens
 	outputTokens := input.OutputTokens
 	cachedTokens := input.CachedTokens
@@ -398,7 +398,7 @@ func NewRequestProfileV2(input RequestProfileV2Input) (RequestProfile, error) {
 	return profile, nil
 }
 
-func validateRequestProfile(profile RequestProfile) error {
+func validateRequestProfileSchema(profile RequestProfile) error {
 	if profile.GroupName == "" || profile.ModelName == "" || profile.RetryIndex < 0 ||
 		profile.PromptTokenEstimate < 0 || profile.CompletionTokenEstimate < 0 ||
 		!validShadowText(profile.RequestPath, 512) || !validShadowText(profile.GroupName, 64) ||
@@ -407,18 +407,18 @@ func validateRequestProfile(profile RequestProfile) error {
 	}
 	switch profile.SchemaVersion {
 	case RequestProfileSchemaV1:
-		if profile.hasV2Fields() {
+		if profile.hasStructuredFields() {
 			return ErrShadowReplayInvalid
 		}
 		return nil
 	case RequestProfileSchemaV2:
-		return validateRequestProfileV2(profile)
+		return validateRequestProfile(profile)
 	default:
 		return ErrShadowReplayInvalid
 	}
 }
 
-func validateRequestProfileV2(profile RequestProfile) error {
+func validateRequestProfile(profile RequestProfile) error {
 	requestKind, kindKnown := profile.RequestKind.Mask()
 	if !kindKnown || requestKind&requestKindMaskAll == 0 || !profile.SourceFormat.valid() ||
 		!requestSourceFormatSupportsKind(profile.SourceFormat, profile.RequestKind) ||
@@ -477,7 +477,7 @@ func requestProfileLegacyQuantity(quantity *RequestQuantity) int {
 	return int(quantity.Value)
 }
 
-func (profile RequestProfile) hasV2Fields() bool {
+func (profile RequestProfile) hasStructuredFields() bool {
 	return profile.RequestKind != "" || profile.SourceFormat != "" || profile.InputModalities != 0 ||
 		profile.OutputModalities != 0 || profile.RequiredCapabilities != 0 || profile.InputTokens != nil ||
 		profile.OutputTokens != nil || profile.CachedTokens != nil || profile.ImageUnits != nil ||
@@ -498,7 +498,7 @@ func resolveRequestProfile(
 	completionTokenEstimate int,
 ) (RequestProfile, error) {
 	if provided == nil {
-		return NewRequestProfile(
+		return NewLegacyRequestProfile(
 			requestPath, groupName, modelName, isStream, retryIndex,
 			promptTokenEstimate, completionTokenEstimate,
 		)

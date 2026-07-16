@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/channelrouting"
@@ -77,7 +78,12 @@ func setupResolveOriginTaskTestDB(t *testing.T) *gorm.DB {
 	model.LOG_DB = db
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}))
+	routinghotcache.ResetForTest()
+	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
+		&model.Task{},
+		&model.RoutingChannelConfiguration{},
+	))
 
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -88,6 +94,7 @@ func setupResolveOriginTaskTestDB(t *testing.T) *gorm.DB {
 		model.LOG_DB = previousLogDB
 		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
 		common.RedisEnabled = previousRedisEnabled
+		routinghotcache.ResetForTest()
 	})
 
 	return db

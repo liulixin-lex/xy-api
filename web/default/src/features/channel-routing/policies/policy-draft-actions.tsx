@@ -16,14 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import {
-  BadgeCheck,
-  CheckCircle2,
-  Eye,
-  FlaskConical,
-  Rocket,
-} from 'lucide-react'
+  BadgeCheckIcon,
+  CheckmarkCircle02Icon,
+  EyeIcon,
+  FlaskConicalIcon,
+  RocketIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -66,7 +66,12 @@ export function ChannelRoutingPolicyDraftActions(props: {
               />
             }
           >
-            <CheckCircle2 aria-hidden='true' />
+            <HugeiconsIcon
+              icon={CheckmarkCircle02Icon}
+              data-icon='inline-start'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
           </TooltipTrigger>
           <TooltipContent>{t('Validate draft')}</TooltipContent>
         </Tooltip>
@@ -84,7 +89,12 @@ export function ChannelRoutingPolicyDraftActions(props: {
               />
             }
           >
-            <FlaskConical aria-hidden='true' />
+            <HugeiconsIcon
+              icon={FlaskConicalIcon}
+              data-icon='inline-start'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
           </TooltipTrigger>
           <TooltipContent>{t('Simulate policy')}</TooltipContent>
         </Tooltip>
@@ -103,7 +113,12 @@ export function ChannelRoutingPolicyDraftActions(props: {
                 />
               }
             >
-              <BadgeCheck aria-hidden='true' />
+              <HugeiconsIcon
+                icon={BadgeCheckIcon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
             </TooltipTrigger>
             <TooltipContent>{t('Approve deployment')}</TooltipContent>
           </Tooltip>
@@ -119,7 +134,12 @@ export function ChannelRoutingPolicyDraftActions(props: {
                 />
               }
             >
-              <Rocket aria-hidden='true' />
+              <HugeiconsIcon
+                icon={RocketIcon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
             </TooltipTrigger>
             <TooltipContent>{t('Publish policy')}</TooltipContent>
           </Tooltip>
@@ -136,7 +156,12 @@ export function ChannelRoutingPolicyDraftActions(props: {
             />
           }
         >
-          <Eye aria-hidden='true' />
+          <HugeiconsIcon
+            icon={EyeIcon}
+            data-icon='inline-start'
+            strokeWidth={2}
+            aria-hidden='true'
+          />
         </TooltipTrigger>
         <TooltipContent>{t('View policy draft')}</TooltipContent>
       </Tooltip>

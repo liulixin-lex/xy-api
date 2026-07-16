@@ -188,7 +188,7 @@ func AsyncBillingV2FleetReady(ctx context.Context) bool {
 	asyncBillingFleetGateCache.ready = false
 	asyncBillingFleetGateCache.expiresAt = now.Add(asyncBillingFleetCacheTTL)
 	if !asyncBillingFleetGateCache.schemaReady || !now.Before(asyncBillingFleetGateCache.schemaExpiresAt) {
-		routingSchemaReady, err := model.RoutingV2SchemaReady(model.DB.WithContext(ctx))
+		routingSchemaReady, err := model.RoutingSchemaReady(model.DB.WithContext(ctx))
 		if err != nil || !routingSchemaReady {
 			resetAsyncBillingFleetCandidateLocked()
 			asyncBillingFleetGateCache.schemaReady = false

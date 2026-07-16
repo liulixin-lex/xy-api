@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	routingConfigStream                = "routing:v2:config"
+	routingConfigStream                = "channel-routing:config"
 	RoutingConfigCheckpointKind        = "config_stream"
 	RoutingConfigCheckpointScope       = routingConfigStream
 	routingConfigStreamMaxLen    int64 = 10_000
@@ -203,11 +203,14 @@ func ConsumeRoutingConfigOnceContext(ctx context.Context) (int, error) {
 			}
 			routingConfigState.markConsumed(message.ID, event.Revision)
 			checkpointRevision := event.Revision
+			configurationEpoch := uint64(0)
 			if metadata, ok := loadRoutingConfigSnapshotMetadata(); ok {
 				checkpointRevision = int64(metadata.Revision)
+				configurationEpoch = metadata.ConfigurationEpoch
 			}
 			_, _ = publishLocalRoutingEvent(RoutingEventTypePolicyApplied, uint64(checkpointRevision), map[string]any{
 				"event_revision": event.Revision, "local_revision": checkpointRevision,
+				"configuration_epoch": configurationEpoch,
 			})
 			if err := persistRoutingConfigCheckpointContext(ctx, message.ID, checkpointRevision); err != nil {
 				routingConfigState.markCheckpointFailure(err)
@@ -247,6 +250,8 @@ func initializeRoutingConfigCursorContext(ctx context.Context, client routingCon
 	if available && int64(metadata.Revision) == head.CurrentRevision && metadata.PolicyHash == head.CurrentHash &&
 		metadata.ActivationID == head.CurrentActivationID && metadata.ActivationStage == head.CurrentStage {
 		view.Revision = metadata.Revision
+		view.ConfigurationEpoch = metadata.ConfigurationEpoch
+		view.ConfigurationHash = metadata.ConfigurationHash
 		view.PolicyHash = metadata.PolicyHash
 		view.ActivationID = metadata.ActivationID
 		view.ActivationStage = metadata.ActivationStage
@@ -349,11 +354,15 @@ func persistRoutingConfigCheckpointContext(ctx context.Context, cursor string, r
 	activationID := int64(0)
 	activationStage := ""
 	trafficBasisPoints := 0
+	configurationEpoch := uint64(0)
+	configurationHash := ""
 	if metadata, ok := loadRoutingConfigSnapshotMetadata(); ok && int64(metadata.Revision) == revision {
 		policyHash = metadata.PolicyHash
 		activationID = metadata.ActivationID
 		activationStage = metadata.ActivationStage
 		trafficBasisPoints = metadata.TrafficBasisPoints
+		configurationEpoch = metadata.ConfigurationEpoch
+		configurationHash = metadata.ConfigurationHash
 	}
 	checkpoint, err := model.NewRoutingRuntimeCheckpoint(
 		NodeEpochID(),
@@ -364,6 +373,8 @@ func persistRoutingConfigCheckpointContext(ctx context.Context, cursor string, r
 		map[string]any{
 			"cursor":               cursor,
 			"policy_hash":          policyHash,
+			"configuration_epoch":  configurationEpoch,
+			"configuration_hash":   configurationHash,
 			"activation_id":        activationID,
 			"activation_stage":     activationStage,
 			"traffic_basis_points": trafficBasisPoints,

@@ -16,18 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  DashboardSquareEditIcon,
+  FloppyDiskIcon,
+  HistoryIcon,
+  RefreshIcon,
+  Shield02Icon,
+  SourceCodeIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AxiosError } from 'axios'
-import {
-  AlignLeft,
-  FilePlus2,
-  History,
-  RefreshCw,
-  Save,
-  ShieldCheck,
-} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -45,7 +45,6 @@ import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -60,7 +59,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
-import { Textarea } from '@/components/ui/textarea'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import {
   createChannelRoutingPolicyDraft,
@@ -77,7 +76,6 @@ import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
 import {
   analyzePolicyDocument,
-  formatPolicyDocumentPath,
   formatPolicyDocumentText,
   policyDocumentPositionAtOffset,
   policyDocumentText,
@@ -94,88 +92,15 @@ import type {
   PolicyDraftDetail,
   PolicyDraftSummary,
 } from '../types'
+import { PolicyJsonEditor, PolicyJsonEditorToolbar } from './policy-json-editor'
+import { ChannelRoutingPolicyVisualEditor } from './policy-visual-editor'
 
 type PolicyDraftFormValues = {
   baseRevision: number
   document: string
 }
 
-function syntaxIssueDetail(
-  detail: string | undefined,
-  translate: (key: string) => string
-): string {
-  switch (detail) {
-    case 'PropertyNameExpected':
-      return translate('A property name is required.')
-    case 'ValueExpected':
-      return translate('A JSON value is required.')
-    case 'ColonExpected':
-      return translate('A colon is required after the property name.')
-    case 'CommaExpected':
-      return translate('A comma is required between values.')
-    case 'CloseBraceExpected':
-      return translate('A closing brace is required.')
-    case 'CloseBracketExpected':
-      return translate('A closing bracket is required.')
-    case 'EndOfFileExpected':
-      return translate('Unexpected content follows the JSON document.')
-    case 'InvalidCommentToken':
-      return translate('Comments are not allowed in policy JSON.')
-    default:
-      return translate('The JSON token is invalid or incomplete.')
-  }
-}
-
-function policyIssueMessage(
-  issue: PolicyDocumentIssue,
-  translate: (key: string, options?: Record<string, unknown>) => string
-): string {
-  switch (issue.code) {
-    case 'json_syntax':
-      return translate('JSON syntax error: {{detail}}', {
-        detail: syntaxIssueDetail(issue.detail, translate),
-      })
-    case 'expected_object':
-      return translate('Must be a JSON object.')
-    case 'expected_array':
-      return translate('Must be a JSON array.')
-    case 'expected_boolean':
-      return translate('Must be true or false.')
-    case 'expected_integer':
-      return translate('Must be a safe integer.')
-    case 'expected_nonnegative_integer':
-      return translate('Must be a non-negative safe integer.')
-    case 'expected_positive_integer':
-      return translate('Must be a positive safe integer.')
-    case 'required_string':
-      return translate('Must be a string and cannot be missing.')
-    case 'string_too_long':
-      return translate('Must be {{limit}} characters or fewer.', {
-        limit: issue.limit,
-      })
-    case 'unsupported_schema_version':
-      return translate('Only policy schema version 1 is supported.')
-    case 'invalid_deployment_stage':
-      return translate('Use observe, shadow, canary, or active.')
-    case 'invalid_policy_profile':
-      return translate(
-        'Use balanced, reliability_first, cost_aware, enterprise_slo, or custom.'
-      )
-    case 'duplicate_value':
-      return translate('This value must be unique in its policy scope.')
-    case 'too_many_items':
-      return translate('Contains more than {{limit}} allowed items.', {
-        limit: issue.limit,
-      })
-    case 'document_too_large':
-      return translate(
-        'The policy document exceeds the {{limit}} byte limit.',
-        {
-          limit: issue.limit,
-        }
-      )
-  }
-}
+type PolicyEditorMode = 'visual' | 'json'
 
 function distributionLabel(
   values: Record<string, number>,
@@ -225,6 +150,8 @@ export function ChannelRoutingPolicyDraftSheet(props: {
   )
   const [restoredDraft, setRestoredDraft] = useState(false)
   const [editorFocusRequest, setEditorFocusRequest] = useState(0)
+  const [editorMode, setEditorMode] = useState<PolicyEditorMode>('visual')
+  const [visualSwitchBlocked, setVisualSwitchBlocked] = useState(false)
   const isEditing = props.draft != null
   const detailQuery = useQuery({
     queryKey: channelRoutingQueryKeys.policyDraft(props.draft?.id ?? 0),
@@ -268,6 +195,9 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     () => analyzePolicyDocument(documentValue),
     [documentValue]
   )
+  useEffect(() => {
+    if (analysis.valid) setVisualSwitchBlocked(false)
+  }, [analysis.valid])
   const saveDraft = useMutation({
     mutationFn: async (payload: {
       values: PolicyDraftFormValues
@@ -322,6 +252,8 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     setPendingRemote(null)
     setPreservedDocument(null)
     setRestoredDraft(false)
+    setEditorMode('visual')
+    setVisualSwitchBlocked(false)
     resetSaveDraft()
 
     if (!props.open) return
@@ -420,14 +352,19 @@ export function ChannelRoutingPolicyDraftSheet(props: {
     setRestoredDraft(true)
     setEditorFocusRequest((request) => request + 1)
   }
-  const replaceDocument = (value: string) => {
+  const replaceDocument = (
+    value: string,
+    options: { focusJsonEditor?: boolean } = {}
+  ) => {
     form.setValue('document', value, {
       shouldDirty: true,
       shouldTouch: true,
       shouldValidate: true,
     })
     setCursor({ line: 1, column: 1 })
-    setEditorFocusRequest((request) => request + 1)
+    if (options.focusJsonEditor !== false) {
+      setEditorFocusRequest((request) => request + 1)
+    }
   }
   const focusIssue = (issue: PolicyDocumentIssue) => {
     const editor = editorRef.current
@@ -455,6 +392,18 @@ export function ChannelRoutingPolicyDraftSheet(props: {
       return
     }
     replaceDocument(formatted)
+  }
+  const changeEditorMode = (nextMode: string) => {
+    if (nextMode !== 'visual' && nextMode !== 'json') return
+    if (nextMode === 'visual' && !analysis.valid) {
+      setVisualSwitchBlocked(true)
+      void form.trigger('document')
+      const firstIssue = analysis.issues[0]
+      if (firstIssue) focusIssue(firstIssue)
+      return
+    }
+    setVisualSwitchBlocked(false)
+    setEditorMode(nextMode)
   }
   const updateCursor = (editor: HTMLTextAreaElement) => {
     setCursor(
@@ -545,7 +494,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
 
               {pendingRemote ? (
                 <Alert role='status' className='border-warning/30 bg-warning/5'>
-                  <History className='text-warning' aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={HistoryIcon}
+                    className='text-warning'
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
                   <AlertTitle>{t('Policy draft changed elsewhere')}</AlertTitle>
                   <AlertDescription className='flex flex-col items-start gap-3'>
                     <p>
@@ -559,7 +513,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                       variant='outline'
                       onClick={() => loadAuthoritativeDetail(pendingRemote)}
                     >
-                      <RefreshCw aria-hidden='true' />
+                      <HugeiconsIcon
+                        icon={RefreshIcon}
+                        data-icon='inline-start'
+                        strokeWidth={2}
+                        aria-hidden='true'
+                      />
                       {t('Load latest version')}
                     </Button>
                   </AlertDescription>
@@ -568,7 +527,11 @@ export function ChannelRoutingPolicyDraftSheet(props: {
 
               {preservedDocument != null && !restoredDraft ? (
                 <Alert role='status'>
-                  <ShieldCheck aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={Shield02Icon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
                   <AlertTitle>{t('Latest version loaded')}</AlertTitle>
                   <AlertDescription className='flex flex-col items-start gap-3'>
                     <p>
@@ -582,7 +545,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                       variant='outline'
                       onClick={restorePreservedDocument}
                     >
-                      <History aria-hidden='true' />
+                      <HugeiconsIcon
+                        icon={HistoryIcon}
+                        data-icon='inline-start'
+                        strokeWidth={2}
+                        aria-hidden='true'
+                      />
                       {t('Restore my draft')}
                     </Button>
                   </AlertDescription>
@@ -591,7 +559,11 @@ export function ChannelRoutingPolicyDraftSheet(props: {
 
               {restoredDraft ? (
                 <Alert role='status'>
-                  <ShieldCheck aria-hidden='true' />
+                  <HugeiconsIcon
+                    icon={Shield02Icon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
                   <AlertTitle>
                     {t('Draft preserved on latest version')}
                   </AlertTitle>
@@ -604,7 +576,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                         variant='outline'
                         onClick={() => loadAuthoritativeDetail(authority)}
                       >
-                        <RefreshCw aria-hidden='true' />
+                        <HugeiconsIcon
+                          icon={RefreshIcon}
+                          data-icon='inline-start'
+                          strokeWidth={2}
+                          aria-hidden='true'
+                        />
                         {t('Load latest version')}
                       </Button>
                     ) : null}
@@ -653,45 +630,22 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                           }
                         />
                       </div>
-                      {writable ? (
-                        <div className='flex flex-wrap gap-1.5'>
-                          <Button
-                            type='button'
-                            size='sm'
-                            variant='outline'
-                            disabled={hasSyntaxIssues}
-                            onClick={formatDocument}
-                          >
-                            <AlignLeft aria-hidden='true' />
-                            {t('Format JSON')}
-                          </Button>
-                          <Button
-                            type='button'
-                            size='sm'
-                            variant='outline'
-                            onClick={() =>
-                              replaceDocument(starterPolicyDocumentText())
+                      {writable && editorMode === 'json' ? (
+                        <PolicyJsonEditorToolbar
+                          hasSyntaxIssues={hasSyntaxIssues}
+                          hasCurrentDocument={currentDocument != null}
+                          onFormat={formatDocument}
+                          onUseStarterTemplate={() =>
+                            replaceDocument(starterPolicyDocumentText())
+                          }
+                          onUseCurrentPolicy={() => {
+                            if (currentDocument) {
+                              replaceDocument(
+                                policyDocumentText(currentDocument)
+                              )
                             }
-                          >
-                            <FilePlus2 aria-hidden='true' />
-                            {t('Starter template')}
-                          </Button>
-                          {currentDocument ? (
-                            <Button
-                              type='button'
-                              size='sm'
-                              variant='outline'
-                              onClick={() =>
-                                replaceDocument(
-                                  policyDocumentText(currentDocument)
-                                )
-                              }
-                            >
-                              <History aria-hidden='true' />
-                              {t('Current policy')}
-                            </Button>
-                          ) : null}
-                        </div>
+                          }}
+                        />
                       ) : null}
                     </div>
 
@@ -714,87 +668,72 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                       ))}
                     </dl>
 
-                    <FormControl>
-                      <Textarea
-                        ref={(node) => {
-                          field.ref(node)
-                          editorRef.current = node
-                        }}
-                        className='min-h-96 resize-y font-mono text-xs leading-relaxed'
-                        spellCheck={false}
-                        readOnly={!writable}
-                        name={field.name}
-                        value={field.value}
-                        onBlur={field.onBlur}
-                        onChange={(event) => {
-                          field.onChange(event)
-                          updateCursor(event.currentTarget)
-                        }}
-                        onSelect={(event) => updateCursor(event.currentTarget)}
-                      />
-                    </FormControl>
-                    <FormDescription className='flex flex-wrap items-center justify-between gap-2 text-xs'>
-                      <span>
-                        {t('Line {{line}}, column {{column}}', cursor)}
-                      </span>
-                      <span>
-                        {t('{{count}} bytes', {
-                          count: format.number(analysis.summary.bytes),
-                        })}
-                      </span>
-                    </FormDescription>
-                    <FormMessage />
-
-                    {analysis.issues.length > 0 ? (
-                      <div
-                        className='border-destructive/30 bg-destructive/5 overflow-hidden rounded-lg border'
-                        role='alert'
+                    <Tabs value={editorMode} onValueChange={changeEditorMode}>
+                      <TabsList
+                        variant='line'
+                        aria-label={t('Policy editor mode')}
                       >
-                        <div className='border-destructive/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
-                          <span className='text-destructive text-sm font-medium'>
-                            {t('Policy document issues')}
-                          </span>
-                          <span className='text-destructive/80 text-xs tabular-nums'>
-                            {analysis.issues.length}
-                          </span>
-                        </div>
-                        <ul className='max-h-48 divide-y overflow-auto'>
-                          {analysis.issues.map((issue) => (
-                            <li
-                              key={`${issue.kind}-${issue.code}-${issue.offset}-${issue.diagnosticId}`}
-                            >
-                              <button
-                                type='button'
-                                className='hover:bg-destructive/5 focus-visible:ring-ring flex w-full min-w-0 items-start gap-3 px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset'
-                                onClick={() => focusIssue(issue)}
-                              >
-                                <span className='text-destructive shrink-0 font-mono text-xs'>
-                                  {formatPolicyDocumentPath(issue.path)}
-                                </span>
-                                <span className='min-w-0 flex-1 text-xs'>
-                                  <span className='block'>
-                                    {policyIssueMessage(issue, t)}
-                                  </span>
-                                  <span className='text-muted-foreground mt-0.5 block'>
-                                    {t('Line {{line}}, column {{column}}', {
-                                      line: issue.line,
-                                      column: issue.column,
-                                    })}
-                                  </span>
-                                </span>
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                        {analysis.issuesTruncated ? (
-                          <p className='text-destructive border-destructive/20 border-t px-3 py-2 text-xs'>
-                            {t(
-                              'Additional issues are hidden until the listed errors are fixed.'
-                            )}
-                          </p>
+                        <TabsTrigger value='visual'>
+                          <HugeiconsIcon
+                            icon={DashboardSquareEditIcon}
+                            data-icon='inline-start'
+                            strokeWidth={2}
+                            aria-hidden='true'
+                          />
+                          {t('Visual editor')}
+                        </TabsTrigger>
+                        <TabsTrigger value='json'>
+                          <HugeiconsIcon
+                            icon={SourceCodeIcon}
+                            data-icon='inline-start'
+                            strokeWidth={2}
+                            aria-hidden='true'
+                          />
+                          {t('Advanced JSON')}
+                        </TabsTrigger>
+                      </TabsList>
+
+                      <TabsContent value='visual' className='pt-2'>
+                        {analysis.document ? (
+                          <ChannelRoutingPolicyVisualEditor
+                            document={analysis.document}
+                            readOnly={!writable}
+                            onChange={(nextDocument) =>
+                              replaceDocument(
+                                policyDocumentText(nextDocument),
+                                { focusJsonEditor: false }
+                              )
+                            }
+                          />
                         ) : null}
-                      </div>
-                    ) : null}
+                      </TabsContent>
+
+                      <TabsContent value='json' className='pt-2'>
+                        <PolicyJsonEditor
+                          value={field.value}
+                          name={field.name}
+                          readOnly={!writable}
+                          visualSwitchBlocked={visualSwitchBlocked}
+                          cursor={cursor}
+                          bytes={analysis.summary.bytes}
+                          issues={analysis.issues}
+                          issuesTruncated={analysis.issuesTruncated}
+                          editorRef={editorRef}
+                          fieldRef={field.ref}
+                          onBlur={field.onBlur}
+                          onChange={(event) => {
+                            field.onChange(event)
+                            updateCursor(event.currentTarget)
+                          }}
+                          onSelect={(event) =>
+                            updateCursor(event.currentTarget)
+                          }
+                          onFocusIssue={focusIssue}
+                        />
+                      </TabsContent>
+                    </Tabs>
+
+                    <FormMessage />
                   </FormItem>
                 )}
               />
@@ -822,7 +761,12 @@ export function ChannelRoutingPolicyDraftSheet(props: {
                 (isEditing && authority == null)
               }
             >
-              <Save aria-hidden='true' />
+              <HugeiconsIcon
+                icon={FloppyDiskIcon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
               {saveDraft.isPending ? t('Saving') : t('Save draft')}
             </Button>
           </SheetFooter>

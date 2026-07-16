@@ -57,13 +57,13 @@ func TestRoutingPolicyApprovalIntentIndexMigrationRepairsWrongNamedIndexes(t *te
 	).Error)
 
 	require.NoError(t, MigrateRoutingPolicyApprovalIntentIndexes(db))
-	ready, err := routingV2CriticalIndexReady(
+	ready, err := routingCriticalIndexReady(
 		db, (RoutingPolicyApproval{}).TableName(), routingPolicyApprovalIntentActorUniqueIndex,
 		[]string{"draft_id", "draft_version", "activation_hash", "actor_id"},
 	)
 	require.NoError(t, err)
 	assert.True(t, ready)
-	ready, err = routingV2CriticalIndexReady(
+	ready, err = routingCriticalIndexReady(
 		db, (RoutingPolicyRollbackApproval{}).TableName(), routingPolicyRollbackApprovalIntentActorUniqueIndex,
 		[]string{"expected_revision", "expected_activation_id", "target_revision", "activation_hash", "actor_id"},
 	)
@@ -116,13 +116,13 @@ func runRoutingPolicyApprovalIntentIndexMigrationContract(t *testing.T, db *gorm
 	assert.False(t, db.Migrator().HasIndex(
 		&RoutingPolicyRollbackApproval{}, routingPolicyRollbackApprovalActorLegacyUniqueIndex,
 	))
-	ready, err := routingV2CriticalIndexReady(
+	ready, err := routingCriticalIndexReady(
 		db, (RoutingPolicyApproval{}).TableName(), routingPolicyApprovalIntentActorUniqueIndex,
 		[]string{"draft_id", "draft_version", "activation_hash", "actor_id"},
 	)
 	require.NoError(t, err)
 	assert.True(t, ready)
-	ready, err = routingV2CriticalIndexReady(
+	ready, err = routingCriticalIndexReady(
 		db, (RoutingPolicyRollbackApproval{}).TableName(), routingPolicyRollbackApprovalIntentActorUniqueIndex,
 		[]string{"expected_revision", "expected_activation_id", "target_revision", "activation_hash", "actor_id"},
 	)

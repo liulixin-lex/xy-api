@@ -15,11 +15,11 @@ import (
 )
 
 func TestRoutingRequestProfileBuildsImmutableAttemptProfile(t *testing.T) {
-	enableRoutingRequestProfileV2ForTest(t)
+	enableRoutingRequestProfileForTest(t)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
-	template := channelrouting.RequestProfileV2Input{
+	template := channelrouting.RequestProfileInput{
 		RequestPath:              "/v1/responses",
 		ModelName:                "gpt-test",
 		RequestKind:              channelrouting.RequestKindResponses,
@@ -58,11 +58,11 @@ func TestRoutingRequestProfileBuildsImmutableAttemptProfile(t *testing.T) {
 }
 
 func TestRoutingRequestProfilePreservesNotApplicableQuantities(t *testing.T) {
-	enableRoutingRequestProfileV2ForTest(t)
+	enableRoutingRequestProfileForTest(t)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest("POST", "/v1/embeddings", nil)
-	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		RequestPath:              "/v1/embeddings",
 		ModelName:                "embedding-test",
 		RequestKind:              channelrouting.RequestKindEmbedding,
@@ -91,7 +91,7 @@ func TestRoutingRequestProfilePreservesNotApplicableQuantities(t *testing.T) {
 }
 
 func TestRoutingRequestProfileWithoutTemplateKeepsV1Compatibility(t *testing.T) {
-	enableRoutingRequestProfileV2ForTest(t)
+	enableRoutingRequestProfileForTest(t)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	profile, err := routingRequestProfile(ctx, "default", 0, 10, 5)
@@ -99,29 +99,29 @@ func TestRoutingRequestProfileWithoutTemplateKeepsV1Compatibility(t *testing.T) 
 	assert.Nil(t, profile)
 }
 
-func TestRoutingRequestProfileV2DefaultsOff(t *testing.T) {
+func TestRoutingRequestProfileDefaultsOff(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(smart_routing_setting.ResetForTest)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{})
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{})
 	profile, err := routingRequestProfile(ctx, "default", 0, 10, 5)
 	require.NoError(t, err)
 	assert.Nil(t, profile)
 }
 
-func TestRoutingRequestProfileCarriesTrafficClassWhenV2ScoringIsDisabled(t *testing.T) {
+func TestRoutingRequestProfileCarriesTrafficClassWhenProfileScoringIsDisabled(t *testing.T) {
 	smart_routing_setting.ResetForTest()
 	t.Cleanup(smart_routing_setting.ResetForTest)
 	setting := smart_routing_setting.GetSetting()
 	setting.Enabled = true
-	setting.RequestProfileV2Enabled = false
+	setting.RequestProfileEnabled = false
 	smart_routing_setting.UpdateSetting(setting)
 
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
-	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		RequestPath:  "/v1/messages",
 		ModelName:    "claude-test",
 		IsStream:     true,
@@ -142,7 +142,7 @@ func TestRoutingAttemptPolicyRemainsActiveWhenProfileScoringIsDisabled(t *testin
 	t.Cleanup(smart_routing_setting.ResetForTest)
 	gin.SetMode(gin.TestMode)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileV2Input{
+	common.SetContextKey(ctx, constant.ContextKeyRoutingRequestProfile, channelrouting.RequestProfileInput{
 		RequestKind:              channelrouting.RequestKindImage,
 		RetrySafety:              channelrouting.RequestRetrySafetyUnsafe,
 		RetryAllowed:             false,
@@ -157,12 +157,12 @@ func TestRoutingAttemptPolicyRemainsActiveWhenProfileScoringIsDisabled(t *testin
 	assert.False(t, policy.HedgeAllowed)
 }
 
-func enableRoutingRequestProfileV2ForTest(t *testing.T) {
+func enableRoutingRequestProfileForTest(t *testing.T) {
 	t.Helper()
 	smart_routing_setting.ResetForTest()
 	setting := smart_routing_setting.GetSetting()
 	setting.Enabled = true
-	setting.RequestProfileV2Enabled = true
+	setting.RequestProfileEnabled = true
 	smart_routing_setting.UpdateSetting(setting)
 	t.Cleanup(smart_routing_setting.ResetForTest)
 }

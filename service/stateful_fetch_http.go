@@ -103,6 +103,22 @@ var sharedStatefulFetchTransportCache = &statefulFetchTransportCache{
 	now:     time.Now,
 }
 
+var statefulFetchPublicAddressProtection = common.SSRFProtection{
+	AllowPrivateIp:         false,
+	DomainFilterMode:       false,
+	IpFilterMode:           false,
+	ApplyIPFilterForDomain: true,
+}
+
+var statefulFetchRejectedPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("192.88.99.2/32"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+}
+
 // GetStatefulFetchHTTPClient returns a strict client for stateful task polling
 // and result media. Target DNS is revalidated for every request and the actual
 // direct, CONNECT, or SOCKS destination is always a validated IP address.
@@ -582,7 +598,7 @@ func validateStatefulFetchTargetIP(host string, address netip.Addr, protection *
 	// The standard public-address policy rejects special-purpose ranges. An
 	// explicit private egress opt-in may add only RFC1918/ULA addresses; it never
 	// opens loopback, link-local/cloud-metadata, multicast, or documentation nets.
-	if validateRoutingCostIP(host, address) == nil {
+	if validateStatefulFetchPublicIP(host, address) == nil {
 		return nil
 	}
 	if address.IsPrivate() && !address.IsLoopback() && !address.IsLinkLocalUnicast() &&
@@ -590,6 +606,22 @@ func validateStatefulFetchTargetIP(host string, address netip.Addr, protection *
 		return nil
 	}
 	return errors.New("stateful fetch target rejected")
+}
+
+func validateStatefulFetchPublicIP(host string, address netip.Addr) error {
+	if !address.IsValid() || address.Is4In6() {
+		return errors.New("stateful fetch target rejected")
+	}
+	address = address.Unmap()
+	for _, prefix := range statefulFetchRejectedPublicPrefixes {
+		if prefix.Contains(address) {
+			return errors.New("stateful fetch target rejected")
+		}
+	}
+	if err := statefulFetchPublicAddressProtection.ValidateResolvedIP(host, net.IP(address.AsSlice())); err != nil {
+		return errors.New("stateful fetch target rejected")
+	}
+	return nil
 }
 
 func parseStatefulFetchProxy(rawURL string) (*statefulFetchProxyConfig, error) {
@@ -717,7 +749,7 @@ func validateStatefulFetchProxyIP(address netip.Addr) error {
 		address.IsLinkLocalMulticast() {
 		return errors.New("stateful fetch proxy target rejected")
 	}
-	if address.IsPrivate() || address.IsLoopback() || validateRoutingCostIP("", address) == nil {
+	if address.IsPrivate() || address.IsLoopback() || validateStatefulFetchPublicIP("", address) == nil {
 		return nil
 	}
 	return errors.New("stateful fetch proxy target rejected")

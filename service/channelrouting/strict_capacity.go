@@ -517,7 +517,7 @@ func strictCapacityRedisKeys(key StrictCapacityKey) (string, string) {
 	identity := strconv.Itoa(key.AccountID) + "\x00" + strconv.Itoa(key.CredentialID) + "\x00" + key.Model
 	digest := sha256.Sum256([]byte(identity))
 	tag := hex.EncodeToString(digest[:16])
-	return "routing:v2:capacity:{" + tag + "}:state", "routing:v2:capacity:{" + tag + "}:leases"
+	return "channel-routing:capacity:{" + tag + "}:state", "channel-routing:capacity:{" + tag + "}:leases"
 }
 
 func strictCapacityReserveArguments(
@@ -625,7 +625,7 @@ func newStrictCapacityToken() (string, error) {
 }
 
 const strictCapacityReserveScript = `
--- strict_capacity_reserve_v2
+-- strict_capacity_reserve
 local state = KEYS[1]
 local leases = KEYS[2]
 local token = ARGV[1]
@@ -895,7 +895,7 @@ return {1, now, expires}
 `
 
 const strictCapacityCommitScript = `
--- strict_capacity_commit_v2
+-- strict_capacity_commit
 local redis_time = redis.call('TIME')
 local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
 local prefix = 'r:' .. ARGV[1] .. ':'
@@ -909,7 +909,7 @@ return 1
 `
 
 const strictCapacityCancelScript = `
--- strict_capacity_cancel_v2
+-- strict_capacity_cancel
 local state = KEYS[1]
 local leases = KEYS[2]
 local token = ARGV[1]
@@ -981,7 +981,7 @@ return 1
 `
 
 const strictCapacityReleaseScript = `
--- strict_capacity_release_v2
+-- strict_capacity_release
 local state = KEYS[1]
 local leases = KEYS[2]
 local token = ARGV[1]
@@ -1014,7 +1014,7 @@ return 1
 `
 
 const strictCapacityRenewScript = `
--- strict_capacity_renew_v2
+-- strict_capacity_renew
 local state = KEYS[1]
 local leases = KEYS[2]
 local token = ARGV[1]

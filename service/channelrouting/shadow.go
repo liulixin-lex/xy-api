@@ -19,6 +19,8 @@ import (
 )
 
 const (
+	DecisionAlgorithmShadow     = "channel-routing-shadow"
+	DecisionAlgorithmCanary     = model.RoutingDecisionAlgorithmCanary
 	DecisionAlgorithmShadowV1   = "channel-routing-shadow-v1"
 	DecisionAlgorithmShadowV2   = "channel-routing-shadow-v2"
 	DecisionAlgorithmCanaryV1   = model.RoutingDecisionAlgorithmCanaryV1
@@ -141,30 +143,36 @@ type ShadowMetricInput struct {
 }
 
 type ShadowCostInput struct {
-	Known                bool                       `json:"known"`
-	Cost                 float64                    `json:"cost"`
-	WorstCaseKnown       bool                       `json:"worst_case_known,omitempty"`
-	WorstCaseCost        float64                    `json:"worst_case_cost,omitempty"`
-	EffectiveKnown       bool                       `json:"effective_known,omitempty"`
-	EffectiveCost        float64                    `json:"effective_cost,omitempty"`
-	Currency             string                     `json:"currency,omitempty"`
-	Unit                 string                     `json:"unit,omitempty"`
-	PricingBasis         string                     `json:"pricing_basis,omitempty"`
-	PricingHash          string                     `json:"pricing_hash,omitempty"`
-	PricingVersion       string                     `json:"pricing_version,omitempty"`
-	ObservedTime         int64                      `json:"observed_time,omitempty"`
-	EffectiveTime        int64                      `json:"effective_time,omitempty"`
-	ExpiresTime          int64                      `json:"expires_time,omitempty"`
-	VersionConfidence    string                     `json:"version_confidence,omitempty"`
-	Freshness            string                     `json:"freshness,omitempty"`
-	SourceSyncStatus     string                     `json:"source_sync_status,omitempty"`
-	AccountSourceType    string                     `json:"account_source_type,omitempty"`
-	AccountKeyHash       string                     `json:"account_key_hash,omitempty"`
-	ConfidenceScore      float64                    `json:"confidence_score,omitempty"`
-	FreshnessScore       float64                    `json:"freshness_score,omitempty"`
-	ExpectedBreakdown    model.RoutingCostBreakdown `json:"expected_breakdown,omitempty"`
-	WorstSingleBreakdown model.RoutingCostBreakdown `json:"worst_single_breakdown,omitempty"`
-	UpdatedUnix          int64                      `json:"updated_unix"`
+	Known                  bool                       `json:"known"`
+	Cost                   float64                    `json:"cost"`
+	WorstCaseKnown         bool                       `json:"worst_case_known,omitempty"`
+	WorstCaseCost          float64                    `json:"worst_case_cost,omitempty"`
+	EffectiveKnown         bool                       `json:"effective_known,omitempty"`
+	EffectiveCost          float64                    `json:"effective_cost,omitempty"`
+	Currency               string                     `json:"currency,omitempty"`
+	Unit                   string                     `json:"unit,omitempty"`
+	PricingBasis           string                     `json:"pricing_basis,omitempty"`
+	PricingHash            string                     `json:"pricing_hash,omitempty"`
+	PricingVersion         string                     `json:"pricing_version,omitempty"`
+	PricingIdentity        string                     `json:"pricing_identity,omitempty"`
+	UnknownReason          string                     `json:"unknown_reason,omitempty"`
+	ConfigurationRevision  int64                      `json:"configuration_revision,omitempty"`
+	UpstreamCostMultiplier float64                    `json:"upstream_cost_multiplier"`
+	BaselineExpectedKnown  bool                       `json:"baseline_expected_known,omitempty"`
+	BaselineExpectedCost   float64                    `json:"baseline_expected_cost,omitempty"`
+	BaselineWorstCaseKnown bool                       `json:"baseline_worst_case_known,omitempty"`
+	BaselineWorstCaseCost  float64                    `json:"baseline_worst_case_cost,omitempty"`
+	ObservedTime           int64                      `json:"observed_time,omitempty"`
+	EffectiveTime          int64                      `json:"effective_time,omitempty"`
+	ExpiresTime            int64                      `json:"expires_time,omitempty"`
+	VersionConfidence      string                     `json:"version_confidence,omitempty"`
+	Freshness              string                     `json:"freshness,omitempty"`
+	FailureDomainHash      string                     `json:"-"`
+	ConfidenceScore        float64                    `json:"confidence_score,omitempty"`
+	FreshnessScore         float64                    `json:"freshness_score,omitempty"`
+	ExpectedBreakdown      model.RoutingCostBreakdown `json:"expected_breakdown,omitempty"`
+	WorstSingleBreakdown   model.RoutingCostBreakdown `json:"worst_single_breakdown,omitempty"`
+	UpdatedUnix            int64                      `json:"updated_unix"`
 }
 
 // ShadowReplayCostInput is the stable selector input persisted for replay.
@@ -231,7 +239,7 @@ type ShadowReplayResult struct {
 	Candidates           []DecisionCandidate `json:"candidates"`
 }
 
-func NewRequestProfile(
+func NewLegacyRequestProfile(
 	requestPath string,
 	groupName string,
 	modelName string,
@@ -257,7 +265,7 @@ func NewRequestProfile(
 }
 
 func (profile RequestProfile) Validate() error {
-	return validateRequestProfile(profile)
+	return validateRequestProfileSchema(profile)
 }
 
 func (profile RequestProfile) Hash() (string, error) {
@@ -352,9 +360,9 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 		if candidate.RequestExclusionReason == "" && credentialReason != "" {
 			candidate.RequestExclusionReason = credentialReason
 		}
-		if candidate.RequestExclusionReason == "" && observation.upstreamAccountID > 0 {
-			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, now); blocked {
-				candidate.RequestExclusionReason = ExclusionReasonUpstreamAccount
+		if candidate.RequestExclusionReason == "" {
+			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, now); blocked {
+				candidate.RequestExclusionReason = ExclusionReasonChannelBalance
 			}
 		}
 		if costEstimate != nil {
@@ -518,12 +526,8 @@ func BuildShadowReplayInput(
 	settings routingselector.Settings,
 	candidates []ShadowCandidateInput,
 ) (ShadowReplayInput, error) {
-	algorithmVersion := DecisionAlgorithmShadowV1
-	if profile.SchemaVersion == RequestProfileSchemaV2 {
-		algorithmVersion = DecisionAlgorithmShadowV2
-	}
 	return buildDecisionReplayInput(
-		algorithmVersion,
+		DecisionAlgorithmShadow,
 		poolID,
 		policyRevision,
 		runtimeGeneration,
@@ -543,12 +547,8 @@ func BuildCanaryReplayInput(
 	settings routingselector.Settings,
 	candidates []ShadowCandidateInput,
 ) (ShadowReplayInput, error) {
-	algorithmVersion := DecisionAlgorithmCanaryV1
-	if profile.SchemaVersion == RequestProfileSchemaV2 {
-		algorithmVersion = DecisionAlgorithmCanaryV2
-	}
 	return buildDecisionReplayInput(
-		algorithmVersion,
+		DecisionAlgorithmCanary,
 		poolID,
 		policyRevision,
 		runtimeGeneration,
@@ -674,7 +674,7 @@ func shadowCandidateFromSnapshot(
 }
 
 func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*ShadowCostInput, error) {
-	if observation.CostPricing != nil {
+	if observation.CostPricing != nil || observation.systemPricing {
 		requestProfile := model.RoutingCostRequestProfile{
 			PromptTokens:             int64(profile.PromptTokenEstimate),
 			ExpectedCompletionTokens: int64(profile.CompletionTokenEstimate),
@@ -688,49 +688,55 @@ func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*Sha
 		if atUnix <= 0 {
 			atUnix = time.Now().Unix()
 		}
-		version := model.RoutingCostSnapshotVersion{
-			PricingHash:      observation.CostPricingHash,
-			PricingVersion:   observation.CostPricingVersion,
-			SourceType:       observation.CostAccountSourceType,
-			ObservedTime:     observation.CostObservedTime,
-			EffectiveTime:    observation.CostEffectiveTime,
-			ExpiresTime:      observation.CostExpiresTime,
-			Confidence:       observation.CostVersionConfidence,
-			ConfidenceScore:  observation.CostConfidenceScore,
-			Freshness:        observation.CostFreshness,
-			FreshnessScore:   observation.CostFreshnessScore,
-			SourceSyncStatus: observation.CostSourceSyncStatus,
-			SourceSyncError:  observation.CostSourceSyncError,
-		}
-		estimate, err := model.EstimateRoutingCostSnapshot(version, *observation.CostPricing, requestProfile, atUnix)
+		estimate, resolved, exists, err := estimateModelSnapshotRoutingCost(observation, requestProfile, atUnix)
 		if err != nil {
 			return nil, ErrShadowReplayInvalid
 		}
+		if !exists {
+			return nil, nil
+		}
+		baselineEstimate := model.RoutingCostEstimate{}
+		if resolved.ChannelConfigurationRevision > 0 {
+			baselineEstimate, err = estimateSystemRoutingBaselineCost(resolved, requestProfile, atUnix)
+			if err != nil {
+				return nil, ErrShadowReplayInvalid
+			}
+		}
+		pricingBasis := resolved.CostBillingMode
+		if resolved.CostPricing != nil {
+			pricingBasis = resolved.CostPricing.BillingMode
+		}
 		return &ShadowCostInput{
-			Known:                estimate.ExpectedKnown,
-			Cost:                 estimate.ExpectedCost,
-			WorstCaseKnown:       estimate.WorstCaseKnown,
-			WorstCaseCost:        estimate.WorstCaseCost,
-			EffectiveKnown:       estimate.ExpectedEffectiveKnown,
-			EffectiveCost:        estimate.ExpectedEffectiveCost,
-			Currency:             estimate.Currency,
-			Unit:                 estimate.Unit,
-			PricingBasis:         observation.CostPricing.BillingMode,
-			PricingHash:          observation.CostPricingHash,
-			PricingVersion:       observation.CostPricingVersion,
-			ObservedTime:         observation.CostObservedTime,
-			EffectiveTime:        observation.CostEffectiveTime,
-			ExpiresTime:          observation.CostExpiresTime,
-			VersionConfidence:    observation.CostVersionConfidence,
-			Freshness:            observation.CostFreshness,
-			SourceSyncStatus:     observation.CostSourceSyncStatus,
-			AccountSourceType:    observation.CostAccountSourceType,
-			AccountKeyHash:       observation.CostAccountKeyHash,
-			ConfidenceScore:      estimate.ConfidenceScore,
-			FreshnessScore:       estimate.FreshnessScore,
-			ExpectedBreakdown:    estimate.ExpectedBreakdown,
-			WorstSingleBreakdown: estimate.WorstCaseSingleBreakdown,
-			UpdatedUnix:          observation.CostObservedTime,
+			Known:                  estimate.ExpectedKnown,
+			Cost:                   estimate.ExpectedCost,
+			WorstCaseKnown:         estimate.WorstCaseKnown,
+			WorstCaseCost:          estimate.WorstCaseCost,
+			EffectiveKnown:         estimate.ExpectedEffectiveKnown,
+			EffectiveCost:          estimate.ExpectedEffectiveCost,
+			Currency:               estimate.Currency,
+			Unit:                   estimate.Unit,
+			PricingBasis:           pricingBasis,
+			PricingHash:            resolved.CostPricingHash,
+			PricingVersion:         resolved.CostPricingVersion,
+			PricingIdentity:        resolved.CostPricingIdentity,
+			UnknownReason:          resolved.CostUnknownReason,
+			ConfigurationRevision:  resolved.ChannelConfigurationRevision,
+			UpstreamCostMultiplier: resolved.CostUpstreamMultiplier,
+			BaselineExpectedKnown:  baselineEstimate.ExpectedKnown,
+			BaselineExpectedCost:   baselineEstimate.ExpectedCost,
+			BaselineWorstCaseKnown: baselineEstimate.WorstCaseKnown,
+			BaselineWorstCaseCost:  baselineEstimate.WorstCaseCost,
+			ObservedTime:           resolved.CostObservedTime,
+			EffectiveTime:          resolved.CostEffectiveTime,
+			ExpiresTime:            resolved.CostExpiresTime,
+			VersionConfidence:      resolved.CostVersionConfidence,
+			Freshness:              resolved.CostFreshness,
+			FailureDomainHash:      resolved.FailureDomainHash,
+			ConfidenceScore:        estimate.ConfidenceScore,
+			FreshnessScore:         estimate.FreshnessScore,
+			ExpectedBreakdown:      estimate.ExpectedBreakdown,
+			WorstSingleBreakdown:   estimate.WorstCaseSingleBreakdown,
+			UpdatedUnix:            resolved.CostUpdatedUnix,
 		}, nil
 	}
 	if !observation.CostKnown && observation.CostUpdatedUnix <= 0 {
@@ -772,6 +778,117 @@ func shadowExpectedCost(observation ModelSnapshot, profile RequestProfile) (*Sha
 	return &ShadowCostInput{
 		Known: known, Cost: cost, PricingBasis: observation.CostBillingMode, UpdatedUnix: observation.CostUpdatedUnix,
 	}, nil
+}
+
+func estimateSystemRoutingBaselineCost(
+	observation ModelSnapshot,
+	profile model.RoutingCostRequestProfile,
+	atUnix int64,
+) (model.RoutingCostEstimate, error) {
+	resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+		LogicalModel:                 observation.ModelName,
+		EffectiveModel:               observation.UpstreamModelName,
+		ModelMappingIdentity:         observation.CostModelMappingIdentity,
+		UpstreamCostMultiplier:       1,
+		ChannelConfigurationRevision: observation.ChannelConfigurationRevision,
+	})
+	if err != nil || !resolution.Known {
+		return model.RoutingCostEstimate{}, err
+	}
+	version := model.RoutingCostSnapshotVersion{
+		PricingHash:     resolution.PricingHash,
+		PricingVersion:  resolution.PricingIdentity,
+		SourceType:      SystemRoutingPricingSourceType,
+		ObservedTime:    atUnix,
+		EffectiveTime:   atUnix,
+		ExpiresTime:     math.MaxInt64,
+		Confidence:      model.RoutingCostConfidenceExact,
+		ConfidenceScore: 1,
+		Freshness:       model.RoutingCostFreshnessFresh,
+		FreshnessScore:  1,
+	}
+	return model.EstimateRoutingCostSnapshot(version, resolution.Pricing, profile, atUnix)
+}
+
+func EstimateModelSnapshotRoutingCost(
+	observation ModelSnapshot,
+	profile model.RoutingCostRequestProfile,
+	atUnix int64,
+) (model.RoutingCostEstimate, bool, error) {
+	estimate, _, exists, err := estimateModelSnapshotRoutingCost(observation, profile, atUnix)
+	return estimate, exists, err
+}
+
+func estimateModelSnapshotRoutingCost(
+	observation ModelSnapshot,
+	profile model.RoutingCostRequestProfile,
+	atUnix int64,
+) (model.RoutingCostEstimate, ModelSnapshot, bool, error) {
+	if atUnix <= 0 {
+		atUnix = time.Now().Unix()
+	}
+	if observation.systemPricing {
+		resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+			LogicalModel:                 observation.ModelName,
+			EffectiveModel:               observation.UpstreamModelName,
+			ModelMappingIdentity:         observation.CostModelMappingIdentity,
+			UpstreamCostMultiplier:       observation.CostUpstreamMultiplier,
+			ChannelConfigurationRevision: observation.ChannelConfigurationRevision,
+		})
+		if err != nil {
+			return model.RoutingCostEstimate{}, observation, true, err
+		}
+		previousIdentity := observation.CostPricingIdentity
+		observation.CostPricing = nil
+		observation.CostPricingHash = ""
+		observation.CostPricingVersion = ""
+		observation.CostPricingIdentity = ""
+		observation.CostUnknownReason = resolution.UnknownReason
+		observation.CostBillingMode = SystemRoutingPricingBasis
+		if !resolution.Known {
+			return model.RoutingCostEstimate{}, observation, true, nil
+		}
+		pricing := resolution.Pricing
+		observation.CostPricing = &pricing
+		observation.CostPricingHash = resolution.PricingHash
+		observation.CostPricingVersion = resolution.PricingIdentity
+		observation.CostPricingIdentity = resolution.PricingIdentity
+		observation.CostUnknownReason = ""
+		observation.CostBillingMode = pricing.BillingMode
+		observation.CostVersionConfidence = model.RoutingCostConfidenceExact
+		observation.CostConfidenceScore = 1
+		observation.CostFreshness = model.RoutingCostFreshnessFresh
+		observation.CostFreshnessScore = 1
+		observation.CostExpiresTime = math.MaxInt64
+		observation.CostUpdatedUnix = 0
+		if observation.CostObservedTime <= 0 || previousIdentity != resolution.PricingIdentity {
+			observation.CostObservedTime = atUnix
+			observation.CostEffectiveTime = atUnix
+		}
+	}
+	if observation.CostPricing == nil {
+		return model.RoutingCostEstimate{}, observation, false, nil
+	}
+	pricing := *observation.CostPricing
+	freeMultiplier := pricing.GroupRatio != nil && *pricing.GroupRatio == 0
+	if observation.systemPricing && !freeMultiplier &&
+		(!profile.KnowledgeSpecified || !profile.RequestPricingFeaturesKnown || profile.UncataloguedSurchargePossible) {
+		return model.RoutingCostEstimate{}, observation, true, nil
+	}
+	version := model.RoutingCostSnapshotVersion{
+		PricingHash:     observation.CostPricingHash,
+		PricingVersion:  observation.CostPricingVersion,
+		SourceType:      SystemRoutingPricingSourceType,
+		ObservedTime:    observation.CostObservedTime,
+		EffectiveTime:   observation.CostEffectiveTime,
+		ExpiresTime:     observation.CostExpiresTime,
+		Confidence:      observation.CostVersionConfidence,
+		ConfidenceScore: observation.CostConfidenceScore,
+		Freshness:       observation.CostFreshness,
+		FreshnessScore:  observation.CostFreshnessScore,
+	}
+	estimate, err := model.EstimateRoutingCostSnapshot(version, pricing, profile, atUnix)
+	return estimate, observation, true, err
 }
 
 func ShadowExpectedCostForChannel(input ShadowReplayInput, channelID int) (float64, bool) {
@@ -858,7 +975,8 @@ func RunShadowReplay(input ShadowReplayInput) (ShadowReplayResult, error) {
 		selectorCandidate := routingselector.Candidate{
 			Channel: &model.Channel{Id: candidate.ChannelID, Priority: &priority, Weight: &weight},
 		}
-		if input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.AlgorithmVersion == DecisionAlgorithmCanaryV2 {
+		if input.AlgorithmVersion == DecisionAlgorithmCanary ||
+			input.AlgorithmVersion == DecisionAlgorithmCanaryV1 || input.AlgorithmVersion == DecisionAlgorithmCanaryV2 {
 			selectorCandidate.ScoreMultiplier = candidate.SlowStartFactor
 		}
 		if candidate.Metric != nil {
@@ -1044,7 +1162,8 @@ func ReplayDecisionAuditContext(ctx context.Context, audit model.RoutingDecision
 			return ShadowReplayResult{}, ErrShadowReplayAudit
 		}
 	}
-	if (audit.AlgorithmVersion == DecisionAlgorithmCanaryV1 || audit.AlgorithmVersion == DecisionAlgorithmCanaryV2) &&
+	if (audit.AlgorithmVersion == DecisionAlgorithmCanary ||
+		audit.AlgorithmVersion == DecisionAlgorithmCanaryV1 || audit.AlgorithmVersion == DecisionAlgorithmCanaryV2) &&
 		!validCanaryDecisionAudit(audit, result) {
 		return ShadowReplayResult{}, ErrShadowReplayAudit
 	}
@@ -1264,16 +1383,19 @@ func shadowReplayCostKnown(cost *ShadowReplayCostInput, settings ShadowSelectorS
 }
 
 func supportedDecisionAlgorithm(algorithmVersion string) bool {
-	return algorithmVersion == DecisionAlgorithmShadowV1 || algorithmVersion == DecisionAlgorithmCanaryV1 ||
+	return algorithmVersion == DecisionAlgorithmShadow || algorithmVersion == DecisionAlgorithmCanary ||
+		algorithmVersion == DecisionAlgorithmShadowV1 || algorithmVersion == DecisionAlgorithmCanaryV1 ||
 		algorithmVersion == DecisionAlgorithmShadowV2 || algorithmVersion == DecisionAlgorithmCanaryV2
 }
 
 func validShadowReplayVersion(schemaVersion int, algorithmVersion string, profileSchemaVersion int) bool {
 	switch {
 	case schemaVersion == shadowReplaySchemaVersionV1 && profileSchemaVersion == RequestProfileSchemaV1:
-		return algorithmVersion == DecisionAlgorithmShadowV1 || algorithmVersion == DecisionAlgorithmCanaryV1
+		return algorithmVersion == DecisionAlgorithmShadow || algorithmVersion == DecisionAlgorithmCanary ||
+			algorithmVersion == DecisionAlgorithmShadowV1 || algorithmVersion == DecisionAlgorithmCanaryV1
 	case schemaVersion == shadowReplaySchemaVersionV2 && profileSchemaVersion == RequestProfileSchemaV2:
-		return algorithmVersion == DecisionAlgorithmShadowV2 || algorithmVersion == DecisionAlgorithmCanaryV2
+		return algorithmVersion == DecisionAlgorithmShadow || algorithmVersion == DecisionAlgorithmCanary ||
+			algorithmVersion == DecisionAlgorithmShadowV2 || algorithmVersion == DecisionAlgorithmCanaryV2
 	default:
 		return false
 	}

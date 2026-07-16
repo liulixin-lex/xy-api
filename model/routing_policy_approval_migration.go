@@ -8,7 +8,7 @@ import (
 
 func MigrateRoutingPolicyApprovalIntentIndexes(db *gorm.DB) error {
 	if db == nil || db.Dialector == nil {
-		return ErrRoutingV2SchemaNotReady
+		return ErrRoutingSchemaNotReady
 	}
 	specs := []struct {
 		model           any
@@ -34,9 +34,9 @@ func MigrateRoutingPolicyApprovalIntentIndexes(db *gorm.DB) error {
 	}
 	for _, spec := range specs {
 		if !db.Migrator().HasTable(spec.model) {
-			return fmt.Errorf("migrate %s: %w", spec.tableName, ErrRoutingV2SchemaNotReady)
+			return fmt.Errorf("migrate %s: %w", spec.tableName, ErrRoutingSchemaNotReady)
 		}
-		ready, err := routingV2CriticalIndexReady(db, spec.tableName, spec.intentIndexName, spec.columns)
+		ready, err := routingCriticalIndexReady(db, spec.tableName, spec.intentIndexName, spec.columns)
 		if err != nil {
 			return err
 		}
@@ -49,12 +49,12 @@ func MigrateRoutingPolicyApprovalIntentIndexes(db *gorm.DB) error {
 			if err := db.Migrator().CreateIndex(spec.model, spec.intentIndexName); err != nil {
 				return fmt.Errorf("create %s: %w", spec.intentIndexName, err)
 			}
-			ready, err = routingV2CriticalIndexReady(db, spec.tableName, spec.intentIndexName, spec.columns)
+			ready, err = routingCriticalIndexReady(db, spec.tableName, spec.intentIndexName, spec.columns)
 			if err != nil {
 				return err
 			}
 			if !ready {
-				return fmt.Errorf("verify %s: %w", spec.intentIndexName, ErrRoutingV2SchemaNotReady)
+				return fmt.Errorf("verify %s: %w", spec.intentIndexName, ErrRoutingSchemaNotReady)
 			}
 		}
 		if db.Migrator().HasIndex(spec.model, spec.legacyIndexName) {
@@ -63,7 +63,7 @@ func MigrateRoutingPolicyApprovalIntentIndexes(db *gorm.DB) error {
 			}
 		}
 		if db.Migrator().HasIndex(spec.model, spec.legacyIndexName) {
-			return fmt.Errorf("verify legacy %s removal: %w", spec.legacyIndexName, ErrRoutingV2SchemaNotReady)
+			return fmt.Errorf("verify legacy %s removal: %w", spec.legacyIndexName, ErrRoutingSchemaNotReady)
 		}
 	}
 	return nil

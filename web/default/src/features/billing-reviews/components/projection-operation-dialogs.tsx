@@ -285,7 +285,7 @@ export function ProjectionOperationDialogs(props: {
         }}
       >
         <DialogContent
-          className='sm:max-w-lg'
+          className='admin-touch-surface sm:max-w-lg'
           finalFocus={props.conflictFinalFocus}
         >
           <DialogHeader>

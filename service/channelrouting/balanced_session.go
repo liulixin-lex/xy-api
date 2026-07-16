@@ -9,6 +9,7 @@ import (
 )
 
 const (
+	DecisionAlgorithmBalanced   = "channel-routing-balanced"
 	DecisionAlgorithmBalancedV1 = "channel-routing-balanced-v1"
 	DecisionAlgorithmBalancedV2 = "channel-routing-balanced-v2"
 )
@@ -113,6 +114,14 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
 	}
+	excludedEndpoints, err := routingSessionEndpointSet(input.ExcludedEndpointIdentities)
+	if err != nil {
+		return BalancedRoutingPlan{}, true, err
+	}
+	excludedFailureDomains, err := routingSessionFailureDomainSet(input.ExcludedFailureDomainHashes)
+	if err != nil {
+		return BalancedRoutingPlan{}, true, err
+	}
 	capacityExcludedChannels, _, err := routingSessionChannelSet(input.CapacityExcludedChannelIDs)
 	if err != nil {
 		return BalancedRoutingPlan{}, true, err
@@ -167,9 +176,19 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		if preparedCandidate.HardExclusionReason == "" && credentialReason != "" {
 			preparedCandidate.HardExclusionReason = credentialReason
 		}
-		if preparedCandidate.HardExclusionReason == "" && observation.upstreamAccountID > 0 {
-			if _, blocked := UpstreamAccountRuntimeBlocked(observation.upstreamAccountID, session.planningTime); blocked {
-				preparedCandidate.HardExclusionReason = ExclusionReasonUpstreamAccount
+		if preparedCandidate.HardExclusionReason == "" {
+			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, session.planningTime); blocked {
+				preparedCandidate.HardExclusionReason = ExclusionReasonChannelBalance
+			}
+		}
+		if preparedCandidate.HardExclusionReason == "" {
+			switch {
+			case routingSessionChannelContains(excludedChannels, member.ChannelID):
+				preparedCandidate.HardExclusionReason = ExclusionReasonRequestFailed
+			case routingSessionEndpointExcluded(excludedEndpoints, channel):
+				preparedCandidate.HardExclusionReason = ExclusionReasonEndpointRequest
+			case routingSessionFailureDomainExcluded(excludedFailureDomains, channel.FailureDomainHash):
+				preparedCandidate.HardExclusionReason = ExclusionReasonFailureDomainRequest
 			}
 		}
 		replayCandidate := balancedReplayCandidateFromRouting(member, preparedCandidate)
@@ -224,7 +243,7 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 			PoolID:            pool.ID,
 			MemberID:          member.ID,
 			CredentialID:      credentialID,
-			UpstreamAccountID: observation.upstreamAccountID,
+			FailureDomainHash: channel.FailureDomainHash,
 		}
 		identities[member.ChannelID] = identity
 	}

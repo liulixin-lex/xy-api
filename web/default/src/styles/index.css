@@ -613,8 +613,28 @@ For commercial licensing, please contact support@quantumnous.com
   }
 }
 
-/* Channel routing keeps dense desktop controls while preserving touch targets. */
+/* Dense admin surfaces preserve mobile touch targets without loosening desktop layouts. */
 @media (pointer: coarse), (max-width: 63.999rem) {
+  .admin-touch-surface [data-slot='button'],
+  .admin-touch-surface [data-slot='dialog-close'],
+  .admin-touch-surface [data-slot='sheet-close'],
+  .admin-touch-surface [data-slot='alert-dialog-action'],
+  .admin-touch-surface [data-slot='alert-dialog-cancel'],
+  .admin-touch-surface [data-slot='tabs-trigger'],
+  .channel-routing-touch-surface [data-slot='button'],
+  .channel-routing-touch-surface [data-slot='dialog-close'],
+  .channel-routing-touch-surface [data-slot='sheet-close'],
+  .channel-routing-touch-surface [data-slot='alert-dialog-action'],
+  .channel-routing-touch-surface [data-slot='alert-dialog-cancel'],
+  .channel-routing-touch-surface [data-slot='tabs-trigger'] {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+
+  .admin-touch-surface [data-slot='input'],
+  .admin-touch-surface [data-slot='native-select'],
+  .admin-touch-surface input[data-slot='form-control']:not([type='hidden']),
+  .admin-touch-surface select[data-slot='form-control'],
   .channel-routing-touch-surface [data-slot='input'],
   .channel-routing-touch-surface [data-slot='native-select'],
   .channel-routing-touch-surface
@@ -623,7 +643,15 @@ For commercial licensing, please contact support@quantumnous.com
     min-height: 2.75rem;
   }
 
+  .admin-touch-surface [data-slot='switch']::after,
   .channel-routing-touch-surface [data-slot='switch']::after {
     inset-block: -0.8rem;
+  }
+
+  .admin-touch-surface [data-slot='checkbox']::after,
+  .admin-touch-surface [data-slot='radio-group-item']::after,
+  .channel-routing-touch-surface [data-slot='checkbox']::after,
+  .channel-routing-touch-surface [data-slot='radio-group-item']::after {
+    inset: -0.875rem;
   }
 }

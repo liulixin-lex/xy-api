@@ -1,12 +1,14 @@
 package channelrouting
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	routinghotcache "github.com/QuantumNous/new-api/pkg/routing_hotcache"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -169,7 +171,6 @@ func TestRequestRoutingSessionUsesVersionedExpectedAndWorstCost(t *testing.T) {
 		CostPricingVersion: "provider-v1", CostObservedTime: now, CostEffectiveTime: now,
 		CostExpiresTime: now + 3600, CostVersionConfidence: model.RoutingCostConfidenceExact,
 		CostConfidenceScore: 1, CostFreshness: model.RoutingCostFreshnessFresh, CostFreshnessScore: 1,
-		CostSourceSyncStatus: model.RoutingUpstreamSyncStatusSuccess,
 	}
 	SetSnapshotForTest(view)
 	session, err := NewRequestRoutingSession("cohort-0027", "default")
@@ -207,7 +208,11 @@ func TestRequestRoutingSessionUsesVersionedExpectedAndWorstCost(t *testing.T) {
 
 func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T) {
 	ResetSnapshotForTest()
-	t.Cleanup(ResetSnapshotForTest)
+	routinghotcache.ResetForTest()
+	t.Cleanup(func() {
+		ResetSnapshotForTest()
+		routinghotcache.ResetForTest()
+	})
 	view := canarySessionSnapshotForTest(11, 3, 401, 29, 101)
 	view.Pools[0].Members = []PoolMemberSnapshot{
 		{
@@ -226,13 +231,23 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
 		},
 		{
-			ID: 14, PoolID: 29, ChannelID: 104, PhysicalStatus: common.ChannelStatusEnabled,
+			ID: 14, PoolID: 29, ChannelID: 104, PhysicalStatus: common.ChannelStatusEnabled, MultiKey: true,
 			LegacyPriority: 100, LegacyWeight: 100, CredentialIDs: []int{1_004, 1_005},
 			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
 		},
 		{
 			ID: 15, PoolID: 29, ChannelID: 105, PhysicalStatus: common.ChannelStatusEnabled,
 			LegacyPriority: 100, LegacyWeight: 100, CredentialIDs: []int{1_006},
+			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
+		},
+		{
+			ID: 16, PoolID: 29, ChannelID: 106, PhysicalStatus: common.ChannelStatusEnabled,
+			LegacyPriority: 100, LegacyWeight: 100, CredentialIDs: []int{1_007},
+			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
+		},
+		{
+			ID: 17, PoolID: 29, ChannelID: 107, PhysicalStatus: common.ChannelStatusEnabled,
+			LegacyPriority: 100, LegacyWeight: 100, CredentialIDs: []int{1_008},
 			Models: []ModelSnapshot{{ModelName: "gpt-test"}},
 		},
 	}
@@ -248,8 +263,10 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 		{ID: 101, Status: common.ChannelStatusEnabled},
 		{ID: 102, Status: common.ChannelStatusEnabled},
 		{ID: 103, Status: common.ChannelStatusEnabled},
-		{ID: 104, Status: common.ChannelStatusEnabled},
+		{ID: 104, Status: common.ChannelStatusEnabled, MultiKey: true},
 		{ID: 105, Status: common.ChannelStatusEnabled},
+		{ID: 106, Status: common.ChannelStatusEnabled, Endpoint: "https://failed-endpoint.example.test/v1"},
+		{ID: 107, Status: common.ChannelStatusEnabled, FailureDomainHash: strings.Repeat("f", 64)},
 		{ID: 999, Status: common.ChannelStatusEnabled},
 	}
 	SetSnapshotForTest(view)
@@ -259,13 +276,18 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	var slowStartKeys []SlowStartKey
 	plan, active, err := session.Plan(RequestRoutingPlanInput{
 		ModelName:                  "gpt-test",
-		AllowedChannelIDs:          []int{101, 102, 103, 104, 105},
+		AllowedChannelIDs:          []int{101, 102, 103, 104, 105, 106, 107},
 		CapacityExcludedChannelIDs: []int{103},
 		ProbeExcludedChannelIDs:    []int{105},
 		ExcludedChannelIDs: []int{
 			102,
 		},
 		ExcludedCredentialIDs: []int{1_004, 1_005},
+		ExcludedEndpointIdentities: []RequestEndpointIdentity{{
+			EndpointAuthority: "https://failed-endpoint.example.test:443",
+			Region:            RoutingRegion(),
+		}},
+		ExcludedFailureDomainHashes: []string{strings.Repeat("f", 64)},
 		SlowStartFactor: func(key SlowStartKey) (float64, error) {
 			slowStartKeys = append(slowStartKeys, key)
 			return 0.25, nil
@@ -274,14 +296,16 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	require.NoError(t, err)
 	require.True(t, active)
 	require.True(t, plan.Gate.InCanary)
-	assert.Equal(t, DecisionAlgorithmCanaryV1, plan.Replay.AlgorithmVersion)
-	require.Len(t, plan.Replay.Candidates, 5, "only the target pool/model index may feed the plan")
+	assert.Equal(t, DecisionAlgorithmCanary, plan.Replay.AlgorithmVersion)
+	require.Len(t, plan.Replay.Candidates, 7, "only the target pool/model index may feed the plan")
 	assert.Equal(t, []SlowStartKey{{PoolID: 29, MemberID: 11, Model: "gpt-test"}}, slowStartKeys)
 	assert.Equal(t, 0.25, plan.Replay.Candidates[0].SlowStartFactor)
 	assert.Equal(t, ExclusionReasonRequestFailed, plan.Replay.Candidates[1].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonLocalCapacity, plan.Replay.Candidates[2].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonCredentialRequest, plan.Replay.Candidates[3].RequestExclusionReason)
 	assert.Equal(t, ExclusionReasonHalfOpenProbe, plan.Replay.Candidates[4].RequestExclusionReason)
+	assert.Equal(t, ExclusionReasonEndpointRequest, plan.Replay.Candidates[5].RequestExclusionReason)
+	assert.Equal(t, ExclusionReasonFailureDomainRequest, plan.Replay.Candidates[6].RequestExclusionReason)
 
 	assert.Equal(t, 101, plan.Result.SelectedChannelID)
 	assert.Equal(t, Identity{SnapshotRevision: 11, PoolID: 29, MemberID: 11, CredentialID: 1_001}, plan.SelectedIdentity)
@@ -297,6 +321,10 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	assert.False(t, candidates[104].Eligible)
 	assert.False(t, candidates[105].Eligible)
 	assert.Equal(t, ExclusionReasonHalfOpenProbe, candidates[105].ExclusionReason)
+	assert.False(t, candidates[106].Eligible)
+	assert.Equal(t, ExclusionReasonEndpointRequest, candidates[106].ExclusionReason)
+	assert.False(t, candidates[107].Eligible)
+	assert.Equal(t, ExclusionReasonFailureDomainRequest, candidates[107].ExclusionReason)
 	_, crossedPool := candidates[999]
 	assert.False(t, crossedPool)
 
@@ -310,6 +338,24 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	assert.Equal(t, 104, pinned.Result.SelectedChannelID)
 	assert.Equal(t, 1_005, pinned.SelectedIdentity.CredentialID)
 
+	now := time.Now()
+	routinghotcache.SetChannelBalanceUnavailableForTest(104, routinghotcache.ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode:       http.StatusPaymentRequired,
+		Reason:                 ExclusionReasonChannelBalance,
+		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
+		UpdatedUnixMilli:       now.UnixMilli(),
+	})
+	blocked, active, err := session.Plan(RequestRoutingPlanInput{
+		ModelName:            "gpt-test",
+		AllowedChannelIDs:    []int{104},
+		RequiredCredentialID: 1_005,
+	})
+	require.NoError(t, err)
+	require.True(t, active)
+	assert.Zero(t, blocked.Result.SelectedChannelID)
+	require.Len(t, blocked.Replay.Candidates, 7)
+	assert.Equal(t, ExclusionReasonChannelBalance, blocked.Replay.Candidates[3].RequestExclusionReason)
+
 	unavailable, active, err := session.Plan(RequestRoutingPlanInput{
 		ModelName:            "gpt-test",
 		AllowedChannelIDs:    []int{104},
@@ -318,7 +364,7 @@ func TestRequestRoutingSessionPlanUsesPoolModelIndexAndFailsClosed(t *testing.T)
 	require.NoError(t, err)
 	require.True(t, active)
 	assert.Zero(t, unavailable.Result.SelectedChannelID)
-	require.Len(t, unavailable.Replay.Candidates, 5)
+	require.Len(t, unavailable.Replay.Candidates, 7)
 	assert.Equal(t, ExclusionReasonCredentialUnavailable, unavailable.Replay.Candidates[3].RequestExclusionReason)
 }
 

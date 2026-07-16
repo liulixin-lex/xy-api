@@ -16,9 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
+import {
+  Alert02Icon,
+  RefreshIcon,
+  Shield02Icon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { RefreshCw, ShieldAlert, TriangleAlert } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -136,7 +140,8 @@ export function ChannelRoutingErrorBudgetSection(props: {
             disabled={query.isFetching}
             onClick={() => void query.refetch()}
           >
-            <RefreshCw
+            <HugeiconsIcon
+              icon={RefreshIcon}
               aria-hidden='true'
               className={
                 query.isFetching
@@ -162,7 +167,7 @@ export function ChannelRoutingErrorBudgetSection(props: {
 
       {query.isError ? (
         <Alert variant='destructive'>
-          <TriangleAlert aria-hidden='true' />
+          <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
           <AlertTitle>{t('Could not load the error budget')}</AlertTitle>
           <AlertDescription className='space-y-2'>
             <p>{t('The latest SLO burn evaluation is unavailable.')}</p>
@@ -173,7 +178,11 @@ export function ChannelRoutingErrorBudgetSection(props: {
               className='min-h-11 sm:min-h-7'
               onClick={() => void query.refetch()}
             >
-              <RefreshCw aria-hidden='true' />
+              <HugeiconsIcon
+                icon={RefreshIcon}
+                data-icon='inline-start'
+                aria-hidden='true'
+              />
               {t('Retry')}
             </Button>
           </AlertDescription>
@@ -231,7 +240,7 @@ export function ChannelRoutingErrorBudgetSection(props: {
 
           {stale ? (
             <Alert role='status'>
-              <TriangleAlert aria-hidden='true' />
+              <HugeiconsIcon icon={Alert02Icon} aria-hidden='true' />
               <AlertTitle>{t('Error budget snapshot is stale')}</AlertTitle>
               <AlertDescription>
                 {t(
@@ -247,7 +256,7 @@ export function ChannelRoutingErrorBudgetSection(props: {
 
           {current.reason === 'revision_isolation_unavailable' ? (
             <Alert role='status'>
-              <ShieldAlert aria-hidden='true' />
+              <HugeiconsIcon icon={Shield02Icon} aria-hidden='true' />
               <AlertTitle>{t('Revision isolation unavailable')}</AlertTitle>
               <AlertDescription>
                 {t(

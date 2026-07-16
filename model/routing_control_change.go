@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	RoutingControlSubjectRuntimeSettings = "runtime_settings"
-	RoutingControlSubjectCostBinding     = "cost_binding"
+	RoutingControlSubjectRuntimeSettings      = "runtime_settings"
+	RoutingControlSubjectCostBinding          = "cost_binding"
+	RoutingControlSubjectChannelConfiguration = "channel_configuration"
 
 	RoutingControlActionBootstrap = "bootstrap"
 	RoutingControlActionReconcile = "reconcile"
@@ -76,6 +77,15 @@ type RoutingControlAuditFilter struct {
 func RoutingRuntimeSettingsDocumentHash(document []byte) string {
 	digest := sha256.Sum256(document)
 	return fmt.Sprintf("%x", digest)
+}
+
+func GetRoutingRuntimeSettingsStateContext(ctx context.Context) (RoutingRuntimeSettingsState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var state RoutingRuntimeSettingsState
+	err := DB.WithContext(ctx).Where("id = ?", routingRuntimeSettingsStateID).First(&state).Error
+	return state, err
 }
 
 func GetOrReconcileRoutingRuntimeSettingsStateContext(
@@ -262,57 +272,6 @@ func ListRoutingControlAuditsContext(ctx context.Context, filter RoutingControlA
 	return audits, query.Order("id desc").Limit(filter.Limit).Find(&audits).Error
 }
 
-func CreateRoutingChannelBindingWithAuditContext(ctx context.Context, binding *RoutingChannelBinding, actorID int) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if binding == nil || binding.ChannelID <= 0 || actorID <= 0 {
-		return ErrRoutingControlAuditInvalid
-	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(binding).Error; err != nil {
-			return err
-		}
-		afterHash, err := RoutingChannelBindingStateHash(*binding)
-		if err != nil {
-			return err
-		}
-		return insertRoutingControlAuditTx(tx, RoutingControlAudit{
-			SubjectType: RoutingControlSubjectCostBinding, SubjectID: int64(binding.ChannelID),
-			Action: RoutingControlActionCreate, ActorID: actorID, AfterHash: afterHash,
-			SummaryJSON: routingCostBindingAuditSummary(*binding, nil), CreatedTimeMs: time.Now().UnixMilli(),
-		})
-	})
-}
-
-func RoutingChannelBindingStateHash(binding RoutingChannelBinding) (string, error) {
-	payload, err := common.Marshal(struct {
-		ID               int     `json:"id"`
-		ChannelID        int     `json:"channel_id"`
-		UpstreamType     string  `json:"upstream_type"`
-		BaseURL          string  `json:"base_url"`
-		UpstreamGroup    string  `json:"upstream_group"`
-		ServesClaudeCode bool    `json:"serves_claude_code"`
-		EgressPolicyJSON *string `json:"egress_policy_json"`
-		EncCredentials   *string `json:"enc_credentials"`
-		KeyVersion       int     `json:"key_version"`
-		NewAPIUserID     *int    `json:"new_api_user_id"`
-		Enabled          bool    `json:"enabled"`
-		UpdatedTime      int64   `json:"updated_time"`
-	}{
-		ID: binding.ID, ChannelID: binding.ChannelID, UpstreamType: binding.UpstreamType,
-		BaseURL: binding.BaseURL, UpstreamGroup: binding.UpstreamGroup,
-		ServesClaudeCode: binding.ServesClaudeCode, EgressPolicyJSON: binding.EgressPolicyJSON,
-		EncCredentials: binding.EncCredentials,
-		KeyVersion:     binding.KeyVersion, NewAPIUserID: binding.NewAPIUserID,
-		Enabled: binding.Enabled, UpdatedTime: binding.UpdatedTime,
-	})
-	if err != nil {
-		return "", err
-	}
-	return RoutingRuntimeSettingsDocumentHash(payload), nil
-}
-
 func loadRoutingRuntimeSettingsStateForUpdate(tx *gorm.DB) (RoutingRuntimeSettingsState, error) {
 	query := tx
 	if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
@@ -336,7 +295,9 @@ func validRoutingRuntimeSettingsDocument(documentJSON string, documentHash strin
 }
 
 func validRoutingControlAudit(audit RoutingControlAudit) bool {
-	if audit.SubjectType != RoutingControlSubjectRuntimeSettings && audit.SubjectType != RoutingControlSubjectCostBinding {
+	if audit.SubjectType != RoutingControlSubjectRuntimeSettings &&
+		audit.SubjectType != RoutingControlSubjectCostBinding &&
+		audit.SubjectType != RoutingControlSubjectChannelConfiguration {
 		return false
 	}
 	switch audit.Action {
@@ -357,26 +318,4 @@ func nextRoutingControlRevision(current int64) (int64, error) {
 		return 0, ErrRoutingRuntimeSettingsInvalid
 	}
 	return current + 1, nil
-}
-
-func routingCostBindingAuditSummary(binding RoutingChannelBinding, previous *RoutingChannelBinding) string {
-	credentialChanged := binding.EncCredentials != nil
-	if previous != nil {
-		credentialChanged = (binding.EncCredentials == nil) != (previous.EncCredentials == nil) ||
-			(binding.EncCredentials != nil && *binding.EncCredentials != *previous.EncCredentials) ||
-			binding.KeyVersion != previous.KeyVersion
-	}
-	payload, err := common.Marshal(struct {
-		ChannelID         int    `json:"channel_id"`
-		UpstreamType      string `json:"upstream_type"`
-		Enabled           bool   `json:"enabled"`
-		CredentialChanged bool   `json:"credential_changed"`
-	}{
-		ChannelID: binding.ChannelID, UpstreamType: binding.UpstreamType,
-		Enabled: binding.Enabled, CredentialChanged: credentialChanged,
-	})
-	if err != nil {
-		return `{}`
-	}
-	return string(payload)
 }

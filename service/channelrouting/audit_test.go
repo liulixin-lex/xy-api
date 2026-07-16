@@ -57,11 +57,13 @@ func TestDecisionAuditPersistsVersionedCostEstimatesWithoutRequestPayload(t *tes
 	actual := &ShadowCostInput{
 		Known: true, Cost: 0.003, WorstCaseKnown: true, WorstCaseCost: 0.012,
 		EffectiveKnown: true, EffectiveCost: 0.004, Currency: "USD", Unit: "mixed",
-		PricingBasis: "token", PricingHash: strings.Repeat("a", 64), PricingVersion: "upstream-v3",
+		PricingBasis: SystemRoutingPricingBasis, PricingHash: strings.Repeat("a", 64), PricingVersion: "system-v3",
+		PricingIdentity:       "billing:" + strings.Repeat("a", 64) + ":channel-config:7",
+		ConfigurationRevision: 7, UpstreamCostMultiplier: 1.5,
+		BaselineExpectedKnown: true, BaselineExpectedCost: 0.002,
+		BaselineWorstCaseKnown: true, BaselineWorstCaseCost: 0.008,
 		ObservedTime: 1_700_000_000, EffectiveTime: 1_699_999_900, ExpiresTime: 1_700_003_600,
 		VersionConfidence: model.RoutingCostConfidenceExact, Freshness: model.RoutingCostFreshnessFresh,
-		SourceSyncStatus:  model.RoutingUpstreamSyncStatusSuccess,
-		AccountSourceType: model.RoutingUpstreamTypeNewAPI, AccountKeyHash: strings.Repeat("b", 64),
 		ConfidenceScore: 0.95, FreshnessScore: 0.9,
 		ExpectedBreakdown:    model.RoutingCostBreakdown{Input: 0.001, Output: 0.002, Total: 0.003},
 		WorstSingleBreakdown: model.RoutingCostBreakdown{Input: 0.002, Output: 0.004, Total: 0.006},
@@ -75,7 +77,7 @@ func TestDecisionAuditPersistsVersionedCostEstimatesWithoutRequestPayload(t *tes
 
 	decisionID, err := EnqueueDecision(DecisionInput{
 		RequestID: "cost-audit", PoolID: 7, GroupName: "vip", ModelName: "gpt-cost",
-		SnapshotRevision: 19, AlgorithmVersion: DecisionAlgorithmObserveV1,
+		SnapshotRevision: 19, AlgorithmVersion: DecisionAlgorithmLegacy,
 		ActualChannelID: 101, ObservedChannelID: 102,
 		ActualCostKnown: true, ActualExpectedCost: actual.Cost,
 		ObservedCostKnown: true, ObservedExpectedCost: observed.Cost,
@@ -94,8 +96,14 @@ func TestDecisionAuditPersistsVersionedCostEstimatesWithoutRequestPayload(t *tes
 	var decoded ShadowCostInput
 	require.NoError(t, common.UnmarshalJsonStr(stored.ActualCostEstimateJSON, &decoded))
 	assert.Equal(t, actual.PricingHash, decoded.PricingHash)
-	assert.Equal(t, actual.AccountKeyHash, decoded.AccountKeyHash)
+	assert.Equal(t, actual.PricingIdentity, decoded.PricingIdentity)
+	assert.Equal(t, actual.ConfigurationRevision, decoded.ConfigurationRevision)
+	assert.Equal(t, actual.UpstreamCostMultiplier, decoded.UpstreamCostMultiplier)
+	assert.Equal(t, actual.BaselineExpectedCost, decoded.BaselineExpectedCost)
 	assert.Equal(t, actual.ExpectedBreakdown, decoded.ExpectedBreakdown)
+	assert.NotContains(t, stored.ActualCostEstimateJSON, "source_sync_status")
+	assert.NotContains(t, stored.ActualCostEstimateJSON, "account_source_type")
+	assert.NotContains(t, stored.ActualCostEstimateJSON, "account_key_hash")
 	assert.Equal(t, observed.Cost-actual.Cost, stored.ExpectedCostDelta)
 }
 
@@ -261,7 +269,7 @@ func TestMaximumReplayPayloadProducesPersistedReplayableAudit(t *testing.T) {
 	t.Cleanup(func() { ResetDecisionAuditsForTest() })
 
 	requestID := "max-pool-replay"
-	profile, err := NewRequestProfile(
+	profile, err := NewLegacyRequestProfile(
 		"/v1/chat/completions", "default", "gpt-test", true, 0, 1_000, 200,
 	)
 	require.NoError(t, err)
@@ -304,7 +312,7 @@ func TestMaximumReplayPayloadProducesPersistedReplayableAudit(t *testing.T) {
 	require.NoError(t, err)
 	decisionID, err := EnqueueDecision(DecisionInput{
 		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
-		SnapshotRevision: 7, AlgorithmVersion: DecisionAlgorithmShadowV1, IsStream: true,
+		SnapshotRevision: 7, AlgorithmVersion: input.AlgorithmVersion, IsStream: true,
 		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
 		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
 		Candidates: replay.Candidates, ReplayInput: &input,
@@ -329,7 +337,7 @@ func TestShadowReplaySupportsPoolBeyondAuditCandidateLimit(t *testing.T) {
 	t.Cleanup(func() { ResetDecisionAuditsForTest() })
 
 	requestID := "large-pool-replay"
-	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
 	require.NoError(t, err)
 	seed, err := DeriveShadowSeed(requestID, 8, 0)
 	require.NoError(t, err)
@@ -355,7 +363,7 @@ func TestShadowReplaySupportsPoolBeyondAuditCandidateLimit(t *testing.T) {
 
 	decisionID, err := EnqueueDecision(DecisionInput{
 		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
-		SnapshotRevision: 8, AlgorithmVersion: DecisionAlgorithmShadowV1,
+		SnapshotRevision: 8, AlgorithmVersion: input.AlgorithmVersion,
 		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
 		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
 		Candidates: replay.Candidates, ReplayInput: &input,
@@ -393,7 +401,7 @@ func TestOversizedShadowReplayPersistsChunksAndReplaysExactly(t *testing.T) {
 	}))
 
 	requestID := "oversized-pool-replay"
-	profile, err := NewRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
+	profile, err := NewLegacyRequestProfile("/v1/chat/completions", "default", "gpt-test", false, 0, 100, 20)
 	require.NoError(t, err)
 	seed, err := DeriveShadowSeed(requestID, 9, 0)
 	require.NoError(t, err)
@@ -424,7 +432,7 @@ func TestOversizedShadowReplayPersistsChunksAndReplaysExactly(t *testing.T) {
 
 	decisionID, err := EnqueueDecision(DecisionInput{
 		RequestID: requestID, PoolID: 1, GroupName: "default", ModelName: "gpt-test",
-		SnapshotRevision: 9, AlgorithmVersion: DecisionAlgorithmShadowV1,
+		SnapshotRevision: 9, AlgorithmVersion: input.AlgorithmVersion,
 		ObservedChannelID: replay.SelectedChannelID, FilteredOpen: replay.FilteredOpen,
 		FilteredCapacity: replay.FilteredCapacity, BreakerBypassed: replay.BreakerBypassed,
 		Candidates: replay.Candidates, ReplayInput: &input,
@@ -606,7 +614,7 @@ func enqueueDecisionForTest(t *testing.T, actualChannelID int, observedChannelID
 		GroupName:         "default",
 		ModelName:         "gpt-test",
 		SnapshotRevision:  3,
-		AlgorithmVersion:  DecisionAlgorithmObserveV1,
+		AlgorithmVersion:  DecisionAlgorithmLegacy,
 		ActualChannelID:   actualChannelID,
 		ObservedChannelID: observedChannelID,
 		Candidates: []DecisionCandidate{{

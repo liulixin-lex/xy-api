@@ -2,6 +2,7 @@ package channelrouting
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,13 +12,97 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingbreaker "github.com/QuantumNous/new-api/pkg/routing_breaker"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/smart_routing_setting"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func TestRoutingRuntimeSettingsEventRefreshesRemoteNodeBeforeFanout(t *testing.T) {
+	db := breakerResetServiceTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.Option{}, &model.RoutingRuntimeSettingsState{}, &model.RoutingControlAudit{},
+	))
+	smart_routing_setting.ResetForTest()
+	t.Cleanup(func() {
+		smart_routing_setting.ResetForTest()
+		refreshRoutingRuntimeSettingsOptions = model.RefreshOptionsFromDatabaseChecked
+	})
+
+	initial := smart_routing_setting.GetStoredSetting()
+	initialDocument, err := common.Marshal(initial)
+	require.NoError(t, err)
+	initialState, err := model.GetOrReconcileRoutingRuntimeSettingsStateContext(
+		context.Background(), string(initialDocument), model.RoutingRuntimeSettingsDocumentHash(initialDocument),
+	)
+	require.NoError(t, err)
+
+	updated := initial
+	updated.Enabled = true
+	updated.Mode = smart_routing_setting.ModeBalanced
+	updated.TopK = 7
+	updated = smart_routing_setting.Normalize(updated)
+	updatedDocument, err := common.Marshal(updated)
+	require.NoError(t, err)
+	values, err := config.ConfigToMap(updated)
+	require.NoError(t, err)
+	persisted := make(map[string]string, len(values))
+	for key, value := range values {
+		persisted["smart_routing_setting."+key] = value
+	}
+	updatedState, err := model.UpdateRoutingRuntimeSettingsContext(
+		context.Background(), initialState.Revision, initialState.DocumentHash,
+		string(updatedDocument), model.RoutingRuntimeSettingsDocumentHash(updatedDocument), persisted, 71,
+	)
+	require.NoError(t, err)
+	assert.False(t, smart_routing_setting.GetStoredSetting().Enabled)
+
+	payload, err := common.Marshal(map[string]any{
+		"revision": updatedState.Revision, "document_hash": updatedState.DocumentHash, "updated_by": 71,
+	})
+	require.NoError(t, err)
+	client := &routingEventRedisMemory{}
+	state := newRoutingEventTransportState()
+	hub := newRoutingEventHub(8)
+	require.NoError(t, initializeRoutingEventTransportContext(context.Background(), state, client))
+	require.NoError(t, broadcastRoutingEventContext(
+		context.Background(), newRoutingEventTransportState(), client, strings.Repeat("a", 32), RoutingEvent{
+			ID: 1, Type: RoutingEventTypeRuntimeSettingsChanged,
+			Revision: uint64(updatedState.Revision), CreatedTimeMs: time.Now().UnixMilli(), PayloadJSON: payload,
+		},
+	))
+
+	refreshFailure := errors.New("temporary option read failure")
+	refreshRoutingRuntimeSettingsOptions = func() error { return refreshFailure }
+	processed, err := consumeRoutingEventsOnceContext(
+		context.Background(), hub, state, client, strings.Repeat("b", 32),
+	)
+	require.ErrorIs(t, err, refreshFailure)
+	assert.Zero(t, processed)
+	assert.Equal(t, "0-0", state.snapshot().Cursor, "retryable refresh failure must not advance the Redis cursor")
+	assert.Zero(t, hub.stats().Buffered, "stale settings must not be fanned out to local SSE clients")
+
+	refreshRoutingRuntimeSettingsOptions = model.RefreshOptionsFromDatabaseChecked
+	processed, err = consumeRoutingEventsOnceContext(
+		context.Background(), hub, state, client, strings.Repeat("b", 32),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+	assert.Equal(t, "1-0", state.snapshot().Cursor)
+	assert.Equal(t, updated, smart_routing_setting.GetStoredSetting())
+	replay, _, cancel, err := hub.subscribe(0, 1, true)
+	require.NoError(t, err)
+	cancel()
+	require.Len(t, replay.Events, 1)
+	assert.Equal(t, RoutingEventTypeRuntimeSettingsChanged, replay.Events[0].Type)
+	assert.Equal(t, uint64(updatedState.Revision), replay.Events[0].Revision)
+}
+
 func TestRoutingEventTransportBroadcastsAcrossIndependentNodeHubs(t *testing.T) {
+	assert.Equal(t, "channel-routing:events", routingEventRedisStream)
+
 	client := &routingEventRedisMemory{}
 	nodeA := strings.Repeat("a", 32)
 	nodeB := strings.Repeat("b", 32)

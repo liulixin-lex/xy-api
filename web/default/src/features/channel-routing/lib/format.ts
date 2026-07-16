@@ -21,9 +21,29 @@ import { useTranslation } from 'react-i18next'
 
 import { toIntlLocale } from '@/i18n/languages'
 
-function toMilliseconds(timestamp: number): number {
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0
-  return timestamp > 10_000_000_000 ? timestamp : timestamp * 1000
+const maximumJavaScriptDateMilliseconds = 8_640_000_000_000_000
+const neverTimestampSentinel = 9_000_000_000_000_000_000
+
+export type ChannelRoutingTimestampResolution =
+  | { kind: 'date'; milliseconds: number }
+  | { kind: 'invalid' }
+  | { kind: 'never' }
+
+export function resolveChannelRoutingTimestamp(
+  timestamp: number
+): ChannelRoutingTimestampResolution {
+  if (!Number.isFinite(timestamp)) return { kind: 'invalid' }
+  if (timestamp <= 0 || timestamp >= neverTimestampSentinel) {
+    return { kind: 'never' }
+  }
+  const milliseconds = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000
+  if (
+    !Number.isFinite(milliseconds) ||
+    milliseconds > maximumJavaScriptDateMilliseconds
+  ) {
+    return { kind: 'invalid' }
+  }
+  return { kind: 'date', milliseconds }
 }
 
 export function formatChannelRoutingCost(
@@ -93,10 +113,10 @@ export function useChannelRoutingFormatters() {
           ? t('{{value}} ms', { value: number.format(value) })
           : t('Unknown'),
       timestamp: (value: number | undefined) => {
-        const milliseconds = toMilliseconds(value ?? 0)
-        return milliseconds > 0
-          ? dateTime.format(new Date(milliseconds))
-          : t('Never')
+        const resolved = resolveChannelRoutingTimestamp(value ?? 0)
+        if (resolved.kind === 'never') return t('Never')
+        if (resolved.kind === 'invalid') return t('Unknown')
+        return dateTime.format(new Date(resolved.milliseconds))
       },
       shortHash: (value: string | undefined) => {
         if (!value) return t('Unknown')

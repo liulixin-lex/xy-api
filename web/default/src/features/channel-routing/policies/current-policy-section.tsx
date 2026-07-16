@@ -16,8 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
-import { Braces, RotateCcw } from 'lucide-react'
+import { BracesIcon, Undo02Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -64,7 +64,12 @@ export function ChannelRoutingCurrentPolicySection(props: {
               aria-expanded={documentVisible}
               onClick={() => setDocumentVisible((visible) => !visible)}
             >
-              <Braces aria-hidden='true' />
+              <HugeiconsIcon
+                icon={BracesIcon}
+                data-icon='inline-start'
+                strokeWidth={2}
+                aria-hidden='true'
+              />
               {documentVisible ? t('Hide document') : t('View document')}
             </Button>
             {props.canDeploy && props.current.head.current_revision > 1 ? (
@@ -73,7 +78,12 @@ export function ChannelRoutingCurrentPolicySection(props: {
                 variant='destructive'
                 onClick={props.onRollback}
               >
-                <RotateCcw aria-hidden='true' />
+                <HugeiconsIcon
+                  icon={Undo02Icon}
+                  data-icon='inline-start'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
                 {t('Rollback')}
               </Button>
             ) : null}

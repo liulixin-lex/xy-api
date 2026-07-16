@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -356,6 +357,84 @@ func RenewSystemTaskLock(taskID string, lockedBy string, lockUntil int64) error 
 		return ErrSystemTaskLockLost
 	}
 	return nil
+}
+
+func markSystemTaskLeaseExpiredContext(ctx context.Context, taskID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !validSystemTaskID(taskID) {
+		return ErrRoutingOperationInvalid
+	}
+	now := common.GetTimestamp()
+	nowMs := time.Now().UnixMilli()
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var task SystemTask
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("task_id = ?", taskID).First(&task).Error; err != nil {
+			return err
+		}
+		if task.Status != SystemTaskStatusRunning {
+			return nil
+		}
+		lastError := "task lease expired"
+		if tx.Migrator().HasTable(&RoutingOperation{}) {
+			var activeOperations []RoutingOperation
+			if err := lockForUpdate(tx.WithContext(ctx)).
+				Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
+					RoutingOperationStatusPending, RoutingOperationStatusRunning,
+				}).
+				Find(&activeOperations).Error; err != nil {
+				return err
+			}
+			for index := range activeOperations {
+				if err := validateStoredRoutingOperation(activeOperations[index]); err != nil {
+					return err
+				}
+			}
+			transitionTimeMs := nowMs
+			for index := range activeOperations {
+				transitionTimeMs = max(
+					transitionTimeMs,
+					activeOperations[index].CreatedTimeMs,
+					activeOperations[index].UpdatedTimeMs,
+				)
+			}
+			updates := routingOperationTerminalUpdates(
+				RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, transitionTimeMs,
+			)
+			updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
+			if err := tx.WithContext(ctx).Model(&RoutingOperation{}).
+				Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
+					RoutingOperationStatusPending, RoutingOperationStatusRunning,
+				}).Updates(updates).Error; err != nil {
+				return err
+			}
+			if len(activeOperations) > 0 {
+				ids := make([]int64, len(activeOperations))
+				for index := range activeOperations {
+					ids[index] = activeOperations[index].ID
+				}
+				var storedOperations []RoutingOperation
+				if err := tx.WithContext(ctx).Where("id IN ?", ids).Find(&storedOperations).Error; err != nil {
+					return err
+				}
+				if len(storedOperations) != len(activeOperations) {
+					return ErrRoutingOperationClaimLost
+				}
+				for index := range storedOperations {
+					if err := validateStoredRoutingOperation(storedOperations[index]); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return tx.WithContext(ctx).Model(&SystemTask{}).
+			Where("task_id = ? AND status = ?", task.TaskID, SystemTaskStatusRunning).
+			Updates(map[string]any{
+				"status": SystemTaskStatusFailed, "active_key": nil,
+				"error": lastError, "updated_at": now,
+			}).Error
+	})
 }
 
 func MarkSystemTaskLeaseExpired(taskID string) error {

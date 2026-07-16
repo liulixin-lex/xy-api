@@ -80,7 +80,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true,
-		Mode:    smart_routing_setting.ModeObserve,
+		Mode:    smart_routing_setting.ModeEnterpriseSLO,
 	})
 
 	held, err := channelRoutingCanaryRuntime.tryReserve(11, canaryPolicy,
@@ -106,6 +106,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityInputKnown, true)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutput, 20)
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCapacityOutputKnown, true)
+	require.NoError(t, ensureRoutingChannelTrafficPolicies(context.Background()))
 	oldDB := model.DB
 	model.DB = nil
 	channel, group, err := CacheGetRandomSatisfiedChannel(&RetryParam{
@@ -137,7 +138,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	require.NoError(t, err)
 	require.Equal(t, 1, flushed)
 	var audit model.RoutingDecisionAudit
-	require.NoError(t, model.DB.Where("algorithm_version = ?", channelrouting.DecisionAlgorithmCanaryV1).
+	require.NoError(t, model.DB.Where("algorithm_version = ?", channelrouting.DecisionAlgorithmCanary).
 		Order("id desc").First(&audit).Error)
 	assert.Equal(t, int64(401), audit.ActivationID)
 	assert.Equal(t, model.RoutingDecisionCohortCanary, audit.Cohort)
@@ -305,7 +306,7 @@ func TestChannelRoutingCanaryReplaysWhenHalfOpenProbeLeaseIsUnavailable(t *testi
 	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true,
-		Mode:    smart_routing_setting.ModeObserve,
+		Mode:    smart_routing_setting.ModeEnterpriseSLO,
 	})
 
 	probeKey := routingbreaker.Key{
@@ -421,7 +422,7 @@ func TestChannelRoutingCanaryFailsClosedAndAuditsRedisProbeCoordinatorError(t *t
 	view.Pools[0].Members[0].Models[0].BreakerState = routingselector.BreakerStateHalfOpen
 	view.Pools[0].Members[0].Models[0].BreakerUpdatedUnix = time.Now().Unix()
 	channelrouting.SetSnapshotForTest(view)
-	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true, Mode: smart_routing_setting.ModeObserve})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true, Mode: smart_routing_setting.ModeEnterpriseSLO})
 	breakerKey := routingbreaker.Key{
 		ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 		Model: "gpt-test", Group: "default",
@@ -493,7 +494,7 @@ func TestChannelRoutingAffinityGatesAutoCanaryBeforeProbeAndPreservesControl(t *
 	model.InitChannelCache()
 	channelrouting.SetSnapshotForTest(channelRoutingCanarySnapshotForTest(33, 703, []int{301}))
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
-		Enabled: true, Mode: smart_routing_setting.ModeBalanced,
+		Enabled: true, Mode: smart_routing_setting.ModeEnterpriseSLO,
 		WeightAvailability: 1, TopK: 1, MinVolume: 10,
 		HalfOpenProbes: 1, MaxEjectedPct: 100, SnapshotStaleSec: 300,
 	})
@@ -557,7 +558,9 @@ func TestChannelRoutingCanaryAffinityAndAutoGroupsSharePinnedSnapshot(t *testing
 		channelrouting.ResetSnapshotForTest()
 		smart_routing_setting.ResetForTest()
 	})
-	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true})
+	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
+		Enabled: true, Mode: smart_routing_setting.ModeEnterpriseSLO,
+	})
 
 	view := channelRoutingCanarySnapshotForTest(31, 601, []int{301})
 	view.Pools = append(view.Pools, channelrouting.PoolSnapshot{
@@ -584,6 +587,42 @@ func TestChannelRoutingCanaryAffinityAndAutoGroupsSharePinnedSnapshot(t *testing
 	require.True(t, active)
 	assert.True(t, gate.InCanary)
 	assert.Equal(t, uint64(31), gate.PolicyRevision, "all concrete auto groups in one request must retain the same runtime snapshot")
+}
+
+func TestGlobalModePreventsCanaryAffinityBypass(t *testing.T) {
+	channelrouting.ResetSnapshotForTest()
+	smart_routing_setting.ResetForTest()
+	previousMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		channelrouting.ResetSnapshotForTest()
+		smart_routing_setting.ResetForTest()
+	})
+	channelrouting.SetSnapshotForTest(channelRoutingCanarySnapshotForTest(41, 801, []int{501}))
+
+	for _, mode := range []string{
+		smart_routing_setting.ModeObserve,
+		smart_routing_setting.ModeShadow,
+		smart_routing_setting.ModeBalanced,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			setting := smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true, Mode: mode})
+			ctx, _ := gin.CreateTestContext(nil)
+			common.SetContextKey(ctx, common.RequestIdKey, "cohort-both-7500")
+			channel, _, handled, err := cacheGetChannelRoutingCanary(&RetryParam{
+				Ctx: ctx, TokenGroup: "default", ModelName: "gpt-test",
+				RequestPath: "/v1/chat/completions", Retry: common.GetPointer(0),
+			}, setting)
+			require.NoError(t, err)
+			assert.Nil(t, channel)
+			assert.False(t, handled)
+
+			bypass, err := ShouldBypassChannelRoutingAffinity(ctx, "default")
+			require.NoError(t, err)
+			assert.False(t, bypass)
+		})
+	}
 }
 
 func channelRoutingCanarySnapshotForTest(revision uint64, activationID int64, channelIDs []int) channelrouting.SnapshotView {

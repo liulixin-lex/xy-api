@@ -28,7 +28,7 @@ func TestListActiveRoutingRuntimeCheckpointsUsesBoundedStableCursor(t *testing.T
 		checkpoint, err := NewRoutingRuntimeCheckpoint(
 			spec.nodeID,
 			"config_stream",
-			"routing:v2:config",
+			"channel-routing:config",
 			int64(index),
 			1,
 			map[string]any{"cursor": spec.nodeID},
@@ -41,7 +41,7 @@ func TestListActiveRoutingRuntimeCheckpointsUsesBoundedStableCursor(t *testing.T
 	}
 
 	first, hasMore, err := ListActiveRoutingRuntimeCheckpointsContext(
-		context.Background(), "config_stream", "routing:v2:config", 500, 0, 0, 2,
+		context.Background(), "config_stream", "channel-routing:config", 500, 0, 0, 2,
 	)
 	require.NoError(t, err)
 	require.Len(t, first, 2)
@@ -49,7 +49,7 @@ func TestListActiveRoutingRuntimeCheckpointsUsesBoundedStableCursor(t *testing.T
 	assert.Equal(t, []string{"node-newest", "node-middle"}, []string{first[0].NodeID, first[1].NodeID})
 
 	second, hasMore, err := ListActiveRoutingRuntimeCheckpointsContext(
-		context.Background(), "config_stream", "routing:v2:config", 500,
+		context.Background(), "config_stream", "channel-routing:config", 500,
 		first[1].ObservedTime, first[1].ID, 2,
 	)
 	require.NoError(t, err)
@@ -64,7 +64,7 @@ func TestListActiveRoutingRuntimeCheckpointsRejectsUnboundedLimit(t *testing.T) 
 	require.NoError(t, db.AutoMigrate(&RoutingRuntimeCheckpoint{}))
 
 	_, _, err := ListActiveRoutingRuntimeCheckpointsContext(
-		context.Background(), "config_stream", "routing:v2:config", 500, 0, 0,
+		context.Background(), "config_stream", "channel-routing:config", 500, 0, 0,
 		RoutingRuntimeCheckpointMaxPageSize+1,
 	)
 	assert.ErrorIs(t, err, ErrRoutingRuntimeCheckpointInvalid)

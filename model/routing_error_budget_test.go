@@ -213,7 +213,7 @@ func TestMigrateRoutingErrorBudgetModelsReplacesLegacyPoolOnlyUniqueIndex(t *tes
 	assert.False(t, db.Migrator().HasTable(&RoutingErrorBudgetHistory{}), "a closed drain gate must not expand or contract the legacy schema")
 
 	require.NoError(t, MigrateRoutingErrorBudgetModelsWithOptions(db, RoutingErrorBudgetMigrationOptions{
-		AlphaV2Drained: true,
+		AlphaDrained: true,
 	}))
 	ready, err := RoutingErrorBudgetSchemaReady(db)
 	require.NoError(t, err)

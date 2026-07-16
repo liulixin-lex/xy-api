@@ -16,18 +16,43 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 import { useEffect, useRef, useState } from 'react'
 
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
 import { channelRoutingIdentityTextIsTruncated } from '../lib/identity-text'
+
+const identityResizeCallbacks = new WeakMap<Element, () => void>()
+let identityResizeObserver: ResizeObserver | null = null
+let identityResizeTargetCount = 0
+
+function observeIdentityResize(element: Element, callback: () => void) {
+  if (typeof ResizeObserver === 'undefined') return () => undefined
+  if (!identityResizeObserver) {
+    identityResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        identityResizeCallbacks.get(entry.target)?.()
+      }
+    })
+  }
+  identityResizeCallbacks.set(element, callback)
+  identityResizeObserver.observe(element)
+  identityResizeTargetCount += 1
+  return () => {
+    identityResizeCallbacks.delete(element)
+    identityResizeObserver?.unobserve(element)
+    identityResizeTargetCount = Math.max(0, identityResizeTargetCount - 1)
+    if (identityResizeTargetCount === 0) {
+      identityResizeObserver?.disconnect()
+      identityResizeObserver = null
+    }
+  }
+}
 
 export function ChannelRoutingIdentityText(props: {
   text: string
@@ -53,65 +78,40 @@ export function ChannelRoutingIdentityText(props: {
     const element = textRef.current
     if (!element) return
     const update = () => {
-      setTruncated(
-        channelRoutingIdentityTextIsTruncated({
-          clientWidth: element.clientWidth,
-          scrollWidth: element.scrollWidth,
-          clientHeight: element.clientHeight,
-          scrollHeight: element.scrollHeight,
-        })
-      )
+      const next = channelRoutingIdentityTextIsTruncated({
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+      })
+      setTruncated((current) => (current === next ? current : next))
     }
     update()
-    if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(update)
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [
-    props.breakAll,
-    props.className,
-    props.text,
-    props.withinInteractive,
-    truncated,
-  ])
+    return observeIdentityResize(element, update)
+  }, [props.breakAll, props.className, props.text, props.withinInteractive])
 
   if (props.withinInteractive) {
     return <span className={className}>{props.text}</span>
   }
 
-  if (!truncated) {
-    return (
-      <span
-        ref={(element) => {
-          textRef.current = element
-        }}
-        className={className}
+  return (
+    <Tooltip disabled={!truncated}>
+      <TooltipTrigger
+        render={
+          <span
+            ref={(element) => {
+              textRef.current = element
+            }}
+            tabIndex={truncated ? 0 : undefined}
+            className={className}
+          />
+        }
       >
         {props.text}
-      </span>
-    )
-  }
-
-  return (
-    <TooltipProvider delay={100}>
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <span
-              ref={(element) => {
-                textRef.current = element
-              }}
-              tabIndex={0}
-              className={className}
-            />
-          }
-        >
-          {props.text}
-        </TooltipTrigger>
-        <TooltipContent className='max-w-sm break-all'>
-          {props.text}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+      </TooltipTrigger>
+      <TooltipContent className='max-w-sm break-all'>
+        {props.text}
+      </TooltipContent>
+    </Tooltip>
   )
 }

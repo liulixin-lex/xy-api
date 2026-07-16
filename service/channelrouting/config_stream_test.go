@@ -21,6 +21,8 @@ import (
 )
 
 func TestRoutingConfigOutboxPublishesStreamEventAndMarksRow(t *testing.T) {
+	assert.Equal(t, "channel-routing:config", routingConfigStream)
+	assert.Equal(t, "channel-routing:config", RoutingConfigCheckpointScope)
 	db := openRoutingConfigTestDB(t)
 	require.NoError(t, db.AutoMigrate(
 		&model.Channel{},
@@ -84,16 +86,26 @@ func TestRoutingConfigStartupBaselinesAtStreamTailBeforeConsumingNewEvents(t *te
 	require.NoError(t, db.AutoMigrate(&model.RoutingRuntimeCheckpoint{}))
 	historyEvent, historyMessage := testRoutingConfigMessage(t, 3, 2)
 	nextEvent, nextMessage := testRoutingConfigMessage(t, 4, 3)
+	configurationHash := strings.Repeat("c", 64)
 	metadata := SnapshotMetadata{}
 	metadataAvailable := false
 	refreshCalls := 0
 	refreshRoutingConfigSnapshot = func(context.Context) (SnapshotView, error) {
 		refreshCalls++
-		view := SnapshotView{Revision: uint64(historyEvent.Revision), PolicyHash: historyEvent.ContentHash}
-		if refreshCalls > 1 {
-			view = SnapshotView{Revision: uint64(nextEvent.Revision), PolicyHash: nextEvent.ContentHash}
+		view := SnapshotView{
+			Revision: uint64(historyEvent.Revision), PolicyHash: historyEvent.ContentHash,
+			ConfigurationEpoch: 7, ConfigurationHash: configurationHash,
 		}
-		metadata = SnapshotMetadata{Revision: view.Revision, PolicyHash: view.PolicyHash}
+		if refreshCalls > 1 {
+			view = SnapshotView{
+				Revision: uint64(nextEvent.Revision), PolicyHash: nextEvent.ContentHash,
+				ConfigurationEpoch: 7, ConfigurationHash: configurationHash,
+			}
+		}
+		metadata = SnapshotMetadata{
+			Revision: view.Revision, PolicyHash: view.PolicyHash,
+			ConfigurationEpoch: view.ConfigurationEpoch, ConfigurationHash: view.ConfigurationHash,
+		}
 		metadataAvailable = true
 		return view, nil
 	}
@@ -122,6 +134,13 @@ func TestRoutingConfigStartupBaselinesAtStreamTailBeforeConsumingNewEvents(t *te
 	)
 	require.NoError(t, err)
 	assert.Equal(t, nextEvent.Revision, checkpoint.PolicyRevision)
+	var payload struct {
+		ConfigurationEpoch uint64 `json:"configuration_epoch"`
+		ConfigurationHash  string `json:"configuration_hash"`
+	}
+	require.NoError(t, checkpoint.DecodePayload(&payload))
+	assert.Equal(t, uint64(7), payload.ConfigurationEpoch)
+	assert.Equal(t, configurationHash, payload.ConfigurationHash)
 }
 
 func TestRoutingConfigOldRevisionNeverRollsSnapshotBack(t *testing.T) {
@@ -158,18 +177,21 @@ func TestRoutingConfigColdNodeAcceptsDatabaseRevisionAheadOfStreamEvent(t *testi
 	refreshCalls := 0
 	metadataAvailable := false
 	policyHash := strings.Repeat("b", 64)
+	configurationHash := strings.Repeat("c", 64)
 	refreshRoutingConfigSnapshot = func(context.Context) (SnapshotView, error) {
 		refreshCalls++
 		metadataAvailable = true
 		return SnapshotView{
 			Revision: 5, PolicyHash: policyHash, ActivationID: 71,
 			ActivationStage: model.RoutingDeploymentStageCanary, TrafficBasisPoints: 250,
+			ConfigurationEpoch: 9, ConfigurationHash: configurationHash,
 		}, nil
 	}
 	loadRoutingConfigSnapshotMetadata = func() (SnapshotMetadata, bool) {
 		return SnapshotMetadata{
 			Revision: 5, PolicyHash: policyHash, ActivationID: 71,
 			ActivationStage: model.RoutingDeploymentStageCanary, TrafficBasisPoints: 250,
+			ConfigurationEpoch: 9, ConfigurationHash: configurationHash,
 		}, metadataAvailable
 	}
 	stub := &routingConfigRedisStub{readMessages: []redis.XMessage{message}}
@@ -190,12 +212,16 @@ func TestRoutingConfigColdNodeAcceptsDatabaseRevisionAheadOfStreamEvent(t *testi
 	assert.Equal(t, int64(5), checkpoint.PolicyRevision)
 	var payload struct {
 		PolicyHash         string `json:"policy_hash"`
+		ConfigurationEpoch uint64 `json:"configuration_epoch"`
+		ConfigurationHash  string `json:"configuration_hash"`
 		ActivationID       int64  `json:"activation_id"`
 		ActivationStage    string `json:"activation_stage"`
 		TrafficBasisPoints int    `json:"traffic_basis_points"`
 	}
 	require.NoError(t, checkpoint.DecodePayload(&payload))
 	assert.Equal(t, policyHash, payload.PolicyHash)
+	assert.Equal(t, uint64(9), payload.ConfigurationEpoch)
+	assert.Equal(t, configurationHash, payload.ConfigurationHash)
 	assert.Equal(t, int64(71), payload.ActivationID)
 	assert.Equal(t, model.RoutingDeploymentStageCanary, payload.ActivationStage)
 	assert.Equal(t, 250, payload.TrafficBasisPoints)

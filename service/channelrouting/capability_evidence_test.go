@@ -175,7 +175,7 @@ func TestCapabilityEvidenceDoesNotChangeRoutingUntilPoolGateIsEnabled(t *testing
 		LegacyPriority: 10, LegacyWeight: 10,
 	}
 	channel := ChannelSnapshot{ID: 101, Status: common.ChannelStatusEnabled}
-	profile := requestProfileV2ForCapabilityTest(t, RequestKindResponses, RequestCapabilityJSONSchema)
+	profile := requestProfileForCapabilityTest(t, RequestKindResponses, RequestCapabilityJSONSchema)
 	kindMask, ok := RequestKindResponses.Mask()
 	require.True(t, ok)
 	observation := ModelSnapshot{
