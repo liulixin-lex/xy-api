@@ -36,7 +36,27 @@ export function handleServerError(error: unknown) {
   }
 
   if (error instanceof AxiosError) {
-    errMsg = error.response?.data.title
+    const status = error.response?.status
+    const data = error.response?.data
+    if (status === 304) {
+      errMsg = i18next.t('Content not modified!')
+    } else if (status === 401) {
+      errMsg = i18next.t('Session expired!')
+    } else if (status === 403) {
+      errMsg = i18next.t('Access Forbidden')
+    } else if (typeof data === 'string' && data.trim()) {
+      errMsg = data.trim()
+    } else if (data && typeof data === 'object') {
+      const payload = data as { title?: unknown; message?: unknown }
+      if (typeof payload.title === 'string' && payload.title.trim()) {
+        errMsg = payload.title.trim()
+      } else if (
+        typeof payload.message === 'string' &&
+        payload.message.trim()
+      ) {
+        errMsg = payload.message.trim()
+      }
+    }
   }
 
   toast.error(errMsg)
