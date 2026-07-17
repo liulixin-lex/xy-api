@@ -83,7 +83,14 @@ func TestBuildRoutingCostRequestProfileKeepsRequestInputTransientAndKnowledgeExp
 	assert.False(t, profile.CacheTokensKnown)
 	assert.False(t, profile.CacheReadTokensKnown)
 	assert.True(t, profile.CacheWriteTokensKnown)
-	assert.True(t, profile.MediaDimensionsKnown)
+	assert.True(t, profile.CacheWriteOneHourTokensKnown)
+	assert.True(t, profile.ImageInputTokensKnown)
+	assert.True(t, profile.ImageOutputTokensKnown)
+	assert.True(t, profile.ImageUnitsKnown)
+	assert.True(t, profile.AudioInputTokensKnown)
+	assert.True(t, profile.AudioOutputTokensKnown)
+	assert.True(t, profile.AudioDurationKnown)
+	assert.True(t, profile.VideoDurationKnown)
 	assert.True(t, profile.RequestInputKnown)
 	assert.Equal(t, int64(100), profile.PromptTokens)
 	assert.Equal(t, int64(400), profile.MaximumPromptTokens)
@@ -108,7 +115,14 @@ func TestBuildRoutingCostRequestProfileKeepsRequestInputTransientAndKnowledgeExp
 	assert.False(t, unknown.MaximumCompletionKnown)
 	assert.False(t, unknown.CacheReadTokensKnown)
 	assert.False(t, unknown.CacheWriteTokensKnown)
-	assert.False(t, unknown.MediaDimensionsKnown)
+	assert.False(t, unknown.CacheWriteOneHourTokensKnown)
+	assert.False(t, unknown.ImageInputTokensKnown)
+	assert.False(t, unknown.ImageOutputTokensKnown)
+	assert.False(t, unknown.ImageUnitsKnown)
+	assert.False(t, unknown.AudioInputTokensKnown)
+	assert.False(t, unknown.AudioOutputTokensKnown)
+	assert.False(t, unknown.AudioDurationKnown)
+	assert.False(t, unknown.VideoDurationKnown)
 }
 
 func TestEstimateRoutingCapacityTokensSplitsCacheReadAndWriteKnowledge(t *testing.T) {
@@ -174,6 +188,7 @@ func TestEstimateRoutingCapacityTokensSplitsCacheReadAndWriteKnowledge(t *testin
 			assert.False(t, profile.CacheTokensKnown)
 			assert.False(t, profile.CacheReadTokensKnown)
 			assert.Equal(t, tt.wantWriteKnown, profile.CacheWriteTokensKnown)
+			assert.Equal(t, tt.wantWriteKnown, profile.CacheWriteOneHourTokensKnown)
 		})
 	}
 }

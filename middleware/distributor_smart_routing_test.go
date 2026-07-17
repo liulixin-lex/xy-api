@@ -512,7 +512,7 @@ func TestMiddlewareCostProfileKeepsHedgeDependencyChecksFailClosed(t *testing.T)
 				ImageInputCostPerMillion: &imageRate,
 			},
 			mutate: func(profile *model.RoutingCostRequestProfile) {
-				profile.MediaDimensionsKnown = false
+				profile.ImageInputTokensKnown = false
 			},
 		},
 		{

@@ -2,12 +2,15 @@ package channelrouting
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"math"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	routingselector "github.com/QuantumNous/new-api/service/routing"
+
+	"gorm.io/gorm"
 )
 
 const (
@@ -301,6 +304,35 @@ func RunPolicyDocumentSimulationAgainstBase(
 	normalizedDraft, documentHash, err := model.NormalizeRoutingPolicyDocument(draftDocument)
 	if err != nil {
 		return HistoricalSimulationResult{}, ErrSimulationInvalidOptions
+	}
+	db := model.DB
+	if db != nil && db.Migrator().HasTable(&model.RoutingPool{}) &&
+		db.Migrator().HasTable(&model.RoutingPoolMember{}) &&
+		db.Migrator().HasTable(&model.RoutingCredentialRef{}) {
+		err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var activePoolCount int64
+			if countErr := tx.Model(&model.RoutingPool{}).
+				Where("active = ?", true).Count(&activePoolCount).Error; countErr != nil {
+				return countErr
+			}
+			if activePoolCount == 0 {
+				return nil
+			}
+			composedBase, composeErr := composeSnapshotPolicyDocument(ctx, tx, normalizedBase)
+			if composeErr != nil {
+				return composeErr
+			}
+			composedDraft, composeErr := composeSnapshotPolicyDocument(ctx, tx, normalizedDraft)
+			if composeErr != nil {
+				return composeErr
+			}
+			normalizedBase = composedBase
+			normalizedDraft = composedDraft
+			return nil
+		}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+		if err != nil {
+			return HistoricalSimulationResult{}, err
+		}
 	}
 	for index := range normalizedDraft.Pools {
 		if normalizedDraft.Pools[index].PoolID != poolID {

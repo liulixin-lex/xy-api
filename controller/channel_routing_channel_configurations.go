@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -27,8 +28,27 @@ type channelRoutingChannelConfigurationRequest struct {
 	ClearFailureDomain     bool    `json:"clear_failure_domain"`
 }
 
+type channelRoutingChannelConfigurationFieldError struct {
+	Field   string         `json:"field"`
+	Reason  string         `json:"reason"`
+	Details map[string]any `json:"details,omitempty"`
+}
+
+func (err *channelRoutingChannelConfigurationFieldError) Error() string {
+	if err == nil {
+		return model.ErrRoutingChannelConfigurationInvalid.Error()
+	}
+	return err.Field + ": " + err.Reason
+}
+
+func (err *channelRoutingChannelConfigurationFieldError) Unwrap() error {
+	return model.ErrRoutingChannelConfigurationInvalid
+}
+
 type channelRoutingChannelConfigurationView struct {
 	ChannelID              int     `json:"channel_id"`
+	RoutingIdentity        string  `json:"routing_identity"`
+	RoutingGeneration      string  `json:"routing_generation"`
 	ChannelName            string  `json:"channel_name"`
 	UpstreamCostMultiplier float64 `json:"upstream_cost_multiplier"`
 	CostSource             string  `json:"cost_source"`
@@ -122,7 +142,9 @@ func UpdateChannelRoutingChannelConfiguration(c *gin.Context) {
 		writeChannelRoutingChannelConfigurationError(c, http.StatusInternalServerError, "channel_configuration_load_failed", "failed to load channel configuration", err)
 		return
 	}
-	if parsedETag.ChannelID != expected.ChannelID || parsedETag.Revision != expected.Revision || ifMatch != currentETag {
+	if parsedETag.ChannelID != expected.ChannelID || parsedETag.RoutingIdentity != expected.RoutingIdentity ||
+		parsedETag.RoutingGeneration != expected.RoutingGeneration || parsedETag.Revision != expected.Revision ||
+		ifMatch != currentETag {
 		writeChannelRoutingChannelConfigurationConflict(c, expected.ChannelID)
 		return
 	}
@@ -131,6 +153,11 @@ func UpdateChannelRoutingChannelConfiguration(c *gin.Context) {
 		status := http.StatusBadRequest
 		code := "invalid_channel_configuration"
 		message := "invalid channel configuration"
+		var fieldErr *channelRoutingChannelConfigurationFieldError
+		if errors.As(err, &fieldErr) {
+			code = "invalid_channel_configuration_field"
+			message = "A channel configuration field is invalid"
+		}
 		if errors.Is(err, errChannelRoutingChannelConfigurationBodyTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 			code = "channel_configuration_too_large"
@@ -140,12 +167,12 @@ func UpdateChannelRoutingChannelConfiguration(c *gin.Context) {
 		return
 	}
 	request.TrafficClass = strings.ToLower(strings.TrimSpace(request.TrafficClass))
-	label, _, err := model.NormalizeRoutingFailureDomainLabel(request.FailureDomainLabel)
-	if err != nil || request.TrafficClass != model.RoutingChannelTrafficClassAll &&
-		request.TrafficClass != model.RoutingChannelTrafficClassClaudeCodeOnly ||
-		math.IsNaN(request.UpstreamCostMultiplier) || math.IsInf(request.UpstreamCostMultiplier, 0) ||
-		request.UpstreamCostMultiplier < 0 || request.UpstreamCostMultiplier > model.RoutingChannelUpstreamCostMultiplierMaximum {
-		writeChannelRoutingChannelConfigurationError(c, http.StatusBadRequest, "invalid_channel_configuration", "invalid channel configuration", model.ErrRoutingChannelConfigurationInvalid)
+	label, validationErr := validateChannelRoutingChannelConfigurationRequest(request)
+	if validationErr != nil {
+		writeChannelRoutingChannelConfigurationError(
+			c, http.StatusBadRequest, "invalid_channel_configuration_field",
+			"A channel configuration field is invalid", validationErr,
+		)
 		return
 	}
 	if request.UpstreamCostMultiplier == 0 {
@@ -164,7 +191,10 @@ func UpdateChannelRoutingChannelConfiguration(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		writeChannelRoutingChannelConfigurationError(c, http.StatusInternalServerError, "channel_configuration_update_failed", "failed to update channel configuration", err)
+		writeChannelRoutingChannelConfigurationError(
+			c, http.StatusInternalServerError, "channel_configuration_update_failed",
+			"The change was not saved. The previous valid configuration remains active.", err,
+		)
 		return
 	}
 	channelrouting.ApplyCommittedRoutingChannelConfiguration(mutation.Configuration)
@@ -196,7 +226,7 @@ func decodeChannelRoutingChannelConfiguration(body io.Reader) (channelRoutingCha
 		return channelRoutingChannelConfigurationRequest{}, errChannelRoutingChannelConfigurationBodyTooLarge
 	}
 	var fields map[string]json.RawMessage
-	if common.Unmarshal(data, &fields) != nil || fields == nil || len(fields) != 4 {
+	if common.Unmarshal(data, &fields) != nil || fields == nil {
 		return channelRoutingChannelConfigurationRequest{}, model.ErrRoutingChannelConfigurationInvalid
 	}
 	expectedTypes := map[string]string{
@@ -205,22 +235,101 @@ func decodeChannelRoutingChannelConfiguration(body io.Reader) (channelRoutingCha
 		"failure_domain_label":     "string",
 		"clear_failure_domain":     "boolean",
 	}
-	for field, expectedType := range expectedTypes {
+	orderedFields := []string{
+		"upstream_cost_multiplier", "traffic_class", "failure_domain_label", "clear_failure_domain",
+	}
+	for _, field := range orderedFields {
+		expectedType := expectedTypes[field]
 		raw, exists := fields[field]
-		if !exists || common.GetJsonType(raw) != expectedType {
-			return channelRoutingChannelConfigurationRequest{}, model.ErrRoutingChannelConfigurationInvalid
+		if !exists {
+			return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+				Field: field, Reason: "required",
+			}
+		}
+		if common.GetJsonType(raw) != expectedType {
+			return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+				Field: field, Reason: "invalid_type", Details: map[string]any{"expected_type": expectedType},
+			}
 		}
 	}
+	extraFields := make([]string, 0)
 	for field := range fields {
 		if _, exists := expectedTypes[field]; !exists {
-			return channelRoutingChannelConfigurationRequest{}, model.ErrRoutingChannelConfigurationInvalid
+			extraFields = append(extraFields, field)
+		}
+	}
+	if len(extraFields) > 0 {
+		sort.Strings(extraFields)
+		return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+			Field: extraFields[0], Reason: "unexpected_field",
 		}
 	}
 	var request channelRoutingChannelConfigurationRequest
-	if common.Unmarshal(data, &request) != nil {
-		return channelRoutingChannelConfigurationRequest{}, model.ErrRoutingChannelConfigurationInvalid
+	if common.Unmarshal(fields["upstream_cost_multiplier"], &request.UpstreamCostMultiplier) != nil {
+		return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+			Field: "upstream_cost_multiplier", Reason: "out_of_range",
+			Details: map[string]any{
+				"minimum": 0, "maximum": model.RoutingChannelUpstreamCostMultiplierMaximum,
+			},
+		}
+	}
+	if common.Unmarshal(fields["traffic_class"], &request.TrafficClass) != nil {
+		return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+			Field: "traffic_class", Reason: "invalid_type",
+		}
+	}
+	if common.Unmarshal(fields["failure_domain_label"], &request.FailureDomainLabel) != nil {
+		return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+			Field: "failure_domain_label", Reason: "invalid_type",
+		}
+	}
+	if common.Unmarshal(fields["clear_failure_domain"], &request.ClearFailureDomain) != nil {
+		return channelRoutingChannelConfigurationRequest{}, &channelRoutingChannelConfigurationFieldError{
+			Field: "clear_failure_domain", Reason: "invalid_type",
+		}
 	}
 	return request, nil
+}
+
+func validateChannelRoutingChannelConfigurationRequest(
+	request channelRoutingChannelConfigurationRequest,
+) (string, error) {
+	if math.IsNaN(request.UpstreamCostMultiplier) || math.IsInf(request.UpstreamCostMultiplier, 0) {
+		return "", &channelRoutingChannelConfigurationFieldError{
+			Field: "upstream_cost_multiplier", Reason: "not_finite",
+		}
+	}
+	if request.UpstreamCostMultiplier < 0 ||
+		request.UpstreamCostMultiplier > model.RoutingChannelUpstreamCostMultiplierMaximum {
+		return "", &channelRoutingChannelConfigurationFieldError{
+			Field: "upstream_cost_multiplier", Reason: "out_of_range",
+			Details: map[string]any{
+				"minimum": 0, "maximum": model.RoutingChannelUpstreamCostMultiplierMaximum,
+			},
+		}
+	}
+	if request.TrafficClass != model.RoutingChannelTrafficClassAll &&
+		request.TrafficClass != model.RoutingChannelTrafficClassClaudeCodeOnly {
+		return "", &channelRoutingChannelConfigurationFieldError{
+			Field: "traffic_class", Reason: "unsupported_value",
+			Details: map[string]any{"allowed": []string{
+				model.RoutingChannelTrafficClassAll, model.RoutingChannelTrafficClassClaudeCodeOnly,
+			}},
+		}
+	}
+	if request.ClearFailureDomain && strings.TrimSpace(request.FailureDomainLabel) != "" {
+		return "", &channelRoutingChannelConfigurationFieldError{
+			Field: "failure_domain_label", Reason: "conflicts_with_clear_failure_domain",
+		}
+	}
+	label, _, err := model.NormalizeRoutingFailureDomainLabel(request.FailureDomainLabel)
+	if err != nil {
+		return "", &channelRoutingChannelConfigurationFieldError{
+			Field: "failure_domain_label", Reason: "invalid_format",
+			Details: map[string]any{"sensitive_values_allowed": false},
+		}
+	}
+	return label, nil
 }
 
 func loadChannelRoutingChannelConfiguration(c *gin.Context) (model.RoutingChannelConfiguration, bool) {
@@ -259,7 +368,9 @@ func channelRoutingChannelConfigurationViews(
 	channels := make(map[int]model.Channel, len(channelIDs))
 	if len(channelIDs) > 0 {
 		var rows []model.Channel
-		if err := model.DB.WithContext(ctx).Select("id", "name", "models").Where("id IN ?", channelIDs).Find(&rows).Error; err != nil {
+		if err := model.DB.WithContext(ctx).
+			Select("id", "routing_identity", "routing_generation", "name", "models").
+			Where("id IN ?", channelIDs).Find(&rows).Error; err != nil {
 			return nil, err
 		}
 		for index := range rows {
@@ -270,7 +381,8 @@ func channelRoutingChannelConfigurationViews(
 	for index := range configurations {
 		configuration := configurations[index]
 		channel, exists := channels[configuration.ChannelID]
-		if !exists {
+		if !exists || channel.RoutingIdentity != configuration.RoutingIdentity ||
+			channel.RoutingGeneration != configuration.RoutingGeneration {
 			return nil, gorm.ErrRecordNotFound
 		}
 		etag, err := channelrouting.ChannelConfigurationETag(configuration)
@@ -279,7 +391,8 @@ func channelRoutingChannelConfigurationViews(
 		}
 		modelCount, costBasisAvailable := channelrouting.ChannelConfigurationCostBasisSummary(channel.GetModels())
 		views = append(views, channelRoutingChannelConfigurationView{
-			ChannelID: configuration.ChannelID, ChannelName: channel.Name,
+			ChannelID: configuration.ChannelID, RoutingIdentity: configuration.RoutingIdentity,
+			RoutingGeneration: configuration.RoutingGeneration, ChannelName: channel.Name,
 			UpstreamCostMultiplier: configuration.UpstreamCostMultiplier,
 			CostSource:             configuration.CostSource, CostConfirmed: configuration.CostConfirmed,
 			TrafficClass: configuration.TrafficClass, FailureDomainStatus: configuration.FailureDomainStatus,
@@ -301,6 +414,7 @@ func writeChannelRoutingChannelConfigurationConflict(c *gin.Context, channelID i
 			c.Header("ETag", view.ETag)
 			c.JSON(http.StatusConflict, gin.H{
 				"success": false, "code": "channel_configuration_conflict", "message": "channel configuration changed",
+				"retryable": true, "impact": "configuration_not_saved_previous_version_active",
 				"conflict": gin.H{"current": view, "current_etag": view.ETag},
 			})
 			return
@@ -308,6 +422,7 @@ func writeChannelRoutingChannelConfigurationConflict(c *gin.Context, channelID i
 	}
 	c.JSON(http.StatusConflict, gin.H{
 		"success": false, "code": "channel_configuration_conflict", "message": "channel configuration changed",
+		"retryable": true, "impact": "configuration_not_saved_previous_version_active",
 		"conflict": gin.H{"current": nil, "current_etag": ""},
 	})
 }
@@ -316,7 +431,23 @@ func writeChannelRoutingChannelConfigurationError(c *gin.Context, status int, co
 	if status >= http.StatusInternalServerError && err != nil {
 		common.SysError(message + ": " + common.SanitizeErrorMessage(err.Error()))
 	}
-	c.JSON(status, gin.H{"success": false, "code": code, "message": message})
+	response := gin.H{
+		"success": false, "code": code, "message": message,
+		"retryable": status == http.StatusConflict || status >= http.StatusInternalServerError,
+		"impact":    "request_rejected",
+	}
+	if strings.Contains(code, "channel_configuration") || strings.Contains(code, "if_match") {
+		response["impact"] = "configuration_not_saved_previous_version_active"
+	}
+	var fieldErr *channelRoutingChannelConfigurationFieldError
+	if errors.As(err, &fieldErr) {
+		response["field"] = fieldErr.Field
+		response["reason"] = fieldErr.Reason
+		if len(fieldErr.Details) > 0 {
+			response["details"] = fieldErr.Details
+		}
+	}
+	c.JSON(status, response)
 }
 
 func parseChannelRoutingChannelConfigurationOptionalBool(raw string) (*bool, error) {

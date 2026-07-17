@@ -694,6 +694,7 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, false)
 	common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, model.RoutingMetricSingleKeyIndex)
 	common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, uint64(0))
+	common.SetContextKey(c, constant.ContextKeyRoutingGeneration, "")
 	common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
 	common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, 0)
@@ -701,7 +702,9 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
-	if _, blocked := channelrouting.ChannelBalanceRuntimeBlocked(channel.Id, time.Now()); blocked {
+	if _, blocked := channelrouting.ChannelBalanceRuntimeBlockedForGeneration(
+		channel.Id, channel.RoutingGeneration, time.Now(),
+	); blocked {
 		return types.NewErrorWithStatusCode(
 			errors.New(channelrouting.ExclusionReasonChannelBalance),
 			types.ErrorCodeGetChannelFailed,
@@ -730,6 +733,7 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)
 	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
 	common.SetContextKey(c, constant.ContextKeyChannelCreateTime, channel.CreatedTime)
+	common.SetContextKey(c, constant.ContextKeyRoutingGeneration, channel.RoutingGeneration)
 	common.SetContextKey(c, constant.ContextKeyChannelSetting, channel.GetSetting())
 	common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, channel.GetOtherSettings())
 	paramOverride := channel.GetParamOverride()
@@ -754,7 +758,15 @@ func SetupContextForSelectedChannelMetadata(c *gin.Context, channel *model.Chann
 	}
 	selectedIdentity, selected := service.GetSelectedRoutingIdentity(c, channel.Id)
 	if selected {
+		if selectedIdentity.ChannelGeneration != "" && selectedIdentity.ChannelGeneration != channel.RoutingGeneration {
+			return types.NewError(
+				errors.New("selected routing channel lifecycle is no longer active"),
+				types.ErrorCodeGetChannelFailed,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
 		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, selectedIdentity.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingGeneration, selectedIdentity.ChannelGeneration)
 		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, selectedIdentity.PoolID)
 		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, selectedIdentity.MemberID)
 	}
@@ -825,6 +837,7 @@ func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *ty
 	}
 	if newAPIError != nil {
 		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, uint64(0))
+		common.SetContextKey(c, constant.ContextKeyRoutingGeneration, "")
 		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, 0)
 		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, 0)
 		service.ClearSelectedRoutingIdentity(c)
@@ -856,6 +869,7 @@ func CommitSelectedChannelCredential(c *gin.Context, channel *model.Channel) *ty
 	} else if smart_routing_setting.Enabled() {
 		if identity, ok := channelrouting.ResolveIdentity(routingGroup, channel.Id, key); ok {
 			common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+			common.SetContextKey(c, constant.ContextKeyRoutingGeneration, identity.ChannelGeneration)
 			common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
 			common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
 			common.SetContextKey(c, constant.ContextKeyRoutingCredentialID, identity.CredentialID)
@@ -921,6 +935,7 @@ func CommitTaskChannelCredential(c *gin.Context, channel *model.Channel, credent
 			)
 		}
 		common.SetContextKey(c, constant.ContextKeyRoutingSnapshotRevision, identity.SnapshotRevision)
+		common.SetContextKey(c, constant.ContextKeyRoutingGeneration, identity.ChannelGeneration)
 		common.SetContextKey(c, constant.ContextKeyRoutingPoolID, identity.PoolID)
 		common.SetContextKey(c, constant.ContextKeyRoutingMemberID, identity.MemberID)
 		if credentialID == 0 {

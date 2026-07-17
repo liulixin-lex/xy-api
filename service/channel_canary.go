@@ -276,8 +276,9 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 			SnapshotStaleSec: plan.Replay.Settings.SnapshotStaleSec,
 		}
 		probeKey := routingbreaker.Key{
-			ChannelID: selected.Id, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model: param.ModelName, Group: group,
+			ChannelID: selected.Id, ChannelGeneration: selected.RoutingGeneration,
+			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model:       param.ModelName, Group: group,
 		}
 		if plan.SelectedBreakerScope == channelrouting.BreakerScopeEndpoint {
 			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
@@ -384,6 +385,7 @@ func selectChannelRoutingCanaryForGroup(param *RetryParam, group string) (*model
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
 			ChannelID:         selected.Id,
 			SnapshotRevision:  plan.SelectedIdentity.SnapshotRevision,
+			ChannelGeneration: plan.SelectedIdentity.ChannelGeneration,
 			PoolID:            plan.SelectedIdentity.PoolID,
 			MemberID:          plan.SelectedIdentity.MemberID,
 			CredentialID:      plan.SelectedIdentity.CredentialID,

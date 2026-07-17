@@ -84,9 +84,12 @@ type RoutingDecisionAudit struct {
 	RetryIndex                      int                          `json:"retry_index"`
 	IsStream                        bool                         `json:"is_stream"`
 	ActualChannelID                 int                          `json:"actual_channel_id" gorm:"index"`
+	ActualChannelGeneration         string                       `json:"actual_channel_generation,omitempty" gorm:"type:varchar(32);index"`
 	ObservedChannelID               int                          `json:"observed_channel_id" gorm:"index"`
+	ObservedChannelGeneration       string                       `json:"observed_channel_generation,omitempty" gorm:"type:varchar(32);index"`
 	SelectedMemberID                int                          `json:"selected_member_id" gorm:"index"`
 	SelectedCredentialID            int                          `json:"selected_credential_id" gorm:"index"`
+	SelectedChannelGeneration       string                       `json:"selected_channel_generation,omitempty" gorm:"type:varchar(32);index"`
 	ReservationMode                 string                       `json:"reservation_mode" gorm:"type:varchar(16);index"`
 	ReservationRPM                  int64                        `json:"reservation_rpm" gorm:"bigint"`
 	ReservationInputTPM             int64                        `json:"reservation_input_tpm" gorm:"bigint"`
@@ -345,6 +348,8 @@ func routingDecisionAuditApproxBytes(audit RoutingDecisionAudit) int {
 		len(audit.PolicyHash) + len(audit.SnapshotHash) + len(audit.ProfileHash) +
 		len(audit.AlgorithmVersion) + len(audit.DifferenceType) + len(audit.ActivationStage) +
 		len(audit.RolloutKey) + len(audit.Cohort) + len(audit.ReservationMode) +
+		len(audit.ActualChannelGeneration) + len(audit.ObservedChannelGeneration) +
+		len(audit.SelectedChannelGeneration) +
 		len(audit.ReservationResourceModel) +
 		len(audit.ReservationPoolSharesJSON) + len(audit.ActualCostEstimateJSON) +
 		len(audit.ObservedCostEstimateJSON) + len(audit.RequestProfileJSON) + len(audit.ReplayInputJSON) +
@@ -470,6 +475,8 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 	hasCanaryMetadata := audit.ActivationID != 0 || audit.ActivationStage != "" || audit.TrafficBasisPoints != 0 ||
 		audit.CanaryBucket != 0 || audit.RolloutKey != "" || audit.Cohort != ""
 	hasSelectedIdentity := audit.SelectedMemberID != 0 || audit.SelectedCredentialID != 0
+	hasLifecycleIdentity := audit.ActualChannelGeneration != "" || audit.ObservedChannelGeneration != "" ||
+		audit.SelectedChannelGeneration != ""
 	hasReservation := audit.ReservationMode != "" || audit.ReservationRPM != 0 || audit.ReservationInputTPM != 0 ||
 		audit.ReservationOutputTPM != 0 || audit.ReservationInflight != 0 || audit.ReservationLimitRPM != 0 ||
 		audit.ReservationLimitInputTPM != 0 || audit.ReservationLimitOutputTPM != 0 || audit.ReservationLimitInflight != 0 ||
@@ -488,13 +495,13 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 			return false
 		}
 		if audit.ObservedChannelID <= 0 {
-			return audit.ActualChannelID == 0 && !hasSelectedIdentity && !hasReservation
+			return audit.ActualChannelID == 0 && !hasSelectedIdentity && !hasReservation && !hasLifecycleIdentity
 		}
 		return audit.ActualChannelID == audit.ObservedChannelID && audit.SelectedMemberID > 0 &&
-			validRoutingDecisionReservation(audit)
+			validRoutingDecisionSelectedGeneration(audit) && validRoutingDecisionReservation(audit)
 	}
 	if !hasCanaryMetadata {
-		return !hasSelectedIdentity && !hasReservation
+		return !hasSelectedIdentity && !hasReservation && !hasLifecycleIdentity
 	}
 	if (audit.AlgorithmVersion != RoutingDecisionAlgorithmCanary &&
 		audit.AlgorithmVersion != RoutingDecisionAlgorithmCanaryV1 &&
@@ -513,10 +520,11 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 		return false
 	}
 	if audit.ObservedChannelID > 0 {
-		if audit.SelectedMemberID <= 0 || audit.ActualChannelID != audit.ObservedChannelID {
+		if audit.SelectedMemberID <= 0 || audit.ActualChannelID != audit.ObservedChannelID ||
+			!validRoutingDecisionSelectedGeneration(audit) {
 			return false
 		}
-	} else if hasSelectedIdentity || hasReservation || audit.ActualChannelID != 0 {
+	} else if hasSelectedIdentity || hasReservation || hasLifecycleIdentity || audit.ActualChannelID != 0 {
 		return false
 	}
 	if audit.Cohort == RoutingDecisionCohortControl {
@@ -529,6 +537,20 @@ func validRoutingDecisionCanaryMetadata(audit *RoutingDecisionAudit) bool {
 		return !hasReservation
 	}
 	return validRoutingDecisionReservation(audit)
+}
+
+func validRoutingDecisionSelectedGeneration(audit *RoutingDecisionAudit) bool {
+	if audit == nil {
+		return false
+	}
+	if audit.SelectedChannelGeneration == "" {
+		return audit.ActualChannelGeneration == "" && audit.ObservedChannelGeneration == ""
+	}
+	if !validRoutingIdentity(audit.SelectedChannelGeneration) {
+		return false
+	}
+	return audit.ActualChannelGeneration == audit.SelectedChannelGeneration &&
+		audit.ObservedChannelGeneration == audit.SelectedChannelGeneration
 }
 
 func validRoutingDecisionReservation(audit *RoutingDecisionAudit) bool {

@@ -533,6 +533,8 @@ func TestRoutingPolicyLargeJSONUsesByteBoundedInsertBatches(t *testing.T) {
 		Pools:         make([]RoutingPolicyPoolContent, 40),
 	}
 	for index := range document.Pools {
+		enabled := true
+		weight := int64(1)
 		document.Pools[index] = RoutingPolicyPoolContent{
 			PoolID:          index + 1,
 			GroupName:       fmt.Sprintf("group-%03d", index),
@@ -541,11 +543,12 @@ func TestRoutingPolicyLargeJSONUsesByteBoundedInsertBatches(t *testing.T) {
 			PolicyProfile:   RoutingPolicyProfileCustom,
 			Policy:          append(json.RawMessage(nil), largeObject...),
 			Members: []RoutingPolicyMemberContent{{
-				MemberID:  index + 1,
-				ChannelID: index + 1,
-				Enabled:   true,
-				Weight:    1,
-				Overrides: append(json.RawMessage(nil), largeObject...),
+				MemberID:          index + 1,
+				ChannelID:         index + 1,
+				RoutingGeneration: routingPolicyGenerationForChannelTest(index + 1),
+				EnabledOverride:   &enabled,
+				WeightOverride:    &weight,
+				Overrides:         append(json.RawMessage(nil), largeObject...),
 			}},
 		}
 	}
@@ -749,6 +752,9 @@ func TestRoutingRuntimeCheckpointIsMonotonicAndCollisionSafe(t *testing.T) {
 }
 
 func routingPolicyDocumentForTest(weight int64) RoutingPolicyDocument {
+	enabled := true
+	priority := int64(1)
+	generation := routingPolicyGenerationForChannelTest(1001)
 	return RoutingPolicyDocument{
 		SchemaVersion: RoutingPolicySchemaVersion,
 		Pools: []RoutingPolicyPoolContent{{
@@ -758,15 +764,20 @@ func routingPolicyDocumentForTest(weight int64) RoutingPolicyDocument {
 			DeploymentStage: RoutingDeploymentStageShadow,
 			PolicyProfile:   RoutingPolicyProfileBalanced,
 			Members: []RoutingPolicyMemberContent{{
-				MemberID:      101,
-				ChannelID:     1001,
-				Enabled:       true,
-				Priority:      1,
-				Weight:        weight,
-				CredentialIDs: []int{201, 202},
+				MemberID:          101,
+				ChannelID:         1001,
+				RoutingGeneration: generation,
+				EnabledOverride:   &enabled,
+				PriorityOverride:  &priority,
+				WeightOverride:    &weight,
+				CredentialIDs:     []int{201, 202},
 			}},
 		}},
 	}
+}
+
+func routingPolicyGenerationForChannelTest(channelID int) string {
+	return fmt.Sprintf("%032x", channelID)
 }
 
 func routingPolicyDocumentWithStagesForTest(stages ...string) RoutingPolicyDocument {
@@ -791,6 +802,8 @@ func migrateRoutingPolicyModelsForTest(db *gorm.DB) error {
 		&routingPolicyApprovalUserForTest{},
 		&CasbinRule{},
 		&Channel{},
+		&RoutingPool{},
+		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
 		&RoutingPolicyHead{},
 		&RoutingPolicyRevision{},
@@ -798,6 +811,8 @@ func migrateRoutingPolicyModelsForTest(db *gorm.DB) error {
 		&RoutingPolicyMemberRevision{},
 		&RoutingPolicyActivation{},
 		&RoutingPolicyDraft{},
+		&RoutingPolicySimulationEvidence{},
+		&RoutingPolicyRiskAcceptance{},
 		&RoutingPolicyApproval{},
 		&RoutingPolicyRollbackApproval{},
 		&RoutingConfigOutbox{},
@@ -845,21 +860,39 @@ func (routingPolicyApprovalUserForTest) TableName() string {
 
 func seedRoutingPolicyLiveReferencesForTest(db *gorm.DB, documents ...RoutingPolicyDocument) error {
 	channels := make(map[int]Channel)
+	pools := make(map[int]RoutingPool)
+	members := make(map[int]RoutingPoolMember)
 	credentials := make(map[int]RoutingCredentialRef)
 	for documentIndex := range documents {
 		document := documents[documentIndex]
 		for poolIndex := range document.Pools {
-			for memberIndex := range document.Pools[poolIndex].Members {
-				member := document.Pools[poolIndex].Members[memberIndex]
+			pool := document.Pools[poolIndex]
+			pools[pool.PoolID] = RoutingPool{
+				ID: pool.PoolID, GroupKey: routingGroupKey(pool.GroupName), GroupName: pool.GroupName,
+				DisplayName: pool.DisplayName, Source: RoutingPoolSourceLegacyGroup, Active: true,
+				DefaultEnabled: true, DefaultPriority: 0, DefaultWeight: 100,
+			}
+			for memberIndex := range pool.Members {
+				member := pool.Members[memberIndex]
+				generation := member.RoutingGeneration
+				if generation == "" {
+					generation = routingPolicyGenerationForChannelTest(member.ChannelID)
+				}
 				mapping := `{}`
 				channels[member.ChannelID] = Channel{
 					Id: member.ChannelID, Name: fmt.Sprintf("routing-policy-%d", member.ChannelID),
-					Models: "gpt-test", ModelMapping: &mapping,
+					RoutingIdentity:   fmt.Sprintf("%032x", member.ChannelID+1_000_000),
+					RoutingGeneration: generation, Models: "gpt-test", ModelMapping: &mapping,
+				}
+				members[member.MemberID] = RoutingPoolMember{
+					ID: member.MemberID, PoolID: pool.PoolID, ChannelID: member.ChannelID,
+					ChannelGeneration: generation, Source: RoutingPoolSourceLegacyGroup, Active: true,
 				}
 				for _, credentialID := range member.CredentialIDs {
 					credentials[credentialID] = RoutingCredentialRef{
 						ID: credentialID, ChannelID: member.ChannelID,
-						Fingerprint: fmt.Sprintf("%064x", credentialID), Active: true,
+						ChannelGeneration: generation,
+						Fingerprint:       fmt.Sprintf("%064x", credentialID), Active: true,
 					}
 				}
 			}
@@ -872,6 +905,26 @@ func seedRoutingPolicyLiveReferencesForTest(db *gorm.DB, documents ...RoutingPol
 	sort.Slice(channelRows, func(i, j int) bool { return channelRows[i].Id < channelRows[j].Id })
 	if len(channelRows) > 0 {
 		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&channelRows).Error; err != nil {
+			return err
+		}
+	}
+	poolRows := make([]RoutingPool, 0, len(pools))
+	for _, pool := range pools {
+		poolRows = append(poolRows, pool)
+	}
+	sort.Slice(poolRows, func(i, j int) bool { return poolRows[i].ID < poolRows[j].ID })
+	if len(poolRows) > 0 {
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&poolRows).Error; err != nil {
+			return err
+		}
+	}
+	memberRows := make([]RoutingPoolMember, 0, len(members))
+	for _, member := range members {
+		memberRows = append(memberRows, member)
+	}
+	sort.Slice(memberRows, func(i, j int) bool { return memberRows[i].ID < memberRows[j].ID })
+	if len(memberRows) > 0 {
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&memberRows).Error; err != nil {
 			return err
 		}
 	}

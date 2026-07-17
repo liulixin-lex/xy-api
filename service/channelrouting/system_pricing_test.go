@@ -39,7 +39,8 @@ func TestResolveSystemRoutingPricingZeroMultiplierIsKnownWithoutBaseline(t *test
 		ExpectedCompletionTokens: 500, MaximumCompletionTokens: 500,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 	}, now)
 	require.NoError(t, err)
 	assert.True(t, estimate.Known)
@@ -75,12 +76,12 @@ func TestResolveSystemRoutingPricingAppliesMultiplierWithoutUserGroupRatio(t *te
 	require.True(t, double.Known)
 	require.NotNil(t, half.Pricing.InputCostPerMillion)
 	require.NotNil(t, half.Pricing.CacheWriteCostPerMillion)
-	require.NotNil(t, half.Pricing.CacheWrite1hCostPerMillion)
+	assert.Nil(t, half.Pricing.CacheWrite1hCostPerMillion)
+	assert.Nil(t, half.Pricing.ImageOutputCostPerMillion)
 	assert.InDelta(t, 4, *half.Pricing.InputCostPerMillion, 1e-12)
 	assert.InDelta(t, 16, *half.Pricing.OutputCostPerMillion, 1e-12)
 	assert.InDelta(t, 1, *half.Pricing.CacheReadCostPerMillion, 1e-12)
 	assert.InDelta(t, 6, *half.Pricing.CacheWriteCostPerMillion, 1e-12)
-	assert.InDelta(t, 9.6, *half.Pricing.CacheWrite1hCostPerMillion, 1e-12)
 	assert.InDelta(t, 12, *half.Pricing.ImageInputCostPerMillion, 1e-12)
 	assert.InDelta(t, 20, *half.Pricing.AudioInputCostPerMillion, 1e-12)
 	assert.InDelta(t, 120, *half.Pricing.AudioOutputCostPerMillion, 1e-12)
@@ -91,7 +92,8 @@ func TestResolveSystemRoutingPricingAppliesMultiplierWithoutUserGroupRatio(t *te
 		CacheWriteTokens: 400, CacheWriteOneHourTokens: 500,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 	}
 	now := time.Now().Unix()
 	version := model.RoutingCostSnapshotVersion{
@@ -104,9 +106,9 @@ func TestResolveSystemRoutingPricingAppliesMultiplierWithoutUserGroupRatio(t *te
 	doubleEstimate, err := model.EstimateRoutingCostSnapshot(version, double.Pricing, profile, now)
 	require.NoError(t, err)
 	assert.InDelta(t, 0.0012, halfEstimate.ExpectedBreakdown.CacheWrite, 1e-12)
-	assert.InDelta(t, 0.0024, halfEstimate.ExpectedBreakdown.CacheWrite1h, 1e-12)
+	assert.Zero(t, halfEstimate.ExpectedBreakdown.CacheWrite1h)
 	assert.InDelta(t, 0.0048, doubleEstimate.ExpectedBreakdown.CacheWrite, 1e-12)
-	assert.InDelta(t, 0.0096, doubleEstimate.ExpectedBreakdown.CacheWrite1h, 1e-12)
+	assert.Zero(t, doubleEstimate.ExpectedBreakdown.CacheWrite1h)
 	assert.InDelta(t, halfEstimate.ExpectedCost*4, doubleEstimate.ExpectedCost, 1e-12)
 	assert.NotEqual(t, half.PricingHash, double.PricingHash)
 }
@@ -141,7 +143,9 @@ func TestResolveSystemRoutingPricingOnlyRequiresKnownCacheReadsWhenTheirPriceDif
 			ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
 			MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 			MaximumCompletionKnown: true, CacheReadTokensKnown: false,
-			CacheWriteTokensKnown: true, MediaDimensionsKnown: true, RequestInputKnown: true,
+			CacheWriteTokensKnown: true, CacheWriteOneHourTokensKnown: true,
+			ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+			AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 		}, now)
 		require.NoError(t, err)
 		return result
@@ -157,24 +161,41 @@ func TestResolveSystemRoutingPricingOnlyRequiresKnownCacheReadsWhenTheirPriceDif
 	assert.False(t, estimate(discountedCache.Pricing).ExpectedKnown)
 }
 
-func TestSystemRoutingPricingRefreshesCachedObservationImmediatelyWhenCatalogChanges(t *testing.T) {
+func TestSystemRoutingPricingIsPinnedToTheRequestSnapshot(t *testing.T) {
 	restoreSystemRoutingRatioSettings(t)
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"routing-pricing-refresh":0.25}`))
 
 	now := time.Now().Unix()
 	profile := model.RoutingCostRequestProfile{
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
-		MaximumCompletionKnown: true, CacheTokensKnown: true, MediaDimensionsKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
 		RequestInputKnown: true, RequestPricingFeaturesKnown: true,
 	}
+	resolved, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+		LogicalModel: "routing-pricing-refresh", EffectiveModel: "routing-pricing-refresh",
+		UpstreamCostMultiplier: 2, ChannelConfigurationRevision: 11,
+	})
+	require.NoError(t, err)
+	require.True(t, resolved.Known)
+	pricing := resolved.Pricing
 	first, cached, exists, err := estimateModelSnapshotRoutingCost(ModelSnapshot{
 		ModelName:                    "routing-pricing-refresh",
 		UpstreamModelName:            "routing-pricing-refresh",
 		ChannelConfigurationRevision: 11,
 		CostUpstreamMultiplier:       2,
+		CostPricing:                  &pricing,
+		CostPricingHash:              resolved.PricingHash,
+		CostPricingVersion:           resolved.PricingIdentity,
+		CostPricingIdentity:          resolved.PricingIdentity,
 		CostObservedTime:             now,
 		CostEffectiveTime:            now,
 		CostExpiresTime:              math.MaxInt64,
+		CostVersionConfidence:        model.RoutingCostConfidenceExact,
+		CostConfidenceScore:          1,
+		CostFreshness:                model.RoutingCostFreshnessFresh,
+		CostFreshnessScore:           1,
 		systemPricing:                true,
 	}, profile, now)
 	require.NoError(t, err)
@@ -184,25 +205,55 @@ func TestSystemRoutingPricingRefreshesCachedObservationImmediatelyWhenCatalogCha
 	firstIdentity := cached.CostPricingIdentity
 	require.NotEmpty(t, firstIdentity)
 
-	// Simulate a cached observation that is well beyond any selector freshness
-	// window. System pricing is configuration state, so the next resolution must
-	// re-read it instead of waiting for SnapshotStaleSec or the cached expiry.
-	cached.CostObservedTime = now - 86_400
-	cached.CostEffectiveTime = now - 86_400
-	cached.CostExpiresTime = now - 1
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"routing-pricing-refresh":0.75}`))
 
-	second, refreshed, exists, err := estimateModelSnapshotRoutingCost(cached, profile, now)
+	second, pinned, exists, err := estimateModelSnapshotRoutingCost(cached, profile, now)
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.True(t, second.ExpectedKnown)
-	assert.InDelta(t, 1.5, second.ExpectedCost, 1e-12)
-	assert.Equal(t, int64(11), refreshed.ChannelConfigurationRevision)
-	assert.Equal(t, 2.0, refreshed.CostUpstreamMultiplier)
-	assert.NotEqual(t, firstIdentity, refreshed.CostPricingIdentity)
-	assert.NotEqual(t, cached.CostPricingHash, refreshed.CostPricingHash)
-	assert.Equal(t, now, refreshed.CostObservedTime)
-	assert.Equal(t, int64(math.MaxInt64), refreshed.CostExpiresTime)
+	assert.InDelta(t, 0.5, second.ExpectedCost, 1e-12)
+	assert.Equal(t, firstIdentity, pinned.CostPricingIdentity)
+	assert.Equal(t, cached.CostPricingHash, pinned.CostPricingHash)
+
+	newSnapshotPricing, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+		LogicalModel: "routing-pricing-refresh", EffectiveModel: "routing-pricing-refresh",
+		UpstreamCostMultiplier: 2, ChannelConfigurationRevision: 11,
+	})
+	require.NoError(t, err)
+	assert.NotEqual(t, firstIdentity, newSnapshotPricing.PricingIdentity)
+	newEstimate, err := model.EstimateRoutingCostSnapshot(model.RoutingCostSnapshotVersion{
+		SourceType: SystemRoutingPricingSourceType, ObservedTime: now, EffectiveTime: now,
+		ExpiresTime: math.MaxInt64, Confidence: model.RoutingCostConfidenceExact,
+		ConfidenceScore: 1, Freshness: model.RoutingCostFreshnessFresh, FreshnessScore: 1,
+	}, newSnapshotPricing.Pricing, profile, now)
+	require.NoError(t, err)
+	assert.InDelta(t, 1.5, newEstimate.ExpectedCost, 1e-12)
+}
+
+func TestSystemRoutingPricingDoesNotTreatUncataloguedMediaSurchargesAsFree(t *testing.T) {
+	restoreSystemRoutingRatioSettings(t)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"routing-media-cost":0.25}`))
+	resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+		LogicalModel: "routing-media-cost", EffectiveModel: "routing-media-cost",
+		UpstreamCostMultiplier: 1, ChannelConfigurationRevision: 1,
+	})
+	require.NoError(t, err)
+	require.True(t, resolution.Known)
+	pricing := resolution.Pricing
+	now := time.Now().Unix()
+	estimate, _, exists, err := estimateModelSnapshotRoutingCost(ModelSnapshot{
+		ModelName: "routing-media-cost", CostPricing: &pricing, systemPricing: true,
+		CostConfidenceScore: 1, CostFreshnessScore: 1,
+	}, model.RoutingCostRequestProfile{
+		MaxAttempts: 1, KnowledgeSpecified: true, RequestPricingFeaturesKnown: true,
+		VideoSeconds: 8, VideoDurationKnown: true, UncataloguedSurchargePossible: true,
+	}, now)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.False(t, estimate.ExpectedKnown)
+	assert.Equal(t, model.RoutingCostUnknownMissingContext, estimate.UnknownReason)
+	assert.Equal(t, []string{"uncatalogued_surcharge"}, estimate.MissingContext)
+	assert.Zero(t, estimate.ExpectedCost)
 }
 
 func TestResolveSystemRoutingPricingSupportsFixedAndExpressionPricing(t *testing.T) {
@@ -244,12 +295,23 @@ func TestShadowExpectedCostIncludesSystemBaselineAndChannelMultiplier(t *testing
 	restoreSystemRoutingRatioSettings(t)
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"baseline-routing-cost":0.75}`))
 	now := time.Now().Unix()
+	resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
+		LogicalModel: "baseline-routing-cost", EffectiveModel: "baseline-routing-cost",
+		UpstreamCostMultiplier: 2, ChannelConfigurationRevision: 9,
+	})
+	require.NoError(t, err)
+	require.True(t, resolution.Known)
+	pricing := resolution.Pricing
 	cost, err := shadowExpectedCost(ModelSnapshot{
 		ModelName:                    "baseline-routing-cost",
 		UpstreamModelName:            "baseline-routing-cost",
 		ChannelConfigurationRevision: 9,
 		CostUpstreamMultiplier:       2,
 		CostBillingMode:              SystemRoutingPricingBasis,
+		CostPricing:                  &pricing,
+		CostPricingHash:              resolution.PricingHash,
+		CostPricingVersion:           resolution.PricingIdentity,
+		CostPricingIdentity:          resolution.PricingIdentity,
 		CostObservedTime:             now,
 		CostEffectiveTime:            now,
 		CostExpiresTime:              math.MaxInt64,
@@ -264,7 +326,9 @@ func TestShadowExpectedCostIncludesSystemBaselineAndChannelMultiplier(t *testing
 		costProfile: &model.RoutingCostRequestProfile{
 			MaxAttempts:        1,
 			KnowledgeSpecified: true, InputTokensKnown: true, MaximumCompletionKnown: true,
-			CacheTokensKnown: true, MediaDimensionsKnown: true, RequestInputKnown: true,
+			CacheTokensKnown: true, ImageInputTokensKnown: true, ImageOutputTokensKnown: true,
+			ImageUnitsKnown: true, AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
+			RequestInputKnown:           true,
 			RequestPricingFeaturesKnown: true,
 		},
 	})
@@ -297,7 +361,8 @@ func TestSystemRoutingCostEstimateFailsClosedWhenFiniteInputsOverflow(t *testing
 		PromptTokens: 1_000_000_000_000, MaximumPromptTokens: 1_000_000_000_000,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 	}, now)
 	assert.ErrorIs(t, err, model.ErrRoutingCostInvalid)
 }

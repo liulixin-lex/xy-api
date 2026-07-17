@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -226,4 +227,23 @@ func TestChannelRoutingRuntimeSettingsUsesStrongETagCASAndPersistentAudit(t *tes
 	assert.Equal(t, initial.Data.DocumentHash, audits[0].BeforeHash)
 	assert.NotEqual(t, audits[0].BeforeHash, audits[0].AfterHash)
 	assert.Equal(t, model.RoutingControlActionBootstrap, audits[1].Action)
+
+	listRecorder := httptest.NewRecorder()
+	listContext, _ := gin.CreateTestContext(listRecorder)
+	listContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/control-audits?limit=10", nil)
+	ListChannelRoutingControlAudits(listContext)
+	require.Equal(t, http.StatusOK, listRecorder.Code, listRecorder.Body.String())
+	assert.Contains(t, listRecorder.Body.String(), `"event_type":"runtime_settings.update"`)
+	assert.Contains(t, listRecorder.Body.String(), `"actor_name":`)
+	assert.NotContains(t, listRecorder.Body.String(), `"before_hash"`)
+	assert.NotContains(t, listRecorder.Body.String(), `"after_hash"`)
+
+	technicalRecorder := httptest.NewRecorder()
+	technicalContext, _ := gin.CreateTestContext(technicalRecorder)
+	technicalContext.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", audits[0].ID)}}
+	technicalContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/control-audits/1/technical", nil)
+	GetChannelRoutingControlAuditTechnical(technicalContext)
+	require.Equal(t, http.StatusOK, technicalRecorder.Code, technicalRecorder.Body.String())
+	assert.Contains(t, technicalRecorder.Body.String(), initial.Data.DocumentHash)
+	assert.Contains(t, technicalRecorder.Body.String(), audits[0].AfterHash)
 }

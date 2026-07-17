@@ -82,6 +82,124 @@ func TestRoutingCostHistoryBackfillsLegacyContentHashOnRead(t *testing.T) {
 	assert.Equal(t, loaded.ContentHash, stored.ContentHash)
 }
 
+func TestRoutingCostGenerationScopedHistoryFencesLateWritesAndSurvivesRetirement(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(
+		&Channel{}, &RoutingChannelLifecycle{}, &RoutingUpstreamAccount{}, &RoutingCostSnapshotVersion{},
+	))
+	channel := Channel{Name: "generation-cost", Key: "secret", Group: "default", CreatedTime: common.GetTimestamp()}
+	require.NoError(t, db.Create(&channel).Error)
+
+	now := common.GetTimestamp()
+	account := RoutingUpstreamAccount{
+		AccountKey: routingCostHash([]byte("generation-cost-account")),
+		SourceType: RoutingUpstreamTypeNewAPI, MaskedIdentity: "retired",
+		Status: RoutingUpstreamAccountStatusDisabled, LastSyncStatus: RoutingUpstreamSyncStatusUnknown,
+		CreatedTime: now, UpdatedTime: now,
+	}
+	require.NoError(t, db.Create(&account).Error)
+	inputRate := 2.0
+	pricing := RoutingNormalizedPricing{
+		BillingMode: "routing_contract_v2", Currency: "USD", Unit: "mixed",
+		InputCostPerMillion: &inputRate,
+	}
+	normalizedPricing, pricingJSON, err := normalizeRoutingNormalizedPricing(pricing)
+	require.NoError(t, err)
+	buildVersion := func(modelName string, observedTime int64) RoutingCostSnapshotVersion {
+		t.Helper()
+		manifest := routingCostSnapshotManifest{
+			SchemaVersion: routingCostSnapshotGenerationVersionSchema,
+			AccountID:     account.ID, ChannelID: channel.Id,
+			RoutingIdentity: channel.RoutingIdentity, RoutingGeneration: channel.RoutingGeneration,
+			LifecycleScope: RoutingCostLifecycleScopeGeneration,
+			UpstreamGroup:  "default", UpstreamModel: modelName, LocalModel: modelName,
+			ObservedTime: observedTime, EffectiveTime: observedTime, ExpiresTime: observedTime + 3_600,
+			PricingVersion: "generation-v2", Confidence: RoutingCostConfidenceExact, ConfidenceScore: 1,
+			Freshness: RoutingCostFreshnessFresh, FreshnessScore: 1,
+			SourceSyncStatus: RoutingUpstreamSyncStatusSuccess, Pricing: normalizedPricing,
+		}
+		pricingHash, hashErr := routingCostPricingHash(account, manifest, pricingJSON)
+		require.NoError(t, hashErr)
+		contentHash, hashErr := routingCostContentHash(account, manifest, pricingJSON)
+		require.NoError(t, hashErr)
+		return RoutingCostSnapshotVersion{
+			SchemaVersion: routingCostSnapshotGenerationVersionSchema,
+			PricingHash:   pricingHash, ContentHash: contentHash, ApplyToken: "generation-cost-fixture",
+			AccountID: account.ID, AccountKey: account.AccountKey, SourceType: account.SourceType,
+			ChannelID: channel.Id, RoutingIdentity: channel.RoutingIdentity,
+			RoutingGeneration: channel.RoutingGeneration, LifecycleScope: RoutingCostLifecycleScopeGeneration,
+			UpstreamGroup: manifest.UpstreamGroup, UpstreamGroupKey: routingCostHash([]byte(manifest.UpstreamGroup)),
+			UpstreamModel: modelName, UpstreamModelKey: RoutingCostModelKey(modelName),
+			LocalModel: modelName, LocalModelKey: RoutingCostModelKey(modelName),
+			ObservedTime: observedTime, EffectiveTime: observedTime, ExpiresTime: observedTime + 3_600,
+			PricingVersion: manifest.PricingVersion, PricingJSON: string(pricingJSON),
+			Confidence: manifest.Confidence, ConfidenceScore: manifest.ConfidenceScore,
+			Freshness: manifest.Freshness, FreshnessScore: manifest.FreshnessScore,
+			SourceSyncStatus: manifest.SourceSyncStatus, CreatedTime: observedTime,
+		}
+	}
+
+	current := buildVersion("generation-current", now)
+	created, err := CreateRoutingCostSnapshotVersionContext(context.Background(), &current)
+	require.NoError(t, err)
+	assert.True(t, created)
+	loaded, _, err := LoadRoutingCostSnapshotVersionContext(context.Background(), current.PricingHash)
+	require.NoError(t, err)
+	assert.Equal(t, channel.RoutingIdentity, loaded.RoutingIdentity)
+	assert.Equal(t, channel.RoutingGeneration, loaded.RoutingGeneration)
+
+	require.NoError(t, db.Model(&RoutingChannelLifecycle{}).
+		Where("routing_generation = ?", channel.RoutingGeneration).
+		Updates(map[string]any{
+			"status": RoutingChannelLifecycleStatusRetired, "retired_reason": RoutingChannelLifecycleReasonUpstreamChanged,
+			"retired_time": now + 1, "updated_time": now + 1,
+		}).Error)
+	require.NoError(t, db.Model(&Channel{}).Where("id = ?", channel.Id).
+		Update("routing_generation", common.GetUUID()).Error)
+
+	late := buildVersion("generation-late", now+1)
+	created, err = CreateRoutingCostSnapshotVersionContext(context.Background(), &late)
+	require.NoError(t, err)
+	assert.False(t, created)
+	var lateCount int64
+	require.NoError(t, db.Model(&RoutingCostSnapshotVersion{}).
+		Where("pricing_hash = ?", late.PricingHash).Count(&lateCount).Error)
+	assert.Zero(t, lateCount)
+
+	loaded, _, err = LoadRoutingCostSnapshotVersionContext(context.Background(), current.PricingHash)
+	require.NoError(t, err, "retiring a lifecycle must not erase its immutable cost history")
+	assert.Equal(t, RoutingCostLifecycleScopeGeneration, loaded.LifecycleScope)
+}
+
+func TestMigrateRoutingCostSnapshotGenerationSchemaMarksLegacyHistoryUnscoped(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, db.AutoMigrate(
+		&RoutingSchemaVersion{}, &RoutingUpstreamAccount{}, &RoutingCostSnapshotVersion{},
+	))
+	version, _ := createHistoricalRoutingCostVersionForTest(t, db, "legacy-unscoped", 1)
+	require.NoError(t, db.Session(&gorm.Session{SkipHooks: true}).
+		Model(&RoutingCostSnapshotVersion{}).Where("id = ?", version.ID).
+		UpdateColumn("lifecycle_scope", nil).Error)
+
+	require.NoError(t, MigrateRoutingCostSnapshotGenerationSchema(db))
+	require.NoError(t, MigrateRoutingCostSnapshotGenerationSchema(db))
+
+	var migrated RoutingCostSnapshotVersion
+	require.NoError(t, db.First(&migrated, version.ID).Error)
+	assert.Equal(t, RoutingCostLifecycleScopeLegacyUnscoped, migrated.LifecycleScope)
+	assert.Empty(t, migrated.RoutingIdentity)
+	assert.Empty(t, migrated.RoutingGeneration)
+	loaded, _, err := LoadRoutingCostSnapshotVersionContext(context.Background(), version.PricingHash)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingCostLifecycleScopeLegacyUnscoped, loaded.LifecycleScope)
+	var markerCount int64
+	require.NoError(t, db.Model(&RoutingSchemaVersion{}).
+		Where("component = ?", routingCostGenerationMigrationComponent).Count(&markerCount).Error)
+	assert.EqualValues(t, 1, markerCount)
+}
+
 func TestNormalizeRoutingActualCostProfileAllowsClaudeCacheOutsideInputTokens(t *testing.T) {
 	profile, err := normalizeRoutingActualCostProfile(
 		RoutingNormalizedPricing{BillingExpression: "p * 1 + c * 2 + cr * 0.1 + cc * 1.25"},
@@ -98,6 +216,14 @@ func TestNormalizeRoutingActualCostProfileAllowsClaudeCacheOutsideInputTokens(t 
 	assert.Equal(t, float64(450), profile.actualTokenParams.Len)
 	assert.Equal(t, float64(300), profile.actualTokenParams.CR)
 	assert.Equal(t, float64(50), profile.actualTokenParams.CC)
+	assert.True(t, profile.CacheReadTokensKnown)
+	assert.True(t, profile.CacheWriteTokensKnown)
+	assert.True(t, profile.CacheWriteOneHourTokensKnown)
+	assert.True(t, profile.ImageInputTokensKnown)
+	assert.True(t, profile.ImageOutputTokensKnown)
+	assert.False(t, profile.ImageUnitsKnown)
+	assert.True(t, profile.AudioInputTokensKnown)
+	assert.True(t, profile.AudioOutputTokensKnown)
 }
 
 func TestRoutingCostEstimateDefinesExpectedWorstAndEffectiveCost(t *testing.T) {
@@ -138,7 +264,9 @@ func TestRoutingCostEstimateFailsClosedWithoutProviderContractMetadata(t *testin
 		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true, RequestPricingFeaturesKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
+		RequestInputKnown: true, RequestPricingFeaturesKnown: true,
 		Request: billingexpr.RequestInput{Body: []byte(`{}`)},
 	}
 	newAPIContract, err := common.Marshal(map[string]any{
@@ -192,7 +320,8 @@ func TestRoutingCostEstimatePreservesFreeMultiplierAndUnknownDimensions(t *testi
 		ExpectedCompletionTokens: 100, MaximumCompletionTokens: 100,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
 		MaximumCompletionKnown: true, CacheTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 	}
 
 	free, err := EstimateRoutingCostSnapshot(version, RoutingNormalizedPricing{
@@ -210,8 +339,10 @@ func TestRoutingCostEstimatePreservesFreeMultiplierAndUnknownDimensions(t *testi
 		InputCostPerMillion: &inputRate, OutputCostPerMillion: &outputRate,
 	}, profile, observed)
 	require.NoError(t, err)
-	assert.True(t, unknown.ExpectedKnown)
+	assert.False(t, unknown.ExpectedKnown)
 	assert.False(t, unknown.WorstCaseKnown)
+	assert.Equal(t, RoutingCostUnknownMissingContext, unknown.UnknownReason)
+	assert.Contains(t, unknown.MissingContext, "input_tokens")
 	assert.InDelta(t, 0.6, unknown.ConfidenceScore, 1e-12)
 }
 

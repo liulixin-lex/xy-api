@@ -131,10 +131,6 @@ func TestRoutingPolicyDraftPublishPersistsOperationAtomically(t *testing.T) {
 	draft, err = ValidateRoutingPolicyDraftContext(context.Background(), draft.ID, draft.Version, draft.ETag, 2)
 	require.NoError(t, err)
 	activation := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 2, Reason: "publish"}
-	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 10)
-	require.NoError(t, err)
-	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 11)
-	require.NoError(t, err)
 
 	publishedDraft, published, operation, err := PublishRoutingPolicyDraftWithOperationContext(
 		context.Background(), draft.ID, draft.Version, draft.ETag,
@@ -183,20 +179,27 @@ func TestRoutingPolicyDraftPreservesUnknownExtensionsAcrossCreateReadUpdateAndPu
 
 	var document RoutingPolicyDocument
 	require.NoError(t, common.Unmarshal([]byte(`{
-		"schema_version":1,
+		"schema_version":2,
 		"pools":[{
 			"pool_id":11,
 			"group_name":"VIP",
 			"display_name":"VIP",
 			"deployment_stage":"shadow",
 			"policy_profile":"balanced",
+			"default_enabled":true,
+			"default_priority":0,
+			"default_weight":100,
 			"policy":{"future_policy":{"mode":"adaptive","revision":9007199254740993}},
 			"members":[{
 				"member_id":101,
 				"channel_id":1001,
+				"routing_generation":"000000000000000000000000000003e9",
 				"enabled":true,
 				"priority":1,
 				"weight":100,
+				"enabled_override":true,
+				"priority_override":1,
+				"weight_override":100,
 				"credential_ids":[201,202],
 				"overrides":{"future_override":{"enabled":true,"label":"blue","revision":9007199254740993}},
 				"member_extension":{"failure_domain":"zone-a","ordinal":9007199254740993}
@@ -213,7 +216,8 @@ func TestRoutingPolicyDraftPreservesUnknownExtensionsAcrossCreateReadUpdateAndPu
 	require.NoError(t, err)
 	assertRoutingPolicyExtensionFixture(t, created, 100)
 
-	created.Pools[0].Members[0].Weight = 250
+	weight := int64(250)
+	created.Pools[0].Members[0].WeightOverride = &weight
 	draft, err = UpdateRoutingPolicyDraftContext(
 		context.Background(), draft.ID, draft.Version, draft.ETag, created, 10,
 	)
@@ -330,9 +334,80 @@ func runRoutingPolicyDraftLifecycleContract(t *testing.T, db *gorm.DB, dbType co
 	drafts, hasMore, err := ListRoutingPolicyDraftsContext(context.Background(), 0, 10)
 	require.NoError(t, err)
 	assert.False(t, hasMore)
-	require.Len(t, drafts, 1)
-	assert.Equal(t, draft.ID, drafts[0].ID)
+	assert.Empty(t, drafts)
 	head, err := GetRoutingPolicyHeadContext(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, published.Revision.Revision, head.CurrentRevision)
+}
+
+func TestRoutingPolicyDraftWorkspaceDerivesStaleStateAndBatchDeleteIsAtomic(t *testing.T) {
+	db := openRoutingSQLiteTestDB(t)
+	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
+	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
+	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+	base, err := PublishRoutingPolicyRevisionContext(
+		context.Background(), 0, routingPolicyDocumentForTest(100),
+		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
+	)
+	require.NoError(t, err)
+	first, err := CreateRoutingPolicyDraftContext(
+		context.Background(), base.Revision.Revision, routingPolicyDocumentForTest(200), 2,
+	)
+	require.NoError(t, err)
+	second, err := CreateRoutingPolicyDraftContext(
+		context.Background(), base.Revision.Revision, routingPolicyDocumentForTest(300), 3,
+	)
+	require.NoError(t, err)
+	first, err = ValidateRoutingPolicyDraftContext(
+		context.Background(), first.ID, first.Version, first.ETag, 2,
+	)
+	require.NoError(t, err)
+
+	advanced, err := PublishRoutingPolicyRevisionContext(
+		context.Background(), base.Revision.Revision, routingPolicyDocumentForTest(400),
+		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 4, Reason: "advance"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, base.Revision.Revision+1, advanced.Revision.Revision)
+
+	drafts, hasMore, err := ListRoutingPolicyDraftsContext(context.Background(), 0, 10)
+	require.NoError(t, err)
+	assert.False(t, hasMore)
+	require.Len(t, drafts, 2)
+	for _, draft := range drafts {
+		assert.Equal(t, RoutingPolicyDraftWorkspaceStale, draft.WorkspaceState)
+		assert.True(t, draft.Stale)
+		assert.True(t, draft.CanDelete)
+		assert.False(t, draft.CanValidate)
+		assert.False(t, draft.CanPublish)
+		assert.Equal(t, "base_policy_changed", draft.BlockingReason)
+	}
+
+	_, err = ValidateRoutingPolicyDraftContext(
+		context.Background(), second.ID, second.Version, second.ETag, 3,
+	)
+	assert.ErrorIs(t, err, ErrRoutingPolicyRevisionConflict)
+	unchanged, err := GetRoutingPolicyDraftContext(context.Background(), second.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RoutingPolicyDraftStatusEditing, unchanged.Status)
+	assert.Equal(t, second.Version, unchanged.Version)
+
+	err = DeleteRoutingPolicyDraftsContext(context.Background(), []RoutingPolicyDraftDeleteSpec{
+		{ID: first.ID, ExpectedVersion: first.Version, ExpectedETag: first.ETag},
+		{ID: second.ID, ExpectedVersion: second.Version, ExpectedETag: strings.Repeat("f", 64)},
+	})
+	assert.ErrorIs(t, err, ErrRoutingPolicyDraftConflict)
+	_, err = GetRoutingPolicyDraftContext(context.Background(), first.ID)
+	require.NoError(t, err)
+	_, err = GetRoutingPolicyDraftContext(context.Background(), second.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, DeleteRoutingPolicyDraftsContext(context.Background(), []RoutingPolicyDraftDeleteSpec{
+		{ID: first.ID, ExpectedVersion: first.Version, ExpectedETag: first.ETag},
+		{ID: second.ID, ExpectedVersion: second.Version, ExpectedETag: second.ETag},
+	}))
+	_, err = GetRoutingPolicyDraftContext(context.Background(), first.ID)
+	assert.ErrorIs(t, err, ErrRoutingPolicyDraftNotFound)
+	_, err = GetRoutingPolicyDraftContext(context.Background(), second.ID)
+	assert.ErrorIs(t, err, ErrRoutingPolicyDraftNotFound)
 }

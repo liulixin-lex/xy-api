@@ -265,6 +265,7 @@ func TestMigrateRoutingDedicatedSchemasPreflightIsReadOnlyBeforeRetirement(t *te
 	const channelID = 801
 	require.NoError(t, db.Session(&gorm.Session{SkipHooks: true}).Create(&Channel{
 		Id: channelID, Name: "legacy-retirement", Key: "serving-key",
+		RoutingIdentity: common.GetUUID(), RoutingGeneration: common.GetUUID(),
 		Models: "gpt-test", Group: "default", Balance: 42,
 		BalanceUpdatedTime: 123, CreatedTime: 100,
 	}).Error)

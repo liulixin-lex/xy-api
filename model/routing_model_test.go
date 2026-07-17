@@ -445,7 +445,6 @@ var routingMigrationModels = []interface{}{
 	&RoutingBreakerState{},
 	&RoutingChannelHealthState{},
 	&RoutingCredentialHealthState{},
-	&RoutingAgentRecommendation{},
 }
 
 var routingExternalCleanupModels = append([]interface{}{
@@ -603,6 +602,7 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		UpdatedTime:         legacyBreakerUpdatedTime,
 	}
 	require.NoError(t, DB.Create(&legacyBreaker).Error)
+	require.NoError(t, prepareRoutingRuntimeGenerationSchema(DB))
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 	require.NoError(t, DB.AutoMigrate(routingMigrationModels...))
 	require.True(t, DB.Migrator().HasColumn(&RoutingCredentialRef{}, "channel_generation"))
@@ -694,22 +694,19 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, int64(1234), migratedLegacyBinding.SyncBackoffUntil)
 	assert.Zero(t, migratedLegacyBinding.SyncFailureCount)
 
-	var migratedLegacyMetric RoutingChannelMetric
-	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
-		91, RoutingMetricSingleKeyIndex, "legacy-gpt-test", "legacy", 6000).First(&migratedLegacyMetric).Error)
-	assert.Equal(t, int64(7), migratedLegacyMetric.RequestCount)
-	assert.Equal(t, int64(6), migratedLegacyMetric.SuccessCount)
-	assert.Zero(t, migratedLegacyMetric.ReliabilityRequestCount)
-	assert.Zero(t, migratedLegacyMetric.ReliabilityFailureCount)
-	assert.Zero(t, migratedLegacyMetric.Err529)
+	var legacyMetricCount int64
+	require.NoError(t, DB.Model(&RoutingChannelMetric{}).Where(
+		"channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
+		91, RoutingMetricSingleKeyIndex, "legacy-gpt-test", "legacy", 6000,
+	).Count(&legacyMetricCount).Error)
+	assert.Zero(t, legacyMetricCount, "unscoped legacy runtime metrics must cold-start")
 
-	var migratedLegacyBreaker RoutingBreakerState
-	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
-		1, RoutingMetricSingleKeyIndex, "gpt-test", "default").First(&migratedLegacyBreaker).Error)
-	assert.Zero(t, migratedLegacyBreaker.SemanticVersion)
-	assert.Equal(t, legacyBreakerUpdatedTime, migratedLegacyBreaker.UpdatedTime)
-	assert.Equal(t, int64(999), migratedLegacyBreaker.WindowRequests)
-	assert.Equal(t, int64(998), migratedLegacyBreaker.WindowFailures)
+	var legacyBreakerCount int64
+	require.NoError(t, DB.Model(&RoutingBreakerState{}).Where(
+		"channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",
+		1, RoutingMetricSingleKeyIndex, "gpt-test", "default",
+	).Count(&legacyBreakerCount).Error)
+	assert.Zero(t, legacyBreakerCount, "unscoped legacy breaker state must cold-start")
 
 	hydrationStates, err := GetRoutingBreakerStatesForHydration(5000)
 	require.NoError(t, err)
@@ -727,10 +724,11 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 		ReliabilityFailureCount: 1,
 		Err529:                  1,
 	}))
+	var migratedLegacyMetric RoutingChannelMetric
 	require.NoError(t, DB.Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ? AND bucket_ts = ?",
 		91, RoutingMetricSingleKeyIndex, "legacy-gpt-test", "legacy", 6000).First(&migratedLegacyMetric).Error)
-	assert.Equal(t, int64(8), migratedLegacyMetric.RequestCount)
-	assert.Equal(t, int64(7), migratedLegacyMetric.SuccessCount)
+	assert.Equal(t, int64(1), migratedLegacyMetric.RequestCount)
+	assert.Equal(t, int64(1), migratedLegacyMetric.SuccessCount)
 	assert.Equal(t, int64(2), migratedLegacyMetric.ReliabilityRequestCount)
 	assert.Equal(t, int64(1), migratedLegacyMetric.ReliabilityFailureCount)
 	assert.Equal(t, int64(1), migratedLegacyMetric.Err529)
@@ -853,7 +851,6 @@ func runRoutingMigrationAndUpsertContract(t *testing.T, db *gorm.DB, dbType comm
 	assert.Equal(t, int64(25), currentBreaker.WindowFailures)
 	assert.Zero(t, currentBreaker.LastProbeAt)
 	assert.Equal(t, int64(1000), currentBreaker.UpdatedTime)
-	assert.Equal(t, legacyBreaker.ID, currentBreaker.ID)
 
 	var breakerCount int64
 	require.NoError(t, DB.Model(&RoutingBreakerState{}).Where("channel_id = ? AND api_key_index = ? AND model_name = ? AND "+commonGroupCol+" = ?",

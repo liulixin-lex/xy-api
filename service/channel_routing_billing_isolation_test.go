@@ -76,7 +76,11 @@ func prepareRoutingBillingIsolationConfiguration(t *testing.T, channelID int, mu
 	})
 
 	require.NoError(t, model.EnsureRoutingConfigurationEpoch(model.DB))
-	configuration, err := model.NewDefaultRoutingChannelConfiguration(channelID, time.Now().Unix())
+	var channel model.Channel
+	require.NoError(t, model.DB.Select(
+		"id", "routing_identity", "routing_generation", "created_time",
+	).Where("id = ?", channelID).Take(&channel).Error)
+	configuration, err := model.NewDefaultRoutingChannelConfigurationForChannel(channel)
 	require.NoError(t, err)
 	configuration.UpstreamCostMultiplier = multiplier
 	configuration.CostSource = model.RoutingChannelCostSourceManual

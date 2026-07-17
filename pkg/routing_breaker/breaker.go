@@ -33,6 +33,7 @@ const (
 
 type Key struct {
 	ChannelID         int
+	ChannelGeneration string
 	APIKeyIndex       int
 	Model             string
 	Group             string
@@ -57,6 +58,7 @@ func (key Key) IsEndpointScoped() bool {
 func (key Key) HotcacheKey() routinghotcache.Key {
 	return routinghotcache.Key{
 		ChannelID:         key.ChannelID,
+		ChannelGeneration: key.ChannelGeneration,
 		APIKeyIndex:       key.APIKeyIndex,
 		Model:             key.Model,
 		Group:             key.Group,
@@ -1118,6 +1120,9 @@ func lessKey(a, b Key) bool {
 	if a.ChannelID != b.ChannelID {
 		return a.ChannelID < b.ChannelID
 	}
+	if a.ChannelGeneration != b.ChannelGeneration {
+		return a.ChannelGeneration < b.ChannelGeneration
+	}
 	if a.APIKeyIndex != b.APIKeyIndex {
 		return a.APIKeyIndex < b.APIKeyIndex
 	}
@@ -1147,6 +1152,7 @@ func unixOrZero(value time.Time) int64 {
 func publishSnapshot(snapshot Snapshot) {
 	routinghotcache.SetBreaker(routinghotcache.Key{
 		ChannelID:         snapshot.Key.ChannelID,
+		ChannelGeneration: snapshot.Key.ChannelGeneration,
 		APIKeyIndex:       snapshot.Key.APIKeyIndex,
 		Model:             snapshot.Key.Model,
 		Group:             snapshot.Key.Group,
@@ -1165,6 +1171,7 @@ func publishSnapshot(snapshot Snapshot) {
 func clearPublishedSnapshot(key Key) {
 	routinghotcache.ClearBreaker(routinghotcache.Key{
 		ChannelID:         key.ChannelID,
+		ChannelGeneration: key.ChannelGeneration,
 		APIKeyIndex:       key.APIKeyIndex,
 		Model:             key.Model,
 		Group:             key.Group,

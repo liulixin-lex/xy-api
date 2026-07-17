@@ -173,7 +173,13 @@ func ChannelRoutingHedgeActualCost(
 	actualProfile.InputTokensKnown = true
 	actualProfile.MaximumCompletionKnown = true
 	actualProfile.CacheTokensKnown = true
-	actualProfile.MediaDimensionsKnown = true
+	actualProfile.CacheReadTokensKnown = true
+	actualProfile.CacheWriteTokensKnown = true
+	actualProfile.CacheWriteOneHourTokensKnown = true
+	actualProfile.ImageInputTokensKnown = true
+	actualProfile.ImageOutputTokensKnown = true
+	actualProfile.AudioInputTokensKnown = true
+	actualProfile.AudioOutputTokensKnown = true
 	actualProfile.RequestInputKnown = true
 
 	group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)

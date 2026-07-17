@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -15,11 +17,16 @@ import (
 const (
 	routingSchemaComponent       = "channel-routing"
 	routingLegacySchemaComponent = "channel-routing-v2"
-	routingSchemaVersion         = "channel-routing-20260715.5"
+	RoutingSchemaCurrentVersion  = "channel-routing-20260716.2"
+	routingSchemaVersion         = RoutingSchemaCurrentVersion
 	routingSchemaPollInterval    = 100 * time.Millisecond
+	routingSchemaFleetLimit      = 512
 )
 
-var ErrRoutingSchemaNotReady = errors.New("channel routing schema is not ready")
+var (
+	ErrRoutingSchemaNotReady          = errors.New("channel routing schema is not ready")
+	ErrRoutingSchemaFleetIncompatible = errors.New("channel routing schema cutover blocked by incompatible active instances")
+)
 
 type RoutingSchemaVersion struct {
 	Component     string `json:"component" gorm:"type:varchar(64);primaryKey"`
@@ -31,10 +38,84 @@ func (RoutingSchemaVersion) TableName() string {
 	return "routing_schema_versions"
 }
 
+func preflightRoutingSchemaCutover(db *gorm.DB) error {
+	if db == nil || db.Dialector == nil {
+		return ErrRoutingSchemaNotReady
+	}
+	if db.Dialector.Name() == "sqlite" {
+		return nil
+	}
+	if !db.Migrator().HasTable(&SystemInstance{}) {
+		return nil
+	}
+	nowMs, err := routingDatabaseNowMs(db)
+	if err != nil {
+		return err
+	}
+	return validateRoutingSchemaFleetForCutover(db, nowMs/1000)
+}
+
+func validateRoutingSchemaFleetForCutover(db *gorm.DB, now int64) error {
+	if db == nil || db.Dialector == nil || now <= 0 {
+		return ErrRoutingSchemaNotReady
+	}
+	var instances []SystemInstance
+	if err := db.Select("node_name", "info", "last_seen_at").
+		Where("last_seen_at >= ?", now-SystemInstanceStaleAfterSeconds).
+		Order("node_name ASC").Limit(routingSchemaFleetLimit + 1).
+		Find(&instances).Error; err != nil {
+		return err
+	}
+	if len(instances) > routingSchemaFleetLimit {
+		return fmt.Errorf(
+			"%w: more than %d active instances were found; drain the fleet and retry",
+			ErrRoutingSchemaFleetIncompatible, routingSchemaFleetLimit,
+		)
+	}
+
+	incompatible := make([]string, 0)
+	for _, instance := range instances {
+		var info struct {
+			Runtime struct {
+				Version string `json:"version"`
+			} `json:"runtime"`
+			Capabilities struct {
+				ChannelRoutingSchema string `json:"channel_routing_schema"`
+			} `json:"capabilities"`
+		}
+		if err := common.UnmarshalJsonStr(instance.Info, &info); err == nil &&
+			info.Capabilities.ChannelRoutingSchema == RoutingSchemaCurrentVersion {
+			continue
+		}
+
+		appVersion := strings.TrimSpace(info.Runtime.Version)
+		if appVersion == "" {
+			appVersion = "unreported"
+		}
+		schemaVersion := strings.TrimSpace(info.Capabilities.ChannelRoutingSchema)
+		if schemaVersion == "" {
+			schemaVersion = "unreported"
+		}
+		incompatible = append(incompatible, fmt.Sprintf(
+			"%q (app=%q, routing_schema=%q)", instance.NodeName, appVersion, schemaVersion,
+		))
+	}
+	if len(incompatible) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: all active instances must report %q before migration; incompatible instances: %s. Stop or upgrade them, then wait at least %d seconds for stale heartbeats before retrying",
+		ErrRoutingSchemaFleetIncompatible, RoutingSchemaCurrentVersion,
+		strings.Join(incompatible, ", "), SystemInstanceStaleAfterSeconds,
+	)
+}
+
 func routingRequiredSchemaModels() []any {
 	return []any{
+		&Channel{},
 		&RoutingSchemaVersion{},
 		&RoutingTopologyMetadata{},
+		&RoutingChannelLifecycle{},
 		&RoutingPool{},
 		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
@@ -47,6 +128,8 @@ func routingRequiredSchemaModels() []any {
 		&RoutingPolicyMemberRevision{},
 		&RoutingPolicyActivation{},
 		&RoutingPolicyDraft{},
+		&RoutingPolicySimulationEvidence{},
+		&RoutingPolicyRiskAcceptance{},
 		&RoutingPolicyApproval{},
 		&RoutingPolicyRollbackApproval{},
 		&RoutingConfigOutbox{},
@@ -66,6 +149,7 @@ func routingRequiredSchemaModels() []any {
 		&RoutingHedgeAttemptAudit{},
 		&RoutingRuntimeSettingsState{},
 		&RoutingControlAudit{},
+		&RoutingPricingVersion{},
 		&RoutingCostSnapshotVersion{},
 		&RoutingConfigurationEpoch{},
 		&RoutingChannelConfiguration{},
@@ -75,7 +159,6 @@ func routingRequiredSchemaModels() []any {
 		&RoutingTelemetryReceipt{},
 		&RoutingBreakerState{},
 		&RoutingChannelHealthState{},
-		&RoutingAgentRecommendation{},
 		&RoutingErrorBudgetState{},
 		&RoutingErrorBudgetHistory{},
 		&RoutingErrorBudgetCursor{},
@@ -224,6 +307,24 @@ func routingPhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !operationIndexReady {
 		return operationIndexReady, err
 	}
+	memberGenerationIndexReady, err := routingCriticalIndexReady(
+		db,
+		(RoutingPoolMember{}).TableName(),
+		routingPoolMemberGenerationUniqueIndex,
+		[]string{"pool_id", "channel_generation"},
+	)
+	if err != nil || !memberGenerationIndexReady {
+		return memberGenerationIndexReady, err
+	}
+	credentialGenerationIndexReady, err := routingCriticalIndexReady(
+		db,
+		(RoutingCredentialRef{}).TableName(),
+		routingCredentialGenerationUniqueIndex,
+		[]string{"channel_generation", "fingerprint"},
+	)
+	if err != nil || !credentialGenerationIndexReady {
+		return credentialGenerationIndexReady, err
+	}
 	canaryIndexReady, err := routingCriticalIndexReady(
 		db,
 		(RoutingCanaryEvaluation{}).TableName(),
@@ -251,7 +352,7 @@ func routingPhysicalSchemaReady(db *gorm.DB) (bool, error) {
 	if err != nil || !rollbackApprovalIndexReady {
 		return rollbackApprovalIndexReady, err
 	}
-	return true, nil
+	return routingControlPlaneV2PreparedDataReady(db)
 }
 
 func routingModelSchemaReady(db *gorm.DB, value any) (bool, error) {
@@ -297,6 +398,8 @@ func routingCriticalIndexDefinition(
 	indexName string,
 ) ([]string, bool, bool, error) {
 	allowed := tableName == (RoutingOperation{}).TableName() && indexName == routingOperationRequestKeyUniqueIndex ||
+		tableName == (RoutingPoolMember{}).TableName() && indexName == routingPoolMemberGenerationUniqueIndex ||
+		tableName == (RoutingCredentialRef{}).TableName() && indexName == routingCredentialGenerationUniqueIndex ||
 		tableName == (RoutingCanaryEvaluation{}).TableName() && indexName == routingCanaryEvaluationWindowUniqueIndex ||
 		tableName == (RoutingPolicyApproval{}).TableName() && indexName == routingPolicyApprovalIntentActorUniqueIndex ||
 		tableName == (RoutingPolicyRollbackApproval{}).TableName() &&

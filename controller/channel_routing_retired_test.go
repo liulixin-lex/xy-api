@@ -29,3 +29,18 @@ func TestChannelRoutingCostConnectorRetiredDoesNotExposeLegacyData(t *testing.T)
 	assert.NotContains(t, recorder.Body.String(), "token")
 	assert.NotContains(t, recorder.Body.String(), "password")
 }
+
+func TestChannelRoutingPolicyApprovalRetiredReturnsStableGoneContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel-routing/policy-drafts/7/approvals", nil)
+
+	ChannelRoutingPolicyApprovalRetired(context)
+
+	require.Equal(t, http.StatusGone, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"code":"policy_approval_retired"`)
+	assert.Contains(t, recorder.Body.String(), `"replacement_path":"/api/channel-routing/policy-drafts"`)
+	assert.Contains(t, recorder.Body.String(), `"retryable":false`)
+	assert.NotContains(t, recorder.Body.String(), "two distinct")
+}

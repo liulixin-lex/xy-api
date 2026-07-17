@@ -37,39 +37,41 @@ type RoutingAuditExportRequest struct {
 // excludes request/replay payloads, candidate payloads, credential identifiers,
 // endpoint URLs, and upstream error text.
 type RoutingAuditExportItem struct {
-	AuditID               int                               `json:"audit_id"`
-	DecisionID            string                            `json:"decision_id"`
-	RequestID             string                            `json:"-"`
-	PoolID                int                               `json:"pool_id"`
-	GroupName             string                            `json:"group_name"`
-	ModelName             string                            `json:"model_name"`
-	SnapshotRevision      int64                             `json:"snapshot_revision"`
-	RuntimeGeneration     int64                             `json:"runtime_generation"`
-	ActivationID          int64                             `json:"activation_id"`
-	ActivationStage       string                            `json:"activation_stage"`
-	TrafficBasisPoints    int                               `json:"traffic_basis_points"`
-	Cohort                string                            `json:"cohort,omitempty"`
-	AlgorithmVersion      string                            `json:"algorithm_version"`
-	RetryIndex            int                               `json:"retry_index"`
-	IsStream              bool                              `json:"is_stream"`
-	ActualChannelID       int                               `json:"actual_channel_id"`
-	ObservedChannelID     int                               `json:"observed_channel_id"`
-	CandidateCount        int                               `json:"candidate_count"`
-	EligibleCount         int                               `json:"eligible_count"`
-	FilteredOpen          int                               `json:"filtered_open"`
-	FilteredCapacity      int                               `json:"filtered_capacity"`
-	BreakerBypassed       bool                              `json:"breaker_bypassed"`
-	ObservedMatchesActual bool                              `json:"observed_matches_actual"`
-	DifferenceType        string                            `json:"difference_type,omitempty"`
-	ActualCostKnown       bool                              `json:"actual_cost_known"`
-	ActualExpectedCost    float64                           `json:"actual_expected_cost,omitempty"`
-	ObservedCostKnown     bool                              `json:"observed_cost_known"`
-	ObservedExpectedCost  float64                           `json:"observed_expected_cost,omitempty"`
-	ExpectedCostDelta     float64                           `json:"expected_cost_delta,omitempty"`
-	Replayable            bool                              `json:"replayable"`
-	AttemptTimeline       *RoutingHedgeDecisionAuditSummary `json:"attempt_timeline,omitempty" gorm:"-"`
-	Hedge                 *RoutingHedgeDecisionAuditSummary `json:"hedge,omitempty" gorm:"-"`
-	CreatedTime           int64                             `json:"created_time"`
+	AuditID                   int                               `json:"audit_id"`
+	DecisionID                string                            `json:"decision_id"`
+	RequestID                 string                            `json:"-"`
+	PoolID                    int                               `json:"pool_id"`
+	GroupName                 string                            `json:"group_name"`
+	ModelName                 string                            `json:"model_name"`
+	SnapshotRevision          int64                             `json:"snapshot_revision"`
+	RuntimeGeneration         int64                             `json:"runtime_generation"`
+	ActivationID              int64                             `json:"activation_id"`
+	ActivationStage           string                            `json:"activation_stage"`
+	TrafficBasisPoints        int                               `json:"traffic_basis_points"`
+	Cohort                    string                            `json:"cohort,omitempty"`
+	AlgorithmVersion          string                            `json:"algorithm_version"`
+	RetryIndex                int                               `json:"retry_index"`
+	IsStream                  bool                              `json:"is_stream"`
+	ActualChannelID           int                               `json:"actual_channel_id"`
+	ActualChannelGeneration   string                            `json:"actual_channel_generation,omitempty"`
+	ObservedChannelID         int                               `json:"observed_channel_id"`
+	ObservedChannelGeneration string                            `json:"observed_channel_generation,omitempty"`
+	CandidateCount            int                               `json:"candidate_count"`
+	EligibleCount             int                               `json:"eligible_count"`
+	FilteredOpen              int                               `json:"filtered_open"`
+	FilteredCapacity          int                               `json:"filtered_capacity"`
+	BreakerBypassed           bool                              `json:"breaker_bypassed"`
+	ObservedMatchesActual     bool                              `json:"observed_matches_actual"`
+	DifferenceType            string                            `json:"difference_type,omitempty"`
+	ActualCostKnown           bool                              `json:"actual_cost_known"`
+	ActualExpectedCost        float64                           `json:"actual_expected_cost,omitempty"`
+	ObservedCostKnown         bool                              `json:"observed_cost_known"`
+	ObservedExpectedCost      float64                           `json:"observed_expected_cost,omitempty"`
+	ExpectedCostDelta         float64                           `json:"expected_cost_delta,omitempty"`
+	Replayable                bool                              `json:"replayable"`
+	AttemptTimeline           *RoutingHedgeDecisionAuditSummary `json:"attempt_timeline,omitempty" gorm:"-"`
+	Hedge                     *RoutingHedgeDecisionAuditSummary `json:"hedge,omitempty" gorm:"-"`
+	CreatedTime               int64                             `json:"created_time"`
 }
 
 type RoutingAuditExport struct {
@@ -166,7 +168,8 @@ func CreateRoutingAuditExportContext(
 			Select([]string{
 				"id AS audit_id", "decision_id", "request_id", "pool_id", "group_name", "model_name", "snapshot_revision",
 				"runtime_generation", "activation_id", "activation_stage", "traffic_basis_points", "cohort",
-				"algorithm_version", "retry_index", "is_stream", "actual_channel_id", "observed_channel_id",
+				"algorithm_version", "retry_index", "is_stream", "actual_channel_id", "actual_channel_generation",
+				"observed_channel_id", "observed_channel_generation",
 				"candidate_count", "eligible_count", "filtered_open", "filtered_capacity", "breaker_bypassed",
 				"observed_matches_actual", "difference_type", "actual_cost_known", "actual_expected_cost",
 				"observed_cost_known", "observed_expected_cost", "expected_cost_delta", "replayable", "created_time",

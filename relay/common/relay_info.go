@@ -67,6 +67,7 @@ type ChannelMeta struct {
 	ChannelIsMultiKey        bool
 	ChannelMultiKeyIndex     int
 	RoutingSnapshotRevision  uint64
+	RoutingGeneration        string
 	RoutingPoolID            int
 	RoutingMemberID          int
 	RoutingCredentialID      int
@@ -288,6 +289,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		ChannelIsMultiKey:        common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
 		ChannelMultiKeyIndex:     common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex),
 		RoutingSnapshotRevision:  routingSnapshotRevision,
+		RoutingGeneration:        common.GetContextKeyString(c, constant.ContextKeyRoutingGeneration),
 		RoutingPoolID:            common.GetContextKeyInt(c, constant.ContextKeyRoutingPoolID),
 		RoutingMemberID:          common.GetContextKeyInt(c, constant.ContextKeyRoutingMemberID),
 		RoutingCredentialID:      common.GetContextKeyInt(c, constant.ContextKeyRoutingCredentialID),

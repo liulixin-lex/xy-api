@@ -61,12 +61,13 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 		target.ModelName = "gpt-test"
 		return target
 	}
-	seedCredential := func(target ActiveProbeTarget) {
+	seedCredential := func(target *ActiveProbeTarget) {
 		key := "probe-key-" + strconv.Itoa(target.ChannelID)
 		channel := model.Channel{
 			Id: target.ChannelID, Key: key, Status: common.ChannelStatusEnabled,
 		}
 		require.NoError(t, db.Create(&channel).Error)
+		target.ChannelGeneration = channel.RoutingGeneration
 		fingerprint, err := model.RoutingCredentialFingerprint(target.ChannelID, channel.RoutingGeneration, key)
 		require.NoError(t, err)
 		require.NoError(t, db.Create(&model.RoutingCredentialRef{
@@ -80,7 +81,7 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 		t.Run("credential_"+strconv.Itoa(statusCode), func(t *testing.T) {
 			resetEffects()
 			target := targetForChannel(1_000 + statusCode)
-			seedCredential(target)
+			seedCredential(&target)
 			execution := ActiveProbeExecution{
 				StatusCode: statusCode,
 				Err:        errors.New("credential rejected"),
@@ -95,7 +96,9 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 				context.Background(), setting, target, execution, model.RoutingProbeOutcomeFailure, now,
 			))
 
-			marker, found := routinghotcache.GetAuthFailure(target.ChannelID)
+			marker, found := routinghotcache.GetAuthFailureForGeneration(
+				target.ChannelID, target.ChannelGeneration,
+			)
 			require.True(t, found)
 			assert.True(t, marker.Marked)
 			assert.Equal(t, now.Unix(), marker.UpdatedUnix)
@@ -127,8 +130,9 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 			))
 
 			cooldown, found := routinghotcache.GetCapacityCooldown(routingbreaker.Key{
-				ChannelID: target.ChannelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-				Model: target.ModelName, Group: target.GroupName,
+				ChannelID: target.ChannelID, ChannelGeneration: target.ChannelGeneration,
+				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+				Model:       target.ModelName, Group: target.GroupName,
 			}.HotcacheKey())
 			require.True(t, found)
 			assert.Equal(t, statusCode, cooldown.SourceStatusCode)
@@ -291,15 +295,19 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 	t.Run("success_clears_serving_markers_and_recovers_breaker", func(t *testing.T) {
 		resetEffects()
 		target := targetForChannel(5_000)
-		seedCredential(target)
+		seedCredential(&target)
 		target.AuthFailure = true
 		target.BreakerState = model.RoutingBreakerStateDegraded
 		key := routingbreaker.Key{
-			ChannelID: target.ChannelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model: target.ModelName, Group: target.GroupName,
+			ChannelID: target.ChannelID, ChannelGeneration: target.ChannelGeneration,
+			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model:       target.ModelName, Group: target.GroupName,
 		}
 		require.NoError(t, model.UpsertRoutingChannelAuthFailure(target.ChannelID, true, "old_failure", now.Add(time.Minute).Unix()))
-		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now.Unix() - 1})
+		routinghotcache.SetAuthFailureForGeneration(
+			target.ChannelID, target.ChannelGeneration,
+			routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now.Unix() - 1},
+		)
 		_, recorded := routinghotcache.RecordCapacityCooldown(
 			key.HotcacheKey(), http.StatusTooManyRequests, time.Minute, time.Second, time.Minute, now,
 		)
@@ -310,7 +318,7 @@ func TestActiveProbeOutcomeAppliesUnifiedRoutingEffects(t *testing.T) {
 			context.Background(), setting, target, ActiveProbeExecution{StatusCode: http.StatusOK}, model.RoutingProbeOutcomeSuccess, now,
 		))
 
-		_, authFound := routinghotcache.GetAuthFailure(target.ChannelID)
+		_, authFound := routinghotcache.GetAuthFailureForGeneration(target.ChannelID, target.ChannelGeneration)
 		assert.False(t, authFound)
 		_, capacityFound := routinghotcache.GetCapacityCooldown(key.HotcacheKey())
 		assert.False(t, capacityFound)

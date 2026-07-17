@@ -125,55 +125,58 @@ type channelRoutingDecisionGate struct {
 }
 
 type channelRoutingDecisionIdentity struct {
-	SnapshotRevision int64 `json:"snapshot_revision"`
-	PoolID           int   `json:"pool_id"`
-	MemberID         int   `json:"member_id"`
-	CredentialID     int   `json:"credential_id"`
-	ChannelID        int   `json:"channel_id"`
+	SnapshotRevision  int64  `json:"snapshot_revision"`
+	PoolID            int    `json:"pool_id"`
+	MemberID          int    `json:"member_id"`
+	CredentialID      int    `json:"credential_id"`
+	ChannelID         int    `json:"channel_id"`
+	ChannelGeneration string `json:"channel_generation,omitempty"`
 }
 
 type channelRoutingDecisionView struct {
-	ID                    int                                     `json:"id"`
-	DecisionID            string                                  `json:"decision_id"`
-	RequestID             string                                  `json:"request_id"`
-	PoolID                int                                     `json:"pool_id"`
-	GroupName             string                                  `json:"group_name"`
-	ModelName             string                                  `json:"model_name"`
-	SnapshotRevision      int64                                   `json:"snapshot_revision"`
-	RuntimeGeneration     int64                                   `json:"runtime_generation"`
-	PolicyHash            string                                  `json:"policy_hash,omitempty"`
-	SnapshotHash          string                                  `json:"snapshot_hash,omitempty"`
-	ProfileHash           string                                  `json:"profile_hash,omitempty"`
-	AlgorithmVersion      string                                  `json:"algorithm_version"`
-	Seed                  int64                                   `json:"seed"`
-	RetryIndex            int                                     `json:"retry_index"`
-	IsStream              bool                                    `json:"is_stream"`
-	ActualChannelID       int                                     `json:"actual_channel_id"`
-	ObservedChannelID     int                                     `json:"observed_channel_id"`
-	CandidateCount        int                                     `json:"candidate_count"`
-	EligibleCount         int                                     `json:"eligible_count"`
-	FilteredOpen          int                                     `json:"filtered_open"`
-	FilteredCapacity      int                                     `json:"filtered_capacity"`
-	BreakerBypassed       bool                                    `json:"breaker_bypassed"`
-	ObservedMatchesActual bool                                    `json:"observed_matches_actual"`
-	DifferenceType        string                                  `json:"difference_type,omitempty"`
-	ActualCostKnown       bool                                    `json:"actual_cost_known"`
-	ActualExpectedCost    float64                                 `json:"actual_expected_cost"`
-	ObservedCostKnown     bool                                    `json:"observed_cost_known"`
-	ObservedExpectedCost  float64                                 `json:"observed_expected_cost"`
-	ExpectedCostDelta     float64                                 `json:"expected_cost_delta"`
-	ActualCostEstimate    *channelrouting.ShadowCostInput         `json:"actual_cost_estimate,omitempty"`
-	ObservedCostEstimate  *channelrouting.ShadowCostInput         `json:"observed_cost_estimate,omitempty"`
-	Replayable            bool                                    `json:"replayable"`
-	Gate                  *channelRoutingDecisionGate             `json:"gate,omitempty"`
-	Cohort                string                                  `json:"cohort,omitempty"`
-	SelectedIdentity      *channelRoutingDecisionIdentity         `json:"selected_identity,omitempty"`
-	CapacityAdmission     *channelrouting.CapacityAdmission       `json:"capacity_admission,omitempty"`
-	ExclusionSummary      model.RoutingDecisionExclusionSummary   `json:"exclusion_summary"`
-	Candidates            channelRoutingDecisionCandidates        `json:"candidate_set"`
-	AttemptTimeline       *model.RoutingHedgeDecisionAuditSummary `json:"attempt_timeline,omitempty"`
-	Hedge                 *model.RoutingHedgeDecisionAuditSummary `json:"hedge,omitempty"`
-	CreatedTime           int64                                   `json:"created_time"`
+	ID                        int                                     `json:"id"`
+	DecisionID                string                                  `json:"decision_id"`
+	RequestID                 string                                  `json:"request_id"`
+	PoolID                    int                                     `json:"pool_id"`
+	GroupName                 string                                  `json:"group_name"`
+	ModelName                 string                                  `json:"model_name"`
+	SnapshotRevision          int64                                   `json:"snapshot_revision"`
+	RuntimeGeneration         int64                                   `json:"runtime_generation"`
+	PolicyHash                string                                  `json:"policy_hash,omitempty"`
+	SnapshotHash              string                                  `json:"snapshot_hash,omitempty"`
+	ProfileHash               string                                  `json:"profile_hash,omitempty"`
+	AlgorithmVersion          string                                  `json:"algorithm_version"`
+	Seed                      int64                                   `json:"seed"`
+	RetryIndex                int                                     `json:"retry_index"`
+	IsStream                  bool                                    `json:"is_stream"`
+	ActualChannelID           int                                     `json:"actual_channel_id"`
+	ActualChannelGeneration   string                                  `json:"actual_channel_generation,omitempty"`
+	ObservedChannelID         int                                     `json:"observed_channel_id"`
+	ObservedChannelGeneration string                                  `json:"observed_channel_generation,omitempty"`
+	CandidateCount            int                                     `json:"candidate_count"`
+	EligibleCount             int                                     `json:"eligible_count"`
+	FilteredOpen              int                                     `json:"filtered_open"`
+	FilteredCapacity          int                                     `json:"filtered_capacity"`
+	BreakerBypassed           bool                                    `json:"breaker_bypassed"`
+	ObservedMatchesActual     bool                                    `json:"observed_matches_actual"`
+	DifferenceType            string                                  `json:"difference_type,omitempty"`
+	ActualCostKnown           bool                                    `json:"actual_cost_known"`
+	ActualExpectedCost        float64                                 `json:"actual_expected_cost"`
+	ObservedCostKnown         bool                                    `json:"observed_cost_known"`
+	ObservedExpectedCost      float64                                 `json:"observed_expected_cost"`
+	ExpectedCostDelta         float64                                 `json:"expected_cost_delta"`
+	ActualCostEstimate        *channelrouting.ShadowCostInput         `json:"actual_cost_estimate,omitempty"`
+	ObservedCostEstimate      *channelrouting.ShadowCostInput         `json:"observed_cost_estimate,omitempty"`
+	Replayable                bool                                    `json:"replayable"`
+	Gate                      *channelRoutingDecisionGate             `json:"gate,omitempty"`
+	Cohort                    string                                  `json:"cohort,omitempty"`
+	SelectedIdentity          *channelRoutingDecisionIdentity         `json:"selected_identity,omitempty"`
+	CapacityAdmission         *channelrouting.CapacityAdmission       `json:"capacity_admission,omitempty"`
+	ExclusionSummary          model.RoutingDecisionExclusionSummary   `json:"exclusion_summary"`
+	Candidates                channelRoutingDecisionCandidates        `json:"candidate_set"`
+	AttemptTimeline           *model.RoutingHedgeDecisionAuditSummary `json:"attempt_timeline,omitempty"`
+	Hedge                     *model.RoutingHedgeDecisionAuditSummary `json:"hedge,omitempty"`
+	CreatedTime               int64                                   `json:"created_time"`
 }
 
 func GetChannelRoutingOverview(c *gin.Context) {
@@ -934,6 +937,7 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 		selectedIdentity = &channelRoutingDecisionIdentity{
 			SnapshotRevision: record.SnapshotRevision, PoolID: record.PoolID, MemberID: record.SelectedMemberID,
 			CredentialID: record.SelectedCredentialID, ChannelID: record.ObservedChannelID,
+			ChannelGeneration: record.SelectedChannelGeneration,
 		}
 	}
 	var capacityAdmission *channelrouting.CapacityAdmission
@@ -988,45 +992,47 @@ func buildChannelRoutingDecisionView(record model.RoutingDecisionAudit) channelR
 		}
 	}
 	return channelRoutingDecisionView{
-		ID:                    record.ID,
-		DecisionID:            record.DecisionID,
-		RequestID:             record.RequestID,
-		PoolID:                record.PoolID,
-		GroupName:             record.GroupName,
-		ModelName:             record.ModelName,
-		SnapshotRevision:      record.SnapshotRevision,
-		RuntimeGeneration:     record.RuntimeGeneration,
-		PolicyHash:            record.PolicyHash,
-		SnapshotHash:          record.SnapshotHash,
-		ProfileHash:           record.ProfileHash,
-		AlgorithmVersion:      record.AlgorithmVersion,
-		Seed:                  record.Seed,
-		RetryIndex:            record.RetryIndex,
-		IsStream:              record.IsStream,
-		ActualChannelID:       record.ActualChannelID,
-		ObservedChannelID:     record.ObservedChannelID,
-		CandidateCount:        record.CandidateCount,
-		EligibleCount:         record.EligibleCount,
-		FilteredOpen:          record.FilteredOpen,
-		FilteredCapacity:      record.FilteredCapacity,
-		BreakerBypassed:       record.BreakerBypassed,
-		ObservedMatchesActual: record.ObservedMatchesActual,
-		DifferenceType:        record.DifferenceType,
-		ActualCostKnown:       record.ActualCostKnown,
-		ActualExpectedCost:    record.ActualExpectedCost,
-		ObservedCostKnown:     record.ObservedCostKnown,
-		ObservedExpectedCost:  record.ObservedExpectedCost,
-		ExpectedCostDelta:     record.ExpectedCostDelta,
-		ActualCostEstimate:    actualCostEstimate,
-		ObservedCostEstimate:  observedCostEstimate,
-		Replayable:            record.Replayable,
-		Gate:                  gate,
-		Cohort:                record.Cohort,
-		SelectedIdentity:      selectedIdentity,
-		CapacityAdmission:     capacityAdmission,
-		ExclusionSummary:      exclusionSummary,
-		Candidates:            payload,
-		CreatedTime:           record.CreatedTime,
+		ID:                        record.ID,
+		DecisionID:                record.DecisionID,
+		RequestID:                 record.RequestID,
+		PoolID:                    record.PoolID,
+		GroupName:                 record.GroupName,
+		ModelName:                 record.ModelName,
+		SnapshotRevision:          record.SnapshotRevision,
+		RuntimeGeneration:         record.RuntimeGeneration,
+		PolicyHash:                record.PolicyHash,
+		SnapshotHash:              record.SnapshotHash,
+		ProfileHash:               record.ProfileHash,
+		AlgorithmVersion:          record.AlgorithmVersion,
+		Seed:                      record.Seed,
+		RetryIndex:                record.RetryIndex,
+		IsStream:                  record.IsStream,
+		ActualChannelID:           record.ActualChannelID,
+		ActualChannelGeneration:   record.ActualChannelGeneration,
+		ObservedChannelID:         record.ObservedChannelID,
+		ObservedChannelGeneration: record.ObservedChannelGeneration,
+		CandidateCount:            record.CandidateCount,
+		EligibleCount:             record.EligibleCount,
+		FilteredOpen:              record.FilteredOpen,
+		FilteredCapacity:          record.FilteredCapacity,
+		BreakerBypassed:           record.BreakerBypassed,
+		ObservedMatchesActual:     record.ObservedMatchesActual,
+		DifferenceType:            record.DifferenceType,
+		ActualCostKnown:           record.ActualCostKnown,
+		ActualExpectedCost:        record.ActualExpectedCost,
+		ObservedCostKnown:         record.ObservedCostKnown,
+		ObservedExpectedCost:      record.ObservedExpectedCost,
+		ExpectedCostDelta:         record.ExpectedCostDelta,
+		ActualCostEstimate:        actualCostEstimate,
+		ObservedCostEstimate:      observedCostEstimate,
+		Replayable:                record.Replayable,
+		Gate:                      gate,
+		Cohort:                    record.Cohort,
+		SelectedIdentity:          selectedIdentity,
+		CapacityAdmission:         capacityAdmission,
+		ExclusionSummary:          exclusionSummary,
+		Candidates:                payload,
+		CreatedTime:               record.CreatedTime,
 	}
 }
 

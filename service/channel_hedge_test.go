@@ -24,7 +24,9 @@ func TestChannelRoutingHedgeCostEstimateFailsClosedWithoutInputAndCompletionBoun
 
 	common.SetContextKey(ctx, constant.ContextKeyRoutingCostProfile, &model.RoutingCostRequestProfile{
 		KnowledgeSpecified: true, MaximumCompletionKnown: true,
-		CacheTokensKnown: true, MediaDimensionsKnown: true, RequestInputKnown: true,
+		CacheTokensKnown: true, ImageInputTokensKnown: true, ImageOutputTokensKnown: true,
+		ImageUnitsKnown: true, AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
+		RequestInputKnown: true,
 	})
 	_, known, err = ChannelRoutingHedgeCostEstimate(ctx, 1, "gpt-test", "/v1/chat/completions", 0)
 	require.NoError(t, err)

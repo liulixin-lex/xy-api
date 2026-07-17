@@ -302,7 +302,9 @@ func TestDeleteExpiredRoutingHistoryCleansRollupsAndAudits(t *testing.T) {
 		OperationType: model.RoutingOperationTypeCostSync, IdempotencyHash: fmt.Sprintf("%064x", 10),
 		CreateToken: fmt.Sprintf("%032x", 11), EvaluationHash: fmt.Sprintf("%064x", 12),
 		SubjectType: model.RoutingOperationSubjectRoutingCosts, Reason: "old operation",
-		Status: model.RoutingOperationStatusFailed, Attempts: 1, LastError: "old failure",
+		Status: model.RoutingOperationStatusFailed, Source: model.RoutingOperationSourceSystem,
+		RetentionCategory: model.RoutingOperationRetentionExtended, NeedsAttention: true,
+		Attempts: 1, LastError: "old failure",
 		CreatedTimeMs: 1, UpdatedTimeMs: 1, CompletedTimeMs: 1,
 	}).Error)
 	resetOutbox := model.RoutingBreakerResetOutbox{

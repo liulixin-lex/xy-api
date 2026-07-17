@@ -98,19 +98,9 @@ func TestRoutingPolicyRollbackRejectsLiveReferenceDriftAtomically(t *testing.T) 
 				RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 2, Reason: "change"},
 			)
 			require.NoError(t, err)
-			head, err := GetRoutingPolicyHeadContext(context.Background())
-			require.NoError(t, err)
 			activation := RoutingPolicyActivationSpec{
 				Stage: RoutingDeploymentStageActive, ActorID: 20, Reason: "restore active policy",
 			}
-			_, _, err = CreateRoutingPolicyRollbackApprovalContext(
-				context.Background(), head, first.Revision.Revision, activation, 10,
-			)
-			require.NoError(t, err)
-			_, _, err = CreateRoutingPolicyRollbackApprovalContext(
-				context.Background(), head, first.Revision.Revision, activation, 11,
-			)
-			require.NoError(t, err)
 			require.NoError(t, test.mutate(db))
 
 			_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(

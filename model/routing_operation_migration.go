@@ -18,15 +18,25 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 	if !db.Migrator().HasTable(&RoutingOperation{}) {
 		return nil
 	}
+	if err := migrateRoutingOperationV2Metadata(db); err != nil {
+		return err
+	}
 	operationTypes := []string{
 		RoutingOperationTypeCanaryAutoRollback,
+		RoutingOperationTypePolicySimulation,
+		RoutingOperationTypeHistoricalSimulation,
+		RoutingOperationTypePolicyPublish,
+		RoutingOperationTypePolicyRollback,
 		RoutingOperationTypeCostSync,
 		RoutingOperationTypeActiveProbe,
+		RoutingOperationTypeAuditExport,
 		RoutingOperationTypeBreakerReset,
 	}
 	terminalStatuses := []RoutingOperationStatus{
 		RoutingOperationStatusSucceeded,
+		RoutingOperationStatusPartial,
 		RoutingOperationStatusFailed,
+		RoutingOperationStatusCancelled,
 		RoutingOperationStatusSuperseded,
 	}
 	lastID := int64(0)
@@ -38,9 +48,9 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 				Where("id > ?", lastID).
 				Where(
 					"(operation_type IN ? AND (updated_time_ms < created_time_ms OR (completed_time_ms > 0 AND completed_time_ms < created_time_ms))) OR "+
-						"(operation_type = ? AND status IN ? AND attempts = 0)",
+						"(operation_type IN ? AND status IN ? AND attempts = 0)",
 					operationTypes,
-					RoutingOperationTypeCanaryAutoRollback,
+					operationTypes,
 					terminalStatuses,
 				).
 				Order("id asc").
@@ -56,9 +66,9 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 				switch repaired.Status {
 				case RoutingOperationStatusPending:
 					repaired.UpdatedTimeMs = transitionTimeMs
-					if repaired.Attempts > 0 {
-						repaired.NextRetryMs = max(repaired.NextRetryMs, transitionTimeMs)
-					}
+				case RoutingOperationStatusRetryWait:
+					repaired.UpdatedTimeMs = transitionTimeMs
+					repaired.NextRetryMs = max(repaired.NextRetryMs, transitionTimeMs)
 				case RoutingOperationStatusRunning:
 					repaired.UpdatedTimeMs = transitionTimeMs
 					if repaired.ClaimUntilMs <= transitionTimeMs {
@@ -68,12 +78,14 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 						repaired.ClaimUntilMs = transitionTimeMs + 1
 					}
 				case RoutingOperationStatusSucceeded,
+					RoutingOperationStatusPartial,
 					RoutingOperationStatusFailed,
+					RoutingOperationStatusCancelled,
 					RoutingOperationStatusSuperseded:
 					transitionTimeMs = max(transitionTimeMs, repaired.CompletedTimeMs)
 					repaired.UpdatedTimeMs = transitionTimeMs
 					repaired.CompletedTimeMs = transitionTimeMs
-					if repaired.OperationType == RoutingOperationTypeCanaryAutoRollback && repaired.Attempts == 0 {
+					if repaired.Attempts == 0 {
 						repaired.Attempts = 1
 					}
 				default:
@@ -197,6 +209,69 @@ func migrateRoutingOperationStateInvariants(db *gorm.DB) error {
 	return nil
 }
 
+func migrateRoutingOperationV2Metadata(db *gorm.DB) error {
+	if db == nil || db.Dialector == nil || !db.Migrator().HasTable(&RoutingOperation{}) {
+		return nil
+	}
+	if !db.Migrator().HasColumn(&RoutingOperation{}, "schema_version") {
+		return ErrRoutingSchemaNotReady
+	}
+	lastID := int64(0)
+	for {
+		processed := 0
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var operations []RoutingOperation
+			if err := lockForUpdate(tx).
+				Where("id > ? AND schema_version < ?", lastID, routingOperationRecordSchemaVersion).
+				Order("id asc").Limit(routingOperationInvariantMigrationBatch).
+				Find(&operations).Error; err != nil {
+				return err
+			}
+			for index := range operations {
+				operation := operations[index]
+				lastID = operation.ID
+				normalizeRoutingOperationStorage(&operation)
+				if operation.Status == RoutingOperationStatusRetryWait {
+					operation.NextRetryMs = max(operation.NextRetryMs, operation.UpdatedTimeMs)
+				}
+				updates := map[string]any{
+					"schema_version":        operation.SchemaVersion,
+					"source":                operation.Source,
+					"correlation_id":        operation.CorrelationID,
+					"parent_operation_id":   operation.ParentOperationID,
+					"retry_of_operation_id": operation.RetryOfOperationID,
+					"retry_sequence":        operation.RetrySequence,
+					"retryable":             operation.Retryable,
+					"cancellable":           operation.Cancellable,
+					"summary":               operation.Summary,
+					"needs_attention":       operation.NeedsAttention,
+					"retention_category":    operation.RetentionCategory,
+					"terminal_actor_id":     operation.TerminalActorID,
+					"status":                operation.Status,
+					"next_retry_ms":         operation.NextRetryMs,
+				}
+				updated := tx.Model(&RoutingOperation{}).
+					Where("id = ? AND schema_version < ?", operation.ID, routingOperationRecordSchemaVersion).
+					Updates(updates)
+				if updated.Error != nil {
+					return updated.Error
+				}
+				if updated.RowsAffected != 1 {
+					return ErrRoutingOperationCorrupt
+				}
+			}
+			processed = len(operations)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if processed < routingOperationInvariantMigrationBatch {
+			return nil
+		}
+	}
+}
+
 func retireRoutingCostSyncWork(db *gorm.DB) error {
 	if db == nil || db.Dialector == nil {
 		return ErrRoutingSchemaNotReady
@@ -217,6 +292,7 @@ func retireRoutingCostSyncWork(db *gorm.DB) error {
 					Where("operation_type = ? AND status IN ?", RoutingOperationTypeCostSync, []RoutingOperationStatus{
 						RoutingOperationStatusPending,
 						RoutingOperationStatusRunning,
+						RoutingOperationStatusRetryWait,
 					}).
 					Order("id asc").
 					Limit(routingOperationInvariantMigrationBatch).
@@ -237,6 +313,7 @@ func retireRoutingCostSyncWork(db *gorm.DB) error {
 						Where("id = ? AND status IN ?", operation.ID, []RoutingOperationStatus{
 							RoutingOperationStatusPending,
 							RoutingOperationStatusRunning,
+							RoutingOperationStatusRetryWait,
 						}).
 						Updates(updates)
 					if updated.Error != nil {

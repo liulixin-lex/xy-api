@@ -40,6 +40,8 @@ type SystemRoutingPricingInput struct {
 type SystemRoutingPricingResolution struct {
 	Known                    bool
 	UnknownReason            string
+	Contract                 model.RoutingPricingContractV2
+	UpstreamCostMultiplier   float64
 	Pricing                  model.RoutingNormalizedPricing
 	PricingHash              string
 	PricingIdentity          string
@@ -66,34 +68,26 @@ func ResolveSystemRoutingPricing(input SystemRoutingPricingInput) (SystemRouting
 	}
 
 	multiplier := input.UpstreamCostMultiplier
-	pricing := model.RoutingNormalizedPricing{
-		BillingMode: SystemRoutingPricingBasis,
-		Currency:    "USD",
-		Unit:        "mixed",
-		GroupRatio:  &multiplier,
-	}
 	manifest := struct {
-		Basis                    string   `json:"basis"`
-		LogicalModel             string   `json:"logical_model"`
-		EffectiveModel           string   `json:"effective_model"`
-		ModelMappingIdentity     string   `json:"model_mapping_identity,omitempty"`
-		ChannelConfigRevision    int64    `json:"channel_config_revision"`
-		UpstreamCostMultiplier   float64  `json:"upstream_cost_multiplier"`
-		QuotaPerUnit             float64  `json:"quota_per_unit"`
-		BillingMode              string   `json:"billing_mode"`
-		BillingExpression        string   `json:"billing_expression,omitempty"`
-		BillingExpressionVersion int      `json:"billing_expression_version"`
-		ModelPrice               *float64 `json:"model_price,omitempty"`
-		ModelRatio               *float64 `json:"model_ratio,omitempty"`
-		CompletionRatio          *float64 `json:"completion_ratio,omitempty"`
-		CacheReadRatio           *float64 `json:"cache_read_ratio,omitempty"`
-		CacheWriteRatio          *float64 `json:"cache_write_ratio,omitempty"`
-		CacheWriteOneHourRatio   *float64 `json:"cache_write_1h_ratio,omitempty"`
-		ImageInputRatio          *float64 `json:"image_input_ratio,omitempty"`
-		AudioInputPrice          *float64 `json:"audio_input_price,omitempty"`
-		AudioInputRatio          *float64 `json:"audio_input_ratio,omitempty"`
-		AudioOutputRatio         *float64 `json:"audio_output_ratio,omitempty"`
+		SchemaVersion          int                            `json:"schema_version"`
+		Basis                  string                         `json:"basis"`
+		LogicalModel           string                         `json:"logical_model"`
+		EffectiveModel         string                         `json:"effective_model"`
+		ModelMappingIdentity   string                         `json:"model_mapping_identity,omitempty"`
+		ChannelConfigRevision  int64                          `json:"channel_config_revision"`
+		UpstreamCostMultiplier float64                        `json:"upstream_cost_multiplier"`
+		QuotaPerUnit           float64                        `json:"quota_per_unit"`
+		Contract               model.RoutingPricingContractV2 `json:"contract"`
+		ModelRatio             *float64                       `json:"model_ratio,omitempty"`
+		CompletionRatio        *float64                       `json:"completion_ratio,omitempty"`
+		CacheReadRatio         *float64                       `json:"cache_read_ratio,omitempty"`
+		CacheWriteRatio        *float64                       `json:"cache_write_ratio,omitempty"`
+		ImageInputRatio        *float64                       `json:"image_input_ratio,omitempty"`
+		AudioInputPrice        *float64                       `json:"audio_input_price,omitempty"`
+		AudioInputRatio        *float64                       `json:"audio_input_ratio,omitempty"`
+		AudioCompletionRatio   *float64                       `json:"audio_completion_ratio,omitempty"`
 	}{
+		SchemaVersion:          model.RoutingPricingContractSchemaVersion,
 		Basis:                  SystemRoutingPricingBasis,
 		LogicalModel:           input.LogicalModel,
 		EffectiveModel:         input.EffectiveModel,
@@ -103,9 +97,18 @@ func ResolveSystemRoutingPricing(input SystemRoutingPricingInput) (SystemRouting
 		QuotaPerUnit:           common.QuotaPerUnit,
 	}
 
-	resolution := SystemRoutingPricingResolution{Pricing: pricing}
+	resolution := SystemRoutingPricingResolution{UpstreamCostMultiplier: multiplier}
 	if multiplier == 0 {
-		manifest.BillingMode = "zero_multiplier"
+		contract, contractErr := model.NormalizeRoutingPricingContractV2(model.RoutingPricingContractV2{
+			SchemaVersion: model.RoutingPricingContractSchemaVersion,
+			Mode:          model.RoutingPricingContractModeFree, Currency: "USD",
+		})
+		if contractErr != nil {
+			return SystemRoutingPricingResolution{}, ErrSystemRoutingPricingInput
+		}
+		resolution.Contract = contract
+		resolution.Pricing = contract.ToRoutingNormalizedPricing(SystemRoutingPricingBasis, multiplier)
+		manifest.Contract = contract
 		return finalizeSystemRoutingPricing(resolution, manifest, input.ChannelConfigurationRevision)
 	}
 	if !finiteSystemRoutingPrice(common.QuotaPerUnit) || common.QuotaPerUnit <= 0 {
@@ -123,12 +126,19 @@ func ResolveSystemRoutingPricing(input SystemRoutingPricingInput) (SystemRouting
 			resolution.UnknownReason = SystemRoutingPricingUnknownExpressionInvalid
 			return resolution, nil
 		}
-		resolution.Pricing.BillingExpression = expression
-		resolution.Pricing.Unit = "expression"
 		resolution.BillingExpressionVersion = billingexpr.ExprVersion(expression)
-		manifest.BillingMode = billing_setting.BillingModeTieredExpr
-		manifest.BillingExpression = expression
-		manifest.BillingExpressionVersion = resolution.BillingExpressionVersion
+		contract, contractErr := model.NormalizeRoutingPricingContractV2(model.RoutingPricingContractV2{
+			SchemaVersion: model.RoutingPricingContractSchemaVersion,
+			Mode:          model.RoutingPricingContractModeExpression, Currency: "USD",
+			BillingExpression: expression, BillingExpressionVersion: resolution.BillingExpressionVersion,
+		})
+		if contractErr != nil {
+			resolution.UnknownReason = SystemRoutingPricingUnknownExpressionInvalid
+			return resolution, nil
+		}
+		resolution.Contract = contract
+		resolution.Pricing = contract.ToRoutingNormalizedPricing(SystemRoutingPricingBasis, multiplier)
+		manifest.Contract = contract
 		return finalizeSystemRoutingPricing(resolution, manifest, input.ChannelConfigurationRevision)
 	}
 
@@ -136,31 +146,37 @@ func ResolveSystemRoutingPricing(input SystemRoutingPricingInput) (SystemRouting
 		if !finiteSystemRoutingPrice(modelPrice) || modelPrice < 0 {
 			return SystemRoutingPricingResolution{}, ErrSystemRoutingPricingInput
 		}
-		resolution.Pricing.Unit = "request"
-		resolution.Pricing.ModelPrice = systemRoutingFloatPointer(modelPrice)
-		resolution.Pricing.PerRequestCost = systemRoutingFloatPointer(modelPrice)
-		manifest.BillingMode = "per_request"
-		manifest.ModelPrice = systemRoutingFloatPointer(modelPrice)
+		contract, contractErr := model.NormalizeRoutingPricingContractV2(model.RoutingPricingContractV2{
+			SchemaVersion: model.RoutingPricingContractSchemaVersion,
+			Mode:          model.RoutingPricingContractModePerRequest, Currency: "USD",
+			PerRequestCost: systemRoutingFloatPointer(modelPrice),
+		})
+		if contractErr != nil {
+			return SystemRoutingPricingResolution{}, ErrSystemRoutingPricingInput
+		}
+		resolution.Contract = contract
+		resolution.Pricing = contract.ToRoutingNormalizedPricing(SystemRoutingPricingBasis, multiplier)
+		manifest.Contract = contract
 		return finalizeSystemRoutingPricing(resolution, manifest, input.ChannelConfigurationRevision)
 	}
 
-	modelRatio, exists, _ := ratio_setting.GetModelRatio(input.EffectiveModel)
+	modelRatio, exists := explicitSystemRoutingModelRatio(input.EffectiveModel)
 	if !exists {
 		resolution.UnknownReason = SystemRoutingPricingUnknownBaseline
 		return resolution, nil
 	}
-	completionRatio := ratio_setting.GetCompletionRatio(input.EffectiveModel)
+	completionRatio, completionConfigured := explicitSystemRoutingCompletionRatio(input.EffectiveModel)
 	cacheReadRatio, cacheReadConfigured := ratio_setting.GetCacheRatio(input.EffectiveModel)
-	cacheWriteRatio, _ := ratio_setting.GetCreateCacheRatio(input.EffectiveModel)
-	cacheWriteOneHourRatio := cacheWriteRatio * (6.0 / 3.75)
-	imageInputRatio, _ := ratio_setting.GetImageRatio(input.EffectiveModel)
+	cacheWriteRatio, cacheWriteConfigured := ratio_setting.GetCreateCacheRatio(input.EffectiveModel)
+	imageInputRatio, imageInputConfigured := ratio_setting.GetImageRatio(input.EffectiveModel)
 	audioInputRatio := ratio_setting.GetAudioRatio(input.EffectiveModel)
-	audioOutputRatio := audioInputRatio * ratio_setting.GetAudioCompletionRatio(input.EffectiveModel)
+	audioInputConfigured := ratio_setting.ContainsAudioRatio(input.EffectiveModel)
+	audioCompletionRatio := ratio_setting.GetAudioCompletionRatio(input.EffectiveModel)
+	audioCompletionConfigured := ratio_setting.ContainsAudioCompletionRatio(input.EffectiveModel)
 	audioInputPrice := operation_setting.GetGeminiInputAudioPricePerMillionTokens(input.EffectiveModel)
 	values := []float64{
 		modelRatio, completionRatio, cacheReadRatio, cacheWriteRatio,
-		cacheWriteOneHourRatio, imageInputRatio, audioInputRatio,
-		audioOutputRatio, audioInputPrice,
+		imageInputRatio, audioInputRatio, audioCompletionRatio, audioInputPrice,
 	}
 	for _, value := range values {
 		if !finiteSystemRoutingPrice(value) || value < 0 {
@@ -169,51 +185,106 @@ func ResolveSystemRoutingPricing(input SystemRoutingPricingInput) (SystemRouting
 	}
 
 	inputRate := modelRatio * 1_000_000 / common.QuotaPerUnit
-	outputRate := inputRate * completionRatio
-	cacheReadRate := inputRate * cacheReadRatio
-	cacheWriteRate := inputRate * cacheWriteRatio
-	cacheWriteOneHourRate := inputRate * cacheWriteOneHourRatio
-	imageInputRate := inputRate * imageInputRatio
-	audioInputRate := inputRate * audioInputRatio
+	contract := model.RoutingPricingContractV2{
+		SchemaVersion: model.RoutingPricingContractSchemaVersion,
+		Mode:          model.RoutingPricingContractModeDimensions, Currency: "USD",
+		InputCostPerMillion: systemRoutingFloatPointer(inputRate),
+	}
+	if completionConfigured {
+		contract.OutputCostPerMillion = systemRoutingFloatPointer(inputRate * completionRatio)
+	}
+	if cacheReadConfigured {
+		contract.CacheReadCostPerMillion = systemRoutingFloatPointer(inputRate * cacheReadRatio)
+	}
+	if cacheWriteConfigured {
+		contract.CacheWriteCostPerMillion = systemRoutingFloatPointer(inputRate * cacheWriteRatio)
+	}
+	if imageInputConfigured {
+		contract.ImageInputCostPerMillion = systemRoutingFloatPointer(inputRate * imageInputRatio)
+	}
+	audioInputRate := 0.0
+	if audioInputConfigured {
+		audioInputRate = inputRate * audioInputRatio
+	}
 	if audioInputPrice > 0 {
 		audioInputRate = audioInputPrice
+		audioInputConfigured = true
 	}
-	audioOutputRate := inputRate * audioOutputRatio
-	for _, value := range []float64{
-		inputRate, outputRate, cacheReadRate, cacheWriteRate,
-		cacheWriteOneHourRate, imageInputRate, audioInputRate, audioOutputRate,
+	if audioInputConfigured {
+		contract.AudioInputCostPerMillion = systemRoutingFloatPointer(audioInputRate)
+	}
+	if audioInputConfigured && audioCompletionConfigured {
+		contract.AudioOutputCostPerMillion = systemRoutingFloatPointer(audioInputRate * audioCompletionRatio)
+	}
+	for _, value := range []*float64{
+		contract.InputCostPerMillion, contract.OutputCostPerMillion,
+		contract.CacheReadCostPerMillion, contract.CacheWriteCostPerMillion,
+		contract.ImageInputCostPerMillion, contract.AudioInputCostPerMillion,
+		contract.AudioOutputCostPerMillion,
 	} {
-		if !finiteSystemRoutingPrice(value) || value < 0 {
+		if value == nil {
+			continue
+		}
+		if !finiteSystemRoutingPrice(*value) || *value < 0 {
 			return SystemRoutingPricingResolution{}, ErrSystemRoutingPricingInput
 		}
 	}
-
-	resolution.Pricing.BaseRatio = systemRoutingFloatPointer(modelRatio)
-	resolution.Pricing.CompletionRatio = systemRoutingFloatPointer(completionRatio)
-	resolution.Pricing.InputCostPerMillion = systemRoutingFloatPointer(inputRate)
-	resolution.Pricing.OutputCostPerMillion = systemRoutingFloatPointer(outputRate)
-	if cacheReadConfigured {
-		resolution.Pricing.CacheReadCostPerMillion = systemRoutingFloatPointer(cacheReadRate)
+	contract, contractErr := model.NormalizeRoutingPricingContractV2(contract)
+	if contractErr != nil {
+		return SystemRoutingPricingResolution{}, ErrSystemRoutingPricingInput
 	}
-	resolution.Pricing.CacheWriteCostPerMillion = systemRoutingFloatPointer(cacheWriteRate)
-	resolution.Pricing.CacheWrite1hCostPerMillion = systemRoutingFloatPointer(cacheWriteOneHourRate)
-	resolution.Pricing.ImageInputCostPerMillion = systemRoutingFloatPointer(imageInputRate)
-	resolution.Pricing.ImageOutputCostPerMillion = systemRoutingFloatPointer(outputRate)
-	resolution.Pricing.AudioInputCostPerMillion = systemRoutingFloatPointer(audioInputRate)
-	resolution.Pricing.AudioOutputCostPerMillion = systemRoutingFloatPointer(audioOutputRate)
-	manifest.BillingMode = "ratio"
+	resolution.Contract = contract
+	resolution.Pricing = contract.ToRoutingNormalizedPricing(SystemRoutingPricingBasis, multiplier)
+	resolution.Pricing.BaseRatio = systemRoutingFloatPointer(modelRatio)
+	if completionConfigured {
+		resolution.Pricing.CompletionRatio = systemRoutingFloatPointer(completionRatio)
+	}
+	manifest.Contract = contract
 	manifest.ModelRatio = systemRoutingFloatPointer(modelRatio)
-	manifest.CompletionRatio = systemRoutingFloatPointer(completionRatio)
+	if completionConfigured {
+		manifest.CompletionRatio = systemRoutingFloatPointer(completionRatio)
+	}
 	if cacheReadConfigured {
 		manifest.CacheReadRatio = systemRoutingFloatPointer(cacheReadRatio)
 	}
-	manifest.CacheWriteRatio = systemRoutingFloatPointer(cacheWriteRatio)
-	manifest.CacheWriteOneHourRatio = systemRoutingFloatPointer(cacheWriteOneHourRatio)
-	manifest.ImageInputRatio = systemRoutingFloatPointer(imageInputRatio)
-	manifest.AudioInputPrice = systemRoutingFloatPointer(audioInputPrice)
-	manifest.AudioInputRatio = systemRoutingFloatPointer(audioInputRatio)
-	manifest.AudioOutputRatio = systemRoutingFloatPointer(audioOutputRatio)
+	if cacheWriteConfigured {
+		manifest.CacheWriteRatio = systemRoutingFloatPointer(cacheWriteRatio)
+	}
+	if imageInputConfigured {
+		manifest.ImageInputRatio = systemRoutingFloatPointer(imageInputRatio)
+	}
+	if audioInputPrice > 0 {
+		manifest.AudioInputPrice = systemRoutingFloatPointer(audioInputPrice)
+	}
+	if ratio_setting.ContainsAudioRatio(input.EffectiveModel) {
+		manifest.AudioInputRatio = systemRoutingFloatPointer(audioInputRatio)
+	}
+	if audioCompletionConfigured {
+		manifest.AudioCompletionRatio = systemRoutingFloatPointer(audioCompletionRatio)
+	}
 	return finalizeSystemRoutingPricing(resolution, manifest, input.ChannelConfigurationRevision)
+}
+
+func explicitSystemRoutingModelRatio(name string) (float64, bool) {
+	name = ratio_setting.FormatMatchingModelName(name)
+	ratios := ratio_setting.GetModelRatioCopy()
+	if ratio, exists := ratios[name]; exists {
+		return ratio, true
+	}
+	if strings.HasSuffix(name, ratio_setting.CompactModelSuffix) {
+		ratio, exists := ratios[ratio_setting.CompactWildcardModelKey]
+		return ratio, exists
+	}
+	return 0, false
+}
+
+func explicitSystemRoutingCompletionRatio(name string) (float64, bool) {
+	name = ratio_setting.FormatMatchingModelName(name)
+	if ratio, exists := ratio_setting.GetCompletionRatioCopy()[name]; exists {
+		return ratio, true
+	}
+	info := ratio_setting.GetCompletionRatioInfo(name)
+	return info.Ratio, info.Locked
 }
 
 func finalizeSystemRoutingPricing[T any](
@@ -233,6 +304,8 @@ func finalizeSystemRoutingPricing[T any](
 		"pricing_identity":           resolution.PricingIdentity,
 		"billing_expression_version": resolution.BillingExpressionVersion,
 		"catalog_scope":              SystemRoutingPricingSourceType,
+		"contract_schema_version":    resolution.Contract.SchemaVersion,
+		"contract_mode":              resolution.Contract.Mode,
 	})
 	if err != nil {
 		return SystemRoutingPricingResolution{}, err

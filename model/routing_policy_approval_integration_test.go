@@ -12,12 +12,12 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestRoutingPolicyApprovalIntentBehaviorSQLite(t *testing.T) {
+func TestRoutingPolicyRetiredApprovalsDoNotGateSQLite(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
-	runRoutingPolicyApprovalIntentBehaviorContract(t, db, common.DatabaseTypeSQLite)
+	runRoutingPolicyRetiredApprovalContract(t, db, common.DatabaseTypeSQLite)
 }
 
-func TestRoutingPolicyApprovalIntentBehaviorExternalDatabaseCompatibility(t *testing.T) {
+func TestRoutingPolicyRetiredApprovalsDoNotGateExternalDatabaseCompatibility(t *testing.T) {
 	tests := []struct {
 		name   string
 		envKey string
@@ -33,20 +33,17 @@ func TestRoutingPolicyApprovalIntentBehaviorExternalDatabaseCompatibility(t *tes
 				t.Skipf("%s is not set", test.envKey)
 			}
 			db := openRoutingExternalTestDB(t, test.dbType, dsn)
-			runRoutingPolicyApprovalIntentBehaviorContract(t, db, test.dbType)
+			runRoutingPolicyRetiredApprovalContract(t, db, test.dbType)
 		})
 	}
 }
 
-func runRoutingPolicyApprovalIntentBehaviorContract(
-	t *testing.T,
-	db *gorm.DB,
-	dbType common.DatabaseType,
-) {
+func runRoutingPolicyRetiredApprovalContract(t *testing.T, db *gorm.DB, dbType common.DatabaseType) {
 	t.Helper()
 	withRoutingTestDB(t, db, dbType)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
 	require.NoError(t, EnsureRoutingPolicyHeadContext(context.Background()))
+
 	base, err := PublishRoutingPolicyRevisionContext(
 		context.Background(), 0, routingPolicyDocumentForTest(100),
 		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
@@ -60,128 +57,55 @@ func runRoutingPolicyApprovalIntentBehaviorContract(
 		context.Background(), draft.ID, draft.Version, draft.ETag, 2,
 	)
 	require.NoError(t, err)
-	publishIntent := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 20, Reason: "deploy"}
-	firstApproval, created, err := CreateRoutingPolicyApprovalContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent, 10,
+	activation := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 20, Reason: "deploy"}
+	_, _, err = CreateRoutingPolicyApprovalContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag, activation, 10,
 	)
 	require.NoError(t, err)
-	require.True(t, created)
-	retry, created, err := CreateRoutingPolicyApprovalContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent, 10,
+	_, _, err = CreateRoutingPolicyApprovalContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag, activation, 11,
 	)
 	require.NoError(t, err)
-	assert.False(t, created)
-	assert.Equal(t, firstApproval.ID, retry.ID)
-	differentPublishIntent := publishIntent
-	differentPublishIntent.Reason = "deploy corrected"
-	_, created, err = CreateRoutingPolicyApprovalContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, differentPublishIntent, 10,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	_, created, err = CreateRoutingPolicyApprovalContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent, 11,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	quorum, err := RequireRoutingPolicyApprovalQuorumContext(
-		context.Background(), draft, publishIntent, RoutingPolicyRequiredApprovals,
-	)
-	require.NoError(t, err)
-	assert.Len(t, quorum, 2)
 	require.NoError(t, db.Model(&routingPolicyApprovalUserForTest{}).
-		Where("id = ?", 11).Update("status", common.UserStatusDisabled).Error)
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "a disabled approver must no longer count")
-	require.NoError(t, db.Model(&routingPolicyApprovalUserForTest{}).
-		Where("id = ?", 11).Update("status", common.UserStatusEnabled).Error)
+		Where("id = ?", 10).Update("status", common.UserStatusDisabled).Error)
 	require.NoError(t, db.Model(&routingPolicyApprovalUserForTest{}).
 		Where("id = ?", 11).Update("role", common.RoleCommonUser).Error)
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "a downgraded approver must no longer count")
-	require.NoError(t, db.Model(&routingPolicyApprovalUserForTest{}).
-		Where("id = ?", 11).Update("role", common.RoleAdminUser).Error)
-	require.NoError(t, db.Where(
-		"ptype = ? AND v0 = ? AND v1 = ? AND v2 = ?",
-		"p", "user:11", "channel_routing", "deploy",
-	).Delete(&CasbinRule{}).Error)
-	require.NoError(t, db.Create(&CasbinRule{
-		Ptype: "p", V0: "role:admin", V1: "channel_routing", V2: "deploy", V3: "allow",
-	}).Error)
-	quorum, err = RequireRoutingPolicyApprovalQuorumContext(
-		context.Background(), draft, publishIntent, RoutingPolicyRequiredApprovals,
-	)
-	require.NoError(t, err)
-	assert.Len(t, quorum, 2, "the current admin role baseline must count when no user override exists")
-	require.NoError(t, db.Create(&CasbinRule{
-		Ptype: "p", V0: "user:11", V1: "channel_routing", V2: "deploy", V3: "deny",
-	}).Error)
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "a user deny must override an allowed admin baseline")
 	require.NoError(t, db.Where(
 		"ptype = ? AND v0 IN ? AND v1 = ? AND v2 = ?",
-		"p", []string{"user:11", "role:admin"}, "channel_routing", "deploy",
+		"p", []string{"user:10", "user:11"}, "channel_routing", "deploy",
 	).Delete(&CasbinRule{}).Error)
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "a revoked deploy grant must invalidate historical approval")
-	require.NoError(t, db.Create(&CasbinRule{
-		Ptype: "p", V0: "user:11", V1: "channel_routing", V2: "deploy", V3: "allow",
-	}).Error)
+
 	_, published, err := PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, publishIntent,
+		context.Background(), draft.ID, draft.Version, draft.ETag, activation,
 	)
-	require.NoError(t, err)
+	require.NoError(t, err, "disabled or downgraded historical approvers must not gate deployment")
+	assert.Equal(t, RoutingDeploymentStageActive, published.Activation.Stage)
 
 	head, err := GetRoutingPolicyHeadContext(context.Background())
 	require.NoError(t, err)
-	rollbackIntent := RoutingPolicyActivationSpec{
-		Stage: RoutingDeploymentStageActive, ActorID: 30, Reason: "rollback",
-	}
-	firstRollbackApproval, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, base.Revision.Revision, rollbackIntent, 12,
+	rollback := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 30, Reason: "rollback"}
+	_, _, err = CreateRoutingPolicyRollbackApprovalContext(
+		context.Background(), head, base.Revision.Revision, rollback, 12,
 	)
 	require.NoError(t, err)
-	require.True(t, created)
-	retryRollback, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, base.Revision.Revision, rollbackIntent, 12,
+	_, _, err = CreateRoutingPolicyRollbackApprovalContext(
+		context.Background(), head, base.Revision.Revision, rollback, 13,
 	)
 	require.NoError(t, err)
-	assert.False(t, created)
-	assert.Equal(t, firstRollbackApproval.ID, retryRollback.ID)
-	differentRollbackIntent := rollbackIntent
-	differentRollbackIntent.Reason = "rollback corrected"
-	_, created, err = CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, base.Revision.Revision, differentRollbackIntent, 12,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	_, created, err = CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, base.Revision.Revision, rollbackIntent, 13,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	require.NoError(t, db.Where(
-		"ptype = ? AND v0 = ? AND v1 = ? AND v2 = ?",
-		"p", "user:13", "channel_routing", "deploy",
-	).Delete(&CasbinRule{}).Error)
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), published.Revision.Revision, base.Revision.Revision, rollbackIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "rollback must revalidate current deploy grants")
-	require.NoError(t, db.Create(&CasbinRule{
-		Ptype: "p", V0: "user:13", V1: "channel_routing", V2: "deploy", V3: "allow",
-	}).Error)
+	require.NoError(t, db.Unscoped().Where("id = ?", 12).Delete(&routingPolicyApprovalUserForTest{}).Error)
+	require.NoError(t, db.Model(&routingPolicyApprovalUserForTest{}).
+		Where("id = ?", 13).Update("role", common.RoleCommonUser).Error)
+
 	rolledBack, _, err := RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), published.Revision.Revision, base.Revision.Revision, rollbackIntent,
+		context.Background(), published.Revision.Revision, base.Revision.Revision, rollback,
 	)
-	require.NoError(t, err)
+	require.NoError(t, err, "missing or downgraded historical approvers must not gate rollback")
 	assert.Equal(t, published.Revision.Revision+1, rolledBack.Revision.Revision)
+
+	var approvalCount int64
+	require.NoError(t, db.Model(&RoutingPolicyApproval{}).Count(&approvalCount).Error)
+	assert.Equal(t, int64(2), approvalCount)
+	var rollbackApprovalCount int64
+	require.NoError(t, db.Model(&RoutingPolicyRollbackApproval{}).Count(&rollbackApprovalCount).Error)
+	assert.Equal(t, int64(2), rollbackApprovalCount)
 }

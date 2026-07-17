@@ -37,17 +37,19 @@ const (
 // is part of the key so samples cannot cross an activation boundary inside the
 // same time bucket.
 type StableKey struct {
-	PoolMemberID     int
-	CredentialID     int
-	Model            string
-	BucketTs         int64
-	SnapshotRevision uint64
+	PoolMemberID      int
+	CredentialID      int
+	ChannelGeneration string
+	Model             string
+	BucketTs          int64
+	SnapshotRevision  uint64
 }
 
 type StableInflightKey struct {
-	PoolMemberID int
-	CredentialID int
-	Model        string
+	PoolMemberID      int
+	CredentialID      int
+	ChannelGeneration string
+	Model             string
 }
 
 // StableSnapshot contains only mergeable counters, totals, and bounded
@@ -58,6 +60,7 @@ type StableSnapshot struct {
 	PoolMemberID               int    `json:"pool_member_id"`
 	CredentialID               int    `json:"credential_id"`
 	ChannelID                  int    `json:"channel_id"`
+	ChannelGeneration          string `json:"channel_generation,omitempty"`
 	Model                      string `json:"model"`
 	BucketTs                   int64  `json:"bucket_ts"`
 	LastSnapshotRevision       uint64 `json:"last_snapshot_revision"`
@@ -103,12 +106,13 @@ type StableStats struct {
 }
 
 type stableMetadata struct {
-	poolID       int
-	channelID    int
-	revision     uint64
-	poolMemberID int
-	credentialID int
-	model        string
+	poolID            int
+	channelID         int
+	channelGeneration string
+	revision          uint64
+	poolMemberID      int
+	credentialID      int
+	model             string
 }
 
 type stableBucket struct {
@@ -268,19 +272,21 @@ func RequeueStableSnapshots(snapshots []StableSnapshot) {
 			continue
 		}
 		key := StableKey{
-			PoolMemberID:     snapshot.PoolMemberID,
-			CredentialID:     snapshot.CredentialID,
-			Model:            snapshot.Model,
-			BucketTs:         snapshot.BucketTs,
-			SnapshotRevision: snapshot.LastSnapshotRevision,
+			PoolMemberID:      snapshot.PoolMemberID,
+			CredentialID:      snapshot.CredentialID,
+			ChannelGeneration: snapshot.ChannelGeneration,
+			Model:             snapshot.Model,
+			BucketTs:          snapshot.BucketTs,
+			SnapshotRevision:  snapshot.LastSnapshotRevision,
 		}
 		metadata := stableMetadata{
-			poolID:       snapshot.PoolID,
-			channelID:    snapshot.ChannelID,
-			revision:     snapshot.LastSnapshotRevision,
-			poolMemberID: snapshot.PoolMemberID,
-			credentialID: snapshot.CredentialID,
-			model:        snapshot.Model,
+			poolID:            snapshot.PoolID,
+			channelID:         snapshot.ChannelID,
+			channelGeneration: snapshot.ChannelGeneration,
+			revision:          snapshot.LastSnapshotRevision,
+			poolMemberID:      snapshot.PoolMemberID,
+			credentialID:      snapshot.CredentialID,
+			model:             snapshot.Model,
 		}
 		withWritableStableBucket(store, key, metadata, func(bucket *stableBucket) {
 			distributionDrops, counterSaturations := bucket.addSnapshotLocked(snapshot)
@@ -336,9 +342,10 @@ func beginStableInflight(c *gin.Context, info *relaycommon.RelayInfo, channelID 
 		return nil
 	}
 	key := StableInflightKey{
-		PoolMemberID: metadata.poolMemberID,
-		CredentialID: metadata.credentialID,
-		Model:        metadata.model,
+		PoolMemberID:      metadata.poolMemberID,
+		CredentialID:      metadata.credentialID,
+		ChannelGeneration: metadata.channelGeneration,
+		Model:             metadata.model,
 	}
 	store := loadOrCreateStableStore()
 	counter, acquired := store.acquireInflightCounter(key, metadata.channelID)
@@ -370,11 +377,12 @@ func recordStableClassifiedAttempt(
 		return
 	}
 	key := StableKey{
-		PoolMemberID:     metadata.poolMemberID,
-		CredentialID:     metadata.credentialID,
-		Model:            metadata.model,
-		BucketTs:         bucketStart(now.Unix()),
-		SnapshotRevision: metadata.revision,
+		PoolMemberID:      metadata.poolMemberID,
+		CredentialID:      metadata.credentialID,
+		ChannelGeneration: metadata.channelGeneration,
+		Model:             metadata.model,
+		BucketTs:          bucketStart(now.Unix()),
+		SnapshotRevision:  metadata.revision,
 	}
 	store := loadOrCreateStableStore()
 	withWritableStableBucket(store, key, metadata, func(bucket *stableBucket) {
@@ -399,6 +407,12 @@ func stableIdentity(c *gin.Context, info *relaycommon.RelayInfo, channelID int) 
 	}
 	if metadata.channelID <= 0 && info.ChannelMeta != nil {
 		metadata.channelID = info.ChannelMeta.ChannelId
+	}
+	if c != nil {
+		metadata.channelGeneration = common.GetContextKeyString(c, constant.ContextKeyRoutingGeneration)
+	}
+	if metadata.channelGeneration == "" && info.ChannelMeta != nil {
+		metadata.channelGeneration = info.ChannelMeta.RoutingGeneration
 	}
 
 	if value, ok := stableContextInt(c, constant.ContextKeyRoutingPoolID); ok {
@@ -949,6 +963,7 @@ func (bucket *stableBucket) snapshotLocked(key StableKey) StableSnapshot {
 		PoolMemberID:               key.PoolMemberID,
 		CredentialID:               key.CredentialID,
 		ChannelID:                  bucket.channelID,
+		ChannelGeneration:          key.ChannelGeneration,
 		Model:                      key.Model,
 		BucketTs:                   key.BucketTs,
 		LastSnapshotRevision:       key.SnapshotRevision,

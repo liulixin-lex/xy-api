@@ -47,6 +47,7 @@ const (
 	ContextKeyRoutingAlgorithmVersion    ContextKey = "routing_algorithm_version"
 	ContextKeyRoutingObserveDecision     ContextKey = "routing_observe_decision"
 	ContextKeyRoutingSnapshotRevision    ContextKey = "routing_snapshot_revision"
+	ContextKeyRoutingGeneration          ContextKey = "routing_generation"
 	ContextKeyRoutingPoolID              ContextKey = "routing_pool_id"
 	ContextKeyRoutingMemberID            ContextKey = "routing_member_id"
 	ContextKeyRoutingCredentialID        ContextKey = "routing_credential_id"

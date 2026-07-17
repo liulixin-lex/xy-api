@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -38,14 +39,31 @@ const (
 
 	RoutingOperationStatusPending    RoutingOperationStatus = "pending"
 	RoutingOperationStatusRunning    RoutingOperationStatus = "running"
+	RoutingOperationStatusRetryWait  RoutingOperationStatus = "retry_wait"
 	RoutingOperationStatusSucceeded  RoutingOperationStatus = "succeeded"
+	RoutingOperationStatusPartial    RoutingOperationStatus = "partially_succeeded"
 	RoutingOperationStatusFailed     RoutingOperationStatus = "failed"
+	RoutingOperationStatusCancelled  RoutingOperationStatus = "cancelled"
 	RoutingOperationStatusSuperseded RoutingOperationStatus = "superseded"
+
+	RoutingOperationSourceAdmin     = "admin"
+	RoutingOperationSourceSystem    = "system"
+	RoutingOperationSourceScheduler = "scheduler"
+	RoutingOperationSourceRecovery  = "recovery"
+	RoutingOperationSourceMigration = "migration"
+
+	RoutingOperationRetentionStandard      = "standard"
+	RoutingOperationRetentionExtended      = "extended"
+	RoutingOperationRetentionHighFrequency = "high_frequency"
+	RoutingOperationRetentionPermanent     = "permanent"
 
 	routingOperationSchemaVersion         = 1
 	routingOperationPolicySchemaVersion   = 2
 	routingOperationControlSchemaVersion  = 3
+	routingOperationRetrySchemaVersion    = 4
+	routingOperationRecordSchemaVersion   = 2
 	routingOperationReasonMaxRunes        = 512
+	routingOperationSummaryMaxRunes       = 512
 	routingOperationErrorMaxRunes         = 4_096
 	routingOperationResultMaxBytes        = 60 << 10
 	routingOperationMaxClaimMs            = int64(5 * 60 * 1_000)
@@ -72,6 +90,15 @@ type RoutingOperationSpec struct {
 	ExpectedActivationID int64  `json:"expected_activation_id"`
 	ActorID              int    `json:"actor_id"`
 	Reason               string `json:"reason"`
+	Source               string `json:"source,omitempty"`
+	CorrelationID        string `json:"correlation_id,omitempty"`
+	ParentOperationID    int64  `json:"parent_operation_id,omitempty"`
+	RetryOfOperationID   int64  `json:"retry_of_operation_id,omitempty"`
+	RetrySequence        int    `json:"retry_sequence,omitempty"`
+	Retryable            *bool  `json:"-"`
+	Cancellable          *bool  `json:"-"`
+	Summary              string `json:"summary,omitempty"`
+	RetentionCategory    string `json:"retention_category,omitempty"`
 	RequestKeyHash       string `json:"-"`
 	RequestPayloadHash   string `json:"-"`
 }
@@ -91,6 +118,7 @@ type RoutingOperationResult struct {
 
 type RoutingOperation struct {
 	ID                   int64                  `json:"id" gorm:"primaryKey"`
+	SchemaVersion        int                    `json:"schema_version" gorm:"index"`
 	OperationType        string                 `json:"type" gorm:"column:operation_type;type:varchar(64);index;not null"`
 	IdempotencyHash      string                 `json:"idempotency_hash" gorm:"type:varchar(64);uniqueIndex;not null"`
 	RequestKeyHash       *string                `json:"-" gorm:"type:varchar(64)"`
@@ -105,6 +133,16 @@ type RoutingOperation struct {
 	ExpectedActivationID int64                  `json:"expected_activation_id" gorm:"bigint;index;not null"`
 	ActorID              int                    `json:"actor_id" gorm:"index;not null"`
 	Reason               string                 `json:"reason" gorm:"type:varchar(512);not null"`
+	Source               string                 `json:"source" gorm:"type:varchar(32);index"`
+	CorrelationID        string                 `json:"correlation_id" gorm:"type:varchar(64);index"`
+	ParentOperationID    int64                  `json:"parent_operation_id,omitempty" gorm:"bigint;index"`
+	RetryOfOperationID   int64                  `json:"retry_of_operation_id,omitempty" gorm:"bigint;index"`
+	RetrySequence        int                    `json:"retry_sequence" gorm:"index"`
+	Retryable            bool                   `json:"retryable" gorm:"index"`
+	Cancellable          bool                   `json:"cancellable" gorm:"index"`
+	Summary              string                 `json:"summary" gorm:"type:varchar(512)"`
+	NeedsAttention       bool                   `json:"needs_attention" gorm:"index"`
+	RetentionCategory    string                 `json:"retention_category" gorm:"type:varchar(32);index"`
 	Status               RoutingOperationStatus `json:"status" gorm:"type:varchar(24);index;not null"`
 	ClaimToken           string                 `json:"-" gorm:"type:varchar(32);index;not null"`
 	ClaimUntilMs         int64                  `json:"claim_until_ms" gorm:"bigint;index;not null"`
@@ -116,6 +154,7 @@ type RoutingOperation struct {
 	ResultOutboxID       int64                  `json:"result_outbox_id" gorm:"bigint;index;not null"`
 	ResultPayloadJSON    string                 `json:"-" gorm:"type:text"`
 	ResultPayloadHash    string                 `json:"result_payload_hash" gorm:"type:varchar(64);index"`
+	TerminalActorID      int                    `json:"terminal_actor_id" gorm:"index"`
 	CreatedTimeMs        int64                  `json:"created_time_ms" gorm:"bigint;index;not null"`
 	UpdatedTimeMs        int64                  `json:"updated_time_ms" gorm:"bigint;index;not null"`
 	CompletedTimeMs      int64                  `json:"completed_time_ms" gorm:"bigint;index;not null"`
@@ -162,6 +201,9 @@ func createRoutingOperationDB(
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
+	if err := validateRoutingOperationRelationshipDB(ctx, db, normalized); err != nil {
+		return RoutingOperation{}, false, err
+	}
 	if err := ctx.Err(); err != nil {
 		return RoutingOperation{}, false, err
 	}
@@ -169,8 +211,16 @@ func createRoutingOperationDB(
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
+	correlationID := normalized.CorrelationID
+	if correlationID == "" {
+		correlationID, err = newRoutingPersistenceToken()
+		if err != nil {
+			return RoutingOperation{}, false, err
+		}
+	}
 	nowMs := time.Now().UnixMilli()
 	operation := RoutingOperation{
+		SchemaVersion:        routingOperationRecordSchemaVersion,
 		OperationType:        normalized.Type,
 		IdempotencyHash:      idempotencyHash,
 		CreateToken:          createToken,
@@ -182,6 +232,15 @@ func createRoutingOperationDB(
 		ExpectedActivationID: normalized.ExpectedActivationID,
 		ActorID:              normalized.ActorID,
 		Reason:               normalized.Reason,
+		Source:               normalized.Source,
+		CorrelationID:        correlationID,
+		ParentOperationID:    normalized.ParentOperationID,
+		RetryOfOperationID:   normalized.RetryOfOperationID,
+		RetrySequence:        normalized.RetrySequence,
+		Retryable:            *normalized.Retryable,
+		Cancellable:          *normalized.Cancellable,
+		Summary:              normalized.Summary,
+		RetentionCategory:    normalized.RetentionCategory,
 		RequestKeyHash:       routingOperationRequestKeyPointer(normalized.RequestKeyHash),
 		RequestPayloadHash:   normalized.RequestPayloadHash,
 		Status:               RoutingOperationStatusPending,
@@ -206,6 +265,7 @@ func createRoutingOperationDB(
 		stored.PoolID != normalized.PoolID || stored.ExpectedRevision != normalized.ExpectedRevision ||
 		stored.ExpectedActivationID != normalized.ExpectedActivationID || stored.ActorID != normalized.ActorID ||
 		stored.Reason != normalized.Reason || !routingOperationRequestIdentityMatches(stored, normalized) ||
+		!routingOperationMetadataMatchesSpec(stored, normalized) ||
 		!validRoutingPersistenceToken(stored.CreateToken) {
 		return RoutingOperation{}, false, ErrRoutingOperationInvalid
 	}
@@ -253,19 +313,35 @@ func CreateFailedRoutingOperationContext(
 		if normalizeErr != nil {
 			return normalizeErr
 		}
+		if relationshipErr := validateRoutingOperationRelationshipDB(ctx, tx, normalized); relationshipErr != nil {
+			return relationshipErr
+		}
 		nowMs := time.Now().UnixMilli()
 		createToken, tokenErr := newRoutingPersistenceToken()
 		if tokenErr != nil {
 			return tokenErr
 		}
+		correlationID := normalized.CorrelationID
+		if correlationID == "" {
+			correlationID, tokenErr = newRoutingPersistenceToken()
+			if tokenErr != nil {
+				return tokenErr
+			}
+		}
 		operation := RoutingOperation{
+			SchemaVersion: routingOperationRecordSchemaVersion,
 			OperationType: normalized.Type, IdempotencyHash: idempotencyHash, CreateToken: createToken,
 			EvaluationHash: normalized.EvaluationHash, SubjectType: normalized.SubjectType, SubjectID: normalized.SubjectID,
 			PoolID: normalized.PoolID, ExpectedRevision: normalized.ExpectedRevision,
 			ExpectedActivationID: normalized.ExpectedActivationID, ActorID: normalized.ActorID, Reason: normalized.Reason,
 			RequestKeyHash: routingOperationRequestKeyPointer(normalized.RequestKeyHash), RequestPayloadHash: normalized.RequestPayloadHash,
 			Status: RoutingOperationStatusFailed, Attempts: 1, LastError: lastError,
-			CreatedTimeMs: nowMs, UpdatedTimeMs: nowMs, CompletedTimeMs: nowMs,
+			Source: normalized.Source, CorrelationID: correlationID, ParentOperationID: normalized.ParentOperationID,
+			RetryOfOperationID: normalized.RetryOfOperationID, RetrySequence: normalized.RetrySequence,
+			Retryable: *normalized.Retryable, Cancellable: *normalized.Cancellable, Summary: normalized.Summary,
+			NeedsAttention: true, RetentionCategory: routingOperationFailureRetention(normalized.RetentionCategory),
+			TerminalActorID: normalized.ActorID,
+			CreatedTimeMs:   nowMs, UpdatedTimeMs: nowMs, CompletedTimeMs: nowMs,
 		}
 		result := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&operation)
 		if result.Error != nil {
@@ -287,6 +363,7 @@ func CreateFailedRoutingOperationContext(
 			stored.PoolID != normalized.PoolID || stored.ExpectedRevision != normalized.ExpectedRevision ||
 			stored.ExpectedActivationID != normalized.ExpectedActivationID || stored.ActorID != normalized.ActorID ||
 			stored.Reason != normalized.Reason || !routingOperationRequestIdentityMatches(stored, normalized) ||
+			!routingOperationMetadataMatchesSpec(stored, normalized) ||
 			stored.Status != RoutingOperationStatusFailed || stored.LastError != lastError {
 			return ErrRoutingOperationInvalid
 		}
@@ -311,6 +388,9 @@ func createSucceededRoutingOperationTx(
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
+	if err := validateRoutingOperationRelationshipDB(ctx, tx, normalized); err != nil {
+		return RoutingOperation{}, false, err
+	}
 	result.PayloadJSON, result.PayloadHash, err = normalizeRoutingOperationResultPayload(payload)
 	if err != nil || !validRoutingOperationTerminalState(RoutingOperationStatusSucceeded, "", result) {
 		return RoutingOperation{}, false, ErrRoutingOperationInvalid
@@ -319,7 +399,15 @@ func createSucceededRoutingOperationTx(
 	if err != nil {
 		return RoutingOperation{}, false, err
 	}
+	correlationID := normalized.CorrelationID
+	if correlationID == "" {
+		correlationID, err = newRoutingPersistenceToken()
+		if err != nil {
+			return RoutingOperation{}, false, err
+		}
+	}
 	operation := RoutingOperation{
+		SchemaVersion: routingOperationRecordSchemaVersion,
 		OperationType: normalized.Type, IdempotencyHash: idempotencyHash, CreateToken: createToken,
 		EvaluationHash: normalized.EvaluationHash, SubjectType: normalized.SubjectType, SubjectID: normalized.SubjectID,
 		PoolID: normalized.PoolID, ExpectedRevision: normalized.ExpectedRevision,
@@ -327,6 +415,10 @@ func createSucceededRoutingOperationTx(
 		RequestKeyHash:     routingOperationRequestKeyPointer(normalized.RequestKeyHash),
 		RequestPayloadHash: normalized.RequestPayloadHash,
 		Status:             RoutingOperationStatusSucceeded, Attempts: 1,
+		Source: normalized.Source, CorrelationID: correlationID, ParentOperationID: normalized.ParentOperationID,
+		RetryOfOperationID: normalized.RetryOfOperationID, RetrySequence: normalized.RetrySequence,
+		Retryable: *normalized.Retryable, Cancellable: *normalized.Cancellable, Summary: normalized.Summary,
+		RetentionCategory: normalized.RetentionCategory, TerminalActorID: normalized.ActorID,
 		ResultRevision: result.Revision, ResultActivationID: result.ActivationID, ResultOutboxID: result.OutboxID,
 		ResultPayloadJSON: result.PayloadJSON, ResultPayloadHash: result.PayloadHash,
 		CreatedTimeMs: nowMs, UpdatedTimeMs: nowMs, CompletedTimeMs: nowMs,
@@ -352,6 +444,7 @@ func createSucceededRoutingOperationTx(
 		stored.PoolID != normalized.PoolID || stored.ExpectedRevision != normalized.ExpectedRevision ||
 		stored.ExpectedActivationID != normalized.ExpectedActivationID || stored.ActorID != normalized.ActorID ||
 		stored.Reason != normalized.Reason || !routingOperationRequestIdentityMatches(stored, normalized) ||
+		!routingOperationMetadataMatchesSpec(stored, normalized) ||
 		stored.Status != RoutingOperationStatusSucceeded ||
 		stored.ResultRevision != result.Revision || stored.ResultActivationID != result.ActivationID ||
 		stored.ResultOutboxID != result.OutboxID || stored.ResultPayloadHash != result.PayloadHash ||
@@ -362,10 +455,14 @@ func createSucceededRoutingOperationTx(
 }
 
 type RoutingOperationFilter struct {
-	OperationType string
-	Status        RoutingOperationStatus
-	BeforeID      int64
-	Limit         int
+	OperationType  string
+	Status         RoutingOperationStatus
+	Source         string
+	CorrelationID  string
+	Retention      string
+	NeedsAttention *bool
+	BeforeID       int64
+	Limit          int
 }
 
 func GetRoutingOperationContext(ctx context.Context, id int64) (RoutingOperation, error) {
@@ -441,7 +538,10 @@ func ListRoutingOperationsContext(
 	}
 	if filter.BeforeID < 0 || filter.Limit < 1 || filter.Limit > RoutingOperationMaxPageSize ||
 		(filter.OperationType != "" && !validRoutingOperationType(filter.OperationType)) ||
-		(filter.Status != "" && !validRoutingOperationStatus(filter.Status)) {
+		(filter.Status != "" && !validRoutingOperationStatus(filter.Status)) ||
+		(filter.Source != "" && !validRoutingOperationSource(filter.Source)) ||
+		(filter.CorrelationID != "" && !validRoutingOperationCorrelationID(filter.CorrelationID)) ||
+		(filter.Retention != "" && !validRoutingOperationRetention(filter.Retention)) {
 		return nil, false, ErrRoutingOperationInvalid
 	}
 	query := DB.WithContext(ctx).Model(&RoutingOperation{}).
@@ -452,6 +552,18 @@ func ListRoutingOperationsContext(
 	}
 	if filter.Status != "" {
 		query = query.Where("status = ?", filter.Status)
+	}
+	if filter.Source != "" {
+		query = query.Where("source = ?", filter.Source)
+	}
+	if filter.CorrelationID != "" {
+		query = query.Where("correlation_id = ?", filter.CorrelationID)
+	}
+	if filter.Retention != "" {
+		query = query.Where("retention_category = ?", filter.Retention)
+	}
+	if filter.NeedsAttention != nil {
+		query = query.Where("needs_attention = ?", *filter.NeedsAttention)
 	}
 	if filter.BeforeID > 0 {
 		query = query.Where("id < ?", filter.BeforeID)
@@ -484,13 +596,34 @@ func DeleteCompletedRoutingOperationsBeforeContext(
 	if cutoffMs <= 0 || nowMs <= 0 || limit < 1 || limit > 500 {
 		return 0, ErrRoutingOperationInvalid
 	}
+	highFrequencyCutoff := nowMs - int64(7*24*time.Hour/time.Millisecond)
+	extendedCutoff := nowMs - int64(90*24*time.Hour/time.Millisecond)
+	if highFrequencyCutoff < 1 {
+		highFrequencyCutoff = 1
+	}
+	if extendedCutoff < 1 {
+		extendedCutoff = 1
+	}
+	terminalStatuses := []RoutingOperationStatus{
+		RoutingOperationStatusSucceeded, RoutingOperationStatusPartial, RoutingOperationStatusFailed,
+		RoutingOperationStatusCancelled, RoutingOperationStatusSuperseded,
+	}
 	var operations []RoutingOperation
-	if err := DB.WithContext(ctx).Select("id").
-		Where("status IN ? AND completed_time_ms > 0 AND completed_time_ms < ?", []RoutingOperationStatus{
-			RoutingOperationStatusSucceeded, RoutingOperationStatusFailed, RoutingOperationStatusSuperseded,
-		}, cutoffMs).
-		Where("NOT EXISTS (SELECT 1 FROM routing_audit_exports WHERE routing_audit_exports.operation_id = routing_operations.id AND routing_audit_exports.expires_time_ms > ?)", nowMs).
-		Order("completed_time_ms asc").Limit(limit).Find(&operations).Error; err != nil {
+	query := DB.WithContext(ctx).Select("id").
+		Where("status IN ? AND completed_time_ms > 0", terminalStatuses).
+		Where("retention_category <> ?", RoutingOperationRetentionPermanent).
+		Where(
+			"(retention_category = ? AND needs_attention = ? AND completed_time_ms < ?) OR "+
+				"(retention_category = ? AND needs_attention = ? AND completed_time_ms < ?) OR "+
+				"((retention_category = ? OR needs_attention = ?) AND completed_time_ms < ?)",
+			RoutingOperationRetentionStandard, false, cutoffMs,
+			RoutingOperationRetentionHighFrequency, false, highFrequencyCutoff,
+			RoutingOperationRetentionExtended, true, extendedCutoff,
+		)
+	if DB.Migrator().HasTable(&RoutingAuditExport{}) {
+		query = query.Where("NOT EXISTS (SELECT 1 FROM routing_audit_exports WHERE routing_audit_exports.operation_id = routing_operations.id AND routing_audit_exports.expires_time_ms > ?)", nowMs)
+	}
+	if err := query.Order("completed_time_ms asc").Limit(limit).Find(&operations).Error; err != nil {
 		return 0, err
 	}
 	if len(operations) == 0 {
@@ -500,9 +633,7 @@ func DeleteCompletedRoutingOperationsBeforeContext(
 	for index := range operations {
 		ids[index] = operations[index].ID
 	}
-	deleted := DB.WithContext(ctx).Where("id IN ? AND status IN ?", ids, []RoutingOperationStatus{
-		RoutingOperationStatusSucceeded, RoutingOperationStatusFailed, RoutingOperationStatusSuperseded,
-	}).Delete(&RoutingOperation{})
+	deleted := DB.WithContext(ctx).Where("id IN ? AND status IN ?", ids, terminalStatuses).Delete(&RoutingOperation{})
 	return deleted.RowsAffected, deleted.Error
 }
 
@@ -533,10 +664,10 @@ func ClaimRoutingOperationContext(
 	}
 	var claimed RoutingOperation
 	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		eligible := "((status = ? AND next_retry_ms <= ?) OR (status = ? AND claim_until_ms <= ?))"
+		eligible := "(status = ? OR (status = ? AND next_retry_ms <= ?) OR (status = ? AND claim_until_ms <= ?))"
 		query := lockForUpdate(tx.WithContext(ctx)).
 			Where("operation_type = ?", operationType).
-			Where(eligible, RoutingOperationStatusPending, nowMs, RoutingOperationStatusRunning, nowMs).
+			Where(eligible, RoutingOperationStatusPending, RoutingOperationStatusRetryWait, nowMs, RoutingOperationStatusRunning, nowMs).
 			Order("id asc")
 		if err := query.First(&claimed).Error; err != nil {
 			return err
@@ -553,12 +684,14 @@ func ClaimRoutingOperationContext(
 		}
 		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 			Where("id = ? AND operation_type = ?", claimed.ID, operationType).
-			Where(eligible, RoutingOperationStatusPending, nowMs, RoutingOperationStatusRunning, nowMs).
+			Where(eligible, RoutingOperationStatusPending, RoutingOperationStatusRetryWait, nowMs, RoutingOperationStatusRunning, nowMs).
 			Updates(map[string]any{
 				"status":          RoutingOperationStatusRunning,
 				"claim_token":     claimToken,
 				"claim_until_ms":  claimNowMs + leaseMs,
 				"attempts":        claimed.Attempts + 1,
+				"next_retry_ms":   0,
+				"last_error":      "",
 				"updated_time_ms": claimNowMs,
 			})
 		if updated.Error != nil {
@@ -676,12 +809,12 @@ func HasRunnableRoutingOperationContext(
 	if !validRoutingOperationType(operationType) || nowMs <= 0 {
 		return false, ErrRoutingOperationInvalid
 	}
-	eligible := "((status = ? AND next_retry_ms <= ?) OR (status = ? AND claim_until_ms <= ?))"
+	eligible := "(status = ? OR (status = ? AND next_retry_ms <= ?) OR (status = ? AND claim_until_ms <= ?))"
 	var operation RoutingOperation
 	err := DB.WithContext(ctx).
 		Select("id").
 		Where("operation_type = ?", operationType).
-		Where(eligible, RoutingOperationStatusPending, nowMs, RoutingOperationStatusRunning, nowMs).
+		Where(eligible, RoutingOperationStatusPending, RoutingOperationStatusRetryWait, nowMs, RoutingOperationStatusRunning, nowMs).
 		Order("id asc").
 		First(&operation).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -723,7 +856,7 @@ func RetryRoutingOperationContext(
 				id, RoutingOperationStatusRunning, claimToken, nowMs,
 			).
 			Updates(map[string]any{
-				"status":               RoutingOperationStatusPending,
+				"status":               RoutingOperationStatusRetryWait,
 				"claim_token":          "",
 				"claim_until_ms":       0,
 				"next_retry_ms":        transitionTimeMs + retryDelayMs,
@@ -808,6 +941,31 @@ func FailRoutingOperationContext(
 	)
 }
 
+func PartiallySucceedRoutingOperationWithPayloadContext(
+	ctx context.Context,
+	id int64,
+	claimToken string,
+	nowMs int64,
+	payload any,
+	summaryErr error,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if summaryErr == nil {
+		return ErrRoutingOperationInvalid
+	}
+	payloadJSON, payloadHash, err := normalizeRoutingOperationResultPayload(payload)
+	if err != nil || payloadJSON == "" {
+		return ErrRoutingOperationInvalid
+	}
+	return finishRoutingOperationContext(
+		ctx, id, claimToken, nowMs, RoutingOperationStatusPartial,
+		routingOperationErrorText(summaryErr),
+		RoutingOperationResult{PayloadJSON: payloadJSON, PayloadHash: payloadHash},
+	)
+}
+
 func SupersedeRoutingOperationContext(
 	ctx context.Context,
 	id int64,
@@ -825,6 +983,125 @@ func SupersedeRoutingOperationContext(
 	return finishRoutingOperationContext(
 		ctx, id, claimToken, nowMs, RoutingOperationStatusSuperseded, reason, RoutingOperationResult{},
 	)
+}
+
+func CancelRoutingOperationContext(
+	ctx context.Context,
+	id int64,
+	actorID int,
+	reason string,
+) (RoutingOperation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reason = routingOperationText(reason, routingOperationErrorMaxRunes)
+	if id <= 0 || actorID < 0 || reason == "" {
+		return RoutingOperation{}, ErrRoutingOperationInvalid
+	}
+	var stored RoutingOperation
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var operation RoutingOperation
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", id).First(&operation).Error; err != nil {
+			return err
+		}
+		if err := validateStoredRoutingOperation(operation); err != nil {
+			return err
+		}
+		if !operation.Cancellable || (operation.Status != RoutingOperationStatusPending &&
+			operation.Status != RoutingOperationStatusRetryWait && operation.Status != RoutingOperationStatusRunning) {
+			return ErrRoutingOperationInvalid
+		}
+		nowMs := max(time.Now().UnixMilli(), operation.CreatedTimeMs, operation.UpdatedTimeMs)
+		updates := routingOperationTerminalUpdates(
+			RoutingOperationStatusCancelled, reason, RoutingOperationResult{}, nowMs,
+		)
+		updates["retention_category"] = routingOperationTerminalRetention(
+			RoutingOperationStatusCancelled, operation.RetentionCategory,
+		)
+		updates["terminal_actor_id"] = actorID
+		updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
+			Where("id = ? AND status = ?", operation.ID, operation.Status).
+			Updates(updates)
+		if err := routingOperationCASResult(updated); err != nil {
+			return err
+		}
+		if err := tx.WithContext(ctx).Where("id = ?", operation.ID).First(&stored).Error; err != nil {
+			return err
+		}
+		if err := validateStoredRoutingOperation(stored); err != nil {
+			return err
+		}
+		return insertRoutingOperationTransitionAuditTx(tx.WithContext(ctx), operation, stored, RoutingControlActionCancel)
+	})
+	return stored, err
+}
+
+func RetryTerminalRoutingOperationContext(
+	ctx context.Context,
+	id int64,
+	actorID int,
+	reason string,
+) (RoutingOperation, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reason = routingOperationText(reason, routingOperationReasonMaxRunes)
+	if id <= 0 || actorID < 0 {
+		return RoutingOperation{}, false, ErrRoutingOperationInvalid
+	}
+	var retried RoutingOperation
+	var created bool
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var source RoutingOperation
+		if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", id).First(&source).Error; err != nil {
+			return err
+		}
+		if err := validateStoredRoutingOperation(source); err != nil {
+			return err
+		}
+		if !source.Retryable || (source.Status != RoutingOperationStatusFailed &&
+			source.Status != RoutingOperationStatusPartial && source.Status != RoutingOperationStatusCancelled) ||
+			source.RetrySequence == int(^uint(0)>>1) {
+			return ErrRoutingOperationInvalid
+		}
+		if reason == "" {
+			reason = source.Reason
+		}
+		retryable := source.Retryable
+		cancellable := source.Cancellable
+		_, _, defaultRetention := routingOperationDefaultPolicy(source.OperationType)
+		if source.RetentionCategory == RoutingOperationRetentionPermanent {
+			defaultRetention = RoutingOperationRetentionPermanent
+		}
+		retryActorID := actorID
+		if retryActorID == 0 {
+			retryActorID = source.ActorID
+		}
+		retrySource := RoutingOperationSourceRecovery
+		if actorID > 0 {
+			retrySource = RoutingOperationSourceAdmin
+		}
+		var createErr error
+		retried, created, createErr = createRoutingOperationDB(ctx, tx, RoutingOperationSpec{
+			Type: source.OperationType, EvaluationHash: source.EvaluationHash,
+			SubjectType: source.SubjectType, SubjectID: source.SubjectID, PoolID: source.PoolID,
+			ExpectedRevision: source.ExpectedRevision, ExpectedActivationID: source.ExpectedActivationID,
+			ActorID: retryActorID, Reason: reason,
+			Source:        retrySource,
+			CorrelationID: source.CorrelationID, ParentOperationID: source.ID,
+			RetryOfOperationID: source.ID, RetrySequence: source.RetrySequence + 1,
+			Retryable: &retryable, Cancellable: &cancellable,
+			Summary: routingOperationText(
+				"Retry "+source.Summary, routingOperationSummaryMaxRunes,
+			),
+			RetentionCategory: defaultRetention,
+		})
+		if createErr != nil || !created {
+			return createErr
+		}
+		return insertRoutingOperationTransitionAuditTx(tx.WithContext(ctx), source, retried, RoutingControlActionRetry)
+	})
+	return retried, created, err
 }
 
 func finishRoutingOperationContext(
@@ -868,11 +1145,14 @@ func finishRoutingOperationTx(
 		return RoutingOperation{}, err
 	}
 	transitionTimeMs := max(minimumWriteTimeMs, observedNowMs, current.CreatedTimeMs, current.UpdatedTimeMs)
+	updates := routingOperationTerminalUpdates(status, lastError, result, transitionTimeMs)
+	updates["retention_category"] = routingOperationTerminalRetention(status, current.RetentionCategory)
+	updates["terminal_actor_id"] = current.ActorID
 	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("id = ? AND status = ? AND claim_token = ? AND claim_until_ms > ?",
 			operation.ID, RoutingOperationStatusRunning, operation.ClaimToken, observedNowMs,
 		).
-		Updates(routingOperationTerminalUpdates(status, lastError, result, transitionTimeMs))
+		Updates(updates)
 	if err := routingOperationCASResult(updated); err != nil {
 		return RoutingOperation{}, err
 	}
@@ -881,6 +1161,9 @@ func finishRoutingOperationTx(
 		return RoutingOperation{}, err
 	}
 	if err := validateStoredRoutingOperation(stored); err != nil {
+		return RoutingOperation{}, err
+	}
+	if err := insertRoutingOperationTransitionAuditTx(tx.WithContext(ctx), current, stored, RoutingControlActionUpdate); err != nil {
 		return RoutingOperation{}, err
 	}
 	return stored, nil
@@ -901,7 +1184,16 @@ func validRoutingOperationTerminalState(
 			return false
 		}
 		return hasRevisionResult || result.PayloadJSON != ""
-	case RoutingOperationStatusFailed, RoutingOperationStatusSuperseded:
+	case RoutingOperationStatusPartial:
+		if lastError == "" || !validRoutingOperationResultPayload(result.PayloadJSON, result.PayloadHash) {
+			return false
+		}
+		hasRevisionResult := result.Revision > 0 || result.ActivationID > 0 || result.OutboxID > 0
+		if hasRevisionResult && (result.Revision <= 0 || result.ActivationID <= 0 || result.OutboxID <= 0) {
+			return false
+		}
+		return hasRevisionResult || result.PayloadJSON != ""
+	case RoutingOperationStatusFailed, RoutingOperationStatusCancelled, RoutingOperationStatusSuperseded:
 		return lastError != "" && result == (RoutingOperationResult{})
 	default:
 		return false
@@ -914,6 +1206,7 @@ func routingOperationTerminalUpdates(
 	result RoutingOperationResult,
 	nowMs int64,
 ) map[string]any {
+	needsAttention := status == RoutingOperationStatusFailed || status == RoutingOperationStatusPartial
 	return map[string]any{
 		"status":               status,
 		"claim_token":          "",
@@ -925,8 +1218,18 @@ func routingOperationTerminalUpdates(
 		"result_outbox_id":     result.OutboxID,
 		"result_payload_json":  result.PayloadJSON,
 		"result_payload_hash":  result.PayloadHash,
+		"needs_attention":      needsAttention,
 		"updated_time_ms":      nowMs,
 		"completed_time_ms":    nowMs,
+	}
+}
+
+func routingOperationTerminalRetention(status RoutingOperationStatus, current string) string {
+	switch status {
+	case RoutingOperationStatusFailed, RoutingOperationStatusPartial, RoutingOperationStatusCancelled:
+		return routingOperationFailureRetention(current)
+	default:
+		return current
 	}
 }
 
@@ -945,10 +1248,45 @@ func normalizeRoutingOperationSpec(spec RoutingOperationSpec) (RoutingOperationS
 	spec.EvaluationHash = strings.ToLower(strings.TrimSpace(spec.EvaluationHash))
 	spec.SubjectType = strings.TrimSpace(spec.SubjectType)
 	spec.Reason = strings.TrimSpace(spec.Reason)
+	spec.Source = strings.TrimSpace(spec.Source)
+	spec.CorrelationID = strings.ToLower(strings.TrimSpace(spec.CorrelationID))
+	spec.Summary = routingOperationText(spec.Summary, routingOperationSummaryMaxRunes)
+	spec.RetentionCategory = strings.TrimSpace(spec.RetentionCategory)
 	spec.RequestKeyHash = strings.ToLower(strings.TrimSpace(spec.RequestKeyHash))
 	spec.RequestPayloadHash = strings.ToLower(strings.TrimSpace(spec.RequestPayloadHash))
+	if spec.Source == "" {
+		if spec.ActorID > 0 {
+			spec.Source = RoutingOperationSourceAdmin
+		} else {
+			spec.Source = RoutingOperationSourceSystem
+		}
+	}
+	defaultRetryable, defaultCancellable, defaultRetention := routingOperationDefaultPolicy(spec.Type)
+	if spec.Retryable == nil {
+		spec.Retryable = &defaultRetryable
+	}
+	if spec.Cancellable == nil {
+		spec.Cancellable = &defaultCancellable
+	}
+	if spec.RetentionCategory == "" {
+		spec.RetentionCategory = defaultRetention
+	}
+	if spec.Summary == "" {
+		spec.Summary = routingOperationText(spec.Reason, routingOperationSummaryMaxRunes)
+	}
+	if spec.Summary == "" {
+		spec.Summary = routingOperationTypeSummary(spec.Type)
+	}
 	if !validRoutingOperationType(spec.Type) || !validRoutingHash(spec.EvaluationHash) || spec.ActorID < 0 ||
 		!utf8.ValidString(spec.Reason) || utf8.RuneCountInString(spec.Reason) > routingOperationReasonMaxRunes ||
+		!validRoutingOperationSource(spec.Source) ||
+		(spec.CorrelationID != "" && !validRoutingOperationCorrelationID(spec.CorrelationID)) ||
+		spec.ParentOperationID < 0 || spec.RetryOfOperationID < 0 || spec.RetrySequence < 0 ||
+		(spec.RetryOfOperationID == 0 && spec.RetrySequence != 0) ||
+		(spec.RetryOfOperationID > 0 && (spec.ParentOperationID <= 0 || spec.RetrySequence <= 0)) ||
+		spec.Retryable == nil || spec.Cancellable == nil ||
+		!utf8.ValidString(spec.Summary) || utf8.RuneCountInString(spec.Summary) > routingOperationSummaryMaxRunes ||
+		!validRoutingOperationRetention(spec.RetentionCategory) ||
 		((spec.RequestKeyHash == "") != (spec.RequestPayloadHash == "")) ||
 		(spec.RequestKeyHash != "" && (!validRoutingHash(spec.RequestKeyHash) || !validRoutingHash(spec.RequestPayloadHash))) {
 		return RoutingOperationSpec{}, "", ErrRoutingOperationInvalid
@@ -1005,7 +1343,29 @@ func normalizeRoutingOperationSpec(spec RoutingOperationSpec) (RoutingOperationS
 	}
 	var canonical []byte
 	var err error
-	if spec.Type == RoutingOperationTypeCanaryAutoRollback {
+	if spec.RetryOfOperationID > 0 {
+		canonical, err = common.Marshal(struct {
+			SchemaVersion        int    `json:"schema_version"`
+			Type                 string `json:"type"`
+			EvaluationHash       string `json:"evaluation_hash"`
+			RequestKeyHash       string `json:"request_key_hash"`
+			SubjectType          string `json:"subject_type"`
+			SubjectID            int64  `json:"subject_id"`
+			PoolID               int    `json:"pool_id"`
+			ExpectedRevision     int64  `json:"expected_revision"`
+			ExpectedActivationID int64  `json:"expected_activation_id"`
+			ParentOperationID    int64  `json:"parent_operation_id"`
+			RetryOfOperationID   int64  `json:"retry_of_operation_id"`
+			RetrySequence        int    `json:"retry_sequence"`
+		}{
+			SchemaVersion: routingOperationRetrySchemaVersion, Type: spec.Type,
+			EvaluationHash: spec.EvaluationHash, RequestKeyHash: spec.RequestKeyHash,
+			SubjectType: spec.SubjectType, SubjectID: spec.SubjectID, PoolID: spec.PoolID,
+			ExpectedRevision: spec.ExpectedRevision, ExpectedActivationID: spec.ExpectedActivationID,
+			ParentOperationID: spec.ParentOperationID, RetryOfOperationID: spec.RetryOfOperationID,
+			RetrySequence: spec.RetrySequence,
+		})
+	} else if spec.Type == RoutingOperationTypeCanaryAutoRollback {
 		canonical, err = common.Marshal(struct {
 			SchemaVersion        int    `json:"schema_version"`
 			Type                 string `json:"type"`
@@ -1074,11 +1434,83 @@ func validRoutingOperationType(operationType string) bool {
 
 func validRoutingOperationStatus(status RoutingOperationStatus) bool {
 	switch status {
-	case RoutingOperationStatusPending, RoutingOperationStatusRunning, RoutingOperationStatusSucceeded,
-		RoutingOperationStatusFailed, RoutingOperationStatusSuperseded:
+	case RoutingOperationStatusPending, RoutingOperationStatusRunning, RoutingOperationStatusRetryWait,
+		RoutingOperationStatusSucceeded, RoutingOperationStatusPartial, RoutingOperationStatusFailed,
+		RoutingOperationStatusCancelled, RoutingOperationStatusSuperseded:
 		return true
 	default:
 		return false
+	}
+}
+
+func validRoutingOperationSource(source string) bool {
+	switch source {
+	case RoutingOperationSourceAdmin, RoutingOperationSourceSystem, RoutingOperationSourceScheduler,
+		RoutingOperationSourceRecovery, RoutingOperationSourceMigration:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRoutingOperationRetention(category string) bool {
+	switch category {
+	case RoutingOperationRetentionStandard, RoutingOperationRetentionExtended,
+		RoutingOperationRetentionHighFrequency, RoutingOperationRetentionPermanent:
+		return true
+	default:
+		return false
+	}
+}
+
+func validRoutingOperationCorrelationID(value string) bool {
+	return validRoutingPersistenceToken(value)
+}
+
+func routingOperationDefaultPolicy(operationType string) (bool, bool, string) {
+	switch operationType {
+	case RoutingOperationTypeActiveProbe, RoutingOperationTypeHistoricalSimulation:
+		return true, true, RoutingOperationRetentionHighFrequency
+	case RoutingOperationTypeAuditExport:
+		return true, true, RoutingOperationRetentionStandard
+	case RoutingOperationTypeBreakerReset:
+		return true, false, RoutingOperationRetentionStandard
+	case RoutingOperationTypePolicySimulation:
+		return false, false, RoutingOperationRetentionHighFrequency
+	default:
+		return false, false, RoutingOperationRetentionStandard
+	}
+}
+
+func routingOperationFailureRetention(category string) string {
+	if category == RoutingOperationRetentionPermanent {
+		return category
+	}
+	return RoutingOperationRetentionExtended
+}
+
+func routingOperationTypeSummary(operationType string) string {
+	switch operationType {
+	case RoutingOperationTypeCanaryAutoRollback:
+		return "Automatic canary rollback"
+	case RoutingOperationTypePolicySimulation:
+		return "Policy simulation"
+	case RoutingOperationTypeHistoricalSimulation:
+		return "Historical simulation"
+	case RoutingOperationTypePolicyPublish:
+		return "Policy publish"
+	case RoutingOperationTypePolicyRollback:
+		return "Policy rollback"
+	case RoutingOperationTypeCostSync:
+		return "Cost synchronization"
+	case RoutingOperationTypeActiveProbe:
+		return "Active probe"
+	case RoutingOperationTypeAuditExport:
+		return "Audit export"
+	case RoutingOperationTypeBreakerReset:
+		return "Breaker reset"
+	default:
+		return "Channel routing operation"
 	}
 }
 
@@ -1087,24 +1519,33 @@ func validateStoredRoutingOperationBase(operation *RoutingOperation) error {
 		return ErrRoutingOperationCorrupt
 	}
 	normalizeRoutingOperationStorage(operation)
+	retryable := operation.Retryable
+	cancellable := operation.Cancellable
 	spec := RoutingOperationSpec{
 		Type: operation.OperationType, EvaluationHash: operation.EvaluationHash,
 		SubjectType: operation.SubjectType, SubjectID: operation.SubjectID, PoolID: operation.PoolID,
 		ExpectedRevision: operation.ExpectedRevision, ExpectedActivationID: operation.ExpectedActivationID,
-		ActorID: operation.ActorID, Reason: operation.Reason,
+		ActorID: operation.ActorID, Reason: operation.Reason, Source: operation.Source,
+		CorrelationID: operation.CorrelationID, ParentOperationID: operation.ParentOperationID,
+		RetryOfOperationID: operation.RetryOfOperationID, RetrySequence: operation.RetrySequence,
+		Retryable: &retryable, Cancellable: &cancellable, Summary: operation.Summary,
+		RetentionCategory:  operation.RetentionCategory,
 		RequestPayloadHash: operation.RequestPayloadHash,
 	}
 	if operation.RequestKeyHash != nil {
 		spec.RequestKeyHash = *operation.RequestKeyHash
 	}
 	_, idempotencyHash, err := normalizeRoutingOperationSpec(spec)
-	if err != nil || operation.ID <= 0 || operation.IdempotencyHash != idempotencyHash ||
+	if err != nil || operation.ID <= 0 || operation.SchemaVersion != routingOperationRecordSchemaVersion ||
+		operation.IdempotencyHash != idempotencyHash ||
 		!routingOperationRequestIdentityMatches(*operation, spec) ||
+		!routingOperationMetadataMatchesSpec(*operation, spec) ||
 		!validRoutingPersistenceToken(operation.CreateToken) || !validRoutingOperationStatus(operation.Status) ||
 		(operation.SystemTaskID != "" &&
 			(operation.OperationType != RoutingOperationTypeCostSync || !validSystemTaskID(operation.SystemTaskID))) ||
 		operation.Attempts < 0 || operation.NextRetryMs < 0 || operation.CreatedTimeMs <= 0 ||
 		operation.UpdatedTimeMs < operation.CreatedTimeMs || operation.CompletedTimeMs < 0 ||
+		operation.TerminalActorID < 0 ||
 		!utf8.ValidString(operation.LastError) || utf8.RuneCountInString(operation.LastError) > routingOperationErrorMaxRunes {
 		return ErrRoutingOperationCorrupt
 	}
@@ -1122,25 +1563,39 @@ func validateStoredRoutingOperation(operation RoutingOperation) error {
 	switch operation.Status {
 	case RoutingOperationStatusPending:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.CompletedTimeMs != 0 ||
-			result != (RoutingOperationResult{}) ||
-			(operation.Attempts == 0 && (operation.LastError != "" || operation.NextRetryMs != 0)) ||
-			(operation.Attempts > 0 && (operation.LastError == "" || operation.NextRetryMs < operation.UpdatedTimeMs)) {
+			result != (RoutingOperationResult{}) || operation.Attempts != 0 || operation.LastError != "" ||
+			operation.NextRetryMs != 0 || operation.NeedsAttention || operation.TerminalActorID != 0 {
+			return ErrRoutingOperationCorrupt
+		}
+	case RoutingOperationStatusRetryWait:
+		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.CompletedTimeMs != 0 ||
+			result != (RoutingOperationResult{}) || operation.Attempts <= 0 || operation.LastError == "" ||
+			operation.NextRetryMs < operation.UpdatedTimeMs || operation.NeedsAttention || operation.TerminalActorID != 0 {
 			return ErrRoutingOperationCorrupt
 		}
 	case RoutingOperationStatusRunning:
 		if !validRoutingPersistenceToken(operation.ClaimToken) || operation.ClaimUntilMs <= operation.UpdatedTimeMs ||
-			operation.Attempts <= 0 || operation.CompletedTimeMs != 0 || result != (RoutingOperationResult{}) {
+			operation.Attempts <= 0 || operation.CompletedTimeMs != 0 || result != (RoutingOperationResult{}) ||
+			operation.NextRetryMs != 0 || operation.NeedsAttention || operation.TerminalActorID != 0 {
 			return ErrRoutingOperationCorrupt
 		}
 	case RoutingOperationStatusSucceeded:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
 			operation.Attempts <= 0 || operation.CompletedTimeMs < operation.CreatedTimeMs ||
+			operation.NeedsAttention ||
 			!validRoutingOperationTerminalState(operation.Status, operation.LastError, result) {
 			return ErrRoutingOperationCorrupt
 		}
-	case RoutingOperationStatusFailed, RoutingOperationStatusSuperseded:
+	case RoutingOperationStatusPartial, RoutingOperationStatusFailed:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
 			operation.Attempts <= 0 || operation.CompletedTimeMs < operation.CreatedTimeMs ||
+			!operation.NeedsAttention || operation.RetentionCategory != routingOperationFailureRetention(operation.RetentionCategory) ||
+			!validRoutingOperationTerminalState(operation.Status, operation.LastError, result) {
+			return ErrRoutingOperationCorrupt
+		}
+	case RoutingOperationStatusCancelled, RoutingOperationStatusSuperseded:
+		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
+			operation.Attempts < 0 || operation.CompletedTimeMs < operation.CreatedTimeMs || operation.NeedsAttention ||
 			!validRoutingOperationTerminalState(operation.Status, operation.LastError, result) {
 			return ErrRoutingOperationCorrupt
 		}
@@ -1164,26 +1619,44 @@ func validateStoredRoutingOperationSummary(operation RoutingOperation) error {
 	switch operation.Status {
 	case RoutingOperationStatusPending:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.CompletedTimeMs != 0 ||
-			hasRevisionResult || hasPayloadResult ||
-			(operation.Attempts == 0 && (operation.LastError != "" || operation.NextRetryMs != 0)) ||
-			(operation.Attempts > 0 && (operation.LastError == "" || operation.NextRetryMs < operation.UpdatedTimeMs)) {
+			hasRevisionResult || hasPayloadResult || operation.Attempts != 0 || operation.LastError != "" ||
+			operation.NextRetryMs != 0 || operation.NeedsAttention || operation.TerminalActorID != 0 {
+			return ErrRoutingOperationCorrupt
+		}
+	case RoutingOperationStatusRetryWait:
+		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.CompletedTimeMs != 0 ||
+			hasRevisionResult || hasPayloadResult || operation.Attempts <= 0 || operation.LastError == "" ||
+			operation.NextRetryMs < operation.UpdatedTimeMs || operation.NeedsAttention || operation.TerminalActorID != 0 {
 			return ErrRoutingOperationCorrupt
 		}
 	case RoutingOperationStatusRunning:
 		if !validRoutingPersistenceToken(operation.ClaimToken) || operation.ClaimUntilMs <= operation.UpdatedTimeMs ||
-			operation.Attempts <= 0 || operation.CompletedTimeMs != 0 || hasRevisionResult || hasPayloadResult {
+			operation.Attempts <= 0 || operation.CompletedTimeMs != 0 || hasRevisionResult || hasPayloadResult ||
+			operation.NextRetryMs != 0 || operation.NeedsAttention || operation.TerminalActorID != 0 {
 			return ErrRoutingOperationCorrupt
 		}
 	case RoutingOperationStatusSucceeded:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
 			operation.Attempts <= 0 || operation.CompletedTimeMs < operation.CreatedTimeMs ||
-			operation.LastError != "" || (!hasRevisionResult && !hasPayloadResult) {
+			operation.LastError != "" || operation.NeedsAttention || (!hasRevisionResult && !hasPayloadResult) {
 			return ErrRoutingOperationCorrupt
 		}
-	case RoutingOperationStatusFailed, RoutingOperationStatusSuperseded:
+	case RoutingOperationStatusPartial:
 		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
 			operation.Attempts <= 0 || operation.CompletedTimeMs < operation.CreatedTimeMs ||
-			operation.LastError == "" || hasRevisionResult || hasPayloadResult {
+			operation.LastError == "" || !operation.NeedsAttention || (!hasRevisionResult && !hasPayloadResult) {
+			return ErrRoutingOperationCorrupt
+		}
+	case RoutingOperationStatusFailed:
+		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
+			operation.Attempts <= 0 || operation.CompletedTimeMs < operation.CreatedTimeMs ||
+			operation.LastError == "" || !operation.NeedsAttention || hasRevisionResult || hasPayloadResult {
+			return ErrRoutingOperationCorrupt
+		}
+	case RoutingOperationStatusCancelled, RoutingOperationStatusSuperseded:
+		if operation.ClaimToken != "" || operation.ClaimUntilMs != 0 || operation.NextRetryMs != 0 ||
+			operation.CompletedTimeMs < operation.CreatedTimeMs || operation.LastError == "" ||
+			operation.NeedsAttention || hasRevisionResult || hasPayloadResult {
 			return ErrRoutingOperationCorrupt
 		}
 	}
@@ -1209,6 +1682,51 @@ func routingOperationRequestIdentityMatches(operation RoutingOperation, spec Rou
 	}
 	return operation.RequestKeyHash != nil && *operation.RequestKeyHash == spec.RequestKeyHash &&
 		operation.RequestPayloadHash == spec.RequestPayloadHash
+}
+
+func routingOperationMetadataMatchesSpec(operation RoutingOperation, spec RoutingOperationSpec) bool {
+	expectedRetention := spec.RetentionCategory
+	expectedNeedsAttention := false
+	if operation.Status == RoutingOperationStatusFailed || operation.Status == RoutingOperationStatusPartial {
+		expectedRetention = routingOperationFailureRetention(expectedRetention)
+		expectedNeedsAttention = true
+	} else if operation.Status == RoutingOperationStatusCancelled {
+		expectedRetention = routingOperationFailureRetention(expectedRetention)
+	}
+	if operation.SchemaVersion != routingOperationRecordSchemaVersion || operation.Source != spec.Source ||
+		operation.ParentOperationID != spec.ParentOperationID || operation.RetryOfOperationID != spec.RetryOfOperationID ||
+		operation.RetrySequence != spec.RetrySequence || operation.Retryable != *spec.Retryable ||
+		operation.Cancellable != *spec.Cancellable || operation.Summary != spec.Summary ||
+		operation.NeedsAttention != expectedNeedsAttention || operation.RetentionCategory != expectedRetention ||
+		!validRoutingOperationCorrelationID(operation.CorrelationID) {
+		return false
+	}
+	return spec.CorrelationID == "" || operation.CorrelationID == spec.CorrelationID
+}
+
+func validateRoutingOperationRelationshipDB(ctx context.Context, db *gorm.DB, spec RoutingOperationSpec) error {
+	if spec.RetryOfOperationID == 0 {
+		return nil
+	}
+	if db == nil || spec.ParentOperationID != spec.RetryOfOperationID || spec.RequestKeyHash != "" {
+		return ErrRoutingOperationInvalid
+	}
+	var parent RoutingOperation
+	if err := db.WithContext(ctx).Where("id = ?", spec.RetryOfOperationID).First(&parent).Error; err != nil {
+		return err
+	}
+	if err := validateStoredRoutingOperation(parent); err != nil {
+		return err
+	}
+	if !parent.Retryable || (parent.Status != RoutingOperationStatusFailed &&
+		parent.Status != RoutingOperationStatusPartial && parent.Status != RoutingOperationStatusCancelled) ||
+		parent.CorrelationID != spec.CorrelationID || parent.RetrySequence+1 != spec.RetrySequence ||
+		parent.OperationType != spec.Type || parent.EvaluationHash != spec.EvaluationHash ||
+		parent.SubjectType != spec.SubjectType || parent.SubjectID != spec.SubjectID || parent.PoolID != spec.PoolID ||
+		parent.ExpectedRevision != spec.ExpectedRevision || parent.ExpectedActivationID != spec.ExpectedActivationID {
+		return ErrRoutingOperationInvalid
+	}
+	return nil
 }
 
 func normalizeRoutingOperationResultPayload(payload any) (string, string, error) {
@@ -1271,12 +1789,55 @@ func normalizeRoutingOperationStorage(operation *RoutingOperation) {
 	operation.EvaluationHash = strings.TrimSpace(operation.EvaluationHash)
 	operation.ClaimToken = strings.TrimSpace(operation.ClaimToken)
 	operation.ResultPayloadHash = strings.TrimSpace(operation.ResultPayloadHash)
+	operation.Source = strings.TrimSpace(operation.Source)
+	operation.CorrelationID = strings.ToLower(strings.TrimSpace(operation.CorrelationID))
+	operation.Summary = routingOperationText(operation.Summary, routingOperationSummaryMaxRunes)
+	operation.RetentionCategory = strings.TrimSpace(operation.RetentionCategory)
 	if operation.RequestKeyHash != nil {
 		trimmed := strings.TrimSpace(*operation.RequestKeyHash)
 		if trimmed == "" {
 			operation.RequestKeyHash = nil
 		} else {
 			operation.RequestKeyHash = &trimmed
+		}
+	}
+	if operation.SchemaVersion == 0 && operation.ID > 0 {
+		operation.SchemaVersion = routingOperationRecordSchemaVersion
+		if operation.Source == "" {
+			if operation.ActorID > 0 {
+				operation.Source = RoutingOperationSourceAdmin
+			} else {
+				operation.Source = RoutingOperationSourceSystem
+			}
+		}
+		if operation.CorrelationID == "" {
+			digest := sha256.Sum256([]byte("routing-operation-legacy:v2\x00" + operation.IdempotencyHash))
+			operation.CorrelationID = hex.EncodeToString(digest[:16])
+		}
+		retryable, cancellable, retention := routingOperationDefaultPolicy(operation.OperationType)
+		operation.Retryable = retryable
+		operation.Cancellable = cancellable
+		if operation.Summary == "" {
+			operation.Summary = routingOperationText(operation.Reason, routingOperationSummaryMaxRunes)
+		}
+		if operation.Summary == "" {
+			operation.Summary = routingOperationTypeSummary(operation.OperationType)
+		}
+		if operation.RetentionCategory == "" {
+			operation.RetentionCategory = retention
+		}
+		if operation.Status == RoutingOperationStatusPending && operation.Attempts > 0 {
+			operation.Status = RoutingOperationStatusRetryWait
+		}
+		if operation.Status == RoutingOperationStatusFailed || operation.Status == RoutingOperationStatusPartial {
+			operation.NeedsAttention = true
+			operation.RetentionCategory = routingOperationFailureRetention(operation.RetentionCategory)
+		}
+		if operation.Status == RoutingOperationStatusCancelled {
+			operation.RetentionCategory = routingOperationFailureRetention(operation.RetentionCategory)
+		}
+		if operation.CompletedTimeMs > 0 && operation.TerminalActorID == 0 {
+			operation.TerminalActorID = operation.ActorID
 		}
 	}
 }

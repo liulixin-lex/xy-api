@@ -9,19 +9,26 @@ import (
 )
 
 type SnapshotMetadata struct {
-	Revision              uint64        `json:"revision"`
-	ConfigurationEpoch    uint64        `json:"configuration_epoch"`
-	ConfigurationHash     string        `json:"configuration_hash"`
-	RuntimeGeneration     uint64        `json:"runtime_generation"`
-	PolicyHash            string        `json:"policy_hash"`
-	ActivationID          int64         `json:"activation_id"`
-	ActivationStage       string        `json:"activation_stage"`
-	TrafficBasisPoints    int           `json:"traffic_basis_points"`
-	ActivationCreatedTime int64         `json:"activation_created_time"`
-	NodeEpochID           string        `json:"node_epoch_id"`
-	BuiltAtUnix           int64         `json:"built_at"`
-	BuildDurationMs       int64         `json:"build_duration_ms"`
-	Stats                 SnapshotStats `json:"stats"`
+	Revision                uint64        `json:"revision"`
+	PolicyRevision          uint64        `json:"policy_revision"`
+	TopologyEpoch           uint64        `json:"topology_epoch"`
+	TopologyHash            string        `json:"topology_hash"`
+	PricingEpoch            uint64        `json:"pricing_epoch"`
+	PricingHash             string        `json:"pricing_hash"`
+	RuntimeSettingsRevision uint64        `json:"runtime_settings_revision"`
+	RuntimeSettingsHash     string        `json:"runtime_settings_hash,omitempty"`
+	ConfigurationEpoch      uint64        `json:"configuration_epoch"`
+	ConfigurationHash       string        `json:"configuration_hash"`
+	RuntimeGeneration       uint64        `json:"runtime_generation"`
+	PolicyHash              string        `json:"policy_hash"`
+	ActivationID            int64         `json:"activation_id"`
+	ActivationStage         string        `json:"activation_stage"`
+	TrafficBasisPoints      int           `json:"traffic_basis_points"`
+	ActivationCreatedTime   int64         `json:"activation_created_time"`
+	NodeEpochID             string        `json:"node_epoch_id"`
+	BuiltAtUnix             int64         `json:"built_at"`
+	BuildDurationMs         int64         `json:"build_duration_ms"`
+	Stats                   SnapshotStats `json:"stats"`
 }
 
 type TelemetryAggregate struct {
@@ -40,6 +47,8 @@ type CostSnapshotItem struct {
 	GroupName              string                          `json:"group_name"`
 	MemberID               int                             `json:"member_id"`
 	ChannelID              int                             `json:"channel_id"`
+	RoutingIdentity        string                          `json:"routing_identity"`
+	RoutingGeneration      string                          `json:"routing_generation"`
 	ChannelName            string                          `json:"channel_name"`
 	ModelName              string                          `json:"model_name"`
 	Known                  bool                            `json:"known"`
@@ -97,19 +106,26 @@ func snapshotMetadata(view SnapshotView) SnapshotMetadata {
 		stats.UnknownClassificationRate = &value
 	}
 	return SnapshotMetadata{
-		Revision:              view.Revision,
-		ConfigurationEpoch:    view.ConfigurationEpoch,
-		ConfigurationHash:     view.ConfigurationHash,
-		RuntimeGeneration:     view.RuntimeGeneration,
-		PolicyHash:            view.PolicyHash,
-		ActivationID:          view.ActivationID,
-		ActivationStage:       view.ActivationStage,
-		TrafficBasisPoints:    view.TrafficBasisPoints,
-		ActivationCreatedTime: view.ActivationCreatedTime,
-		NodeEpochID:           NodeEpochID(),
-		BuiltAtUnix:           view.BuiltAtUnix,
-		BuildDurationMs:       view.BuildDurationMs,
-		Stats:                 stats,
+		Revision:                view.Revision,
+		PolicyRevision:          view.PolicyRevision,
+		TopologyEpoch:           view.TopologyEpoch,
+		TopologyHash:            view.TopologyHash,
+		PricingEpoch:            view.PricingEpoch,
+		PricingHash:             view.PricingHash,
+		RuntimeSettingsRevision: view.RuntimeSettingsRevision,
+		RuntimeSettingsHash:     view.RuntimeSettingsHash,
+		ConfigurationEpoch:      view.ConfigurationEpoch,
+		ConfigurationHash:       view.ConfigurationHash,
+		RuntimeGeneration:       view.RuntimeGeneration,
+		PolicyHash:              view.PolicyHash,
+		ActivationID:            view.ActivationID,
+		ActivationStage:         view.ActivationStage,
+		TrafficBasisPoints:      view.TrafficBasisPoints,
+		ActivationCreatedTime:   view.ActivationCreatedTime,
+		NodeEpochID:             NodeEpochID(),
+		BuiltAtUnix:             view.BuiltAtUnix,
+		BuildDurationMs:         view.BuildDurationMs,
+		Stats:                   stats,
 	}
 }
 
@@ -354,6 +370,8 @@ func ListCostSnapshots(group string, modelFilter string, known *bool, offset int
 						GroupName:              pool.GroupName,
 						MemberID:               member.ID,
 						ChannelID:              member.ChannelID,
+						RoutingIdentity:        routingIdentityForSnapshotMember(snapshot, member),
+						RoutingGeneration:      member.ChannelGeneration,
 						ChannelName:            member.ChannelName,
 						ModelName:              observation.ModelName,
 						Known:                  costKnown,
@@ -390,6 +408,17 @@ func ListCostSnapshots(group string, modelFilter string, known *bool, offset int
 		}
 	}
 	return items, total, snapshotMetadata(snapshot.view), true
+}
+
+func routingIdentityForSnapshotMember(snapshot *runtimeSnapshot, member PoolMemberSnapshot) string {
+	if snapshot == nil || member.ChannelGeneration == "" {
+		return ""
+	}
+	channel, exists := snapshot.channelByID[member.ChannelID]
+	if !exists || channel.RoutingGeneration != member.ChannelGeneration {
+		return ""
+	}
+	return channel.RoutingIdentity
 }
 
 func clonePoolSnapshot(source PoolSnapshot) PoolSnapshot {

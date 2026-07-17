@@ -56,6 +56,8 @@ var (
 // into user quota, settlement, or billing logs.
 type RoutingChannelConfiguration struct {
 	ChannelID              int     `json:"channel_id" gorm:"primaryKey;autoIncrement:false"`
+	RoutingIdentity        string  `json:"routing_identity" gorm:"type:varchar(32);index;not null"`
+	RoutingGeneration      string  `json:"routing_generation" gorm:"type:varchar(32);index;not null"`
 	UpstreamCostMultiplier float64 `json:"upstream_cost_multiplier" gorm:"not null"`
 	CostSource             string  `json:"cost_source" gorm:"type:varchar(32);index;not null"`
 	CostConfirmed          bool    `json:"cost_confirmed" gorm:"index;not null"`
@@ -153,7 +155,11 @@ type RoutingChannelConfigurationEvent struct {
 	EventID           string `json:"event_id"`
 	EventType         string `json:"event_type"`
 	Action            string `json:"action"`
+	AggregateID       string `json:"aggregate_id,omitempty"`
+	AggregateRevision int64  `json:"aggregate_revision,omitempty"`
 	ChannelID         int    `json:"channel_id"`
+	RoutingIdentity   string `json:"routing_identity,omitempty"`
+	RoutingGeneration string `json:"routing_generation,omitempty"`
 	Revision          int64  `json:"revision"`
 	PreviousRevision  int64  `json:"previous_revision"`
 	ConfigEpoch       int64  `json:"config_epoch"`
@@ -178,21 +184,25 @@ func (RoutingConfigurationEpoch) TableName() string {
 }
 
 type RoutingChannelConfigurationOutbox struct {
-	ID              int64  `json:"id" gorm:"primaryKey"`
-	EventID         string `json:"event_id" gorm:"type:varchar(96);uniqueIndex;not null"`
-	ChannelID       int    `json:"channel_id" gorm:"index;not null"`
-	Revision        int64  `json:"revision" gorm:"bigint;index;not null"`
-	ConfigEpoch     int64  `json:"config_epoch" gorm:"bigint;uniqueIndex;not null"`
-	EventType       string `json:"event_type" gorm:"type:varchar(64);index;not null"`
-	PayloadJSON     string `json:"-" gorm:"type:text;not null"`
-	PayloadHash     string `json:"payload_hash" gorm:"type:char(64);not null"`
-	CreatedTime     int64  `json:"created_time" gorm:"bigint;index;not null"`
-	PublishedTime   int64  `json:"published_time" gorm:"bigint;index;not null"`
-	Attempts        int    `json:"attempts" gorm:"not null"`
-	NextAttemptTime int64  `json:"next_attempt_time" gorm:"bigint;index;not null"`
-	ClaimToken      string `json:"-" gorm:"type:char(32);index;not null"`
-	ClaimedUntil    int64  `json:"claimed_until" gorm:"bigint;index;not null"`
-	LastError       string `json:"last_error" gorm:"type:text;not null"`
+	ID                int64  `json:"id" gorm:"primaryKey"`
+	EventID           string `json:"event_id" gorm:"type:varchar(96);uniqueIndex;not null"`
+	AggregateID       string `json:"aggregate_id" gorm:"type:varchar(32);index;not null"`
+	AggregateRevision int64  `json:"aggregate_revision" gorm:"bigint;index;not null"`
+	ChannelID         int    `json:"channel_id" gorm:"index;not null"`
+	RoutingIdentity   string `json:"routing_identity" gorm:"type:varchar(32);index;not null"`
+	RoutingGeneration string `json:"routing_generation" gorm:"type:varchar(32);index;not null"`
+	Revision          int64  `json:"revision" gorm:"bigint;index;not null"`
+	ConfigEpoch       int64  `json:"config_epoch" gorm:"bigint;uniqueIndex;not null"`
+	EventType         string `json:"event_type" gorm:"type:varchar(64);index;not null"`
+	PayloadJSON       string `json:"-" gorm:"type:text;not null"`
+	PayloadHash       string `json:"payload_hash" gorm:"type:char(64);not null"`
+	CreatedTime       int64  `json:"created_time" gorm:"bigint;index;not null"`
+	PublishedTime     int64  `json:"published_time" gorm:"bigint;index;not null"`
+	Attempts          int    `json:"attempts" gorm:"not null"`
+	NextAttemptTime   int64  `json:"next_attempt_time" gorm:"bigint;index;not null"`
+	ClaimToken        string `json:"-" gorm:"type:char(32);index;not null"`
+	ClaimedUntil      int64  `json:"claimed_until" gorm:"bigint;index;not null"`
+	LastError         string `json:"last_error" gorm:"type:text;not null"`
 }
 
 func (RoutingChannelConfigurationOutbox) TableName() string {
@@ -210,6 +220,8 @@ func NewDefaultRoutingChannelConfiguration(channelID int, createdTime int64) (Ro
 	}
 	configuration := RoutingChannelConfiguration{
 		ChannelID:              channelID,
+		RoutingIdentity:        common.GetUUID(),
+		RoutingGeneration:      common.GetUUID(),
 		UpstreamCostMultiplier: 1,
 		CostSource:             RoutingChannelCostSourceDefaulted,
 		CostConfirmed:          false,
@@ -219,6 +231,22 @@ func NewDefaultRoutingChannelConfiguration(channelID int, createdTime int64) (Ro
 		CreatedTime:            createdTime,
 		UpdatedTime:            createdTime,
 	}
+	if !ValidRoutingChannelConfiguration(configuration) {
+		return RoutingChannelConfiguration{}, ErrRoutingChannelConfigurationInvalid
+	}
+	return configuration, nil
+}
+
+func NewDefaultRoutingChannelConfigurationForChannel(channel Channel) (RoutingChannelConfiguration, error) {
+	if !validRoutingChannel(channel) {
+		return RoutingChannelConfiguration{}, ErrRoutingChannelConfigurationInvalid
+	}
+	configuration, err := NewDefaultRoutingChannelConfiguration(channel.Id, channel.CreatedTime)
+	if err != nil {
+		return RoutingChannelConfiguration{}, err
+	}
+	configuration.RoutingIdentity = channel.RoutingIdentity
+	configuration.RoutingGeneration = channel.RoutingGeneration
 	if !ValidRoutingChannelConfiguration(configuration) {
 		return RoutingChannelConfiguration{}, ErrRoutingChannelConfigurationInvalid
 	}
@@ -242,7 +270,8 @@ func NormalizeRoutingFailureDomainLabel(label string) (string, string, error) {
 }
 
 func ValidRoutingChannelConfiguration(configuration RoutingChannelConfiguration) bool {
-	if configuration.ChannelID <= 0 || configuration.Revision <= 0 || configuration.UpdatedBy < 0 ||
+	if configuration.ChannelID <= 0 || !validRoutingIdentity(configuration.RoutingIdentity) ||
+		!validRoutingIdentity(configuration.RoutingGeneration) || configuration.Revision <= 0 || configuration.UpdatedBy < 0 ||
 		configuration.CreatedTime <= 0 || configuration.UpdatedTime < configuration.CreatedTime ||
 		!validRoutingChannelMultiplier(configuration.UpstreamCostMultiplier) ||
 		!validRoutingChannelCostSource(configuration.CostSource) ||
@@ -272,6 +301,8 @@ func RoutingChannelConfigurationStateHash(configuration RoutingChannelConfigurat
 	}
 	payload, err := common.Marshal(struct {
 		ChannelID              int     `json:"channel_id"`
+		RoutingIdentity        string  `json:"routing_identity"`
+		RoutingGeneration      string  `json:"routing_generation"`
 		UpstreamCostMultiplier float64 `json:"upstream_cost_multiplier"`
 		CostSource             string  `json:"cost_source"`
 		CostConfirmed          bool    `json:"cost_confirmed"`
@@ -284,8 +315,10 @@ func RoutingChannelConfigurationStateHash(configuration RoutingChannelConfigurat
 		CreatedTime            int64   `json:"created_time"`
 		UpdatedTime            int64   `json:"updated_time"`
 	}{
-		ChannelID: configuration.ChannelID, UpstreamCostMultiplier: configuration.UpstreamCostMultiplier,
-		CostSource: configuration.CostSource, CostConfirmed: configuration.CostConfirmed,
+		ChannelID: configuration.ChannelID, RoutingIdentity: configuration.RoutingIdentity,
+		RoutingGeneration:      configuration.RoutingGeneration,
+		UpstreamCostMultiplier: configuration.UpstreamCostMultiplier,
+		CostSource:             configuration.CostSource, CostConfirmed: configuration.CostConfirmed,
 		TrafficClass: configuration.TrafficClass, FailureDomainLabel: configuration.FailureDomainLabel,
 		FailureDomainHash: configuration.FailureDomainHash, FailureDomainStatus: configuration.FailureDomainStatus,
 		Revision: configuration.Revision, UpdatedBy: configuration.UpdatedBy,
@@ -346,7 +379,10 @@ func GetRoutingChannelConfigurationContext(ctx context.Context, channelID int) (
 		return RoutingChannelConfiguration{}, gorm.ErrRecordNotFound
 	}
 	var configuration RoutingChannelConfiguration
-	err := DB.WithContext(ctx).Where("channel_id = ?", channelID).First(&configuration).Error
+	err := DB.WithContext(ctx).Table("routing_channel_configurations AS routing_channel_configurations").
+		Select("routing_channel_configurations.*").
+		Joins("JOIN channels ON channels.id = routing_channel_configurations.channel_id AND channels.routing_identity = routing_channel_configurations.routing_identity AND channels.routing_generation = routing_channel_configurations.routing_generation").
+		Where("routing_channel_configurations.channel_id = ?", channelID).First(&configuration).Error
 	return configuration, err
 }
 
@@ -363,7 +399,7 @@ func ListRoutingChannelConfigurationsContext(
 		return nil, 0, ErrRoutingChannelConfigurationInvalid
 	}
 	query := DB.WithContext(ctx).Model(&RoutingChannelConfiguration{}).
-		Joins("JOIN channels ON channels.id = routing_channel_configurations.channel_id")
+		Joins("JOIN channels ON channels.id = routing_channel_configurations.channel_id AND channels.routing_identity = routing_channel_configurations.routing_identity AND channels.routing_generation = routing_channel_configurations.routing_generation")
 	if filter.CostConfirmed != nil {
 		query = query.Where("routing_channel_configurations.cost_confirmed = ?", *filter.CostConfirmed)
 	}
@@ -425,6 +461,18 @@ func UpdateRoutingChannelConfigurationContext(
 		if err != nil {
 			return err
 		}
+		var channel Channel
+		channelQuery := tx.Select("id", "routing_identity", "routing_generation").Where("id = ?", expected.ChannelID)
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			channelQuery = channelQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := channelQuery.First(&channel).Error; err != nil {
+			return err
+		}
+		if current.RoutingIdentity != channel.RoutingIdentity ||
+			current.RoutingGeneration != channel.RoutingGeneration {
+			return ErrRoutingChannelConfigurationChanged
+		}
 		if !sameRoutingChannelConfiguration(current, expected) {
 			return ErrRoutingChannelConfigurationChanged
 		}
@@ -461,7 +509,9 @@ func UpdateRoutingChannelConfigurationContext(
 			return ErrRoutingChannelConfigurationInvalid
 		}
 		result := tx.Model(&RoutingChannelConfiguration{}).
-			Where("channel_id = ? AND revision = ?", current.ChannelID, current.Revision).
+			Where("channel_id = ? AND routing_identity = ? AND routing_generation = ? AND revision = ?",
+				current.ChannelID, current.RoutingIdentity, current.RoutingGeneration, current.Revision,
+			).
 			Updates(map[string]any{
 				"upstream_cost_multiplier": updated.UpstreamCostMultiplier,
 				"cost_source":              updated.CostSource,
@@ -494,22 +544,34 @@ func UpdateRoutingChannelConfigurationContext(
 		}
 		summary, err := common.Marshal(struct {
 			ChannelID              int     `json:"channel_id"`
+			RoutingIdentity        string  `json:"routing_identity"`
+			RoutingGeneration      string  `json:"routing_generation"`
 			UpstreamCostMultiplier float64 `json:"upstream_cost_multiplier"`
 			CostConfirmed          bool    `json:"cost_confirmed"`
 			TrafficClass           string  `json:"traffic_class"`
 			FailureDomainStatus    string  `json:"failure_domain_status"`
 		}{
-			ChannelID: updated.ChannelID, UpstreamCostMultiplier: updated.UpstreamCostMultiplier,
-			CostConfirmed: updated.CostConfirmed, TrafficClass: updated.TrafficClass,
+			ChannelID: updated.ChannelID, RoutingIdentity: updated.RoutingIdentity,
+			RoutingGeneration:      updated.RoutingGeneration,
+			UpstreamCostMultiplier: updated.UpstreamCostMultiplier,
+			CostConfirmed:          updated.CostConfirmed, TrafficClass: updated.TrafficClass,
 			FailureDomainStatus: updated.FailureDomainStatus,
 		})
 		if err != nil {
 			return err
 		}
+		auditDocuments, err := routingChannelConfigurationAuditDocuments(&current, updated)
+		if err != nil {
+			return err
+		}
 		if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
 			SubjectType: RoutingControlSubjectChannelConfiguration, SubjectID: int64(updated.ChannelID),
+			SubjectIdentity: updated.RoutingIdentity, SubjectGeneration: updated.RoutingGeneration,
 			Action: RoutingControlActionUpdate, ActorID: actorID,
 			BeforeHash: beforeHash, AfterHash: afterHash, SummaryJSON: string(summary),
+			SubjectSnapshotJSON: auditDocuments.SubjectSnapshot, ChangeSetJSON: auditDocuments.ChangeSet,
+			ImpactJSON: auditDocuments.Impact, RelationJSON: auditDocuments.Relations,
+			TechnicalJSON: auditDocuments.Technical,
 			CreatedTimeMs: time.Now().UnixMilli(),
 		}); err != nil {
 			return err
@@ -539,7 +601,8 @@ func MigrateRoutingChannelConfigurations(db *gorm.DB) error {
 	lastChannelID := 0
 	for {
 		var channels []Channel
-		query := db.Select("id", "created_time").Order("id asc").Limit(routingChannelConfigurationMigrationBatch)
+		query := db.Select("id", "routing_identity", "routing_generation", "created_time").
+			Order("id asc").Limit(routingChannelConfigurationMigrationBatch)
 		if lastChannelID > 0 {
 			query = query.Where("id > ?", lastChannelID)
 		}
@@ -811,6 +874,9 @@ func (outbox RoutingChannelConfigurationOutbox) DecodePayload() (RoutingChannelC
 		event.Revision != outbox.Revision || event.ConfigEpoch != outbox.ConfigEpoch {
 		return RoutingChannelConfigurationEvent{}, ErrRoutingChannelConfigurationInvalid
 	}
+	if err := validatePreparedRoutingChannelConfigurationOutbox(outbox, event); err != nil {
+		return RoutingChannelConfigurationEvent{}, err
+	}
 	return event, nil
 }
 
@@ -878,7 +944,7 @@ func createDefaultRoutingChannelConfigurationsTx(tx *gorm.DB, channels []Channel
 		return nil
 	}
 	for index := range channels {
-		configuration, err := NewDefaultRoutingChannelConfiguration(channels[index].Id, channels[index].CreatedTime)
+		configuration, err := NewDefaultRoutingChannelConfigurationForChannel(channels[index])
 		if err != nil {
 			return err
 		}
@@ -893,10 +959,18 @@ func createDefaultRoutingChannelConfigurationsTx(tx *gorm.DB, channels []Channel
 			if err != nil {
 				return err
 			}
+			auditDocuments, err := routingChannelConfigurationAuditDocuments(nil, configuration)
+			if err != nil {
+				return err
+			}
 			if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
 				SubjectType: RoutingControlSubjectChannelConfiguration, SubjectID: int64(configuration.ChannelID),
+				SubjectIdentity: configuration.RoutingIdentity, SubjectGeneration: configuration.RoutingGeneration,
 				Action: RoutingControlActionBootstrap, AfterHash: afterHash,
-				SummaryJSON: `{"source":"channel_creation"}`, CreatedTimeMs: time.Now().UnixMilli(),
+				SummaryJSON: `{"source":"channel_creation"}`, SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+				ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+				RelationJSON: auditDocuments.Relations, TechnicalJSON: auditDocuments.Technical,
+				CreatedTimeMs: time.Now().UnixMilli(),
 			}); err != nil {
 				return err
 			}
@@ -905,13 +979,142 @@ func createDefaultRoutingChannelConfigurationsTx(tx *gorm.DB, channels []Channel
 	return nil
 }
 
-func createDefaultRoutingChannelConfigurationTx(tx *gorm.DB, channelID int, createdTime int64) error {
-	return createDefaultRoutingChannelConfigurationsTx(tx, []Channel{{Id: channelID, CreatedTime: createdTime}})
+func createDefaultRoutingChannelConfigurationTx(tx *gorm.DB, channel Channel) error {
+	return createDefaultRoutingChannelConfigurationsTx(tx, []Channel{channel})
+}
+
+func rotateRoutingChannelConfigurationGenerationTx(
+	tx *gorm.DB,
+	previous Channel,
+	current Channel,
+	now int64,
+) error {
+	if tx == nil || !validRoutingChannel(previous) || !validRoutingChannel(current) ||
+		previous.Id != current.Id || previous.RoutingIdentity != current.RoutingIdentity ||
+		previous.RoutingGeneration == current.RoutingGeneration || now <= 0 ||
+		!tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+		return ErrRoutingChannelConfigurationInvalid
+	}
+	configuration, err := loadRoutingChannelConfigurationForUpdate(tx, previous.Id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return createDefaultRoutingChannelConfigurationTx(tx, current)
+	}
+	if err != nil {
+		return err
+	}
+	if configuration.RoutingIdentity != previous.RoutingIdentity ||
+		configuration.RoutingGeneration != previous.RoutingGeneration {
+		return ErrRoutingChannelConfigurationChanged
+	}
+	if configuration.Revision == math.MaxInt64 {
+		return ErrRoutingChannelConfigurationInvalid
+	}
+	updated := configuration
+	updated.RoutingGeneration = current.RoutingGeneration
+	updated.Revision++
+	updated.UpdatedBy = 0
+	if now <= configuration.UpdatedTime {
+		now = configuration.UpdatedTime + 1
+	}
+	updated.UpdatedTime = now
+	if !ValidRoutingChannelConfiguration(updated) {
+		return ErrRoutingChannelConfigurationInvalid
+	}
+	result := tx.Model(&RoutingChannelConfiguration{}).
+		Where("channel_id = ? AND routing_identity = ? AND routing_generation = ? AND revision = ?",
+			configuration.ChannelID, configuration.RoutingIdentity, configuration.RoutingGeneration, configuration.Revision,
+		).
+		Updates(map[string]any{
+			"routing_generation": updated.RoutingGeneration,
+			"revision":           updated.Revision,
+			"updated_by":         updated.UpdatedBy,
+			"updated_time":       updated.UpdatedTime,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrRoutingChannelConfigurationChanged
+	}
+	beforeHash, err := RoutingChannelConfigurationStateHash(configuration)
+	if err != nil {
+		return err
+	}
+	afterHash, err := RoutingChannelConfigurationStateHash(updated)
+	if err != nil {
+		return err
+	}
+	if tx.Migrator().HasTable(&RoutingControlAudit{}) {
+		summary, marshalErr := common.Marshal(struct {
+			Source             string `json:"source"`
+			RoutingIdentity    string `json:"routing_identity"`
+			PreviousGeneration string `json:"previous_generation"`
+			CurrentGeneration  string `json:"current_generation"`
+		}{
+			Source:             "channel_lifecycle_rotation",
+			RoutingIdentity:    current.RoutingIdentity,
+			PreviousGeneration: previous.RoutingGeneration,
+			CurrentGeneration:  current.RoutingGeneration,
+		})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		auditDocuments, auditErr := routingChannelConfigurationAuditDocuments(&configuration, updated)
+		if auditErr != nil {
+			return auditErr
+		}
+		if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
+			SubjectType: RoutingControlSubjectChannelConfiguration, SubjectID: int64(updated.ChannelID),
+			SubjectIdentity: updated.RoutingIdentity, SubjectGeneration: updated.RoutingGeneration,
+			Action: RoutingControlActionUpdate, BeforeHash: beforeHash, AfterHash: afterHash,
+			SummaryJSON: string(summary), SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+			ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+			RelationJSON: auditDocuments.Relations, TechnicalJSON: auditDocuments.Technical,
+			CreatedTimeMs: time.Now().UnixMilli(),
+		}); err != nil {
+			return err
+		}
+	}
+	if !tx.Migrator().HasTable(&RoutingConfigurationEpoch{}) ||
+		!tx.Migrator().HasTable(&RoutingChannelConfigurationOutbox{}) {
+		return nil
+	}
+	configEpoch, err := advanceRoutingConfigurationEpochTx(tx, now, afterHash)
+	if err != nil {
+		return err
+	}
+	outbox, err := newRoutingChannelConfigurationOutbox(
+		updated, configuration.Revision, configEpoch, afterHash, RoutingControlActionUpdate,
+	)
+	if err != nil {
+		return err
+	}
+	return tx.Create(&outbox).Error
 }
 
 func migrateRoutingChannelConfigurationTx(tx *gorm.DB, channel Channel, binding RoutingChannelBinding) error {
 	current, err := loadRoutingChannelConfigurationForUpdate(tx, channel.Id)
 	if err == nil {
+		if current.RoutingIdentity == "" && current.RoutingGeneration == "" {
+			result := tx.Model(&RoutingChannelConfiguration{}).
+				Where("channel_id = ? AND routing_identity = ? AND routing_generation = ?", channel.Id, "", "").
+				Updates(map[string]any{
+					"routing_identity":   channel.RoutingIdentity,
+					"routing_generation": channel.RoutingGeneration,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrRoutingChannelConfigurationChanged
+			}
+			current.RoutingIdentity = channel.RoutingIdentity
+			current.RoutingGeneration = channel.RoutingGeneration
+		}
+		if current.RoutingIdentity != channel.RoutingIdentity ||
+			current.RoutingGeneration != channel.RoutingGeneration {
+			return ErrRoutingChannelConfigurationChanged
+		}
 		if !ValidRoutingChannelConfiguration(current) {
 			return ErrRoutingChannelConfigurationInvalid
 		}
@@ -929,7 +1132,8 @@ func migrateRoutingChannelConfigurationTx(tx *gorm.DB, channel Channel, binding 
 	if createdTime <= 0 {
 		createdTime = now
 	}
-	candidate, err := NewDefaultRoutingChannelConfiguration(channel.Id, createdTime)
+	channel.CreatedTime = createdTime
+	candidate, err := NewDefaultRoutingChannelConfigurationForChannel(channel)
 	if err != nil {
 		return err
 	}
@@ -954,10 +1158,18 @@ func migrateRoutingChannelConfigurationTx(tx *gorm.DB, channel Channel, binding 
 	if err != nil {
 		return err
 	}
+	auditDocuments, err := routingChannelConfigurationAuditDocuments(nil, candidate)
+	if err != nil {
+		return err
+	}
 	return insertRoutingControlAuditTx(tx, RoutingControlAudit{
 		SubjectType: RoutingControlSubjectChannelConfiguration, SubjectID: int64(candidate.ChannelID),
+		SubjectIdentity: candidate.RoutingIdentity, SubjectGeneration: candidate.RoutingGeneration,
 		Action: RoutingControlActionBootstrap, AfterHash: afterHash,
-		SummaryJSON: `{"source":"legacy_migration"}`, CreatedTimeMs: time.Now().UnixMilli(),
+		SummaryJSON: `{"source":"legacy_migration"}`, SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+		ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+		RelationJSON: auditDocuments.Relations, TechnicalJSON: auditDocuments.Technical,
+		CreatedTimeMs: time.Now().UnixMilli(),
 	})
 }
 
@@ -1129,10 +1341,12 @@ func newRoutingChannelConfigurationOutbox(
 		!validRoutingChannelHash(stateHash) || action != RoutingControlActionUpdate {
 		return RoutingChannelConfigurationOutbox{}, ErrRoutingChannelConfigurationInvalid
 	}
-	eventID := fmt.Sprintf("routing-channel-config:%d:%020d", configuration.ChannelID, configuration.Revision)
+	eventID := common.GetUUID()
 	event := RoutingChannelConfigurationEvent{
 		EventID: eventID, EventType: RoutingChannelConfigurationEventType, Action: action,
+		AggregateID: configuration.RoutingGeneration, AggregateRevision: configuration.Revision,
 		ChannelID: configuration.ChannelID, Revision: configuration.Revision, PreviousRevision: previousRevision,
+		RoutingIdentity: configuration.RoutingIdentity, RoutingGeneration: configuration.RoutingGeneration,
 		ConfigEpoch: configEpoch.Epoch, ConfigurationHash: configEpoch.StateHash,
 		TrafficClass: configuration.TrafficClass,
 		StateHash:    stateHash, UpdatedTime: configuration.UpdatedTime,
@@ -1142,7 +1356,10 @@ func newRoutingChannelConfigurationOutbox(
 		return RoutingChannelConfigurationOutbox{}, ErrRoutingChannelConfigurationInvalid
 	}
 	return RoutingChannelConfigurationOutbox{
-		EventID: eventID, ChannelID: configuration.ChannelID, Revision: configuration.Revision,
+		EventID: eventID, AggregateID: configuration.RoutingGeneration,
+		AggregateRevision: configuration.Revision, ChannelID: configuration.ChannelID,
+		RoutingIdentity: configuration.RoutingIdentity, RoutingGeneration: configuration.RoutingGeneration,
+		Revision:    configuration.Revision,
 		ConfigEpoch: configEpoch.Epoch,
 		EventType:   RoutingChannelConfigurationEventType, PayloadJSON: string(payload),
 		PayloadHash: routingChannelConfigurationHash(payload), CreatedTime: common.GetTimestamp(),
@@ -1150,7 +1367,12 @@ func newRoutingChannelConfigurationOutbox(
 }
 
 func validRoutingChannelConfigurationEvent(event RoutingChannelConfigurationEvent) bool {
-	return event.EventID != "" && len(event.EventID) <= 96 && event.EventType == RoutingChannelConfigurationEventType &&
+	legacyIdentity := routingChannelConfigurationEventHasLegacyIdentity(event)
+	currentIdentity := validRoutingIdentity(event.AggregateID) &&
+		event.AggregateID == event.RoutingGeneration && event.AggregateRevision == event.Revision &&
+		validRoutingIdentity(event.RoutingIdentity) && validRoutingIdentity(event.RoutingGeneration)
+	return event.EventID != "" && len(event.EventID) <= 96 && (legacyIdentity || currentIdentity) &&
+		event.EventType == RoutingChannelConfigurationEventType &&
 		event.Action == RoutingControlActionUpdate && event.ChannelID > 0 && event.Revision > 1 &&
 		event.PreviousRevision > 0 && event.PreviousRevision < event.Revision &&
 		event.ConfigEpoch > 0 && validRoutingChannelHash(event.ConfigurationHash) &&
@@ -1247,6 +1469,7 @@ func loadRoutingChannelConfigurationForUpdate(tx *gorm.DB, channelID int) (Routi
 
 func sameRoutingChannelConfiguration(left RoutingChannelConfiguration, right RoutingChannelConfiguration) bool {
 	return left.ChannelID == right.ChannelID &&
+		left.RoutingIdentity == right.RoutingIdentity && left.RoutingGeneration == right.RoutingGeneration &&
 		math.Float64bits(left.UpstreamCostMultiplier) == math.Float64bits(right.UpstreamCostMultiplier) &&
 		left.CostSource == right.CostSource && left.CostConfirmed == right.CostConfirmed &&
 		left.TrafficClass == right.TrafficClass && left.FailureDomainLabel == right.FailureDomainLabel &&

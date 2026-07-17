@@ -70,6 +70,7 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	}
 	model.InitChannelCache()
 	view := channelRoutingCanarySnapshotForTest(11, 401, []int{101, 102})
+	view = channelRoutingSnapshotWithCurrentLifecyclesForTest(t, view)
 	view.Pools[0].CanaryPolicy = canaryPolicy
 	view.Pools[0].Members[0].Models[0].BreakerKnown = true
 	view.Pools[0].Members[0].Models[0].BreakerState = routingselector.BreakerStateHalfOpen
@@ -91,8 +92,9 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	require.NoError(t, held.Commit())
 	t.Cleanup(func() { require.NoError(t, held.Release()) })
 	probeKey := routingbreaker.Key{
-		ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model: "gpt-test", Group: "default",
+		ChannelID: 101, ChannelGeneration: view.Pools[0].Members[0].ChannelGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test", Group: "default",
 	}
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key: probeKey, State: routingbreaker.StateHalfOpen, UpdatedAt: time.Now(),
@@ -126,7 +128,9 @@ func TestChannelRoutingCanaryUsesCacheAndReplaysAfterCapacityExclusion(t *testin
 	identity, ok := GetSelectedRoutingIdentity(ctx, 102)
 	require.True(t, ok)
 	assert.Equal(t, SelectedRoutingIdentity{
-		ChannelID: 102, SnapshotRevision: 11, PoolID: 29, MemberID: 2, CredentialID: 1002,
+		ChannelID: 102, SnapshotRevision: 11,
+		ChannelGeneration: view.Pools[0].Members[1].ChannelGeneration,
+		PoolID:            29, MemberID: 2, CredentialID: 1002,
 	}, identity)
 	reservation, ok := routingCapacityReservationFromContext(ctx)
 	require.True(t, ok)
@@ -289,6 +293,7 @@ func TestChannelRoutingCanaryReplaysWhenHalfOpenProbeLeaseIsUnavailable(t *testi
 	}
 	model.InitChannelCache()
 	view := channelRoutingCanarySnapshotForTest(11, 701, []int{101, 102})
+	view = channelRoutingSnapshotWithCurrentLifecyclesForTest(t, view)
 	canaryPolicy := view.Pools[0].CanaryPolicy
 	for memberID := 1; memberID <= 2; memberID++ {
 		factor, factorErr := channelRoutingCanaryRuntime.slowStartFactor(11, canaryPolicy, channelrouting.SlowStartKey{
@@ -310,11 +315,13 @@ func TestChannelRoutingCanaryReplaysWhenHalfOpenProbeLeaseIsUnavailable(t *testi
 	})
 
 	probeKey := routingbreaker.Key{
-		ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model: "gpt-test", Group: "default",
+		ChannelID: 101, ChannelGeneration: view.Pools[0].Members[0].ChannelGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test", Group: "default",
 	}
 	secondProbeKey := probeKey
 	secondProbeKey.ChannelID = 102
+	secondProbeKey.ChannelGeneration = view.Pools[0].Members[1].ChannelGeneration
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{
 		{Key: probeKey, State: routingbreaker.StateHalfOpen, UpdatedAt: time.Now()},
 		{Key: secondProbeKey, State: routingbreaker.StateHalfOpen, UpdatedAt: time.Now()},
@@ -418,14 +425,16 @@ func TestChannelRoutingCanaryFailsClosedAndAuditsRedisProbeCoordinatorError(t *t
 	}).Error)
 	model.InitChannelCache()
 	view := channelRoutingCanarySnapshotForTest(11, 702, []int{101})
+	view = channelRoutingSnapshotWithCurrentLifecyclesForTest(t, view)
 	view.Pools[0].Members[0].Models[0].BreakerKnown = true
 	view.Pools[0].Members[0].Models[0].BreakerState = routingselector.BreakerStateHalfOpen
 	view.Pools[0].Members[0].Models[0].BreakerUpdatedUnix = time.Now().Unix()
 	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{Enabled: true, Mode: smart_routing_setting.ModeEnterpriseSLO})
 	breakerKey := routingbreaker.Key{
-		ChannelID: 101, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model: "gpt-test", Group: "default",
+		ChannelID: 101, ChannelGeneration: view.Pools[0].Members[0].ChannelGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test", Group: "default",
 	}
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key: breakerKey, State: routingbreaker.StateHalfOpen, UpdatedAt: time.Now(),
@@ -483,16 +492,21 @@ func TestChannelRoutingAffinityGatesAutoCanaryBeforeProbeAndPreservesControl(t *
 
 	priority := int64(10)
 	weight := uint(10)
-	require.NoError(t, model.DB.Create(&model.Channel{
+	channelRecord := model.Channel{
 		Id: 301, Name: "affinity-half-open", Status: common.ChannelStatusEnabled,
 		Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight,
-	}).Error)
+	}
+	require.NoError(t, model.DB.Create(&channelRecord).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{
 		Group: "default", Model: "gpt-test", ChannelId: 301,
 		Enabled: true, Priority: &priority, Weight: weight,
 	}).Error)
 	model.InitChannelCache()
-	channelrouting.SetSnapshotForTest(channelRoutingCanarySnapshotForTest(33, 703, []int{301}))
+	view := channelRoutingCanarySnapshotForTest(33, 703, []int{301})
+	view.Pools[0].Members[0].ChannelGeneration = channelRecord.RoutingGeneration
+	view.Channels[0].RoutingIdentity = channelRecord.RoutingIdentity
+	view.Channels[0].RoutingGeneration = channelRecord.RoutingGeneration
+	channelrouting.SetSnapshotForTest(view)
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled: true, Mode: smart_routing_setting.ModeEnterpriseSLO,
 		WeightAvailability: 1, TopK: 1, MinVolume: 10,
@@ -500,12 +514,14 @@ func TestChannelRoutingAffinityGatesAutoCanaryBeforeProbeAndPreservesControl(t *
 	})
 	now := time.Now()
 	breakerKey := routingbreaker.Key{
-		ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model: "gpt-test", Group: "default",
+		ChannelID: 301, ChannelGeneration: channelRecord.RoutingGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test", Group: "default",
 	}
 	cacheKey := routinghotcache.Key{
-		ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model: "gpt-test", Group: "default",
+		ChannelID: 301, ChannelGeneration: channelRecord.RoutingGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+		Model:       "gpt-test", Group: "default",
 	}
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key: breakerKey, State: routingbreaker.StateHalfOpen, UpdatedAt: now,
@@ -652,6 +668,29 @@ func channelRoutingCanarySnapshotForTest(revision uint64, activationID int64, ch
 		}},
 		Channels: channels,
 	}
+}
+
+func channelRoutingSnapshotWithCurrentLifecyclesForTest(
+	t *testing.T,
+	view channelrouting.SnapshotView,
+) channelrouting.SnapshotView {
+	t.Helper()
+	lifecycles := make(map[int]model.Channel, len(view.Channels))
+	for index := range view.Channels {
+		lifecycle := requireRoutingChannelLifecycleForTest(t, view.Channels[index].ID)
+		lifecycles[lifecycle.Id] = lifecycle
+		view.Channels[index].RoutingIdentity = lifecycle.RoutingIdentity
+		view.Channels[index].RoutingGeneration = lifecycle.RoutingGeneration
+	}
+	for poolIndex := range view.Pools {
+		for memberIndex := range view.Pools[poolIndex].Members {
+			member := &view.Pools[poolIndex].Members[memberIndex]
+			lifecycle, ok := lifecycles[member.ChannelID]
+			require.True(t, ok)
+			member.ChannelGeneration = lifecycle.RoutingGeneration
+		}
+	}
+	return view
 }
 
 func TestChannelRoutingCanaryRuntimeSharesCapacityAcrossPolicyRevisions(t *testing.T) {

@@ -3,7 +3,6 @@ package channelrouting
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 
 	"github.com/QuantumNous/new-api/model"
@@ -53,9 +52,12 @@ func syncLegacyRoutingPolicyDBContext(ctx context.Context, db *gorm.DB) (model.R
 			}
 			preservePolicy := currentRevision.Revision > 0 &&
 				(currentRevision.ActorID != 0 || currentRevision.Reason != legacyRoutingPolicySyncReason)
-			document, err := buildLegacyRoutingPolicyDocumentContext(ctx, tx, current, preservePolicy)
-			if err != nil {
-				return err
+			document := current
+			if currentRevision.SchemaVersion != model.RoutingPolicySchemaVersion {
+				document, err = buildLegacyRoutingPolicyDocumentContext(ctx, tx, current, preservePolicy)
+				if err != nil {
+					return err
+				}
 			}
 
 			stage := head.CurrentStage
@@ -152,81 +154,8 @@ func buildLegacyRoutingPolicyDocumentContext(
 	current model.RoutingPolicyDocument,
 	preservePolicy bool,
 ) (model.RoutingPolicyDocument, error) {
-	var pools []model.RoutingPool
-	if err := db.WithContext(ctx).Where("active = ?", true).Order("id asc").Find(&pools).Error; err != nil {
-		return model.RoutingPolicyDocument{}, err
-	}
-	var members []model.RoutingPoolMember
-	if err := db.WithContext(ctx).Where("active = ?", true).Order("pool_id asc").Order("id asc").Find(&members).Error; err != nil {
-		return model.RoutingPolicyDocument{}, err
-	}
-	var credentials []model.RoutingCredentialRef
-	if err := db.WithContext(ctx).Where("active = ?", true).Order("channel_id asc").Order("id asc").Find(&credentials).Error; err != nil {
-		return model.RoutingPolicyDocument{}, err
-	}
-
-	currentPools := make(map[int]model.RoutingPolicyPoolContent, len(current.Pools))
-	currentMembers := make(map[int]model.RoutingPolicyMemberContent)
-	for poolIndex := range current.Pools {
-		pool := current.Pools[poolIndex]
-		currentPools[pool.PoolID] = pool
-		for memberIndex := range pool.Members {
-			currentMembers[pool.Members[memberIndex].MemberID] = pool.Members[memberIndex]
-		}
-	}
-	membersByPool := make(map[int][]model.RoutingPoolMember)
-	for index := range members {
-		membersByPool[members[index].PoolID] = append(membersByPool[members[index].PoolID], members[index])
-	}
-	credentialsByChannel := make(map[int][]int)
-	for index := range credentials {
-		credential := credentials[index]
-		credentialsByChannel[credential.ChannelID] = append(credentialsByChannel[credential.ChannelID], credential.ID)
-	}
-
-	document := model.RoutingPolicyDocument{
-		SchemaVersion:   model.RoutingPolicySchemaVersion,
-		Pools:           make([]model.RoutingPolicyPoolContent, 0, len(pools)),
-		ExtensionFields: current.ExtensionFields,
-	}
-	for index := range pools {
-		pool := pools[index]
-		content, exists := currentPools[pool.ID]
-		if !exists {
-			content = model.RoutingPolicyPoolContent{
-				PoolID:          pool.ID,
-				DeploymentStage: model.RoutingDeploymentStageObserve,
-				PolicyProfile:   model.RoutingPolicyProfileBalanced,
-				Policy:          json.RawMessage(`{}`),
-			}
-		}
-		content.PoolID = pool.ID
-		content.GroupName = pool.GroupName
-		content.DisplayName = pool.DisplayName
-		content.Members = make([]model.RoutingPolicyMemberContent, 0, len(membersByPool[pool.ID]))
-		for memberIndex := range membersByPool[pool.ID] {
-			member := membersByPool[pool.ID][memberIndex]
-			memberContent, memberExists := currentMembers[member.ID]
-			if !memberExists || memberContent.ChannelID != member.ChannelID {
-				memberContent = model.RoutingPolicyMemberContent{
-					MemberID:  member.ID,
-					ChannelID: member.ChannelID,
-					Enabled:   true,
-					Priority:  member.LegacyPriority,
-					Weight:    member.LegacyWeight,
-					Overrides: json.RawMessage(`{}`),
-				}
-			} else if !preservePolicy {
-				memberContent.Enabled = true
-				memberContent.Priority = member.LegacyPriority
-				memberContent.Weight = member.LegacyWeight
-			}
-			memberContent.MemberID = member.ID
-			memberContent.ChannelID = member.ChannelID
-			memberContent.CredentialIDs = append([]int(nil), credentialsByChannel[member.ChannelID]...)
-			content.Members = append(content.Members, memberContent)
-		}
-		document.Pools = append(document.Pools, content)
-	}
-	return document, nil
+	document, _, err := model.ConvertRoutingPolicyDocumentToV2DBContext(
+		ctx, db, current, preservePolicy,
+	)
+	return document, err
 }

@@ -19,22 +19,49 @@ const (
 	RoutingControlSubjectRuntimeSettings      = "runtime_settings"
 	RoutingControlSubjectCostBinding          = "cost_binding"
 	RoutingControlSubjectChannelConfiguration = "channel_configuration"
+	RoutingControlSubjectChannelLifecycle     = "channel_lifecycle"
+	RoutingControlSubjectPolicyDraft          = "policy_draft"
+	RoutingControlSubjectPolicyRevision       = "policy_revision"
+	RoutingControlSubjectPolicyActivation     = "policy_activation"
+	RoutingControlSubjectPolicyRiskAcceptance = "policy_risk_acceptance"
+	RoutingControlSubjectOperation            = "operation"
+	RoutingControlSubjectPricing              = "pricing"
 
-	RoutingControlActionBootstrap = "bootstrap"
-	RoutingControlActionReconcile = "reconcile"
-	RoutingControlActionCreate    = "create"
-	RoutingControlActionUpdate    = "update"
-	RoutingControlActionDelete    = "delete"
+	RoutingControlActionBootstrap  = "bootstrap"
+	RoutingControlActionReconcile  = "reconcile"
+	RoutingControlActionCreate     = "create"
+	RoutingControlActionUpdate     = "update"
+	RoutingControlActionDelete     = "delete"
+	RoutingControlActionValidate   = "validate"
+	RoutingControlActionPublish    = "publish"
+	RoutingControlActionRollback   = "rollback"
+	RoutingControlActionRiskAccept = "risk_accept"
+	RoutingControlActionRotate     = "rotate"
+	RoutingControlActionRetire     = "retire"
+	RoutingControlActionRetry      = "retry"
+	RoutingControlActionCancel     = "cancel"
 
-	routingRuntimeSettingsStateID  = 1
-	routingControlSummaryMaxBytes  = 16 << 10
-	RoutingControlAuditMaxPageSize = 100
+	RoutingControlAuditSourceSystem    = "system"
+	RoutingControlAuditSourceAdmin     = "admin"
+	RoutingControlAuditSourceMigration = "migration"
+	RoutingControlAuditSourceReconcile = "reconciler"
+
+	RoutingControlAuditResultSucceeded = "succeeded"
+	RoutingControlAuditResultPartial   = "partially_succeeded"
+	RoutingControlAuditResultFailed    = "failed"
+	RoutingControlAuditResultRejected  = "rejected"
+
+	routingRuntimeSettingsStateID    = 1
+	routingControlSummaryMaxBytes    = 16 << 10
+	RoutingControlAuditMaxPageSize   = 100
+	RoutingControlAuditSchemaVersion = 2
 )
 
 var (
 	ErrRoutingRuntimeSettingsConflict = errors.New("channel routing runtime settings changed")
 	ErrRoutingRuntimeSettingsInvalid  = errors.New("invalid channel routing runtime settings state")
 	ErrRoutingControlAuditInvalid     = errors.New("invalid channel routing control audit")
+	ErrRoutingControlAuditImmutable   = errors.New("channel routing control audit is immutable")
 )
 
 type RoutingRuntimeSettingsState struct {
@@ -51,15 +78,43 @@ func (RoutingRuntimeSettingsState) TableName() string {
 }
 
 type RoutingControlAudit struct {
-	ID            int64  `json:"id" gorm:"primaryKey"`
-	SubjectType   string `json:"subject_type" gorm:"type:varchar(32);index;not null"`
-	SubjectID     int64  `json:"subject_id" gorm:"bigint;index;not null"`
-	Action        string `json:"action" gorm:"type:varchar(32);index;not null"`
-	ActorID       int    `json:"actor_id" gorm:"index;not null"`
-	BeforeHash    string `json:"before_hash,omitempty" gorm:"type:char(64);index"`
-	AfterHash     string `json:"after_hash,omitempty" gorm:"type:char(64);index"`
-	SummaryJSON   string `json:"-" gorm:"type:text;not null"`
-	CreatedTimeMs int64  `json:"created_time_ms" gorm:"bigint;index;not null"`
+	ID                    int64  `json:"id" gorm:"primaryKey"`
+	SchemaVersion         int    `json:"schema_version" gorm:"index"`
+	EventType             string `json:"event_type" gorm:"type:varchar(96);index"`
+	SubjectType           string `json:"subject_type" gorm:"type:varchar(32);index;not null"`
+	SubjectID             int64  `json:"subject_id" gorm:"bigint;index;not null"`
+	SubjectIdentity       string `json:"subject_identity" gorm:"type:varchar(128);index"`
+	SubjectGeneration     string `json:"subject_generation,omitempty" gorm:"type:varchar(32);index"`
+	SubjectName           string `json:"subject_name" gorm:"type:varchar(256)"`
+	Action                string `json:"action" gorm:"type:varchar(32);index;not null"`
+	Source                string `json:"source" gorm:"type:varchar(32);index"`
+	Reason                string `json:"reason,omitempty" gorm:"type:varchar(512)"`
+	Result                string `json:"result" gorm:"type:varchar(32);index"`
+	ActorID               int    `json:"actor_id" gorm:"index;not null"`
+	ActorName             string `json:"actor_name" gorm:"type:varchar(128)"`
+	ActorRole             int    `json:"actor_role"`
+	BeforeHash            string `json:"before_hash,omitempty" gorm:"type:char(64);index"`
+	AfterHash             string `json:"after_hash,omitempty" gorm:"type:char(64);index"`
+	SummaryJSON           string `json:"-" gorm:"type:text;not null"`
+	SubjectSnapshotJSON   string `json:"-" gorm:"type:text"`
+	ChangeSetJSON         string `json:"-" gorm:"type:text"`
+	ImpactJSON            string `json:"-" gorm:"type:text"`
+	RecommendationJSON    string `json:"-" gorm:"type:text"`
+	RelationJSON          string `json:"-" gorm:"type:text"`
+	TechnicalJSON         string `json:"-" gorm:"type:text"`
+	ErrorCode             string `json:"error_code,omitempty" gorm:"type:varchar(64);index"`
+	ErrorMessage          string `json:"error_message,omitempty" gorm:"type:text"`
+	NeedsAttention        bool   `json:"needs_attention" gorm:"index"`
+	CorrelationID         string `json:"correlation_id,omitempty" gorm:"type:varchar(64);index"`
+	OperationID           int64  `json:"operation_id,omitempty" gorm:"bigint;index"`
+	DraftID               int64  `json:"draft_id,omitempty" gorm:"bigint;index"`
+	SimulationOperationID int64  `json:"simulation_operation_id,omitempty" gorm:"bigint;index"`
+	PolicyRevision        int64  `json:"policy_revision,omitempty" gorm:"bigint;index"`
+	ActivationID          int64  `json:"activation_id,omitempty" gorm:"bigint;index"`
+	RollbackOfRevision    int64  `json:"rollback_of_revision,omitempty" gorm:"bigint;index"`
+	TopologyEpoch         int64  `json:"topology_epoch,omitempty" gorm:"bigint;index"`
+	PricingEpoch          int64  `json:"pricing_epoch,omitempty" gorm:"bigint;index"`
+	CreatedTimeMs         int64  `json:"created_time_ms" gorm:"bigint;index;not null"`
 }
 
 func (RoutingControlAudit) TableName() string {
@@ -67,11 +122,15 @@ func (RoutingControlAudit) TableName() string {
 }
 
 type RoutingControlAuditFilter struct {
-	BeforeID    int64
-	SubjectType string
-	SubjectID   int64
-	ActorID     int
-	Limit       int
+	BeforeID       int64
+	SubjectType    string
+	SubjectID      int64
+	ActorID        int
+	Source         string
+	Result         string
+	CorrelationID  string
+	NeedsAttention *bool
+	Limit          int
 }
 
 func RoutingRuntimeSettingsDocumentHash(document []byte) string {
@@ -80,11 +139,21 @@ func RoutingRuntimeSettingsDocumentHash(document []byte) string {
 }
 
 func GetRoutingRuntimeSettingsStateContext(ctx context.Context) (RoutingRuntimeSettingsState, error) {
+	return GetRoutingRuntimeSettingsStateDBContext(ctx, DB)
+}
+
+func GetRoutingRuntimeSettingsStateDBContext(
+	ctx context.Context,
+	db *gorm.DB,
+) (RoutingRuntimeSettingsState, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if db == nil || db.Dialector == nil {
+		return RoutingRuntimeSettingsState{}, ErrRoutingRuntimeSettingsInvalid
+	}
 	var state RoutingRuntimeSettingsState
-	err := DB.WithContext(ctx).Where("id = ?", routingRuntimeSettingsStateID).First(&state).Error
+	err := db.WithContext(ctx).Where("id = ?", routingRuntimeSettingsStateID).First(&state).Error
 	return state, err
 }
 
@@ -118,10 +187,16 @@ func GetOrReconcileRoutingRuntimeSettingsStateContext(
 				return err
 			}
 			if created.RowsAffected == 1 {
+				auditDocuments, _, auditErr := routingRuntimeSettingsAuditDocuments("", documentJSON, candidate.Revision)
+				if auditErr != nil {
+					return auditErr
+				}
 				if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
-					SubjectType: RoutingControlSubjectRuntimeSettings,
-					Action:      RoutingControlActionBootstrap, AfterHash: documentHash,
-					SummaryJSON: `{"source":"existing_options"}`, CreatedTimeMs: nowMs,
+					SubjectType: RoutingControlSubjectRuntimeSettings, SubjectIdentity: "runtime-settings",
+					Action: RoutingControlActionBootstrap, AfterHash: documentHash,
+					SummaryJSON: `{"source":"existing_options"}`, SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+					ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+					TechnicalJSON: auditDocuments.Technical, CreatedTimeMs: nowMs,
 				}); err != nil {
 					return err
 				}
@@ -147,11 +222,18 @@ func GetOrReconcileRoutingRuntimeSettingsStateContext(
 			if result.RowsAffected != 1 {
 				return ErrRoutingRuntimeSettingsConflict
 			}
+			auditDocuments, _, auditErr := routingRuntimeSettingsAuditDocuments(
+				current.DocumentJSON, documentJSON, nextRevision,
+			)
+			if auditErr != nil {
+				return auditErr
+			}
 			if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
-				SubjectType: RoutingControlSubjectRuntimeSettings,
-				Action:      RoutingControlActionReconcile,
-				BeforeHash:  current.DocumentHash, AfterHash: documentHash,
-				SummaryJSON: `{"source":"external_option_update"}`, CreatedTimeMs: nowMs,
+				SubjectType: RoutingControlSubjectRuntimeSettings, SubjectIdentity: "runtime-settings",
+				Action: RoutingControlActionReconcile, BeforeHash: current.DocumentHash, AfterHash: documentHash,
+				SummaryJSON: `{"source":"external_option_update"}`, SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+				ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+				TechnicalJSON: auditDocuments.Technical, CreatedTimeMs: nowMs,
 			}); err != nil {
 				return err
 			}
@@ -223,17 +305,25 @@ func UpdateRoutingRuntimeSettingsContext(
 		if result.RowsAffected != 1 {
 			return ErrRoutingRuntimeSettingsConflict
 		}
+		auditDocuments, changedKeys, err := routingRuntimeSettingsAuditDocuments(
+			current.DocumentJSON, documentJSON, nextRevision,
+		)
+		if err != nil {
+			return err
+		}
 		summary, err := common.Marshal(struct {
 			ChangedKeys []string `json:"changed_keys"`
-		}{ChangedKeys: keys})
+		}{ChangedKeys: changedKeys})
 		if err != nil {
 			return err
 		}
 		if err := insertRoutingControlAuditTx(tx, RoutingControlAudit{
-			SubjectType: RoutingControlSubjectRuntimeSettings,
-			Action:      RoutingControlActionUpdate, ActorID: actorID,
+			SubjectType: RoutingControlSubjectRuntimeSettings, SubjectIdentity: "runtime-settings",
+			Action: RoutingControlActionUpdate, ActorID: actorID,
 			BeforeHash: current.DocumentHash, AfterHash: documentHash,
-			SummaryJSON: string(summary), CreatedTimeMs: nowMs,
+			SummaryJSON: string(summary), SubjectSnapshotJSON: auditDocuments.SubjectSnapshot,
+			ChangeSetJSON: auditDocuments.ChangeSet, ImpactJSON: auditDocuments.Impact,
+			TechnicalJSON: auditDocuments.Technical, CreatedTimeMs: nowMs,
 		}); err != nil {
 			return err
 		}
@@ -252,7 +342,11 @@ func ListRoutingControlAuditsContext(ctx context.Context, filter RoutingControlA
 		ctx = context.Background()
 	}
 	if filter.Limit < 1 || filter.Limit > RoutingControlAuditMaxPageSize || filter.BeforeID < 0 ||
-		filter.SubjectID < 0 || filter.ActorID < 0 {
+		filter.SubjectID < 0 || filter.ActorID < 0 ||
+		(filter.SubjectType != "" && !validRoutingControlAuditSubjectType(filter.SubjectType)) ||
+		(filter.Source != "" && !validRoutingControlAuditSource(filter.Source)) ||
+		(filter.Result != "" && !validRoutingControlAuditResult(filter.Result)) ||
+		(filter.CorrelationID != "" && !validRoutingOperationCorrelationID(filter.CorrelationID)) {
 		return nil, ErrRoutingControlAuditInvalid
 	}
 	query := DB.WithContext(ctx).Model(&RoutingControlAudit{})
@@ -268,8 +362,36 @@ func ListRoutingControlAuditsContext(ctx context.Context, filter RoutingControlA
 	if filter.ActorID > 0 {
 		query = query.Where("actor_id = ?", filter.ActorID)
 	}
+	if filter.Source != "" {
+		query = query.Where("source = ?", filter.Source)
+	}
+	if filter.Result != "" {
+		query = query.Where("result = ?", filter.Result)
+	}
+	if filter.CorrelationID != "" {
+		query = query.Where("correlation_id = ?", filter.CorrelationID)
+	}
+	if filter.NeedsAttention != nil {
+		query = query.Where("needs_attention = ?", *filter.NeedsAttention)
+	}
 	var audits []RoutingControlAudit
 	return audits, query.Order("id desc").Limit(filter.Limit).Find(&audits).Error
+}
+
+func GetRoutingControlAuditContext(ctx context.Context, id int64) (RoutingControlAudit, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if id <= 0 {
+		return RoutingControlAudit{}, ErrRoutingControlAuditInvalid
+	}
+	var audit RoutingControlAudit
+	err := DB.WithContext(ctx).Where("id = ?", id).First(&audit).Error
+	return audit, err
+}
+
+func IsRoutingControlAuditNotFound(err error) bool {
+	return errors.Is(err, gorm.ErrRecordNotFound)
 }
 
 func loadRoutingRuntimeSettingsStateForUpdate(tx *gorm.DB) (RoutingRuntimeSettingsState, error) {
@@ -283,7 +405,7 @@ func loadRoutingRuntimeSettingsStateForUpdate(tx *gorm.DB) (RoutingRuntimeSettin
 }
 
 func insertRoutingControlAuditTx(tx *gorm.DB, audit RoutingControlAudit) error {
-	if tx == nil || !validRoutingControlAudit(audit) {
+	if tx == nil || tx.Dialector == nil {
 		return ErrRoutingControlAuditInvalid
 	}
 	return tx.Create(&audit).Error
@@ -292,25 +414,6 @@ func insertRoutingControlAuditTx(tx *gorm.DB, audit RoutingControlAudit) error {
 func validRoutingRuntimeSettingsDocument(documentJSON string, documentHash string) bool {
 	return documentJSON != "" && len(documentJSON) <= routingControlSummaryMaxBytes && utf8.ValidString(documentJSON) &&
 		validRoutingHash(documentHash) && RoutingRuntimeSettingsDocumentHash([]byte(documentJSON)) == documentHash
-}
-
-func validRoutingControlAudit(audit RoutingControlAudit) bool {
-	if audit.SubjectType != RoutingControlSubjectRuntimeSettings &&
-		audit.SubjectType != RoutingControlSubjectCostBinding &&
-		audit.SubjectType != RoutingControlSubjectChannelConfiguration {
-		return false
-	}
-	switch audit.Action {
-	case RoutingControlActionBootstrap, RoutingControlActionReconcile, RoutingControlActionCreate,
-		RoutingControlActionUpdate, RoutingControlActionDelete:
-	default:
-		return false
-	}
-	return audit.SubjectID >= 0 && audit.ActorID >= 0 && audit.CreatedTimeMs > 0 &&
-		(audit.BeforeHash == "" || validRoutingHash(audit.BeforeHash)) &&
-		(audit.AfterHash == "" || validRoutingHash(audit.AfterHash)) &&
-		audit.BeforeHash != audit.AfterHash && audit.SummaryJSON != "" &&
-		len(audit.SummaryJSON) <= routingControlSummaryMaxBytes && utf8.ValidString(audit.SummaryJSON)
 }
 
 func nextRoutingControlRevision(current int64) (int64, error) {

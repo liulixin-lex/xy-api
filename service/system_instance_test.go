@@ -110,6 +110,39 @@ func TestAsyncBillingV2FleetReadyFailsClosedAndRestartsStabilityWindow(t *testin
 	assertFleetCandidateCleared(t)
 }
 
+func TestReportCurrentSystemInstancePublishesRoutingSchemaCapability(t *testing.T) {
+	require.NoError(t, model.DB.AutoMigrate(&model.SystemInstance{}))
+	const nodeName = "routing-schema-capability-test"
+	require.NoError(t, model.DB.Delete(&model.SystemInstance{}, "node_name = ?", nodeName).Error)
+
+	previousNodeName := common.NodeName
+	previousNodeNameSource := common.NodeNameSource
+	previousNodeNameManuallyConfigured := common.NodeNameManuallyConfigured
+	previousVersion := common.Version
+	previousStartTime := common.StartTime
+	common.NodeName = nodeName
+	common.NodeNameSource = common.NodeNameSourceManual
+	common.NodeNameManuallyConfigured = true
+	common.Version = "v0.1.14-test"
+	common.StartTime = time.Now().Unix() - 1
+	t.Cleanup(func() {
+		common.NodeName = previousNodeName
+		common.NodeNameSource = previousNodeNameSource
+		common.NodeNameManuallyConfigured = previousNodeNameManuallyConfigured
+		common.Version = previousVersion
+		common.StartTime = previousStartTime
+		require.NoError(t, model.DB.Delete(&model.SystemInstance{}, "node_name = ?", nodeName).Error)
+	})
+
+	require.NoError(t, ReportCurrentSystemInstance())
+	var instance model.SystemInstance
+	require.NoError(t, model.DB.First(&instance, "node_name = ?", nodeName).Error)
+	var info SystemInstanceInfo
+	require.NoError(t, common.UnmarshalJsonStr(instance.Info, &info))
+	assert.Equal(t, "v0.1.14-test", info.Runtime.Version)
+	assert.Equal(t, model.RoutingSchemaCurrentVersion, info.Capabilities.ChannelRoutingSchema)
+}
+
 func resetAsyncBillingFleetGateForTest(schemaReady bool) {
 	asyncBillingFleetGateCache.Lock()
 	defer asyncBillingFleetGateCache.Unlock()

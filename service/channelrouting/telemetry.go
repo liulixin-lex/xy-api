@@ -79,6 +79,7 @@ func stableSnapshotsToRoutingRollups(snapshots []routingmetrics.StableSnapshot) 
 		rollups = append(rollups, model.RoutingMetricRollup{
 			MemberID:                snapshot.PoolMemberID,
 			CredentialID:            snapshot.CredentialID,
+			ChannelGeneration:       snapshot.ChannelGeneration,
 			ModelName:               snapshot.Model,
 			BucketTs:                snapshot.BucketTs,
 			ChannelID:               snapshot.ChannelID,
@@ -213,30 +214,6 @@ func DeleteExpiredRoutingHistoryContext(ctx context.Context, retentionDays int) 
 			return deleted, deleteErr
 		}
 		if operationsDeleted < 500 {
-			break
-		}
-	}
-	for batch := 0; batch < 20; batch++ {
-		approvalsDeleted, deleteErr := model.DeleteStaleRoutingPolicyApprovalsContext(
-			ctx, cutoffTime.UnixMilli(), 500,
-		)
-		deleted += approvalsDeleted
-		if deleteErr != nil {
-			return deleted, deleteErr
-		}
-		if approvalsDeleted < 500 {
-			break
-		}
-	}
-	for batch := 0; batch < 20; batch++ {
-		approvalsDeleted, deleteErr := model.DeleteStaleRoutingPolicyRollbackApprovalsContext(
-			ctx, cutoffTime.UnixMilli(), 500,
-		)
-		deleted += approvalsDeleted
-		if deleteErr != nil {
-			return deleted, deleteErr
-		}
-		if approvalsDeleted < 500 {
 			break
 		}
 	}

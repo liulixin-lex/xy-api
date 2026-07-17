@@ -55,7 +55,6 @@ func TestMain(m *testing.M) {
 		&RoutingCostSnapshot{},
 		&RoutingChannelMetric{},
 		&RoutingBreakerState{},
-		&RoutingAgentRecommendation{},
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
@@ -89,7 +88,6 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM routing_cost_snapshots")
 		DB.Exec("DELETE FROM routing_channel_metrics")
 		DB.Exec("DELETE FROM routing_breaker_states")
-		DB.Exec("DELETE FROM routing_agent_recommendations")
 		DB.Exec("DELETE FROM system_instances")
 		DB.Exec("DELETE FROM system_task_locks")
 		DB.Exec("DELETE FROM system_tasks")

@@ -61,6 +61,7 @@ type SystemInstanceCapabilities struct {
 	AsyncBillingProtocol      int    `json:"async_billing_protocol"`
 	AsyncBillingRolloutEpoch  string `json:"async_billing_rollout_epoch,omitempty"`
 	AsyncBillingIncarnationID string `json:"async_billing_incarnation_id,omitempty"`
+	ChannelRoutingSchema      string `json:"channel_routing_schema,omitempty"`
 }
 
 type SystemInstanceRoleInfo struct {
@@ -156,6 +157,7 @@ func ReportCurrentSystemInstance() error {
 			AsyncBillingProtocol:      asyncBillingProtocolVersion,
 			AsyncBillingRolloutEpoch:  asyncBillingRolloutEpoch(),
 			AsyncBillingIncarnationID: asyncBillingIncarnationID(),
+			ChannelRoutingSchema:      model.RoutingSchemaCurrentVersion,
 		},
 	}
 	return model.UpsertSystemInstance(

@@ -298,6 +298,7 @@ func routingCanaryRollbackPoolIDsTx(
 	nonterminalStatuses := []RoutingOperationStatus{
 		RoutingOperationStatusPending,
 		RoutingOperationStatusRunning,
+		RoutingOperationStatusRetryWait,
 	}
 	candidates := make([]candidate, 0)
 	err := tx.WithContext(ctx).Model(&RoutingOperation{}).
@@ -342,7 +343,8 @@ func routingCanaryRollbackPoolIDsTx(
 		if !exists || operation.PoolID != candidates[index].PoolID ||
 			operation.OperationType != RoutingOperationTypeCanaryAutoRollback ||
 			operation.ExpectedRevision != expectedRevision || operation.ExpectedActivationID != expectedActivationID ||
-			(operation.Status != RoutingOperationStatusPending && operation.Status != RoutingOperationStatusRunning) ||
+			(operation.Status != RoutingOperationStatusPending && operation.Status != RoutingOperationStatusRunning &&
+				operation.Status != RoutingOperationStatusRetryWait) ||
 			!validRoutingPersistenceToken(operation.CreateToken) || operation.CreatedTimeMs <= 0 {
 			return nil, ErrRoutingCanaryAutoRollbackInvalid
 		}
@@ -415,6 +417,7 @@ func finishRoutingCanaryRollbackOperationGroupTx(
 	nonterminalStatuses := []RoutingOperationStatus{
 		RoutingOperationStatusPending,
 		RoutingOperationStatusRunning,
+		RoutingOperationStatusRetryWait,
 	}
 	query := lockForUpdate(tx.WithContext(ctx)).
 		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
@@ -444,6 +447,7 @@ func finishRoutingCanaryRollbackOperationGroupTx(
 	operationCount := int64(len(operations))
 	updates := routingOperationTerminalUpdates(status, lastError, result, transitionTimeMs)
 	updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
+	updates["retention_category"] = routingOperationTerminalRetention(status, RoutingOperationRetentionStandard)
 	updated := tx.WithContext(ctx).Model(&RoutingOperation{}).
 		Where("operation_type = ? AND expected_revision = ? AND expected_activation_id = ?",
 			RoutingOperationTypeCanaryAutoRollback, expectedRevision, expectedActivationID,

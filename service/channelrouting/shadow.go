@@ -361,7 +361,9 @@ func CaptureShadowReplayRequest(request ShadowRequest) (ShadowReplayInput, bool,
 			candidate.RequestExclusionReason = credentialReason
 		}
 		if candidate.RequestExclusionReason == "" {
-			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, now); blocked {
+			if _, blocked := ChannelBalanceRuntimeBlockedForGeneration(
+				member.ChannelID, member.ChannelGeneration, now,
+			); blocked {
 				candidate.RequestExclusionReason = ExclusionReasonChannelBalance
 			}
 		}
@@ -785,29 +787,25 @@ func estimateSystemRoutingBaselineCost(
 	profile model.RoutingCostRequestProfile,
 	atUnix int64,
 ) (model.RoutingCostEstimate, error) {
-	resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
-		LogicalModel:                 observation.ModelName,
-		EffectiveModel:               observation.UpstreamModelName,
-		ModelMappingIdentity:         observation.CostModelMappingIdentity,
-		UpstreamCostMultiplier:       1,
-		ChannelConfigurationRevision: observation.ChannelConfigurationRevision,
-	})
-	if err != nil || !resolution.Known {
-		return model.RoutingCostEstimate{}, err
+	if observation.CostPricing == nil {
+		return model.RoutingCostEstimate{}, nil
 	}
+	pricing := *observation.CostPricing
+	one := 1.0
+	pricing.GroupRatio = &one
 	version := model.RoutingCostSnapshotVersion{
-		PricingHash:     resolution.PricingHash,
-		PricingVersion:  resolution.PricingIdentity,
+		PricingHash:     observation.CostPricingHash,
+		PricingVersion:  observation.CostPricingVersion,
 		SourceType:      SystemRoutingPricingSourceType,
-		ObservedTime:    atUnix,
-		EffectiveTime:   atUnix,
-		ExpiresTime:     math.MaxInt64,
-		Confidence:      model.RoutingCostConfidenceExact,
-		ConfidenceScore: 1,
-		Freshness:       model.RoutingCostFreshnessFresh,
-		FreshnessScore:  1,
+		ObservedTime:    observation.CostObservedTime,
+		EffectiveTime:   observation.CostEffectiveTime,
+		ExpiresTime:     observation.CostExpiresTime,
+		Confidence:      observation.CostVersionConfidence,
+		ConfidenceScore: observation.CostConfidenceScore,
+		Freshness:       observation.CostFreshness,
+		FreshnessScore:  observation.CostFreshnessScore,
 	}
-	return model.EstimateRoutingCostSnapshot(version, resolution.Pricing, profile, atUnix)
+	return model.EstimateRoutingCostSnapshot(version, pricing, profile, atUnix)
 }
 
 func EstimateModelSnapshotRoutingCost(
@@ -827,53 +825,30 @@ func estimateModelSnapshotRoutingCost(
 	if atUnix <= 0 {
 		atUnix = time.Now().Unix()
 	}
-	if observation.systemPricing {
-		resolution, err := ResolveSystemRoutingPricing(SystemRoutingPricingInput{
-			LogicalModel:                 observation.ModelName,
-			EffectiveModel:               observation.UpstreamModelName,
-			ModelMappingIdentity:         observation.CostModelMappingIdentity,
-			UpstreamCostMultiplier:       observation.CostUpstreamMultiplier,
-			ChannelConfigurationRevision: observation.ChannelConfigurationRevision,
-		})
-		if err != nil {
-			return model.RoutingCostEstimate{}, observation, true, err
-		}
-		previousIdentity := observation.CostPricingIdentity
-		observation.CostPricing = nil
-		observation.CostPricingHash = ""
-		observation.CostPricingVersion = ""
-		observation.CostPricingIdentity = ""
-		observation.CostUnknownReason = resolution.UnknownReason
-		observation.CostBillingMode = SystemRoutingPricingBasis
-		if !resolution.Known {
-			return model.RoutingCostEstimate{}, observation, true, nil
-		}
-		pricing := resolution.Pricing
-		observation.CostPricing = &pricing
-		observation.CostPricingHash = resolution.PricingHash
-		observation.CostPricingVersion = resolution.PricingIdentity
-		observation.CostPricingIdentity = resolution.PricingIdentity
-		observation.CostUnknownReason = ""
-		observation.CostBillingMode = pricing.BillingMode
-		observation.CostVersionConfidence = model.RoutingCostConfidenceExact
-		observation.CostConfidenceScore = 1
-		observation.CostFreshness = model.RoutingCostFreshnessFresh
-		observation.CostFreshnessScore = 1
-		observation.CostExpiresTime = math.MaxInt64
-		observation.CostUpdatedUnix = 0
-		if observation.CostObservedTime <= 0 || previousIdentity != resolution.PricingIdentity {
-			observation.CostObservedTime = atUnix
-			observation.CostEffectiveTime = atUnix
-		}
-	}
 	if observation.CostPricing == nil {
-		return model.RoutingCostEstimate{}, observation, false, nil
+		return model.RoutingCostEstimate{}, observation, observation.systemPricing, nil
 	}
 	pricing := *observation.CostPricing
 	freeMultiplier := pricing.GroupRatio != nil && *pricing.GroupRatio == 0
 	if observation.systemPricing && !freeMultiplier &&
 		(!profile.KnowledgeSpecified || !profile.RequestPricingFeaturesKnown || profile.UncataloguedSurchargePossible) {
-		return model.RoutingCostEstimate{}, observation, true, nil
+		missing := make([]string, 0, 3)
+		if !profile.KnowledgeSpecified {
+			missing = append(missing, "request_profile")
+		}
+		if !profile.RequestPricingFeaturesKnown {
+			missing = append(missing, "request_pricing_features")
+		}
+		if profile.UncataloguedSurchargePossible {
+			missing = append(missing, "uncatalogued_surcharge")
+		}
+		return model.RoutingCostEstimate{
+			Currency: pricing.Currency, Unit: pricing.Unit,
+			ConfidenceScore: observation.CostConfidenceScore,
+			FreshnessScore:  observation.CostFreshnessScore,
+			UnknownReason:   model.RoutingCostUnknownMissingContext,
+			MissingContext:  missing,
+		}, observation, true, nil
 	}
 	version := model.RoutingCostSnapshotVersion{
 		PricingHash:     observation.CostPricingHash,

@@ -34,6 +34,8 @@ var ErrRoutingTopologyLimitExceeded = errors.New("routing topology limit exceede
 type RoutingTopologyMetadata struct {
 	ID                   int    `json:"id" gorm:"primaryKey"`
 	CredentialSecretHash string `json:"-" gorm:"type:varchar(128);not null"`
+	TopologyEpoch        int64  `json:"topology_epoch" gorm:"bigint;not null"`
+	TopologyHash         string `json:"topology_hash" gorm:"type:char(64);index;not null"`
 	CreatedTime          int64  `json:"created_time" gorm:"bigint"`
 	UpdatedTime          int64  `json:"updated_time" gorm:"bigint"`
 }
@@ -43,14 +45,17 @@ func (RoutingTopologyMetadata) TableName() string {
 }
 
 type RoutingPool struct {
-	ID          int    `json:"id" gorm:"primaryKey"`
-	GroupKey    string `json:"-" gorm:"type:varchar(64);uniqueIndex;not null"`
-	GroupName   string `json:"group_name" gorm:"type:varchar(64);index;not null"`
-	DisplayName string `json:"display_name" gorm:"type:varchar(128);not null"`
-	Source      string `json:"source" gorm:"type:varchar(32);index;not null"`
-	Active      bool   `json:"active" gorm:"index"`
-	CreatedTime int64  `json:"created_time" gorm:"bigint"`
-	UpdatedTime int64  `json:"updated_time" gorm:"bigint;index"`
+	ID              int    `json:"id" gorm:"primaryKey"`
+	GroupKey        string `json:"-" gorm:"type:varchar(64);uniqueIndex;not null"`
+	GroupName       string `json:"group_name" gorm:"type:varchar(64);index;not null"`
+	DisplayName     string `json:"display_name" gorm:"type:varchar(128);not null"`
+	Source          string `json:"source" gorm:"type:varchar(32);index;not null"`
+	Active          bool   `json:"active" gorm:"index"`
+	DefaultEnabled  bool   `json:"default_enabled" gorm:"not null"`
+	DefaultPriority int64  `json:"default_priority" gorm:"bigint;not null"`
+	DefaultWeight   int64  `json:"default_weight" gorm:"bigint;not null"`
+	CreatedTime     int64  `json:"created_time" gorm:"bigint"`
+	UpdatedTime     int64  `json:"updated_time" gorm:"bigint;index"`
 }
 
 func (RoutingPool) TableName() string {
@@ -58,15 +63,19 @@ func (RoutingPool) TableName() string {
 }
 
 type RoutingPoolMember struct {
-	ID             int    `json:"id" gorm:"primaryKey"`
-	PoolID         int    `json:"pool_id" gorm:"uniqueIndex:idx_routing_pool_member,priority:1;index;not null"`
-	ChannelID      int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_pool_member,priority:2;index;not null"`
-	Source         string `json:"source" gorm:"type:varchar(32);index;not null"`
-	Active         bool   `json:"active" gorm:"index"`
-	LegacyPriority int64  `json:"legacy_priority" gorm:"bigint"`
-	LegacyWeight   int64  `json:"legacy_weight" gorm:"bigint"`
-	CreatedTime    int64  `json:"created_time" gorm:"bigint"`
-	UpdatedTime    int64  `json:"updated_time" gorm:"bigint;index"`
+	ID                int    `json:"id" gorm:"primaryKey"`
+	PoolID            int    `json:"pool_id" gorm:"uniqueIndex:idx_routing_pool_member_generation,priority:1;index;not null"`
+	ChannelID         int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration string `json:"channel_generation" gorm:"type:varchar(32);uniqueIndex:idx_routing_pool_member_generation,priority:2;index"`
+	Source            string `json:"source" gorm:"type:varchar(32);index;not null"`
+	Active            bool   `json:"active" gorm:"index"`
+	EnabledOverride   *bool  `json:"enabled_override,omitempty"`
+	PriorityOverride  *int64 `json:"priority_override,omitempty" gorm:"bigint"`
+	WeightOverride    *int64 `json:"weight_override,omitempty" gorm:"bigint"`
+	LegacyPriority    int64  `json:"legacy_priority" gorm:"bigint"`
+	LegacyWeight      int64  `json:"legacy_weight" gorm:"bigint"`
+	CreatedTime       int64  `json:"created_time" gorm:"bigint"`
+	UpdatedTime       int64  `json:"updated_time" gorm:"bigint;index"`
 }
 
 func (RoutingPoolMember) TableName() string {
@@ -75,9 +84,9 @@ func (RoutingPoolMember) TableName() string {
 
 type RoutingCredentialRef struct {
 	ID                 int    `json:"id" gorm:"primaryKey"`
-	ChannelID          int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_credential_ref,priority:1;index;not null"`
-	ChannelGeneration  string `json:"-" gorm:"type:varchar(32);index"`
-	Fingerprint        string `json:"-" gorm:"type:varchar(64);uniqueIndex:idx_routing_credential_ref,priority:2;not null"`
+	ChannelID          int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration  string `json:"-" gorm:"type:varchar(32);uniqueIndex:idx_routing_credential_ref_generation,priority:1;index"`
+	Fingerprint        string `json:"-" gorm:"type:varchar(64);uniqueIndex:idx_routing_credential_ref_generation,priority:2;not null"`
 	FingerprintVersion int    `json:"fingerprint_version"`
 	Active             bool   `json:"active" gorm:"index"`
 	LastSeenIndex      int    `json:"last_seen_index"`
@@ -92,15 +101,17 @@ func (RoutingCredentialRef) TableName() string {
 }
 
 type RoutingTopologyReconcileSummary struct {
-	ActivePools        int `json:"active_pools"`
-	ActiveMembers      int `json:"active_members"`
-	ActiveCredentials  int `json:"active_credentials"`
-	CreatedPools       int `json:"created_pools"`
-	CreatedMembers     int `json:"created_members"`
-	CreatedCredentials int `json:"created_credentials"`
-	RetiredPools       int `json:"retired_pools"`
-	RetiredMembers     int `json:"retired_members"`
-	RetiredCredentials int `json:"retired_credentials"`
+	ActivePools        int    `json:"active_pools"`
+	ActiveMembers      int    `json:"active_members"`
+	ActiveCredentials  int    `json:"active_credentials"`
+	CreatedPools       int    `json:"created_pools"`
+	CreatedMembers     int    `json:"created_members"`
+	CreatedCredentials int    `json:"created_credentials"`
+	RetiredPools       int    `json:"retired_pools"`
+	RetiredMembers     int    `json:"retired_members"`
+	RetiredCredentials int    `json:"retired_credentials"`
+	TopologyEpoch      int64  `json:"topology_epoch"`
+	TopologyHash       string `json:"topology_hash"`
 }
 
 func RoutingCredentialFingerprint(channelID int, channelGeneration string, key string) (string, error) {
@@ -128,7 +139,7 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		secretVerifier := routingCredentialSecretVerifier()
 		metadata := RoutingTopologyMetadata{}
-		err := tx.Where("id = ?", routingTopologyMetadataID).First(&metadata).Error
+		err := lockForUpdate(tx).Where("id = ?", routingTopologyMetadataID).First(&metadata).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			secretHash, hashErr := common.Password2Hash(secretVerifier)
 			if hashErr != nil {
@@ -137,6 +148,7 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			candidate := RoutingTopologyMetadata{
 				ID:                   routingTopologyMetadataID,
 				CredentialSecretHash: secretHash,
+				TopologyHash:         routingTopologyInitialHash(),
 				CreatedTime:          now,
 				UpdatedTime:          now,
 			}
@@ -235,13 +247,16 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			pool, exists := poolsByGroup[group]
 			if !exists {
 				candidate := RoutingPool{
-					GroupKey:    routingGroupKey(group),
-					GroupName:   group,
-					DisplayName: group,
-					Source:      RoutingPoolSourceLegacyGroup,
-					Active:      true,
-					CreatedTime: now,
-					UpdatedTime: now,
+					GroupKey:        routingGroupKey(group),
+					GroupName:       group,
+					DisplayName:     group,
+					Source:          RoutingPoolSourceLegacyGroup,
+					Active:          true,
+					DefaultEnabled:  true,
+					DefaultPriority: 0,
+					DefaultWeight:   100,
+					CreatedTime:     now,
+					UpdatedTime:     now,
 				}
 				if err := tx.Clauses(clause.OnConflict{
 					Columns:   []clause.Column{{Name: "group_key"}},
@@ -295,21 +310,31 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 		}
 		membersByKey := make(map[routingPoolMemberIdentity]RoutingPoolMember, len(existingMembers))
 		for _, member := range existingMembers {
-			membersByKey[routingPoolMemberIdentity{PoolID: member.PoolID, ChannelID: member.ChannelID}] = member
+			membersByKey[routingPoolMemberIdentity{
+				PoolID: member.PoolID, ChannelGeneration: member.ChannelGeneration,
+			}] = member
 		}
 		desiredMembers := make(map[routingPoolMemberIdentity]struct{})
 		for i := range channels {
 			priority := int64(0)
+			var priorityOverride *int64
 			if channels[i].Priority != nil {
 				priority = *channels[i].Priority
+				value := priority
+				priorityOverride = &value
 			}
-			weight := int64(0)
+			weight := int64(100)
+			var weightOverride *int64
 			if channels[i].Weight != nil {
 				weight = int64(*channels[i].Weight)
+				value := weight
+				weightOverride = &value
 			}
 			for _, group := range channelGroups[channels[i].Id] {
 				pool := poolsByGroup[group]
-				identity := routingPoolMemberIdentity{PoolID: pool.ID, ChannelID: channels[i].Id}
+				identity := routingPoolMemberIdentity{
+					PoolID: pool.ID, ChannelGeneration: channels[i].RoutingGeneration,
+				}
 				if _, exists := desiredMembers[identity]; !exists && len(desiredMembers) >= routingTopologyMaxMembers {
 					return fmt.Errorf("%w: members", ErrRoutingTopologyLimitExceeded)
 				}
@@ -317,33 +342,44 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 				member, exists := membersByKey[identity]
 				if !exists {
 					candidate := RoutingPoolMember{
-						PoolID:         pool.ID,
-						ChannelID:      channels[i].Id,
-						Source:         RoutingPoolSourceLegacyGroup,
-						Active:         true,
-						LegacyPriority: priority,
-						LegacyWeight:   weight,
-						CreatedTime:    now,
-						UpdatedTime:    now,
+						PoolID:            pool.ID,
+						ChannelID:         channels[i].Id,
+						ChannelGeneration: channels[i].RoutingGeneration,
+						Source:            RoutingPoolSourceLegacyGroup,
+						Active:            true,
+						PriorityOverride:  priorityOverride,
+						WeightOverride:    weightOverride,
+						LegacyPriority:    priority,
+						LegacyWeight:      weight,
+						CreatedTime:       now,
+						UpdatedTime:       now,
 					}
 					if err := tx.Clauses(clause.OnConflict{
-						Columns:   []clause.Column{{Name: "pool_id"}, {Name: "channel_id"}},
+						Columns:   []clause.Column{{Name: "pool_id"}, {Name: "channel_generation"}},
 						DoNothing: true,
 					}).Create(&candidate).Error; err != nil {
 						return err
 					}
-					if err := tx.Where("pool_id = ? AND channel_id = ?", pool.ID, channels[i].Id).First(&member).Error; err != nil {
+					if err := tx.Where(
+						"pool_id = ? AND channel_generation = ?", pool.ID, channels[i].RoutingGeneration,
+					).First(&member).Error; err != nil {
 						return err
 					}
 					if candidate.ID != 0 && candidate.ID == member.ID {
 						summary.CreatedMembers++
 					}
-				} else if !member.Active || member.LegacyPriority != priority || member.LegacyWeight != weight {
+				} else if member.ChannelID != channels[i].Id {
+					return ErrRoutingChannelLifecycleConflicted
+				} else if !member.Active || member.LegacyPriority != priority || member.LegacyWeight != weight ||
+					!routingOptionalInt64Equal(member.PriorityOverride, priorityOverride) ||
+					!routingOptionalInt64Equal(member.WeightOverride, weightOverride) {
 					if err := tx.Model(&RoutingPoolMember{}).Where("id = ?", member.ID).Updates(map[string]any{
-						"active":          true,
-						"legacy_priority": priority,
-						"legacy_weight":   weight,
-						"updated_time":    now,
+						"active":            true,
+						"priority_override": priorityOverride,
+						"weight_override":   weightOverride,
+						"legacy_priority":   priority,
+						"legacy_weight":     weight,
+						"updated_time":      now,
 					}).Error; err != nil {
 						return err
 					}
@@ -355,7 +391,9 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			if member.Source != RoutingPoolSourceLegacyGroup || !member.Active {
 				continue
 			}
-			identity := routingPoolMemberIdentity{PoolID: member.PoolID, ChannelID: member.ChannelID}
+			identity := routingPoolMemberIdentity{
+				PoolID: member.PoolID, ChannelGeneration: member.ChannelGeneration,
+			}
 			if _, desired := desiredMembers[identity]; desired {
 				continue
 			}
@@ -377,7 +415,9 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 		}
 		credentialsByKey := make(map[routingCredentialIdentity]RoutingCredentialRef, len(existingCredentials))
 		for _, ref := range existingCredentials {
-			credentialsByKey[routingCredentialIdentity{ChannelID: ref.ChannelID, Fingerprint: ref.Fingerprint}] = ref
+			credentialsByKey[routingCredentialIdentity{
+				ChannelGeneration: ref.ChannelGeneration, Fingerprint: ref.Fingerprint,
+			}] = ref
 		}
 		desiredCredentials := make(map[routingCredentialIdentity]routingCredentialObservation)
 		for i := range channels {
@@ -397,17 +437,17 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			credentialKeys = append(credentialKeys, identity)
 		}
 		sort.Slice(credentialKeys, func(i, j int) bool {
-			if credentialKeys[i].ChannelID == credentialKeys[j].ChannelID {
+			if credentialKeys[i].ChannelGeneration == credentialKeys[j].ChannelGeneration {
 				return credentialKeys[i].Fingerprint < credentialKeys[j].Fingerprint
 			}
-			return credentialKeys[i].ChannelID < credentialKeys[j].ChannelID
+			return credentialKeys[i].ChannelGeneration < credentialKeys[j].ChannelGeneration
 		})
 		for _, identity := range credentialKeys {
 			observation := desiredCredentials[identity]
 			ref, exists := credentialsByKey[identity]
 			if !exists {
 				candidate := RoutingCredentialRef{
-					ChannelID:          identity.ChannelID,
+					ChannelID:          observation.ChannelID,
 					ChannelGeneration:  observation.ChannelGeneration,
 					Fingerprint:        identity.Fingerprint,
 					FingerprintVersion: RoutingCredentialFingerprintVersion,
@@ -418,17 +458,21 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 					UpdatedTime:        now,
 				}
 				if err := tx.Clauses(clause.OnConflict{
-					Columns:   []clause.Column{{Name: "channel_id"}, {Name: "fingerprint"}},
+					Columns:   []clause.Column{{Name: "channel_generation"}, {Name: "fingerprint"}},
 					DoNothing: true,
 				}).Create(&candidate).Error; err != nil {
 					return err
 				}
-				if err := tx.Where("channel_id = ? AND fingerprint = ?", identity.ChannelID, identity.Fingerprint).First(&ref).Error; err != nil {
+				if err := tx.Where(
+					"channel_generation = ? AND fingerprint = ?", identity.ChannelGeneration, identity.Fingerprint,
+				).First(&ref).Error; err != nil {
 					return err
 				}
 				if candidate.ID != 0 && candidate.ID == ref.ID {
 					summary.CreatedCredentials++
 				}
+			} else if ref.ChannelID != observation.ChannelID {
+				return ErrRoutingChannelLifecycleConflicted
 			} else if !ref.Active || ref.ChannelGeneration != observation.ChannelGeneration ||
 				ref.FingerprintVersion != RoutingCredentialFingerprintVersion || ref.LastSeenIndex != observation.FirstIndex ||
 				ref.CurrentOccurrences != observation.Occurrences || ref.RetiredTime != 0 {
@@ -450,7 +494,9 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			if !ref.Active {
 				continue
 			}
-			identity := routingCredentialIdentity{ChannelID: ref.ChannelID, Fingerprint: ref.Fingerprint}
+			identity := routingCredentialIdentity{
+				ChannelGeneration: ref.ChannelGeneration, Fingerprint: ref.Fingerprint,
+			}
 			if _, desired := desiredCredentials[identity]; desired {
 				continue
 			}
@@ -465,6 +511,12 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 			summary.RetiredCredentials++
 		}
 
+		version, err := advanceRoutingTopologyVersionTx(tx, now)
+		if err != nil {
+			return err
+		}
+		summary.TopologyEpoch = version.Epoch
+		summary.TopologyHash = version.StateHash
 		return ctx.Err()
 	})
 	if err != nil {
@@ -474,16 +526,17 @@ func ReconcileLegacyRoutingTopologyContext(ctx context.Context) (RoutingTopology
 }
 
 type routingPoolMemberIdentity struct {
-	PoolID    int
-	ChannelID int
+	PoolID            int
+	ChannelGeneration string
 }
 
 type routingCredentialIdentity struct {
-	ChannelID   int
-	Fingerprint string
+	ChannelGeneration string
+	Fingerprint       string
 }
 
 type routingCredentialObservation struct {
+	ChannelID         int
 	ChannelGeneration string
 	FirstIndex        int
 	Occurrences       int
@@ -542,9 +595,12 @@ func routingCredentialObservations(channel Channel) (map[routingCredentialIdenti
 		if err != nil {
 			return nil, fmt.Errorf("routing credential fingerprint for channel %d: %w", channel.Id, err)
 		}
-		identity := routingCredentialIdentity{ChannelID: channel.Id, Fingerprint: fingerprint}
+		identity := routingCredentialIdentity{
+			ChannelGeneration: channel.RoutingGeneration, Fingerprint: fingerprint,
+		}
 		observation, exists := result[identity]
 		if !exists {
+			observation.ChannelID = channel.Id
 			observation.ChannelGeneration = channel.RoutingGeneration
 			observation.FirstIndex = indexes[index]
 		}
@@ -552,4 +608,11 @@ func routingCredentialObservations(channel Channel) (map[routingCredentialIdenti
 		result[identity] = observation
 	}
 	return result, nil
+}
+
+func routingOptionalInt64Equal(left *int64, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }

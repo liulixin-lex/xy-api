@@ -179,7 +179,7 @@ func TestActiveProbeOperationFailureIsRetriedWithSanitizedError(t *testing.T) {
 	require.Error(t, err)
 	stored, getErr := model.GetRoutingOperationContext(context.Background(), operation.ID)
 	require.NoError(t, getErr)
-	assert.Equal(t, model.RoutingOperationStatusPending, stored.Status)
+	assert.Equal(t, model.RoutingOperationStatusRetryWait, stored.Status)
 	assert.Contains(t, stored.LastError, "api_key=***")
 	assert.NotContains(t, stored.LastError, "SECRET-VALUE")
 	assert.Greater(t, stored.NextRetryMs, stored.UpdatedTimeMs)

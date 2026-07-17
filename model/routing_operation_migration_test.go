@@ -228,9 +228,9 @@ func runRetireRoutingCostSyncWorkContract(t *testing.T, db *gorm.DB, dbType comm
 		Payload: `{"request":"terminal"}`, State: `{"cursor":3}`, Result: `{"done":true}`,
 		CreatedAt: 140, UpdatedAt: 150,
 	}
-	unrelatedActiveKey := SystemTaskTypeRoutingAgent
+	unrelatedActiveKey := SystemTaskTypeChannelTest
 	unrelatedTask := SystemTask{
-		TaskID: "systask_" + strings.Repeat("u", 32), Type: SystemTaskTypeRoutingAgent,
+		TaskID: "systask_" + strings.Repeat("u", 32), Type: SystemTaskTypeChannelTest,
 		Status: SystemTaskStatusPending, ActiveKey: &unrelatedActiveKey,
 		Payload: `{"request":"unrelated"}`, State: `{"cursor":4}`, Result: `{"kept":true}`,
 		CreatedAt: 160, UpdatedAt: 170,
@@ -245,8 +245,8 @@ func runRetireRoutingCostSyncWorkContract(t *testing.T, db *gorm.DB, dbType comm
 		LockedBy: "running-runner", LockedUntil: 500, UpdatedAt: 130,
 	}
 	unrelatedLock := SystemTaskLock{
-		Type: SystemTaskTypeRoutingAgent, TaskID: unrelatedTask.TaskID,
-		LockedBy: "agent-runner", LockedUntil: 600, UpdatedAt: 170,
+		Type: SystemTaskTypeChannelTest, TaskID: unrelatedTask.TaskID,
+		LockedBy: "channel-test-runner", LockedUntil: 600, UpdatedAt: 170,
 	}
 	require.NoError(t, db.Create(&costSyncLock).Error)
 	require.NoError(t, db.Create(&unrelatedLock).Error)
@@ -312,6 +312,6 @@ func runRetireRoutingCostSyncWorkContract(t *testing.T, db *gorm.DB, dbType comm
 		Where("type = ?", SystemTaskTypeRoutingCostSync).Count(&costSyncLockCount).Error)
 	assert.Zero(t, costSyncLockCount)
 	var storedUnrelatedLock SystemTaskLock
-	require.NoError(t, db.Where("type = ?", SystemTaskTypeRoutingAgent).First(&storedUnrelatedLock).Error)
+	require.NoError(t, db.Where("type = ?", SystemTaskTypeChannelTest).First(&storedUnrelatedLock).Error)
 	assert.Equal(t, unrelatedLock, storedUnrelatedLock)
 }

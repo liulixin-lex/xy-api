@@ -110,7 +110,8 @@ func writeChannelRoutingBreakerResetResponse(
 		return
 	}
 	response := channelRoutingBreakerResetResponse{Operation: view, Target: target}
-	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning {
+	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning ||
+		operation.Status == model.RoutingOperationStatusRetryWait {
 		c.JSON(http.StatusAccepted, gin.H{"success": true, "message": "", "data": response})
 		return
 	}

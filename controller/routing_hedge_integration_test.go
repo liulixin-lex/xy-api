@@ -533,7 +533,9 @@ func newRoutingHedgeIntegrationFixture(
 		ExpectedCompletionTokens: 5, MaximumCompletionTokens: 10, MaxAttempts: 1,
 		KnowledgeSpecified: true, InputTokensKnown: true, MaximumCompletionKnown: true,
 		CacheTokensKnown: false, CacheWriteTokensKnown: true,
-		MediaDimensionsKnown: true, RequestInputKnown: true,
+		CacheWriteOneHourTokensKnown: true,
+		ImageInputTokensKnown:        true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true, RequestInputKnown: true,
 		RequestPricingFeaturesKnown: true,
 	})
 

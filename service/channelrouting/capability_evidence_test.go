@@ -109,12 +109,17 @@ func TestRefreshSnapshotPublishesVersionedCapabilityEvidenceBehindPoolGate(t *te
 	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
 	require.NoError(t, err)
 	require.Len(t, document.Pools, 1)
-	require.Len(t, document.Pools[0].Members, 1)
+	require.Empty(t, document.Pools[0].Members)
+	var topologyMember model.RoutingPoolMember
+	require.NoError(t, db.Where("channel_id = ? AND active = ?", 741, true).First(&topologyMember).Error)
 	document.Pools[0].DeploymentStage = model.RoutingDeploymentStageShadow
 	document.Pools[0].Policy = json.RawMessage(`{
 		"capability_routing":{"enabled":true,"schema_version":1}
 	}`)
-	document.Pools[0].Members[0].Overrides = json.RawMessage(`{
+	document.Pools[0].Members = []model.RoutingPolicyMemberContent{{
+		MemberID: topologyMember.ID, ChannelID: topologyMember.ChannelID,
+		RoutingGeneration: topologyMember.ChannelGeneration,
+		Overrides: json.RawMessage(`{
 		"capabilities":{
 			"revision":9,
 			"default":{
@@ -132,7 +137,8 @@ func TestRefreshSnapshotPublishesVersionedCapabilityEvidenceBehindPoolGate(t *te
 				}
 			}
 		}
-	}`)
+	}`),
+	}}
 	_, err = model.PublishRoutingPolicyRevisionDBContext(
 		context.Background(),
 		db,

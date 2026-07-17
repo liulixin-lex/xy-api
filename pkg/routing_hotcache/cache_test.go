@@ -26,6 +26,71 @@ func TestHotcacheStoresMetricAndBreakerSnapshots(t *testing.T) {
 	assert.Equal(t, "degraded", breaker.State)
 }
 
+func TestHotcacheSeparatesReusedChannelLifecycles(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	oldKey := Key{
+		ChannelID: 77, ChannelGeneration: "old-generation",
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+	}
+	currentKey := oldKey
+	currentKey.ChannelGeneration = "current-generation"
+	oldLifecycle := ChannelLifecycleKey{ChannelID: 77, ChannelGeneration: oldKey.ChannelGeneration}
+	currentLifecycle := ChannelLifecycleKey{ChannelID: 77, ChannelGeneration: currentKey.ChannelGeneration}
+
+	SetMetricForTest(oldKey, MetricSnapshot{RequestCount: 9, UpdatedUnix: 100})
+	SetBreakerForTest(oldKey, BreakerSnapshot{State: "open", UpdatedUnix: 100})
+	SetCapacityCooldownForTest(oldKey, CapacityCooldownSnapshot{
+		SourceStatusCode: 429, CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000,
+	})
+	SetAuthFailureForGeneration(77, oldLifecycle.ChannelGeneration, HealthMarker{Marked: true, UpdatedUnix: 100})
+	SetChannelBalanceUnavailableForGenerationForTest(77, oldLifecycle.ChannelGeneration, ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode: 402, CooldownUntilUnixMilli: 200_000, UpdatedUnixMilli: 100_000,
+	})
+
+	_, metricFound := GetMetric(currentKey)
+	_, breakerFound := GetBreaker(currentKey)
+	_, capacityFound := GetCapacityCooldown(currentKey)
+	_, authFound := GetAuthFailureForGeneration(currentLifecycle.ChannelID, currentLifecycle.ChannelGeneration)
+	_, balanceFound := GetChannelBalanceUnavailableForGeneration(currentLifecycle.ChannelID, currentLifecycle.ChannelGeneration)
+	assert.False(t, metricFound)
+	assert.False(t, breakerFound)
+	assert.False(t, capacityFound)
+	assert.False(t, authFound)
+	assert.False(t, balanceFound)
+
+	SetMetricForTest(currentKey, MetricSnapshot{RequestCount: 1, UpdatedUnix: 200})
+	SetBreakerForTest(currentKey, BreakerSnapshot{State: "healthy", UpdatedUnix: 200})
+	SetCapacityCooldownForTest(currentKey, CapacityCooldownSnapshot{
+		SourceStatusCode: 429, CooldownUntilUnixMilli: 300_000, UpdatedUnixMilli: 200_000,
+	})
+	SetAuthFailureForGeneration(77, currentLifecycle.ChannelGeneration, HealthMarker{Marked: false, UpdatedUnix: 200})
+	SetChannelBalanceUnavailableForGenerationForTest(77, currentLifecycle.ChannelGeneration, ChannelBalanceUnavailableSnapshot{
+		SourceStatusCode: 402, CooldownUntilUnixMilli: 300_000, UpdatedUnixMilli: 200_000,
+	})
+
+	currentMetric, metricFound := GetMetric(currentKey)
+	currentBreaker, breakerFound := GetBreaker(currentKey)
+	currentCapacity, capacityFound := GetCapacityCooldown(currentKey)
+	currentAuth, authFound := GetAuthFailureForGeneration(currentLifecycle.ChannelID, currentLifecycle.ChannelGeneration)
+	currentBalance, balanceFound := GetChannelBalanceUnavailableForGeneration(currentLifecycle.ChannelID, currentLifecycle.ChannelGeneration)
+	require.True(t, metricFound)
+	require.True(t, breakerFound)
+	require.True(t, capacityFound)
+	require.True(t, authFound)
+	require.True(t, balanceFound)
+	assert.Equal(t, int64(1), currentMetric.RequestCount)
+	assert.Equal(t, "healthy", currentBreaker.State)
+	assert.Equal(t, int64(300_000), currentCapacity.CooldownUntilUnixMilli)
+	assert.False(t, currentAuth.Marked)
+	assert.Equal(t, int64(300_000), currentBalance.CooldownUntilUnixMilli)
+	assert.Equal(t, Stats{
+		Metrics: 2, Breakers: 2, CapacityCooldowns: 2,
+		ChannelBalanceUnavailable: 2, AuthFailures: 2,
+	}, RuntimeStats())
+}
+
 func TestHotcacheResetClearsSnapshots(t *testing.T) {
 	key := Key{ChannelID: 12, APIKeyIndex: -1, Model: "gpt-test", Group: "default"}
 	SetMetricForTest(key, MetricSnapshot{RequestCount: 1})

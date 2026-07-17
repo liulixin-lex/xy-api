@@ -77,9 +77,6 @@ func CreateRoutingPolicyRollbackApprovalContext(
 		if err != nil {
 			return err
 		}
-		if !routingPolicyPublishRequiresApproval(document, activation) {
-			return ErrRoutingPolicyApprovalInvalid
-		}
 		if err := validateRoutingPolicyLiveReferencesTx(tx.WithContext(ctx), document); err != nil {
 			return err
 		}
@@ -230,9 +227,9 @@ func requireRoutingPolicyRollbackApprovalQuorumDBContext(
 	return valid, nil
 }
 
-// DeleteStaleRoutingPolicyRollbackApprovalsContext removes only approvals that
-// can no longer authorize the current monotonic policy head. Current-head
-// approvals remain available regardless of age until that head changes.
+// DeleteStaleRoutingPolicyRollbackApprovalsContext is retained for compatibility
+// with older maintenance callers. Approval rows are immutable historical facts
+// and are no longer eligible for retention cleanup.
 func DeleteStaleRoutingPolicyRollbackApprovalsContext(
 	ctx context.Context,
 	cutoffTimeMs int64,
@@ -244,27 +241,7 @@ func DeleteStaleRoutingPolicyRollbackApprovalsContext(
 	if cutoffTimeMs <= 0 || limit < 1 || limit > routingPolicyRollbackApprovalRetentionBatch {
 		return 0, ErrRoutingPolicyApprovalInvalid
 	}
-	head, err := GetRoutingPolicyHeadContext(ctx)
-	if err != nil {
-		return 0, err
-	}
-	ids := make([]int64, 0, limit)
-	if err := DB.WithContext(ctx).Model(&RoutingPolicyRollbackApproval{}).
-		Select("id").
-		Where("created_time_ms < ?", cutoffTimeMs).
-		Where(
-			"expected_revision <> ? OR expected_activation_id <> ? OR expected_head_hash <> ?",
-			head.CurrentRevision, head.CurrentActivationID, head.CurrentHash,
-		).
-		Order("id asc").Limit(limit).Pluck("id", &ids).Error; err != nil {
-		return 0, err
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	deleted := DB.WithContext(ctx).Session(&gorm.Session{SkipHooks: true}).
-		Where("id IN ?", ids).Delete(&RoutingPolicyRollbackApproval{})
-	return deleted.RowsAffected, deleted.Error
+	return 0, nil
 }
 
 func validateRoutingPolicyRollbackApproval(approval RoutingPolicyRollbackApproval) error {

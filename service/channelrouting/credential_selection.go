@@ -71,9 +71,10 @@ func (snapshot *runtimeSnapshot) selectCredential(
 			continue
 		}
 		inflight := routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
-			PoolMemberID: member.ID,
-			CredentialID: credentialID,
-			Model:        modelName,
+			PoolMemberID:      member.ID,
+			CredentialID:      credentialID,
+			ChannelGeneration: member.ChannelGeneration,
+			Model:             modelName,
 		})
 		candidate := rankedCredential{
 			id:       credentialID,

@@ -236,7 +236,9 @@ func TestRoutingChannelConfigurationOutboxRefreshesCostAndCannotRollBackWhenNewe
 	require.True(t, ok)
 	profile := model.RoutingCostRequestProfile{
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
-		MaximumCompletionKnown: true, CacheTokensKnown: true, MediaDimensionsKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
 		RequestInputKnown: true, RequestPricingFeaturesKnown: true,
 	}
 	initialEstimate, exists, err := EstimateModelSnapshotRoutingCost(initialObservation, profile, time.Now().Unix())

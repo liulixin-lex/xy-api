@@ -288,6 +288,9 @@ func InitLogDB() (err error) {
 }
 
 func migrateDB() error {
+	if err := preflightRoutingSchemaCutover(DB); err != nil {
+		return err
+	}
 	if err := invalidateRoutingSchemaVersion(DB); err != nil {
 		return err
 	}
@@ -298,6 +301,15 @@ func migrateDB() error {
 		return err
 	}
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingControlPlaneV2Schema(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingTopologyGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingRuntimeGenerationSchema(DB); err != nil {
 		return err
 	}
 	if err := prepareBillingLogOperationKeyColumn(DB); err != nil {
@@ -348,6 +360,7 @@ func migrateDB() error {
 		&PerfMetric{},
 		&RoutingSchemaVersion{},
 		&RoutingTopologyMetadata{},
+		&RoutingChannelLifecycle{},
 		&RoutingPool{},
 		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
@@ -359,6 +372,8 @@ func migrateDB() error {
 		&RoutingPolicyMemberRevision{},
 		&RoutingPolicyActivation{},
 		&RoutingPolicyDraft{},
+		&RoutingPolicySimulationEvidence{},
+		&RoutingPolicyRiskAcceptance{},
 		&RoutingPolicyApproval{},
 		&RoutingPolicyRollbackApproval{},
 		&RoutingConfigOutbox{},
@@ -378,6 +393,7 @@ func migrateDB() error {
 		&RoutingHedgeAttemptAudit{},
 		&RoutingRuntimeSettingsState{},
 		&RoutingControlAudit{},
+		&RoutingPricingVersion{},
 		&RoutingCostSnapshotVersion{},
 		&RoutingConfigurationEpoch{},
 		&RoutingChannelConfiguration{},
@@ -387,7 +403,6 @@ func migrateDB() error {
 		&RoutingBreakerState{},
 		&RoutingChannelHealthState{},
 		&RoutingCredentialHealthState{},
-		&RoutingAgentRecommendation{},
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
@@ -415,6 +430,24 @@ func migrateDB() error {
 	if err := EnsureChannelRoutingGenerations(DB); err != nil {
 		return err
 	}
+	if err := EnsureChannelRoutingIdentitiesAndLifecycles(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingCostSnapshotGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := EnsureRoutingPricingVersion(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingTopologyGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingRuntimeGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := RetireRoutingAgentPlaceholderSchema(DB); err != nil {
+		return err
+	}
 	if err := migrateRoutingDedicatedSchemas(DB); err != nil {
 		return err
 	}
@@ -437,10 +470,22 @@ func migrateDB() error {
 }
 
 func migrateDBFast() error {
+	if err := preflightRoutingSchemaCutover(DB); err != nil {
+		return err
+	}
 	if err := invalidateRoutingSchemaVersion(DB); err != nil {
 		return err
 	}
 	if err := prepareRoutingCanaryEvaluationWindowUniqueIndex(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingControlPlaneV2Schema(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingTopologyGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := prepareRoutingRuntimeGenerationSchema(DB); err != nil {
 		return err
 	}
 	if err := prepareBillingLogOperationKeyColumn(DB); err != nil {
@@ -496,6 +541,7 @@ func migrateDBFast() error {
 		{&PerfMetric{}, "PerfMetric"},
 		{&RoutingSchemaVersion{}, "RoutingSchemaVersion"},
 		{&RoutingTopologyMetadata{}, "RoutingTopologyMetadata"},
+		{&RoutingChannelLifecycle{}, "RoutingChannelLifecycle"},
 		{&RoutingPool{}, "RoutingPool"},
 		{&RoutingPoolMember{}, "RoutingPoolMember"},
 		{&RoutingCredentialRef{}, "RoutingCredentialRef"},
@@ -507,6 +553,8 @@ func migrateDBFast() error {
 		{&RoutingPolicyMemberRevision{}, "RoutingPolicyMemberRevision"},
 		{&RoutingPolicyActivation{}, "RoutingPolicyActivation"},
 		{&RoutingPolicyDraft{}, "RoutingPolicyDraft"},
+		{&RoutingPolicySimulationEvidence{}, "RoutingPolicySimulationEvidence"},
+		{&RoutingPolicyRiskAcceptance{}, "RoutingPolicyRiskAcceptance"},
 		{&RoutingPolicyApproval{}, "RoutingPolicyApproval"},
 		{&RoutingPolicyRollbackApproval{}, "RoutingPolicyRollbackApproval"},
 		{&RoutingConfigOutbox{}, "RoutingConfigOutbox"},
@@ -526,6 +574,7 @@ func migrateDBFast() error {
 		{&RoutingHedgeAttemptAudit{}, "RoutingHedgeAttemptAudit"},
 		{&RoutingRuntimeSettingsState{}, "RoutingRuntimeSettingsState"},
 		{&RoutingControlAudit{}, "RoutingControlAudit"},
+		{&RoutingPricingVersion{}, "RoutingPricingVersion"},
 		{&RoutingCostSnapshotVersion{}, "RoutingCostSnapshotVersion"},
 		{&RoutingConfigurationEpoch{}, "RoutingConfigurationEpoch"},
 		{&RoutingChannelConfiguration{}, "RoutingChannelConfiguration"},
@@ -535,7 +584,6 @@ func migrateDBFast() error {
 		{&RoutingBreakerState{}, "RoutingBreakerState"},
 		{&RoutingChannelHealthState{}, "RoutingChannelHealthState"},
 		{&RoutingCredentialHealthState{}, "RoutingCredentialHealthState"},
-		{&RoutingAgentRecommendation{}, "RoutingAgentRecommendation"},
 		{&SystemInstance{}, "SystemInstance"},
 		{&SystemTask{}, "SystemTask"},
 		{&SystemTaskLock{}, "SystemTaskLock"},
@@ -579,6 +627,24 @@ func migrateDBFast() error {
 		return err
 	}
 	if err := EnsureChannelRoutingGenerations(DB); err != nil {
+		return err
+	}
+	if err := EnsureChannelRoutingIdentitiesAndLifecycles(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingCostSnapshotGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := EnsureRoutingPricingVersion(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingTopologyGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := MigrateRoutingRuntimeGenerationSchema(DB); err != nil {
+		return err
+	}
+	if err := RetireRoutingAgentPlaceholderSchema(DB); err != nil {
 		return err
 	}
 	if err := migrateRoutingDedicatedSchemas(DB); err != nil {
@@ -743,6 +809,7 @@ func validateRoutingRetirementCutover(db *gorm.DB, alphaDrained bool) error {
 			Where("operation_type = ? AND status IN ?", RoutingOperationTypeCostSync, []RoutingOperationStatus{
 				RoutingOperationStatusPending,
 				RoutingOperationStatusRunning,
+				RoutingOperationStatusRetryWait,
 			}).Limit(1).Pluck("id", &operationIDs).Error; err != nil {
 			return fmt.Errorf("inspect legacy routing cost sync operations: %w", err)
 		}

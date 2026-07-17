@@ -30,6 +30,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func requireRoutingChannelLifecycleForTest(t *testing.T, channelID int) model.Channel {
+	t.Helper()
+	var channel model.Channel
+	require.NoError(t, model.DB.Select("id", "routing_identity", "routing_generation").Where("id = ?", channelID).Take(&channel).Error)
+	require.NotEmpty(t, channel.RoutingIdentity)
+	require.NotEmpty(t, channel.RoutingGeneration)
+	return channel
+}
+
 func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *testing.T) {
 	truncate(t)
 	routinghotcache.ResetForTest()
@@ -49,12 +58,15 @@ func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 101, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 102, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	model.InitChannelCache()
+	weakLifecycle := requireRoutingChannelLifecycleForTest(t, 101)
+	strongLifecycle := requireRoutingChannelLifecycleForTest(t, 102)
 
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID:   101,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       "gpt-test",
-		Group:       "default",
+		ChannelID:         101,
+		ChannelGeneration: weakLifecycle.RoutingGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             "gpt-test",
+		Group:             "default",
 	}, routinghotcache.MetricSnapshot{
 		RequestCount:            100,
 		SuccessCount:            99,
@@ -64,10 +76,11 @@ func TestSelectSmartChannelForGroupUsesReliabilityAvailabilityWithinPriority(t *
 		TPS:                     1,
 	})
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID:   102,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       "gpt-test",
-		Group:       "default",
+		ChannelID:         102,
+		ChannelGeneration: strongLifecycle.RoutingGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             "gpt-test",
+		Group:             "default",
 	}, routinghotcache.MetricSnapshot{
 		RequestCount:            100,
 		SuccessCount:            10,
@@ -226,6 +239,8 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channels[i].Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	}
 	model.InitChannelCache()
+	singleGeneration := channels[0].RoutingGeneration
+	multiGeneration := channels[1].RoutingGeneration
 
 	now := time.Now()
 	perRequestCost := 0.5
@@ -234,8 +249,8 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 		Pools: []channelrouting.PoolSnapshot{{
 			ID: 1, GroupName: "default", DeploymentStage: model.RoutingDeploymentStageObserve,
 			Members: []channelrouting.PoolMemberSnapshot{
-				{ID: 1, PoolID: 1, ChannelID: 141, Models: []channelrouting.ModelSnapshot{{ModelName: "gpt-test"}}},
-				{ID: 2, PoolID: 1, ChannelID: 142, Models: []channelrouting.ModelSnapshot{{
+				{ID: 1, PoolID: 1, ChannelID: 141, ChannelGeneration: singleGeneration, Models: []channelrouting.ModelSnapshot{{ModelName: "gpt-test"}}},
+				{ID: 2, PoolID: 1, ChannelID: 142, ChannelGeneration: multiGeneration, Models: []channelrouting.ModelSnapshot{{
 					ModelName: "gpt-test",
 					CostPricing: &model.RoutingNormalizedPricing{
 						BillingMode:    channelrouting.SystemRoutingPricingBasis,
@@ -256,14 +271,14 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 			},
 		}},
 		Channels: []channelrouting.ChannelSnapshot{
-			{ID: 141, Status: common.ChannelStatusEnabled},
-			{ID: 142, Status: common.ChannelStatusEnabled, MultiKey: true},
+			{ID: 141, RoutingIdentity: channels[0].RoutingIdentity, RoutingGeneration: singleGeneration, Status: common.ChannelStatusEnabled},
+			{ID: 142, RoutingIdentity: channels[1].RoutingIdentity, RoutingGeneration: multiGeneration, Status: common.ChannelStatusEnabled, MultiKey: true},
 		},
 	})
-	singleAggregate := routinghotcache.Key{ChannelID: 141, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	singlePositive := routinghotcache.Key{ChannelID: 141, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
-	multiAggregate := routinghotcache.Key{ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	multiPositive := routinghotcache.Key{ChannelID: 142, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
+	singleAggregate := routinghotcache.Key{ChannelID: 141, ChannelGeneration: singleGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	singlePositive := routinghotcache.Key{ChannelID: 141, ChannelGeneration: singleGeneration, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
+	multiAggregate := routinghotcache.Key{ChannelID: 142, ChannelGeneration: multiGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	multiPositive := routinghotcache.Key{ChannelID: 142, ChannelGeneration: multiGeneration, APIKeyIndex: 2, Model: "gpt-test", Group: "default"}
 
 	routinghotcache.SetMetricForTest(singleAggregate, routinghotcache.MetricSnapshot{RequestCount: 11, ReliabilityRequestCount: 10, ReliabilityFailureCount: 1, P95TTFTMs: 123})
 	routinghotcache.SetMetricForTest(singlePositive, routinghotcache.MetricSnapshot{RequestCount: 99, ReliabilityRequestCount: 99, ReliabilityFailureCount: 99})
@@ -280,11 +295,14 @@ func TestSmartRoutingCandidatesIgnoreLegacyMetricBreakerInflightAndCapacityForMu
 	legacyInflightRelease := routingmetrics.BeginInflight(nil, &relaycommon.RelayInfo{
 		UsingGroup:      "default",
 		OriginModelName: "gpt-test",
-		ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 142, ChannelIsMultiKey: false},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId: 142, RoutingGeneration: multiGeneration, ChannelIsMultiKey: false,
+		},
 	}, 142)
 	t.Cleanup(legacyInflightRelease)
 	require.Equal(t, int64(1), routingmetrics.InflightCount(routingmetrics.InflightKey{
-		ChannelID: 142, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+		ChannelID: 142, ChannelGeneration: multiGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
 	}))
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -366,9 +384,10 @@ func TestSelectSmartChannelForGroupCapacityCooldownBlocksHalfOpenProbeAndRestore
 	require.NoError(t, model.DB.Create(&model.Channel{Id: 151, Name: "capacity-half-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 151, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	model.InitChannelCache()
+	channelLifecycle := requireRoutingChannelLifecycleForTest(t, 151)
 
-	cacheKey := routinghotcache.Key{ChannelID: 151, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	breakerKey := routingbreaker.Key{ChannelID: 151, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: 151, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	breakerKey := routingbreaker.Key{ChannelID: 151, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{
 		RequestCount:            100,
 		SuccessCount:            99,
@@ -443,14 +462,16 @@ func TestSelectSmartChannelForGroupRefreshesCapacityOnMemoizedRetry(t *testing.T
 		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	}
 	model.InitChannelCache()
+	firstLifecycle := requireRoutingChannelLifecycleForTest(t, 152)
+	retryLifecycle := requireRoutingChannelLifecycleForTest(t, 153)
 
-	firstKey := routinghotcache.Key{ChannelID: 152, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
-	retryKey := routinghotcache.Key{ChannelID: 153, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	firstKey := routinghotcache.Key{ChannelID: 152, ChannelGeneration: firstLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	retryKey := routinghotcache.Key{ChannelID: 153, ChannelGeneration: retryLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routinghotcache.SetMetricForTest(firstKey, routinghotcache.MetricSnapshot{ReliabilityRequestCount: 100, ReliabilityFailureCount: 0})
 	routinghotcache.SetMetricForTest(retryKey, routinghotcache.MetricSnapshot{ReliabilityRequestCount: 100, ReliabilityFailureCount: 10})
 	routinghotcache.SetBreakerForTest(retryKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
-		Key:       routingbreaker.Key{ChannelID: 153, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
+		Key:       routingbreaker.Key{ChannelID: 153, ChannelGeneration: retryLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
 		State:     routingbreaker.StateHalfOpen,
 		UpdatedAt: time.Now(),
 	}})
@@ -517,10 +538,11 @@ func TestCacheGetRandomSatisfiedChannelUsesLegacyWhenSmartRoutingObserves(t *tes
 	require.NoError(t, err)
 
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID:   202,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       "gpt-test",
-		Group:       "default",
+		ChannelID:         202,
+		ChannelGeneration: requireRoutingChannelLifecycleForTest(t, 202).RoutingGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             "gpt-test",
+		Group:             "default",
 	}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 100, ReliabilityRequestCount: 100, ReliabilityFailureCount: 0, P95LatencyMs: 50, TPS: 10})
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
 		Enabled:            true,
@@ -709,13 +731,15 @@ func TestObserveCandidatesUseStableMultiKeyTelemetryWithoutLegacyAggregate(t *te
 	require.Len(t, member.CredentialIDs, 2)
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: member.PoolID, PoolMemberID: member.ID, CredentialID: member.CredentialIDs[0], ChannelID: 203,
-		Model: "gpt-test", BucketTs: time.Now().Unix(), LastSnapshotRevision: first.Revision,
+		ChannelGeneration: member.ChannelGeneration,
+		Model:             "gpt-test", BucketTs: time.Now().Unix(), LastSnapshotRevision: first.Revision,
 		RequestCount: 10, SuccessCount: 9, FailureCount: 1,
 		ReliabilityRequestCount: 10, ReliabilityFailureCount: 1,
 		OutputTokens: 500, GenerationMs: 2000,
 	}})
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID: 203, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+		ChannelID: 203, ChannelGeneration: member.ChannelGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
 	}, routinghotcache.MetricSnapshot{RequestCount: 999, SuccessCount: 999, TPS: 999})
 	_, err = channelrouting.RefreshSnapshotContext(context.Background())
 	require.NoError(t, err)
@@ -765,11 +789,13 @@ func TestCacheGetRandomSatisfiedChannelDoesNotFallbackWhenSmartSafetyFiltersEmpt
 	model.InitChannelCache()
 
 	for _, channelID := range []int{211, 212} {
+		channelLifecycle := requireRoutingChannelLifecycleForTest(t, channelID)
 		routinghotcache.SetMetricForTest(routinghotcache.Key{
-			ChannelID:   channelID,
-			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model:       "gpt-test",
-			Group:       "default",
+			ChannelID:         channelID,
+			ChannelGeneration: channelLifecycle.RoutingGeneration,
+			APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+			Model:             "gpt-test",
+			Group:             "default",
 		}, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 10, ReliabilityRequestCount: 100, ReliabilityFailureCount: 90, P95LatencyMs: 100, TPS: 10})
 	}
 	smart_routing_setting.UpdateSetting(smart_routing_setting.SmartRoutingSetting{
@@ -827,6 +853,7 @@ func TestSmartRoutingCandidatesUseChannelBalanceSignalForMultiKeyChannel(t *test
 
 	priority := int64(10)
 	weight := uint(10)
+	channelGenerations := make(map[int]string, 4)
 	for _, channel := range []model.Channel{
 		{Id: 301, Name: "authfail", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 		{Id: 302, Name: "low-balance", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight, Balance: 0.25, BalanceUpdatedTime: common.GetTimestamp(), ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
@@ -835,13 +862,14 @@ func TestSmartRoutingCandidatesUseChannelBalanceSignalForMultiKeyChannel(t *test
 	} {
 		channel := channel
 		require.NoError(t, model.DB.Create(&channel).Error)
+		channelGenerations[channel.Id] = channel.RoutingGeneration
 		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	}
 	model.InitChannelCache()
 
 	now := common.GetTimestamp()
-	routinghotcache.SetAuthFailureForTest(301, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
-	routinghotcache.SetChannelBalanceUnavailableForTest(304, routinghotcache.ChannelBalanceUnavailableSnapshot{
+	routinghotcache.SetAuthFailureForGeneration(301, channelGenerations[301], routinghotcache.HealthMarker{Marked: true, UpdatedUnix: now})
+	routinghotcache.SetChannelBalanceUnavailableForGenerationForTest(304, channelGenerations[304], routinghotcache.ChannelBalanceUnavailableSnapshot{
 		SourceStatusCode:       http.StatusPaymentRequired,
 		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
 		CooldownUntilUnixMilli: time.Now().Add(time.Minute).UnixMilli(),
@@ -900,16 +928,17 @@ func TestSelectSmartChannelForGroupReservesHalfOpenProbe(t *testing.T) {
 	require.NoError(t, model.DB.Create(&model.Channel{Id: 311, Name: "half-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 311, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	model.InitChannelCache()
+	channelLifecycle := requireRoutingChannelLifecycleForTest(t, 311)
 
 	now := time.Now()
-	breakerKey := routingbreaker.Key{ChannelID: 311, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	breakerKey := routingbreaker.Key{ChannelID: 311, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key:           breakerKey,
 		State:         routingbreaker.StateHalfOpen,
 		EjectionCount: 1,
 		UpdatedAt:     now,
 	}})
-	cacheKey := routinghotcache.Key{ChannelID: 311, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: 311, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 	setting := smart_routing_setting.SmartRoutingSetting{
@@ -971,15 +1000,16 @@ func TestSelectSmartChannelForGroupFallsBackToLocalHalfOpenProbeWhenRedisLeaseFa
 	require.NoError(t, model.DB.Create(&model.Channel{Id: 312, Name: "half-open-local", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 312, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	model.InitChannelCache()
+	channelLifecycle := requireRoutingChannelLifecycleForTest(t, 312)
 
-	breakerKey := routingbreaker.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	breakerKey := routingbreaker.Key{ChannelID: 312, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
 		Key:           breakerKey,
 		State:         routingbreaker.StateHalfOpen,
 		EjectionCount: 1,
 		UpdatedAt:     time.Now(),
 	}})
-	cacheKey := routinghotcache.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: 312, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 
@@ -1177,15 +1207,16 @@ func TestRecordSmartRoutingDecisionDoesNotReserveHalfOpenProbe(t *testing.T) {
 	require.NoError(t, model.DB.Create(&model.Channel{Id: 312, Name: "observe-half-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight}).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: 312, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	model.InitChannelCache()
+	channelLifecycle := requireRoutingChannelLifecycleForTest(t, 312)
 
 	now := time.Now()
 	routingbreaker.HydrateDefaultSnapshots([]routingbreaker.Snapshot{{
-		Key:           routingbreaker.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
+		Key:           routingbreaker.Key{ChannelID: 312, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"},
 		State:         routingbreaker.StateHalfOpen,
 		EjectionCount: 1,
 		UpdatedAt:     now,
 	}})
-	cacheKey := routinghotcache.Key{ChannelID: 312, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: 312, ChannelGeneration: channelLifecycle.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}
 	routinghotcache.SetMetricForTest(cacheKey, routinghotcache.MetricSnapshot{RequestCount: 100, SuccessCount: 99, ReliabilityRequestCount: 100, ReliabilityFailureCount: 1, P95LatencyMs: 100, TPS: 10})
 	routinghotcache.SetBreakerForTest(cacheKey, routinghotcache.BreakerSnapshot{State: routingselector.BreakerStateHalfOpen, UpdatedUnix: common.GetTimestamp()})
 
@@ -1292,12 +1323,14 @@ func TestLegacyRandomSelectionExcludesChannelBalanceSignal(t *testing.T) {
 
 	priority := int64(10)
 	weight := uint(10)
+	channelGenerations := make(map[int]string, 2)
 	for _, channel := range []model.Channel{
 		{Id: 411, Name: "blocked", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
 		{Id: 412, Name: "healthy", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
 	} {
 		channel := channel
 		require.NoError(t, model.DB.Create(&channel).Error)
+		channelGenerations[channel.Id] = channel.RoutingGeneration
 		require.NoError(t, model.DB.Create(&model.Ability{
 			Group: "default", Model: "gpt-test", ChannelId: channel.Id,
 			Enabled: true, Priority: &priority, Weight: weight,
@@ -1305,7 +1338,7 @@ func TestLegacyRandomSelectionExcludesChannelBalanceSignal(t *testing.T) {
 	}
 	model.InitChannelCache()
 	now := time.Now()
-	routinghotcache.SetChannelBalanceUnavailableForTest(411, routinghotcache.ChannelBalanceUnavailableSnapshot{
+	routinghotcache.SetChannelBalanceUnavailableForGenerationForTest(411, channelGenerations[411], routinghotcache.ChannelBalanceUnavailableSnapshot{
 		SourceStatusCode:       http.StatusPaymentRequired,
 		Reason:                 routinghotcache.ChannelBalanceUnavailableReason,
 		CooldownUntilUnixMilli: now.Add(time.Minute).UnixMilli(),
@@ -1336,17 +1369,17 @@ func TestGetAdmissibleAffinityChannelRejectsPreferredFilteredBySmartRouting(t *t
 
 	priority := int64(10)
 	weight := uint(10)
-	for _, channel := range []model.Channel{
+	channels := []model.Channel{
 		{Id: 421, Name: "affinity-open", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
 		{Id: 422, Name: "healthy", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-test", Priority: &priority, Weight: &weight},
-	} {
-		channel := channel
-		require.NoError(t, model.DB.Create(&channel).Error)
-		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channel.Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
+	}
+	for index := range channels {
+		require.NoError(t, model.DB.Create(&channels[index]).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "gpt-test", ChannelId: channels[index].Id, Enabled: true, Priority: &priority, Weight: weight}).Error)
 	}
 	model.InitChannelCache()
 	now := common.GetTimestamp()
-	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 421, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}, routinghotcache.BreakerSnapshot{
+	routinghotcache.SetBreakerForTest(routinghotcache.Key{ChannelID: 421, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default"}, routinghotcache.BreakerSnapshot{
 		State:             routingselector.BreakerStateOpen,
 		CooldownUntilUnix: now + 60,
 		UpdatedUnix:       now,

@@ -177,7 +177,9 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 			preparedCandidate.HardExclusionReason = credentialReason
 		}
 		if preparedCandidate.HardExclusionReason == "" {
-			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, session.planningTime); blocked {
+			if _, blocked := ChannelBalanceRuntimeBlockedForGeneration(
+				member.ChannelID, member.ChannelGeneration, session.planningTime,
+			); blocked {
 				preparedCandidate.HardExclusionReason = ExclusionReasonChannelBalance
 			}
 		}
@@ -240,6 +242,7 @@ func (session *RequestRoutingSession) PlanBalanced(input BalancedRoutingPlanInpu
 		}
 		identity := Identity{
 			SnapshotRevision:  snapshot.view.Revision,
+			ChannelGeneration: member.ChannelGeneration,
 			PoolID:            pool.ID,
 			MemberID:          member.ID,
 			CredentialID:      credentialID,

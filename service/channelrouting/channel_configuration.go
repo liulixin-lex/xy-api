@@ -28,12 +28,15 @@ var routingChannelConfigurationEventEpoch atomic.Uint64
 type routingChannelConfigurationEventState struct {
 	configuration  model.RoutingChannelConfiguration
 	channelDeleted bool
+	staleLifecycle bool
 }
 
 type RoutingChannelConfigurationETag struct {
-	ChannelID int
-	Revision  int64
-	StateHash string
+	ChannelID         int
+	RoutingIdentity   string
+	RoutingGeneration string
+	Revision          int64
+	StateHash         string
 }
 
 func ChannelConfigurationETag(configuration model.RoutingChannelConfiguration) (string, error) {
@@ -41,7 +44,14 @@ func ChannelConfigurationETag(configuration model.RoutingChannelConfiguration) (
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("\"rcc.%d.%d.%s\"", configuration.ChannelID, configuration.Revision, stateHash), nil
+	return fmt.Sprintf(
+		"\"rcc2.%s.%s.%d.%d.%s\"",
+		configuration.RoutingIdentity,
+		configuration.RoutingGeneration,
+		configuration.ChannelID,
+		configuration.Revision,
+		stateHash,
+	), nil
 }
 
 func ParseChannelConfigurationETag(value string) (RoutingChannelConfigurationETag, error) {
@@ -50,24 +60,59 @@ func ParseChannelConfigurationETag(value string) (RoutingChannelConfigurationETa
 		return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
 	}
 	parts := strings.Split(value[1:len(value)-1], ".")
-	if len(parts) != 4 || parts[0] != "rcc" || len(parts[3]) != 64 {
+	if len(parts) == 4 && parts[0] == "rcc" {
+		channelID, err := strconv.Atoi(parts[1])
+		if err != nil || channelID <= 0 {
+			return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
+		}
+		revision, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || revision <= 0 || !validChannelConfigurationETagHash(parts[3]) {
+			return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
+		}
+		return RoutingChannelConfigurationETag{ChannelID: channelID, Revision: revision, StateHash: parts[3]}, nil
+	}
+	if len(parts) != 6 || parts[0] != "rcc2" || !validChannelConfigurationETagIdentity(parts[1]) ||
+		!validChannelConfigurationETagIdentity(parts[2]) || !validChannelConfigurationETagHash(parts[5]) {
 		return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
 	}
-	channelID, err := strconv.Atoi(parts[1])
+	channelID, err := strconv.Atoi(parts[3])
 	if err != nil || channelID <= 0 {
 		return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
 	}
-	revision, err := strconv.ParseInt(parts[2], 10, 64)
+	revision, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil || revision <= 0 {
 		return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
 	}
-	for index := range parts[3] {
-		char := parts[3][index]
+	return RoutingChannelConfigurationETag{
+		ChannelID: channelID, RoutingIdentity: parts[1], RoutingGeneration: parts[2],
+		Revision: revision, StateHash: parts[5],
+	}, nil
+}
+
+func validChannelConfigurationETagIdentity(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for index := range value {
+		char := value[index]
 		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
-			return RoutingChannelConfigurationETag{}, ErrRoutingChannelConfigurationETagInvalid
+			return false
 		}
 	}
-	return RoutingChannelConfigurationETag{ChannelID: channelID, Revision: revision, StateHash: parts[3]}, nil
+	return true
+}
+
+func validChannelConfigurationETagHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for index := range value {
+		char := value[index]
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func ChannelConfigurationCostBasisSummary(models []string) (int, bool) {
@@ -210,6 +255,12 @@ func refreshRoutingChannelConfigurationEventContext(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if event.RoutingGeneration == "" || event.RoutingIdentity == "" || event.AggregateID == "" {
+		// Pre-v2 events cannot prove which lifecycle they belong to. Acknowledge
+		// them without applying channel-scoped state so a reused numeric ID can
+		// never reinterpret legacy work as belonging to the current channel.
+		return routingChannelConfigurationEventState{staleLifecycle: true}, nil
+	}
 	view, err := RefreshSnapshotContext(ctx)
 	if err != nil {
 		return routingChannelConfigurationEventState{}, err
@@ -236,6 +287,11 @@ func refreshRoutingChannelConfigurationEventContext(
 	if err != nil {
 		return routingChannelConfigurationEventState{}, err
 	}
+	if configuration.RoutingIdentity != event.RoutingIdentity ||
+		configuration.RoutingGeneration != event.RoutingGeneration ||
+		event.AggregateID != event.RoutingGeneration || event.AggregateRevision != event.Revision {
+		return routingChannelConfigurationEventState{staleLifecycle: true}, nil
+	}
 	if configuration.Revision < event.Revision {
 		return routingChannelConfigurationEventState{}, model.ErrRoutingChannelConfigurationChanged
 	}
@@ -261,6 +317,9 @@ func applyRoutingChannelConfigurationEventState(
 	event model.RoutingChannelConfigurationEvent,
 	state routingChannelConfigurationEventState,
 ) {
+	if state.staleLifecycle {
+		return
+	}
 	if state.channelDeleted {
 		routinghotcache.DeleteChannelTrafficPolicy(event.ChannelID, event.UpdatedTime)
 		model.NotifyRoutingTopologyChanged()

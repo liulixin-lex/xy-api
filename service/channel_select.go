@@ -598,10 +598,11 @@ func acquireRoutingHalfOpenProbe(
 		return true
 	}
 	key := routingbreaker.Key{
-		ChannelID:   candidate.Channel.Id,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       modelName,
-		Group:       group,
+		ChannelID:         candidate.Channel.Id,
+		ChannelGeneration: candidate.Channel.RoutingGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             modelName,
+		Group:             group,
 	}
 	acquired, _ := acquireRoutingHalfOpenProbeForKey(
 		c,
@@ -881,10 +882,11 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 						continue
 					}
 					cacheKey := routinghotcache.Key{
-						ChannelID:   refreshed[i].Channel.Id,
-						APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-						Model:       param.ModelName,
-						Group:       group,
+						ChannelID:         refreshed[i].Channel.Id,
+						ChannelGeneration: refreshed[i].Channel.RoutingGeneration,
+						APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+						Model:             param.ModelName,
+						Group:             group,
 					}
 					refreshed[i].Capacity = routingCapacityForKey(
 						cacheKey,
@@ -915,10 +917,11 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 			continue
 		}
 		cacheKey := routinghotcache.Key{
-			ChannelID:   channel.Id,
-			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model:       param.ModelName,
-			Group:       group,
+			ChannelID:         channel.Id,
+			ChannelGeneration: channel.RoutingGeneration,
+			APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+			Model:             param.ModelName,
+			Group:             group,
 		}
 		candidate := routingselector.Candidate{Channel: channel}
 		candidate.Capacity = routingCapacityForKey(cacheKey, channel.ChannelInfo.IsMultiKey)
@@ -965,10 +968,11 @@ func smartRoutingCandidatesForGroup(param *RetryParam, group string) ([]routings
 				}
 			}
 			inflight := routingmetrics.InflightCount(routingmetrics.InflightKey{
-				ChannelID:   channel.Id,
-				APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-				Model:       param.ModelName,
-				Group:       group,
+				ChannelID:         channel.Id,
+				ChannelGeneration: channel.RoutingGeneration,
+				APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+				Model:             param.ModelName,
+				Group:             group,
 			})
 			if candidate.Metric != nil {
 				candidate.Metric.Inflight = inflight
@@ -1009,7 +1013,9 @@ func routingCapacityForKey(
 	if !multiKey {
 		capacity, capacityKnown = routinghotcache.GetCapacityCooldown(key)
 	}
-	channelCapacity, channelCapacityKnown := routinghotcache.GetChannelBalanceUnavailable(key.ChannelID)
+	channelCapacity, channelCapacityKnown := routinghotcache.GetChannelBalanceUnavailableForGeneration(
+		key.ChannelID, key.ChannelGeneration,
+	)
 	if !capacityKnown && !channelCapacityKnown {
 		return nil
 	}
@@ -1276,10 +1282,14 @@ func MarkRoutingChannelFailed(c *gin.Context, channelID int) int {
 }
 
 func AffinityAdmissible(channelID int) bool {
+	return affinityAdmissibleForGeneration(channelID, "")
+}
+
+func affinityAdmissibleForGeneration(channelID int, channelGeneration string) bool {
 	if channelID <= 0 {
 		return true
 	}
-	if routinghotcache.ChannelBalanceUnavailableActive(channelID, time.Now()) {
+	if routinghotcache.ChannelBalanceUnavailableActiveForGeneration(channelID, channelGeneration, time.Now()) {
 		return false
 	}
 	return true
@@ -1350,7 +1360,8 @@ func admissibleAffinityChannelLegacy(c *gin.Context, preferredID int, modelName 
 	preferred, err := model.CacheGetChannel(preferredID)
 	setting := smart_routing_setting.GetSetting()
 	if err != nil || preferred == nil || preferred.Status != common.ChannelStatusEnabled ||
-		!channelSupportsSmartRoutingRequestPath(preferred, requestPath) || !AffinityAdmissible(preferred.Id) ||
+		!channelSupportsSmartRoutingRequestPath(preferred, requestPath) ||
+		!affinityAdmissibleForGeneration(preferred.Id, preferred.RoutingGeneration) ||
 		(smart_routing_setting.ResolveEffectiveMode(setting).AllowsAffinityRouting() &&
 			routingChannelBalanceBelowMargin(preferred, setting)) {
 		return nil, "", false
@@ -1455,7 +1466,9 @@ func applyRoutingHealthMarkers(candidate *routingselector.Candidate, channelID i
 	if candidate == nil || candidate.Channel == nil || channelID <= 0 {
 		return
 	}
-	if unavailable, ok := routinghotcache.GetChannelBalanceUnavailable(channelID); ok &&
+	if unavailable, ok := routinghotcache.GetChannelBalanceUnavailableForGeneration(
+		channelID, candidate.Channel.RoutingGeneration,
+	); ok &&
 		unavailable.CooldownUntilUnixMilli > time.Now().UnixMilli() {
 		candidate.Breaker = &routingselector.BreakerSnapshot{
 			State:             routingselector.BreakerStateOpen,
