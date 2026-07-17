@@ -47,6 +47,20 @@ const activeProbeStatKeys = [
   'max_inflight',
 ] as const satisfies readonly (keyof ChannelRoutingActiveProbeStats)[]
 
+export type ChannelRoutingOperationResultRow = {
+  label: string
+  value: string | number | boolean
+  format?:
+    | 'basis_points'
+    | 'boolean'
+    | 'bytes'
+    | 'number'
+    | 'ratio'
+    | 'status'
+    | 'timestamp'
+    | 'usd'
+}
+
 function operationResult(
   operation: RoutingOperation
 ): Record<string, unknown> | null {
@@ -63,6 +77,7 @@ function operationResult(
 export function channelRoutingOperationDisplayStatus(
   operation: RoutingOperation
 ): string {
+  if (operation.status === 'partially_succeeded') return 'partially_succeeded'
   const result = operationResult(operation)
   if (
     operation.status === 'succeeded' &&
@@ -88,10 +103,59 @@ export function channelRoutingOperationTypeLabel(type: string): string {
   return labels[type] ?? type
 }
 
+export function channelRoutingOperationSourceLabel(source: string): string {
+  const labels: Record<string, string> = {
+    admin: 'Administrator',
+    migration: 'Migration',
+    recovery: 'Recovery',
+    scheduler: 'Scheduler',
+    system: 'System',
+  }
+  return labels[source] ?? source
+}
+
+export function channelRoutingOperationRetentionLabel(
+  retention: string
+): string {
+  const labels: Record<string, string> = {
+    extended: 'Extended retention',
+    high_frequency: 'High-frequency retention',
+    permanent: 'Permanent retention',
+    standard: 'Standard retention',
+  }
+  return labels[retention] ?? retention
+}
+
 export function channelRoutingOperationIsActive(
   operation: RoutingOperation | undefined
 ): boolean {
-  return operation?.status === 'pending' || operation?.status === 'running'
+  return (
+    operation?.status === 'pending' ||
+    operation?.status === 'running' ||
+    operation?.status === 'retry_wait'
+  )
+}
+
+export function channelRoutingOperationCanRetry(
+  operation: RoutingOperation | undefined
+): boolean {
+  if (!operation?.retryable) return false
+  return (
+    operation.status === 'failed' ||
+    operation.status === 'partially_succeeded' ||
+    operation.status === 'cancelled'
+  )
+}
+
+export function channelRoutingOperationCanCancel(
+  operation: RoutingOperation | undefined
+): boolean {
+  if (!operation?.cancellable) return false
+  return (
+    operation.status === 'pending' ||
+    operation.status === 'running' ||
+    operation.status === 'retry_wait'
+  )
 }
 
 export function channelRoutingOperationAuditExportId(
@@ -131,6 +195,184 @@ export function channelRoutingOperationActiveProbeResult(
     enabled: result.enabled,
     stats: stats as ChannelRoutingActiveProbeStats,
   }
+}
+
+export function channelRoutingOperationResultRows(
+  operation: RoutingOperation
+): ChannelRoutingOperationResultRow[] {
+  const result = operationResult(operation)
+  if (!result) return []
+
+  if (operation.type === 'active_probe') {
+    const probe = channelRoutingOperationActiveProbeResult(operation)
+    if (!probe) return []
+    return [
+      { label: 'Probe enabled', value: probe.enabled, format: 'boolean' },
+      { label: 'Executed', value: probe.stats.executed, format: 'number' },
+      { label: 'Succeeded', value: probe.stats.succeeded, format: 'number' },
+      { label: 'Failed', value: probe.stats.failed, format: 'number' },
+      { label: 'Timed out', value: probe.stats.timed_out, format: 'number' },
+      {
+        label: 'Local errors',
+        value: probe.stats.local_errors,
+        format: 'number',
+      },
+    ]
+  }
+
+  if (operation.type === 'audit_export') {
+    const exportId = channelRoutingOperationAuditExportId(operation)
+    if (!exportId) return []
+    return compactOperationResultRows([
+      { label: 'Export ID', value: exportId },
+      operationResultRow(result, 'record_count', 'Records', 'number'),
+      operationResultRow(result, 'content_bytes', 'Content size', 'bytes'),
+      operationResultRow(result, 'created_time_ms', 'Created', 'timestamp'),
+      operationResultRow(result, 'expires_time_ms', 'Expires', 'timestamp'),
+    ])
+  }
+
+  if (operation.type === 'breaker_reset') {
+    const scope = result.scope
+    const generation = result.generation
+    if (
+      (scope !== 'member' && scope !== 'endpoint') ||
+      !positiveInteger(generation)
+    ) {
+      return []
+    }
+    return [
+      {
+        label: 'Scope',
+        value: scope === 'member' ? 'Member / model' : 'Endpoint / region',
+        format: 'status',
+      },
+      { label: 'Generation', value: generation, format: 'number' },
+    ]
+  }
+
+  if (
+    operation.type === 'historical_simulation' ||
+    operation.type === 'policy_simulation'
+  ) {
+    const risk = operationResultRecord(result.risk)
+    const skipReasons = operationResultRecord(result.skip_reasons)
+    const skippedSamples = skipReasons
+      ? Object.values(skipReasons).reduce<number>((total, value) => {
+          if (!Number.isSafeInteger(value) || (value as number) < 0) {
+            return total
+          }
+          return total + (value as number)
+        }, 0)
+      : undefined
+    return compactOperationResultRows([
+      operationResultRow(result, 'pool_id', 'Pool', 'number'),
+      operationResultRow(
+        result,
+        'scanned_samples',
+        'Scanned samples',
+        'number'
+      ),
+      operationResultRow(
+        result,
+        'evaluated_samples',
+        'Evaluated samples',
+        'number'
+      ),
+      operationResultRow(
+        result,
+        'actual_match_count',
+        'Actual matches',
+        'number'
+      ),
+      operationResultRow(
+        result,
+        'actual_match_rate',
+        'Actual match rate',
+        'ratio'
+      ),
+      operationResultRow(
+        result,
+        'selection_changed_count',
+        'Selection changes',
+        'number'
+      ),
+      operationResultRow(
+        result,
+        'selection_change_rate',
+        'Selection change rate',
+        'ratio'
+      ),
+      operationResultRow(
+        result,
+        'cost_known_samples',
+        'Cost-known samples',
+        'number'
+      ),
+      operationResultRow(
+        result,
+        'total_expected_cost_delta',
+        'Total expected cost delta',
+        'usd'
+      ),
+      operationResultRow(
+        result,
+        'average_expected_cost_delta',
+        'Average expected cost delta',
+        'usd'
+      ),
+      skippedSamples === undefined
+        ? null
+        : {
+            label: 'Skipped samples',
+            value: skippedSamples,
+            format: 'number',
+          },
+      operationResultRow(result, 'simulated_algorithm', 'Simulated algorithm'),
+      typeof risk?.state === 'string'
+        ? { label: 'Risk state', value: risk.state, format: 'status' }
+        : null,
+      operationResultRow(result, 'target_stage', 'Target stage', 'status'),
+      operationResultRow(
+        result,
+        'target_traffic_basis_points',
+        'Canary traffic',
+        'basis_points'
+      ),
+    ])
+  }
+
+  if (operation.type === 'policy_publish') {
+    return compactOperationResultRows([
+      operationResultRow(result, 'draft_id', 'Draft', 'number'),
+      operationResultRow(result, 'draft_version', 'Draft version', 'number'),
+    ])
+  }
+
+  if (operation.type === 'policy_manual_rollback') {
+    return compactOperationResultRows([
+      operationResultRow(
+        result,
+        'source_revision',
+        'Source revision',
+        'number'
+      ),
+    ])
+  }
+
+  if (operation.type === 'cost_sync') {
+    return compactOperationResultRows([
+      operationResultRow(result, 'task_status', 'Task status', 'status'),
+      operationResultRow(
+        result,
+        'execution_state',
+        'Execution state',
+        'status'
+      ),
+    ])
+  }
+
+  return []
 }
 
 export function channelRoutingOperationBreakerResetResult(
@@ -212,4 +454,36 @@ function breakerResetTarget(
 
 function positiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0
+}
+
+function operationResultRecord(value: unknown): Record<string, unknown> | null {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  return value as Record<string, unknown>
+}
+
+function operationResultRow(
+  result: Record<string, unknown>,
+  key: string,
+  label: string,
+  format?: ChannelRoutingOperationResultRow['format']
+): ChannelRoutingOperationResultRow | null {
+  const value = result[key]
+  if (typeof value === 'string' && value.trim() !== '') {
+    return { label, value, format }
+  }
+  if (typeof value === 'boolean') return { label, value, format }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return { label, value, format }
+  }
+  return null
+}
+
+function compactOperationResultRows(
+  rows: Array<ChannelRoutingOperationResultRow | null>
+): ChannelRoutingOperationResultRow[] {
+  return rows.filter(
+    (row): row is ChannelRoutingOperationResultRow => row != null
+  )
 }

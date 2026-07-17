@@ -314,10 +314,7 @@ export function ChannelRoutingOverviewPage() {
         queryKey: channelRoutingQueryKeys.operationsRoot(),
       })
     },
-    onError: (error) => {
-      if (error instanceof ActiveProbeBlockedError) return
-      toast.error(t('Could not run the active probe. Try again.'))
-    },
+    meta: { handleErrorLocally: true },
   })
   const activeProbeOperationId = activeProbe.data?.id ?? null
   const activeProbeOperationQuery = useQuery({

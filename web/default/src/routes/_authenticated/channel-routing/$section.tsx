@@ -61,7 +61,7 @@ const searchSchema = z.object({
   model: z.string().max(128).optional().catch(''),
   known: triStateSearchSchema,
   costTab: z
-    .enum(['channel-multipliers', 'effective-costs'])
+    .enum(['channel-multipliers', 'cost-catalog', 'request-comparison'])
     .optional()
     .catch('channel-multipliers'),
   policyTab: z
@@ -124,9 +124,24 @@ const searchSchema = z.object({
     .optional()
     .catch(''),
   operationStatus: z
-    .enum(['', 'pending', 'running', 'succeeded', 'failed', 'superseded'])
+    .enum([
+      '',
+      'pending',
+      'running',
+      'retry_wait',
+      'succeeded',
+      'partially_succeeded',
+      'failed',
+      'cancelled',
+      'superseded',
+    ])
     .optional()
     .catch(''),
+  operationSource: z
+    .enum(['', 'admin', 'system', 'scheduler', 'recovery', 'migration'])
+    .optional()
+    .catch(''),
+  operationAttention: triStateSearchSchema,
 })
 
 export const Route = createFileRoute(

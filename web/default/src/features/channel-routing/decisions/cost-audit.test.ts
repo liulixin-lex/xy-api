@@ -22,14 +22,8 @@ import { describe, test } from 'node:test'
 import {
   hasCurrentChannelCostAudit,
   hasCurrentRoutingAttemptCostAudit,
-  hasKnownCostSemantics,
-  isKnownZeroMultiplierCost,
 } from '../lib/cost-audit'
-import type {
-  CostSnapshotSummary,
-  RoutingAttempt,
-  RoutingCostEstimate,
-} from '../types'
+import type { RoutingAttempt, RoutingCostEstimate } from '../types'
 
 const historicalEstimate: RoutingCostEstimate = {
   known: true,
@@ -118,46 +112,6 @@ describe('attempt channel cost audit detection', () => {
         unknown_reason: 'system_pricing_missing',
       }),
       true
-    )
-  })
-})
-
-const zeroMultiplierCost: CostSnapshotSummary = {
-  pool_id: 1,
-  group_name: 'default',
-  member_id: 2,
-  channel_id: 3,
-  channel_name: 'Free channel',
-  model_name: 'unpriced-model',
-  known: true,
-  expression_pricing: false,
-  billing_mode: 'system_pricing_x_channel_multiplier',
-  configuration_revision: 4,
-  upstream_cost_multiplier: 0,
-  confidence: 'exact',
-  confidence_score: 1,
-  freshness: 'fresh',
-  freshness_score: 1,
-  snapshot_time: 100,
-}
-
-describe('effective cost semantics', () => {
-  test('treats a known 0× channel as free without requiring baseline rates', () => {
-    assert.equal(isKnownZeroMultiplierCost(zeroMultiplierCost), true)
-    assert.equal(hasKnownCostSemantics(zeroMultiplierCost), true)
-  })
-
-  test('does not let an unknown or nonzero channel bypass baseline validation', () => {
-    assert.equal(
-      hasKnownCostSemantics({ ...zeroMultiplierCost, known: false }),
-      false
-    )
-    assert.equal(
-      hasKnownCostSemantics({
-        ...zeroMultiplierCost,
-        upstream_cost_multiplier: 1,
-      }),
-      false
     )
   })
 })

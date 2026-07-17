@@ -40,6 +40,23 @@ export type ChannelConfigurationConflictSummary = {
   overlappingLabels: string[]
 }
 
+export function channelConfigurationFormFieldForApiField(
+  field: string | undefined
+): keyof ChannelConfigurationFormValues | null {
+  switch (field) {
+    case 'upstream_cost_multiplier':
+      return 'upstreamCostMultiplier'
+    case 'traffic_class':
+      return 'trafficClass'
+    case 'failure_domain_label':
+      return 'failureDomainLabel'
+    case 'clear_failure_domain':
+      return 'clearFailureDomain'
+    default:
+      return null
+  }
+}
+
 function normalizedFailureDomainLabel(value: string): string {
   return value.trim().replaceAll(/\s+/gu, ' ')
 }

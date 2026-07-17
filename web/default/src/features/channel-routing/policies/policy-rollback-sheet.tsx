@@ -17,15 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import {
-  BadgeCheckIcon,
-  RefreshIcon,
-  Shield02Icon,
-  Undo02Icon,
-} from '@hugeicons/core-free-icons'
+import { Alert02Icon, Undo02Icon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AxiosError } from 'axios'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -39,6 +33,7 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -51,7 +46,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Progress } from '@/components/ui/progress'
 import {
   Sheet,
   SheetContent,
@@ -60,14 +54,14 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
 import { useDebounce } from '@/hooks'
 
 import {
-  approveChannelRoutingPolicyRollback,
   createChannelRoutingIdempotencyKey,
+  getChannelRoutingPolicyApiError,
   getChannelRoutingPolicyRevision,
-  listChannelRoutingPolicyRollbackApprovals,
   rollbackChannelRoutingPolicy,
 } from '../api/client'
 import { channelRoutingQueryKeys } from '../api/query-keys'
@@ -88,27 +82,6 @@ const deploymentStages = new Set<PolicyActivationSpec['stage']>([
   'canary',
   'active',
 ])
-
-function rollbackRequestErrorMessage(
-  error: unknown,
-  translate: (key: string) => string
-): string {
-  const status =
-    error instanceof AxiosError ? error.response?.status : undefined
-  if (status === 403) {
-    return translate(
-      'You do not have permission to approve or execute this rollback.'
-    )
-  }
-  if (status === 409 || status === 412 || status === 428) {
-    return translate(
-      'The current policy changed. Refresh the page before continuing.'
-    )
-  }
-  return translate(
-    'The rollback request failed. Refresh the approval status and try again.'
-  )
-}
 
 export function ChannelRoutingPolicyRollbackSheet(props: {
   current: CurrentRoutingPolicy | null
@@ -147,10 +120,10 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
             .min(1, t('Rollback reason is required'))
             .max(512, t('Change reason must be 512 characters or fewer')),
         })
-        .superRefine((value, context) => {
+        .superRefine((values, context) => {
           if (
-            value.stage === 'canary' &&
-            (value.trafficBasisPoints < 100 || value.trafficBasisPoints > 500)
+            values.stage === 'canary' &&
+            (values.trafficBasisPoints < 100 || values.trafficBasisPoints > 500)
           ) {
             context.addIssue({
               code: 'custom',
@@ -158,7 +131,7 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
               message: t('Canary traffic must be between 1% and 5%'),
             })
           }
-          if (value.stage !== 'canary' && value.trafficBasisPoints !== 0) {
+          if (values.stage !== 'canary' && values.trafficBasisPoints !== 0) {
             context.addIssue({
               code: 'custom',
               path: ['trafficBasisPoints'],
@@ -182,11 +155,6 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
     name: 'sourceRevision',
   })
   const watchedStage = useWatch({ control: form.control, name: 'stage' })
-  const watchedTraffic = useWatch({
-    control: form.control,
-    name: 'trafficBasisPoints',
-  })
-  const watchedReason = useWatch({ control: form.control, name: 'reason' })
   const debouncedSourceRevision = useDebounce(sourceRevision, 350)
   const sourceQuery = useQuery({
     queryKey: channelRoutingQueryKeys.policyRevision(debouncedSourceRevision),
@@ -196,74 +164,6 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
       Number.isInteger(debouncedSourceRevision) &&
       debouncedSourceRevision > 0 &&
       debouncedSourceRevision < currentRevision,
-  })
-  const approvalTarget = useDebounce(
-    {
-      sourceRevision,
-      stage: watchedStage,
-      trafficBasisPoints: watchedTraffic,
-      reason: watchedReason.trim(),
-    } satisfies PolicyRollbackFormValues,
-    400
-  )
-  const approvalTargetIsValid = schema.safeParse(approvalTarget).success
-  const approvalTargetMatchesForm =
-    approvalTarget.sourceRevision === sourceRevision &&
-    approvalTarget.stage === watchedStage &&
-    approvalTarget.trafficBasisPoints === watchedTraffic &&
-    approvalTarget.reason === watchedReason.trim()
-  const approvalActivation: PolicyActivationSpec = {
-    stage: approvalTarget.stage,
-    traffic_basis_points: approvalTarget.trafficBasisPoints,
-    reason: approvalTarget.reason,
-  }
-  const approvalsQuery = useQuery({
-    queryKey: channelRoutingQueryKeys.policyRollbackApprovals(
-      approvalTarget.sourceRevision,
-      {
-        expectedRevision: currentRevision,
-        activation: approvalTargetIsValid ? approvalActivation : 'invalid',
-      }
-    ),
-    queryFn: () =>
-      listChannelRoutingPolicyRollbackApprovals(
-        approvalTarget.sourceRevision,
-        approvalActivation
-      ),
-    enabled:
-      props.open &&
-      props.current != null &&
-      approvalTargetIsValid &&
-      sourceQuery.data?.revision.revision === approvalTarget.sourceRevision,
-  })
-  const approveRollback = useMutation({
-    mutationFn: (values: PolicyRollbackFormValues) => {
-      if (!props.current) throw new Error('Current policy is required')
-      if (approvalsQuery.data?.requires_approval !== true) {
-        throw new Error('Rollback approval is not required')
-      }
-      return approveChannelRoutingPolicyRollback(
-        values.sourceRevision,
-        props.current,
-        {
-          stage: values.stage,
-          traffic_basis_points: values.trafficBasisPoints,
-          reason: values.reason.trim(),
-        }
-      )
-    },
-    onSuccess: async (response, values) => {
-      await queryClient.invalidateQueries({
-        queryKey: channelRoutingQueryKeys.policyRollbackApprovalsRoot(
-          values.sourceRevision
-        ),
-      })
-      toast.success(
-        response.created
-          ? t('Rollback approval recorded')
-          : t('Rollback approval already recorded')
-      )
-    },
   })
   const rollback = useMutation({
     mutationFn: (values: PolicyRollbackFormValues) => {
@@ -303,8 +203,8 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
       )
       props.onOpenChange(false)
     },
+    meta: { handleErrorLocally: true },
   })
-  const resetApproveRollback = approveRollback.reset
   const resetRollback = rollback.reset
 
   useEffect(() => {
@@ -322,68 +222,36 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
     })
     idempotencyRef.current = null
     setConfirmationValues(null)
-    resetApproveRollback()
     resetRollback()
   }, [
     currentRevision,
     form,
     props.current?.head.current_stage,
     props.open,
-    resetApproveRollback,
     resetRollback,
   ])
 
-  const approvalReady =
-    approvalTargetIsValid &&
-    approvalTargetMatchesForm &&
-    approvalsQuery.data != null &&
-    !approvalsQuery.isLoading &&
-    !approvalsQuery.isError
-  const requiresApproval =
-    approvalReady && approvalsQuery.data.requires_approval === true
-  const targetApprovalCount = approvalReady ? approvalsQuery.data.count : 0
-  const requiredApprovals = Math.max(1, approvalsQuery.data?.required ?? 2)
-  const quorum = approvalReady && approvalsQuery.data.quorum === true
-  const matchingApprovals = approvalsQuery.data?.target_activation_hash
-    ? (approvalsQuery.data.items.filter(
-        (approval) =>
-          approval.activation_hash ===
-          approvalsQuery.data?.target_activation_hash
-      ) ?? [])
-    : []
-
-  let approvalDescription = t(
-    'Complete the rollback details to check approval status.'
+  const rollbackError = getChannelRoutingPolicyApiError(rollback.error)
+  let rollbackErrorDescription = t(
+    'The rollback request failed. Refresh the current policy and try again.'
   )
-  let approvalStatus = 'pending'
-  let approvalStatusLabel = t('Pending')
-  if (approvalTargetIsValid && approvalsQuery.isLoading) {
-    approvalDescription = t('Checking whether this rollback needs approval.')
-  } else if (approvalTargetIsValid && approvalsQuery.isError) {
-    approvalDescription = rollbackRequestErrorMessage(approvalsQuery.error, t)
-    approvalStatus = 'failed'
-    approvalStatusLabel = t('Unavailable')
-  } else if (approvalReady && !requiresApproval) {
-    approvalDescription = t(
-      'This rollback does not require approval and can be executed directly.'
+  if (rollbackError.status === 403) {
+    rollbackErrorDescription = t(
+      'You do not have permission to execute this rollback.'
     )
-    approvalStatus = 'ready'
-    approvalStatusLabel = t('Not required')
-  } else if (approvalReady) {
-    approvalDescription = t(
-      '{{count}} of {{required}} approvals are eligible for this executor',
-      {
-        count: targetApprovalCount,
-        required: requiredApprovals,
-      }
+  } else if (
+    rollbackError.status === 409 ||
+    rollbackError.status === 412 ||
+    rollbackError.status === 428
+  ) {
+    rollbackErrorDescription = t(
+      'The current policy changed. Refresh the page before continuing.'
     )
-    approvalStatus = quorum ? 'succeeded' : 'pending'
-    approvalStatusLabel = quorum ? t('Ready') : t('Pending')
   }
-
-  let approveButtonLabel = t('Approve rollback')
-  if (approveRollback.isPending) approveButtonLabel = t('Approving rollback')
-  else if (!requiresApproval) approveButtonLabel = t('Approval not required')
+  const sourceReady =
+    sourceQuery.data?.revision.revision === sourceRevision &&
+    sourceRevision > 0 &&
+    sourceRevision < currentRevision
 
   return (
     <>
@@ -397,7 +265,6 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
             <SheetTitle className='flex items-center gap-2'>
               <HugeiconsIcon
                 icon={Undo02Icon}
-                className='size-4'
                 strokeWidth={2}
                 aria-hidden='true'
               />
@@ -405,7 +272,7 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
             </SheetTitle>
             <SheetDescription>
               {t(
-                'Rollback creates a new immutable revision from an older policy document.'
+                'Rollback creates a new immutable revision from an older policy document and activates it at the selected stage.'
               )}
             </SheetDescription>
           </SheetHeader>
@@ -482,9 +349,17 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                 </dl>
               ) : null}
               {sourceQuery.isError ? (
-                <div className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'>
-                  {t('The selected policy revision could not be loaded.')}
-                </div>
+                <Alert variant='destructive' role='alert'>
+                  <HugeiconsIcon
+                    icon={Alert02Icon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
+                  <AlertTitle>{t('Policy revision unavailable')}</AlertTitle>
+                  <AlertDescription>
+                    {t('The selected policy revision could not be loaded.')}
+                  </AlertDescription>
+                </Alert>
               ) : null}
 
               <div className='grid gap-3 sm:grid-cols-2'>
@@ -580,175 +455,44 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
                 )}
               />
 
-              <section
-                className='space-y-3 border-t pt-4'
-                aria-labelledby='rollback-approval-heading'
-              >
-                <div className='flex items-start justify-between gap-3'>
-                  <div className='min-w-0'>
-                    <h3
-                      id='rollback-approval-heading'
-                      className='flex items-center gap-2 text-sm font-semibold'
-                    >
-                      <HugeiconsIcon
-                        icon={Shield02Icon}
-                        className='size-4'
-                        strokeWidth={2}
-                        aria-hidden='true'
-                      />
-                      {t('Rollback approval')}
-                    </h3>
-                    <p className='text-muted-foreground mt-1 text-xs'>
-                      {approvalDescription}
-                    </p>
-                  </div>
-                  <ChannelRoutingStatusBadge
-                    status={approvalStatus}
-                    label={approvalStatusLabel}
-                  />
-                </div>
-
-                {requiresApproval ? (
-                  <>
-                    <Progress
-                      aria-label={t('Rollback approval progress')}
-                      value={Math.min(
-                        100,
-                        (targetApprovalCount / requiredApprovals) * 100
-                      )}
-                    />
-                    <div className='bg-muted/40 grid grid-cols-2 gap-3 rounded-lg border p-3 text-sm'>
-                      <div>
-                        <div className='text-muted-foreground text-xs'>
-                          {t('Expected revision')}
-                        </div>
-                        <div className='mt-1 font-medium'>
-                          r{approvalsQuery.data?.expected_revision}
-                        </div>
-                      </div>
-                      <div>
-                        <div className='text-muted-foreground text-xs'>
-                          {t('Target revision')}
-                        </div>
-                        <div className='mt-1 font-medium'>
-                          r{approvalsQuery.data?.target_revision}
-                        </div>
-                      </div>
-                    </div>
-                    <p className='text-muted-foreground text-xs'>
-                      {t(
-                        'Approvals are bound to the current policy head, target revision, stage, traffic allocation, and reason.'
-                      )}
-                    </p>
-                    <p className='text-muted-foreground text-xs'>
-                      {t(
-                        'Your own approval is recorded for audit but does not count when you execute this rollback.'
-                      )}
-                    </p>
-                  </>
-                ) : null}
-
-                {requiresApproval && matchingApprovals.length > 0 ? (
-                  <ul className='divide-y rounded-lg border text-sm'>
-                    {matchingApprovals.map((approval) => (
-                      <li
-                        key={approval.id}
-                        className='flex items-center justify-between gap-3 px-3 py-2'
-                      >
-                        <span>
-                          {t('Approver #{{id}}', { id: approval.actor_id })}
-                        </span>
-                        <span className='text-muted-foreground text-xs'>
-                          {format.timestamp(approval.created_time_ms)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-
-                {approvalsQuery.isError ? (
-                  <Button
-                    type='button'
-                    size='sm'
-                    variant='outline'
-                    onClick={() => void approvalsQuery.refetch()}
-                  >
-                    <HugeiconsIcon
-                      icon={RefreshIcon}
-                      data-icon='inline-start'
-                      strokeWidth={2}
-                      aria-hidden='true'
-                    />
-                    {t('Refresh approval status')}
-                  </Button>
-                ) : null}
-
-                {approveRollback.isError ? (
-                  <div
-                    className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'
-                    role='alert'
-                  >
-                    {rollbackRequestErrorMessage(approveRollback.error, t)}
-                  </div>
-                ) : null}
-              </section>
-
               {rollback.isError ? (
-                <div
-                  className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'
-                  role='alert'
-                >
-                  {rollbackRequestErrorMessage(rollback.error, t)}
-                </div>
+                <Alert variant='destructive' role='alert'>
+                  <HugeiconsIcon
+                    icon={Alert02Icon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
+                  <AlertTitle>{t('Rollback failed')}</AlertTitle>
+                  <AlertDescription>
+                    {rollbackErrorDescription}
+                  </AlertDescription>
+                </Alert>
               ) : null}
             </form>
           </Form>
 
           <SheetFooter className={sideDrawerFooterClassName()}>
             <Button
-              type='button'
-              variant='outline'
-              disabled={
-                !props.canDeploy ||
-                approveRollback.isPending ||
-                rollback.isPending ||
-                !approvalReady ||
-                !requiresApproval
-              }
-              onClick={() =>
-                void form.handleSubmit((values) =>
-                  approveRollback.mutate(values)
-                )()
-              }
-            >
-              <HugeiconsIcon
-                icon={BadgeCheckIcon}
-                data-icon='inline-start'
-                strokeWidth={2}
-                aria-hidden='true'
-              />
-              {approveButtonLabel}
-            </Button>
-            <Button
               type='submit'
               form='channel-routing-policy-rollback-form'
-              variant='destructive'
               disabled={
                 !props.canDeploy ||
-                approveRollback.isPending ||
                 rollback.isPending ||
-                !sourceQuery.data ||
-                !approvalReady ||
-                (requiresApproval && !quorum)
+                sourceQuery.isLoading ||
+                !sourceReady
               }
             >
-              <HugeiconsIcon
-                icon={Undo02Icon}
-                data-icon='inline-start'
-                strokeWidth={2}
-                aria-hidden='true'
-              />
-              {t('Execute rollback')}
+              {rollback.isPending ? (
+                <Spinner data-icon='inline-start' />
+              ) : (
+                <HugeiconsIcon
+                  icon={Undo02Icon}
+                  data-icon='inline-start'
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
+              )}
+              {rollback.isPending ? t('Rolling back') : t('Review rollback')}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -759,15 +503,13 @@ export function ChannelRoutingPolicyRollbackSheet(props: {
         onOpenChange={(open) => {
           if (!open && !rollback.isPending) setConfirmationValues(null)
         }}
-        title={t('Rollback to revision {{revision}}?', {
+        title={t('Roll back to revision {{revision}}?', {
           revision: confirmationValues?.sourceRevision,
         })}
         desc={t(
-          'The current revision remains in history. A new revision will activate the selected older policy.'
+          'The current policy is preserved in history. Rollback creates a new higher revision from the selected document.'
         )}
-        confirmText={
-          rollback.isPending ? t('Rolling back') : t('Rollback policy')
-        }
+        confirmText={rollback.isPending ? t('Rolling back') : t('Rollback')}
         destructive
         isLoading={rollback.isPending}
         handleConfirm={() => {

@@ -24,6 +24,7 @@ import type { TFunction } from 'i18next'
 import type { RoutingChannelConfiguration } from '../types'
 import {
   channelConfigurationConflictSummary,
+  channelConfigurationFormFieldForApiField,
   channelConfigurationFormValues,
   channelConfigurationRequest,
   createChannelConfigurationSchema,
@@ -85,6 +86,24 @@ describe('channel configuration form contract', () => {
     }
   })
 
+  test('reports a negative multiplier on the multiplier field', () => {
+    const schema = createChannelConfigurationSchema(translate)
+    const result = schema.safeParse({
+      ...channelConfigurationFormValues(configuration),
+      upstreamCostMultiplier: '-1',
+    })
+
+    assert.equal(result.success, false)
+    if (result.success) return
+    assert.deepEqual(result.error.issues, [
+      {
+        code: 'custom',
+        path: ['upstreamCostMultiplier'],
+        message: 'Channel multiplier must be between 0 and 1000.',
+      },
+    ])
+  })
+
   test('requires an explicit choice between a label and clearing the domain', () => {
     const schema = createChannelConfigurationSchema(translate)
     const result = schema.safeParse({
@@ -94,6 +113,25 @@ describe('channel configuration form contract', () => {
     })
 
     assert.equal(result.success, false)
+  })
+
+  test('maps every server validation field to its exact form control', () => {
+    assert.deepEqual(
+      [
+        'upstream_cost_multiplier',
+        'traffic_class',
+        'failure_domain_label',
+        'clear_failure_domain',
+        'unknown_field',
+      ].map(channelConfigurationFormFieldForApiField),
+      [
+        'upstreamCostMultiplier',
+        'trafficClass',
+        'failureDomainLabel',
+        'clearFailureDomain',
+        null,
+      ]
+    )
   })
 
   test('identifies overlapping edits after a stale ETag response', () => {

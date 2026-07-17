@@ -16,33 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type {
-  CostSnapshotSummary,
-  RoutingAttempt,
-  RoutingCostEstimate,
-} from '../types'
-
-export function isKnownZeroMultiplierCost(
-  cost: Pick<CostSnapshotSummary, 'known' | 'upstream_cost_multiplier'>
-): boolean {
-  return (
-    cost.known &&
-    Number.isFinite(cost.upstream_cost_multiplier) &&
-    cost.upstream_cost_multiplier === 0
-  )
-}
-
-export function hasKnownCostSemantics(cost: CostSnapshotSummary): boolean {
-  if (!cost.known) return false
-  if (isKnownZeroMultiplierCost(cost)) return true
-  if (cost.expression_pricing) return Boolean(cost.billing_mode?.trim())
-  return (
-    typeof cost.display_rate === 'number' &&
-    Number.isFinite(cost.display_rate) &&
-    Boolean(cost.currency?.trim()) &&
-    Boolean(cost.unit?.trim())
-  )
-}
+import type { RoutingAttempt, RoutingCostEstimate } from '../types'
 
 export function hasCurrentChannelCostAudit(
   estimate: RoutingCostEstimate

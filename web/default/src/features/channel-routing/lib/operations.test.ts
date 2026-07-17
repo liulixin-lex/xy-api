@@ -24,8 +24,13 @@ import {
   channelRoutingOperationActiveProbeResult,
   channelRoutingOperationAuditExportId,
   channelRoutingOperationBreakerResetResult,
+  channelRoutingOperationCanCancel,
+  channelRoutingOperationCanRetry,
   channelRoutingOperationDisplayStatus,
   channelRoutingOperationIsActive,
+  channelRoutingOperationRetentionLabel,
+  channelRoutingOperationResultRows,
+  channelRoutingOperationSourceLabel,
   channelRoutingOperationTypeLabel,
 } from './operations'
 
@@ -84,6 +89,12 @@ describe('channel routing operation presentation', () => {
       channelRoutingOperationDisplayStatus(operation('cost_sync', 'failed')),
       'failed'
     )
+    assert.equal(
+      channelRoutingOperationDisplayStatus(
+        operation('cost_sync', 'partially_succeeded')
+      ),
+      'partially_succeeded'
+    )
   })
 
   test('polls only non-terminal operations', () => {
@@ -96,11 +107,46 @@ describe('channel routing operation presentation', () => {
       true
     )
     assert.equal(
+      channelRoutingOperationIsActive(operation('cost_sync', 'retry_wait')),
+      true
+    )
+    assert.equal(
       channelRoutingOperationIsActive(operation('cost_sync', 'succeeded')),
       false
     )
     assert.equal(
       channelRoutingOperationIsActive(operation('cost_sync', 'failed')),
+      false
+    )
+  })
+
+  test('exposes only server-authorized retry and cancellation transitions', () => {
+    assert.equal(
+      channelRoutingOperationCanRetry({
+        ...operation('active_probe', 'failed'),
+        retryable: true,
+      }),
+      true
+    )
+    assert.equal(
+      channelRoutingOperationCanRetry({
+        ...operation('active_probe', 'succeeded'),
+        retryable: true,
+      }),
+      false
+    )
+    assert.equal(
+      channelRoutingOperationCanCancel({
+        ...operation('active_probe', 'retry_wait'),
+        cancellable: true,
+      }),
+      true
+    )
+    assert.equal(
+      channelRoutingOperationCanCancel({
+        ...operation('active_probe', 'failed'),
+        cancellable: true,
+      }),
       false
     )
   })
@@ -113,6 +159,11 @@ describe('channel routing operation presentation', () => {
     assert.equal(
       channelRoutingOperationTypeLabel('future_operation'),
       'future_operation'
+    )
+    assert.equal(channelRoutingOperationSourceLabel('recovery'), 'Recovery')
+    assert.equal(
+      channelRoutingOperationRetentionLabel('extended'),
+      'Extended retention'
     )
   })
 
@@ -236,6 +287,31 @@ describe('channel routing operation presentation', () => {
         })
       ),
       null
+    )
+  })
+
+  test('renders only public result fields from the operation contract', () => {
+    assert.deepEqual(
+      channelRoutingOperationResultRows(
+        operation('breaker_reset', 'succeeded', {
+          scope: 'member',
+          generation: 7,
+          outbox_id: 19,
+          target: { credential_id: 22 },
+        })
+      ),
+      [
+        { label: 'Scope', value: 'Member / model', format: 'status' },
+        { label: 'Generation', value: 7, format: 'number' },
+      ]
+    )
+    assert.deepEqual(
+      channelRoutingOperationResultRows(
+        operation('future_operation', 'succeeded', {
+          secret_key: 'must-not-render',
+        })
+      ),
+      []
     )
   })
 })

@@ -19,6 +19,14 @@ For commercial licensing, please contact support@quantumnous.com
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Field,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+} from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
@@ -41,6 +49,7 @@ function profileLabel(
 }
 
 export function PolicyPoolSettings(props: {
+  schemaVersion: number
   pool: PolicyPoolDocument
   pools: PolicyPoolDocument[]
   readOnly: boolean
@@ -228,6 +237,75 @@ export function PolicyPoolSettings(props: {
           </NativeSelect>
         </div>
       </div>
+
+      {props.schemaVersion === 2 ? (
+        <FieldSet className='rounded-lg border p-3'>
+          <FieldLegend variant='label'>{t('Default')}</FieldLegend>
+          <FieldGroup className='grid gap-3 sm:grid-cols-3'>
+            <Field
+              orientation='horizontal'
+              data-disabled={props.readOnly ? true : undefined}
+            >
+              <Checkbox
+                id={`policy-default-enabled-${props.pool.pool_id}`}
+                checked={props.pool.default_enabled ?? true}
+                disabled={props.readOnly}
+                onCheckedChange={(checked) =>
+                  props.onUpdate({ default_enabled: checked === true })
+                }
+              />
+              <FieldLabel
+                htmlFor={`policy-default-enabled-${props.pool.pool_id}`}
+              >
+                {t('Enabled')}
+              </FieldLabel>
+            </Field>
+            <Field data-disabled={props.readOnly ? true : undefined}>
+              <FieldLabel
+                htmlFor={`policy-default-priority-${props.pool.pool_id}`}
+              >
+                {t('Priority')}
+              </FieldLabel>
+              <Input
+                key={`${props.pool.pool_id}:default-priority:${props.pool.default_priority ?? 0}`}
+                id={`policy-default-priority-${props.pool.pool_id}`}
+                type='number'
+                step={1}
+                defaultValue={props.pool.default_priority ?? 0}
+                disabled={props.readOnly}
+                onBlur={(event) => {
+                  const value = event.currentTarget.valueAsNumber
+                  if (Number.isSafeInteger(value)) {
+                    props.onUpdate({ default_priority: value })
+                  }
+                }}
+              />
+            </Field>
+            <Field data-disabled={props.readOnly ? true : undefined}>
+              <FieldLabel
+                htmlFor={`policy-default-weight-${props.pool.pool_id}`}
+              >
+                {t('Weight')}
+              </FieldLabel>
+              <Input
+                key={`${props.pool.pool_id}:default-weight:${props.pool.default_weight ?? 100}`}
+                id={`policy-default-weight-${props.pool.pool_id}`}
+                type='number'
+                min={0}
+                step={1}
+                defaultValue={props.pool.default_weight ?? 100}
+                disabled={props.readOnly}
+                onBlur={(event) => {
+                  const value = event.currentTarget.valueAsNumber
+                  if (Number.isSafeInteger(value) && value >= 0) {
+                    props.onUpdate({ default_weight: value })
+                  }
+                }}
+              />
+            </Field>
+          </FieldGroup>
+        </FieldSet>
+      ) : null}
     </section>
   )
 }

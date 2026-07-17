@@ -79,6 +79,7 @@ export function ChannelRoutingDecisionSheet(props: {
   })
   const replay = useMutation({
     mutationFn: () => replayChannelRoutingDecision(props.decisionId ?? ''),
+    meta: { handleErrorLocally: true },
   })
   const decision = decisionQuery.data
   const attemptTimeline = decision?.attempt_timeline ?? decision?.hedge

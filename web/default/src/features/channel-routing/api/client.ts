@@ -27,6 +27,7 @@ import type {
   ChannelRoutingBreakerResetRequest,
   ChannelRoutingBreakerResetResponse,
   ChannelRoutingControlAuditPage,
+  ChannelRoutingControlAuditTechnical,
   ChannelRoutingCostDetailResponse,
   ChannelRoutingDecision,
   ChannelRoutingDecisionSummary,
@@ -36,7 +37,6 @@ import type {
   ChannelRoutingReplayProfilesResponse,
   ChannelRoutingRuntimeSettings,
   ChannelSnapshot,
-  CostSnapshotSummary,
   CurrentRoutingPolicy,
   CursorResponse,
   DecisionReplayResult,
@@ -45,14 +45,10 @@ import type {
   HistoricalSimulationResponse,
   PagedResponse,
   PolicyActivationSpec,
-  PolicyApprovalList,
-  PolicyApprovalResponse,
   PolicyDocument,
   PolicyDraftDetail,
   PolicyDraftSummary,
   PolicyPublishResponse,
-  PolicyRollbackApprovalList,
-  PolicyRollbackApprovalResponse,
   PolicyRollbackResponse,
   PolicySimulationResponse,
   PoolSnapshot,
@@ -62,7 +58,15 @@ import type {
   RoutingChannelConfigurationPage,
   RoutingChannelConfigurationTrafficClass,
   RoutingChannelConfigurationUpdate,
+  RoutingCostCatalogMember,
+  RoutingCostCatalogModel,
+  RoutingCostCatalogPage,
+  RoutingCostCatalogPool,
+  RoutingCostComparisonRequest,
+  RoutingCostComparisonResponse,
   RoutingOperation,
+  RoutingOperationRetryResponse,
+  RoutingOperationTechnical,
   RoutingPolicyRevisionDetail,
   RoutingProbeOutcome,
   RoutingProbeResult,
@@ -201,6 +205,19 @@ export function getChannelRoutingConfigurationApiError(
   }
 }
 
+export function getChannelRoutingPolicyApiError(error: unknown): {
+  status?: number
+  code?: string
+  message?: string
+} {
+  if (!isAxiosError<{ code?: string; message?: string }>(error)) return {}
+  return {
+    status: error.response?.status,
+    code: error.response?.data?.code,
+    message: error.response?.data?.message,
+  }
+}
+
 function configurationConflictFromError(
   error: unknown
 ): ChannelRoutingConfigurationConflictError | null {
@@ -267,11 +284,28 @@ export async function listChannelRoutingControlAudits(params: {
   subject_type?: string
   subject_id?: number
   actor_id?: number
+  source?: string
+  result?: string
+  correlation_id?: string
+  needs_attention?: boolean
 }): Promise<ChannelRoutingControlAuditPage> {
   const response = await api.get<ApiEnvelope<ChannelRoutingControlAuditPage>>(
     '/api/channel-routing/control-audits',
     { ...requestConfig, params }
   )
+  return unwrap(response.data)
+}
+
+export async function getChannelRoutingControlAuditTechnical(
+  id: number,
+  signal?: AbortSignal
+): Promise<ChannelRoutingControlAuditTechnical> {
+  const response = await api.get<
+    ApiEnvelope<ChannelRoutingControlAuditTechnical>
+  >(`/api/channel-routing/control-audits/${id}/technical`, {
+    ...requestConfig,
+    signal,
+  })
   return unwrap(response.data)
 }
 
@@ -396,27 +430,63 @@ export async function resetChannelRoutingBreaker(
   return unwrap(response.data)
 }
 
-export async function listChannelRoutingCosts(params: {
+export async function listChannelRoutingCostCatalogPools(params: {
   page: number
   page_size: number
-  group?: string
-  model?: string
-  known?: boolean
-}): Promise<PagedResponse<CostSnapshotSummary>> {
+  search?: string
+}): Promise<RoutingCostCatalogPage<RoutingCostCatalogPool>> {
   const response = await api.get<
-    ApiEnvelope<PagedResponse<CostSnapshotSummary>>
-  >('/api/channel-routing/costs', { ...requestConfig, params })
+    ApiEnvelope<RoutingCostCatalogPage<RoutingCostCatalogPool>>
+  >('/api/channel-routing/cost-catalog/pools', { ...requestConfig, params })
   return unwrap(response.data)
 }
 
-export async function getChannelRoutingCostDetail(
+export async function listChannelRoutingCostCatalogMembers(
+  poolId: number,
+  params: { page: number; page_size: number; search?: string }
+): Promise<RoutingCostCatalogPage<RoutingCostCatalogMember>> {
+  const response = await api.get<
+    ApiEnvelope<RoutingCostCatalogPage<RoutingCostCatalogMember>>
+  >(`/api/channel-routing/cost-catalog/pools/${poolId}/members`, {
+    ...requestConfig,
+    params,
+  })
+  return unwrap(response.data)
+}
+
+export async function listChannelRoutingCostCatalogModels(
+  poolId: number,
+  memberId: number,
+  params: { page: number; page_size: number; search?: string }
+): Promise<RoutingCostCatalogPage<RoutingCostCatalogModel>> {
+  const response = await api.get<
+    ApiEnvelope<RoutingCostCatalogPage<RoutingCostCatalogModel>>
+  >(
+    `/api/channel-routing/cost-catalog/pools/${poolId}/members/${memberId}/models`,
+    { ...requestConfig, params }
+  )
+  return unwrap(response.data)
+}
+
+export async function getChannelRoutingCostCatalogModel(
   poolId: number,
   memberId: number,
   model: string
 ): Promise<ChannelRoutingCostDetailResponse> {
   const response = await api.get<ApiEnvelope<ChannelRoutingCostDetailResponse>>(
-    `/api/channel-routing/costs/${poolId}/${memberId}`,
+    `/api/channel-routing/cost-catalog/pools/${poolId}/members/${memberId}/model`,
     { ...requestConfig, params: { model } }
+  )
+  return unwrap(response.data)
+}
+
+export async function estimateChannelRoutingCosts(
+  request: RoutingCostComparisonRequest
+): Promise<RoutingCostComparisonResponse> {
+  const response = await api.post<ApiEnvelope<RoutingCostComparisonResponse>>(
+    '/api/channel-routing/cost-estimates',
+    request,
+    requestConfig
   )
   return unwrap(response.data)
 }
@@ -685,7 +755,13 @@ export async function validateChannelRoutingPolicyDraft(
 
 export async function simulateChannelRoutingPolicyDraft(
   draft: PolicyDraftSummary,
-  payload: { pool_id: number; cursor?: number; limit: number },
+  payload: {
+    pool_id: number
+    cursor?: number
+    limit: number
+    target_stage: PolicyActivationSpec['stage']
+    target_traffic_basis_points: number
+  },
   idempotencyKey: string
 ): Promise<PolicySimulationResponse> {
   const response = await api.post<ApiEnvelope<PolicySimulationResponse>>(
@@ -702,31 +778,11 @@ export async function simulateChannelRoutingPolicyDraft(
   return unwrap(response.data)
 }
 
-export async function listChannelRoutingPolicyApprovals(
-  draftId: number,
-  activation?: PolicyActivationSpec
-): Promise<PolicyApprovalList> {
-  const params = activation
-    ? {
-        stage: activation.stage,
-        traffic_basis_points: activation.traffic_basis_points,
-        reason: activation.reason,
-      }
-    : undefined
-  const response = await api.get<ApiEnvelope<PolicyApprovalList>>(
-    `/api/channel-routing/policy-drafts/${draftId}/approvals`,
-    { ...requestConfig, params }
-  )
-  return unwrap(response.data)
-}
-
-export async function approveChannelRoutingPolicyDraft(
-  draft: PolicyDraftSummary,
-  activation: PolicyActivationSpec
-): Promise<PolicyApprovalResponse> {
-  const response = await api.post<ApiEnvelope<PolicyApprovalResponse>>(
-    `/api/channel-routing/policy-drafts/${draft.id}/approvals`,
-    activation,
+export async function deleteChannelRoutingPolicyDraft(
+  draft: PolicyDraftSummary
+): Promise<{ deleted_ids: number[] }> {
+  const response = await api.delete<ApiEnvelope<{ deleted_ids: number[] }>>(
+    `/api/channel-routing/policy-drafts/${draft.id}`,
     {
       ...requestConfig,
       headers: { 'If-Match': policyDraftIfMatch(draft) },
@@ -735,14 +791,40 @@ export async function approveChannelRoutingPolicyDraft(
   return unwrap(response.data)
 }
 
+export async function deleteChannelRoutingPolicyDrafts(
+  drafts: PolicyDraftSummary[]
+): Promise<{ deleted_ids: number[] }> {
+  const response = await api.delete<ApiEnvelope<{ deleted_ids: number[] }>>(
+    '/api/channel-routing/policy-drafts',
+    {
+      ...requestConfig,
+      data: {
+        items: drafts.map((draft) => ({
+          id: draft.id,
+          etag: policyDraftIfMatch(draft),
+        })),
+      },
+    }
+  )
+  return unwrap(response.data)
+}
+
 export async function publishChannelRoutingPolicyDraft(
   draft: PolicyDraftSummary,
   activation: PolicyActivationSpec,
-  idempotencyKey: string
+  idempotencyKey: string,
+  riskAcceptance?: { accepted: boolean; reason: string }
 ): Promise<PolicyPublishResponse> {
+  const payload = riskAcceptance?.accepted
+    ? {
+        ...activation,
+        accept_simulation_risk: true,
+        risk_acceptance_reason: riskAcceptance.reason.trim(),
+      }
+    : activation
   const response = await api.post<ApiEnvelope<PolicyPublishResponse>>(
     `/api/channel-routing/policy-drafts/${draft.id}/publish`,
-    activation,
+    payload,
     {
       ...requestConfig,
       headers: {
@@ -780,40 +862,6 @@ function policyHeadIfMatch(current: CurrentRoutingPolicy): string {
   return `"crh.${current.head.current_revision}.${current.head.current_activation_id}.${hash}"`
 }
 
-export async function listChannelRoutingPolicyRollbackApprovals(
-  sourceRevision: number,
-  activation?: PolicyActivationSpec
-): Promise<PolicyRollbackApprovalList> {
-  const params = activation
-    ? {
-        stage: activation.stage,
-        traffic_basis_points: activation.traffic_basis_points,
-        reason: activation.reason,
-      }
-    : undefined
-  const response = await api.get<ApiEnvelope<PolicyRollbackApprovalList>>(
-    `/api/channel-routing/policies/${sourceRevision}/rollback-approvals`,
-    { ...requestConfig, params }
-  )
-  return unwrap(response.data)
-}
-
-export async function approveChannelRoutingPolicyRollback(
-  sourceRevision: number,
-  current: CurrentRoutingPolicy,
-  activation: PolicyActivationSpec
-): Promise<PolicyRollbackApprovalResponse> {
-  const response = await api.post<ApiEnvelope<PolicyRollbackApprovalResponse>>(
-    `/api/channel-routing/policies/${sourceRevision}/rollback-approvals`,
-    activation,
-    {
-      ...requestConfig,
-      headers: { 'If-Match': policyHeadIfMatch(current) },
-    }
-  )
-  return unwrap(response.data)
-}
-
 export async function rollbackChannelRoutingPolicy(
   sourceRevision: number,
   current: CurrentRoutingPolicy,
@@ -839,6 +887,8 @@ export async function listChannelRoutingOperations(params: {
   cursor?: number
   type?: string
   status?: string
+  source?: string
+  needs_attention?: boolean
 }): Promise<CursorResponse<RoutingOperation>> {
   const response = await api.get<ApiEnvelope<CursorResponse<RoutingOperation>>>(
     '/api/channel-routing/operations',
@@ -848,10 +898,46 @@ export async function listChannelRoutingOperations(params: {
 }
 
 export async function getChannelRoutingOperation<Result = unknown>(
-  id: number
+  id: number,
+  signal?: AbortSignal
 ): Promise<RoutingOperation<Result>> {
   const response = await api.get<ApiEnvelope<RoutingOperation<Result>>>(
     `/api/channel-routing/operations/${id}`,
+    { ...requestConfig, signal }
+  )
+  return unwrap(response.data)
+}
+
+export async function getChannelRoutingOperationTechnical(
+  id: number,
+  signal?: AbortSignal
+): Promise<RoutingOperationTechnical> {
+  const response = await api.get<ApiEnvelope<RoutingOperationTechnical>>(
+    `/api/channel-routing/operations/${id}/technical`,
+    { ...requestConfig, signal }
+  )
+  return unwrap(response.data)
+}
+
+export async function retryChannelRoutingOperation(
+  id: number,
+  reason: string
+): Promise<RoutingOperationRetryResponse> {
+  const response = await api.post<ApiEnvelope<RoutingOperationRetryResponse>>(
+    `/api/channel-routing/operations/${id}/retry`,
+    { reason },
+    requestConfig
+  )
+  return unwrap(response.data)
+}
+
+export async function cancelChannelRoutingOperation(
+  id: number,
+  reason: string
+): Promise<RoutingOperation> {
+  const response = await api.post<ApiEnvelope<RoutingOperation>>(
+    `/api/channel-routing/operations/${id}/cancel`,
+    { reason },
     requestConfig
   )
   return unwrap(response.data)

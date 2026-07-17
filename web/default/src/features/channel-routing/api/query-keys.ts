@@ -27,6 +27,8 @@ export const channelRoutingQueryKeys = {
     [...channelRoutingQueryKeys.all, 'control-audits'] as const,
   controlAudits: (params: object) =>
     [...channelRoutingQueryKeys.controlAuditsRoot(), params] as const,
+  controlAuditTechnical: (id: number) =>
+    [...channelRoutingQueryKeys.controlAuditsRoot(), id, 'technical'] as const,
   nodesRoot: () => [...channelRoutingQueryKeys.all, 'nodes'] as const,
   nodes: (params: object) =>
     [...channelRoutingQueryKeys.nodesRoot(), params] as const,
@@ -51,8 +53,38 @@ export const channelRoutingQueryKeys = {
   endpoints: (params: object) =>
     [...channelRoutingQueryKeys.endpointsRoot(), params] as const,
   costsRoot: () => [...channelRoutingQueryKeys.all, 'costs'] as const,
-  costs: (params: object) =>
-    [...channelRoutingQueryKeys.costsRoot(), params] as const,
+  costCatalogRoot: () =>
+    [...channelRoutingQueryKeys.costsRoot(), 'catalog'] as const,
+  costCatalogPools: (params: object) =>
+    [...channelRoutingQueryKeys.costCatalogRoot(), 'pools', params] as const,
+  costCatalogMembers: (poolId: number, params: object) =>
+    [
+      ...channelRoutingQueryKeys.costCatalogRoot(),
+      'pools',
+      poolId,
+      'members',
+      params,
+    ] as const,
+  costCatalogModels: (poolId: number, memberId: number, params: object) =>
+    [
+      ...channelRoutingQueryKeys.costCatalogRoot(),
+      'pools',
+      poolId,
+      'members',
+      memberId,
+      'models',
+      params,
+    ] as const,
+  costCatalogModel: (poolId: number, memberId: number, model: string) =>
+    [
+      ...channelRoutingQueryKeys.costCatalogRoot(),
+      'pools',
+      poolId,
+      'members',
+      memberId,
+      'model',
+      model,
+    ] as const,
   channelConfigurationsRoot: () =>
     [...channelRoutingQueryKeys.all, 'channel-configurations'] as const,
   channelConfigurations: (params: object) =>
@@ -91,30 +123,27 @@ export const channelRoutingQueryKeys = {
     [...channelRoutingQueryKeys.policyDraftsRoot(), params] as const,
   policyDraft: (id: number) =>
     [...channelRoutingQueryKeys.policyDraftsRoot(), id] as const,
-  policySimulationRisk: (id: number) =>
-    [...channelRoutingQueryKeys.policyDraft(id), 'simulation-risk'] as const,
-  policyApprovals: (id: number, params: object) =>
-    [...channelRoutingQueryKeys.policyDraft(id), 'approvals', params] as const,
+  policySimulationRisk: (
+    id: number,
+    target: { stage: string; traffic_basis_points: number }
+  ) =>
+    [
+      ...channelRoutingQueryKeys.policyDraft(id),
+      'simulation-risk',
+      target,
+    ] as const,
   policiesRoot: () => [...channelRoutingQueryKeys.all, 'policies'] as const,
   currentPolicy: () =>
     [...channelRoutingQueryKeys.policiesRoot(), 'current'] as const,
   policyRevision: (revision: number) =>
     [...channelRoutingQueryKeys.policiesRoot(), revision] as const,
-  policyRollbackApprovalsRoot: (revision: number) =>
-    [
-      ...channelRoutingQueryKeys.policyRevision(revision),
-      'rollback-approvals',
-    ] as const,
-  policyRollbackApprovals: (revision: number, params: object) =>
-    [
-      ...channelRoutingQueryKeys.policyRollbackApprovalsRoot(revision),
-      params,
-    ] as const,
   operationsRoot: () => [...channelRoutingQueryKeys.all, 'operations'] as const,
   operations: (params: object) =>
     [...channelRoutingQueryKeys.operationsRoot(), params] as const,
   operation: (id: number) =>
     [...channelRoutingQueryKeys.operationsRoot(), id] as const,
+  operationTechnical: (id: number) =>
+    [...channelRoutingQueryKeys.operation(id), 'technical'] as const,
   auditExportsRoot: () =>
     [...channelRoutingQueryKeys.all, 'audit-exports'] as const,
 }

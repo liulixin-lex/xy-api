@@ -238,6 +238,7 @@ export function ChannelRoutingPolicyDraftSheet(props: {
         void detailQuery.refetch()
       }
     },
+    meta: { handleErrorLocally: true },
   })
   const resetSaveDraft = saveDraft.reset
   let editorSubject = 'closed'
@@ -326,7 +327,7 @@ export function ChannelRoutingPolicyDraftSheet(props: {
   ])
 
   const activeDraft = authority ?? props.draft
-  const immutable = activeDraft?.status === 'published'
+  const immutable = activeDraft != null && activeDraft.status !== 'editing'
   const writable = props.canWrite && !immutable
   const loadAuthoritativeDetail = (detail: PolicyDraftDetail) => {
     setPreservedDocument(form.getValues('document'))
@@ -447,15 +448,21 @@ export function ChannelRoutingPolicyDraftSheet(props: {
               ? t('Policy draft #{{id}}', { id: props.draft?.id })
               : t('Create policy draft')}
           </SheetTitle>
-          <SheetDescription>
-            {isEditing
-              ? t('Revision {{version}} · {{status}}', {
-                  version: activeDraft?.version,
-                  status: activeDraft?.status,
-                })
-              : t(
-                  'Create an immutable policy change candidate from a base revision.'
-                )}
+          <SheetDescription className='flex flex-wrap items-center gap-2'>
+            {isEditing ? (
+              <>
+                <span>
+                  {t('Revision')} {activeDraft?.version}
+                </span>
+                <ChannelRoutingStatusBadge
+                  status={activeDraft?.status ?? 'unknown'}
+                />
+              </>
+            ) : (
+              t(
+                'Create an immutable policy change candidate from a base revision.'
+              )
+            )}
           </SheetDescription>
         </SheetHeader>
 

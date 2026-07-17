@@ -47,6 +47,8 @@ export function ChannelRoutingOperationsAudits() {
         cursor={search.operationCursor ?? 0}
         operationType={search.operationType ?? ''}
         operationStatus={search.operationStatus ?? ''}
+        operationSource={search.operationSource ?? ''}
+        operationAttention={search.operationAttention ?? 'all'}
         onSearchChange={(patch) =>
           void navigate({
             search: (previous) => ({ ...previous, ...patch }),

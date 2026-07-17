@@ -21,7 +21,7 @@ import { FlaskConicalIcon, PlayIcon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import z from 'zod'
@@ -36,6 +36,7 @@ import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -59,13 +60,21 @@ import {
 } from '../api/client'
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import { ChannelRoutingHistoricalSimulationResults } from '../components/historical-simulation-results'
-import type { PolicyDraftSummary } from '../types'
+import {
+  ChannelRoutingEmptyState,
+  ChannelRoutingErrorState,
+  ChannelRoutingLoadingState,
+} from '../components/page-state'
+import { policySimulationDraftState } from '../lib/policy-simulation'
+import type { PolicyActivationSpec, PolicyDraftSummary } from '../types'
 import { ChannelRoutingPolicySimulationRiskSection } from './policy-simulation-risk-section'
 
 type PolicySimulationFormValues = {
   poolId: number
   cursor: number
   limit: number
+  targetStage: PolicyActivationSpec['stage']
+  targetTrafficBasisPoints: number
 }
 
 export function ChannelRoutingPolicySimulationSheet(props: {
@@ -78,37 +87,82 @@ export function ChannelRoutingPolicySimulationSheet(props: {
   const idempotencyRef = useRef<{ signature: string; key: string } | null>(null)
   const schema = useMemo(
     () =>
-      z.object({
-        poolId: z
-          .number({ error: t('Enter a valid number') })
-          .int(t('Value must be an integer'))
-          .min(1, t('Select a routing group')),
-        cursor: z
-          .number({ error: t('Enter a valid number') })
-          .int(t('Value must be an integer'))
-          .min(0, t('Cursor cannot be negative')),
-        limit: z
-          .number({ error: t('Enter a valid number') })
-          .int(t('Value must be an integer'))
-          .min(
-            1,
-            t('Value must be between {{min}} and {{max}}', { min: 1, max: 50 })
-          )
-          .max(
-            50,
-            t('Value must be between {{min}} and {{max}}', { min: 1, max: 50 })
-          ),
-      }),
+      z
+        .object({
+          poolId: z
+            .number({ error: t('Enter a valid number') })
+            .int(t('Value must be an integer'))
+            .min(1, t('Select a routing group')),
+          cursor: z
+            .number({ error: t('Enter a valid number') })
+            .int(t('Value must be an integer'))
+            .min(0, t('Cursor cannot be negative')),
+          limit: z
+            .number({ error: t('Enter a valid number') })
+            .int(t('Value must be an integer'))
+            .min(
+              1,
+              t('Value must be between {{min}} and {{max}}', {
+                min: 1,
+                max: 50,
+              })
+            )
+            .max(
+              50,
+              t('Value must be between {{min}} and {{max}}', {
+                min: 1,
+                max: 50,
+              })
+            ),
+          targetStage: z.enum(['observe', 'shadow', 'canary', 'active']),
+          targetTrafficBasisPoints: z
+            .number({ error: t('Enter a valid number') })
+            .int(t('Value must be an integer'))
+            .min(0, t('Traffic allocation cannot be negative'))
+            .max(500, t('Canary traffic must be between 1% and 5%')),
+        })
+        .superRefine((values, context) => {
+          if (
+            values.targetStage === 'canary' &&
+            (values.targetTrafficBasisPoints < 100 ||
+              values.targetTrafficBasisPoints > 500)
+          ) {
+            context.addIssue({
+              code: 'custom',
+              path: ['targetTrafficBasisPoints'],
+              message: t('Canary traffic must be between 1% and 5%'),
+            })
+          }
+          if (
+            values.targetStage !== 'canary' &&
+            values.targetTrafficBasisPoints !== 0
+          ) {
+            context.addIssue({
+              code: 'custom',
+              path: ['targetTrafficBasisPoints'],
+              message: t('Traffic allocation must be zero outside Canary'),
+            })
+          }
+        }),
     [t]
   )
   const form = useForm<PolicySimulationFormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { poolId: 0, cursor: 0, limit: 50 },
+    defaultValues: {
+      poolId: 0,
+      cursor: 0,
+      limit: 50,
+      targetStage: 'canary',
+      targetTrafficBasisPoints: 100,
+    },
   })
+  const targetStage = useWatch({ control: form.control, name: 'targetStage' })
   const detailQuery = useQuery({
     queryKey: channelRoutingQueryKeys.policyDraft(props.draft?.id ?? 0),
-    queryFn: () => getChannelRoutingPolicyDraft(props.draft?.id ?? 0),
+    queryFn: ({ signal }) =>
+      getChannelRoutingPolicyDraft(props.draft?.id ?? 0, signal),
     enabled: props.open && props.draft != null,
+    meta: { handleErrorLocally: true },
   })
   const poolOptions = useMemo(() => {
     const pools = detailQuery.data?.document.pools ?? []
@@ -151,6 +205,8 @@ export function ChannelRoutingPolicySimulationSheet(props: {
         pool_id: input.values.poolId,
         cursor: cursor || undefined,
         limit: input.values.limit,
+        target_stage: input.values.targetStage,
+        target_traffic_basis_points: input.values.targetTrafficBasisPoints,
       }
       const signature = JSON.stringify({
         draft_id: props.draft.id,
@@ -170,12 +226,15 @@ export function ChannelRoutingPolicySimulationSheet(props: {
         idempotencyRef.current.key
       )
     },
-    onSuccess: async (response) => {
+    onSuccess: async (response, input) => {
       idempotencyRef.current = null
       if (props.draft) {
         queryClient.setQueryData(
-          channelRoutingQueryKeys.policySimulationRisk(props.draft.id),
-          response.result.risk ?? null
+          channelRoutingQueryKeys.policySimulationRisk(props.draft.id, {
+            stage: input.values.targetStage,
+            traffic_basis_points: input.values.targetTrafficBasisPoints,
+          }),
+          response
         )
       }
       await queryClient.invalidateQueries({
@@ -183,12 +242,25 @@ export function ChannelRoutingPolicySimulationSheet(props: {
       })
       toast.success(t('Policy simulation completed'))
     },
+    meta: { handleErrorLocally: true },
   })
   const resetSimulation = simulation.reset
+  const draftState = policySimulationDraftState({
+    hasDetail: detailQuery.data != null,
+    loading: detailQuery.isLoading,
+    error: detailQuery.isError,
+    poolCount: poolOptions.length,
+  })
 
   useEffect(() => {
     if (!props.open) return
-    form.reset({ poolId: poolOptions[0]?.id ?? 0, cursor: 0, limit: 50 })
+    form.reset({
+      poolId: poolOptions[0]?.id ?? 0,
+      cursor: 0,
+      limit: 50,
+      targetStage: 'canary',
+      targetTrafficBasisPoints: 100,
+    })
     idempotencyRef.current = null
     resetSimulation()
   }, [form, poolOptions, props.draft?.id, props.open, resetSimulation])
@@ -221,114 +293,213 @@ export function ChannelRoutingPolicySimulationSheet(props: {
           <form
             id='channel-routing-policy-simulation-form'
             className={sideDrawerFormClassName('gap-5')}
-            onSubmit={form.handleSubmit((values) =>
+            onSubmit={form.handleSubmit((values) => {
+              if (draftState !== 'ready') return
               simulation.mutate({ values })
-            )}
+            })}
           >
-            <div className='grid gap-3 sm:grid-cols-3'>
-              <FormField
-                control={form.control}
-                name='poolId'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Routing group')}</FormLabel>
-                    <FormControl>
-                      {poolOptions.length > 0 ? (
-                        <NativeSelect
-                          className='w-full'
-                          value={String(field.value)}
-                          onChange={(event) =>
-                            field.onChange(Number(event.target.value))
-                          }
-                        >
-                          {poolOptions.map((pool) => (
-                            <NativeSelectOption key={pool.id} value={pool.id}>
-                              {pool.label} (#{pool.id})
-                            </NativeSelectOption>
-                          ))}
-                        </NativeSelect>
-                      ) : (
-                        <Input
-                          type='number'
-                          min={1}
-                          value={field.value || ''}
-                          onChange={(event) =>
-                            field.onChange(event.target.valueAsNumber)
-                          }
-                        />
-                      )}
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name='cursor'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Start cursor')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        min={0}
-                        value={field.value}
-                        onChange={(event) =>
-                          field.onChange(event.target.valueAsNumber)
-                        }
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name='limit'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Samples')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        min={1}
-                        max={50}
-                        value={field.value}
-                        onChange={(event) =>
-                          field.onChange(event.target.valueAsNumber)
-                        }
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </div>
-
-            {simulation.isError ? (
-              <div className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'>
-                {t(
-                  'Policy simulation failed. Refresh the draft and try again.'
-                )}
-              </div>
+            {draftState === 'loading' ? (
+              <ChannelRoutingLoadingState rows={3} />
             ) : null}
+            {draftState === 'error' ? (
+              <ChannelRoutingErrorState
+                error={detailQuery.error}
+                onRetry={() => void detailQuery.refetch()}
+              />
+            ) : null}
+            {draftState === 'empty' ? (
+              <ChannelRoutingEmptyState
+                title={t('No policy pools')}
+                description={t(
+                  'No routing groups are available in the current snapshot.'
+                )}
+              />
+            ) : null}
+            {draftState === 'ready' ? (
+              <>
+                <div className='grid gap-3 sm:grid-cols-3'>
+                  <FormField
+                    control={form.control}
+                    name='poolId'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Routing group')}</FormLabel>
+                        <FormControl>
+                          <NativeSelect
+                            className='w-full'
+                            value={String(field.value)}
+                            onChange={(event) =>
+                              field.onChange(Number(event.target.value))
+                            }
+                          >
+                            {poolOptions.map((pool) => (
+                              <NativeSelectOption key={pool.id} value={pool.id}>
+                                {pool.label} (#{pool.id})
+                              </NativeSelectOption>
+                            ))}
+                          </NativeSelect>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='cursor'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Start cursor')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={0}
+                            value={field.value}
+                            onChange={(event) =>
+                              field.onChange(event.target.valueAsNumber)
+                            }
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name='limit'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Samples')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={1}
+                            max={50}
+                            value={field.value}
+                            onChange={(event) =>
+                              field.onChange(event.target.valueAsNumber)
+                            }
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
 
-            {simulation.data ? (
-              <div className='space-y-5'>
-                <ChannelRoutingPolicySimulationRiskSection
-                  risk={simulation.data.result.risk}
-                />
-                <ChannelRoutingHistoricalSimulationResults
-                  result={simulation.data.result}
-                  pending={simulation.isPending}
-                  onNextBatch={(cursor) => {
-                    form.setValue('cursor', cursor, { shouldDirty: true })
-                    void form.handleSubmit((values) =>
-                      simulation.mutate({ values, cursor })
-                    )()
-                  }}
-                />
-              </div>
+                <section
+                  className='flex flex-col gap-3 border-t pt-4'
+                  aria-labelledby='policy-simulation-target'
+                >
+                  <div>
+                    <h3
+                      id='policy-simulation-target'
+                      className='text-sm font-semibold'
+                    >
+                      {t('Simulation deployment target')}
+                    </h3>
+                    <p className='text-muted-foreground mt-1 text-xs'>
+                      {t(
+                        'Failure evidence applies only to this exact stage and Canary traffic allocation.'
+                      )}
+                    </p>
+                  </div>
+                  <div className='grid gap-3 sm:grid-cols-2'>
+                    <FormField
+                      control={form.control}
+                      name='targetStage'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Deployment stage')}</FormLabel>
+                          <FormControl>
+                            <NativeSelect
+                              className='w-full'
+                              value={field.value}
+                              onChange={(event) => {
+                                const stage = event.target
+                                  .value as PolicyActivationSpec['stage']
+                                field.onChange(stage)
+                                form.setValue(
+                                  'targetTrafficBasisPoints',
+                                  stage === 'canary' ? 100 : 0,
+                                  { shouldValidate: true }
+                                )
+                              }}
+                            >
+                              <NativeSelectOption value='observe'>
+                                {t('Observe')}
+                              </NativeSelectOption>
+                              <NativeSelectOption value='shadow'>
+                                {t('Shadow')}
+                              </NativeSelectOption>
+                              <NativeSelectOption value='canary'>
+                                {t('Canary')}
+                              </NativeSelectOption>
+                              <NativeSelectOption value='active'>
+                                {t('Active')}
+                              </NativeSelectOption>
+                            </NativeSelect>
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='targetTrafficBasisPoints'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Traffic allocation')}</FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={targetStage === 'canary' ? 100 : 0}
+                              max={targetStage === 'canary' ? 500 : 0}
+                              step={100}
+                              disabled={targetStage !== 'canary'}
+                              value={field.value}
+                              onChange={(event) =>
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {targetStage === 'canary'
+                              ? t('Enter 100 to 500 basis points')
+                              : t('Traffic allocation is zero outside Canary')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                </section>
+
+                {simulation.isError ? (
+                  <div className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'>
+                    {t(
+                      'Policy simulation failed. Refresh the draft and try again.'
+                    )}
+                  </div>
+                ) : null}
+
+                {simulation.data ? (
+                  <div className='space-y-5'>
+                    <ChannelRoutingPolicySimulationRiskSection
+                      risk={simulation.data.result.risk}
+                    />
+                    <ChannelRoutingHistoricalSimulationResults
+                      result={simulation.data.result}
+                      pending={simulation.isPending}
+                      onNextBatch={(cursor) => {
+                        form.setValue('cursor', cursor, { shouldDirty: true })
+                        void form.handleSubmit((values) =>
+                          simulation.mutate({ values, cursor })
+                        )()
+                      }}
+                    />
+                  </div>
+                ) : null}
+              </>
             ) : null}
           </form>
         </Form>
@@ -337,7 +508,7 @@ export function ChannelRoutingPolicySimulationSheet(props: {
           <Button
             type='submit'
             form='channel-routing-policy-simulation-form'
-            disabled={simulation.isPending || detailQuery.isLoading}
+            disabled={simulation.isPending || draftState !== 'ready'}
           >
             <HugeiconsIcon
               icon={PlayIcon}

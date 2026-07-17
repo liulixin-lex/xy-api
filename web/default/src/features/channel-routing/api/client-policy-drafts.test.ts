@@ -27,9 +27,15 @@ import type {
   ApiEnvelope,
   PolicyDraftDetail,
   PolicyDraftSummary,
+  PolicyPublishResponse,
+  PolicySimulationResponse,
 } from '../types'
 import {
+  deleteChannelRoutingPolicyDraft,
+  deleteChannelRoutingPolicyDrafts,
   getChannelRoutingPolicyDraft,
+  publishChannelRoutingPolicyDraft,
+  simulateChannelRoutingPolicyDraft,
   updateChannelRoutingPolicyDraft,
 } from './client'
 
@@ -53,7 +59,13 @@ const detail = {
   updated_time_ms: 200,
   validated_time_ms: 0,
   published_time_ms: 0,
-  document: { schema_version: 1, pools: [] },
+  workspace_state: 'working',
+  stale: false,
+  can_validate: true,
+  can_publish: false,
+  can_delete: true,
+  blocking_reason: 'draft_requires_validation',
+  document: { schema_version: 2, pools: [] },
 } satisfies PolicyDraftDetail
 
 afterEach(() => {
@@ -106,5 +118,105 @@ describe('channel routing policy draft API', () => {
     await updateChannelRoutingPolicyDraft(detail, detail.document)
 
     assert.equal(captured[0]?.headers.get('If-Match'), responseETag)
+  })
+
+  test('uses ETags for single and all-or-nothing batch deletion', async () => {
+    const captured: InternalAxiosRequestConfig[] = []
+    api.defaults.adapter = async (config) => {
+      captured.push(config)
+      const data: ApiEnvelope<{ deleted_ids: number[] }> = {
+        success: true,
+        data: { deleted_ids: [7] },
+      }
+      return {
+        data,
+        status: 200,
+        statusText: 'OK',
+        headers: new AxiosHeaders(),
+        config,
+      }
+    }
+
+    await deleteChannelRoutingPolicyDraft(detail)
+    await deleteChannelRoutingPolicyDrafts([detail])
+
+    assert.equal(captured[0]?.headers.get('If-Match'), responseETag)
+    assert.deepEqual(JSON.parse(String(captured[1]?.data)), {
+      items: [{ id: 7, etag: responseETag }],
+    })
+  })
+
+  test('only sends risk acceptance when the operator explicitly accepts it', async () => {
+    const captured: InternalAxiosRequestConfig[] = []
+    api.defaults.adapter = async (config) => {
+      captured.push(config)
+      const data: ApiEnvelope<PolicyPublishResponse> = {
+        success: true,
+        data: {} as PolicyPublishResponse,
+      }
+      return {
+        data,
+        status: 200,
+        statusText: 'OK',
+        headers: new AxiosHeaders(),
+        config,
+      }
+    }
+    const activation = {
+      stage: 'active' as const,
+      traffic_basis_points: 0,
+      reason: 'validated rollout',
+    }
+
+    await publishChannelRoutingPolicyDraft(detail, activation, 'publish-one')
+    await publishChannelRoutingPolicyDraft(detail, activation, 'publish-two', {
+      accepted: true,
+      reason: 'Known capacity risk is covered by the monitored rollout.',
+    })
+
+    const withoutAcceptance = JSON.parse(String(captured[0]?.data))
+    const withAcceptance = JSON.parse(String(captured[1]?.data))
+    assert.equal(withoutAcceptance.accept_simulation_risk, undefined)
+    assert.equal(withAcceptance.accept_simulation_risk, true)
+    assert.equal(
+      withAcceptance.risk_acceptance_reason,
+      'Known capacity risk is covered by the monitored rollout.'
+    )
+  })
+
+  test('binds simulation evidence to the exact deployment target', async () => {
+    const captured: InternalAxiosRequestConfig[] = []
+    api.defaults.adapter = async (config) => {
+      captured.push(config)
+      const data: ApiEnvelope<PolicySimulationResponse> = {
+        success: true,
+        data: {} as PolicySimulationResponse,
+      }
+      return {
+        data,
+        status: 200,
+        statusText: 'OK',
+        headers: new AxiosHeaders(),
+        config,
+      }
+    }
+
+    await simulateChannelRoutingPolicyDraft(
+      detail,
+      {
+        pool_id: 11,
+        limit: 50,
+        target_stage: 'canary',
+        target_traffic_basis_points: 300,
+      },
+      'simulation-target-0001'
+    )
+
+    assert.deepEqual(JSON.parse(String(captured[0]?.data)), {
+      pool_id: 11,
+      limit: 50,
+      target_stage: 'canary',
+      target_traffic_basis_points: 300,
+    })
   })
 })

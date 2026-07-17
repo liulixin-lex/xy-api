@@ -16,9 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Activity01Icon, Download01Icon } from '@hugeicons/core-free-icons'
+import {
+  Activity01Icon,
+  Cancel01Icon,
+  Download01Icon,
+  RefreshIcon,
+} from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from '@tanstack/react-query'
+import { useId, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -27,7 +38,10 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
 import {
   Sheet,
   SheetContent,
@@ -35,6 +49,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import { Spinner } from '@/components/ui/spinner'
+import { Textarea } from '@/components/ui/textarea'
 import {
   ADMIN_PERMISSION_ACTIONS,
   ADMIN_PERMISSION_RESOURCES,
@@ -43,8 +59,11 @@ import {
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  cancelChannelRoutingOperation,
   downloadChannelRoutingAuditExport,
   getChannelRoutingOperation,
+  getChannelRoutingPolicyApiError,
+  retryChannelRoutingOperation,
 } from '../api/client'
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
@@ -55,20 +74,44 @@ import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
 import {
   channelRoutingOperationAuditExportId,
-  channelRoutingOperationBreakerResetResult,
+  channelRoutingOperationCanCancel,
+  channelRoutingOperationCanRetry,
   channelRoutingOperationDisplayStatus,
   channelRoutingOperationIsActive,
+  channelRoutingOperationRetentionLabel,
+  channelRoutingOperationSourceLabel,
   channelRoutingOperationTypeLabel,
 } from '../lib/operations'
+import type { RoutingOperation } from '../types'
+import {
+  ChannelRoutingOperationResultSection,
+  ChannelRoutingOperationTechnicalSection,
+} from './operation-detail-sections'
+
+type OperationAction = 'cancel' | 'retry'
 
 export function ChannelRoutingOperationSheet(props: {
   operationId: number | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  onOperationChange?: (operationId: number) => void
 }) {
   const { t } = useTranslation()
   const format = useChannelRoutingFormatters()
+  const queryClient = useQueryClient()
   const user = useAuthStore((state) => state.auth.user)
+  const [action, setAction] = useState<OperationAction | null>(null)
+  const [reason, setReason] = useState('')
+  const [reasonError, setReasonError] = useState('')
+  const reasonId = useId()
+  const reasonHelpId = useId()
+  const reasonErrorId = useId()
+  const reasonRef = useRef<HTMLTextAreaElement>(null)
+  const canOperate = hasPermission(
+    user,
+    ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
+    ADMIN_PERMISSION_ACTIONS.OPERATE
+  )
   const canAuditExport = hasPermission(
     user,
     ADMIN_PERMISSION_RESOURCES.CHANNEL_ROUTING,
@@ -76,30 +119,138 @@ export function ChannelRoutingOperationSheet(props: {
   )
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.operation(props.operationId ?? 0),
-    queryFn: () => getChannelRoutingOperation(props.operationId ?? 0),
+    queryFn: ({ signal }) =>
+      getChannelRoutingOperation(props.operationId ?? 0, signal),
     enabled: props.open && props.operationId != null,
     refetchInterval: (operationQuery) =>
       channelRoutingOperationIsActive(operationQuery.state.data)
         ? 3_000
         : false,
   })
+  const actionMutation = useMutation({
+    mutationFn: async (request: {
+      action: OperationAction
+      operationId: number
+      reason: string
+    }) => {
+      if (request.action === 'retry') {
+        const response = await retryChannelRoutingOperation(
+          request.operationId,
+          request.reason
+        )
+        return {
+          action: request.action,
+          operation: response.operation,
+          created: response.created,
+        }
+      }
+      return {
+        action: request.action,
+        operation: await cancelChannelRoutingOperation(
+          request.operationId,
+          request.reason
+        ),
+        created: false,
+      }
+    },
+    onSuccess: (result, request) => {
+      invalidateOperationViews(
+        queryClient,
+        request.operationId,
+        result.operation.id
+      )
+      setAction(null)
+      setReason('')
+      setReasonError('')
+      if (result.action === 'retry') {
+        toast.success(
+          result.created
+            ? t('Retry operation #{{id}} was created', {
+                id: result.operation.id,
+              })
+            : t('Existing retry operation reused')
+        )
+        props.onOperationChange?.(result.operation.id)
+        return
+      }
+      toast.success(t('Operation cancelled'))
+    },
+    meta: { handleErrorLocally: true },
+  })
+  const operation = query.data
+  const displayStatus = operation
+    ? channelRoutingOperationDisplayStatus(operation)
+    : ''
+  const auditExportId = operation
+    ? channelRoutingOperationAuditExportId(operation)
+    : null
+  const canRetry = canOperate && channelRoutingOperationCanRetry(operation)
+  const canCancel = canOperate && channelRoutingOperationCanCancel(operation)
+  const actionAllowed = operationActionAllowed(action, canRetry, canCancel)
+  const actionError = actionMutation.error
+    ? getChannelRoutingPolicyApiError(actionMutation.error).message ||
+      t('The operation action could not be completed.')
+    : ''
   const downloadExport = useMutation({
     mutationFn: downloadChannelRoutingAuditExport,
     onSuccess: () => toast.success(t('Audit export downloaded')),
-    onError: () => toast.error(t('Could not download the audit export.')),
   })
-  const displayStatus = query.data
-    ? channelRoutingOperationDisplayStatus(query.data)
-    : ''
-  const auditExportId = query.data
-    ? channelRoutingOperationAuditExportId(query.data)
-    : null
-  const breakerResetResult = query.data
-    ? channelRoutingOperationBreakerResetResult(query.data)
-    : null
+  let actionButtonIcon: ReactNode = null
+  if (actionMutation.isPending) {
+    actionButtonIcon = <Spinner data-icon='inline-start' />
+  } else if (action === 'retry') {
+    actionButtonIcon = (
+      <HugeiconsIcon
+        icon={RefreshIcon}
+        data-icon='inline-start'
+        strokeWidth={2}
+        aria-hidden='true'
+      />
+    )
+  } else if (action === 'cancel') {
+    actionButtonIcon = (
+      <HugeiconsIcon
+        icon={Cancel01Icon}
+        data-icon='inline-start'
+        strokeWidth={2}
+        aria-hidden='true'
+      />
+    )
+  }
+
+  function closeActionEditor() {
+    if (actionMutation.isPending) return
+    setAction(null)
+    setReason('')
+    setReasonError('')
+    actionMutation.reset()
+  }
+
+  function handleActionSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const normalizedReason = reason.trim()
+    if (!action || !operation || !actionAllowed) return
+    if (normalizedReason === '') {
+      setReasonError(t('Enter a reason before continuing.'))
+      reasonRef.current?.focus()
+      return
+    }
+    setReasonError('')
+    actionMutation.mutate({
+      action,
+      operationId: operation.id,
+      reason: normalizedReason,
+    })
+  }
 
   return (
-    <Sheet open={props.open} onOpenChange={props.onOpenChange}>
+    <Sheet
+      open={props.open}
+      onOpenChange={(open) => {
+        if (!open) closeActionEditor()
+        props.onOpenChange(open)
+      }}
+    >
       <SheetContent
         className={sideDrawerContentClassName(
           'channel-routing-touch-surface max-w-none max-lg:[&_button]:min-h-11 max-lg:[&_button]:min-w-11 sm:!max-w-3xl'
@@ -116,10 +267,10 @@ export function ChannelRoutingOperationSheet(props: {
             {t('Operation #{{id}}', { id: props.operationId })}
           </SheetTitle>
           <SheetDescription>
-            {query.data
-              ? t('{{type}} · started {{time}}', {
-                  type: query.data.type,
-                  time: format.timestamp(query.data.created_time_ms),
+            {operation
+              ? t('{{type}}, started {{time}}', {
+                  type: t(channelRoutingOperationTypeLabel(operation.type)),
+                  time: format.timestamp(operation.created_time_ms),
                 })
               : t('Persistent channel routing operation details')}
           </SheetDescription>
@@ -133,71 +284,188 @@ export function ChannelRoutingOperationSheet(props: {
               onRetry={() => void query.refetch()}
             />
           ) : null}
-          {query.data ? (
+          {operation ? (
             <>
               <div className='flex flex-wrap items-center gap-2'>
                 <ChannelRoutingStatusBadge status={displayStatus} />
-                <ChannelRoutingStatusBadge
-                  status={query.data.type}
-                  label={t(channelRoutingOperationTypeLabel(query.data.type))}
-                />
+                <Badge variant='outline'>
+                  {t(channelRoutingOperationTypeLabel(operation.type))}
+                </Badge>
               </div>
 
-              <dl className='grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3'>
-                {[
-                  [
-                    t('Subject'),
-                    `${query.data.subject_type} #${query.data.subject_id}`,
-                  ],
-                  [
-                    t('Pool'),
-                    query.data.pool_id > 0
-                      ? `#${query.data.pool_id}`
-                      : t('All'),
-                  ],
-                  [t('Actor'), `#${query.data.actor_id}`],
-                  [t('Expected revision'), `r${query.data.expected_revision}`],
-                  [t('Attempts'), format.number(query.data.attempts)],
-                  [
-                    t('Completed'),
-                    query.data.completed_time_ms > 0
-                      ? format.timestamp(query.data.completed_time_ms)
-                      : t('Pending'),
-                  ],
-                  [
-                    t('Result revision'),
-                    query.data.result_revision > 0
-                      ? `r${query.data.result_revision}`
-                      : t('Not available'),
-                  ],
-                  [
-                    t('Result activation'),
-                    query.data.result_activation_id > 0
-                      ? `#${query.data.result_activation_id}`
-                      : t('Not available'),
-                  ],
-                  [
-                    t('Evaluation hash'),
-                    format.shortHash(query.data.evaluation_hash),
-                  ],
-                ].map(([label, value]) => (
-                  <div key={label} className='min-w-0'>
-                    <dt className='text-muted-foreground text-xs'>{label}</dt>
-                    <dd className='mt-1 font-medium break-words'>{value}</dd>
-                  </div>
-                ))}
-              </dl>
-
-              {displayStatus === 'partial' ? (
-                <p
-                  role='status'
-                  className='border-warning/30 bg-warning/10 text-warning-foreground rounded-lg border p-3 text-sm'
-                >
-                  {t(
-                    'This operation completed with partial results. Review its result and error details.'
-                  )}
-                </p>
+              {operation.needs_attention ? (
+                <Alert>
+                  <AlertTitle>{t('Operator attention required')}</AlertTitle>
+                  <AlertDescription>
+                    {t(
+                      'Review the summary and last error before retrying or resolving the related control issue.'
+                    )}
+                  </AlertDescription>
+                </Alert>
               ) : null}
+
+              {canRetry || canCancel ? (
+                <section className='flex flex-col gap-3 border-b pb-5'>
+                  <div className='flex flex-wrap gap-2'>
+                    {canRetry ? (
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='outline'
+                        disabled={actionMutation.isPending}
+                        onClick={() => {
+                          setAction('retry')
+                          setReason('')
+                          setReasonError('')
+                          actionMutation.reset()
+                        }}
+                      >
+                        <HugeiconsIcon
+                          icon={RefreshIcon}
+                          data-icon='inline-start'
+                          strokeWidth={2}
+                          aria-hidden='true'
+                        />
+                        {t('Retry operation')}
+                      </Button>
+                    ) : null}
+                    {canCancel ? (
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant='outline'
+                        disabled={actionMutation.isPending}
+                        onClick={() => {
+                          setAction('cancel')
+                          setReason('')
+                          setReasonError('')
+                          actionMutation.reset()
+                        }}
+                      >
+                        <HugeiconsIcon
+                          icon={Cancel01Icon}
+                          data-icon='inline-start'
+                          strokeWidth={2}
+                          aria-hidden='true'
+                        />
+                        {t('Cancel operation')}
+                      </Button>
+                    ) : null}
+                  </div>
+
+                  {action && actionAllowed ? (
+                    <form
+                      className='bg-muted/30 flex flex-col gap-3 rounded-lg border p-3'
+                      onSubmit={handleActionSubmit}
+                    >
+                      <div className='flex flex-col gap-2'>
+                        <Label htmlFor={reasonId}>
+                          {action === 'retry'
+                            ? t('Retry reason')
+                            : t('Cancellation reason')}
+                        </Label>
+                        <Textarea
+                          ref={reasonRef}
+                          id={reasonId}
+                          value={reason}
+                          maxLength={512}
+                          rows={3}
+                          aria-invalid={reasonError !== ''}
+                          aria-describedby={
+                            reasonError
+                              ? `${reasonHelpId} ${reasonErrorId}`
+                              : reasonHelpId
+                          }
+                          placeholder={t(
+                            'Record the operational reason for this action'
+                          )}
+                          disabled={actionMutation.isPending}
+                          onChange={(event) => {
+                            setReason(event.target.value)
+                            if (reasonError) setReasonError('')
+                          }}
+                        />
+                        <p
+                          id={reasonHelpId}
+                          className='text-muted-foreground text-xs'
+                        >
+                          {t(
+                            'This reason is stored in the immutable control audit.'
+                          )}
+                        </p>
+                        {reasonError ? (
+                          <p
+                            id={reasonErrorId}
+                            className='text-destructive text-xs'
+                            role='alert'
+                          >
+                            {reasonError}
+                          </p>
+                        ) : null}
+                      </div>
+                      {actionError ? (
+                        <Alert variant='destructive'>
+                          <AlertTitle>
+                            {t('Operation action failed')}
+                          </AlertTitle>
+                          <AlertDescription>{t(actionError)}</AlertDescription>
+                        </Alert>
+                      ) : null}
+                      <div className='flex flex-wrap justify-end gap-2'>
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='ghost'
+                          disabled={actionMutation.isPending}
+                          onClick={closeActionEditor}
+                        >
+                          {t('Keep operation unchanged')}
+                        </Button>
+                        <Button
+                          type='submit'
+                          size='sm'
+                          variant={
+                            action === 'cancel' ? 'destructive' : 'default'
+                          }
+                          disabled={actionMutation.isPending}
+                        >
+                          {actionButtonIcon}
+                          {action === 'retry'
+                            ? t('Create retry')
+                            : t('Confirm cancellation')}
+                        </Button>
+                      </div>
+                    </form>
+                  ) : null}
+                </section>
+              ) : null}
+
+              <OperationFacts operation={operation} />
+
+              <section className='flex flex-col gap-2 border-t pt-4'>
+                <h3 className='text-sm font-semibold'>{t('Summary')}</h3>
+                <p className='text-muted-foreground text-sm break-words'>
+                  {operation.summary || t('No summary recorded')}
+                </p>
+              </section>
+
+              <section className='flex flex-col gap-2 border-t pt-4'>
+                <h3 className='text-sm font-semibold'>{t('Reason')}</h3>
+                <p className='text-muted-foreground text-sm break-words'>
+                  {operation.reason || t('Not available')}
+                </p>
+              </section>
+
+              {operation.last_error ? (
+                <Alert variant='destructive'>
+                  <AlertTitle>{t('Last error')}</AlertTitle>
+                  <AlertDescription className='break-words'>
+                    {operation.last_error}
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+
+              <ChannelRoutingOperationResultSection operation={operation} />
 
               {canAuditExport && auditExportId ? (
                 <Button
@@ -207,170 +475,200 @@ export function ChannelRoutingOperationSheet(props: {
                   disabled={downloadExport.isPending}
                   onClick={() => downloadExport.mutate(auditExportId)}
                 >
-                  <HugeiconsIcon
-                    icon={Download01Icon}
-                    data-icon='inline-start'
-                    strokeWidth={2}
-                    aria-hidden='true'
-                  />
+                  {downloadExport.isPending ? (
+                    <Spinner data-icon='inline-start' />
+                  ) : (
+                    <HugeiconsIcon
+                      icon={Download01Icon}
+                      data-icon='inline-start'
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
+                  )}
                   {downloadExport.isPending
                     ? t('Downloading')
                     : t('Download JSON')}
                 </Button>
               ) : null}
 
-              <section className='space-y-2 border-t pt-4'>
-                <h3 className='text-sm font-semibold'>{t('Reason')}</h3>
-                <p className='text-muted-foreground text-sm break-words'>
-                  {query.data.reason || t('Not available')}
-                </p>
-              </section>
-
-              {query.data.last_error ? (
-                <section className='border-destructive/30 bg-destructive/5 text-destructive space-y-2 rounded-lg border p-3'>
-                  <h3 className='text-sm font-semibold'>{t('Last error')}</h3>
-                  <p className='text-sm break-words'>{query.data.last_error}</p>
-                </section>
+              {canAuditExport ? (
+                <ChannelRoutingOperationTechnicalSection
+                  operationId={operation.id}
+                  sheetOpen={props.open}
+                />
               ) : null}
-
-              {breakerResetResult && (
-                <section className='space-y-3 border-t pt-4'>
-                  <h3 className='text-sm font-semibold'>
-                    {t('Breaker reset result')}
-                  </h3>
-                  <dl className='grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3'>
-                    <div>
-                      <dt className='text-muted-foreground text-xs'>
-                        {t('Scope')}
-                      </dt>
-                      <dd className='mt-1 font-medium'>
-                        {breakerResetResult.scope === 'member'
-                          ? t('Member / model')
-                          : t('Endpoint / region')}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt className='text-muted-foreground text-xs'>
-                        {t('Generation')}
-                      </dt>
-                      <dd className='mt-1 font-medium'>
-                        {format.number(breakerResetResult.generation)}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt className='text-muted-foreground text-xs'>
-                        {t('Outbox')}
-                      </dt>
-                      <dd className='mt-1 font-medium'>
-                        #{breakerResetResult.outbox_id}
-                      </dd>
-                    </div>
-                  </dl>
-                  <div className='border-t pt-3'>
-                    <h4 className='text-muted-foreground text-xs font-medium'>
-                      {t('Normalized target')}
-                    </h4>
-                    <dl className='mt-2 grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3'>
-                      {breakerResetResult.target.scope === 'member' ? (
-                        <>
-                          <div>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Pool')}
-                            </dt>
-                            <dd className='mt-1 font-medium'>
-                              #{breakerResetResult.target.pool_id}
-                            </dd>
-                          </div>
-                          <div>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Member')}
-                            </dt>
-                            <dd className='mt-1 font-medium'>
-                              #{breakerResetResult.target.member_id}
-                            </dd>
-                          </div>
-                          <div>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Channel')}
-                            </dt>
-                            <dd className='mt-1 font-medium'>
-                              #{breakerResetResult.target.channel_id}
-                            </dd>
-                          </div>
-                          <div className='min-w-0'>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Model')}
-                            </dt>
-                            <dd className='mt-1 font-medium break-words'>
-                              {breakerResetResult.target.model_name}
-                            </dd>
-                          </div>
-                          <div className='min-w-0'>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Group')}
-                            </dt>
-                            <dd className='mt-1 font-medium break-words'>
-                              {breakerResetResult.target.group_name}
-                            </dd>
-                          </div>
-                          <div>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Key index')}
-                            </dt>
-                            <dd className='mt-1 font-medium'>
-                              {format.number(
-                                breakerResetResult.target.api_key_index
-                              )}
-                            </dd>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <div className='col-span-2 min-w-0 sm:col-span-3'>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Endpoint authority')}
-                            </dt>
-                            <dd className='mt-1 font-mono text-xs break-all'>
-                              {breakerResetResult.target.endpoint_authority}
-                            </dd>
-                          </div>
-                          <div className='min-w-0'>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Host')}
-                            </dt>
-                            <dd className='mt-1 font-medium break-all'>
-                              {breakerResetResult.target.endpoint_host}
-                            </dd>
-                          </div>
-                          <div className='min-w-0'>
-                            <dt className='text-muted-foreground text-xs'>
-                              {t('Region')}
-                            </dt>
-                            <dd className='mt-1 font-medium break-words'>
-                              {breakerResetResult.target.region}
-                            </dd>
-                          </div>
-                        </>
-                      )}
-                    </dl>
-                  </div>
-                </section>
-              )}
-
-              {!breakerResetResult && query.data.result != null && (
-                <section className='space-y-2 border-t pt-4'>
-                  <h3 className='text-sm font-semibold'>
-                    {t('Operation result')}
-                  </h3>
-                  <pre className='bg-muted/40 max-h-96 overflow-auto rounded-lg border p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap'>
-                    {JSON.stringify(query.data.result, null, 2)}
-                  </pre>
-                </section>
-              )}
             </>
           ) : null}
         </div>
       </SheetContent>
     </Sheet>
   )
+}
+
+function OperationFacts(props: { operation: RoutingOperation }) {
+  const { t } = useTranslation()
+  const format = useChannelRoutingFormatters()
+  const operation = props.operation
+  const facts: Array<{ label: string; value: ReactNode }> = [
+    {
+      label: t('Subject'),
+      value: `${operation.subject_type} #${operation.subject_id}`,
+    },
+    {
+      label: t('Pool'),
+      value: operation.pool_id > 0 ? `#${operation.pool_id}` : t('All'),
+    },
+    { label: t('Actor'), value: `#${operation.actor_id}` },
+    {
+      label: t('Source'),
+      value: t(
+        channelRoutingOperationSourceLabel(operation.source || 'system')
+      ),
+    },
+    { label: t('Attempts'), value: format.number(operation.attempts) },
+    {
+      label: t('Retention'),
+      value: operation.retention_category
+        ? t(channelRoutingOperationRetentionLabel(operation.retention_category))
+        : t('Not available'),
+    },
+    { label: t('Started'), value: format.timestamp(operation.created_time_ms) },
+    { label: t('Updated'), value: format.timestamp(operation.updated_time_ms) },
+    {
+      label: t('Completed'),
+      value:
+        operation.completed_time_ms > 0
+          ? format.timestamp(operation.completed_time_ms)
+          : t('Pending'),
+    },
+  ]
+  if (operation.next_retry_ms > 0) {
+    facts.push({
+      label: t('Next retry'),
+      value: format.timestamp(operation.next_retry_ms),
+    })
+  }
+  if (operation.expected_revision > 0) {
+    facts.push({
+      label: t('Expected revision'),
+      value: `r${operation.expected_revision}`,
+    })
+  }
+  if (operation.expected_activation_id > 0) {
+    facts.push({
+      label: t('Expected activation'),
+      value: `#${operation.expected_activation_id}`,
+    })
+  }
+  if (operation.result_revision > 0) {
+    facts.push({
+      label: t('Result revision'),
+      value: `r${operation.result_revision}`,
+    })
+  }
+  if (operation.result_activation_id > 0) {
+    facts.push({
+      label: t('Result activation'),
+      value: `#${operation.result_activation_id}`,
+    })
+  }
+  if (operation.terminal_actor_id) {
+    facts.push({
+      label: t('Terminal actor'),
+      value: `#${operation.terminal_actor_id}`,
+    })
+  }
+
+  return (
+    <>
+      <dl className='grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3'>
+        {facts.map((fact) => (
+          <div key={fact.label} className='min-w-0'>
+            <dt className='text-muted-foreground text-xs'>{fact.label}</dt>
+            <dd className='mt-1 font-medium break-words'>{fact.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {operation.correlation_id ||
+      operation.parent_operation_id ||
+      operation.retry_of_operation_id ? (
+        <section className='flex flex-col gap-3 border-t pt-4'>
+          <h3 className='text-sm font-semibold'>{t('Operation chain')}</h3>
+          <dl className='grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-3'>
+            {operation.correlation_id ? (
+              <div className='min-w-0 sm:col-span-3'>
+                <dt className='text-muted-foreground text-xs'>
+                  {t('Correlation ID')}
+                </dt>
+                <dd className='mt-1 font-mono text-xs break-all'>
+                  {operation.correlation_id}
+                </dd>
+              </div>
+            ) : null}
+            {operation.parent_operation_id ? (
+              <div>
+                <dt className='text-muted-foreground text-xs'>
+                  {t('Parent operation')}
+                </dt>
+                <dd className='mt-1 font-medium'>
+                  #{operation.parent_operation_id}
+                </dd>
+              </div>
+            ) : null}
+            {operation.retry_of_operation_id ? (
+              <div>
+                <dt className='text-muted-foreground text-xs'>
+                  {t('Retry of operation')}
+                </dt>
+                <dd className='mt-1 font-medium'>
+                  #{operation.retry_of_operation_id}
+                </dd>
+              </div>
+            ) : null}
+            {operation.retry_sequence ? (
+              <div>
+                <dt className='text-muted-foreground text-xs'>
+                  {t('Retry sequence')}
+                </dt>
+                <dd className='mt-1 font-medium'>
+                  {format.number(operation.retry_sequence)}
+                </dd>
+              </div>
+            ) : null}
+          </dl>
+        </section>
+      ) : null}
+    </>
+  )
+}
+
+function invalidateOperationViews(
+  queryClient: QueryClient,
+  previousOperationId: number,
+  nextOperationId: number
+) {
+  void Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: channelRoutingQueryKeys.operationsRoot(),
+    }),
+    queryClient.invalidateQueries({
+      queryKey: channelRoutingQueryKeys.controlAuditsRoot(),
+    }),
+    queryClient.invalidateQueries({
+      queryKey: channelRoutingQueryKeys.operation(previousOperationId),
+    }),
+    queryClient.invalidateQueries({
+      queryKey: channelRoutingQueryKeys.operation(nextOperationId),
+    }),
+  ])
+}
+
+function operationActionAllowed(
+  action: OperationAction | null,
+  canRetry: boolean,
+  canCancel: boolean
+): boolean {
+  if (action === 'retry') return canRetry
+  if (action === 'cancel') return canCancel
+  return false
 }

@@ -17,8 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import {
-  BadgeCheckIcon,
   CheckmarkCircle02Icon,
+  Delete02Icon,
   EyeIcon,
   FlaskConicalIcon,
   RocketIcon,
@@ -40,20 +40,22 @@ export function ChannelRoutingPolicyDraftActions(props: {
   canWrite: boolean
   canDeploy: boolean
   validating: boolean
+  deleting: boolean
   mutationsDisabled?: boolean
   onValidate: () => void
   onSimulate: () => void
-  onApprove: () => void
   onPublish: () => void
+  onDelete: () => void
   onView: () => void
 }) {
   const { t } = useTranslation()
   const simulationAvailable =
-    props.draft.status === 'validated' || props.draft.status === 'published'
+    props.draft.workspace_state === 'working' &&
+    props.draft.status === 'validated'
 
   return (
     <div className='flex flex-wrap items-center justify-end gap-1'>
-      {props.canWrite && props.draft.status === 'editing' ? (
+      {props.canWrite && props.draft.can_validate ? (
         <Tooltip>
           <TooltipTrigger
             render={
@@ -99,51 +101,51 @@ export function ChannelRoutingPolicyDraftActions(props: {
           <TooltipContent>{t('Simulate policy')}</TooltipContent>
         </Tooltip>
       ) : null}
-      {props.canDeploy && props.draft.status === 'validated' ? (
-        <>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  size='icon-sm'
-                  variant='ghost'
-                  aria-label={t('Approve deployment')}
-                  disabled={props.mutationsDisabled}
-                  onClick={props.onApprove}
-                />
-              }
-            >
-              <HugeiconsIcon
-                icon={BadgeCheckIcon}
-                data-icon='inline-start'
-                strokeWidth={2}
-                aria-hidden='true'
+      {props.canDeploy && props.draft.can_publish ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                size='icon-sm'
+                variant='ghost'
+                aria-label={t('Publish policy')}
+                disabled={props.mutationsDisabled}
+                onClick={props.onPublish}
               />
-            </TooltipTrigger>
-            <TooltipContent>{t('Approve deployment')}</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  size='icon-sm'
-                  variant='ghost'
-                  aria-label={t('Publish policy')}
-                  disabled={props.mutationsDisabled}
-                  onClick={props.onPublish}
-                />
-              }
-            >
-              <HugeiconsIcon
-                icon={RocketIcon}
-                data-icon='inline-start'
-                strokeWidth={2}
-                aria-hidden='true'
+            }
+          >
+            <HugeiconsIcon
+              icon={RocketIcon}
+              data-icon='inline-start'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
+          </TooltipTrigger>
+          <TooltipContent>{t('Publish policy')}</TooltipContent>
+        </Tooltip>
+      ) : null}
+      {props.canWrite && props.draft.can_delete ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                size='icon-sm'
+                variant='ghost'
+                aria-label={t('Permanently delete draft')}
+                disabled={props.mutationsDisabled || props.deleting}
+                onClick={props.onDelete}
               />
-            </TooltipTrigger>
-            <TooltipContent>{t('Publish policy')}</TooltipContent>
-          </Tooltip>
-        </>
+            }
+          >
+            <HugeiconsIcon
+              icon={Delete02Icon}
+              data-icon='inline-start'
+              strokeWidth={2}
+              aria-hidden='true'
+            />
+          </TooltipTrigger>
+          <TooltipContent>{t('Permanently delete draft')}</TooltipContent>
+        </Tooltip>
       ) : null}
       <Tooltip>
         <TooltipTrigger

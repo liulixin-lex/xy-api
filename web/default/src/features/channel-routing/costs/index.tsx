@@ -19,27 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import {
   ArrowReloadHorizontalIcon,
   Coins01Icon,
+  Database01Icon,
   MultiplicationSignIcon,
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
-/*
-Copyright (C) 2023-2026 QuantumNous
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as
-published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-For commercial licensing, please contact support@quantumnous.com
-*/
 import { useIsFetching, useQueryClient } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
@@ -50,7 +33,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import { ChannelRoutingPageFrame } from '../components/page-frame'
 import { ChannelConfigurationsSection } from './channel-configurations-section'
-import { EffectiveCostsSection } from './effective-costs-section'
+import { CostCatalogSection } from './cost-catalog-section'
+import { RequestCostComparisonSection } from './request-cost-comparison-section'
 
 const route = getRouteApi('/_authenticated/channel-routing/$section')
 
@@ -61,9 +45,9 @@ export function ChannelRoutingCostsPage() {
   const queryClient = useQueryClient()
   const activeTab = search.costTab ?? 'channel-multipliers'
   const activeQueryKey =
-    activeTab === 'effective-costs'
-      ? channelRoutingQueryKeys.costsRoot()
-      : channelRoutingQueryKeys.channelConfigurationsRoot()
+    activeTab === 'channel-multipliers'
+      ? channelRoutingQueryKeys.channelConfigurationsRoot()
+      : channelRoutingQueryKeys.costCatalogRoot()
   const isFetching =
     useIsFetching({
       queryKey: activeQueryKey,
@@ -88,6 +72,7 @@ export function ChannelRoutingCostsPage() {
         >
           <HugeiconsIcon
             icon={ArrowReloadHorizontalIcon}
+            data-icon='inline-start'
             strokeWidth={2}
             className={
               isFetching ? 'animate-spin motion-reduce:animate-none' : undefined
@@ -100,7 +85,11 @@ export function ChannelRoutingCostsPage() {
       <Tabs
         value={activeTab}
         onValueChange={(value) => {
-          if (value !== 'channel-multipliers' && value !== 'effective-costs') {
+          if (
+            value !== 'channel-multipliers' &&
+            value !== 'cost-catalog' &&
+            value !== 'request-comparison'
+          ) {
             return
           }
           void navigate({
@@ -130,7 +119,18 @@ export function ChannelRoutingCostsPage() {
             {t('Channel multipliers')}
           </TabsTrigger>
           <TabsTrigger
-            value='effective-costs'
+            value='cost-catalog'
+            className='min-h-11 flex-none shrink-0 px-3'
+          >
+            <HugeiconsIcon
+              icon={Database01Icon}
+              strokeWidth={2}
+              aria-hidden='true'
+            />
+            {t('Cost catalog')}
+          </TabsTrigger>
+          <TabsTrigger
+            value='request-comparison'
             className='min-h-11 flex-none shrink-0 px-3'
           >
             <HugeiconsIcon
@@ -138,7 +138,7 @@ export function ChannelRoutingCostsPage() {
               strokeWidth={2}
               aria-hidden='true'
             />
-            {t('Effective costs')}
+            {t('Request cost comparison')}
           </TabsTrigger>
         </TabsList>
         <TabsContent value='channel-multipliers'>
@@ -146,8 +146,13 @@ export function ChannelRoutingCostsPage() {
             <ChannelConfigurationsSection />
           ) : null}
         </TabsContent>
-        <TabsContent value='effective-costs'>
-          {activeTab === 'effective-costs' ? <EffectiveCostsSection /> : null}
+        <TabsContent value='cost-catalog'>
+          {activeTab === 'cost-catalog' ? <CostCatalogSection /> : null}
+        </TabsContent>
+        <TabsContent value='request-comparison'>
+          {activeTab === 'request-comparison' ? (
+            <RequestCostComparisonSection />
+          ) : null}
         </TabsContent>
       </Tabs>
     </ChannelRoutingPageFrame>

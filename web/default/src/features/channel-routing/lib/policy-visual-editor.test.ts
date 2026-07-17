@@ -30,7 +30,7 @@ import {
 } from './policy-visual-editor'
 
 const document: PolicyDocument = {
-  schema_version: 1,
+  schema_version: 2,
   extension_root: { keep: true },
   pools: [
     {
@@ -39,6 +39,9 @@ const document: PolicyDocument = {
       display_name: 'Default',
       deployment_stage: 'shadow',
       policy_profile: 'balanced',
+      default_enabled: true,
+      default_priority: 0,
+      default_weight: 100,
       extension_pool: 'keep',
       policy: {
         weight_cost: 0.2,
@@ -56,9 +59,13 @@ const document: PolicyDocument = {
         {
           member_id: 11,
           channel_id: 101,
+          routing_generation: '00000000000000000000000000000065',
           enabled: true,
           priority: 10,
           weight: 100,
+          enabled_override: true,
+          priority_override: 10,
+          weight_override: 100,
           credential_ids: [7],
           overrides: { extension_override: true },
           extension_member: 'keep',
@@ -111,9 +118,37 @@ describe('policy visual editor transforms', () => {
       hedge: { enabled: true, extension_hedge: true },
     })
     assert.equal(member.pools[0].members[0].extension_member, 'keep')
+    assert.equal(member.pools[0].members[0].weight_override, 0)
     assert.deepEqual(member.pools[0].members[0].overrides, {
       extension_override: true,
     })
+  })
+
+  test('keeps v2 inherited values aligned with pool defaults and explicit zero overrides', () => {
+    const inherited = structuredClone(document)
+    const member = inherited.pools[0].members[0]
+    delete member.enabled_override
+    delete member.priority_override
+    delete member.weight_override
+
+    const defaultsChanged = updatePolicyPoolDocument(inherited, 0, {
+      default_enabled: false,
+      default_priority: 7,
+      default_weight: 80,
+    })
+    assert.equal(defaultsChanged.pools[0].members[0].enabled, false)
+    assert.equal(defaultsChanged.pools[0].members[0].priority, 7)
+    assert.equal(defaultsChanged.pools[0].members[0].weight, 80)
+
+    const paused = updatePolicyMemberDocument(defaultsChanged, 0, 0, {
+      enabled: false,
+      priority: 0,
+      weight: 0,
+    })
+    assert.equal(paused.pools[0].members[0].enabled_override, false)
+    assert.equal(paused.pools[0].members[0].priority_override, 0)
+    assert.equal(paused.pools[0].members[0].weight_override, 0)
+    assert.equal(paused.pools[0].members[0].weight, 0)
   })
 
   test('accepts unique positive credential ids and rejects ambiguous input', () => {
