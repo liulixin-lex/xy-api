@@ -24,7 +24,6 @@ const (
 	SystemTaskTypeMidjourneyPoll       = "midjourney_poll"
 	SystemTaskTypeAsyncTaskPoll        = "async_task_poll"
 	SystemTaskTypeRoutingCostSync      = "routing_cost_sync"
-	SystemTaskTypeRoutingAgent         = "routing_agent"
 	SystemTaskTypeBillingLogAudit      = "billing_log_audit"
 	SystemTaskTypeAsyncBillingRecovery = "async_billing_recovery"
 )
@@ -381,7 +380,7 @@ func markSystemTaskLeaseExpiredContext(ctx context.Context, taskID string) error
 			var activeOperations []RoutingOperation
 			if err := lockForUpdate(tx.WithContext(ctx)).
 				Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
-					RoutingOperationStatusPending, RoutingOperationStatusRunning,
+					RoutingOperationStatusPending, RoutingOperationStatusRunning, RoutingOperationStatusRetryWait,
 				}).
 				Find(&activeOperations).Error; err != nil {
 				return err
@@ -403,9 +402,10 @@ func markSystemTaskLeaseExpiredContext(ctx context.Context, taskID string) error
 				RoutingOperationStatusFailed, lastError, RoutingOperationResult{}, transitionTimeMs,
 			)
 			updates["attempts"] = gorm.Expr("CASE WHEN attempts < ? THEN ? ELSE attempts END", 1, 1)
+			updates["retention_category"] = RoutingOperationRetentionExtended
 			if err := tx.WithContext(ctx).Model(&RoutingOperation{}).
 				Where("system_task_id = ? AND status IN ?", task.TaskID, []RoutingOperationStatus{
-					RoutingOperationStatusPending, RoutingOperationStatusRunning,
+					RoutingOperationStatusPending, RoutingOperationStatusRunning, RoutingOperationStatusRetryWait,
 				}).Updates(updates).Error; err != nil {
 				return err
 			}

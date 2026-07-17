@@ -16,7 +16,6 @@ func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
 	t.Cleanup(ResetForTest)
 	t.Setenv("SMART_ROUTING_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_MODE", ModeEnterpriseSLO)
-	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "true")
 
 	var before SmartRoutingSetting
@@ -30,13 +29,11 @@ func TestNormalizeDoesNotReadEnvironmentOrPublish(t *testing.T) {
 		WeightThroughput:   1,
 		WeightCost:         0,
 		TopK:               0,
-		AgentEnabled:       false,
 		HedgeEnabled:       false,
 	})
 
 	assert.False(t, normalized.Enabled)
 	assert.Equal(t, ModeBalanced, normalized.Mode)
-	assert.False(t, normalized.AgentEnabled)
 	assert.False(t, normalized.HedgeEnabled)
 	assert.Equal(t, 1, normalized.TopK)
 	assert.InDelta(t, 0.5, normalized.WeightAvailability, 0.000001)
@@ -124,25 +121,21 @@ func TestGetSettingAppliesEnvOverridesEveryRead(t *testing.T) {
 	ResetForTest()
 	t.Setenv("SMART_ROUTING_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_MODE", ModeBalanced)
-	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
 	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "true")
 
 	setting := GetSetting()
 
 	assert.True(t, setting.Enabled)
 	assert.Equal(t, ModeBalanced, setting.Mode)
-	assert.True(t, setting.AgentEnabled)
 	assert.True(t, setting.HedgeEnabled)
 
 	t.Setenv("SMART_ROUTING_ENABLED", "false")
 	t.Setenv("SMART_ROUTING_MODE", "invalid")
-	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "false")
 	t.Setenv("SMART_ROUTING_HEDGE_ENABLED", "false")
 
 	setting = GetSetting()
 	assert.False(t, setting.Enabled)
 	assert.Equal(t, ModeObserve, setting.Mode)
-	assert.False(t, setting.AgentEnabled)
 	assert.False(t, setting.HedgeEnabled)
 }
 
@@ -167,6 +160,19 @@ func TestRequestProfileSettingExportsOnlyUnversionedKey(t *testing.T) {
 	assert.Equal(t, "false", values["request_profile_enabled"])
 	_, legacyPresent := values["request_profile_v2_enabled"]
 	assert.False(t, legacyPresent)
+}
+
+func TestRoutingAgentSettingsAndEnvironmentOverrideAreRetired(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	t.Setenv("SMART_ROUTING_AGENT_ENABLED", "true")
+
+	values, err := config.ConfigToMap(GetSetting())
+	require.NoError(t, err)
+	for _, key := range []string{"agent_enabled", "agent_auto_apply", "agent_model"} {
+		_, exists := values[key]
+		assert.False(t, exists, key)
+	}
 }
 
 func TestUpdateSettingNormalizesAndStoresValues(t *testing.T) {

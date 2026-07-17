@@ -598,10 +598,11 @@ func TestRefreshRoutingHotcacheHydratesOnlyCurrentBreakerSemanticVersion(t *test
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 	})
-	require.NoError(t, db.Create(&model.Channel{Id: 11, Name: "current-single", Key: "single-key"}).Error)
+	channel := model.Channel{Id: 11, Name: "current-single", Key: "single-key"}
+	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&[]model.RoutingBreakerState{
 		{ChannelID: 10, APIKeyIndex: -1, ModelName: "legacy", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: 0, UpdatedTime: common.GetTimestamp()},
-		{ChannelID: 11, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: common.GetTimestamp()},
+		{ChannelID: 11, ChannelGeneration: channel.RoutingGeneration, APIKeyIndex: -1, ModelName: "current", Group: "default", State: model.RoutingBreakerStateOpen, SemanticVersion: model.RoutingBreakerSemanticVersion, UpdatedTime: common.GetTimestamp()},
 	}).Error)
 
 	summary, err := refreshRoutingHotcacheFromDB(context.Background(), smart_routing_setting.GetSetting())
@@ -623,10 +624,15 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 		routinghotcache.ResetForTest()
 	})
 
-	require.NoError(t, db.Create(&[]model.Channel{
+	channels := []model.Channel{
 		{Id: 21, Name: "single", Key: "single-key"},
 		{Id: 22, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
-	}).Error)
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	generationByChannelID := map[int]string{
+		channels[0].Id: channels[0].RoutingGeneration,
+		channels[1].Id: channels[1].RoutingGeneration,
+	}
 	now := common.GetTimestamp()
 	type routingKey struct {
 		channelID   int
@@ -643,11 +649,11 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 	breakers := make([]model.RoutingBreakerState, 0, len(keys))
 	for _, key := range keys {
 		metrics = append(metrics, model.RoutingChannelMetric{
-			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
+			ChannelID: key.channelID, ChannelGeneration: generationByChannelID[key.channelID], APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
 			Group: "default", BucketTs: now, RequestCount: 1, SuccessCount: 1,
 		})
 		breakers = append(breakers, model.RoutingBreakerState{
-			ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
+			ChannelID: key.channelID, ChannelGeneration: generationByChannelID[key.channelID], APIKeyIndex: key.apiKeyIndex, ModelName: key.modelName,
 			Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
 			State: model.RoutingBreakerStateOpen, UpdatedTime: now,
 		})
@@ -665,7 +671,7 @@ func TestRefreshRoutingHotcacheIgnoresLegacyMultiKeyAndPositiveIndexRows(t *test
 	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
 
 	for _, key := range keys {
-		cacheKey := routinghotcache.Key{ChannelID: key.channelID, APIKeyIndex: key.apiKeyIndex, Model: key.modelName, Group: "default"}
+		cacheKey := routinghotcache.Key{ChannelID: key.channelID, ChannelGeneration: generationByChannelID[key.channelID], APIKeyIndex: key.apiKeyIndex, Model: key.modelName, Group: "default"}
 		_, metricOK := routinghotcache.GetMetric(cacheKey)
 		_, breakerOK := routinghotcache.GetBreaker(cacheKey)
 		want := key.channelID == 21 && key.apiKeyIndex == model.RoutingMetricSingleKeyIndex
@@ -686,19 +692,20 @@ func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 	})
-	require.NoError(t, db.Create(&[]model.Channel{
+	channels := []model.Channel{
 		{Id: 23, Name: "single", Key: "single-key"},
 		{Id: 24, Name: "multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
-	}).Error)
+	}
+	require.NoError(t, db.Create(&channels).Error)
 
 	const invalidRows = 5000
 	now := common.GetTimestamp()
 	require.NoError(t, db.Create(&model.RoutingChannelMetric{
-		ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
+		ChannelID: 23, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
 		Group: "default", BucketTs: now, RequestCount: 1, SuccessCount: 1,
 	}).Error)
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
-		ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
+		ChannelID: 23, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "valid-single",
 		Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
 		State: model.RoutingBreakerStateDegraded, UpdatedTime: now,
 	}).Error)
@@ -707,11 +714,11 @@ func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
 	for i := 0; i < invalidRows; i++ {
 		modelName := fmt.Sprintf("legacy-multi-%04d", i)
 		metrics = append(metrics, model.RoutingChannelMetric{
-			ChannelID: 24, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
+			ChannelID: 24, ChannelGeneration: channels[1].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
 			Group: "default", BucketTs: now, RequestCount: 1,
 		})
 		breakers = append(breakers, model.RoutingBreakerState{
-			ChannelID: 24, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
+			ChannelID: 24, ChannelGeneration: channels[1].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: modelName,
 			Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
 			State: model.RoutingBreakerStateOpen, UpdatedTime: now,
 		})
@@ -734,7 +741,7 @@ func TestRefreshRoutingHotcachePagesPastLegacyMultiKeyRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary["metrics"])
 	assert.Equal(t, 1, summary["breakers"])
-	cacheKey := routinghotcache.Key{ChannelID: 23, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "valid-single", Group: "default"}
+	cacheKey := routinghotcache.Key{ChannelID: 23, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "valid-single", Group: "default"}
 	_, metricOK := routinghotcache.GetMetric(cacheKey)
 	_, breakerOK := routinghotcache.GetBreaker(cacheKey)
 	assert.True(t, metricOK)
@@ -754,14 +761,15 @@ func TestRefreshRoutingHotcacheDoesNotPageThroughExpiredBreakerHistory(t *testin
 		routingbreaker.ResetDefaultForTest(routingbreaker.DefaultConfig())
 		routinghotcache.ResetForTest()
 	})
-	require.NoError(t, db.Create(&[]model.Channel{
+	channels := []model.Channel{
 		{Id: 25, Name: "expired-multi", Key: "key-0\nkey-1", ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 		{Id: 26, Name: "fresh-single", Key: "single-key"},
-	}).Error)
+	}
+	require.NoError(t, db.Create(&channels).Error)
 
 	now := common.GetTimestamp()
 	require.NoError(t, db.Create(&model.RoutingBreakerState{
-		ChannelID: 26, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "fresh-single",
+		ChannelID: 26, ChannelGeneration: channels[1].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "fresh-single",
 		Group: "default", SemanticVersion: model.RoutingBreakerSemanticVersion,
 		State: model.RoutingBreakerStateDegraded, UpdatedTime: now,
 	}).Error)
@@ -769,7 +777,7 @@ func TestRefreshRoutingHotcacheDoesNotPageThroughExpiredBreakerHistory(t *testin
 	expired := make([]model.RoutingBreakerState, 0, expiredRows)
 	for i := 0; i < expiredRows; i++ {
 		expired = append(expired, model.RoutingBreakerState{
-			ChannelID: 25, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			ChannelID: 25, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
 			ModelName: fmt.Sprintf("expired-multi-%04d", i), Group: "default",
 			SemanticVersion: model.RoutingBreakerSemanticVersion,
 			State:           model.RoutingBreakerStateOpen,
@@ -797,10 +805,10 @@ func TestRefreshRoutingHotcacheDoesNotPageThroughExpiredBreakerHistory(t *testin
 	assert.Equal(t, 1, routingbreaker.RuntimeStats().Entries)
 
 	_, freshOK := routinghotcache.GetBreaker(routinghotcache.Key{
-		ChannelID: 26, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "fresh-single", Group: "default",
+		ChannelID: 26, ChannelGeneration: channels[1].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "fresh-single", Group: "default",
 	})
 	_, expiredOK := routinghotcache.GetBreaker(routinghotcache.Key{
-		ChannelID: 25, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "expired-multi-0000", Group: "default",
+		ChannelID: 25, ChannelGeneration: channels[0].RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "expired-multi-0000", Group: "default",
 	})
 	assert.True(t, freshOK)
 	assert.False(t, expiredOK)
@@ -816,9 +824,10 @@ func TestRefreshRoutingHotcacheReturnsEligibilityLookupErrors(t *testing.T) {
 		common.MemoryCacheEnabled = previousMemoryCache
 		routinghotcache.ResetForTest()
 	})
-	require.NoError(t, db.Create(&model.Channel{Id: 27, Name: "single", Key: "single-key"}).Error)
+	channel := model.Channel{Id: 27, Name: "single", Key: "single-key"}
+	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelMetric{
-		ChannelID: 27, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
+		ChannelID: 27, ChannelGeneration: channel.RoutingGeneration, APIKeyIndex: model.RoutingMetricSingleKeyIndex, ModelName: "gpt-test",
 		Group: "default", BucketTs: common.GetTimestamp(), RequestCount: 1,
 	}).Error)
 
