@@ -51,6 +51,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import { authenticationOrAuthorizationStatus } from '@/lib/query-error-policy'
 
 import {
   createChannelRoutingAuditExport,
@@ -166,14 +167,20 @@ export function ChannelRoutingAuditExportSheet(props: {
       })
       toast.success(t('Audit export ready'))
     },
-    onError: () => {
+    onError: (error) => {
+      if (authenticationOrAuthorizationStatus(error) != null) return
       toast.error(t('Could not create the audit export. Try again.'))
     },
+    meta: { handleErrorLocally: true },
   })
   const downloadExport = useMutation({
     mutationFn: downloadChannelRoutingAuditExport,
     onSuccess: () => toast.success(t('Audit export downloaded')),
-    onError: () => toast.error(t('Could not download the audit export.')),
+    onError: (error) => {
+      if (authenticationOrAuthorizationStatus(error) != null) return
+      toast.error(t('Could not download the audit export.'))
+    },
+    meta: { handleErrorLocally: true },
   })
   const resetCreateExport = createExport.reset
   const resetDownloadExport = downloadExport.reset

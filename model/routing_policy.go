@@ -23,7 +23,8 @@ import (
 )
 
 const (
-	RoutingPolicySchemaVersion        = 1
+	RoutingPolicyLegacySchemaVersion  = 1
+	RoutingPolicySchemaVersion        = 2
 	RoutingPolicyMaxMembersPerPool    = 4_096
 	RoutingPolicyCanaryMinBasisPoints = 100
 	RoutingPolicyCanaryMaxBasisPoints = 500
@@ -66,6 +67,7 @@ var (
 	ErrRoutingPolicyContentCorrupt     = errors.New("routing policy content is corrupt")
 	ErrRoutingPolicyPoolIdentity       = errors.New("routing policy pool identity cannot be rebound")
 	ErrRoutingPolicyMemberIdentity     = errors.New("routing policy member identity cannot be rebound")
+	ErrRoutingPolicyLegacyRollback     = errors.New("legacy routing policy rollback requires a v2 conversion draft")
 	ErrRoutingRuntimeCheckpointInvalid = errors.New("invalid routing runtime checkpoint")
 	ErrRoutingConfigOutboxClaimLost    = errors.New("routing config outbox claim lost")
 	errRoutingPolicyDatabaseNil        = errors.New("routing policy database is nil")
@@ -145,6 +147,9 @@ type RoutingPolicyPoolRevision struct {
 	DeploymentStage string  `json:"deployment_stage" gorm:"type:varchar(16);not null;index"`
 	PolicyProfile   string  `json:"policy_profile" gorm:"type:varchar(32);not null;index"`
 	PolicyJSON      string  `json:"-" gorm:"type:text;not null"`
+	DefaultEnabled  *bool   `json:"-"`
+	DefaultPriority *int64  `json:"-" gorm:"bigint"`
+	DefaultWeight   *int64  `json:"-" gorm:"bigint"`
 	ExtensionsJSON  *string `json:"-" gorm:"type:text"`
 }
 
@@ -166,9 +171,13 @@ type RoutingPolicyMemberRevision struct {
 	PoolID            int     `json:"pool_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:2;index:idx_routing_policy_member_pool,priority:2"`
 	MemberID          int     `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_revision,priority:2;index"`
 	ChannelID         int     `json:"channel_id" gorm:"not null;uniqueIndex:idx_routing_policy_member_channel,priority:3;index"`
+	RoutingGeneration string  `json:"routing_generation,omitempty" gorm:"type:varchar(32);index"`
 	Enabled           bool    `json:"enabled" gorm:"not null"`
 	Priority          int64   `json:"priority" gorm:"bigint;not null"`
 	Weight            int64   `json:"weight" gorm:"bigint;not null"`
+	EnabledOverride   *bool   `json:"-"`
+	PriorityOverride  *int64  `json:"-" gorm:"bigint"`
+	WeightOverride    *int64  `json:"-" gorm:"bigint"`
 	CredentialIDsJSON string  `json:"-" gorm:"type:text;not null"`
 	OverridesJSON     string  `json:"-" gorm:"type:text;not null"`
 	ExtensionsJSON    *string `json:"-" gorm:"type:text"`
@@ -264,19 +273,26 @@ type RoutingPolicyPoolContent struct {
 	DeploymentStage string                       `json:"deployment_stage"`
 	PolicyProfile   string                       `json:"policy_profile"`
 	Policy          json.RawMessage              `json:"policy"`
+	DefaultEnabled  *bool                        `json:"default_enabled,omitempty"`
+	DefaultPriority *int64                       `json:"default_priority,omitempty"`
+	DefaultWeight   *int64                       `json:"default_weight,omitempty"`
 	Members         []RoutingPolicyMemberContent `json:"members"`
 	ExtensionFields map[string]json.RawMessage   `json:"-"`
 }
 
 type RoutingPolicyMemberContent struct {
-	MemberID        int                        `json:"member_id"`
-	ChannelID       int                        `json:"channel_id"`
-	Enabled         bool                       `json:"enabled"`
-	Priority        int64                      `json:"priority"`
-	Weight          int64                      `json:"weight"`
-	CredentialIDs   []int                      `json:"credential_ids"`
-	Overrides       json.RawMessage            `json:"overrides"`
-	ExtensionFields map[string]json.RawMessage `json:"-"`
+	MemberID          int                        `json:"member_id"`
+	ChannelID         int                        `json:"channel_id"`
+	RoutingGeneration string                     `json:"routing_generation,omitempty"`
+	Enabled           bool                       `json:"enabled"`
+	Priority          int64                      `json:"priority"`
+	Weight            int64                      `json:"weight"`
+	EnabledOverride   *bool                      `json:"enabled_override,omitempty"`
+	PriorityOverride  *int64                     `json:"priority_override,omitempty"`
+	WeightOverride    *int64                     `json:"weight_override,omitempty"`
+	CredentialIDs     []int                      `json:"credential_ids"`
+	Overrides         json.RawMessage            `json:"overrides"`
+	ExtensionFields   map[string]json.RawMessage `json:"-"`
 }
 
 func (document RoutingPolicyDocument) MarshalJSON() ([]byte, error) {
@@ -351,7 +367,8 @@ func routingPolicyDocumentKnownField(key string) bool {
 
 func routingPolicyPoolKnownField(key string) bool {
 	switch key {
-	case "pool_id", "group_name", "display_name", "deployment_stage", "policy_profile", "policy", "members":
+	case "pool_id", "group_name", "display_name", "deployment_stage", "policy_profile", "policy",
+		"default_enabled", "default_priority", "default_weight", "members":
 		return true
 	default:
 		return false
@@ -360,7 +377,8 @@ func routingPolicyPoolKnownField(key string) bool {
 
 func routingPolicyMemberKnownField(key string) bool {
 	switch key {
-	case "member_id", "channel_id", "enabled", "priority", "weight", "credential_ids", "overrides":
+	case "member_id", "channel_id", "routing_generation", "enabled", "priority", "weight",
+		"enabled_override", "priority_override", "weight_override", "credential_ids", "overrides":
 		return true
 	default:
 		return false
@@ -639,6 +657,9 @@ func rollbackRoutingPolicyRevisionWithOperationContext(
 	if err != nil {
 		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
 	}
+	if source.SchemaVersion != RoutingPolicySchemaVersion {
+		return RoutingPolicyPublishResult{}, RoutingOperation{}, ErrRoutingPolicyLegacyRollback
+	}
 	evaluationHash, err := routingPolicyRollbackOperationHash(expectedRevision, source, activation)
 	if err != nil {
 		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
@@ -679,13 +700,6 @@ func rollbackRoutingPolicyRevisionWithOperationContext(
 		if head.CurrentRevision != expectedRevision {
 			return newRoutingPolicyRevisionConflict(expectedRevision, head)
 		}
-		if routingPolicyPublishRequiresApproval(document, activation) {
-			if _, err := requireRoutingPolicyRollbackApprovalQuorumDBContext(
-				ctx, tx, head, source, activation, RoutingPolicyRequiredApprovals,
-			); err != nil {
-				return err
-			}
-		}
 		published, err = publishNormalizedRoutingPolicyRevisionTx(
 			ctx, tx, expectedRevision, sourceRevision, document, source.ContentHash,
 			activation, changedPoolIDs, common.GetTimestamp(),
@@ -713,7 +727,12 @@ func rollbackRoutingPolicyRevisionWithOperationContext(
 			}{SourceRevision: sourceRevision},
 			time.Now().UnixMilli(),
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		return insertRoutingOperationTransitionAuditTx(
+			tx.WithContext(ctx), routingOperationInitialAuditState(operation), operation, RoutingControlActionRollback,
+		)
 	})
 	if err != nil {
 		return RoutingPolicyPublishResult{}, RoutingOperation{}, err
@@ -803,12 +822,8 @@ func RollbackRoutingPolicyRevisionDBContext(
 		if err != nil {
 			return err
 		}
-		if routingPolicyPublishRequiresApproval(document, activation) {
-			if _, err := requireRoutingPolicyRollbackApprovalQuorumDBContext(
-				ctx, tx, head, target, activation, RoutingPolicyRequiredApprovals,
-			); err != nil {
-				return err
-			}
+		if target.SchemaVersion != RoutingPolicySchemaVersion {
+			return ErrRoutingPolicyLegacyRollback
 		}
 		changedPoolIDs := make([]int, len(document.Pools))
 		for index := range document.Pools {
@@ -888,6 +903,9 @@ func LoadRoutingPolicyRevisionDBContext(ctx context.Context, db *gorm.DB, revisi
 			DeploymentStage: row.DeploymentStage,
 			PolicyProfile:   row.PolicyProfile,
 			Policy:          json.RawMessage(row.PolicyJSON),
+			DefaultEnabled:  row.DefaultEnabled,
+			DefaultPriority: row.DefaultPriority,
+			DefaultWeight:   row.DefaultWeight,
 			Members:         make([]RoutingPolicyMemberContent, 0),
 			ExtensionFields: extensions,
 		}
@@ -906,15 +924,44 @@ func LoadRoutingPolicyRevisionDBContext(ctx context.Context, db *gorm.DB, revisi
 		if err != nil {
 			return RoutingPolicyDocument{}, RoutingPolicyRevision{}, err
 		}
+		if revision.SchemaVersion == RoutingPolicySchemaVersion {
+			pool := document.Pools[poolIndex]
+			if pool.DefaultEnabled == nil || pool.DefaultPriority == nil || pool.DefaultWeight == nil {
+				return RoutingPolicyDocument{}, RoutingPolicyRevision{}, fmt.Errorf(
+					"%w: v2 pool defaults are incomplete", ErrRoutingPolicyContentCorrupt,
+				)
+			}
+			effectiveEnabled := *pool.DefaultEnabled
+			effectivePriority := *pool.DefaultPriority
+			effectiveWeight := *pool.DefaultWeight
+			if row.EnabledOverride != nil {
+				effectiveEnabled = *row.EnabledOverride
+			}
+			if row.PriorityOverride != nil {
+				effectivePriority = *row.PriorityOverride
+			}
+			if row.WeightOverride != nil {
+				effectiveWeight = *row.WeightOverride
+			}
+			if row.Enabled != effectiveEnabled || row.Priority != effectivePriority || row.Weight != effectiveWeight {
+				return RoutingPolicyDocument{}, RoutingPolicyRevision{}, fmt.Errorf(
+					"%w: v2 member effective values conflict with overrides", ErrRoutingPolicyContentCorrupt,
+				)
+			}
+		}
 		document.Pools[poolIndex].Members = append(document.Pools[poolIndex].Members, RoutingPolicyMemberContent{
-			MemberID:        row.MemberID,
-			ChannelID:       row.ChannelID,
-			Enabled:         row.Enabled,
-			Priority:        row.Priority,
-			Weight:          row.Weight,
-			CredentialIDs:   credentialIDs,
-			Overrides:       json.RawMessage(row.OverridesJSON),
-			ExtensionFields: extensions,
+			MemberID:          row.MemberID,
+			ChannelID:         row.ChannelID,
+			RoutingGeneration: row.RoutingGeneration,
+			Enabled:           row.Enabled,
+			Priority:          row.Priority,
+			Weight:            row.Weight,
+			EnabledOverride:   row.EnabledOverride,
+			PriorityOverride:  row.PriorityOverride,
+			WeightOverride:    row.WeightOverride,
+			CredentialIDs:     credentialIDs,
+			Overrides:         json.RawMessage(row.OverridesJSON),
+			ExtensionFields:   extensions,
 		})
 	}
 
@@ -1448,7 +1495,11 @@ func publishNormalizedRoutingPolicyRevisionTx(
 	if finalize.RowsAffected != 1 {
 		return RoutingPolicyPublishResult{}, ErrRoutingPolicyRevisionConflict
 	}
-	return RoutingPolicyPublishResult{Revision: revision, Activation: activation, Outbox: outbox}, nil
+	result := RoutingPolicyPublishResult{Revision: revision, Activation: activation, Outbox: outbox}
+	if err := insertRoutingPolicyPublicationAuditTx(ctx, tx, head, document, result); err != nil {
+		return RoutingPolicyPublishResult{}, err
+	}
+	return result, nil
 }
 
 func ensureRoutingPolicyHeadTx(tx *gorm.DB) (RoutingPolicyHead, error) {
@@ -1498,7 +1549,8 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 	if document.SchemaVersion == 0 {
 		document.SchemaVersion = RoutingPolicySchemaVersion
 	}
-	if document.SchemaVersion != RoutingPolicySchemaVersion || len(document.Pools) > routingTopologyMaxPools {
+	if document.SchemaVersion != RoutingPolicyLegacySchemaVersion &&
+		document.SchemaVersion != RoutingPolicySchemaVersion || len(document.Pools) > routingTopologyMaxPools {
 		return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 	}
 
@@ -1536,6 +1588,28 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 		}
 		if pool.DisplayName == "" {
 			pool.DisplayName = pool.GroupName
+		}
+		if document.SchemaVersion == RoutingPolicySchemaVersion {
+			defaultEnabled := true
+			defaultPriority := int64(0)
+			defaultWeight := int64(100)
+			if pool.DefaultEnabled != nil {
+				defaultEnabled = *pool.DefaultEnabled
+			}
+			if pool.DefaultPriority != nil {
+				defaultPriority = *pool.DefaultPriority
+			}
+			if pool.DefaultWeight != nil {
+				defaultWeight = *pool.DefaultWeight
+			}
+			if defaultWeight < 0 {
+				return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
+			}
+			pool.DefaultEnabled = &defaultEnabled
+			pool.DefaultPriority = &defaultPriority
+			pool.DefaultWeight = &defaultWeight
+		} else if pool.DefaultEnabled != nil || pool.DefaultPriority != nil || pool.DefaultWeight != nil {
+			return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 		}
 		if _, exists := poolIDs[pool.PoolID]; exists {
 			return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
@@ -1582,6 +1656,42 @@ func normalizeRoutingPolicyDocument(document RoutingPolicyDocument) (RoutingPoli
 			}
 			member.ExtensionFields = memberExtensions
 			if member.MemberID <= 0 || member.ChannelID <= 0 || member.Weight < 0 {
+				return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
+			}
+			if document.SchemaVersion == RoutingPolicySchemaVersion {
+				if member.RoutingGeneration != "" && !validRoutingIdentity(member.RoutingGeneration) {
+					return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
+				}
+				if member.WeightOverride != nil && *member.WeightOverride < 0 {
+					return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
+				}
+				if member.RoutingGeneration == "" &&
+					member.EnabledOverride == nil && member.PriorityOverride == nil && member.WeightOverride == nil &&
+					(member.Enabled || member.Priority != 0 || member.Weight != 0) {
+					enabled := member.Enabled
+					priority := member.Priority
+					weight := member.Weight
+					member.EnabledOverride = &enabled
+					member.PriorityOverride = &priority
+					member.WeightOverride = &weight
+				}
+				effectiveEnabled := *pool.DefaultEnabled
+				effectivePriority := *pool.DefaultPriority
+				effectiveWeight := *pool.DefaultWeight
+				if member.EnabledOverride != nil {
+					effectiveEnabled = *member.EnabledOverride
+				}
+				if member.PriorityOverride != nil {
+					effectivePriority = *member.PriorityOverride
+				}
+				if member.WeightOverride != nil {
+					effectiveWeight = *member.WeightOverride
+				}
+				member.Enabled = effectiveEnabled
+				member.Priority = effectivePriority
+				member.Weight = effectiveWeight
+			} else if member.RoutingGeneration != "" || member.EnabledOverride != nil ||
+				member.PriorityOverride != nil || member.WeightOverride != nil {
 				return RoutingPolicyDocument{}, "", ErrRoutingPolicyInvalid
 			}
 			if _, exists := memberIDs[member.MemberID]; exists {
@@ -1673,9 +1783,10 @@ func validateRoutingPolicyPoolIdentitiesTx(tx *gorm.DB, document RoutingPolicyDo
 
 func validateRoutingPolicyMemberIdentitiesTx(tx *gorm.DB, document RoutingPolicyDocument) error {
 	type memberIdentity struct {
-		MemberID  int
-		PoolID    int
-		ChannelID int
+		MemberID          int
+		PoolID            int
+		ChannelID         int
+		RoutingGeneration string
 	}
 	desired := make(map[int]memberIdentity, routingPolicyDocumentMemberCount(document))
 	memberIDs := make([]int, 0, len(desired))
@@ -1685,6 +1796,7 @@ func validateRoutingPolicyMemberIdentitiesTx(tx *gorm.DB, document RoutingPolicy
 			member := pool.Members[memberIndex]
 			desired[member.MemberID] = memberIdentity{
 				MemberID: member.MemberID, PoolID: pool.PoolID, ChannelID: member.ChannelID,
+				RoutingGeneration: member.RoutingGeneration,
 			}
 			memberIDs = append(memberIDs, member.MemberID)
 		}
@@ -1697,15 +1809,17 @@ func validateRoutingPolicyMemberIdentitiesTx(tx *gorm.DB, document RoutingPolicy
 		end := min(start+routingPolicyMemberInsertBatch, len(memberIDs))
 		var historical []memberIdentity
 		if err := tx.Model(&RoutingPolicyMemberRevision{}).
-			Select("member_id", "pool_id", "channel_id").
+			Select("member_id", "pool_id", "channel_id", "routing_generation").
 			Where("member_id IN ?", memberIDs[start:end]).
-			Group("member_id, pool_id, channel_id").
+			Group("member_id, pool_id, channel_id, routing_generation").
 			Find(&historical).Error; err != nil {
 			return err
 		}
 		for index := range historical {
 			identity, exists := desired[historical[index].MemberID]
-			if !exists || identity.PoolID != historical[index].PoolID || identity.ChannelID != historical[index].ChannelID {
+			if !exists || identity.PoolID != historical[index].PoolID || identity.ChannelID != historical[index].ChannelID ||
+				historical[index].RoutingGeneration != "" &&
+					identity.RoutingGeneration != historical[index].RoutingGeneration {
 				return ErrRoutingPolicyMemberIdentity
 			}
 		}
@@ -1859,6 +1973,9 @@ func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) (
 			DeploymentStage: pool.DeploymentStage,
 			PolicyProfile:   pool.PolicyProfile,
 			PolicyJSON:      string(pool.Policy),
+			DefaultEnabled:  pool.DefaultEnabled,
+			DefaultPriority: pool.DefaultPriority,
+			DefaultWeight:   pool.DefaultWeight,
 			ExtensionsJSON:  poolExtensionsJSON,
 		})
 		for memberIndex := range pool.Members {
@@ -1879,9 +1996,13 @@ func routingPolicyRevisionRows(revision int64, document RoutingPolicyDocument) (
 				PoolID:            pool.PoolID,
 				MemberID:          member.MemberID,
 				ChannelID:         member.ChannelID,
+				RoutingGeneration: member.RoutingGeneration,
 				Enabled:           member.Enabled,
 				Priority:          member.Priority,
 				Weight:            member.Weight,
+				EnabledOverride:   member.EnabledOverride,
+				PriorityOverride:  member.PriorityOverride,
+				WeightOverride:    member.WeightOverride,
 				CredentialIDsJSON: string(credentialIDs),
 				OverridesJSON:     string(member.Overrides),
 				ExtensionsJSON:    memberExtensionsJSON,

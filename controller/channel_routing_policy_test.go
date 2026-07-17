@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -124,7 +126,8 @@ func TestChannelRoutingPolicyDraftAPIUsesETagCASAndBoundedSummaries(t *testing.T
 	decodedBase, decodedDocument, err := decodeChannelRoutingPolicyDraftCreate(bytes.NewReader(createBody))
 	require.NoError(t, err)
 	assert.Equal(t, base.Revision.Revision, decodedBase)
-	assert.Equal(t, int64(200), decodedDocument.Pools[0].Members[0].Weight)
+	require.NotNil(t, decodedDocument.Pools[0].Members[0].WeightOverride)
+	assert.Equal(t, int64(200), *decodedDocument.Pools[0].Members[0].WeightOverride)
 	assert.Contains(t, decodedDocument.ExtensionFields, "root_extension")
 	assert.Contains(t, decodedDocument.Pools[0].ExtensionFields, "pool_extension")
 	assert.Contains(t, decodedDocument.Pools[0].Members[0].ExtensionFields, "member_extension")
@@ -225,7 +228,7 @@ func TestChannelRoutingPolicyDraftAPIUsesETagCASAndBoundedSummaries(t *testing.T
 	require.NoError(t, common.Unmarshal(validateRecorder.Body.Bytes(), &validatedEnvelope))
 	assert.Equal(t, model.RoutingPolicyDraftStatusValidated, validatedEnvelope.Data.Status)
 
-	enqueueControllerReplayAudit(t, 11, "draft-simulation-history")
+	enqueueControllerReplayAuditWithCandidates(t, 11, "draft-simulation-history", 101, 1001, 102, 1002)
 	flushed, err := channelrouting.FlushDecisionAuditsContext(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, flushed)
@@ -254,8 +257,24 @@ func TestChannelRoutingPolicyDraftAPIUsesETagCASAndBoundedSummaries(t *testing.T
 	assert.Equal(t, createdEnvelope.Data.ID, operation.SubjectID)
 	assert.Equal(t, 11, operation.PoolID)
 	assert.Len(t, operation.ResultPayloadHash, 64)
+	var evidence model.RoutingPolicySimulationEvidence
+	require.NoError(t, db.Where("operation_id = ?", operation.ID).First(&evidence).Error)
 
-	enqueueControllerReplayAudit(t, 11, "draft-simulation-history-newer")
+	simulationReplayRecorder := httptest.NewRecorder()
+	simulationReplayContext, _ := gin.CreateTestContext(simulationReplayRecorder)
+	simulationReplayContext.Params = detailContext.Params
+	simulationReplayContext.Request = httptest.NewRequest(
+		http.MethodPost, "/api/channel-routing/policy-drafts/1/simulate",
+		bytes.NewReader(channelRoutingPolicyDraftBody(t, map[string]any{"pool_id": 11, "limit": 10})),
+	)
+	simulationReplayContext.Request.Header.Set("If-Match", validateETag)
+	simulationReplayContext.Request.Header.Set("Idempotency-Key", "policy-simulation-0001")
+	SimulateChannelRoutingPolicyDraft(simulationReplayContext)
+	require.Equal(t, http.StatusOK, simulationReplayRecorder.Code, simulationReplayRecorder.Body.String())
+	assert.Contains(t, simulationReplayRecorder.Body.String(), fmt.Sprintf(`"evidence":{"id":%d`, evidence.ID))
+	assert.Contains(t, simulationReplayRecorder.Body.String(), fmt.Sprintf(`"operation":{"id":%d`, operation.ID))
+
+	enqueueControllerReplayAuditWithCandidates(t, 11, "draft-simulation-history-newer", 101, 1001, 102, 1002)
 	flushed, err = channelrouting.FlushDecisionAuditsContext(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, flushed)
@@ -417,9 +436,7 @@ func TestChannelRoutingPolicyDraftAPIUsesETagCASAndBoundedSummaries(t *testing.T
 	}
 	require.NoError(t, common.Unmarshal(listRecorder.Body.Bytes(), &listEnvelope))
 	require.True(t, listEnvelope.Success)
-	require.Len(t, listEnvelope.Data.Items, 1)
-	_, includesDocument := listEnvelope.Data.Items[0]["document"]
-	assert.False(t, includesDocument)
+	assert.Empty(t, listEnvelope.Data.Items, "published drafts leave the workspace")
 
 	eventReplay, _, cancelEvents, err := channelrouting.SubscribeRoutingEvents(0)
 	require.NoError(t, err)
@@ -434,7 +451,7 @@ func TestChannelRoutingPolicyDraftAPIUsesETagCASAndBoundedSummaries(t *testing.T
 	assert.True(t, eventTypes[channelrouting.RoutingEventTypePolicyRolledBack])
 }
 
-func TestChannelRoutingPolicyApprovalAPIEnforcesActiveDeployQuorum(t *testing.T) {
+func TestChannelRoutingPolicyActivePublishNeedsNoApprovalQuorum(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
 	seedChannelRoutingPolicyChannelForTest(t, db)
@@ -455,28 +472,6 @@ func TestChannelRoutingPolicyApprovalAPIEnforcesActiveDeployQuorum(t *testing.T)
 	etag := channelRoutingPolicyDraftETag(draft.Summary())
 	params := gin.Params{{Key: "id", Value: strconv.FormatInt(draft.ID, 10)}}
 
-	approve := func(actorID int) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Params = params
-		common.SetContextKey(ctx, constant.ContextKeyUserId, actorID)
-		ctx.Request = httptest.NewRequest(
-			http.MethodPost, "/api/channel-routing/policy-drafts/1/approvals",
-			bytes.NewReader(channelRoutingPolicyDraftBody(t, map[string]any{
-				"stage": model.RoutingDeploymentStageActive, "traffic_basis_points": 0, "reason": "deploy",
-			})),
-		)
-		ctx.Request.Header.Set("If-Match", etag)
-		ApproveChannelRoutingPolicyDraft(ctx)
-		return recorder
-	}
-
-	first := approve(10)
-	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
-	retry := approve(10)
-	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
-	assert.Contains(t, retry.Body.String(), `"created":false`)
-
 	publishRecorder := httptest.NewRecorder()
 	publishContext, _ := gin.CreateTestContext(publishRecorder)
 	publishContext.Params = params
@@ -490,38 +485,84 @@ func TestChannelRoutingPolicyApprovalAPIEnforcesActiveDeployQuorum(t *testing.T)
 	publishContext.Request.Header.Set("If-Match", etag)
 	publishContext.Request.Header.Set("Idempotency-Key", "publish-active-0001")
 	PublishChannelRoutingPolicyDraft(publishContext)
-	assert.Equal(t, http.StatusPreconditionFailed, publishRecorder.Code, publishRecorder.Body.String())
-	assert.Contains(t, publishRecorder.Body.String(), `"code":"policy_approval_required"`)
+	require.Equal(t, http.StatusOK, publishRecorder.Code, publishRecorder.Body.String())
+	assert.Contains(t, publishRecorder.Body.String(), `"status":"published"`)
+	assert.NotContains(t, publishRecorder.Body.String(), "approval")
+}
 
-	second := approve(11)
-	require.Equal(t, http.StatusCreated, second.Code, second.Body.String())
-	listRecorder := httptest.NewRecorder()
-	listContext, _ := gin.CreateTestContext(listRecorder)
-	listContext.Params = params
-	listContext.Request = httptest.NewRequest(http.MethodGet, "/api/channel-routing/policy-drafts/1/approvals", nil)
-	ListChannelRoutingPolicyApprovals(listContext)
-	require.Equal(t, http.StatusOK, listRecorder.Code, listRecorder.Body.String())
-	assert.Contains(t, listRecorder.Body.String(), `"count":2`)
-	assert.Contains(t, listRecorder.Body.String(), `"quorum":true`)
+func TestChannelRoutingPolicyFailedSimulationRequiresExplicitRiskAcceptance(t *testing.T) {
+	db := openChannelRoutingControllerDB(t)
+	withChannelRoutingControllerState(t, db)
+	seedChannelRoutingPolicyChannelForTest(t, db)
+	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
+	base, err := model.PublishRoutingPolicyRevisionContext(
+		context.Background(), 0, channelRoutingPolicyDraftDocumentForTest(100),
+		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
+	)
+	require.NoError(t, err)
+	draft, err := model.CreateRoutingPolicyDraftContext(
+		context.Background(), base.Revision.Revision, channelRoutingPolicyDraftDocumentForTest(200), 2,
+	)
+	require.NoError(t, err)
+	draft, err = model.ValidateRoutingPolicyDraftContext(
+		context.Background(), draft.ID, draft.Version, draft.ETag, 2,
+	)
+	require.NoError(t, err)
+	head, err := model.GetRoutingPolicyHeadContext(context.Background())
+	require.NoError(t, err)
+	_, err = model.CreateRoutingPolicySimulationEvidenceContext(
+		context.Background(), model.RoutingPolicySimulationEvidenceSpec{
+			OperationID: 9_901, Draft: draft.Summary(), Head: head, TargetBound: true,
+			TargetStage: model.RoutingDeploymentStageActive,
+			RiskState:   model.RoutingPolicySimulationRiskFail,
+			RiskPayload: map[string]any{"state": "fail", "reason": "capacity_insufficient"},
+		},
+	)
+	require.NoError(t, err)
+	etag := channelRoutingPolicyDraftETag(draft.Summary())
+	params := gin.Params{{Key: "id", Value: strconv.FormatInt(draft.ID, 10)}}
 
-	publishRecorder = httptest.NewRecorder()
-	publishContext, _ = gin.CreateTestContext(publishRecorder)
-	publishContext.Params = params
-	common.SetContextKey(publishContext, constant.ContextKeyUserId, 20)
-	publishContext.Request = httptest.NewRequest(
+	blocked := httptest.NewRecorder()
+	blockedContext, _ := gin.CreateTestContext(blocked)
+	blockedContext.Params = params
+	common.SetContextKey(blockedContext, constant.ContextKeyUserId, 20)
+	blockedContext.Request = httptest.NewRequest(
 		http.MethodPost, "/api/channel-routing/policy-drafts/1/publish",
 		bytes.NewReader(channelRoutingPolicyDraftBody(t, map[string]any{
 			"stage": model.RoutingDeploymentStageActive, "traffic_basis_points": 0, "reason": "deploy",
 		})),
 	)
-	publishContext.Request.Header.Set("If-Match", etag)
-	publishContext.Request.Header.Set("Idempotency-Key", "publish-active-0001")
-	PublishChannelRoutingPolicyDraft(publishContext)
-	require.Equal(t, http.StatusOK, publishRecorder.Code, publishRecorder.Body.String())
-	assert.Contains(t, publishRecorder.Body.String(), `"status":"published"`)
+	blockedContext.Request.Header.Set("If-Match", etag)
+	blockedContext.Request.Header.Set("Idempotency-Key", "publish-risk-blocked-0001")
+	PublishChannelRoutingPolicyDraft(blockedContext)
+	require.Equal(t, http.StatusPreconditionFailed, blocked.Code, blocked.Body.String())
+	assert.Contains(t, blocked.Body.String(), `"code":"policy_simulation_risk_acceptance_required"`)
+
+	accepted := httptest.NewRecorder()
+	acceptedContext, _ := gin.CreateTestContext(accepted)
+	acceptedContext.Params = params
+	common.SetContextKey(acceptedContext, constant.ContextKeyUserId, 20)
+	acceptedContext.Request = httptest.NewRequest(
+		http.MethodPost, "/api/channel-routing/policy-drafts/1/publish",
+		bytes.NewReader(channelRoutingPolicyDraftBody(t, map[string]any{
+			"stage": model.RoutingDeploymentStageActive, "traffic_basis_points": 0, "reason": "deploy",
+			"accept_simulation_risk": true,
+			"risk_acceptance_reason": "Capacity is constrained; proceed with monitored rollout.",
+		})),
+	)
+	acceptedContext.Request.Header.Set("If-Match", etag)
+	acceptedContext.Request.Header.Set("Idempotency-Key", "publish-risk-accepted-0001")
+	PublishChannelRoutingPolicyDraft(acceptedContext)
+	require.Equal(t, http.StatusOK, accepted.Code, accepted.Body.String())
+	assert.Contains(t, accepted.Body.String(), `"status":"published"`)
+
+	var acceptance model.RoutingPolicyRiskAcceptance
+	require.NoError(t, db.First(&acceptance).Error)
+	assert.Equal(t, 20, acceptance.ActorID)
+	assert.Equal(t, "Capacity is constrained; proceed with monitored rollout.", acceptance.Reason)
 }
 
-func TestChannelRoutingPolicyRollbackApprovalAPIEnforcesBoundQuorum(t *testing.T) {
+func TestChannelRoutingPolicyActiveRollbackNeedsNoApprovalQuorum(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
 	seedChannelRoutingPolicyChannelForTest(t, db)
@@ -549,173 +590,84 @@ func TestChannelRoutingPolicyRollbackApprovalAPIEnforcesBoundQuorum(t *testing.T
 			"stage": model.RoutingDeploymentStageActive, "traffic_basis_points": 0, "reason": reason,
 		})
 	}
-	rollback := func(targetRevision int64, actorID int, reason string, idempotencyKey string) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Params = gin.Params{{Key: "version", Value: strconv.FormatInt(targetRevision, 10)}}
-		common.SetContextKey(ctx, constant.ContextKeyUserId, actorID)
-		ctx.Request = httptest.NewRequest(
-			http.MethodPost, "/api/channel-routing/policies/1/rollback", bytes.NewReader(activationBody(reason)),
-		)
-		ctx.Request.Header.Set("If-Match", headETag)
-		ctx.Request.Header.Set("Idempotency-Key", idempotencyKey)
-		RollbackChannelRoutingPolicy(ctx)
-		return recorder
-	}
-	approve := func(actorID int) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Params = gin.Params{{Key: "version", Value: strconv.FormatInt(first.Revision.Revision, 10)}}
-		common.SetContextKey(ctx, constant.ContextKeyUserId, actorID)
-		ctx.Request = httptest.NewRequest(
-			http.MethodPost, "/api/channel-routing/policies/1/rollback-approvals",
-			bytes.NewReader(activationBody("restore active policy")),
-		)
-		ctx.Request.Header.Set("If-Match", headETag)
-		ApproveChannelRoutingPolicyRollback(ctx)
-		return recorder
-	}
-
-	withoutApproval := rollback(first.Revision.Revision, 20, "restore active policy", "rollback-without-approval-0001")
-	require.Equal(t, http.StatusPreconditionFailed, withoutApproval.Code, withoutApproval.Body.String())
-	assert.Contains(t, withoutApproval.Body.String(), `"code":"policy_approval_required"`)
-
-	firstApproval := approve(10)
-	require.Equal(t, http.StatusCreated, firstApproval.Code, firstApproval.Body.String())
-	retry := approve(10)
-	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
-	assert.Contains(t, retry.Body.String(), `"created":false`)
-	secondApproval := approve(11)
-	require.Equal(t, http.StatusCreated, secondApproval.Code, secondApproval.Body.String())
-
-	wrongTarget := rollback(second.Revision.Revision, 20, "restore active policy", "rollback-wrong-target-0001")
-	require.Equal(t, http.StatusPreconditionFailed, wrongTarget.Code, wrongTarget.Body.String())
-	wrongReason := rollback(first.Revision.Revision, 20, "different rollback intent", "rollback-wrong-reason-0001")
-	require.Equal(t, http.StatusPreconditionFailed, wrongReason.Code, wrongReason.Body.String())
-	executorApproved := rollback(first.Revision.Revision, 10, "restore active policy", "rollback-self-approval-0001")
-	require.Equal(t, http.StatusPreconditionFailed, executorApproved.Code, executorApproved.Body.String())
-
-	listRecorder := httptest.NewRecorder()
-	listContext, _ := gin.CreateTestContext(listRecorder)
-	listContext.Params = gin.Params{{Key: "version", Value: strconv.FormatInt(first.Revision.Revision, 10)}}
-	common.SetContextKey(listContext, constant.ContextKeyUserId, 20)
-	listContext.Request = httptest.NewRequest(
-		http.MethodGet, "/api/channel-routing/policies/1/rollback-approvals", nil,
+	success := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(success)
+	ctx.Params = gin.Params{{Key: "version", Value: strconv.FormatInt(first.Revision.Revision, 10)}}
+	common.SetContextKey(ctx, constant.ContextKeyUserId, 20)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost, "/api/channel-routing/policies/1/rollback",
+		bytes.NewReader(activationBody("restore active policy")),
 	)
-	ListChannelRoutingPolicyRollbackApprovals(listContext)
-	require.Equal(t, http.StatusOK, listRecorder.Code, listRecorder.Body.String())
-	assert.Contains(t, listRecorder.Body.String(), `"count":2`)
-	assert.Contains(t, listRecorder.Body.String(), `"quorum":true`)
-
-	success := rollback(first.Revision.Revision, 20, "restore active policy", "rollback-approved-0001")
+	ctx.Request.Header.Set("If-Match", headETag)
+	ctx.Request.Header.Set("Idempotency-Key", "rollback-without-approval-0001")
+	RollbackChannelRoutingPolicy(ctx)
 	require.Equal(t, http.StatusOK, success.Code, success.Body.String())
 	assert.Contains(t, success.Body.String(), `"rollback_of_revision":1`)
 	assert.Contains(t, success.Body.String(), `"type":"policy_manual_rollback"`)
+	assert.NotContains(t, success.Body.String(), "approval")
 }
 
-func TestChannelRoutingPolicyDraftApprovalStatusReportsRequirement(t *testing.T) {
+func TestChannelRoutingLegacyRollbackRequiresSafeV2Draft(t *testing.T) {
 	db := openChannelRoutingControllerDB(t)
 	withChannelRoutingControllerState(t, db)
 	seedChannelRoutingPolicyChannelForTest(t, db)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
-	base, err := model.PublishRoutingPolicyRevisionContext(
-		context.Background(), 0, channelRoutingPolicyDraftDocumentForTest(100),
-		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
+	seedChannelRoutingLegacyPolicyForTest(t, db)
+	current, err := model.PublishRoutingPolicyRevisionContext(
+		context.Background(), 1, channelRoutingPolicyDraftDocumentForTest(200),
+		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 2, Reason: "current v2"},
 	)
 	require.NoError(t, err)
-	balanced, err := model.CreateRoutingPolicyDraftContext(
-		context.Background(), base.Revision.Revision, channelRoutingPolicyDraftDocumentForTest(200), 2,
-	)
+	head, err := model.GetRoutingPolicyHeadContext(context.Background())
 	require.NoError(t, err)
-	balanced, err = model.ValidateRoutingPolicyDraftContext(
-		context.Background(), balanced.ID, balanced.Version, balanced.ETag, 2,
+	require.Equal(t, current.Revision.Revision, head.CurrentRevision)
+	headETag := channelRoutingPolicyHeadETag(head)
+
+	direct := httptest.NewRecorder()
+	directContext, _ := gin.CreateTestContext(direct)
+	directContext.Params = gin.Params{{Key: "version", Value: "1"}}
+	common.SetContextKey(directContext, constant.ContextKeyUserId, 20)
+	directContext.Request = httptest.NewRequest(
+		http.MethodPost, "/api/channel-routing/policies/1/rollback",
+		bytes.NewReader(channelRoutingPolicyDraftBody(t, map[string]any{
+			"stage": model.RoutingDeploymentStageActive, "traffic_basis_points": 0, "reason": "legacy rollback",
+		})),
 	)
-	require.NoError(t, err)
-	enterpriseDocument := channelRoutingPolicyDraftDocumentForTest(300)
-	enterpriseDocument.Pools[0].PolicyProfile = model.RoutingPolicyProfileEnterpriseSLO
-	enterprise, err := model.CreateRoutingPolicyDraftContext(
-		context.Background(), base.Revision.Revision, enterpriseDocument, 3,
+	directContext.Request.Header.Set("If-Match", headETag)
+	directContext.Request.Header.Set("Idempotency-Key", "legacy-rollback-direct-0001")
+	RollbackChannelRoutingPolicy(directContext)
+	require.Equal(t, http.StatusConflict, direct.Code, direct.Body.String())
+	assert.Contains(t, direct.Body.String(), `"code":"legacy_policy_requires_conversion_draft"`)
+
+	preview := httptest.NewRecorder()
+	previewContext, _ := gin.CreateTestContext(preview)
+	previewContext.Params = gin.Params{{Key: "version", Value: "1"}}
+	common.SetContextKey(previewContext, constant.ContextKeyUserId, 20)
+	previewContext.Request = httptest.NewRequest(
+		http.MethodPost, "/api/channel-routing/policies/1/rollback-draft", nil,
 	)
-	require.NoError(t, err)
-	enterprise, err = model.ValidateRoutingPolicyDraftContext(
-		context.Background(), enterprise.ID, enterprise.Version, enterprise.ETag, 3,
-	)
-	require.NoError(t, err)
-	status := func(draftID int64, query string) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(draftID, 10)}}
-		common.SetContextKey(ctx, constant.ContextKeyUserId, 20)
-		ctx.Request = httptest.NewRequest(
-			http.MethodGet, "/api/channel-routing/policy-drafts/1/approvals"+query, nil,
-		)
-		ListChannelRoutingPolicyApprovals(ctx)
-		return recorder
+	previewContext.Request.Header.Set("If-Match", headETag)
+	CreateChannelRoutingPolicyRollbackDraft(previewContext)
+	require.Equal(t, http.StatusCreated, preview.Code, preview.Body.String())
+	var envelope struct {
+		Success bool                                      `json:"success"`
+		Data    channelRoutingPolicyRollbackDraftResponse `json:"data"`
 	}
-
-	untargeted := status(balanced.ID, "")
-	require.Equal(t, http.StatusOK, untargeted.Code, untargeted.Body.String())
-	assert.Contains(t, untargeted.Body.String(), `"requires_approval":false`)
-	ordinary := status(balanced.ID, "?stage=shadow&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, ordinary.Code, ordinary.Body.String())
-	assert.Contains(t, ordinary.Body.String(), `"requires_approval":false`)
-	active := status(balanced.ID, "?stage=active&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, active.Code, active.Body.String())
-	assert.Contains(t, active.Body.String(), `"requires_approval":true`)
-	enterpriseStatus := status(enterprise.ID, "?stage=shadow&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, enterpriseStatus.Code, enterpriseStatus.Body.String())
-	assert.Contains(t, enterpriseStatus.Body.String(), `"requires_approval":true`)
-	invalid := status(balanced.ID, "?stage=canary&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
-	assert.Contains(t, invalid.Body.String(), `"code":"invalid_activation"`)
-}
-
-func TestChannelRoutingPolicyRollbackApprovalStatusReportsRequirement(t *testing.T) {
-	db := openChannelRoutingControllerDB(t)
-	withChannelRoutingControllerState(t, db)
-	seedChannelRoutingPolicyChannelForTest(t, db)
-	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
-	balanced, err := model.PublishRoutingPolicyRevisionContext(
-		context.Background(), 0, channelRoutingPolicyDraftDocumentForTest(100),
-		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1, Reason: "base"},
+	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &envelope))
+	require.True(t, envelope.Success)
+	assert.Equal(t, model.RoutingPolicySchemaVersion, envelope.Data.Document.SchemaVersion)
+	assert.Equal(t, model.RoutingPolicyLegacySchemaVersion, envelope.Data.Conversion.SourceSchemaVersion)
+	validated, err := model.ValidateRoutingPolicyDraftContext(
+		context.Background(), envelope.Data.Draft.ID, envelope.Data.Draft.Version,
+		envelope.Data.Draft.ETag, 20,
 	)
 	require.NoError(t, err)
-	enterpriseDocument := channelRoutingPolicyDraftDocumentForTest(200)
-	enterpriseDocument.Pools[0].PolicyProfile = model.RoutingPolicyProfileEnterpriseSLO
-	enterprise, err := model.PublishRoutingPolicyRevisionContext(
-		context.Background(), balanced.Revision.Revision, enterpriseDocument,
-		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 2, Reason: "enterprise"},
-	)
-	require.NoError(t, err)
-	_, err = model.PublishRoutingPolicyRevisionContext(
-		context.Background(), enterprise.Revision.Revision, channelRoutingPolicyDraftDocumentForTest(300),
-		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 3, Reason: "current"},
-	)
-	require.NoError(t, err)
-	status := func(targetRevision int64, query string) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Params = gin.Params{{Key: "version", Value: strconv.FormatInt(targetRevision, 10)}}
-		common.SetContextKey(ctx, constant.ContextKeyUserId, 20)
-		ctx.Request = httptest.NewRequest(
-			http.MethodGet, "/api/channel-routing/policies/1/rollback-approvals"+query, nil,
-		)
-		ListChannelRoutingPolicyRollbackApprovals(ctx)
-		return recorder
-	}
+	assert.Equal(t, model.RoutingPolicyDraftStatusValidated, validated.Status)
 
-	ordinary := status(balanced.Revision.Revision, "?stage=shadow&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, ordinary.Code, ordinary.Body.String())
-	assert.Contains(t, ordinary.Body.String(), `"requires_approval":false`)
-	active := status(balanced.Revision.Revision, "?stage=active&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, active.Code, active.Body.String())
-	assert.Contains(t, active.Body.String(), `"requires_approval":true`)
-	enterpriseStatus := status(enterprise.Revision.Revision, "?stage=shadow&traffic_basis_points=0&reason=status-check")
-	require.Equal(t, http.StatusOK, enterpriseStatus.Code, enterpriseStatus.Body.String())
-	assert.Contains(t, enterpriseStatus.Body.String(), `"requires_approval":true`)
-	invalid := status(balanced.Revision.Revision, "?reason=status-check")
-	require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
-	assert.Contains(t, invalid.Body.String(), `"code":"invalid_activation"`)
+	history, revision, err := model.LoadRoutingPolicyRevisionContext(context.Background(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoutingPolicyLegacySchemaVersion, revision.SchemaVersion)
+	assert.Equal(t, model.RoutingPolicyLegacySchemaVersion, history.SchemaVersion)
 }
 
 func TestChannelRoutingPolicyDraftAPIRejectsUnknownFieldsAndMismatchedTags(t *testing.T) {
@@ -774,6 +726,9 @@ func TestChannelRoutingPolicyDraftAPIRejectsUnknownFieldsAndMismatchedTags(t *te
 }
 
 func channelRoutingPolicyDraftDocumentForTest(weight int64) model.RoutingPolicyDocument {
+	enabled := true
+	priority := int64(1)
+	generation := fmt.Sprintf("%032x", 1001)
 	return model.RoutingPolicyDocument{
 		SchemaVersion: model.RoutingPolicySchemaVersion,
 		Pools: []model.RoutingPolicyPoolContent{{
@@ -782,7 +737,8 @@ func channelRoutingPolicyDraftDocumentForTest(weight int64) model.RoutingPolicyD
 			PolicyProfile:   model.RoutingPolicyProfileBalanced,
 			Policy:          json.RawMessage(`{}`),
 			Members: []model.RoutingPolicyMemberContent{{
-				MemberID: 101, ChannelID: 1001, Enabled: true, Priority: 1, Weight: weight,
+				MemberID: 101, ChannelID: 1001, RoutingGeneration: generation,
+				EnabledOverride: &enabled, PriorityOverride: &priority, WeightOverride: &weight,
 				Overrides: json.RawMessage(`{}`),
 			}},
 		}},
@@ -808,9 +764,76 @@ func channelRoutingPolicyDraftDocumentWithExtensionsForTest(weight int64) model.
 func seedChannelRoutingPolicyChannelForTest(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	mapping := `{}`
+	generation := fmt.Sprintf("%032x", 1001)
+	key := "routing-policy-controller-key"
+	fingerprint, err := model.RoutingCredentialFingerprint(1001, generation, key)
+	require.NoError(t, err)
 	require.NoError(t, db.Create(&model.Channel{
-		Id: 1001, Name: "routing-policy-controller", Models: "gpt-test", ModelMapping: &mapping,
+		Id: 1001, Name: "routing-policy-controller", Key: key, Models: "gpt-test", ModelMapping: &mapping,
+		RoutingIdentity: fmt.Sprintf("%032x", 1_001_001), RoutingGeneration: generation,
 	}).Error)
+	require.NoError(t, db.Create(&model.RoutingPool{
+		ID: 11, GroupKey: "vip", GroupName: "VIP", DisplayName: "VIP",
+		Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+		DefaultEnabled: true, DefaultPriority: 0, DefaultWeight: 100,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingPoolMember{
+		ID: 101, PoolID: 11, ChannelID: 1001, ChannelGeneration: generation,
+		Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingCredentialRef{
+		ID: 201, ChannelID: 1001, ChannelGeneration: generation, Fingerprint: fingerprint,
+		FingerprintVersion: model.RoutingCredentialFingerprintVersion,
+		Active:             true, LastSeenIndex: model.RoutingMetricSingleKeyIndex, CurrentOccurrences: 1,
+	}).Error)
+}
+
+func seedChannelRoutingLegacyPolicyForTest(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	legacy := model.RoutingPolicyDocument{
+		SchemaVersion: model.RoutingPolicyLegacySchemaVersion,
+		Pools: []model.RoutingPolicyPoolContent{{
+			PoolID: 11, GroupName: "VIP", DisplayName: "Legacy VIP",
+			DeploymentStage: model.RoutingDeploymentStageShadow,
+			PolicyProfile:   model.RoutingPolicyProfileBalanced,
+			Policy:          json.RawMessage(`{}`),
+			Members:         []model.RoutingPolicyMemberContent{},
+		}},
+	}
+	legacy, contentHash, err := model.NormalizeRoutingPolicyDocument(legacy)
+	require.NoError(t, err)
+	groupHash := sha256.Sum256([]byte("VIP"))
+	now := time.Now().Unix()
+	revision := model.RoutingPolicyRevision{
+		Revision: 1, SchemaVersion: model.RoutingPolicyLegacySchemaVersion,
+		ContentHash: contentHash, PoolCount: 1, ActorID: 1, Reason: "legacy policy", CreatedTime: now,
+	}
+	pool := model.RoutingPolicyPoolRevision{
+		Revision: 1, PoolID: 11, GroupKey: fmt.Sprintf("%x", groupHash),
+		GroupName: "VIP", DisplayName: legacy.Pools[0].DisplayName,
+		DeploymentStage: legacy.Pools[0].DeploymentStage,
+		PolicyProfile:   legacy.Pools[0].PolicyProfile,
+		PolicyJSON:      string(legacy.Pools[0].Policy),
+	}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&revision).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&pool).Error; err != nil {
+			return err
+		}
+		activation := model.RoutingPolicyActivation{
+			Revision: 1, Stage: model.RoutingDeploymentStageShadow,
+			ActorID: 1, Reason: "legacy policy", CreatedTime: now,
+		}
+		if err := tx.Create(&activation).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.RoutingPolicyHead{}).Where("id = ?", 1).Updates(map[string]any{
+			"current_revision": int64(1), "current_activation_id": activation.ID,
+			"current_hash": contentHash, "current_stage": activation.Stage, "updated_time": now,
+		}).Error
+	}))
 }
 
 func channelRoutingPolicyDraftBody(t *testing.T, value any) []byte {

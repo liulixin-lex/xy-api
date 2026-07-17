@@ -91,6 +91,7 @@ type decisionCanaryAuditFields struct {
 	cohort                          string
 	selectedMemberID                int
 	selectedCredentialID            int
+	selectedChannelGeneration       string
 	reservationMode                 string
 	reservationDemand               Demand
 	reservationLimit                Limit
@@ -311,9 +312,12 @@ func EnqueueDecision(input DecisionInput) (string, error) {
 		RetryIndex:                      input.RetryIndex,
 		IsStream:                        input.IsStream,
 		ActualChannelID:                 input.ActualChannelID,
+		ActualChannelGeneration:         canaryFields.selectedChannelGeneration,
 		ObservedChannelID:               input.ObservedChannelID,
+		ObservedChannelGeneration:       canaryFields.selectedChannelGeneration,
 		SelectedMemberID:                canaryFields.selectedMemberID,
 		SelectedCredentialID:            canaryFields.selectedCredentialID,
+		SelectedChannelGeneration:       canaryFields.selectedChannelGeneration,
 		ReservationMode:                 canaryFields.reservationMode,
 		ReservationRPM:                  canaryFields.reservationDemand.RPM,
 		ReservationInputTPM:             canaryFields.reservationDemand.InputTPM,
@@ -377,7 +381,9 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 			}
 			identity := input.SelectedIdentity
 			if input.ActualChannelID != input.ObservedChannelID || identity.SnapshotRevision != input.SnapshotRevision ||
-				identity.PoolID != input.PoolID || identity.MemberID <= 0 || identity.CredentialID < 0 ||
+				(identity.ChannelGeneration != "" && !validSnapshotGeneration(identity.ChannelGeneration)) ||
+				identity.PoolID != input.PoolID ||
+				identity.MemberID <= 0 || identity.CredentialID < 0 ||
 				input.CapacityAdmission == nil {
 				return decisionCanaryAuditFields{}, ErrBalancedReplayInvalid
 			}
@@ -403,6 +409,7 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 			}
 			fields.selectedMemberID = identity.MemberID
 			fields.selectedCredentialID = identity.CredentialID
+			fields.selectedChannelGeneration = identity.ChannelGeneration
 			fields.reservationMode = string(admission.Mode)
 			fields.reservationDemand = admission.Demand
 			fields.reservationLimit = admission.Limit
@@ -482,7 +489,9 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 	}
 	identity := input.SelectedIdentity
 	if input.ActualChannelID != input.ObservedChannelID || identity.SnapshotRevision != input.SnapshotRevision ||
-		identity.PoolID != input.PoolID || identity.MemberID <= 0 || identity.CredentialID < 0 {
+		(identity.ChannelGeneration != "" && !validSnapshotGeneration(identity.ChannelGeneration)) ||
+		identity.PoolID != input.PoolID ||
+		identity.MemberID <= 0 || identity.CredentialID < 0 {
 		return decisionCanaryAuditFields{}, ErrShadowReplayInvalid
 	}
 	if gate.InCanary {
@@ -501,6 +510,7 @@ func decisionCanaryFieldsFromInput(input DecisionInput, replayable bool) (decisi
 	}
 	fields.selectedMemberID = identity.MemberID
 	fields.selectedCredentialID = identity.CredentialID
+	fields.selectedChannelGeneration = identity.ChannelGeneration
 	if input.CapacityAdmission == nil {
 		return fields, nil
 	}
@@ -609,9 +619,10 @@ func ResolveMemberIdentity(group string, channelID int) (Identity, bool) {
 		return Identity{}, false
 	}
 	return Identity{
-		SnapshotRevision: snapshot.view.Revision,
-		PoolID:           poolID,
-		MemberID:         memberID,
+		SnapshotRevision:  snapshot.view.Revision,
+		ChannelGeneration: channelGenerationForMember(snapshot, memberID),
+		PoolID:            poolID,
+		MemberID:          memberID,
 	}, true
 }
 

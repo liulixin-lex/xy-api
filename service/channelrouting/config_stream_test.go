@@ -28,13 +28,19 @@ func TestRoutingConfigOutboxPublishesStreamEventAndMarksRow(t *testing.T) {
 		&model.Channel{},
 		&model.RoutingPolicyHead{}, &model.RoutingPolicyRevision{}, &model.RoutingPolicyPoolRevision{},
 		&model.RoutingPolicyMemberRevision{}, &model.RoutingPolicyActivation{}, &model.RoutingConfigOutbox{},
+		&model.RoutingPoolMember{},
 	))
-	require.NoError(t, db.Create(&model.Channel{Id: 1, Name: "config-stream", Models: "gpt-test"}).Error)
+	channel := model.Channel{Id: 1, Name: "config-stream", Models: "gpt-test"}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.RoutingPoolMember{
+		ID: 1, PoolID: 1, ChannelID: channel.Id,
+		ChannelGeneration: channel.RoutingGeneration, Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+	}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	published, err := model.PublishRoutingPolicyRevisionContext(
 		context.Background(),
 		0,
-		testRoutingConfigPolicyDocument(),
+		testRoutingConfigPolicyDocument(channel.RoutingGeneration),
 		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1},
 	)
 	require.NoError(t, err)
@@ -279,7 +285,7 @@ func openRoutingConfigTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func testRoutingConfigPolicyDocument() model.RoutingPolicyDocument {
+func testRoutingConfigPolicyDocument(channelGeneration string) model.RoutingPolicyDocument {
 	return model.RoutingPolicyDocument{
 		SchemaVersion: model.RoutingPolicySchemaVersion,
 		Pools: []model.RoutingPolicyPoolContent{{
@@ -287,7 +293,8 @@ func testRoutingConfigPolicyDocument() model.RoutingPolicyDocument {
 			DeploymentStage: model.RoutingDeploymentStageShadow,
 			PolicyProfile:   model.RoutingPolicyProfileBalanced,
 			Members: []model.RoutingPolicyMemberContent{{
-				MemberID: 1, ChannelID: 1, Enabled: true, Priority: 1, Weight: 1,
+				MemberID: 1, ChannelID: 1, RoutingGeneration: channelGeneration,
+				Enabled: true, Priority: 1, Weight: 1,
 			}},
 		}},
 	}

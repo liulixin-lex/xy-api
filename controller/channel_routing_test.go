@@ -35,10 +35,11 @@ func TestChannelRoutingReadAPIsExposeSnapshotWithoutSecrets(t *testing.T) {
 	priority := int64(7)
 	weight := uint(13)
 	baseURL := "https://user:password@provider.example/v1?api_key=secret"
-	require.NoError(t, db.Create(&model.Channel{
+	channel := model.Channel{
 		Id: 401, Name: "provider-a", Key: "serving-secret", Group: "vip", Models: "gpt-test",
 		Status: common.ChannelStatusEnabled, Priority: &priority, Weight: &weight, BaseURL: &baseURL,
-	}).Error)
+	}
+	require.NoError(t, db.Create(&channel).Error)
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
 	configuration, err := model.GetRoutingChannelConfigurationContext(context.Background(), 401)
@@ -55,7 +56,8 @@ func TestChannelRoutingReadAPIsExposeSnapshotWithoutSecrets(t *testing.T) {
 	require.NoError(t, err)
 
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID: 401, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip",
+		ChannelID: 401, ChannelGeneration: channel.RoutingGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "vip",
 	}, routinghotcache.MetricSnapshot{
 		RequestCount: 20, SuccessCount: 19, ReliabilityRequestCount: 20, ReliabilityFailureCount: 1,
 		P95TTFTMs: 250, OutputTokens: 1000, GenerationMs: 4000, TPS: 250, UpdatedUnix: common.GetTimestamp(),
@@ -989,6 +991,8 @@ func openChannelRoutingControllerDB(t *testing.T) *gorm.DB {
 		&model.RoutingPolicyMemberRevision{},
 		&model.RoutingPolicyActivation{},
 		&model.RoutingPolicyDraft{},
+		&model.RoutingPolicySimulationEvidence{},
+		&model.RoutingPolicyRiskAcceptance{},
 		&model.RoutingPolicyApproval{},
 		&model.RoutingPolicyRollbackApproval{},
 		&model.RoutingConfigOutbox{},

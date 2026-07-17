@@ -484,6 +484,7 @@ func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument
 		},
 	}
 	for index, stage := range stages {
+		channelID := 2_001 + index
 		document.Pools[index] = RoutingPolicyPoolContent{
 			PoolID:          101 + index,
 			GroupName:       "canary-group-" + string(rune('a'+index)),
@@ -495,13 +496,14 @@ func routingCanaryRollbackDocumentForTest(stages []string) RoutingPolicyDocument
 				"pool_extension": json.RawMessage(`{"kind":"canary"}`),
 			},
 			Members: []RoutingPolicyMemberContent{{
-				MemberID:      1_001 + index,
-				ChannelID:     2_001 + index,
-				Enabled:       true,
-				Priority:      int64(index + 1),
-				Weight:        int64(100 + index),
-				CredentialIDs: []int{3_002 + index*2, 3_001 + index*2},
-				Overrides:     json.RawMessage(`{"timeout_ms":900,"headers":{"z":"last","a":"first"}}`),
+				MemberID:          1_001 + index,
+				ChannelID:         channelID,
+				RoutingGeneration: routingPolicyGenerationForChannelTest(channelID),
+				Enabled:           true,
+				Priority:          int64(index + 1),
+				Weight:            int64(100 + index),
+				CredentialIDs:     []int{3_002 + index*2, 3_001 + index*2},
+				Overrides:         json.RawMessage(`{"timeout_ms":900,"headers":{"z":"last","a":"first"}}`),
 				ExtensionFields: map[string]json.RawMessage{
 					"member_extension": json.RawMessage(`{"enabled":true}`),
 				},
@@ -523,6 +525,8 @@ func cloneRoutingPolicyDocumentForTest(t *testing.T, document RoutingPolicyDocum
 func migrateRoutingCanaryRollbackModelsForTest(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&Channel{},
+		&RoutingPool{},
+		&RoutingPoolMember{},
 		&RoutingCredentialRef{},
 		&RoutingPolicyHead{},
 		&RoutingPolicyRevision{},

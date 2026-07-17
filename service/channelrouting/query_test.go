@@ -72,9 +72,12 @@ func TestListCostSnapshotsReturnsVersionedPricingWithoutRetiredAccountContract(t
 	}
 	SetSnapshotForTest(SnapshotView{
 		Revision: 19, BuiltAtUnix: 1_700_000_000,
+		Channels: []ChannelSnapshot{{
+			ID: 101, RoutingIdentity: strings.Repeat("1", 32), RoutingGeneration: strings.Repeat("2", 32),
+		}},
 		Pools: []PoolSnapshot{{
 			ID: 7, GroupName: "vip", Members: []PoolMemberSnapshot{{
-				ID: 11, PoolID: 7, ChannelID: 101, ChannelName: "provider-a",
+				ID: 11, PoolID: 7, ChannelID: 101, ChannelGeneration: strings.Repeat("2", 32), ChannelName: "provider-a",
 				Models: []ModelSnapshot{{
 					ModelName: "gpt-cost", ChannelConfigurationRevision: 7,
 					CostKnown: true, Cost: 0.003, CostPricing: pricing,
@@ -101,6 +104,8 @@ func TestListCostSnapshotsReturnsVersionedPricingWithoutRetiredAccountContract(t
 	assert.Equal(t, 7, item.PoolID)
 	assert.Equal(t, 11, item.MemberID)
 	assert.Equal(t, 101, item.ChannelID)
+	assert.Equal(t, strings.Repeat("1", 32), item.RoutingIdentity)
+	assert.Equal(t, strings.Repeat("2", 32), item.RoutingGeneration)
 	assert.Equal(t, "provider-a", item.ChannelName)
 	assert.True(t, item.Known)
 	assert.Equal(t, 0.003, item.Cost)
@@ -122,6 +127,30 @@ func TestListCostSnapshotsReturnsVersionedPricingWithoutRetiredAccountContract(t
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), `"account"`)
 	assert.NotContains(t, string(encoded), `"source_sync_status"`)
+}
+
+func TestListCostSnapshotsDoesNotBindReusedChannelIDToRetiredGeneration(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	retiredGeneration := strings.Repeat("2", 32)
+	SetSnapshotForTest(SnapshotView{
+		Channels: []ChannelSnapshot{{
+			ID: 101, RoutingIdentity: strings.Repeat("3", 32), RoutingGeneration: strings.Repeat("4", 32),
+		}},
+		Pools: []PoolSnapshot{{
+			ID: 7, GroupName: "vip", Members: []PoolMemberSnapshot{{
+				ID: 11, PoolID: 7, ChannelID: 101, ChannelGeneration: retiredGeneration,
+				ChannelName: "retired-provider", Models: []ModelSnapshot{{ModelName: "gpt-cost", CostKnown: true}},
+			}},
+		}},
+	})
+
+	items, total, _, ok := ListCostSnapshots("vip", "gpt-cost", nil, 0, 10)
+	require.True(t, ok)
+	require.Len(t, items, 1)
+	assert.Equal(t, 1, total)
+	assert.Empty(t, items[0].RoutingIdentity)
+	assert.Equal(t, retiredGeneration, items[0].RoutingGeneration)
 }
 
 func TestTelemetryAggregateKeepsGlobalP95SeparateFromWorstMemberP95(t *testing.T) {

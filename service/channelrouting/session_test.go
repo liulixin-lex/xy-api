@@ -178,7 +178,9 @@ func TestRequestRoutingSessionUsesVersionedExpectedAndWorstCost(t *testing.T) {
 	profile := &model.RoutingCostRequestProfile{
 		PromptTokens: 1_000, ExpectedCompletionTokens: 500, MaximumCompletionTokens: 1_000,
 		MaxAttempts: 1, KnowledgeSpecified: true, InputTokensKnown: true,
-		MaximumCompletionKnown: true, CacheTokensKnown: true, MediaDimensionsKnown: true,
+		MaximumCompletionKnown: true, CacheTokensKnown: true,
+		ImageInputTokensKnown: true, ImageOutputTokensKnown: true, ImageUnitsKnown: true,
+		AudioInputTokensKnown: true, AudioOutputTokensKnown: true,
 		RequestInputKnown: true,
 	}
 	input := RequestRoutingCostInput{
@@ -199,7 +201,7 @@ func TestRequestRoutingSessionUsesVersionedExpectedAndWorstCost(t *testing.T) {
 	estimate, available, err = session.CostEstimateForChannel(101, input)
 	require.NoError(t, err)
 	require.True(t, available)
-	assert.True(t, estimate.Known)
+	assert.False(t, estimate.Known, "a charged input dimension with unknown quantity is not fully comparable")
 	assert.False(t, estimate.WorstCaseKnown)
 	_, worstKnown, err := session.WorstCaseCostForChannel(101, input)
 	require.NoError(t, err)

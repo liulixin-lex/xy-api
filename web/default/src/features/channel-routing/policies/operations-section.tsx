@@ -52,6 +52,8 @@ import { ChannelRoutingStatusBadge } from '../components/status-badge'
 import { useChannelRoutingFormatters } from '../lib/format'
 import {
   channelRoutingOperationDisplayStatus,
+  channelRoutingOperationRetentionLabel,
+  channelRoutingOperationSourceLabel,
   channelRoutingOperationTypeLabel,
 } from '../lib/operations'
 import { ChannelRoutingOperationSheet } from './operation-sheet'
@@ -72,18 +74,35 @@ type RoutingOperationStatusFilter =
   | ''
   | 'pending'
   | 'running'
+  | 'retry_wait'
   | 'succeeded'
+  | 'partially_succeeded'
   | 'failed'
+  | 'cancelled'
   | 'superseded'
+
+type RoutingOperationSourceFilter =
+  | ''
+  | 'admin'
+  | 'system'
+  | 'scheduler'
+  | 'recovery'
+  | 'migration'
+
+type RoutingOperationAttentionFilter = 'all' | boolean
 
 export function ChannelRoutingOperationsSection(props: {
   cursor: number
   operationType: RoutingOperationTypeFilter
   operationStatus: RoutingOperationStatusFilter
+  operationSource: RoutingOperationSourceFilter
+  operationAttention: RoutingOperationAttentionFilter
   onSearchChange: (patch: {
     operationCursor?: number
     operationType?: RoutingOperationTypeFilter
     operationStatus?: RoutingOperationStatusFilter
+    operationSource?: RoutingOperationSourceFilter
+    operationAttention?: RoutingOperationAttentionFilter
   }) => void
 }) {
   const { t } = useTranslation()
@@ -96,6 +115,9 @@ export function ChannelRoutingOperationsSection(props: {
     limit: 10,
     type: props.operationType || undefined,
     status: props.operationStatus || undefined,
+    source: props.operationSource || undefined,
+    needs_attention:
+      props.operationAttention === 'all' ? undefined : props.operationAttention,
   }
   const query = useQuery({
     queryKey: channelRoutingQueryKeys.operations(params),
@@ -104,7 +126,7 @@ export function ChannelRoutingOperationsSection(props: {
 
   return (
     <section
-      className='space-y-3 border-t pt-5'
+      className='flex flex-col gap-3 border-t pt-5'
       aria-labelledby='routing-operations-heading'
     >
       <div className='flex flex-wrap items-center justify-between gap-3'>
@@ -206,12 +228,72 @@ export function ChannelRoutingOperationsSection(props: {
           <NativeSelectOption value='running'>
             {t('Running')}
           </NativeSelectOption>
+          <NativeSelectOption value='retry_wait'>
+            {t('Waiting to retry')}
+          </NativeSelectOption>
           <NativeSelectOption value='succeeded'>
             {t('Succeeded')}
           </NativeSelectOption>
+          <NativeSelectOption value='partially_succeeded'>
+            {t('Partially succeeded')}
+          </NativeSelectOption>
           <NativeSelectOption value='failed'>{t('Failed')}</NativeSelectOption>
+          <NativeSelectOption value='cancelled'>
+            {t('Cancelled')}
+          </NativeSelectOption>
           <NativeSelectOption value='superseded'>
             {t('Superseded')}
+          </NativeSelectOption>
+        </NativeSelect>
+        <NativeSelect
+          size='sm'
+          value={props.operationSource}
+          aria-label={t('Operation source')}
+          onChange={(event) =>
+            props.onSearchChange({
+              operationCursor: 0,
+              operationSource: event.target
+                .value as RoutingOperationSourceFilter,
+            })
+          }
+        >
+          <NativeSelectOption value=''>
+            {t('All operation sources')}
+          </NativeSelectOption>
+          <NativeSelectOption value='admin'>
+            {t('Administrator')}
+          </NativeSelectOption>
+          <NativeSelectOption value='system'>{t('System')}</NativeSelectOption>
+          <NativeSelectOption value='scheduler'>
+            {t('Scheduler')}
+          </NativeSelectOption>
+          <NativeSelectOption value='recovery'>
+            {t('Recovery')}
+          </NativeSelectOption>
+          <NativeSelectOption value='migration'>
+            {t('Migration')}
+          </NativeSelectOption>
+        </NativeSelect>
+        <NativeSelect
+          size='sm'
+          value={String(props.operationAttention)}
+          aria-label={t('Attention status')}
+          onChange={(event) => {
+            const value = event.target.value
+            props.onSearchChange({
+              operationCursor: 0,
+              operationAttention: value === 'all' ? 'all' : value === 'true',
+            })
+          }}
+        >
+          <NativeSelectOption value='all'>
+            {t('All attention states')}
+          </NativeSelectOption>
+          <NativeSelectOption value='true'>
+            {t('Needs attention')}
+          </NativeSelectOption>
+          <NativeSelectOption value='false'>
+            {t('No action needed')}
           </NativeSelectOption>
         </NativeSelect>
       </div>
@@ -246,7 +328,9 @@ export function ChannelRoutingOperationsSection(props: {
                   <TableHead>{t('Type')}</TableHead>
                   <TableHead>{t('Subject')}</TableHead>
                   <TableHead>{t('Status')}</TableHead>
-                  <TableHead>{t('Actor')}</TableHead>
+                  <TableHead>{t('Summary')}</TableHead>
+                  <TableHead>{t('Source')}</TableHead>
+                  <TableHead>{t('Attention')}</TableHead>
                   <TableHead>{t('Started')}</TableHead>
                   <TableHead className='w-14'>
                     <span className='sr-only'>{t('Actions')}</span>
@@ -268,14 +352,68 @@ export function ChannelRoutingOperationsSection(props: {
                       />
                     </TableCell>
                     <TableCell>
-                      {operation.subject_type} #{operation.subject_id}
+                      <div className='text-sm'>
+                        {operation.subject_type} #{operation.subject_id}
+                      </div>
+                      {operation.pool_id > 0 ? (
+                        <div className='text-muted-foreground text-xs'>
+                          {t('Pool #{{id}}', { id: operation.pool_id })}
+                        </div>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       <ChannelRoutingStatusBadge
                         status={channelRoutingOperationDisplayStatus(operation)}
                       />
                     </TableCell>
-                    <TableCell>#{operation.actor_id}</TableCell>
+                    <TableCell className='max-w-72'>
+                      <p className='line-clamp-2 text-xs break-words'>
+                        {operation.summary || t('No summary recorded')}
+                      </p>
+                      {operation.retention_category ? (
+                        <p className='text-muted-foreground mt-1 text-xs'>
+                          {t(
+                            channelRoutingOperationRetentionLabel(
+                              operation.retention_category
+                            )
+                          )}
+                        </p>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      <div className='text-xs font-medium'>
+                        {t(
+                          channelRoutingOperationSourceLabel(
+                            operation.source || 'system'
+                          )
+                        )}
+                      </div>
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t('Actor #{{id}}', { id: operation.actor_id })}
+                      </div>
+                      {operation.retry_sequence ? (
+                        <div className='text-muted-foreground mt-1 text-xs'>
+                          {t('Retry {{sequence}} of #{{id}}', {
+                            sequence: operation.retry_sequence,
+                            id:
+                              operation.retry_of_operation_id ||
+                              operation.parent_operation_id,
+                          })}
+                        </div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      <ChannelRoutingStatusBadge
+                        status={
+                          operation.needs_attention ? 'warning' : 'healthy'
+                        }
+                        label={
+                          operation.needs_attention
+                            ? t('Needs attention')
+                            : t('No action needed')
+                        }
+                      />
+                    </TableCell>
                     <TableCell>
                       {format.timestamp(operation.created_time_ms)}
                     </TableCell>
@@ -336,7 +474,27 @@ export function ChannelRoutingOperationsSection(props: {
                   <span>
                     {operation.subject_type} #{operation.subject_id}
                   </span>
+                  <span>
+                    {t(
+                      channelRoutingOperationSourceLabel(
+                        operation.source || 'system'
+                      )
+                    )}
+                  </span>
                   <span>{format.timestamp(operation.created_time_ms)}</span>
+                </div>
+                <p className='mt-2 line-clamp-2 text-xs break-words'>
+                  {operation.summary || t('No summary recorded')}
+                </p>
+                <div className='mt-2'>
+                  <ChannelRoutingStatusBadge
+                    status={operation.needs_attention ? 'warning' : 'healthy'}
+                    label={
+                      operation.needs_attention
+                        ? t('Needs attention')
+                        : t('No action needed')
+                    }
+                  />
                 </div>
               </button>
             ))}
@@ -359,6 +517,7 @@ export function ChannelRoutingOperationsSection(props: {
         onOpenChange={(open) => {
           if (!open) setSelectedOperationId(null)
         }}
+        onOperationChange={setSelectedOperationId}
       />
     </section>
   )

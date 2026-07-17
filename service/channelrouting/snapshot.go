@@ -25,13 +25,18 @@ import (
 )
 
 var (
-	ErrSnapshotLimitExceeded       = errors.New("channel routing snapshot limit exceeded")
-	ErrSnapshotPolicyReference     = errors.New("channel routing snapshot policy reference is invalid")
-	ErrSnapshotActivation          = errors.New("channel routing snapshot activation is invalid")
-	ErrSnapshotRevisionRollback    = errors.New("channel routing snapshot revision cannot move backwards")
-	ErrSnapshotRevisionConflict    = errors.New("channel routing snapshot revision hash conflict")
-	ErrSnapshotConfigEpochRollback = errors.New("channel routing configuration epoch cannot move backwards")
-	ErrSnapshotConfigEpochConflict = errors.New("channel routing configuration epoch hash conflict")
+	ErrSnapshotLimitExceeded         = errors.New("channel routing snapshot limit exceeded")
+	ErrSnapshotPolicyReference       = errors.New("channel routing snapshot policy reference is invalid")
+	ErrSnapshotActivation            = errors.New("channel routing snapshot activation is invalid")
+	ErrSnapshotRevisionRollback      = errors.New("channel routing snapshot revision cannot move backwards")
+	ErrSnapshotRevisionConflict      = errors.New("channel routing snapshot revision hash conflict")
+	ErrSnapshotConfigEpochRollback   = errors.New("channel routing configuration epoch cannot move backwards")
+	ErrSnapshotConfigEpochConflict   = errors.New("channel routing configuration epoch hash conflict")
+	ErrSnapshotTopologyEpochRollback = errors.New("channel routing topology epoch cannot move backwards")
+	ErrSnapshotTopologyEpochConflict = errors.New("channel routing topology epoch hash conflict")
+	ErrSnapshotPricingEpochRollback  = errors.New("channel routing pricing epoch cannot move backwards")
+	ErrSnapshotPricingEpochConflict  = errors.New("channel routing pricing epoch hash conflict")
+	ErrSnapshotSettingsRollback      = errors.New("channel routing runtime settings revision cannot move backwards")
 )
 
 type SnapshotLimits struct {
@@ -91,22 +96,30 @@ type SnapshotStats struct {
 }
 
 type SnapshotView struct {
-	Revision              uint64            `json:"revision"`
-	ConfigurationEpoch    uint64            `json:"configuration_epoch"`
-	ConfigurationHash     string            `json:"configuration_hash"`
-	RuntimeGeneration     uint64            `json:"runtime_generation"`
-	PolicyHash            string            `json:"policy_hash"`
-	ActivationID          int64             `json:"activation_id"`
-	ActivationStage       string            `json:"activation_stage"`
-	TrafficBasisPoints    int               `json:"traffic_basis_points"`
-	ActivationCreatedTime int64             `json:"activation_created_time"`
-	BuiltAtUnix           int64             `json:"built_at"`
-	BuildDurationMs       int64             `json:"build_duration_ms"`
-	AggregateP95TTFTMs    float64           `json:"aggregate_p95_ttft_ms"`
-	AggregateP95TTFTKnown bool              `json:"aggregate_p95_ttft_known"`
-	Pools                 []PoolSnapshot    `json:"pools"`
-	Channels              []ChannelSnapshot `json:"channels"`
-	Stats                 SnapshotStats     `json:"stats"`
+	Revision                uint64            `json:"revision"`
+	PolicyRevision          uint64            `json:"policy_revision"`
+	TopologyEpoch           uint64            `json:"topology_epoch"`
+	TopologyHash            string            `json:"topology_hash"`
+	PricingEpoch            uint64            `json:"pricing_epoch"`
+	PricingHash             string            `json:"pricing_hash"`
+	RuntimeSettingsRevision uint64            `json:"runtime_settings_revision"`
+	RuntimeSettingsHash     string            `json:"runtime_settings_hash,omitempty"`
+	ConfigurationEpoch      uint64            `json:"configuration_epoch"`
+	ConfigurationHash       string            `json:"configuration_hash"`
+	RuntimeGeneration       uint64            `json:"runtime_generation"`
+	PolicyHash              string            `json:"policy_hash"`
+	ActivationID            int64             `json:"activation_id"`
+	ActivationStage         string            `json:"activation_stage"`
+	TrafficBasisPoints      int               `json:"traffic_basis_points"`
+	ActivationCreatedTime   int64             `json:"activation_created_time"`
+	BuiltAtUnix             int64             `json:"built_at"`
+	GeneratedAt             int64             `json:"generated_at"`
+	BuildDurationMs         int64             `json:"build_duration_ms"`
+	AggregateP95TTFTMs      float64           `json:"aggregate_p95_ttft_ms"`
+	AggregateP95TTFTKnown   bool              `json:"aggregate_p95_ttft_known"`
+	Pools                   []PoolSnapshot    `json:"pools"`
+	Channels                []ChannelSnapshot `json:"channels"`
+	Stats                   SnapshotStats     `json:"stats"`
 }
 
 type PoolSnapshot struct {
@@ -130,6 +143,7 @@ type PoolMemberSnapshot struct {
 	ID                     int             `json:"id"`
 	PoolID                 int             `json:"pool_id"`
 	ChannelID              int             `json:"channel_id"`
+	ChannelGeneration      string          `json:"channel_generation"`
 	ChannelName            string          `json:"channel_name"`
 	ChannelType            int             `json:"channel_type"`
 	PhysicalStatus         int             `json:"physical_status"`
@@ -233,7 +247,8 @@ type ModelSnapshot struct {
 
 type ChannelSnapshot struct {
 	ID                     int      `json:"id"`
-	RoutingGeneration      string   `json:"-"`
+	RoutingIdentity        string   `json:"routing_identity"`
+	RoutingGeneration      string   `json:"routing_generation"`
 	Name                   string   `json:"name"`
 	Type                   int      `json:"type"`
 	Status                 int      `json:"status"`
@@ -262,6 +277,7 @@ type ChannelSnapshot struct {
 
 type Identity struct {
 	SnapshotRevision  uint64 `json:"snapshot_revision"`
+	ChannelGeneration string `json:"channel_generation"`
 	PoolID            int    `json:"pool_id"`
 	MemberID          int    `json:"member_id"`
 	CredentialID      int    `json:"credential_id"`
@@ -320,8 +336,22 @@ type stableMetricKey struct {
 }
 
 type activeMetricMember struct {
-	poolID    int
-	channelID int
+	poolID            int
+	channelID         int
+	channelGeneration string
+}
+
+func validSnapshotGeneration(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for index := range value {
+		char := value[index]
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 const (
@@ -399,8 +429,26 @@ func RefreshSnapshotContext(ctx context.Context) (SnapshotView, error) {
 		ctx = context.Background()
 	}
 	db := model.DB
-	if _, err := syncLegacyRoutingPolicyDBContext(ctx, db); err != nil {
+	if err := model.EnsureRoutingPolicyHeadDBContext(ctx, db); err != nil {
 		return SnapshotView{}, err
+	}
+	head, err := model.GetRoutingPolicyHeadDBContext(ctx, db)
+	if err != nil {
+		return SnapshotView{}, err
+	}
+	needsPolicyMigration := head.CurrentRevision == 0
+	if head.CurrentRevision > 0 {
+		var revision model.RoutingPolicyRevision
+		if err := db.WithContext(ctx).Select("revision", "schema_version").
+			Where("revision = ?", head.CurrentRevision).First(&revision).Error; err != nil {
+			return SnapshotView{}, err
+		}
+		needsPolicyMigration = revision.SchemaVersion < model.RoutingPolicySchemaVersion
+	}
+	if needsPolicyMigration {
+		if _, err := syncLegacyRoutingPolicyDBContext(ctx, db); err != nil {
+			return SnapshotView{}, err
+		}
 	}
 
 	snapshot, err := buildSnapshotContext(ctx, db, DefaultSnapshotLimits)
@@ -427,6 +475,23 @@ func publishRuntimeSnapshot(snapshot *runtimeSnapshot) (SnapshotView, error) {
 		if snapshot.view.ConfigurationEpoch == current.view.ConfigurationEpoch &&
 			snapshot.view.ConfigurationHash != current.view.ConfigurationHash {
 			return SnapshotView{}, ErrSnapshotConfigEpochConflict
+		}
+		if snapshot.view.TopologyEpoch < current.view.TopologyEpoch {
+			return SnapshotView{}, ErrSnapshotTopologyEpochRollback
+		}
+		if snapshot.view.TopologyEpoch == current.view.TopologyEpoch &&
+			snapshot.view.TopologyHash != current.view.TopologyHash {
+			return SnapshotView{}, ErrSnapshotTopologyEpochConflict
+		}
+		if snapshot.view.PricingEpoch < current.view.PricingEpoch {
+			return SnapshotView{}, ErrSnapshotPricingEpochRollback
+		}
+		if snapshot.view.PricingEpoch == current.view.PricingEpoch &&
+			snapshot.view.PricingHash != current.view.PricingHash {
+			return SnapshotView{}, ErrSnapshotPricingEpochConflict
+		}
+		if snapshot.view.RuntimeSettingsRevision < current.view.RuntimeSettingsRevision {
+			return SnapshotView{}, ErrSnapshotSettingsRollback
 		}
 		if snapshot.view.Revision == current.view.Revision {
 			if snapshot.view.PolicyHash != current.view.PolicyHash ||
@@ -464,9 +529,10 @@ func ResolveIdentity(group string, channelID int, credential string) (Identity, 
 		return Identity{}, false
 	}
 	identity := Identity{
-		SnapshotRevision: snapshot.view.Revision,
-		PoolID:           poolID,
-		MemberID:         memberID,
+		SnapshotRevision:  snapshot.view.Revision,
+		ChannelGeneration: channelGenerationForMember(snapshot, memberID),
+		PoolID:            poolID,
+		MemberID:          memberID,
 	}
 	channel, ok := snapshot.channelByID[channelID]
 	if !ok {
@@ -512,14 +578,30 @@ func ResolveObserveModelSnapshot(group string, channelID int, modelName string) 
 		return ModelSnapshot{}, Identity{}, false
 	}
 	identity := Identity{
-		SnapshotRevision: snapshot.view.Revision,
-		PoolID:           poolID,
-		MemberID:         memberID,
+		SnapshotRevision:  snapshot.view.Revision,
+		ChannelGeneration: channelGenerationForMember(snapshot, memberID),
+		PoolID:            poolID,
+		MemberID:          memberID,
 	}
 	if channel, exists := snapshot.channelByID[channelID]; exists {
 		identity.FailureDomainHash = channel.FailureDomainHash
 	}
 	return observation, identity, true
+}
+
+func channelGenerationForMember(snapshot *runtimeSnapshot, memberID int) string {
+	if snapshot == nil || memberID <= 0 {
+		return ""
+	}
+	for poolIndex := range snapshot.view.Pools {
+		for memberIndex := range snapshot.view.Pools[poolIndex].Members {
+			member := snapshot.view.Pools[poolIndex].Members[memberIndex]
+			if member.ID == memberID {
+				return member.ChannelGeneration
+			}
+		}
+	}
+	return ""
 }
 
 func buildSnapshotContext(ctx context.Context, db *gorm.DB, limits SnapshotLimits) (*runtimeSnapshot, error) {
@@ -678,9 +760,32 @@ func buildSnapshotWithinTransaction(
 	liveRollups []routingmetrics.StableSnapshot,
 ) (*runtimeSnapshot, error) {
 	started := time.Now()
+	var err error
+	document, err = composeSnapshotPolicyDocument(ctx, db, document)
+	if err != nil {
+		return nil, err
+	}
 	configurationEpoch, err := model.GetRoutingConfigurationEpochDBContext(ctx, db)
 	if err != nil {
 		return nil, err
+	}
+	topologyVersion, err := model.GetRoutingTopologyVersionDBContext(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	pricingVersion := model.RoutingPricingVersion{}
+	if db.Migrator().HasTable(&model.RoutingPricingVersion{}) {
+		pricingVersion, err = model.GetRoutingPricingVersionDBContext(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+	}
+	runtimeSettings := model.RoutingRuntimeSettingsState{}
+	if db.Migrator().HasTable(&model.RoutingRuntimeSettingsState{}) {
+		runtimeSettings, err = model.GetRoutingRuntimeSettingsStateDBContext(ctx, db)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
 	}
 
 	pools := make([]model.RoutingPool, 0, len(document.Pools))
@@ -694,6 +799,14 @@ func buildSnapshotWithinTransaction(
 	enterprisePolicyByPoolID := make(map[int]EnterprisePoolPolicy, len(document.Pools))
 	enterpriseMemberPolicyByID := make(map[int]enterpriseMemberPolicy, revision.MemberCount)
 	capabilityOverridesByMemberID := make(map[int]routingCapabilityOverrides, revision.MemberCount)
+	var liveMembers []model.RoutingPoolMember
+	if err := db.WithContext(ctx).Where("active = ?", true).Order("id asc").Find(&liveMembers).Error; err != nil {
+		return nil, err
+	}
+	liveMemberByID := make(map[int]model.RoutingPoolMember, len(liveMembers))
+	for _, member := range liveMembers {
+		liveMemberByID[member.ID] = member
+	}
 	for poolIndex := range document.Pools {
 		pool := document.Pools[poolIndex]
 		selectorPolicy, err := resolvePoolSelectorPolicy(pool.PolicyProfile, pool.Policy)
@@ -731,6 +844,14 @@ func buildSnapshotWithinTransaction(
 		})
 		for memberIndex := range pool.Members {
 			member := pool.Members[memberIndex]
+			liveMember, exists := liveMemberByID[member.MemberID]
+			if !exists || liveMember.PoolID != pool.PoolID || liveMember.ChannelID != member.ChannelID ||
+				!validSnapshotGeneration(liveMember.ChannelGeneration) {
+				return nil, fmt.Errorf(
+					"%w: member %d no longer belongs to pool %d channel %d",
+					ErrSnapshotPolicyReference, member.MemberID, pool.PoolID, member.ChannelID,
+				)
+			}
 			capabilityOverrides, err := resolveMemberCapabilityEvidence(member.Overrides)
 			if err != nil {
 				return nil, fmt.Errorf("invalid routing capability override for member %d: %w", member.MemberID, err)
@@ -745,13 +866,14 @@ func buildSnapshotWithinTransaction(
 				continue
 			}
 			members = append(members, model.RoutingPoolMember{
-				ID:             member.MemberID,
-				PoolID:         pool.PoolID,
-				ChannelID:      member.ChannelID,
-				Source:         "policy_revision",
-				Active:         true,
-				LegacyPriority: member.Priority,
-				LegacyWeight:   member.Weight,
+				ID:                member.MemberID,
+				PoolID:            pool.PoolID,
+				ChannelID:         member.ChannelID,
+				ChannelGeneration: liveMember.ChannelGeneration,
+				Source:            "policy_revision",
+				Active:            true,
+				LegacyPriority:    member.Priority,
+				LegacyWeight:      member.Weight,
 			})
 			memberCredentialIDs[member.MemberID] = append([]int(nil), member.CredentialIDs...)
 		}
@@ -771,8 +893,12 @@ func buildSnapshotWithinTransaction(
 		return nil, fmt.Errorf("%w: credentials", ErrSnapshotLimitExceeded)
 	}
 	activeMembers := make(map[int]activeMetricMember, len(members))
+	activeMemberIDs := make([]int, 0, len(members))
 	for _, member := range members {
-		activeMembers[member.ID] = activeMetricMember{poolID: member.PoolID, channelID: member.ChannelID}
+		activeMembers[member.ID] = activeMetricMember{
+			poolID: member.PoolID, channelID: member.ChannelID, channelGeneration: member.ChannelGeneration,
+		}
+		activeMemberIDs = append(activeMemberIDs, member.ID)
 	}
 	activeCredentialChannels := make(map[int]int, len(credentials))
 	activeCredentials := make(map[int]model.RoutingCredentialRef, len(credentials))
@@ -781,6 +907,22 @@ func buildSnapshotWithinTransaction(
 		activeCredentialChannels[credential.ID] = credential.ChannelID
 		activeCredentials[credential.ID] = credential
 		channelsWithActiveCredentials[credential.ChannelID] = struct{}{}
+	}
+	for memberID, credentialIDs := range memberCredentialIDs {
+		member, exists := activeMembers[memberID]
+		if !exists {
+			return nil, fmt.Errorf("%w: member %d is missing", ErrSnapshotPolicyReference, memberID)
+		}
+		for _, credentialID := range credentialIDs {
+			credential, exists := activeCredentials[credentialID]
+			if !exists || credential.ChannelID != member.channelID ||
+				credential.ChannelGeneration != member.channelGeneration {
+				return nil, fmt.Errorf(
+					"%w: credential %d does not belong to member %d lifecycle",
+					ErrSnapshotPolicyReference, credentialID, memberID,
+				)
+			}
+		}
 	}
 	modelNamesByPolicyChannel, err := validateSnapshotPolicyReferences(ctx, db, document, activeCredentials, limits)
 	if err != nil {
@@ -853,12 +995,18 @@ metricPages:
 	for {
 		metricQuery := db.WithContext(ctx).Table("routing_metric_rollups AS metric_rollups").
 			Select(
-				"metric_rollups.id, metric_rollups.member_id, metric_rollups.model_key, metric_rollups.model_name, "+
-					"metric_rollups.credential_id, metric_rollups.bucket_ts, "+
-					"COALESCE(LENGTH(metric_rollups.latency_sketch), 0) AS latency_sketch_bytes, "+
+				"metric_rollups.id, metric_rollups.member_id, metric_rollups.model_key, metric_rollups.model_name, " +
+					"metric_rollups.credential_id, metric_rollups.bucket_ts, " +
+					"COALESCE(LENGTH(metric_rollups.latency_sketch), 0) AS latency_sketch_bytes, " +
 					"COALESCE(LENGTH(metric_rollups.ttft_sketch), 0) AS ttft_sketch_bytes",
-			).
-			Joins(
+			)
+		if document.SchemaVersion == model.RoutingPolicySchemaVersion {
+			if len(activeMemberIDs) == 0 {
+				break metricPages
+			}
+			metricQuery = metricQuery.Where("metric_rollups.member_id IN ?", activeMemberIDs)
+		} else {
+			metricQuery = metricQuery.Joins(
 				"JOIN routing_policy_member_revisions AS metric_members ON metric_members.revision = ? "+
 					"AND metric_members.member_id = metric_rollups.member_id "+
 					"AND metric_members.pool_id = metric_rollups.pool_id "+
@@ -866,7 +1014,9 @@ metricPages:
 					"AND metric_members.enabled = ?",
 				revision.Revision,
 				true,
-			).
+			)
+		}
+		metricQuery = metricQuery.
 			Joins("LEFT JOIN routing_credential_refs AS metric_credentials ON metric_credentials.id = metric_rollups.credential_id AND metric_credentials.channel_id = metric_rollups.channel_id").
 			Where(
 				"metric_rollups.bucket_ts >= ? AND ((metric_rollups.credential_id = 0 AND NOT EXISTS ("+
@@ -1032,7 +1182,7 @@ metricPages:
 	for len(channels) <= limits.MaxChannels {
 		var page []model.Channel
 		query := db.WithContext(ctx).
-			Select("id", "routing_generation", "type", "status", "name", "key", "base_url", "balance", "balance_updated_time", "models", "model_mapping", "channel_info").
+			Select("id", "routing_identity", "routing_generation", "type", "status", "name", "key", "base_url", "balance", "balance_updated_time", "models", "model_mapping", "channel_info").
 			Order("id asc").Limit(500)
 		if lastChannelID > 0 {
 			query = query.Where("id > ?", lastChannelID)
@@ -1181,11 +1331,13 @@ metricPages:
 	invalidNumericValues := 0
 	for _, channel := range channels {
 		configuration, configured := configurationByChannel[channel.Id]
-		if !configured {
+		if !configured || configuration.RoutingIdentity != channel.RoutingIdentity ||
+			configuration.RoutingGeneration != channel.RoutingGeneration {
 			return nil, fmt.Errorf("%w: channel %d has no routing configuration", ErrSnapshotPolicyReference, channel.Id)
 		}
 		view := ChannelSnapshot{
 			ID:                     channel.Id,
+			RoutingIdentity:        channel.RoutingIdentity,
 			RoutingGeneration:      channel.RoutingGeneration,
 			Name:                   channel.Name,
 			Type:                   channel.Type,
@@ -1232,7 +1384,9 @@ metricPages:
 		}
 		view.EffectiveModelCount = len(effectiveModels)
 		view.CostBasisAvailable = costBasisAvailable && len(effectiveModels) > 0
-		if authFailure, ok := routinghotcache.GetAuthFailure(channel.Id); ok {
+		if authFailure, ok := routinghotcache.GetAuthFailureForGeneration(
+			channel.Id, channel.RoutingGeneration,
+		); ok {
 			view.AuthFailure = authFailure.Marked
 			view.AuthFailureUpdatedAt = authFailure.UpdatedUnix
 		}
@@ -1262,8 +1416,15 @@ metricPages:
 		if _, ok := poolByID[member.PoolID]; !ok {
 			continue
 		}
-		if _, ok := channelByID[member.ChannelID]; !ok {
+		channel, ok := channelByID[member.ChannelID]
+		if !ok {
 			continue
+		}
+		if member.ChannelGeneration == "" || member.ChannelGeneration != channel.RoutingGeneration {
+			return nil, fmt.Errorf(
+				"%w: member %d generation does not match channel %d",
+				ErrSnapshotPolicyReference, member.ID, member.ChannelID,
+			)
 		}
 		membersByPool[member.PoolID] = append(membersByPool[member.PoolID], member)
 		memberByPoolChannel[poolChannelKey{PoolID: member.PoolID, ChannelID: member.ChannelID}] = member.ID
@@ -1310,20 +1471,21 @@ metricPages:
 				channelsWithCredentials[channel.Id] = struct{}{}
 			}
 			memberView := PoolMemberSnapshot{
-				ID:               member.ID,
-				PoolID:           member.PoolID,
-				ChannelID:        member.ChannelID,
-				ChannelName:      channel.Name,
-				ChannelType:      channel.Type,
-				PhysicalStatus:   channel.Status,
-				LegacyPriority:   member.LegacyPriority,
-				LegacyWeight:     member.LegacyWeight,
-				MultiKey:         channel.ChannelInfo.IsMultiKey,
-				CredentialCount:  len(credentialIDs),
-				CredentialIDs:    credentialIDs,
-				ModelCount:       len(modelNamesByChannel[channel.Id]),
-				Models:           make([]ModelSnapshot, 0, len(modelNamesByChannel[channel.Id])),
-				enterprisePolicy: enterpriseMemberPolicyByID[member.ID],
+				ID:                member.ID,
+				PoolID:            member.PoolID,
+				ChannelID:         member.ChannelID,
+				ChannelGeneration: member.ChannelGeneration,
+				ChannelName:       channel.Name,
+				ChannelType:       channel.Type,
+				PhysicalStatus:    channel.Status,
+				LegacyPriority:    member.LegacyPriority,
+				LegacyWeight:      member.LegacyWeight,
+				MultiKey:          channel.ChannelInfo.IsMultiKey,
+				CredentialCount:   len(credentialIDs),
+				CredentialIDs:     credentialIDs,
+				ModelCount:        len(modelNamesByChannel[channel.Id]),
+				Models:            make([]ModelSnapshot, 0, len(modelNamesByChannel[channel.Id])),
+				enterprisePolicy:  enterpriseMemberPolicyByID[member.ID],
 			}
 			for _, modelName := range modelNamesByChannel[channel.Id] {
 				if modelSnapshotCount >= limits.MaxTotalModelSnapshots {
@@ -1408,21 +1570,29 @@ metricPages:
 	}
 
 	view := SnapshotView{
-		Revision:              uint64(revision.Revision),
-		ConfigurationEpoch:    uint64(configurationEpoch.Epoch),
-		ConfigurationHash:     configurationEpoch.StateHash,
-		PolicyHash:            revision.ContentHash,
-		ActivationID:          activation.ID,
-		ActivationStage:       activation.Stage,
-		TrafficBasisPoints:    activation.TrafficBasisPoints,
-		ActivationCreatedTime: activation.CreatedTime,
-		BuiltAtUnix:           common.GetTimestamp(),
-		BuildDurationMs:       time.Since(started).Milliseconds(),
-		AggregateP95TTFTMs:    aggregateP95TTFTMs,
-		AggregateP95TTFTKnown: aggregateP95TTFTKnown,
-		Pools:                 poolViews,
-		Channels:              channelViews,
-		Stats:                 stats,
+		Revision:                uint64(revision.Revision),
+		PolicyRevision:          uint64(revision.Revision),
+		TopologyEpoch:           uint64(topologyVersion.Epoch),
+		TopologyHash:            topologyVersion.StateHash,
+		PricingEpoch:            uint64(pricingVersion.Epoch),
+		PricingHash:             pricingVersion.StateHash,
+		RuntimeSettingsRevision: uint64(runtimeSettings.Revision),
+		RuntimeSettingsHash:     runtimeSettings.DocumentHash,
+		ConfigurationEpoch:      uint64(configurationEpoch.Epoch),
+		ConfigurationHash:       configurationEpoch.StateHash,
+		PolicyHash:              revision.ContentHash,
+		ActivationID:            activation.ID,
+		ActivationStage:         activation.Stage,
+		TrafficBasisPoints:      activation.TrafficBasisPoints,
+		ActivationCreatedTime:   activation.CreatedTime,
+		BuiltAtUnix:             common.GetTimestamp(),
+		GeneratedAt:             time.Now().UnixMilli(),
+		BuildDurationMs:         time.Since(started).Milliseconds(),
+		AggregateP95TTFTMs:      aggregateP95TTFTMs,
+		AggregateP95TTFTKnown:   aggregateP95TTFTKnown,
+		Pools:                   poolViews,
+		Channels:                channelViews,
+		Stats:                   stats,
 	}
 	poolIndexByID := make(map[int]int, len(poolViews))
 	poolSummaries := make([]PoolSnapshotSummary, len(poolViews))
@@ -1534,16 +1704,18 @@ func snapshotModel(
 	}
 	if len(credentialIDs) == 0 {
 		view.Inflight = routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
-			PoolMemberID: memberID,
-			CredentialID: 0,
-			Model:        modelName,
+			PoolMemberID:      memberID,
+			CredentialID:      0,
+			ChannelGeneration: channel.RoutingGeneration,
+			Model:             modelName,
 		})
 	} else {
 		for _, credentialID := range credentialIDs {
 			view.Inflight = saturatingMetricTotal(view.Inflight, routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
-				PoolMemberID: memberID,
-				CredentialID: credentialID,
-				Model:        modelName,
+				PoolMemberID:      memberID,
+				CredentialID:      credentialID,
+				ChannelGeneration: channel.RoutingGeneration,
+				Model:             modelName,
 			}))
 		}
 	}
@@ -1591,10 +1763,11 @@ func snapshotModel(
 		}
 	}
 	key := routinghotcache.Key{
-		ChannelID:   channel.Id,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       modelName,
-		Group:       group,
+		ChannelID:         channel.Id,
+		ChannelGeneration: channel.RoutingGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             modelName,
+		Group:             group,
 	}
 	if !channel.ChannelInfo.IsMultiKey {
 		if telemetryAvailable && !view.MetricKnown {
@@ -1766,7 +1939,8 @@ func aggregateStableMetrics(
 			continue
 		}
 		member, active := activeMembers[rollup.MemberID]
-		if !active || member.poolID != rollup.PoolID || member.channelID != rollup.ChannelID {
+		if !active || member.poolID != rollup.PoolID || member.channelID != rollup.ChannelID ||
+			member.channelGeneration != rollup.ChannelGeneration {
 			continue
 		}
 		if _, visible := visibleModelsByMember[rollup.MemberID][rollup.ModelName]; !visible {
@@ -1829,7 +2003,8 @@ func aggregateStableMetrics(
 			continue
 		}
 		member, active := activeMembers[snapshot.PoolMemberID]
-		if !active || member.poolID != snapshot.PoolID || member.channelID != snapshot.ChannelID {
+		if !active || member.poolID != snapshot.PoolID || member.channelID != snapshot.ChannelID ||
+			member.channelGeneration != snapshot.ChannelGeneration {
 			continue
 		}
 		if _, visible := visibleModelsByMember[snapshot.PoolMemberID][snapshot.Model]; !visible {

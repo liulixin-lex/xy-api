@@ -24,6 +24,7 @@ import (
 
 type Channel struct {
 	Id                 int     `json:"id"`
+	RoutingIdentity    string  `json:"-" gorm:"column:routing_identity;type:varchar(32);index"`
 	RoutingGeneration  string  `json:"-" gorm:"column:routing_generation;type:varchar(32)"`
 	Type               int     `json:"type" gorm:"default:0"`
 	Key                string  `json:"key" gorm:"not null"`
@@ -65,7 +66,12 @@ type Channel struct {
 var ErrChannelHasStatefulReferences = errors.New("channel has stateful task references; disable it instead of changing its upstream identity")
 
 func (channel *Channel) BeforeCreate(_ *gorm.DB) error {
-	channel.RoutingGeneration = common.GetUUID()
+	if !validRoutingIdentity(channel.RoutingIdentity) {
+		channel.RoutingIdentity = common.GetUUID()
+	}
+	if !validRoutingIdentity(channel.RoutingGeneration) {
+		channel.RoutingGeneration = common.GetUUID()
+	}
 	return nil
 }
 
@@ -73,7 +79,14 @@ func (channel *Channel) AfterCreate(tx *gorm.DB) error {
 	if channel == nil {
 		return ErrRoutingChannelConfigurationInvalid
 	}
-	return createDefaultRoutingChannelConfigurationTx(tx, channel.Id, channel.CreatedTime)
+	if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+		if err := ensureRoutingChannelLifecycleTx(
+			tx, *channel, RoutingChannelLifecycleReasonCreated, common.GetTimestamp(),
+		); err != nil {
+			return err
+		}
+	}
+	return createDefaultRoutingChannelConfigurationTx(tx, *channel)
 }
 
 func EnsureChannelRoutingGenerations(db *gorm.DB) error {
@@ -83,8 +96,8 @@ func EnsureChannelRoutingGenerations(db *gorm.DB) error {
 	const batchSize = 200
 	for {
 		var channels []Channel
-		if err := db.Select("id").
-			Where("routing_generation IS NULL OR routing_generation = ?", "").
+		if err := db.Select("id", "routing_identity", "routing_generation").
+			Where("routing_identity IS NULL OR routing_identity = ? OR routing_generation IS NULL OR routing_generation = ?", "", "").
 			Order("id asc").Limit(batchSize).Find(&channels).Error; err != nil {
 			return err
 		}
@@ -93,9 +106,17 @@ func EnsureChannelRoutingGenerations(db *gorm.DB) error {
 		}
 		if err := db.Transaction(func(tx *gorm.DB) error {
 			for i := range channels {
-				result := tx.Model(&Channel{}).
-					Where("id = ? AND (routing_generation IS NULL OR routing_generation = ?)", channels[i].Id, "").
-					Update("routing_generation", common.GetUUID())
+				updates := map[string]any{}
+				if !validRoutingIdentity(channels[i].RoutingIdentity) {
+					updates["routing_identity"] = common.GetUUID()
+				}
+				if !validRoutingIdentity(channels[i].RoutingGeneration) {
+					updates["routing_generation"] = common.GetUUID()
+				}
+				if len(updates) == 0 {
+					continue
+				}
+				result := tx.Model(&Channel{}).Where("id = ?", channels[i].Id).Updates(updates)
 				if result.Error != nil {
 					return result.Error
 				}
@@ -761,6 +782,21 @@ func BatchDeleteChannels(ids []int) error {
 			return err
 		}
 	}
+	now := common.GetTimestamp()
+	for index := range channels {
+		if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+			if err := retireRoutingChannelLifecycleTx(
+				tx, channels[index], RoutingChannelLifecycleReasonDeleted, now,
+			); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := retireRoutingChannelGenerationStateTx(tx, channels[index], now); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
 	for _, chunk := range lo.Chunk(ids, 200) {
 		if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
 			if err := tx.Where("channel_id in (?)", chunk).Delete(&RoutingChannelConfiguration{}).Error; err != nil {
@@ -908,8 +944,8 @@ func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 		keysRemoved := credentialChanged && !channelKeyMultisetContains(
 			(&Channel{Key: effectiveKey}).GetKeys(), current.GetKeys(),
 		)
-		identityChanged := endpointChanged || credentialChanged || credentialModeChanged
-		if identityChanged {
+		lifecycleChanged := endpointChanged
+		if lifecycleChanged || credentialChanged || credentialModeChanged {
 			hasReferences, err := HasStatefulChannelReferencesTx(tx, channel.Id)
 			if err != nil {
 				return err
@@ -917,24 +953,41 @@ func (channel *Channel) UpdateWithCredentialChange() (bool, error) {
 			if hasReferences && (endpointChanged || credentialModeChanged || keysRemoved) {
 				return ErrChannelHasStatefulReferences
 			}
-			if !hasReferences {
-				channel.RoutingGeneration = common.GetUUID()
-			} else {
-				channel.RoutingGeneration = current.RoutingGeneration
-			}
-		} else {
-			channel.RoutingGeneration = current.RoutingGeneration
+		}
+		channel.RoutingIdentity = current.RoutingIdentity
+		channel.RoutingGeneration = current.RoutingGeneration
+		if lifecycleChanged {
+			channel.RoutingGeneration = common.GetUUID()
 		}
 		if err := tx.Model(channel).Updates(channel).Error; err != nil {
 			return err
 		}
-		if credentialChanged {
-			now := common.GetTimestamp()
-			if err := tx.Model(&RoutingChannelHealthState{}).Where("channel_id = ?", channel.Id).
-				Updates(map[string]any{
-					"auth_failure": false, "auth_failure_reason": "", "auth_failure_until": int64(0), "updated_time": now,
-				}).Error; err != nil {
+		now := common.GetTimestamp()
+		if lifecycleChanged {
+			if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+				if err := rotateRoutingChannelLifecycleTx(
+					tx, current, *channel, RoutingChannelLifecycleReasonUpstreamChanged, now,
+				); err != nil {
+					return err
+				}
+			}
+			if err := retireRoutingChannelGenerationStateTx(tx, current, now); err != nil {
 				return err
+			}
+			if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+				if err := rotateRoutingChannelConfigurationGenerationTx(tx, current, *channel, now); err != nil {
+					return err
+				}
+			}
+		}
+		if credentialChanged {
+			if tx.Migrator().HasTable(&RoutingChannelHealthState{}) {
+				if err := tx.Model(&RoutingChannelHealthState{}).Where("channel_id = ?", channel.Id).
+					Updates(map[string]any{
+						"auth_failure": false, "auth_failure_reason": "", "auth_failure_until": int64(0), "updated_time": now,
+					}).Error; err != nil {
+					return err
+				}
 			}
 		}
 		if err := tx.First(channel, "id = ?", channel.Id).Error; err != nil {
@@ -1074,6 +1127,17 @@ func (channel *Channel) Delete() error {
 			return err
 		}
 		if err := EnsureNoStatefulChannelReferencesTx(tx, current.Id); err != nil {
+			return err
+		}
+		now := common.GetTimestamp()
+		if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+			if err := retireRoutingChannelLifecycleTx(
+				tx, current, RoutingChannelLifecycleReasonDeleted, now,
+			); err != nil {
+				return err
+			}
+		}
+		if err := retireRoutingChannelGenerationStateTx(tx, current, now); err != nil {
 			return err
 		}
 		if err := tx.Where("channel_id = ?", current.Id).Delete(&Ability{}).Error; err != nil {
@@ -1343,9 +1407,35 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 				if err := EnsureNoStatefulChannelReferencesTx(tx, channels[index].Id); err != nil {
 					return err
 				}
+				next := channels[index]
+				next.RoutingGeneration = common.GetUUID()
+				if paramOverride != nil {
+					next.ParamOverride = paramOverride
+				}
+				if headerOverride != nil {
+					next.HeaderOverride = headerOverride
+				}
 				if err := tx.Model(&Channel{}).Where("id = ?", channels[index].Id).
-					Update("routing_generation", common.GetUUID()).Error; err != nil {
+					Update("routing_generation", next.RoutingGeneration).Error; err != nil {
 					return err
+				}
+				now := common.GetTimestamp()
+				if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+					if err := rotateRoutingChannelLifecycleTx(
+						tx, channels[index], next, RoutingChannelLifecycleReasonUpstreamChanged, now,
+					); err != nil {
+						return err
+					}
+				}
+				if err := retireRoutingChannelGenerationStateTx(tx, channels[index], now); err != nil {
+					return err
+				}
+				if tx.Migrator().HasTable(&RoutingChannelConfiguration{}) {
+					if err := rotateRoutingChannelConfigurationGenerationTx(
+						tx, channels[index], next, now,
+					); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -1411,8 +1501,19 @@ func deleteChannelsByStatuses(statuses []int64) (int64, error) {
 			return nil
 		}
 		ids := make([]int, 0, len(channels))
+		now := common.GetTimestamp()
 		for index := range channels {
 			if err := EnsureNoStatefulChannelReferencesTx(tx, channels[index].Id); err != nil {
+				return err
+			}
+			if tx.Migrator().HasTable(&RoutingChannelLifecycle{}) {
+				if err := retireRoutingChannelLifecycleTx(
+					tx, channels[index], RoutingChannelLifecycleReasonDeleted, now,
+				); err != nil {
+					return err
+				}
+			}
+			if err := retireRoutingChannelGenerationStateTx(tx, channels[index], now); err != nil {
 				return err
 			}
 			ids = append(ids, channels[index].Id)

@@ -40,12 +40,13 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	priority := int64(11)
 	weight := uint(23)
 	baseURL := "https://user:secret@example.com/v1?token=hidden"
-	require.NoError(t, db.Create(&model.Channel{
+	channel := model.Channel{
 		Id: 301, Name: "primary", Type: 1, Status: common.ChannelStatusEnabled,
 		Key: "credential-a", Group: "vip", Models: "gpt-b,gpt-a,gpt-a",
 		Priority: &priority, Weight: &weight, BaseURL: &baseURL,
 		Balance: 12.5, BalanceUpdatedTime: 100,
-	}).Error)
+	}
+	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.RoutingChannelBinding{
 		ChannelID: 301, UpstreamType: model.RoutingUpstreamTypeSub2API,
 		BaseURL: "https://cost.example", UpstreamGroup: "vip", Enabled: true,
@@ -59,7 +60,8 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	routinghotcache.SetMetricForTest(routinghotcache.Key{
-		ChannelID: 301, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-a", Group: "vip",
+		ChannelID: 301, ChannelGeneration: channel.RoutingGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-a", Group: "vip",
 	}, routinghotcache.MetricSnapshot{
 		RequestCount: 10, SuccessCount: 9, ReliabilityRequestCount: 9, ReliabilityFailureCount: 1,
 		P95LatencyMs: 1200, P95TTFTMs: 300, OutputTokens: 900, GenerationMs: 3000, TPS: 300, UpdatedUnix: 123,
@@ -99,6 +101,7 @@ func TestRefreshSnapshotPublishesImmutableObserveIdentity(t *testing.T) {
 	identity, ok := ResolveIdentity("vip", 301, "credential-a")
 	require.True(t, ok)
 	assert.Equal(t, view.Revision, identity.SnapshotRevision)
+	assert.Equal(t, channel.RoutingGeneration, identity.ChannelGeneration)
 	assert.NotZero(t, identity.PoolID)
 	assert.NotZero(t, identity.MemberID)
 	assert.NotZero(t, identity.CredentialID)
@@ -492,7 +495,8 @@ func TestSnapshotStableRollupMergesCredentialsAndLiveDeltasWithoutLegacyFallback
 	}}))
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: member.PoolID, PoolMemberID: member.ID, CredentialID: member.CredentialIDs[1], ChannelID: 305,
-		Model: "gpt-test", BucketTs: now, LastSnapshotRevision: first.Revision,
+		ChannelGeneration: member.ChannelGeneration,
+		Model:             "gpt-test", BucketTs: now, LastSnapshotRevision: first.Revision,
 		RequestCount: 2, FailureCount: 2, UnknownClassificationCount: 1,
 		TotalLatencyMs: 1100, TtftSumMs: 400, TtftCount: 2,
 		OutputTokens: 20, GenerationMs: 200, Err429: 1, Err529: 1,
@@ -574,7 +578,8 @@ func TestSnapshotStableTelemetryIsolatedByPoolMemberAndCurrentBucketWindow(t *te
 	currentBucket -= currentBucket % int64(setting.MetricBucketSec)
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: upper.PoolID, PoolMemberID: upper.ID, CredentialID: upper.CredentialIDs[0], ChannelID: 306,
-		Model: "gpt-test", BucketTs: currentBucket, LastSnapshotRevision: first.Revision,
+		ChannelGeneration: upper.ChannelGeneration,
+		Model:             "gpt-test", BucketTs: currentBucket, LastSnapshotRevision: first.Revision,
 		RequestCount: 1, SuccessCount: 1,
 	}})
 
@@ -625,7 +630,8 @@ func TestSnapshotExcludesCredentialZeroAfterKeylessChannelBecomesKeyed(t *testin
 	}}))
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: member.PoolID, PoolMemberID: member.ID, CredentialID: 0, ChannelID: 308,
-		Model: "gpt-test", BucketTs: now, LastSnapshotRevision: first.Revision,
+		ChannelGeneration: member.ChannelGeneration,
+		Model:             "gpt-test", BucketTs: now, LastSnapshotRevision: first.Revision,
 		RequestCount: 1, SuccessCount: 1,
 	}})
 
@@ -639,7 +645,8 @@ func TestSnapshotExcludesCredentialZeroAfterKeylessChannelBecomesKeyed(t *testin
 	assert.Positive(t, identity.CredentialID)
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: identity.PoolID, PoolMemberID: identity.MemberID, CredentialID: identity.CredentialID, ChannelID: 308,
-		Model: "gpt-test", BucketTs: now, LastSnapshotRevision: second.Revision,
+		ChannelGeneration: identity.ChannelGeneration,
+		Model:             "gpt-test", BucketTs: now, LastSnapshotRevision: second.Revision,
 		RequestCount: 2, SuccessCount: 2,
 	}})
 
@@ -760,7 +767,8 @@ func runSnapshotExternalContract(t *testing.T, db *gorm.DB, dbType common.Databa
 	require.NoError(t, err)
 	routingmetrics.RequeueStableSnapshots([]routingmetrics.StableSnapshot{{
 		PoolID: upperMember.PoolID, PoolMemberID: upperMember.ID, CredentialID: credentialA.ID, ChannelID: 501,
-		Model: "Model-X", BucketTs: now, LastSnapshotRevision: 1, RequestCount: 3, SuccessCount: 3,
+		ChannelGeneration: upperMember.ChannelGeneration,
+		Model:             "Model-X", BucketTs: now, LastSnapshotRevision: 1, RequestCount: 3, SuccessCount: 3,
 	}})
 
 	view, err := RefreshSnapshotContext(context.Background())
@@ -999,12 +1007,23 @@ func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testin
 	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
 	require.NoError(t, err)
 	require.Len(t, document.Pools, 1)
-	require.Len(t, document.Pools[0].Members, 1)
-	require.Len(t, document.Pools[0].Members[0].CredentialIDs, 2)
-	member := document.Pools[0].Members[0]
-	selectedCredential := member.CredentialIDs[0]
-	unselectedCredential := member.CredentialIDs[1]
-	document.Pools[0].Members[0].CredentialIDs = []int{selectedCredential}
+	require.Empty(t, document.Pools[0].Members)
+	var topologyMember model.RoutingPoolMember
+	require.NoError(t, db.Where("channel_id = ? AND active = ?", 612, true).First(&topologyMember).Error)
+	var credentials []model.RoutingCredentialRef
+	require.NoError(t, db.Where(
+		"channel_id = ? AND channel_generation = ? AND active = ?",
+		612, topologyMember.ChannelGeneration, true,
+	).Order("id asc").Find(&credentials).Error)
+	require.Len(t, credentials, 2)
+	selectedCredential := credentials[0].ID
+	unselectedCredential := credentials[1].ID
+	member := model.RoutingPolicyMemberContent{
+		MemberID: topologyMember.ID, ChannelID: topologyMember.ChannelID,
+		RoutingGeneration: topologyMember.ChannelGeneration,
+		CredentialIDs:     []int{selectedCredential}, Overrides: json.RawMessage(`{}`),
+	}
+	document.Pools[0].Members = []model.RoutingPolicyMemberContent{member}
 	published, err := model.PublishRoutingPolicyRevisionDBContext(
 		context.Background(), db, head.CurrentRevision, document,
 		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "select_one_credential"},
@@ -1039,7 +1058,9 @@ func TestSnapshotMetricBudgetUsesOnlyCurrentPolicyModelsAndCredentials(t *testin
 	assert.InDelta(t, 10, observation.P95TTFTMs, 1)
 	assert.InDelta(t, 10, firstView.AggregateP95TTFTMs, 1)
 
-	document.Pools[0].Members[0].Weight++
+	weight := int64(101)
+	document.Pools[0].Members[0].Weight = weight
+	document.Pools[0].Members[0].WeightOverride = &weight
 	next, err := model.PublishRoutingPolicyRevisionDBContext(
 		context.Background(), db, published.Revision.Revision, document,
 		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 8, Reason: "overflow_revision"},
@@ -1108,8 +1129,11 @@ func TestSnapshotSanitizesNonFiniteTelemetryAndBalanceValues(t *testing.T) {
 	}).Error)
 	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
+	var currentChannel model.Channel
+	require.NoError(t, db.Select("id", "routing_generation").Where("id = ?", 304).First(&currentChannel).Error)
 	key := routinghotcache.Key{
-		ChannelID: 304, APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
+		ChannelID: 304, ChannelGeneration: currentChannel.RoutingGeneration,
+		APIKeyIndex: model.RoutingMetricSingleKeyIndex, Model: "gpt-test", Group: "default",
 	}
 	routinghotcache.SetMetricForTest(key, routinghotcache.MetricSnapshot{
 		RequestCount: 1, SuccessCount: 1, P95LatencyMs: math.NaN(), P95TTFTMs: math.Inf(1), TPS: math.Inf(-1),
@@ -1172,6 +1196,18 @@ func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 			},
 		},
 		{
+			name:     "active member generation does not match current channel",
+			channels: []model.Channel{{Id: 704, Name: "primary", Group: "default", Models: "gpt-test"}},
+			configure: func(t *testing.T, db *gorm.DB, document *model.RoutingPolicyDocument) {
+				document.Pools[0].Members[0].ChannelID = 704
+			},
+			invalidate: func(t *testing.T, db *gorm.DB, document model.RoutingPolicyDocument) {
+				require.NoError(t, db.Model(&model.RoutingPoolMember{}).
+					Where("id = ?", document.Pools[0].Members[0].MemberID).
+					Update("channel_generation", strings.Repeat("f", 32)).Error)
+			},
+		},
+		{
 			name: "credential belongs to another channel",
 			channels: []model.Channel{
 				{Id: 702, Name: "primary", Key: "key-a", Group: "default", Models: "gpt-test"},
@@ -1213,6 +1249,18 @@ func TestSnapshotFailsClosedForInvalidPolicyReferences(t *testing.T) {
 				}},
 			}
 			test.configure(t, db, &document)
+			policyMember := &document.Pools[0].Members[0]
+			var topologyMember model.RoutingPoolMember
+			require.NoError(t, db.Where(
+				"channel_id = ? AND active = ?", policyMember.ChannelID, true,
+			).First(&topologyMember).Error)
+			var topologyPool model.RoutingPool
+			require.NoError(t, db.Where("id = ?", topologyMember.PoolID).First(&topologyPool).Error)
+			document.Pools[0].PoolID = topologyPool.ID
+			document.Pools[0].GroupName = topologyPool.GroupName
+			document.Pools[0].DisplayName = topologyPool.DisplayName
+			policyMember.MemberID = topologyMember.ID
+			policyMember.RoutingGeneration = topologyMember.ChannelGeneration
 			_, err = model.PublishRoutingPolicyRevisionDBContext(
 				context.Background(), db, 0, document,
 				model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 7, Reason: "reference_test"},
@@ -1443,6 +1491,7 @@ func snapshotMetricRollup(
 		ModelKey:             modelKey,
 		BucketTs:             bucketTs,
 		ChannelID:            member.ChannelID,
+		ChannelGeneration:    member.ChannelGeneration,
 		PoolID:               member.PoolID,
 		SchemaVersion:        model.RoutingMetricRollupSchemaVersion,
 		LastSnapshotRevision: 1,

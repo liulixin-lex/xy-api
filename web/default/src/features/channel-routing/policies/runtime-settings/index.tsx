@@ -90,7 +90,6 @@ import {
 } from './lib/runtime-settings'
 import { RuntimeSettingsNavigationGuard } from './navigation-guard'
 import { RuntimeActiveProbeSection } from './sections/active-probe-section'
-import { RuntimeAgentSection } from './sections/agent-section'
 import { RuntimeBasicsSection } from './sections/basics-section'
 import { RuntimeBreakerSection } from './sections/breaker-section'
 import { RuntimeFirstByteSection } from './sections/first-byte-section'
@@ -286,12 +285,13 @@ function RuntimeSettingsEditor(props: {
         })
         mapped = true
       }
+      if (apiError.status === 401 || apiError.status === 403) return
+      if (mapped) return
       toast.error(
-        mapped
-          ? t('Review the highlighted runtime settings.')
-          : t('Could not save runtime settings. Your draft was preserved.')
+        t('Could not save runtime settings. Your draft was preserved.')
       )
     },
+    meta: { handleErrorLocally: true },
   })
 
   const submit = (values: RuntimeSettingsFormValues) => {
@@ -432,7 +432,6 @@ function RuntimeSettingsEditor(props: {
               <RuntimeHedgeSection />
               <RuntimeActiveProbeSection />
               <RuntimeRefreshRetentionSection />
-              <RuntimeAgentSection />
 
               {isDirty ? (
                 <div className='bg-background/95 supports-backdrop-filter:bg-background/85 sticky bottom-3 z-20 flex flex-col gap-3 rounded-xl border p-3 shadow-sm backdrop-blur sm:flex-row sm:items-center sm:justify-between'>

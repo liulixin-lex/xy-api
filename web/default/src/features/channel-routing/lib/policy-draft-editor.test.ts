@@ -44,7 +44,13 @@ const detail = {
   updated_time_ms: 100,
   validated_time_ms: 0,
   published_time_ms: 0,
-  document: { schema_version: 1, pools: [] },
+  workspace_state: 'working',
+  stale: false,
+  can_validate: true,
+  can_publish: false,
+  can_delete: true,
+  blocking_reason: 'draft_requires_validation',
+  document: { schema_version: 2, pools: [] },
 } satisfies PolicyDraftDetail
 
 describe('policy draft editor concurrency', () => {

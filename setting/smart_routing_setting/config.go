@@ -79,9 +79,6 @@ type SmartRoutingSetting struct {
 	ActiveProbePerHost       int     `json:"active_probe_per_host"`
 	ActiveProbeTokenBudget   int     `json:"active_probe_token_budget"`
 	ActiveProbeCostBudgetUSD float64 `json:"active_probe_cost_budget_usd"`
-	AgentEnabled             bool    `json:"agent_enabled"`
-	AgentAutoApply           bool    `json:"agent_auto_apply"`
-	AgentModel               string  `json:"agent_model"`
 }
 
 var defaultSmartRoutingSetting = SmartRoutingSetting{
@@ -138,9 +135,6 @@ var defaultSmartRoutingSetting = SmartRoutingSetting{
 	ActiveProbePerHost:       1,
 	ActiveProbeTokenBudget:   4_096,
 	ActiveProbeCostBudgetUSD: 0.25,
-	AgentEnabled:             false,
-	AgentAutoApply:           false,
-	AgentModel:               "claude-opus-4-8",
 }
 
 var smartRoutingSetting = defaultSmartRoutingSetting
@@ -205,11 +199,6 @@ func applyEnvOverrides(setting *SmartRoutingSetting) {
 	if value, ok := os.LookupEnv("SMART_ROUTING_REQUEST_PROFILE_ENABLED"); ok {
 		if parsed, err := strconv.ParseBool(value); err == nil {
 			setting.RequestProfileEnabled = parsed
-		}
-	}
-	if value, ok := os.LookupEnv("SMART_ROUTING_AGENT_ENABLED"); ok {
-		if parsed, err := strconv.ParseBool(value); err == nil {
-			setting.AgentEnabled = parsed
 		}
 	}
 	if value, ok := os.LookupEnv("SMART_ROUTING_HEDGE_ENABLED"); ok {

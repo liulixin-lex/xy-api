@@ -170,8 +170,9 @@ func RequireRoutingPolicyApprovalQuorumContext(
 	return requireRoutingPolicyApprovalQuorumDBContext(ctx, DB, draft, activation, required)
 }
 
-// DeleteStaleRoutingPolicyApprovalsContext removes only approvals that can no
-// longer authorize an unchanged validated draft on the current policy head.
+// DeleteStaleRoutingPolicyApprovalsContext is retained for compatibility with
+// older maintenance callers. Approval rows are immutable historical facts and
+// are no longer eligible for retention cleanup.
 func DeleteStaleRoutingPolicyApprovalsContext(
 	ctx context.Context,
 	cutoffTimeMs int64,
@@ -183,35 +184,7 @@ func DeleteStaleRoutingPolicyApprovalsContext(
 	if cutoffTimeMs <= 0 || limit < 1 || limit > routingPolicyApprovalRetentionBatch {
 		return 0, ErrRoutingPolicyApprovalInvalid
 	}
-	head, err := GetRoutingPolicyHeadContext(ctx)
-	if err != nil {
-		return 0, err
-	}
-	ids := make([]int64, 0, limit)
-	approvalTable := (RoutingPolicyApproval{}).TableName()
-	draftTable := (RoutingPolicyDraft{}).TableName()
-	staleDraft := "NOT EXISTS (" +
-		"SELECT 1 FROM " + draftTable + " AS draft " +
-		"WHERE draft.id = approval.draft_id AND draft.version = approval.draft_version " +
-		"AND draft.etag = approval.draft_e_tag AND draft.document_hash = approval.document_hash " +
-		"AND draft.status = ? AND draft.validated_head_revision = approval.head_revision " +
-		"AND draft.validated_head_hash = approval.head_hash)"
-	if err := DB.WithContext(ctx).Table(approvalTable+" AS approval").
-		Select("approval.id").
-		Where("approval.created_time_ms < ?", cutoffTimeMs).
-		Where(
-			"approval.head_revision <> ? OR approval.head_hash <> ? OR "+staleDraft,
-			head.CurrentRevision, head.CurrentHash, RoutingPolicyDraftStatusValidated,
-		).
-		Order("approval.id asc").Limit(limit).Pluck("approval.id", &ids).Error; err != nil {
-		return 0, err
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	deleted := DB.WithContext(ctx).Session(&gorm.Session{SkipHooks: true}).
-		Where("id IN ?", ids).Delete(&RoutingPolicyApproval{})
-	return deleted.RowsAffected, deleted.Error
+	return 0, nil
 }
 
 func requireRoutingPolicyApprovalQuorumDBContext(

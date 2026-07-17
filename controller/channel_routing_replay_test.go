@@ -168,6 +168,18 @@ func TestSimulateChannelRoutingGroupUsesStrictBoundedRequestSchema(t *testing.T)
 }
 
 func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) string {
+	return enqueueControllerReplayAuditWithCandidates(t, poolID, requestID, 11, 101, 12, 102)
+}
+
+func enqueueControllerReplayAuditWithCandidates(
+	t *testing.T,
+	poolID int,
+	requestID string,
+	firstMemberID int,
+	firstChannelID int,
+	secondMemberID int,
+	secondChannelID int,
+) string {
 	t.Helper()
 	profile, err := channelrouting.NewLegacyRequestProfile(
 		"/v1/chat/completions", "group-"+strconv.Itoa(poolID), "gpt-test", false, 0, 1_000, 200,
@@ -191,12 +203,12 @@ func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) st
 		RandomSeed:         seed,
 	}, []channelrouting.ShadowCandidateInput{
 		{
-			PoolMemberID: 11, ChannelID: 101, Priority: 10, Weight: 10,
+			PoolMemberID: firstMemberID, ChannelID: firstChannelID, Priority: 10, Weight: 10,
 			Metric: &channelrouting.ShadowMetricInput{RequestCount: 100, SuccessCount: 100, ReliabilityRequestCount: 100, P95LatencyMs: 300, OutputTokensPerSecond: 50},
 			Cost:   &channelrouting.ShadowReplayCostInput{Known: true, Cost: 10, UpdatedUnix: 990},
 		},
 		{
-			PoolMemberID: 12, ChannelID: 102, Priority: 10, Weight: 10,
+			PoolMemberID: secondMemberID, ChannelID: secondChannelID, Priority: 10, Weight: 10,
 			Metric: &channelrouting.ShadowMetricInput{RequestCount: 100, SuccessCount: 80, ReliabilityRequestCount: 100, ReliabilityFailureCount: 20, P95LatencyMs: 250, OutputTokensPerSecond: 60},
 			Cost:   &channelrouting.ShadowReplayCostInput{Known: true, Cost: 1, UpdatedUnix: 990},
 		},
@@ -204,7 +216,7 @@ func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) st
 	require.NoError(t, err)
 	replay, err := channelrouting.RunShadowReplay(input)
 	require.NoError(t, err)
-	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(input, 101)
+	actualCost, actualCostKnown := channelrouting.ShadowExpectedCostForChannel(input, firstChannelID)
 	decisionID, err := channelrouting.EnqueueDecision(channelrouting.DecisionInput{
 		RequestID:            requestID,
 		PoolID:               poolID,
@@ -214,14 +226,14 @@ func enqueueControllerReplayAudit(t *testing.T, poolID int, requestID string) st
 		AlgorithmVersion:     input.AlgorithmVersion,
 		RetryIndex:           profile.RetryIndex,
 		IsStream:             profile.IsStream,
-		ActualChannelID:      101,
+		ActualChannelID:      firstChannelID,
 		ObservedChannelID:    replay.SelectedChannelID,
 		FilteredOpen:         replay.FilteredOpen,
 		FilteredCapacity:     replay.FilteredCapacity,
 		BreakerBypassed:      replay.BreakerBypassed,
 		Candidates:           replay.Candidates,
 		ReplayInput:          &input,
-		DifferenceType:       channelrouting.ClassifyShadowDifference(101, replay),
+		DifferenceType:       channelrouting.ClassifyShadowDifference(firstChannelID, replay),
 		ActualCostKnown:      actualCostKnown,
 		ActualExpectedCost:   actualCost,
 		ObservedCostKnown:    replay.SelectedCostKnown,

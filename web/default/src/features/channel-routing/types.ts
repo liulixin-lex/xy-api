@@ -90,9 +90,6 @@ export type SmartRoutingSetting = {
   active_probe_per_host: number
   active_probe_token_budget: number
   active_probe_cost_budget_usd: number
-  agent_enabled: boolean
-  agent_auto_apply: boolean
-  agent_model: string
 }
 
 export type SmartRoutingSettingField = keyof SmartRoutingSetting
@@ -111,22 +108,72 @@ export type ChannelRoutingControlAuditSubject =
   | 'runtime_settings'
   | 'channel_configuration'
   | 'cost_binding'
+  | 'channel_lifecycle'
+  | 'policy_draft'
+  | 'policy_revision'
+  | 'policy_activation'
+  | 'policy_risk_acceptance'
+  | 'operation'
+  | 'pricing'
+
+export type ChannelRoutingControlAuditResult =
+  | 'succeeded'
+  | 'partially_succeeded'
+  | 'failed'
+  | 'rejected'
+  | string
 
 export type ChannelRoutingControlAudit = {
   id: number
+  schema_version: number
+  event_type: string
   subject_type: ChannelRoutingControlAuditSubject
   subject_id: number
-  action: 'bootstrap' | 'reconcile' | 'create' | 'update' | 'delete' | string
+  subject_identity: string
+  subject_generation?: string
+  subject_name: string
+  action: string
+  source: string
+  reason?: string
+  result: ChannelRoutingControlAuditResult
   actor_id: number
-  before_hash?: string
-  after_hash?: string
-  summary: Record<string, unknown>
+  actor_name: string
+  actor_role: number
+  summary: unknown
+  subject?: unknown
+  changes?: unknown
+  impact?: unknown
+  recommendations?: unknown
+  relations?: unknown
+  error_code?: string
+  error_message?: string
+  needs_attention: boolean
+  correlation_id?: string
+  operation_id?: number
+  draft_id?: number
+  simulation_operation_id?: number
+  policy_revision?: number
+  activation_id?: number
+  rollback_of_revision?: number
+  topology_epoch?: number
+  pricing_epoch?: number
   created_time_ms: number
 }
 
 export type ChannelRoutingControlAuditPage = {
   items: ChannelRoutingControlAudit[]
   next_before_id: number
+}
+
+export type ChannelRoutingControlAuditTechnical = {
+  id: number
+  schema_version: number
+  event_type: string
+  technical: {
+    before_hash?: string
+    after_hash?: string
+    details?: unknown
+  }
 }
 
 export type ChannelRoutingNode = {
@@ -351,6 +398,7 @@ export type PoolMemberSnapshot = {
   id: number
   pool_id: number
   channel_id: number
+  channel_generation: string
   channel_name: string
   channel_type: number
   physical_status: number
@@ -430,6 +478,8 @@ export type ChannelRoutingErrorBudgetResponse = {
 
 export type ChannelSnapshot = {
   id: number
+  routing_identity: string
+  routing_generation: string
   name: string
   type: number
   status: number
@@ -460,23 +510,17 @@ export type ChannelSnapshot = {
   configuration_revision: number
 }
 
-export type CostSnapshotSummary = {
+export type CostSnapshot = {
   pool_id: number
   group_name: string
   member_id: number
   channel_id: number
+  routing_identity: string
+  routing_generation: string
   channel_name: string
   model_name: string
   known: boolean
   cost?: number
-  display_rate?: number
-  display_rate_basis?:
-    | 'per_request'
-    | 'model_price'
-    | 'input_per_million'
-    | string
-  expression_pricing: boolean
-  billing_mode?: string
   currency?: string
   unit?: string
   version?: string
@@ -495,12 +539,6 @@ export type CostSnapshotSummary = {
   freshness: string
   freshness_score: number
   snapshot_time: number
-}
-
-export type CostSnapshot = Omit<
-  CostSnapshotSummary,
-  'display_rate' | 'display_rate_basis' | 'expression_pricing' | 'billing_mode'
-> & {
   pricing?: RoutingNormalizedPricing
 }
 
@@ -508,6 +546,146 @@ export type ChannelRoutingCostDetailResponse = {
   item: CostSnapshot
   snapshot_revision: number
   snapshot_built_at: number
+}
+
+export type RoutingCostCatalogMetadata = {
+  policy_revision?: number
+  topology_epoch?: number
+  pricing_epoch: number
+  pricing_hash: string
+  snapshot_built_at: number
+}
+
+export type RoutingCostCatalogPage<T> = RoutingCostCatalogMetadata & {
+  items: T[]
+  total: number
+  page: number
+  page_size: number
+  pool_id?: number
+  member_id?: number
+}
+
+export type RoutingCostCatalogPool = {
+  pool_id: number
+  group_name: string
+  display_name: string
+  member_count: number
+  model_count: number
+  known_contract_count: number
+  unknown_contract_count: number
+}
+
+export type RoutingCostCatalogMember = {
+  pool_id: number
+  member_id: number
+  channel_id: number
+  routing_identity: string
+  routing_generation: string
+  channel_name: string
+  channel_type: number
+  physical_status: number
+  model_count: number
+  known_contract_count: number
+  unknown_contract_count: number
+  configuration_revision: number
+  upstream_cost_multiplier: number
+}
+
+export type RoutingCostCatalogModel = {
+  pool_id: number
+  member_id: number
+  channel_id: number
+  routing_generation: string
+  model_name: string
+  upstream_model_name?: string
+  known: boolean
+  unknown_reason?: string
+  billing_mode?: string
+  currency?: string
+  contract_mode?: string
+  configured_dimensions: string[]
+  explicit_free_dimensions: string[]
+  configuration_revision: number
+  upstream_cost_multiplier: number
+  pricing_identity?: string
+}
+
+export type RoutingCostComparisonProfile = {
+  input_tokens?: number
+  maximum_input_tokens?: number
+  output_tokens?: number
+  maximum_output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cache_write_1h_tokens?: number
+  image_input_tokens?: number
+  image_output_tokens?: number
+  audio_input_tokens?: number
+  audio_output_tokens?: number
+  image_units?: number
+  audio_seconds?: number
+  video_seconds?: number
+  task_units?: number
+  max_attempts: number
+  retry_probability: number
+  hedge_probability: number
+  hedge_allowed: boolean
+}
+
+export type RoutingCostComparisonRequest = {
+  pool_id: number
+  model_name: string
+  member_ids: number[]
+  decision_id?: string
+  profile?: RoutingCostComparisonProfile
+}
+
+export type RoutingRequestCostEstimate = {
+  known: boolean
+  expected_known: boolean
+  worst_case_known: boolean
+  expected_effective_known: boolean
+  expected_cost: number
+  worst_case_cost: number
+  expected_effective_cost: number
+  currency: string
+  unit: string
+  confidence_score: number
+  freshness_score: number
+  expected_breakdown: RoutingCostBreakdown
+  worst_case_single_breakdown: RoutingCostBreakdown
+  unknown_reason?: string
+  missing_context?: string[]
+}
+
+export type RoutingCostComparisonCandidate = {
+  pool_id: number
+  member_id: number
+  channel_id: number
+  routing_identity: string
+  routing_generation: string
+  channel_name: string
+  model_name: string
+  upstream_model_name?: string
+  comparable: boolean
+  missing_context?: string[]
+  unknown_reason?: string
+  single_attempt: RoutingRequestCostEstimate
+  before_multiplier: RoutingRequestCostEstimate
+  upstream_cost_multiplier: number
+  pricing_identity?: string
+  pricing_hash?: string
+}
+
+export type RoutingCostComparisonResponse = {
+  profile_source: string
+  model_name: string
+  pool_id: number
+  pricing_epoch: number
+  pricing_hash: string
+  generated_at: number
+  quantity_sources: Record<string, string>
+  candidates: RoutingCostComparisonCandidate[]
 }
 
 export type RoutingChannelConfigurationCostSource =
@@ -574,10 +752,18 @@ export type RoutingNormalizedPricing = {
   per_image_cost: number | null
   audio_input_cost_per_million: number | null
   audio_output_cost_per_million: number | null
+  audio_cost_per_second: number | null
+  video_cost_per_second: number | null
+  per_task_cost: number | null
   per_request_cost: number | null
   billing_expression: string
   tiers: unknown
   extras: unknown
+  contract_v2?: {
+    schema_version: number
+    mode: string
+    currency: string
+  }
 }
 
 export type RoutingCostBreakdown = {
@@ -591,6 +777,9 @@ export type RoutingCostBreakdown = {
   image_units: number
   audio_input: number
   audio_output: number
+  audio_seconds: number
+  video_seconds: number
+  task_units: number
   per_request: number
   expression: number
   total: number
@@ -958,9 +1147,13 @@ export type EndpointBreakerPage = {
 export type PolicyMemberDocument = {
   member_id: number
   channel_id: number
+  routing_generation?: string
   enabled: boolean
   priority: number
   weight: number
+  enabled_override?: boolean | null
+  priority_override?: number | null
+  weight_override?: number | null
   credential_ids: number[]
   overrides: Record<string, unknown>
   [key: string]: unknown
@@ -978,6 +1171,9 @@ export type PolicyPoolDocument = {
     | 'enterprise_slo'
     | 'custom'
   policy: Record<string, unknown>
+  default_enabled?: boolean | null
+  default_priority?: number | null
+  default_weight?: number | null
   members: PolicyMemberDocument[]
   [key: string]: unknown
 }
@@ -1005,6 +1201,12 @@ export type PolicyDraftSummary = {
   updated_time_ms: number
   validated_time_ms: number
   published_time_ms: number
+  workspace_state: 'working' | 'stale' | 'published' | string
+  stale: boolean
+  can_validate: boolean
+  can_publish: boolean
+  can_delete: boolean
+  blocking_reason?: string
 }
 
 export type PolicyDraftDetail = PolicyDraftSummary & {
@@ -1084,12 +1286,24 @@ export type RoutingPolicyRevisionDetail = {
   document: PolicyDocument
 }
 
+export type RoutingOperationStatus =
+  | 'pending'
+  | 'running'
+  | 'retry_wait'
+  | 'succeeded'
+  | 'partially_succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'superseded'
+  | string
+
 export type RoutingOperation<Result = unknown> = {
   id: number
+  schema_version?: number
   type: string
-  idempotency_hash: string
+  idempotency_hash?: string
   system_task_id?: string
-  evaluation_hash: string
+  evaluation_hash?: string
   subject_type: string
   subject_id: number
   pool_id: number
@@ -1097,19 +1311,52 @@ export type RoutingOperation<Result = unknown> = {
   expected_activation_id: number
   actor_id: number
   reason: string
-  status: string
-  claim_until_ms: number
+  source?: string
+  correlation_id?: string
+  parent_operation_id?: number
+  retry_of_operation_id?: number
+  retry_sequence?: number
+  retryable?: boolean
+  cancellable?: boolean
+  summary?: string
+  needs_attention?: boolean
+  retention_category?: string
+  status: RoutingOperationStatus
+  claim_until_ms?: number
   attempts: number
   next_retry_ms: number
   last_error: string
   result_revision: number
   result_activation_id: number
-  result_outbox_id: number
-  result_payload_hash: string
+  result_outbox_id?: number
+  result_payload_hash?: string
+  terminal_actor_id?: number
   created_time_ms: number
   updated_time_ms: number
   completed_time_ms: number
   result?: Result
+}
+
+export type RoutingOperationTechnical = {
+  id: number
+  schema_version: number
+  type: string
+  technical: {
+    idempotency_hash: string
+    request_key_hash?: string
+    request_payload_hash?: string
+    evaluation_hash: string
+    system_task_id?: string
+    claim_until_ms?: number
+    result_outbox_id?: number
+    result_payload_hash?: string
+    result?: unknown
+  }
+}
+
+export type RoutingOperationRetryResponse = {
+  operation: RoutingOperation
+  created: boolean
 }
 
 export type ChannelRoutingBreakerResetRequest =
@@ -1215,7 +1462,26 @@ export type ChannelRoutingAuditExportResponse = {
 export type PolicySimulationResponse = {
   draft: PolicyDraftSummary
   operation: RoutingOperation
+  evidence?: PolicySimulationEvidence
   result: HistoricalSimulationResult
+}
+
+export type PolicySimulationEvidence = {
+  id: number
+  operation_id: number
+  draft_id: number
+  draft_version: number
+  draft_etag: string
+  document_hash: string
+  head_revision: number
+  head_hash: string
+  head_activation_id: number
+  target_bound: boolean
+  target_stage?: string
+  target_traffic_basis_points: number
+  risk_state: 'pass' | 'fail' | 'unknown' | string
+  risk_hash: string
+  created_time_ms: number
 }
 
 export type HistoricalSimulationResponse = {
@@ -1223,82 +1489,10 @@ export type HistoricalSimulationResponse = {
   result: HistoricalSimulationResult
 }
 
-export type PolicyApproval = {
-  id: number
-  draft_id: number
-  draft_version: number
-  draft_etag: string
-  document_hash: string
-  head_revision: number
-  head_hash: string
-  activation_stage: string
-  activation_traffic_basis_points: number
-  activation_reason_hash: string
-  activation_hash: string
-  actor_id: number
-  created_time_ms: number
-}
-
-export type PolicyApprovalGroup = {
-  activation_hash: string
-  activation_stage: string
-  activation_traffic_basis_points: number
-  activation_reason_hash: string
-  count: number
-  quorum: boolean
-}
-
-export type PolicyApprovalList = {
-  items: PolicyApproval[]
-  groups: PolicyApprovalGroup[]
-  requires_approval: boolean
-  required: number
-  count: number
-  quorum: boolean
-  target_activation_hash?: string
-}
-
-export type PolicyApprovalResponse = {
-  approval: PolicyApproval
-  created: boolean
-}
-
 export type PolicyPublishResponse = {
   draft: PolicyDraftSummary
   published: RoutingPolicyPublishResult
   operation: RoutingOperation
-}
-
-export type PolicyRollbackApproval = {
-  id: number
-  expected_revision: number
-  expected_activation_id: number
-  expected_head_hash: string
-  target_revision: number
-  target_content_hash: string
-  activation_stage: string
-  activation_traffic_basis_points: number
-  activation_reason_hash: string
-  activation_hash: string
-  actor_id: number
-  created_time_ms: number
-}
-
-export type PolicyRollbackApprovalList = {
-  items: PolicyRollbackApproval[]
-  groups: PolicyApprovalGroup[]
-  requires_approval: boolean
-  required: number
-  count: number
-  quorum: boolean
-  expected_revision: number
-  target_revision: number
-  target_activation_hash?: string
-}
-
-export type PolicyRollbackApprovalResponse = {
-  approval: PolicyRollbackApproval
-  created: boolean
 }
 
 export type PolicyRollbackResponse = {

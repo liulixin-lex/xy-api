@@ -179,7 +179,12 @@ func TestRunHistoricalSimulationReplaysBalancedDraftPolicyAgainstShadowHistory(t
 }
 
 func TestRunPolicyDocumentSimulationAppliesDraftMembership(t *testing.T) {
-	openHistoricalSimulationTestDB(t)
+	db := openHistoricalSimulationTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.RoutingPool{},
+		&model.RoutingPoolMember{},
+		&model.RoutingCredentialRef{},
+	))
 	enqueueHistoricalSimulationAudit(t, 5, "balanced-draft-membership")
 	flushed, err := FlushDecisionAuditsContext(context.Background())
 	require.NoError(t, err)
@@ -267,6 +272,77 @@ func TestRunPolicyDocumentSimulationAgainstBaseAttachesHistoricalRisk(t *testing
 	assert.Contains(t, result.Risk.Reasons, "slo_tradeoff_requires_review")
 	assert.Contains(t, result.Risk.Reasons, "capacity_evidence_incomplete")
 	assert.Contains(t, result.Risk.Reasons, "traffic_change_rate_limit_unconfigured")
+}
+
+func TestRunPolicyDocumentSimulationAgainstBaseMaterializesDynamicPoolDefaults(t *testing.T) {
+	db := openHistoricalSimulationTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
+		&model.RoutingPool{},
+		&model.RoutingPoolMember{},
+		&model.RoutingCredentialRef{},
+	))
+	require.NoError(t, db.Create([]model.Channel{
+		{
+			Id: 101, Name: "dynamic-default-101", Models: "gpt-test",
+			RoutingIdentity: strings.Repeat("1", 32), RoutingGeneration: strings.Repeat("2", 32),
+		},
+		{
+			Id: 102, Name: "dynamic-default-102", Models: "gpt-test",
+			RoutingIdentity: strings.Repeat("3", 32), RoutingGeneration: strings.Repeat("4", 32),
+		},
+	}).Error)
+	require.NoError(t, db.Create(&model.RoutingPool{
+		ID: 5, GroupKey: "group-5", GroupName: "group-5", DisplayName: "group-5",
+		Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+		DefaultEnabled: true, DefaultPriority: 10, DefaultWeight: 10,
+	}).Error)
+	require.NoError(t, db.Create([]model.RoutingPoolMember{
+		{
+			ID: 11, PoolID: 5, ChannelID: 101, ChannelGeneration: strings.Repeat("2", 32),
+			Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+		},
+		{
+			ID: 12, PoolID: 5, ChannelID: 102, ChannelGeneration: strings.Repeat("4", 32),
+			Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+		},
+	}).Error)
+	enqueueHistoricalSimulationAudit(t, 5, "dynamic-pool-default-simulation")
+	flushed, err := FlushDecisionAuditsContext(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, flushed)
+
+	defaultEnabled := true
+	defaultPriority := int64(10)
+	baseWeight := int64(10)
+	draftWeight := int64(20)
+	base := simulationRiskDocument(model.RoutingPolicyPoolContent{
+		PoolID: 5, GroupName: "group-5", DisplayName: "group-5",
+		DeploymentStage: model.RoutingDeploymentStageActive,
+		PolicyProfile:   model.RoutingPolicyProfileBalanced,
+		Policy:          json.RawMessage(`{}`),
+		DefaultEnabled:  &defaultEnabled,
+		DefaultPriority: &defaultPriority,
+		DefaultWeight:   &baseWeight,
+		Members:         []model.RoutingPolicyMemberContent{},
+	})
+	draft := base
+	draft.Pools = append([]model.RoutingPolicyPoolContent(nil), base.Pools...)
+	draft.Pools[0].DefaultWeight = &draftWeight
+
+	result, err := RunPolicyDocumentSimulationAgainstBase(context.Background(), base, draft, 5, 0, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.EvaluatedSamples)
+	require.Len(t, result.Samples, 1)
+	assert.NotZero(t, result.Samples[0].SimulatedChannelID)
+	require.NotNil(t, result.Risk)
+	assert.NotEqual(t, PolicySimulationRiskReady, result.Risk.State)
+	assert.True(t, result.Risk.Changes.TrafficAffecting)
+	assert.Equal(t, 2, result.Risk.Changes.ChangedMembers)
+	assert.Equal(t, 2, result.Risk.Changes.MemberWeightChanges)
+	assert.Equal(t, []int{5}, result.Risk.Scope.AffectedPoolIDs)
+	assert.Equal(t, []int{101, 102}, result.Risk.Scope.AffectedChannelIDs)
+	assert.Equal(t, []string{"gpt-test"}, result.Risk.Scope.AffectedModels)
 }
 
 func TestPolicySimulationRiskScopesStructuralChangesAndAffectedResources(t *testing.T) {
@@ -432,23 +508,68 @@ func TestPolicySimulationRiskExternalDatabaseCompatibility(t *testing.T) {
 			}
 			db := openSnapshotExternalTestDB(t, test.dbType, dsn)
 			withSnapshotTestDBType(t, db, test.dbType)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}))
+			require.NoError(t, db.AutoMigrate(
+				&model.Channel{},
+				&model.RoutingPool{},
+				&model.RoutingPoolMember{},
+				&model.RoutingCredentialRef{},
+				&model.RoutingDecisionAudit{},
+			))
 			require.NoError(t, db.Create([]model.Channel{
-				{Id: 901, Name: "simulation-risk-901", Models: "gpt-a,gpt-b"},
-				{Id: 902, Name: "simulation-risk-902", Models: "gpt-b,gpt-c"},
+				{
+					Id: 901, Name: "simulation-risk-901", Models: "gpt-a,gpt-b",
+					RoutingIdentity: strings.Repeat("5", 32), RoutingGeneration: strings.Repeat("6", 32),
+				},
+				{
+					Id: 902, Name: "simulation-risk-902", Models: "gpt-b,gpt-c",
+					RoutingIdentity: strings.Repeat("7", 32), RoutingGeneration: strings.Repeat("8", 32),
+				},
 			}).Error)
-			base := simulationRiskDocument(simulationRiskPool(9, 901, 902))
-			draft := simulationRiskDocument(simulationRiskPool(9, 901, 902))
-			draft.Pools[0].Members[0].Weight = 20
+			require.NoError(t, db.Create(&model.RoutingPool{
+				ID: 9, GroupKey: "group-9", GroupName: "group-9", DisplayName: "group-9",
+				Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+				DefaultEnabled: true, DefaultPriority: 10, DefaultWeight: 10,
+			}).Error)
+			require.NoError(t, db.Create([]model.RoutingPoolMember{
+				{
+					ID: 901, PoolID: 9, ChannelID: 901, ChannelGeneration: strings.Repeat("6", 32),
+					Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+				},
+				{
+					ID: 902, PoolID: 9, ChannelID: 902, ChannelGeneration: strings.Repeat("8", 32),
+					Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+				},
+			}).Error)
+			defaultEnabled := true
+			defaultPriority := int64(10)
+			baseWeight := int64(10)
+			draftWeight := int64(20)
+			base := simulationRiskDocument(model.RoutingPolicyPoolContent{
+				PoolID: 9, GroupName: "group-9", DisplayName: "group-9",
+				DeploymentStage: model.RoutingDeploymentStageActive,
+				PolicyProfile:   model.RoutingPolicyProfileBalanced,
+				Policy:          json.RawMessage(`{}`),
+				DefaultEnabled:  &defaultEnabled,
+				DefaultPriority: &defaultPriority,
+				DefaultWeight:   &baseWeight,
+				Members:         []model.RoutingPolicyMemberContent{},
+			})
+			draft := base
+			draft.Pools = append([]model.RoutingPolicyPoolContent(nil), base.Pools...)
+			draft.Pools[0].DefaultWeight = &draftWeight
 
-			scope, changes := policySimulationImpactScope(context.Background(), base, draft, 9)
-			assert.Equal(t, []int{9}, scope.AffectedPoolIDs)
-			assert.Equal(t, []int{901, 902}, scope.AffectedChannelIDs)
-			assert.Equal(t, []string{"gpt-a", "gpt-b", "gpt-c"}, scope.AffectedModels)
-			assert.Equal(t, PolicySimulationEvidenceKnown, scope.ModelEvidenceState)
-			assert.False(t, scope.Truncated)
-			assert.Equal(t, 1, changes.MemberWeightChanges)
-			assert.True(t, changes.TrafficAffecting)
+			result, err := RunPolicyDocumentSimulationAgainstBase(
+				context.Background(), base, draft, 9, 0, 10,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, result.Risk)
+			assert.Equal(t, []int{9}, result.Risk.Scope.AffectedPoolIDs)
+			assert.Equal(t, []int{901, 902}, result.Risk.Scope.AffectedChannelIDs)
+			assert.Equal(t, []string{"gpt-a", "gpt-b", "gpt-c"}, result.Risk.Scope.AffectedModels)
+			assert.Equal(t, PolicySimulationEvidenceKnown, result.Risk.Scope.ModelEvidenceState)
+			assert.False(t, result.Risk.Scope.Truncated)
+			assert.Equal(t, 2, result.Risk.Changes.MemberWeightChanges)
+			assert.True(t, result.Risk.Changes.TrafficAffecting)
 		})
 	}
 }

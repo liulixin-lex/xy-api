@@ -17,9 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { BadgeCheckIcon, RocketIcon } from '@hugeicons/core-free-icons'
+import { Alert02Icon, RocketIcon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -33,7 +33,9 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Form,
   FormControl,
@@ -45,7 +47,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { Progress } from '@/components/ui/progress'
 import {
   Sheet,
   SheetContent,
@@ -54,13 +55,12 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
-import { useDebounce } from '@/hooks'
 
 import {
-  approveChannelRoutingPolicyDraft,
   createChannelRoutingIdempotencyKey,
-  listChannelRoutingPolicyApprovals,
+  getChannelRoutingPolicyApiError,
   publishChannelRoutingPolicyDraft,
 } from '../api/client'
 import { channelRoutingQueryKeys } from '../api/query-keys'
@@ -69,21 +69,38 @@ import { useChannelRoutingFormatters } from '../lib/format'
 import type {
   PolicyActivationSpec,
   PolicyDraftSummary,
-  PolicySimulationRiskAssessment,
+  PolicySimulationResponse,
 } from '../types'
 import { ChannelRoutingPolicySimulationRiskSection } from './policy-simulation-risk-section'
-
-type PolicyActivationIntent = 'approve' | 'publish'
 
 type PolicyActivationFormValues = {
   stage: PolicyActivationSpec['stage']
   trafficBasisPoints: number
   reason: string
+  acceptSimulationRisk: boolean
+  riskAcceptanceReason: string
+}
+
+function activationTarget(values: PolicyActivationFormValues) {
+  return {
+    stage: values.stage,
+    traffic_basis_points: values.trafficBasisPoints,
+  }
+}
+
+function activationSignature(
+  draft: PolicyDraftSummary,
+  values: PolicyActivationFormValues
+) {
+  return JSON.stringify({
+    draft_id: draft.id,
+    draft_version: draft.version,
+    ...activationTarget(values),
+  })
 }
 
 export function ChannelRoutingPolicyActivationSheet(props: {
   draft: PolicyDraftSummary | null
-  intent: PolicyActivationIntent
   canDeploy: boolean
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -93,6 +110,7 @@ export function ChannelRoutingPolicyActivationSheet(props: {
   const queryClient = useQueryClient()
   const [confirmationValues, setConfirmationValues] =
     useState<PolicyActivationFormValues | null>(null)
+  const [serverRiskTarget, setServerRiskTarget] = useState<string | null>(null)
   const idempotencyRef = useRef<{ signature: string; key: string } | null>(null)
   const schema = useMemo(
     () =>
@@ -109,11 +127,16 @@ export function ChannelRoutingPolicyActivationSheet(props: {
             .trim()
             .min(1, t('Change reason is required'))
             .max(512, t('Change reason must be 512 characters or fewer')),
+          acceptSimulationRisk: z.boolean(),
+          riskAcceptanceReason: z
+            .string()
+            .trim()
+            .max(512, t('Change reason must be 512 characters or fewer')),
         })
-        .superRefine((value, context) => {
+        .superRefine((values, context) => {
           if (
-            value.stage === 'canary' &&
-            (value.trafficBasisPoints < 100 || value.trafficBasisPoints > 500)
+            values.stage === 'canary' &&
+            (values.trafficBasisPoints < 100 || values.trafficBasisPoints > 500)
           ) {
             context.addIssue({
               code: 'custom',
@@ -121,11 +144,21 @@ export function ChannelRoutingPolicyActivationSheet(props: {
               message: t('Canary traffic must be between 1% and 5%'),
             })
           }
-          if (value.stage !== 'canary' && value.trafficBasisPoints !== 0) {
+          if (values.stage !== 'canary' && values.trafficBasisPoints !== 0) {
             context.addIssue({
               code: 'custom',
               path: ['trafficBasisPoints'],
               message: t('Traffic allocation must be zero outside Canary'),
+            })
+          }
+          if (
+            values.acceptSimulationRisk &&
+            values.riskAcceptanceReason.trim() === ''
+          ) {
+            context.addIssue({
+              code: 'custom',
+              path: ['riskAcceptanceReason'],
+              message: t('Risk acceptance reason is required'),
             })
           }
         }),
@@ -133,66 +166,45 @@ export function ChannelRoutingPolicyActivationSheet(props: {
   )
   const form = useForm<PolicyActivationFormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { stage: 'canary', trafficBasisPoints: 100, reason: '' },
+    defaultValues: {
+      stage: 'canary',
+      trafficBasisPoints: 100,
+      reason: '',
+      acceptSimulationRisk: false,
+      riskAcceptanceReason: '',
+    },
   })
   const watchedStage = useWatch({ control: form.control, name: 'stage' })
   const watchedTraffic = useWatch({
     control: form.control,
     name: 'trafficBasisPoints',
   })
-  const watchedReason = useWatch({ control: form.control, name: 'reason' })
-  const target = useDebounce(
-    {
-      stage: watchedStage,
-      traffic_basis_points: watchedTraffic,
-      reason: watchedReason.trim(),
-    } satisfies PolicyActivationSpec,
-    400
-  )
-  const targetIsValid = schema.safeParse({
-    stage: target.stage,
-    trafficBasisPoints: target.traffic_basis_points,
-    reason: target.reason,
-  }).success
-  const targetMatchesForm =
-    target.stage === watchedStage &&
-    target.traffic_basis_points === watchedTraffic &&
-    target.reason === watchedReason.trim()
-  const approvalsQuery = useQuery({
-    queryKey: channelRoutingQueryKeys.policyApprovals(props.draft?.id ?? 0, {
-      target: targetIsValid ? target : 'all',
-    }),
-    queryFn: () =>
-      listChannelRoutingPolicyApprovals(
-        props.draft?.id ?? 0,
-        targetIsValid ? target : undefined
-      ),
-    enabled: props.open && props.draft != null,
+  const acceptedSimulationRisk = useWatch({
+    control: form.control,
+    name: 'acceptSimulationRisk',
   })
-  const approve = useMutation({
-    mutationFn: (values: PolicyActivationFormValues) => {
-      if (!props.draft) throw new Error('Policy draft is required')
-      if (approvalsQuery.data?.requires_approval !== true) {
-        throw new Error('Policy approval is not required')
-      }
-      return approveChannelRoutingPolicyDraft(props.draft, {
-        stage: values.stage,
-        traffic_basis_points: values.trafficBasisPoints,
-        reason: values.reason.trim(),
-      })
-    },
-    onSuccess: async (response) => {
-      await queryClient.invalidateQueries({
-        queryKey: channelRoutingQueryKeys.policyDraftsRoot(),
-      })
-      toast.success(
-        response.created
-          ? t('Policy approval recorded')
-          : t('Approval already recorded')
+  const currentTarget = {
+    stage: watchedStage,
+    traffic_basis_points: watchedTraffic,
+  }
+  const cachedSimulation = props.draft
+    ? queryClient.getQueryData<PolicySimulationResponse>(
+        channelRoutingQueryKeys.policySimulationRisk(
+          props.draft.id,
+          currentTarget
+        )
       )
-      props.onOpenChange(false)
-    },
-  })
+    : undefined
+  const currentSignature = props.draft
+    ? activationSignature(props.draft, {
+        ...form.getValues(),
+        stage: watchedStage,
+        trafficBasisPoints: watchedTraffic,
+      })
+    : ''
+  const riskAcceptanceRequired =
+    cachedSimulation?.result.risk?.state === 'fail' ||
+    serverRiskTarget === currentSignature
   const publish = useMutation({
     mutationFn: (values: PolicyActivationFormValues) => {
       if (!props.draft) throw new Error('Policy draft is required')
@@ -201,7 +213,13 @@ export function ChannelRoutingPolicyActivationSheet(props: {
         traffic_basis_points: values.trafficBasisPoints,
         reason: values.reason.trim(),
       }
-      const signature = JSON.stringify(activation)
+      const riskAcceptance = values.acceptSimulationRisk
+        ? {
+            accepted: true,
+            reason: values.riskAcceptanceReason.trim(),
+          }
+        : undefined
+      const signature = JSON.stringify({ activation, riskAcceptance })
       if (idempotencyRef.current?.signature !== signature) {
         idempotencyRef.current = {
           signature,
@@ -211,7 +229,8 @@ export function ChannelRoutingPolicyActivationSheet(props: {
       return publishChannelRoutingPolicyDraft(
         props.draft,
         activation,
-        idempotencyRef.current.key
+        idempotencyRef.current.key,
+        riskAcceptance
       )
     },
     onSuccess: async (response) => {
@@ -227,98 +246,47 @@ export function ChannelRoutingPolicyActivationSheet(props: {
       )
       props.onOpenChange(false)
     },
+    onError: (error, values) => {
+      const apiError = getChannelRoutingPolicyApiError(error)
+      if (
+        props.draft &&
+        apiError.code === 'policy_simulation_risk_acceptance_required'
+      ) {
+        setServerRiskTarget(activationSignature(props.draft, values))
+        requestAnimationFrame(() => form.setFocus('acceptSimulationRisk'))
+      }
+    },
+    meta: { handleErrorLocally: true },
   })
-  const resetApprove = approve.reset
   const resetPublish = publish.reset
 
   useEffect(() => {
     if (!props.open) return
-    form.reset({ stage: 'canary', trafficBasisPoints: 100, reason: '' })
+    form.reset({
+      stage: 'canary',
+      trafficBasisPoints: 100,
+      reason: '',
+      acceptSimulationRisk: false,
+      riskAcceptanceReason: '',
+    })
     idempotencyRef.current = null
     setConfirmationValues(null)
-    resetApprove()
+    setServerRiskTarget(null)
     resetPublish()
-  }, [
-    form,
-    props.draft?.id,
-    props.intent,
-    props.open,
-    resetApprove,
-    resetPublish,
-  ])
-
-  const isPublishing = props.intent === 'publish'
-  const simulationRisk = props.draft
-    ? queryClient.getQueryData<PolicySimulationRiskAssessment | null>(
-        channelRoutingQueryKeys.policySimulationRisk(props.draft.id)
-      )
-    : undefined
-  const simulationBlocked = simulationRisk?.state === 'fail'
-  const mutation = isPublishing ? publish : approve
-  const approvalReady =
-    targetIsValid &&
-    targetMatchesForm &&
-    approvalsQuery.data != null &&
-    !approvalsQuery.isLoading &&
-    !approvalsQuery.isError
-  const requiresApproval =
-    approvalReady && approvalsQuery.data.requires_approval === true
-  const targetApprovalCount = targetIsValid
-    ? (approvalsQuery.data?.count ?? 0)
-    : 0
-  const requiredApprovals = Math.max(1, approvalsQuery.data?.required ?? 2)
-  const quorum = approvalReady && approvalsQuery.data.quorum === true
-  const matchingApprovals = approvalsQuery.data?.target_activation_hash
-    ? (approvalsQuery.data.items.filter(
-        (approval) =>
-          approval.activation_hash ===
-          approvalsQuery.data?.target_activation_hash
-      ) ?? [])
-    : []
+  }, [form, props.draft?.id, props.open, resetPublish])
 
   const submit = (values: PolicyActivationFormValues) => {
-    if (isPublishing) {
-      if (simulationBlocked) return
-      setConfirmationValues(values)
+    if (riskAcceptanceRequired && !values.acceptSimulationRisk) {
+      form.setError('acceptSimulationRisk', {
+        type: 'manual',
+        message: t('Explicit risk acceptance is required'),
+      })
+      form.setFocus('acceptSimulationRisk')
       return
     }
-    if (!requiresApproval) return
-    approve.mutate(values)
+    setConfirmationValues(values)
   }
-
-  let approvalDescription = t(
-    'Complete the activation details to check approval status.'
-  )
-  let approvalStatus = 'pending'
-  let approvalStatusLabel = t('Pending')
-  if (targetIsValid && approvalsQuery.isLoading) {
-    approvalDescription = t('Checking whether this deployment needs approval.')
-  } else if (targetIsValid && approvalsQuery.isError) {
-    approvalDescription = t(
-      'Approval status could not be loaded. Refresh it before continuing.'
-    )
-    approvalStatus = 'failed'
-    approvalStatusLabel = t('Unavailable')
-  } else if (approvalReady && !requiresApproval) {
-    approvalDescription = t(
-      'This deployment does not require approval. You can publish it directly.'
-    )
-    approvalStatus = 'ready'
-    approvalStatusLabel = t('Not required')
-  } else if (approvalReady) {
-    approvalDescription = t('{{count}} of {{required}} eligible approvals', {
-      count: targetApprovalCount,
-      required: requiredApprovals,
-    })
-    approvalStatus = quorum ? 'succeeded' : 'pending'
-    approvalStatusLabel = quorum ? t('Ready') : t('Pending')
-  }
-  let submitLabel = t('Record approval')
-  if (isPublishing) submitLabel = t('Review publish')
-  else if (!requiresApproval) submitLabel = t('Approval not required')
-  if (isPublishing && simulationBlocked) {
-    submitLabel = t('Blocked by simulation risk')
-  }
+  const publishError = getChannelRoutingPolicyApiError(publish.error)
 
   return (
     <>
@@ -330,28 +298,16 @@ export function ChannelRoutingPolicyActivationSheet(props: {
         >
           <SheetHeader className={sideDrawerHeaderClassName()}>
             <SheetTitle className='flex items-center gap-2'>
-              {isPublishing ? (
-                <HugeiconsIcon
-                  icon={RocketIcon}
-                  className='size-4'
-                  strokeWidth={2}
-                  aria-hidden='true'
-                />
-              ) : (
-                <HugeiconsIcon
-                  icon={BadgeCheckIcon}
-                  className='size-4'
-                  strokeWidth={2}
-                  aria-hidden='true'
-                />
-              )}
-              {isPublishing
-                ? t('Publish policy draft #{{id}}', { id: props.draft?.id })
-                : t('Approve policy draft #{{id}}', { id: props.draft?.id })}
+              <HugeiconsIcon
+                icon={RocketIcon}
+                strokeWidth={2}
+                aria-hidden='true'
+              />
+              {t('Publish policy draft #{{id}}', { id: props.draft?.id })}
             </SheetTitle>
             <SheetDescription>
               {t(
-                'Approvals are bound to the exact stage, traffic allocation, and reason.'
+                'Simulation is optional. A matching known failure requires explicit risk acceptance before publishing.'
               )}
             </SheetDescription>
           </SheetHeader>
@@ -382,6 +338,8 @@ export function ChannelRoutingPolicyActivationSheet(props: {
                               stage === 'canary' ? 100 : 0,
                               { shouldValidate: true }
                             )
+                            form.setValue('acceptSimulationRisk', false)
+                            form.setValue('riskAcceptanceReason', '')
                           }}
                         >
                           <NativeSelectOption value='observe'>
@@ -416,9 +374,11 @@ export function ChannelRoutingPolicyActivationSheet(props: {
                           step={100}
                           disabled={watchedStage !== 'canary'}
                           value={field.value}
-                          onChange={(event) =>
+                          onChange={(event) => {
                             field.onChange(event.target.valueAsNumber)
-                          }
+                            form.setValue('acceptSimulationRisk', false)
+                            form.setValue('riskAcceptanceReason', '')
+                          }}
                         />
                       </FormControl>
                       <FormDescription>
@@ -455,72 +415,101 @@ export function ChannelRoutingPolicyActivationSheet(props: {
                 )}
               />
 
-              <section
-                className='space-y-3 border-t pt-4'
-                aria-labelledby='approval-status-heading'
-              >
-                <div className='flex items-center justify-between gap-3'>
-                  <div>
-                    <h3
-                      id='approval-status-heading'
-                      className='text-sm font-semibold'
-                    >
-                      {t('Approval quorum')}
-                    </h3>
-                    <p className='text-muted-foreground mt-1 text-xs'>
-                      {approvalDescription}
-                    </p>
-                  </div>
-                  <ChannelRoutingStatusBadge
-                    status={approvalStatus}
-                    label={approvalStatusLabel}
-                  />
-                </div>
-                {requiresApproval ? (
-                  <Progress
-                    aria-label={t('Approval progress')}
-                    value={Math.min(
-                      100,
-                      (targetApprovalCount / requiredApprovals) * 100
+              <ChannelRoutingPolicySimulationRiskSection
+                risk={cachedSimulation?.result.risk}
+                compact
+              />
+
+              {riskAcceptanceRequired ? (
+                <section
+                  className='flex flex-col gap-3 border-t pt-4'
+                  aria-labelledby='simulation-risk-acceptance'
+                >
+                  <Alert role='alert'>
+                    <HugeiconsIcon
+                      icon={Alert02Icon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
+                    <AlertTitle id='simulation-risk-acceptance'>
+                      {t('Known simulation risk requires acceptance')}
+                    </AlertTitle>
+                    <AlertDescription>
+                      {t(
+                        'Accepting this risk is recorded permanently with the published revision and your reason.'
+                      )}
+                    </AlertDescription>
+                  </Alert>
+                  <FormField
+                    control={form.control}
+                    name='acceptSimulationRisk'
+                    render={({ field }) => (
+                      <FormItem className='flex items-start gap-3 rounded-lg border p-3'>
+                        <FormControl>
+                          <Checkbox
+                            checked={field.value}
+                            onCheckedChange={(value) =>
+                              field.onChange(value === true)
+                            }
+                          />
+                        </FormControl>
+                        <div className='grid gap-1'>
+                          <FormLabel>
+                            {t('Accept known simulation risk')}
+                          </FormLabel>
+                          <FormDescription>
+                            {t(
+                              'This does not bypass policy structure, baseline, member, credential, stage, or traffic validation.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </div>
+                      </FormItem>
                     )}
                   />
-                ) : null}
-                {requiresApproval && matchingApprovals.length > 0 ? (
-                  <ul className='divide-y rounded-lg border text-sm'>
-                    {matchingApprovals.map((approval) => (
-                      <li
-                        key={approval.id}
-                        className='flex items-center justify-between gap-3 px-3 py-2'
-                      >
-                        <span>
-                          {t('Approver #{{id}}', { id: approval.actor_id })}
-                        </span>
-                        <span className='text-muted-foreground text-xs'>
-                          {format.timestamp(approval.created_time_ms)}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-              </section>
-
-              {isPublishing ? (
-                <ChannelRoutingPolicySimulationRiskSection
-                  risk={simulationRisk}
-                  compact
-                />
+                  <FormField
+                    control={form.control}
+                    name='riskAcceptanceReason'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Risk acceptance reason')}</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            rows={3}
+                            maxLength={512}
+                            disabled={!acceptedSimulationRisk}
+                            placeholder={t(
+                              'Explain why this known risk is acceptable for this deployment'
+                            )}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </section>
               ) : null}
 
-              {mutation.isError ? (
-                <div className='border-destructive/30 bg-destructive/5 text-destructive rounded-lg border p-3 text-sm'>
-                  {isPublishing
-                    ? t(
-                        'Could not publish this policy. Refresh the draft and approval status.'
-                      )
-                    : t(
-                        'Could not record this approval. Refresh the draft and try again.'
-                      )}
-                </div>
+              {publish.isError ? (
+                <Alert variant='destructive' role='alert'>
+                  <HugeiconsIcon
+                    icon={Alert02Icon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
+                  <AlertTitle>{t('Policy publish failed')}</AlertTitle>
+                  <AlertDescription>
+                    {publishError.code ===
+                    'policy_simulation_risk_acceptance_required'
+                      ? t(
+                          'A matching simulation found a known failure. Review and accept the risk to continue.'
+                        )
+                      : t(
+                          'Could not publish this policy. Refresh the draft and try again.'
+                        )}
+                  </AlertDescription>
+                </Alert>
               ) : null}
             </form>
           </Form>
@@ -529,33 +518,19 @@ export function ChannelRoutingPolicyActivationSheet(props: {
             <Button
               type='submit'
               form='channel-routing-policy-activation-form'
-              disabled={
-                !props.canDeploy ||
-                mutation.isPending ||
-                approvalsQuery.isLoading ||
-                approvalsQuery.isError ||
-                !approvalReady ||
-                (!isPublishing && !requiresApproval) ||
-                (isPublishing && requiresApproval && !quorum) ||
-                (isPublishing && simulationBlocked)
-              }
+              disabled={!props.canDeploy || publish.isPending}
             >
-              {isPublishing ? (
+              {publish.isPending ? (
+                <Spinner data-icon='inline-start' />
+              ) : (
                 <HugeiconsIcon
                   icon={RocketIcon}
                   data-icon='inline-start'
                   strokeWidth={2}
                   aria-hidden='true'
                 />
-              ) : (
-                <HugeiconsIcon
-                  icon={BadgeCheckIcon}
-                  data-icon='inline-start'
-                  strokeWidth={2}
-                  aria-hidden='true'
-                />
               )}
-              {submitLabel}
+              {publish.isPending ? t('Publishing') : t('Review publish')}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -596,6 +571,16 @@ export function ChannelRoutingPolicyActivationSheet(props: {
               <dt className='text-muted-foreground'>{t('Reason')}</dt>
               <dd className='mt-1 break-words'>{confirmationValues.reason}</dd>
             </div>
+            {confirmationValues.acceptSimulationRisk ? (
+              <div>
+                <dt className='text-muted-foreground'>
+                  {t('Accepted simulation risk')}
+                </dt>
+                <dd className='mt-1 break-words'>
+                  {confirmationValues.riskAcceptanceReason}
+                </dd>
+              </div>
+            ) : null}
           </dl>
         ) : null}
       </ConfirmDialog>

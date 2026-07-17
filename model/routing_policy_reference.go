@@ -21,21 +21,91 @@ func validateRoutingPolicyLiveReferencesTx(tx *gorm.DB, document RoutingPolicyDo
 	if tx == nil {
 		return errRoutingPolicyDatabaseNil
 	}
+	if document.SchemaVersion != RoutingPolicySchemaVersion {
+		return fmt.Errorf(
+			"%w: legacy policy schema %d must be converted before activation",
+			ErrRoutingPolicyReferenceInvalid, document.SchemaVersion,
+		)
+	}
+	type memberReference struct {
+		PoolID            int
+		ChannelID         int
+		RoutingGeneration string
+	}
+	type credentialReference struct {
+		ChannelID         int
+		RoutingGeneration string
+	}
 	channelSet := make(map[int]struct{})
-	credentialChannels := make(map[int]int)
+	channelGenerations := make(map[int]string)
+	memberReferences := make(map[int]memberReference)
+	credentialReferences := make(map[int]credentialReference)
 	for poolIndex := range document.Pools {
-		for memberIndex := range document.Pools[poolIndex].Members {
-			member := document.Pools[poolIndex].Members[memberIndex]
+		pool := document.Pools[poolIndex]
+		for memberIndex := range pool.Members {
+			member := pool.Members[memberIndex]
+			if !validRoutingIdentity(member.RoutingGeneration) {
+				return fmt.Errorf(
+					"%w: member %d has no exact routing generation",
+					ErrRoutingPolicyReferenceInvalid, member.MemberID,
+				)
+			}
+			memberReferences[member.MemberID] = memberReference{
+				PoolID: pool.PoolID, ChannelID: member.ChannelID,
+				RoutingGeneration: member.RoutingGeneration,
+			}
+			if generation, exists := channelGenerations[member.ChannelID]; exists &&
+				generation != member.RoutingGeneration {
+				return fmt.Errorf(
+					"%w: channel %d is referenced through multiple generations",
+					ErrRoutingPolicyReferenceInvalid, member.ChannelID,
+				)
+			}
+			channelGenerations[member.ChannelID] = member.RoutingGeneration
 			channelSet[member.ChannelID] = struct{}{}
 			for _, credentialID := range member.CredentialIDs {
-				if channelID, exists := credentialChannels[credentialID]; exists && channelID != member.ChannelID {
+				expected := credentialReference{
+					ChannelID: member.ChannelID, RoutingGeneration: member.RoutingGeneration,
+				}
+				if existing, exists := credentialReferences[credentialID]; exists && existing != expected {
 					return fmt.Errorf(
-						"%w: credential %d is referenced by channels %d and %d",
-						ErrRoutingPolicyReferenceInvalid, credentialID, channelID, member.ChannelID,
+						"%w: credential %d is referenced by multiple channel lifecycles",
+						ErrRoutingPolicyReferenceInvalid, credentialID,
 					)
 				}
-				credentialChannels[credentialID] = member.ChannelID
+				credentialReferences[credentialID] = expected
 			}
+		}
+	}
+
+	memberIDs := make([]int, 0, len(memberReferences))
+	for memberID := range memberReferences {
+		memberIDs = append(memberIDs, memberID)
+	}
+	sort.Ints(memberIDs)
+	activeMembers := make(map[int]RoutingPoolMember, len(memberIDs))
+	for start := 0; start < len(memberIDs); start += routingPolicyMemberInsertBatch {
+		end := min(start+routingPolicyMemberInsertBatch, len(memberIDs))
+		var page []RoutingPoolMember
+		if err := lockForUpdate(tx).
+			Select("id", "pool_id", "channel_id", "channel_generation", "active").
+			Where("id IN ? AND active = ?", memberIDs[start:end], true).
+			Find(&page).Error; err != nil {
+			return err
+		}
+		for index := range page {
+			activeMembers[page[index].ID] = page[index]
+		}
+	}
+	for _, memberID := range memberIDs {
+		expected := memberReferences[memberID]
+		member, exists := activeMembers[memberID]
+		if !exists || member.PoolID != expected.PoolID || member.ChannelID != expected.ChannelID ||
+			member.ChannelGeneration != expected.RoutingGeneration {
+			return fmt.Errorf(
+				"%w: member %d is missing, inactive, or belongs to another lifecycle",
+				ErrRoutingPolicyReferenceInvalid, memberID,
+			)
 		}
 	}
 
@@ -49,7 +119,7 @@ func validateRoutingPolicyLiveReferencesTx(tx *gorm.DB, document RoutingPolicyDo
 		end := min(start+routingPolicyMemberInsertBatch, len(channelIDs))
 		var page []Channel
 		if err := lockForUpdate(tx).
-			Select("id", "models", "model_mapping").
+			Select("id", "routing_identity", "routing_generation", "models", "model_mapping").
 			Where("id IN ?", channelIDs[start:end]).
 			Find(&page).Error; err != nil {
 			return err
@@ -63,13 +133,23 @@ func validateRoutingPolicyLiveReferencesTx(tx *gorm.DB, document RoutingPolicyDo
 		}
 	}
 	for _, channelID := range channelIDs {
-		if _, exists := channels[channelID]; !exists {
+		channel, exists := channels[channelID]
+		if !exists {
 			return fmt.Errorf("%w: channel %d does not exist", ErrRoutingPolicyReferenceInvalid, channelID)
+		}
+		if !validRoutingIdentity(channel.RoutingIdentity) || !validRoutingIdentity(channel.RoutingGeneration) {
+			return fmt.Errorf("%w: channel %d lifecycle is invalid", ErrRoutingPolicyReferenceInvalid, channelID)
+		}
+		if channelGenerations[channelID] != channel.RoutingGeneration {
+			return fmt.Errorf(
+				"%w: channel %d generation changed",
+				ErrRoutingPolicyReferenceInvalid, channelID,
+			)
 		}
 	}
 
-	credentialIDs := make([]int, 0, len(credentialChannels))
-	for credentialID := range credentialChannels {
+	credentialIDs := make([]int, 0, len(credentialReferences))
+	for credentialID := range credentialReferences {
 		credentialIDs = append(credentialIDs, credentialID)
 	}
 	sort.Ints(credentialIDs)
@@ -78,7 +158,7 @@ func validateRoutingPolicyLiveReferencesTx(tx *gorm.DB, document RoutingPolicyDo
 		end := min(start+routingPolicyMemberInsertBatch, len(credentialIDs))
 		var page []RoutingCredentialRef
 		if err := lockForUpdate(tx).
-			Select("id", "channel_id", "active").
+			Select("id", "channel_id", "channel_generation", "active").
 			Where("id IN ? AND active = ?", credentialIDs[start:end], true).
 			Find(&page).Error; err != nil {
 			return err
@@ -95,11 +175,11 @@ func validateRoutingPolicyLiveReferencesTx(tx *gorm.DB, document RoutingPolicyDo
 				ErrRoutingPolicyReferenceInvalid, credentialID,
 			)
 		}
-		expectedChannelID := credentialChannels[credentialID]
-		if credential.ChannelID != expectedChannelID {
+		expected := credentialReferences[credentialID]
+		if credential.ChannelID != expected.ChannelID || credential.ChannelGeneration != expected.RoutingGeneration {
 			return fmt.Errorf(
-				"%w: credential %d belongs to channel %d, not %d",
-				ErrRoutingPolicyReferenceInvalid, credentialID, credential.ChannelID, expectedChannelID,
+				"%w: credential %d belongs to another channel lifecycle",
+				ErrRoutingPolicyReferenceInvalid, credentialID,
 			)
 		}
 	}

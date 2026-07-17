@@ -16,10 +16,15 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 )
 
+type channelBalanceRefreshKey struct {
+	ChannelID         int
+	ChannelGeneration string
+}
+
 var channelBalanceRefreshState = struct {
 	sync.Mutex
-	inflight map[int]struct{}
-}{inflight: make(map[int]struct{})}
+	inflight map[channelBalanceRefreshKey]struct{}
+}{inflight: make(map[channelBalanceRefreshKey]struct{})}
 
 var (
 	loadChannelForBalanceRefresh = func(channelID int) (*model.Channel, error) {
@@ -38,11 +43,28 @@ func recordChannelBalanceAttemptEffect(
 	attemptStartedAt time.Time,
 	now time.Time,
 ) {
+	recordChannelBalanceAttemptEffectForGeneration(
+		channelID, "", success, statusCode, apiErr, classification, attemptStartedAt, now,
+	)
+}
+
+func recordChannelBalanceAttemptEffectForGeneration(
+	channelID int,
+	channelGeneration string,
+	success bool,
+	statusCode int,
+	apiErr *types.NewAPIError,
+	classification routingerror.Classification,
+	attemptStartedAt time.Time,
+	now time.Time,
+) {
 	if channelID <= 0 {
 		return
 	}
 	if success {
-		routinghotcache.ClearChannelBalanceUnavailable(channelID, attemptStartedAt)
+		routinghotcache.ClearChannelBalanceUnavailableForGeneration(
+			channelID, channelGeneration, attemptStartedAt,
+		)
 		return
 	}
 	if statusCode != 402 || classification.Responsibility != routingerror.ResponsibilityCapacity ||
@@ -60,8 +82,9 @@ func recordChannelBalanceAttemptEffect(
 		baseCooldown = time.Second
 	}
 	retryAfter := retryAfterFromAPIError(apiErr, maxCooldown)
-	if _, recorded := routinghotcache.RecordChannelBalanceUnavailable(
+	if _, recorded := routinghotcache.RecordChannelBalanceUnavailableForGeneration(
 		channelID,
+		channelGeneration,
 		statusCode,
 		classification.Rule,
 		retryAfter,
@@ -69,26 +92,31 @@ func recordChannelBalanceAttemptEffect(
 		maxCooldown,
 		now,
 	); recorded {
-		scheduleChannelBalanceRefresh(channelID)
+		scheduleChannelBalanceRefreshForGeneration(channelID, channelGeneration)
 	}
 }
 
 func scheduleChannelBalanceRefresh(channelID int) {
+	scheduleChannelBalanceRefreshForGeneration(channelID, "")
+}
+
+func scheduleChannelBalanceRefreshForGeneration(channelID int, channelGeneration string) {
 	if channelID <= 0 {
 		return
 	}
+	key := channelBalanceRefreshKey{ChannelID: channelID, ChannelGeneration: channelGeneration}
 	channelBalanceRefreshState.Lock()
-	if _, refreshing := channelBalanceRefreshState.inflight[channelID]; refreshing {
+	if _, refreshing := channelBalanceRefreshState.inflight[key]; refreshing {
 		channelBalanceRefreshState.Unlock()
 		return
 	}
-	channelBalanceRefreshState.inflight[channelID] = struct{}{}
+	channelBalanceRefreshState.inflight[key] = struct{}{}
 	channelBalanceRefreshState.Unlock()
 
 	runChannelBalanceRefresh(func() {
 		defer func() {
 			channelBalanceRefreshState.Lock()
-			delete(channelBalanceRefreshState.inflight, channelID)
+			delete(channelBalanceRefreshState.inflight, key)
 			channelBalanceRefreshState.Unlock()
 		}()
 		startedAt := time.Now()
@@ -101,7 +129,8 @@ func scheduleChannelBalanceRefresh(channelID int) {
 			))
 			return
 		}
-		if channel == nil || channel.ChannelInfo.IsMultiKey {
+		if channel == nil || channel.ChannelInfo.IsMultiKey ||
+			(channelGeneration != "" && channel.RoutingGeneration != channelGeneration) {
 			return
 		}
 		balance, err := updateChannelBalanceForRefresh(channel)
@@ -114,14 +143,16 @@ func scheduleChannelBalanceRefresh(channelID int) {
 			return
 		}
 		if balance > 0 {
-			routinghotcache.ClearChannelBalanceUnavailable(channelID, startedAt)
+			routinghotcache.ClearChannelBalanceUnavailableForGeneration(
+				channelID, channelGeneration, startedAt,
+			)
 		}
 	})
 }
 
 func resetChannelBalanceRefreshForTest() {
 	channelBalanceRefreshState.Lock()
-	channelBalanceRefreshState.inflight = make(map[int]struct{})
+	channelBalanceRefreshState.inflight = make(map[channelBalanceRefreshKey]struct{})
 	channelBalanceRefreshState.Unlock()
 	loadChannelForBalanceRefresh = func(channelID int) (*model.Channel, error) {
 		return model.GetChannelById(channelID, true)

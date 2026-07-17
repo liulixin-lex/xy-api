@@ -74,6 +74,7 @@ import {
 import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   channelConfigurationConflictSummary,
+  channelConfigurationFormFieldForApiField,
   channelConfigurationFormValues,
   channelConfigurationRequest,
   createChannelConfigurationSchema,
@@ -173,36 +174,49 @@ export function ChannelConfigurationSheet(props: {
         return
       }
       const failure = getChannelRoutingConfigurationApiError(error)
+      if (failure.status === 401 || failure.status === 403) return
+
       let message = t('Could not save the channel configuration. Try again.')
-      if (failure.status === 403) {
-        message = t(
-          'Sensitive write permission is required to edit channel multipliers.'
-        )
-      } else if (failure.code === 'channel_configuration_not_found') {
+      if (failure.code === 'channel_configuration_not_found') {
         message = t('This channel configuration no longer exists.')
       } else if (
         failure.code === 'invalid_if_match' ||
         failure.code === 'if_match_required'
       ) {
         message = t('Refresh the channel configuration before saving again.')
-      } else if (failure.code === 'invalid_channel_configuration') {
+      } else if (
+        failure.code === 'invalid_channel_configuration' ||
+        failure.code === 'invalid_channel_configuration_field'
+      ) {
         message = t('Review the highlighted fields and try again.')
       }
 
-      if (failure.field === 'upstream_cost_multiplier') {
-        form.setError('upstreamCostMultiplier', { message })
-      } else if (failure.field === 'traffic_class') {
-        form.setError('trafficClass', { message })
-      } else if (
-        failure.field === 'failure_domain_label' ||
-        failure.field === 'clear_failure_domain'
-      ) {
-        form.setError('failureDomainLabel', { message })
-      } else {
-        form.setError('root.server', { message })
+      const formField = channelConfigurationFormFieldForApiField(failure.field)
+      if (failure.status === 400 && formField) {
+        if (formField === 'upstreamCostMultiplier') {
+          if (failure.reason === 'required') {
+            message = t('Enter a channel multiplier.')
+          } else if (
+            failure.reason === 'invalid_type' ||
+            failure.reason === 'not_finite'
+          ) {
+            message = t('Enter a finite channel multiplier.')
+          } else if (failure.reason === 'out_of_range') {
+            message = t('Channel multiplier must be between 0 and 1000.')
+          }
+        } else if (
+          formField === 'failureDomainLabel' &&
+          failure.reason === 'conflicts_with_clear_failure_domain'
+        ) {
+          message = t('Remove the label before clearing the failure domain.')
+        }
+        form.setError(formField, { message }, { shouldFocus: true })
+        return
       }
-      toast.error(message)
+
+      form.setError('root.server', { message })
     },
+    meta: { handleErrorLocally: true },
   })
 
   const requestClose = () => {
@@ -330,6 +344,7 @@ export function ChannelConfigurationSheet(props: {
             <form
               id='channel-routing-configuration-form'
               className={sideDrawerFormClassName()}
+              noValidate
               onSubmit={form.handleSubmit(submitValues)}
             >
               <Alert role='note'>
@@ -570,17 +585,21 @@ export function ChannelConfigurationSheet(props: {
                       name='clearFailureDomain'
                       render={({ field }) => (
                         <FormItem className='flex min-h-16 items-center justify-between gap-4 border-y py-3'>
-                          <div className='space-y-1'>
+                          <div className='min-w-0 space-y-1'>
                             <FormLabel>{t('Clear failure domain')}</FormLabel>
                             <FormDescription>
                               {t(
                                 'This removes the configured or migrated independence signal used by Hedge safety checks.'
                               )}
                             </FormDescription>
+                            <FormMessage />
                           </div>
                           <FormControl>
                             <Switch
+                              ref={field.ref}
+                              name={field.name}
                               checked={field.value}
+                              onBlur={field.onBlur}
                               onCheckedChange={(checked) => {
                                 field.onChange(checked)
                                 if (checked) {

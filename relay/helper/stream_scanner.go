@@ -627,10 +627,11 @@ func FirstByteFailoverTimeout(info *relaycommon.RelayInfo) time.Duration {
 			group = "default"
 		}
 		if metric, ok := routinghotcache.GetMetric(routinghotcache.Key{
-			ChannelID:   info.ChannelId,
-			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model:       info.OriginModelName,
-			Group:       group,
+			ChannelID:         info.ChannelId,
+			ChannelGeneration: info.ChannelMeta.RoutingGeneration,
+			APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+			Model:             info.OriginModelName,
+			Group:             group,
 		}); ok && metric.P95TTFTMs > 0 && setting.FirstByteP95Multiplier > 0 {
 			derived := int(metric.P95TTFTMs * setting.FirstByteP95Multiplier)
 			if derived > timeoutMs {

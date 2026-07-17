@@ -207,7 +207,10 @@ func (session *RequestRoutingSession) IdentityForChannel(channelID int) (Identit
 		if member.ID != memberID || member.ChannelID != channelID || member.PoolID != pool.ID {
 			continue
 		}
-		identity := Identity{SnapshotRevision: session.snapshot.view.Revision, PoolID: pool.ID, MemberID: member.ID}
+		identity := Identity{
+			SnapshotRevision: session.snapshot.view.Revision, ChannelGeneration: member.ChannelGeneration,
+			PoolID: pool.ID, MemberID: member.ID,
+		}
 		if channel, ok := session.snapshot.channelByID[channelID]; ok {
 			identity.FailureDomainHash = channel.FailureDomainHash
 		}
@@ -441,7 +444,9 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 			}
 		}
 		if candidate.RequestExclusionReason == "" {
-			if _, blocked := ChannelBalanceRuntimeBlocked(member.ChannelID, now); blocked {
+			if _, blocked := ChannelBalanceRuntimeBlockedForGeneration(
+				member.ChannelID, member.ChannelGeneration, now,
+			); blocked {
 				candidate.RequestExclusionReason = ExclusionReasonChannelBalance
 			}
 		}
@@ -477,6 +482,7 @@ func (session *RequestRoutingSession) Plan(input RequestRoutingPlanInput) (Reque
 		}
 		identity := Identity{
 			SnapshotRevision:  snapshot.view.Revision,
+			ChannelGeneration: member.ChannelGeneration,
 			PoolID:            pool.ID,
 			MemberID:          member.ID,
 			CredentialID:      credentialID,

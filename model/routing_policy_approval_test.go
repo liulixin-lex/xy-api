@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRoutingPolicyApprovalQuorumIsVersionBoundImmutableAndIdempotent(t *testing.T) {
+func TestHistoricalRoutingPolicyApprovalsRemainVersionBoundImmutableAndIdempotent(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
@@ -109,7 +109,10 @@ func TestRoutingPolicyApprovalQuorumIsVersionBoundImmutableAndIdempotent(t *test
 		context.Background(), time.Now().Add(time.Hour).UnixMilli(), 100,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, int64(4), deleted)
+	assert.Zero(t, deleted, "historical approvals must be retained after a draft changes")
+	var retained int64
+	require.NoError(t, db.Model(&RoutingPolicyApproval{}).Count(&retained).Error)
+	assert.Equal(t, int64(4), retained)
 }
 
 func TestRoutingPolicyApprovalRejectsStaleValidatedHead(t *testing.T) {
@@ -146,7 +149,7 @@ func TestRoutingPolicyApprovalRejectsStaleValidatedHead(t *testing.T) {
 	assert.Zero(t, count)
 }
 
-func TestRoutingPolicyActivePublishRequiresTwoDistinctApprovals(t *testing.T) {
+func TestRoutingPolicyActivePublishDoesNotRequireHistoricalApprovals(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
@@ -165,33 +168,6 @@ func TestRoutingPolicyActivePublishRequiresTwoDistinctApprovals(t *testing.T) {
 	)
 	require.NoError(t, err)
 	activation := RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageActive, ActorID: 20, Reason: "deploy"}
-
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, activation,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired)
-	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 10)
-	require.NoError(t, err)
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, activation,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired)
-	_, _, err = CreateRoutingPolicyApprovalContext(context.Background(), draft.ID, draft.Version, draft.ETag, activation, 11)
-	require.NoError(t, err)
-
-	differentIntent := activation
-	differentIntent.Reason = "different deploy intent"
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, differentIntent,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "approvals must bind the exact activation intent")
-
-	approverAsPublisher := activation
-	approverAsPublisher.ActorID = 10
-	_, _, err = PublishRoutingPolicyDraftContext(
-		context.Background(), draft.ID, draft.Version, draft.ETag, approverAsPublisher,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "the publisher's own approval cannot count toward quorum")
 
 	publishedDraft, published, err := PublishRoutingPolicyDraftContext(
 		context.Background(), draft.ID, draft.Version, draft.ETag, activation,

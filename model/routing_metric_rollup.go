@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/QuantumNous/new-api/common"
 	routingdistribution "github.com/QuantumNous/new-api/pkg/routing_distribution"
 
 	"gorm.io/gorm"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	RoutingMetricRollupSchemaVersion     = 3
+	RoutingMetricRollupSchemaVersion     = 4
 	RoutingMetricRollupMaxBatch          = 500
 	RoutingMetricRollupDefaultQueryLimit = 1_000
 	RoutingMetricRollupMaxQueryLimit     = 200_000
@@ -60,15 +61,16 @@ type RoutingMetricRollupMigrationOptions struct {
 // RoutingMetricRollup stores mergeable counters keyed by stable routing identities.
 // Percentiles are intentionally excluded because scalar percentiles are not mergeable.
 type RoutingMetricRollup struct {
-	ID            int    `json:"id" gorm:"primaryKey"`
-	MemberID      int    `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:1;index"`
-	CredentialID  int    `json:"credential_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:2;index"`
-	ModelName     string `json:"model_name" gorm:"type:varchar(128);not null;index"`
-	ModelKey      string `json:"-" gorm:"type:char(64);not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:3"`
-	BucketTs      int64  `json:"bucket_ts" gorm:"bigint;not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:4;index:idx_routing_metric_rollup_bucket_ts"`
-	ChannelID     int    `json:"channel_id" gorm:"not null;index"`
-	PoolID        int    `json:"pool_id" gorm:"not null;index"`
-	SchemaVersion int    `json:"schema_version" gorm:"not null"`
+	ID                int    `json:"id" gorm:"primaryKey"`
+	MemberID          int    `json:"member_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:1;index"`
+	CredentialID      int    `json:"credential_id" gorm:"not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:2;index"`
+	ModelName         string `json:"model_name" gorm:"type:varchar(128);not null;index"`
+	ModelKey          string `json:"-" gorm:"type:char(64);not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:3"`
+	BucketTs          int64  `json:"bucket_ts" gorm:"bigint;not null;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:4;index:idx_routing_metric_rollup_bucket_ts"`
+	ChannelID         int    `json:"channel_id" gorm:"not null;index"`
+	ChannelGeneration string `json:"channel_generation" gorm:"type:varchar(32);index"`
+	PoolID            int    `json:"pool_id" gorm:"not null;index"`
+	SchemaVersion     int    `json:"schema_version" gorm:"not null"`
 	// LastSnapshotRevision keeps its legacy column/API name, but schema v3 treats
 	// it as the exact snapshot revision and the fifth physical rollup key.
 	LastSnapshotRevision int64  `json:"last_snapshot_revision" gorm:"bigint;not null;index;uniqueIndex:idx_routing_metric_rollup_revision_key,priority:5"`
@@ -607,15 +609,19 @@ func routingMetricRollupIndexDefinition(db *gorm.DB, indexName string) ([]string
 			IsUnique   bool   `gorm:"column:is_unique"`
 		}
 		if err := db.Raw(
-			"SELECT pg_get_indexdef(index_meta.indexrelid, position.number, TRUE) AS column_name, "+
+			"SELECT indexed_column.attname AS column_name, "+
 				"index_meta.indisunique AS is_unique "+
 				"FROM pg_catalog.pg_index AS index_meta "+
 				"JOIN pg_catalog.pg_class AS index_table ON index_table.oid = index_meta.indexrelid "+
 				"JOIN pg_catalog.pg_class AS data_table ON data_table.oid = index_meta.indrelid "+
 				"JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = data_table.relnamespace "+
-				"JOIN LATERAL generate_series(1, index_meta.indnatts::integer) AS position(number) ON TRUE "+
+				"JOIN LATERAL unnest(index_meta.indkey::smallint[]) WITH ORDINALITY "+
+				"AS indexed_key(attribute_number, position) ON TRUE "+
+				"JOIN pg_catalog.pg_attribute AS indexed_column "+
+				"ON indexed_column.attrelid = data_table.oid "+
+				"AND indexed_column.attnum = indexed_key.attribute_number "+
 				"WHERE namespace.nspname = current_schema() AND data_table.relname = ? AND index_table.relname = ? "+
-				"ORDER BY position.number",
+				"ORDER BY indexed_key.position",
 			"routing_metric_rollups", indexName,
 		).Scan(&rows).Error; err != nil {
 			return nil, false, false, err
@@ -662,7 +668,8 @@ func UpsertRoutingMetricRollupsContext(ctx context.Context, rollups []RoutingMet
 	}
 
 	err = runRoutingMetricTransactionWithRetry(ctx, func(tx *gorm.DB) error {
-		return applyRoutingMetricRollupsTx(ctx, tx, normalized)
+		_, applyErr := applyRoutingMetricRollupsTx(ctx, tx, normalized)
+		return applyErr
 	})
 	if err != nil && ctx.Err() != nil {
 		return ctx.Err()
@@ -792,8 +799,13 @@ func sortRoutingMetricRollupsByKey(rollups []RoutingMetricRollup) {
 	})
 }
 
-func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []RoutingMetricRollup) error {
+func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []RoutingMetricRollup) (int, error) {
 	sortRoutingMetricRollupsByKey(rollups)
+	accepted, err := filterActiveRoutingMetricRollupsTx(ctx, tx, rollups)
+	if err != nil || len(accepted) == 0 {
+		return 0, err
+	}
+	rollups = accepted
 	placeholders := make([]RoutingMetricRollup, 0, len(rollups))
 	for index := range rollups {
 		rollup := rollups[index]
@@ -804,6 +816,7 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			ModelKey:             rollup.ModelKey,
 			BucketTs:             rollup.BucketTs,
 			ChannelID:            rollup.ChannelID,
+			ChannelGeneration:    rollup.ChannelGeneration,
 			PoolID:               rollup.PoolID,
 			SchemaVersion:        rollup.SchemaVersion,
 			LastSnapshotRevision: rollup.LastSnapshotRevision,
@@ -819,7 +832,7 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 		},
 		DoNothing: true,
 	}).CreateInBatches(&placeholders, RoutingMetricRollupMaxBatch).Error; err != nil {
-		return err
+		return 0, err
 	}
 
 	for index := range rollups {
@@ -830,13 +843,14 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			incoming.MemberID, incoming.CredentialID, incoming.ModelKey, incoming.BucketTs,
 			incoming.LastSnapshotRevision,
 		).First(&current).Error; err != nil {
-			return err
+			return 0, err
 		}
 		if err := mergeRoutingMetricRollup(&current, incoming); err != nil {
-			return err
+			return 0, err
 		}
 		if err := tx.WithContext(ctx).Model(&RoutingMetricRollup{}).Where("id = ?", current.ID).Updates(map[string]any{
 			"channel_id":                current.ChannelID,
+			"channel_generation":        current.ChannelGeneration,
 			"pool_id":                   current.PoolID,
 			"schema_version":            current.SchemaVersion,
 			"sketch_codec_version":      current.SketchCodecVersion,
@@ -862,15 +876,125 @@ func applyRoutingMetricRollupsTx(ctx context.Context, tx *gorm.DB, rollups []Rou
 			"retry_after_count":         current.RetryAfterCount,
 			"retry_after_total_ms":      current.RetryAfterTotalMs,
 		}).Error; err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(rollups), nil
+}
+
+func filterActiveRoutingMetricRollupsTx(
+	ctx context.Context,
+	tx *gorm.DB,
+	rollups []RoutingMetricRollup,
+) ([]RoutingMetricRollup, error) {
+	if !routingGenerationFencingAvailable(tx) {
+		return rollups, nil
+	}
+	memberIDs := make([]int, 0, len(rollups))
+	seenMembers := make(map[int]struct{}, len(rollups))
+	credentialIDs := make([]int, 0, len(rollups))
+	seenCredentials := make(map[int]struct{}, len(rollups))
+	for index := range rollups {
+		rollup := rollups[index]
+		if _, exists := seenMembers[rollup.MemberID]; !exists {
+			seenMembers[rollup.MemberID] = struct{}{}
+			memberIDs = append(memberIDs, rollup.MemberID)
+		}
+		if rollup.CredentialID > 0 {
+			if _, exists := seenCredentials[rollup.CredentialID]; !exists {
+				seenCredentials[rollup.CredentialID] = struct{}{}
+				credentialIDs = append(credentialIDs, rollup.CredentialID)
+			}
+		}
+	}
+	sort.Ints(memberIDs)
+	sort.Ints(credentialIDs)
+
+	var candidateMembers []RoutingPoolMember
+	if err := tx.WithContext(ctx).Select("id", "channel_id").Where("id IN ?", memberIDs).
+		Order("channel_id asc").Find(&candidateMembers).Error; err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int, 0, len(candidateMembers))
+	seenChannels := make(map[int]struct{}, len(candidateMembers))
+	for index := range candidateMembers {
+		channelID := candidateMembers[index].ChannelID
+		if _, exists := seenChannels[channelID]; !exists {
+			seenChannels[channelID] = struct{}{}
+			channelIDs = append(channelIDs, channelID)
+		}
+	}
+	sort.Ints(channelIDs)
+
+	var channels []Channel
+	if len(channelIDs) > 0 {
+		query := tx.WithContext(ctx).Select("id", "routing_generation").Where("id IN ?", channelIDs).Order("id asc")
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.Find(&channels).Error; err != nil {
+			return nil, err
+		}
+	}
+	channelsByID := make(map[int]Channel, len(channels))
+	for index := range channels {
+		channelsByID[channels[index].Id] = channels[index]
+	}
+
+	var members []RoutingPoolMember
+	if err := tx.WithContext(ctx).
+		Where("id IN ? AND active = ?", memberIDs, true).Order("id asc").Find(&members).Error; err != nil {
+		return nil, err
+	}
+	membersByID := make(map[int]RoutingPoolMember, len(members))
+	for index := range members {
+		membersByID[members[index].ID] = members[index]
+	}
+
+	credentialsByID := make(map[int]RoutingCredentialRef, len(credentialIDs))
+	if len(credentialIDs) > 0 {
+		var credentials []RoutingCredentialRef
+		if err := tx.WithContext(ctx).
+			Where("id IN ? AND active = ?", credentialIDs, true).Order("id asc").Find(&credentials).Error; err != nil {
+			return nil, err
+		}
+		for index := range credentials {
+			credentialsByID[credentials[index].ID] = credentials[index]
+		}
+	}
+
+	accepted := make([]RoutingMetricRollup, 0, len(rollups))
+	for index := range rollups {
+		rollup := rollups[index]
+		member, memberActive := membersByID[rollup.MemberID]
+		channel, channelActive := channelsByID[rollup.ChannelID]
+		if !memberActive || !channelActive || member.PoolID != rollup.PoolID ||
+			member.ChannelID != rollup.ChannelID || !validRoutingIdentity(member.ChannelGeneration) ||
+			channel.RoutingGeneration != member.ChannelGeneration ||
+			(rollup.ChannelGeneration != "" && rollup.ChannelGeneration != member.ChannelGeneration) {
+			continue
+		}
+		if rollup.CredentialID > 0 {
+			credential, credentialActive := credentialsByID[rollup.CredentialID]
+			if !credentialActive || credential.ChannelID != rollup.ChannelID ||
+				credential.ChannelGeneration != member.ChannelGeneration {
+				continue
+			}
+		}
+		rollup.ChannelGeneration = member.ChannelGeneration
+		accepted = append(accepted, rollup)
+	}
+	return accepted, nil
 }
 
 func mergeRoutingMetricRollup(current *RoutingMetricRollup, incoming *RoutingMetricRollup) error {
 	if current.LastSnapshotRevision != incoming.LastSnapshotRevision {
 		return fmt.Errorf("%w: snapshot revision mismatch", ErrRoutingMetricRollupInvalid)
+	}
+	if current.ChannelGeneration == "" {
+		current.ChannelGeneration = incoming.ChannelGeneration
+	} else if incoming.ChannelGeneration != current.ChannelGeneration {
+		return fmt.Errorf("%w: channel generation mismatch", ErrRoutingMetricRollupInvalid)
 	}
 	codecVersion := current.SketchCodecVersion
 	if codecVersion == 0 {
@@ -1146,13 +1270,15 @@ func validateRoutingMetricRollup(rollup *RoutingMetricRollup) error {
 	if rollup.ModelKey != routingMetricRollupModelKey(rollup.ModelName) {
 		return errors.New("model key does not match model name")
 	}
-	if rollup.BucketTs < 0 ||
-		(rollup.SchemaVersion != 1 && rollup.SchemaVersion != 2 && rollup.SchemaVersion != RoutingMetricRollupSchemaVersion) ||
+	if rollup.BucketTs < 0 || rollup.SchemaVersion < 1 || rollup.SchemaVersion > RoutingMetricRollupSchemaVersion ||
 		rollup.LastSnapshotRevision < 0 {
 		return errors.New("bucket, schema version, or snapshot revision is invalid")
 	}
 	if rollup.SchemaVersion == RoutingMetricRollupSchemaVersion && rollup.LastSnapshotRevision == 0 {
-		return errors.New("schema v3 requires an exact positive snapshot revision")
+		return errors.New("current schema requires an exact positive snapshot revision")
+	}
+	if rollup.ChannelGeneration != "" && !validRoutingIdentity(rollup.ChannelGeneration) {
+		return errors.New("channel generation is invalid")
 	}
 	for _, counter := range []int64{
 		rollup.RequestCount,

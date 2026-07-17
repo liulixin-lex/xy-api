@@ -10,6 +10,7 @@ import (
 type SelectedRoutingIdentity struct {
 	ChannelID         int
 	SnapshotRevision  uint64
+	ChannelGeneration string
 	PoolID            int
 	MemberID          int
 	CredentialID      int

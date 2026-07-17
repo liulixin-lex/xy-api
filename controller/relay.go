@@ -517,8 +517,9 @@ func recordRoutingAttemptEffects(
 	if !attemptStart.IsZero() && info.FirstResponseTime.After(attemptStart) {
 		ttft = info.FirstResponseTime.Sub(attemptStart)
 	}
-	recordChannelBalanceAttemptEffect(
+	recordChannelBalanceAttemptEffectForGeneration(
 		channelID,
+		common.GetContextKeyString(c, constant.ContextKeyRoutingGeneration),
 		success,
 		statusCode,
 		apiErr,
@@ -620,10 +621,11 @@ func recordRoutingAttemptEffects(
 		return
 	}
 	key := routingbreaker.Key{
-		ChannelID:   channelID,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       info.OriginModelName,
-		Group:       group,
+		ChannelID:         channelID,
+		ChannelGeneration: common.GetContextKeyString(c, constant.ContextKeyRoutingGeneration),
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             info.OriginModelName,
+		Group:             group,
 	}
 
 	if success {

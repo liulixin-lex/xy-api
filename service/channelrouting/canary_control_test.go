@@ -347,9 +347,15 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 		&model.RoutingControlLease{},
 		&model.RoutingCanaryEvaluation{},
 		&model.RoutingOperation{},
+		&model.RoutingPoolMember{},
 	))
-	require.NoError(t, db.Create(&model.Channel{
+	channel := model.Channel{
 		Id: 201, Name: "canary-rollback", Models: "gpt-test",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.RoutingPoolMember{
+		ID: 101, PoolID: 29, ChannelID: channel.Id,
+		ChannelGeneration: channel.RoutingGeneration, Source: model.RoutingPoolSourceLegacyGroup, Active: true,
 	}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	document := model.RoutingPolicyDocument{
@@ -359,7 +365,8 @@ func TestCanaryOperationWorkerExecutesPoolScopedRollback(t *testing.T) {
 			DeploymentStage: model.RoutingDeploymentStageCanary,
 			PolicyProfile:   model.RoutingPolicyProfileBalanced,
 			Members: []model.RoutingPolicyMemberContent{{
-				MemberID: 101, ChannelID: 201, Enabled: true, Priority: 1, Weight: 100,
+				MemberID: 101, ChannelID: 201, RoutingGeneration: channel.RoutingGeneration,
+				Enabled: true, Priority: 1, Weight: 100,
 			}},
 		}},
 	}

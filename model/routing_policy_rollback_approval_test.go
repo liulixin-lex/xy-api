@@ -15,7 +15,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestRoutingPolicyRollbackApprovalRequiresTwoIndependentActors(t *testing.T) {
+func TestRoutingPolicyRollbackNeedsNoApprovalQuorum(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
@@ -42,50 +42,6 @@ func TestRoutingPolicyRollbackApprovalRequiresTwoIndependentActors(t *testing.T)
 		Stage: RoutingDeploymentStageActive, ActorID: 20, Reason: "restore active policy",
 	}
 
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), head.CurrentRevision, first.Revision.Revision, activation,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired)
-	assertRoutingPolicyRowCounts(t, 3, 3, 3, 3, 3)
-	assertRoutingPolicyOperationCountForTest(t, 0)
-
-	firstApproval, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, activation, 10,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	retry, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, activation, 10,
-	)
-	require.NoError(t, err)
-	assert.False(t, created)
-	assert.Equal(t, firstApproval.ID, retry.ID)
-	_, created, err = CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, activation, 11,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), head.CurrentRevision, second.Revision.Revision, activation,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "approvals must bind the target revision")
-
-	differentReason := activation
-	differentReason.Reason = "different rollback intent"
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), head.CurrentRevision, first.Revision.Revision, differentReason,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "approvals must bind the exact rollback reason")
-
-	executorApproved := activation
-	executorApproved.ActorID = 10
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), head.CurrentRevision, first.Revision.Revision, executorApproved,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "the executor's own approval cannot count")
-	assertRoutingPolicyRowCounts(t, 3, 3, 3, 3, 3)
-	assertRoutingPolicyOperationCountForTest(t, 0)
-
 	rolledBack, operation, err := RollbackRoutingPolicyRevisionWithOperationContext(
 		context.Background(), head.CurrentRevision, first.Revision.Revision, activation,
 	)
@@ -96,17 +52,9 @@ func TestRoutingPolicyRollbackApprovalRequiresTwoIndependentActors(t *testing.T)
 	assert.Equal(t, rolledBack.Revision.Revision, operation.ResultRevision)
 	assertRoutingPolicyRowCounts(t, 4, 4, 4, 4, 4)
 	assertRoutingPolicyOperationCountForTest(t, 1)
-	newHead, err := GetRoutingPolicyHeadContext(context.Background())
-	require.NoError(t, err)
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
-		context.Background(), newHead.CurrentRevision, first.Revision.Revision, activation,
-	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired, "approvals must bind the exact policy head")
-	assertRoutingPolicyRowCounts(t, 4, 4, 4, 4, 4)
-	assertRoutingPolicyOperationCountForTest(t, 1)
 }
 
-func TestRoutingPolicyEnterpriseRollbackRequiresApprovalOutsideActiveStage(t *testing.T) {
+func TestRoutingPolicyEnterpriseRollbackNeedsNoApprovalQuorum(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
@@ -128,51 +76,16 @@ func TestRoutingPolicyEnterpriseRollbackRequiresApprovalOutsideActiveStage(t *te
 	activation := RoutingPolicyActivationSpec{
 		Stage: RoutingDeploymentStageShadow, ActorID: 20, Reason: "restore enterprise",
 	}
-	_, _, err = RollbackRoutingPolicyRevisionWithOperationContext(
+	rolledBack, operation, err := RollbackRoutingPolicyRevisionWithOperationContext(
 		context.Background(), second.Revision.Revision, first.Revision.Revision,
 		activation,
 	)
-	assert.ErrorIs(t, err, ErrRoutingPolicyApprovalRequired)
-	assertRoutingPolicyRowCounts(t, 2, 2, 2, 2, 2)
-	assertRoutingPolicyOperationCountForTest(t, 0)
-	head, err := GetRoutingPolicyHeadContext(context.Background())
 	require.NoError(t, err)
-	firstApproval, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, activation, 10,
-	)
-	require.NoError(t, err)
-	require.True(t, created)
-	retry, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, activation, 10,
-	)
-	require.NoError(t, err)
-	assert.False(t, created)
-	assert.Equal(t, firstApproval.ID, retry.ID)
-	differentReason := activation
-	differentReason.Reason = "restore enterprise with corrected reason"
-	differentReasonApproval, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, differentReason, 10,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	assert.NotEqual(t, firstApproval.ID, differentReasonApproval.ID)
-	canaryIntent := activation
-	canaryIntent.Stage = RoutingDeploymentStageCanary
-	canaryIntent.TrafficBasisPoints = RoutingPolicyCanaryMinBasisPoints
-	canaryApproval, created, err := CreateRoutingPolicyRollbackApprovalContext(
-		context.Background(), head, first.Revision.Revision, canaryIntent, 10,
-	)
-	require.NoError(t, err)
-	assert.True(t, created)
-	assert.NotEqual(t, firstApproval.ID, canaryApproval.ID)
-	items, err := ListRoutingPolicyRollbackApprovalsContext(
-		context.Background(), head, first.Revision.Revision,
-	)
-	require.NoError(t, err)
-	assert.Len(t, items, 3)
+	assert.Equal(t, first.Revision.Revision, rolledBack.Revision.RollbackOfRevision)
+	assert.Equal(t, RoutingOperationStatusSucceeded, operation.Status)
 }
 
-func TestRoutingPolicyRollbackApprovalIsImmutableAndRetainedUntilHeadChanges(t *testing.T) {
+func TestRoutingPolicyRollbackApprovalIsImmutableAndPermanentlyRetained(t *testing.T) {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, migrateRoutingPolicyModelsForTest(db))
@@ -215,7 +128,7 @@ func TestRoutingPolicyRollbackApprovalIsImmutableAndRetainedUntilHeadChanges(t *
 	cutoff := time.Now().Add(time.Hour).UnixMilli()
 	deleted, err := DeleteStaleRoutingPolicyRollbackApprovalsContext(context.Background(), cutoff, 100)
 	require.NoError(t, err)
-	assert.Zero(t, deleted, "an approval for the current head must not expire before the head changes")
+	assert.Zero(t, deleted)
 
 	_, err = PublishRoutingPolicyRevisionContext(
 		context.Background(), second.Revision.Revision, routingPolicyDocumentForTest(300),
@@ -224,10 +137,10 @@ func TestRoutingPolicyRollbackApprovalIsImmutableAndRetainedUntilHeadChanges(t *
 	require.NoError(t, err)
 	deleted, err = DeleteStaleRoutingPolicyRollbackApprovalsContext(context.Background(), cutoff, 100)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), deleted)
+	assert.Zero(t, deleted, "historical approval facts must survive head changes")
 	var count int64
 	require.NoError(t, db.Model(&RoutingPolicyRollbackApproval{}).Count(&count).Error)
-	assert.Zero(t, count)
+	assert.Equal(t, int64(1), count)
 }
 
 func TestRoutingPolicyRollbackConcurrentExecutorsAdvanceHeadOnce(t *testing.T) {
@@ -245,18 +158,6 @@ func TestRoutingPolicyRollbackConcurrentExecutorsAdvanceHeadOnce(t *testing.T) {
 		RoutingPolicyActivationSpec{Stage: RoutingDeploymentStageShadow, ActorID: 2, Reason: "change"},
 	)
 	require.NoError(t, err)
-	head, err := GetRoutingPolicyHeadContext(context.Background())
-	require.NoError(t, err)
-	approvalIntent := RoutingPolicyActivationSpec{
-		Stage: RoutingDeploymentStageActive, Reason: "restore active policy",
-	}
-	for _, actorID := range []int{10, 11} {
-		_, _, err = CreateRoutingPolicyRollbackApprovalContext(
-			context.Background(), head, first.Revision.Revision, approvalIntent, actorID,
-		)
-		require.NoError(t, err)
-	}
-
 	errs := make([]error, 2)
 	start := make(chan struct{})
 	var wait sync.WaitGroup

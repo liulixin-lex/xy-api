@@ -120,7 +120,6 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(asyncBillingRecoveryHandler{})
 	service.RegisterSystemTaskHandler(billingLogAuditHandler{})
-	service.RegisterSystemTaskHandler(routingAgentHandler{})
 }
 
 func syncRoutingBreakerConfigFromSetting(setting smart_routing_setting.SmartRoutingSetting) {
@@ -889,6 +888,9 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 			continue
 		}
 		if !stateAccepted {
+			if metric.ChannelGeneration != "" && metric.ChannelGeneration != fence.Generation {
+				continue
+			}
 			clearRoutingRuntimeChannelState(metric.ChannelID)
 			rejectedChannels[metric.ChannelID] = struct{}{}
 			delete(acceptedChannelFences, metric.ChannelID)
@@ -997,6 +999,9 @@ func flushRoutingRuntimeState(ctx context.Context, setting smart_routing_setting
 			continue
 		}
 		if !stateAccepted {
+			if state.ChannelGeneration != "" && state.ChannelGeneration != fence.Generation {
+				continue
+			}
 			clearRoutingRuntimeChannelState(snapshot.Key.ChannelID)
 			rejectedChannels[snapshot.Key.ChannelID] = struct{}{}
 			delete(acceptedChannelFences, snapshot.Key.ChannelID)
@@ -1147,7 +1152,13 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 	lastMetricBucketTs := int64(0)
 	lastMetricID := 0
 	for len(validMetrics) < routingSnapshotLimit {
-		query := model.DB.WithContext(ctx).Where("bucket_ts >= ? AND api_key_index = ?", now-metricWindow, model.RoutingMetricSingleKeyIndex)
+		query := model.DB.WithContext(ctx).
+			Where("bucket_ts >= ? AND api_key_index = ?", now-metricWindow, model.RoutingMetricSingleKeyIndex).
+			Where(`EXISTS (
+				SELECT 1 FROM channels
+				WHERE channels.id = routing_channel_metrics.channel_id
+					AND channels.routing_generation = routing_channel_metrics.channel_generation
+			)`)
 		if lastMetricID > 0 {
 			query = query.Where("(bucket_ts < ? OR (bucket_ts = ? AND id < ?))", lastMetricBucketTs, lastMetricBucketTs, lastMetricID)
 		}
@@ -1232,7 +1243,11 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 	summary["breakers"] = len(retained)
 
 	var healthStates []model.RoutingChannelHealthState
-	if err := model.DB.WithContext(ctx).Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where(`EXISTS (
+		SELECT 1 FROM channels
+		WHERE channels.id = routing_channel_health_states.channel_id
+			AND channels.routing_generation = routing_channel_health_states.channel_generation
+	)`).Order("updated_time desc").Limit(5000).Find(&healthStates).Error; err != nil {
 		return summary, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1246,6 +1261,7 @@ func refreshRoutingHotcacheFromDB(ctx context.Context, setting smart_routing_set
 func routingBreakerSnapshotToModel(snapshot routingbreaker.Snapshot) model.RoutingBreakerState {
 	state := model.RoutingBreakerState{
 		ChannelID:           snapshot.Key.ChannelID,
+		ChannelGeneration:   snapshot.Key.ChannelGeneration,
 		APIKeyIndex:         snapshot.Key.APIKeyIndex,
 		ModelName:           snapshot.Key.Model,
 		Group:               snapshot.Key.Group,
@@ -1283,10 +1299,11 @@ func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routi
 		}
 		snapshot := routingbreaker.Snapshot{
 			Key: routingbreaker.Key{
-				ChannelID:   state.ChannelID,
-				APIKeyIndex: state.APIKeyIndex,
-				Model:       state.ModelName,
-				Group:       state.Group,
+				ChannelID:         state.ChannelID,
+				ChannelGeneration: state.ChannelGeneration,
+				APIKeyIndex:       state.APIKeyIndex,
+				Model:             state.ModelName,
+				Group:             state.Group,
 			},
 			State:               routingbreaker.State(state.State),
 			ResetGeneration:     state.ResetGeneration,
@@ -1310,26 +1327,6 @@ func routingBreakerModelsToSnapshots(states []model.RoutingBreakerState) []routi
 		snapshots = append(snapshots, snapshot)
 	}
 	return snapshots
-}
-
-type routingAgentHandler struct{}
-
-func (routingAgentHandler) Type() string { return model.SystemTaskTypeRoutingAgent }
-
-func (routingAgentHandler) Enabled() bool {
-	setting := smart_routing_setting.GetSetting()
-	return smart_routing_setting.ResolveEffectiveMode(setting).AllowsEnterpriseFeatures() && setting.AgentEnabled
-}
-
-func (routingAgentHandler) Interval() time.Duration { return time.Hour }
-
-func (routingAgentHandler) NewPayload() any { return nil }
-
-func (routingAgentHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
-	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, map[string]any{
-		"analyzed": false,
-		"reason":   "routing agent provider integration is not configured; recommendations remain read-only",
-	}, nil)
 }
 
 func finishSystemTaskHandler(task *model.SystemTask, runnerID string, status model.SystemTaskStatus, result any, runErr error) {

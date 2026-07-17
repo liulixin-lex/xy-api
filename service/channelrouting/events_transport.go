@@ -233,6 +233,20 @@ func consumeRoutingEventsOnceContext(
 					continue
 				}
 			}
+			if message.eventType == RoutingEventTypePricingChanged {
+				applied, applyErr := consumeRoutingPricingEventPayloadContext(
+					ctx, message.revision, message.payload,
+				)
+				if applyErr != nil {
+					state.markRetryableRejected(applyErr)
+					return processed, applyErr
+				}
+				if !applied {
+					state.markConsumed(raw.ID)
+					processed++
+					continue
+				}
+			}
 			if _, publishErr := hub.publish(
 				message.eventType, message.revision, message.payload, time.UnixMilli(message.createdTimeMs),
 			); publishErr != nil {

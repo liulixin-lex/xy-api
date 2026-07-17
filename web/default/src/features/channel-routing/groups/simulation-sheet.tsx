@@ -210,6 +210,7 @@ export function ChannelRoutingSimulationSheet(props: {
         queryKey: channelRoutingQueryKeys.operationsRoot(),
       })
     },
+    meta: { handleErrorLocally: true },
   })
   const resetSimulation = simulation.reset
 

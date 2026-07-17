@@ -164,10 +164,11 @@ func ApplyRoutingTelemetryBatchContext(ctx context.Context, batch RoutingTelemet
 			result.Duplicate = true
 			return nil
 		}
-		if err := applyRoutingMetricRollupsTx(ctx, tx, normalized); err != nil {
+		appliedItems, err := applyRoutingMetricRollupsTx(ctx, tx, normalized)
+		if err != nil {
 			return err
 		}
-		result.AppliedItems = len(normalized)
+		result.AppliedItems = appliedItems
 		return nil
 	})
 	if err != nil && ctx.Err() != nil {
@@ -655,6 +656,9 @@ func normalizeRoutingTelemetryBatchAt(batch RoutingTelemetryBatch, now time.Time
 			return nil, err
 		}
 		incoming := normalized[0]
+		if routingGenerationFencingAvailable(DB) && !validRoutingIdentity(incoming.ChannelGeneration) {
+			return nil, fmt.Errorf("%w: channel generation is missing or invalid at item %d", ErrRoutingTelemetryInvalid, index)
+		}
 		if incoming.BucketTs > maxProducedBucketTs {
 			return nil, fmt.Errorf("%w: bucket timestamp is not plausible for produced time at item %d", ErrRoutingTelemetryInvalid, index)
 		}
@@ -670,7 +674,8 @@ func normalizeRoutingTelemetryBatchAt(batch RoutingTelemetryBatch, now time.Time
 			merged[key] = incoming
 			continue
 		}
-		if current.ModelName != incoming.ModelName || current.ChannelID != incoming.ChannelID || current.PoolID != incoming.PoolID {
+		if current.ModelName != incoming.ModelName || current.ChannelID != incoming.ChannelID ||
+			current.ChannelGeneration != incoming.ChannelGeneration || current.PoolID != incoming.PoolID {
 			return nil, fmt.Errorf("%w: conflicting metric identity at item %d", ErrRoutingTelemetryInvalid, index)
 		}
 		if err := mergeRoutingMetricRollup(&current, &incoming); err != nil {

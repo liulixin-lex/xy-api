@@ -260,7 +260,8 @@ func TestChannelCredentialUpdateClearsPersistedRoutingAuthFailure(t *testing.T) 
 	}
 	require.NoError(t, db.Create(&credential).Error)
 	require.NoError(t, db.Create(&RoutingChannelHealthState{
-		ChannelID: channel.Id, AuthFailure: true, AuthFailureReason: "old credential rejected", AuthFailureUntil: 9_999,
+		ChannelID: channel.Id, ChannelGeneration: channel.RoutingGeneration,
+		AuthFailure: true, AuthFailureReason: "old credential rejected", AuthFailureUntil: 9_999,
 	}).Error)
 
 	channel.Key = "new-key"
@@ -273,7 +274,7 @@ func TestChannelCredentialUpdateClearsPersistedRoutingAuthFailure(t *testing.T) 
 	assert.Zero(t, health.AuthFailureUntil)
 
 	applied, err := ApplyRoutingChannelProbeAuthStateContext(
-		context.Background(), channel.Id, credential.ID, true, "late old credential", 20_000,
+		context.Background(), channel.Id, channel.RoutingGeneration, credential.ID, true, "late old credential", 20_000,
 	)
 	require.NoError(t, err)
 	assert.False(t, applied)

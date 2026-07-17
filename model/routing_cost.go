@@ -30,10 +30,11 @@ const (
 	RoutingCostConfidenceExact   = "exact"
 	RoutingCostConfidenceDerived = "derived"
 
-	RoutingCostFreshnessFresh   = "fresh"
-	RoutingCostFreshnessStale   = "stale"
-	RoutingCostFreshnessExpired = "expired"
-	RoutingCostFreshnessUnknown = "unknown"
+	RoutingCostFreshnessFresh        = "fresh"
+	RoutingCostFreshnessStale        = "stale"
+	RoutingCostFreshnessExpired      = "expired"
+	RoutingCostFreshnessUnknown      = "unknown"
+	RoutingCostUnknownMissingContext = "missing_context"
 
 	// RoutingCostSub2APIIntervalUnmatchedTier marks request profiles that fall
 	// outside the interval prices exposed by Sub2API. The upstream falls back to
@@ -52,17 +53,22 @@ const (
 	// safety checks must run before the snapshot can be treated as known.
 	RoutingCostSub2APIDisplayContractV1 = "display_v1"
 
-	routingCostSnapshotVersionSchema = 1
-	routingCostJSONMaxBytes          = 60 << 10
-	routingCostTextMaxBytes          = 4 << 10
-	routingCostMigrationBatch        = 500
-	routingCostRetentionBatch        = 500
+	RoutingCostLifecycleScopeGeneration     = "generation"
+	RoutingCostLifecycleScopeLegacyUnscoped = "legacy-unscoped"
+
+	routingCostSnapshotVersionSchema           = 1
+	routingCostSnapshotGenerationVersionSchema = 2
+	routingCostJSONMaxBytes                    = 60 << 10
+	routingCostTextMaxBytes                    = 4 << 10
+	routingCostMigrationBatch                  = 500
+	routingCostRetentionBatch                  = 500
 )
 
 var (
 	ErrRoutingCostInvalid          = errors.New("invalid versioned routing cost snapshot")
 	ErrRoutingCostHistoryImmutable = errors.New("routing cost history is immutable")
 	ErrRoutingCostVersionCorrupt   = errors.New("routing cost snapshot version is corrupt")
+	ErrRoutingCostGenerationStale  = errors.New("routing cost snapshot generation is stale")
 )
 
 type RoutingUpstreamAccount struct {
@@ -85,37 +91,85 @@ func (RoutingUpstreamAccount) TableName() string {
 }
 
 type RoutingCostSnapshotVersion struct {
-	ID               int64   `json:"id" gorm:"primaryKey"`
-	SchemaVersion    int     `json:"schema_version" gorm:"not null"`
-	PricingHash      string  `json:"pricing_hash" gorm:"type:char(64);uniqueIndex;not null"`
-	ContentHash      string  `json:"content_hash" gorm:"type:char(64);index"`
-	ApplyToken       string  `json:"-" gorm:"type:char(32);not null"`
-	AccountID        int     `json:"account_id" gorm:"index;not null"`
-	AccountKey       string  `json:"-" gorm:"type:char(64);index;not null"`
-	SourceType       string  `json:"source_type" gorm:"type:varchar(32);index;not null"`
-	ChannelID        int     `json:"channel_id" gorm:"index;not null"`
-	UpstreamGroup    string  `json:"upstream_group" gorm:"type:varchar(128);not null"`
-	UpstreamGroupKey string  `json:"-" gorm:"type:char(64);index;not null"`
-	UpstreamModel    string  `json:"upstream_model" gorm:"type:varchar(128);not null"`
-	UpstreamModelKey string  `json:"-" gorm:"type:char(64);index;not null"`
-	LocalModel       string  `json:"local_model" gorm:"type:varchar(128);not null"`
-	LocalModelKey    string  `json:"-" gorm:"type:char(64);index;not null"`
-	ObservedTime     int64   `json:"observed_time" gorm:"bigint;index;not null"`
-	EffectiveTime    int64   `json:"effective_time" gorm:"bigint;index;not null"`
-	ExpiresTime      int64   `json:"expires_time" gorm:"bigint;index;not null"`
-	PricingVersion   string  `json:"pricing_version" gorm:"type:varchar(128);index;not null"`
-	PricingJSON      string  `json:"-" gorm:"type:text;not null"`
-	Confidence       string  `json:"confidence" gorm:"type:varchar(32);index;not null"`
-	ConfidenceScore  float64 `json:"confidence_score" gorm:"not null"`
-	Freshness        string  `json:"freshness" gorm:"type:varchar(32);index;not null"`
-	FreshnessScore   float64 `json:"freshness_score" gorm:"not null"`
-	SourceSyncStatus string  `json:"source_sync_status" gorm:"type:varchar(32);index;not null"`
-	SourceSyncError  string  `json:"source_sync_error" gorm:"type:text;not null"`
-	CreatedTime      int64   `json:"created_time" gorm:"bigint;index;not null"`
+	ID                int64   `json:"id" gorm:"primaryKey"`
+	SchemaVersion     int     `json:"schema_version" gorm:"not null"`
+	PricingHash       string  `json:"pricing_hash" gorm:"type:char(64);uniqueIndex;not null"`
+	ContentHash       string  `json:"content_hash" gorm:"type:char(64);index"`
+	ApplyToken        string  `json:"-" gorm:"type:char(32);not null"`
+	AccountID         int     `json:"account_id" gorm:"index;not null"`
+	AccountKey        string  `json:"-" gorm:"type:char(64);index;not null"`
+	SourceType        string  `json:"source_type" gorm:"type:varchar(32);index;not null"`
+	ChannelID         int     `json:"channel_id" gorm:"index;not null"`
+	RoutingIdentity   string  `json:"routing_identity,omitempty" gorm:"type:varchar(32);index"`
+	RoutingGeneration string  `json:"routing_generation,omitempty" gorm:"type:varchar(32);index"`
+	LifecycleScope    string  `json:"lifecycle_scope" gorm:"type:varchar(32);index"`
+	UpstreamGroup     string  `json:"upstream_group" gorm:"type:varchar(128);not null"`
+	UpstreamGroupKey  string  `json:"-" gorm:"type:char(64);index;not null"`
+	UpstreamModel     string  `json:"upstream_model" gorm:"type:varchar(128);not null"`
+	UpstreamModelKey  string  `json:"-" gorm:"type:char(64);index;not null"`
+	LocalModel        string  `json:"local_model" gorm:"type:varchar(128);not null"`
+	LocalModelKey     string  `json:"-" gorm:"type:char(64);index;not null"`
+	ObservedTime      int64   `json:"observed_time" gorm:"bigint;index;not null"`
+	EffectiveTime     int64   `json:"effective_time" gorm:"bigint;index;not null"`
+	ExpiresTime       int64   `json:"expires_time" gorm:"bigint;index;not null"`
+	PricingVersion    string  `json:"pricing_version" gorm:"type:varchar(128);index;not null"`
+	PricingJSON       string  `json:"-" gorm:"type:text;not null"`
+	Confidence        string  `json:"confidence" gorm:"type:varchar(32);index;not null"`
+	ConfidenceScore   float64 `json:"confidence_score" gorm:"not null"`
+	Freshness         string  `json:"freshness" gorm:"type:varchar(32);index;not null"`
+	FreshnessScore    float64 `json:"freshness_score" gorm:"not null"`
+	SourceSyncStatus  string  `json:"source_sync_status" gorm:"type:varchar(32);index;not null"`
+	SourceSyncError   string  `json:"source_sync_error" gorm:"type:text;not null"`
+	CreatedTime       int64   `json:"created_time" gorm:"bigint;index;not null"`
 }
 
 func (RoutingCostSnapshotVersion) TableName() string {
 	return "routing_cost_snapshot_versions"
+}
+
+func (version *RoutingCostSnapshotVersion) BeforeCreate(tx *gorm.DB) error {
+	if version == nil {
+		return ErrRoutingCostInvalid
+	}
+	switch version.SchemaVersion {
+	case routingCostSnapshotVersionSchema:
+		if version.RoutingIdentity != "" || version.RoutingGeneration != "" ||
+			(version.LifecycleScope != "" && version.LifecycleScope != RoutingCostLifecycleScopeLegacyUnscoped) {
+			return ErrRoutingCostInvalid
+		}
+		version.LifecycleScope = RoutingCostLifecycleScopeLegacyUnscoped
+		return nil
+	case routingCostSnapshotGenerationVersionSchema:
+		if version.LifecycleScope == "" {
+			version.LifecycleScope = RoutingCostLifecycleScopeGeneration
+		}
+		if version.ChannelID <= 0 || version.LifecycleScope != RoutingCostLifecycleScopeGeneration ||
+			!validRoutingIdentity(version.RoutingIdentity) || !validRoutingIdentity(version.RoutingGeneration) ||
+			tx == nil {
+			return ErrRoutingCostInvalid
+		}
+		var channel Channel
+		err := tx.Select("id", "routing_identity", "routing_generation").
+			Where("id = ?", version.ChannelID).First(&channel).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) || err == nil &&
+			(channel.RoutingIdentity != version.RoutingIdentity || channel.RoutingGeneration != version.RoutingGeneration) {
+			return ErrRoutingCostGenerationStale
+		}
+		if err != nil {
+			return err
+		}
+		var lifecycle RoutingChannelLifecycle
+		if err := tx.Select("id", "status").Where(
+			"channel_id = ? AND routing_identity = ? AND routing_generation = ? AND status = ?",
+			version.ChannelID, version.RoutingIdentity, version.RoutingGeneration,
+			RoutingChannelLifecycleStatusActive,
+		).First(&lifecycle).Error; err != nil {
+			return err
+		}
+		return nil
+	default:
+		return ErrRoutingCostInvalid
+	}
 }
 
 func (*RoutingCostSnapshotVersion) BeforeUpdate(*gorm.DB) error {
@@ -126,30 +180,55 @@ func (*RoutingCostSnapshotVersion) BeforeDelete(*gorm.DB) error {
 	return ErrRoutingCostHistoryImmutable
 }
 
+// CreateRoutingCostSnapshotVersionContext persists a generation-scoped cost
+// fact. A delayed result for a retired generation is acknowledged and ignored
+// so an asynchronous retry cannot attach historical cost to a reused channel
+// number.
+func CreateRoutingCostSnapshotVersionContext(
+	ctx context.Context,
+	version *RoutingCostSnapshotVersion,
+) (bool, error) {
+	if version == nil || version.SchemaVersion != routingCostSnapshotGenerationVersionSchema || DB == nil {
+		return false, ErrRoutingCostInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := DB.WithContext(ctx).Create(version).Error
+	if errors.Is(err, ErrRoutingCostGenerationStale) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 type RoutingNormalizedPricing struct {
-	QuotaType                  int             `json:"quota_type"`
-	BillingMode                string          `json:"billing_mode"`
-	Currency                   string          `json:"currency"`
-	Unit                       string          `json:"unit"`
-	GroupRatio                 *float64        `json:"group_ratio"`
-	BaseRatio                  *float64        `json:"base_ratio"`
-	CompletionRatio            *float64        `json:"completion_ratio"`
-	ModelPrice                 *float64        `json:"model_price"`
-	InputCostPerMillion        *float64        `json:"input_cost_per_million"`
-	OutputCostPerMillion       *float64        `json:"output_cost_per_million"`
-	CacheReadCostPerMillion    *float64        `json:"cache_read_cost_per_million"`
-	CacheWriteCostPerMillion   *float64        `json:"cache_write_cost_per_million"`
-	CacheWrite1hCostPerMillion *float64        `json:"cache_write_1h_cost_per_million"`
-	ImageInputCostPerMillion   *float64        `json:"image_input_cost_per_million"`
-	ImageOutputCostPerMillion  *float64        `json:"image_output_cost_per_million"`
-	ImageCost                  *float64        `json:"image_cost"`
-	PerImageCost               *float64        `json:"per_image_cost"`
-	AudioInputCostPerMillion   *float64        `json:"audio_input_cost_per_million"`
-	AudioOutputCostPerMillion  *float64        `json:"audio_output_cost_per_million"`
-	PerRequestCost             *float64        `json:"per_request_cost"`
-	BillingExpression          string          `json:"billing_expression"`
-	Tiers                      json.RawMessage `json:"tiers"`
-	Extras                     json.RawMessage `json:"extras"`
+	QuotaType                  int                       `json:"quota_type,omitempty"`
+	BillingMode                string                    `json:"billing_mode"`
+	Currency                   string                    `json:"currency"`
+	Unit                       string                    `json:"unit"`
+	GroupRatio                 *float64                  `json:"group_ratio,omitempty"`
+	BaseRatio                  *float64                  `json:"base_ratio,omitempty"`
+	CompletionRatio            *float64                  `json:"completion_ratio,omitempty"`
+	ModelPrice                 *float64                  `json:"model_price,omitempty"`
+	InputCostPerMillion        *float64                  `json:"input_cost_per_million,omitempty"`
+	OutputCostPerMillion       *float64                  `json:"output_cost_per_million,omitempty"`
+	CacheReadCostPerMillion    *float64                  `json:"cache_read_cost_per_million,omitempty"`
+	CacheWriteCostPerMillion   *float64                  `json:"cache_write_cost_per_million,omitempty"`
+	CacheWrite1hCostPerMillion *float64                  `json:"cache_write_1h_cost_per_million,omitempty"`
+	ImageInputCostPerMillion   *float64                  `json:"image_input_cost_per_million,omitempty"`
+	ImageOutputCostPerMillion  *float64                  `json:"image_output_cost_per_million,omitempty"`
+	ImageCost                  *float64                  `json:"image_cost,omitempty"`
+	PerImageCost               *float64                  `json:"per_image_cost,omitempty"`
+	AudioInputCostPerMillion   *float64                  `json:"audio_input_cost_per_million,omitempty"`
+	AudioOutputCostPerMillion  *float64                  `json:"audio_output_cost_per_million,omitempty"`
+	AudioCostPerSecond         *float64                  `json:"audio_cost_per_second,omitempty"`
+	VideoCostPerSecond         *float64                  `json:"video_cost_per_second,omitempty"`
+	PerTaskCost                *float64                  `json:"per_task_cost,omitempty"`
+	PerRequestCost             *float64                  `json:"per_request_cost,omitempty"`
+	BillingExpression          string                    `json:"billing_expression,omitempty"`
+	Tiers                      json.RawMessage           `json:"tiers,omitempty"`
+	Extras                     json.RawMessage           `json:"extras,omitempty"`
+	ContractV2                 *RoutingPricingContractV2 `json:"contract_v2,omitempty"`
 }
 
 // RoutingCostRequestProfile describes one logical request for platform-cost
@@ -169,6 +248,9 @@ type RoutingCostRequestProfile struct {
 	AudioInputTokens              int64
 	AudioOutputTokens             int64
 	ImageUnits                    float64
+	AudioSeconds                  float64
+	VideoSeconds                  float64
+	TaskUnits                     float64
 	MaxAttempts                   int
 	RetryProbability              float64
 	HedgeProbability              float64
@@ -179,7 +261,15 @@ type RoutingCostRequestProfile struct {
 	CacheTokensKnown              bool
 	CacheReadTokensKnown          bool
 	CacheWriteTokensKnown         bool
-	MediaDimensionsKnown          bool
+	CacheWriteOneHourTokensKnown  bool
+	ImageInputTokensKnown         bool
+	ImageOutputTokensKnown        bool
+	ImageUnitsKnown               bool
+	AudioInputTokensKnown         bool
+	AudioOutputTokensKnown        bool
+	AudioDurationKnown            bool
+	VideoDurationKnown            bool
+	TaskUnitsKnown                bool
 	RequestInputKnown             bool
 	RequestPricingFeaturesKnown   bool
 	UncataloguedSurchargePossible bool
@@ -212,6 +302,9 @@ type RoutingCostBreakdown struct {
 	ImageUnits   float64 `json:"image_units"`
 	AudioInput   float64 `json:"audio_input"`
 	AudioOutput  float64 `json:"audio_output"`
+	AudioSeconds float64 `json:"audio_seconds"`
+	VideoSeconds float64 `json:"video_seconds"`
+	TaskUnits    float64 `json:"task_units"`
 	PerRequest   float64 `json:"per_request"`
 	Expression   float64 `json:"expression"`
 	Total        float64 `json:"total"`
@@ -231,25 +324,31 @@ type RoutingCostEstimate struct {
 	FreshnessScore           float64              `json:"freshness_score"`
 	ExpectedBreakdown        RoutingCostBreakdown `json:"expected_breakdown"`
 	WorstCaseSingleBreakdown RoutingCostBreakdown `json:"worst_case_single_breakdown"`
+	UnknownReason            string               `json:"unknown_reason,omitempty"`
+	MissingContext           []string             `json:"missing_context,omitempty"`
 }
 
 type routingCostSnapshotManifest struct {
-	AccountID        int
-	ChannelID        int
-	UpstreamGroup    string
-	UpstreamModel    string
-	LocalModel       string
-	ObservedTime     int64
-	EffectiveTime    int64
-	ExpiresTime      int64
-	PricingVersion   string
-	Confidence       string
-	ConfidenceScore  float64
-	Freshness        string
-	FreshnessScore   float64
-	SourceSyncStatus string
-	SourceSyncError  string
-	Pricing          RoutingNormalizedPricing
+	SchemaVersion     int
+	AccountID         int
+	ChannelID         int
+	RoutingIdentity   string
+	RoutingGeneration string
+	LifecycleScope    string
+	UpstreamGroup     string
+	UpstreamModel     string
+	LocalModel        string
+	ObservedTime      int64
+	EffectiveTime     int64
+	ExpiresTime       int64
+	PricingVersion    string
+	Confidence        string
+	ConfidenceScore   float64
+	Freshness         string
+	FreshnessScore    float64
+	SourceSyncStatus  string
+	SourceSyncError   string
+	Pricing           RoutingNormalizedPricing
 }
 
 func RoutingCostModelKey(modelName string) string {
@@ -267,6 +366,21 @@ func LoadRoutingCostSnapshotVersionContext(ctx context.Context, pricingHash stri
 	if err := DB.WithContext(ctx).Where("pricing_hash = ?", pricingHash).First(&version).Error; err != nil {
 		return RoutingCostSnapshotVersion{}, RoutingNormalizedPricing{}, err
 	}
+	if !validRoutingCostSnapshotLifecycle(version) {
+		return RoutingCostSnapshotVersion{}, RoutingNormalizedPricing{}, ErrRoutingCostVersionCorrupt
+	}
+	if version.SchemaVersion == routingCostSnapshotGenerationVersionSchema {
+		if !DB.WithContext(ctx).Migrator().HasTable(&RoutingChannelLifecycle{}) {
+			return RoutingCostSnapshotVersion{}, RoutingNormalizedPricing{}, ErrRoutingCostVersionCorrupt
+		}
+		var lifecycle RoutingChannelLifecycle
+		if err := DB.WithContext(ctx).Select("id").Where(
+			"channel_id = ? AND routing_identity = ? AND routing_generation = ?",
+			version.ChannelID, version.RoutingIdentity, version.RoutingGeneration,
+		).First(&lifecycle).Error; err != nil {
+			return RoutingCostSnapshotVersion{}, RoutingNormalizedPricing{}, ErrRoutingCostVersionCorrupt
+		}
+	}
 	var pricing RoutingNormalizedPricing
 	if err := common.UnmarshalJsonStr(version.PricingJSON, &pricing); err != nil {
 		return RoutingCostSnapshotVersion{}, RoutingNormalizedPricing{}, ErrRoutingCostVersionCorrupt
@@ -277,22 +391,26 @@ func LoadRoutingCostSnapshotVersionContext(ctx context.Context, pricingHash stri
 	}
 	account := RoutingUpstreamAccount{ID: version.AccountID, AccountKey: version.AccountKey, SourceType: version.SourceType}
 	manifest := routingCostSnapshotManifest{
-		AccountID:        version.AccountID,
-		ChannelID:        version.ChannelID,
-		UpstreamGroup:    version.UpstreamGroup,
-		UpstreamModel:    version.UpstreamModel,
-		LocalModel:       version.LocalModel,
-		ObservedTime:     version.ObservedTime,
-		EffectiveTime:    version.EffectiveTime,
-		ExpiresTime:      version.ExpiresTime,
-		PricingVersion:   version.PricingVersion,
-		Confidence:       version.Confidence,
-		ConfidenceScore:  version.ConfidenceScore,
-		Freshness:        version.Freshness,
-		FreshnessScore:   version.FreshnessScore,
-		SourceSyncStatus: version.SourceSyncStatus,
-		SourceSyncError:  version.SourceSyncError,
-		Pricing:          normalized,
+		SchemaVersion:     version.SchemaVersion,
+		AccountID:         version.AccountID,
+		ChannelID:         version.ChannelID,
+		RoutingIdentity:   version.RoutingIdentity,
+		RoutingGeneration: version.RoutingGeneration,
+		LifecycleScope:    version.LifecycleScope,
+		UpstreamGroup:     version.UpstreamGroup,
+		UpstreamModel:     version.UpstreamModel,
+		LocalModel:        version.LocalModel,
+		ObservedTime:      version.ObservedTime,
+		EffectiveTime:     version.EffectiveTime,
+		ExpiresTime:       version.ExpiresTime,
+		PricingVersion:    version.PricingVersion,
+		Confidence:        version.Confidence,
+		ConfidenceScore:   version.ConfidenceScore,
+		Freshness:         version.Freshness,
+		FreshnessScore:    version.FreshnessScore,
+		SourceSyncStatus:  version.SourceSyncStatus,
+		SourceSyncError:   version.SourceSyncError,
+		Pricing:           normalized,
 	}
 	expectedHash, err := routingCostPricingHash(account, manifest, pricingJSON)
 	expectedContentHash, contentErr := routingCostContentHash(account, manifest, pricingJSON)
@@ -429,25 +547,59 @@ func EstimateRoutingCostSnapshot(
 	dependencies := routingCostPricingDependencies(pricing)
 	cacheReadTokensKnown := profile.CacheTokensKnown || profile.CacheReadTokensKnown
 	cacheWriteTokensKnown := profile.CacheTokensKnown || profile.CacheWriteTokensKnown
+	cacheWriteOneHourTokensKnown := profile.CacheTokensKnown || profile.CacheWriteOneHourTokensKnown
 	expectedKnown := true
 	worstKnown := true
 	if profile.KnowledgeSpecified {
-		if dependencies.request && !profile.RequestInputKnown ||
-			dependencies.cacheRead && !cacheReadTokensKnown ||
-			dependencies.cacheWrite && !cacheWriteTokensKnown ||
-			dependencies.media && !profile.MediaDimensionsKnown {
-			expectedKnown = false
-			worstKnown = false
+		missing := make([]string, 0, 12)
+		if dependencies.request && !profile.RequestInputKnown {
+			missing = append(missing, "request_fields")
+		}
+		if dependencies.cacheRead && !cacheReadTokensKnown {
+			missing = append(missing, "cache_read_tokens")
+		}
+		if dependencies.cacheWrite && !cacheWriteTokensKnown {
+			missing = append(missing, "cache_write_tokens")
+		}
+		if dependencies.cacheWriteOneHour && !cacheWriteOneHourTokensKnown {
+			missing = append(missing, "cache_write_1h_tokens")
+		}
+		if dependencies.imageInput && !profile.ImageInputTokensKnown {
+			missing = append(missing, "image_input_tokens")
+		}
+		if dependencies.imageOutput && !profile.ImageOutputTokensKnown {
+			missing = append(missing, "image_output_tokens")
+		}
+		if dependencies.imageUnits && !profile.ImageUnitsKnown {
+			missing = append(missing, "image_units")
+		}
+		if dependencies.audioInput && !profile.AudioInputTokensKnown {
+			missing = append(missing, "audio_input_tokens")
+		}
+		if dependencies.audioOutput && !profile.AudioOutputTokensKnown {
+			missing = append(missing, "audio_output_tokens")
+		}
+		if dependencies.audioDuration && !profile.AudioDurationKnown {
+			missing = append(missing, "audio_seconds")
+		}
+		if dependencies.videoDuration && !profile.VideoDurationKnown {
+			missing = append(missing, "video_seconds")
+		}
+		if dependencies.taskUnits && !profile.TaskUnitsKnown {
+			missing = append(missing, "task_units")
 		}
 		if dependencies.input && !profile.InputTokensKnown {
-			worstKnown = false
-			if profile.PromptTokens == 0 {
-				expectedKnown = false
-			}
+			missing = append(missing, "input_tokens")
 			estimate.ConfidenceScore *= 0.6
 		}
 		if dependencies.output && !profile.MaximumCompletionKnown {
+			missing = append(missing, "completion_tokens")
+		}
+		if len(missing) > 0 {
+			expectedKnown = false
 			worstKnown = false
+			estimate.UnknownReason = RoutingCostUnknownMissingContext
+			estimate.MissingContext = missing
 		}
 	}
 	if expectedKnown {
@@ -568,10 +720,17 @@ func validateRoutingCostRequestProfile(profile RoutingCostRequestProfile) error 
 	if profile.MaxAttempts < 0 || profile.MaxAttempts > 16 ||
 		!routingCostFinite(profile.RetryProbability) || profile.RetryProbability < 0 || profile.RetryProbability > 1 ||
 		!routingCostFinite(profile.HedgeProbability) || profile.HedgeProbability < 0 || profile.HedgeProbability > 1 ||
-		!routingCostFinite(profile.ImageUnits) || profile.ImageUnits < 0 || profile.ImageUnits > float64(maxCostDimension) {
+		!routingCostFinite(profile.ImageUnits) || profile.ImageUnits < 0 || profile.ImageUnits > float64(maxCostDimension) ||
+		!routingCostFinite(profile.AudioSeconds) || profile.AudioSeconds < 0 || profile.AudioSeconds > float64(maxCostDimension) ||
+		!routingCostFinite(profile.VideoSeconds) || profile.VideoSeconds < 0 || profile.VideoSeconds > float64(maxCostDimension) ||
+		!routingCostFinite(profile.TaskUnits) || profile.TaskUnits < 0 || profile.TaskUnits > float64(maxCostDimension) {
 		return ErrRoutingCostInvalid
 	}
 	return nil
+}
+
+func ValidateRoutingCostRequestProfile(profile RoutingCostRequestProfile) error {
+	return validateRoutingCostRequestProfile(profile)
 }
 
 func routingCostFreshnessAt(version RoutingCostSnapshotVersion, atUnix int64) float64 {
@@ -639,37 +798,37 @@ func routingCostSingleAttempt(
 	} else if pricing.BaseRatio != nil {
 		inputRate = *pricing.BaseRatio * 1_000_000 / common.QuotaPerUnit
 	}
-	outputRate := inputRate
+	outputRate := 0.0
 	if pricing.OutputCostPerMillion != nil {
 		outputRate = *pricing.OutputCostPerMillion
-	} else if pricing.CompletionRatio != nil {
+	} else if pricing.CompletionRatio != nil && (pricing.InputCostPerMillion != nil || pricing.BaseRatio != nil) {
 		outputRate = inputRate * *pricing.CompletionRatio
 	}
-	cacheReadRate := inputRate
+	cacheReadRate := 0.0
 	if pricing.CacheReadCostPerMillion != nil {
 		cacheReadRate = *pricing.CacheReadCostPerMillion
 	}
-	cacheWriteRate := inputRate
+	cacheWriteRate := 0.0
 	if pricing.CacheWriteCostPerMillion != nil {
 		cacheWriteRate = *pricing.CacheWriteCostPerMillion
 	}
-	cacheWriteOneHourRate := cacheWriteRate
+	cacheWriteOneHourRate := 0.0
 	if pricing.CacheWrite1hCostPerMillion != nil {
 		cacheWriteOneHourRate = *pricing.CacheWrite1hCostPerMillion
 	}
-	imageInputRate := inputRate
+	imageInputRate := 0.0
 	if pricing.ImageInputCostPerMillion != nil {
 		imageInputRate = *pricing.ImageInputCostPerMillion
 	}
-	imageOutputRate := outputRate
+	imageOutputRate := 0.0
 	if pricing.ImageOutputCostPerMillion != nil {
 		imageOutputRate = *pricing.ImageOutputCostPerMillion
 	}
-	audioInputRate := inputRate
+	audioInputRate := 0.0
 	if pricing.AudioInputCostPerMillion != nil {
 		audioInputRate = *pricing.AudioInputCostPerMillion
 	}
-	audioOutputRate := outputRate
+	audioOutputRate := 0.0
 	if pricing.AudioOutputCostPerMillion != nil {
 		audioOutputRate = *pricing.AudioOutputCostPerMillion
 	}
@@ -691,6 +850,9 @@ func routingCostSingleAttempt(
 		ImageUnits:   profile.ImageUnits * perImageRate,
 		AudioInput:   float64(profile.AudioInputTokens) * audioInputRate / 1_000_000,
 		AudioOutput:  float64(profile.AudioOutputTokens) * audioOutputRate / 1_000_000,
+		AudioSeconds: profile.AudioSeconds * routingCostPointerValue(pricing.AudioCostPerSecond),
+		VideoSeconds: profile.VideoSeconds * routingCostPointerValue(pricing.VideoCostPerSecond),
+		TaskUnits:    profile.TaskUnits * routingCostPointerValue(pricing.PerTaskCost),
 		PerRequest:   routingCostPointerValue(pricing.PerRequestCost),
 	}
 	breakdown = scaleRoutingCostBreakdown(breakdown, groupRatio)
@@ -924,18 +1086,30 @@ func normalizeRoutingActualCostProfile(
 	profile.CacheTokensKnown = true
 	profile.CacheReadTokensKnown = true
 	profile.CacheWriteTokensKnown = true
-	profile.MediaDimensionsKnown = true
+	profile.CacheWriteOneHourTokensKnown = true
+	profile.ImageInputTokensKnown = true
+	profile.ImageOutputTokensKnown = true
+	profile.AudioInputTokensKnown = true
+	profile.AudioOutputTokensKnown = true
 	profile.RequestInputKnown = true
 	return profile, nil
 }
 
 type routingCostDependencies struct {
-	input      bool
-	output     bool
-	cacheRead  bool
-	cacheWrite bool
-	media      bool
-	request    bool
+	input             bool
+	output            bool
+	cacheRead         bool
+	cacheWrite        bool
+	cacheWriteOneHour bool
+	imageInput        bool
+	imageOutput       bool
+	imageUnits        bool
+	audioInput        bool
+	audioOutput       bool
+	audioDuration     bool
+	videoDuration     bool
+	taskUnits         bool
+	request           bool
 }
 
 func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCostDependencies {
@@ -946,12 +1120,16 @@ func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCos
 	if expression != "" {
 		used := billingexpr.UsedVars(expression)
 		return routingCostDependencies{
-			input:      used["p"] || used["len"],
-			output:     used["c"],
-			cacheRead:  used["cr"],
-			cacheWrite: used["cc"] || used["cc1h"],
-			media:      used["img"] || used["img_o"] || used["ai"] || used["ao"],
-			request:    used["header"] || used["param"],
+			input:             used["p"] || used["len"],
+			output:            used["c"],
+			cacheRead:         used["cr"],
+			cacheWrite:        used["cc"],
+			cacheWriteOneHour: used["cc1h"],
+			imageInput:        used["img"],
+			imageOutput:       used["img_o"],
+			audioInput:        used["ai"],
+			audioOutput:       used["ao"],
+			request:           used["header"] || used["param"],
 		}
 	}
 	inputRate := 0.0
@@ -960,25 +1138,32 @@ func routingCostPricingDependencies(pricing RoutingNormalizedPricing) routingCos
 	} else if pricing.BaseRatio != nil {
 		inputRate = *pricing.BaseRatio * 1_000_000 / common.QuotaPerUnit
 	}
-	outputRate := inputRate
+	outputRate := 0.0
 	if pricing.OutputCostPerMillion != nil {
 		outputRate = *pricing.OutputCostPerMillion
-	} else if pricing.CompletionRatio != nil {
+	} else if pricing.CompletionRatio != nil && (pricing.InputCostPerMillion != nil || pricing.BaseRatio != nil) {
 		outputRate = inputRate * *pricing.CompletionRatio
 	}
 	return routingCostDependencies{
-		input:  inputRate > 0,
-		output: outputRate > 0,
-		// Missing subtype prices inherit p/c and therefore need no separate
-		// quantity. Pointer presence, including an explicit free price, opts the
-		// subtype into separate accounting.
-		cacheRead: pricing.CacheReadCostPerMillion != nil,
-		cacheWrite: pricing.CacheWriteCostPerMillion != nil ||
-			pricing.CacheWrite1hCostPerMillion != nil,
-		media: pricing.ImageInputCostPerMillion != nil || pricing.ImageOutputCostPerMillion != nil ||
-			pricing.PerImageCost != nil || pricing.ImageCost != nil ||
-			pricing.AudioInputCostPerMillion != nil || pricing.AudioOutputCostPerMillion != nil,
+		input:             inputRate > 0,
+		output:            outputRate > 0,
+		cacheRead:         routingCostPositivePointer(pricing.CacheReadCostPerMillion),
+		cacheWrite:        routingCostPositivePointer(pricing.CacheWriteCostPerMillion),
+		cacheWriteOneHour: routingCostPositivePointer(pricing.CacheWrite1hCostPerMillion),
+		imageInput:        routingCostPositivePointer(pricing.ImageInputCostPerMillion),
+		imageOutput:       routingCostPositivePointer(pricing.ImageOutputCostPerMillion),
+		imageUnits: routingCostPositivePointer(pricing.PerImageCost) ||
+			routingCostPositivePointer(pricing.ImageCost),
+		audioInput:    routingCostPositivePointer(pricing.AudioInputCostPerMillion),
+		audioOutput:   routingCostPositivePointer(pricing.AudioOutputCostPerMillion),
+		audioDuration: routingCostPositivePointer(pricing.AudioCostPerSecond),
+		videoDuration: routingCostPositivePointer(pricing.VideoCostPerSecond),
+		taskUnits:     routingCostPositivePointer(pricing.PerTaskCost),
 	}
+}
+
+func routingCostPositivePointer(value *float64) bool {
+	return value != nil && *value > 0
 }
 
 func scaleRoutingCostBreakdown(breakdown RoutingCostBreakdown, ratio float64) RoutingCostBreakdown {
@@ -992,11 +1177,15 @@ func scaleRoutingCostBreakdown(breakdown RoutingCostBreakdown, ratio float64) Ro
 	breakdown.ImageUnits *= ratio
 	breakdown.AudioInput *= ratio
 	breakdown.AudioOutput *= ratio
+	breakdown.AudioSeconds *= ratio
+	breakdown.VideoSeconds *= ratio
+	breakdown.TaskUnits *= ratio
 	breakdown.PerRequest *= ratio
 	breakdown.Expression *= ratio
 	breakdown.Total = breakdown.Input + breakdown.Output + breakdown.CacheRead + breakdown.CacheWrite +
 		breakdown.CacheWrite1h + breakdown.ImageInput + breakdown.ImageOutput + breakdown.ImageUnits +
-		breakdown.AudioInput + breakdown.AudioOutput + breakdown.PerRequest + breakdown.Expression
+		breakdown.AudioInput + breakdown.AudioOutput + breakdown.AudioSeconds + breakdown.VideoSeconds +
+		breakdown.TaskUnits + breakdown.PerRequest + breakdown.Expression
 	return breakdown
 }
 
@@ -1067,6 +1256,13 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 	pricing.Currency = strings.ToUpper(strings.TrimSpace(pricing.Currency))
 	pricing.Unit = strings.ToLower(strings.TrimSpace(pricing.Unit))
 	pricing.BillingExpression = strings.TrimSpace(pricing.BillingExpression)
+	if pricing.ContractV2 != nil {
+		contract, contractErr := NormalizeRoutingPricingContractV2(*pricing.ContractV2)
+		if contractErr != nil {
+			return RoutingNormalizedPricing{}, nil, ErrRoutingCostInvalid
+		}
+		pricing.ContractV2 = &contract
+	}
 	if pricing.Currency == "" {
 		pricing.Currency = "USD"
 	}
@@ -1091,6 +1287,34 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 			pricing.Unit = "mixed"
 		}
 	}
+	if pricing.ContractV2 != nil {
+		contract := *pricing.ContractV2
+		multiplier := 1.0
+		if pricing.GroupRatio != nil {
+			multiplier = *pricing.GroupRatio
+		}
+		expected := contract.ToRoutingNormalizedPricing(pricing.BillingMode, multiplier)
+		if contract.Currency != pricing.Currency || expected.Unit != pricing.Unit ||
+			!routingCostOptionalFloatEqual(expected.InputCostPerMillion, pricing.InputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.OutputCostPerMillion, pricing.OutputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.CacheReadCostPerMillion, pricing.CacheReadCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.CacheWriteCostPerMillion, pricing.CacheWriteCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.CacheWrite1hCostPerMillion, pricing.CacheWrite1hCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.ImageInputCostPerMillion, pricing.ImageInputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.ImageOutputCostPerMillion, pricing.ImageOutputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.PerImageCost, pricing.PerImageCost) ||
+			!routingCostOptionalFloatEqual(expected.AudioInputCostPerMillion, pricing.AudioInputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.AudioOutputCostPerMillion, pricing.AudioOutputCostPerMillion) ||
+			!routingCostOptionalFloatEqual(expected.AudioCostPerSecond, pricing.AudioCostPerSecond) ||
+			!routingCostOptionalFloatEqual(expected.VideoCostPerSecond, pricing.VideoCostPerSecond) ||
+			!routingCostOptionalFloatEqual(expected.PerTaskCost, pricing.PerTaskCost) ||
+			!routingCostOptionalFloatEqual(expected.PerRequestCost, pricing.PerRequestCost) ||
+			!routingCostOptionalFloatEqual(expected.ModelPrice, pricing.ModelPrice) ||
+			expected.BillingExpression != pricing.BillingExpression ||
+			(strings.TrimSpace(string(pricing.Tiers)) != "" && strings.TrimSpace(string(pricing.Tiers)) != "{}") {
+			return RoutingNormalizedPricing{}, nil, ErrRoutingCostInvalid
+		}
+	}
 	if pricing.QuotaType < 0 || pricing.QuotaType > 1 || !validRoutingCostText(pricing.BillingMode, 64) || pricing.BillingMode == "" ||
 		!validRoutingCostText(pricing.Currency, 8) || !validRoutingCostUnit(pricing.Unit) ||
 		!validRoutingCostText(pricing.BillingExpression, 16_384) {
@@ -1112,6 +1336,9 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 		pricing.PerImageCost,
 		pricing.AudioInputCostPerMillion,
 		pricing.AudioOutputCostPerMillion,
+		pricing.AudioCostPerSecond,
+		pricing.VideoCostPerSecond,
+		pricing.PerTaskCost,
 		pricing.PerRequestCost,
 	}
 	for _, value := range values {
@@ -1143,6 +1370,13 @@ func normalizeRoutingNormalizedPricing(pricing RoutingNormalizedPricing) (Routin
 	return pricing, pricingJSON, nil
 }
 
+func routingCostOptionalFloatEqual(left *float64, right *float64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
 func normalizeRoutingCostJSON(value json.RawMessage) (json.RawMessage, error) {
 	if len(strings.TrimSpace(string(value))) == 0 {
 		return json.RawMessage(`{}`), nil
@@ -1166,44 +1400,54 @@ func normalizeRoutingCostJSON(value json.RawMessage) (json.RawMessage, error) {
 }
 
 func routingCostPricingHash(account RoutingUpstreamAccount, write routingCostSnapshotManifest, pricingJSON []byte) (string, error) {
+	schemaVersion, routingIdentity, routingGeneration, lifecycleScope, err := routingCostSnapshotHashLifecycle(write)
+	if err != nil {
+		return "", err
+	}
 	manifest := struct {
-		SchemaVersion    int             `json:"schema_version"`
-		AccountKey       string          `json:"account_key"`
-		SourceType       string          `json:"source_type"`
-		ChannelID        int             `json:"channel_id"`
-		UpstreamGroup    string          `json:"upstream_group"`
-		UpstreamModel    string          `json:"upstream_model"`
-		LocalModel       string          `json:"local_model"`
-		ObservedTime     int64           `json:"observed_time"`
-		EffectiveTime    int64           `json:"effective_time"`
-		ExpiresTime      int64           `json:"expires_time"`
-		PricingVersion   string          `json:"pricing_version"`
-		Confidence       string          `json:"confidence"`
-		ConfidenceScore  float64         `json:"confidence_score"`
-		Freshness        string          `json:"freshness"`
-		FreshnessScore   float64         `json:"freshness_score"`
-		SourceSyncStatus string          `json:"source_sync_status"`
-		SourceSyncError  string          `json:"source_sync_error"`
-		Pricing          json.RawMessage `json:"pricing"`
+		SchemaVersion     int             `json:"schema_version"`
+		AccountKey        string          `json:"account_key"`
+		SourceType        string          `json:"source_type"`
+		ChannelID         int             `json:"channel_id"`
+		RoutingIdentity   string          `json:"routing_identity,omitempty"`
+		RoutingGeneration string          `json:"routing_generation,omitempty"`
+		LifecycleScope    string          `json:"lifecycle_scope,omitempty"`
+		UpstreamGroup     string          `json:"upstream_group"`
+		UpstreamModel     string          `json:"upstream_model"`
+		LocalModel        string          `json:"local_model"`
+		ObservedTime      int64           `json:"observed_time"`
+		EffectiveTime     int64           `json:"effective_time"`
+		ExpiresTime       int64           `json:"expires_time"`
+		PricingVersion    string          `json:"pricing_version"`
+		Confidence        string          `json:"confidence"`
+		ConfidenceScore   float64         `json:"confidence_score"`
+		Freshness         string          `json:"freshness"`
+		FreshnessScore    float64         `json:"freshness_score"`
+		SourceSyncStatus  string          `json:"source_sync_status"`
+		SourceSyncError   string          `json:"source_sync_error"`
+		Pricing           json.RawMessage `json:"pricing"`
 	}{
-		SchemaVersion:    routingCostSnapshotVersionSchema,
-		AccountKey:       account.AccountKey,
-		SourceType:       account.SourceType,
-		ChannelID:        write.ChannelID,
-		UpstreamGroup:    write.UpstreamGroup,
-		UpstreamModel:    write.UpstreamModel,
-		LocalModel:       write.LocalModel,
-		ObservedTime:     write.ObservedTime,
-		EffectiveTime:    write.EffectiveTime,
-		ExpiresTime:      write.ExpiresTime,
-		PricingVersion:   write.PricingVersion,
-		Confidence:       write.Confidence,
-		ConfidenceScore:  write.ConfidenceScore,
-		Freshness:        write.Freshness,
-		FreshnessScore:   write.FreshnessScore,
-		SourceSyncStatus: write.SourceSyncStatus,
-		SourceSyncError:  write.SourceSyncError,
-		Pricing:          json.RawMessage(pricingJSON),
+		SchemaVersion:     schemaVersion,
+		AccountKey:        account.AccountKey,
+		SourceType:        account.SourceType,
+		ChannelID:         write.ChannelID,
+		RoutingIdentity:   routingIdentity,
+		RoutingGeneration: routingGeneration,
+		LifecycleScope:    lifecycleScope,
+		UpstreamGroup:     write.UpstreamGroup,
+		UpstreamModel:     write.UpstreamModel,
+		LocalModel:        write.LocalModel,
+		ObservedTime:      write.ObservedTime,
+		EffectiveTime:     write.EffectiveTime,
+		ExpiresTime:       write.ExpiresTime,
+		PricingVersion:    write.PricingVersion,
+		Confidence:        write.Confidence,
+		ConfidenceScore:   write.ConfidenceScore,
+		Freshness:         write.Freshness,
+		FreshnessScore:    write.FreshnessScore,
+		SourceSyncStatus:  write.SourceSyncStatus,
+		SourceSyncError:   write.SourceSyncError,
+		Pricing:           json.RawMessage(pricingJSON),
 	}
 	encoded, err := common.Marshal(manifest)
 	if err != nil {
@@ -1213,38 +1457,48 @@ func routingCostPricingHash(account RoutingUpstreamAccount, write routingCostSna
 }
 
 func routingCostContentHash(account RoutingUpstreamAccount, write routingCostSnapshotManifest, pricingJSON []byte) (string, error) {
+	schemaVersion, routingIdentity, routingGeneration, lifecycleScope, err := routingCostSnapshotHashLifecycle(write)
+	if err != nil {
+		return "", err
+	}
 	manifest := struct {
-		SchemaVersion    int             `json:"schema_version"`
-		AccountKey       string          `json:"account_key"`
-		SourceType       string          `json:"source_type"`
-		ChannelID        int             `json:"channel_id"`
-		UpstreamGroup    string          `json:"upstream_group"`
-		UpstreamModel    string          `json:"upstream_model"`
-		LocalModel       string          `json:"local_model"`
-		PricingVersion   string          `json:"pricing_version"`
-		Confidence       string          `json:"confidence"`
-		ConfidenceScore  float64         `json:"confidence_score"`
-		Freshness        string          `json:"freshness"`
-		FreshnessScore   float64         `json:"freshness_score"`
-		SourceSyncStatus string          `json:"source_sync_status"`
-		SourceSyncError  string          `json:"source_sync_error"`
-		Pricing          json.RawMessage `json:"pricing"`
+		SchemaVersion     int             `json:"schema_version"`
+		AccountKey        string          `json:"account_key"`
+		SourceType        string          `json:"source_type"`
+		ChannelID         int             `json:"channel_id"`
+		RoutingIdentity   string          `json:"routing_identity,omitempty"`
+		RoutingGeneration string          `json:"routing_generation,omitempty"`
+		LifecycleScope    string          `json:"lifecycle_scope,omitempty"`
+		UpstreamGroup     string          `json:"upstream_group"`
+		UpstreamModel     string          `json:"upstream_model"`
+		LocalModel        string          `json:"local_model"`
+		PricingVersion    string          `json:"pricing_version"`
+		Confidence        string          `json:"confidence"`
+		ConfidenceScore   float64         `json:"confidence_score"`
+		Freshness         string          `json:"freshness"`
+		FreshnessScore    float64         `json:"freshness_score"`
+		SourceSyncStatus  string          `json:"source_sync_status"`
+		SourceSyncError   string          `json:"source_sync_error"`
+		Pricing           json.RawMessage `json:"pricing"`
 	}{
-		SchemaVersion:    routingCostSnapshotVersionSchema,
-		AccountKey:       account.AccountKey,
-		SourceType:       account.SourceType,
-		ChannelID:        write.ChannelID,
-		UpstreamGroup:    write.UpstreamGroup,
-		UpstreamModel:    write.UpstreamModel,
-		LocalModel:       write.LocalModel,
-		PricingVersion:   write.PricingVersion,
-		Confidence:       write.Confidence,
-		ConfidenceScore:  write.ConfidenceScore,
-		Freshness:        write.Freshness,
-		FreshnessScore:   write.FreshnessScore,
-		SourceSyncStatus: write.SourceSyncStatus,
-		SourceSyncError:  write.SourceSyncError,
-		Pricing:          json.RawMessage(pricingJSON),
+		SchemaVersion:     schemaVersion,
+		AccountKey:        account.AccountKey,
+		SourceType:        account.SourceType,
+		ChannelID:         write.ChannelID,
+		RoutingIdentity:   routingIdentity,
+		RoutingGeneration: routingGeneration,
+		LifecycleScope:    lifecycleScope,
+		UpstreamGroup:     write.UpstreamGroup,
+		UpstreamModel:     write.UpstreamModel,
+		LocalModel:        write.LocalModel,
+		PricingVersion:    write.PricingVersion,
+		Confidence:        write.Confidence,
+		ConfidenceScore:   write.ConfidenceScore,
+		Freshness:         write.Freshness,
+		FreshnessScore:    write.FreshnessScore,
+		SourceSyncStatus:  write.SourceSyncStatus,
+		SourceSyncError:   write.SourceSyncError,
+		Pricing:           json.RawMessage(pricingJSON),
 	}
 	encoded, err := common.Marshal(manifest)
 	if err != nil {
@@ -1253,7 +1507,42 @@ func routingCostContentHash(account RoutingUpstreamAccount, write routingCostSna
 	return routingCostHash(encoded), nil
 }
 
+func routingCostSnapshotHashLifecycle(write routingCostSnapshotManifest) (int, string, string, string, error) {
+	schemaVersion := write.SchemaVersion
+	if schemaVersion == 0 {
+		schemaVersion = routingCostSnapshotVersionSchema
+	}
+	switch schemaVersion {
+	case routingCostSnapshotVersionSchema:
+		return schemaVersion, "", "", "", nil
+	case routingCostSnapshotGenerationVersionSchema:
+		if write.LifecycleScope != RoutingCostLifecycleScopeGeneration ||
+			!validRoutingIdentity(write.RoutingIdentity) || !validRoutingIdentity(write.RoutingGeneration) {
+			return 0, "", "", "", ErrRoutingCostInvalid
+		}
+		return schemaVersion, write.RoutingIdentity, write.RoutingGeneration, write.LifecycleScope, nil
+	default:
+		return 0, "", "", "", ErrRoutingCostInvalid
+	}
+}
+
+func validRoutingCostSnapshotLifecycle(version RoutingCostSnapshotVersion) bool {
+	switch version.SchemaVersion {
+	case routingCostSnapshotVersionSchema:
+		return version.RoutingIdentity == "" && version.RoutingGeneration == "" &&
+			(version.LifecycleScope == "" || version.LifecycleScope == RoutingCostLifecycleScopeLegacyUnscoped)
+	case routingCostSnapshotGenerationVersionSchema:
+		return version.LifecycleScope == RoutingCostLifecycleScopeGeneration &&
+			validRoutingIdentity(version.RoutingIdentity) && validRoutingIdentity(version.RoutingGeneration)
+	default:
+		return false
+	}
+}
+
 func routingNormalizedPricingHasKnownCost(pricing RoutingNormalizedPricing) bool {
+	if pricing.ContractV2 != nil && pricing.ContractV2.Mode == RoutingPricingContractModeFree {
+		return true
+	}
 	if pricing.GroupRatio != nil && *pricing.GroupRatio == 0 {
 		return true
 	}
@@ -1271,6 +1560,9 @@ func routingNormalizedPricingHasKnownCost(pricing RoutingNormalizedPricing) bool
 		pricing.PerImageCost,
 		pricing.AudioInputCostPerMillion,
 		pricing.AudioOutputCostPerMillion,
+		pricing.AudioCostPerSecond,
+		pricing.VideoCostPerSecond,
+		pricing.PerTaskCost,
 		pricing.PerRequestCost,
 	} {
 		if value != nil {

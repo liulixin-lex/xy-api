@@ -9,6 +9,7 @@ import (
 
 type Key struct {
 	ChannelID         int
+	ChannelGeneration string
 	APIKeyIndex       int
 	Model             string
 	Group             string
@@ -60,6 +61,11 @@ type HealthMarker struct {
 	UpdatedUnix int64
 }
 
+type ChannelLifecycleKey struct {
+	ChannelID         int
+	ChannelGeneration string
+}
+
 type ChannelTrafficPolicy struct {
 	ClaudeCodeOnly bool
 }
@@ -107,8 +113,8 @@ var cache = struct {
 	breakers                  map[Key]BreakerSnapshot
 	sharedEndpoints           map[Key]SharedEndpointBreakerSnapshot
 	capacityCooldowns         map[Key]CapacityCooldownSnapshot
-	channelBalanceUnavailable map[int]ChannelBalanceUnavailableSnapshot
-	authFailures              map[int]HealthMarker
+	channelBalanceUnavailable map[ChannelLifecycleKey]ChannelBalanceUnavailableSnapshot
+	authFailures              map[ChannelLifecycleKey]HealthMarker
 	channelPolicies           map[int]ChannelTrafficPolicy
 	channelOverrides          map[int]channelTrafficPolicyOverride
 	policiesLoadedAt          int64
@@ -120,8 +126,8 @@ var cache = struct {
 	breakers:                  map[Key]BreakerSnapshot{},
 	sharedEndpoints:           map[Key]SharedEndpointBreakerSnapshot{},
 	capacityCooldowns:         map[Key]CapacityCooldownSnapshot{},
-	channelBalanceUnavailable: map[int]ChannelBalanceUnavailableSnapshot{},
-	authFailures:              map[int]HealthMarker{},
+	channelBalanceUnavailable: map[ChannelLifecycleKey]ChannelBalanceUnavailableSnapshot{},
+	authFailures:              map[ChannelLifecycleKey]HealthMarker{},
 	channelPolicies:           map[int]ChannelTrafficPolicy{},
 	channelOverrides:          map[int]channelTrafficPolicyOverride{},
 	limits:                    defaultLimits,
@@ -177,9 +183,15 @@ func ListLocalEndpointBreakers() []SharedEndpointBreakerEntry {
 }
 
 func GetAuthFailure(channelID int) (HealthMarker, bool) {
+	return GetAuthFailureForGeneration(channelID, "")
+}
+
+func GetAuthFailureForGeneration(channelID int, channelGeneration string) (HealthMarker, bool) {
 	cache.RLock()
 	defer cache.RUnlock()
-	snapshot, ok := cache.authFailures[channelID]
+	snapshot, ok := cache.authFailures[ChannelLifecycleKey{
+		ChannelID: channelID, ChannelGeneration: channelGeneration,
+	}]
 	return snapshot, ok
 }
 
@@ -300,9 +312,9 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 				deleted++
 			}
 		}
-		for channelID, marker := range cache.authFailures {
+		for lifecycle, marker := range cache.authFailures {
 			if marker.UpdatedUnix > 0 && marker.UpdatedUnix < cutoff {
-				delete(cache.authFailures, channelID)
+				delete(cache.authFailures, lifecycle)
 				deleted++
 			}
 		}
@@ -314,9 +326,9 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 			deleted++
 		}
 	}
-	for channelID, snapshot := range cache.channelBalanceUnavailable {
+	for lifecycle, snapshot := range cache.channelBalanceUnavailable {
 		if snapshot.CooldownUntilUnixMilli <= deadline {
-			delete(cache.channelBalanceUnavailable, channelID)
+			delete(cache.channelBalanceUnavailable, lifecycle)
 			deleted++
 		}
 	}
@@ -326,8 +338,11 @@ func Prune(nowUnix int64, staleSeconds int64) int {
 	deleted += trimBoundedMap(cache.breakers, cache.limits.MaxBreakers, breakerUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.sharedEndpoints, cache.limits.MaxSharedEndpoints, sharedEndpointUpdatedUnix, keyLess)
 	deleted += trimBoundedMap(cache.capacityCooldowns, cache.limits.MaxCapacityCooldowns, capacityUpdatedUnixMilli, keyLess)
-	deleted += trimBoundedMap(cache.channelBalanceUnavailable, cache.limits.MaxHealth, channelBalanceUnavailableUpdatedUnixMilli, intLess)
-	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess)
+	deleted += trimBoundedMap(
+		cache.channelBalanceUnavailable, cache.limits.MaxHealth,
+		channelBalanceUnavailableUpdatedUnixMilli, channelLifecycleLess,
+	)
+	deleted += trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, channelLifecycleLess)
 	cache.evictions += int64(deleted)
 	return deleted
 }
@@ -393,20 +408,41 @@ func SetAuthFailureForTest(channelID int, marker HealthMarker) {
 }
 
 func SetAuthFailure(channelID int, marker HealthMarker) {
+	SetAuthFailureForGeneration(channelID, "", marker)
+}
+
+func SetAuthFailureForGeneration(channelID int, channelGeneration string, marker HealthMarker) {
 	if channelID <= 0 {
 		return
 	}
 	cache.Lock()
 	defer cache.Unlock()
-	cache.authFailures[channelID] = marker
+	cache.authFailures[ChannelLifecycleKey{
+		ChannelID: channelID, ChannelGeneration: channelGeneration,
+	}] = marker
 	cache.limits = normalizedLimits(cache.limits)
-	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
+	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, channelLifecycleLess))
 }
 
 func ClearAuthFailure(channelID int) {
+	if channelID <= 0 {
+		return
+	}
 	cache.Lock()
 	defer cache.Unlock()
-	delete(cache.authFailures, channelID)
+	for lifecycle := range cache.authFailures {
+		if lifecycle.ChannelID == channelID {
+			delete(cache.authFailures, lifecycle)
+		}
+	}
+}
+
+func ClearAuthFailureForGeneration(channelID int, channelGeneration string) {
+	cache.Lock()
+	defer cache.Unlock()
+	delete(cache.authFailures, ChannelLifecycleKey{
+		ChannelID: channelID, ChannelGeneration: channelGeneration,
+	})
 }
 
 func ClearChannel(channelID int) {
@@ -430,8 +466,16 @@ func ClearChannel(channelID int) {
 			delete(cache.capacityCooldowns, key)
 		}
 	}
-	delete(cache.channelBalanceUnavailable, channelID)
-	delete(cache.authFailures, channelID)
+	for lifecycle := range cache.channelBalanceUnavailable {
+		if lifecycle.ChannelID == channelID {
+			delete(cache.channelBalanceUnavailable, lifecycle)
+		}
+	}
+	for lifecycle := range cache.authFailures {
+		if lifecycle.ChannelID == channelID {
+			delete(cache.authFailures, lifecycle)
+		}
+	}
 }
 
 func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, _ int) {
@@ -444,10 +488,11 @@ func LoadMetricSnapshots(snapshots []model.RoutingChannelMetric, _ int) {
 			continue
 		}
 		key := Key{
-			ChannelID:   snapshot.ChannelID,
-			APIKeyIndex: snapshot.APIKeyIndex,
-			Model:       snapshot.ModelName,
-			Group:       snapshot.Group,
+			ChannelID:         snapshot.ChannelID,
+			ChannelGeneration: snapshot.ChannelGeneration,
+			APIKeyIndex:       snapshot.APIKeyIndex,
+			Model:             snapshot.ModelName,
+			Group:             snapshot.Group,
 		}
 		if existing, ok := cache.metrics[key]; ok {
 			if existing.UpdatedUnix > snapshot.BucketTs {
@@ -545,10 +590,11 @@ func LoadBreakerSnapshots(snapshots []model.RoutingBreakerState) {
 			continue
 		}
 		key := Key{
-			ChannelID:   snapshot.ChannelID,
-			APIKeyIndex: snapshot.APIKeyIndex,
-			Model:       snapshot.ModelName,
-			Group:       snapshot.Group,
+			ChannelID:         snapshot.ChannelID,
+			ChannelGeneration: snapshot.ChannelGeneration,
+			APIKeyIndex:       snapshot.APIKeyIndex,
+			Model:             snapshot.ModelName,
+			Group:             snapshot.Group,
 		}
 		if existing, ok := cache.breakers[key]; ok && existing.UpdatedUnix >= snapshot.UpdatedTime {
 			continue
@@ -573,15 +619,19 @@ func LoadHealthSnapshots(snapshots []model.RoutingChannelHealthState, nowUnix in
 			continue
 		}
 		if snapshot.AuthFailure && (snapshot.AuthFailureUntil <= 0 || snapshot.AuthFailureUntil > nowUnix) {
-			cache.authFailures[snapshot.ChannelID] = HealthMarker{
+			cache.authFailures[ChannelLifecycleKey{
+				ChannelID: snapshot.ChannelID, ChannelGeneration: snapshot.ChannelGeneration,
+			}] = HealthMarker{
 				Marked:      true,
 				UpdatedUnix: snapshot.UpdatedTime,
 			}
 		} else {
-			delete(cache.authFailures, snapshot.ChannelID)
+			delete(cache.authFailures, ChannelLifecycleKey{
+				ChannelID: snapshot.ChannelID, ChannelGeneration: snapshot.ChannelGeneration,
+			})
 		}
 	}
-	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, intLess))
+	cache.evictions += int64(trimBoundedMap(cache.authFailures, cache.limits.MaxHealth, healthUpdatedUnix, channelLifecycleLess))
 }
 
 func normalizedLimits(value Limits) Limits {
@@ -685,6 +735,9 @@ func keyLess(left Key, right Key) bool {
 	if left.ChannelID != right.ChannelID {
 		return left.ChannelID < right.ChannelID
 	}
+	if left.ChannelGeneration != right.ChannelGeneration {
+		return left.ChannelGeneration < right.ChannelGeneration
+	}
 	if left.APIKeyIndex != right.APIKeyIndex {
 		return left.APIKeyIndex < right.APIKeyIndex
 	}
@@ -698,6 +751,13 @@ func intLess(left int, right int) bool {
 	return left < right
 }
 
+func channelLifecycleLess(left ChannelLifecycleKey, right ChannelLifecycleKey) bool {
+	if left.ChannelID != right.ChannelID {
+		return left.ChannelID < right.ChannelID
+	}
+	return left.ChannelGeneration < right.ChannelGeneration
+}
+
 func ResetForTest() {
 	cache.Lock()
 	defer cache.Unlock()
@@ -705,8 +765,8 @@ func ResetForTest() {
 	cache.breakers = map[Key]BreakerSnapshot{}
 	cache.sharedEndpoints = map[Key]SharedEndpointBreakerSnapshot{}
 	cache.capacityCooldowns = map[Key]CapacityCooldownSnapshot{}
-	cache.channelBalanceUnavailable = map[int]ChannelBalanceUnavailableSnapshot{}
-	cache.authFailures = map[int]HealthMarker{}
+	cache.channelBalanceUnavailable = map[ChannelLifecycleKey]ChannelBalanceUnavailableSnapshot{}
+	cache.authFailures = map[ChannelLifecycleKey]HealthMarker{}
 	cache.channelPolicies = map[int]ChannelTrafficPolicy{}
 	cache.channelOverrides = map[int]channelTrafficPolicyOverride{}
 	cache.policiesLoadedAt = 0

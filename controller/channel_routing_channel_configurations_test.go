@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -47,7 +48,12 @@ func TestChannelRoutingChannelConfigurationGetAndListDoNotExposeInternalHash(t *
 	assert.Equal(t, model.RoutingFailureDomainStatusHistoricalMigrated, response.Data.FailureDomainStatus)
 	assert.Empty(t, response.Data.FailureDomainLabel)
 	assert.Equal(t, response.Data.ETag, recorder.Header().Get("ETag"))
-	assert.True(t, strings.HasPrefix(response.Data.ETag, `"rcc.901.1.`))
+	assert.Equal(t, configuration.RoutingIdentity, response.Data.RoutingIdentity)
+	assert.Equal(t, configuration.RoutingGeneration, response.Data.RoutingGeneration)
+	assert.True(t, strings.HasPrefix(
+		response.Data.ETag,
+		`"rcc2.`+configuration.RoutingIdentity+`.`+configuration.RoutingGeneration+`.901.1.`,
+	))
 	assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
 	assert.NotContains(t, recorder.Body.String(), "failure_domain_hash")
 	assert.NotContains(t, recorder.Body.String(), configuration.FailureDomainHash)
@@ -104,7 +110,15 @@ func TestChannelRoutingChannelConfigurationPutRequiresCompleteStrictDocumentAndS
 	for index, document := range invalidDocuments {
 		recorder := putChannelRoutingChannelConfiguration(902, document, etag)
 		assert.Equal(t, http.StatusBadRequest, recorder.Code, strconv.Itoa(index)+": "+recorder.Body.String())
-		assert.Contains(t, recorder.Body.String(), `"code":"invalid_channel_configuration"`)
+		if index == len(invalidDocuments)-1 {
+			assert.Contains(t, recorder.Body.String(), `"code":"invalid_channel_configuration"`)
+		} else {
+			assert.Contains(t, recorder.Body.String(), `"code":"invalid_channel_configuration_field"`)
+			assert.Contains(t, recorder.Body.String(), `"field":`)
+			assert.Contains(t, recorder.Body.String(), `"reason":`)
+		}
+		assert.Contains(t, recorder.Body.String(), `"retryable":false`)
+		assert.Contains(t, recorder.Body.String(), `"impact":"configuration_not_saved_previous_version_active"`)
 	}
 
 	tooLarge := `{"upstream_cost_multiplier":1,"traffic_class":"all","failure_domain_label":"` +
@@ -116,6 +130,73 @@ func TestChannelRoutingChannelConfigurationPutRequiresCompleteStrictDocumentAndS
 	unchanged, err := model.GetRoutingChannelConfigurationContext(context.Background(), 902)
 	require.NoError(t, err)
 	assert.Equal(t, configuration, unchanged)
+}
+
+func TestChannelRoutingChannelConfigurationValidationReportsExactFieldAndReason(t *testing.T) {
+	testCases := []struct {
+		name   string
+		body   string
+		field  string
+		reason string
+	}{
+		{
+			name:   "channel multiplier",
+			body:   `{"upstream_cost_multiplier":-1,"traffic_class":"all","failure_domain_label":"","clear_failure_domain":false}`,
+			field:  "upstream_cost_multiplier",
+			reason: "out_of_range",
+		},
+		{
+			name:   "traffic class",
+			body:   `{"upstream_cost_multiplier":1,"traffic_class":"unsupported","failure_domain_label":"","clear_failure_domain":false}`,
+			field:  "traffic_class",
+			reason: "unsupported_value",
+		},
+		{
+			name:   "failure domain label",
+			body:   `{"upstream_cost_multiplier":1,"traffic_class":"all","failure_domain_label":"zone-a","clear_failure_domain":true}`,
+			field:  "failure_domain_label",
+			reason: "conflicts_with_clear_failure_domain",
+		},
+		{
+			name:   "clear failure domain",
+			body:   `{"upstream_cost_multiplier":1,"traffic_class":"all","failure_domain_label":"","clear_failure_domain":"false"}`,
+			field:  "clear_failure_domain",
+			reason: "invalid_type",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request, err := decodeChannelRoutingChannelConfiguration(strings.NewReader(testCase.body))
+			if err == nil {
+				_, err = validateChannelRoutingChannelConfigurationRequest(request)
+			}
+			var fieldErr *channelRoutingChannelConfigurationFieldError
+			require.ErrorAs(t, err, &fieldErr)
+			assert.Equal(t, testCase.field, fieldErr.Field)
+			assert.Equal(t, testCase.reason, fieldErr.Reason)
+		})
+	}
+}
+
+func TestChannelRoutingChannelConfigurationInternalErrorPreservesStablePublicContract(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	writeChannelRoutingChannelConfigurationError(
+		context,
+		http.StatusInternalServerError,
+		"channel_configuration_update_failed",
+		"The change was not saved. The previous valid configuration remains active.",
+		errors.New("UNIQUE constraint failed: routing_channel_configuration_outbox.event_id SQLSTATE 23505"),
+	)
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"code":"channel_configuration_update_failed"`)
+	assert.Contains(t, recorder.Body.String(), `"retryable":true`)
+	assert.Contains(t, recorder.Body.String(), `"impact":"configuration_not_saved_previous_version_active"`)
+	assert.Contains(t, recorder.Body.String(), "previous valid configuration remains active")
+	assert.NotContains(t, recorder.Body.String(), "UNIQUE")
+	assert.NotContains(t, recorder.Body.String(), "SQLSTATE")
+	assert.NotContains(t, recorder.Body.String(), "event_id")
 }
 
 func TestChannelRoutingChannelConfigurationPutPersistsAuditOutboxAndConflictState(t *testing.T) {

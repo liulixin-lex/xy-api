@@ -29,13 +29,19 @@ func TestRoutingConfigRealRedisBroadcastsToIndependentNodeCursors(t *testing.T) 
 		&model.RoutingPolicyActivation{},
 		&model.RoutingConfigOutbox{},
 		&model.RoutingRuntimeCheckpoint{},
+		&model.RoutingPoolMember{},
 	))
-	require.NoError(t, db.Create(&model.Channel{Id: 1}).Error)
+	channel := model.Channel{Id: 1, Models: "gpt-test"}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.RoutingPoolMember{
+		ID: 1, PoolID: 1, ChannelID: channel.Id,
+		ChannelGeneration: channel.RoutingGeneration, Source: model.RoutingPoolSourceLegacyGroup, Active: true,
+	}).Error)
 	require.NoError(t, model.EnsureRoutingPolicyHeadContext(context.Background()))
 	published, err := model.PublishRoutingPolicyRevisionContext(
 		context.Background(),
 		0,
-		testRoutingConfigPolicyDocument(),
+		testRoutingConfigPolicyDocument(channel.RoutingGeneration),
 		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1},
 	)
 	require.NoError(t, err)
@@ -74,7 +80,7 @@ func TestRoutingConfigRealRedisBroadcastsToIndependentNodeCursors(t *testing.T) 
 	second, err := model.PublishRoutingPolicyRevisionContext(
 		context.Background(),
 		published.Revision.Revision,
-		testRoutingConfigPolicyDocument(),
+		testRoutingConfigPolicyDocument(channel.RoutingGeneration),
 		model.RoutingPolicyActivationSpec{Stage: model.RoutingDeploymentStageShadow, ActorID: 1},
 	)
 	require.NoError(t, err)

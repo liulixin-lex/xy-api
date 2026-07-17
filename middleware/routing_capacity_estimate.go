@@ -326,8 +326,10 @@ func buildRoutingCostRequestProfile(
 		}
 	}
 	imageUnits := 0.0
-	if value := gjson.GetBytes(body, "n"); value.Exists() && value.Type == gjson.Number && value.Num > 0 {
+	imageUnitsKnown := !mediaRequest
+	if value := gjson.GetBytes(body, "n"); value.Exists() && value.Type == gjson.Number && value.Num >= 0 {
 		imageUnits = value.Num
+		imageUnitsKnown = true
 	}
 	requestHeaders := make(map[string]string, len(headers))
 	for key, values := range headers {
@@ -349,7 +351,14 @@ func buildRoutingCostRequestProfile(
 		CacheTokensKnown:              false,
 		CacheReadTokensKnown:          false,
 		CacheWriteTokensKnown:         estimate.CacheWriteTokensKnown,
-		MediaDimensionsKnown:          !mediaRequest,
+		CacheWriteOneHourTokensKnown:  estimate.CacheWriteTokensKnown,
+		ImageInputTokensKnown:         !mediaRequest,
+		ImageOutputTokensKnown:        !mediaRequest,
+		ImageUnitsKnown:               imageUnitsKnown,
+		AudioInputTokensKnown:         !mediaRequest,
+		AudioOutputTokensKnown:        !mediaRequest,
+		AudioDurationKnown:            !mediaRequest,
+		VideoDurationKnown:            !mediaRequest,
 		RequestInputKnown:             len(body) > 0,
 		RequestPricingFeaturesKnown:   estimate.RequestPricingFeaturesKnown,
 		UncataloguedSurchargePossible: estimate.UncataloguedSurchargePossible,

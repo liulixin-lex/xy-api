@@ -32,6 +32,7 @@ var (
 type RoutingCredentialHealthState struct {
 	CredentialID            int    `json:"credential_id" gorm:"primaryKey"`
 	ChannelID               int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration       string `json:"channel_generation" gorm:"type:varchar(32);index"`
 	AuthFailure             bool   `json:"auth_failure"`
 	AuthFailureReason       string `json:"auth_failure_reason" gorm:"type:varchar(256)"`
 	AuthFailureUntilMs      int64  `json:"auth_failure_until_ms" gorm:"bigint;index"`
@@ -74,7 +75,9 @@ func upsertRoutingCredentialHealthStatesContext(ctx context.Context, db *gorm.DB
 			return err
 		}
 		if current, ok := merged[state.CredentialID]; ok {
-			if current.ChannelID != state.ChannelID {
+			if current.ChannelID != state.ChannelID ||
+				(current.ChannelGeneration != "" && state.ChannelGeneration != "" &&
+					current.ChannelGeneration != state.ChannelGeneration) {
 				return ErrRoutingRuntimeHealthInvalid
 			}
 			state = mergeRoutingCredentialHealthState(current, state)
@@ -88,24 +91,28 @@ func upsertRoutingCredentialHealthStatesContext(ctx context.Context, db *gorm.DB
 	}
 	sort.Ints(credentialIDs)
 
-	activeCredentials := make(map[int]int, len(credentialIDs))
+	activeCredentials := make(map[int]RoutingCredentialRef, len(credentialIDs))
 	for start := 0; start < len(credentialIDs); start += routingRuntimeHealthWriteBatch {
 		end := min(start+routingRuntimeHealthWriteBatch, len(credentialIDs))
 		var refs []RoutingCredentialRef
-		if err := db.Select("id", "channel_id").
+		if err := db.Select("id", "channel_id", "channel_generation").
 			Where("id IN ? AND active = ?", credentialIDs[start:end], true).
 			Find(&refs).Error; err != nil {
 			return err
 		}
 		for index := range refs {
-			activeCredentials[refs[index].ID] = refs[index].ChannelID
+			activeCredentials[refs[index].ID] = refs[index]
 		}
 	}
 
+	generationScoped := db.Migrator().HasTable(&Channel{})
 	valid := make([]RoutingCredentialHealthState, 0, len(activeCredentials))
 	for _, credentialID := range credentialIDs {
 		state := merged[credentialID]
-		if channelID, ok := activeCredentials[credentialID]; ok && channelID == state.ChannelID {
+		if ref, ok := activeCredentials[credentialID]; ok && ref.ChannelID == state.ChannelID &&
+			(!generationScoped || validRoutingIdentity(ref.ChannelGeneration)) &&
+			(state.ChannelGeneration == "" || state.ChannelGeneration == ref.ChannelGeneration) {
+			state.ChannelGeneration = ref.ChannelGeneration
 			valid = append(valid, state)
 		}
 	}
@@ -137,6 +144,7 @@ WHERE NOT EXISTS (
 	SELECT 1 FROM routing_credential_refs
 	WHERE routing_credential_refs.id = routing_credential_health_states.credential_id
 		AND routing_credential_refs.channel_id = routing_credential_health_states.channel_id
+		AND routing_credential_refs.channel_generation = routing_credential_health_states.channel_generation
 		AND routing_credential_refs.active = ?
 )`, true).Error; err != nil {
 		return err
@@ -157,6 +165,7 @@ func ListRoutingCredentialHealthStatesContext(ctx context.Context, limit int) ([
 			SELECT 1 FROM routing_credential_refs
 			WHERE routing_credential_refs.id = routing_credential_health_states.credential_id
 				AND routing_credential_refs.channel_id = routing_credential_health_states.channel_id
+				AND routing_credential_refs.channel_generation = routing_credential_health_states.channel_generation
 				AND routing_credential_refs.active = ?
 		)`, true).
 		Order("updated_time_ms desc").Order("credential_id asc").
@@ -177,6 +186,7 @@ func ListRoutingCredentialHealthStatesContext(ctx context.Context, limit int) ([
 
 func normalizeRoutingCredentialHealthState(state *RoutingCredentialHealthState) error {
 	if state == nil || state.CredentialID <= 0 || state.ChannelID <= 0 ||
+		(state.ChannelGeneration != "" && !validRoutingIdentity(state.ChannelGeneration)) ||
 		state.AuthVersion < 0 || state.AuthUpdatedTimeMs < 0 ||
 		state.CapacityVersion < 0 || state.CapacityUpdatedTimeMs < 0 ||
 		state.AuthFailureUntilMs < 0 || state.CapacityCooldownUntilMs < 0 ||
@@ -230,6 +240,7 @@ func mergeRoutingCredentialHealthState(current RoutingCredentialHealthState, inc
 	if current.CredentialID == 0 {
 		current.CredentialID = incoming.CredentialID
 		current.ChannelID = incoming.ChannelID
+		current.ChannelGeneration = incoming.ChannelGeneration
 	}
 	if incoming.AuthVersion > current.AuthVersion {
 		current.AuthFailure = incoming.AuthFailure

@@ -26,6 +26,7 @@ export const channelRoutingEventNames = [
   'routing.policy.applied',
   'routing.runtime_settings.changed',
   'routing.channel_configuration.changed',
+  'routing.pricing.changed',
   'routing.probe.completed',
   'routing.audit_export.ready',
   'routing.error_budget.changed',
@@ -203,6 +204,16 @@ export function getChannelRoutingEventResources(
     case 'routing.channel_configuration.changed':
       return [
         'overview',
+        'channels',
+        'costs',
+        'channel-configurations',
+        'decisions',
+        'control-audits',
+      ]
+    case 'routing.pricing.changed':
+      return [
+        'overview',
+        'groups',
         'channels',
         'costs',
         'channel-configurations',

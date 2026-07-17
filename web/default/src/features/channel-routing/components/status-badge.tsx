@@ -56,7 +56,8 @@ function statusPresentation(status: string | number) {
     normalized === 'exact' ||
     normalized === 'full' ||
     normalized === 'fresh' ||
-    normalized === 'completed'
+    normalized === 'completed' ||
+    normalized === 'working'
   ) {
     return {
       icon: CheckmarkCircle02Icon,
@@ -66,6 +67,7 @@ function statusPresentation(status: string | number) {
   if (
     normalized === 'warning' ||
     normalized === 'partial' ||
+    normalized === 'partially_succeeded' ||
     normalized === 'degraded' ||
     normalized === 'derived' ||
     normalized === 'group_only'
@@ -73,6 +75,12 @@ function statusPresentation(status: string | number) {
     return {
       icon: AlertCircleIcon,
       className: 'border-warning/40 bg-warning/15 text-foreground',
+    }
+  }
+  if (normalized === 'cancelled' || normalized === 'superseded') {
+    return {
+      icon: CancelCircleIcon,
+      className: 'border-border bg-muted/50 text-muted-foreground',
     }
   }
   if (
@@ -85,6 +93,7 @@ function statusPresentation(status: string | number) {
     normalized === 'timeout' ||
     normalized === 'editing' ||
     normalized === 'pending' ||
+    normalized === 'retry_wait' ||
     normalized === 'running' ||
     normalized === 'half_open'
   ) {
@@ -105,7 +114,8 @@ function statusPresentation(status: string | number) {
     normalized === 'breached' ||
     normalized === 'local_error' ||
     normalized === 'critical' ||
-    normalized === 'expired'
+    normalized === 'expired' ||
+    normalized === 'rejected'
   ) {
     return {
       icon: CancelCircleIcon,
@@ -171,20 +181,25 @@ function statusLabel(
     open: 'Open',
     passed: 'Passed',
     partial: 'Partial',
+    partially_succeeded: 'Partially succeeded',
     pending: 'Pending',
     published: 'Published',
     ready: 'Ready',
+    rejected: 'Rejected',
     running: 'Running',
+    retry_wait: 'Waiting to retry',
     shadow: 'Shadow',
     stale: 'Stale',
     succeeded: 'Succeeded',
     success: 'Success',
     superseded: 'Superseded',
+    cancelled: 'Cancelled',
     timeout: 'Timeout',
     unavailable: 'Unavailable',
     unknown: 'Unknown',
     validated: 'Validated',
     warning: 'Warning',
+    working: 'Working',
   }
   if (normalized === '1') return translate('Enabled')
   if (normalized === '2' || normalized === '3') return translate('Disabled')

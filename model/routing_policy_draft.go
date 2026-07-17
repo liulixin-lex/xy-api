@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -21,6 +24,11 @@ const (
 	RoutingPolicyDraftMaxPageSize      = 100
 	RoutingPolicyDraftMaxDocumentBytes = routingPolicyMaxCanonicalBytes
 	routingPolicyDraftSchemaVersion    = 1
+	RoutingPolicyDraftMaxDeleteBatch   = 100
+
+	RoutingPolicyDraftWorkspaceWorking   = "working"
+	RoutingPolicyDraftWorkspaceStale     = "stale"
+	RoutingPolicyDraftWorkspacePublished = "published"
 )
 
 var (
@@ -98,6 +106,18 @@ type RoutingPolicyDraftSummary struct {
 	UpdatedTimeMs         int64  `json:"updated_time_ms"`
 	ValidatedTimeMs       int64  `json:"validated_time_ms"`
 	PublishedTimeMs       int64  `json:"published_time_ms"`
+	WorkspaceState        string `json:"workspace_state" gorm:"-"`
+	Stale                 bool   `json:"stale" gorm:"-"`
+	CanValidate           bool   `json:"can_validate" gorm:"-"`
+	CanPublish            bool   `json:"can_publish" gorm:"-"`
+	CanDelete             bool   `json:"can_delete" gorm:"-"`
+	BlockingReason        string `json:"blocking_reason,omitempty" gorm:"-"`
+}
+
+type RoutingPolicyDraftDeleteSpec struct {
+	ID              int64  `json:"id"`
+	ExpectedVersion int64  `json:"expected_version"`
+	ExpectedETag    string `json:"expected_etag"`
 }
 
 func CreateRoutingPolicyDraftContext(
@@ -196,7 +216,9 @@ func ListRoutingPolicyDraftsContext(
 	if beforeID < 0 || limit < 1 || limit > RoutingPolicyDraftMaxPageSize {
 		return nil, false, ErrRoutingPolicyDraftInvalid
 	}
-	query := DB.WithContext(ctx).Model(&RoutingPolicyDraft{}).Order("id desc").Limit(limit + 1)
+	query := DB.WithContext(ctx).Model(&RoutingPolicyDraft{}).
+		Where("status <> ?", RoutingPolicyDraftStatusPublished).
+		Order("id desc").Limit(limit + 1)
 	if beforeID > 0 {
 		query = query.Where("id < ?", beforeID)
 	}
@@ -213,7 +235,41 @@ func ListRoutingPolicyDraftsContext(
 			return nil, false, err
 		}
 	}
+	if err := DecorateRoutingPolicyDraftSummariesContext(ctx, drafts); err != nil {
+		return nil, false, err
+	}
 	return drafts, hasMore, nil
+}
+
+func DecorateRoutingPolicyDraftSummariesContext(
+	ctx context.Context,
+	drafts []RoutingPolicyDraftSummary,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(drafts) == 0 {
+		return nil
+	}
+	head, err := GetRoutingPolicyHeadContext(ctx)
+	if err != nil {
+		return err
+	}
+	for index := range drafts {
+		decorateRoutingPolicyDraftWorkspace(&drafts[index], head)
+	}
+	return nil
+}
+
+func DecorateRoutingPolicyDraftSummaryContext(
+	ctx context.Context,
+	draft RoutingPolicyDraftSummary,
+) (RoutingPolicyDraftSummary, error) {
+	items := []RoutingPolicyDraftSummary{draft}
+	if err := DecorateRoutingPolicyDraftSummariesContext(ctx, items); err != nil {
+		return RoutingPolicyDraftSummary{}, err
+	}
+	return items[0], nil
 }
 
 func UpdateRoutingPolicyDraftContext(
@@ -321,6 +377,9 @@ func ValidateRoutingPolicyDraftContext(
 		if err := lockForUpdate(tx.WithContext(ctx)).Where("id = ?", routingPolicyHeadID).First(&head).Error; err != nil {
 			return err
 		}
+		if head.CurrentRevision != draft.BaseRevision || head.CurrentHash != draft.BaseHash {
+			return newRoutingPolicyRevisionConflict(draft.BaseRevision, head)
+		}
 		if err := validateRoutingPolicyLiveReferencesTx(tx.WithContext(ctx), document); err != nil {
 			return err
 		}
@@ -348,6 +407,77 @@ func ValidateRoutingPolicyDraftContext(
 	return cloneRoutingPolicyDraft(stored), nil
 }
 
+func DeleteRoutingPolicyDraftContext(
+	ctx context.Context,
+	id int64,
+	expectedVersion int64,
+	expectedETag string,
+) error {
+	return DeleteRoutingPolicyDraftsContext(ctx, []RoutingPolicyDraftDeleteSpec{{
+		ID: id, ExpectedVersion: expectedVersion, ExpectedETag: expectedETag,
+	}})
+}
+
+func DeleteRoutingPolicyDraftsContext(
+	ctx context.Context,
+	specs []RoutingPolicyDraftDeleteSpec,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(specs) == 0 || len(specs) > RoutingPolicyDraftMaxDeleteBatch {
+		return ErrRoutingPolicyDraftInvalid
+	}
+	ordered := append([]RoutingPolicyDraftDeleteSpec(nil), specs...)
+	sort.Slice(ordered, func(left int, right int) bool { return ordered[left].ID < ordered[right].ID })
+	for index := range ordered {
+		spec := ordered[index]
+		if spec.ID <= 0 || spec.ExpectedVersion <= 0 || !validRoutingHash(spec.ExpectedETag) ||
+			(index > 0 && ordered[index-1].ID == spec.ID) {
+			return ErrRoutingPolicyDraftInvalid
+		}
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		ids := make([]int64, len(ordered))
+		for index := range ordered {
+			ids[index] = ordered[index].ID
+		}
+		var drafts []RoutingPolicyDraft
+		query := tx.WithContext(ctx).Where("id IN ?", ids).Order("id asc")
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.Find(&drafts).Error; err != nil {
+			return err
+		}
+		if len(drafts) != len(ordered) {
+			return ErrRoutingPolicyDraftNotFound
+		}
+		for index := range drafts {
+			draft := drafts[index]
+			spec := ordered[index]
+			if err := validateStoredRoutingPolicyDraft(draft); err != nil {
+				return err
+			}
+			if err := requireRoutingPolicyDraftVersion(draft, spec.ExpectedVersion, spec.ExpectedETag); err != nil {
+				return err
+			}
+			if draft.Status == RoutingPolicyDraftStatusPublished {
+				return ErrRoutingPolicyDraftImmutable
+			}
+		}
+		result := tx.WithContext(ctx).Where("id IN ? AND status <> ?", ids, RoutingPolicyDraftStatusPublished).
+			Delete(&RoutingPolicyDraft{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(ids)) {
+			return ErrRoutingPolicyDraftConflict
+		}
+		return nil
+	})
+}
+
 func PublishRoutingPolicyDraftContext(
 	ctx context.Context,
 	id int64,
@@ -357,6 +487,7 @@ func PublishRoutingPolicyDraftContext(
 ) (RoutingPolicyDraft, RoutingPolicyPublishResult, error) {
 	draft, published, _, err := publishRoutingPolicyDraftContext(
 		ctx, id, expectedVersion, expectedETag, activation, RoutingOperationRequestIdentity{}, false,
+		RoutingPolicyRiskAcceptanceSpec{},
 	)
 	return draft, published, err
 }
@@ -370,6 +501,7 @@ func PublishRoutingPolicyDraftWithOperationContext(
 ) (RoutingPolicyDraft, RoutingPolicyPublishResult, RoutingOperation, error) {
 	return publishRoutingPolicyDraftContext(
 		ctx, id, expectedVersion, expectedETag, activation, RoutingOperationRequestIdentity{}, true,
+		RoutingPolicyRiskAcceptanceSpec{},
 	)
 }
 
@@ -386,6 +518,24 @@ func PublishRoutingPolicyDraftWithOperationRequestContext(
 	}
 	return publishRoutingPolicyDraftContext(
 		ctx, id, expectedVersion, expectedETag, activation, requestIdentity, true,
+		RoutingPolicyRiskAcceptanceSpec{},
+	)
+}
+
+func PublishRoutingPolicyDraftWithOperationRequestAndRiskContext(
+	ctx context.Context,
+	id int64,
+	expectedVersion int64,
+	expectedETag string,
+	activation RoutingPolicyActivationSpec,
+	requestIdentity RoutingOperationRequestIdentity,
+	riskAcceptance RoutingPolicyRiskAcceptanceSpec,
+) (RoutingPolicyDraft, RoutingPolicyPublishResult, RoutingOperation, error) {
+	if !validRoutingOperationRequestIdentity(requestIdentity) {
+		return RoutingPolicyDraft{}, RoutingPolicyPublishResult{}, RoutingOperation{}, ErrRoutingOperationInvalid
+	}
+	return publishRoutingPolicyDraftContext(
+		ctx, id, expectedVersion, expectedETag, activation, requestIdentity, true, riskAcceptance,
 	)
 }
 
@@ -397,6 +547,7 @@ func publishRoutingPolicyDraftContext(
 	activation RoutingPolicyActivationSpec,
 	requestIdentity RoutingOperationRequestIdentity,
 	createOperation bool,
+	riskAcceptance RoutingPolicyRiskAcceptanceSpec,
 ) (RoutingPolicyDraft, RoutingPolicyPublishResult, RoutingOperation, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -404,10 +555,16 @@ func publishRoutingPolicyDraftContext(
 	if id <= 0 || expectedVersion <= 0 || !validRoutingHash(expectedETag) || activation.Validate() != nil {
 		return RoutingPolicyDraft{}, RoutingPolicyPublishResult{}, RoutingOperation{}, ErrRoutingPolicyDraftInvalid
 	}
+	if err := validateRoutingPolicyRiskAcceptance(riskAcceptance); err != nil {
+		return RoutingPolicyDraft{}, RoutingPolicyPublishResult{}, RoutingOperation{}, err
+	}
 
 	var stored RoutingPolicyDraft
 	var published RoutingPolicyPublishResult
 	var operation RoutingOperation
+	var riskEvidence RoutingPolicySimulationEvidence
+	var riskAcceptanceRecord RoutingPolicyRiskAcceptance
+	riskAcceptance.Reason = strings.TrimSpace(riskAcceptance.Reason)
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		draft, loadErr := loadRoutingPolicyDraftForUpdate(ctx, tx, id)
 		if loadErr != nil {
@@ -442,6 +599,7 @@ func publishRoutingPolicyDraftContext(
 		if draft.Status != RoutingPolicyDraftStatusValidated || draft.Version == math.MaxInt64 {
 			return ErrRoutingPolicyDraftInvalid
 		}
+		previousDraft := draft
 		document, err := draft.Document()
 		if err != nil {
 			return err
@@ -456,12 +614,21 @@ func publishRoutingPolicyDraftContext(
 		if head.CurrentRevision != draft.BaseRevision || head.CurrentHash != draft.BaseHash {
 			return newRoutingPolicyRevisionConflict(draft.BaseRevision, head)
 		}
-		if routingPolicyPublishRequiresApproval(document, activation) {
-			if _, err := requireRoutingPolicyApprovalQuorumDBContext(
-				ctx, tx, draft, activation, RoutingPolicyRequiredApprovals,
-			); err != nil {
-				return err
-			}
+		matchingEvidence, evidenceFound, evidenceErr := latestMatchingRoutingPolicySimulationEvidenceTx(
+			tx.WithContext(ctx), draft, head, activation,
+		)
+		if evidenceErr != nil {
+			return evidenceErr
+		}
+		requiresRiskAcceptance := evidenceFound && matchingEvidence.RiskState == RoutingPolicySimulationRiskFail
+		if requiresRiskAcceptance && !riskAcceptance.Accepted {
+			return ErrRoutingPolicySimulationRiskAcceptanceRequired
+		}
+		if riskAcceptance.Accepted && !requiresRiskAcceptance {
+			return ErrRoutingPolicySimulationRiskAcceptanceInvalid
+		}
+		if requiresRiskAcceptance {
+			riskEvidence = matchingEvidence
 		}
 		changedPoolIDs := make([]int, len(document.Pools))
 		for index := range document.Pools {
@@ -482,6 +649,18 @@ func publishRoutingPolicyDraftContext(
 			return err
 		}
 		nowMs := time.Now().UnixMilli()
+		if riskAcceptance.Accepted {
+			riskAcceptanceRecord = RoutingPolicyRiskAcceptance{
+				EvidenceID: riskEvidence.ID, OperationID: riskEvidence.OperationID,
+				DraftID: draft.ID, DraftVersion: draft.Version, DocumentHash: draft.DocumentHash,
+				TargetStage: activation.Stage, TargetTrafficBasisPoints: activation.TrafficBasisPoints,
+				PublishedRevision: published.Revision.Revision, ActorID: activation.ActorID,
+				Reason: riskAcceptance.Reason, RiskHash: riskEvidence.RiskHash, CreatedTimeMs: nowMs,
+			}
+			if err := tx.WithContext(ctx).Create(&riskAcceptanceRecord).Error; err != nil {
+				return err
+			}
+		}
 		draft.Version++
 		draft.Status = RoutingPolicyDraftStatusPublished
 		draft.UpdatedBy = activation.ActorID
@@ -525,6 +704,24 @@ func publishRoutingPolicyDraftContext(
 				return err
 			}
 		}
+		if operation.ID > 0 {
+			if err := insertRoutingOperationTransitionAuditTx(
+				tx.WithContext(ctx), routingOperationInitialAuditState(operation), operation, RoutingControlActionPublish,
+			); err != nil {
+				return err
+			}
+		}
+		if riskAcceptanceRecord.ID > 0 {
+			if err := insertRoutingPolicyRiskAcceptanceAuditTx(tx.WithContext(ctx), riskAcceptanceRecord); err != nil {
+				return err
+			}
+		}
+		if err := insertRoutingPolicyDraftPublicationAuditTx(
+			tx.WithContext(ctx), previousDraft, draft, published, operation,
+			riskAcceptanceRecord.ID > 0, activation.Reason,
+		); err != nil {
+			return err
+		}
 		stored = draft
 		return nil
 	})
@@ -532,31 +729,6 @@ func publishRoutingPolicyDraftContext(
 		return RoutingPolicyDraft{}, RoutingPolicyPublishResult{}, RoutingOperation{}, err
 	}
 	return cloneRoutingPolicyDraft(stored), published, operation, nil
-}
-
-func routingPolicyPublishRequiresApproval(
-	document RoutingPolicyDocument,
-	activation RoutingPolicyActivationSpec,
-) bool {
-	if activation.Stage == RoutingDeploymentStageActive {
-		return true
-	}
-	for index := range document.Pools {
-		if document.Pools[index].PolicyProfile == RoutingPolicyProfileEnterpriseSLO {
-			return true
-		}
-	}
-	return false
-}
-
-func RoutingPolicyDeploymentRequiresApproval(
-	document RoutingPolicyDocument,
-	activation RoutingPolicyActivationSpec,
-) (bool, error) {
-	if err := ValidateRoutingPolicyActivationDocument(document, activation); err != nil {
-		return false, err
-	}
-	return routingPolicyPublishRequiresApproval(document, activation), nil
 }
 
 func routingPolicyDraftPublishOperationHash(
@@ -755,6 +927,42 @@ func (draft RoutingPolicyDraft) summary() RoutingPolicyDraftSummary {
 		ValidatedHeadRevision: draft.ValidatedHeadRevision, ValidatedHeadHash: draft.ValidatedHeadHash,
 		PublishedRevision: draft.PublishedRevision, CreatedTimeMs: draft.CreatedTimeMs, UpdatedTimeMs: draft.UpdatedTimeMs,
 		ValidatedTimeMs: draft.ValidatedTimeMs, PublishedTimeMs: draft.PublishedTimeMs,
+	}
+}
+
+func decorateRoutingPolicyDraftWorkspace(summary *RoutingPolicyDraftSummary, head RoutingPolicyHead) {
+	if summary == nil {
+		return
+	}
+	summary.CanValidate = false
+	summary.CanPublish = false
+	summary.CanDelete = summary.Status != RoutingPolicyDraftStatusPublished
+	summary.Stale = false
+	summary.BlockingReason = ""
+	if summary.Status == RoutingPolicyDraftStatusPublished {
+		summary.WorkspaceState = RoutingPolicyDraftWorkspacePublished
+		summary.BlockingReason = "published"
+		return
+	}
+	if summary.BaseRevision != head.CurrentRevision || summary.BaseHash != head.CurrentHash {
+		summary.WorkspaceState = RoutingPolicyDraftWorkspaceStale
+		summary.Stale = true
+		summary.BlockingReason = "base_policy_changed"
+		return
+	}
+	summary.WorkspaceState = RoutingPolicyDraftWorkspaceWorking
+	switch summary.Status {
+	case RoutingPolicyDraftStatusEditing:
+		summary.CanValidate = true
+		summary.BlockingReason = "draft_requires_validation"
+	case RoutingPolicyDraftStatusValidated:
+		if summary.ValidatedHeadRevision == head.CurrentRevision && summary.ValidatedHeadHash == head.CurrentHash {
+			summary.CanPublish = true
+		} else {
+			summary.Stale = true
+			summary.WorkspaceState = RoutingPolicyDraftWorkspaceStale
+			summary.BlockingReason = "validation_evidence_stale"
+		}
 	}
 }
 

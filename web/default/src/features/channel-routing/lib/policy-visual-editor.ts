@@ -222,6 +222,18 @@ function replaceAt<T>(items: T[], index: number, value: T): T[] {
   return next
 }
 
+function withPolicyMemberEffectiveValues(
+  pool: PolicyPoolDocument,
+  member: PolicyMemberDocument
+): PolicyMemberDocument {
+  return {
+    ...member,
+    enabled: member.enabled_override ?? pool.default_enabled ?? true,
+    priority: member.priority_override ?? pool.default_priority ?? 0,
+    weight: member.weight_override ?? pool.default_weight ?? 100,
+  }
+}
+
 export function updatePolicyPoolDocument(
   document: PolicyDocument,
   poolIndex: number,
@@ -229,9 +241,21 @@ export function updatePolicyPoolDocument(
 ): PolicyDocument {
   const pool = document.pools[poolIndex]
   if (!pool) return document
+  let nextPool = { ...pool, ...patch }
+  if (document.schema_version === 2) {
+    nextPool = {
+      ...nextPool,
+      default_enabled: nextPool.default_enabled ?? true,
+      default_priority: nextPool.default_priority ?? 0,
+      default_weight: nextPool.default_weight ?? 100,
+      members: nextPool.members.map((member) =>
+        withPolicyMemberEffectiveValues(nextPool, member)
+      ),
+    }
+  }
   return {
     ...document,
-    pools: replaceAt(document.pools, poolIndex, { ...pool, ...patch }),
+    pools: replaceAt(document.pools, poolIndex, nextPool),
   }
 }
 
@@ -310,7 +334,20 @@ export function updatePolicyMemberDocument(
   const pool = document.pools[poolIndex]
   const member = pool?.members[memberIndex]
   if (!pool || !member) return document
-  const members = replaceAt(pool.members, memberIndex, { ...member, ...patch })
+  let nextMember = { ...member, ...patch }
+  if (document.schema_version === 2) {
+    if (patch.enabled !== undefined) {
+      nextMember.enabled_override = patch.enabled
+    }
+    if (patch.priority !== undefined) {
+      nextMember.priority_override = patch.priority
+    }
+    if (patch.weight !== undefined) {
+      nextMember.weight_override = patch.weight
+    }
+    nextMember = withPolicyMemberEffectiveValues(pool, nextMember)
+  }
+  const members = replaceAt(pool.members, memberIndex, nextMember)
   return updatePolicyPoolDocument(document, poolIndex, { members })
 }
 

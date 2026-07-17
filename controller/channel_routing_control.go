@@ -58,7 +58,8 @@ func RunChannelRoutingActiveProbe(c *gin.Context) {
 		return
 	}
 	status := http.StatusOK
-	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning {
+	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning ||
+		operation.Status == model.RoutingOperationStatusRetryWait {
 		status = http.StatusAccepted
 	}
 	c.JSON(status, gin.H{"success": true, "message": "", "data": view})
@@ -170,7 +171,8 @@ func writeExistingChannelRoutingControlOperation(
 		return true
 	}
 	status := http.StatusOK
-	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning {
+	if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRunning ||
+		operation.Status == model.RoutingOperationStatusRetryWait {
 		status = http.StatusAccepted
 	}
 	c.JSON(status, gin.H{"success": true, "message": "", "data": view})

@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
+import { channelRoutingQueryKeys } from '../api/query-keys'
 import {
   channelRoutingEventNames,
   getChannelRoutingEventResources,
@@ -128,6 +129,18 @@ describe('channel routing event contract', () => {
         ],
       ],
       [
+        'routing.pricing.changed',
+        [
+          'overview',
+          'groups',
+          'channels',
+          'costs',
+          'channel-configurations',
+          'decisions',
+          'control-audits',
+        ],
+      ],
+      [
         'routing.probe.completed',
         ['overview', 'groups', 'channels', 'endpoints', 'probes', 'operations'],
       ],
@@ -160,6 +173,15 @@ describe('channel routing event contract', () => {
     for (const [eventType, resources] of expected) {
       assert.deepEqual(getChannelRoutingEventResources(eventType), resources)
     }
+  })
+
+  test('keeps the cost catalog under the costs event invalidation root', () => {
+    assert.deepEqual(
+      channelRoutingQueryKeys
+        .costCatalogRoot()
+        .slice(0, channelRoutingQueryKeys.costsRoot().length),
+      channelRoutingQueryKeys.costsRoot()
+    )
   })
 
   test('resumes from the ready cursor and honors bounded retry headers', () => {

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -34,16 +34,11 @@ type channelRoutingPolicyRollbackResponse struct {
 	Operation model.RoutingOperation           `json:"operation"`
 }
 
-type channelRoutingPolicyRollbackApprovalList struct {
-	Items                []model.RoutingPolicyRollbackApproval `json:"items"`
-	Groups               []channelRoutingPolicyApprovalGroup   `json:"groups"`
-	Required             int                                   `json:"required"`
-	RequiresApproval     bool                                  `json:"requires_approval"`
-	Count                int                                   `json:"count"`
-	Quorum               bool                                  `json:"quorum"`
-	ExpectedRevision     int64                                 `json:"expected_revision"`
-	TargetRevision       int64                                 `json:"target_revision"`
-	TargetActivationHash string                                `json:"target_activation_hash,omitempty"`
+type channelRoutingPolicyRollbackDraftResponse struct {
+	SourceRevision int64                                  `json:"source_revision"`
+	Draft          model.RoutingPolicyDraftSummary        `json:"draft"`
+	Document       model.RoutingPolicyDocument            `json:"document"`
+	Conversion     model.RoutingPolicyV2ConversionSummary `json:"conversion"`
 }
 
 type channelRoutingOperationView struct {
@@ -52,9 +47,69 @@ type channelRoutingOperationView struct {
 }
 
 type channelRoutingOperationList struct {
-	Items      []channelRoutingOperationView `json:"items"`
-	NextCursor int64                         `json:"next_cursor"`
-	HasMore    bool                          `json:"has_more"`
+	Items      []channelRoutingOperationPublicView `json:"items"`
+	NextCursor int64                               `json:"next_cursor"`
+	HasMore    bool                                `json:"has_more"`
+}
+
+type channelRoutingOperationPublicView struct {
+	ID                   int64                        `json:"id"`
+	SchemaVersion        int                          `json:"schema_version"`
+	OperationType        string                       `json:"type"`
+	SubjectType          string                       `json:"subject_type"`
+	SubjectID            int64                        `json:"subject_id"`
+	PoolID               int                          `json:"pool_id"`
+	ExpectedRevision     int64                        `json:"expected_revision"`
+	ExpectedActivationID int64                        `json:"expected_activation_id"`
+	ActorID              int                          `json:"actor_id"`
+	Reason               string                       `json:"reason"`
+	Source               string                       `json:"source"`
+	CorrelationID        string                       `json:"correlation_id"`
+	ParentOperationID    int64                        `json:"parent_operation_id,omitempty"`
+	RetryOfOperationID   int64                        `json:"retry_of_operation_id,omitempty"`
+	RetrySequence        int                          `json:"retry_sequence"`
+	Retryable            bool                         `json:"retryable"`
+	Cancellable          bool                         `json:"cancellable"`
+	Summary              string                       `json:"summary"`
+	NeedsAttention       bool                         `json:"needs_attention"`
+	RetentionCategory    string                       `json:"retention_category"`
+	Status               model.RoutingOperationStatus `json:"status"`
+	Attempts             int                          `json:"attempts"`
+	NextRetryMs          int64                        `json:"next_retry_ms"`
+	LastError            string                       `json:"last_error"`
+	ResultRevision       int64                        `json:"result_revision"`
+	ResultActivationID   int64                        `json:"result_activation_id"`
+	TerminalActorID      int                          `json:"terminal_actor_id,omitempty"`
+	CreatedTimeMs        int64                        `json:"created_time_ms"`
+	UpdatedTimeMs        int64                        `json:"updated_time_ms"`
+	CompletedTimeMs      int64                        `json:"completed_time_ms"`
+	Result               json.RawMessage              `json:"result,omitempty"`
+}
+
+type channelRoutingSimulationOperationSummary struct {
+	PoolID                   int                                            `json:"pool_id"`
+	Cursor                   int                                            `json:"cursor"`
+	NextCursor               int                                            `json:"next_cursor"`
+	Limit                    int                                            `json:"limit"`
+	ScannedSamples           int                                            `json:"scanned_samples"`
+	EvaluatedSamples         int                                            `json:"evaluated_samples"`
+	ActualMatchCount         int                                            `json:"actual_match_count"`
+	ActualMatchRate          *float64                                       `json:"actual_match_rate,omitempty"`
+	SelectionChangedCount    int                                            `json:"selection_changed_count"`
+	SelectionChangeRate      *float64                                       `json:"selection_change_rate,omitempty"`
+	CostKnownSamples         int                                            `json:"cost_known_samples"`
+	TotalExpectedCostDelta   float64                                        `json:"total_expected_cost_delta"`
+	AverageCostDelta         *float64                                       `json:"average_expected_cost_delta,omitempty"`
+	SkipReasons              map[string]int                                 `json:"skip_reasons"`
+	SimulatedAlgorithm       string                                         `json:"simulated_algorithm"`
+	Risk                     *channelrouting.PolicySimulationRiskAssessment `json:"risk,omitempty"`
+	TargetBound              bool                                           `json:"target_bound,omitempty"`
+	TargetStage              string                                         `json:"target_stage,omitempty"`
+	TargetTrafficBasisPoints int                                            `json:"target_traffic_basis_points,omitempty"`
+}
+
+type channelRoutingOperationActionRequest struct {
+	Reason string `json:"reason"`
 }
 
 func GetChannelRoutingCurrentPolicy(c *gin.Context) {
@@ -92,119 +147,6 @@ func GetChannelRoutingPolicyRevision(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, channelRoutingPolicyRevisionResponse{Revision: revision, Document: document})
-}
-
-func ListChannelRoutingPolicyRollbackApprovals(c *gin.Context) {
-	targetRevision, err := parseChannelRoutingPolicyRevision(c.Param("version"))
-	if err != nil {
-		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_policy_revision", "invalid channel routing policy revision", err)
-		return
-	}
-	target, err := parseChannelRoutingPolicyApprovalTarget(c)
-	if err != nil {
-		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_activation", "invalid channel routing policy activation", err)
-		return
-	}
-	requiresApproval := false
-	if target.Present {
-		document, _, loadErr := model.LoadRoutingPolicyRevisionContext(c.Request.Context(), targetRevision)
-		if loadErr != nil {
-			writeChannelRoutingPolicyControlError(c, loadErr)
-			return
-		}
-		requiresApproval, err = model.RoutingPolicyDeploymentRequiresApproval(document, target.Activation)
-		if err != nil {
-			writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_activation", "invalid channel routing policy activation", err)
-			return
-		}
-	}
-	head, err := model.GetRoutingPolicyHeadContext(c.Request.Context())
-	if err != nil {
-		writeChannelRoutingPolicyControlError(c, err)
-		return
-	}
-	items, err := model.ListRoutingPolicyRollbackApprovalsContext(c.Request.Context(), head, targetRevision)
-	if err != nil {
-		writeChannelRoutingPolicyControlError(c, err)
-		return
-	}
-	executorID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
-	groupsByHash := make(map[string]*channelRoutingPolicyApprovalGroup, len(items))
-	for index := range items {
-		approval := items[index]
-		if approval.ActorID == executorID {
-			continue
-		}
-		group := groupsByHash[approval.ActivationHash]
-		if group == nil {
-			group = &channelRoutingPolicyApprovalGroup{
-				ActivationHash: approval.ActivationHash, ActivationStage: approval.ActivationStage,
-				ActivationTrafficBasisPoints: approval.ActivationTrafficBasisPoints,
-				ActivationReasonHash:         approval.ActivationReasonHash,
-			}
-			groupsByHash[approval.ActivationHash] = group
-		}
-		group.Count++
-	}
-	groups := make([]channelRoutingPolicyApprovalGroup, 0, len(groupsByHash))
-	for _, group := range groupsByHash {
-		group.Quorum = group.Count >= model.RoutingPolicyRequiredApprovals
-		groups = append(groups, *group)
-	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].ActivationHash < groups[j].ActivationHash })
-	targetHash := target.Hash
-	count := 0
-	quorum := false
-	if targetHash != "" {
-		if group := groupsByHash[targetHash]; group != nil {
-			count = group.Count
-			quorum = group.Quorum
-		}
-	} else {
-		for index := range groups {
-			count = max(count, groups[index].Count)
-			quorum = quorum || groups[index].Quorum
-		}
-	}
-	c.Header("ETag", channelRoutingPolicyHeadETag(head))
-	common.ApiSuccess(c, channelRoutingPolicyRollbackApprovalList{
-		Items: items, Groups: groups, Required: model.RoutingPolicyRequiredApprovals,
-		RequiresApproval: requiresApproval, Count: count, Quorum: quorum, ExpectedRevision: head.CurrentRevision,
-		TargetRevision: targetRevision, TargetActivationHash: targetHash,
-	})
-}
-
-func ApproveChannelRoutingPolicyRollback(c *gin.Context) {
-	targetRevision, err := parseChannelRoutingPolicyRevision(c.Param("version"))
-	if err != nil {
-		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_policy_revision", "invalid channel routing policy revision", err)
-		return
-	}
-	expectedHead, ok := requireChannelRoutingPolicyHeadIfMatch(c)
-	if !ok {
-		return
-	}
-	activation, err := decodeChannelRoutingPolicyActivation(c.Request.Body)
-	if err != nil {
-		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_activation", "invalid channel routing policy activation", err)
-		return
-	}
-	approval, created, err := model.CreateRoutingPolicyRollbackApprovalContext(
-		c.Request.Context(), expectedHead, targetRevision, activation,
-		common.GetContextKeyInt(c, constant.ContextKeyUserId),
-	)
-	if err != nil {
-		writeChannelRoutingPolicyControlError(c, err)
-		return
-	}
-	status := http.StatusOK
-	if created {
-		status = http.StatusCreated
-	}
-	c.Header("ETag", channelRoutingPolicyHeadETag(expectedHead))
-	c.JSON(status, gin.H{"success": true, "message": "", "data": gin.H{
-		"approval": approval, "created": created,
-	}})
 }
 
 func RollbackChannelRoutingPolicy(c *gin.Context) {
@@ -256,6 +198,55 @@ func RollbackChannelRoutingPolicy(c *gin.Context) {
 	common.ApiSuccess(c, channelRoutingPolicyRollbackResponse{Published: published, Operation: operation})
 }
 
+func CreateChannelRoutingPolicyRollbackDraft(c *gin.Context) {
+	sourceRevision, err := parseChannelRoutingPolicyRevision(c.Param("version"))
+	if err != nil {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_policy_revision", "invalid channel routing policy revision", err)
+		return
+	}
+	head, ok := requireChannelRoutingPolicyHeadIfMatch(c)
+	if !ok {
+		return
+	}
+	if sourceRevision >= head.CurrentRevision {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_rollback_source", "rollback source must be older than the current policy", model.ErrRoutingPolicyInvalid)
+		return
+	}
+	document, source, err := model.LoadRoutingPolicyRevisionContext(c.Request.Context(), sourceRevision)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	converted, conversion, err := model.ConvertRoutingPolicyDocumentToV2DBContext(
+		c.Request.Context(), model.DB, document, true,
+	)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	draft, err := model.CreateRoutingPolicyDraftContext(
+		c.Request.Context(), head.CurrentRevision, converted,
+		common.GetContextKeyInt(c, constant.ContextKeyUserId),
+	)
+	if err != nil {
+		writeChannelRoutingPolicyDraftModelError(c, err)
+		return
+	}
+	summary, err := model.DecorateRoutingPolicyDraftSummaryContext(c.Request.Context(), draft.Summary())
+	if err != nil {
+		writeChannelRoutingPolicyDraftModelError(c, err)
+		return
+	}
+	c.Header("ETag", channelRoutingPolicyDraftETag(summary))
+	publishChannelRoutingControlEvent(channelrouting.RoutingEventTypePolicyDraftChanged, head.CurrentRevision, gin.H{
+		"action": "rollback_draft_created", "draft_id": summary.ID,
+		"source_revision": source.Revision, "source_schema_version": source.SchemaVersion,
+	})
+	c.JSON(http.StatusCreated, gin.H{"success": true, "message": "", "data": channelRoutingPolicyRollbackDraftResponse{
+		SourceRevision: sourceRevision, Draft: summary, Document: converted, Conversion: conversion,
+	}})
+}
+
 func ListChannelRoutingOperations(c *gin.Context) {
 	limit, err := parseChannelRoutingPolicyDraftLimit(c.Query("limit"))
 	if err != nil {
@@ -270,8 +261,19 @@ func ListChannelRoutingOperations(c *gin.Context) {
 	filter := model.RoutingOperationFilter{
 		OperationType: strings.TrimSpace(c.Query("type")),
 		Status:        model.RoutingOperationStatus(strings.TrimSpace(c.Query("status"))),
+		Source:        strings.TrimSpace(c.Query("source")),
+		CorrelationID: strings.TrimSpace(c.Query("correlation_id")),
+		Retention:     strings.TrimSpace(c.Query("retention_category")),
 		BeforeID:      cursor,
 		Limit:         limit,
+	}
+	if raw, exists := c.GetQuery("needs_attention"); exists {
+		value, parseErr := strconv.ParseBool(strings.TrimSpace(raw))
+		if parseErr != nil {
+			writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_filter", "invalid channel routing operation filter", parseErr)
+			return
+		}
+		filter.NeedsAttention = &value
 	}
 	operations, hasMore, err := model.ListRoutingOperationsContext(c.Request.Context(), filter)
 	if err != nil {
@@ -282,9 +284,13 @@ func ListChannelRoutingOperations(c *gin.Context) {
 		writeChannelRoutingPolicyControlError(c, err)
 		return
 	}
-	items := make([]channelRoutingOperationView, len(operations))
+	items := make([]channelRoutingOperationPublicView, len(operations))
 	for index := range operations {
-		items[index] = channelRoutingOperationView{RoutingOperation: operations[index]}
+		items[index], err = channelRoutingOperationPublicViewFromModel(operations[index], false)
+		if err != nil {
+			writeChannelRoutingPolicyControlError(c, err)
+			return
+		}
 	}
 	nextCursor := int64(0)
 	if hasMore && len(operations) > 0 {
@@ -308,12 +314,144 @@ func GetChannelRoutingOperation(c *gin.Context) {
 		writeChannelRoutingPolicyControlError(c, err)
 		return
 	}
-	view, err := channelRoutingOperationViewFromModel(operation)
+	view, err := channelRoutingOperationPublicViewFromModel(operation, true)
 	if err != nil {
 		writeChannelRoutingPolicyControlError(c, err)
 		return
 	}
 	common.ApiSuccess(c, view)
+}
+
+func GetChannelRoutingOperationTechnical(c *gin.Context) {
+	id, ok := parseChannelRoutingOperationID(c)
+	if !ok {
+		return
+	}
+	operation, err := model.GetRoutingOperationContext(c.Request.Context(), id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		writeChannelRoutingPolicyDraftError(c, http.StatusNotFound, "operation_not_found", "channel routing operation not found", err)
+		return
+	}
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	technical, err := operation.TechnicalPayload()
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"id": operation.ID, "schema_version": operation.SchemaVersion,
+		"type": operation.OperationType, "technical": technical,
+	})
+}
+
+func RetryChannelRoutingOperation(c *gin.Context) {
+	id, ok := parseChannelRoutingOperationID(c)
+	if !ok {
+		return
+	}
+	reason, ok := decodeChannelRoutingOperationAction(c)
+	if !ok {
+		return
+	}
+	operation, created, err := model.RetryTerminalRoutingOperationContext(
+		c.Request.Context(), id, common.GetContextKeyInt(c, constant.ContextKeyUserId), reason,
+	)
+	if err != nil {
+		writeChannelRoutingOperationActionError(c, err, "operation_not_retryable", "channel routing operation cannot be retried")
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	view, err := channelRoutingOperationPublicViewFromModel(operation, true)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	publishChannelRoutingControlEvent(channelrouting.RoutingEventTypeOperationChanged, operation.ExpectedRevision, gin.H{
+		"action": "retried", "operation_id": operation.ID, "retry_of_operation_id": operation.RetryOfOperationID,
+		"correlation_id": operation.CorrelationID, "status": operation.Status,
+	})
+	c.JSON(status, gin.H{"success": true, "message": "", "data": gin.H{
+		"operation": view, "created": created,
+	}})
+}
+
+func CancelChannelRoutingOperation(c *gin.Context) {
+	id, ok := parseChannelRoutingOperationID(c)
+	if !ok {
+		return
+	}
+	reason, ok := decodeChannelRoutingOperationAction(c)
+	if !ok {
+		return
+	}
+	operation, err := model.CancelRoutingOperationContext(
+		c.Request.Context(), id, common.GetContextKeyInt(c, constant.ContextKeyUserId), reason,
+	)
+	if err != nil {
+		writeChannelRoutingOperationActionError(c, err, "operation_not_cancellable", "channel routing operation cannot be cancelled")
+		return
+	}
+	view, err := channelRoutingOperationPublicViewFromModel(operation, true)
+	if err != nil {
+		writeChannelRoutingPolicyControlError(c, err)
+		return
+	}
+	publishChannelRoutingControlEvent(channelrouting.RoutingEventTypeOperationChanged, operation.ExpectedRevision, gin.H{
+		"action": "cancelled", "operation_id": operation.ID,
+		"correlation_id": operation.CorrelationID, "status": operation.Status,
+	})
+	common.ApiSuccess(c, view)
+}
+
+func parseChannelRoutingOperationID(c *gin.Context) (int64, bool) {
+	id, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || id <= 0 {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_id", "invalid channel routing operation id", model.ErrRoutingOperationInvalid)
+		return 0, false
+	}
+	return id, true
+}
+
+func decodeChannelRoutingOperationAction(c *gin.Context) (string, bool) {
+	if c.Request.Body == nil {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_action", "operation reason is required", model.ErrRoutingOperationInvalid)
+		return "", false
+	}
+	data, err := io.ReadAll(io.LimitReader(c.Request.Body, 4_097))
+	if err != nil || len(data) == 0 || len(data) > 4_096 {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_action", "operation reason is required", model.ErrRoutingOperationInvalid)
+		return "", false
+	}
+	var fields map[string]json.RawMessage
+	if common.Unmarshal(data, &fields) != nil || len(fields) != 1 {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_action", "operation reason is required", model.ErrRoutingOperationInvalid)
+		return "", false
+	}
+	raw, exists := fields["reason"]
+	var request channelRoutingOperationActionRequest
+	if !exists || common.Unmarshal(raw, &request.Reason) != nil || strings.TrimSpace(request.Reason) == "" {
+		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_operation_action", "operation reason is required", model.ErrRoutingOperationInvalid)
+		return "", false
+	}
+	return request.Reason, true
+}
+
+func writeChannelRoutingOperationActionError(c *gin.Context, err error, code string, message string) {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		writeChannelRoutingPolicyDraftError(c, http.StatusNotFound, "operation_not_found", "channel routing operation not found", err)
+		return
+	}
+	if errors.Is(err, model.ErrRoutingOperationInvalid) || errors.Is(err, model.ErrRoutingOperationClaimLost) {
+		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, code, message, err)
+		return
+	}
+	writeChannelRoutingPolicyControlError(c, err)
 }
 
 func requireChannelRoutingPolicyHeadIfMatch(c *gin.Context) (model.RoutingPolicyHead, bool) {
@@ -396,6 +534,155 @@ func parseChannelRoutingPolicyRevision(value string) (int64, error) {
 	return revision, nil
 }
 
+func channelRoutingOperationPublicViewFromModel(
+	operation model.RoutingOperation,
+	includeResult bool,
+) (channelRoutingOperationPublicView, error) {
+	view := channelRoutingOperationPublicView{
+		ID: operation.ID, SchemaVersion: operation.SchemaVersion, OperationType: operation.OperationType,
+		SubjectType: operation.SubjectType, SubjectID: operation.SubjectID, PoolID: operation.PoolID,
+		ExpectedRevision: operation.ExpectedRevision, ExpectedActivationID: operation.ExpectedActivationID,
+		ActorID: operation.ActorID, Reason: operation.Reason, Source: operation.Source,
+		CorrelationID: operation.CorrelationID, ParentOperationID: operation.ParentOperationID,
+		RetryOfOperationID: operation.RetryOfOperationID, RetrySequence: operation.RetrySequence,
+		Retryable: operation.Retryable, Cancellable: operation.Cancellable, Summary: operation.Summary,
+		NeedsAttention: operation.NeedsAttention, RetentionCategory: operation.RetentionCategory,
+		Status: operation.Status, Attempts: operation.Attempts, NextRetryMs: operation.NextRetryMs,
+		LastError: operation.LastError, ResultRevision: operation.ResultRevision,
+		ResultActivationID: operation.ResultActivationID, TerminalActorID: operation.TerminalActorID,
+		CreatedTimeMs: operation.CreatedTimeMs, UpdatedTimeMs: operation.UpdatedTimeMs,
+		CompletedTimeMs: operation.CompletedTimeMs,
+	}
+	if !includeResult {
+		return view, nil
+	}
+	result, err := channelRoutingOperationPublicResult(operation)
+	if err != nil {
+		return channelRoutingOperationPublicView{}, err
+	}
+	view.Result = result
+	return view, nil
+}
+
+func channelRoutingOperationPublicResult(operation model.RoutingOperation) (json.RawMessage, error) {
+	payload, err := operation.ResultPayload()
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		if operation.OperationType != model.RoutingOperationTypeCostSync || operation.SystemTaskID == "" {
+			return nil, nil
+		}
+		executionState := string(operation.Status)
+		if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRetryWait {
+			executionState = "accepted"
+		}
+		return marshalChannelRoutingOperationPublicResult(struct {
+			TaskStatus     string `json:"task_status"`
+			ExecutionState string `json:"execution_state"`
+		}{TaskStatus: string(operation.Status), ExecutionState: executionState})
+	}
+
+	switch operation.OperationType {
+	case model.RoutingOperationTypeActiveProbe:
+		var result channelrouting.ActiveProbeOperationResult
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(result)
+	case model.RoutingOperationTypeAuditExport:
+		var result model.RoutingAuditExportResult
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(struct {
+			ExportID      string `json:"export_id"`
+			RecordCount   int    `json:"record_count"`
+			ContentBytes  int    `json:"content_bytes"`
+			CreatedTimeMs int64  `json:"created_time_ms"`
+			ExpiresTimeMs int64  `json:"expires_time_ms"`
+		}{
+			ExportID: result.ExportID, RecordCount: result.RecordCount, ContentBytes: result.ContentBytes,
+			CreatedTimeMs: result.CreatedTimeMs, ExpiresTimeMs: result.ExpiresTimeMs,
+		})
+	case model.RoutingOperationTypeBreakerReset:
+		var result struct {
+			Scope      string `json:"scope"`
+			Generation int64  `json:"generation"`
+		}
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(result)
+	case model.RoutingOperationTypeHistoricalSimulation:
+		var result channelrouting.HistoricalSimulationResult
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(channelRoutingSimulationSummary(result))
+	case model.RoutingOperationTypePolicySimulation:
+		var result channelRoutingPolicySimulationOperationResult
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		summary := channelRoutingSimulationSummary(result.Result)
+		summary.TargetBound = result.TargetBound
+		summary.TargetStage = result.TargetStage
+		summary.TargetTrafficBasisPoints = result.TargetTrafficBasisPoints
+		return marshalChannelRoutingOperationPublicResult(summary)
+	case model.RoutingOperationTypePolicyPublish:
+		var result struct {
+			DraftID      int64 `json:"draft_id"`
+			DraftVersion int64 `json:"draft_version"`
+		}
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(result)
+	case model.RoutingOperationTypePolicyRollback:
+		var result struct {
+			SourceRevision int64 `json:"source_revision"`
+		}
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(result)
+	case model.RoutingOperationTypeCostSync:
+		var result struct {
+			TaskStatus     string `json:"task_status,omitempty"`
+			ExecutionState string `json:"execution_state,omitempty"`
+		}
+		if common.Unmarshal(payload, &result) != nil {
+			return nil, model.ErrRoutingOperationInvalid
+		}
+		return marshalChannelRoutingOperationPublicResult(result)
+	default:
+		return nil, nil
+	}
+}
+
+func channelRoutingSimulationSummary(
+	result channelrouting.HistoricalSimulationResult,
+) channelRoutingSimulationOperationSummary {
+	return channelRoutingSimulationOperationSummary{
+		PoolID: result.PoolID, Cursor: result.Cursor, NextCursor: result.NextCursor, Limit: result.Limit,
+		ScannedSamples: result.ScannedSamples, EvaluatedSamples: result.EvaluatedSamples,
+		ActualMatchCount: result.ActualMatchCount, ActualMatchRate: result.ActualMatchRate,
+		SelectionChangedCount: result.SelectionChangedCount, SelectionChangeRate: result.SelectionChangeRate,
+		CostKnownSamples: result.CostKnownSamples, TotalExpectedCostDelta: result.TotalExpectedCostDelta,
+		AverageCostDelta: result.AverageCostDelta, SkipReasons: result.SkipReasons,
+		SimulatedAlgorithm: result.SimulatedAlgorithm, Risk: result.Risk,
+	}
+}
+
+func marshalChannelRoutingOperationPublicResult(value any) (json.RawMessage, error) {
+	encoded, err := common.Marshal(value)
+	if err != nil {
+		return nil, model.ErrRoutingOperationInvalid
+	}
+	return json.RawMessage(encoded), nil
+}
+
 func channelRoutingOperationViewFromModel(operation model.RoutingOperation) (channelRoutingOperationView, error) {
 	view := channelRoutingOperationView{RoutingOperation: operation}
 	payload, err := operation.ResultPayload()
@@ -405,7 +692,7 @@ func channelRoutingOperationViewFromModel(operation model.RoutingOperation) (cha
 	if len(payload) == 0 {
 		if operation.OperationType == model.RoutingOperationTypeCostSync && operation.SystemTaskID != "" {
 			executionState := string(operation.Status)
-			if operation.Status == model.RoutingOperationStatusPending {
+			if operation.Status == model.RoutingOperationStatusPending || operation.Status == model.RoutingOperationStatusRetryWait {
 				executionState = "accepted"
 			}
 			encoded, err := common.Marshal(map[string]string{
@@ -466,12 +753,10 @@ func writeChannelRoutingPolicyControlError(c *gin.Context, err error) {
 		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "policy_revision_conflict", "channel routing policy revision changed", err)
 	case errors.Is(err, model.ErrRoutingOperationIdempotencyConflict):
 		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "idempotency_key_conflict", "Idempotency-Key was already used for a different request", err)
-	case errors.Is(err, model.ErrRoutingPolicyApprovalRequired):
-		writeChannelRoutingPolicyDraftError(c, http.StatusPreconditionFailed, "policy_approval_required", "two distinct approvals are required before rollback", err)
-	case errors.Is(err, model.ErrRoutingPolicyApprovalInvalid):
-		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "policy_approval_invalid", "channel routing policy rollback approval is invalid", err)
 	case errors.Is(err, model.ErrRoutingPolicyReferenceInvalid):
 		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "policy_reference_invalid", "channel routing policy references changed", err)
+	case errors.Is(err, model.ErrRoutingPolicyLegacyRollback):
+		writeChannelRoutingPolicyDraftError(c, http.StatusConflict, "legacy_policy_requires_conversion_draft", "legacy policy history must be converted into a v2 draft before rollback", err)
 	case errors.Is(err, model.ErrRoutingPolicyInvalid), errors.Is(err, model.ErrRoutingOperationInvalid):
 		writeChannelRoutingPolicyDraftError(c, http.StatusBadRequest, "invalid_policy_operation", "invalid channel routing policy operation", err)
 	default:

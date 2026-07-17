@@ -81,9 +81,6 @@ const base: SmartRoutingSetting = {
   active_probe_per_host: 1,
   active_probe_token_budget: 4_096,
   active_probe_cost_budget_usd: 0.25,
-  agent_enabled: false,
-  agent_auto_apply: false,
-  agent_model: 'claude-opus-4-8',
 }
 
 describe('runtime settings form contract', () => {
@@ -120,15 +117,11 @@ describe('runtime settings form contract', () => {
     }
   })
 
-  test('localizes routing modes without translating administrator model IDs', () => {
+  test('localizes routing modes', () => {
     const translate = (key: string) => `translated:${key}`
     assert.equal(
       displayRuntimeSettingValue('mode', 'enterprise_slo', translate),
       'translated:Enterprise SLO'
-    )
-    assert.equal(
-      displayRuntimeSettingValue('agent_model', 'claude-opus-4-8', translate),
-      'claude-opus-4-8'
     )
   })
 

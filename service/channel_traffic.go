@@ -130,7 +130,9 @@ func getRandomSatisfiedChannelForRequest(
 			param.RequestPath,
 			func(channel *model.Channel) bool {
 				return channel != nil &&
-					!routinghotcache.ChannelBalanceUnavailableActive(channel.Id, now) &&
+					!routinghotcache.ChannelBalanceUnavailableActiveForGeneration(
+						channel.Id, channel.RoutingGeneration, now,
+					) &&
 					routingChannelRequestIdentityAdmissible(param.Ctx, group, channel)
 			},
 		)
@@ -149,7 +151,9 @@ func getRandomSatisfiedChannelForRequest(
 		retry,
 		param.RequestPath,
 		func(channel *model.Channel) bool {
-			if channel == nil || routinghotcache.ChannelBalanceUnavailableActive(channel.Id, now) ||
+			if channel == nil || routinghotcache.ChannelBalanceUnavailableActiveForGeneration(
+				channel.Id, channel.RoutingGeneration, now,
+			) ||
 				!routingChannelRequestIdentityAdmissible(param.Ctx, group, channel) {
 				return false
 			}

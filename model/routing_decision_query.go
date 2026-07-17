@@ -12,39 +12,42 @@ var ErrRoutingDecisionQueryInvalid = errors.New("invalid routing decision query"
 const RoutingDecisionReplayProfileMaxLimit = 50
 
 type RoutingDecisionAuditSummary struct {
-	ID                    int     `json:"id"`
-	DecisionID            string  `json:"decision_id"`
-	RequestID             string  `json:"request_id"`
-	PoolID                int     `json:"pool_id"`
-	GroupName             string  `json:"group_name"`
-	ModelName             string  `json:"model_name"`
-	SnapshotRevision      int64   `json:"snapshot_revision"`
-	RuntimeGeneration     int64   `json:"runtime_generation"`
-	ActivationID          int64   `json:"activation_id"`
-	ActivationStage       string  `json:"activation_stage"`
-	TrafficBasisPoints    int     `json:"traffic_basis_points"`
-	Cohort                string  `json:"cohort,omitempty"`
-	AlgorithmVersion      string  `json:"algorithm_version"`
-	RetryIndex            int     `json:"retry_index"`
-	IsStream              bool    `json:"is_stream"`
-	ActualChannelID       int     `json:"actual_channel_id"`
-	ObservedChannelID     int     `json:"observed_channel_id"`
-	SelectedMemberID      int     `json:"selected_member_id"`
-	SelectedCredentialID  int     `json:"selected_credential_id"`
-	CandidateCount        int     `json:"candidate_count"`
-	EligibleCount         int     `json:"eligible_count"`
-	FilteredOpen          int     `json:"filtered_open"`
-	FilteredCapacity      int     `json:"filtered_capacity"`
-	BreakerBypassed       bool    `json:"breaker_bypassed"`
-	ObservedMatchesActual bool    `json:"observed_matches_actual"`
-	DifferenceType        string  `json:"difference_type,omitempty"`
-	ActualCostKnown       bool    `json:"actual_cost_known"`
-	ActualExpectedCost    float64 `json:"actual_expected_cost"`
-	ObservedCostKnown     bool    `json:"observed_cost_known"`
-	ObservedExpectedCost  float64 `json:"observed_expected_cost"`
-	ExpectedCostDelta     float64 `json:"expected_cost_delta"`
-	Replayable            bool    `json:"replayable"`
-	CreatedTime           int64   `json:"created_time"`
+	ID                        int     `json:"id"`
+	DecisionID                string  `json:"decision_id"`
+	RequestID                 string  `json:"request_id"`
+	PoolID                    int     `json:"pool_id"`
+	GroupName                 string  `json:"group_name"`
+	ModelName                 string  `json:"model_name"`
+	SnapshotRevision          int64   `json:"snapshot_revision"`
+	RuntimeGeneration         int64   `json:"runtime_generation"`
+	ActivationID              int64   `json:"activation_id"`
+	ActivationStage           string  `json:"activation_stage"`
+	TrafficBasisPoints        int     `json:"traffic_basis_points"`
+	Cohort                    string  `json:"cohort,omitempty"`
+	AlgorithmVersion          string  `json:"algorithm_version"`
+	RetryIndex                int     `json:"retry_index"`
+	IsStream                  bool    `json:"is_stream"`
+	ActualChannelID           int     `json:"actual_channel_id"`
+	ActualChannelGeneration   string  `json:"actual_channel_generation,omitempty"`
+	ObservedChannelID         int     `json:"observed_channel_id"`
+	ObservedChannelGeneration string  `json:"observed_channel_generation,omitempty"`
+	SelectedMemberID          int     `json:"selected_member_id"`
+	SelectedCredentialID      int     `json:"selected_credential_id"`
+	SelectedChannelGeneration string  `json:"selected_channel_generation,omitempty"`
+	CandidateCount            int     `json:"candidate_count"`
+	EligibleCount             int     `json:"eligible_count"`
+	FilteredOpen              int     `json:"filtered_open"`
+	FilteredCapacity          int     `json:"filtered_capacity"`
+	BreakerBypassed           bool    `json:"breaker_bypassed"`
+	ObservedMatchesActual     bool    `json:"observed_matches_actual"`
+	DifferenceType            string  `json:"difference_type,omitempty"`
+	ActualCostKnown           bool    `json:"actual_cost_known"`
+	ActualExpectedCost        float64 `json:"actual_expected_cost"`
+	ObservedCostKnown         bool    `json:"observed_cost_known"`
+	ObservedExpectedCost      float64 `json:"observed_expected_cost"`
+	ExpectedCostDelta         float64 `json:"expected_cost_delta"`
+	Replayable                bool    `json:"replayable"`
+	CreatedTime               int64   `json:"created_time"`
 }
 
 type RoutingDecisionAuditSummaryFilter struct {
@@ -184,7 +187,8 @@ func routingDecisionAuditSummaryQuery(ctx context.Context) *gorm.DB {
 		"id", "decision_id", "request_id", "pool_id", "group_name", "model_name",
 		"snapshot_revision", "runtime_generation", "activation_id", "activation_stage",
 		"traffic_basis_points", "cohort", "algorithm_version", "retry_index", "is_stream",
-		"actual_channel_id", "observed_channel_id", "selected_member_id", "selected_credential_id",
+		"actual_channel_id", "actual_channel_generation", "observed_channel_id", "observed_channel_generation",
+		"selected_member_id", "selected_credential_id", "selected_channel_generation",
 		"candidate_count", "eligible_count", "filtered_open", "filtered_capacity", "breaker_bypassed",
 		"observed_matches_actual", "difference_type", "actual_cost_known", "actual_expected_cost",
 		"observed_cost_known", "observed_expected_cost", "expected_cost_delta", "replayable", "created_time",

@@ -244,7 +244,9 @@ func TestMigrateRoutingChannelConfigurationsUsesOnlyReliableHistoryAndIsIdempote
 		&RoutingChannelConfigurationOutbox{}, &RoutingControlAudit{},
 	))
 	require.NoError(t, EnsureRoutingConfigurationEpoch(db))
-	manual, err := NewDefaultRoutingChannelConfiguration(604, 100)
+	var manualChannel Channel
+	require.NoError(t, db.Where("id = ?", 604).First(&manualChannel).Error)
+	manual, err := NewDefaultRoutingChannelConfigurationForChannel(manualChannel)
 	require.NoError(t, err)
 	manual.UpstreamCostMultiplier = 3
 	manual.CostSource = RoutingChannelCostSourceManual
@@ -643,7 +645,7 @@ func openRoutingChannelConfigurationTestDB(t *testing.T) *gorm.DB {
 	db := openRoutingSQLiteTestDB(t)
 	withRoutingTestDB(t, db, common.DatabaseTypeSQLite)
 	require.NoError(t, db.AutoMigrate(
-		&Channel{}, &Ability{}, &RoutingConfigurationEpoch{}, &RoutingChannelConfiguration{},
+		&Channel{}, &Ability{}, &RoutingChannelLifecycle{}, &RoutingConfigurationEpoch{}, &RoutingChannelConfiguration{},
 		&RoutingChannelConfigurationOutbox{}, &RoutingControlAudit{},
 	))
 	require.NoError(t, EnsureRoutingConfigurationEpoch(db))

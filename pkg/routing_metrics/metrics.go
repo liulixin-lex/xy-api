@@ -18,18 +18,20 @@ import (
 )
 
 type bucketKey struct {
-	channelID   int
-	apiKeyIndex int
-	modelName   string
-	group       string
-	bucketTs    int64
+	channelID         int
+	channelGeneration string
+	apiKeyIndex       int
+	modelName         string
+	group             string
+	bucketTs          int64
 }
 
 type InflightKey struct {
-	ChannelID   int
-	APIKeyIndex int
-	Model       string
-	Group       string
+	ChannelID         int
+	ChannelGeneration string
+	APIKeyIndex       int
+	Model             string
+	Group             string
 }
 
 type Limits struct {
@@ -337,11 +339,12 @@ func recordBucket(
 
 func recordSnapshot(snapshot model.RoutingChannelMetric) {
 	key := bucketKey{
-		channelID:   snapshot.ChannelID,
-		apiKeyIndex: snapshot.APIKeyIndex,
-		modelName:   snapshot.ModelName,
-		group:       snapshot.Group,
-		bucketTs:    snapshot.BucketTs,
+		channelID:         snapshot.ChannelID,
+		channelGeneration: snapshot.ChannelGeneration,
+		apiKeyIndex:       snapshot.APIKeyIndex,
+		modelName:         snapshot.ModelName,
+		group:             snapshot.Group,
+		bucketTs:          snapshot.BucketTs,
 	}
 	withWritableBucket(key, func(b *bucket) {
 		b.addSnapshotLocked(snapshot)
@@ -684,6 +687,7 @@ func (b *bucket) snapshot(key bucketKey) model.RoutingChannelMetric {
 func (b *bucket) snapshotLocked(key bucketKey) model.RoutingChannelMetric {
 	return model.RoutingChannelMetric{
 		ChannelID:               key.channelID,
+		ChannelGeneration:       key.channelGeneration,
 		APIKeyIndex:             key.apiKeyIndex,
 		ModelName:               key.modelName,
 		Group:                   key.group,
@@ -738,11 +742,19 @@ func inflightKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int) (In
 	if group == "" {
 		group = "default"
 	}
+	channelGeneration := ""
+	if c != nil {
+		channelGeneration = common.GetContextKeyString(c, constant.ContextKeyRoutingGeneration)
+	}
+	if channelGeneration == "" && info.ChannelMeta != nil {
+		channelGeneration = info.ChannelMeta.RoutingGeneration
+	}
 	return InflightKey{
-		ChannelID:   channelID,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       info.OriginModelName,
-		Group:       group,
+		ChannelID:         channelID,
+		ChannelGeneration: channelGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             info.OriginModelName,
+		Group:             group,
 	}, true
 }
 
@@ -783,11 +795,12 @@ func attemptBucketKey(c *gin.Context, info *relaycommon.RelayInfo, channelID int
 		return bucketKey{}, false
 	}
 	return bucketKey{
-		channelID:   key.ChannelID,
-		apiKeyIndex: key.APIKeyIndex,
-		modelName:   key.Model,
-		group:       key.Group,
-		bucketTs:    bucketStart(now.Unix()),
+		channelID:         key.ChannelID,
+		channelGeneration: key.ChannelGeneration,
+		apiKeyIndex:       key.APIKeyIndex,
+		modelName:         key.Model,
+		group:             key.Group,
+		bucketTs:          bucketStart(now.Unix()),
 	}, true
 }
 
@@ -805,6 +818,9 @@ func sortRoutingMetrics(metrics []model.RoutingChannelMetric) {
 		right := metrics[j]
 		if left.ChannelID != right.ChannelID {
 			return left.ChannelID < right.ChannelID
+		}
+		if left.ChannelGeneration != right.ChannelGeneration {
+			return left.ChannelGeneration < right.ChannelGeneration
 		}
 		if left.APIKeyIndex != right.APIKeyIndex {
 			return left.APIKeyIndex < right.APIKeyIndex

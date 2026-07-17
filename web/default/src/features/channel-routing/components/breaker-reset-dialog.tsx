@@ -192,6 +192,7 @@ export function ChannelRoutingBreakerResetDialog(props: {
         queryKey: channelRoutingQueryKeys.operationsRoot(),
       })
     },
+    meta: { handleErrorLocally: true },
   })
   const operationId = response?.operation.id ?? null
   const operationQuery = useQuery({

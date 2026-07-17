@@ -27,6 +27,13 @@ const (
 	RoutingBreakerStateOpen       = "open"
 	RoutingBreakerStateHalfOpen   = "half_open"
 	RoutingBreakerSemanticVersion = 2
+
+	routingChannelMetricLegacyUniqueIndex = "idx_routing_metric_key"
+	routingChannelMetricUniqueIndex       = "idx_routing_metric_generation_key"
+	routingBreakerLegacyUniqueIndex       = "idx_routing_breaker_key"
+	routingBreakerUniqueIndex             = "idx_routing_breaker_generation_key"
+	routingChannelHealthLegacyUniqueIndex = "idx_routing_channel_health_states_channel_id"
+	routingChannelHealthUniqueIndex       = "idx_routing_channel_health_generation"
 )
 
 var (
@@ -119,11 +126,12 @@ func (RoutingCostSnapshot) TableName() string {
 
 type RoutingChannelMetric struct {
 	ID                      int    `json:"id" gorm:"primaryKey"`
-	ChannelID               int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_metric_key,priority:1;index"`
-	APIKeyIndex             int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_metric_key,priority:2"`
-	ModelName               string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_metric_key,priority:3"`
-	Group                   string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_metric_key,priority:4"`
-	BucketTs                int64  `json:"bucket_ts" gorm:"uniqueIndex:idx_routing_metric_key,priority:5;index:idx_routing_metric_bucket_ts"`
+	ChannelID               int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_metric_generation_key,priority:1;index"`
+	ChannelGeneration       string `json:"channel_generation" gorm:"type:varchar(32);uniqueIndex:idx_routing_metric_generation_key,priority:2;index"`
+	APIKeyIndex             int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_metric_generation_key,priority:3"`
+	ModelName               string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_metric_generation_key,priority:4"`
+	Group                   string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_metric_generation_key,priority:5"`
+	BucketTs                int64  `json:"bucket_ts" gorm:"uniqueIndex:idx_routing_metric_generation_key,priority:6;index:idx_routing_metric_bucket_ts"`
 	RequestCount            int64  `json:"request_count"`
 	SuccessCount            int64  `json:"success_count"`
 	ReliabilityRequestCount int64  `json:"reliability_request_count" gorm:"not null;default:0"`
@@ -158,7 +166,8 @@ func UpsertRoutingChannelMetricContext(ctx context.Context, metric *RoutingChann
 	if err != nil {
 		return err
 	}
-	return eligibility.UpsertRoutingChannelMetricContext(ctx, metric)
+	_, _, err = eligibility.UpsertRoutingChannelMetricForChannelContext(ctx, metric, RoutingChannelStateFence{})
+	return err
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metric *RoutingChannelMetric) error {
@@ -166,7 +175,8 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetric(metr
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricContext(ctx context.Context, metric *RoutingChannelMetric) error {
-	return eligibility.upsertRoutingChannelMetric(DB.WithContext(ctx), metric)
+	_, _, err := eligibility.UpsertRoutingChannelMetricForChannelContext(ctx, metric, RoutingChannelStateFence{})
+	return err
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricForChannelContext(
@@ -184,7 +194,8 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingChannelMetricForCh
 			metric.ChannelID, metric.APIKeyIndex,
 		)
 	}
-	return withRoutingChannelStateWrite(ctx, metric.ChannelID, expectedFence, metric.BucketTs, func(tx *gorm.DB) error {
+	return withRoutingChannelStateWrite(ctx, metric.ChannelID, metric.ChannelGeneration, expectedFence, metric.BucketTs, func(tx *gorm.DB, fence RoutingChannelStateFence) error {
+		metric.ChannelGeneration = fence.Generation
 		return eligibility.upsertRoutingChannelMetric(tx, metric)
 	})
 }
@@ -203,6 +214,7 @@ func (eligibility LegacyRoutingStateEligibility) upsertRoutingChannelMetric(db *
 	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "channel_id"},
+			{Name: "channel_generation"},
 			{Name: "api_key_index"},
 			{Name: "model_name"},
 			{Name: "group"},
@@ -243,10 +255,11 @@ func DeleteRoutingMetricsBeforeContext(ctx context.Context, cutoffTs int64) (int
 
 type RoutingBreakerState struct {
 	ID                  int    `json:"id" gorm:"primaryKey"`
-	ChannelID           int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_breaker_key,priority:1;index"`
-	APIKeyIndex         int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_breaker_key,priority:2"`
-	ModelName           string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_breaker_key,priority:3"`
-	Group               string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_breaker_key,priority:4"`
+	ChannelID           int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_breaker_generation_key,priority:1;index"`
+	ChannelGeneration   string `json:"channel_generation" gorm:"type:varchar(32);uniqueIndex:idx_routing_breaker_generation_key,priority:2;index"`
+	APIKeyIndex         int    `json:"api_key_index" gorm:"uniqueIndex:idx_routing_breaker_generation_key,priority:3"`
+	ModelName           string `json:"model_name" gorm:"type:varchar(128);uniqueIndex:idx_routing_breaker_generation_key,priority:4"`
+	Group               string `json:"group" gorm:"column:group;type:varchar(64);uniqueIndex:idx_routing_breaker_generation_key,priority:5"`
 	SemanticVersion     int    `json:"semantic_version" gorm:"index"`
 	ResetGeneration     int64  `json:"reset_generation" gorm:"bigint;index;default:0;not null"`
 	State               string `json:"state" gorm:"type:varchar(32);index"`
@@ -291,7 +304,8 @@ func UpsertRoutingBreakerStateContext(ctx context.Context, state *RoutingBreaker
 	if err != nil {
 		return err
 	}
-	return eligibility.UpsertRoutingBreakerStateContext(ctx, state)
+	_, _, err = eligibility.UpsertRoutingBreakerStateForChannelContext(ctx, state, RoutingChannelStateFence{})
+	return err
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state *RoutingBreakerState) error {
@@ -299,7 +313,8 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerState(state
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateContext(ctx context.Context, state *RoutingBreakerState) error {
-	return eligibility.upsertRoutingBreakerState(DB.WithContext(ctx), state)
+	_, _, err := eligibility.UpsertRoutingBreakerStateForChannelContext(ctx, state, RoutingChannelStateFence{})
+	return err
 }
 
 func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateForChannelContext(
@@ -317,7 +332,8 @@ func (eligibility LegacyRoutingStateEligibility) UpsertRoutingBreakerStateForCha
 			state.ChannelID, state.APIKeyIndex,
 		)
 	}
-	return withRoutingChannelStateWrite(ctx, state.ChannelID, expectedFence, state.UpdatedTime, func(tx *gorm.DB) error {
+	return withRoutingChannelStateWrite(ctx, state.ChannelID, state.ChannelGeneration, expectedFence, state.UpdatedTime, func(tx *gorm.DB, fence RoutingChannelStateFence) error {
+		state.ChannelGeneration = fence.Generation
 		return eligibility.upsertRoutingBreakerState(tx, state)
 	})
 }
@@ -346,7 +362,7 @@ func (eligibility LegacyRoutingStateEligibility) upsertRoutingBreakerState(db *g
 			return err
 		}
 		targetKey, err := routingBreakerResetMemberTargetKey(
-			state.ChannelID, state.APIKeyIndex, state.ModelName, state.Group,
+			state.ChannelID, state.ChannelGeneration, state.APIKeyIndex, state.ModelName, state.Group,
 		)
 		if err != nil {
 			return err
@@ -382,6 +398,7 @@ func (eligibility LegacyRoutingStateEligibility) upsertRoutingBreakerStateLocked
 	}
 	onConflict := clause.OnConflict{Columns: []clause.Column{
 		{Name: "channel_id"},
+		{Name: "channel_generation"},
 		{Name: "api_key_index"},
 		{Name: "model_name"},
 		{Name: "group"},
@@ -429,9 +446,10 @@ func (eligibility LegacyRoutingStateEligibility) upsertRoutingBreakerStateLocked
 func withRoutingChannelStateWrite(
 	ctx context.Context,
 	channelID int,
+	channelGeneration string,
 	expectedFence RoutingChannelStateFence,
 	stateUpdatedTime int64,
-	write func(*gorm.DB) error,
+	write func(*gorm.DB, RoutingChannelStateFence) error,
 ) (RoutingChannelStateFence, bool, error) {
 	if channelID <= 0 || write == nil {
 		return RoutingChannelStateFence{}, false, nil
@@ -459,10 +477,13 @@ func withRoutingChannelStateWrite(
 		if expectedFence.Valid() && expectedFence != fence {
 			return nil
 		}
+		if channelGeneration != "" && channelGeneration != fence.Generation {
+			return nil
+		}
 		if channel.CreatedTime > 0 && stateUpdatedTime <= channel.CreatedTime {
 			return nil
 		}
-		if err := write(tx); err != nil {
+		if err := write(tx, fence); err != nil {
 			return err
 		}
 		stateAccepted = true
@@ -502,7 +523,13 @@ func GetRoutingBreakerStatesForHydrationPageContext(ctx context.Context, limit i
 		limit = 5000
 	}
 	var states []RoutingBreakerState
-	query := DB.WithContext(ctx).Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex)
+	query := DB.WithContext(ctx).
+		Where("semantic_version = ? AND api_key_index = ?", RoutingBreakerSemanticVersion, RoutingMetricSingleKeyIndex).
+		Where(`EXISTS (
+			SELECT 1 FROM channels
+			WHERE channels.id = routing_breaker_states.channel_id
+				AND channels.routing_generation = routing_breaker_states.channel_generation
+		)`)
 	if cutoffUpdatedTime > 0 {
 		query = query.Where("updated_time >= ?", cutoffUpdatedTime)
 	}
@@ -518,7 +545,8 @@ func GetRoutingBreakerStatesForHydrationPageContext(ctx context.Context, limit i
 
 type RoutingChannelHealthState struct {
 	ID                int    `json:"id" gorm:"primaryKey"`
-	ChannelID         int    `json:"channel_id" gorm:"uniqueIndex;not null"`
+	ChannelID         int    `json:"channel_id" gorm:"uniqueIndex:idx_routing_channel_health_generation,priority:1;not null"`
+	ChannelGeneration string `json:"channel_generation" gorm:"type:varchar(32);uniqueIndex:idx_routing_channel_health_generation,priority:2;index"`
 	AuthFailure       bool   `json:"auth_failure"`
 	AuthFailureReason string `json:"auth_failure_reason" gorm:"type:varchar(128)"`
 	AuthFailureUntil  int64  `json:"auth_failure_until" gorm:"bigint;index"`
@@ -556,18 +584,37 @@ func UpsertRoutingChannelAuthFailureContext(ctx context.Context, channelID int, 
 	if until <= 0 {
 		until = now
 	}
-	return upsertRoutingChannelAuthFailureDB(DB.WithContext(ctx), channelID, marked, reason, until, now)
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		query := tx.Select("id", "routing_generation").Where("id = ?", channelID)
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&channel).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if !validRoutingIdentity(channel.RoutingGeneration) {
+			return nil
+		}
+		return upsertRoutingChannelAuthFailureDB(
+			tx.WithContext(ctx), channelID, channel.RoutingGeneration, marked, reason, until, now,
+		)
+	})
 }
 
 func ApplyRoutingChannelProbeAuthStateContext(
 	ctx context.Context,
 	channelID int,
+	channelGeneration string,
 	credentialID int,
 	marked bool,
 	reason string,
 	until int64,
 ) (bool, error) {
-	if channelID <= 0 || credentialID <= 0 {
+	if channelID <= 0 || !validRoutingIdentity(channelGeneration) || credentialID <= 0 {
 		return false, nil
 	}
 	if ctx == nil {
@@ -583,12 +630,15 @@ func ApplyRoutingChannelProbeAuthStateContext(
 			}
 			return err
 		}
-		if channel.Status != common.ChannelStatusEnabled || channel.ChannelInfo.IsMultiKey || channel.Key == "" {
+		if channel.RoutingGeneration != channelGeneration || channel.Status != common.ChannelStatusEnabled ||
+			channel.ChannelInfo.IsMultiKey || channel.Key == "" {
 			return nil
 		}
 		var credential RoutingCredentialRef
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND channel_id = ? AND active = ?", credentialID, channelID, true).
+			Where("id = ? AND channel_id = ? AND channel_generation = ? AND active = ?",
+				credentialID, channelID, channelGeneration, true,
+			).
 			First(&credential).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
@@ -609,7 +659,9 @@ func ApplyRoutingChannelProbeAuthStateContext(
 		} else if until <= 0 {
 			until = now
 		}
-		if err := upsertRoutingChannelAuthFailureDB(tx.WithContext(ctx), channelID, marked, reason, until, now); err != nil {
+		if err := upsertRoutingChannelAuthFailureDB(
+			tx.WithContext(ctx), channelID, channelGeneration, marked, reason, until, now,
+		); err != nil {
 			return err
 		}
 		applied = true
@@ -621,13 +673,14 @@ func ApplyRoutingChannelProbeAuthStateContext(
 func upsertRoutingChannelAuthFailureDB(
 	db *gorm.DB,
 	channelID int,
+	channelGeneration string,
 	marked bool,
 	reason string,
 	until int64,
 	updatedTime int64,
 ) error {
 	return db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "channel_id"}},
+		Columns: []clause.Column{{Name: "channel_id"}, {Name: "channel_generation"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"auth_failure":        marked,
 			"auth_failure_reason": reason,
@@ -636,6 +689,7 @@ func upsertRoutingChannelAuthFailureDB(
 		}),
 	}).Create(&RoutingChannelHealthState{
 		ChannelID:         channelID,
+		ChannelGeneration: channelGeneration,
 		AuthFailure:       marked,
 		AuthFailureReason: reason,
 		AuthFailureUntil:  until,
@@ -657,51 +711,30 @@ func ClearRoutingChannelAuthFailureContext(ctx context.Context, channelID int, u
 	if updatedTime <= 0 {
 		updatedTime = common.GetTimestamp()
 	}
-	return DB.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "channel_id"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{
-			"auth_failure":        false,
-			"auth_failure_reason": "",
-			"auth_failure_until":  int64(0),
-			"updated_time":        updatedTime,
-		}),
-	}).Create(&RoutingChannelHealthState{
-		ChannelID:   channelID,
-		UpdatedTime: updatedTime,
-	}).Error
-}
-
-type RoutingAgentRecommendation struct {
-	ID           int    `json:"id" gorm:"primaryKey"`
-	Type         string `json:"type" gorm:"type:varchar(64);index"`
-	TargetJSON   string `json:"target_json" gorm:"type:text"`
-	ProposedJSON string `json:"proposed_json" gorm:"type:text"`
-	Rationale    string `json:"rationale" gorm:"type:text"`
-	Severity     string `json:"severity" gorm:"type:varchar(32);index"`
-	Status       string `json:"status" gorm:"type:varchar(32);index"`
-	AppliedBy    *int   `json:"applied_by"`
-	CreatedTime  int64  `json:"created_time" gorm:"bigint;index"`
-	UpdatedTime  int64  `json:"updated_time" gorm:"bigint;index"`
-}
-
-func (RoutingAgentRecommendation) TableName() string {
-	return "routing_agent_recommendations"
-}
-
-func (recommendation *RoutingAgentRecommendation) BeforeCreate(_ *gorm.DB) error {
-	now := common.GetTimestamp()
-	if recommendation.CreatedTime == 0 {
-		recommendation.CreatedTime = now
-	}
-	if recommendation.UpdatedTime == 0 {
-		recommendation.UpdatedTime = now
-	}
-	return nil
-}
-
-func (recommendation *RoutingAgentRecommendation) BeforeUpdate(_ *gorm.DB) error {
-	recommendation.UpdatedTime = common.GetTimestamp()
-	return nil
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var channel Channel
+		query := tx.Select("id", "routing_generation").Where("id = ?", channelID)
+		if tx.Dialector.Name() != string(common.DatabaseTypeSQLite) {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&channel).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		return tx.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "channel_id"}, {Name: "channel_generation"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"auth_failure":        false,
+				"auth_failure_reason": "",
+				"auth_failure_until":  int64(0),
+				"updated_time":        updatedTime,
+			}),
+		}).Create(&RoutingChannelHealthState{
+			ChannelID: channelID, ChannelGeneration: channel.RoutingGeneration, UpdatedTime: updatedTime,
+		}).Error
+	})
 }
 
 type RoutingJSONMap map[string]any

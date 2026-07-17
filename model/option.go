@@ -317,6 +317,8 @@ func UpdateOptionsBulk(values map[string]string) error {
 		return left < right
 	})
 
+	pricingChanged := routingPricingOptionsChanged(values)
+	pricingVersion := RoutingPricingVersion{}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for _, key := range keys {
 			option := Option{Key: key, Value: values[key]}
@@ -328,12 +330,21 @@ func UpdateOptionsBulk(values map[string]string) error {
 				return err
 			}
 		}
+		if pricingChanged {
+			if err := reconcileRoutingPricingVersionIfPresentTx(tx, common.GetTimestamp()); err != nil {
+				return err
+			}
+			if tx.Migrator().HasTable(&RoutingPricingVersion{}) {
+				if err := tx.Where("id = ?", routingPricingVersionID).First(&pricingVersion).Error; err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-
 	optionCommitPublishMu.Lock()
 	defer optionCommitPublishMu.Unlock()
 	options, err := AllOption()
@@ -433,6 +444,10 @@ func UpdateOptionsBulk(values map[string]string) error {
 		if err := updateOptionMap(k, v); err != nil {
 			return err
 		}
+	}
+	if pricingChanged {
+		NotifyRoutingTopologyChanged()
+		notifyRoutingPricingChanged(pricingVersion)
 	}
 	return nil
 }

@@ -35,6 +35,7 @@ type RoutingProbeResult struct {
 	PoolID             int    `json:"pool_id" gorm:"index;not null"`
 	MemberID           int    `json:"member_id" gorm:"index;not null"`
 	ChannelID          int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration  string `json:"channel_generation" gorm:"type:varchar(32);index"`
 	CredentialID       int    `json:"credential_id" gorm:"index;not null"`
 	GroupName          string `json:"group_name" gorm:"type:varchar(64);index;not null"`
 	ModelName          string `json:"model_name" gorm:"type:varchar(128);index;not null"`
@@ -105,6 +106,23 @@ func CreateRoutingProbeResultContext(
 			currentLease.LeaseUntilMs < result.FinishedTimeMs {
 			return ErrRoutingControlLeaseLost
 		}
+		if routingGenerationFencingAvailable(tx) {
+			active, err := routingChannelGenerationBindingActiveTx(
+				ctx,
+				tx,
+				result.PoolID,
+				result.MemberID,
+				result.ChannelID,
+				result.ChannelGeneration,
+				result.CredentialID,
+			)
+			if err != nil {
+				return err
+			}
+			if !active {
+				return nil
+			}
+		}
 
 		create := tx.WithContext(ctx).Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "probe_id"}},
@@ -122,7 +140,8 @@ func CreateRoutingProbeResultContext(
 		if err := tx.WithContext(ctx).Where("probe_id = ?", result.ProbeID).First(&existing).Error; err != nil {
 			return err
 		}
-		if existing.TargetKey != result.TargetKey || existing.LeaseFencingToken != result.LeaseFencingToken ||
+		if existing.TargetKey != result.TargetKey || existing.ChannelGeneration != result.ChannelGeneration ||
+			existing.LeaseFencingToken != result.LeaseFencingToken ||
 			existing.NodeEpochID != result.NodeEpochID {
 			return ErrRoutingProbeResultConflict
 		}
@@ -203,7 +222,9 @@ func validateRoutingProbeResult(lease RoutingControlLease, result RoutingProbeRe
 		len(lease.LeaseToken) != 32 || lease.FencingToken <= 0 || result.LeaseFencingToken != lease.FencingToken ||
 		result.NodeEpochID != lease.HolderID || len(result.ProbeID) != 64 || len(result.TargetKey) != 64 ||
 		result.ProbeType != RoutingProbeTypeServing || result.SnapshotRevision <= 0 || result.PoolID <= 0 ||
-		result.MemberID <= 0 || result.ChannelID <= 0 || result.CredentialID < 0 ||
+		result.MemberID <= 0 || result.ChannelID <= 0 ||
+		(routingGenerationFencingAvailable(DB) && !validRoutingIdentity(result.ChannelGeneration)) ||
+		result.CredentialID < 0 ||
 		!validRoutingProbeText(result.GroupName, 64, false) || !validRoutingProbeText(result.ModelName, 128, false) ||
 		!validRoutingProbeText(result.EndpointHost, 255, false) || !validRoutingProbeText(result.EndpointAuthority, 320, false) ||
 		!validRoutingProbeText(result.Region, 64, false) || !validRoutingProbeText(result.BreakerScope, 16, false) ||

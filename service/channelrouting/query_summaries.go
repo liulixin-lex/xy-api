@@ -13,6 +13,8 @@ const (
 
 type ChannelSnapshotSummary struct {
 	ID                     int                       `json:"id"`
+	RoutingIdentity        string                    `json:"routing_identity"`
+	RoutingGeneration      string                    `json:"routing_generation"`
 	Name                   string                    `json:"name"`
 	Type                   int                       `json:"type"`
 	Status                 int                       `json:"status"`
@@ -48,6 +50,8 @@ type CostSnapshotSummary struct {
 	GroupName              string   `json:"group_name"`
 	MemberID               int      `json:"member_id"`
 	ChannelID              int      `json:"channel_id"`
+	RoutingIdentity        string   `json:"routing_identity"`
+	RoutingGeneration      string   `json:"routing_generation"`
 	ChannelName            string   `json:"channel_name"`
 	ModelName              string   `json:"model_name"`
 	Known                  bool     `json:"known"`
@@ -163,7 +167,9 @@ func ListChannelSnapshotSummaries(
 		credentialEnd := min(ChannelSummaryCredentialLimit, len(channel.CredentialIDs))
 		modelEnd := min(ChannelSummaryModelLimit, len(channel.ModelNames))
 		items = append(items, ChannelSnapshotSummary{
-			ID: channel.ID, Name: channel.Name, Type: channel.Type, Status: channel.Status,
+			ID: channel.ID, RoutingIdentity: channel.RoutingIdentity,
+			RoutingGeneration: channel.RoutingGeneration,
+			Name:              channel.Name, Type: channel.Type, Status: channel.Status,
 			Endpoint: channel.Endpoint, EndpointAuthority: authority, Region: region,
 			EndpointState: endpointStates[authority+"\x00"+region], MultiKey: channel.MultiKey,
 			CredentialCount: len(channel.CredentialIDs), CredentialsTruncated: credentialEnd < len(channel.CredentialIDs),
@@ -217,7 +223,9 @@ func ListCostSnapshotSummaries(
 					continue
 				}
 				if total >= offset && len(items) < limit {
-					items = append(items, costSnapshotSummary(pool, member, observation))
+					items = append(items, costSnapshotSummary(
+						pool, member, routingIdentityForSnapshotMember(snapshot, member), observation,
+					))
 				}
 				total++
 			}
@@ -248,7 +256,9 @@ func GetCostSnapshotDetail(
 		for modelIndex := range member.Models {
 			observation := member.Models[modelIndex]
 			if observation.ModelName == modelName {
-				return costSnapshotDetail(pool, member, observation), snapshotMetadata(snapshot.view), true
+				return costSnapshotDetail(
+					pool, member, routingIdentityForSnapshotMember(snapshot, member), observation,
+				), snapshotMetadata(snapshot.view), true
 			}
 		}
 		return CostSnapshotItem{}, snapshotMetadata(snapshot.view), false
@@ -256,9 +266,15 @@ func GetCostSnapshotDetail(
 	return CostSnapshotItem{}, snapshotMetadata(snapshot.view), false
 }
 
-func costSnapshotSummary(pool PoolSnapshot, member PoolMemberSnapshot, observation ModelSnapshot) CostSnapshotSummary {
+func costSnapshotSummary(
+	pool PoolSnapshot,
+	member PoolMemberSnapshot,
+	routingIdentity string,
+	observation ModelSnapshot,
+) CostSnapshotSummary {
 	item := CostSnapshotSummary{
 		PoolID: pool.ID, GroupName: pool.GroupName, MemberID: member.ID, ChannelID: member.ChannelID,
+		RoutingIdentity: routingIdentity, RoutingGeneration: member.ChannelGeneration,
 		ChannelName: member.ChannelName, ModelName: observation.ModelName,
 		Known: observation.CostKnown || observation.CostPricing != nil, Cost: observation.Cost,
 		BillingMode: observation.CostBillingMode,
@@ -299,11 +315,17 @@ func costSnapshotSummary(pool PoolSnapshot, member PoolMemberSnapshot, observati
 	return item
 }
 
-func costSnapshotDetail(pool PoolSnapshot, member PoolMemberSnapshot, observation ModelSnapshot) CostSnapshotItem {
-	summary := costSnapshotSummary(pool, member, observation)
+func costSnapshotDetail(
+	pool PoolSnapshot,
+	member PoolMemberSnapshot,
+	routingIdentity string,
+	observation ModelSnapshot,
+) CostSnapshotItem {
+	summary := costSnapshotSummary(pool, member, routingIdentity, observation)
 	item := CostSnapshotItem{
 		PoolID: summary.PoolID, GroupName: summary.GroupName, MemberID: summary.MemberID,
-		ChannelID: summary.ChannelID, ChannelName: summary.ChannelName, ModelName: summary.ModelName,
+		ChannelID: summary.ChannelID, RoutingIdentity: summary.RoutingIdentity,
+		RoutingGeneration: summary.RoutingGeneration, ChannelName: summary.ChannelName, ModelName: summary.ModelName,
 		Known: summary.Known, Cost: summary.Cost, Currency: summary.Currency, Unit: summary.Unit,
 		Version: summary.Version, PricingVersion: summary.PricingVersion,
 		PricingIdentity: summary.PricingIdentity, UnknownReason: summary.UnknownReason,

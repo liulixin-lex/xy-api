@@ -35,6 +35,7 @@ type RoutingBreakerResetTarget struct {
 	PoolID            int    `json:"pool_id,omitempty"`
 	MemberID          int    `json:"member_id,omitempty"`
 	ChannelID         int    `json:"channel_id,omitempty"`
+	ChannelGeneration string `json:"channel_generation,omitempty"`
 	APIKeyIndex       int    `json:"api_key_index,omitempty"`
 	ModelName         string `json:"model_name,omitempty"`
 	GroupName         string `json:"group_name,omitempty"`
@@ -53,6 +54,7 @@ type RoutingBreakerResetCommand struct {
 	PoolID            int    `json:"pool_id" gorm:"index;not null"`
 	MemberID          int    `json:"member_id" gorm:"index;not null"`
 	ChannelID         int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration string `json:"channel_generation" gorm:"type:varchar(32);index"`
 	APIKeyIndex       int    `json:"api_key_index" gorm:"not null"`
 	ModelName         string `json:"model_name" gorm:"type:varchar(128);not null"`
 	GroupName         string `json:"group_name" gorm:"type:varchar(64);not null"`
@@ -77,6 +79,7 @@ type RoutingBreakerResetTombstone struct {
 	PoolID            int    `json:"pool_id" gorm:"index;not null"`
 	MemberID          int    `json:"member_id" gorm:"index;not null"`
 	ChannelID         int    `json:"channel_id" gorm:"index;not null"`
+	ChannelGeneration string `json:"channel_generation" gorm:"type:varchar(32);index"`
 	APIKeyIndex       int    `json:"api_key_index" gorm:"not null"`
 	ModelName         string `json:"model_name" gorm:"type:varchar(128);not null"`
 	GroupName         string `json:"group_name" gorm:"type:varchar(64);not null"`
@@ -386,8 +389,9 @@ func ExecuteRoutingBreakerResetOperationContext(
 		)
 		if target.Scope == RoutingBreakerResetScopeMember {
 			result := tx.WithContext(ctx).Where(&RoutingBreakerState{
-				ChannelID: target.ChannelID, APIKeyIndex: target.APIKeyIndex,
-				ModelName: target.ModelName, Group: target.GroupName,
+				ChannelID: target.ChannelID, ChannelGeneration: target.ChannelGeneration,
+				APIKeyIndex: target.APIKeyIndex,
+				ModelName:   target.ModelName, Group: target.GroupName,
 			}).Delete(&RoutingBreakerState{})
 			if result.Error != nil {
 				return result.Error
@@ -697,8 +701,9 @@ func DeleteCompletedRoutingBreakerResetCommandsBeforeContext(
 func (command RoutingBreakerResetCommand) Target() RoutingBreakerResetTarget {
 	return RoutingBreakerResetTarget{
 		Scope: command.Scope, PoolID: command.PoolID, MemberID: command.MemberID,
-		ChannelID: command.ChannelID, APIKeyIndex: command.APIKeyIndex,
-		ModelName: command.ModelName, GroupName: command.GroupName,
+		ChannelID: command.ChannelID, ChannelGeneration: command.ChannelGeneration,
+		APIKeyIndex: command.APIKeyIndex,
+		ModelName:   command.ModelName, GroupName: command.GroupName,
 		EndpointHost: command.EndpointHost, EndpointAuthority: command.EndpointAuthority, Region: command.Region,
 	}
 }
@@ -706,8 +711,9 @@ func (command RoutingBreakerResetCommand) Target() RoutingBreakerResetTarget {
 func (tombstone RoutingBreakerResetTombstone) Target() RoutingBreakerResetTarget {
 	return RoutingBreakerResetTarget{
 		Scope: tombstone.Scope, PoolID: tombstone.PoolID, MemberID: tombstone.MemberID,
-		ChannelID: tombstone.ChannelID, APIKeyIndex: tombstone.APIKeyIndex,
-		ModelName: tombstone.ModelName, GroupName: tombstone.GroupName,
+		ChannelID: tombstone.ChannelID, ChannelGeneration: tombstone.ChannelGeneration,
+		APIKeyIndex: tombstone.APIKeyIndex,
+		ModelName:   tombstone.ModelName, GroupName: tombstone.GroupName,
 		EndpointHost: tombstone.EndpointHost, EndpointAuthority: tombstone.EndpointAuthority, Region: tombstone.Region,
 	}
 }
@@ -790,8 +796,8 @@ func routingBreakerResetMemberTargetCurrentTx(
 	}
 	var memberCount int64
 	if err := tx.WithContext(ctx).Model(&RoutingPolicyMemberRevision{}).
-		Where("revision = ? AND pool_id = ? AND member_id = ? AND channel_id = ?",
-			operation.ExpectedRevision, target.PoolID, target.MemberID, target.ChannelID,
+		Where("revision = ? AND pool_id = ? AND member_id = ? AND channel_id = ? AND routing_generation = ?",
+			operation.ExpectedRevision, target.PoolID, target.MemberID, target.ChannelID, target.ChannelGeneration,
 		).
 		Count(&memberCount).Error; err != nil {
 		return false, err
@@ -911,13 +917,14 @@ func normalizeRoutingBreakerResetTarget(target RoutingBreakerResetTarget) (Routi
 	switch target.Scope {
 	case RoutingBreakerResetScopeMember:
 		if target.PoolID <= 0 || target.MemberID <= 0 || target.ChannelID <= 0 || target.APIKeyIndex != RoutingMetricSingleKeyIndex ||
+			(target.ChannelGeneration != "" && !validRoutingIdentity(target.ChannelGeneration)) ||
 			!validText(target.ModelName, 128, false) || !validText(target.GroupName, 64, false) ||
 			target.EndpointHost != "" || target.EndpointAuthority != "" || target.Region != "" {
 			return RoutingBreakerResetTarget{}, "", ErrRoutingBreakerResetInvalid
 		}
 	case RoutingBreakerResetScopeEndpoint:
 		if target.PoolID != 0 || target.MemberID != 0 || target.ChannelID != 0 || target.APIKeyIndex != 0 ||
-			target.ModelName != "" || target.GroupName != "" ||
+			target.ChannelGeneration != "" || target.ModelName != "" || target.GroupName != "" ||
 			!validText(target.EndpointHost, 255, false) || !validText(target.EndpointAuthority, 320, false) ||
 			!validText(target.Region, 64, false) {
 			return RoutingBreakerResetTarget{}, "", ErrRoutingBreakerResetInvalid
@@ -931,7 +938,7 @@ func normalizeRoutingBreakerResetTarget(target RoutingBreakerResetTarget) (Routi
 		targetKey, err = routingBreakerResetEndpointTargetKey(target.EndpointAuthority, target.Region)
 	} else {
 		targetKey, err = routingBreakerResetMemberTargetKey(
-			target.ChannelID, target.APIKeyIndex, target.ModelName, target.GroupName,
+			target.ChannelID, target.ChannelGeneration, target.APIKeyIndex, target.ModelName, target.GroupName,
 		)
 	}
 	if err != nil {
@@ -940,23 +947,33 @@ func normalizeRoutingBreakerResetTarget(target RoutingBreakerResetTarget) (Routi
 	return target, targetKey, nil
 }
 
-func routingBreakerResetMemberTargetKey(channelID int, apiKeyIndex int, modelName string, groupName string) (string, error) {
+func routingBreakerResetMemberTargetKey(
+	channelID int,
+	channelGeneration string,
+	apiKeyIndex int,
+	modelName string,
+	groupName string,
+) (string, error) {
 	modelName = strings.TrimSpace(modelName)
 	groupName = strings.TrimSpace(groupName)
-	if channelID <= 0 || apiKeyIndex != RoutingMetricSingleKeyIndex || modelName == "" || groupName == "" ||
+	if channelID <= 0 || (channelGeneration != "" && !validRoutingIdentity(channelGeneration)) ||
+		apiKeyIndex != RoutingMetricSingleKeyIndex ||
+		modelName == "" || groupName == "" ||
 		utf8.RuneCountInString(modelName) > 128 || utf8.RuneCountInString(groupName) > 64 ||
 		!utf8.ValidString(modelName) || !utf8.ValidString(groupName) {
 		return "", ErrRoutingBreakerResetInvalid
 	}
 	canonical, err := common.Marshal(struct {
-		Scope       string `json:"scope"`
-		ChannelID   int    `json:"channel_id"`
-		APIKeyIndex int    `json:"api_key_index"`
-		ModelName   string `json:"model_name"`
-		GroupName   string `json:"group_name"`
+		Scope             string `json:"scope"`
+		ChannelID         int    `json:"channel_id"`
+		ChannelGeneration string `json:"channel_generation,omitempty"`
+		APIKeyIndex       int    `json:"api_key_index"`
+		ModelName         string `json:"model_name"`
+		GroupName         string `json:"group_name"`
 	}{
-		Scope: RoutingBreakerResetScopeMember, ChannelID: channelID, APIKeyIndex: apiKeyIndex,
-		ModelName: modelName, GroupName: groupName,
+		Scope: RoutingBreakerResetScopeMember, ChannelID: channelID, ChannelGeneration: channelGeneration,
+		APIKeyIndex: apiKeyIndex,
+		ModelName:   modelName, GroupName: groupName,
 	})
 	if err != nil {
 		return "", err
@@ -996,7 +1013,8 @@ func routingBreakerResetCommandFromTarget(
 		LegacyBreakerID: legacyBreakerID, LegacyGeneration: legacyGeneration,
 		Scope:  target.Scope,
 		PoolID: target.PoolID, MemberID: target.MemberID, ChannelID: target.ChannelID,
-		APIKeyIndex: target.APIKeyIndex, ModelName: target.ModelName, GroupName: target.GroupName,
+		ChannelGeneration: target.ChannelGeneration,
+		APIKeyIndex:       target.APIKeyIndex, ModelName: target.ModelName, GroupName: target.GroupName,
 		EndpointHost: target.EndpointHost, EndpointAuthority: target.EndpointAuthority, Region: target.Region,
 		CreatedTimeMs: nowMs,
 	}
@@ -1010,7 +1028,8 @@ func routingBreakerResetTombstoneFromTarget(
 	return RoutingBreakerResetTombstone{
 		TargetKey: targetKey, Scope: target.Scope,
 		PoolID: target.PoolID, MemberID: target.MemberID, ChannelID: target.ChannelID,
-		APIKeyIndex: target.APIKeyIndex, ModelName: target.ModelName, GroupName: target.GroupName,
+		ChannelGeneration: target.ChannelGeneration,
+		APIKeyIndex:       target.APIKeyIndex, ModelName: target.ModelName, GroupName: target.GroupName,
 		EndpointHost: target.EndpointHost, EndpointAuthority: target.EndpointAuthority, Region: target.Region,
 		CreatedTimeMs: nowMs, UpdatedTimeMs: nowMs,
 	}

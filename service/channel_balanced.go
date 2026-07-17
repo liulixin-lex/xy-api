@@ -285,8 +285,9 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 			SnapshotStaleSec: plan.Policy.SnapshotStaleSec,
 		}
 		probeKey := routingbreaker.Key{
-			ChannelID: selected.Id, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model: param.ModelName, Group: group,
+			ChannelID: selected.Id, ChannelGeneration: selected.RoutingGeneration,
+			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model:       param.ModelName, Group: group,
 		}
 		if plan.SelectedBreakerScope == channelrouting.BreakerScopeEndpoint {
 			probeKey = routingbreaker.NewEndpointKey(plan.SelectedEndpointAuthority, plan.SelectedRegion)
@@ -444,7 +445,8 @@ func selectChannelRoutingBalancedForGroupWithRequirement(
 		}
 		SetSelectedRoutingIdentity(param.Ctx, SelectedRoutingIdentity{
 			ChannelID: selected.Id, SnapshotRevision: plan.SelectedIdentity.SnapshotRevision,
-			PoolID: plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID,
+			ChannelGeneration: plan.SelectedIdentity.ChannelGeneration,
+			PoolID:            plan.SelectedIdentity.PoolID, MemberID: plan.SelectedIdentity.MemberID,
 			CredentialID:      plan.SelectedIdentity.CredentialID,
 			FailureDomainHash: plan.SelectedIdentity.FailureDomainHash,
 		})
@@ -473,14 +475,16 @@ func channelRoutingBalancedRuntimeByChannelID(
 			continue
 		}
 		key := routinghotcache.Key{
-			ChannelID: channelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			Model: modelName, Group: group,
+			ChannelID: channelID, ChannelGeneration: identity.ChannelGeneration,
+			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			Model:       modelName, Group: group,
 		}
 		state := routingselector.BalancedRuntimeState{
 			Inflight: routingmetrics.StableInflightCount(routingmetrics.StableInflightKey{
-				PoolMemberID: identity.MemberID,
-				CredentialID: identity.CredentialID,
-				Model:        modelName,
+				PoolMemberID:      identity.MemberID,
+				CredentialID:      identity.CredentialID,
+				ChannelGeneration: identity.ChannelGeneration,
+				Model:             modelName,
 			}),
 			HasInflight: true,
 		}

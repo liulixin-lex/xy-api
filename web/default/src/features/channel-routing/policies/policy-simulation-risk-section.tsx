@@ -27,8 +27,8 @@ function simulationRiskStateLabel(
   translate: (key: string) => string
 ): string {
   if (state === 'pass') return translate('Passed')
-  if (state === 'fail') return translate('Blocked')
-  return translate('Needs review')
+  if (state === 'fail') return translate('Risk found')
+  return translate('Evidence limited')
 }
 
 function simulationRiskReasonLabel(
@@ -76,10 +76,12 @@ export function ChannelRoutingPolicySimulationRiskSection(props: {
       ].filter((item) => Number(item[1]) > 0)
     : []
   let description = t(
-    'Evidence is incomplete. Review the unknown items before publishing.'
+    'Evidence is incomplete. Publishing remains available, but the result should not be treated as proof of safety.'
   )
   if (state === 'fail') {
-    description = t('Publishing is blocked by confirmed SLO or capacity risk.')
+    description = t(
+      'A matching known failure requires explicit risk acceptance before publishing.'
+    )
   } else if (state === 'pass') {
     description = t('The simulated change passed all available risk checks.')
   }
@@ -106,7 +108,9 @@ export function ChannelRoutingPolicySimulationRiskSection(props: {
 
       {!risk ? (
         <p className='border-border bg-muted/40 text-muted-foreground rounded-md border px-3 py-2 text-sm'>
-          {t('No simulation risk result is available for this draft.')}
+          {t(
+            'No matching simulation result is available. Simulation is optional and publishing remains available.'
+          )}
         </p>
       ) : (
         <>

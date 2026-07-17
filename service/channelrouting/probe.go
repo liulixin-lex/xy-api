@@ -51,6 +51,7 @@ type ActiveProbeTarget struct {
 	PoolID               int
 	MemberID             int
 	ChannelID            int
+	ChannelGeneration    string
 	CredentialID         int
 	GroupName            string
 	ModelName            string
@@ -570,6 +571,7 @@ func validateActiveProbeTarget(target ActiveProbeTarget) error {
 	snapshot := currentSnapshot.Load()
 	if snapshot == nil || snapshot.view.Revision != target.SnapshotRevision ||
 		target.PoolID <= 0 || target.MemberID <= 0 || target.ChannelID <= 0 ||
+		(target.ChannelGeneration != "" && !validSnapshotGeneration(target.ChannelGeneration)) ||
 		target.GroupName == "" || target.ModelName == "" {
 		return ErrActiveProbeTargetStale
 	}
@@ -582,7 +584,8 @@ func validateActiveProbeTarget(target ActiveProbeTarget) error {
 		return ErrActiveProbeTargetStale
 	}
 	channel, exists := snapshot.channelByID[target.ChannelID]
-	if !exists || channel.Status != common.ChannelStatusEnabled || channel.MultiKey != target.MultiKey ||
+	if !exists || channel.RoutingGeneration != target.ChannelGeneration ||
+		channel.Status != common.ChannelStatusEnabled || channel.MultiKey != target.MultiKey ||
 		EndpointHost(channel.Endpoint, channel.ID) != target.EndpointHost ||
 		EndpointAuthority(channel.Endpoint, channel.ID) != target.EndpointAuthority ||
 		RoutingRegion() != target.Region {
@@ -684,6 +687,7 @@ func currentActiveProbeTargets(setting smart_routing_setting.SmartRoutingSetting
 						PoolID:               pool.ID,
 						MemberID:             member.ID,
 						ChannelID:            member.ChannelID,
+						ChannelGeneration:    member.ChannelGeneration,
 						CredentialID:         credentialID,
 						GroupName:            pool.GroupName,
 						ModelName:            observation.ModelName,
@@ -767,6 +771,7 @@ func activeProbeResult(
 		PoolID:             target.PoolID,
 		MemberID:           target.MemberID,
 		ChannelID:          target.ChannelID,
+		ChannelGeneration:  target.ChannelGeneration,
 		CredentialID:       target.CredentialID,
 		GroupName:          target.GroupName,
 		ModelName:          target.ModelName,
@@ -839,10 +844,11 @@ func applyActiveProbeBreakerOutcome(
 		routingbreaker.RecordActiveProbeSuccess(endpointKey)
 	}
 	key := routingbreaker.Key{
-		ChannelID:   target.ChannelID,
-		APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-		Model:       target.ModelName,
-		Group:       target.GroupName,
+		ChannelID:         target.ChannelID,
+		ChannelGeneration: target.ChannelGeneration,
+		APIKeyIndex:       model.RoutingMetricSingleKeyIndex,
+		Model:             target.ModelName,
+		Group:             target.GroupName,
 	}
 	if outcome == model.RoutingProbeOutcomeSuccess {
 		if target.CredentialID > 0 {
@@ -852,10 +858,12 @@ func applyActiveProbeBreakerOutcome(
 		if target.MultiKey {
 			return nil
 		}
-		_, cachedAuthFailure := routinghotcache.GetAuthFailure(target.ChannelID)
+		_, cachedAuthFailure := routinghotcache.GetAuthFailureForGeneration(
+			target.ChannelID, target.ChannelGeneration,
+		)
 		if target.AuthFailure || cachedAuthFailure {
 			applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
-				ctx, target.ChannelID, target.CredentialID, false, "", now.Unix(),
+				ctx, target.ChannelID, target.ChannelGeneration, target.CredentialID, false, "", now.Unix(),
 			)
 			if err != nil {
 				return err
@@ -863,7 +871,7 @@ func applyActiveProbeBreakerOutcome(
 			if !applied {
 				return nil
 			}
-			routinghotcache.ClearAuthFailure(target.ChannelID)
+			routinghotcache.ClearAuthFailureForGeneration(target.ChannelID, target.ChannelGeneration)
 		}
 		routinghotcache.ClearCapacityCooldown(key.HotcacheKey())
 		if target.BreakerState == model.RoutingBreakerStateOpen || target.BreakerState == model.RoutingBreakerStateHalfOpen ||
@@ -894,12 +902,16 @@ func applyActiveProbeBreakerOutcome(
 			return nil
 		}
 		applied, err := model.ApplyRoutingChannelProbeAuthStateContext(
-			ctx, target.ChannelID, target.CredentialID, true, reason, until,
+			ctx, target.ChannelID, target.ChannelGeneration, target.CredentialID, true, reason, until,
 		)
 		if err != nil || !applied {
 			return err
 		}
-		routinghotcache.SetAuthFailure(target.ChannelID, routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix})
+		routinghotcache.SetAuthFailureForGeneration(
+			target.ChannelID,
+			target.ChannelGeneration,
+			routinghotcache.HealthMarker{Marked: true, UpdatedUnix: nowUnix},
+		)
 		return nil
 	}
 	if execution.Classification.CapacityEffect == routingerror.CapacityCooldown {
@@ -1001,11 +1013,12 @@ func activeProbeCostBudgetNanoUSD(costUSD float64) int64 {
 
 func activeProbeTargetKey(target ActiveProbeTarget) string {
 	payload := fmt.Sprintf(
-		"routing-probe-target:v5\x00%d\x00%d\x00%d\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		"routing-probe-target:v6\x00%d\x00%d\x00%d\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
 		target.SnapshotRevision,
 		target.PoolID,
 		target.MemberID,
 		target.ChannelID,
+		target.ChannelGeneration,
 		target.CredentialID,
 		target.GroupName,
 		target.ModelName,

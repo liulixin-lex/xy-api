@@ -445,19 +445,19 @@ func TestRoutingHedgeHistoricalFailureDomainMigrationSurvivesSnapshotAdmission(t
 	baseURL := "https://shared-upstream.example.test/v1"
 	channels := []model.Channel{
 		{
-			Id: 98_210, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Id: 98_210, RoutingIdentity: common.GetUUID(), RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
 			Key: "serving-key-a1", Status: common.ChannelStatusEnabled, Name: "legacy-account-a1",
 			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
 			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,
 		},
 		{
-			Id: 98_211, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Id: 98_211, RoutingIdentity: common.GetUUID(), RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
 			Key: "serving-key-a2", Status: common.ChannelStatusEnabled, Name: "legacy-account-a2",
 			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
 			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,
 		},
 		{
-			Id: 98_212, RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
+			Id: 98_212, RoutingIdentity: common.GetUUID(), RoutingGeneration: common.GetUUID(), Type: constant.ChannelTypeOpenAI,
 			Key: "serving-key-b", Status: common.ChannelStatusEnabled, Name: "legacy-account-b",
 			Weight: &weight, Priority: &priority, BaseURL: &baseURL,
 			Group: "legacy-failure-domain", Models: "gpt-legacy-domain", CreatedTime: now,

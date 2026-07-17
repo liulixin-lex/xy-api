@@ -46,15 +46,40 @@ type channelRoutingRuntimeSettingsView struct {
 }
 
 type channelRoutingControlAuditView struct {
-	ID            int64  `json:"id"`
-	SubjectType   string `json:"subject_type"`
-	SubjectID     int64  `json:"subject_id"`
-	Action        string `json:"action"`
-	ActorID       int    `json:"actor_id"`
-	BeforeHash    string `json:"before_hash,omitempty"`
-	AfterHash     string `json:"after_hash,omitempty"`
-	Summary       any    `json:"summary"`
-	CreatedTimeMs int64  `json:"created_time_ms"`
+	ID                    int64  `json:"id"`
+	SchemaVersion         int    `json:"schema_version"`
+	EventType             string `json:"event_type"`
+	SubjectType           string `json:"subject_type"`
+	SubjectID             int64  `json:"subject_id"`
+	SubjectIdentity       string `json:"subject_identity"`
+	SubjectGeneration     string `json:"subject_generation,omitempty"`
+	SubjectName           string `json:"subject_name"`
+	Action                string `json:"action"`
+	Source                string `json:"source"`
+	Reason                string `json:"reason,omitempty"`
+	Result                string `json:"result"`
+	ActorID               int    `json:"actor_id"`
+	ActorName             string `json:"actor_name"`
+	ActorRole             int    `json:"actor_role"`
+	Summary               any    `json:"summary"`
+	Subject               any    `json:"subject,omitempty"`
+	Changes               any    `json:"changes,omitempty"`
+	Impact                any    `json:"impact,omitempty"`
+	Recommendations       any    `json:"recommendations,omitempty"`
+	Relations             any    `json:"relations,omitempty"`
+	ErrorCode             string `json:"error_code,omitempty"`
+	ErrorMessage          string `json:"error_message,omitempty"`
+	NeedsAttention        bool   `json:"needs_attention"`
+	CorrelationID         string `json:"correlation_id,omitempty"`
+	OperationID           int64  `json:"operation_id,omitempty"`
+	DraftID               int64  `json:"draft_id,omitempty"`
+	SimulationOperationID int64  `json:"simulation_operation_id,omitempty"`
+	PolicyRevision        int64  `json:"policy_revision,omitempty"`
+	ActivationID          int64  `json:"activation_id,omitempty"`
+	RollbackOfRevision    int64  `json:"rollback_of_revision,omitempty"`
+	TopologyEpoch         int64  `json:"topology_epoch,omitempty"`
+	PricingEpoch          int64  `json:"pricing_epoch,omitempty"`
+	CreatedTimeMs         int64  `json:"created_time_ms"`
 }
 
 func GetChannelRoutingRuntimeSettings(c *gin.Context) {
@@ -187,30 +212,60 @@ func ListChannelRoutingControlAudits(c *gin.Context) {
 		}
 	}
 	subjectType := strings.TrimSpace(c.Query("subject_type"))
-	if subjectType != "" && subjectType != model.RoutingControlSubjectRuntimeSettings &&
-		subjectType != model.RoutingControlSubjectCostBinding &&
-		subjectType != model.RoutingControlSubjectChannelConfiguration {
+	if subjectType != "" && !model.IsRoutingControlAuditSubjectType(subjectType) {
 		writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_filter", "invalid control audit filter", model.ErrRoutingControlAuditInvalid)
 		return
 	}
+	source := strings.TrimSpace(c.Query("source"))
+	if source != "" && !model.IsRoutingControlAuditSource(source) {
+		writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_filter", "invalid control audit filter", model.ErrRoutingControlAuditInvalid)
+		return
+	}
+	result := strings.TrimSpace(c.Query("result"))
+	if result != "" && !model.IsRoutingControlAuditResult(result) {
+		writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_filter", "invalid control audit filter", model.ErrRoutingControlAuditInvalid)
+		return
+	}
+	correlationID := strings.TrimSpace(c.Query("correlation_id"))
+	var needsAttention *bool
+	if raw, exists := c.GetQuery("needs_attention"); exists {
+		parsed, parseErr := strconv.ParseBool(strings.TrimSpace(raw))
+		if parseErr != nil {
+			writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_filter", "invalid control audit filter", model.ErrRoutingControlAuditInvalid)
+			return
+		}
+		needsAttention = &parsed
+	}
 	audits, err := model.ListRoutingControlAuditsContext(c.Request.Context(), model.RoutingControlAuditFilter{
-		BeforeID: beforeID, SubjectType: subjectType, SubjectID: subjectID, ActorID: actorID, Limit: limit,
+		BeforeID: beforeID, SubjectType: subjectType, SubjectID: subjectID, ActorID: actorID,
+		Source: source, Result: result, CorrelationID: correlationID, NeedsAttention: needsAttention, Limit: limit,
 	})
 	if err != nil {
+		if errors.Is(err, model.ErrRoutingControlAuditInvalid) {
+			writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_filter", "invalid control audit filter", err)
+			return
+		}
 		writeChannelRoutingRuntimeSettingsError(c, http.StatusInternalServerError, "control_audit_list_failed", "failed to load control audits", err)
 		return
 	}
 	views := make([]channelRoutingControlAuditView, 0, len(audits))
 	for _, audit := range audits {
-		var summary any
-		if err := common.UnmarshalJsonStr(audit.SummaryJSON, &summary); err != nil {
-			summary = map[string]any{"status": "unavailable"}
-		}
+		payload := audit.PublicPayload()
 		views = append(views, channelRoutingControlAuditView{
-			ID: audit.ID, SubjectType: audit.SubjectType, SubjectID: audit.SubjectID,
-			Action: audit.Action, ActorID: audit.ActorID,
-			BeforeHash: audit.BeforeHash, AfterHash: audit.AfterHash,
-			Summary: summary, CreatedTimeMs: audit.CreatedTimeMs,
+			ID: audit.ID, SchemaVersion: audit.SchemaVersion, EventType: audit.EventType,
+			SubjectType: audit.SubjectType, SubjectID: audit.SubjectID,
+			SubjectIdentity: audit.SubjectIdentity, SubjectGeneration: audit.SubjectGeneration,
+			SubjectName: audit.SubjectName, Action: audit.Action, Source: audit.Source,
+			Reason: audit.Reason, Result: audit.Result,
+			ActorID: audit.ActorID, ActorName: audit.ActorName, ActorRole: audit.ActorRole,
+			Summary: payload.Summary, Subject: payload.Subject, Changes: payload.Changes,
+			Impact: payload.Impact, Recommendations: payload.Recommendations, Relations: payload.Relations,
+			ErrorCode: audit.ErrorCode, ErrorMessage: audit.ErrorMessage, NeedsAttention: audit.NeedsAttention,
+			CorrelationID: audit.CorrelationID, OperationID: audit.OperationID, DraftID: audit.DraftID,
+			SimulationOperationID: audit.SimulationOperationID, PolicyRevision: audit.PolicyRevision,
+			ActivationID: audit.ActivationID, RollbackOfRevision: audit.RollbackOfRevision,
+			TopologyEpoch: audit.TopologyEpoch, PricingEpoch: audit.PricingEpoch,
+			CreatedTimeMs: audit.CreatedTimeMs,
 		})
 	}
 	nextCursor := int64(0)
@@ -218,6 +273,27 @@ func ListChannelRoutingControlAudits(c *gin.Context) {
 		nextCursor = views[len(views)-1].ID
 	}
 	common.ApiSuccess(c, gin.H{"items": views, "next_before_id": nextCursor})
+}
+
+func GetChannelRoutingControlAuditTechnical(c *gin.Context) {
+	id, err := strconv.ParseInt(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || id <= 0 {
+		writeChannelRoutingRuntimeSettingsError(c, http.StatusBadRequest, "invalid_control_audit_id", "invalid control audit id", model.ErrRoutingControlAuditInvalid)
+		return
+	}
+	audit, err := model.GetRoutingControlAuditContext(c.Request.Context(), id)
+	if model.IsRoutingControlAuditNotFound(err) {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "code": "control_audit_not_found", "message": "control audit not found"})
+		return
+	}
+	if err != nil {
+		writeChannelRoutingRuntimeSettingsError(c, http.StatusInternalServerError, "control_audit_load_failed", "failed to load control audit", err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"id": audit.ID, "schema_version": audit.SchemaVersion,
+		"event_type": audit.EventType, "technical": audit.TechnicalPayload(),
+	})
 }
 
 func loadChannelRoutingRuntimeSettingsView(c *gin.Context) (channelRoutingRuntimeSettingsView, error) {

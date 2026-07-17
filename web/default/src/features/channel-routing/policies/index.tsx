@@ -23,7 +23,7 @@ import {
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { getRouteApi } from '@tanstack/react-router'
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -50,10 +50,59 @@ const OperationsAudits = lazy(() =>
 )
 
 export function ChannelRoutingPoliciesPage() {
-  const { t } = useTranslation()
+  const { i18n, t } = useTranslation()
   const search = route.useSearch()
   const navigate = route.useNavigate()
   const activeTab = search.policyTab ?? 'runtime-settings'
+  const tabsViewportRef = useRef<HTMLDivElement>(null)
+  const language = i18n.resolvedLanguage || i18n.language
+
+  useEffect(() => {
+    const viewport = tabsViewportRef.current
+    if (!viewport) return
+
+    let animationFrame = 0
+    const revealActiveTab = () => {
+      window.cancelAnimationFrame(animationFrame)
+      animationFrame = window.requestAnimationFrame(() => {
+        const activeTabElement = viewport.querySelector<HTMLElement>(
+          '[role="tab"][aria-selected="true"]'
+        )
+        const tabsList = viewport.firstElementChild
+        if (!activeTabElement || !tabsList) return
+
+        const viewportRect = viewport.getBoundingClientRect()
+        const activeTabRect = activeTabElement.getBoundingClientRect()
+        const tabsListStyle = window.getComputedStyle(tabsList)
+        const inlineStartPadding = Number.parseFloat(
+          tabsListStyle.paddingInlineStart
+        )
+        viewport.scrollTo({
+          behavior: 'auto',
+          left:
+            viewport.scrollLeft +
+            activeTabRect.left -
+            viewportRect.left -
+            (Number.isFinite(inlineStartPadding) ? inlineStartPadding : 0),
+        })
+      })
+    }
+
+    revealActiveTab()
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.cancelAnimationFrame(animationFrame)
+    }
+
+    const resizeObserver = new ResizeObserver(revealActiveTab)
+    resizeObserver.observe(viewport)
+    const tabsList = viewport.firstElementChild
+    if (tabsList) resizeObserver.observe(tabsList)
+
+    return () => {
+      resizeObserver.disconnect()
+      window.cancelAnimationFrame(animationFrame)
+    }
+  }, [activeTab, language])
 
   return (
     <ChannelRoutingPageFrame
@@ -76,33 +125,39 @@ export function ChannelRoutingPoliciesPage() {
           })
         }}
       >
-        <TabsList
-          variant='line'
-          aria-label={t('Routing policy views')}
-          className='h-auto min-h-11 max-w-full justify-start overflow-x-auto'
-        >
-          <TabsTrigger
-            value='runtime-settings'
-            className='min-h-11 flex-none shrink-0 px-3'
+        <div ref={tabsViewportRef} className='overflow-x-auto pb-1'>
+          <TabsList
+            variant='line'
+            aria-label={t('Routing policy views')}
+            className='h-auto min-h-11 min-w-max justify-start'
           >
-            <HugeiconsIcon icon={Settings02Icon} aria-hidden='true' />
-            {t('Runtime settings')}
-          </TabsTrigger>
-          <TabsTrigger
-            value='versioned-policies'
-            className='min-h-11 flex-none shrink-0 px-3'
-          >
-            <HugeiconsIcon icon={PolicyIcon} aria-hidden='true' />
-            {t('Versioned policies')}
-          </TabsTrigger>
-          <TabsTrigger
-            value='operations-audits'
-            className='min-h-11 flex-none shrink-0 px-3'
-          >
-            <HugeiconsIcon icon={Audit02Icon} aria-hidden='true' />
-            {t('Operations and control audits')}
-          </TabsTrigger>
-        </TabsList>
+            <TabsTrigger
+              value='runtime-settings'
+              className='min-h-11 flex-none shrink-0 px-3'
+            >
+              <HugeiconsIcon icon={Settings02Icon} aria-hidden='true' />
+              {t('Runtime settings')}
+            </TabsTrigger>
+            <TabsTrigger
+              value='versioned-policies'
+              className='min-h-11 flex-none shrink-0 px-3'
+            >
+              <HugeiconsIcon icon={PolicyIcon} aria-hidden='true' />
+              {t('Versioned policies')}
+            </TabsTrigger>
+            <TabsTrigger
+              value='operations-audits'
+              className='min-h-11 flex-none shrink-0 px-3'
+            >
+              <HugeiconsIcon icon={Audit02Icon} aria-hidden='true' />
+              {t('Operations and control audits')}
+            </TabsTrigger>
+            <span
+              aria-hidden='true'
+              className='w-[calc(100dvw-10rem)] max-w-[28rem] min-w-8 shrink-0 lg:hidden'
+            />
+          </TabsList>
+        </div>
 
         <TabsContent value='runtime-settings' className='pt-3'>
           {activeTab === 'runtime-settings' ? (

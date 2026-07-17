@@ -2,16 +2,102 @@ package channelrouting
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
-func TestSyncLegacyRoutingPolicyPublishesOnlyChangedTopology(t *testing.T) {
+func TestRefreshSnapshotMigratesLegacyPolicyExactlyOnce(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
+	db := openSnapshotTestDB(t)
+	withSnapshotTestDB(t, db)
+	withSnapshotSecret(t)
+	require.NoError(t, db.Create(&model.Channel{
+		Id: 903, Name: "legacy-policy", Key: "key-a", Group: "VIP", Models: "gpt-test",
+	}).Error)
+	_, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	require.NoError(t, err)
+	var pool model.RoutingPool
+	require.NoError(t, db.Where("group_name = ? AND active = ?", "VIP", true).First(&pool).Error)
+	require.NoError(t, model.EnsureRoutingPolicyHeadDBContext(context.Background(), db))
+	legacy := model.RoutingPolicyDocument{
+		SchemaVersion: model.RoutingPolicyLegacySchemaVersion,
+		Pools: []model.RoutingPolicyPoolContent{{
+			PoolID: pool.ID, GroupName: pool.GroupName, DisplayName: "Legacy VIP",
+			DeploymentStage: model.RoutingDeploymentStageShadow,
+			PolicyProfile:   model.RoutingPolicyProfileCustom,
+			Policy:          json.RawMessage(`{"hedge_enabled":false}`),
+			Members:         []model.RoutingPolicyMemberContent{},
+		}},
+	}
+	legacy, contentHash, err := model.NormalizeRoutingPolicyDocument(legacy)
+	require.NoError(t, err)
+	groupHash := sha256.Sum256([]byte(pool.GroupName))
+	now := time.Now().Unix()
+	revision := model.RoutingPolicyRevision{
+		Revision: 1, SchemaVersion: model.RoutingPolicyLegacySchemaVersion, ContentHash: contentHash,
+		PoolCount: 1, ActorID: 42, Reason: "legacy manual policy", CreatedTime: now,
+	}
+	poolRow := model.RoutingPolicyPoolRevision{
+		Revision: 1, PoolID: pool.ID, GroupKey: fmt.Sprintf("%x", groupHash),
+		GroupName: pool.GroupName, DisplayName: legacy.Pools[0].DisplayName,
+		DeploymentStage: legacy.Pools[0].DeploymentStage, PolicyProfile: legacy.Pools[0].PolicyProfile,
+		PolicyJSON: string(legacy.Pools[0].Policy),
+	}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&revision).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&poolRow).Error; err != nil {
+			return err
+		}
+		activation := model.RoutingPolicyActivation{
+			Revision: 1, Stage: model.RoutingDeploymentStageShadow,
+			ActorID: 42, Reason: "legacy manual policy", CreatedTime: now,
+		}
+		if err := tx.Create(&activation).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.RoutingPolicyHead{}).Where("id = ?", 1).Updates(map[string]any{
+			"current_revision": int64(1), "current_activation_id": activation.ID,
+			"current_hash": contentHash, "current_stage": activation.Stage, "updated_time": now,
+		}).Error
+	}))
+
+	first, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), first.PolicyRevision)
+	second, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, first.PolicyRevision, second.PolicyRevision)
+	var revisionCount int64
+	require.NoError(t, db.Model(&model.RoutingPolicyRevision{}).Count(&revisionCount).Error)
+	assert.Equal(t, int64(2), revisionCount)
+
+	legacyHistory, legacyRevision, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, 1)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoutingPolicyLegacySchemaVersion, legacyRevision.SchemaVersion)
+	assert.Equal(t, "Legacy VIP", legacyHistory.Pools[0].DisplayName)
+	current, currentRevision, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, 2)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoutingPolicySchemaVersion, currentRevision.SchemaVersion)
+	require.Len(t, current.Pools, 1)
+	assert.Equal(t, "Legacy VIP", current.Pools[0].DisplayName)
+	assert.Empty(t, current.Pools[0].Members)
+}
+
+func TestSyncLegacyRoutingPolicyDoesNotPublishTopologyOnlyChanges(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
 	db := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, db)
 	withSnapshotSecret(t)
@@ -35,17 +121,25 @@ func TestSyncLegacyRoutingPolicyPublishesOnlyChangedTopology(t *testing.T) {
 
 	weight := uint(25)
 	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 901).Update("weight", weight).Error)
-	_, err = model.ReconcileLegacyRoutingTopologyContext(context.Background())
+	topology, err := model.ReconcileLegacyRoutingTopologyContext(context.Background())
 	require.NoError(t, err)
 	changed, err := SyncLegacyRoutingPolicyContext(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), changed.CurrentRevision)
+	assert.Equal(t, first.CurrentRevision, changed.CurrentRevision)
 	document, revision, err := model.LoadRoutingPolicyRevisionContext(context.Background(), changed.CurrentRevision)
 	require.NoError(t, err)
 	assert.Equal(t, changed.CurrentHash, revision.ContentHash)
 	require.Len(t, document.Pools, 1)
-	require.Len(t, document.Pools[0].Members, 1)
-	assert.Equal(t, int64(weight), document.Pools[0].Members[0].Weight)
+	assert.Empty(t, document.Pools[0].Members)
+	view, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(first.CurrentRevision), view.PolicyRevision)
+	assert.Equal(t, uint64(topology.TopologyEpoch), view.TopologyEpoch)
+	require.Len(t, view.Pools, 1)
+	require.Len(t, view.Pools[0].Members, 1)
+	assert.Equal(t, int64(weight), view.Pools[0].Members[0].LegacyWeight)
+	require.NoError(t, db.Model(&model.RoutingConfigOutbox{}).Count(&outboxCount).Error)
+	assert.Equal(t, int64(1), outboxCount)
 }
 
 func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *testing.T) {
@@ -63,8 +157,9 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 	initialDocument, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, initialHead.CurrentRevision)
 	require.NoError(t, err)
 	require.Len(t, initialDocument.Pools, 1)
-	require.Len(t, initialDocument.Pools[0].Members, 1)
-	initialCredentialIDs := append([]int(nil), initialDocument.Pools[0].Members[0].CredentialIDs...)
+	require.Empty(t, initialDocument.Pools[0].Members)
+	var topologyMember model.RoutingPoolMember
+	require.NoError(t, db.Where("channel_id = ? AND active = ?", 902, true).First(&topologyMember).Error)
 
 	manualDocument := initialDocument
 	manualDocument.ExtensionFields = map[string]json.RawMessage{
@@ -76,13 +171,19 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 	manualDocument.Pools[0].ExtensionFields = map[string]json.RawMessage{
 		"pool_extension": json.RawMessage(`{"tier":"critical"}`),
 	}
-	manualDocument.Pools[0].Members[0].Enabled = false
-	manualDocument.Pools[0].Members[0].Priority = 88
-	manualDocument.Pools[0].Members[0].Weight = 77
-	manualDocument.Pools[0].Members[0].Overrides = json.RawMessage(`{"region":"primary"}`)
-	manualDocument.Pools[0].Members[0].ExtensionFields = map[string]json.RawMessage{
-		"member_extension": json.RawMessage(`{"zone":"a"}`),
-	}
+	enabled := false
+	priority := int64(88)
+	weight := int64(77)
+	manualDocument.Pools[0].Members = []model.RoutingPolicyMemberContent{{
+		MemberID: topologyMember.ID, ChannelID: topologyMember.ChannelID,
+		RoutingGeneration: topologyMember.ChannelGeneration,
+		Enabled:           false, Priority: priority, Weight: weight,
+		EnabledOverride: &enabled, PriorityOverride: &priority, WeightOverride: &weight,
+		Overrides: json.RawMessage(`{"region":"primary"}`),
+		ExtensionFields: map[string]json.RawMessage{
+			"member_extension": json.RawMessage(`{"zone":"a"}`),
+		},
+	}}
 	manual, err := model.PublishRoutingPolicyRevisionDBContext(
 		context.Background(),
 		db,
@@ -98,21 +199,13 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), manual.Revision.Revision)
 
-	for _, topologyChange := range []struct {
-		expectedRevision int64
-		key              string
-	}{
-		{expectedRevision: 3, key: "key-b"},
-		{expectedRevision: 4, key: "key-c"},
-	} {
-		expectedRevision := topologyChange.expectedRevision
-		key := topologyChange.key
+	for _, key := range []string{"key-b", "key-c"} {
 		require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 902).Update("key", key).Error)
 		_, err = model.ReconcileLegacyRoutingTopologyContext(context.Background())
 		require.NoError(t, err)
 		head, syncErr := SyncLegacyRoutingPolicyContext(context.Background())
 		require.NoError(t, syncErr)
-		assert.Equal(t, expectedRevision, head.CurrentRevision)
+		assert.Equal(t, manual.Revision.Revision, head.CurrentRevision)
 
 		document, revision, loadErr := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
 		require.NoError(t, loadErr)
@@ -130,9 +223,8 @@ func TestSyncLegacyRoutingPolicyPreservesManualPolicyAcrossTopologyChanges(t *te
 		assert.Equal(t, int64(77), member.Weight)
 		assert.JSONEq(t, `{"region":"primary"}`, string(member.Overrides))
 		assert.JSONEq(t, `{"zone":"a"}`, string(member.ExtensionFields["member_extension"]))
-		require.Len(t, member.CredentialIDs, 1)
-		assert.NotEqual(t, initialCredentialIDs, member.CredentialIDs)
-		assert.Equal(t, legacyRoutingPolicyPreserveSyncReason, revision.Reason)
+		assert.Empty(t, member.CredentialIDs)
+		assert.Equal(t, "admin_policy_update", revision.Reason)
 
 		var activation model.RoutingPolicyActivation
 		require.NoError(t, db.Where("id = ?", head.CurrentActivationID).First(&activation).Error)
@@ -282,6 +374,8 @@ func TestEmptyInstallPublishesStableRevisionAndQueryableSnapshot(t *testing.T) {
 }
 
 func TestLegacyPolicySyncSupportsGroupLargerThanAuditPayload(t *testing.T) {
+	ResetSnapshotForTest()
+	t.Cleanup(ResetSnapshotForTest)
 	db := openSnapshotTestDB(t)
 	withSnapshotTestDB(t, db)
 	withSnapshotSecret(t)
@@ -300,5 +394,9 @@ func TestLegacyPolicySyncSupportsGroupLargerThanAuditPayload(t *testing.T) {
 	document, _, err := model.LoadRoutingPolicyRevisionDBContext(context.Background(), db, head.CurrentRevision)
 	require.NoError(t, err)
 	require.Len(t, document.Pools, 1)
-	assert.Len(t, document.Pools[0].Members, MaxDecisionCandidates+1)
+	assert.Empty(t, document.Pools[0].Members)
+	view, err := RefreshSnapshotContext(context.Background())
+	require.NoError(t, err)
+	require.Len(t, view.Pools, 1)
+	assert.Len(t, view.Pools[0].Members, MaxDecisionCandidates+1)
 }

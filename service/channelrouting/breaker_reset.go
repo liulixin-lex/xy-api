@@ -78,8 +78,9 @@ func ResolveMemberBreakerResetTarget(
 	return BreakerResetResolvedTarget{
 		Target: model.RoutingBreakerResetTarget{
 			Scope: model.RoutingBreakerResetScopeMember, PoolID: poolID, MemberID: memberID,
-			ChannelID: member.ChannelID, APIKeyIndex: model.RoutingMetricSingleKeyIndex,
-			ModelName: modelName, GroupName: pool.GroupName,
+			ChannelID: member.ChannelID, ChannelGeneration: member.ChannelGeneration,
+			APIKeyIndex: model.RoutingMetricSingleKeyIndex,
+			ModelName:   modelName, GroupName: pool.GroupName,
 		},
 		ExpectedRevision: int64(snapshot.view.Revision), ExpectedActivationID: snapshot.view.ActivationID,
 	}, nil
@@ -377,8 +378,9 @@ func applyRoutingBreakerReset(event model.RoutingBreakerResetEvent) bool {
 	}
 	if target.Scope == model.RoutingBreakerResetScopeMember {
 		_, applied := routingbreaker.ApplyDefaultResetGeneration(routingbreaker.Key{
-			ChannelID: target.ChannelID, APIKeyIndex: target.APIKeyIndex,
-			Model: target.ModelName, Group: target.GroupName,
+			ChannelID: target.ChannelID, ChannelGeneration: target.ChannelGeneration,
+			APIKeyIndex: target.APIKeyIndex,
+			Model:       target.ModelName, Group: target.GroupName,
 		}, event.Generation)
 		return applied
 	}

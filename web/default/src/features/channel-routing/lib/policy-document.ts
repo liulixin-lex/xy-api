@@ -31,7 +31,8 @@ import {
 
 import type { PolicyDocument } from '../types'
 
-const policySchemaVersion = 1
+const legacyPolicySchemaVersion = 1
+const policySchemaVersion = 2
 const maxPolicyBytes = 64 << 20
 const maxPolicyPools = 4_096
 const maxPolicyMembers = 100_000
@@ -47,6 +48,7 @@ const policyProfiles = new Set([
   'enterprise_slo',
   'custom',
 ])
+const routingGenerationPattern = /^[0-9a-f]{32}$/
 
 export type PolicyDocumentIssueCode =
   | 'document_too_large'
@@ -59,10 +61,12 @@ export type PolicyDocumentIssueCode =
   | 'expected_positive_integer'
   | 'invalid_deployment_stage'
   | 'invalid_policy_profile'
+  | 'invalid_routing_generation'
   | 'json_syntax'
   | 'required_string'
   | 'string_too_long'
   | 'too_many_items'
+  | 'unsupported_schema_field'
   | 'unsupported_schema_version'
 
 export type PolicyDocumentIssue = {
@@ -247,7 +251,10 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
     }
   }
 
-  if (value.schema_version !== policySchemaVersion) {
+  const schemaVersion = value.schema_version
+  const legacySchema = schemaVersion === legacyPolicySchemaVersion
+  const currentSchema = schemaVersion === policySchemaVersion
+  if (!legacySchema && !currentSchema) {
     addIssue({
       kind: 'schema',
       code: 'unsupported_schema_version',
@@ -373,6 +380,64 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
       })
     }
 
+    let defaultEnabled = true
+    let defaultPriority = 0
+    let defaultWeight = 100
+    if (currentSchema) {
+      if (poolValue.default_enabled == null) {
+        poolValue.default_enabled = defaultEnabled
+      } else if (typeof poolValue.default_enabled !== 'boolean') {
+        addIssue({
+          kind: 'schema',
+          code: 'expected_boolean',
+          path: [...poolPath, 'default_enabled'],
+        })
+      } else {
+        defaultEnabled = poolValue.default_enabled
+      }
+
+      if (poolValue.default_priority == null) {
+        poolValue.default_priority = defaultPriority
+      } else if (!isSafeInteger(poolValue.default_priority)) {
+        addIssue({
+          kind: 'schema',
+          code: 'expected_integer',
+          path: [...poolPath, 'default_priority'],
+        })
+      } else {
+        defaultPriority = poolValue.default_priority
+      }
+
+      if (poolValue.default_weight == null) {
+        poolValue.default_weight = defaultWeight
+      } else if (
+        !isSafeInteger(poolValue.default_weight) ||
+        poolValue.default_weight < 0
+      ) {
+        addIssue({
+          kind: 'schema',
+          code: 'expected_nonnegative_integer',
+          path: [...poolPath, 'default_weight'],
+        })
+      } else {
+        defaultWeight = poolValue.default_weight
+      }
+    } else if (legacySchema) {
+      for (const field of [
+        'default_enabled',
+        'default_priority',
+        'default_weight',
+      ]) {
+        if (poolValue[field] != null) {
+          addIssue({
+            kind: 'schema',
+            code: 'unsupported_schema_field',
+            path: [...poolPath, field],
+          })
+        }
+      }
+    }
+
     if (!isRecord(poolValue.policy)) {
       addIssue({
         kind: 'schema',
@@ -380,17 +445,23 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
         path: [...poolPath, 'policy'],
       })
     }
-    if (!Array.isArray(poolValue.members)) {
+    let members: unknown[]
+    if (poolValue.members == null) {
+      members = []
+      poolValue.members = members
+    } else if (!Array.isArray(poolValue.members)) {
       addIssue({
         kind: 'schema',
         code: 'expected_array',
         path: [...poolPath, 'members'],
       })
       return
+    } else {
+      members = poolValue.members
     }
 
-    summary.memberCount += poolValue.members.length
-    if (poolValue.members.length > maxMembersPerPool) {
+    summary.memberCount += members.length
+    if (members.length > maxMembersPerPool) {
       addIssue({
         kind: 'schema',
         code: 'too_many_items',
@@ -400,7 +471,7 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
     }
     const channelIds = new Set<number>()
 
-    poolValue.members.forEach((memberValue, memberIndex) => {
+    members.forEach((memberValue, memberIndex) => {
       const memberPath: JSONPath = [...poolPath, 'members', memberIndex]
       if (!isRecord(memberValue)) {
         addIssue({
@@ -448,33 +519,172 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
         channelIds.add(memberValue.channel_id)
       }
 
-      if (typeof memberValue.enabled !== 'boolean') {
-        addIssue({
-          kind: 'schema',
-          code: 'expected_boolean',
-          path: [...memberPath, 'enabled'],
-        })
-      } else if (memberValue.enabled) {
-        summary.enabledMemberCount += 1
-      }
+      if (currentSchema) {
+        let rawEnabled = false
+        let rawPriority = 0
+        let rawWeight = 0
+        if (memberValue.enabled != null) {
+          if (typeof memberValue.enabled !== 'boolean') {
+            addIssue({
+              kind: 'schema',
+              code: 'expected_boolean',
+              path: [...memberPath, 'enabled'],
+            })
+          } else {
+            rawEnabled = memberValue.enabled
+          }
+        }
+        if (memberValue.priority != null) {
+          if (!isSafeInteger(memberValue.priority)) {
+            addIssue({
+              kind: 'schema',
+              code: 'expected_integer',
+              path: [...memberPath, 'priority'],
+            })
+          } else {
+            rawPriority = memberValue.priority
+          }
+        }
+        if (memberValue.weight != null) {
+          if (!isSafeInteger(memberValue.weight) || memberValue.weight < 0) {
+            addIssue({
+              kind: 'schema',
+              code: 'expected_nonnegative_integer',
+              path: [...memberPath, 'weight'],
+            })
+          } else {
+            rawWeight = memberValue.weight
+          }
+        }
 
-      if (!isSafeInteger(memberValue.priority)) {
-        addIssue({
-          kind: 'schema',
-          code: 'expected_integer',
-          path: [...memberPath, 'priority'],
-        })
-      }
-      if (!isSafeInteger(memberValue.weight) || memberValue.weight < 0) {
-        addIssue({
-          kind: 'schema',
-          code: 'expected_nonnegative_integer',
-          path: [...memberPath, 'weight'],
-        })
+        let routingGeneration = ''
+        if (memberValue.routing_generation == null) {
+          delete memberValue.routing_generation
+        } else if (
+          typeof memberValue.routing_generation !== 'string' ||
+          (memberValue.routing_generation.length > 0 &&
+            !routingGenerationPattern.test(memberValue.routing_generation))
+        ) {
+          addIssue({
+            kind: 'schema',
+            code: 'invalid_routing_generation',
+            path: [...memberPath, 'routing_generation'],
+          })
+        } else {
+          routingGeneration = memberValue.routing_generation
+          if (routingGeneration.length === 0) {
+            delete memberValue.routing_generation
+          }
+        }
+
+        let enabledOverride: boolean | undefined
+        if (memberValue.enabled_override == null) {
+          delete memberValue.enabled_override
+        } else if (typeof memberValue.enabled_override !== 'boolean') {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_boolean',
+            path: [...memberPath, 'enabled_override'],
+          })
+        } else {
+          enabledOverride = memberValue.enabled_override
+        }
+
+        let priorityOverride: number | undefined
+        if (memberValue.priority_override == null) {
+          delete memberValue.priority_override
+        } else if (!isSafeInteger(memberValue.priority_override)) {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_integer',
+            path: [...memberPath, 'priority_override'],
+          })
+        } else {
+          priorityOverride = memberValue.priority_override
+        }
+
+        let weightOverride: number | undefined
+        if (memberValue.weight_override == null) {
+          delete memberValue.weight_override
+        } else if (
+          !isSafeInteger(memberValue.weight_override) ||
+          memberValue.weight_override < 0
+        ) {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_nonnegative_integer',
+            path: [...memberPath, 'weight_override'],
+          })
+        } else {
+          weightOverride = memberValue.weight_override
+        }
+
+        if (
+          routingGeneration.length === 0 &&
+          enabledOverride === undefined &&
+          priorityOverride === undefined &&
+          weightOverride === undefined &&
+          (rawEnabled || rawPriority !== 0 || rawWeight !== 0)
+        ) {
+          enabledOverride = rawEnabled
+          priorityOverride = rawPriority
+          weightOverride = rawWeight
+          memberValue.enabled_override = enabledOverride
+          memberValue.priority_override = priorityOverride
+          memberValue.weight_override = weightOverride
+        }
+
+        memberValue.enabled = enabledOverride ?? defaultEnabled
+        memberValue.priority = priorityOverride ?? defaultPriority
+        memberValue.weight = weightOverride ?? defaultWeight
+        if (memberValue.enabled) summary.enabledMemberCount += 1
+      } else {
+        if (legacySchema) {
+          for (const field of [
+            'routing_generation',
+            'enabled_override',
+            'priority_override',
+            'weight_override',
+          ]) {
+            if (memberValue[field] != null && memberValue[field] !== '') {
+              addIssue({
+                kind: 'schema',
+                code: 'unsupported_schema_field',
+                path: [...memberPath, field],
+              })
+            }
+          }
+        }
+        if (typeof memberValue.enabled !== 'boolean') {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_boolean',
+            path: [...memberPath, 'enabled'],
+          })
+        } else if (memberValue.enabled) {
+          summary.enabledMemberCount += 1
+        }
+
+        if (!isSafeInteger(memberValue.priority)) {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_integer',
+            path: [...memberPath, 'priority'],
+          })
+        }
+        if (!isSafeInteger(memberValue.weight) || memberValue.weight < 0) {
+          addIssue({
+            kind: 'schema',
+            code: 'expected_nonnegative_integer',
+            path: [...memberPath, 'weight'],
+          })
+        }
       }
 
       const credentialIdsPath = [...memberPath, 'credential_ids']
-      if (!Array.isArray(memberValue.credential_ids)) {
+      if (memberValue.credential_ids == null) {
+        memberValue.credential_ids = []
+      } else if (!Array.isArray(memberValue.credential_ids)) {
         addIssue({
           kind: 'schema',
           code: 'expected_array',
@@ -511,7 +721,9 @@ export function analyzePolicyDocument(source: string): PolicyDocumentAnalysis {
         })
       }
 
-      if (!isRecord(memberValue.overrides)) {
+      if (memberValue.overrides === undefined) {
+        memberValue.overrides = {}
+      } else if (!isRecord(memberValue.overrides)) {
         addIssue({
           kind: 'schema',
           code: 'expected_object',

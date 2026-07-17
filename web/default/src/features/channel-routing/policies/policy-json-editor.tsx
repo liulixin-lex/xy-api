@@ -96,13 +96,17 @@ function policyIssueMessage(
         limit: issue.limit,
       })
     case 'unsupported_schema_version':
-      return translate('Only policy schema version 1 is supported.')
+      return `${translate('Schema version')}: 1, 2`
+    case 'unsupported_schema_field':
+      return `${translate('Schema version')}: 2`
     case 'invalid_deployment_stage':
       return translate('Use observe, shadow, canary, or active.')
     case 'invalid_policy_profile':
       return translate(
         'Use balanced, reliability_first, cost_aware, enterprise_slo, or custom.'
       )
+    case 'invalid_routing_generation':
+      return `${translate('Routing generation')}: [0-9a-f]{32}`
     case 'duplicate_value':
       return translate('This value must be unique in its policy scope.')
     case 'too_many_items':

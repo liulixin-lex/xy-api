@@ -124,9 +124,6 @@ export const runtimeSettingsSchema = z
     active_probe_cost_budget_usd: finiteNumber
       .gt(0, greaterThanZeroMessage)
       .max(1_000, allowedMaximumMessage),
-    agent_enabled: z.boolean(),
-    agent_auto_apply: z.boolean(),
-    agent_model: z.string().max(256, 'Enter 256 characters or fewer'),
   })
   .superRefine((settings, context) => {
     const addIssue = (field: SmartRoutingSettingField, message: string) => {
@@ -196,9 +193,6 @@ export const runtimeSettingsSchema = z
         'Per-host probe concurrency must not exceed total concurrency'
       )
     }
-    if (settings.agent_enabled && settings.agent_model.trim() === '') {
-      addIssue('agent_model', 'Choose an agent model before enabling the agent')
-    }
   })
 
 export type RuntimeSettingsFormValues = z.infer<typeof runtimeSettingsSchema>
@@ -221,7 +215,6 @@ export function displayRuntimeSettingValue(
     }
     return translate(labels[value] ?? value)
   }
-  if (field === 'agent_model') return value || translate('Empty')
   return value ? translate(value) : translate('Empty')
 }
 
@@ -279,9 +272,6 @@ export const runtimeSettingFields = [
   'active_probe_per_host',
   'active_probe_token_budget',
   'active_probe_cost_budget_usd',
-  'agent_enabled',
-  'agent_auto_apply',
-  'agent_model',
 ] as const satisfies readonly SmartRoutingSettingField[]
 
 export const runtimeSettingLabels: Record<SmartRoutingSettingField, string> = {
@@ -338,9 +328,6 @@ export const runtimeSettingLabels: Record<SmartRoutingSettingField, string> = {
   active_probe_per_host: 'Per-host probe concurrency',
   active_probe_token_budget: 'Probe token budget',
   active_probe_cost_budget_usd: 'Probe cost budget',
-  agent_enabled: 'Routing agent',
-  agent_auto_apply: 'Agent auto apply',
-  agent_model: 'Agent model',
 }
 
 export const highRiskRuntimeSettingFields = new Set<SmartRoutingSettingField>([
@@ -350,7 +337,6 @@ export const highRiskRuntimeSettingFields = new Set<SmartRoutingSettingField>([
   'hedge_max_buffered_bytes',
   'hedge_ratio_window_sec',
   'hedge_max_extra_basis_points',
-  'agent_auto_apply',
   'active_probe_enabled',
   'active_probe_token_budget',
   'active_probe_cost_budget_usd',

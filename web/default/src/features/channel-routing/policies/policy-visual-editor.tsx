@@ -128,6 +128,7 @@ export function ChannelRoutingPolicyVisualEditor(props: {
 
         <div className='min-w-0 space-y-5'>
           <PolicyPoolSettings
+            schemaVersion={props.document.schema_version}
             pool={selectedPool}
             pools={props.document.pools}
             readOnly={props.readOnly}
