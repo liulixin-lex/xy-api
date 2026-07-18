@@ -24,10 +24,20 @@ checks, force-pushing protected history, rewriting or deleting published tags,
 overwriting release assets, or mutating production data without a validated
 backup and migration plan.
 
+## Branch Roles
+
+- `main`: protected default branch for active `v0.2` development.
+- `support/v0.1`: protected maintenance branch for `v0.1.6`-compatible fixes.
+- `archive/channel-routing-v0.1.14`: locked historical branch; never use it as
+  a development or release source.
+- Short-lived work branches: created from the intended target branch and
+  deleted automatically after a successful squash merge.
+
 ## Required Operating Flow
 
 1. Confirm the worktree and remote state.
-2. Create or reuse a correctly named branch.
+2. Create or reuse a correctly named branch from `main`, or from
+   `support/v0.1` for an explicitly scoped maintenance fix.
 3. Make the smallest scoped change.
 4. Run local checks when the toolchain is available.
 5. Push and wait for GitHub checks.
