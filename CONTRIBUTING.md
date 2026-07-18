@@ -2,7 +2,15 @@
 
 ## Development Model
 
-The repository uses a short-lived branch model:
+Long-lived branches have one clear role:
+
+- `main` is the active `v0.2` development line based on `v0.1.6`.
+- `support/v0.1` is the production-compatible maintenance line for critical
+  fixes that must remain safe for `v0.1.6` deployments.
+- `archive/channel-routing-v0.1.14` is a locked historical branch for the
+  intentionally skipped channel-routing releases. Do not develop from it.
+
+The repository otherwise uses short-lived branches:
 
 - `feat/<topic>` for features.
 - `fix/<topic>` for bug fixes.
@@ -11,8 +19,10 @@ The repository uses a short-lived branch model:
 - `refactor/<topic>` for behavior-preserving restructuring.
 - `hotfix/<topic>` for urgent supported-release fixes.
 
-The `next/v0.2` line is based on `v0.1.6`. Read `COMPATIBILITY.md` before making
-runtime changes and `UPSTREAM.md` before porting upstream code.
+Create normal work from and target it back to `main`. Create a production
+hotfix from `support/v0.1` only when the same fix must be released on the
+supported `v0.1` line. Read `COMPATIBILITY.md` before making runtime changes and
+`UPSTREAM.md` before porting upstream code.
 
 ## Pull Requests
 

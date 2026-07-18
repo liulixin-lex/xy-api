@@ -8,12 +8,10 @@ on:
   push:
     branches:
       - main
-      - next/v0.2
       - support/v0.1
   pull_request:
     branches:
       - main
-      - next/v0.2
       - support/v0.1
   schedule:
     - cron: "23 18 * * 0"
