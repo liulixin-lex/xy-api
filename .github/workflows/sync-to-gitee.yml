@@ -60,7 +60,7 @@ jobs:
 
       - name: Create Gitee Release
         id: create_release
-        uses: nICEnnnnnnnLee/action-gitee-release@v2.0.0
+        uses: nICEnnnnnnnLee/action-gitee-release@44b412edade0c837fb0ad7d73f4674ec07c8b722 # v2.0.0
         with:
           gitee_action: create_release
           gitee_owner: ${{ env.GITEE_OWNER }}
@@ -73,7 +73,7 @@ jobs:
 
       - name: Upload Assets to Gitee
         if: hashFiles('release_assets/*') != ''
-        uses: nICEnnnnnnnLee/action-gitee-release@v2.0.0
+        uses: nICEnnnnnnnLee/action-gitee-release@44b412edade0c837fb0ad7d73f4674ec07c8b722 # v2.0.0
         with:
           gitee_action: upload_asset
           gitee_owner: ${{ env.GITEE_OWNER }}

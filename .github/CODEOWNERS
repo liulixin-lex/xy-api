@@ -1,0 +1,12 @@
+* @liulixin-lex
+
+/.github/ @liulixin-lex
+/AGENTS.md @liulixin-lex
+/CODEX_OPERATIONS.md @liulixin-lex
+/COMPATIBILITY.md @liulixin-lex
+/UPSTREAM.md @liulixin-lex
+/Dockerfile @liulixin-lex
+/docker-compose.yml @liulixin-lex
+/model/ @liulixin-lex
+/service/ @liulixin-lex
+/relay/ @liulixin-lex

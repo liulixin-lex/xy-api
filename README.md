@@ -54,6 +54,9 @@
 
 ## 📝 Project Description
 
+> [!NOTE]
+> The `v0.2` development line is based on this fork's `v0.1.6` release and preserves its production contract. It intentionally excludes the channel-routing series from `v0.1.7` through `v0.1.14`. See `COMPATIBILITY.md` and `UPSTREAM.md` before upgrading or porting changes.
+
 > [!IMPORTANT]
 > - This project is intended solely for lawful and authorized AI API gateway, organization-level authentication, multi-model management, usage analytics, cost accounting, and private deployment scenarios.
 > - Users must lawfully obtain upstream API keys, accounts, model services, and interface permissions, and must comply with upstream terms of service and applicable laws and regulations.
