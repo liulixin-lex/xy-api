@@ -95,9 +95,9 @@ jobs:
             MINOR=${BASH_REMATCH[2]}
             PATCH=${BASH_REMATCH[3]}
             REST=${BASH_REMATCH[4]}
-          
+
             VERSION="$MAJOR.$MINOR.$PATCH"
-          
+
             # If there's extra content, append it without adding -dev
             if [[ -n "$REST" ]]; then
               VERSION="$VERSION$REST"
