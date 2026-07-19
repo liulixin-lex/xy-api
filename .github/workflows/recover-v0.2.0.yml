@@ -35,13 +35,12 @@ jobs:
     timeout-minutes: 15
     permissions:
       actions: read
-      contents: write
+      contents: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CONFIRM_TAG: ${{ inputs.confirm_tag }}
       CONFIRM_RELEASE_ID: ${{ inputs.confirm_release_id }}
       IMMUTABLE_RELEASES_VERIFIED_TAG: ${{ vars.IMMUTABLE_RELEASES_VERIFIED_TAG }}
-      IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.GHCR_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
     steps:
       - name: Check out the protected recovery implementation
@@ -58,6 +57,8 @@ jobs:
           path: release-source
 
       - name: Validate confirmations, tag, release policy, and source runs
+        env:
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REPOSITORY" != liulixin-lex/xy-api ] || \
@@ -107,7 +108,10 @@ jobs:
             echo '::error::GitHub Immutable Releases is not freshly verified for v0.2.0.'
             exit 1
           fi
-          rulesets=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
+          # GitHub omits bypass_actors unless the caller can write the ruleset.
+          # Use the same scoped administration token that verified immutable releases.
+          rulesets=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
           ruleset_ids=$(jq --raw-output \
             '.[] | select(
               .name == "Protect immutable release tags" and
@@ -118,12 +122,17 @@ jobs:
             echo '::error::Expected one active immutable release tag ruleset.'
             exit 1
           fi
-          ruleset=$(gh api "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
-          if ! jq --exit-status '
+          ruleset=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
+          if ! jq --exit-status --argjson ruleset_id "$ruleset_ids" '
+            .id == $ruleset_id and
+            .name == "Protect immutable release tags" and
             .target == "tag" and
             .enforcement == "active" and
+            has("bypass_actors") and
             .bypass_actors == [] and
             .conditions.ref_name.include == ["refs/tags/v*"] and
+            .conditions.ref_name.exclude == [] and
             any(.rules[]; .type == "deletion") and
             any(.rules[];
               .type == "update" and
@@ -626,7 +635,6 @@ jobs:
       tag: v0.2.0
       release_ref: refs/tags/v0.2.0
       release_commit: ea3c0ef6cccddcf252f14f03abb11b2b74366233
-    secrets: inherit
 
   anchor_container:
     name: Anchor verified container digests in the existing draft
@@ -823,7 +831,6 @@ jobs:
       DOCKERHUB_DIGEST: ${{ needs.docker.outputs.dockerhub_digest }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
       IMMUTABLE_RELEASES_VERIFIED_TAG: ${{ vars.IMMUTABLE_RELEASES_VERIFIED_TAG }}
-      IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.GHCR_TOKEN }}
     steps:
       - name: Check out recovery tooling
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -851,7 +858,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
@@ -859,6 +866,8 @@ jobs:
           cosign-release: v2.5.2
 
       - name: Re-verify all assets, images, policies, and publish once
+        env:
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
           if ! [[ "$ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
@@ -888,26 +897,35 @@ jobs:
             echo '::error::GitHub Immutable Releases is disabled.'
             exit 1
           fi
-          rulesets=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
-          ruleset_ids=$(jq --raw-output '
-            .[] | select(
+          validate_tag_ruleset_contract() {
+            local rulesets ruleset_id ruleset
+            rulesets=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100") || return 1
+            ruleset_id=$(jq --raw-output '
+              .[] | select(
+                .name == "Protect immutable release tags" and
+                .target == "tag" and
+                .enforcement == "active"
+              ) | .id' <<<"$rulesets")
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]] || return 1
+            ruleset=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+              "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_id}") || return 1
+            jq --exit-status --argjson ruleset_id "$ruleset_id" '
+              .id == $ruleset_id and
               .name == "Protect immutable release tags" and
               .target == "tag" and
-              .enforcement == "active"
-            ) | .id' <<<"$rulesets")
-          if [ "$(wc -w <<<"$ruleset_ids")" -ne 1 ]; then
-            echo '::error::The immutable release tag ruleset changed before publication.'
-            exit 1
-          fi
-          ruleset=$(gh api "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
-          if ! jq --exit-status '
-            .bypass_actors == [] and
-            .conditions.ref_name.include == ["refs/tags/v*"] and
-            any(.rules[]; .type == "deletion") and
-            any(.rules[];
-              .type == "update" and
-              .parameters.update_allows_fetch_and_merge == false
-            )' <<<"$ruleset" >/dev/null; then
+              .enforcement == "active" and
+              has("bypass_actors") and
+              .bypass_actors == [] and
+              .conditions.ref_name.include == ["refs/tags/v*"] and
+              .conditions.ref_name.exclude == [] and
+              any(.rules[]; .type == "deletion") and
+              any(.rules[];
+                .type == "update" and
+                .parameters.update_allows_fetch_and_merge == false
+              )' <<<"$ruleset" >/dev/null
+          }
+          if ! validate_tag_ruleset_contract; then
             echo '::error::The immutable release tag ruleset changed before publication.'
             exit 1
           fi
@@ -1081,6 +1099,9 @@ jobs:
             prepublish_inventory=$(jq --compact-output '[.assets[] |
               {name: .name, digest: .digest}
             ] | sort_by(.name)' <<<"$prepublish_release")
+            git fetch --no-tags origin main
+            prepublish_remote_tag_commit=$(git ls-remote --tags origin \
+              "refs/tags/$TAG" | awk '{print $1}')
             prepublish_immutable=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
               "/repos/${GITHUB_REPOSITORY}/immutable-releases" \
               --jq '.enabled' 2>/dev/null || true)
@@ -1091,6 +1112,9 @@ jobs:
                [ "$(printf '%s' "$prepublish_inventory" | sha256sum | awk '{print $1}')" != \
                  "$ASSET_FINGERPRINT" ] || \
                [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$TAG_COMMIT" ] || \
+               [ "$prepublish_remote_tag_commit" != "$TAG_COMMIT" ] || \
+               ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main || \
+               ! validate_tag_ruleset_contract || \
                [ "$prepublish_immutable" != true ]; then
               echo '::error::The release contract changed immediately before publication.'
               exit 1
