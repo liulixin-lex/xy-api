@@ -564,21 +564,17 @@ jobs:
             echo '::error::The release tag changed after immutable-source preflight.'
             exit 1
           fi
-          error_file=$(mktemp)
           existing_directory=$(mktemp -d)
           cleanup() {
-            rm -f "$error_file"
             rm -rf "$existing_directory"
           }
           trap cleanup EXIT
 
-          if ! release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>"$error_file"); then
-            if grep --quiet 'HTTP 404' "$error_file"; then
-              echo 'state=absent' >>"$GITHUB_OUTPUT"
-              exit 0
-            fi
-            cat "$error_file" >&2
-            exit 1
+          release_json=$(scripts/release/github-release-assets.sh \
+            resolve "$GITHUB_REPOSITORY" "$TAG")
+          if [ "$release_json" = null ]; then
+            echo 'state=absent' >>"$GITHUB_OUTPUT"
+            exit 0
           fi
 
           if ! jq --exit-status \
@@ -602,6 +598,11 @@ jobs:
             release_state=draft
           else
             release_state=public
+          fi
+          release_id=$(jq --raw-output '.id' <<<"$release_json")
+          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::Unable to resolve the existing release id.'
+            exit 1
           fi
 
           desktop_version=${TAG#v}
@@ -652,9 +653,11 @@ jobs:
               '.assets | any(.name == $name)' <<<"$release_json" >/dev/null; then
               continue
             fi
-            gh release download "$TAG" \
-              --dir "$existing_directory" \
-              --pattern "$asset_name"
+            scripts/release/github-release-assets.sh download \
+              "$GITHUB_REPOSITORY" \
+              "$release_id" \
+              "$asset_name" \
+              "$existing_directory/$asset_name"
             if ! cmp -s \
               "release-assets/$asset_name" \
               "$existing_directory/$asset_name"; then
@@ -663,27 +666,64 @@ jobs:
             fi
           done
           echo "state=$release_state" >>"$GITHUB_OUTPUT"
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
 
-      - name: Create draft release with verified assets
+      - name: Create the private draft when absent
         id: draft
+        if: steps.existing.outputs.state == 'absent'
+        run: |
+          set -euo pipefail
+          release_json=$(scripts/release/github-release-assets.sh \
+            create-draft \
+            "$GITHUB_REPOSITORY" \
+            "$TAG" \
+            "$TAG_COMMIT" \
+            "docs/releases/${TAG}.md")
+          release_id=$(jq --raw-output '.id' <<<"$release_json")
+          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::GitHub did not return a valid draft release id.'
+            exit 1
+          fi
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+
+      - name: Stage any missing verified core assets by release id
         if: steps.existing.outputs.state != 'public'
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
-        with:
-          tag_name: ${{ needs.preflight.outputs.tag }}
-          draft: true
-          prerelease: false
-          make_latest: false
-          generate_release_notes: false
-          body_path: docs/releases/${{ needs.preflight.outputs.tag }}.md
-          overwrite_files: false
-          fail_on_unmatched_files: true
-          files: release-assets/*
+        env:
+          EXISTING_RELEASE_ID: ${{ steps.existing.outputs.release_id }}
+          CREATED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          release_id=${EXISTING_RELEASE_ID:-$CREATED_RELEASE_ID}
+          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::A valid mutable draft release id is required.'
+            exit 1
+          fi
+          for asset_path in release-assets/*; do
+            asset_name=${asset_path##*/}
+            release_json=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases/${release_id}")
+            if jq --exit-status --arg name "$asset_name" \
+              '.assets | any(.name == $name)' <<<"$release_json" >/dev/null; then
+              continue
+            fi
+            scripts/release/github-release-assets.sh upload \
+              "$GITHUB_REPOSITORY" "$release_id" "$asset_path" >/dev/null
+          done
 
       - name: Resolve and verify the release
         id: resolve
+        env:
+          EXISTING_RELEASE_ID: ${{ steps.existing.outputs.release_id }}
+          CREATED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
         run: |
           set -euo pipefail
-          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          release_id=${EXISTING_RELEASE_ID:-$CREATED_RELEASE_ID}
+          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::Unable to resolve the staged release id.'
+            exit 1
+          fi
+          release_json=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases/${release_id}")
 
           core_assets=$(jq --compact-output --null-input \
             --arg tag "$TAG" \
@@ -712,9 +752,8 @@ jobs:
             echo '::error::The release is missing verified core assets or has invalid metadata.'
             exit 1
           fi
-          release_id=$(jq --raw-output '.id' <<<"$release_json")
-          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
-            echo '::error::Unable to resolve the staged release id.'
+          if [ "$(jq --raw-output '.id' <<<"$release_json")" != "$release_id" ]; then
+            echo '::error::The staged release id changed during verification.'
             exit 1
           fi
           echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
@@ -737,16 +776,17 @@ jobs:
     name: Wait for Electron and verify core/desktop release assets
     needs: [preflight, draft_release]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 70
     permissions:
       actions: read
-      contents: read
+      contents: write
     outputs:
       asset_fingerprint: ${{ steps.assets.outputs.asset_fingerprint }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.preflight.outputs.tag }}
       TAG_COMMIT: ${{ needs.preflight.outputs.commit }}
+      RELEASE_ID: ${{ needs.draft_release.outputs.release_id }}
     steps:
       - name: Check out release verification tooling
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -755,9 +795,10 @@ jobs:
           fetch-depth: 1
 
       - name: Wait for the matching Electron workflow
+        id: electron
         run: |
           set -euo pipefail
-          for _ in $(seq 1 330); do
+          for _ in $(seq 1 390); do
             response=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/electron-build.yml/runs?per_page=100")
             run_json=$(jq --compact-output \
               --arg sha "$TAG_COMMIT" \
@@ -784,17 +825,171 @@ jobs:
               echo "::error::Electron workflow failed with conclusion '$conclusion': $run_url"
               exit 1
             fi
+            run_id=$(jq --raw-output '.id' <<<"$run_json")
+            if ! [[ "$run_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo '::error::The matching Electron workflow has an invalid run id.'
+              exit 1
+            fi
+            artifacts_json=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100")
+            if [ "$(jq '.total_count' <<<"$artifacts_json")" -gt 100 ]; then
+              echo '::error::The Electron run has too many artifacts for an unambiguous recovery.'
+              exit 1
+            fi
+            matching_artifacts=$(jq --compact-output \
+              '[.artifacts[] | select(.name == "windows-build")]' \
+              <<<"$artifacts_json")
+            if ! jq --exit-status \
+              'length == 1 and
+               .[0].expired == false and
+               (.[0].size_in_bytes | type == "number" and . > 0) and
+               (.[0].digest |
+                 type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+              <<<"$matching_artifacts" >/dev/null; then
+              echo '::error::The matching Electron run does not expose one valid windows-build artifact.'
+              exit 1
+            fi
+            echo "run_id=$run_id" >>"$GITHUB_OUTPUT"
             echo "Electron workflow completed successfully."
             exit 0
           done
           echo '::error::Timed out waiting for the Electron release workflow.'
           exit 1
 
+      - name: Download the exact Electron workflow artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-build
+          path: electron-build
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.electron.outputs.run_id }}
+
+      - name: Verify and stage Electron assets by release id
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$TAG_COMMIT" ]; then
+            echo '::error::The release tag changed before Electron assets were staged.'
+            exit 1
+          fi
+
+          desktop_version=${TAG#v}
+          desktop_assets=(
+            "New-API-App.${desktop_version}.exe"
+            "New-API-App.Setup.${desktop_version}.exe"
+            checksums-electron-windows.txt
+          )
+          expected_inventory=$(printf '%s\n' "${desktop_assets[@]}" | sort)
+          actual_inventory=$(find electron-build \
+            -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          if ! diff -u \
+            <(printf '%s\n' "$expected_inventory") \
+            <(printf '%s\n' "$actual_inventory") || \
+             [ "$(find electron-build -mindepth 1 -maxdepth 1 | wc -l)" -ne 3 ]; then
+            echo '::error::The Electron artifact contains an unexpected file inventory.'
+            exit 1
+          fi
+          for asset_name in "${desktop_assets[@]}"; do
+            if [ -L "electron-build/$asset_name" ] || \
+               [ ! -s "electron-build/$asset_name" ]; then
+              echo "::error::Electron artifact is not a non-empty regular file: $asset_name"
+              exit 1
+            fi
+          done
+          (
+            cd electron-build
+            mapfile -t checksum_names < <(awk '
+              NF != 2 || $1 !~ /^[0-9a-f]{64}$/ { exit 1 }
+              {
+                name = $2
+                sub(/^\*/, "", name)
+                sub(/^\.\//, "", name)
+                print name
+              }
+            ' checksums-electron-windows.txt)
+            expected_names=(
+              "New-API-App.${desktop_version}.exe"
+              "New-API-App.Setup.${desktop_version}.exe"
+            )
+            if [ "${#checksum_names[@]}" -ne 2 ]; then
+              echo '::error::Electron checksum inventory must contain exactly two installers.'
+              exit 1
+            fi
+            for index in "${!expected_names[@]}"; do
+              if [ "${checksum_names[$index]}" != "${expected_names[$index]}" ]; then
+                echo "::error::Unexpected Electron checksum entry: ${checksum_names[$index]}"
+                exit 1
+              fi
+              if [ "$(od -An -N2 -tx1 "${expected_names[$index]}" | \
+                tr -d '[:space:]')" != 4d5a ]; then
+                echo "::error::Electron installer is not a Windows executable: ${expected_names[$index]}"
+                exit 1
+              fi
+            done
+            sha256sum --check --strict checksums-electron-windows.txt
+          )
+
+          release_json=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          if ! jq --exit-status \
+            --arg tag "$TAG" \
+            --arg commit "$TAG_COMMIT" \
+            --rawfile expected_body "docs/releases/${TAG}.md" \
+            '.tag_name == $tag and
+             .prerelease == false and
+             .body == $expected_body and
+             ((.draft == true and .immutable != true) or
+              (.draft == false and .immutable == true)) and
+             (.target_commitish == "main" or
+              .target_commitish == $tag or
+              .target_commitish == $commit)' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::Electron assets cannot be reconciled with this release.'
+            exit 1
+          fi
+          if [ "$(jq --raw-output '.draft' <<<"$release_json")" = true ]; then
+            release_state=draft
+          else
+            release_state=public
+          fi
+
+          comparison_directory=$(mktemp -d)
+          trap 'rm -rf "$comparison_directory"' EXIT
+          for asset_name in "${desktop_assets[@]}"; do
+            release_json=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+            if jq --exit-status --arg name "$asset_name" \
+              '.assets | any(.name == $name)' <<<"$release_json" >/dev/null; then
+              scripts/release/github-release-assets.sh download \
+                "$GITHUB_REPOSITORY" \
+                "$RELEASE_ID" \
+                "$asset_name" \
+                "$comparison_directory/$asset_name"
+              if ! cmp -s \
+                "electron-build/$asset_name" \
+                "$comparison_directory/$asset_name"; then
+                echo "::error::Existing Electron release asset differs from the verified build: $asset_name"
+                exit 1
+              fi
+              continue
+            fi
+            if [ "$release_state" != draft ]; then
+              echo "::error::The immutable release is missing Electron asset: $asset_name"
+              exit 1
+            fi
+            scripts/release/github-release-assets.sh upload \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "electron-build/$asset_name" >/dev/null
+          done
+
       - name: Verify release asset inventory and checksums
         id: assets
         run: |
           set -euo pipefail
-          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          release_json=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
           if jq --exit-status '.draft == true and .immutable != true' \
             <<<"$release_json" >/dev/null; then
             release_state=draft
@@ -837,23 +1032,37 @@ jobs:
           core_directory="$RUNNER_TEMP/core-release-assets"
           desktop_directory="$RUNNER_TEMP/electron-release-assets"
           mkdir -p "$core_directory" "$desktop_directory"
-          gh release download "$TAG" \
-            --dir "$core_directory" \
-            --pattern "new-api-${TAG}" \
-            --pattern "new-api-arm64-${TAG}" \
-            --pattern "new-api-macos-${TAG}" \
-            --pattern "new-api-${TAG}.exe" \
-            --pattern 'checksums-linux.txt' \
-            --pattern 'checksums-macos.txt' \
-            --pattern 'checksums-windows.txt' \
-            --pattern 'checksums.txt'
+          core_assets=(
+            "new-api-${TAG}"
+            "new-api-arm64-${TAG}"
+            "new-api-macos-${TAG}"
+            "new-api-${TAG}.exe"
+            checksums-linux.txt
+            checksums-macos.txt
+            checksums-windows.txt
+            checksums.txt
+          )
+          for asset_name in "${core_assets[@]}"; do
+            scripts/release/github-release-assets.sh download \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "$asset_name" \
+              "$core_directory/$asset_name"
+          done
           scripts/release/verify-release-assets.sh "$core_directory" "$TAG"
 
-          gh release download "$TAG" \
-            --dir "$desktop_directory" \
-            --pattern "New-API-App.${desktop_version}.exe" \
-            --pattern "New-API-App.Setup.${desktop_version}.exe" \
-            --pattern 'checksums-electron-windows.txt'
+          desktop_assets=(
+            "New-API-App.${desktop_version}.exe"
+            "New-API-App.Setup.${desktop_version}.exe"
+            checksums-electron-windows.txt
+          )
+          for asset_name in "${desktop_assets[@]}"; do
+            scripts/release/github-release-assets.sh download \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "$asset_name" \
+              "$desktop_directory/$asset_name"
+          done
           (
             cd "$desktop_directory"
             mapfile -t checksum_names < <(awk '
@@ -882,7 +1091,8 @@ jobs:
             sha256sum --check --strict checksums-electron-windows.txt
           )
 
-          verified_release=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          verified_release=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
           verified_asset_names=$(jq --raw-output \
             '.assets[].name | select(. != "container-images.json")' \
             <<<"$verified_release" | sort)
@@ -1064,15 +1274,20 @@ jobs:
             '.assets | any(.name == "container-images.json")' \
             <<<"$release_json" >/dev/null; then
             existing_directory=$(mktemp -d)
-            gh release download "$TAG" \
-              --dir "$existing_directory" \
-              --pattern 'container-images.json'
+            scripts/release/github-release-assets.sh download \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              container-images.json \
+              "$existing_directory/container-images.json"
             if ! cmp -s container-images.json "$existing_directory/container-images.json"; then
               echo '::error::Existing container-images.json differs from verified image outputs.'
               exit 1
             fi
           elif [ "$(jq --raw-output '.draft' <<<"$release_json")" = true ]; then
-            gh release upload "$TAG" container-images.json
+            scripts/release/github-release-assets.sh upload \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              container-images.json >/dev/null
           else
             echo '::error::The immutable public release is missing container-images.json.'
             exit 1
@@ -1165,6 +1380,8 @@ jobs:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      IMMUTABLE_RELEASES_VERIFIED_TAG: ${{ vars.IMMUTABLE_RELEASES_VERIFIED_TAG }}
+      IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.GHCR_TOKEN }}
     steps:
       - name: Check out release tooling
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -1214,6 +1431,18 @@ jobs:
           if ! [[ "$ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
              ! [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo '::error::Verified release or image fingerprints are missing.'
+            exit 1
+          fi
+          if [ "$IMMUTABLE_RELEASES_VERIFIED_TAG" != "$TAG" ] || \
+             [ -z "$IMMUTABLE_SETTINGS_TOKEN" ]; then
+            echo '::error::Immutable Release verification is missing for this exact tag.'
+            exit 1
+          fi
+          immutable_releases_enabled=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            "/repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            --jq '.enabled' 2>/dev/null || true)
+          if [ "$immutable_releases_enabled" != true ]; then
+            echo '::error::GitHub Immutable Releases is disabled or cannot be verified.'
             exit 1
           fi
 
@@ -1319,65 +1548,63 @@ jobs:
           fi
 
           if [ "$release_state" = draft ]; then
-            current_latest_tag=$(gh api \
-              "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')
-            if ! [[ "$current_latest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo '::error::The current latest GitHub Release is not a stable semantic version.'
-              exit 1
-            fi
-            newest_tag=$(printf '%s\n%s\n' "$current_latest_tag" "$TAG" | sort -V | tail -n 1)
+            mapfile -t published_stable_tags < <(gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+            for published_tag in "${published_stable_tags[@]}"; do
+              if ! [[ "$published_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                echo "::error::Published stable release has an invalid semantic version tag: $published_tag"
+                exit 1
+              fi
+            done
+            newest_tag=$(printf '%s\n' "${published_stable_tags[@]}" "$TAG" | \
+              sort -V | tail -n 1)
             if [ "$newest_tag" != "$TAG" ]; then
-              echo "::error::Refusing to publish $TAG after newer release $current_latest_tag."
+              echo "::error::Refusing to publish $TAG after newer release $newest_tag."
               exit 1
             fi
 
             prepublish_release=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+            resolved_release=$(scripts/release/github-release-assets.sh \
+              resolve "$GITHUB_REPOSITORY" "$TAG")
+            prepublish_immutable=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+              "/repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled' 2>/dev/null || true)
             if ! validate_release_contract "$prepublish_release" || \
                ! jq --exit-status '.draft == true and .immutable != true' \
                  <<<"$prepublish_release" >/dev/null || \
-               [ "$(printf '%s' "$prepublish_release" | fingerprint_assets)" != "$ASSET_FINGERPRINT" ]; then
+               [ "$(printf '%s' "$prepublish_release" | fingerprint_assets)" != "$ASSET_FINGERPRINT" ] || \
+               [ "$(jq --raw-output '.id' <<<"$resolved_release")" != "$RELEASE_ID" ] || \
+               [ "$prepublish_immutable" != true ]; then
               echo '::error::The draft changed immediately before the irreversible publication request.'
               exit 1
             fi
 
-            release_publish_confirmed=false
-            for attempt in 1 2 3; do
-              if gh api \
-                --method PATCH \
-                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-                -F draft=false \
-                -F prerelease=false \
-                -f make_latest=true >/dev/null; then
-                release_publish_confirmed=true
-                break
-              fi
-              if current_release=$(gh api \
-                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" 2>/dev/null) && \
-                 validate_release_contract "$current_release" && \
-                 jq --exit-status '.draft == false and .immutable == true' \
-                   <<<"$current_release" >/dev/null; then
-                release_publish_confirmed=true
-                break
-              fi
-              sleep $((attempt * 5))
-            done
-            if [ "$release_publish_confirmed" != true ]; then
-              echo '::error::Unable to confirm immutable publication of the verified draft.'
-              exit 1
+            if ! gh api \
+              --method PATCH \
+              "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -F draft=false \
+              -F prerelease=false \
+              -f make_latest=true >/dev/null; then
+              echo 'The publication response was not confirmed; reconciling by release id without retrying the PATCH.'
             fi
           fi
 
           publication_verified=false
-          for _ in $(seq 1 12); do
+          for _ in $(seq 1 18); do
             if published_release=$(gh api \
                  "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" 2>/dev/null) && \
                validate_release_contract "$published_release" && \
                jq --exit-status '.draft == false and .immutable == true' \
                  <<<"$published_release" >/dev/null; then
               published_fingerprint=$(printf '%s' "$published_release" | fingerprint_assets)
+              tag_release_id=$(gh api \
+                "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+                --jq '.id' 2>/dev/null || true)
               latest_release_tag=$(gh api \
                 "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
               if [ "$published_fingerprint" = "$ASSET_FINGERPRINT" ] && \
+                 [ "$tag_release_id" = "$RELEASE_ID" ] && \
                  [ "$latest_release_tag" = "$TAG" ]; then
                 publication_verified=true
                 break

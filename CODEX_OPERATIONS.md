@@ -85,3 +85,11 @@ a recovery run may resume only the exact immutable public Release after
 re-verifying its tag, body, complete asset names and digests, checksums,
 container manifest, signatures, and attestations. It must not recreate a
 draft, upload over an immutable asset, or move a version tag.
+
+GitHub draft Releases must be discovered by enumerating authenticated Release
+list results and requiring exactly one matching tag. The public
+`releases/tags/{tag}` endpoint, tag-based `gh release` asset commands, and
+independent workflow writers are not valid draft coordination mechanisms.
+After discovery, all draft reads and mutations use the fixed Release ID and
+asset IDs, never overwrite an existing asset, and reconcile an uncertain write
+by reading it back instead of blindly retrying the mutation.
