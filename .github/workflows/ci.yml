@@ -353,7 +353,9 @@ jobs:
             "new-api-macos-amd64-$VERSION" \
             "new-api-macos-arm64-$VERSION" \
             -output "new-api-macos-$VERSION"
-          lipo -verify_arch x86_64 arm64 "new-api-macos-$VERSION"
+          architectures=" $(lipo -archs "new-api-macos-$VERSION") "
+          [[ "$architectures" == *' x86_64 '* ]]
+          [[ "$architectures" == *' arm64 '* ]]
           [ "$("./new-api-macos-$VERSION" --version)" = "$VERSION" ]
           file "new-api-macos-$VERSION" | grep --quiet 'Mach-O universal binary'
           shasum -a 256 "new-api-macos-$VERSION" >checksums-macos.txt
