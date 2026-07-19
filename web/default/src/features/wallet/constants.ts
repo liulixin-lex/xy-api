@@ -33,6 +33,8 @@ export const PAYMENT_TYPES = {
   ALIPAY: 'alipay',
   WECHAT: 'wxpay',
   STRIPE: 'stripe',
+  XORPAY_NATIVE: 'xorpay_native',
+  XORPAY_ALIPAY: 'xorpay_alipay',
   CREEM: 'creem',
   WAFFO: 'waffo',
   WAFFO_PANCAKE: 'waffo_pancake',
@@ -50,6 +52,8 @@ export const PAYMENT_ICON_COLORS = {
   [PAYMENT_TYPES.ALIPAY]: '#1677FF',
   [PAYMENT_TYPES.WECHAT]: '#07C160',
   [PAYMENT_TYPES.STRIPE]: '#635BFF',
+  [PAYMENT_TYPES.XORPAY_NATIVE]: '#07C160',
+  [PAYMENT_TYPES.XORPAY_ALIPAY]: '#1677FF',
   [PAYMENT_TYPES.CREEM]: '#6366F1',
   [PAYMENT_TYPES.WAFFO]: '#2563EB',
   [PAYMENT_TYPES.WAFFO_PANCAKE]: '#F97316',
@@ -69,3 +73,8 @@ export const DEFAULT_DISCOUNT_RATE = 1.0
  * Default minimum topup amount
  */
 export const DEFAULT_MIN_TOPUP = 1
+
+/**
+ * Server-authoritative upper bound for a single online top-up.
+ */
+export const MAX_TOPUP_AMOUNT = 10_000

@@ -28,12 +28,59 @@ import {
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 
+const isSecurePaymentCallbackOrigin = (value) => {
+  const trimmed = (value || '').trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(
+      parsed.hostname,
+    );
+    const secureProtocol =
+      parsed.protocol === 'https:' || (loopback && parsed.protocol === 'http:');
+    return (
+      secureProtocol &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.search &&
+      !parsed.hash &&
+      (parsed.pathname === '' || parsed.pathname === '/')
+    );
+  } catch {
+    return false;
+  }
+};
+
+const isValidTopupGroupRatios = (value) => {
+  try {
+    const parsed = JSON.parse((value || '').trim());
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return false;
+    }
+    const ratios = Object.entries(parsed);
+    return (
+      ratios.length >= 1 &&
+      ratios.length <= 100 &&
+      ratios.every(
+        ([group, ratio]) =>
+          group.trim().length >= 1 &&
+          group.length <= 64 &&
+          typeof ratio === 'number' &&
+          Number.isFinite(ratio) &&
+          ratio > 0 &&
+          ratio <= 1000,
+      )
+    );
+  } catch {
+    return false;
+  }
+};
+
 export default function SettingsGeneralPayment(props) {
   const { t } = useTranslation();
   const sectionTitle = props.hideSectionTitle ? undefined : t('通用设置');
   const [loading, setLoading] = useState(false);
   const [inputs, setInputs] = useState({
-    ServerAddress: '',
     CustomCallbackAddress: '',
     TopupGroupRatio: '',
     PayMethods: '',
@@ -42,11 +89,11 @@ export default function SettingsGeneralPayment(props) {
   });
   const [originInputs, setOriginInputs] = useState({});
   const formApiRef = useRef(null);
+  const submitInFlightRef = useRef(false);
 
   useEffect(() => {
     if (props.options && formApiRef.current) {
       const currentInputs = {
-        ServerAddress: props.options.ServerAddress || '',
         CustomCallbackAddress: props.options.CustomCallbackAddress || '',
         TopupGroupRatio: props.options.TopupGroupRatio || '',
         PayMethods: props.options.PayMethods || '',
@@ -64,9 +111,20 @@ export default function SettingsGeneralPayment(props) {
   };
 
   const submitGeneralSettings = async () => {
+    if (submitInFlightRef.current) return;
+
+    const callbackBase = removeTrailingSlash(inputs.CustomCallbackAddress);
+    if (!isSecurePaymentCallbackOrigin(callbackBase)) {
+      showError(
+        t(
+          'Enter a required HTTPS payment callback origin without a path, query, credentials, or fragment.',
+        ),
+      );
+      return;
+    }
     if (
       originInputs.TopupGroupRatio !== inputs.TopupGroupRatio &&
-      !verifyJSON(inputs.TopupGroupRatio)
+      !isValidTopupGroupRatios(inputs.TopupGroupRatio)
     ) {
       showError(t('充值分组倍率不是合法的 JSON 字符串'));
       return;
@@ -98,63 +156,57 @@ export default function SettingsGeneralPayment(props) {
       return;
     }
 
+    submitInFlightRef.current = true;
     setLoading(true);
     try {
-      const options = [
-        {
-          key: 'ServerAddress',
-          value: removeTrailingSlash(inputs.ServerAddress),
-        },
-      ];
-
-      if (inputs.CustomCallbackAddress !== '') {
-        options.push({
-          key: 'CustomCallbackAddress',
-          value: removeTrailingSlash(inputs.CustomCallbackAddress),
-        });
+      const options = {};
+      if (originInputs.CustomCallbackAddress !== inputs.CustomCallbackAddress) {
+        options.CustomCallbackAddress = callbackBase;
       }
       if (originInputs.TopupGroupRatio !== inputs.TopupGroupRatio) {
-        options.push({ key: 'TopupGroupRatio', value: inputs.TopupGroupRatio });
+        options.TopupGroupRatio = inputs.TopupGroupRatio;
       }
       if (originInputs.PayMethods !== inputs.PayMethods) {
-        options.push({ key: 'PayMethods', value: inputs.PayMethods });
+        options.PayMethods = inputs.PayMethods;
       }
       if (originInputs.AmountOptions !== inputs.AmountOptions) {
-        options.push({
-          key: 'payment_setting.amount_options',
-          value: inputs.AmountOptions,
-        });
+        options['payment_setting.amount_options'] =
+          inputs.AmountOptions.trim() || '[]';
       }
       if (originInputs.AmountDiscount !== inputs.AmountDiscount) {
-        options.push({
-          key: 'payment_setting.amount_discount',
-          value: inputs.AmountDiscount,
-        });
+        options['payment_setting.amount_discount'] =
+          inputs.AmountDiscount.trim() || '{}';
       }
 
-      const results = await Promise.all(
-        options.map((option) =>
-          API.put('/api/option/', {
-            key: option.key,
-            value: option.value,
-          }),
-        ),
-      );
-
-      const errorResults = results.filter((res) => !res.data.success);
-      if (errorResults.length === 0) {
+      if (Object.keys(options).length === 0) {
         showSuccess(t('更新成功'));
-        setOriginInputs({ ...inputs });
-        props.refresh && props.refresh();
-      } else {
-        errorResults.forEach((res) => {
-          showError(res.data.message);
-        });
+        return;
       }
+
+      await props.withPaymentVerification(async () => {
+        const response = await API.put(
+          '/api/option/payment',
+          {
+            options,
+            expected_version: props.configVersion || 1,
+          },
+          { skipErrorHandler: true },
+        );
+        if (response.data.success) {
+          showSuccess(t('更新成功'));
+          setOriginInputs({ ...inputs });
+          await props.refresh?.(response.data?.data?.version);
+        } else {
+          showError(response.data.message || t('更新失败'));
+        }
+        return response;
+      });
     } catch (error) {
-      showError(t('更新失败'));
+      showError(error?.response?.data?.message || t('更新失败'));
+    } finally {
+      submitInFlightRef.current = false;
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -165,26 +217,20 @@ export default function SettingsGeneralPayment(props) {
         getFormApi={(api) => (formApiRef.current = api)}
       >
         <Form.Section text={sectionTitle}>
-          <Form.Input
-            field='ServerAddress'
-            label={t('服务器地址')}
-            placeholder={'https://yourdomain.com'}
-            style={{ width: '100%' }}
-            extraText={t(
-              '该服务器地址将影响支付回调地址以及默认首页展示的地址，请确保正确配置',
-            )}
-          />
-          <Row
-            gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}
-            style={{ marginTop: 16 }}
-          >
+          <Row gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}>
             <Col xs={24} sm={24} md={12} lg={12} xl={12}>
               <Form.Input
                 field='CustomCallbackAddress'
-                label={t('回调地址')}
+                label={t('Secure payment callback base')}
                 placeholder={t('例如：https://yourdomain.com')}
+                rules={[
+                  {
+                    required: true,
+                    message: t('支付回调安全基址为必填项'),
+                  },
+                ]}
                 extraText={t(
-                  '留空时默认使用服务器地址作为回调地址，填写后将覆盖默认值',
+                  'Epay、Stripe 与 XORPay 的新支付只使用此 HTTPS 站点源生成回调与返回地址。请勿填写路径、查询参数、凭据或片段。',
                 )}
               />
             </Col>
@@ -238,7 +284,11 @@ export default function SettingsGeneralPayment(props) {
               />
             </Col>
           </Row>
-          <Button onClick={submitGeneralSettings} style={{ marginTop: 16 }}>
+          <Button
+            onClick={submitGeneralSettings}
+            loading={loading}
+            style={{ marginTop: 16 }}
+          >
             {t('保存通用设置')}
           </Button>
         </Form.Section>

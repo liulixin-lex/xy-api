@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,13 +16,14 @@ import (
 
 // UserBase struct remains the same as it represents the cached data structure
 type UserBase struct {
-	Id       int    `json:"id"`
-	Group    string `json:"group"`
-	Email    string `json:"email"`
-	Quota    int    `json:"quota"`
-	Status   int    `json:"status"`
-	Username string `json:"username"`
-	Setting  string `json:"setting"`
+	Id            int    `json:"id"`
+	Group         string `json:"group"`
+	Email         string `json:"email"`
+	Quota         int    `json:"quota"`
+	Status        int    `json:"status"`
+	PaymentFrozen bool   `json:"-"`
+	Username      string `json:"username"`
+	Setting       string `json:"setting"`
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -91,6 +93,9 @@ func updateUserCache(user User) error {
 	if err := updateUserStatusCache(user.Id, user.Status == common.UserStatusEnabled); err != nil {
 		return err
 	}
+	if err := updateUserPaymentFrozenCache(user.Id, user.PaymentFrozen); err != nil {
+		return err
+	}
 	if err := updateUserNameCache(user.Id, user.Username); err != nil {
 		return err
 	}
@@ -127,13 +132,14 @@ func GetUserCache(userId int) (userCache *UserBase, err error) {
 
 	// Create cache object from user data
 	userCache = &UserBase{
-		Id:       user.Id,
-		Group:    user.Group,
-		Quota:    user.Quota,
-		Status:   user.Status,
-		Username: user.Username,
-		Setting:  user.Setting,
-		Email:    user.Email,
+		Id:            user.Id,
+		Group:         user.Group,
+		Quota:         user.Quota,
+		Status:        user.Status,
+		PaymentFrozen: user.PaymentFrozen,
+		Username:      user.Username,
+		Setting:       user.Setting,
+		Email:         user.Email,
 	}
 
 	return userCache, nil
@@ -215,6 +221,13 @@ func updateUserStatusCache(userId int, status bool) error {
 		statusInt = common.UserStatusDisabled
 	}
 	return common.RedisHSetField(getUserCacheKey(userId), "Status", fmt.Sprintf("%d", statusInt))
+}
+
+func updateUserPaymentFrozenCache(userId int, paymentFrozen bool) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	return common.RedisHSetField(getUserCacheKey(userId), "PaymentFrozen", strconv.FormatBool(paymentFrozen))
 }
 
 func updateUserQuotaCache(userId int, quota int) error {

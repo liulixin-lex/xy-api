@@ -296,6 +296,7 @@ func GenerateMjOtherInfo(relayInfo *relaycommon.RelayInfo, priceData types.Price
 	if priceData.GroupRatioInfo.HasSpecialRatio {
 		other["user_group_ratio"] = priceData.GroupRatioInfo.GroupSpecialRatio
 	}
+	appendBillingInfo(relayInfo, other)
 	appendRequestPath(nil, relayInfo, other)
 	return other
 }

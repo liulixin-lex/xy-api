@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,14 +16,18 @@ const (
 	// SecureVerificationSessionKey means the user has fully passed secure verification.
 	SecureVerificationSessionKey       = "secure_verified_at"
 	secureVerificationMethodSessionKey = "secure_verified_method"
+	secureVerificationUserIDSessionKey = "secure_verified_user_id"
 	secureVerificationMethod2FA        = "2fa"
 	secureVerificationMethodPasskey    = "passkey"
 	// PasskeyReadySessionKey means WebAuthn finished and /api/verify can finalize step-up verification.
-	PasskeyReadySessionKey = "secure_passkey_ready_at"
+	PasskeyReadySessionKey       = "secure_passkey_ready_at"
+	passkeyReadyUserIDSessionKey = "secure_passkey_ready_user_id"
 	// SecureVerificationTimeout 验证有效期（秒）
 	SecureVerificationTimeout = 300 // 5分钟
 	// PasskeyReadyTimeout passkey ready 标记有效期（秒）
-	PasskeyReadyTimeout = 60
+	PasskeyReadyTimeout                = 60
+	secureVerificationRequestBodyLimit = 4 << 10
+	secureVerificationCodeMaxLength    = 128
 )
 
 type UniversalVerifyRequest struct {
@@ -47,9 +52,16 @@ func UniversalVerify(c *gin.Context) {
 		return
 	}
 
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, secureVerificationRequestBodyLimit)
 	var req UniversalVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiError(c, fmt.Errorf("参数错误: %v", err))
+		return
+	}
+	req.Method = strings.ToLower(strings.TrimSpace(req.Method))
+	req.Code = strings.TrimSpace(req.Code)
+	if len(req.Method) > 16 || len(req.Code) > secureVerificationCodeMaxLength {
+		common.ApiError(c, fmt.Errorf("参数错误"))
 		return
 	}
 
@@ -145,9 +157,11 @@ func UniversalVerify(c *gin.Context) {
 func setSecureVerificationSession(c *gin.Context, method string) (int64, error) {
 	session := sessions.Default(c)
 	session.Delete(PasskeyReadySessionKey)
+	session.Delete(passkeyReadyUserIDSessionKey)
 	now := time.Now().Unix()
 	session.Set(SecureVerificationSessionKey, now)
 	session.Set(secureVerificationMethodSessionKey, method)
+	session.Set(secureVerificationUserIDSessionKey, c.GetInt("id"))
 	if err := session.Save(); err != nil {
 		return 0, err
 	}
@@ -164,15 +178,27 @@ func consumePasskeyReady(c *gin.Context) (bool, error) {
 	readyAt, ok := readyAtRaw.(int64)
 	if !ok {
 		session.Delete(PasskeyReadySessionKey)
+		session.Delete(passkeyReadyUserIDSessionKey)
 		_ = session.Save()
 		return false, fmt.Errorf("无效的 Passkey 验证状态")
 	}
+	readyUserID, ok := session.Get(passkeyReadyUserIDSessionKey).(int)
+	if !ok || readyUserID != c.GetInt("id") {
+		session.Delete(PasskeyReadySessionKey)
+		session.Delete(passkeyReadyUserIDSessionKey)
+		if err := session.Save(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
 	session.Delete(PasskeyReadySessionKey)
+	session.Delete(passkeyReadyUserIDSessionKey)
 	if err := session.Save(); err != nil {
 		return false, err
 	}
 	// Expired ready markers cannot be reused.
-	if time.Now().Unix()-readyAt >= PasskeyReadyTimeout {
+	elapsed := time.Now().Unix() - readyAt
+	if elapsed < 0 || elapsed >= PasskeyReadyTimeout {
 		return false, nil
 	}
 	return true, nil

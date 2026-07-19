@@ -305,3 +305,26 @@ func TestCancelAffiliateRewardRecordMarksCanceledAndReversesAvailableBalance(t *
 	assert.Equal(t, int64(300), summary.CanceledRewardQuota)
 	assert.Equal(t, int64(0), summary.AvailableRewardQuota)
 }
+
+func TestCancelAffiliateRewardRecordRejectsInconsistentAvailableBalance(t *testing.T) {
+	truncateTables(t)
+	now := int64(1_800_000_000)
+	require.NoError(t, DB.Create(&User{
+		Id: 72, Username: "inconsistent-inviter", Password: "secret", Status: common.UserStatusEnabled,
+		AffCode: "aff72", AffQuota: 25, AffHistoryQuota: 25,
+	}).Error)
+	require.NoError(t, DB.Create(&AffiliateRewardRecord{
+		Id: 720, InviterId: 72, InviteeId: 73, TopUpId: 7201, RewardQuota: 300,
+		Status: AffiliateRewardStatusAvailable, AvailableAt: now - 60, CreatedAt: now - 60,
+	}).Error)
+
+	err := CancelAffiliateRewardRecord(720, now)
+	require.Error(t, err)
+	var record AffiliateRewardRecord
+	require.NoError(t, DB.First(&record, 720).Error)
+	assert.Equal(t, AffiliateRewardStatusAvailable, record.Status)
+	var inviter User
+	require.NoError(t, DB.First(&inviter, 72).Error)
+	assert.Equal(t, 25, inviter.AffQuota)
+	assert.Equal(t, 25, inviter.AffHistoryQuota)
+}

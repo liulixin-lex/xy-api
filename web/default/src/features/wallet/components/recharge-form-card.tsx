@@ -16,11 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect } from 'react'
 import { Gift, ExternalLink, Loader2, Receipt, WalletCards } from 'lucide-react'
+import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { formatNumber } from '@/lib/format'
-import { cn } from '@/lib/utils'
+
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -34,13 +33,17 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { formatNumber } from '@/lib/format'
+import { cn } from '@/lib/utils'
+
+import { MAX_TOPUP_AMOUNT } from '../constants'
 import {
-  formatCurrency,
   getDiscountLabel,
   getPaymentIcon,
   getMinTopupAmount,
-  calculatePresetPricing,
+  getSafePaymentUrl,
 } from '../lib'
+import { formatPaymentDecimalAmount } from '../lib/billing'
 import type {
   PaymentMethod,
   PresetAmount,
@@ -58,7 +61,10 @@ interface RechargeFormCardProps {
   topupAmount: number
   onTopupAmountChange: (amount: number) => void
   paymentAmount: number
+  paymentCurrency?: string
+  paymentProvider?: string
   calculating: boolean
+  quoteError?: string | null
   onPaymentMethodSelect: (method: PaymentMethod) => void
   paymentLoading: string | null
   redemptionCode: string
@@ -67,7 +73,8 @@ interface RechargeFormCardProps {
   redeeming: boolean
   topupLink?: string
   loading?: boolean
-  priceRatio?: number
+  loadError?: string | null
+  onRetryLoad?: () => void
   usdExchangeRate?: number
   onOpenBilling?: () => void
   creemProducts?: CreemProduct[]
@@ -88,7 +95,10 @@ export function RechargeFormCard({
   topupAmount,
   onTopupAmountChange,
   paymentAmount,
+  paymentCurrency,
+  paymentProvider,
   calculating,
+  quoteError,
   onPaymentMethodSelect,
   paymentLoading,
   redemptionCode,
@@ -97,7 +107,8 @@ export function RechargeFormCard({
   redeeming,
   topupLink,
   loading,
-  priceRatio = 1,
+  loadError,
+  onRetryLoad,
   usdExchangeRate = 1,
   onOpenBilling,
   creemProducts,
@@ -111,6 +122,7 @@ export function RechargeFormCard({
 }: RechargeFormCardProps) {
   const { t } = useTranslation()
   const [localAmount, setLocalAmount] = useState(topupAmount.toString())
+  const safeTopupLink = topupLink ? getSafePaymentUrl(topupLink)?.href : null
 
   useEffect(() => {
     setLocalAmount(topupAmount.toString())
@@ -118,15 +130,20 @@ export function RechargeFormCard({
 
   const handleAmountChange = (value: string) => {
     setLocalAmount(value)
-    const numValue = Number.parseInt(value) || 0
-    if (numValue >= 0) {
-      onTopupAmountChange(numValue)
-    }
+    const numValue = Number(value)
+    onTopupAmountChange(
+      Number.isSafeInteger(numValue) &&
+        numValue >= 1 &&
+        numValue <= MAX_TOPUP_AMOUNT
+        ? numValue
+        : 0
+    )
   }
 
   const hasConfigurableTopup =
     topupInfo?.enable_online_topup ||
     topupInfo?.enable_stripe_topup ||
+    topupInfo?.enable_xorpay_topup ||
     enableWaffoTopup ||
     enableWaffoPancakeTopup
   const hasAnyTopup = hasConfigurableTopup || enableCreemTopup
@@ -135,7 +152,7 @@ export function RechargeFormCard({
   const hasWaffoPaymentMethods =
     Array.isArray(waffoPayMethods) && waffoPayMethods.length > 0
   const minTopup = getMinTopupAmount(topupInfo)
-  const redemptionEnabled = topupInfo?.enable_redemption !== false
+  const redemptionEnabled = !!topupInfo && topupInfo.enable_redemption !== false
 
   if (loading) {
     return (
@@ -150,7 +167,10 @@ export function RechargeFormCard({
             <div className='space-y-3'>
               <Skeleton className='h-3 w-16' />
               <div className='grid grid-cols-2 gap-3 sm:grid-cols-4'>
-                {Array.from({ length: 8 }, (_, i) => `amount-skeleton-${i}`).map((key) => (
+                {Array.from(
+                  { length: 8 },
+                  (_, i) => `amount-skeleton-${i}`
+                ).map((key) => (
                   <Skeleton key={key} className='h-[72px] rounded-lg' />
                 ))}
               </div>
@@ -166,7 +186,10 @@ export function RechargeFormCard({
             <div className='space-y-3'>
               <Skeleton className='h-3 w-32' />
               <div className='flex flex-wrap gap-3'>
-                {Array.from({ length: 3 }, (_, i) => `gateway-skeleton-${i}`).map((key) => (
+                {Array.from(
+                  { length: 3 },
+                  (_, i) => `gateway-skeleton-${i}`
+                ).map((key) => (
                   <Skeleton key={key} className='h-10 w-24 rounded-lg' />
                 ))}
               </div>
@@ -280,6 +303,24 @@ export function RechargeFormCard({
       }
       contentClassName='space-y-4 sm:space-y-6'
     >
+      {loadError && (
+        <Alert variant='destructive'>
+          <AlertDescription className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+            <span>{loadError}</span>
+            {onRetryLoad && (
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                disabled={loading}
+                onClick={onRetryLoad}
+              >
+                {t('Retry')}
+              </Button>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
       {/* Online Topup Section */}
       {hasAnyTopup ? (
         <div className='space-y-4 sm:space-y-6'>
@@ -296,17 +337,8 @@ export function RechargeFormCard({
                         preset.discount ||
                         topupInfo?.discount?.[preset.value] ||
                         1.0
-                      const {
-                        displayValue,
-                        actualPrice,
-                        savedAmount,
-                        hasDiscount,
-                      } = calculatePresetPricing(
-                        preset.value,
-                        priceRatio,
-                        discount,
-                        usdExchangeRate
-                      )
+                      const displayValue = preset.value * usdExchangeRate
+                      const hasDiscount = discount < 1
                       return (
                         <Button
                           key={preset.value}
@@ -329,15 +361,6 @@ export function RechargeFormCard({
                               </div>
                             )}
                           </div>
-                          <div className='text-muted-foreground mt-1.5 w-full text-xs sm:mt-2'>
-                            Pay {formatCurrency(actualPrice)}
-                            {hasDiscount && savedAmount > 0 && (
-                              <span className='text-green-600'>
-                                {' '}
-                                • Save {formatCurrency(savedAmount)}
-                              </span>
-                            )}
-                          </div>
                         </Button>
                       )
                     })}
@@ -356,10 +379,14 @@ export function RechargeFormCard({
                   <Input
                     id='topup-amount'
                     type='number'
+                    step={1}
                     value={localAmount}
                     onChange={(e) => handleAmountChange(e.target.value)}
                     min={minTopup}
-                    placeholder={`Minimum ${minTopup}`}
+                    max={MAX_TOPUP_AMOUNT}
+                    placeholder={t('Minimum {{amount}}', {
+                      amount: minTopup,
+                    })}
                     className='h-9 text-base sm:h-10 sm:text-lg'
                   />
                   <div className='bg-muted/30 flex min-h-9 items-center justify-between gap-2 rounded-md border px-3 lg:min-w-52'>
@@ -370,11 +397,22 @@ export function RechargeFormCard({
                       <Skeleton className='h-5 w-16' />
                     ) : (
                       <span className='text-sm font-semibold'>
-                        {formatCurrency(paymentAmount)}
+                        {paymentCurrency
+                          ? formatPaymentDecimalAmount(
+                              paymentAmount,
+                              paymentCurrency,
+                              paymentProvider
+                            )
+                          : '—'}
                       </span>
                     )}
                   </div>
                 </div>
+                {quoteError && (
+                  <Alert variant='destructive'>
+                    <AlertDescription>{quoteError}</AlertDescription>
+                  </Alert>
+                )}
               </div>
 
               <div className='space-y-2.5 sm:space-y-3'>
@@ -465,13 +503,15 @@ export function RechargeFormCard({
           )}
         </div>
       ) : (
-        <Alert>
-          <AlertDescription>
-            {t(
-              'Online topup is not enabled. Please use redemption code or contact administrator.'
-            )}
-          </AlertDescription>
-        </Alert>
+        !loadError && (
+          <Alert>
+            <AlertDescription>
+              {t(
+                'Online topup is not enabled. Please use redemption code or contact administrator.'
+              )}
+            </AlertDescription>
+          </Alert>
+        )
       )}
 
       {/* Creem Products Section */}
@@ -520,11 +560,11 @@ export function RechargeFormCard({
               {t('Redeem')}
             </Button>
           </div>
-          {topupLink && (
+          {safeTopupLink && (
             <p className='text-muted-foreground text-xs'>
               {t('Need a redemption code?')}{' '}
               <a
-                href={topupLink}
+                href={safeTopupLink}
                 target='_blank'
                 rel='noopener noreferrer'
                 className='inline-flex items-center gap-1 underline-offset-4 hover:underline'

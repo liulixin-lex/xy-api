@@ -29,6 +29,105 @@ export interface ApiResponse<T = unknown> {
   data?: T
 }
 
+export type PaymentProvider = 'epay' | 'stripe' | 'xorpay'
+export type LegacyPaymentProvider = 'creem' | 'waffo' | 'waffo_pancake'
+export type PaymentMethodProvider = PaymentProvider | LegacyPaymentProvider
+export type PaymentOrderKind = 'topup' | 'subscription'
+export type PaymentOrderStatus =
+  | 'pending'
+  | 'processing'
+  | 'success'
+  | 'failed'
+  | 'expired'
+  | 'manual_review'
+  | 'refund_pending'
+  | 'refunded'
+  | 'disputed'
+  | 'debt'
+
+export interface PaymentQuoteRequest {
+  order_kind: PaymentOrderKind
+  provider: PaymentProvider
+  payment_method: string
+  amount?: number
+  plan_id?: number
+}
+
+export interface PaymentQuote {
+  quote_id: string
+  order_kind: PaymentOrderKind
+  provider: PaymentProvider
+  payment_method: string
+  requested_amount: number
+  credit_quota: number
+  expected_amount_minor: number
+  payable_amount: string
+  currency: string
+  expires_at: number
+}
+
+/** UI quote also represents preserved legacy checkout flows during migration. */
+export type ClientPaymentQuote = Omit<PaymentQuote, 'provider'> & {
+  provider: PaymentMethodProvider
+  legacy?: boolean
+}
+
+export interface PaymentStartRequest {
+  quote_id: string
+  request_id: string
+}
+
+interface PaymentStartBase {
+  trade_no: string
+  expires_at: number
+}
+
+export interface PaymentFormPostStart extends PaymentStartBase {
+  flow: 'form_post'
+  action: string
+  fields: Record<string, string>
+}
+
+export interface PaymentPendingStart extends PaymentStartBase {
+  flow: 'pending'
+}
+
+export interface PaymentHostedRedirectStart extends PaymentStartBase {
+  flow: 'hosted_redirect'
+  url: string
+}
+
+export interface PaymentQrStart extends PaymentStartBase {
+  flow: 'qr'
+  qr_content: string
+}
+
+export type PaymentStart =
+  | PaymentFormPostStart
+  | PaymentHostedRedirectStart
+  | PaymentQrStart
+  | PaymentPendingStart
+
+export interface PaymentOrder {
+  trade_no: string
+  order_kind: PaymentOrderKind
+  provider: PaymentProvider
+  payment_method: string
+  status: PaymentOrderStatus
+  requested_amount: number
+  credit_quota: number
+  expected_amount_minor: number
+  paid_amount_minor: number
+  currency: string
+  expires_at: number
+  settled_at?: number
+  status_reason?: string
+}
+
+export type PaymentQuoteResponse = ApiResponse<PaymentQuote>
+export type PaymentStartResponse = ApiResponse<PaymentStart>
+export type PaymentOrderResponse = ApiResponse<PaymentOrder>
+
 /**
  * Standard API response types
  */
@@ -94,12 +193,16 @@ export interface PaymentMethod {
   name: string
   /** Payment method type identifier */
   type: string
+  /** Explicit gateway owner. UI dispatch must not infer by exclusion. */
+  provider: PaymentMethodProvider
   /** Legacy optional color for UI display */
   color?: string
   /** Minimum topup amount for this payment method */
   min_topup?: number
   /** Optional react-icons component name or safe icon URL */
   icon?: string
+  /** ISO 4217 settlement currency advertised by the gateway */
+  currency?: string
 }
 
 /**
@@ -124,12 +227,16 @@ export interface TopupInfo {
   enable_online_topup: boolean
   /** Whether Stripe topup is enabled */
   enable_stripe_topup: boolean
+  /** Whether XORPay is available for new payments */
+  enable_xorpay_topup?: boolean
   /** Available payment methods */
   pay_methods: PaymentMethod[]
   /** Minimum topup amount for online topup */
   min_topup: number
   /** Minimum topup amount for Stripe */
   stripe_min_topup: number
+  /** Minimum topup amount for XORPay */
+  xorpay_min_topup?: number
   /** Preset amount options */
   amount_options: number[]
   /** Discount rates by amount */
@@ -251,7 +358,7 @@ export interface UserWalletData {
 /**
  * Topup record status
  */
-export type TopupStatus = 'success' | 'pending' | 'expired'
+export type TopupStatus = PaymentOrderStatus
 
 /**
  * Topup billing record
@@ -269,6 +376,28 @@ export interface TopupRecord {
   trade_no: string
   /** Payment method type */
   payment_method: string
+  /** Explicit payment gateway for new records */
+  payment_provider?: PaymentMethodProvider
+  /** Alias used by the unified payment order projection */
+  provider?: PaymentMethodProvider
+  /** User-visible order purpose */
+  order_kind?: PaymentOrderKind
+  /** ISO 4217 currency code for actual payment */
+  currency?: string
+  /** Canonical quota credited by this order */
+  credit_quota?: number
+  /** Canonical expected payment amount in the currency's minor unit */
+  expected_amount_minor?: number
+  /** Actual settled payment amount in the currency's minor unit */
+  paid_amount_minor?: number
+  /** Cumulative amount reported refunded by the provider */
+  refunded_amount_minor?: number
+  /** Cumulative amount currently disputed at the provider */
+  disputed_amount_minor?: number
+  /** Cumulative amount whose entitlement has been reversed */
+  reversed_amount_minor?: number
+  /** Safe, user-facing status explanation */
+  status_reason?: string
   /** Creation timestamp */
   create_time: number
   /** Completion timestamp */
@@ -288,6 +417,3 @@ export interface BillingHistoryResponse {
 /**
  * Complete order request (admin only)
  */
-export interface CompleteOrderRequest {
-  trade_no: string
-}

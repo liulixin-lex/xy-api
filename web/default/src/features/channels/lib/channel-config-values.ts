@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export function hasConfiguredOverrideValue(value: string | undefined): boolean {
   if (typeof value !== 'string') return false
 

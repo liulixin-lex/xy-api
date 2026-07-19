@@ -1,8 +1,3 @@
-import type {
-  ColumnDef,
-  Row,
-  Table as TanstackTable,
-} from '@tanstack/react-table'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -21,6 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type {
+  ColumnDef,
+  Row,
+  Table as TanstackTable,
+} from '@tanstack/react-table'
 import * as React from 'react'
 
 import { PageFooterPortal } from '@/components/layout/components/page-footer'

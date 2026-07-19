@@ -46,7 +46,6 @@ export default function SettingsPaymentGatewayCreem(props) {
     CreemProducts: '[]',
     CreemTestMode: false,
   });
-  const [originInputs, setOriginInputs] = useState({});
   const [products, setProducts] = useState([]);
   const [showProductModal, setShowProductModal] = useState(false);
   const [editingProduct, setEditingProduct] = useState(null);
@@ -68,7 +67,6 @@ export default function SettingsPaymentGatewayCreem(props) {
         CreemTestMode: props.options.CreemTestMode === 'true',
       };
       setInputs(currentInputs);
-      setOriginInputs({ ...currentInputs });
       formApiRef.current.setValues(currentInputs);
 
       // Parse products
@@ -88,54 +86,48 @@ export default function SettingsPaymentGatewayCreem(props) {
   const submitCreemSetting = async () => {
     setLoading(true);
     try {
-      const options = [];
+      const options = {
+        CreemTestMode: inputs.CreemTestMode,
+        CreemProducts: JSON.stringify(products),
+      };
 
-      if (inputs.CreemApiKey && inputs.CreemApiKey !== '') {
-        options.push({ key: 'CreemApiKey', value: inputs.CreemApiKey });
+      if ((inputs.CreemApiKey || '').trim()) {
+        options.CreemApiKey = inputs.CreemApiKey.trim();
       }
 
-      if (inputs.CreemWebhookSecret && inputs.CreemWebhookSecret !== '') {
-        options.push({
-          key: 'CreemWebhookSecret',
-          value: inputs.CreemWebhookSecret,
-        });
+      if ((inputs.CreemWebhookSecret || '').trim()) {
+        options.CreemWebhookSecret = inputs.CreemWebhookSecret.trim();
       }
 
-      // Save test mode setting
-      options.push({
-        key: 'CreemTestMode',
-        value: inputs.CreemTestMode ? 'true' : 'false',
+      await props.withPaymentVerification(async () => {
+        const response = await API.put(
+          '/api/option/payment',
+          {
+            options,
+            expected_version: props.configVersion || 1,
+          },
+          { skipErrorHandler: true },
+        );
+        if (response.data?.success) {
+          showSuccess(t('更新成功'));
+          const nextInputs = {
+            ...inputs,
+            CreemApiKey: '',
+            CreemWebhookSecret: '',
+          };
+          setInputs(nextInputs);
+          formApiRef.current?.setValues(nextInputs);
+          await props.refresh?.(response.data?.data?.version);
+        } else {
+          showError(response.data?.message || t('更新失败'));
+        }
+        return response;
       });
-
-      // Save products as JSON string
-      options.push({ key: 'CreemProducts', value: JSON.stringify(products) });
-
-      // 发送请求
-      const requestQueue = options.map((opt) =>
-        API.put('/api/option/', {
-          key: opt.key,
-          value: opt.value,
-        }),
-      );
-
-      const results = await Promise.all(requestQueue);
-
-      // 检查所有请求是否成功
-      const errorResults = results.filter((res) => !res.data.success);
-      if (errorResults.length > 0) {
-        errorResults.forEach((res) => {
-          showError(res.data.message);
-        });
-      } else {
-        showSuccess(t('更新成功'));
-        // 更新本地存储的原始值
-        setOriginInputs({ ...inputs });
-        props.refresh?.();
-      }
     } catch (error) {
-      showError(t('更新失败'));
+      showError(error?.response?.data?.message || t('更新失败'));
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const openProductModal = (product = null) => {
@@ -246,6 +238,7 @@ export default function SettingsPaymentGatewayCreem(props) {
             theme='borderless'
             size='small'
             icon={<Trash2 size={14} />}
+            aria-label={t('删除产品')}
             onClick={() => deleteProduct(record.productId)}
           />
         </div>
@@ -284,6 +277,7 @@ export default function SettingsPaymentGatewayCreem(props) {
                 label={t('API 密钥')}
                 placeholder={t('Creem API 密钥，敏感信息不显示')}
                 type='password'
+                autoComplete='new-password'
               />
             </Col>
             <Col xs={24} sm={24} md={8} lg={8} xl={8}>
@@ -294,6 +288,7 @@ export default function SettingsPaymentGatewayCreem(props) {
                   '用于验证回调 new-api 的 webhook 请求的密钥，敏感信息不显示',
                 )}
                 type='password'
+                autoComplete='new-password'
               />
             </Col>
             <Col xs={24} sm={24} md={8} lg={8} xl={8}>

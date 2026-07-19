@@ -18,7 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { formatLocalCurrencyAmount } from '@/lib/currency'
+
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -30,9 +31,12 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { formatLocalCurrencyAmount } from '@/lib/currency'
+
 import { DEFAULT_DISCOUNT_RATE } from '../../constants'
-import { formatCurrency, getPaymentIcon } from '../../lib'
-import type { PaymentMethod } from '../../types'
+import { getPaymentIcon } from '../../lib'
+import { formatPaymentDecimalAmount } from '../../lib/billing'
+import type { ClientPaymentQuote, PaymentMethod } from '../../types'
 
 interface PaymentConfirmDialogProps {
   open: boolean
@@ -40,6 +44,8 @@ interface PaymentConfirmDialogProps {
   onConfirm: () => void
   topupAmount: number
   paymentAmount: number
+  quote: ClientPaymentQuote | null
+  quoteError?: string | null
   paymentMethod: PaymentMethod | undefined
   calculating: boolean
   processing: boolean
@@ -53,6 +59,8 @@ export function PaymentConfirmDialog({
   onConfirm,
   topupAmount,
   paymentAmount,
+  quote,
+  quoteError,
   paymentMethod,
   calculating,
   processing,
@@ -99,11 +107,23 @@ export function PaymentConfirmDialog({
             ) : (
               <div className='flex items-baseline gap-2'>
                 <span className='text-2xl font-semibold'>
-                  {formatCurrency(paymentAmount)}
+                  {quote
+                    ? formatPaymentDecimalAmount(
+                        quote.payable_amount,
+                        quote.currency,
+                        quote.provider
+                      )
+                    : '—'}
                 </span>
                 {hasDiscount && (
                   <span className='text-muted-foreground text-sm line-through'>
-                    {formatCurrency(originalAmount)}
+                    {quote
+                      ? formatPaymentDecimalAmount(
+                          originalAmount,
+                          quote.currency,
+                          quote.provider
+                        )
+                      : '—'}
                   </span>
                 )}
               </div>
@@ -115,7 +135,13 @@ export function PaymentConfirmDialog({
               <div className='flex items-center justify-between text-sm'>
                 <span className='text-muted-foreground'>{t('You save')}</span>
                 <span className='font-semibold text-green-600'>
-                  {formatCurrency(discountAmount)}
+                  {quote
+                    ? formatPaymentDecimalAmount(
+                        discountAmount,
+                        quote.currency,
+                        quote.provider
+                      )
+                    : '—'}
                 </span>
               </div>
             </div>
@@ -137,13 +163,22 @@ export function PaymentConfirmDialog({
               </div>
             </div>
           </div>
+
+          {quoteError && (
+            <Alert variant='destructive'>
+              <AlertDescription>{quoteError}</AlertDescription>
+            </Alert>
+          )}
         </div>
 
         <AlertDialogFooter className='grid grid-cols-2 gap-2 sm:flex'>
           <AlertDialogCancel disabled={processing}>
             {t('Cancel')}
           </AlertDialogCancel>
-          <AlertDialogAction onClick={onConfirm} disabled={processing}>
+          <AlertDialogAction
+            onClick={onConfirm}
+            disabled={processing || calculating || !quote || !!quoteError}
+          >
             {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
             {t('Confirm Payment')}
           </AlertDialogAction>

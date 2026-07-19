@@ -16,13 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo } from 'react'
 import { ShieldCheck, KeyRound, Loader2 } from 'lucide-react'
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+
+import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Dialog } from '@/components/dialog'
+
 import type {
   SecureVerificationState,
   VerificationMethod,
@@ -86,7 +88,10 @@ export function SecureVerificationDialog({
   return (
     <Dialog
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && state.loading) return
+        onOpenChange(nextOpen)
+      }}
       title={
         <>
           <ShieldCheck className='text-primary h-5 w-5' />

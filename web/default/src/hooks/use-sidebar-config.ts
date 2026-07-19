@@ -20,7 +20,10 @@ import { useMemo } from 'react'
 
 import type { NavGroup, NavItem } from '@/components/layout/types'
 import { useStatus } from '@/hooks/use-status'
-import { canManageSystemSettings } from '@/lib/admin-permissions'
+import {
+  canManagePaymentOperations,
+  canManageSystemSettings,
+} from '@/lib/admin-permissions'
 import { useAuthStore } from '@/stores/auth-store'
 
 type SidebarSectionConfig = {
@@ -225,6 +228,9 @@ function isNavItemVisible(
 
   // Handle direct link type
   if ('url' in item && item.url) {
+    if (item.url.startsWith('/system-settings') && !canAccessSystemSettings) {
+      return false
+    }
     const configUrls = item.configUrls ?? [item.url]
     return configUrls.some((url) =>
       isModuleEnabled(
@@ -326,7 +332,9 @@ export function useSidebarConfig(navGroups: NavGroup[]): NavGroup[] {
     return parseUserSidebarConfig(auth?.user?.sidebar_modules)
   }, [auth?.user?.permissions?.sidebar_settings, auth?.user?.sidebar_modules])
 
-  const canAccessSystemSettings = canManageSystemSettings(auth?.user)
+  const canAccessSystemSettings =
+    canManageSystemSettings(auth?.user) ||
+    canManagePaymentOperations(auth?.user)
 
   const filteredNavGroups = useMemo(
     () =>

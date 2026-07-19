@@ -16,13 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useCallback, useEffect, useMemo, useState } from 'react'
 import i18next from 'i18next'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
+
+import { getApiErrorMessage } from '@/lib/api-error'
 import {
   extractVerificationInfo,
   isVerificationRequiredError,
 } from '@/lib/secure-verification'
+
 import { checkVerificationMethods, verify } from '../api'
 import type {
   SecureVerificationState,
@@ -61,6 +64,8 @@ export function useSecureVerification(
   const [methods, setMethods] = useState<VerificationMethods>(defaultMethods)
   const [state, setState] = useState<InternalState>(initialState)
   const [open, setOpen] = useState(false)
+  const pendingApiCallRef = useRef<ApiCall>(null)
+  const verificationExecutionRef = useRef(false)
 
   const fetchVerificationMethods = useCallback(async () => {
     const result = await checkVerificationMethods()
@@ -73,6 +78,8 @@ export function useSecureVerification(
   }, [fetchVerificationMethods])
 
   const reset = useCallback(() => {
+    pendingApiCallRef.current = null
+    verificationExecutionRef.current = false
     setState(initialState)
     setOpen(false)
   }, [])
@@ -84,8 +91,10 @@ export function useSecureVerification(
     ) => {
       const { preferredMethod, title, description } = config
       const availableMethods = await fetchVerificationMethods()
+      const passkeyAvailable =
+        availableMethods.hasPasskey && availableMethods.passkeySupported
 
-      if (!availableMethods.has2FA && !availableMethods.hasPasskey) {
+      if (!availableMethods.has2FA && !passkeyAvailable) {
         toast.error(
           i18next.t(
             'Please enable Two-factor Authentication or Passkey before proceeding'
@@ -99,15 +108,21 @@ export function useSecureVerification(
         return false
       }
 
-      let defaultMethod: VerificationMethod | null = preferredMethod ?? null
+      let defaultMethod: VerificationMethod | null = null
+      if (preferredMethod === '2fa' && availableMethods.has2FA) {
+        defaultMethod = '2fa'
+      } else if (preferredMethod === 'passkey' && passkeyAvailable) {
+        defaultMethod = 'passkey'
+      }
       if (!defaultMethod) {
-        if (availableMethods.hasPasskey && availableMethods.passkeySupported) {
+        if (passkeyAvailable) {
           defaultMethod = 'passkey'
         } else if (availableMethods.has2FA) {
           defaultMethod = '2fa'
         }
       }
 
+      pendingApiCallRef.current = apiCall
       setState((prev) => ({
         ...prev,
         apiCall,
@@ -123,7 +138,7 @@ export function useSecureVerification(
 
   const executeVerification = useCallback(
     async (method?: VerificationMethod, code?: string) => {
-      if (!state.apiCall) {
+      if (!pendingApiCallRef.current) {
         toast.error(i18next.t('Verification is not configured properly'))
         return
       }
@@ -133,12 +148,25 @@ export function useSecureVerification(
         toast.error(i18next.t('Select a verification method first'))
         return
       }
+      if (verificationExecutionRef.current) return
 
+      verificationExecutionRef.current = true
       setState((prev) => ({ ...prev, loading: true }))
+      let operationClaimed = false
 
       try {
         await verify(actualMethod, code ?? state.code)
-        const result = await state.apiCall()
+        const apiCall = pendingApiCallRef.current
+        if (!apiCall) {
+          reset()
+          return
+        }
+
+        pendingApiCallRef.current = null
+        operationClaimed = true
+        setState((prev) => ({ ...prev, apiCall: null }))
+
+        const result = await apiCall()
 
         if (successMessage) {
           toast.success(successMessage)
@@ -148,18 +176,22 @@ export function useSecureVerification(
 
         if (autoReset) {
           reset()
+        } else {
+          setOpen(false)
         }
 
         return result
       } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : i18next.t('Verification failed')
+        if (operationClaimed) reset()
+        const message = getApiErrorMessage(
+          error,
+          i18next.t('Verification failed')
+        )
         toast.error(message)
         onError?.(error)
         throw error
       } finally {
+        verificationExecutionRef.current = false
         setState((prev) => ({ ...prev, loading: false }))
       }
     },
@@ -179,10 +211,10 @@ export function useSecureVerification(
   }, [reset])
 
   const withVerification = useCallback(
-    async (
-      apiCall: () => Promise<unknown>,
+    async <T>(
+      apiCall: () => Promise<T>,
       config: StartVerificationOptions = {}
-    ) => {
+    ): Promise<T | null> => {
       try {
         return await apiCall()
       } catch (error) {

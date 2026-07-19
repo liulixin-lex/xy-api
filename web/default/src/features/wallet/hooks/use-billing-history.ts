@@ -16,14 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect, useCallback } from 'react'
 import i18next from 'i18next'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
+
 import { useIsAdmin } from '@/hooks/use-admin'
+
 import {
   getUserBillingHistory,
   getAllBillingHistory,
-  completeOrder,
   isApiSuccess,
 } from '../api'
 import type { TopupRecord } from '../types'
@@ -37,10 +38,12 @@ interface UseBillingHistoryOptions {
   initialPage?: number
   /** Initial page size */
   initialPageSize?: number
+  /** Fetch only while the history surface is visible. */
+  enabled?: boolean
 }
 
 export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
-  const { initialPage = 1, initialPageSize = 10 } = options
+  const { initialPage = 1, initialPageSize = 10, enabled = true } = options
   const isAdmin = useIsAdmin()
 
   const [records, setRecords] = useState<TopupRecord[]>([])
@@ -48,73 +51,71 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
   const [page, setPage] = useState(initialPage)
   const [pageSize, setPageSize] = useState(initialPageSize)
   const [keyword, setKeyword] = useState('')
+  const [debouncedKeyword, setDebouncedKeyword] = useState('')
   const [loading, setLoading] = useState(false)
-  const [completing, setCompleting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const requestRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedKeyword(keyword.trim()), 300)
+    return () => clearTimeout(timer)
+  }, [keyword])
 
   /**
    * Fetch billing history
    */
   const fetchBillingHistory = useCallback(async () => {
+    if (!enabled) return
+    requestRef.current?.abort()
+    const controller = new AbortController()
+    requestRef.current = controller
     setLoading(true)
     try {
       const response = isAdmin
-        ? await getAllBillingHistory(page, pageSize, keyword)
-        : await getUserBillingHistory(page, pageSize, keyword)
+        ? await getAllBillingHistory(
+            page,
+            pageSize,
+            debouncedKeyword,
+            controller.signal
+          )
+        : await getUserBillingHistory(
+            page,
+            pageSize,
+            debouncedKeyword,
+            controller.signal
+          )
 
       if (isApiSuccess(response) && response.data) {
         setRecords(response.data.items || [])
         setTotal(response.data.total || 0)
+        setError(null)
       } else {
-        toast.error(
+        const message =
           response.message || i18next.t('Failed to load billing history')
-        )
-        setRecords([])
-        setTotal(0)
+        setError(message)
+        toast.error(message)
       }
     } catch (error) {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'ERR_CANCELED'
+      ) {
+        return
+      }
       // eslint-disable-next-line no-console
       console.error('Failed to fetch billing history:', error)
-      toast.error(i18next.t('Failed to load billing history'))
-      setRecords([])
-      setTotal(0)
+      const message = i18next.t('Failed to load billing history')
+      setError(message)
+      toast.error(message)
     } finally {
-      setLoading(false)
+      if (requestRef.current === controller) {
+        requestRef.current = null
+        setLoading(false)
+      }
     }
-  }, [isAdmin, page, pageSize, keyword])
-
-  /**
-   * Complete a pending order (admin only)
-   */
-  const handleCompleteOrder = useCallback(
-    async (tradeNo: string) => {
-      if (!isAdmin) {
-        toast.error(i18next.t('Admin access required'))
-        return false
-      }
-
-      setCompleting(true)
-      try {
-        const response = await completeOrder({ trade_no: tradeNo })
-        if (isApiSuccess(response)) {
-          toast.success(i18next.t('Order completed successfully'))
-          // Refresh the list
-          await fetchBillingHistory()
-          return true
-        } else {
-          toast.error(response.message || i18next.t('Failed to complete order'))
-          return false
-        }
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error('Failed to complete order:', error)
-        toast.error(i18next.t('Failed to complete order'))
-        return false
-      } finally {
-        setCompleting(false)
-      }
-    },
-    [isAdmin, fetchBillingHistory]
-  )
+  }, [debouncedKeyword, enabled, isAdmin, page, pageSize])
 
   /**
    * Change page
@@ -141,7 +142,11 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
 
   // Fetch data when dependencies change
   useEffect(() => {
-    fetchBillingHistory()
+    void fetchBillingHistory()
+    return () => {
+      requestRef.current?.abort()
+      requestRef.current = null
+    }
   }, [fetchBillingHistory])
 
   return {
@@ -151,12 +156,11 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     pageSize,
     keyword,
     loading,
-    completing,
+    error,
     isAdmin,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,
-    handleCompleteOrder,
     refresh: fetchBillingHistory,
   }
 }

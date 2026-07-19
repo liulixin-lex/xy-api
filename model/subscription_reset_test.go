@@ -97,6 +97,7 @@ func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(
 	for _, id := range []int{9201, 9202} {
 		sub := getSubscriptionResetSub(t, id)
 		assert.Zero(t, sub.AmountUsed)
+		assert.EqualValues(t, 1, sub.QuotaResetVersion)
 		assert.GreaterOrEqual(t, sub.LastResetTime, beforeReset)
 		assert.LessOrEqual(t, sub.LastResetTime, afterReset)
 		assert.Equal(t, calcNextResetTime(time.Unix(sub.LastResetTime, 0), plan, sub.EndTime), sub.NextResetTime)
@@ -132,6 +133,16 @@ func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
 	assert.False(t, result.AdvanceResetTime)
 	sub := getSubscriptionResetSub(t, 9302)
 	assert.Zero(t, sub.AmountUsed)
+	assert.EqualValues(t, 1, sub.QuotaResetVersion)
+	assert.Equal(t, lastReset, sub.LastResetTime)
+	assert.Equal(t, nextReset, sub.NextResetTime)
+
+	// A second reset in the same second still creates a distinct quota epoch.
+	result, err = AdminResetUserSubscriptionsByPlan(201, plan.Id, false)
+	require.NoError(t, err)
+	assert.False(t, result.AdvanceResetTime)
+	sub = getSubscriptionResetSub(t, 9302)
+	assert.EqualValues(t, 2, sub.QuotaResetVersion)
 	assert.Equal(t, lastReset, sub.LastResetTime)
 	assert.Equal(t, nextReset, sub.NextResetTime)
 }
@@ -231,6 +242,7 @@ func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
 	for _, id := range []int{9502, 9503, 9504} {
 		sub := getSubscriptionResetSub(t, id)
 		assert.Zero(t, sub.AmountUsed)
+		assert.EqualValues(t, 1, sub.QuotaResetVersion)
 		assert.Zero(t, sub.LastResetTime)
 		assert.Zero(t, sub.NextResetTime)
 	}

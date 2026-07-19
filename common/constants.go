@@ -232,6 +232,16 @@ var (
 	CriticalRateLimitNum            = 20
 	CriticalRateLimitDuration int64 = 20 * 60
 
+	// Payment mutation limits are keyed by authenticated user ID. Quote and
+	// start have separate buckets because quote calculation is cheaper than an
+	// upstream order creation attempt.
+	PaymentQuoteRateLimitEnable         = true
+	PaymentQuoteRateLimitNum            = 30
+	PaymentQuoteRateLimitDuration int64 = 60
+	PaymentStartRateLimitEnable         = true
+	PaymentStartRateLimitNum            = 10
+	PaymentStartRateLimitDuration int64 = 60
+
 	UploadRateLimitNum            = 10
 	UploadRateLimitDuration int64 = 60
 
@@ -272,8 +282,10 @@ const (
 )
 
 const (
-	TopUpStatusPending = "pending"
-	TopUpStatusSuccess = "success"
-	TopUpStatusFailed  = "failed"
-	TopUpStatusExpired = "expired"
+	TopUpStatusPending      = "pending"
+	TopUpStatusSuccess      = "success"
+	TopUpStatusFailed       = "failed"
+	TopUpStatusExpired      = "expired"
+	TopUpStatusManualReview = "manual_review"
+	TopUpStatusRefunded     = "refunded"
 )

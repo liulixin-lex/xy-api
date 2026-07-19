@@ -1,6 +1,28 @@
 package operation_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"time"
+
+	"github.com/QuantumNous/new-api/setting/config"
+)
+
+var EpayCurrency = "CNY"
+
+// Credential generations bind each order to the exact merchant credential
+// used to create it. This lets a stale application node finish an order during
+// a planned rotation without making the previous key valid for newer orders.
+var EpayCredentialGeneration int64 = 1
+var EpayIdPrevious = ""
+var EpayKeyPrevious = ""
+var EpayPreviousCredentialGeneration int64
+var EpayPreviousValidBefore int64
+var EpayPreviousExpiresAt int64
+
+func EpayPreviousCredentialActive() bool {
+	return EpayPreviousCredentialGeneration > 0 &&
+		EpayPreviousExpiresAt > time.Now().Unix() &&
+		EpayIdPrevious != "" && EpayKeyPrevious != ""
+}
 
 type PaymentSetting struct {
 	AmountOptions  []int           `json:"amount_options"`

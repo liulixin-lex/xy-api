@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-
 export const INTERFACE_LANGUAGE_OPTIONS = [
   { code: 'zhCN', label: '简体中文' },
   { code: 'zhTW', label: '繁體中文' },

@@ -306,7 +306,6 @@ export type ModelSettings = {
   'billing_setting.billing_mode': string
   'billing_setting.billing_expr': string
   'tool_price_setting.prices': string
-  TopupGroupRatio: string
   GroupRatio: string
   UserUsableGroups: string
   GroupGroupRatio: string
@@ -334,6 +333,7 @@ export type ModelSettings = {
 }
 
 export type BillingSettings = {
+  ServerAddress: string
   QuotaForNewUser: number
   PreConsumedQuota: number
   QuotaForInviter: number
@@ -383,12 +383,28 @@ export type BillingSettings = {
   'payment_setting.compliance_confirmed_at': number
   'payment_setting.compliance_confirmed_by': number
   'payment_setting.compliance_confirmed_ip': string
+  'payment_setting.config_version': number
+  'payment_setting.epay_previous_credential_active': boolean
+  'payment_setting.stripe_previous_credential_active': boolean
+  'payment_setting.stripe_test_mode_enabled': boolean
+  'payment_setting.stripe_test_mode_blocked': boolean
+  'payment_setting.stripe_test_mode_isolation_required': boolean
+  'payment_setting.xorpay_previous_credential_active': boolean
   StripeApiSecret: string
   StripeWebhookSecret: string
   StripePriceId: string
+  StripeAccountId: string
+  StripeCredentialAccountId: string
+  StripeCredentialLivemode: string
+  StripeCurrency: string
   StripeUnitPrice: number
   StripeMinTopUp: number
   StripePromotionCodesEnabled: boolean
+  XorPayAid: string
+  XorPayAppSecret: string
+  XorPayUnitPrice: number
+  XorPayMinTopUp: number
+  XorPayEnabledMethods: string
   CreemApiKey: string
   CreemWebhookSecret: string
   CreemTestMode: boolean

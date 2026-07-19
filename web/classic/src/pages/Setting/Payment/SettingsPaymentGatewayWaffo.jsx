@@ -39,6 +39,7 @@ import {
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, TriangleAlert } from 'lucide-react';
+import { getSafePaymentIconUrl } from '../../../components/topup/payment-utils';
 
 const { Text } = Typography;
 const toBoolean = (value) => value === true || value === 'true';
@@ -69,6 +70,15 @@ export default function SettingsPaymentGatewayWaffo(props) {
   const handleIconFileChange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    if (
+      !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(
+        file.type,
+      )
+    ) {
+      showError(t('仅支持 PNG、JPG、GIF 或 WebP 图片'));
+      e.target.value = '';
+      return;
+    }
     const MAX_ICON_SIZE = 100 * 1024; // 100 KB
     if (file.size > MAX_ICON_SIZE) {
       showError(t('图标文件不能超过 100KB，请压缩后重新上传'));
@@ -138,109 +148,80 @@ export default function SettingsPaymentGatewayWaffo(props) {
   };
 
   const submitWaffoSetting = async () => {
+    const minTopUp = Number(inputs.WaffoMinTopUp);
+    const unitPrice = Number(inputs.WaffoUnitPrice);
+    if (!Number.isInteger(minTopUp) || minTopUp < 1 || minTopUp > 10000) {
+      showError(t('最低充值数量必须是 1 到 10000 之间的整数'));
+      return;
+    }
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      showError(t('充值价格必须是大于 0 的数字'));
+      return;
+    }
+
     setLoading(true);
     try {
-      const options = [];
+      const options = {
+        WaffoEnabled: !!inputs.WaffoEnabled,
+        WaffoPublicCert: (inputs.WaffoPublicCert || '').trim(),
+        WaffoSandboxPublicCert: (inputs.WaffoSandboxPublicCert || '').trim(),
+        WaffoSandbox: !!inputs.WaffoSandbox,
+        WaffoMerchantId: (inputs.WaffoMerchantId || '').trim(),
+        WaffoCurrency: (inputs.WaffoCurrency || 'USD').trim().toUpperCase(),
+        WaffoUnitPrice: unitPrice,
+        WaffoMinTopUp: minTopUp,
+        WaffoNotifyUrl: (inputs.WaffoNotifyUrl || '').trim(),
+        WaffoReturnUrl: (inputs.WaffoReturnUrl || '').trim(),
+        WaffoPayMethods: JSON.stringify(waffoPayMethods),
+      };
 
-      options.push({
-        key: 'WaffoEnabled',
-        value: inputs.WaffoEnabled ? 'true' : 'false',
-      });
-
-      if (inputs.WaffoApiKey && inputs.WaffoApiKey !== '') {
-        options.push({ key: 'WaffoApiKey', value: inputs.WaffoApiKey });
+      if ((inputs.WaffoApiKey || '').trim()) {
+        options.WaffoApiKey = inputs.WaffoApiKey.trim();
       }
 
-      if (inputs.WaffoPrivateKey && inputs.WaffoPrivateKey !== '') {
-        options.push({ key: 'WaffoPrivateKey', value: inputs.WaffoPrivateKey });
+      if ((inputs.WaffoPrivateKey || '').trim()) {
+        options.WaffoPrivateKey = inputs.WaffoPrivateKey.trim();
       }
 
-      options.push({
-        key: 'WaffoPublicCert',
-        value: inputs.WaffoPublicCert || '',
-      });
-      options.push({
-        key: 'WaffoSandboxPublicCert',
-        value: inputs.WaffoSandboxPublicCert || '',
-      });
-
-      if (inputs.WaffoSandboxApiKey && inputs.WaffoSandboxApiKey !== '') {
-        options.push({
-          key: 'WaffoSandboxApiKey',
-          value: inputs.WaffoSandboxApiKey,
-        });
+      if ((inputs.WaffoSandboxApiKey || '').trim()) {
+        options.WaffoSandboxApiKey = inputs.WaffoSandboxApiKey.trim();
       }
 
-      if (
-        inputs.WaffoSandboxPrivateKey &&
-        inputs.WaffoSandboxPrivateKey !== ''
-      ) {
-        options.push({
-          key: 'WaffoSandboxPrivateKey',
-          value: inputs.WaffoSandboxPrivateKey,
-        });
+      if ((inputs.WaffoSandboxPrivateKey || '').trim()) {
+        options.WaffoSandboxPrivateKey = inputs.WaffoSandboxPrivateKey.trim();
       }
 
-      options.push({
-        key: 'WaffoSandbox',
-        value: inputs.WaffoSandbox ? 'true' : 'false',
+      await props.withPaymentVerification(async () => {
+        const response = await API.put(
+          '/api/option/payment',
+          {
+            options,
+            expected_version: props.configVersion || 1,
+          },
+          { skipErrorHandler: true },
+        );
+        if (response.data?.success) {
+          showSuccess(t('更新成功'));
+          const nextInputs = {
+            ...inputs,
+            WaffoApiKey: '',
+            WaffoPrivateKey: '',
+            WaffoSandboxApiKey: '',
+            WaffoSandboxPrivateKey: '',
+          };
+          setInputs(nextInputs);
+          formApiRef.current?.setValues(nextInputs);
+          await props.refresh?.(response.data?.data?.version);
+        } else {
+          showError(response.data?.message || t('更新失败'));
+        }
+        return response;
       });
-
-      options.push({
-        key: 'WaffoMerchantId',
-        value: inputs.WaffoMerchantId || '',
-      });
-      options.push({ key: 'WaffoCurrency', value: inputs.WaffoCurrency || '' });
-
-      options.push({
-        key: 'WaffoUnitPrice',
-        value: String(inputs.WaffoUnitPrice || 1.0),
-      });
-
-      options.push({
-        key: 'WaffoMinTopUp',
-        value: String(inputs.WaffoMinTopUp || 1),
-      });
-
-      options.push({
-        key: 'WaffoNotifyUrl',
-        value: inputs.WaffoNotifyUrl || '',
-      });
-      options.push({
-        key: 'WaffoReturnUrl',
-        value: inputs.WaffoReturnUrl || '',
-      });
-
-      // 保存支付方式列表
-      options.push({
-        key: 'WaffoPayMethods',
-        value: JSON.stringify(waffoPayMethods),
-      });
-
-      // 发送请求
-      const requestQueue = options.map((opt) =>
-        API.put('/api/option/', {
-          key: opt.key,
-          value: opt.value,
-        }),
-      );
-
-      const results = await Promise.all(requestQueue);
-
-      // 检查所有请求是否成功
-      const errorResults = results.filter((res) => !res.data.success);
-      if (errorResults.length > 0) {
-        errorResults.forEach((res) => {
-          showError(res.data.message);
-        });
-      } else {
-        showSuccess(t('更新成功'));
-        props.refresh?.();
-      }
     } catch (error) {
-      showError(t('更新失败'));
+      showError(error?.response?.data?.message || t('更新失败'));
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   // 打开新增弹窗
@@ -306,26 +287,32 @@ export default function SettingsPaymentGatewayWaffo(props) {
     {
       title: t('图标'),
       dataIndex: 'icon',
-      render: (text) =>
-        text ? (
+      render: (text) => {
+        const safeIconUrl = getSafePaymentIconUrl(text);
+        return safeIconUrl ? (
           <img
-            src={text}
-            alt='icon'
+            src={safeIconUrl}
+            alt=''
+            aria-hidden='true'
+            loading='lazy'
+            decoding='async'
+            referrerPolicy='no-referrer'
             style={{ width: 24, height: 24, objectFit: 'contain' }}
           />
         ) : (
-          <Text type='tertiary'>—</Text>
-        ),
+          <Text type='tertiary'>-</Text>
+        );
+      },
     },
     {
       title: t('支付方式类型'),
       dataIndex: 'payMethodType',
-      render: (text) => text || <Text type='tertiary'>—</Text>,
+      render: (text) => text || <Text type='tertiary'>-</Text>,
     },
     {
       title: t('支付方式名称'),
       dataIndex: 'payMethodName',
-      render: (text) => text || <Text type='tertiary'>—</Text>,
+      render: (text) => text || <Text type='tertiary'>-</Text>,
     },
     {
       title: t('操作'),
@@ -349,6 +336,14 @@ export default function SettingsPaymentGatewayWaffo(props) {
       ),
     },
   ];
+  const callbackBaseAddress = removeTrailingSlash(
+    props.options.CustomCallbackAddress || props.options.ServerAddress || '',
+  );
+  const displayedWebhookUrl = (inputs.WaffoNotifyUrl || '').trim()
+    ? removeTrailingSlash(inputs.WaffoNotifyUrl)
+    : callbackBaseAddress
+      ? `${callbackBaseAddress}/api/waffo/webhook`
+      : `${t('网站地址')}/api/waffo/webhook`;
 
   return (
     <Spin spinning={loading}>
@@ -363,17 +358,13 @@ export default function SettingsPaymentGatewayWaffo(props) {
             icon={<BookOpen size={16} />}
             description={
               <>
-                Waffo 密钥、商户和支付方式等设置请
+                {t('Waffo 密钥、商户和支付方式等设置请')}
                 <a href='https://waffo.com' target='_blank' rel='noreferrer'>
-                  点击此处
+                  {t('点击此处')}
                 </a>
-                进行配置，切换沙盒模式时请同步填写对应环境的密钥。
+                {t('进行配置，切换沙盒模式时请同步填写对应环境的密钥。')}
                 <br />
-                {t('回调地址')}：
-                {props.options.ServerAddress
-                  ? removeTrailingSlash(props.options.ServerAddress)
-                  : t('网站地址')}
-                /api/waffo/webhook
+                {t('回调地址')}：{displayedWebhookUrl}
               </>
             }
             style={{ marginBottom: 12 }}
@@ -428,6 +419,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('保存后不会回显，请填写生产环境对应的 API 密钥')}
                 type='password'
+                autoComplete='new-password'
               />
             </Col>
             <Col xs={24} sm={24} md={8} lg={8} xl={8}>
@@ -439,6 +431,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('保存后不会回显，请填写生产环境对应的 API 私钥')}
                 type='password'
+                autoComplete='new-password'
                 autosize={{ minRows: 3, maxRows: 6 }}
               />
             </Col>
@@ -451,6 +444,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('用于校验生产环境的 Waffo 回调签名')}
                 type='password'
+                autoComplete='new-password'
                 autosize={{ minRows: 3, maxRows: 6 }}
               />
             </Col>
@@ -469,6 +463,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('保存后不会回显，请填写测试环境对应的 API 密钥')}
                 type='password'
+                autoComplete='new-password'
               />
             </Col>
             <Col xs={24} sm={24} md={8} lg={8} xl={8}>
@@ -480,6 +475,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('保存后不会回显，请填写测试环境对应的 API 私钥')}
                 type='password'
+                autoComplete='new-password'
                 autosize={{ minRows: 3, maxRows: 6 }}
               />
             </Col>
@@ -492,6 +488,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
                 )}
                 extraText={t('用于校验测试环境的 Waffo 回调签名')}
                 type='password'
+                autoComplete='new-password'
                 autosize={{ minRows: 3, maxRows: 6 }}
               />
             </Col>
@@ -616,22 +613,27 @@ export default function SettingsPaymentGatewayWaffo(props) {
               <Text strong>{t('图标')}</Text>
             </div>
             <Space align='center'>
-              {payMethodForm.icon && (
-                <img
-                  src={payMethodForm.icon}
-                  alt='preview'
-                  style={{
-                    width: 32,
-                    height: 32,
-                    objectFit: 'contain',
-                    border: '1px solid var(--semi-color-border)',
-                    borderRadius: 4,
-                  }}
-                />
-              )}
+              {payMethodForm.icon &&
+                (() => {
+                  const safeIconUrl = getSafePaymentIconUrl(payMethodForm.icon);
+                  return safeIconUrl ? (
+                    <img
+                      src={safeIconUrl}
+                      alt={t('支付方式图标预览')}
+                      referrerPolicy='no-referrer'
+                      style={{
+                        width: 32,
+                        height: 32,
+                        objectFit: 'contain',
+                        border: '1px solid var(--semi-color-border)',
+                        borderRadius: 4,
+                      }}
+                    />
+                  ) : null;
+                })()}
               <input
                 type='file'
-                accept='image/*'
+                accept='image/png,image/jpeg,image/gif,image/webp'
                 ref={iconFileInputRef}
                 style={{ display: 'none' }}
                 onChange={handleIconFileChange}
@@ -656,7 +658,7 @@ export default function SettingsPaymentGatewayWaffo(props) {
             </Space>
             <div>
               <Text type='tertiary' size='small'>
-                {t('上传 PNG/JPG/SVG 图片，建议尺寸 ≤ 128×128px')}
+                {t('上传 PNG/JPG/GIF/WebP 图片，建议尺寸不超过 128×128px')}
               </Text>
             </div>
           </div>

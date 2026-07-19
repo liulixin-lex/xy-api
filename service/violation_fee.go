@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -11,8 +12,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
-
-	"github.com/shopspring/decimal"
 
 	"github.com/gin-gonic/gin"
 )
@@ -81,22 +80,18 @@ func shouldChargeViolationFee(err *types.NewAPIError) bool {
 	return HasCSAMViolationMarker(err)
 }
 
-func calcViolationFeeQuota(amount, groupRatio float64) int {
+func calcViolationFeeQuota(amount, groupRatio float64) (int, *common.QuotaClamp) {
 	if amount <= 0 {
-		return 0
+		return 0, nil
 	}
 	if groupRatio <= 0 {
-		return 0
+		return 0, nil
 	}
-	quota := decimal.NewFromFloat(amount).
-		Mul(decimal.NewFromFloat(common.QuotaPerUnit)).
-		Mul(decimal.NewFromFloat(groupRatio)).
-		Round(0).
-		IntPart()
+	quota, clamp := common.QuotaRoundChecked(amount * common.QuotaPerUnit * groupRatio)
 	if quota <= 0 {
-		return 0
+		return 0, clamp
 	}
-	return int(quota)
+	return quota, clamp
 }
 
 // ChargeViolationFeeIfNeeded charges an additional fee after the normal flow finishes (including refund).
@@ -118,18 +113,55 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	}
 
 	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
-	feeQuota := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
+	feeQuota, clamp := calcViolationFeeQuota(settings.ViolationDeductionAmount, groupRatio)
+	noteQuotaClamp(relayInfo, clamp)
 	if feeQuota <= 0 {
 		return false
 	}
 
-	if err := PostConsumeQuota(relayInfo, feeQuota, 0, true); err != nil {
+	fundingSource := relayInfo.BillingSource
+	if fundingSource != BillingSourceSubscription {
+		fundingSource = BillingSourceWallet
+	}
+	requestID := "violation_" + common.Sha1([]byte(relayInfo.RequestId+":"+string(types.ErrorCodeViolationFeeGrokCSAM)))
+	alreadySettled := false
+	_, err := model.PreConsumeBillingReservation(model.BillingReservationInput{
+		RequestId: requestID, UserId: relayInfo.UserId, TokenId: relayInfo.TokenId,
+		FundingSource: fundingSource, Quota: feeQuota, SkipToken: relayInfo.IsPlayground,
+	}, relayInfo.TokenKey)
+	if err == nil {
+		_, err = model.SettleBillingReservation(requestID, feeQuota, relayInfo.TokenKey)
+	}
+	if errors.Is(err, model.ErrBillingReservationFinalized) {
+		var reservation *model.BillingReservation
+		reservation, err = model.GetBillingReservation(requestID)
+		if err == nil && (reservation.Status != model.BillingReservationStatusSettled || reservation.SettledQuota != feeQuota) {
+			err = model.ErrBillingReservationConflict
+		} else if err == nil {
+			alreadySettled = true
+		}
+	}
+	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("failed to charge violation fee: %s", err.Error()))
 		return false
 	}
+	if alreadySettled {
+		return true
+	}
+	if fundingSource == BillingSourceSubscription {
+		checkAndSendSubscriptionQuotaNotify(relayInfo)
+	} else {
+		checkAndSendQuotaNotify(relayInfo, feeQuota, 0)
+	}
 
 	model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, feeQuota)
-	model.UpdateChannelUsedQuota(relayInfo.ChannelId, feeQuota)
+	channelID := 0
+	if relayInfo.ChannelMeta != nil {
+		channelID = relayInfo.ChannelId
+	}
+	if channelID > 0 {
+		model.UpdateChannelUsedQuota(channelID, feeQuota)
+	}
 
 	useTimeSeconds := time.Now().Unix() - relayInfo.StartTime.Unix()
 	tokenName := ctx.GetString("token_name")
@@ -148,7 +180,7 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	}
 
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
-		ChannelId:      relayInfo.ChannelId,
+		ChannelId:      channelID,
 		ModelName:      relayInfo.OriginModelName,
 		TokenName:      tokenName,
 		Quota:          feeQuota,

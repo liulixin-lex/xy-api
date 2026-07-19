@@ -16,13 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect } from 'react'
-import * as z from 'zod'
-import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { useEffect } from 'react'
+import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+import * as z from 'zod'
+
+import { Dialog } from '@/components/dialog'
+import { ReactIconByName } from '@/components/react-icon-by-name'
 import { Button } from '@/components/ui/button'
 import { Combobox } from '@/components/ui/combobox'
+import { ComboboxInput } from '@/components/ui/combobox-input'
 import {
   Form,
   FormControl,
@@ -33,16 +37,52 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Dialog } from '@/components/dialog'
-import { ReactIconByName } from '@/components/react-icon-by-name'
 
 const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
-  z.object({
-    name: z.string().min(1, t('Payment method name is required')),
-    type: z.string().min(1, t('Payment type key is required')),
-    icon: z.string().optional(),
-    min_topup: z.string().optional(),
-  })
+  z
+    .object({
+      name: z
+        .string()
+        .trim()
+        .min(1, t('Payment method name is required'))
+        .max(128, t('Payment method name is too long')),
+      type: z
+        .string()
+        .trim()
+        .min(1, t('Payment type key is required'))
+        .regex(
+          /^[A-Za-z0-9_-]{1,64}$/,
+          t('Use 1 to 64 letters, numbers, underscores, or hyphens.')
+        ),
+      provider: z.enum(['epay', 'stripe', 'xorpay', 'waffo_pancake']),
+      icon: z.string().trim().max(64, t('Icon name is too long')).optional(),
+      min_topup: z
+        .string()
+        .trim()
+        .optional()
+        .refine((value) => {
+          if (!value) return true
+          const amount = Number(value)
+          return Number.isSafeInteger(amount) && amount >= 1 && amount <= 10_000
+        }, t('Minimum top-up must be a positive whole number between 1 and 10000')),
+    })
+    .superRefine((value, ctx) => {
+      const valid =
+        value.provider === 'epay' ||
+        (value.provider === 'stripe' && value.type === 'stripe') ||
+        (value.provider === 'xorpay' &&
+          (value.type === 'xorpay_native' || value.type === 'xorpay_alipay')) ||
+        (value.provider === 'waffo_pancake' && value.type === 'waffo_pancake')
+      if (!valid) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['type'],
+          message: t(
+            'The payment type key does not match the selected provider.'
+          ),
+        })
+      }
+    })
 
 type PaymentMethodDialogFormValues = z.infer<
   ReturnType<typeof createPaymentMethodDialogSchema>
@@ -53,6 +93,7 @@ const PAYMENT_METHOD_FORM_ID = 'payment-method-form'
 export type PaymentMethodData = {
   name: string
   type: string
+  provider: 'epay' | 'stripe' | 'xorpay' | 'waffo_pancake'
   icon?: string
   min_topup?: string
   color?: string
@@ -61,7 +102,7 @@ export type PaymentMethodData = {
 type PaymentMethodDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSave: (data: PaymentMethodData) => void
+  onSave: (data: PaymentMethodData) => boolean | void
   editData?: PaymentMethodData | null
 }
 
@@ -70,6 +111,8 @@ const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   stripe: 'SiStripe',
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
+  xorpay_alipay: 'SiAlipay',
+  xorpay_native: 'SiWechat',
 }
 
 const getDefaultIconName = (type: string) => PAYMENT_TYPE_ICON_NAMES[type] ?? ''
@@ -88,35 +131,60 @@ export function PaymentMethodDialog({
       iconName: 'SiAlipay',
       label: `${t('Alipay')} (Epay: alipay)`,
       name: t('Alipay'),
+      provider: 'epay' as const,
       value: 'alipay',
     },
     {
       iconName: 'SiWechat',
       label: `${t('WeChat Pay')} (Epay: wxpay)`,
       name: t('WeChat Pay'),
+      provider: 'epay' as const,
       value: 'wxpay',
     },
     {
       iconName: 'SiStripe',
       label: `${t('Stripe')} (stripe)`,
       name: t('Stripe'),
+      provider: 'stripe' as const,
       value: 'stripe',
+    },
+    {
+      iconName: 'SiWechat',
+      label: `${t('XORPay WeChat Pay')} (xorpay_native)`,
+      name: t('XORPay WeChat Pay'),
+      provider: 'xorpay' as const,
+      value: 'xorpay_native',
+    },
+    {
+      iconName: 'SiAlipay',
+      label: `${t('XORPay Alipay')} (xorpay_alipay)`,
+      name: t('XORPay Alipay'),
+      provider: 'xorpay' as const,
+      value: 'xorpay_alipay',
     },
     {
       iconName: 'LuCreditCard',
       label: 'Waffo Pancake (waffo_pancake)',
       name: 'Waffo Pancake',
+      provider: 'waffo_pancake' as const,
       value: 'waffo_pancake',
     },
   ]
   const getPaymentTypeOption = (value: string) =>
     paymentTypeOptions.find((option) => option.value === value)
+  const providerOptions = [
+    { label: 'Epay', value: 'epay' },
+    { label: 'Stripe', value: 'stripe' },
+    { label: 'XORPay', value: 'xorpay' },
+    { label: 'Waffo Pancake', value: 'waffo_pancake' },
+  ]
 
   const form = useForm<PaymentMethodDialogFormValues>({
     resolver: zodResolver(paymentMethodDialogSchema),
     defaultValues: {
       name: '',
       type: '',
+      provider: 'epay',
       icon: '',
       min_topup: '',
     },
@@ -129,6 +197,7 @@ export function PaymentMethodDialog({
       form.reset({
         name: editData.name,
         type: editData.type,
+        provider: editData.provider,
         icon: editData.icon ?? getDefaultIconName(editData.type),
         min_topup: editData.min_topup ?? '',
       })
@@ -136,6 +205,7 @@ export function PaymentMethodDialog({
       form.reset({
         name: '',
         type: '',
+        provider: 'epay',
         icon: '',
         min_topup: '',
       })
@@ -144,8 +214,9 @@ export function PaymentMethodDialog({
 
   const handleSubmit = (values: PaymentMethodDialogFormValues) => {
     const data: PaymentMethodData = {
-      name: values.name,
-      type: values.type,
+      name: values.name.trim(),
+      type: values.type.trim(),
+      provider: values.provider,
     }
     if (values.icon && values.icon.trim() !== '') {
       data.icon = values.icon.trim()
@@ -153,7 +224,8 @@ export function PaymentMethodDialog({
     if (values.min_topup && values.min_topup.trim() !== '') {
       data.min_topup = values.min_topup
     }
-    onSave(data)
+    if (editData?.color) data.color = editData.color
+    if (onSave(data) === false) return
     form.reset()
     onOpenChange(false)
   }
@@ -223,6 +295,12 @@ export function PaymentMethodDialog({
                       const nextOption = getPaymentTypeOption(value)
 
                       field.onChange(value)
+                      if (nextOption?.provider) {
+                        form.setValue('provider', nextOption.provider, {
+                          shouldDirty: true,
+                          shouldValidate: true,
+                        })
+                      }
                       if (
                         nextOption?.iconName &&
                         (!currentIcon ||
@@ -248,7 +326,31 @@ export function PaymentMethodDialog({
                 </FormControl>
                 <FormDescription className='leading-relaxed'>
                   {t(
-                    'Used to decide the payment flow. Built-in keys include stripe for Stripe and waffo_pancake for Waffo Pancake; other values are sent to Epay as the type parameter.'
+                    'The method key is sent only to the explicitly selected payment provider.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name='provider'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Payment Provider')}</FormLabel>
+                <FormControl>
+                  <ComboboxInput
+                    options={providerOptions}
+                    value={field.value}
+                    onValueChange={field.onChange}
+                    placeholder={t('Search payment providers...')}
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(
+                    'Explicit provider routing prevents custom methods from being sent to the wrong gateway.'
                   )}
                 </FormDescription>
                 <FormMessage />
@@ -297,7 +399,9 @@ export function PaymentMethodDialog({
                 <FormControl>
                   <Input
                     type='number'
-                    step='0.01'
+                    min={1}
+                    max={10_000}
+                    step={1}
                     placeholder={t('e.g., 50')}
                     {...field}
                   />

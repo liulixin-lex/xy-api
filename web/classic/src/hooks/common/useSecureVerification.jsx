@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { SecureVerificationService } from '../../services/secureVerification';
 import { showError, showSuccess } from '../../helpers';
@@ -56,6 +56,8 @@ export const useSecureVerification = ({
     code: '',
     apiCall: null,
   });
+  const pendingApiCallRef = useRef(null);
+  const verificationExecutionRef = useRef(false);
 
   // 检查可用的验证方式
   const checkVerificationMethods = useCallback(async () => {
@@ -72,6 +74,8 @@ export const useSecureVerification = ({
 
   // 重置状态
   const resetState = useCallback(() => {
+    pendingApiCallRef.current = null;
+    verificationExecutionRef.current = false;
     setVerificationState({
       method: null,
       loading: false,
@@ -88,8 +92,9 @@ export const useSecureVerification = ({
 
       // 检查验证方式
       const methods = await checkVerificationMethods();
+      const passkeyAvailable = methods.hasPasskey && methods.passkeySupported;
 
-      if (!methods.has2FA && !methods.hasPasskey) {
+      if (!methods.has2FA && !passkeyAvailable) {
         const errorMessage = t('您需要先启用两步验证或 Passkey 才能执行此操作');
         showError(errorMessage);
         onError?.(new Error(errorMessage));
@@ -97,15 +102,21 @@ export const useSecureVerification = ({
       }
 
       // 设置默认验证方式
-      let defaultMethod = preferredMethod;
+      let defaultMethod = null;
+      if (preferredMethod === '2fa' && methods.has2FA) {
+        defaultMethod = '2fa';
+      } else if (preferredMethod === 'passkey' && passkeyAvailable) {
+        defaultMethod = 'passkey';
+      }
       if (!defaultMethod) {
-        if (methods.hasPasskey && methods.passkeySupported) {
+        if (passkeyAvailable) {
           defaultMethod = 'passkey';
         } else if (methods.has2FA) {
           defaultMethod = '2fa';
         }
       }
 
+      pendingApiCallRef.current = apiCall;
       setVerificationState((prev) => ({
         ...prev,
         method: defaultMethod,
@@ -123,19 +134,32 @@ export const useSecureVerification = ({
   // 执行验证
   const executeVerification = useCallback(
     async (method, code = '') => {
-      if (!verificationState.apiCall) {
+      if (!pendingApiCallRef.current) {
         showError(t('验证配置错误'));
         return;
       }
+      if (verificationExecutionRef.current) return;
 
+      verificationExecutionRef.current = true;
       setVerificationState((prev) => ({ ...prev, loading: true }));
+      let operationClaimed = false;
 
       try {
         // 先调用验证 API，成功后后端会设置 session
         await SecureVerificationService.verify(method, code);
 
+        const apiCall = pendingApiCallRef.current;
+        if (!apiCall) {
+          resetState();
+          return;
+        }
+
+        pendingApiCallRef.current = null;
+        operationClaimed = true;
+        setVerificationState((prev) => ({ ...prev, apiCall: null }));
+
         // 验证成功，调用业务 API（此时中间件会通过）
-        const result = await verificationState.apiCall();
+        const result = await apiCall();
 
         // 显示成功消息
         if (successMessage) {
@@ -148,26 +172,26 @@ export const useSecureVerification = ({
         // 自动重置状态
         if (autoReset) {
           resetState();
+        } else {
+          setIsModalVisible(false);
         }
 
         return result;
       } catch (error) {
-        showError(error.message || t('验证失败，请重试'));
+        if (operationClaimed) resetState();
+        showError(
+          error?.response?.data?.message ||
+            error?.message ||
+            t('验证失败，请重试'),
+        );
         onError?.(error);
         throw error;
       } finally {
+        verificationExecutionRef.current = false;
         setVerificationState((prev) => ({ ...prev, loading: false }));
       }
     },
-    [
-      verificationState.apiCall,
-      successMessage,
-      onSuccess,
-      onError,
-      autoReset,
-      resetState,
-      t,
-    ],
+    [successMessage, onSuccess, onError, autoReset, resetState, t],
   );
 
   // 设置验证码

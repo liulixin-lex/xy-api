@@ -26,6 +26,7 @@ import {
   ShieldAlert,
   Wrench,
 } from 'lucide-react'
+
 import { getAuthSectionNavItems } from '@/features/system-settings/auth/section-registry.tsx'
 import { getBillingSectionNavItems } from '@/features/system-settings/billing/section-registry.tsx'
 import { getContentSectionNavItems } from '@/features/system-settings/content/section-registry.tsx'
@@ -33,6 +34,9 @@ import { getModelsSectionNavItems } from '@/features/system-settings/models/sect
 import { getOperationsSectionNavItems } from '@/features/system-settings/operations/section-registry.tsx'
 import { getSecuritySectionNavItems } from '@/features/system-settings/security/section-registry.tsx'
 import { getSiteSectionNavItems } from '@/features/system-settings/site/section-registry.tsx'
+import { canManageSystemSettings } from '@/lib/admin-permissions'
+import type { AuthUser } from '@/stores/auth-store'
+
 import type { NavGroup, SidebarView } from '../types'
 
 /**
@@ -42,7 +46,28 @@ import type { NavGroup, SidebarView } from '../types'
  * header already provides top-level context — the inner group label
  * scopes the items as "administration" actions.
  */
-function getSystemSettingsNavGroups(t: TFunction): NavGroup[] {
+function getSystemSettingsNavGroups(
+  t: TFunction,
+  user?: AuthUser | null
+): NavGroup[] {
+  const billingItems = getBillingSectionNavItems(t, user)
+  if (!canManageSystemSettings(user)) {
+    return [
+      {
+        id: 'system-administration',
+        title: t('System Administration'),
+        items: billingItems.length
+          ? [
+              {
+                title: t('Billing & Payment'),
+                icon: CreditCard,
+                items: billingItems,
+              },
+            ]
+          : [],
+      },
+    ]
+  }
   return [
     {
       id: 'system-administration',
@@ -61,7 +86,7 @@ function getSystemSettingsNavGroups(t: TFunction): NavGroup[] {
         {
           title: t('Billing & Payment'),
           icon: CreditCard,
-          items: getBillingSectionNavItems(t),
+          items: billingItems,
         },
         {
           title: t('Models & Routing'),

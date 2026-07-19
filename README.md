@@ -177,6 +177,7 @@ docker run --name new-api -d --restart always \
 | 🚀 Deployment Guide | [Installation Documentation](https://docs.newapi.pro/en/docs/installation) |
 | ⚙️ Environment Configuration | [Environment Variables](https://docs.newapi.pro/en/docs/installation/config-maintenance/environment-variables) |
 | 📡 API Documentation | [API Documentation](https://docs.newapi.pro/en/docs/api) |
+| 💳 Payment Operations | [Gateway setup, security, migration, and incident runbook](docs/payment-operations.md) |
 | ❓ FAQ | [FAQ](https://docs.newapi.pro/en/docs/support/faq) |
 | 💬 Community Interaction | [Communication Channels](https://docs.newapi.pro/en/docs/support/community-interaction) |
 
@@ -198,7 +199,7 @@ docker run --name new-api -d --restart always \
 
 ### 💰 Authorized Usage Accounting and Billing
 
-- ✅ Internal top-up and quota allocation for lawful authorized scenarios (EPay, Stripe)
+- ✅ Internal top-up and quota allocation for lawful authorized scenarios (EPay, Stripe, XORPay)
 - ✅ Organization-level per-request, usage-based, and cache-hit cost accounting
 - ✅ Cache billing statistics for OpenAI, Azure, DeepSeek, Claude, Qwen, and supported models
 - ✅ Flexible billing policies for internal management or authorized enterprise customers
@@ -318,6 +319,19 @@ docker run --name new-api -d --restart always \
 |--------|------|--------|
 | `SESSION_SECRET` | Session secret (required for multi-machine deployment) | - |
 | `CRYPTO_SECRET` | Encryption secret (required for Redis) | - |
+| `PAYMENT_SECRET_KEY` | Dedicated encryption key for payment credentials (at least 32 characters; required before saving gateway secrets; identical on all nodes) | - |
+| `PAYMENT_SECRET_KEY_PREVIOUS` | Previous payment encryption key used only during explicit key rotation; remove after credentials are re-encrypted | - |
+| `PAYMENT_QUOTE_RATE_LIMIT_ENABLE` | Enable authenticated per-user payment quote and amount-preview limiting | `true` |
+| `PAYMENT_QUOTE_RATE_LIMIT` | Maximum quote or amount-preview requests in one window | `30` |
+| `PAYMENT_QUOTE_RATE_LIMIT_DURATION` | Payment quote limit window in seconds | `60` |
+| `PAYMENT_START_RATE_LIMIT_ENABLE` | Enable authenticated per-user payment-start limiting | `true` |
+| `PAYMENT_START_RATE_LIMIT` | Maximum payment-start requests in one window | `10` |
+| `PAYMENT_START_RATE_LIMIT_DURATION` | Payment-start limit window in seconds | `60` |
+| `PAYMENT_STRIPE_TEST_MODE_ENABLED` | Allow Stripe test credentials and test-mode fulfillment; enable only in a data-isolated sandbox, never against production users or quota | `false` |
+| `BILLING_RESERVATION_STALE_MINUTES` | Age in minutes before an open durable billing reservation enters reconciliation and the administrator attention queue | `5` |
+| `BILLING_RECONCILE_INTERVAL_MINUTES` | Durable billing reservation reconciliation interval in minutes | `5` |
+| `BILLING_RECONCILE_BATCH_SIZE` | Maximum reservations processed by each reconciliation pass (1-1000) | `100` |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs allowed to supply forwarded client-IP headers; empty disables forwarded headers | - |
 | `SQL_DSN` | Database connection string | - |
 | `REDIS_CONN_STRING` | Redis connection string | - |
 | `RELAY_IDLE_CONN_TIMEOUT` | Idle keep-alive timeout for relay HTTP clients, seconds. Defaults to Go standard library behavior; set `0` to disable | `90` |

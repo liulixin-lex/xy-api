@@ -32,7 +32,7 @@ import { Crown, CalendarClock, Package } from 'lucide-react';
 import { SiStripe } from 'react-icons/si';
 import { IconCreditCard } from '@douyinfe/semi-icons';
 import { renderQuota } from '../../../helpers';
-import { getCurrencyConfig } from '../../../helpers/render';
+import { formatPaymentDecimal } from '../payment-utils';
 import {
   formatSubscriptionDuration,
   formatSubscriptionResetPeriod,
@@ -49,7 +49,6 @@ const SubscriptionPurchaseModal = ({
   selectedEpayMethod,
   setSelectedEpayMethod,
   epayMethods = [],
-  enableOnlineTopUp = false,
   enableStripeTopUp = false,
   enableCreemTopUp = false,
   purchaseLimitInfo = null,
@@ -59,16 +58,13 @@ const SubscriptionPurchaseModal = ({
 }) => {
   const plan = selectedPlan?.plan;
   const totalAmount = Number(plan?.total_amount || 0);
-  const { symbol, rate } = getCurrencyConfig();
   const price = plan ? Number(plan.price_amount || 0) : 0;
-  const convertedPrice = price * rate;
-  const displayPrice = convertedPrice.toFixed(
-    Number.isInteger(convertedPrice) ? 0 : 2,
-  );
-  // 只有当管理员开启支付网关 AND 套餐配置了对应的支付ID时才显示
-  const hasStripe = enableStripeTopUp && !!plan?.stripe_price_id;
+  const displayPrice = formatPaymentDecimal(price, plan?.currency || 'USD');
+  const planCurrency = (plan?.currency || 'USD').toUpperCase();
+  const supportsUnifiedPayment = planCurrency === 'USD';
+  const hasStripe = supportsUnifiedPayment && enableStripeTopUp;
   const hasCreem = enableCreemTopUp && !!plan?.creem_product_id;
-  const hasEpay = enableOnlineTopUp && epayMethods.length > 0;
+  const hasEpay = supportsUnifiedPayment && epayMethods.length > 0;
   const hasAnyPayment = hasStripe || hasCreem || hasEpay;
   const purchaseLimit = Number(purchaseLimitInfo?.limit || 0);
   const purchaseCount = Number(purchaseLimitInfo?.count || 0);
@@ -162,7 +158,6 @@ const SubscriptionPurchaseModal = ({
                   {t('应付金额')}：
                 </Text>
                 <Text strong className='text-xl text-purple-600'>
-                  {symbol}
                   {displayPrice}
                 </Text>
               </div>
@@ -174,6 +169,18 @@ const SubscriptionPurchaseModal = ({
             <Banner
               type='warning'
               description={`${t('已达到购买上限')} (${purchaseCount}/${purchaseLimit})`}
+              className='!rounded-xl'
+              closeIcon={null}
+            />
+          )}
+
+          {!supportsUnifiedPayment && (
+            <Banner
+              type='warning'
+              description={t(
+                '当前套餐使用 {{currency}} 定价，Stripe、易支付和 XORPay 统一支付仅支持 USD 套餐；如已配置 Creem，可继续使用 Creem 支付。',
+                { currency: planCurrency },
+              )}
               className='!rounded-xl'
               closeIcon={null}
             />
@@ -195,7 +202,7 @@ const SubscriptionPurchaseModal = ({
                       icon={<SiStripe size={14} color='#635BFF' />}
                       onClick={onPayStripe}
                       loading={paying}
-                      disabled={purchaseLimitReached}
+                      disabled={purchaseLimitReached || paying}
                     >
                       Stripe
                     </Button>
@@ -207,7 +214,7 @@ const SubscriptionPurchaseModal = ({
                       icon={<IconCreditCard />}
                       onClick={onPayCreem}
                       loading={paying}
-                      disabled={purchaseLimitReached}
+                      disabled={purchaseLimitReached || paying}
                     >
                       Creem
                     </Button>
@@ -228,14 +235,16 @@ const SubscriptionPurchaseModal = ({
                       value: m.type,
                       label: m.name || m.type,
                     }))}
-                    disabled={purchaseLimitReached}
+                    disabled={purchaseLimitReached || paying}
                   />
                   <Button
                     theme='solid'
                     type='primary'
                     onClick={onPayEpay}
                     loading={paying}
-                    disabled={!selectedEpayMethod || purchaseLimitReached}
+                    disabled={
+                      !selectedEpayMethod || purchaseLimitReached || paying
+                    }
                   >
                     {t('支付')}
                   </Button>
@@ -245,7 +254,11 @@ const SubscriptionPurchaseModal = ({
           ) : (
             <Banner
               type='info'
-              description={t('管理员未开启在线支付功能，请联系管理员配置。')}
+              description={
+                supportsUnifiedPayment
+                  ? t('管理员未开启在线支付功能，请联系管理员配置。')
+                  : t('当前套餐没有可用的兼容支付方式，请联系管理员。')
+              }
               className='!rounded-xl'
               closeIcon={null}
             />

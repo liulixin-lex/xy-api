@@ -1,13 +1,3 @@
-import { useQueryClient } from '@tanstack/react-query'
-import type { ColumnDef } from '@tanstack/react-table'
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  ListOrdered,
-  Shuffle,
-  SlidersHorizontal,
-} from 'lucide-react'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -26,6 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQueryClient } from '@tanstack/react-query'
+import type { ColumnDef } from '@tanstack/react-table'
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  ListOrdered,
+  Shuffle,
+  SlidersHorizontal,
+} from 'lucide-react'
 /* eslint-disable react-refresh/only-export-components */
 import { useState, useMemo, useContext } from 'react'
 import { useTranslation } from 'react-i18next'

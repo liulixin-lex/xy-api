@@ -92,6 +92,7 @@ export interface PlanPayload {
 export interface SubscriptionPayRequest {
   plan_id: number
   payment_method?: string
+  request_id?: string
 }
 
 export interface SubscriptionPayResponse {
@@ -142,6 +143,56 @@ export interface SelfSubscriptionData {
   billing_preference: string
   subscriptions: UserSubscriptionRecord[]
   all_subscriptions: UserSubscriptionRecord[]
+}
+
+// ============================================================================
+// Read-only Stripe Legacy Subscription Inventory
+// ============================================================================
+
+export interface StripeLegacySubscription {
+  id: number
+  stripe_subscription_id: string
+  stripe_customer_id: string
+  checkout_session_id?: string
+  trade_no?: string
+  user_id?: number
+  subscription_plan_id?: number
+  mapping_status: string
+  mapping_reason?: string
+  mapping_source?: string
+  review_reason?: string
+  price_ids: string[]
+  product_id?: string
+  quantity: number
+  currency?: string
+  status: string
+  collection_method?: string
+  cancel_at_period_end: boolean
+  current_period_start: number
+  current_period_end: number
+  cancel_at: number
+  canceled_at: number
+  ended_at: number
+  trial_start: number
+  trial_end: number
+  latest_invoice_id?: string
+  latest_invoice_status?: string
+  latest_invoice_paid: boolean
+  latest_invoice_amount_due: number
+  latest_invoice_amount_paid: number
+  latest_invoice_currency?: string
+  livemode: boolean
+  stripe_created_at: number
+  state_observed_at: number
+  last_synced_at: number
+  sync_source: string
+}
+
+export interface StripeInventoryPage {
+  page: number
+  page_size: number
+  total: number
+  items: StripeLegacySubscription[]
 }
 
 // ============================================================================

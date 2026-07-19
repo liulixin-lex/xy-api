@@ -19,14 +19,30 @@ For commercial licensing, please contact support@quantumnous.com
 import { createFileRoute, redirect } from '@tanstack/react-router'
 
 import { SystemSettings } from '@/features/system-settings'
-import { canManageSystemSettings } from '@/lib/admin-permissions'
+import {
+  canManagePaymentOperations,
+  canManageSystemSettings,
+} from '@/lib/admin-permissions'
 import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated/system-settings')({
-  beforeLoad: () => {
+  beforeLoad: ({ location }) => {
     const { auth } = useAuthStore.getState()
+    const canManageSettings = canManageSystemSettings(auth.user)
+    const isPaymentOperationsPath = location.pathname.endsWith(
+      '/billing/payment-operations'
+    )
+    const isSystemSettingsIndex = /^\/system-settings\/?$/.test(
+      location.pathname
+    )
 
-    if (!canManageSystemSettings(auth.user)) {
+    if (
+      !canManageSettings &&
+      !(
+        (isPaymentOperationsPath || isSystemSettingsIndex) &&
+        canManagePaymentOperations(auth.user)
+      )
+    ) {
       throw redirect({
         to: '/403',
       })

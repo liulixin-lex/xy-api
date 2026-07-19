@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -76,16 +77,24 @@ func buildCompletionRatioMetaValue(optionValues map[string]string) string {
 }
 
 func GetOptions(c *gin.Context) {
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+		return
+	}
 	var options []*model.Option
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
 	for k, v := range common.OptionMap {
+		if _, internal := paymentInternalCredentialOptionKeys[k]; internal {
+			continue
+		}
 		value := common.Interface2String(v)
 		isSensitiveKey := strings.HasSuffix(k, "Token") ||
 			strings.HasSuffix(k, "Secret") ||
 			strings.HasSuffix(k, "Key") ||
 			strings.HasSuffix(k, "secret") ||
-			strings.HasSuffix(k, "api_key")
+			strings.HasSuffix(k, "api_key") ||
+			model.IsPaymentSecretOption(k)
 		if isSensitiveKey {
 			continue
 		}
@@ -101,6 +110,17 @@ func GetOptions(c *gin.Context) {
 		}
 	}
 	common.OptionMapRWMutex.Unlock()
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+	previousCredentialStatus := paymentPreviousCredentialStatusLocked()
+	stripeTestModeEnabled := setting.StripeTestModeEnabled()
+	stripeTestModeBlocked := setting.StripeCredentialLivemode == "test" && !stripeTestModeEnabled
+	unlockPaymentConfiguration()
+	options = append(options, previousCredentialStatus.options()...)
+	options = append(options,
+		&model.Option{Key: paymentStripeTestModeEnabledOptionKey, Value: strconv.FormatBool(stripeTestModeEnabled)},
+		&model.Option{Key: paymentStripeTestModeBlockedOptionKey, Value: strconv.FormatBool(stripeTestModeBlocked)},
+		&model.Option{Key: paymentStripeTestModeIsolationRequiredOptionKey, Value: "true"},
+	)
 	options = append(options, &model.Option{
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),
@@ -136,6 +156,10 @@ func UpdateOption(c *gin.Context) {
 		option.Value = common.Interface2String(option.Value.(int))
 	default:
 		option.Value = fmt.Sprintf("%v", option.Value)
+	}
+	if isPaymentAtomicOnlyOptionKey(option.Key) {
+		common.ApiErrorMsg(c, "Payment settings must be changed through the atomic payment settings endpoint")
+		return
 	}
 	switch option.Key {
 	case "QuotaForInviter", "QuotaForInvitee":
@@ -338,7 +362,28 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	}
-	err = model.UpdateOption(option.Key, option.Value.(string))
+	if option.Key == "ServerAddress" {
+		if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+			common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+			return
+		}
+		expectedVersion, versionErr := model.CurrentPaymentConfigurationVersion()
+		if versionErr != nil {
+			common.ApiError(c, versionErr)
+			return
+		}
+		unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
+		_, err = model.UpdatePaymentOptionsBulkWithVersionLockHeld(
+			map[string]string{option.Key: option.Value.(string)}, expectedVersion,
+		)
+		unlockPaymentConfiguration()
+		if errors.Is(err, model.ErrPaymentConfigurationVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Payment settings changed concurrently; refresh and retry"})
+			return
+		}
+	} else {
+		err = model.UpdateOption(option.Key, option.Value.(string))
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return

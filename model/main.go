@@ -1,6 +1,8 @@
 package model
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -211,12 +213,85 @@ func InitDB() (err error) {
 			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
 		}
 		common.SysLog("database migration started")
-		err = migrateDB()
+		err = migrateDBSafely()
 		return err
 	} else {
 		common.FatalLog(err)
 	}
 	return err
+}
+
+const postgresMigrationAdvisoryLockKey int64 = 0x4e4150494d494752
+
+// migrateDBSafely serializes PostgreSQL schema changes across application
+// instances. PostgreSQL does not make concurrent CREATE TABLE idempotent: two
+// master nodes starting from the same clean or legacy schema can otherwise
+// race in pg_type before either table becomes visible to the other session.
+// The connection-scoped advisory lock leaves the existing per-statement
+// migration transaction behavior unchanged and is released before the pinned
+// connection returns to the pool.
+func migrateDBSafely() (resultErr error) {
+	if !common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		return migrateDB()
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	connection, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("reserve PostgreSQL database migration connection: %w", err)
+	}
+	defer connection.Close()
+
+	lockContext, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	_, err = connection.ExecContext(lockContext, "SELECT pg_advisory_lock($1)", postgresMigrationAdvisoryLockKey)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("acquire PostgreSQL database migration lock: %w", err)
+	}
+
+	defer func() {
+		unlockContext, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer unlockCancel()
+		var released bool
+		unlockErr := connection.QueryRowContext(
+			unlockContext, "SELECT pg_advisory_unlock($1)", postgresMigrationAdvisoryLockKey,
+		).Scan(&released)
+		if unlockErr == nil && !released {
+			unlockErr = errors.New("PostgreSQL database migration lock was not held by the migration connection")
+		}
+		if unlockErr == nil {
+			return
+		}
+		if resultErr == nil {
+			resultErr = fmt.Errorf("release PostgreSQL database migration lock: %w", unlockErr)
+			return
+		}
+		common.SysError("failed to release PostgreSQL database migration lock: " + unlockErr.Error())
+	}()
+
+	migrationDB, err := gorm.Open(postgres.New(postgres.Config{
+		Conn:                 connection,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{
+		SkipDefaultTransaction:                   DB.SkipDefaultTransaction,
+		NamingStrategy:                           DB.NamingStrategy,
+		Logger:                                   DB.Logger,
+		NowFunc:                                  DB.NowFunc,
+		PrepareStmt:                              false,
+		DisableForeignKeyConstraintWhenMigrating: DB.DisableForeignKeyConstraintWhenMigrating,
+		IgnoreRelationshipsWhenMigrating:         DB.IgnoreRelationshipsWhenMigrating,
+		DisableNestedTransaction:                 DB.DisableNestedTransaction,
+		CreateBatchSize:                          DB.CreateBatchSize,
+		TranslateError:                           DB.TranslateError,
+	})
+	if err != nil {
+		resultErr = fmt.Errorf("initialize PostgreSQL database migration session: %w", err)
+		return resultErr
+	}
+	resultErr = migrateDBOn(migrationDB)
+	return resultErr
 }
 
 func InitLogDB() (err error) {
@@ -261,14 +336,24 @@ func InitLogDB() (err error) {
 }
 
 func migrateDB() error {
+	return migrateDBOn(DB)
+}
+
+func migrateDBOn(db *gorm.DB) error {
 	// Migrate price_amount column from float/double to decimal for existing tables
-	migrateSubscriptionPlanPriceAmount()
+	migrateSubscriptionPlanPriceAmountOn(db)
+	if err := ensurePaymentProjectionColumnsSQLiteOn(db); err != nil {
+		return err
+	}
 	// Migrate model_limits column from varchar to text for existing tables
-	if err := migrateTokenModelLimitsToText(); err != nil {
+	if err := migrateTokenModelLimitsToTextOn(db); err != nil {
+		return err
+	}
+	if err := ensureUserPaymentFrozenColumnOn(db); err != nil {
 		return err
 	}
 
-	err := DB.AutoMigrate(
+	err := db.AutoMigrate(
 		&Channel{},
 		&Token{},
 		&User{},
@@ -279,6 +364,21 @@ func migrateDB() error {
 		&Log{},
 		&Midjourney{},
 		&TopUp{},
+		&PaymentQuote{},
+		&PaymentUserGuard{},
+		&PaymentOrder{},
+		&PaymentEvent{},
+		&PaymentLedgerEntry{},
+		&PaymentDebt{},
+		&PaymentCustomerBinding{},
+		&PaymentCustomerBindingRetirement{},
+		&PaymentOperationsAudit{},
+		&PaymentConfigurationAudit{},
+		&StripeLegacySubscription{},
+		&StripeLegacyInvoice{},
+		&BillingReservation{},
+		&QuotaLedgerEntry{},
+		&BillingReservationAdminResolution{},
 		&AffiliateRewardRecord{},
 		&InviteInitialQuotaRecord{},
 		&InviteLinkBatch{},
@@ -308,18 +408,48 @@ func migrateDB() error {
 		return err
 	}
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
-		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
+		if err := ensureSubscriptionPlanTableSQLiteOn(db); err != nil {
 			return err
 		}
 	} else {
-		if err := DB.AutoMigrate(&SubscriptionPlan{}); err != nil {
+		if err := db.AutoMigrate(&SubscriptionPlan{}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func ensureUserPaymentFrozenColumnOn(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&User{}) {
+		return nil
+	}
+	if !db.Migrator().HasColumn(&User{}, "PaymentFrozen") {
+		var addColumnSQL string
+		switch {
+		case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
+			addColumnSQL = `ALTER TABLE "users" ADD COLUMN "payment_frozen" boolean`
+		case common.UsingMainDatabase(common.DatabaseTypeMySQL):
+			addColumnSQL = "ALTER TABLE `users` ADD COLUMN `payment_frozen` boolean NULL"
+		case common.UsingMainDatabase(common.DatabaseTypeSQLite):
+			addColumnSQL = "ALTER TABLE `users` ADD COLUMN `payment_frozen` numeric NOT NULL DEFAULT 0"
+		default:
+			return nil
+		}
+		if err := db.Exec(addColumnSQL).Error; err != nil {
+			return fmt.Errorf("add users.payment_frozen compatibility column: %w", err)
+		}
+	}
+	result := db.Table("users").Where("payment_frozen IS NULL").Update("payment_frozen", false)
+	if result.Error != nil {
+		return fmt.Errorf("backfill users.payment_frozen: %w", result.Error)
+	}
+	return nil
+}
+
 func migrateDBFast() error {
+	if err := ensurePaymentProjectionColumnsSQLite(); err != nil {
+		return err
+	}
 
 	var wg sync.WaitGroup
 
@@ -337,6 +467,21 @@ func migrateDBFast() error {
 		{&Log{}, "Log"},
 		{&Midjourney{}, "Midjourney"},
 		{&TopUp{}, "TopUp"},
+		{&PaymentQuote{}, "PaymentQuote"},
+		{&PaymentUserGuard{}, "PaymentUserGuard"},
+		{&PaymentOrder{}, "PaymentOrder"},
+		{&PaymentEvent{}, "PaymentEvent"},
+		{&PaymentLedgerEntry{}, "PaymentLedgerEntry"},
+		{&PaymentDebt{}, "PaymentDebt"},
+		{&PaymentCustomerBinding{}, "PaymentCustomerBinding"},
+		{&PaymentCustomerBindingRetirement{}, "PaymentCustomerBindingRetirement"},
+		{&PaymentOperationsAudit{}, "PaymentOperationsAudit"},
+		{&PaymentConfigurationAudit{}, "PaymentConfigurationAudit"},
+		{&StripeLegacySubscription{}, "StripeLegacySubscription"},
+		{&StripeLegacyInvoice{}, "StripeLegacyInvoice"},
+		{&BillingReservation{}, "BillingReservation"},
+		{&QuotaLedgerEntry{}, "QuotaLedgerEntry"},
+		{&BillingReservationAdminResolution{}, "BillingReservationAdminResolution"},
 		{&AffiliateRewardRecord{}, "AffiliateRewardRecord"},
 		{&InviteInitialQuotaRecord{}, "InviteInitialQuotaRecord"},
 		{&InviteLinkBatch{}, "InviteLinkBatch"},
@@ -497,12 +642,43 @@ type sqliteColumnDef struct {
 	DDL  string
 }
 
+func ensurePaymentProjectionColumnsSQLite() error {
+	return ensurePaymentProjectionColumnsSQLiteOn(DB)
+}
+
+func ensurePaymentProjectionColumnsSQLiteOn(db *gorm.DB) error {
+	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		return nil
+	}
+	columns := []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{table: "subscription_orders", name: "provider_order_key", ddl: "`provider_order_key` varchar(320)"},
+		{table: "user_subscriptions", name: "payment_order_id", ddl: "`payment_order_id` bigint"},
+	}
+	for _, column := range columns {
+		if !db.Migrator().HasTable(column.table) || db.Migrator().HasColumn(column.table, column.name) {
+			continue
+		}
+		if err := db.Exec("ALTER TABLE `" + column.table + "` ADD COLUMN " + column.ddl).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func ensureSubscriptionPlanTableSQLite() error {
+	return ensureSubscriptionPlanTableSQLiteOn(DB)
+}
+
+func ensureSubscriptionPlanTableSQLiteOn(db *gorm.DB) error {
 	if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		return nil
 	}
 	tableName := "subscription_plans"
-	if !DB.Migrator().HasTable(tableName) {
+	if !db.Migrator().HasTable(tableName) {
 		createSQL := `CREATE TABLE ` + "`" + tableName + "`" + ` (
 ` + "`id`" + ` integer,
 ` + "`title`" + ` varchar(128) NOT NULL,
@@ -529,12 +705,12 @@ func ensureSubscriptionPlanTableSQLite() error {
 ` + "`updated_at`" + ` bigint,
 PRIMARY KEY (` + "`id`" + `)
 )`
-		return DB.Exec(createSQL).Error
+		return db.Exec(createSQL).Error
 	}
 	var cols []struct {
 		Name string `gorm:"column:name"`
 	}
-	if err := DB.Raw("PRAGMA table_info(`" + tableName + "`)").Scan(&cols).Error; err != nil {
+	if err := db.Raw("PRAGMA table_info(`" + tableName + "`)").Scan(&cols).Error; err != nil {
 		return err
 	}
 	existing := make(map[string]struct{}, len(cols))
@@ -569,7 +745,7 @@ PRIMARY KEY (` + "`id`" + `)
 		if _, ok := existing[col.Name]; ok {
 			continue
 		}
-		if err := DB.Exec("ALTER TABLE `" + tableName + "` ADD COLUMN " + col.DDL).Error; err != nil {
+		if err := db.Exec("ALTER TABLE `" + tableName + "` ADD COLUMN " + col.DDL).Error; err != nil {
 			return err
 		}
 	}
@@ -579,6 +755,10 @@ PRIMARY KEY (` + "`id`" + `)
 // migrateTokenModelLimitsToText migrates model_limits column from varchar(1024) to text
 // This is safe to run multiple times - it checks the column type first
 func migrateTokenModelLimitsToText() error {
+	return migrateTokenModelLimitsToTextOn(DB)
+}
+
+func migrateTokenModelLimitsToTextOn(db *gorm.DB) error {
 	// SQLite uses type affinity, so TEXT and VARCHAR are effectively the same — no migration needed
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
 		return nil
@@ -587,18 +767,18 @@ func migrateTokenModelLimitsToText() error {
 	tableName := "tokens"
 	columnName := "model_limits"
 
-	if !DB.Migrator().HasTable(tableName) {
+	if !db.Migrator().HasTable(tableName) {
 		return nil
 	}
 
-	if !DB.Migrator().HasColumn(&Token{}, columnName) {
+	if !db.Migrator().HasColumn(&Token{}, columnName) {
 		return nil
 	}
 
 	var alterSQL string
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
 		var dataType string
-		if err := DB.Raw(`SELECT data_type FROM information_schema.columns
+		if err := db.Raw(`SELECT data_type FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&dataType).Error; err != nil {
 			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
@@ -608,7 +788,7 @@ func migrateTokenModelLimitsToText() error {
 		alterSQL = fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE text`, tableName, columnName)
 	} else if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 		var columnType string
-		if err := DB.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
+		if err := db.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
 				WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&columnType).Error; err != nil {
 			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
@@ -621,7 +801,7 @@ func migrateTokenModelLimitsToText() error {
 	}
 
 	if alterSQL != "" {
-		if err := DB.Exec(alterSQL).Error; err != nil {
+		if err := db.Exec(alterSQL).Error; err != nil {
 			return fmt.Errorf("failed to migrate %s.%s to text: %w", tableName, columnName, err)
 		}
 		common.SysLog(fmt.Sprintf("Successfully migrated %s.%s to text", tableName, columnName))
@@ -632,6 +812,10 @@ func migrateTokenModelLimitsToText() error {
 // migrateSubscriptionPlanPriceAmount migrates price_amount column from float/double to decimal(10,6)
 // This is safe to run multiple times - it checks the column type first
 func migrateSubscriptionPlanPriceAmount() {
+	migrateSubscriptionPlanPriceAmountOn(DB)
+}
+
+func migrateSubscriptionPlanPriceAmountOn(db *gorm.DB) {
 	// SQLite doesn't support ALTER COLUMN, and its type affinity handles this automatically
 	// Skip early to avoid GORM parsing the existing table DDL which may cause issues
 	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
@@ -642,12 +826,12 @@ func migrateSubscriptionPlanPriceAmount() {
 	columnName := "price_amount"
 
 	// Check if table exists first
-	if !DB.Migrator().HasTable(tableName) {
+	if !db.Migrator().HasTable(tableName) {
 		return
 	}
 
 	// Check if column exists
-	if !DB.Migrator().HasColumn(&SubscriptionPlan{}, columnName) {
+	if !db.Migrator().HasColumn(&SubscriptionPlan{}, columnName) {
 		return
 	}
 
@@ -655,7 +839,7 @@ func migrateSubscriptionPlanPriceAmount() {
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
 		// PostgreSQL: Check if already decimal/numeric
 		var dataType string
-		if err := DB.Raw(`SELECT data_type FROM information_schema.columns
+		if err := db.Raw(`SELECT data_type FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&dataType).Error; err != nil {
 			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
@@ -667,7 +851,7 @@ func migrateSubscriptionPlanPriceAmount() {
 	} else if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 		// MySQL: Check if already decimal
 		var columnType string
-		if err := DB.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
+		if err := db.Raw(`SELECT COLUMN_TYPE FROM information_schema.columns
 				WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
 			tableName, columnName).Scan(&columnType).Error; err != nil {
 			common.SysLog(fmt.Sprintf("Warning: failed to query metadata for %s.%s: %v", tableName, columnName, err))
@@ -681,7 +865,7 @@ func migrateSubscriptionPlanPriceAmount() {
 	}
 
 	if alterSQL != "" {
-		if err := DB.Exec(alterSQL).Error; err != nil {
+		if err := db.Exec(alterSQL).Error; err != nil {
 			common.SysLog(fmt.Sprintf("Warning: failed to migrate %s.%s to decimal: %v", tableName, columnName, err))
 		} else {
 			common.SysLog(fmt.Sprintf("Successfully migrated %s.%s to decimal(10,6)", tableName, columnName))

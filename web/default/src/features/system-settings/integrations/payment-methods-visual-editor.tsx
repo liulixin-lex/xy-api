@@ -16,9 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useMemo } from 'react'
 import { Lightbulb, Pencil, Plus, Search, Trash2 } from 'lucide-react'
+import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { StaticDataTable } from '@/components/data-table/static/static-data-table'
 import { StaticRowActions } from '@/components/data-table/static/static-row-actions'
@@ -48,6 +49,52 @@ const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   stripe: 'SiStripe',
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
+  xorpay_alipay: 'SiAlipay',
+  xorpay_native: 'SiWechat',
+}
+
+function inferProvider(type: string): PaymentMethodData['provider'] {
+  if (type === 'stripe') return 'stripe'
+  if (type.startsWith('xorpay_')) return 'xorpay'
+  if (type === 'waffo_pancake') return 'waffo_pancake'
+  return 'epay'
+}
+
+function normalizePaymentMethod(item: unknown): PaymentMethodData | null {
+  if (
+    !item ||
+    typeof item !== 'object' ||
+    !('name' in item) ||
+    !('type' in item) ||
+    typeof item.name !== 'string' ||
+    typeof item.type !== 'string'
+  ) {
+    return null
+  }
+
+  const providerValues = ['epay', 'stripe', 'xorpay', 'waffo_pancake']
+  const provider =
+    'provider' in item &&
+    typeof item.provider === 'string' &&
+    providerValues.includes(item.provider)
+      ? (item.provider as PaymentMethodData['provider'])
+      : inferProvider(item.type)
+  const method: PaymentMethodData = {
+    name: item.name,
+    type: item.type,
+    provider,
+  }
+  if ('icon' in item && typeof item.icon === 'string') method.icon = item.icon
+  if ('color' in item && typeof item.color === 'string') {
+    method.color = item.color
+  }
+  if (
+    'min_topup' in item &&
+    (typeof item.min_topup === 'string' || typeof item.min_topup === 'number')
+  ) {
+    method.min_topup = String(item.min_topup)
+  }
+  return method
 }
 
 function getDefaultIconName(type: string) {
@@ -69,6 +116,7 @@ export function PaymentMethodsVisualEditor({
       template: {
         icon: getDefaultIconName('alipay'),
         name: '支付宝',
+        provider: 'epay' as const,
         type: 'alipay',
       },
     },
@@ -77,6 +125,7 @@ export function PaymentMethodsVisualEditor({
       template: {
         icon: getDefaultIconName('wxpay'),
         name: '微信',
+        provider: 'epay' as const,
         type: 'wxpay',
       },
     },
@@ -86,7 +135,26 @@ export function PaymentMethodsVisualEditor({
         icon: getDefaultIconName('stripe'),
         min_topup: '10',
         name: 'Stripe',
+        provider: 'stripe' as const,
         type: 'stripe',
+      },
+    },
+    {
+      name: t('XORPay WeChat Pay'),
+      template: {
+        icon: getDefaultIconName('xorpay_native'),
+        name: t('XORPay WeChat Pay'),
+        provider: 'xorpay' as const,
+        type: 'xorpay_native',
+      },
+    },
+    {
+      name: t('XORPay Alipay'),
+      template: {
+        icon: getDefaultIconName('xorpay_alipay'),
+        name: t('XORPay Alipay'),
+        provider: 'xorpay' as const,
+        type: 'xorpay_alipay',
       },
     },
     {
@@ -94,6 +162,7 @@ export function PaymentMethodsVisualEditor({
       template: {
         icon: getDefaultIconName('waffo_pancake'),
         name: 'Waffo Pancake',
+        provider: 'waffo_pancake' as const,
         type: 'waffo_pancake',
       },
     },
@@ -103,6 +172,7 @@ export function PaymentMethodsVisualEditor({
         icon: 'LuCreditCard',
         min_topup: '50',
         name: '自定义1',
+        provider: 'epay' as const,
         type: 'custom1',
       },
     },
@@ -119,18 +189,9 @@ export function PaymentMethodsVisualEditor({
       context: 'payment methods',
     })
 
-    return parsed.filter(
-      (item): item is PaymentMethodData =>
-        typeof item === 'object' &&
-        item !== null &&
-        'name' in item &&
-        'type' in item &&
-        typeof item.name === 'string' &&
-        typeof item.type === 'string' &&
-        (!('icon' in item) || typeof item.icon === 'string') &&
-        (!('min_topup' in item) || typeof item.min_topup === 'string') &&
-        (!('color' in item) || typeof item.color === 'string')
-    )
+    return parsed
+      .map(normalizePaymentMethod)
+      .filter((item): item is PaymentMethodData => item !== null)
   }, [value])
 
   const filteredMethods = useMemo(() => {
@@ -151,20 +212,26 @@ export function PaymentMethodsVisualEditor({
       silent: true,
     })
 
-    const updatedArray = [...parsed]
+    const updatedArray = parsed
+      .map(normalizePaymentMethod)
+      .filter((item): item is PaymentMethodData => item !== null)
+    const editIndex = editData
+      ? updatedArray.findIndex(
+          (method) =>
+            method.name === editData.name && method.type === editData.type
+        )
+      : -1
+    const duplicate = updatedArray.some(
+      (method, index) => index !== editIndex && method.type === data.type
+    )
+    if (duplicate) {
+      toast.error(t('Payment type keys must be unique'))
+      return false
+    }
 
     if (editData) {
-      const index = updatedArray.findIndex(
-        (item): item is PaymentMethodData =>
-          typeof item === 'object' &&
-          item !== null &&
-          'name' in item &&
-          'type' in item &&
-          item.name === editData.name &&
-          item.type === editData.type
-      )
-      if (index !== -1) {
-        updatedArray[index] = data
+      if (editIndex !== -1) {
+        updatedArray[editIndex] = data
       } else {
         updatedArray.push(data)
       }
@@ -173,6 +240,7 @@ export function PaymentMethodsVisualEditor({
     }
 
     onChange(JSON.stringify(updatedArray, null, 2))
+    return true
   }
 
   const handleDelete = (method: PaymentMethodData) => {
@@ -214,20 +282,16 @@ export function PaymentMethodsVisualEditor({
       silent: true,
     })
 
-    // Check if template already exists
-    const exists = parsed.some(
-      (item) =>
-        typeof item === 'object' &&
-        item !== null &&
-        'type' in item &&
-        'name' in item &&
-        item.type === template.type &&
-        item.name === template.name
-    )
+    const normalized = parsed
+      .map(normalizePaymentMethod)
+      .filter((item): item is PaymentMethodData => item !== null)
+    const exists = normalized.some((item) => item.type === template.type)
 
     if (!exists) {
-      parsed.push(template)
-      onChange(JSON.stringify(parsed, null, 2))
+      normalized.push(template)
+      onChange(JSON.stringify(normalized, null, 2))
+    } else {
+      toast.error(t('Payment type keys must be unique'))
     }
   }
 
@@ -238,6 +302,7 @@ export function PaymentMethodsVisualEditor({
           <Search className='text-muted-foreground absolute top-2.5 left-2.5 h-4 w-4' />
           <Input
             placeholder={t('Search payment methods...')}
+            aria-label={t('Search payment methods')}
             value={searchText}
             onChange={(e) => setSearchText(e.target.value)}
             className='pl-9'
@@ -326,6 +391,13 @@ export function PaymentMethodsVisualEditor({
                 ),
               },
               {
+                id: 'provider',
+                header: t('Payment Provider'),
+                cell: (method) => (
+                  <span className='text-sm font-medium'>{method.provider}</span>
+                ),
+              },
+              {
                 id: 'icon',
                 header: t('Icon'),
                 cell: (method) => {
@@ -399,12 +471,17 @@ export function PaymentMethodsVisualEditor({
                       <code className='bg-muted rounded px-1.5 py-0.5 text-xs'>
                         {method.type}
                       </code>
+                      <span className='text-muted-foreground ml-2 text-xs'>
+                        {method.provider}
+                      </span>
                     </div>
                     <div className='flex gap-1'>
                       <Button
                         type='button'
                         variant='ghost'
-                        size='sm'
+                        size='icon'
+                        className='size-10'
+                        aria-label={`${t('Edit')} ${method.name}`}
                         onClick={(e) => {
                           e.preventDefault()
                           e.stopPropagation()
@@ -416,7 +493,9 @@ export function PaymentMethodsVisualEditor({
                       <Button
                         type='button'
                         variant='ghost'
-                        size='sm'
+                        size='icon'
+                        className='size-10'
+                        aria-label={`${t('Delete')} ${method.name}`}
                         onClick={(e) => {
                           e.preventDefault()
                           e.stopPropagation()

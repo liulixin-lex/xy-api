@@ -20,6 +20,12 @@ import { Code2, Eye, HelpCircle } from 'lucide-react'
 import { memo, useCallback, useMemo, useState, type ReactNode } from 'react'
 import type { UseFormReturn } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+
+import {
+  sideDrawerContentClassName,
+  sideDrawerFormClassName,
+  sideDrawerHeaderClassName,
+} from '@/components/drawer-layout'
 import {
   Accordion,
   AccordionContent,
@@ -45,11 +51,7 @@ import {
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import {
-  sideDrawerContentClassName,
-  sideDrawerFormClassName,
-  sideDrawerHeaderClassName,
-} from '@/components/drawer-layout'
+
 import {
   SettingsForm,
   SettingsSwitchContent,
@@ -62,7 +64,6 @@ import { GroupSpecialUsableRulesEditor } from './group-special-usable-editor'
 
 type GroupFormValues = {
   GroupRatio: string
-  TopupGroupRatio: string
   UserUsableGroups: string
   GroupGroupRatio: string
   AutoGroups: string
@@ -101,7 +102,6 @@ export const GroupRatioForm = memo(function GroupRatioForm({
 
   const watchedGroupRatio = form.watch('GroupRatio')
   const watchedUserUsableGroups = form.watch('UserUsableGroups')
-  const watchedTopupGroupRatio = form.watch('TopupGroupRatio')
   const groupNames = useMemo(() => {
     const ratioMap = safeJsonParse<Record<string, number>>(watchedGroupRatio, {
       fallback: {},
@@ -111,18 +111,8 @@ export const GroupRatioForm = memo(function GroupRatioForm({
       watchedUserUsableGroups,
       { fallback: {}, silent: true }
     )
-    const topupMap = safeJsonParse<Record<string, number>>(
-      watchedTopupGroupRatio,
-      { fallback: {}, silent: true }
-    )
-    return [
-      ...new Set([
-        ...Object.keys(ratioMap),
-        ...Object.keys(usableMap),
-        ...Object.keys(topupMap),
-      ]),
-    ]
-  }, [watchedGroupRatio, watchedUserUsableGroups, watchedTopupGroupRatio])
+    return [...new Set([...Object.keys(ratioMap), ...Object.keys(usableMap)])]
+  }, [watchedGroupRatio, watchedUserUsableGroups])
 
   return (
     <div className='space-y-6'>
@@ -163,7 +153,6 @@ export const GroupRatioForm = memo(function GroupRatioForm({
           <div className='space-y-6'>
             <GroupRatioVisualEditor
               groupRatio={form.watch('GroupRatio')}
-              topupGroupRatio={form.watch('TopupGroupRatio')}
               userUsableGroups={form.watch('UserUsableGroups')}
               groupGroupRatio={form.watch('GroupGroupRatio')}
               autoGroups={form.watch('AutoGroups')}
@@ -219,26 +208,6 @@ export const GroupRatioForm = memo(function GroupRatioForm({
                     {t(
                       'JSON map of group → ratio applied when the user selects the group explicitly.'
                     )}
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name='TopupGroupRatio'
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('Top-up group ratios')}</FormLabel>
-                  <FormControl>
-                    <Textarea rows={6} {...field} />
-                  </FormControl>
-                  <FormDescription>
-                    {t(
-                      'Optional multiplier per user group used when calculating recharge pricing. Provide a JSON object such as'
-                    )}
-                    {` { "default": 1, "vip": 1.2 }`}.
                   </FormDescription>
                   <FormMessage />
                 </FormItem>
@@ -402,7 +371,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
 
         <div className={sideDrawerFormClassName('gap-5')}>
           <section className='space-y-2'>
-            <h3 className='text-sm font-semibold'>{t('The two roles of a group')}</h3>
+            <h3 className='text-sm font-semibold'>
+              {t('The two roles of a group')}
+            </h3>
             <div className='text-muted-foreground space-y-2 text-sm leading-6'>
               <p>
                 {t(
@@ -414,7 +385,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
                   {t('Token group')}
                 </span>
                 {': '}
-                {t('decides which channels are used and which base ratio applies.')}
+                {t(
+                  'decides which channels are used and which base ratio applies.'
+                )}
               </p>
               <p>
                 <span className='text-foreground font-medium'>
@@ -422,14 +395,16 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
                 </span>
                 {': '}
                 {t(
-                  'decides the top-up ratio, which groups the user can pick for tokens, and whether an override ratio applies.'
+                  'decides which groups the user can pick for tokens and whether an override ratio applies.'
                 )}
               </p>
             </div>
           </section>
 
           <section className='space-y-2'>
-            <h3 className='text-sm font-semibold'>{t('How a call is priced')}</h3>
+            <h3 className='text-sm font-semibold'>
+              {t('How a call is priced')}
+            </h3>
             <ol className='text-muted-foreground list-decimal space-y-2 pl-5 text-sm leading-6'>
               <li>
                 <span className='text-foreground font-medium'>
@@ -451,7 +426,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
                 <span className='text-foreground font-medium'>
                   {t('Charge.')}
                 </span>{' '}
-                {t('Cost = model price × that one ratio. Nothing else from the group settings enters the formula.')}
+                {t(
+                  'Cost = model price × that one ratio. Nothing else from the group settings enters the formula.'
+                )}
               </li>
             </ol>
             <p className='text-muted-foreground text-sm leading-6'>
@@ -464,7 +441,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
           <section className='space-y-3'>
             <h3 className='text-sm font-semibold'>{t('Worked example')}</h3>
             <p className='text-muted-foreground text-sm leading-6'>
-              {t('The admin configured three groups and one special ratio rule:')}
+              {t(
+                'The admin configured three groups and one special ratio rule:'
+              )}
             </p>
 
             <div className='overflow-hidden rounded-lg border'>
@@ -527,7 +506,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
                 </div>
                 <div className='space-y-2 p-3'>
                   <GuideStepRow chip='1'>
-                    {t('Billing group = premium (the token has a group, so use it)')}
+                    {t(
+                      'Billing group = premium (the token has a group, so use it)'
+                    )}
                   </GuideStepRow>
                   <GuideStepRow chip='2'>
                     {t(
@@ -548,7 +529,9 @@ function GroupPricingGuide({ open, onOpenChange }: GroupPricingGuideProps) {
                 </div>
                 <div className='space-y-2 p-3'>
                   <GuideStepRow chip='1'>
-                    {t('Billing group = default (the token has a group, so use it)')}
+                    {t(
+                      'Billing group = default (the token has a group, so use it)'
+                    )}
                   </GuideStepRow>
                   <GuideStepRow chip='2'>
                     {t(

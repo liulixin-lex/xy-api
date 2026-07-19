@@ -7,6 +7,9 @@ import { pluginReact } from '@rsbuild/plugin-react';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
+const workspaceNodeModulesDir = path.resolve(__dirname, '../node_modules');
+const workspaceReactDir = path.join(workspaceNodeModulesDir, 'react');
+const workspaceReactDomDir = path.join(workspaceNodeModulesDir, 'react-dom');
 const semiUiDir = path.resolve(
   path.dirname(require.resolve('@douyinfe/semi-ui')),
   '../..',
@@ -20,6 +23,14 @@ const classicDateFnsDir = dateFnsCandidates.find((dir) =>
 );
 if (!classicDateFnsDir) {
   throw new Error('date-fns@2 is required for the classic frontend build');
+}
+if (
+  !fs.existsSync(path.join(workspaceReactDir, 'package.json')) ||
+  !fs.existsSync(path.join(workspaceReactDomDir, 'package.json'))
+) {
+  throw new Error(
+    'workspace React packages are required for the classic frontend build',
+  );
 }
 
 export default defineConfig(({ envMode }) => {
@@ -51,6 +62,10 @@ export default defineConfig(({ envMode }) => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),
+        // Workspace dependencies are hoisted to web/node_modules. Force the
+        // classic renderer and every shared package to use the same React.
+        react: workspaceReactDir,
+        'react-dom': workspaceReactDomDir,
         '@douyinfe/semi-ui/dist/css/semi.css': path.resolve(
           semiUiDir,
           'dist/css/semi.css',

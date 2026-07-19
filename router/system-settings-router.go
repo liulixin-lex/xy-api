@@ -11,18 +11,51 @@ import (
 
 func registerSystemSettingsRoutes(apiRouter *gin.RouterGroup) {
 	for _, route := range systemSettingsPermissionRoutes {
-		apiRouter.Handle(route.method, route.path,
+		handlers := []gin.HandlerFunc{
 			middleware.AdminAuth(),
 			middleware.RequirePermission(route.permission),
-			route.handler,
-		)
+		}
+		for _, permission := range route.additionalPermissions {
+			handlers = append(handlers, middleware.RequirePermission(permission))
+		}
+		if route.criticalRateLimit {
+			handlers = append(handlers, middleware.CriticalRateLimit())
+		}
+		if route.secureVerification {
+			handlers = append(handlers, middleware.SecureVerificationRequired())
+		}
+		handlers = append(handlers, route.handler)
+		apiRouter.Handle(route.method, route.path, handlers...)
 	}
 }
 
 var systemSettingsPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/option/", permission: authz.SystemSettingManage, handler: controller.GetOptions},
 	{method: http.MethodPut, path: "/option/", permission: authz.SystemSettingManage, handler: controller.UpdateOption},
-	{method: http.MethodPost, path: "/option/payment_compliance", permission: authz.SystemSettingManage, handler: controller.ConfirmPaymentCompliance},
+	{method: http.MethodPut, path: "/option/payment", permission: authz.SystemSettingManage, additionalPermissions: []authz.Permission{authz.PaymentGatewayManage}, secureVerification: true, handler: controller.UpdatePaymentSettings},
+	{method: http.MethodGet, path: "/option/payment/audit", permission: authz.PaymentOperationsManage, handler: controller.ListPaymentAudit},
+	{method: http.MethodGet, path: "/option/payment/audit/:trade_no", permission: authz.PaymentOperationsManage, handler: controller.GetPaymentAudit},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/fulfill", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolveManualPaymentOrder},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/reject", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.RejectManualPaymentOrder},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/void", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.VoidManualPaymentOrder},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/external-refund", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ConfirmExternalPaymentRefund},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/credential-incident/acknowledge", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.AcknowledgePaymentCredentialIncident},
+	{method: http.MethodPost, path: "/option/payment/audit/:trade_no/credential-incident/resolve", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolvePaymentCredentialIncident},
+	{method: http.MethodPost, path: "/option/payment/audit/unmatched/:id/dismiss", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.DismissUnmatchedPaymentEvent},
+	{method: http.MethodPost, path: "/option/payment/audit/unmatched/:id/link", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.LinkUnmatchedPaymentEvent},
+	{method: http.MethodPost, path: "/option/payment/audit/unmatched/:id/retry-legacy", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.RetryLegacyUnmatchedPaymentEvent},
+	{method: http.MethodPost, path: "/option/payment/audit/unmatched/:id/resolve-legacy-topup", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolveLegacyTopUpPaymentEvent},
+	{method: http.MethodPost, path: "/option/payment/audit/unmatched/:id/resolve-legacy-subscription", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolveLegacySubscriptionPaymentEvent},
+	{method: http.MethodGet, path: "/option/payment/customer-bindings", permission: authz.PaymentOperationsManage, handler: controller.ListStripeCustomerBindings},
+	{method: http.MethodPost, path: "/option/payment/customer-bindings/:id/retire", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.RetireStripeCustomerBinding},
+	{method: http.MethodPost, path: "/option/payment/debts/:id/resolve", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolvePaymentDebt},
+	{method: http.MethodGet, path: "/option/billing/reservations", permission: authz.PaymentOperationsManage, handler: controller.ListBillingReservationsForAdmin},
+	{method: http.MethodGet, path: "/option/billing/reservations/:request_id", permission: authz.PaymentOperationsManage, handler: controller.GetBillingReservationForAdmin},
+	{method: http.MethodPost, path: "/option/billing/reservations/:request_id/resolve", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.ResolveBillingReservationForAdmin},
+	{method: http.MethodPost, path: "/user/topup/complete", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.AdminCompleteTopUp},
+	{method: http.MethodGet, path: "/subscription/admin/stripe/inventory", permission: authz.PaymentOperationsManage, handler: controller.AdminListStripeLegacySubscriptionInventory},
+	{method: http.MethodPost, path: "/subscription/admin/stripe/inventory/sync", permission: authz.PaymentOperationsManage, secureVerification: true, criticalRateLimit: true, handler: controller.AdminSyncStripeLegacySubscriptionInventory},
+	{method: http.MethodPost, path: "/option/payment_compliance", permission: authz.SystemSettingManage, additionalPermissions: []authz.Permission{authz.PaymentGatewayManage}, secureVerification: true, handler: controller.ConfirmPaymentCompliance},
 	{method: http.MethodGet, path: "/option/affiliate_rewards", permission: authz.SystemSettingManage, handler: controller.GetAdminAffiliateRewards},
 	{method: http.MethodGet, path: "/option/invite_link_batches", permission: authz.SystemSettingManage, handler: controller.ListInviteLinkBatches},
 	{method: http.MethodPost, path: "/option/invite_link_batches", permission: authz.SystemSettingManage, handler: controller.CreateInviteLinkBatch},

@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -46,6 +47,20 @@ func TestMain(m *testing.M) {
 		&AffiliateRewardRecord{},
 		&InviteInitialQuotaRecord{},
 		&InviteLinkBatch{},
+		&PaymentQuote{},
+		&PaymentUserGuard{},
+		&PaymentOrder{},
+		&PaymentEvent{},
+		&PaymentLedgerEntry{},
+		&PaymentDebt{},
+		&PaymentCustomerBinding{},
+		&PaymentCustomerBindingRetirement{},
+		&PaymentOperationsAudit{},
+		&PaymentConfigurationAudit{},
+		&StripeLegacySubscription{},
+		&StripeLegacyInvoice{},
+		&BillingReservation{},
+		&QuotaLedgerEntry{},
 		&SubscriptionPlan{},
 		&SubscriptionOrder{},
 		&UserSubscription{},
@@ -63,6 +78,26 @@ func TestMain(m *testing.M) {
 
 func truncateTables(t *testing.T) {
 	t.Helper()
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	for key, value := range map[string]string{
+		PaymentConfigurationVersionOptionKey:        "1",
+		"EpayCredentialGeneration":                  "1",
+		"EpayPreviousCredentialGeneration":          "0",
+		"EpayPreviousValidBefore":                   "0",
+		"EpayPreviousExpiresAt":                     "0",
+		"StripeWebhookCredentialGeneration":         "1",
+		"StripeWebhookPreviousCredentialGeneration": "0",
+		"StripeWebhookPreviousValidBefore":          "0",
+		"StripeWebhookSecretPreviousExpiresAt":      "0",
+		"XorPayCredentialGeneration":                "1",
+		"XorPayPreviousCredentialGeneration":        "0",
+		"XorPayPreviousValidBefore":                 "0",
+		"XorPayPreviousExpiresAt":                   "0",
+	} {
+		var option Option
+		require.NoError(t, DB.Where(fmt.Sprintf("%s = ?", optionKeyColumn()), key).
+			Assign(Option{Value: value}).FirstOrCreate(&option, Option{Key: key}).Error)
+	}
 	t.Cleanup(func() {
 		DB.Exec("DELETE FROM tasks")
 		DB.Exec("DELETE FROM users")
@@ -75,6 +110,20 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM affiliate_reward_records")
 		DB.Exec("DELETE FROM invite_initial_quota_records")
 		DB.Exec("DELETE FROM invite_link_batches")
+		DB.Exec("DELETE FROM payment_ledger_entries")
+		DB.Exec("DELETE FROM payment_events")
+		DB.Exec("DELETE FROM payment_debts")
+		DB.Exec("DELETE FROM payment_customer_bindings")
+		DB.Exec("DELETE FROM payment_customer_binding_retirements")
+		DB.Exec("DELETE FROM payment_operations_audits")
+		DB.Exec("DELETE FROM payment_configuration_audits")
+		DB.Exec("DELETE FROM stripe_legacy_invoices")
+		DB.Exec("DELETE FROM stripe_legacy_subscriptions")
+		DB.Exec("DELETE FROM payment_orders")
+		DB.Exec("DELETE FROM payment_quotes")
+		DB.Exec("DELETE FROM payment_user_guards")
+		DB.Exec("DELETE FROM quota_ledger_entries")
+		DB.Exec("DELETE FROM billing_reservations")
 		DB.Exec("DELETE FROM subscription_orders")
 		DB.Exec("DELETE FROM subscription_plans")
 		DB.Exec("DELETE FROM user_subscriptions")
@@ -202,6 +251,30 @@ func TestUpdateWithStatus_Lose(t *testing.T) {
 	var reloaded Task
 	require.NoError(t, DB.First(&reloaded, task.ID).Error)
 	assert.EqualValues(t, TaskStatusFailure, reloaded.Status) // unchanged
+}
+
+func TestUpdateQuotaRejectsUnpersistedTaskAndUsesPrimaryKeyGuard(t *testing.T) {
+	truncateTables(t)
+
+	unpersisted := &Task{Quota: 123}
+	assert.ErrorIs(t, unpersisted.UpdateQuota(), ErrTaskNotPersisted)
+
+	persisted := &Task{
+		TaskID: "task_quota_primary_key_guard",
+		Status: TaskStatusInProgress,
+		Quota:  10,
+		Data:   json.RawMessage(`{}`),
+	}
+	insertTask(t, persisted)
+	persisted.Quota = 25
+	require.NoError(t, persisted.UpdateQuota())
+
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, persisted.ID).Error)
+	assert.Equal(t, 25, reloaded.Quota)
+
+	missing := &Task{ID: persisted.ID + 1000000, Quota: 50}
+	assert.ErrorIs(t, missing.UpdateQuota(), ErrTaskNotPersisted)
 }
 
 func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {

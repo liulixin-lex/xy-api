@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -28,6 +29,7 @@ type User struct {
 	DisplayName                   string                     `json:"display_name" gorm:"index" validate:"max=20"`
 	Role                          int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
 	Status                        int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
+	PaymentFrozen                 bool                       `json:"-" gorm:"not null;index"`          // payment debt freeze; explicit admin status actions clear this marker
 	Email                         string                     `json:"email" gorm:"index" validate:"max=50"`
 	GitHubId                      string                     `json:"github_id" gorm:"column:github_id;index"`
 	DiscordId                     string                     `json:"discord_id" gorm:"column:discord_id;index"`
@@ -66,13 +68,14 @@ type User struct {
 
 func (user *User) ToBaseUser() *UserBase {
 	cache := &UserBase{
-		Id:       user.Id,
-		Group:    user.Group,
-		Quota:    user.Quota,
-		Status:   user.Status,
-		Username: user.Username,
-		Setting:  user.Setting,
-		Email:    user.Email,
+		Id:            user.Id,
+		Group:         user.Group,
+		Quota:         user.Quota,
+		Status:        user.Status,
+		PaymentFrozen: user.PaymentFrozen,
+		Username:      user.Username,
+		Setting:       user.Setting,
+		Email:         user.Email,
 	}
 	return cache
 }
@@ -432,28 +435,42 @@ func HardDeleteUserById(id int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
-		if err := deleteUserOAuthBindingsByUserId(tx, id); err != nil {
-			return err
-		}
-		return tx.Unscoped().Delete(&User{}, "id = ?", id).Error
-	})
+	return (&User{Id: id}).HardDelete()
 }
 
 func inviteUser(inviterId int) (err error) {
-	user, err := GetUserById(inviterId, true)
-	if err != nil {
-		return err
+	if inviterId <= 0 || common.QuotaForInviter < 0 || common.QuotaForInviter > common.MaxQuota {
+		return errors.New("invalid inviter reward")
 	}
-	user.AffCount++
-	user.AffQuota += common.QuotaForInviter
-	user.AffHistoryQuota += common.QuotaForInviter
-	return DB.Save(user).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id", "aff_count", "aff_quota", "aff_history").First(&user, inviterId).Error; err != nil {
+			return err
+		}
+		if user.AffCount >= math.MaxInt32 || user.AffQuota < 0 || user.AffHistoryQuota < 0 ||
+			user.AffQuota > common.MaxQuota-common.QuotaForInviter || user.AffHistoryQuota > common.MaxQuota-common.QuotaForInviter {
+			return ErrQuotaOverflow
+		}
+		result := tx.Model(&User{}).Where("id = ? AND aff_count < ? AND aff_quota <= ? AND aff_history <= ?",
+			inviterId, math.MaxInt32, common.MaxQuota-common.QuotaForInviter, common.MaxQuota-common.QuotaForInviter).
+			Updates(map[string]interface{}{
+				"aff_count":   gorm.Expr("aff_count + ?", 1),
+				"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
+				"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrQuotaOverflow
+		}
+		return nil
+	})
 }
 
 func (user *User) TransferAffQuotaToQuota(quota int) error {
 	// 检查quota是否小于最小额度
-	if float64(quota) < common.QuotaPerUnit {
+	if quota <= 0 || quota > common.MaxQuota || math.IsNaN(common.QuotaPerUnit) || math.IsInf(common.QuotaPerUnit, 0) || common.QuotaPerUnit <= 0 || float64(quota) < common.QuotaPerUnit {
 		return fmt.Errorf("转移额度最小为%s！", logger.LogQuota(int(common.QuotaPerUnit)))
 	}
 
@@ -477,10 +494,16 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 	}
 	user.AffQuota += settledQuota
 	user.AffHistoryQuota += settledQuota
+	if user.AffQuota < 0 || user.AffHistoryQuota < 0 || user.AffQuota > common.MaxQuota || user.AffHistoryQuota > common.MaxQuota {
+		return ErrQuotaOverflow
+	}
 
 	// 再次检查用户的AffQuota是否足够
 	if user.AffQuota < quota {
 		return errors.New("邀请额度不足！")
+	}
+	if user.Quota < 0 || quota > math.MaxInt32-user.Quota {
+		return ErrQuotaOverflow
 	}
 
 	// 更新用户额度
@@ -496,7 +519,15 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 	}
 
 	// 提交事务
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		if cacheErr := invalidateUserCache(user.Id); cacheErr != nil {
+			common.SysLog("failed to invalidate user cache after affiliate quota transfer: " + cacheErr.Error())
+		}
+	}
+	return nil
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
@@ -795,7 +826,20 @@ func (user *User) Delete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	if err := DB.Delete(user).Error; err != nil {
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if tx.Migrator().HasTable(&PaymentUserGuard{}) {
+			if err := lockPaymentUserGuardTx(tx, user.Id); err != nil {
+				return err
+			}
+		}
+		if err := lockForUpdate(tx).Select("id").First(&User{}, user.Id).Error; err != nil {
+			return err
+		}
+		if err := ensureUserFinancialHistoryCanBeDeletedTx(tx, user.Id); err != nil {
+			return err
+		}
+		return tx.Delete(&User{}, user.Id).Error
+	}); err != nil {
 		return err
 	}
 
@@ -808,11 +852,97 @@ func (user *User) HardDelete() error {
 		return errors.New("id 为空！")
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		if tx.Migrator().HasTable(&PaymentUserGuard{}) {
+			if err := lockPaymentUserGuardTx(tx, user.Id); err != nil {
+				return err
+			}
+		}
+		if err := lockForUpdate(tx).Select("id").First(&User{}, user.Id).Error; err != nil {
+			return err
+		}
+		if err := ensureUserFinancialHistoryCanBeDeletedTx(tx, user.Id); err != nil {
+			return err
+		}
 		if err := deleteUserOAuthBindingsByUserId(tx, user.Id); err != nil {
 			return err
 		}
 		return tx.Unscoped().Delete(user).Error
 	})
+}
+
+var ErrUserFinancialHistoryRequiresRetention = errors.New("user has payment or billing history that must be retained; disable the account instead")
+
+func ensureUserFinancialHistoryCanBeDeletedTx(tx *gorm.DB, userId int) error {
+	if tx == nil || userId <= 0 {
+		return errors.New("invalid user deletion check")
+	}
+	if tx.Migrator().HasTable(&PaymentQuote{}) {
+		// Quotes that never created an order are disposable intent state. Remove
+		// them under the same per-user payment lock before deciding whether any
+		// consumed financial contract still requires user retention.
+		if err := tx.Where("user_id = ? AND consumed_at = 0", userId).Delete(&PaymentQuote{}).Error; err != nil {
+			return err
+		}
+		var consumedQuotes int64
+		if err := tx.Model(&PaymentQuote{}).Where("user_id = ? AND consumed_at > 0", userId).Count(&consumedQuotes).Error; err != nil {
+			return err
+		}
+		if consumedQuotes > 0 {
+			return ErrUserFinancialHistoryRequiresRetention
+		}
+	}
+	queries := []*gorm.DB{
+		tx.Model(&PaymentOrder{}).Where("user_id = ?", userId),
+		tx.Model(&PaymentDebt{}).Where("user_id = ?", userId),
+		tx.Model(&PaymentLedgerEntry{}).Where("user_id = ?", userId),
+		tx.Model(&BillingReservation{}).Where("user_id = ?", userId),
+		tx.Model(&TopUp{}).Where("user_id = ?", userId),
+		tx.Model(&SubscriptionOrder{}).Where("user_id = ?", userId),
+		tx.Model(&UserSubscription{}).Where("user_id = ?", userId),
+		tx.Model(&AffiliateRewardRecord{}).Where("inviter_id = ? OR invitee_id = ?", userId, userId),
+		tx.Model(&Task{}).Where("user_id = ? AND status NOT IN ?", userId, []TaskStatus{TaskStatusSuccess, TaskStatusFailure}),
+		tx.Model(&Midjourney{}).Where("user_id = ? AND status NOT IN ?", userId, []string{MidjourneyStatusSuccess, MidjourneyStatusFailure}),
+	}
+	optionalQueries := []struct {
+		model any
+		query *gorm.DB
+	}{
+		{model: &PaymentCustomerBinding{}, query: tx.Model(&PaymentCustomerBinding{}).Where("user_id = ?", userId)},
+		{model: &PaymentCustomerBindingRetirement{}, query: tx.Model(&PaymentCustomerBindingRetirement{}).Where("user_id = ?", userId)},
+		{model: &PaymentOperationsAudit{}, query: tx.Model(&PaymentOperationsAudit{}).Where("user_id = ?", userId)},
+		{model: &StripeLegacySubscription{}, query: tx.Model(&StripeLegacySubscription{}).Where("user_id = ?", userId)},
+	}
+	for _, optional := range optionalQueries {
+		if !tx.Migrator().HasTable(optional.model) {
+			continue
+		}
+		var count int64
+		if err := optional.query.Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrUserFinancialHistoryRequiresRetention
+		}
+	}
+	for _, query := range queries {
+		var count int64
+		if err := query.Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrUserFinancialHistoryRequiresRetention
+		}
+	}
+	if tx.Migrator().HasTable(&PaymentUserGuard{}) {
+		updated := tx.Model(&PaymentUserGuard{}).Where("user_id = ? AND blocked = ?", userId, false).Update("blocked", true)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return errors.New("payment user deletion guard changed")
+		}
+	}
+	return nil
 }
 
 // ValidateAndFill check password & user status
@@ -1107,50 +1237,50 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheIncrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to increase user quota: " + err.Error())
-		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
+	// User quota is financial state. It must be persisted before success is
+	// returned and must never be routed through the process-local batch queue.
+	_ = db // retained for API compatibility; quota writes are always durable.
+	if quota == 0 {
 		return nil
 	}
-	return increaseUserQuota(id, quota)
+	if err = increaseUserQuota(id, quota); err != nil {
+		return err
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		if cacheErr := invalidateUserCache(id); cacheErr != nil {
+			common.SysLog("failed to invalidate user quota cache after increase: " + cacheErr.Error())
+		}
+	}
+	return nil
 }
 
 func increaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
-	if err != nil {
-		return err
-	}
-	return err
+	return applyUserQuotaDeltaTx(DB, id, quota)
 }
 
 func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to decrease user quota: " + err.Error())
-		}
-	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
+	// See IncreaseUserQuota: financial debits are conditional, synchronous and
+	// durable regardless of BATCH_UPDATE_ENABLED.
+	_ = db
+	if quota == 0 {
 		return nil
 	}
-	return decreaseUserQuota(id, quota)
+	if err = decreaseUserQuota(id, quota); err != nil {
+		return err
+	}
+	if common.RedisEnabled && common.RDB != nil {
+		if cacheErr := invalidateUserCache(id); cacheErr != nil {
+			common.SysLog("failed to invalidate user quota cache after decrease: " + cacheErr.Error())
+		}
+	}
+	return nil
 }
 
 func decreaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
-	if err != nil {
-		return err
-	}
-	return err
+	return applyUserQuotaDeltaTx(DB, id, -quota)
 }
 
 func DeltaUpdateUserQuota(id int, delta int) (err error) {

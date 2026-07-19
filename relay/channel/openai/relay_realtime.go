@@ -1,7 +1,9 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -15,6 +17,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
+
+var errRealtimeBilling = errors.New("realtime billing failed")
 
 func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.RealtimeUsage) {
 	if info == nil || info.ClientWs == nil || info.TargetWs == nil {
@@ -30,12 +34,16 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	sendChan := make(chan []byte, 100)
 	receiveChan := make(chan []byte, 100)
 	errChan := make(chan error, 2)
+	var usageMu sync.Mutex
+	var readers sync.WaitGroup
 
 	usage := &dto.RealtimeUsage{}
 	localUsage := &dto.RealtimeUsage{}
 	sumUsage := &dto.RealtimeUsage{}
 
+	readers.Add(2)
 	gopool.Go(func() {
+		defer readers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in client reader: %v", r)
@@ -76,10 +84,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					return
 				}
 				logger.LogInfo(c, fmt.Sprintf("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+				usageMu.Lock()
 				localUsage.TotalTokens += textToken + audioToken
 				localUsage.InputTokens += textToken + audioToken
 				localUsage.InputTokenDetails.TextTokens += textToken
 				localUsage.InputTokenDetails.AudioTokens += audioToken
+				usageMu.Unlock()
 
 				err = helper.WssString(c, targetConn, string(message))
 				if err != nil {
@@ -96,6 +106,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	})
 
 	gopool.Go(func() {
+		defer readers.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				errChan <- fmt.Errorf("panic in target reader: %v", r)
@@ -123,7 +134,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 				}
 
 				if realtimeEvent.Type == dto.RealtimeEventTypeResponseDone {
+					if realtimeEvent.Response == nil {
+						errChan <- fmt.Errorf("realtime response.done is missing response")
+						return
+					}
 					realtimeUsage := realtimeEvent.Response.Usage
+					usageMu.Lock()
 					if realtimeUsage != nil {
 						usage.TotalTokens += realtimeUsage.TotalTokens
 						usage.InputTokens += realtimeUsage.InputTokens
@@ -135,7 +151,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						usage.OutputTokenDetails.TextTokens += realtimeUsage.OutputTokenDetails.TextTokens
 						err := preConsumeUsage(c, info, usage, sumUsage)
 						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
+							usageMu.Unlock()
+							errChan <- fmt.Errorf("%w: consume provider usage: %v", errRealtimeBilling, err)
 							return
 						}
 						// 本次计费完成，清除
@@ -145,6 +162,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					} else {
 						textToken, audioToken, err := service.CountTokenRealtime(info, *realtimeEvent, info.UpstreamModelName)
 						if err != nil {
+							usageMu.Unlock()
 							errChan <- fmt.Errorf("error counting text token: %v", err)
 							return
 						}
@@ -156,7 +174,8 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						localUsage.InputTokenDetails.AudioTokens += audioToken
 						err = preConsumeUsage(c, info, localUsage, sumUsage)
 						if err != nil {
-							errChan <- fmt.Errorf("error consume usage: %v", err)
+							usageMu.Unlock()
+							errChan <- fmt.Errorf("%w: consume locally counted usage: %v", errRealtimeBilling, err)
 							return
 						}
 						// 本次计费完成，清除
@@ -166,6 +185,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming sumUsage: %v", sumUsage))
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming localUsage: %v", localUsage))
 					logger.LogInfo(c, fmt.Sprintf("realtime streaming localUsage: %v", localUsage))
+					usageMu.Unlock()
 
 				} else if realtimeEvent.Type == dto.RealtimeEventTypeSessionUpdated || realtimeEvent.Type == dto.RealtimeEventTypeSessionCreated {
 					realtimeSession := realtimeEvent.Session
@@ -181,10 +201,12 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 						return
 					}
 					logger.LogInfo(c, fmt.Sprintf("type: %s, textToken: %d, audioToken: %d", realtimeEvent.Type, textToken, audioToken))
+					usageMu.Lock()
 					localUsage.TotalTokens += textToken + audioToken
 					localUsage.OutputTokens += textToken + audioToken
 					localUsage.OutputTokenDetails.TextTokens += textToken
 					localUsage.OutputTokenDetails.AudioTokens += audioToken
+					usageMu.Unlock()
 				}
 
 				err = helper.WssString(c, clientConn, string(message))
@@ -201,26 +223,69 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 		}
 	})
 
+	var billingErr error
 	select {
 	case <-clientClosed:
 	case <-targetClosed:
 	case err := <-errChan:
-		//return service.OpenAIErrorWrapper(err, "realtime_error", http.StatusInternalServerError), nil
-		logger.LogError(c, "realtime error: "+err.Error())
+		if errors.Is(err, errRealtimeBilling) {
+			billingErr = err
+		} else {
+			logger.LogError(c, "realtime error: "+err.Error())
+		}
 	case <-c.Done():
 	}
+	_ = clientConn.Close()
+	_ = targetConn.Close()
+	readers.Wait()
 
+	// A close/error can win the select concurrently with the billing failure.
+	// Drain both reader results before deciding whether final settlement is safe.
+drainErrors:
+	for {
+		select {
+		case err := <-errChan:
+			if errors.Is(err, errRealtimeBilling) {
+				billingErr = err
+			} else {
+				logger.LogError(c, "realtime error: "+err.Error())
+			}
+		default:
+			break drainErrors
+		}
+	}
+	if billingErr != nil {
+		return finalizeRealtimeBillingFailure(c, info, sumUsage, billingErr)
+	}
+
+	usageMu.Lock()
 	if usage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, usage, sumUsage)
+		if err := preConsumeUsage(c, info, usage, sumUsage); err != nil {
+			usageMu.Unlock()
+			return finalizeRealtimeBillingFailure(c, info, sumUsage, fmt.Errorf("%w: consume trailing provider usage: %v", errRealtimeBilling, err))
+		}
 	}
 
 	if localUsage.TotalTokens != 0 {
-		_ = preConsumeUsage(c, info, localUsage, sumUsage)
+		if err := preConsumeUsage(c, info, localUsage, sumUsage); err != nil {
+			usageMu.Unlock()
+			return finalizeRealtimeBillingFailure(c, info, sumUsage, fmt.Errorf("%w: consume trailing local usage: %v", errRealtimeBilling, err))
+		}
 	}
+	usageMu.Unlock()
 
 	// check usage total tokens, if 0, use local usage
 
 	return nil, sumUsage
+}
+
+func finalizeRealtimeBillingFailure(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, cause error) (*types.NewAPIError, *dto.RealtimeUsage) {
+	if usage != nil && usage.TotalTokens > 0 {
+		if settleErr := service.PostWssConsumeQuota(c, info, info.UpstreamModelName, usage, "realtime stream interrupted by billing"); settleErr != nil {
+			cause = errors.Join(cause, settleErr)
+		}
+	}
+	return types.NewError(cause, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry()), usage
 }
 
 func preConsumeUsage(ctx *gin.Context, info *relaycommon.RelayInfo, usage *dto.RealtimeUsage, totalUsage *dto.RealtimeUsage) error {

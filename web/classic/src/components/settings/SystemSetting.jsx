@@ -135,10 +135,8 @@ const SystemSetting = () => {
     if (success) {
       let newInputs = {};
       data.forEach((item) => {
+        if (item.key === 'TopupGroupRatio') return;
         switch (item.key) {
-          case 'TopupGroupRatio':
-            item.value = JSON.stringify(JSON.parse(item.value), null, 2);
-            break;
           case 'EmailDomainWhitelist':
             setEmailDomainWhitelist(item.value ? item.value.split(',') : []);
             break;

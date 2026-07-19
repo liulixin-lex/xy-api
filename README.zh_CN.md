@@ -177,6 +177,7 @@ docker run --name new-api -d --restart always \
 | 🚀 部署指南 | [安装文档](https://docs.newapi.pro/zh/docs/installation) |
 | ⚙️ 环境配置 | [环境变量](https://docs.newapi.pro/zh/docs/installation/config-maintenance/environment-variables) |
 | 📡 接口文档 | [API 文档](https://docs.newapi.pro/zh/docs/api) |
+| 💳 支付运维 | [网关配置、安全、迁移与事故处置手册](docs/payment-operations.md) |
 | ❓ 常见问题 | [FAQ](https://docs.newapi.pro/zh/docs/support/faq) |
 | 💬 社区交流 | [交流渠道](https://docs.newapi.pro/zh/docs/support/community-interaction) |
 
@@ -198,7 +199,7 @@ docker run --name new-api -d --restart always \
 
 ### 💰 授权用量与成本管理
 
-- ✅ 合法授权场景下的内部充值与额度分配（易支付、Stripe）
+- ✅ 合法授权场景下的内部充值与额度分配（易支付、Stripe、XORPay）
 - ✅ 组织内按次、按量或缓存命中成本核算
 - ✅ 支持 OpenAI、Azure、DeepSeek、Claude、Qwen 等模型的缓存计费统计
 - ✅ 面向内部管理或企业客户的灵活计费策略配置
@@ -318,6 +319,19 @@ docker run --name new-api -d --restart always \
 |--------|--------------------------------------------------------------|--------|
 | `SESSION_SECRET` | 会话密钥（多机部署必须）                                                 | - |
 | `CRYPTO_SECRET` | 加密密钥（Redis 必须）                                               | - |
+| `PAYMENT_SECRET_KEY` | 支付凭证专用加密密钥（至少 32 个字符；保存网关密钥前必须配置；多节点必须一致） | - |
+| `PAYMENT_SECRET_KEY_PREVIOUS` | 支付加密密钥轮换期间使用的上一把密钥；凭证完成重加密后应删除 | - |
+| `PAYMENT_QUOTE_RATE_LIMIT_ENABLE` | 启用按认证用户统计的支付报价和金额预览限流 | `true` |
+| `PAYMENT_QUOTE_RATE_LIMIT` | 每个窗口允许的支付报价或金额预览请求数 | `30` |
+| `PAYMENT_QUOTE_RATE_LIMIT_DURATION` | 支付报价限流窗口（秒） | `60` |
+| `PAYMENT_START_RATE_LIMIT_ENABLE` | 启用按认证用户统计的支付启动限流 | `true` |
+| `PAYMENT_START_RATE_LIMIT` | 每个窗口允许的支付启动请求数 | `10` |
+| `PAYMENT_START_RATE_LIMIT_DURATION` | 支付启动限流窗口（秒） | `60` |
+| `PAYMENT_STRIPE_TEST_MODE_ENABLED` | 允许 Stripe 测试凭证和测试模式入账；仅可在与生产用户、额度和数据库完全隔离的 sandbox 环境开启 | `false` |
+| `BILLING_RESERVATION_STALE_MINUTES` | 未完成 durable billing reservation 进入自动对账和管理员关注队列前的等待分钟数 | `5` |
+| `BILLING_RECONCILE_INTERVAL_MINUTES` | durable billing reservation 自动对账间隔（分钟） | `5` |
+| `BILLING_RECONCILE_BATCH_SIZE` | 每轮自动对账最多处理的 reservation 数量（1-1000） | `100` |
+| `TRUSTED_PROXY_CIDRS` | 可提供转发客户端 IP 请求头的反向代理 CIDR，多个用逗号分隔；留空即禁用转发头 | - |
 | `SQL_DSN` | 数据库连接字符串                                                     | - |
 | `REDIS_CONN_STRING` | Redis 连接字符串                                                  | - |
 | `STREAMING_TIMEOUT` | 流式超时时间（秒）                                                    | `300` |

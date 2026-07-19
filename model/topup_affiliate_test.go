@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -57,6 +58,63 @@ func getAffiliateRewardUser(t *testing.T, id int) User {
 	var user User
 	require.NoError(t, DB.First(&user, id).Error)
 	return user
+}
+
+func settleAffiliateRewardTopUp(t *testing.T, tradeNo, actualPaymentMethod string) error {
+	t.Helper()
+	var topUp TopUp
+	if err := DB.Where("trade_no = ?", tradeNo).First(&topUp).Error; err != nil {
+		return err
+	}
+	if topUp.Status == common.TopUpStatusPending && actualPaymentMethod != "" && actualPaymentMethod != topUp.PaymentMethod {
+		if err := DB.Model(&TopUp{}).Where("id = ?", topUp.Id).Update("payment_method", actualPaymentMethod).Error; err != nil {
+			return err
+		}
+		topUp.PaymentMethod = actualPaymentMethod
+	}
+	currency := "USD"
+	if topUp.PaymentProvider == PaymentProviderEpay || topUp.PaymentProvider == PaymentProviderXorPay {
+		currency = "CNY"
+	}
+	expectedMinor := decimal.NewFromFloat(topUp.Money).
+		Mul(decimal.NewFromInt(common.PaymentProviderCurrencyMinorUnit(topUp.PaymentProvider, currency))).Round(0).IntPart()
+	credentialGeneration := int64(0)
+	if topUp.PaymentProvider == PaymentProviderEpay || topUp.PaymentProvider == PaymentProviderStripe || topUp.PaymentProvider == PaymentProviderXorPay {
+		credentialGeneration = 1
+	}
+	event := PaymentEventInput{
+		Provider: topUp.PaymentProvider, ProviderCredentialGeneration: credentialGeneration,
+		EventKey: "affiliate-test-paid:" + tradeNo, EventType: "paid", TradeNo: tradeNo,
+		ProviderOrderKey: topUp.PaymentProvider + ":affiliate_test_" + tradeNo,
+		PaidAmountMinor:  expectedMinor, Currency: currency, PaymentMethod: topUp.PaymentMethod,
+		Paid: true, NormalizedPayload: common.GetJsonString(map[string]interface{}{"trade_no": tradeNo, "paid": true}),
+	}
+	if topUp.PaymentOrderId == nil {
+		credit, clamp := common.QuotaFromDecimalChecked(decimal.NewFromInt(topUp.Amount).Mul(decimal.NewFromFloat(common.QuotaPerUnit)))
+		if clamp != nil || credit <= 0 {
+			return ErrQuotaOverflow
+		}
+		order := &PaymentOrder{
+			TradeNo: tradeNo, UserID: topUp.UserId, OrderKind: PaymentOrderKindTopUp,
+			Provider: topUp.PaymentProvider, ProviderCredentialGeneration: credentialGeneration,
+			PaymentMethod: topUp.PaymentMethod, RequestID: "affiliate_test_" + tradeNo,
+			ExpectedAmountMinor: expectedMinor, Currency: currency, RequestedAmount: topUp.Amount,
+			CreditQuota: int64(credit), PricingSnapshot: common.GetJsonString(map[string]interface{}{
+				"version": 1, "quota_per_unit": common.QuotaPerUnit,
+			}),
+			LegacyRecordType: PaymentOrderKindTopUp, LegacyRecordID: topUp.Id,
+			Status: PaymentOrderStatusPending, CreatedAt: topUp.CreateTime,
+			UpdatedAt: common.GetTimestamp(), Version: 1,
+		}
+		if err := DB.Create(order).Error; err != nil {
+			return err
+		}
+		if err := DB.Model(&TopUp{}).Where("id = ?", topUp.Id).Update("payment_order_id", order.ID).Error; err != nil {
+			return err
+		}
+	}
+	_, err := ProcessPaymentEvent(event)
+	return err
 }
 
 func TestRechargeWaffoAppliesContinuousAffiliateRewardOnce(t *testing.T) {
@@ -128,13 +186,13 @@ func TestManualCompleteTopUpAppliesFirstTopUpAffiliateRewardSnapshotOnlyOnce(t *
 	insertAffiliateRewardTopUp(t, "first-topup-affiliate-1", 11, 20, PaymentProviderWaffo)
 	insertAffiliateRewardTopUp(t, "first-topup-affiliate-2", 11, 30, PaymentProviderWaffo)
 
-	require.NoError(t, ManualCompleteTopUp("first-topup-affiliate-1", "127.0.0.1"))
+	require.NoError(t, settleAffiliateRewardTopUp(t, "first-topup-affiliate-1", ""))
 
 	inviter := getAffiliateRewardUser(t, 10)
 	assert.Equal(t, 6000, inviter.AffQuota)
 	assert.Equal(t, 6000, inviter.AffHistoryQuota)
 
-	require.NoError(t, ManualCompleteTopUp("first-topup-affiliate-2", "127.0.0.1"))
+	require.NoError(t, settleAffiliateRewardTopUp(t, "first-topup-affiliate-2", ""))
 	inviter = getAffiliateRewardUser(t, 10)
 	assert.Equal(t, 6000, inviter.AffQuota)
 	assert.Equal(t, 6000, inviter.AffHistoryQuota)
@@ -169,7 +227,7 @@ func TestLegacyFirstTopUpAffiliateRewardKeepsTenPercent(t *testing.T) {
 	})
 	insertAffiliateRewardTopUp(t, "legacy-first-topup-affiliate", 13, 20, PaymentProviderWaffo)
 
-	require.NoError(t, ManualCompleteTopUp("legacy-first-topup-affiliate", "127.0.0.1"))
+	require.NoError(t, settleAffiliateRewardTopUp(t, "legacy-first-topup-affiliate", ""))
 
 	inviter := getAffiliateRewardUser(t, 12)
 	assert.Equal(t, 2000, inviter.AffQuota)
@@ -204,7 +262,7 @@ func TestRechargeEpayAppliesContinuousAffiliateRewardOnce(t *testing.T) {
 	})
 	insertAffiliateRewardTopUp(t, "epay-continuous-affiliate", 21, 20, PaymentProviderEpay)
 
-	require.NoError(t, RechargeEpay("epay-continuous-affiliate", "wxpay", "127.0.0.1"))
+	require.NoError(t, settleAffiliateRewardTopUp(t, "epay-continuous-affiliate", "wxpay"))
 
 	inviter := getAffiliateRewardUser(t, 20)
 	assert.Equal(t, 1000, inviter.AffQuota)
@@ -218,7 +276,7 @@ func TestRechargeEpayAppliesContinuousAffiliateRewardOnce(t *testing.T) {
 	assert.Equal(t, common.TopUpStatusSuccess, topUp.Status)
 	assert.Equal(t, "wxpay", topUp.PaymentMethod)
 
-	require.NoError(t, RechargeEpay("epay-continuous-affiliate", "alipay", "127.0.0.1"))
+	require.NoError(t, settleAffiliateRewardTopUp(t, "epay-continuous-affiliate", "alipay"))
 	inviter = getAffiliateRewardUser(t, 20)
 	assert.Equal(t, 1000, inviter.AffQuota)
 	assert.Equal(t, 1000, inviter.AffHistoryQuota)
@@ -246,19 +304,19 @@ func TestRechargeEpaySaturatesOversizedQuotaAndAffiliateReward(t *testing.T) {
 	})
 	insertAffiliateRewardTopUp(t, "epay-oversized-affiliate", 23, int64(common.MaxQuota)+1, PaymentProviderEpay)
 
-	require.NoError(t, RechargeEpay("epay-oversized-affiliate", "wxpay", "127.0.0.1"))
+	err := settleAffiliateRewardTopUp(t, "epay-oversized-affiliate", "wxpay")
+	require.Error(t, err)
 
 	invitee := getAffiliateRewardUser(t, 23)
-	assert.Equal(t, common.MaxQuota, invitee.Quota)
+	assert.Zero(t, invitee.Quota)
 
 	inviter := getAffiliateRewardUser(t, 22)
-	assert.Equal(t, common.MaxQuota, inviter.AffQuota)
-	assert.Equal(t, common.MaxQuota, inviter.AffHistoryQuota)
+	assert.Zero(t, inviter.AffQuota)
+	assert.Zero(t, inviter.AffHistoryQuota)
 
-	var record AffiliateRewardRecord
-	require.NoError(t, DB.Where("invitee_id = ?", 23).First(&record).Error)
-	assert.Equal(t, common.MaxQuota, record.TopUpQuota)
-	assert.Equal(t, common.MaxQuota, record.RewardQuota)
+	var records int64
+	require.NoError(t, DB.Model(&AffiliateRewardRecord{}).Where("invitee_id = ?", 23).Count(&records).Error)
+	assert.Zero(t, records)
 }
 
 func TestAffiliateTopUpRewardSaturatesOversizedDirectQuota(t *testing.T) {
