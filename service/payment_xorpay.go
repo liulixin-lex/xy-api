@@ -436,6 +436,12 @@ func xorPayUpstreamMethod(method string) (string, error) {
 }
 
 func xorPayMD5(value string) string {
+	// XORPay's published request and callback authentication protocol mandates
+	// this legacy MD5 construction, so it cannot be replaced locally without
+	// breaking provider interoperability. Compensating controls include TLS-only
+	// provider transport, constant-time callback comparison, credential-generation
+	// scoping, exact order/currency/amount checks, and idempotent settlement.
+	// codeql[go/weak-sensitive-data-hashing]
 	digest := md5.Sum([]byte(value))
 	return fmt.Sprintf("%x", digest)
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -180,6 +181,15 @@ func UpdateOption(c *gin.Context) {
 		}
 	}
 	switch option.Key {
+	case "WorkerUrl", "WeChatServerAddress":
+		serviceURL := strings.TrimSpace(option.Value.(string))
+		if serviceURL != "" {
+			if err := service.ValidatePinnedServiceBaseURL(serviceURL); err != nil {
+				common.ApiErrorMsg(c, "服务地址必须是有效的 HTTP/HTTPS 基础地址，且不能包含凭据、查询参数或片段")
+				return
+			}
+		}
+		option.Value = serviceURL
 	case "GitHubOAuthEnabled":
 		if option.Value == "true" && common.GitHubClientId == "" {
 			c.JSON(http.StatusOK, gin.H{
@@ -221,12 +231,18 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "WeChatAuthEnabled":
-		if option.Value == "true" && common.WeChatServerAddress == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法启用微信登录，请先填入微信登录相关配置信息！",
-			})
-			return
+		if option.Value == "true" {
+			if common.WeChatServerAddress == "" {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": "无法启用微信登录，请先填入微信登录相关配置信息！",
+				})
+				return
+			}
+			if err := service.ValidatePinnedServiceBaseURL(common.WeChatServerAddress); err != nil {
+				common.ApiErrorMsg(c, "无法启用微信登录：服务地址必须是有效的 HTTP/HTTPS 基础地址")
+				return
+			}
 		}
 	case "TurnstileCheckEnabled":
 		if option.Value == "true" && common.TurnstileSiteKey == "" {

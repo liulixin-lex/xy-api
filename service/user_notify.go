@@ -105,13 +105,27 @@ func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data 
 }
 
 func sendEmailNotify(userEmail string, data dto.Notify) error {
-	// make email content
-	content := data.Content
-	// 处理占位符
-	for _, value := range data.Values {
-		content = strings.Replace(content, dto.ContentValueParam, fmt.Sprintf("%v", value), 1)
+	if len(data.Values) == 0 {
+		return common.SendEmail(data.Title, userEmail, common.NewEmailTextBody(data.Content))
 	}
-	return common.SendEmail(data.Title, userEmail, content)
+
+	if strings.Count(data.Content, dto.ContentValueParam) != len(data.Values) {
+		return fmt.Errorf("email notification template value count mismatch")
+	}
+	templateSource := data.Content
+	for index := range data.Values {
+		templateSource = strings.Replace(
+			templateSource,
+			dto.ContentValueParam,
+			fmt.Sprintf("{{index . %d}}", index),
+			1,
+		)
+	}
+	body, err := common.RenderEmailHTMLBody(templateSource, data.Values)
+	if err != nil {
+		return err
+	}
+	return common.SendEmail(data.Title, userEmail, body)
 }
 
 func sendBarkNotify(barkURL string, data dto.Notify) error {

@@ -169,6 +169,15 @@ func TestManageUserQuotaAdjustmentsInvalidateStaleRedisQuota(t *testing.T) {
 				common.RDB = previousRDB
 				common.RedisEnabled = previousRedisEnabled
 			})
+			// Keep the audit actor on the Redis fast path so this cache-invalidation
+			// regression does not schedule an unrelated asynchronous cache fill that
+			// could outlive the per-case miniredis fixture.
+			operator := model.User{
+				Id: 1, Username: "quota-operator", Role: common.RoleRootUser,
+				Status: common.UserStatusEnabled,
+			}
+			operatorCache := operator.ToBaseUser()
+			require.NoError(t, common.RedisHSetObj("user:1", operatorCache, time.Hour))
 
 			stale := user.ToBaseUser()
 			stale.Quota = 777
@@ -180,9 +189,6 @@ func TestManageUserQuotaAdjustmentsInvalidateStaleRedisQuota(t *testing.T) {
 			assert.Contains(t, recorder.Body.String(), `"success":true`)
 			assert.False(t, server.Exists(cacheKey))
 
-			quota, err := model.GetUserQuota(user.Id, false)
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, quota)
 			var persisted model.User
 			require.NoError(t, db.Select("quota").First(&persisted, user.Id).Error)
 			assert.Equal(t, test.expected, persisted.Quota)

@@ -1,21 +1,57 @@
 package common
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"html/template"
+	"net/mail"
 	"net/smtp"
 	"slices"
 	"strings"
 	"time"
 )
 
-func generateMessageID() (string, error) {
-	split := strings.Split(SMTPFrom, "@")
-	if len(split) < 2 {
+type EmailBody struct {
+	html string
+}
+
+// NewEmailTextBody converts untrusted plain text to an HTML email body while
+// preserving line breaks. HTML markup in content is always escaped.
+func NewEmailTextBody(content string) EmailBody {
+	escaped := template.HTMLEscapeString(content)
+	escaped = strings.ReplaceAll(escaped, "\r\n", "\n")
+	escaped = strings.ReplaceAll(escaped, "\r", "\n")
+	escaped = strings.ReplaceAll(escaped, "\n", "<br>\n")
+	return EmailBody{html: escaped}
+}
+
+// RenderEmailHTMLBody renders a trusted, server-defined HTML template. Dynamic
+// values must be passed through data so html/template can escape each value for
+// its text, attribute, or URL context.
+func RenderEmailHTMLBody(templateSource string, data any) (EmailBody, error) {
+	tmpl, err := template.New("email").Option("missingkey=error").Parse(templateSource)
+	if err != nil {
+		return EmailBody{}, fmt.Errorf("parse email template: %w", err)
+	}
+
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, data); err != nil {
+		return EmailBody{}, fmt.Errorf("render email template: %w", err)
+	}
+	return EmailBody{html: rendered.String()}, nil
+}
+
+func generateMessageID(sender string) (string, error) {
+	address, err := mail.ParseAddress(sender)
+	if err != nil {
 		return "", fmt.Errorf("invalid SMTP account")
 	}
-	domain := strings.Split(SMTPFrom, "@")[1]
+	_, domain, found := strings.Cut(address.Address, "@")
+	if !found || domain == "" {
+		return "", fmt.Errorf("invalid SMTP account")
+	}
 	return fmt.Sprintf("<%d.%s@%s>", time.Now().UnixNano(), GetRandomString(12), domain), nil
 }
 
@@ -75,29 +111,71 @@ func newSMTPClient(addr string) (*smtp.Client, error) {
 	return client, nil
 }
 
-func SendEmail(subject string, receiver string, content string) error {
-	if SMTPFrom == "" { // for compatibility
-		SMTPFrom = SMTPAccount
+func parseEmailRecipients(receiver string) ([]*mail.Address, error) {
+	if receiver == "" || len(receiver) > 4096 {
+		return nil, fmt.Errorf("invalid email recipient")
 	}
-	id, err2 := generateMessageID()
-	if err2 != nil {
-		return err2
+	parts := strings.Split(receiver, ";")
+	if len(parts) > 100 {
+		return nil, fmt.Errorf("too many email recipients")
 	}
+	recipients := make([]*mail.Address, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("invalid email recipient")
+		}
+		address, err := mail.ParseAddress(part)
+		if err != nil || address.Address == "" {
+			return nil, fmt.Errorf("invalid email recipient")
+		}
+		recipients = append(recipients, address)
+	}
+	if len(recipients) == 0 {
+		return nil, fmt.Errorf("invalid email recipient")
+	}
+	return recipients, nil
+}
+
+func SendEmail(subject string, receiver string, body EmailBody) error {
 	if SMTPServer == "" && SMTPAccount == "" {
 		return fmt.Errorf("SMTP 服务器未配置")
 	}
+
+	sender := strings.TrimSpace(SMTPFrom)
+	if sender == "" { // for compatibility
+		sender = strings.TrimSpace(SMTPAccount)
+	}
+	fromAddress, err := mail.ParseAddress(sender)
+	if err != nil || fromAddress.Address == "" {
+		return fmt.Errorf("invalid SMTP account")
+	}
+	recipients, err := parseEmailRecipients(receiver)
+	if err != nil {
+		return err
+	}
+	id, err := generateMessageID(sender)
+	if err != nil {
+		return err
+	}
+
+	toHeaders := make([]string, 0, len(recipients))
+	for _, recipient := range recipients {
+		toHeaders = append(toHeaders, recipient.String())
+	}
+	fromHeader := (&mail.Address{Name: SystemName, Address: fromAddress.Address}).String()
 	encodedSubject := fmt.Sprintf("=?UTF-8?B?%s?=", base64.StdEncoding.EncodeToString([]byte(subject)))
-	mail := []byte(fmt.Sprintf("To: %s\r\n"+
-		"From: %s <%s>\r\n"+
+	message := []byte(fmt.Sprintf("To: %s\r\n"+
+		"From: %s\r\n"+
 		"Subject: %s\r\n"+
 		"Date: %s\r\n"+
-		"Message-ID: %s\r\n"+ // 添加 Message-ID 头
+		"Message-ID: %s\r\n"+
+		"MIME-Version: 1.0\r\n"+
+		"Content-Transfer-Encoding: 8bit\r\n"+
 		"Content-Type: text/html; charset=UTF-8\r\n\r\n%s\r\n",
-		receiver, SystemName, SMTPFrom, encodedSubject, time.Now().Format(time.RFC1123Z), id, content))
+		strings.Join(toHeaders, ", "), fromHeader, encodedSubject, time.Now().Format(time.RFC1123Z), id, body.html))
 	auth := getSMTPAuth()
 	addr := fmt.Sprintf("%s:%d", SMTPServer, SMTPPort)
-	to := strings.Split(receiver, ";")
-	var err error
 	client, err := newSMTPClient(addr)
 	if err != nil {
 		return err
@@ -108,11 +186,11 @@ func SendEmail(subject string, receiver string, content string) error {
 			return err
 		}
 	}
-	if err = client.Mail(SMTPFrom); err != nil {
+	if err = client.Mail(fromAddress.Address); err != nil {
 		return err
 	}
-	for _, receiver := range to {
-		if err = client.Rcpt(receiver); err != nil {
+	for _, recipient := range recipients {
+		if err = client.Rcpt(recipient.Address); err != nil {
 			return err
 		}
 	}
@@ -120,7 +198,10 @@ func SendEmail(subject string, receiver string, content string) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(mail)
+	// EmailBody can only contain context-escaped text or html/template output;
+	// recipients and all header values are parsed or MIME-encoded above.
+	// codeql[go/email-injection]
+	_, err = w.Write(message)
 	if err != nil {
 		return err
 	}
@@ -130,7 +211,7 @@ func SendEmail(subject string, receiver string, content string) error {
 	}
 	err = client.Quit()
 	if err != nil {
-		SysError(fmt.Sprintf("failed to send email to %s: %v", receiver, err))
+		SysError(fmt.Sprintf("failed to complete SMTP session for %d recipient(s): %v", len(recipients), err))
 	}
 	return err
 }
