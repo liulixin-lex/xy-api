@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"strings"
 
@@ -22,10 +23,67 @@ func ValidatePaymentCallbackOrigin(raw string, allowLocalHTTP bool) error {
 	if escapedPath := parsed.EscapedPath(); escapedPath != "" && escapedPath != "/" {
 		return errors.New("payment callback address must be an origin without a path")
 	}
-	if parsed.Scheme != "https" && !(allowLocalHTTP && parsed.Scheme == "http" && isLocalDevelopmentHost(parsed.Hostname())) {
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if parsed.Scheme == "http" {
+		if allowLocalHTTP && isLocalDevelopmentHost(host) {
+			return nil
+		}
 		return errors.New("payment callback address must use HTTPS")
 	}
+	if parsed.Scheme != "https" {
+		return errors.New("payment callback address must use HTTPS")
+	}
+	if isLocalDevelopmentHost(host) {
+		return errors.New("payment callback address must use a public HTTPS origin")
+	}
+	ipHost := host
+	if zoneIndex := strings.LastIndexByte(ipHost, '%'); zoneIndex >= 0 {
+		ipHost = ipHost[:zoneIndex]
+	}
+	if ip := net.ParseIP(ipHost); ip != nil {
+		if common.IsPrivateIP(ip) {
+			return errors.New("payment callback address must use a public HTTPS origin")
+		}
+	} else if isAmbiguousIPv4Literal(ipHost) {
+		return errors.New("payment callback address must use a canonical public hostname")
+	}
 	return nil
+}
+
+// Some URL clients interpret decimal, octal, hexadecimal, or shortened IPv4
+// text as an address even though net.ParseIP treats it as a hostname. Reject
+// these ambiguous forms so a callback cannot appear public here and resolve to
+// loopback or private space at the provider.
+func isAmbiguousIPv4Literal(host string) bool {
+	parts := strings.Split(strings.TrimSpace(host), ".")
+	if len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		digits := part
+		base := byte(10)
+		if len(digits) > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X') {
+			digits = digits[2:]
+			base = 16
+		}
+		if digits == "" {
+			return false
+		}
+		for index := 0; index < len(digits); index++ {
+			character := digits[index]
+			if character >= '0' && character <= '9' {
+				continue
+			}
+			if base == 16 && (character >= 'a' && character <= 'f' || character >= 'A' && character <= 'F') {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func PaymentReturnURL(suffix string) string {

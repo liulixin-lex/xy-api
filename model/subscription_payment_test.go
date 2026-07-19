@@ -40,6 +40,23 @@ func seedSubscriptionPaymentPlan(t *testing.T, id int, maxPurchase int) *Subscri
 	return plan
 }
 
+func TestValidateSubscriptionPlanForExternalPaymentRejectsUnfulfillableQuota(t *testing.T) {
+	plan := &SubscriptionPlan{
+		Title:            "External Payment Boundary",
+		PriceAmount:      10,
+		Currency:         "USD",
+		DurationUnit:     SubscriptionDurationDay,
+		DurationValue:    1,
+		Enabled:          true,
+		TotalAmount:      math.MaxInt32,
+		QuotaResetPeriod: SubscriptionResetNever,
+	}
+
+	require.NoError(t, ValidateSubscriptionPlanForExternalPayment(plan))
+	plan.TotalAmount = int64(math.MaxInt32) + 1
+	assert.EqualError(t, ValidateSubscriptionPlanForExternalPayment(plan), "套餐总额度超出外部支付可交付范围")
+}
+
 func newPendingSubscriptionPaymentOrder(t *testing.T, userId int, plan *SubscriptionPlan, tradeNo string, provider string) *SubscriptionOrder {
 	t.Helper()
 	order := &SubscriptionOrder{
@@ -256,6 +273,7 @@ func TestBalancePurchaseRequestIsIdempotent(t *testing.T) {
 func TestCanonicalPaymentOrderReservesPurchaseAndExcludesOwnProjectionOnFulfillment(t *testing.T) {
 	truncateTables(t)
 	seedSubscriptionPaymentUser(t, 8111, 0)
+	seedStripeCustomerBinding(t, 8111, "cus_subscription_reservation")
 	plan := seedSubscriptionPaymentPlan(t, 8211, 1)
 	snapshot, err := NewSubscriptionPlanSnapshot(plan)
 	require.NoError(t, err)
@@ -264,13 +282,13 @@ func TestCanonicalPaymentOrderReservesPurchaseAndExcludesOwnProjectionOnFulfillm
 
 	createQuote := func(quoteId string) {
 		t.Helper()
-			require.NoError(t, CreatePaymentQuote(&PaymentQuote{
+		require.NoError(t, CreatePaymentQuote(&PaymentQuote{
 			QuoteID:             quoteId,
 			UserID:              8111,
 			OrderKind:           PaymentOrderKindSubscription,
-				Provider:            PaymentProviderStripe,
-				PaymentMethod:       PaymentMethodStripe,
-				ProviderLivemode:    livePaymentModeForTest(),
+			Provider:            PaymentProviderStripe,
+			PaymentMethod:       PaymentMethodStripe,
+			ProviderLivemode:    livePaymentModeForTest(),
 			RequestedAmount:     int64(plan.Id),
 			ExpectedAmountMinor: 1000,
 			Currency:            "USD",

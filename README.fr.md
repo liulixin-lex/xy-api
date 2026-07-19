@@ -109,6 +109,9 @@
 
 ### Utilisation de Docker Compose (recommandé)
 
+> [!WARNING]
+> La mise à niveau directe vers v0.2.0 n'est prise en charge que depuis v0.1.6 ou une installation neuve. Ne remplacez pas directement l'image d'un déploiement v0.1.7-v0.1.14. Effectuez d'abord une sauvegarde et consultez le [guide de publication et de migration v0.2.0](docs/releases/v0.2.0.md) avant de modifier un déploiement existant.
+
 ```bash
 # Cloner le projet
 git clone https://github.com/liulixin-lex/xy-api.git
@@ -125,23 +128,23 @@ docker-compose up -d
 <summary><strong>Utilisation des commandes Docker</strong></summary>
 
 ```bash
-# Tirer la dernière image
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# Tirer l'image v0.2.0
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # Utilisation de SQLite (par défaut)
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 
-# Utilisation de MySQL
+# Utilisation de MySQL (remplacez mysql-host par un service du réseau de conteneurs ou une adresse accessible)
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 Astuce:** `-v ./data:/data` sauvegardera les données dans le dossier `data` du répertoire actuel, vous pouvez également le changer en chemin absolu comme `-v /your/custom/path:/data`
@@ -195,7 +198,7 @@ docker run --name new-api -d --restart always \
 
 ### 💰 Comptabilisation et facturation des usages autorisés
 
-- ✅ Rechargement interne et allocation de quotas pour les scénarios légalement autorisés (EPay, Stripe)
+- ✅ Rechargement interne et allocation de quotas pour les scénarios légalement autorisés (EPay, Stripe, XORPay)
 - ✅ Comptabilisation des coûts par requête, par utilisation et par hit de cache au niveau organisationnel
 - ✅ Statistiques de facturation du cache pour OpenAI, Azure, DeepSeek, Claude, Qwen et les modèles pris en charge
 - ✅ Politiques de facturation flexibles pour la gestion interne ou les clients entreprise autorisés
@@ -295,7 +298,7 @@ docker run --name new-api -d --restart always \
 ## 🚢 Déploiement
 
 > [!TIP]
-> **Dernière image Docker:** `ghcr.io/liulixin-lex/xy-api:latest`
+> **Image Docker stable actuelle de la série v0.2 :** `ghcr.io/liulixin-lex/xy-api:v0.2.0`
 
 ### 📋 Exigences de déploiement
 
@@ -362,17 +365,18 @@ docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 **Utilisation de MySQL:**
 ```bash
+# Remplacez mysql-host par le nom du service MySQL sur le réseau de conteneurs ou par une autre adresse accessible
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 Explication du chemin:**
@@ -388,7 +392,7 @@ docker run --name new-api -d --restart always \
 2. Recherchez **New-API** dans le magasin d'applications
 3. Installation en un clic
 
-📖 [Tutoriel avec des images](./docs/BT.md)
+📖 [Tutoriel avec des images](./docs/installation/BT.md)
 
 </details>
 

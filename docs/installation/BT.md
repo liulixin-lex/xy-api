@@ -45,6 +45,7 @@
    - **环境变量**：
      - `SESSION_SECRET`：会话密钥（**必填**，多机部署时必须一致）
      - `CRYPTO_SECRET`：加密密钥（使用 Redis 时必填）
+     - `PAYMENT_SECRET_KEY`：支付凭证专用加密密钥（启用易支付、Stripe 或 XORPay 前必填，至少 32 个字符，多节点必须一致）
 5. 点击 **确认** 开始安装
 6. 等待安装完成后，访问 `http://您的服务器IP:3000` 即可使用
 
@@ -57,7 +58,7 @@
 version: '3'
 services:
   new-api:
-    image: ghcr.io/liulixin-lex/xy-api:latest
+    image: ghcr.io/liulixin-lex/xy-api:v0.2.0
     container_name: new-api
     restart: always
     ports:
@@ -66,6 +67,8 @@ services:
       - ./data:/data
     environment:
       - SESSION_SECRET=your_session_secret_here  # 请修改为随机字符串
+      # 启用易支付、Stripe 或 XORPay 前取消下一行注释，并设置至少 32 个字符的随机密钥；多节点必须一致
+      # - PAYMENT_SECRET_KEY=replace_with_at_least_32_random_characters
       - TZ=Asia/Shanghai
 ```
 
@@ -86,6 +89,7 @@ docker-compose up -d
 | ------------------- | ------------------ | ------ |
 | `SESSION_SECRET`    | 会话密钥，多机部署必须一致      | **必填** |
 | `CRYPTO_SECRET`     | 加密密钥，使用 Redis 时必填  | 条件必填   |
+| `PAYMENT_SECRET_KEY` | 支付凭证专用加密密钥，至少 32 个字符，多节点必须一致 | 启用支付网关时必填 |
 | `SQL_DSN`           | 数据库连接字符串（使用外部数据库时） | 可选     |
 | `REDIS_CONN_STRING` | Redis 连接字符串        | 可选     |
 
@@ -97,6 +101,9 @@ openssl rand -hex 16
 
 # 或使用 Linux 命令
 head -c 16 /dev/urandom | xxd -p
+
+# 启用支付网关时生成 PAYMENT_SECRET_KEY（64 个十六进制字符）
+openssl rand -hex 32
 ```
 
 ***
@@ -124,9 +131,12 @@ volumes:
 
 ### Q4：如何更新版本？
 
+> [!WARNING]
+> v0.2.0 仅支持从 v0.1.6 直接升级或全新安装。v0.1.7-v0.1.14 部署不要直接切换镜像；请先备份，并按 [v0.2.0 发布与迁移说明](../releases/v0.2.0.md)执行迁移。
+
 ```bash
-# 拉取最新镜像
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# 拉取 v0.2.0 镜像
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # 重启容器
 docker-compose down && docker-compose up -d
@@ -147,5 +157,4 @@ docker-compose down && docker-compose up -d
 
 ![宝塔面板 Docker 安装](https://github.com/user-attachments/assets/7a6fc03e-c457-45e4-b8f9-184508fc26b0)
 
-> ⚠️ 注意：密钥为环境变量 `SESSION_SECRET`，请务必设置！
-
+> ⚠️ 注意：`SESSION_SECRET` 是必填会话密钥；启用易支付、Stripe 或 XORPay 前，还必须设置至少 32 个字符的 `PAYMENT_SECRET_KEY`。多节点部署时，两者都必须在所有节点保持一致。

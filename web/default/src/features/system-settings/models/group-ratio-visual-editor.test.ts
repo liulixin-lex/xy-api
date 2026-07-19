@@ -31,9 +31,40 @@ const source = readFileSync(
 describe('group ratio visual editor draft values', () => {
   test('keeps group ratio input as a string draft while editing decimals', () => {
     assert.match(source, /ratio:\s+string/)
-    assert.match(source, /ratio:\s+String\(normalizeRatio\(ratioMap\[name\]\)\)/)
+    assert.match(
+      source,
+      /ratio:\s+String\(normalizeRatio\(ratioMap\[name\]\)\)/
+    )
     assert.match(source, /ratio:\s+'1'/)
     assert.match(source, /value=\{row\.ratio\}/)
-    assert.match(source, /updateRow\(row\._id,\s*'ratio',\s*event\.target\.value\)/)
+    assert.match(source, /updateRow\(row\._id,\s*'ratio',\s*nextValue\)/)
+  })
+
+  test('serializes an empty ratio as invalid instead of silently making it free', () => {
+    assert.match(source, /Record<string, number \| null>/)
+    assert.match(
+      source,
+      /groupRatio\[name\] = parseFiniteNonNegativeNumber\(row\.ratio\)/
+    )
+    assert.doesNotMatch(
+      source,
+      /groupRatio\[name\] = normalizeRatio\(row\.ratio\)/
+    )
+    assert.match(
+      source,
+      /aria-invalid=\{invalidRatioRowIds\.has\(row\._id\) \|\| undefined\}/
+    )
+    assert.match(source, /id='group-pricing-ratio-error'/)
+  })
+
+  test('rejects negative and non-finite override ratios while preserving zero', () => {
+    assert.match(source, /parseFiniteNonNegativeNumber\(ratio\)/)
+    assert.match(
+      source,
+      /const canSave = targetGroup !== null && parsedRatio !== null/
+    )
+    assert.match(source, /disabled=\{!canSave\}/)
+    assert.match(source, /min=\{0\}/)
+    assert.match(source, /aria-invalid=\{ratioInvalid \|\| undefined\}/)
   })
 })

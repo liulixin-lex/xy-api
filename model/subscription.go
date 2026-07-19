@@ -385,6 +385,9 @@ func ValidateSubscriptionPlanForExternalPayment(plan *SubscriptionPlan) error {
 	if plan.PriceAmount < 0.01 {
 		return errors.New("套餐金额过低")
 	}
+	if plan.TotalAmount > math.MaxInt32 {
+		return errors.New("套餐总额度超出外部支付可交付范围")
+	}
 	return nil
 }
 

@@ -465,9 +465,24 @@ func SyncOptions(frequency int) {
 	}
 }
 
+func validateOptionValueBeforePersistence(key, value string) error {
+	if err := ratio_setting.ValidatePriceRatioOption(key, value); err != nil {
+		return fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if key == "tool_price_setting.prices" {
+		if err := operation_setting.ValidateToolPricesByJSONString(value); err != nil {
+			return fmt.Errorf("invalid %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
 func UpdateOption(key string, value string) error {
 	if key == PaymentConfigurationVersionOptionKey {
 		return errors.New("payment configuration version cannot be updated directly")
+	}
+	if err := validateOptionValueBeforePersistence(key, value); err != nil {
+		return err
 	}
 	// Save to database first
 	option := Option{
@@ -516,6 +531,11 @@ func updateOptionsBulk(values map[string]string) error {
 	}
 	if _, exists := values[PaymentConfigurationVersionOptionKey]; exists {
 		return errors.New("payment configuration version cannot be updated directly")
+	}
+	for key, value := range values {
+		if err := validateOptionValueBeforePersistence(key, value); err != nil {
+			return err
+		}
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
@@ -593,6 +613,11 @@ func updatePaymentOptionsWithVersionLockHeld(
 	if _, exists := values[PaymentConfigurationVersionOptionKey]; exists {
 		return 0, errors.New("payment configuration version cannot be updated directly")
 	}
+	for key, value := range values {
+		if err := validateOptionValueBeforePersistence(key, value); err != nil {
+			return 0, err
+		}
+	}
 
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -658,6 +683,24 @@ func updatePaymentOptionsWithVersionLockHeld(
 		}
 		if preconditions != nil {
 			activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
+			if preconditions.RequireNoCallbackDependentOrders {
+				providers := []struct {
+					name string
+				}{
+					{name: PaymentProviderEpay},
+					{name: PaymentProviderStripe},
+					{name: PaymentProviderXorPay},
+				}
+				for _, provider := range providers {
+					count, err := countPaymentOrdersDependingOnCallbackOriginTx(tx, provider.name, common.GetTimestamp())
+					if err != nil {
+						return err
+					}
+					if count > 0 {
+						return fmt.Errorf("%w: CustomCallbackAddress cannot be changed while %s payment orders still depend on the current callback origin", ErrPaymentConfigurationPrecondition, provider.name)
+					}
+				}
+			}
 			if preconditions.RequireNoActiveEpayOrders {
 				var count int64
 				if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", PaymentProviderEpay, activeStatuses).
@@ -865,39 +908,6 @@ func updatePaymentOptionsWithVersionLockHeld(
 		}
 	}
 	return nextVersion, nil
-}
-
-func countLegacyActivePaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyProvider bool) (int64, error) {
-	if tx == nil || strings.TrimSpace(provider) == "" {
-		return 0, errors.New("invalid legacy payment projection lookup")
-	}
-	statuses := []string{common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview}
-	countProjection := func(modelValue interface{}) (int64, error) {
-		if !tx.Migrator().HasTable(modelValue) {
-			return 0, nil
-		}
-		query := tx.Model(modelValue).
-			Where("(payment_order_id IS NULL OR payment_order_id = 0) AND status IN ?", statuses)
-		if includeEmptyProvider {
-			query = query.Where("payment_provider = ? OR payment_provider = ''", provider)
-		} else {
-			query = query.Where("payment_provider = ?", provider)
-		}
-		var count int64
-		if err := query.Count(&count).Error; err != nil {
-			return 0, err
-		}
-		return count, nil
-	}
-	topUpCount, err := countProjection(&TopUp{})
-	if err != nil {
-		return 0, err
-	}
-	subscriptionCount, err := countProjection(&SubscriptionOrder{})
-	if err != nil {
-		return 0, err
-	}
-	return topUpCount + subscriptionCount, nil
 }
 
 func updateOptionMap(key string, value string) (err error) {

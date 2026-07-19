@@ -26,9 +26,11 @@ import (
 	"github.com/stripe/stripe-go/v86/webhook"
 )
 
-const maxStripeWebhookBytes = 1 << 20
-
-const maxStripeVerificationResponseBytes = 64 << 10
+const (
+	maxStripeWebhookBytes                = 1 << 20
+	maxStripeVerificationResponseBytes   = 64 << 10
+	stripeCheckoutSessionExpirySafetyGap = 5 * time.Minute
+)
 
 var (
 	stripeAccountIdentityEndpoint             = "https://api.stripe.com/v1/account"
@@ -43,6 +45,21 @@ type stripePaymentProvider struct{}
 
 type stripeAccountParams interface {
 	SetStripeAccount(string)
+}
+
+type stripeCheckoutSessionContract struct {
+	SessionID                     string
+	TradeNo                       string
+	AmountMinor                   int64
+	Currency                      string
+	Livemode                      bool
+	RequirePaid                   bool
+	ExpectedProviderPaymentKey    string
+	CompareProviderPaymentKey     bool
+	ExpectedCustomerID            string
+	CompareCustomerID             bool
+	RequirePaidProviderPaymentKey bool
+	RequirePaidCustomerID         bool
 }
 
 func setStripeAccount(params stripeAccountParams, accountID string) {
@@ -176,7 +193,10 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 	if err != nil {
 		return nil, err
 	}
-	expiresAt := time.Now().Add(30 * time.Minute).Unix()
+	// Stripe rejects expires_at values that are less than 30 minutes from the
+	// instant the API receives the request. Keep a deterministic margin for
+	// serialization, queueing, network, and clock skew.
+	expiresAt := time.Now().Add(30*time.Minute + stripeCheckoutSessionExpirySafetyGap).Unix()
 	params := &stripe.CheckoutSessionParams{
 		ClientReferenceID: stripe.String(order.TradeNo),
 		SuccessURL:        stripe.String(successURL),
@@ -526,18 +546,27 @@ func (*stripePaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedP
 			return nil, errors.New("stripe refund is missing charge identity")
 		}
 		normalized.TradeNo = strings.TrimSpace(charge.Metadata["trade_no"])
-		normalized.Refunded = true
-		normalized.RefundedAmountMinor = charge.AmountRefunded
 		normalized.Currency = strings.ToUpper(string(charge.Currency))
-		normalized.NormalizedPayload = common.GetJsonString(map[string]interface{}{
+		payloadFields := map[string]interface{}{
 			"event_id":        event.ID,
 			"event_type":      event.Type,
+			"api_version":     event.APIVersion,
 			"charge_id":       charge.ID,
 			"payment_intent":  paymentIntentID,
 			"amount_refunded": charge.AmountRefunded,
 			"currency":        charge.Currency,
 			"data_digest":     dataDigest,
-		})
+		}
+		if !stripeFinancialEventAPIVersionCompatible(event.APIVersion) {
+			normalized.ManualReview = true
+			normalized.ProviderState = "api_version_manual_review"
+			payloadFields["automatic_action"] = "blocked_incompatible_api_version"
+			normalized.NormalizedPayload = common.GetJsonString(payloadFields)
+			break
+		}
+		normalized.Refunded = true
+		normalized.RefundedAmountMinor = charge.AmountRefunded
+		normalized.NormalizedPayload = common.GetJsonString(payloadFields)
 	case stripe.EventTypeChargeDisputeCreated, stripe.EventTypeChargeDisputeClosed:
 		var dispute stripe.Dispute
 		if err := common.Unmarshal(event.Data.Raw, &dispute); err != nil {
@@ -562,16 +591,13 @@ func (*stripePaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedP
 		if normalized.TradeNo == "" && dispute.Charge != nil {
 			normalized.TradeNo = strings.TrimSpace(dispute.Charge.Metadata["trade_no"])
 		}
-		normalized.Disputed = event.Type == stripe.EventTypeChargeDisputeCreated || dispute.Status == stripe.DisputeStatusLost
-		normalized.DisputeResolved = event.Type == stripe.EventTypeChargeDisputeClosed
-		normalized.DisputeWon = normalized.DisputeResolved && (dispute.Status == stripe.DisputeStatusWon || dispute.Status == stripe.DisputeStatusWarningClosed)
 		normalized.ProviderResourceKey = "stripe:" + dispute.ID
 		normalized.ProviderState = string(dispute.Status)
-		normalized.DisputedAmountMinor = dispute.Amount
 		normalized.Currency = strings.ToUpper(string(dispute.Currency))
-		normalized.NormalizedPayload = common.GetJsonString(map[string]interface{}{
+		payloadFields := map[string]interface{}{
 			"event_id":       event.ID,
 			"event_type":     event.Type,
+			"api_version":    event.APIVersion,
 			"dispute_id":     dispute.ID,
 			"charge_id":      chargeID,
 			"payment_intent": paymentIntentID,
@@ -579,7 +605,19 @@ func (*stripePaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedP
 			"currency":       dispute.Currency,
 			"status":         dispute.Status,
 			"data_digest":    dataDigest,
-		})
+		}
+		if !stripeFinancialEventAPIVersionCompatible(event.APIVersion) {
+			normalized.ManualReview = true
+			normalized.ProviderState = "api_version_manual_review"
+			payloadFields["automatic_action"] = "blocked_incompatible_api_version"
+			normalized.NormalizedPayload = common.GetJsonString(payloadFields)
+			break
+		}
+		normalized.Disputed = event.Type == stripe.EventTypeChargeDisputeCreated || dispute.Status == stripe.DisputeStatusLost
+		normalized.DisputeResolved = event.Type == stripe.EventTypeChargeDisputeClosed
+		normalized.DisputeWon = normalized.DisputeResolved && (dispute.Status == stripe.DisputeStatusWon || dispute.Status == stripe.DisputeStatusWarningClosed)
+		normalized.DisputedAmountMinor = dispute.Amount
+		normalized.NormalizedPayload = common.GetJsonString(payloadFields)
 	default:
 		normalized.NormalizedPayload = common.GetJsonString(map[string]interface{}{
 			"event_id": event.ID, "event_type": event.Type, "data_digest": dataDigest,
@@ -589,6 +627,28 @@ func (*stripePaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedP
 		return nil, errors.New("stripe event ID is missing")
 	}
 	return normalized, nil
+}
+
+// Stripe freezes an Event's data.object at the webhook endpoint API version.
+// Financial reversals must therefore only be automated for release trains
+// whose Charge and Dispute contracts are covered by our signed fixtures. The
+// v0.1.6 baseline used Acacia and the current SDK uses Dahlia; other trains are
+// retained for manual review rather than being interpreted through a possibly
+// incompatible struct. Checkout payments have a separate live Session
+// confirmation, while subscription and invoice events are inventory-only.
+func stripeFinancialEventAPIVersionCompatible(apiVersion string) bool {
+	parts := strings.SplitN(strings.TrimSpace(apiVersion), ".", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	if _, err := time.Parse("2006-01-02", parts[0]); err != nil {
+		return false
+	}
+	currentParts := strings.SplitN(stripe.APIVersion, ".", 2)
+	if len(currentParts) != 2 || currentParts[1] == "" {
+		return false
+	}
+	return parts[1] == "acacia" || parts[1] == currentParts[1]
 }
 
 func (p *stripePaymentProvider) Query(ctx context.Context, order *model.PaymentOrder) (*NormalizedPaymentEvent, error) {
@@ -603,8 +663,25 @@ func (p *stripePaymentProvider) Query(ctx context.Context, order *model.PaymentO
 	if order.ProviderLivemode == nil || *order.ProviderLivemode != credentialLivemode {
 		return nil, errors.New("stripe order credential mode does not match the verified configuration")
 	}
-	session, err := p.getCheckoutSession(ctx, strings.TrimPrefix(*order.ProviderOrderKey, "stripe:"))
+	sessionID := strings.TrimPrefix(*order.ProviderOrderKey, "stripe:")
+	contract := stripeCheckoutSessionContract{
+		SessionID:                     sessionID,
+		TradeNo:                       order.TradeNo,
+		AmountMinor:                   order.ExpectedAmountMinor,
+		Currency:                      order.Currency,
+		Livemode:                      credentialLivemode,
+		RequirePaidProviderPaymentKey: true,
+		RequirePaidCustomerID:         true,
+	}
+	if order.ProviderPaymentKey != nil {
+		contract.ExpectedProviderPaymentKey = strings.TrimSpace(*order.ProviderPaymentKey)
+		contract.CompareProviderPaymentKey = true
+	}
+	session, err := p.getAndValidateCheckoutSession(ctx, contract)
 	if err != nil {
+		if errors.Is(err, errStripeCheckoutConfirmation) {
+			return nil, markStripeCheckoutContractMismatch(order.TradeNo)
+		}
 		return nil, err
 	}
 	credentialGeneration := setting.StripeWebhookCredentialGeneration
@@ -631,7 +708,12 @@ func (p *stripePaymentProvider) Query(ctx context.Context, order *model.PaymentO
 	if session.PaymentIntent != nil && session.PaymentIntent.ID != "" {
 		result.ProviderPaymentKey = "stripe:" + session.PaymentIntent.ID
 	}
-	result.EventKey = model.PaymentEventKey(model.PaymentProviderStripe, "query", result.ProviderOrderKey, order.TradeNo, fmt.Sprintf("%s:%d:%s", session.PaymentStatus, session.AmountTotal, session.Currency))
+	result.NormalizedPayload = common.GetJsonString(map[string]interface{}{
+		"session_id": session.ID, "trade_no": order.TradeNo, "mode": session.Mode,
+		"status": session.Status, "payment_status": session.PaymentStatus,
+		"amount_total": session.AmountTotal, "currency": session.Currency, "livemode": session.Livemode,
+	})
+	result.EventKey = model.PaymentEventKey(model.PaymentProviderStripe, "query", result.ProviderOrderKey, order.TradeNo, result.NormalizedPayload)
 	return result, nil
 }
 
@@ -647,11 +729,28 @@ func (p *stripePaymentProvider) RecoverStart(ctx context.Context, order *model.P
 	if order.ProviderLivemode == nil || *order.ProviderLivemode != credentialLivemode {
 		return nil, errors.New("stripe order credential mode does not match the verified configuration")
 	}
-	session, err := p.getCheckoutSession(ctx, strings.TrimPrefix(*order.ProviderOrderKey, "stripe:"))
+	sessionID := strings.TrimPrefix(*order.ProviderOrderKey, "stripe:")
+	contract := stripeCheckoutSessionContract{
+		SessionID:   sessionID,
+		TradeNo:     order.TradeNo,
+		AmountMinor: order.ExpectedAmountMinor,
+		Currency:    order.Currency,
+		Livemode:    credentialLivemode,
+	}
+	if order.ProviderPaymentKey != nil {
+		contract.ExpectedProviderPaymentKey = strings.TrimSpace(*order.ProviderPaymentKey)
+		contract.CompareProviderPaymentKey = true
+	}
+	session, err := p.getAndValidateCheckoutSession(ctx, contract)
 	if err != nil {
+		if errors.Is(err, errStripeCheckoutConfirmation) {
+			return nil, markStripeCheckoutContractMismatch(order.TradeNo)
+		}
 		return nil, err
 	}
-	if session == nil || session.URL == "" {
+	if session.Status != stripe.CheckoutSessionStatusOpen ||
+		session.PaymentStatus != stripe.CheckoutSessionPaymentStatusUnpaid ||
+		session.ExpiresAt <= time.Now().Unix() || session.URL == "" {
 		return nil, errors.New("stripe checkout session has no recoverable URL")
 	}
 	if err := validateStripeCheckoutURL(session.URL); err != nil {
@@ -675,38 +774,34 @@ func (p *stripePaymentProvider) getCheckoutSession(ctx context.Context, sessionI
 	return api.CheckoutSessions.Get(sessionID, params)
 }
 
-// confirmPaidCheckoutSession binds entitlement-granting webhook events to the
-// account authenticated by the configured Stripe API credential. A webhook
-// signing secret does not itself disclose which direct Stripe account issued
-// it, so signature verification alone cannot detect an accidentally paired
-// secret from another account.
-func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, event *NormalizedPaymentEvent) error {
-	if event == nil || !event.Paid || event.Provider != model.PaymentProviderStripe {
-		return nil
+func (p *stripePaymentProvider) getAndValidateCheckoutSession(ctx context.Context, contract stripeCheckoutSessionContract) (*stripe.CheckoutSession, error) {
+	session, err := p.getCheckoutSession(ctx, contract.SessionID)
+	if err != nil {
+		return nil, err
 	}
-	if event.ProviderLivemode == nil || !strings.HasPrefix(event.ProviderOrderKey, "stripe:cs_") ||
-		strings.TrimSpace(event.TradeNo) == "" || event.PaidAmountMinor <= 0 || strings.TrimSpace(event.Currency) == "" {
-		return errStripeCheckoutConfirmation
+	if err := validateStripeCheckoutSessionContract(session, contract); err != nil {
+		return nil, err
 	}
-	credentialMode, err := stripeCredentialModeForUse(setting.StripeApiSecret)
-	if err != nil || credentialMode != setting.StripeCredentialLivemode ||
-		credentialMode != setting.StripeWebhookCredentialLivemode {
-		return errStripeCheckoutConfirmation
+	return session, nil
+}
+
+func markStripeCheckoutContractMismatch(tradeNo string) error {
+	if err := model.MarkPaymentOrderManualReview(tradeNo,
+		"Stripe Checkout Session contract does not match this payment order; verify it manually"); err != nil &&
+		!errors.Is(err, model.ErrPaymentOrderNotFound) {
+		return err
 	}
-	expectedFingerprint := StripeCheckoutConfigurationFingerprint(
-		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
-		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
-	)
-	if expectedFingerprint == "" || setting.StripeConfigurationVerifiedAt <= 0 ||
-		setting.StripeConfigurationVerifiedFingerprint != expectedFingerprint {
+	return fmt.Errorf("%w: Stripe Checkout Session contract mismatch", model.ErrPaymentManualReview)
+}
+
+func validateStripeCheckoutSessionContract(session *stripe.CheckoutSession, contract stripeCheckoutSessionContract) error {
+	contract.SessionID = strings.TrimSpace(contract.SessionID)
+	contract.TradeNo = strings.TrimSpace(contract.TradeNo)
+	contract.Currency = strings.ToUpper(strings.TrimSpace(contract.Currency))
+	if session == nil || contract.SessionID == "" || contract.TradeNo == "" || contract.AmountMinor <= 0 || contract.Currency == "" {
 		return errStripeCheckoutConfirmation
 	}
 
-	sessionID := strings.TrimPrefix(event.ProviderOrderKey, "stripe:")
-	session, err := p.getCheckoutSession(ctx, sessionID)
-	if err != nil || session == nil {
-		return errStripeCheckoutConfirmation
-	}
 	clientTradeNo := strings.TrimSpace(session.ClientReferenceID)
 	metadataTradeNo := strings.TrimSpace(session.Metadata["trade_no"])
 	if clientTradeNo != "" && metadataTradeNo != "" && clientTradeNo != metadataTradeNo {
@@ -715,6 +810,26 @@ func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, 
 	if clientTradeNo == "" {
 		clientTradeNo = metadataTradeNo
 	}
+	if session.ID != contract.SessionID || clientTradeNo != contract.TradeNo ||
+		session.Mode != stripe.CheckoutSessionModePayment || session.AmountTotal != contract.AmountMinor ||
+		!strings.EqualFold(string(session.Currency), contract.Currency) || session.Livemode != contract.Livemode {
+		return errStripeCheckoutConfirmation
+	}
+	switch session.Status {
+	case stripe.CheckoutSessionStatusOpen, stripe.CheckoutSessionStatusComplete, stripe.CheckoutSessionStatusExpired:
+	default:
+		return errStripeCheckoutConfirmation
+	}
+	switch session.PaymentStatus {
+	case stripe.CheckoutSessionPaymentStatusPaid, stripe.CheckoutSessionPaymentStatusUnpaid:
+	default:
+		return errStripeCheckoutConfirmation
+	}
+	if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid && session.Status != stripe.CheckoutSessionStatusComplete ||
+		session.Status == stripe.CheckoutSessionStatusExpired && session.PaymentStatus != stripe.CheckoutSessionPaymentStatusUnpaid {
+		return errStripeCheckoutConfirmation
+	}
+
 	providerPaymentKey := ""
 	if session.PaymentIntent != nil && strings.TrimSpace(session.PaymentIntent.ID) != "" {
 		providerPaymentKey = "stripe:" + strings.TrimSpace(session.PaymentIntent.ID)
@@ -723,15 +838,58 @@ func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, 
 	if session.Customer != nil {
 		customerID = strings.TrimSpace(session.Customer.ID)
 	}
-	expectedLivemode := credentialMode == "live"
-	if session.ID != sessionID || clientTradeNo != strings.TrimSpace(event.TradeNo) ||
-		session.Mode != stripe.CheckoutSessionModePayment ||
-		session.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid ||
-		session.AmountTotal != event.PaidAmountMinor ||
-		!strings.EqualFold(string(session.Currency), event.Currency) ||
-		session.Livemode != expectedLivemode || *event.ProviderLivemode != expectedLivemode ||
-		providerPaymentKey != strings.TrimSpace(event.ProviderPaymentKey) ||
-		customerID != strings.TrimSpace(event.CustomerID) {
+	if contract.RequirePaid && session.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid ||
+		contract.CompareProviderPaymentKey && providerPaymentKey != strings.TrimSpace(contract.ExpectedProviderPaymentKey) ||
+		contract.CompareCustomerID && customerID != strings.TrimSpace(contract.ExpectedCustomerID) ||
+		contract.RequirePaidProviderPaymentKey && session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid && providerPaymentKey == "" ||
+		contract.RequirePaidCustomerID && session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid && customerID == "" {
+		return errStripeCheckoutConfirmation
+	}
+	return nil
+}
+
+// confirmPaidCheckoutSession binds entitlement-granting webhook events to the
+// account authenticated by the configured Stripe API credential. A webhook
+// signing secret does not itself disclose which direct Stripe account issued
+// it, so signature verification alone cannot detect an accidentally paired
+// secret from another account. Checkout catalog readiness (Price, currency,
+// and its verification fingerprint) gates creation only: changing or disabling
+// that catalog must not prevent an already-paid Session from being confirmed.
+func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, event *NormalizedPaymentEvent) error {
+	if event == nil || !event.Paid || event.Provider != model.PaymentProviderStripe {
+		return nil
+	}
+	if event.ProviderLivemode == nil || !strings.HasPrefix(event.ProviderOrderKey, "stripe:cs_") ||
+		strings.TrimSpace(event.TradeNo) == "" || event.PaidAmountMinor <= 0 || strings.TrimSpace(event.Currency) == "" {
+		return errStripeCheckoutConfirmation
+	}
+	// An already-signed test-mode event must still be authority-checked after
+	// operators disable new test payments. The settlement layer then records it
+	// as manual review without granting entitlement. Creation, query, and resume
+	// paths continue to use stripeCredentialModeForUse and remain disabled.
+	credentialMode, err := StripeCredentialMode(setting.StripeApiSecret)
+	if err != nil || credentialMode != setting.StripeCredentialLivemode ||
+		credentialMode != setting.StripeWebhookCredentialLivemode {
+		return errStripeCheckoutConfirmation
+	}
+
+	sessionID := strings.TrimPrefix(event.ProviderOrderKey, "stripe:")
+	session, err := p.getAndValidateCheckoutSession(ctx, stripeCheckoutSessionContract{
+		SessionID:                  sessionID,
+		TradeNo:                    event.TradeNo,
+		AmountMinor:                event.PaidAmountMinor,
+		Currency:                   event.Currency,
+		Livemode:                   credentialMode == "live",
+		RequirePaid:                true,
+		ExpectedProviderPaymentKey: event.ProviderPaymentKey,
+		CompareProviderPaymentKey:  true,
+		ExpectedCustomerID:         event.CustomerID,
+		CompareCustomerID:          true,
+	})
+	if err != nil {
+		return errStripeCheckoutConfirmation
+	}
+	if *event.ProviderLivemode != session.Livemode {
 		return errStripeCheckoutConfirmation
 	}
 	return nil

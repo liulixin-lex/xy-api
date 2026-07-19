@@ -50,6 +50,13 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+} from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -69,6 +76,7 @@ import {
 } from '@/components/ui/sheet'
 
 import { safeJsonParse } from '../utils/json-parser'
+import { parseFiniteNonNegativeNumber } from './pricing-map-validation'
 
 type GroupRatioVisualEditorProps = {
   groupRatio: string
@@ -148,13 +156,13 @@ function buildGroupPricingRows(
 }
 
 function serializeGroupPricingRows(rows: GroupPricingRow[]) {
-  const groupRatio: Record<string, number> = {}
+  const groupRatio: Record<string, number | null> = {}
   const userUsableGroups: Record<string, string> = {}
 
   for (const row of rows) {
     const name = row.name.trim()
     if (!name) continue
-    groupRatio[name] = normalizeRatio(row.ratio)
+    groupRatio[name] = parseFiniteNonNegativeNumber(row.ratio)
     if (row.selectable) {
       userUsableGroups[name] = row.description
     }
@@ -195,6 +203,7 @@ function UnknownGroupBadge() {
 }
 
 type GroupNameSelectProps = {
+  id?: string
   options: string[]
   value: string | null
   placeholder: string
@@ -217,7 +226,7 @@ function GroupNameSelect(props: GroupNameSelectProps) {
         if (typeof v === 'string' && v !== '') props.onValueChange(v)
       }}
     >
-      <SelectTrigger className={props.className ?? 'w-48'}>
+      <SelectTrigger id={props.id} className={props.className ?? 'w-48'}>
         <SelectValue placeholder={props.placeholder} />
       </SelectTrigger>
       <SelectContent alignItemWithTrigger={false}>
@@ -483,6 +492,20 @@ function GroupPricingTable({
       .map(([name]) => name)
   }, [rows])
 
+  const invalidRatioRowIds = useMemo(
+    () =>
+      new Set(
+        rows
+          .filter(
+            (row) =>
+              row.name.trim() &&
+              parseFiniteNonNegativeNumber(row.ratio) === null
+          )
+          .map((row) => row._id)
+      ),
+    [rows]
+  )
+
   return (
     <Card className={sectionCardClassName}>
       <CardHeader className={sectionHeaderClassName}>
@@ -533,9 +556,21 @@ function GroupPricingTable({
                     min={0}
                     step={0.1}
                     value={row.ratio}
-                    onChange={(event) =>
-                      updateRow(row._id, 'ratio', event.target.value)
+                    aria-invalid={invalidRatioRowIds.has(row._id) || undefined}
+                    aria-describedby={
+                      invalidRatioRowIds.has(row._id)
+                        ? 'group-pricing-ratio-error'
+                        : undefined
                     }
+                    onChange={(event) => {
+                      const nextValue = event.target.value
+                      if (
+                        nextValue === '' ||
+                        parseFiniteNonNegativeNumber(nextValue) !== null
+                      ) {
+                        updateRow(row._id, 'ratio', nextValue)
+                      }
+                    }}
                   />
                 ),
               },
@@ -609,6 +644,16 @@ function GroupPricingTable({
               {t('Duplicate group names: {{names}}', {
                 names: duplicateNames.join(', '),
               })}
+            </p>
+          )}
+
+          {invalidRatioRowIds.size > 0 && (
+            <p
+              id='group-pricing-ratio-error'
+              role='alert'
+              className='text-destructive text-sm'
+            >
+              {t('Enter a finite, non-negative number.')}
             </p>
           )}
         </div>
@@ -980,11 +1025,12 @@ function GroupOverrideDialog({
   }, [editData, open])
 
   const baseRatio = targetGroup ? baseRatioByName.get(targetGroup) : undefined
+  const parsedRatio = parseFiniteNonNegativeNumber(ratio)
+  const ratioInvalid = ratio.trim() !== '' && parsedRatio === null
+  const canSave = targetGroup !== null && parsedRatio !== null
 
   const handleSave = () => {
-    if (!targetGroup || !ratio.trim()) return
-    const parsedRatio = Number.parseFloat(ratio)
-    if (Number.isNaN(parsedRatio)) return
+    if (!targetGroup || parsedRatio === null) return
 
     onSave(targetGroup, parsedRatio, editData?.targetGroup)
     setTargetGroup(null)
@@ -1013,39 +1059,44 @@ function GroupOverrideDialog({
           <Button variant='outline' onClick={() => onOpenChange(false)}>
             {t('Cancel')}
           </Button>
-          <Button onClick={handleSave}>
+          <Button onClick={handleSave} disabled={!canSave}>
             {editData ? t('Update') : t('Add')}
           </Button>
         </>
       }
     >
-      <div className='space-y-4 py-4'>
-        <div className='space-y-2'>
-          <Label>{t('Billing group')}</Label>
+      <FieldGroup className='py-4'>
+        <Field>
+          <FieldLabel htmlFor='group-override-target'>
+            {t('Billing group')}
+          </FieldLabel>
           <GroupNameSelect
+            id='group-override-target'
             className='w-full'
             options={groupOptions}
             value={targetGroup}
             placeholder={t('Select a group')}
             onValueChange={setTargetGroup}
           />
-          <p className='text-muted-foreground text-xs'>
+          <FieldDescription>
             {t('The token group that will have a custom ratio')}
-          </p>
-        </div>
-        <div className='space-y-2'>
-          <Label>{t('Ratio')}</Label>
+          </FieldDescription>
+        </Field>
+        <Field data-invalid={ratioInvalid || undefined}>
+          <FieldLabel htmlFor='group-override-ratio'>{t('Ratio')}</FieldLabel>
           <Input
+            id='group-override-ratio'
+            type='number'
+            inputMode='decimal'
+            min={0}
+            step='any'
             value={ratio}
-            onChange={(e) => {
-              const val = e.target.value
-              if (val === '' || !Number.isNaN(Number.parseFloat(val))) {
-                setRatio(val)
-              }
-            }}
+            onChange={(event) => setRatio(event.target.value)}
             placeholder={baseRatio === undefined ? '0.9' : String(baseRatio)}
+            aria-invalid={ratioInvalid || undefined}
+            aria-describedby='group-override-ratio-description group-override-ratio-error'
           />
-          <p className='text-muted-foreground text-xs'>
+          <FieldDescription id='group-override-ratio-description'>
             {baseRatio !== undefined
               ? t('(instead of {{ratio}})', { ratio: baseRatio })
               : t(
@@ -1055,9 +1106,12 @@ function GroupOverrideDialog({
                     targetGroup: targetGroup || t('this token group'),
                   }
                 )}
-          </p>
-        </div>
-      </div>
+          </FieldDescription>
+          <FieldError id='group-override-ratio-error'>
+            {ratioInvalid ? t('Enter a finite, non-negative number.') : null}
+          </FieldError>
+        </Field>
+      </FieldGroup>
     </Dialog>
   )
 }

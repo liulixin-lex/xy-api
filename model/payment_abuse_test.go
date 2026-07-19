@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,6 +33,20 @@ func createAbuseTestQuote(t *testing.T, userID int, provider string, amount int6
 		QuoteID: quoteID, UserID: userID, OrderKind: PaymentOrderKindTopUp,
 		Provider: provider, PaymentMethod: "alipay", RequestedAmount: amount,
 		CreditQuota: amount * 500, ExpectedAmountMinor: amount * 730, Currency: "CNY",
+		PricingSnapshot: fmt.Sprintf(`{"amount":%d}`, amount), ExpiresAt: expiresAt,
+	}
+	require.NoError(t, CreatePaymentQuote(quote))
+	return quote
+}
+
+func createStripeAbuseTestQuote(t *testing.T, userID int, amount int64, expiresAt int64) *PaymentQuote {
+	t.Helper()
+	quoteID, err := GeneratePaymentQuoteID()
+	require.NoError(t, err)
+	quote := &PaymentQuote{
+		QuoteID: quoteID, UserID: userID, OrderKind: PaymentOrderKindTopUp,
+		Provider: PaymentProviderStripe, PaymentMethod: PaymentMethodStripe, ProviderLivemode: livePaymentModeForTest(),
+		RequestedAmount: amount, CreditQuota: amount * 500, ExpectedAmountMinor: amount * 100, Currency: "USD",
 		PricingSnapshot: fmt.Sprintf(`{"amount":%d}`, amount), ExpiresAt: expiresAt,
 	}
 	require.NoError(t, CreatePaymentQuote(quote))
@@ -160,6 +175,65 @@ func TestConcurrentEquivalentQuotesWithSameRequestReturnOneOrder(t *testing.T) {
 	assert.EqualValues(t, 1, orderCount)
 	assert.EqualValues(t, 1, projectionCount)
 	assert.EqualValues(t, 2, consumedQuoteCount)
+}
+
+func TestConcurrentStripeOrdersWithoutCustomerCreateOnlyOneOrder(t *testing.T) {
+	truncateTables(t)
+	const userID = 974150
+	seedPaymentUser(t, userID, 100)
+	now := time.Now().Unix()
+	firstQuote := createStripeAbuseTestQuote(t, userID, 10, now+3600)
+	secondQuote := createStripeAbuseTestQuote(t, userID, 20, now+3600)
+
+	orders := make([]*PaymentOrder, 2)
+	errorsByIndex := make([]error, 2)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for index, quote := range []*PaymentQuote{firstQuote, secondQuote} {
+		wait.Add(1)
+		go func(index int, quoteID string) {
+			defer wait.Done()
+			<-start
+			orders[index], errorsByIndex[index] = CreatePaymentOrderFromQuote(userID, quoteID, fmt.Sprintf("stripe-unbound-%d", index))
+		}(index, quote.QuoteID)
+	}
+	close(start)
+	wait.Wait()
+
+	successes := 0
+	limited := 0
+	var remainingQuote *PaymentQuote
+	for index, err := range errorsByIndex {
+		if err == nil {
+			successes++
+			require.NotNil(t, orders[index])
+			continue
+		}
+		if errors.Is(err, ErrPaymentInFlightOrderLimit) {
+			limited++
+			if index == 0 {
+				remainingQuote = firstQuote
+			} else {
+				remainingQuote = secondQuote
+			}
+			continue
+		}
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, 1, limited)
+	require.NotNil(t, remainingQuote)
+
+	var orderCount, consumedQuoteCount int64
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("user_id = ? AND provider = ?", userID, PaymentProviderStripe).Count(&orderCount).Error)
+	require.NoError(t, DB.Model(&PaymentQuote{}).Where("quote_id IN ? AND consumed_at > 0", []string{firstQuote.QuoteID, secondQuote.QuoteID}).Count(&consumedQuoteCount).Error)
+	assert.EqualValues(t, 1, orderCount)
+	assert.EqualValues(t, 1, consumedQuoteCount)
+
+	seedStripeCustomerBinding(t, userID, "cus_stripe_order_capacity")
+	replacement, err := CreatePaymentOrderFromQuote(userID, remainingQuote.QuoteID, "stripe-after-binding")
+	require.NoError(t, err)
+	assert.NotZero(t, replacement.ID)
 }
 
 func TestExpireDuePaymentOrdersSynchronizesProjectionAndAllowsLatePaid(t *testing.T) {

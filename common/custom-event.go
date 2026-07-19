@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 )
 
 type stringWriter interface {
@@ -37,13 +36,6 @@ func checkWriter(writer io.Writer) stringWriter {
 // W3C Working Draft 29 October 2009
 // http://www.w3.org/TR/2009/WD-eventsource-20091029/
 
-var writeContentType = []string{"text/event-stream"}
-var noCache = []string{"no-cache"}
-
-var fieldReplacer = strings.NewReplacer(
-	"\n", "\\n",
-	"\r", "\\r")
-
 var dataReplacer = strings.NewReplacer(
 	"\n", "\n",
 	"\r", "\\r")
@@ -53,8 +45,6 @@ type CustomEvent struct {
 	Id    string
 	Retry uint
 	Data  interface{}
-
-	Mutex sync.Mutex
 }
 
 func encode(writer io.Writer, event CustomEvent) error {
@@ -63,9 +53,13 @@ func encode(writer io.Writer, event CustomEvent) error {
 }
 
 func writeData(w stringWriter, data interface{}) error {
-	dataReplacer.WriteString(w, fmt.Sprint(data))
-	if strings.HasPrefix(data.(string), "data") {
-		w.writeString("\n\n")
+	dataString := fmt.Sprint(data)
+	if _, err := dataReplacer.WriteString(w, dataString); err != nil {
+		return err
+	}
+	if strings.HasPrefix(dataString, "data") {
+		_, err := w.writeString("\n\n")
+		return err
 	}
 	return nil
 }
@@ -76,12 +70,10 @@ func (r CustomEvent) Render(w http.ResponseWriter) error {
 }
 
 func (r CustomEvent) WriteContentType(w http.ResponseWriter) {
-	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
 	header := w.Header()
-	header["Content-Type"] = writeContentType
+	header.Set("Content-Type", "text/event-stream")
 
 	if _, exist := header["Cache-Control"]; !exist {
-		header["Cache-Control"] = noCache
+		header.Set("Cache-Control", "no-cache")
 	}
 }

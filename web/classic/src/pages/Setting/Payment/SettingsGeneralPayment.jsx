@@ -27,29 +27,7 @@ import {
   verifyJSON,
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
-
-const isSecurePaymentCallbackOrigin = (value) => {
-  const trimmed = (value || '').trim();
-  if (!trimmed) return false;
-  try {
-    const parsed = new URL(trimmed);
-    const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(
-      parsed.hostname,
-    );
-    const secureProtocol =
-      parsed.protocol === 'https:' || (loopback && parsed.protocol === 'http:');
-    return (
-      secureProtocol &&
-      !parsed.username &&
-      !parsed.password &&
-      !parsed.search &&
-      !parsed.hash &&
-      (parsed.pathname === '' || parsed.pathname === '/')
-    );
-  } catch {
-    return false;
-  }
-};
+import { isSecurePaymentCallbackOrigin } from '../../../helpers/payment-callback-origin';
 
 const isValidTopupGroupRatios = (value) => {
   try {

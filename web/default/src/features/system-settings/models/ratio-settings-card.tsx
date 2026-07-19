@@ -33,6 +33,10 @@ import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
 import { GroupRatioForm } from './group-ratio-form'
 import { ModelRatioForm } from './model-ratio-form'
+import {
+  isFiniteNonNegativeNestedNumberMap,
+  isFiniteNonNegativeNumberMap,
+} from './pricing-map-validation'
 import { ToolPriceSettings } from './tool-price-settings'
 import { UpstreamRatioSync } from './upstream-ratio-sync'
 import {
@@ -98,16 +102,25 @@ function createJsonStringField(
   })
 }
 
+function createFiniteNonNegativeMapField(t: Translate) {
+  return createJsonStringField(t, {
+    allowEmpty: false,
+    predicate: isFiniteNonNegativeNumberMap,
+    predicateMessage:
+      'Every price or ratio must be a finite, non-negative number.',
+  })
+}
+
 const createModelSchema = (t: Translate) =>
   z.object({
-    ModelPrice: createJsonStringField(t),
-    ModelRatio: createJsonStringField(t),
-    CacheRatio: createJsonStringField(t),
-    CreateCacheRatio: createJsonStringField(t),
-    CompletionRatio: createJsonStringField(t),
-    ImageRatio: createJsonStringField(t),
-    AudioRatio: createJsonStringField(t),
-    AudioCompletionRatio: createJsonStringField(t),
+    ModelPrice: createFiniteNonNegativeMapField(t),
+    ModelRatio: createFiniteNonNegativeMapField(t),
+    CacheRatio: createFiniteNonNegativeMapField(t),
+    CreateCacheRatio: createFiniteNonNegativeMapField(t),
+    CompletionRatio: createFiniteNonNegativeMapField(t),
+    ImageRatio: createFiniteNonNegativeMapField(t),
+    AudioRatio: createFiniteNonNegativeMapField(t),
+    AudioCompletionRatio: createFiniteNonNegativeMapField(t),
     ExposeRatioEnabled: z.boolean(),
     BillingMode: createJsonStringField(t),
     BillingExpr: createJsonStringField(t),
@@ -115,9 +128,14 @@ const createModelSchema = (t: Translate) =>
 
 const createGroupSchema = (t: Translate) =>
   z.object({
-    GroupRatio: createJsonStringField(t),
+    GroupRatio: createFiniteNonNegativeMapField(t),
     UserUsableGroups: createJsonStringField(t),
-    GroupGroupRatio: createJsonStringField(t),
+    GroupGroupRatio: createJsonStringField(t, {
+      allowEmpty: false,
+      predicate: isFiniteNonNegativeNestedNumberMap,
+      predicateMessage:
+        'Every price or ratio must be a finite, non-negative number.',
+    }),
     AutoGroups: createJsonStringField(t, {
       predicate: (parsed) =>
         Array.isArray(parsed) &&

@@ -415,7 +415,9 @@ export function PaymentMethodsVisualEditor({
                       </span>
                     </div>
                   ) : (
-                    <span className='text-muted-foreground text-sm'>—</span>
+                    <span className='text-muted-foreground text-sm'>
+                      {t('Not available')}
+                    </span>
                   )
                 },
               },
@@ -428,7 +430,9 @@ export function PaymentMethodsVisualEditor({
                       {method.min_topup}
                     </span>
                   ) : (
-                    <span className='text-muted-foreground text-sm'>—</span>
+                    <span className='text-muted-foreground text-sm'>
+                      {t('Not available')}
+                    </span>
                   ),
               },
               {
@@ -523,7 +527,9 @@ export function PaymentMethodsVisualEditor({
                           </span>
                         </div>
                       ) : (
-                        <span className='text-muted-foreground text-xs'>—</span>
+                        <span className='text-muted-foreground text-xs'>
+                          {t('Not available')}
+                        </span>
                       )}
                     </div>
                     {method.min_topup && (

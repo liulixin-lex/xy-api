@@ -1392,9 +1392,10 @@ func TestStripeWebhookRetainsLegacyChargeIdentityAndResolvesWarningClosed(t *tes
 			"id":"ch_legacy_123","object":"charge","amount_refunded":500,"currency":"usd",
 			"payment_intent":null,"metadata":{"trade_no":"PO_LEGACY_CHARGE"}
 		}}
-	}`, stripe.APIVersion))
+	}`, "2025-02-24.acacia"))
 	refund := verify(t, refundPayload)
 	assert.True(t, refund.Refunded)
+	assert.False(t, refund.ManualReview)
 	assert.Equal(t, "stripe:ch_legacy_123", refund.ProviderPaymentKey)
 	assert.Equal(t, "PO_LEGACY_CHARGE", refund.TradeNo)
 
@@ -1411,6 +1412,87 @@ func TestStripeWebhookRetainsLegacyChargeIdentityAndResolvesWarningClosed(t *tes
 	assert.Equal(t, "stripe:dp_warning_123", dispute.ProviderResourceKey)
 	assert.Equal(t, "warning_closed", dispute.ProviderState)
 	assert.EqualValues(t, 1721304002, dispute.ProviderCreatedAt)
+}
+
+func TestStripeFinancialWebhookIncompatibleAPIVersionRequiresManualReview(t *testing.T) {
+	originalWebhookSecret := setting.StripeWebhookSecret
+	originalPrevious := setting.StripeWebhookSecretPrevious
+	originalAccount := setting.StripeAccountId
+	originalWebhookMode := setting.StripeWebhookCredentialLivemode
+	originalGeneration := setting.StripeWebhookCredentialGeneration
+	t.Cleanup(func() {
+		setting.StripeWebhookSecret = originalWebhookSecret
+		setting.StripeWebhookSecretPrevious = originalPrevious
+		setting.StripeAccountId = originalAccount
+		setting.StripeWebhookCredentialLivemode = originalWebhookMode
+		setting.StripeWebhookCredentialGeneration = originalGeneration
+	})
+	setting.StripeWebhookSecret = "whsec_api_version_gate"
+	setting.StripeWebhookSecretPrevious = ""
+	setting.StripeAccountId = ""
+	setting.StripeWebhookCredentialLivemode = "test"
+	setting.StripeWebhookCredentialGeneration = 1
+
+	provider, err := GetPaymentProvider(model.PaymentProviderStripe)
+	require.NoError(t, err)
+	verify := func(t *testing.T, payload []byte) *NormalizedPaymentEvent {
+		t.Helper()
+		signed := stripewebhook.GenerateTestSignedPayload(&stripewebhook.UnsignedPayload{
+			Payload: payload,
+			Secret:  setting.StripeWebhookSecret,
+		})
+		request := httptest.NewRequest(http.MethodPost, "/api/stripe/webhook", strings.NewReader(string(payload)))
+		request.Header.Set("Stripe-Signature", signed.Header)
+		event, verifyErr := provider.VerifyWebhook(request)
+		require.NoError(t, verifyErr)
+		return event
+	}
+
+	refundPayload := []byte(`{
+		"id":"evt_refund_basil","object":"event","api_version":"2025-06-30.basil","created":1721304003,
+		"livemode":false,"type":"charge.refunded","data":{"object":{
+			"id":"ch_basil_123","object":"charge","amount_refunded":500,"currency":"usd",
+			"payment_intent":"pi_basil_123","metadata":{"trade_no":"PO_BASIL_REFUND"}
+		}}
+	}`)
+	refund := verify(t, refundPayload)
+	assert.True(t, refund.ManualReview)
+	assert.False(t, refund.Refunded)
+	assert.Zero(t, refund.RefundedAmountMinor)
+	assert.Equal(t, "stripe:pi_basil_123", refund.ProviderPaymentKey)
+	assert.Equal(t, "PO_BASIL_REFUND", refund.TradeNo)
+	assert.Equal(t, "api_version_manual_review", refund.ProviderState)
+	assert.Contains(t, refund.NormalizedPayload, "blocked_incompatible_api_version")
+
+	disputePayload := []byte(`{
+		"id":"evt_dispute_clover","object":"event","api_version":"2025-09-30.clover","created":1721304004,
+		"livemode":false,"type":"charge.dispute.closed","data":{"object":{
+			"id":"dp_clover_123","object":"dispute","amount":999,"currency":"usd","status":"lost",
+			"charge":"ch_clover_123","payment_intent":"pi_clover_123","metadata":{"trade_no":"PO_CLOVER_DISPUTE"}
+		}}
+	}`)
+	dispute := verify(t, disputePayload)
+	assert.True(t, dispute.ManualReview)
+	assert.False(t, dispute.Disputed)
+	assert.False(t, dispute.DisputeResolved)
+	assert.False(t, dispute.DisputeWon)
+	assert.Zero(t, dispute.DisputedAmountMinor)
+	assert.Equal(t, "stripe:pi_clover_123", dispute.ProviderPaymentKey)
+	assert.Equal(t, "stripe:dp_clover_123", dispute.ProviderResourceKey)
+	assert.Equal(t, "PO_CLOVER_DISPUTE", dispute.TradeNo)
+	assert.Equal(t, "api_version_manual_review", dispute.ProviderState)
+	assert.Contains(t, dispute.NormalizedPayload, "blocked_incompatible_api_version")
+}
+
+func TestStripeFinancialWebhookAPIVersionCompatibilityIsExplicit(t *testing.T) {
+	assert.True(t, stripeFinancialEventAPIVersionCompatible("2025-02-24.acacia"))
+	assert.True(t, stripeFinancialEventAPIVersionCompatible(stripe.APIVersion))
+	for _, version := range []string{
+		"", "2025-02-24", "not-a-date.acacia", "2025-06-30.basil",
+		"2025-09-30.clover", "2026-06-24.preview",
+	} {
+		assert.False(t, stripeFinancialEventAPIVersionCompatible(version), version)
+	}
 }
 
 func TestStripeWebhookRejectsExpiredSignatureTimestamp(t *testing.T) {

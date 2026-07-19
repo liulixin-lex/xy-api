@@ -109,6 +109,9 @@
 
 ### 使用 Docker Compose（推薦）
 
+> [!WARNING]
+> v0.2.0 僅支援從 v0.1.6 直接升級或全新安裝。請勿讓 v0.1.7-v0.1.14 部署直接切換到此映像。修改現有部署前，請先備份，並依照 [v0.2.0 發布與遷移說明](docs/releases/v0.2.0.md)操作。
+
 ```bash
 # 複製項目
 git clone https://github.com/liulixin-lex/xy-api.git
@@ -125,23 +128,23 @@ docker-compose up -d
 <summary><strong>使用 Docker 命令</strong></summary>
 
 ```bash
-# 拉取最新鏡像
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# 拉取 v0.2.0 映像
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # 使用 SQLite（預設）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 
-# 使用 MySQL
+# 使用 MySQL（將 mysql-host 替換為容器網路中的服務名稱或其他可達位址）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 提示：** `-v ./data:/data` 會將數據保存在當前目錄的 `data` 資料夾中，你也可以改為絕對路徑如 `-v /your/custom/path:/data`
@@ -195,7 +198,7 @@ docker run --name new-api -d --restart always \
 
 ### 💰 授權用量與成本管理
 
-- ✅ 合法授權場景下的內部儲值與額度分配（易支付、Stripe）
+- ✅ 合法授權場景下的內部儲值與額度分配（易支付、Stripe、XORPay）
 - ✅ 組織內按次、按量或快取命中成本核算
 - ✅ 支援 OpenAI、Azure、DeepSeek、Claude、Qwen 等模型的快取計費統計
 - ✅ 面向內部管理或企業客戶的靈活計費策略配置
@@ -295,7 +298,7 @@ docker run --name new-api -d --restart always \
 ## 🚢 部署
 
 > [!TIP]
-> **最新版 Docker 鏡像：** `ghcr.io/liulixin-lex/xy-api:latest`
+> **目前 v0.2 系列穩定 Docker 映像：** `ghcr.io/liulixin-lex/xy-api:v0.2.0`
 
 ### 📋 部署要求
 
@@ -362,17 +365,18 @@ docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 **使用 MySQL：**
 ```bash
+# 將 mysql-host 替換為容器網路中的 MySQL 服務名稱或其他可達位址
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 路徑說明：**
@@ -388,7 +392,7 @@ docker run --name new-api -d --restart always \
 2. 在應用商店搜尋 **New-API**
 3. 一鍵安裝
 
-📖 [圖文教學](./docs/BT.md)
+📖 [圖文教學](./docs/installation/BT.md)
 
 </details>
 

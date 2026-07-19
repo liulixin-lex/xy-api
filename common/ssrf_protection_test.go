@@ -15,15 +15,50 @@ func TestSSRFProtectionRejectsLiteralPrivateAndReservedIPs(t *testing.T) {
 	}
 
 	tests := []string{
+		"0.0.0.0",
+		"0.1.2.3",
 		"127.0.0.1",
 		"10.0.0.1",
+		"100.64.0.1",
 		"169.254.169.254",
+		"192.88.99.2",
+		"198.18.0.1",
+		"::",
+		"::1",
+		"::127.0.0.1",
+		"fe80::1",
 		"fc00::1",
+		"::ffff:0.0.0.0",
 		"::ffff:127.0.0.1",
+		"64:ff9b::7f00:1",
+		"64:ff9b:1::1",
+		"100:0:0:1::1",
+		"2002:7f00:1::",
+		"3fff::1",
+		"5f00::1",
 	}
 	for _, host := range tests {
 		t.Run(host, func(t *testing.T) {
 			require.Error(t, protection.ValidateNetworkTarget(host, 80))
+		})
+	}
+}
+
+func TestSSRFProtectionAllowsOrdinaryPublicIPs(t *testing.T) {
+	protection := &SSRFProtection{
+		AllowPrivateIp:   false,
+		DomainFilterMode: false,
+		IpFilterMode:     false,
+	}
+
+	for _, host := range []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"2001:4860:4860::8888",
+		"2606:4700:4700::1111",
+	} {
+		t.Run(host, func(t *testing.T) {
+			require.NoError(t, protection.ValidateNetworkTarget(host, 443))
 		})
 	}
 }
@@ -38,7 +73,7 @@ func TestSSRFProtectionAllowsPrivateIPWhenExplicitlyEnabled(t *testing.T) {
 	require.NoError(t, protection.ValidateNetworkTarget("10.0.0.1", 80))
 }
 
-func TestSSRFProtectionRejectsResolvedPrivateIP(t *testing.T) {
+func TestSSRFProtectionRejectsResolvedPrivateAndTransitionIPs(t *testing.T) {
 	protection := &SSRFProtection{
 		AllowPrivateIp:         false,
 		DomainFilterMode:       false,
@@ -47,7 +82,17 @@ func TestSSRFProtectionRejectsResolvedPrivateIP(t *testing.T) {
 	}
 
 	require.NoError(t, protection.ValidateNetworkTarget("example.com", 80))
-	require.Error(t, protection.ValidateResolvedIP("example.com", net.ParseIP("169.254.169.254")))
+	for _, rawIP := range []string{
+		"169.254.169.254",
+		"192.88.99.2",
+		"64:ff9b:1::1",
+		"2002:7f00:1::",
+		"5f00::1",
+	} {
+		t.Run(rawIP, func(t *testing.T) {
+			require.Error(t, protection.ValidateResolvedIP("example.com", net.ParseIP(rawIP)))
+		})
+	}
 }
 
 func TestNewSSRFProtectionFromFetchSettingParsesPortRanges(t *testing.T) {

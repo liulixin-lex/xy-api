@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	xorPayBaseURL          = "https://xorpay.com"
-	xorPayMaxResponseBytes = 128 << 10
-	xorPayDefaultExpiry    = int64(7200)
+	xorPayBaseURL              = "https://xorpay.com"
+	xorPayMaxResponseBytes     = 128 << 10
+	xorPayMaxWebhookBytes      = 64 << 10
+	xorPayMaxWebhookParameters = 32
+	xorPayDefaultExpiry        = int64(7200)
 )
 
 var xorPayAidPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -127,7 +129,7 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 		return nil, fmt.Errorf("%w: xorpay returned HTTP %d", ErrPaymentStateUnknown, response.StatusCode)
 	}
 	var result xorPayCreateResponse
-	if err := common.DecodeJson(io.LimitReader(response.Body, xorPayMaxResponseBytes), &result); err != nil {
+	if err := decodeXorPayResponse(response.Body, &result); err != nil {
 		return nil, fmt.Errorf("%w: invalid xorpay response", ErrPaymentStateUnknown)
 	}
 	if result.Status != "ok" {
@@ -182,12 +184,20 @@ func (*xorPayProvider) VerifyWebhook(request *http.Request) (*NormalizedPaymentE
 	if !currentConfigured && !setting.XorPayPreviousCredentialActive() {
 		return nil, errors.New("xorpay webhook is not configured")
 	}
+	if len(request.URL.RawQuery) > xorPayMaxWebhookBytes ||
+		request.ContentLength > xorPayMaxWebhookBytes {
+		return nil, errors.New("xorpay callback is too large")
+	}
+	request.Body = http.MaxBytesReader(nil, request.Body, xorPayMaxWebhookBytes)
 	if err := request.ParseForm(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid xorpay callback form: %w", err)
+	}
+	if len(request.Form) > xorPayMaxWebhookParameters {
+		return nil, errors.New("xorpay callback contains too many parameters")
 	}
 	params := make(map[string]string, len(request.PostForm))
 	for key, values := range request.PostForm {
-		if len(values) != 1 || len(values[0]) > 2048 {
+		if key == "" || len(key) > 64 || len(values) != 1 {
 			return nil, fmt.Errorf("invalid xorpay parameter: %s", key)
 		}
 		params[key] = values[0]
@@ -200,7 +210,7 @@ func (*xorPayProvider) VerifyWebhook(request *http.Request) (*NormalizedPaymentE
 	if aoid == "" || tradeNo == "" || price == "" || payTime == "" || sign == "" {
 		return nil, errors.New("xorpay callback is missing required fields")
 	}
-	if !xorPayAidPattern.MatchString(aoid) || len(tradeNo) > 128 || len(price) > 64 || len(payTime) > 64 {
+	if !xorPayAidPattern.MatchString(aoid) || len(tradeNo) > 128 || len(price) > 64 || len(payTime) > 64 || len(sign) != md5.Size*2 {
 		return nil, errors.New("xorpay callback contains invalid identifiers")
 	}
 	scope, err := resolvePaymentCredentialScope(model.PaymentProviderXorPay, tradeNo)
@@ -393,7 +403,7 @@ func (p *xorPayProvider) queryStatus(ctx context.Context, endpoint string) (stri
 		return "", fmt.Errorf("xorpay query returned HTTP %d", response.StatusCode)
 	}
 	var result xorPayQueryResponse
-	if err := common.DecodeJson(io.LimitReader(response.Body, xorPayMaxResponseBytes), &result); err != nil {
+	if err := decodeXorPayResponse(response.Body, &result); err != nil {
 		return "", errors.New("invalid xorpay query response")
 	}
 	switch result.Status {
@@ -402,6 +412,17 @@ func (p *xorPayProvider) queryStatus(ctx context.Context, endpoint string) (stri
 	default:
 		return "", fmt.Errorf("unknown xorpay query status: %s", result.Status)
 	}
+}
+
+func decodeXorPayResponse(body io.Reader, target any) error {
+	payload, err := io.ReadAll(io.LimitReader(body, xorPayMaxResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(payload) > xorPayMaxResponseBytes {
+		return errors.New("xorpay response exceeds size limit")
+	}
+	return common.Unmarshal(payload, target)
 }
 
 func newXorPayHTTPClient() *http.Client {

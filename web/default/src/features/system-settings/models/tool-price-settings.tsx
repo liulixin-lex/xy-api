@@ -16,16 +16,23 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { Code2, Copy, Eye, Plus, Trash2 } from 'lucide-react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+
+import { StaticDataTable } from '@/components/data-table'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { StaticDataTable } from '@/components/data-table'
+
 import { useUpdateOption } from '../hooks/use-update-option'
+import {
+  isFiniteNonNegativeNumber,
+  isFiniteNonNegativeNumberMap,
+  parseFiniteNonNegativeNumber,
+} from './pricing-map-validation'
 
 const OPTION_KEY = 'tool_price_setting.prices'
 
@@ -51,7 +58,7 @@ function rowsToObject(rows: ToolPriceRow[]): Record<string, number> {
   for (const row of rows) {
     const k = row.key.trim()
     if (!k) continue
-    prices[k] = Number(row.price) || 0
+    prices[k] = isFiniteNonNegativeNumber(row.price) ? row.price : 0
   }
   return prices
 }
@@ -74,7 +81,8 @@ function parseInitialPrices(
       parsed &&
       typeof parsed === 'object' &&
       !Array.isArray(parsed) &&
-      Object.keys(parsed as object).length > 0
+      Object.keys(parsed as object).length > 0 &&
+      isFiniteNonNegativeNumberMap(parsed)
     ) {
       return parsed as Record<string, number>
     }
@@ -123,6 +131,12 @@ export const ToolPriceSettings = memo(function ToolPriceSettings({
         const parsed = JSON.parse(text) as unknown
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
           setJsonError(t('JSON must be an object'))
+          return
+        }
+        if (!isFiniteNonNegativeNumberMap(parsed)) {
+          setJsonError(
+            t('Every price or ratio must be a finite, non-negative number.')
+          )
           return
         }
         const nextRows = objectToRows(parsed as Record<string, number>)
@@ -280,9 +294,14 @@ export const ToolPriceSettings = memo(function ToolPriceSettings({
                   min={0}
                   step={0.5}
                   value={row.price}
-                  onChange={(e) =>
-                    updateRow(row.id, 'price', Number(e.target.value) || 0)
-                  }
+                  onChange={(event) => {
+                    const nextPrice = parseFiniteNonNegativeNumber(
+                      event.target.value
+                    )
+                    if (nextPrice !== null) {
+                      updateRow(row.id, 'price', nextPrice)
+                    }
+                  }}
                 />
               ),
             },
@@ -312,8 +331,18 @@ export const ToolPriceSettings = memo(function ToolPriceSettings({
             className='font-mono text-sm'
             rows={12}
             spellCheck={false}
+            aria-invalid={!!jsonError || undefined}
+            aria-describedby={jsonError ? 'tool-price-json-error' : undefined}
           />
-          {jsonError && <p className='text-destructive text-sm'>{jsonError}</p>}
+          {jsonError && (
+            <p
+              id='tool-price-json-error'
+              role='alert'
+              className='text-destructive text-sm'
+            >
+              {jsonError}
+            </p>
+          )}
         </div>
       )}
 

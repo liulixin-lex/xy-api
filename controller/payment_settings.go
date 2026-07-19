@@ -36,8 +36,8 @@ type paymentSettingsUpdateRequest struct {
 const (
 	maxPaymentSettingsRequestBytes                  int64 = 1 << 20
 	stripeWebhookSecretOverlap                            = setting.StripeWebhookSecretOverlap
-	epayCredentialOverlap                                 = 24 * time.Hour
-	xorPayCredentialOverlap                               = 24 * time.Hour
+	epayCredentialOverlap                                 = model.PaymentCallbackRecoveryWindow + 3*time.Hour
+	xorPayCredentialOverlap                               = model.PaymentCallbackRecoveryWindow + 25*time.Hour
 	paymentEpayPreviousCredentialActiveOptionKey          = "payment_setting.epay_previous_credential_active"
 	paymentStripePreviousCredentialActiveOptionKey        = "payment_setting.stripe_previous_credential_active"
 	paymentStripeTestModeEnabledOptionKey                 = "payment_setting.stripe_test_mode_enabled"
@@ -344,6 +344,12 @@ func validateStripeSandboxSettingsMutation(values map[string]string, credentialM
 
 func paymentConfigurationPreconditions(values map[string]string, emergencyRevocations map[string]bool) *model.PaymentConfigurationPreconditions {
 	preconditions := &model.PaymentConfigurationPreconditions{}
+	nextStripeAPISecret, stripeAPISecretSupplied := values["StripeApiSecret"]
+	stripeEmergencyAPIClear := emergencyRevocations[model.PaymentProviderStripe] && stripeAPISecretSupplied &&
+		strings.TrimSpace(nextStripeAPISecret) == "" && strings.TrimSpace(setting.StripeApiSecret) != ""
+	if next, exists := values["CustomCallbackAddress"]; exists && next != operation_setting.CustomCallbackAddress {
+		preconditions.RequireNoCallbackDependentOrders = true
+	}
 	if next, exists := values["PayAddress"]; exists && next != operation_setting.PayAddress &&
 		!epayEmergencyMigrationReplacesCurrent(values, emergencyRevocations) {
 		preconditions.RequireNoActiveEpayOrders = true
@@ -362,7 +368,12 @@ func paymentConfigurationPreconditions(values map[string]string, emergencyRevoca
 		}
 	}
 	if next, changingSecret := values["StripeApiSecret"]; changingSecret && next != setting.StripeApiSecret &&
+		!stripeEmergencyAPIClear &&
 		(strings.TrimSpace(setting.StripeCredentialAccountId) == "" || strings.TrimSpace(setting.StripeCredentialLivemode) == "") {
+		preconditions.RequireNoStripeHistory = true
+	}
+	if next, exists := values["StripeApiSecret"]; exists && strings.TrimSpace(next) == "" &&
+		strings.TrimSpace(setting.StripeApiSecret) != "" && !stripeEmergencyAPIClear {
 		preconditions.RequireNoStripeHistory = true
 	}
 	if next, exists := values["StripeWebhookSecret"]; exists && next != setting.StripeWebhookSecret && setting.StripeWebhookSecret != "" &&
@@ -602,6 +613,30 @@ func preparePaymentCredentialRotations(values map[string]string, revokePrevious 
 
 func validateInFlightPaymentConfigurationChanges(values map[string]string, emergencyRevocations map[string]bool) error {
 	activeStatuses := []string{model.PaymentOrderStatusPending, model.PaymentOrderStatusProcessing, model.PaymentOrderStatusManualReview}
+	nextStripeAPISecret, stripeAPISecretSupplied := values["StripeApiSecret"]
+	stripeEmergencyAPIClear := emergencyRevocations[model.PaymentProviderStripe] && stripeAPISecretSupplied &&
+		strings.TrimSpace(nextStripeAPISecret) == "" && strings.TrimSpace(setting.StripeApiSecret) != ""
+	if next, exists := values["CustomCallbackAddress"]; exists && next != operation_setting.CustomCallbackAddress {
+		for _, provider := range []string{model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderXorPay} {
+			count, err := model.CountPaymentOrdersDependingOnCallbackOrigin(provider, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			if count > 0 {
+				return fmt.Errorf("CustomCallbackAddress cannot be changed while %s payment orders still depend on the current callback origin", provider)
+			}
+		}
+	}
+	if next, exists := values["StripeApiSecret"]; exists && strings.TrimSpace(next) == "" &&
+		strings.TrimSpace(setting.StripeApiSecret) != "" && !stripeEmergencyAPIClear {
+		hasHistory, err := model.HasStripeAccountBoundData()
+		if err != nil {
+			return err
+		}
+		if hasHistory {
+			return errors.New("StripeApiSecret cannot be cleared while durable Stripe data exists; rotate to a verified credential for the same account or use the emergency credential revocation flow with a reason")
+		}
+	}
 	if next, exists := values["StripeWebhookSecret"]; exists && next == "" && setting.StripeWebhookSecret != "" &&
 		!emergencyRevocations[model.PaymentProviderStripe] {
 		hasHistory, err := model.HasStripeAccountBoundData()
@@ -613,6 +648,7 @@ func validateInFlightPaymentConfigurationChanges(values map[string]string, emerg
 		}
 	}
 	if nextSecret, changingSecret := values["StripeApiSecret"]; changingSecret && nextSecret != setting.StripeApiSecret &&
+		!stripeEmergencyAPIClear &&
 		(strings.TrimSpace(setting.StripeCredentialAccountId) == "" || strings.TrimSpace(setting.StripeCredentialLivemode) == "") {
 		hasHistory, err := model.HasStripeAccountBoundData()
 		if err != nil {

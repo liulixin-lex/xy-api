@@ -35,12 +35,10 @@ import { Button, Tooltip, Toast } from '@douyinfe/semi-ui';
 import { copy, rehypeSplitWordsIntoSpans } from '../../../helpers';
 import { IconCopy } from '@douyinfe/semi-icons';
 import { useTranslation } from 'react-i18next';
+import { MERMAID_CONFIG } from './mermaid-config';
+import { HTML_PREVIEW_SANDBOX } from './markdown-security';
 
-mermaid.initialize({
-  startOnLoad: false,
-  theme: 'default',
-  securityLevel: 'loose',
-});
+mermaid.initialize(MERMAID_CONFIG);
 
 export function Mermaid(props) {
   const ref = useRef(null);
@@ -66,7 +64,8 @@ export function Mermaid(props) {
     const text = new XMLSerializer().serializeToString(svg);
     const blob = new Blob([text], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
-    window.open(url, '_blank');
+    window.open(url, '_blank', 'noopener,noreferrer');
+    window.setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   if (hasError) {
@@ -121,7 +120,7 @@ function SandboxedHtmlPreview({ code }) {
   return (
     <iframe
       ref={iframeRef}
-      sandbox='allow-same-origin'
+      sandbox={HTML_PREVIEW_SANDBOX}
       srcDoc={code}
       title='HTML Preview'
       style={{

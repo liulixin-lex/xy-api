@@ -109,6 +109,9 @@
 
 ### Docker Composeを使用（推奨）
 
+> [!WARNING]
+> v0.2.0 への直接アップグレードは、v0.1.6 または新規インストールからのみサポートされます。v0.1.7-v0.1.14 の環境でこのイメージへ直接切り替えないでください。既存環境を変更する前にバックアップを取得し、[v0.2.0 リリースおよび移行ガイド](docs/releases/v0.2.0.md)に従ってください。
+
 ```bash
 # プロジェクトをクローン
 git clone https://github.com/liulixin-lex/xy-api.git
@@ -125,23 +128,23 @@ docker-compose up -d
 <summary><strong>Dockerコマンドを使用</strong></summary>
 
 ```bash
-# 最新のイメージをプル
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# v0.2.0 イメージをプル
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # SQLiteを使用（デフォルト）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 
-# MySQLを使用
+# MySQLを使用（mysql-host はコンテナネットワーク上のサービス名または到達可能なアドレスに置き換えてください）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 ヒント:** `-v ./data:/data` は現在のディレクトリの `data` フォルダにデータを保存します。絶対パスに変更することもできます：`-v /your/custom/path:/data`
@@ -195,7 +198,7 @@ docker run --name new-api -d --restart always \
 
 ### 💰 認可済み利用量とコスト管理
 
-- ✅ 合法的に許可されたシナリオでの内部チャージとクォータ割り当て（EPay、Stripe）
+- ✅ 合法的に許可されたシナリオでの内部チャージとクォータ割り当て（EPay、Stripe、XORPay）
 - ✅ 組織レベルのリクエスト単位、使用量ベース、キャッシュヒットのコスト会計
 - ✅ OpenAI、Azure、DeepSeek、Claude、Qwen などのモデルのキャッシュ課金統計
 - ✅ 内部管理または認可済み企業顧客向けの柔軟な課金ポリシー
@@ -297,7 +300,7 @@ docker run --name new-api -d --restart always \
 ## 🚢 デプロイ
 
 > [!TIP]
-> **最新のDockerイメージ:** `ghcr.io/liulixin-lex/xy-api:latest`
+> **現在の v0.2 系安定版 Docker イメージ:** `ghcr.io/liulixin-lex/xy-api:v0.2.0`
 
 ### 📋 デプロイ要件
 
@@ -364,17 +367,18 @@ docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 **MySQLを使用:**
 ```bash
+# mysql-host はコンテナネットワーク上の MySQL サービス名または到達可能なアドレスに置き換えてください
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 パス説明:**
@@ -388,7 +392,7 @@ docker run --name new-api -d --restart always \
 
 1. 宝塔パネル（**9.2.0バージョン**以上）をインストールし、アプリケーションストアで**New-API**を検索してインストールします。
 
-📖 [画像付きチュートリアル](./docs/BT.md)
+📖 [画像付きチュートリアル](./docs/installation/BT.md)
 
 </details>
 

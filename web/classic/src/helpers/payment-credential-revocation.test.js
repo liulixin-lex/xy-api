@@ -22,6 +22,7 @@ import { describe, test } from 'node:test';
 
 import {
   buildEmergencyCredentialReplacement,
+  getEmergencyCredentialClearSecrets,
   isEmergencyCredentialRevocationReasonValid,
   normalizeEmergencyCredentialRevocationReason,
   resolveEmergencyCredentialRevocationMode,
@@ -126,6 +127,15 @@ describe('classic emergency credential replacement', () => {
       resolveEmergencyCredentialRevocationMode('stripe', 'none', false),
       'stripe_disable',
     );
+  });
+
+  test('only full Stripe shutdown clears the API credential', () => {
+    assert.deepEqual(getEmergencyCredentialClearSecrets('stripe_disable_all'), [
+      'StripeApiSecret',
+    ]);
+    assert.deepEqual(getEmergencyCredentialClearSecrets('stripe_disable'), []);
+    assert.deepEqual(getEmergencyCredentialClearSecrets('replace'), []);
+    assert.deepEqual(getEmergencyCredentialClearSecrets('revoke_previous'), []);
   });
 
   test('normalizes and validates the required audit reason boundaries', () => {

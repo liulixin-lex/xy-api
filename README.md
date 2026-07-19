@@ -112,6 +112,9 @@
 
 ### Using Docker Compose (Recommended)
 
+> [!WARNING]
+> Direct upgrade to v0.2.0 is supported only from v0.1.6 or a clean installation. Do not switch a v0.1.7-v0.1.14 deployment directly to this image. Back up first and follow the [v0.2.0 release and migration guide](docs/releases/v0.2.0.md) before changing an existing deployment.
+
 ```bash
 # Clone the project
 git clone https://github.com/liulixin-lex/xy-api.git
@@ -128,23 +131,23 @@ docker-compose up -d
 <summary><strong>Using Docker Commands</strong></summary>
 
 ```bash
-# Pull the latest image
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# Pull the v0.2.0 image
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # Using SQLite (default)
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 
-# Using MySQL
+# Using MySQL (replace mysql-host with a service name on the container network or another reachable address)
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 Tip:** `-v ./data:/data` will save data in the `data` folder of the current directory, you can also change it to an absolute path like `-v /your/custom/path:/data`
@@ -299,7 +302,7 @@ docker run --name new-api -d --restart always \
 ## 🚢 Deployment
 
 > [!TIP]
-> **Latest Docker image:** `ghcr.io/liulixin-lex/xy-api:latest`
+> **Current v0.2 stable Docker image:** `ghcr.io/liulixin-lex/xy-api:v0.2.0`
 
 ### 📋 Deployment Requirements
 
@@ -380,17 +383,18 @@ docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 **Using MySQL:**
 ```bash
+# Replace mysql-host with the MySQL service name on the container network or another reachable address
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 Path explanation:**
@@ -406,7 +410,7 @@ docker run --name new-api -d --restart always \
 2. Search for **New-API** in the application store
 3. One-click installation
 
-📖 [Tutorial with images](./docs/BT.md)
+📖 [Tutorial with images](./docs/installation/BT.md)
 
 </details>
 

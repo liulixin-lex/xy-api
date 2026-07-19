@@ -112,6 +112,9 @@
 
 ### 使用 Docker Compose（推荐）
 
+> [!WARNING]
+> v0.2.0 仅支持从 v0.1.6 直接升级或全新安装。不要让 v0.1.7-v0.1.14 部署直接切换到此镜像。修改现有部署前，请先备份，并按 [v0.2.0 发布与迁移说明](docs/releases/v0.2.0.md)操作。
+
 ```bash
 # 克隆项目
 git clone https://github.com/liulixin-lex/xy-api.git
@@ -128,23 +131,23 @@ docker-compose up -d
 <summary><strong>使用 Docker 命令</strong></summary>
 
 ```bash
-# 拉取最新镜像
-docker pull ghcr.io/liulixin-lex/xy-api:latest
+# 拉取 v0.2.0 镜像
+docker pull ghcr.io/liulixin-lex/xy-api:v0.2.0
 
 # 使用 SQLite（默认）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 
-# 使用 MySQL
+# 使用 MySQL（将 mysql-host 替换为容器网络中的服务名或其它可达地址）
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 提示：** `-v ./data:/data` 会将数据保存在当前目录的 `data` 文件夹中，你也可以改为绝对路径如 `-v /your/custom/path:/data`
@@ -299,7 +302,7 @@ docker run --name new-api -d --restart always \
 ## 🚢 部署
 
 > [!TIP]
-> **最新版 Docker 镜像：** `ghcr.io/liulixin-lex/xy-api:latest`
+> **当前 v0.2 系列稳定 Docker 镜像：** `ghcr.io/liulixin-lex/xy-api:v0.2.0`
 
 ### 📋 部署要求
 
@@ -379,17 +382,18 @@ docker run --name new-api -d --restart always \
   -p 3000:3000 \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 **使用 MySQL：**
 ```bash
+# 将 mysql-host 替换为容器网络中的 MySQL 服务名或其它可达地址
 docker run --name new-api -d --restart always \
   -p 3000:3000 \
-  -e SQL_DSN="root:123456@tcp(localhost:3306)/oneapi" \
+  -e SQL_DSN="root:123456@tcp(mysql-host:3306)/oneapi" \
   -e TZ=Asia/Shanghai \
   -v ./data:/data \
-  ghcr.io/liulixin-lex/xy-api:latest
+  ghcr.io/liulixin-lex/xy-api:v0.2.0
 ```
 
 > **💡 路径说明：**
