@@ -177,9 +177,9 @@ jobs:
             --collation-server=gbk_chinese_ci
           for attempt in $(seq 1 90); do
             if docker exec new-api-mysql57 sh -c \
-              'mysqladmin ping --silent -uroot -p"$MYSQL_ROOT_PASSWORD"' && \
+              'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --skip-column-names -e "SELECT 1" >/dev/null 2>&1' && \
               docker exec new-api-mysql57-gbk8 sh -c \
-              'mysqladmin ping --silent -uroot -p"$MYSQL_ROOT_PASSWORD"'; then
+              'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --skip-column-names -e "SELECT 1" >/dev/null 2>&1'; then
               break
             fi
             if [ "$attempt" -eq 90 ]; then
