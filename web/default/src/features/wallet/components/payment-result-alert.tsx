@@ -154,15 +154,17 @@ export function PaymentResultAlert(props: PaymentResultAlertProps) {
             {t('History')}
           </Button>
         )}
-        <Button
-          type='button'
-          size='icon-sm'
-          variant='ghost'
-          aria-label={t('Dismiss')}
-          onClick={props.onDismiss}
-        >
-          <X className='h-4 w-4' />
-        </Button>
+        {!pending && (
+          <Button
+            type='button'
+            size='icon-sm'
+            variant='ghost'
+            aria-label={t('Dismiss')}
+            onClick={props.onDismiss}
+          >
+            <X className='h-4 w-4' />
+          </Button>
+        )}
       </div>
     </Alert>
   )

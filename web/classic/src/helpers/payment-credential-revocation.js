@@ -61,6 +61,9 @@ export const resolveEmergencyCredentialRevocationMode = (
   return previousCredentialActive ? 'revoke_previous' : null;
 };
 
+export const getEmergencyCredentialClearSecrets = (mode) =>
+  mode === 'stripe_disable_all' ? ['StripeApiSecret'] : [];
+
 export const normalizeEmergencyCredentialRevocationReason = (reason) =>
   (reason || '').trim();
 

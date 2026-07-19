@@ -100,28 +100,38 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 	if err != nil {
 		return 0, err
 	}
-	if config.Width == 0 || config.Height == 0 {
-		// not an image, but might be a valid file
-		if format != "" {
-			// file type
-			return 3 * baseTokens, nil
-		}
-		return 0, errors.New(fmt.Sprintf("fail to decode image config: %s", fileMeta.GetIdentifier()))
-	}
-
 	width := config.Width
 	height := config.Height
+	if width == 0 || height == 0 {
+		// Preserve the existing fallback for a valid decoded file whose format is
+		// known but whose image dimensions are unavailable.
+		if format != "" {
+			return 3 * baseTokens, nil
+		}
+		return 0, fmt.Errorf("fail to decode image config: %s", fileMeta.GetIdentifier())
+	}
+	if width < 0 || height < 0 {
+		return 0, fmt.Errorf("invalid image dimensions: width=%d, height=%d", width, height)
+	}
 	logger.LogDebug(c, "image token input: format=%s, width=%d, height=%d", format, width, height)
 
 	if isPatchBased {
 		// 32x32 patch-based calculation with 1536 cap and model multiplier
-		ceilDiv := func(a, b int) int { return (a + b - 1) / b }
-		rawPatchesW := ceilDiv(width, 32)
-		rawPatchesH := ceilDiv(height, 32)
-		rawPatches := rawPatchesW * rawPatchesH
-		if rawPatches > 1536 {
+		const (
+			patchSize  uint64 = 32
+			maxPatches uint64 = 1536
+		)
+		rawPatchesW := (uint64(width) + patchSize - 1) / patchSize
+		rawPatchesH := (uint64(height) + patchSize - 1) / patchSize
+		patchesExceedCap := rawPatchesW > maxPatches ||
+			rawPatchesH > maxPatches ||
+			rawPatchesW > maxPatches/rawPatchesH
+		if patchesExceedCap {
 			// scale down
-			area := float64(width * height)
+			area := float64(width) * float64(height)
+			if area <= 0 || math.IsNaN(area) || math.IsInf(area, 0) {
+				return 0, fmt.Errorf("invalid image area: width=%d, height=%d", width, height)
+			}
 			r := math.Sqrt(float64(32*32*1536) / area)
 			wScaled := float64(width) * r
 			hScaled := float64(height) * r
@@ -136,44 +146,72 @@ func getImageToken(c *gin.Context, fileMeta *types.FileMeta, model string, strea
 			hScaled = float64(height) * r
 			patchesW := math.Ceil(wScaled / 32.0)
 			patchesH := math.Ceil(hScaled / 32.0)
-			imageTokens := int(patchesW * patchesH)
-			if imageTokens > 1536 {
-				imageTokens = 1536
+			scaledPatches := patchesW * patchesH
+			if scaledPatches <= 0 || math.IsNaN(scaledPatches) || math.IsInf(scaledPatches, 0) {
+				return 0, fmt.Errorf("invalid scaled image patch count: width=%d, height=%d", width, height)
 			}
-			return int(math.Round(float64(imageTokens) * multiplier)), nil
+			imageTokens := int(maxPatches)
+			if scaledPatches < float64(maxPatches) {
+				imageTokens = common.QuotaFromFloat(scaledPatches)
+			}
+			return common.QuotaRound(float64(imageTokens) * multiplier), nil
 		}
 		// below cap
-		imageTokens := rawPatches
-		return int(math.Round(float64(imageTokens) * multiplier)), nil
+		imageTokens := int(rawPatchesW * rawPatchesH)
+		return common.QuotaRound(float64(imageTokens) * multiplier), nil
 	}
 
 	// Tile-based calculation for 4o/4.1/4.5/o1/o3/etc.
 	// Step 1: fit within 2048x2048 square
+	const (
+		maxFitDimension      = 2048
+		targetShortDimension = 768
+		tileSize             = 512
+		maxFinalDimension    = maxFitDimension * targetShortDimension
+		maxTileCount         = ((maxFinalDimension + tileSize - 1) / tileSize) *
+			((targetShortDimension + tileSize - 1) / tileSize)
+	)
 	maxSide := math.Max(float64(width), float64(height))
 	fitScale := 1.0
-	if maxSide > 2048 {
-		fitScale = maxSide / 2048.0
+	if maxSide > maxFitDimension {
+		fitScale = maxSide / maxFitDimension
 	}
-	fitW := int(math.Round(float64(width) / fitScale))
-	fitH := int(math.Round(float64(height) / fitScale))
+	fitW := common.QuotaRound(float64(width) / fitScale)
+	fitH := common.QuotaRound(float64(height) / fitScale)
+	if fitW < 1 {
+		fitW = 1
+	} else if fitW > maxFitDimension {
+		fitW = maxFitDimension
+	}
+	if fitH < 1 {
+		fitH = 1
+	} else if fitH > maxFitDimension {
+		fitH = maxFitDimension
+	}
 
 	// Step 2: scale so that shortest side is exactly 768
 	minSide := math.Min(float64(fitW), float64(fitH))
-	if minSide == 0 {
-		return baseTokens, nil
+	shortScale := targetShortDimension / minSide
+	finalW := common.QuotaRound(float64(fitW) * shortScale)
+	finalH := common.QuotaRound(float64(fitH) * shortScale)
+	if finalW <= 0 || finalH <= 0 || finalW > maxFinalDimension || finalH > maxFinalDimension {
+		return 0, fmt.Errorf("invalid scaled image dimensions: width=%d, height=%d", finalW, finalH)
 	}
-	shortScale := 768.0 / minSide
-	finalW := int(math.Round(float64(fitW) * shortScale))
-	finalH := int(math.Round(float64(fitH) * shortScale))
 
 	// Count 512px tiles
-	tilesW := (finalW + 512 - 1) / 512
-	tilesH := (finalH + 512 - 1) / 512
+	tilesW := (uint64(finalW) + tileSize - 1) / tileSize
+	tilesH := (uint64(finalH) + tileSize - 1) / tileSize
+	if tilesW > maxTileCount || tilesH > maxTileCount || tilesW > uint64(maxTileCount)/tilesH {
+		return 0, fmt.Errorf("invalid image tile count: width=%d, height=%d", tilesW, tilesH)
+	}
 	tiles := tilesW * tilesH
+	if tiles > maxTileCount {
+		return 0, fmt.Errorf("image tile count exceeds limit: %d", tiles)
+	}
 
 	logger.LogDebug(c, "image token scaled size: width=%d, height=%d, tiles=%d", finalW, finalH, tiles)
 
-	return tiles*tileTokens + baseTokens, nil
+	return common.QuotaFromFloat(float64(tiles)*float64(tileTokens) + float64(baseTokens)), nil
 }
 
 func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *relaycommon.RelayInfo) (int, error) {

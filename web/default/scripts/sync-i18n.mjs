@@ -22,6 +22,7 @@ import path from 'node:path'
 // This script is executed from the web/ package root (see package.json script).
 const LOCALES_DIR = path.resolve('src/i18n/locales')
 const FALLBACK_COMPARE_LOCALE = 'en' // used for "still English" detection only
+const UNTRANSLATED_SCAN_LOCALES = new Set(['fr', 'ja', 'ru', 'vi', 'zh'])
 const OBFUSCATED_KEYS = [
   {
     runtime: ['footer', 'new' + 'api', 'projectAttributionSuffix'].join('.'),
@@ -242,8 +243,9 @@ function isLikelyUntranslated({ locale, baseValue, value }) {
   if (locale === 'ru') return true
 
   // For fr/vi: still useful but noisier; keep it conservative.
-  if (locale === 'fr' || locale === 'vi')
+  if (locale === 'fr' || locale === 'vi') {
     return /\b(the|and|or|to|with|please)\b/i.test(s)
+  }
 
   return false
 }
@@ -299,15 +301,23 @@ async function main() {
     const missing = []
     const fixed = reorderLikeBase(baseJson, json, compareJson, extras, missing)
 
-    // Untranslated scan (translation namespace only)
+    // Untranslated scan (translation namespace only). zh-TW has acknowledged
+    // historical English copy outside the new payment flows. Until that debt
+    // is remediated in a dedicated translation pass, report it as not evaluated
+    // instead of returning a misleading zero from an unsupported heuristic.
     const untranslated = {}
     const compareTrans = compareJson?.translation ?? {}
     const trans = fixed?.translation ?? {}
+    let untranslatedScanStatus = 'not-evaluated'
+    if (locale === FALLBACK_COMPARE_LOCALE || locale === baseLocale) {
+      untranslatedScanStatus = 'not-applicable'
+    } else if (UNTRANSLATED_SCAN_LOCALES.has(locale)) {
+      untranslatedScanStatus = 'evaluated'
+    }
     if (
       isPlainObject(compareTrans) &&
       isPlainObject(trans) &&
-      locale !== FALLBACK_COMPARE_LOCALE &&
-      locale !== baseLocale
+      untranslatedScanStatus === 'evaluated'
     ) {
       for (const k of Object.keys(compareTrans)) {
         const baseValue = compareTrans[k]
@@ -322,7 +332,11 @@ async function main() {
       file: filename,
       missingCount: missing.length,
       extrasCount: Object.keys(extras).length,
-      untranslatedCount: Object.keys(untranslated).length,
+      untranslatedScanStatus,
+      untranslatedCount:
+        untranslatedScanStatus === 'evaluated'
+          ? Object.keys(untranslated).length
+          : null,
     }
 
     if (Object.keys(extras).length > 0) {

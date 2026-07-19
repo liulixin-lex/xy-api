@@ -1,10 +1,12 @@
 package operation_setting
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"sync/atomic"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/config"
 )
 
@@ -56,6 +58,10 @@ func init() {
 	RebuildToolPriceIndex()
 }
 
+func ValidateToolPricesByJSONString(jsonStr string) error {
+	return common.ValidateFiniteNonNegativeFloatMapJSON(jsonStr)
+}
+
 // ---------------------------------------------------------------------------
 // Precomputed price index (atomic, lock-free on read path)
 // ---------------------------------------------------------------------------
@@ -83,6 +89,10 @@ func RebuildToolPriceIndex() {
 		merged[k] = v
 	}
 	for k, v := range toolPriceSetting.Prices {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			common.SysError("invalid tool price ignored while rebuilding index: " + k)
+			continue
+		}
 		merged[k] = v
 	}
 

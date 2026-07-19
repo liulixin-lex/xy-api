@@ -31,7 +31,9 @@ The following areas are frozen during that phase:
 
 ## Compatibility Rules
 
-1. The existing `v0.1.6` tag, release assets, and published images are immutable.
+1. The existing `v0.1.6` tag, release assets, and published images are the
+   preservation baseline and must remain unchanged. The tag is repository-rule
+   protected; historical asset checksums and image digests must be retained.
 2. Changes from `v0.1.7` through `v0.1.14` must not be merged wholesale.
 3. A later non-routing fix may be ported only after its dependencies and runtime
    impact are reviewed independently.
@@ -48,17 +50,55 @@ The following areas are frozen during that phase:
 A stable release requires all of the following:
 
 - Backend tests and both frontend builds pass from a clean checkout.
-- amd64 and arm64 images build and pass startup smoke tests.
+- amd64 and arm64 images build and pass startup smoke tests; both standalone
+  Linux binaries execute version checks and runtime acceptance on native
+  architecture runners.
 - `/api/status`, login, token creation, model listing, normal relay, streaming,
-  quota charging, recharge, and subscription flows are verified.
+  quota charging, and no-charge top-up, payment, and subscription
+  read/fail-closed probes are verified.
 - SQLite, MySQL, PostgreSQL, Redis-enabled, and Redis-disabled startup paths are
   verified using the `v0.1.6` schema contract.
 - Release notes describe compatibility, backup requirements, upgrade scope,
   rollback boundaries, and known limitations.
 - No stable tag, release asset, or image tag is overwritten.
+- GitHub Immutable Releases is enabled before a stable tag is created, and a
+  public release is treated as an irreversible publication boundary.
 
-## Pending Verification
+## v0.2.0 Verification Baseline
 
-- Production-data-copy verification has not yet been performed for `v0.2.0`.
-- A stable `v0.2.0` release must not be published until the acceptance checks
-  above are complete.
+The pre-release data and runtime rehearsal completed on 2026-07-19:
+
+- A verified `v0.1.6` PostgreSQL 15 production backup was restored into an
+  isolated database and migrated by `v0.2.0` without touching the source
+  installation. The table set expanded additively from 35 to 50, the selected
+  core-data digest remained identical, and user, option, setup, token, log,
+  channel, top-up, redemption, and subscription row counts were preserved.
+- The restored PostgreSQL copy passed repeated startup and two-node concurrent
+  startup with Redis enabled. The original `v0.1.6` application, PostgreSQL,
+  and Redis services remained healthy after the rehearsal.
+- Independent `v0.1.6` upgrade fixtures passed on SQLite, MySQL 5.7.44, and
+  PostgreSQL 9.6. Their selected core-data digests remained unchanged and all
+  15 canonical payment and billing tables were added on each dialect.
+- The versioned `v0.2.0` runtime passed initialization, login, token creation,
+  model listing, normal relay, streaming relay, exact quota/log reconciliation,
+  safe recharge probes, and subscription fail-closed checks on clean SQLite and
+  on all three upgraded database fixtures. Redis-enabled and Redis-disabled
+  paths were both exercised.
+
+Publication remains conditional on the tag-triggered release workflow. It must
+still pass the clean backend test and race suites, blocking vet and frontend
+checks, native amd64/arm64 image startup, complete binary and Electron asset
+checksums, multi-architecture manifest inspection, and Sigstore verification
+before it can make the GitHub Release public. The workflow publishes the exact
+`v0.2.0` container tag and digest, but leaves the global container `latest`
+alias on the prior line while v0.1.7-v0.1.14 direct upgrades are unsupported.
+Real merchant charges remain explicitly outside this release's asserted
+verification scope.
+
+The repository Compose baseline requires the operator to provide the verified
+v0.2.0 GHCR digest and independent strong database, Redis, session, crypto, and
+payment secrets. Its active helper images are digest-pinned and its preflight
+container rejects weak, placeholder, reused, or invalid rotation keys before
+data services start.
+Run-scoped registry candidate references are release intermediates only; the
+immutable Release manifest digest remains the deployment authority.

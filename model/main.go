@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -340,6 +341,19 @@ func migrateDB() error {
 }
 
 func migrateDBOn(db *gorm.DB) error {
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		var err error
+		db, err = prepareMySQLMigrationDB(db, 700, []string{
+			"subscription_orders",
+			"payment_orders",
+			"payment_events",
+			"stripe_legacy_subscriptions",
+			"stripe_legacy_invoices",
+		})
+		if err != nil {
+			return err
+		}
+	}
 	// Migrate price_amount column from float/double to decimal for existing tables
 	migrateSubscriptionPlanPriceAmountOn(db)
 	if err := ensurePaymentProjectionColumnsSQLiteOn(db); err != nil {
@@ -419,6 +433,144 @@ func migrateDBOn(db *gorm.DB) error {
 	return nil
 }
 
+// prepareMySQLMigrationDB verifies the server's real InnoDB key capacity before
+// any schema mutation, upgrades only existing tables that receive new long
+// indexes, and makes every newly created table explicitly DYNAMIC. MySQL 5.7.8
+// defaults to COMPACT even though Barracuda and large prefixes are available;
+// relying on an implicit server default would therefore break clean utf8mb4
+// installations.
+func prepareMySQLMigrationDB(db *gorm.DB, requiredIndexCharacters int64, existingTables []string) (*gorm.DB, error) {
+	if db == nil {
+		return nil, errors.New("invalid MySQL migration capability request")
+	}
+	if db.Dialector.Name() != "mysql" {
+		return db, nil
+	}
+	if requiredIndexCharacters <= 0 {
+		return nil, errors.New("invalid MySQL migration index requirement")
+	}
+	if err := checkMySQLLongIndexCapability(db, requiredIndexCharacters); err != nil {
+		return nil, err
+	}
+	if err := ensureMySQLLongIndexRowFormatOn(db, existingTables); err != nil {
+		return nil, err
+	}
+	return db.Set("gorm:table_options", "ENGINE=InnoDB ROW_FORMAT=DYNAMIC"), nil
+}
+
+func checkMySQLLongIndexCapability(db *gorm.DB, requiredIndexCharacters int64) error {
+	var charsetMaxBytes int64
+	if err := db.Raw(`
+		SELECT CHARACTER_SETS.MAXLEN
+		FROM information_schema.SCHEMATA
+		JOIN information_schema.CHARACTER_SETS
+			ON CHARACTER_SETS.CHARACTER_SET_NAME = SCHEMATA.DEFAULT_CHARACTER_SET_NAME
+		WHERE SCHEMATA.SCHEMA_NAME = DATABASE()
+	`).Row().Scan(&charsetMaxBytes); err != nil {
+		return fmt.Errorf("read MySQL schema character width: %w", err)
+	}
+	if charsetMaxBytes <= 0 || requiredIndexCharacters > math.MaxInt64/charsetMaxBytes {
+		return errors.New("invalid MySQL schema character width")
+	}
+	requiredIndexBytes := requiredIndexCharacters * charsetMaxBytes
+	var pageSize int64
+	if err := db.Raw("SELECT @@innodb_page_size").Row().Scan(&pageSize); err != nil {
+		return fmt.Errorf("read MySQL InnoDB page size: %w", err)
+	}
+	maxIndexBytes := int64(768)
+	if pageSize >= 16*1024 {
+		maxIndexBytes = 3072
+	} else if pageSize >= 8*1024 {
+		maxIndexBytes = 1536
+	}
+	if requiredIndexBytes > maxIndexBytes {
+		return fmt.Errorf(
+			"MySQL InnoDB page size %d supports at most %d index bytes, but this schema requires %d characters at %d bytes each (%d bytes)",
+			pageSize, maxIndexBytes, requiredIndexCharacters, charsetMaxBytes, requiredIndexBytes,
+		)
+	}
+	type mysqlVariable struct {
+		Name  string `gorm:"column:Variable_name"`
+		Value string `gorm:"column:Value"`
+	}
+	for _, variable := range []struct {
+		query    string
+		name     string
+		accepted func(string) bool
+		hint     string
+	}{
+		{
+			query: "SHOW VARIABLES LIKE 'innodb_large_prefix'", name: "innodb_large_prefix",
+			accepted: func(value string) bool { return value == "1" || strings.EqualFold(value, "ON") },
+			hint:     "ON",
+		},
+		{
+			query: "SHOW VARIABLES LIKE 'innodb_file_format'", name: "innodb_file_format",
+			accepted: func(value string) bool { return strings.EqualFold(value, "Barracuda") },
+			hint:     "Barracuda",
+		},
+	} {
+		var value mysqlVariable
+		result := db.Raw(variable.query).Scan(&value)
+		if result.Error != nil {
+			return fmt.Errorf("read MySQL %s: %w", variable.name, result.Error)
+		}
+		// MySQL 8 removed these switches because their capable values are
+		// permanent. MySQL 5.7 exposes them and must report the safe value.
+		if result.RowsAffected > 0 && !variable.accepted(strings.TrimSpace(value.Value)) {
+			return fmt.Errorf("MySQL %s must be %s for DYNAMIC utf8mb4 indexes", variable.name, variable.hint)
+		}
+	}
+	return nil
+}
+
+// ensureMySQLLongIndexRowFormatOn upgrades only existing tables that receive
+// new indexed identifiers longer than their current row format can support.
+// The v0.1.6 subscription_orders table is the important upgrade case; the
+// other main-database entries make an interrupted first migration resumable.
+func ensureMySQLLongIndexRowFormatOn(db *gorm.DB, tables []string) error {
+	type tableStorage struct {
+		Engine    string `gorm:"column:ENGINE"`
+		RowFormat string `gorm:"column:ROW_FORMAT"`
+	}
+	for _, table := range tables {
+		var storage tableStorage
+		if err := db.Raw(
+			"SELECT ENGINE, ROW_FORMAT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'",
+			table,
+		).Scan(&storage).Error; err != nil {
+			return fmt.Errorf("inspect MySQL row format for %s: %w", table, err)
+		}
+		if storage.Engine == "" {
+			continue
+		}
+		if !strings.EqualFold(storage.Engine, "InnoDB") {
+			return fmt.Errorf("MySQL table %s uses %s; payment migrations require InnoDB transactions", table, storage.Engine)
+		}
+		if strings.EqualFold(storage.RowFormat, "Dynamic") || strings.EqualFold(storage.RowFormat, "Compressed") {
+			continue
+		}
+		quotedTable := "`" + strings.ReplaceAll(table, "`", "``") + "`"
+		if err := db.Exec("ALTER TABLE " + quotedTable + " ROW_FORMAT=DYNAMIC").Error; err != nil {
+			return fmt.Errorf(
+				"upgrade MySQL table %s to ROW_FORMAT=DYNAMIC for utf8mb4 indexed identifiers: %w",
+				table, err,
+			)
+		}
+		var verified tableStorage
+		if err := db.Raw(
+			"SELECT ENGINE, ROW_FORMAT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'",
+			table,
+		).Scan(&verified).Error; err != nil {
+			return fmt.Errorf("verify MySQL row format for %s: %w", table, err)
+		}
+		if !strings.EqualFold(verified.Engine, "InnoDB") || !strings.EqualFold(verified.RowFormat, "Dynamic") {
+			return fmt.Errorf("MySQL table %s did not retain required InnoDB DYNAMIC row format", table)
+		}
+	}
+	return nil
+}
+
 func ensureUserPaymentFrozenColumnOn(db *gorm.DB) error {
 	if !db.Migrator().HasTable(&User{}) {
 		return nil
@@ -447,6 +599,20 @@ func ensureUserPaymentFrozenColumnOn(db *gorm.DB) error {
 }
 
 func migrateDBFast() error {
+	migrationDB := DB
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		var err error
+		migrationDB, err = prepareMySQLMigrationDB(DB, 700, []string{
+			"subscription_orders",
+			"payment_orders",
+			"payment_events",
+			"stripe_legacy_subscriptions",
+			"stripe_legacy_invoices",
+		})
+		if err != nil {
+			return err
+		}
+	}
 	if err := ensurePaymentProjectionColumnsSQLite(); err != nil {
 		return err
 	}
@@ -512,7 +678,7 @@ func migrateDBFast() error {
 		wg.Add(1)
 		go func(model interface{}, name string) {
 			defer wg.Done()
-			if err := DB.AutoMigrate(model); err != nil {
+			if err := migrationDB.AutoMigrate(model); err != nil {
 				errChan <- fmt.Errorf("failed to migrate %s: %v", name, err)
 			}
 		}(m.model, m.name)
@@ -533,7 +699,7 @@ func migrateDBFast() error {
 			return err
 		}
 	} else {
-		if err := DB.AutoMigrate(&SubscriptionPlan{}); err != nil {
+		if err := migrationDB.AutoMigrate(&SubscriptionPlan{}); err != nil {
 			return err
 		}
 	}
@@ -545,7 +711,15 @@ func migrateLOGDB() error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return migrateClickHouseLogDB()
 	}
-	return LOG_DB.AutoMigrate(&Log{})
+	migrationDB := LOG_DB
+	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+		var err error
+		migrationDB, err = prepareMySQLMigrationDB(LOG_DB, 382, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return migrationDB.AutoMigrate(&Log{})
 }
 
 func migrateClickHouseLogDB() error {

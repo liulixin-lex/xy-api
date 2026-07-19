@@ -113,7 +113,7 @@ export function PaymentConfirmDialog({
                         quote.currency,
                         quote.provider
                       )
-                    : '—'}
+                    : t('Not available')}
                 </span>
                 {hasDiscount && (
                   <span className='text-muted-foreground text-sm line-through'>
@@ -123,7 +123,7 @@ export function PaymentConfirmDialog({
                           quote.currency,
                           quote.provider
                         )
-                      : '—'}
+                      : t('Not available')}
                   </span>
                 )}
               </div>
@@ -141,7 +141,7 @@ export function PaymentConfirmDialog({
                         quote.currency,
                         quote.provider
                       )
-                    : '—'}
+                    : t('Not available')}
                 </span>
               </div>
             </div>

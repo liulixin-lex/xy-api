@@ -144,11 +144,17 @@ func CreateCacheRatio2JSONString() string {
 
 // UpdateCacheRatioByJSONString updates the cache ratio map from a JSON string
 func UpdateCacheRatioByJSONString(jsonStr string) error {
+	if err := ValidatePriceRatioOption("CacheRatio", jsonStr); err != nil {
+		return err
+	}
 	return types.LoadFromJsonStringWithCallback(cacheRatioMap, jsonStr, InvalidateExposedDataCache)
 }
 
 // UpdateCreateCacheRatioByJSONString updates the create cache ratio map from a JSON string
 func UpdateCreateCacheRatioByJSONString(jsonStr string) error {
+	if err := ValidatePriceRatioOption("CreateCacheRatio", jsonStr); err != nil {
+		return err
+	}
 	return types.LoadFromJsonStringWithCallback(createCacheRatioMap, jsonStr, InvalidateExposedDataCache)
 }
 

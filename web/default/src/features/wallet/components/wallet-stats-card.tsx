@@ -18,8 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { Activity, BarChart3, WalletCards } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { formatQuota } from '@/lib/format'
+
 import { Skeleton } from '@/components/ui/skeleton'
+import { formatQuota } from '@/lib/format'
+
 import type { UserWalletData } from '../types'
 
 interface WalletStatsCardProps {
@@ -33,13 +35,15 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
     return (
       <div className='overflow-hidden rounded-lg border'>
         <div className='divide-border/60 grid grid-cols-3 divide-x'>
-          {Array.from({ length: 3 }, (_, i) => `wallet-stat-skeleton-${i}`).map((key) => (
-            <div key={key} className='px-3 py-3 sm:px-5 sm:py-4'>
-              <Skeleton className='h-3.5 w-20' />
-              <Skeleton className='mt-2 h-7 w-28' />
-              <Skeleton className='mt-1.5 h-3.5 w-24' />
-            </div>
-          ))}
+          {Array.from({ length: 3 }, (_, i) => `wallet-stat-skeleton-${i}`).map(
+            (key) => (
+              <div key={key} className='px-3 py-3 sm:px-5 sm:py-4'>
+                <Skeleton className='h-3.5 w-16 sm:w-20' />
+                <Skeleton className='mt-2 h-7 w-20 sm:w-28' />
+                <Skeleton className='mt-1.5 h-3.5 w-16 sm:w-24' />
+              </div>
+            )
+          )}
         </div>
       </div>
     )
@@ -71,9 +75,9 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
       <div className='divide-border/60 grid grid-cols-3 divide-x'>
         {stats.map((item) => (
           <div key={item.label} className='px-3 py-3 sm:px-5 sm:py-4'>
-            <div className='flex items-center gap-2'>
-              <item.icon className='text-muted-foreground/60 size-3.5 shrink-0' />
-              <div className='text-muted-foreground truncate text-xs font-medium tracking-wider uppercase'>
+            <div className='flex min-h-8 items-start gap-1.5 sm:min-h-0 sm:items-center sm:gap-2'>
+              <item.icon className='text-muted-foreground/60 hidden size-3.5 shrink-0 sm:block' />
+              <div className='text-muted-foreground min-w-0 text-[10px] leading-4 font-medium tracking-wide uppercase sm:text-xs sm:tracking-wider'>
                 {item.label}
               </div>
             </div>

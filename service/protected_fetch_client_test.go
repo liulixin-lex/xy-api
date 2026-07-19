@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -86,6 +88,44 @@ func TestProtectedFetchDialerRejectsPrivateReboundAddress(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, conn)
 	require.Contains(t, err.Error(), "private IP address not allowed")
+}
+
+func TestProtectedFetchClientRejectsRedirectToPrivateAddress(t *testing.T) {
+	var privateTargetReached atomic.Bool
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/redirect" {
+			http.Redirect(writer, request, "http://127.0.0.1/private", http.StatusFound)
+			return
+		}
+		privateTargetReached.Store(true)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	directDialer := &net.Dialer{}
+	client := newProtectedFetchHTTPClientWithProxy(
+		staticSSRFResolver{},
+		func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return directDialer.DialContext(ctx, network, server.Listener.Addr().String())
+		},
+		staticProtection(&common.SSRFProtection{
+			AllowPrivateIp:         false,
+			DomainFilterMode:       false,
+			IpFilterMode:           false,
+			ApplyIPFilterForDomain: true,
+		}),
+		func(*http.Request) (*url.URL, error) { return nil, nil },
+	)
+
+	response, err := client.Get("http://93.184.216.34/redirect")
+	require.Error(t, err)
+	require.NotNil(t, response)
+	require.Equal(t, http.StatusFound, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	require.Contains(t, err.Error(), "redirect")
+	require.Contains(t, err.Error(), "private IP address not allowed")
+	require.False(t, privateTargetReached.Load())
 }
 
 func TestProtectedFetchDialerRejectsMixedResolvedIPs(t *testing.T) {

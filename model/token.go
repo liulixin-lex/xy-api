@@ -129,7 +129,10 @@ func validateLikePattern(input string) error {
 	return nil
 }
 
-const searchHardLimit = 100
+const (
+	searchHardLimit     = 100
+	searchScanHardLimit = 10_000
+)
 
 func SearchUserTokens(userId int, keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
 	// model 层强制截断
@@ -138,6 +141,8 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	}
 	if offset < 0 {
 		offset = 0
+	} else if offset > searchScanHardLimit {
+		offset = searchScanHardLimit
 	}
 
 	if token != "" {
@@ -146,6 +151,9 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 
 	// 超量用户（令牌数超过上限）只允许精确搜索，禁止模糊搜索
 	maxTokens := operation_setting.GetMaxUserTokens()
+	if maxTokens <= 0 {
+		return nil, 0, errors.New("令牌搜索配置无效")
+	}
 	hasFuzzy := strings.Contains(keyword, "%") || strings.Contains(token, "%")
 	if hasFuzzy {
 		count, err := CountUserTokens(userId)
@@ -153,7 +161,7 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 			common.SysLog("failed to count user tokens: " + err.Error())
 			return nil, 0, errors.New("获取令牌数量失败")
 		}
-		if int(count) > maxTokens {
+		if count > int64(maxTokens) {
 			return nil, 0, errors.New("令牌数量超过上限，仅允许精确搜索，请勿使用 % 通配符")
 		}
 	}
@@ -176,8 +184,13 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		baseQuery = baseQuery.Where(commonKeyCol+" LIKE ? ESCAPE '!'", tokenPattern)
 	}
 
-	// 先查匹配总数（用于分页，受 maxTokens 上限保护，避免全表 COUNT）
-	err = baseQuery.Limit(maxTokens).Count(&total).Error
+	// 先在有界派生表中统计匹配数。直接对聚合 COUNT 加 LIMIT 不会限制
+	// 数据库扫描，因此必须把 LIMIT 放在子查询里，避免遗留超量账号被
+	// 搜索接口反复触发无界扫描。
+	limitedMatches := baseQuery.Session(&gorm.Session{}).
+		Select("id").
+		Limit(searchScanHardLimit + 1)
+	err = DB.Table("(?) AS token_search_matches", limitedMatches).Count(&total).Error
 	if err != nil {
 		common.SysError("failed to count search tokens: " + err.Error())
 		return nil, 0, errors.New("搜索令牌失败")

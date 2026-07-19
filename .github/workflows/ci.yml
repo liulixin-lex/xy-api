@@ -28,6 +28,7 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/actionlint.tar.gz"
           curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
             --retry 3 --retry-all-errors \
             'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz' \
             --output "$archive"
@@ -36,7 +37,7 @@ jobs:
             "$archive" | sha256sum --check --strict
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y yamllint
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y yamllint shellcheck
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Lint workflows and enforce immutable action references
@@ -46,6 +47,13 @@ jobs:
           # inline shell style debt is handled separately so it cannot mask
           # real workflow regressions during the v0.2 compatibility phase.
           actionlint -shellcheck=
+          # Stable publication workflows have no inline ShellCheck debt and
+          # must keep their embedded release scripts fully blocking.
+          actionlint \
+            .github/workflows/ci.yml \
+            .github/workflows/docker-build.yml \
+            .github/workflows/electron-build.yml \
+            .github/workflows/release.yml
           yamllint \
             -d '{extends: default, rules: {document-start: disable, line-length: disable, truthy: disable, comments: disable}}' \
             .github/workflows .github/dependabot.yml
@@ -55,11 +63,20 @@ jobs:
             echo '::error::Every external GitHub Action must be pinned to a full commit SHA.'
             exit 1
           fi
+          mapfile -t release_scripts < <(find scripts/release -maxdepth 1 -type f -name '*.sh' | sort)
+          if [ "${#release_scripts[@]}" -eq 0 ]; then
+            echo '::error::No release shell scripts were discovered.'
+            exit 1
+          fi
+          for release_script in "${release_scripts[@]}"; do
+            bash -n "$release_script"
+          done
+          shellcheck -x "${release_scripts[@]}"
 
   backend:
     name: Backend tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -104,10 +121,87 @@ jobs:
             exit 1
           fi
           go test "${packages[@]}"
+          go test -race "${packages[@]}"
 
-      - name: Go vet advisory
-        continue-on-error: true
+      - name: Run Go vet
         run: go vet ./...
+
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  mysql57-migration:
+    name: MySQL 5.7 COMPACT migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Start MySQL 5.7 with the 5.7.8-era COMPACT default
+        run: |
+          set -euo pipefail
+          MYSQL_ROOT_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$MYSQL_ROOT_PASSWORD"
+          printf '%s\n' \
+            "MYSQL57_TEST_CLEAN_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_clean?charset=utf8mb4&parseTime=true" \
+            "MYSQL57_TEST_UPGRADE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_upgrade?charset=utf8&parseTime=true" \
+            "MYSQL57_TEST_LOG_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_log?charset=utf8mb4&parseTime=true" \
+            "MYSQL57_TEST_GBK8_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3307)/new_api_gbk8?charset=gbk&parseTime=true" \
+            >>"$GITHUB_ENV"
+          docker run --detach \
+            --name new-api-mysql57 \
+            --publish 3306:3306 \
+            --env MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
+            mysql@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb \
+            --innodb-default-row-format=COMPACT \
+            --innodb-file-format=Barracuda \
+            --innodb-large-prefix=ON \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci
+          docker run --detach \
+            --name new-api-mysql57-gbk8 \
+            --publish 3307:3306 \
+            --env MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
+            mysql@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb \
+            --innodb-page-size=8192 \
+            --innodb-default-row-format=COMPACT \
+            --innodb-file-format=Barracuda \
+            --innodb-large-prefix=ON \
+            --character-set-server=gbk \
+            --collation-server=gbk_chinese_ci
+          for attempt in $(seq 1 90); do
+            if docker exec new-api-mysql57 sh -c \
+              'mysqladmin ping --silent -uroot -p"$MYSQL_ROOT_PASSWORD"' && \
+              docker exec new-api-mysql57-gbk8 sh -c \
+              'mysqladmin ping --silent -uroot -p"$MYSQL_ROOT_PASSWORD"'; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs new-api-mysql57
+              docker logs new-api-mysql57-gbk8
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec new-api-mysql57 sh -c \
+            'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+              CREATE DATABASE new_api_clean CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE DATABASE new_api_upgrade CHARACTER SET utf8 COLLATE utf8_general_ci;
+              CREATE DATABASE new_api_log CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+            "'
+          docker exec new-api-mysql57-gbk8 sh -c \
+            'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+              CREATE DATABASE new_api_gbk8 CHARACTER SET gbk COLLATE gbk_chinese_ci;
+            "'
+
+      - name: Verify clean, upgrade, fail-closed, repeat, and log migrations
+        run: go test ./model -run '^TestMySQL57CompactMigrationCompatibility$' -count=1
 
   frontend-default:
     name: Default frontend build
@@ -117,23 +211,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: '1.3.14'
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
 
       - name: Install frontend dependencies
         working-directory: web
         run: bun install --frozen-lockfile
 
+      - name: Audit frontend dependency lockfile
+        working-directory: web
+        run: ../scripts/release/audit-bun-lockfile.sh
+
       - name: Typecheck default frontend
         working-directory: web/default
         run: bun run typecheck
 
-      - name: Lint default frontend advisory
-        continue-on-error: true
+      - name: Test default frontend
         working-directory: web/default
-        run: bun run lint
+        run: bun test
+
+      - name: Lint default frontend
+        working-directory: web/default
+        run: |
+          bun run lint
+          bun run copyright:check
+
+      - name: Validate default frontend locales
+        working-directory: web/default
+        run: |
+          set -euo pipefail
+          bun run i18n:sync
+          git diff --exit-code -- src/i18n/locales
+          jq --exit-status '
+            .base == "en.json" and
+            ((.locales | keys) == ["en", "fr", "ja", "ru", "vi", "zh", "zh-TW"]) and
+            ([.locales[] |
+              .missingCount == 0 and .extrasCount == 0
+            ] | all) and
+            (.locales.en.untranslatedScanStatus == "not-applicable") and
+            (.locales.en.untranslatedCount == null) and
+            ([.locales.fr, .locales.ja, .locales.ru, .locales.vi, .locales.zh] |
+              all(
+                .untranslatedScanStatus == "evaluated" and
+                .untranslatedCount == 0
+              )
+            ) and
+            (.locales["zh-TW"].untranslatedScanStatus == "not-evaluated") and
+            (.locales["zh-TW"].untranslatedCount == null)
+          ' src/i18n/locales/_reports/_sync-report.json >/dev/null
 
       - name: Format check default frontend advisory
         continue-on-error: true
@@ -144,7 +270,7 @@ jobs:
         working-directory: web/default
         env:
           DISABLE_ESLINT_PLUGIN: 'true'
-        run: VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+        run: VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun --bun run build
 
   frontend-classic:
     name: Classic frontend build
@@ -154,15 +280,142 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: '1.3.14'
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
 
       - name: Install frontend dependencies
         working-directory: web
         run: bun install --frozen-lockfile
 
+      - name: Lint classic frontend
+        working-directory: web/classic
+        run: bun run lint
+
+      - name: Test classic frontend
+        working-directory: web/classic
+        run: bun test
+
       - name: Build classic frontend
         working-directory: web/classic
-        run: VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
+        run: VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun --bun run build
+
+  macos-universal:
+    name: macOS universal binary
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Resolve repository version
+        run: |
+          set -euo pipefail
+          version=$(<VERSION)
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid repository VERSION: $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Build embedded frontends
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --frozen-lockfile
+          cd default
+          DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+          cd ../classic
+          VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build and verify universal macOS binary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-macos-amd64-$VERSION"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-macos-arm64-$VERSION"
+          lipo -create \
+            "new-api-macos-amd64-$VERSION" \
+            "new-api-macos-arm64-$VERSION" \
+            -output "new-api-macos-$VERSION"
+          lipo -verify_arch x86_64 arm64 "new-api-macos-$VERSION"
+          [ "$("./new-api-macos-$VERSION" --version)" = "$VERSION" ]
+          file "new-api-macos-$VERSION" | grep --quiet 'Mach-O universal binary'
+          shasum -a 256 "new-api-macos-$VERSION" >checksums-macos.txt
+          shasum -a 256 --check checksums-macos.txt
+
+  electron-windows:
+    name: Windows desktop package
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Resolve repository version
+        run: |
+          set -euo pipefail
+          version=$(<VERSION)
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid repository VERSION: $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.23.1'
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build embedded frontends
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --frozen-lockfile
+          cd default
+          DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+          cd ../classic
+          VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Build Windows backend
+        run: |
+          set -euo pipefail
+          go mod download
+          CGO_ENABLED=0 GOEXPERIMENT=greenteagc GOOS=windows GOARCH=amd64 \
+            go build \
+              -trimpath \
+              -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+              -o new-api.exe
+          reported_version=$(./new-api.exe --version | tr -d '\r')
+          [ "$reported_version" = "$VERSION" ]
+
+      - name: Build and verify Electron installers
+        run: scripts/release/build-electron-windows.sh "$VERSION"

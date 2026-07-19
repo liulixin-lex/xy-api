@@ -27,6 +27,14 @@ func seedPaymentUser(t *testing.T, id int, quota int) {
 	}).Error)
 }
 
+func seedStripeCustomerBinding(t *testing.T, userID int, customerID string) {
+	t.Helper()
+	require.NoError(t, DB.Create(&PaymentCustomerBinding{
+		Provider: PaymentProviderStripe, CustomerKey: customerID, UserID: userID,
+	}).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", userID).Update("stripe_customer", customerID).Error)
+}
+
 func livePaymentModeForTest() *bool {
 	livemode := true
 	return &livemode
@@ -957,6 +965,7 @@ func TestWonDisputeRestoresQuotaAndReleasesPaymentFreeze(t *testing.T) {
 func TestCanonicalSubscriptionOrderReservesAndFulfillsSnapshot(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 970005, 0)
+	seedStripeCustomerBinding(t, 970005, "cus_canonical_subscription")
 	allowWallet := true
 	plan := &SubscriptionPlan{
 		Id:                  970105,
@@ -1209,17 +1218,107 @@ func TestOutOfOrderReversalIsPersistedBeforeWebhookAcknowledgement(t *testing.T)
 	var refundEvent PaymentEvent
 	require.NoError(t, DB.Where("provider = ? AND event_key = ?", PaymentProviderStripe, refund.EventKey).First(&refundEvent).Error)
 	assert.Equal(t, PaymentEventStatusManualReview, refundEvent.Status)
-	assert.Equal(t, order.ID, refundEvent.PaymentOrderID)
+	assert.Zero(t, refundEvent.PaymentOrderID)
 
 	paid := paidPaymentEvent(order, "stripe-paid-after-refund")
 	_, err = ProcessPaymentEvent(paid)
-	require.ErrorIs(t, err, ErrPaymentManualReview)
+	require.NoError(t, err)
 	var user User
 	require.NoError(t, DB.First(&user, 970006).Error)
 	assert.Zero(t, user.Quota)
 	stored, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
 	require.NoError(t, lookupErr)
-	assert.Equal(t, PaymentOrderStatusManualReview, stored.Status)
+	assert.Equal(t, PaymentOrderStatusRefunded, stored.Status)
+	require.NoError(t, DB.First(&refundEvent, refundEvent.ID).Error)
+	assert.Equal(t, PaymentEventStatusProcessed, refundEvent.Status)
+	assert.Equal(t, order.ID, refundEvent.PaymentOrderID)
+}
+
+func TestReversalProviderPaymentIdentityCannotBeRedirectedByTradeMetadata(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 970043, 0)
+	seedPaymentUser(t, 970044, 0)
+	orderA := createTopUpPaymentOrder(t, 970043, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	orderB := createTopUpPaymentOrder(t, 970044, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	paidA := paidPaymentEvent(orderA, "stripe-paid-reversal-authority-a")
+	paidA.ProviderOrderKey = "stripe:cs_reversal_authority_a"
+	paidA.ProviderPaymentKey = "stripe:pi_reversal_authority_a"
+	paidB := paidPaymentEvent(orderB, "stripe-paid-reversal-authority-b")
+	paidB.ProviderOrderKey = "stripe:cs_reversal_authority_b"
+	paidB.ProviderPaymentKey = "stripe:pi_reversal_authority_b"
+	_, err := ProcessPaymentEvent(paidA)
+	require.NoError(t, err)
+	_, err = ProcessPaymentEvent(paidB)
+	require.NoError(t, err)
+
+	result, err := ProcessPaymentEvent(PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-refund-conflicting-trade-metadata", EventType: "charge.refunded",
+		TradeNo: orderB.TradeNo, ProviderPaymentKey: paidA.ProviderPaymentKey,
+		RefundedAmountMinor: 1000, Currency: "USD", Refunded: true,
+		NormalizedPayload: `{"amount_refunded":1000,"metadata_trade":"order-b"}`,
+	})
+	require.ErrorIs(t, err, ErrPaymentManualReview)
+	require.NotNil(t, result.Order)
+	assert.Equal(t, orderA.ID, result.Order.ID)
+
+	storedA, lookupErr := GetPaymentOrderByTradeNo(orderA.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.Equal(t, PaymentOrderStatusManualReview, storedA.Status)
+	assert.Zero(t, storedA.RefundedAmountMinor)
+	storedB, lookupErr := GetPaymentOrderByTradeNo(orderB.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.Equal(t, PaymentOrderStatusFulfilled, storedB.Status)
+	assert.Zero(t, storedB.RefundedAmountMinor)
+	for _, userID := range []int{970043, 970044} {
+		var user User
+		require.NoError(t, DB.First(&user, userID).Error)
+		assert.Equal(t, 1000, user.Quota)
+	}
+	var storedEvent PaymentEvent
+	require.NoError(t, DB.Where("event_key = ?", "stripe-refund-conflicting-trade-metadata").First(&storedEvent).Error)
+	assert.Equal(t, orderA.ID, storedEvent.PaymentOrderID)
+	assert.Equal(t, PaymentEventStatusManualReview, storedEvent.Status)
+}
+
+func TestIncompatibleStripeFinancialEventKeepsPaymentIdentityAuthority(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 970046, 0)
+	seedPaymentUser(t, 970047, 0)
+	orderA := createTopUpPaymentOrder(t, 970046, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	orderB := createTopUpPaymentOrder(t, 970047, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	paidA := paidPaymentEvent(orderA, "stripe-paid-incompatible-financial-a")
+	paidA.ProviderOrderKey = "stripe:cs_incompatible_financial_a"
+	paidA.ProviderPaymentKey = "stripe:pi_incompatible_financial_a"
+	paidB := paidPaymentEvent(orderB, "stripe-paid-incompatible-financial-b")
+	paidB.ProviderOrderKey = "stripe:cs_incompatible_financial_b"
+	paidB.ProviderPaymentKey = "stripe:pi_incompatible_financial_b"
+	_, err := ProcessPaymentEvent(paidA)
+	require.NoError(t, err)
+	_, err = ProcessPaymentEvent(paidB)
+	require.NoError(t, err)
+
+	result, err := ProcessPaymentEvent(PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-incompatible-financial-conflicting-trade", EventType: "charge.refunded",
+		TradeNo: orderB.TradeNo, ProviderPaymentKey: paidA.ProviderPaymentKey,
+		ProviderState: "api_version_manual_review", ManualReview: true,
+		NormalizedPayload: `{"automatic_action":"blocked_incompatible_api_version"}`,
+	})
+	require.ErrorIs(t, err, ErrPaymentManualReview)
+	require.NotNil(t, result.Order)
+	assert.Equal(t, orderA.ID, result.Order.ID)
+
+	storedA, lookupErr := GetPaymentOrderByTradeNo(orderA.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.Equal(t, PaymentOrderStatusManualReview, storedA.Status)
+	storedB, lookupErr := GetPaymentOrderByTradeNo(orderB.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.Equal(t, PaymentOrderStatusFulfilled, storedB.Status)
+	var storedEvent PaymentEvent
+	require.NoError(t, DB.Where("event_key = ?", "stripe-incompatible-financial-conflicting-trade").First(&storedEvent).Error)
+	assert.Equal(t, orderA.ID, storedEvent.PaymentOrderID)
+	assert.Equal(t, PaymentEventStatusManualReview, storedEvent.Status)
 }
 
 func TestAffiliateRewardIsReversedAndRestoredWithBuyerDispute(t *testing.T) {
@@ -1469,6 +1568,75 @@ func TestRefundAndDisputeReverseIndependentAmountsWithoutOverCredit(t *testing.T
 	assert.Equal(t, PaymentOrderStatusRefundPending, stored.Status)
 }
 
+func TestMultipleStripeDisputesAggregateByResource(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 970045, 0)
+	order := createTopUpPaymentOrder(t, 970045, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	paid := paidPaymentEvent(order, "stripe-paid-multiple-disputes")
+	paid.ProviderPaymentKey = "stripe:pi_multiple_disputes"
+	_, err := ProcessPaymentEvent(paid)
+	require.NoError(t, err)
+
+	disputeA := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-multiple-disputes-a-created", EventType: "charge.dispute.created",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: "stripe:dp_multiple_a",
+		ProviderCreatedAt: 100, ProviderState: "needs_response", DisputedAmountMinor: 600,
+		Currency: "USD", Disputed: true, NormalizedPayload: `{"amount":600,"status":"needs_response"}`,
+	}
+	_, err = ProcessPaymentEvent(disputeA)
+	require.NoError(t, err)
+	disputeB := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-multiple-disputes-b-created", EventType: "charge.dispute.created",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: "stripe:dp_multiple_b",
+		ProviderCreatedAt: 101, ProviderState: "needs_response", DisputedAmountMinor: 400,
+		Currency: "USD", Disputed: true, NormalizedPayload: `{"amount":400,"status":"needs_response"}`,
+	}
+	_, err = ProcessPaymentEvent(disputeB)
+	require.NoError(t, err)
+
+	var user User
+	require.NoError(t, DB.First(&user, order.UserID).Error)
+	assert.Zero(t, user.Quota)
+	stored, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.EqualValues(t, 1000, stored.DisputedAmountMinor)
+	assert.EqualValues(t, 1000, stored.ReversedAmountMinor)
+
+	_, err = ProcessPaymentEvent(PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-multiple-disputes-b-won", EventType: "charge.dispute.closed",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: disputeB.ProviderResourceKey,
+		ProviderCreatedAt: 102, ProviderState: "won", DisputedAmountMinor: 400,
+		Currency: "USD", DisputeResolved: true, DisputeWon: true, NormalizedPayload: `{"amount":400,"status":"won"}`,
+	})
+	require.NoError(t, err)
+	require.NoError(t, DB.First(&user, order.UserID).Error)
+	assert.Equal(t, 400, user.Quota)
+	stored, lookupErr = GetPaymentOrderByTradeNo(order.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.EqualValues(t, 600, stored.DisputedAmountMinor)
+	assert.EqualValues(t, 600, stored.ReversedAmountMinor)
+	assert.Equal(t, PaymentOrderStatusDisputed, stored.Status)
+
+	_, err = ProcessPaymentEvent(PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-multiple-disputes-a-won", EventType: "charge.dispute.closed",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: disputeA.ProviderResourceKey,
+		ProviderCreatedAt: 103, ProviderState: "won", DisputedAmountMinor: 600,
+		Currency: "USD", DisputeResolved: true, DisputeWon: true, NormalizedPayload: `{"amount":600,"status":"won"}`,
+	})
+	require.NoError(t, err)
+	require.NoError(t, DB.First(&user, order.UserID).Error)
+	assert.Equal(t, 1000, user.Quota)
+	stored, lookupErr = GetPaymentOrderByTradeNo(order.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.Zero(t, stored.DisputedAmountMinor)
+	assert.Zero(t, stored.ReversedAmountMinor)
+	assert.Equal(t, PaymentOrderStatusFulfilled, stored.Status)
+}
+
 func TestAdminCanAuditablyFulfillManualPaymentOrder(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 970012, 0)
@@ -1544,6 +1712,56 @@ func TestDelayedDisputeCreatedCannotReverseNewerClosedState(t *testing.T) {
 	assert.Zero(t, debtCount)
 }
 
+func TestStaleSameTimestampDisputeDoesNotReenterAggregate(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 970048, 0)
+	order := createTopUpPaymentOrder(t, 970048, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	paid := paidPaymentEvent(order, "stripe-paid-before-same-timestamp-stale-dispute")
+	paid.ProviderPaymentKey = "stripe:pi_same_timestamp_stale"
+	_, err := ProcessPaymentEvent(paid)
+	require.NoError(t, err)
+
+	closedA := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-same-timestamp-a-won", EventType: "charge.dispute.closed",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: "stripe:dp_same_timestamp_a",
+		ProviderCreatedAt: 100, ProviderState: "won", DisputedAmountMinor: 600,
+		Currency: "USD", DisputeResolved: true, DisputeWon: true, NormalizedPayload: `{"amount":600,"status":"won"}`,
+	}
+	_, err = ProcessPaymentEvent(closedA)
+	require.NoError(t, err)
+	staleCreatedA := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-same-timestamp-a-created-late", EventType: "charge.dispute.created",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: closedA.ProviderResourceKey,
+		ProviderCreatedAt: 100, ProviderState: "needs_response", DisputedAmountMinor: 600,
+		Currency: "USD", Disputed: true, NormalizedPayload: `{"amount":600,"status":"needs_response"}`,
+	}
+	_, err = ProcessPaymentEvent(staleCreatedA)
+	require.NoError(t, err)
+	var staleEvent PaymentEvent
+	require.NoError(t, DB.Where("event_key = ?", staleCreatedA.EventKey).First(&staleEvent).Error)
+	assert.Equal(t, PaymentEventStatusDismissed, staleEvent.Status)
+
+	disputeB := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		EventKey: "stripe-same-timestamp-b-created", EventType: "charge.dispute.created",
+		ProviderPaymentKey: paid.ProviderPaymentKey, ProviderResourceKey: "stripe:dp_same_timestamp_b",
+		ProviderCreatedAt: 101, ProviderState: "needs_response", DisputedAmountMinor: 400,
+		Currency: "USD", Disputed: true, NormalizedPayload: `{"amount":400,"status":"needs_response"}`,
+	}
+	_, err = ProcessPaymentEvent(disputeB)
+	require.NoError(t, err)
+
+	var user User
+	require.NoError(t, DB.First(&user, order.UserID).Error)
+	assert.Equal(t, 600, user.Quota)
+	stored, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
+	require.NoError(t, lookupErr)
+	assert.EqualValues(t, 400, stored.DisputedAmountMinor)
+	assert.EqualValues(t, 400, stored.ReversedAmountMinor)
+}
+
 func TestLaterWonDisputeRestoresEarlierLostState(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 970014, 0)
@@ -1587,6 +1805,7 @@ func TestLaterWonDisputeRestoresEarlierLostState(t *testing.T) {
 func TestResolvingMultiplePaymentDebtsReleasesSingleUserFreeze(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 970015, 0)
+	seedStripeCustomerBinding(t, 970015, "cus_multi_debt")
 	orders := []*PaymentOrder{
 		createTopUpPaymentOrder(t, 970015, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000),
 		createTopUpPaymentOrder(t, 970015, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000),

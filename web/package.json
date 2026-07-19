@@ -35,6 +35,7 @@
     "sse.js": "^2.8.0"
   },
   "overrides": {
+    "dompurify": "3.4.11",
     "form-data": "4.0.6",
     "hono": "4.12.31",
     "minimist": "1.2.8"

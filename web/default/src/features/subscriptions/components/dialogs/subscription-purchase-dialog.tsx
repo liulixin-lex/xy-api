@@ -591,7 +591,7 @@ export function SubscriptionPurchaseDialog(props: Props) {
                       onClick={() => void handlePayGateway('stripe', 'stripe')}
                       disabled={paying || limitReached}
                     >
-                      Stripe
+                      {t('Stripe')}
                     </Button>
                   )}
                   {hasCreem && (
@@ -601,7 +601,7 @@ export function SubscriptionPurchaseDialog(props: Props) {
                       onClick={handlePayCreem}
                       disabled={paying || limitReached}
                     >
-                      Creem
+                      {t('Creem')}
                     </Button>
                   )}
                   {hasWaffoPancake && (

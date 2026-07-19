@@ -423,6 +423,19 @@ export default function SettingsPaymentGateway(props) {
                     ? t('Emergency replace credentials')
                     : t('Disable Stripe webhooks now')}
                 </Button>
+                <Button
+                  type='danger'
+                  theme='borderless'
+                  onClick={() =>
+                    props.requestEmergencyCredentialRevocation?.(
+                      'stripe',
+                      { state: 'none', options: {} },
+                      'stripe_disable_all',
+                    )
+                  }
+                >
+                  {t('Disable Stripe completely now')}
+                </Button>
               </div>
             }
             closeIcon={null}

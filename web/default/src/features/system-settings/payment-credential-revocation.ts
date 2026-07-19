@@ -25,6 +25,7 @@ export type EmergencyCredentialRevocationMode =
   | 'replace'
   | 'revoke_previous'
   | 'stripe_disable'
+  | 'stripe_disable_all'
 
 export type EmergencyCredentialReplacement = {
   state: EmergencyCredentialReplacementState
@@ -101,4 +102,10 @@ export function resolveEmergencyCredentialRevocationMode(
   if (replacementState === 'complete') return 'replace'
   if (provider === 'stripe') return 'stripe_disable'
   return previousCredentialActive ? 'revoke_previous' : null
+}
+
+export function getEmergencyCredentialClearSecrets(
+  mode: EmergencyCredentialRevocationMode
+): string[] {
+  return mode === 'stripe_disable_all' ? ['StripeApiSecret'] : []
 }

@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -47,88 +48,75 @@ func NewSSRFProtectionFromFetchSetting(allowPrivateIp bool, domainFilterMode boo
 	}, nil
 }
 
-// privateIPv4Nets IPv4 私有/保留/特殊用途网段
-// 参考 IANA IPv4 Special-Purpose Address Registry
-// https://www.iana.org/assignments/iana-ipv4-special-registry/
-var privateIPv4Nets = []net.IPNet{
-	{IP: net.IPv4(0, 0, 0, 0), Mask: net.CIDRMask(8, 32)},          // 0.0.0.0/8 ("This network" / 未指定)
-	{IP: net.IPv4(10, 0, 0, 0), Mask: net.CIDRMask(8, 32)},         // 10.0.0.0/8 (私有)
-	{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)},      // 100.64.0.0/10 (运营商级 NAT / CGNAT)
-	{IP: net.IPv4(127, 0, 0, 0), Mask: net.CIDRMask(8, 32)},        // 127.0.0.0/8 (回环)
-	{IP: net.IPv4(169, 254, 0, 0), Mask: net.CIDRMask(16, 32)},     // 169.254.0.0/16 (链路本地)
-	{IP: net.IPv4(172, 16, 0, 0), Mask: net.CIDRMask(12, 32)},      // 172.16.0.0/12 (私有)
-	{IP: net.IPv4(192, 0, 0, 0), Mask: net.CIDRMask(24, 32)},       // 192.0.0.0/24 (IETF 协议分配)
-	{IP: net.IPv4(192, 0, 2, 0), Mask: net.CIDRMask(24, 32)},       // 192.0.2.0/24 (TEST-NET-1)
-	{IP: net.IPv4(192, 168, 0, 0), Mask: net.CIDRMask(16, 32)},     // 192.168.0.0/16 (私有)
-	{IP: net.IPv4(198, 18, 0, 0), Mask: net.CIDRMask(15, 32)},      // 198.18.0.0/15 (基准测试)
-	{IP: net.IPv4(198, 51, 100, 0), Mask: net.CIDRMask(24, 32)},    // 198.51.100.0/24 (TEST-NET-2)
-	{IP: net.IPv4(203, 0, 113, 0), Mask: net.CIDRMask(24, 32)},     // 203.0.113.0/24 (TEST-NET-3)
-	{IP: net.IPv4(224, 0, 0, 0), Mask: net.CIDRMask(4, 32)},        // 224.0.0.0/4 (组播)
-	{IP: net.IPv4(240, 0, 0, 0), Mask: net.CIDRMask(4, 32)},        // 240.0.0.0/4 (保留)
-	{IP: net.IPv4(255, 255, 255, 255), Mask: net.CIDRMask(32, 32)}, // 255.255.255.255/32 (受限广播)
+// nonPublicIPv4Prefixes is the default SSRF deny list for IPv4. It follows
+// the IANA IPv4 Special-Purpose Address Registry and keeps multicast blocked.
+// The deprecated 6to4 relay range is denied as a transition-address bypass.
+var nonPublicIPv4Prefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),       // "This network" / unspecified
+	netip.MustParsePrefix("10.0.0.0/8"),      // Private-Use
+	netip.MustParsePrefix("100.64.0.0/10"),   // Shared Address Space / CGNAT
+	netip.MustParsePrefix("127.0.0.0/8"),     // Loopback
+	netip.MustParsePrefix("169.254.0.0/16"),  // Link Local
+	netip.MustParsePrefix("172.16.0.0/12"),   // Private-Use
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF Protocol Assignments
+	netip.MustParsePrefix("192.0.2.0/24"),    // Documentation TEST-NET-1
+	netip.MustParsePrefix("192.88.99.0/24"),  // Deprecated 6to4 Relay Anycast
+	netip.MustParsePrefix("192.168.0.0/16"),  // Private-Use
+	netip.MustParsePrefix("198.18.0.0/15"),   // Benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // Documentation TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),  // Documentation TEST-NET-3
+	netip.MustParsePrefix("224.0.0.0/4"),     // Multicast
+	netip.MustParsePrefix("240.0.0.0/4"),     // Reserved and limited broadcast
 }
 
-// privateIPv6Nets IPv6 私有/保留/特殊用途网段
-// 参考 IANA IPv6 Special-Purpose Address Registry
-// https://www.iana.org/assignments/iana-ipv6-special-registry/
-var privateIPv6Nets = func() []net.IPNet {
-	cidrs := []string{
-		"::/128",        // 未指定地址
-		"::1/128",       // 回环
-		"::ffff:0:0/96", // IPv4-mapped
-		"64:ff9b::/96",  // IPv4/IPv6 translation
-		"100::/64",      // Discard-Only
-		"2001::/23",     // IETF Protocol Assignments
-		"2001:db8::/32", // 文档
-		"fc00::/7",      // Unique Local Address (ULA)
-		"fe80::/10",     // 链路本地
-		"ff00::/8",      // 组播
-	}
-	nets := make([]net.IPNet, 0, len(cidrs))
-	for _, c := range cidrs {
-		if _, n, err := net.ParseCIDR(c); err == nil && n != nil {
-			nets = append(nets, *n)
-		}
-	}
-	return nets
-}()
+// nonPublicIPv6Prefixes is the default SSRF deny list for IPv6. Besides the
+// IANA non-public ranges, it denies deprecated/transition prefixes that can
+// encapsulate an IPv4 target and otherwise bypass IPv4-only checks.
+var nonPublicIPv6Prefixes = []netip.Prefix{
+	netip.MustParsePrefix("::/96"),          // Deprecated IPv4-compatible addresses
+	netip.MustParsePrefix("64:ff9b::/96"),   // Well-Known NAT64 prefix
+	netip.MustParsePrefix("64:ff9b:1::/48"), // Local-use IPv4/IPv6 translation
+	netip.MustParsePrefix("100::/64"),       // Discard-Only
+	netip.MustParsePrefix("100:0:0:1::/64"), // Dummy IPv6 prefix
+	netip.MustParsePrefix("2001::/23"),      // IETF Protocol Assignments
+	netip.MustParsePrefix("2001:db8::/32"),  // Documentation
+	netip.MustParsePrefix("2002::/16"),      // 6to4
+	netip.MustParsePrefix("3fff::/20"),      // Documentation
+	netip.MustParsePrefix("5f00::/16"),      // Segment Routing (SRv6) SIDs
+	netip.MustParsePrefix("fc00::/7"),       // Unique-Local
+	netip.MustParsePrefix("fe80::/10"),      // Link-Local Unicast
+	netip.MustParsePrefix("ff00::/8"),       // Multicast
+}
 
 // isPrivateIP 检查IP是否为私有/保留/特殊用途地址
 func isPrivateIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
-	// 未指定地址 (0.0.0.0, ::)
-	if ip.IsUnspecified() {
-		return true
-	}
-	// 回环、链路本地 (unicast/multicast)
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
-	}
-	// 接口本地组播 (IPv6 ff01::/16 等)
-	if ip.IsInterfaceLocalMulticast() {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return true
 	}
 
-	if v4 := ip.To4(); v4 != nil {
-		for _, privateNet := range privateIPv4Nets {
-			if privateNet.Contains(v4) {
+	// net.ParseIP represents IPv4 as an IPv4-mapped IPv6 address. Unmap it so
+	// every IPv4 spelling is checked against exactly the same IPv4 prefixes.
+	addr = addr.Unmap()
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() || addr.IsPrivate() {
+		return true
+	}
+
+	if addr.Is4() {
+		for _, prefix := range nonPublicIPv4Prefixes {
+			if prefix.Contains(addr) {
 				return true
 			}
 		}
 		return false
 	}
 
-	// IPv6 检查
-	for _, privateNet := range privateIPv6Nets {
-		if privateNet.Contains(ip) {
+	for _, prefix := range nonPublicIPv6Prefixes {
+		if prefix.Contains(addr) {
 			return true
 		}
-	}
-	// 兜底: Go 标准库识别的其他私有地址
-	if ip.IsPrivate() {
-		return true
 	}
 	return false
 }

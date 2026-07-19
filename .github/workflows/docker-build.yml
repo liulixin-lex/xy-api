@@ -1,28 +1,107 @@
 name: Publish Docker image (Multi-arch)
 
 on:
-  push:
-    tags:
-      - 'v*'
-      - '!v*-*'
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: 'Tag or version to build (e.g., v0.0.1)'
+        description: Stable semver tag to build
         required: true
         type: string
-      confirm_tag:
-        description: 'Type the same tag again to confirm publishing this tag and latest'
+      release_ref:
+        description: Protected publish-once tag ref to validate
         required: true
         type: string
-
+      release_commit:
+        description: Commit resolved by the caller's immutable-source preflight
+        required: true
+        type: string
+    outputs:
+      ghcr_digest:
+        description: Verified GHCR multi-arch manifest digest
+        value: ${{ jobs.publish_version.outputs.ghcr_digest }}
+      dockerhub_digest:
+        description: Verified Docker Hub multi-arch manifest digest, when configured
+        value: ${{ jobs.publish_version.outputs.dockerhub_digest }}
 env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_REF: ${{ inputs.release_ref }}
+  RELEASE_COMMIT: ${{ inputs.release_commit }}
+  CANDIDATE_SUFFIX: candidate-${{ github.run_id }}
+
+concurrency:
+  group: docker-release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: Validate immutable release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      ghcr_repository: ${{ steps.release.outputs.ghcr_repository }}
+      commit: ${{ steps.release.outputs.commit }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          fetch-depth: 0
+
+      - name: Validate tag, source, and optional registry configuration
+        id: release
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Docker release tags must use lowercase v semver. Current value: $tag"
+            exit 1
+          fi
+          repository_version=$(<VERSION)
+          if [ "$repository_version" != "$tag" ] || ! cmp -s VERSION <(printf '%s\n' "$tag"); then
+            echo "::error::VERSION must contain exactly $tag and a final newline."
+            exit 1
+          fi
+          if [ "$RELEASE_REF" != "refs/tags/$tag" ]; then
+            echo '::error::Docker releases must resolve from their immutable tag ref.'
+            exit 1
+          fi
+          if ! [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
+             [ "$(git rev-parse HEAD)" != "$RELEASE_COMMIT" ]; then
+            echo '::error::Docker checkout does not match the caller-verified release commit.'
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          tag_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          if [ "$RELEASE_COMMIT" != "$tag_commit" ]; then
+            echo '::error::The release tag no longer resolves to the caller-verified commit.'
+            exit 1
+          fi
+
+          configured_values=0
+          [ -n "$DOCKERHUB_USERNAME" ] && configured_values=$((configured_values + 1))
+          [ -n "$DOCKERHUB_TOKEN" ] && configured_values=$((configured_values + 1))
+          [ -n "$DOCKERHUB_REPOSITORY" ] && configured_values=$((configured_values + 1))
+          if [ "$configured_values" -ne 0 ] && [ "$configured_values" -ne 3 ]; then
+            echo '::error::Docker Hub publishing requires username, token, and repository together.'
+            exit 1
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "ghcr_repository=${GITHUB_REPOSITORY,,}"
+            echo "commit=$tag_commit"
+          } >>"$GITHUB_OUTPUT"
+
   build_single_arch:
-    name: Build & push (${{ matrix.arch }})
+    name: Build, smoke, and sign candidate (${{ matrix.arch }})
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -34,50 +113,34 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
-
+    timeout-minutes: 60
     permissions:
       packages: write
       contents: read
       id-token: write
-
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
     steps:
-      - name: Check out
+      - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.RELEASE_COMMIT }}
           fetch-depth: 1
 
-      - name: Resolve tag & write VERSION
-        id: version
-        run: |
-          TAG="$RELEASE_TAG"
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${{ inputs.confirm_tag }}" != "$TAG" ]; then
-            echo "::error::confirm_tag must exactly match tag before publishing a stable Docker image."
-            exit 1
-          fi
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Docker release tags must use lowercase v semver, for example v0.0.1. Current value: $TAG"
-            exit 1
-          fi
-          echo "TAG=${TAG}" >> $GITHUB_ENV
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "${TAG}" > VERSION
-          echo "Building tag: ${TAG} for ${{ matrix.arch }}"
-
-      - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Install verified Docker Buildx
+        run: scripts/release/install-buildx.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Log in to Docker Hub
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
+        if: env.DOCKERHUB_REPOSITORY != ''
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
@@ -90,28 +153,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (labels)
+      - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: |
-            ghcr.io/${{ env.GHCR_REPOSITORY }}
+          images: ghcr.io/${{ env.GHCR_REPOSITORY }}
+          labels: |
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ needs.preflight.outputs.commit }}
 
-      - name: Prepare image tags
+      - name: Prepare candidate tags
         id: tags
         run: |
+          set -euo pipefail
           {
-            echo "tags<<EOF"
-            echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${{ matrix.arch }}"
-            echo "ghcr.io/${GHCR_REPOSITORY}:latest-${{ matrix.arch }}"
-            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-              echo "${DOCKERHUB_REPOSITORY}:${TAG}-${{ matrix.arch }}"
-              echo "${DOCKERHUB_REPOSITORY}:latest-${{ matrix.arch }}"
+            echo 'tags<<EOF'
+            echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${CANDIDATE_SUFFIX}-${{ matrix.arch }}"
+            if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo "${DOCKERHUB_REPOSITORY}:${TAG}-${CANDIDATE_SUFFIX}-${{ matrix.arch }}"
             fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+            echo 'EOF'
+          } >>"$GITHUB_OUTPUT"
 
-      - name: Build & push
+      - name: Build and push candidate
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -125,50 +189,138 @@ jobs:
           provenance: mode=max
           sbom: true
 
+      - name: Block high and critical candidate vulnerabilities
+        run: |
+          set -euo pipefail
+          candidate="ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}"
+          vex_path="$GITHUB_WORKSPACE/security/vex/${TAG}.openvex.json"
+          vex_product="pkg:golang/github.com/quantumnous/new-api@${TAG}"
+
+          jq --exit-status \
+            --arg product "$vex_product" \
+            --argjson expected '["CVE-2025-62155","CVE-2026-25591","CVE-2026-25802","CVE-2026-33655","CVE-2026-41432","CVE-2026-42339"]' '
+            .["@context"] == "https://openvex.dev/ns/v0.2.0" and
+            (.statements | type == "array" and length > 0) and
+            ([.statements[].vulnerability.name] | length == (unique | length)) and
+            ([.statements[].vulnerability.name] | sort) == ($expected | sort) and
+            all(.statements[];
+              (.vulnerability.name |
+                type == "string" and test("^CVE-[0-9]{4}-[0-9]+$")) and
+              .status == "fixed" and
+              (.status_notes | type == "string" and length >= 40) and
+              (.products |
+                type == "array" and
+                length == 1 and
+                .[0]["@id"] == $product)
+            )
+          ' "$vex_path" >/dev/null
+
+          docker pull --platform "linux/${{ matrix.arch }}" "$candidate"
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$vex_path:/vex/release.openvex.json:ro" \
+            --mount type=volume,destination=/root/.cache/ \
+            aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image \
+            --image-src docker \
+            --scanners vuln \
+            --pkg-types os,library \
+            --severity HIGH,CRITICAL \
+            --vex /vex/release.openvex.json \
+            --show-suppressed \
+            --exit-code 1 \
+            --no-progress \
+            "$candidate"
+
+      - name: Run native startup and version smoke
+        run: |
+          set -euo pipefail
+          scripts/release/smoke-image.sh \
+            "ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}" \
+            "$TAG" \
+            "${{ matrix.arch }}"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
 
-      - name: Sign image with cosign
+      - name: Sign and verify candidate digest
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          issuer='https://token.actions.githubusercontent.com'
+
+          ghcr_digest="ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "$ghcr_digest"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$ghcr_digest" >/dev/null
+
+          if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            dockerhub_digest="${DOCKERHUB_REPOSITORY}@${{ steps.build.outputs.digest }}"
+            cosign sign --yes "$dockerhub_digest"
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$dockerhub_digest" >/dev/null
           fi
 
-      - name: Image summary
+      - name: Record verified candidate digest
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "ghcr.io/${GHCR_REPOSITORY}:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "${DOCKERHUB_REPOSITORY}:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          digest='${{ steps.build.outputs.digest }}'
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::The verified candidate digest is invalid.'
+            exit 1
           fi
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          printf '%s\n' "$digest" >"candidate-digest-${{ matrix.arch }}.txt"
 
-  create_manifests:
-    name: Create multi-arch manifests
-    needs: [build_single_arch]
+      - name: Upload verified candidate digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: candidate-digest-${{ matrix.arch }}
+          retention-days: 30
+          if-no-files-found: error
+          path: candidate-digest-${{ matrix.arch }}.txt
+
+  create_candidate_manifest:
+    name: Create, inspect, and sign candidate manifest
+    needs: [preflight, build_single_arch]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    timeout-minutes: 20
     permissions:
       packages: write
       contents: read
       id-token: write
-
+    outputs:
+      ghcr_digest: ${{ steps.manifest.outputs.ghcr_digest }}
+      dockerhub_digest: ${{ steps.manifest.outputs.dockerhub_digest }}
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
     steps:
-      - name: Set version
-        run: echo "TAG=${{ needs.build_single_arch.outputs.tag }}" >> $GITHUB_ENV
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          fetch-depth: 1
 
-      - name: Normalize GHCR repository
-        run: echo "GHCR_REPOSITORY=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Install verified Docker Buildx
+        run: scripts/release/install-buildx.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
       - name: Log in to Docker Hub
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
+        if: env.DOCKERHUB_REPOSITORY != ''
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
@@ -181,55 +333,286 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Create & push manifest (GHCR version)
-        run: |
-          docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:${TAG} \
-            ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
 
-      - name: Create & push manifest (GHCR latest)
-        run: |
-          docker buildx imagetools create \
-            -t ghcr.io/${GHCR_REPOSITORY}:latest \
-            ghcr.io/${GHCR_REPOSITORY}:latest-amd64 \
-            ghcr.io/${GHCR_REPOSITORY}:latest-arm64
+      - name: Download verified architecture digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: candidate-digest-*
+          path: candidate-digests
+          merge-multiple: true
 
-      - name: Create & push manifest (Docker Hub version)
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
+      - name: Create and verify candidate manifests
+        id: manifest
         run: |
-          docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:${TAG} \
-            ${DOCKERHUB_REPOSITORY}:${TAG}-amd64 \
-            ${DOCKERHUB_REPOSITORY}:${TAG}-arm64
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          issuer='https://token.actions.githubusercontent.com'
+          mapfile -t digest_files < <(find candidate-digests \
+            -mindepth 1 -maxdepth 1 -type f -name 'candidate-digest-*.txt' | sort)
+          if [ "${#digest_files[@]}" -ne 2 ] || \
+             [ ! -f candidate-digests/candidate-digest-amd64.txt ] || \
+             [ ! -f candidate-digests/candidate-digest-arm64.txt ]; then
+            echo '::error::Expected exactly one verified digest file per release architecture.'
+            exit 1
+          fi
+          amd64_digest=$(<candidate-digests/candidate-digest-amd64.txt)
+          arm64_digest=$(<candidate-digests/candidate-digest-arm64.txt)
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid verified architecture digest: $digest"
+              exit 1
+            fi
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "ghcr.io/${GHCR_REPOSITORY}@${digest}" >/dev/null
+            if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              cosign verify \
+                --certificate-identity "$identity" \
+                --certificate-oidc-issuer "$issuer" \
+                "${DOCKERHUB_REPOSITORY}@${digest}" >/dev/null
+            fi
+          done
 
-      - name: Create & push manifest (Docker Hub latest)
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && env.DOCKERHUB_REPOSITORY != ''
-        run: |
+          ghcr_candidate="ghcr.io/${GHCR_REPOSITORY}:${TAG}-${CANDIDATE_SUFFIX}"
           docker buildx imagetools create \
-            -t ${DOCKERHUB_REPOSITORY}:latest \
-            ${DOCKERHUB_REPOSITORY}:latest-amd64 \
-            ${DOCKERHUB_REPOSITORY}:latest-arm64
+            --tag "$ghcr_candidate" \
+            "ghcr.io/${GHCR_REPOSITORY}@${amd64_digest}" \
+            "ghcr.io/${GHCR_REPOSITORY}@${arm64_digest}"
+          scripts/release/verify-image-index.sh \
+            "$ghcr_candidate" \
+            "$TAG" \
+            "$RELEASE_COMMIT"
+          ghcr_digest=$(docker buildx imagetools inspect "$ghcr_candidate" --format '{{json .Manifest}}' | jq --raw-output '.digest')
+          if [[ ! "$ghcr_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Unable to resolve the GHCR candidate manifest digest.'
+            exit 1
+          fi
+          cosign sign --yes "ghcr.io/${GHCR_REPOSITORY}@${ghcr_digest}"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "ghcr.io/${GHCR_REPOSITORY}@${ghcr_digest}" >/dev/null
+          echo "ghcr_digest=$ghcr_digest" >>"$GITHUB_OUTPUT"
+
+          if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            dockerhub_candidate="${DOCKERHUB_REPOSITORY}:${TAG}-${CANDIDATE_SUFFIX}"
+            docker buildx imagetools create \
+              --tag "$dockerhub_candidate" \
+              "${DOCKERHUB_REPOSITORY}@${amd64_digest}" \
+              "${DOCKERHUB_REPOSITORY}@${arm64_digest}"
+            scripts/release/verify-image-index.sh \
+              "$dockerhub_candidate" \
+              "$TAG" \
+              "$RELEASE_COMMIT"
+            dockerhub_digest=$(docker buildx imagetools inspect "$dockerhub_candidate" --format '{{json .Manifest}}' | jq --raw-output '.digest')
+            if [[ ! "$dockerhub_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::Unable to resolve the Docker Hub candidate manifest digest.'
+              exit 1
+            fi
+            cosign sign --yes "${DOCKERHUB_REPOSITORY}@${dockerhub_digest}"
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "${DOCKERHUB_REPOSITORY}@${dockerhub_digest}" >/dev/null
+            echo "dockerhub_digest=$dockerhub_digest" >>"$GITHUB_OUTPUT"
+          fi
+
+  smoke_candidate_manifest:
+    name: Pull and start candidate manifest (${{ matrix.arch }})
+    needs: [preflight, create_candidate_manifest]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      packages: read
+      contents: read
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          fetch-depth: 1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Verify registry platform selection and startup
+        run: |
+          set -euo pipefail
+          scripts/release/smoke-image.sh \
+            "ghcr.io/${GHCR_REPOSITORY}@${{ needs.create_candidate_manifest.outputs.ghcr_digest }}" \
+            "$TAG" \
+            "${{ matrix.arch }}"
+
+  publish_version:
+    name: Publish versioned manifest once
+    needs: [preflight, create_candidate_manifest, smoke_candidate_manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      ghcr_digest: ${{ steps.publish.outputs.ghcr_digest }}
+      dockerhub_digest: ${{ steps.publish.outputs.dockerhub_digest }}
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+      GHCR_CANDIDATE_DIGEST: ${{ needs.create_candidate_manifest.outputs.ghcr_digest }}
+      DOCKERHUB_CANDIDATE_DIGEST: ${{ needs.create_candidate_manifest.outputs.dockerhub_digest }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          fetch-depth: 1
+
+      - name: Install verified Docker Buildx
+        run: scripts/release/install-buildx.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_REPOSITORY != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
 
-      - name: Sign manifests with cosign
+      - name: Publish or resume version tags without replacement
+        id: publish
         run: |
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:${TAG}
-          cosign sign --yes ghcr.io/${GHCR_REPOSITORY}:latest
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:${TAG}
-            cosign sign --yes ${DOCKERHUB_REPOSITORY}:latest
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          issuer='https://token.actions.githubusercontent.com'
+          inspect_error=$(mktemp)
+          trap 'rm -f "$inspect_error"' EXIT
+
+          resolve_publish_once_tag() {
+            local image_reference=$1
+            local repository_reference=$2
+            local candidate_digest=$3
+            local output_variable=$4
+            local existing_manifest
+            local published_digest
+            local tag_already_exists=false
+
+            if ! [[ "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid verified candidate digest for $image_reference."
+              exit 1
+            fi
+            : >"$inspect_error"
+            if existing_manifest=$(docker buildx imagetools inspect \
+              "$image_reference" \
+              --format '{{json .Manifest}}' 2>"$inspect_error"); then
+              published_digest=$(jq --raw-output '.digest' <<<"$existing_manifest")
+              if ! [[ "$published_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::$image_reference exists but returned an invalid manifest digest."
+                exit 1
+              fi
+              tag_already_exists=true
+            else
+              if ! grep --extended-regexp --ignore-case --quiet \
+                'manifest unknown|name unknown|not found' "$inspect_error"; then
+                cat "$inspect_error" >&2
+                echo "::error::Unable to determine whether $image_reference is unused."
+                exit 1
+              fi
+              docker buildx imagetools create \
+                --tag "$image_reference" \
+                "${repository_reference}@${candidate_digest}"
+              published_digest=$(docker buildx imagetools inspect \
+                "$image_reference" \
+                --format '{{json .Manifest}}' | jq --raw-output '.digest')
+              if [ "$published_digest" != "$candidate_digest" ]; then
+                echo "::error::$image_reference does not resolve to the verified candidate digest after first publication."
+                exit 1
+              fi
+            fi
+
+            scripts/release/verify-image-index.sh \
+              "${repository_reference}@${published_digest}" \
+              "$TAG" \
+              "$RELEASE_COMMIT"
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "${repository_reference}@${published_digest}" >/dev/null
+
+            if [ "$tag_already_exists" = true ]; then
+              echo "Resuming from existing signed publish-once tag $image_reference at $published_digest."
+              if [ "$published_digest" != "$candidate_digest" ]; then
+                echo 'The fresh run produced a different provenance-bearing candidate; the signed existing version digest remains authoritative.'
+              fi
+            fi
+            printf -v "$output_variable" '%s' "$published_digest"
+          }
+
+          ghcr_version="ghcr.io/${GHCR_REPOSITORY}:${TAG}"
+          ghcr_digest=''
+          resolve_publish_once_tag \
+            "$ghcr_version" \
+            "ghcr.io/${GHCR_REPOSITORY}" \
+            "$GHCR_CANDIDATE_DIGEST" \
+            ghcr_digest
+          echo "ghcr_digest=$ghcr_digest" >>"$GITHUB_OUTPUT"
+
+          if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            dockerhub_version="${DOCKERHUB_REPOSITORY}:${TAG}"
+            dockerhub_digest=''
+            resolve_publish_once_tag \
+              "$dockerhub_version" \
+              "$DOCKERHUB_REPOSITORY" \
+              "$DOCKERHUB_CANDIDATE_DIGEST" \
+              dockerhub_digest
+            echo "dockerhub_digest=$dockerhub_digest" >>"$GITHUB_OUTPUT"
           fi
 
-      - name: Manifest summary
+      - name: Record verified version manifests
         run: |
-          echo "### Multi-arch Manifest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect ghcr.io/${GHCR_REPOSITORY}:${TAG} >> $GITHUB_STEP_SUMMARY
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_REPOSITORY" ]; then
-            echo "---" >> $GITHUB_STEP_SUMMARY
-            docker buildx imagetools inspect ${DOCKERHUB_REPOSITORY}:${TAG} >> $GITHUB_STEP_SUMMARY
-          fi
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo '### Verified versioned Docker manifest'
+            echo
+            echo "- GHCR: \`ghcr.io/${GHCR_REPOSITORY}:${TAG}@${{ steps.publish.outputs.ghcr_digest }}\`"
+            if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+              echo "- Docker Hub: \`${DOCKERHUB_REPOSITORY}:${TAG}@${{ steps.publish.outputs.dockerhub_digest }}\`"
+            fi
+            echo "- Only the publish-once version tag is created; the global \`latest\` alias is intentionally left unchanged."
+          } >>"$GITHUB_STEP_SUMMARY"

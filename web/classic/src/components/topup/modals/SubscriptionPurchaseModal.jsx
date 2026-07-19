@@ -204,7 +204,7 @@ const SubscriptionPurchaseModal = ({
                       loading={paying}
                       disabled={purchaseLimitReached || paying}
                     >
-                      Stripe
+                      {t('Stripe')}
                     </Button>
                   )}
                   {hasCreem && (
@@ -216,7 +216,7 @@ const SubscriptionPurchaseModal = ({
                       loading={paying}
                       disabled={purchaseLimitReached || paying}
                     >
-                      Creem
+                      {t('Creem')}
                     </Button>
                   )}
                 </div>

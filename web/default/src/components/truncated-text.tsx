@@ -1,4 +1,3 @@
-import { TruncatedCell } from '@/components/data-table/core/truncated-cell'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -17,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { TruncatedCell } from '@/components/data-table/core/truncated-cell'
 import { cn } from '@/lib/utils'
 
 interface TruncatedTextProps {

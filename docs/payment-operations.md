@@ -61,10 +61,18 @@ an administrator reason field.
 Set `CustomCallbackAddress` to the public HTTPS origin that receives payment
 webhooks and browser returns. Payment providers do not fall back to
 `ServerAddress`. Local HTTP is accepted only for loopback development.
+Production validation rejects localhost names, literal private or IANA
+special-purpose addresses, and ambiguous alternate IPv4 spellings even when
+they are written with HTTPS. Public DNS resolution, certificate validity, and
+external reachability remain operator gates.
 
 The public routes are:
 
-- Epay: `/api/payment/epay/notify`
+- Epay canonical: `/api/payment/epay/notify`
+- Epay legacy top-up adoption: `/api/user/epay/notify`
+- Epay legacy subscription adoption: `/api/subscription/epay/notify`
+- Epay legacy subscription browser return:
+  `/api/subscription/epay/return` (display-only, never settlement authority)
 - Stripe: `/api/stripe/webhook`
 - XORPay: `/api/xorpay/notify`
 
@@ -107,8 +115,15 @@ an end-user or public network merely to make a forwarded header appear in logs.
   status before any local state transition.
 - Provider trade numbers are namespaced by credential generation so two
   merchants cannot claim the same raw trade number after a rotation.
-- Previous credentials are accepted only for orders created inside the
-  configured overlap window.
+- A normal rotation retains the previous credential generation for 30 days
+  plus 3 hours. This covers the two-hour local order lifetime, the full 30-day
+  late-callback recovery window after expiry, and a one-hour clock and
+  scheduling margin. Previous credentials remain eligible only for orders
+  created no later than the rotation cutoff.
+- Another normal Epay rotation is rejected while that overlap is active. An
+  audited emergency revocation does not wait for the overlap: it immediately
+  revokes the affected generation and routes any dependent evidence to the
+  incident/manual-review flow instead of accepting another callback with it.
 
 ### Stripe
 
@@ -153,6 +168,24 @@ an end-user or public network merely to make a forwarded header appear in logs.
   - `charge.refunded`
   - `charge.dispute.created`
   - `charge.dispute.closed`
+- Configure the Stripe webhook endpoint API version as
+  `2026-06-24.dahlia`, matching the pinned `stripe-go` SDK. Financial refund
+  and dispute events from the v0.1.6 `acacia` train remain explicitly covered
+  for upgrade compatibility. A validly signed refund or dispute from another
+  train, a preview train, or an invalid/missing API version is retained with
+  provider identities for manual review, but it cannot automatically reverse
+  an entitlement. One-time Checkout payment events are separately confirmed
+  by re-fetching the exact Session before settlement.
+- Refund and dispute events select their order only through the immutable
+  `ProviderPaymentKey`. Canonical Checkout orders bind this key to the
+  PaymentIntent; mutable `trade_no` metadata and the Checkout/order identity
+  cannot redirect a reversal. Missing bindings remain in manual review, and
+  conflicting metadata is preserved as a mismatch rather than used as
+  authority.
+- Each Stripe dispute is tracked by its own `ProviderResourceKey`, derived from
+  the Stripe dispute ID. Current exposure is the aggregate of the latest state
+  of every dispute resource, so closing or winning one dispute cannot clear or
+  overwrite another open dispute on the same payment.
 - Keep test and live deployments isolated. Do not reuse one database while
   switching between unrelated Stripe accounts or modes; account and customer
   history is intentionally retained as payment authority.
@@ -169,8 +202,10 @@ an end-user or public network merely to make a forwarded header appear in logs.
   Sessions remain verifiable while new checkouts can bind a new Customer.
 
 The repository pins `stripe-go` in `go.mod`; that SDK release carries its API
-version. Upgrade it through a reviewed dependency change and rerun webhook
-fixtures before changing the Stripe webhook endpoint version.
+version. Upgrade it through a reviewed dependency change, add the new release
+train to the explicit financial-event compatibility policy only after its
+Charge/Dispute contracts are covered, and rerun signed webhook fixtures before
+changing the Stripe webhook endpoint version.
 
 ### XORPay
 
@@ -180,8 +215,15 @@ fixtures before changing the Stripe webhook endpoint version.
 - Create and callback signatures use the exact field order defined by XORPay.
 - `order_id` is the local canonical trade number; `aoid` is the provider order
   authority used for query and reconciliation.
-- Previous credentials are accepted only for their bound order generation and
-  overlap window.
+- A normal rotation retains the previous credential generation for 30 days
+  plus 25 hours. This covers the maximum accepted 24-hour provider order
+  lifetime, the full 30-day late-callback recovery window after expiry, and a
+  one-hour clock and scheduling margin. Previous credentials remain eligible
+  only for orders created no later than the rotation cutoff.
+- Another normal XORPay rotation is rejected while that overlap is active. An
+  audited emergency revocation immediately invalidates the affected
+  generation and moves dependent evidence into the incident/manual-review
+  path.
 - XORPay can report whether an `aoid` was paid, but its public query API cannot
   recover QR content after the create response is lost. In that case the order
   remains `state_unknown` and is reconciled by query, webhook, or expiry. Do not

@@ -1,17 +1,16 @@
 name: Release (Linux, macOS, Windows)
-permissions:
-  contents: write
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build (e.g., v0.0.1)'
+        description: Release tag to publish (e.g., v0.2.0)
         required: true
         type: string
-      name:
-        description: 'reason'
-        required: false
+      confirm_tag:
+        description: Type the same tag again to confirm the stable release
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
@@ -19,209 +18,1381 @@ on:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  RELEASE_REF: ${{ github.ref }}
 
 jobs:
-  linux:
-    name: Linux Release
+  preflight:
+    name: Validate immutable release source
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CONFIRM_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_tag || '' }}
+      IMMUTABLE_RELEASES_VERIFIED_TAG: ${{ vars.IMMUTABLE_RELEASES_VERIFIED_TAG }}
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      release_ref: ${{ steps.release.outputs.release_ref }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
-      - name: Checkout
+      - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ env.RELEASE_REF }}
-          fetch-depth: 1
-      - name: Determine Version
+          fetch-depth: 0
+
+      - name: Validate tag, VERSION, and protected release line
+        id: release
         run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$CONFIRM_TAG" != "$tag" ]; then
+              echo '::error::confirm_tag must exactly match tag before publishing a stable release.'
+              exit 1
+            fi
+            if [ "$GITHUB_REF" != "refs/tags/$tag" ]; then
+              echo '::error::Manual release recovery must be dispatched on the immutable tag ref.'
+              exit 1
+            fi
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release version must use lowercase v semver. Current value: $tag"
             exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+          if [ "$RELEASE_REF" != "refs/tags/$tag" ]; then
+            echo '::error::Stable releases must resolve from their immutable tag ref.'
+            exit 1
+          fi
+          repository_version=$(<VERSION)
+          if [ "$repository_version" != "$tag" ] || ! cmp -s VERSION <(printf '%s\n' "$tag"); then
+            echo "::error::VERSION must contain exactly $tag and a final newline."
+            exit 1
+          fi
+          if [ ! -s "docs/releases/$tag.md" ]; then
+            echo "::error::Missing release notes: docs/releases/$tag.md"
+            exit 1
+          fi
+          if ! grep --extended-regexp --line-regexp --quiet "## ${tag//./\\.} - [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md must contain a dated $tag release heading."
+            exit 1
+          fi
+          tag_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          if [ "$(git rev-parse HEAD)" != "$tag_commit" ]; then
+            echo '::error::The checked-out commit does not match the release tag.'
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo '::error::Stable releases must be reachable from protected main.'
+            exit 1
+          fi
+          if [ "$IMMUTABLE_RELEASES_VERIFIED_TAG" != "$tag" ]; then
+            echo '::error::The immutable-release setting was not freshly verified for this exact tag.'
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "release_ref=refs/tags/$tag"
+            echo "commit=$tag_commit"
+          } >>"$GITHUB_OUTPUT"
+
+  quality_gate:
+    name: Release tests, race detector, vet, and typecheck
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          bun-version: '1.3.14'
-      - name: Build Frontend (default)
-        env:
-          CI: ""
-        run: |
-          cd web
-          bun install --frozen-lockfile
-          cd default
-          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
-      - name: Build Frontend (classic)
-        env:
-          CI: ""
-        run: |
-          cd web
-          bun install --filter ./classic --frozen-lockfile
-          cd classic
-          VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.5'
-      - name: Build Backend (amd64)
-        run: |
-          go mod download
-          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o new-api-$VERSION
-      - name: Build Backend (arm64)
-        run: |
-          sudo apt-get update
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y gcc-aarch64-linux-gnu
-          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION' -extldflags '-static'" -o new-api-arm64-$VERSION
-      - name: Generate checksums
-        run: sha256sum new-api-* > checksums-linux.txt
+          cache: true
 
-      - name: Upload release artifacts
+      - name: Prepare embedded frontend placeholders
+        run: |
+          set -euo pipefail
+          mkdir -p web/default/dist web/classic/dist
+          printf '<!doctype html><title>release gate</title>' > web/default/dist/index.html
+          printf '<!doctype html><title>release gate</title>' > web/classic/dist/index.html
+
+      - name: Run backend tests and static analysis
+        run: |
+          set -euo pipefail
+          go test ./...
+          go test -race ./...
+          go vet ./...
+
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Validate frontend source and locales
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --frozen-lockfile
+          ../scripts/release/audit-bun-lockfile.sh
+          bun run --cwd default typecheck
+          (cd default && bun test)
+          bun run --cwd default lint
+          bun run --cwd default copyright:check
+          bun run --cwd default i18n:sync
+          git diff --exit-code -- default/src/i18n/locales
+          jq --exit-status '
+            .base == "en.json" and
+            ((.locales | keys) == ["en", "fr", "ja", "ru", "vi", "zh", "zh-TW"]) and
+            ([.locales[] |
+              .missingCount == 0 and .extrasCount == 0
+            ] | all) and
+            (.locales.en.untranslatedScanStatus == "not-applicable") and
+            (.locales.en.untranslatedCount == null) and
+            ([.locales.fr, .locales.ja, .locales.ru, .locales.vi, .locales.zh] |
+              all(
+                .untranslatedScanStatus == "evaluated" and
+                .untranslatedCount == 0
+              )
+            ) and
+            (.locales["zh-TW"].untranslatedScanStatus == "not-evaluated") and
+            (.locales["zh-TW"].untranslatedCount == null)
+          ' default/src/i18n/locales/_reports/_sync-report.json >/dev/null
+          bun run --cwd classic lint
+          (cd classic && bun test)
+
+  linux:
+    name: Linux release assets
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Build default frontend
+        env:
+          CI: ''
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --frozen-lockfile
+          cd default
+          DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Build classic frontend
+        env:
+          CI: ''
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --filter ./classic --frozen-lockfile
+          cd classic
+          VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build Linux binaries
+        run: |
+          set -euo pipefail
+          go mod download
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-$VERSION"
+          CGO_ENABLED=0 \
+            GOOS=linux \
+            GOARCH=arm64 \
+            go build \
+              -trimpath \
+              -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+              -o "new-api-arm64-$VERSION"
+
+      - name: Verify Linux architecture, version, and checksums
+        run: |
+          set -euo pipefail
+          [ "$("./new-api-$VERSION" --version)" = "$VERSION" ]
+          file "new-api-$VERSION" | grep --quiet 'x86-64'
+          file "new-api-arm64-$VERSION" | grep --quiet 'ARM aarch64'
+          file "new-api-$VERSION" | grep --quiet 'statically linked'
+          file "new-api-arm64-$VERSION" | grep --quiet 'statically linked'
+          sha256sum "new-api-$VERSION" "new-api-arm64-$VERSION" >checksums-linux.txt
+          sha256sum --check --strict checksums-linux.txt
+
+      - name: Upload Linux release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-release
+          retention-days: 30
+          if-no-files-found: error
           path: |
-            new-api-*
+            new-api-${{ env.VERSION }}
+            new-api-arm64-${{ env.VERSION }}
             checksums-linux.txt
 
   macos:
-    name: macOS Release
+    name: macOS release assets
+    needs: preflight
     runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
     steps:
-      - name: Checkout
+      - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-depth: 1
-      - name: Determine Version
-        run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
-            exit 1
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: '1.3.14'
-      - name: Build Frontend (default)
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Build default frontend
         env:
-          CI: ""
-          NODE_OPTIONS: "--max-old-space-size=4096"
+          CI: ''
+          NODE_OPTIONS: --max-old-space-size=4096
         run: |
+          set -euo pipefail
           cd web
           bun install --frozen-lockfile
           cd default
-          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
-      - name: Build Frontend (classic)
+          DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Build classic frontend
         env:
-          CI: ""
+          CI: ''
         run: |
+          set -euo pipefail
           cd web
           bun install --filter ./classic --frozen-lockfile
           cd classic
-          VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
+          VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.5'
-      - name: Build Backend
-        run: |
-          go mod download
-          go build -ldflags "-X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-macos-$VERSION
-      - name: Generate checksums
-        run: shasum -a 256 new-api-macos-* > checksums-macos.txt
+          cache: true
 
-      - name: Upload release artifacts
+      - name: Build and verify macOS binary
+        run: |
+          set -euo pipefail
+          go mod download
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-macos-amd64-$VERSION"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-macos-arm64-$VERSION"
+          lipo -create \
+            "new-api-macos-amd64-$VERSION" \
+            "new-api-macos-arm64-$VERSION" \
+            -output "new-api-macos-$VERSION"
+          architectures=" $(lipo -archs "new-api-macos-$VERSION") "
+          [[ "$architectures" == *' x86_64 '* ]]
+          [[ "$architectures" == *' arm64 '* ]]
+          [ "$("./new-api-macos-$VERSION" --version)" = "$VERSION" ]
+          file "new-api-macos-$VERSION" | grep --quiet 'Mach-O universal binary'
+          shasum -a 256 "new-api-macos-$VERSION" >checksums-macos.txt
+          shasum -a 256 --check checksums-macos.txt
+
+      - name: Upload macOS release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-release
+          retention-days: 30
+          if-no-files-found: error
           path: |
-            new-api-macos-*
+            new-api-macos-${{ env.VERSION }}
             checksums-macos.txt
 
   windows:
-    name: Windows Release
+    name: Windows release assets
+    needs: preflight
     runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
     steps:
-      - name: Checkout
+      - name: Check out release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-depth: 1
-      - name: Determine Version
-        run: |
-          VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
-            exit 1
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: '1.3.14'
-      - name: Build Frontend (default)
+
+      - name: Install verified Bun
+        shell: bash
+        run: scripts/release/install-bun.sh
+
+      - name: Build default frontend
         env:
-          CI: ""
+          CI: ''
         run: |
+          set -euo pipefail
           cd web
           bun install --frozen-lockfile
           cd default
-          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
-      - name: Build Frontend (classic)
+          DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
+      - name: Build classic frontend
         env:
-          CI: ""
+          CI: ''
         run: |
+          set -euo pipefail
           cd web
           bun install --filter ./classic --frozen-lockfile
           cd classic
-          VITE_REACT_APP_VERSION=$VERSION bun run build
-          cd ../..
+          VITE_REACT_APP_VERSION="$VERSION" bun --bun run build
+
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26.5'
-      - name: Build Backend
-        run: |
-          go mod download
-          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-$VERSION.exe
-      - name: Generate checksums
-        run: sha256sum new-api-*.exe > checksums-windows.txt
+          cache: true
 
-      - name: Upload release artifacts
+      - name: Build and verify Windows binary
+        run: |
+          set -euo pipefail
+          go mod download
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" \
+            -o "new-api-$VERSION.exe"
+          reported_version=$(./new-api-"$VERSION".exe --version | tr -d '\r')
+          [ "$reported_version" = "$VERSION" ]
+          sha256sum "new-api-$VERSION.exe" | sed 's/ \*/  /' >checksums-windows.txt
+          sha256sum --check --strict checksums-windows.txt
+
+      - name: Upload Windows release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-release
+          retention-days: 30
+          if-no-files-found: error
           path: |
-            new-api-*.exe
+            new-api-${{ env.VERSION }}.exe
             checksums-windows.txt
 
-  release:
-    name: Upload Release
-    needs: [linux, macos, windows]
+  runtime_acceptance:
+    name: Runtime acceptance (Redis ${{ matrix.redis_mode }})
+    needs: [preflight, quality_gate, linux]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    concurrency:
-      group: release-upload-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        redis_mode: [disabled, enabled]
+    services:
+      redis:
+        image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
     steps:
-      - name: Download release artifacts
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download Linux release binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-release
+          path: linux-release
+
+      - name: Run login, relay, quota, and fail-closed payment smoke
+        env:
+          REDIS_MODE: ${{ matrix.redis_mode }}
+        run: >-
+          scripts/release/smoke-linux-standalone.sh
+          "$GITHUB_WORKSPACE/linux-release/new-api-$VERSION"
+          "$VERSION"
+          "$REDIS_MODE"
+
+  linux_arm64_acceptance:
+    name: Native arm64 standalone acceptance
+    needs: [preflight, quality_gate, linux]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download Linux release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-release
+          path: linux-release
+
+      - name: Verify native arm64 asset architecture and checksums
+        run: |
+          set -euo pipefail
+          cd linux-release
+          sha256sum --check --strict checksums-linux.txt
+          file "new-api-arm64-$VERSION" | grep --quiet 'ARM aarch64'
+          file "new-api-arm64-$VERSION" | grep --quiet 'statically linked'
+
+      - name: Run native arm64 version and runtime smoke
+        run: >-
+          scripts/release/smoke-linux-standalone.sh
+          "$GITHUB_WORKSPACE/linux-release/new-api-arm64-$VERSION"
+          "$VERSION"
+          disabled
+
+  verify_assets:
+    name: Verify complete release asset set
+    needs: [preflight, quality_gate, linux, macos, windows, runtime_acceptance, linux_arm64_acceptance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Release
+      - name: Verify checksums and exact asset inventory
+        run: scripts/release/verify-release-assets.sh release-assets "${{ needs.preflight.outputs.tag }}"
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-release-assets
+          retention-days: 30
+          if-no-files-found: error
+          path: release-assets/*
+
+  draft_release:
+    name: Stage or resume GitHub release
+    needs: [preflight, verify_assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: stable-release-${{ needs.preflight.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.resolve.outputs.release_id }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      TAG_COMMIT: ${{ needs.preflight.outputs.commit }}
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-release-assets
+          path: release-assets
+
+      - name: Re-verify aggregate checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check --strict checksums.txt
+
+      - name: Validate any resumable release before mutation
+        id: existing
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$TAG_COMMIT" ]; then
+            echo '::error::The release tag changed after immutable-source preflight.'
+            exit 1
+          fi
+          error_file=$(mktemp)
+          existing_directory=$(mktemp -d)
+          cleanup() {
+            rm -f "$error_file"
+            rm -rf "$existing_directory"
+          }
+          trap cleanup EXIT
+
+          if ! release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>"$error_file"); then
+            if grep --quiet 'HTTP 404' "$error_file"; then
+              echo 'state=absent' >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$error_file" >&2
+            exit 1
+          fi
+
+          if ! jq --exit-status \
+            --arg tag "$TAG" \
+            --arg commit "$TAG_COMMIT" \
+            --rawfile expected_body "docs/releases/${TAG}.md" \
+            '.tag_name == $tag and
+             .prerelease == false and
+             .body == $expected_body and
+             ((.draft == true and .immutable != true) or
+              (.draft == false and .immutable == true)) and
+             (.target_commitish == "main" or
+              .target_commitish == $tag or
+              .target_commitish == $commit)' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::An existing release is not a resumable draft or immutable publication for this tag.'
+            exit 1
+          fi
+          if jq --exit-status '.draft == true and .immutable != true' \
+            <<<"$release_json" >/dev/null; then
+            release_state=draft
+          else
+            release_state=public
+          fi
+
+          desktop_version=${TAG#v}
+          allowed_assets=$(jq --compact-output --null-input \
+            --arg tag "$TAG" \
+            --arg desktop_version "$desktop_version" \
+            '[
+              "New-API-App.\($desktop_version).exe",
+              "New-API-App.Setup.\($desktop_version).exe",
+              "checksums-electron-windows.txt",
+              "container-images.json",
+              "checksums-linux.txt",
+              "checksums-macos.txt",
+              "checksums-windows.txt",
+              "checksums.txt",
+              "new-api-\($tag)",
+              "new-api-arm64-\($tag)",
+              "new-api-macos-\($tag)",
+              "new-api-\($tag).exe"
+            ]')
+          if ! jq --exit-status \
+            --argjson allowed_assets "$allowed_assets" \
+            '([.assets[].name] - $allowed_assets) | length == 0' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::The resumable release contains an unexpected asset.'
+            exit 1
+          fi
+          if [ "$release_state" = public ] && ! jq --exit-status \
+            --argjson expected_assets "$allowed_assets" \
+            '([.assets[].name] | sort) == ($expected_assets | sort)' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::The immutable public release has an incomplete asset inventory.'
+            exit 1
+          fi
+
+          core_assets=(
+            "new-api-${TAG}"
+            "new-api-arm64-${TAG}"
+            "new-api-macos-${TAG}"
+            "new-api-${TAG}.exe"
+            checksums-linux.txt
+            checksums-macos.txt
+            checksums-windows.txt
+            checksums.txt
+          )
+          for asset_name in "${core_assets[@]}"; do
+            if ! jq --exit-status --arg name "$asset_name" \
+              '.assets | any(.name == $name)' <<<"$release_json" >/dev/null; then
+              continue
+            fi
+            gh release download "$TAG" \
+              --dir "$existing_directory" \
+              --pattern "$asset_name"
+            if ! cmp -s \
+              "release-assets/$asset_name" \
+              "$existing_directory/$asset_name"; then
+              echo "::error::Existing release asset differs from the verified build: $asset_name"
+              exit 1
+            fi
+          done
+          echo "state=$release_state" >>"$GITHUB_OUTPUT"
+
+      - name: Create draft release with verified assets
+        id: draft
+        if: steps.existing.outputs.state != 'public'
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: |
-            release-assets/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          draft: true
+          prerelease: false
+          make_latest: false
+          generate_release_notes: false
+          body_path: docs/releases/${{ needs.preflight.outputs.tag }}.md
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: release-assets/*
+
+      - name: Resolve and verify the release
+        id: resolve
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+
+          core_assets=$(jq --compact-output --null-input \
+            --arg tag "$TAG" \
+            '[
+              "checksums-linux.txt",
+              "checksums-macos.txt",
+              "checksums-windows.txt",
+              "checksums.txt",
+              "new-api-\($tag)",
+              "new-api-arm64-\($tag)",
+              "new-api-macos-\($tag)",
+              "new-api-\($tag).exe"
+            ] | sort')
+          if ! jq --exit-status \
+            --arg tag "$TAG" \
+            --argjson core_assets "$core_assets" \
+            --rawfile expected_body "docs/releases/${TAG}.md" \
+            '.tag_name == $tag and
+             .prerelease == false and
+             .body == $expected_body and
+             ((.draft == true and .immutable != true) or
+              (.draft == false and .immutable == true)) and
+             (([.assets[].name] | sort) as $actual |
+              ($core_assets - $actual) | length == 0)' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::The release is missing verified core assets or has invalid metadata.'
+            exit 1
+          fi
+          release_id=$(jq --raw-output '.id' <<<"$release_json")
+          if ! [[ "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::Unable to resolve the staged release id.'
+            exit 1
+          fi
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+
+  docker:
+    name: Verify and publish versioned multi-arch images once
+    needs: [preflight, verify_staged_release]
+    permissions:
+      packages: write
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      tag: ${{ needs.preflight.outputs.tag }}
+      release_ref: ${{ needs.preflight.outputs.release_ref }}
+      release_commit: ${{ needs.preflight.outputs.commit }}
+    secrets: inherit
+
+  verify_staged_release:
+    name: Wait for Electron and verify core/desktop release assets
+    needs: [preflight, draft_release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      asset_fingerprint: ${{ steps.assets.outputs.asset_fingerprint }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      TAG_COMMIT: ${{ needs.preflight.outputs.commit }}
+    steps:
+      - name: Check out release verification tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Wait for the matching Electron workflow
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 330); do
+            response=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/electron-build.yml/runs?per_page=100")
+            run_json=$(jq --compact-output \
+              --arg sha "$TAG_COMMIT" \
+              --arg tag "$TAG" \
+              '[.workflow_runs[] | select(
+                .event == "push" and
+                .head_sha == $sha and
+                .head_branch == $tag
+              )] | sort_by(.run_number, .run_attempt) | last // empty' \
+              <<<"$response")
+            if [ -z "$run_json" ]; then
+              sleep 10
+              continue
+            fi
+
+            status=$(jq --raw-output '.status' <<<"$run_json")
+            if [ "$status" != completed ]; then
+              sleep 10
+              continue
+            fi
+            conclusion=$(jq --raw-output '.conclusion' <<<"$run_json")
+            if [ "$conclusion" != success ]; then
+              run_url=$(jq --raw-output '.html_url' <<<"$run_json")
+              echo "::error::Electron workflow failed with conclusion '$conclusion': $run_url"
+              exit 1
+            fi
+            echo "Electron workflow completed successfully."
+            exit 0
+          done
+          echo '::error::Timed out waiting for the Electron release workflow.'
+          exit 1
+
+      - name: Verify release asset inventory and checksums
+        id: assets
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          if jq --exit-status '.draft == true and .immutable != true' \
+            <<<"$release_json" >/dev/null; then
+            release_state=draft
+          elif jq --exit-status '.draft == false and .immutable == true' \
+            <<<"$release_json" >/dev/null; then
+            release_state=public
+          else
+            echo '::error::The release is neither a resumable draft nor an immutable publication.'
+            exit 1
+          fi
+
+          desktop_version=${TAG#v}
+          expected_assets=$(printf '%s\n' \
+            "New-API-App.${desktop_version}.exe" \
+            "New-API-App.Setup.${desktop_version}.exe" \
+            "checksums-electron-windows.txt" \
+            "checksums-linux.txt" \
+            "checksums-macos.txt" \
+            "checksums-windows.txt" \
+            "checksums.txt" \
+            "new-api-${TAG}" \
+            "new-api-arm64-${TAG}" \
+            "new-api-macos-${TAG}" \
+            "new-api-${TAG}.exe" | sort)
+          actual_base_assets=$(jq --raw-output \
+            '.assets[].name | select(. != "container-images.json")' \
+            <<<"$release_json" | sort)
+          container_manifest_count=$(jq \
+            '[.assets[].name | select(. == "container-images.json")] | length' \
+            <<<"$release_json")
+          if { [ "$release_state" = draft ] && [ "$container_manifest_count" -gt 1 ]; } || \
+             { [ "$release_state" = public ] && [ "$container_manifest_count" -ne 1 ]; } || \
+             ! diff -u \
+               <(printf '%s\n' "$expected_assets") \
+               <(printf '%s\n' "$actual_base_assets"); then
+            echo '::error::The release asset inventory is incomplete or contains unexpected files.'
+            exit 1
+          fi
+
+          core_directory="$RUNNER_TEMP/core-release-assets"
+          desktop_directory="$RUNNER_TEMP/electron-release-assets"
+          mkdir -p "$core_directory" "$desktop_directory"
+          gh release download "$TAG" \
+            --dir "$core_directory" \
+            --pattern "new-api-${TAG}" \
+            --pattern "new-api-arm64-${TAG}" \
+            --pattern "new-api-macos-${TAG}" \
+            --pattern "new-api-${TAG}.exe" \
+            --pattern 'checksums-linux.txt' \
+            --pattern 'checksums-macos.txt' \
+            --pattern 'checksums-windows.txt' \
+            --pattern 'checksums.txt'
+          scripts/release/verify-release-assets.sh "$core_directory" "$TAG"
+
+          gh release download "$TAG" \
+            --dir "$desktop_directory" \
+            --pattern "New-API-App.${desktop_version}.exe" \
+            --pattern "New-API-App.Setup.${desktop_version}.exe" \
+            --pattern 'checksums-electron-windows.txt'
+          (
+            cd "$desktop_directory"
+            mapfile -t checksum_names < <(awk '
+              NF != 2 || $1 !~ /^[0-9a-f]{64}$/ { exit 1 }
+              {
+                name = $2
+                sub(/^\*/, "", name)
+                sub(/^\.\//, "", name)
+                print name
+              }
+            ' checksums-electron-windows.txt)
+            expected_names=(
+              "New-API-App.${desktop_version}.exe"
+              "New-API-App.Setup.${desktop_version}.exe"
+            )
+            if [ "${#checksum_names[@]}" -ne 2 ]; then
+              echo '::error::Electron checksum inventory must contain exactly two installers.'
+              exit 1
+            fi
+            for index in "${!expected_names[@]}"; do
+              if [ "${checksum_names[$index]}" != "${expected_names[$index]}" ]; then
+                echo "::error::Unexpected Electron checksum entry: ${checksum_names[$index]}"
+                exit 1
+              fi
+            done
+            sha256sum --check --strict checksums-electron-windows.txt
+          )
+
+          verified_release=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          verified_asset_names=$(jq --raw-output \
+            '.assets[].name | select(. != "container-images.json")' \
+            <<<"$verified_release" | sort)
+          if ! diff -u \
+            <(printf '%s\n' "$expected_assets") \
+            <(printf '%s\n' "$verified_asset_names"); then
+            echo '::error::A release asset name changed during checksum verification.'
+            exit 1
+          fi
+          if ! jq --exit-status \
+            --arg tag "$TAG" \
+            --argjson minimum_count 11 \
+            --argjson maximum_count 12 \
+            '.tag_name == $tag and
+             .prerelease == false and
+             ((.assets | length) >= $minimum_count) and
+             ((.assets | length) <= $maximum_count) and
+             (((.draft == true and .immutable != true) and
+               ([.assets[].name | select(. == "container-images.json")] | length) <= 1) or
+              ((.draft == false and .immutable == true) and
+               ([.assets[].name | select(. == "container-images.json")] | length) == 1)) and
+             ([.assets[].digest |
+               type == "string" and test("^sha256:[0-9a-f]{64}$")
+              ] | all)' \
+            <<<"$verified_release" >/dev/null; then
+            echo '::error::The verified release does not expose a complete SHA-256 asset inventory.'
+            exit 1
+          fi
+          local_asset_inventory=$(
+            for asset_path in "$core_directory"/* "$desktop_directory"/*; do
+              asset_name=${asset_path##*/}
+              asset_digest=$(sha256sum "$asset_path" | awk '{print $1}')
+              jq --compact-output --null-input \
+                --arg name "$asset_name" \
+                --arg digest "sha256:$asset_digest" \
+                '{name:$name,digest:$digest}'
+            done | jq --compact-output --slurp 'sort_by(.name)'
+          )
+          api_asset_inventory=$(jq --compact-output \
+            '[.assets[] |
+              select(.name != "container-images.json") |
+              {name: .name, digest: .digest}
+             ] | sort_by(.name)' \
+            <<<"$verified_release")
+          if [ "$local_asset_inventory" != "$api_asset_inventory" ]; then
+            echo '::error::Release asset digests changed during local checksum verification.'
+            exit 1
+          fi
+          asset_fingerprint=$(printf '%s' "$api_asset_inventory" | \
+            sha256sum | awk '{print $1}')
+          if ! [[ "$asset_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '::error::Unable to fingerprint the verified draft assets.'
+            exit 1
+          fi
+          echo "asset_fingerprint=$asset_fingerprint" >>"$GITHUB_OUTPUT"
+
+  stage_container_manifest:
+    name: Anchor verified container digests in the release
+    needs: [preflight, draft_release, docker, verify_staged_release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: stable-release-${{ needs.preflight.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      asset_fingerprint: ${{ steps.manifest.outputs.asset_fingerprint }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_ID: ${{ needs.draft_release.outputs.release_id }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      TAG_COMMIT: ${{ needs.preflight.outputs.commit }}
+      BASE_ASSET_FINGERPRINT: ${{ needs.verify_staged_release.outputs.asset_fingerprint }}
+      GHCR_DIGEST: ${{ needs.docker.outputs.ghcr_digest }}
+      DOCKERHUB_DIGEST: ${{ needs.docker.outputs.dockerhub_digest }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Create, stage, and fingerprint container manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          if ! [[ "$BASE_ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
+             ! [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Verified asset or GHCR digest output is missing.'
+            exit 1
+          fi
+          if [ -n "$DOCKERHUB_REPOSITORY" ] && \
+             ! [[ "$DOCKERHUB_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::The configured Docker Hub mirror digest is missing.'
+            exit 1
+          fi
+
+          ghcr_repository=${GITHUB_REPOSITORY,,}
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          issuer='https://token.actions.githubusercontent.com'
+          jq --sort-keys --indent 2 --null-input \
+            --arg tag "$TAG" \
+            --arg commit "$TAG_COMMIT" \
+            --arg ghcr_tag "ghcr.io/${ghcr_repository}:${TAG}" \
+            --arg ghcr_digest "$GHCR_DIGEST" \
+            --arg ghcr_reference "ghcr.io/${ghcr_repository}@${GHCR_DIGEST}" \
+            --arg dockerhub_repository "$DOCKERHUB_REPOSITORY" \
+            --arg dockerhub_digest "$DOCKERHUB_DIGEST" \
+            --arg identity "$identity" \
+            --arg issuer "$issuer" \
+            '{
+              schema_version: 1,
+              release: {tag: $tag, source_commit: $commit},
+              images: {
+                ghcr: {
+                  tag: $ghcr_tag,
+                  digest: $ghcr_digest,
+                  reference: $ghcr_reference
+                },
+                dockerhub: (
+                  if $dockerhub_repository == "" then null else {
+                    tag: ($dockerhub_repository + ":" + $tag),
+                    digest: $dockerhub_digest,
+                    reference: ($dockerhub_repository + "@" + $dockerhub_digest)
+                  } end
+                )
+              },
+              cosign: {
+                certificate_identity: $identity,
+                certificate_oidc_issuer: $issuer
+              }
+            }' >container-images.json
+
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          base_assets=$(jq --compact-output --null-input \
+            --arg tag "$TAG" \
+            --arg desktop_version "${TAG#v}" \
+            '[
+              "New-API-App.\($desktop_version).exe",
+              "New-API-App.Setup.\($desktop_version).exe",
+              "checksums-electron-windows.txt",
+              "checksums-linux.txt",
+              "checksums-macos.txt",
+              "checksums-windows.txt",
+              "checksums.txt",
+              "new-api-\($tag)",
+              "new-api-arm64-\($tag)",
+              "new-api-macos-\($tag)",
+              "new-api-\($tag).exe"
+            ] | sort')
+          if ! jq --exit-status \
+            --arg tag "$TAG" \
+            --argjson base_assets "$base_assets" \
+            --rawfile expected_body "docs/releases/${TAG}.md" \
+            '.tag_name == $tag and
+             .prerelease == false and
+             .body == $expected_body and
+             (([.assets[].name | select(. != "container-images.json")] | sort) == $base_assets) and
+             (.draft == true or (.draft == false and .immutable == true))' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::The release is not a resumable verified draft/publication state.'
+            exit 1
+          fi
+          base_inventory=$(jq --compact-output \
+            '[.assets[] |
+              select(.name != "container-images.json") |
+              {name: .name, digest: .digest}
+             ] | sort_by(.name)' <<<"$release_json")
+          current_base_fingerprint=$(printf '%s' "$base_inventory" | \
+            sha256sum | awk '{print $1}')
+          if [ "$current_base_fingerprint" != "$BASE_ASSET_FINGERPRINT" ]; then
+            echo '::error::A verified core or desktop asset changed before container anchoring.'
+            exit 1
+          fi
+
+          if jq --exit-status \
+            '.assets | any(.name == "container-images.json")' \
+            <<<"$release_json" >/dev/null; then
+            existing_directory=$(mktemp -d)
+            gh release download "$TAG" \
+              --dir "$existing_directory" \
+              --pattern 'container-images.json'
+            if ! cmp -s container-images.json "$existing_directory/container-images.json"; then
+              echo '::error::Existing container-images.json differs from verified image outputs.'
+              exit 1
+            fi
+          elif [ "$(jq --raw-output '.draft' <<<"$release_json")" = true ]; then
+            gh release upload "$TAG" container-images.json
+          else
+            echo '::error::The immutable public release is missing container-images.json.'
+            exit 1
+          fi
+
+          expected_final_assets=$(jq --compact-output \
+            --argjson base_assets "$base_assets" --null-input \
+            '$base_assets + ["container-images.json"] | sort')
+          local_manifest_digest="sha256:$(sha256sum container-images.json | awk '{print $1}')"
+          final_release=''
+          final_release_ready=false
+          for _ in $(seq 1 30); do
+            if ! final_release=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" 2>/dev/null); then
+              sleep 2
+              continue
+            fi
+            final_assets=$(jq --compact-output \
+              '[.assets[].name] | sort' <<<"$final_release")
+            if [ "$final_assets" != "$expected_final_assets" ] || \
+               ! jq --exit-status \
+                 '[.assets[].digest |
+                   type == "string" and test("^sha256:[0-9a-f]{64}$")
+                  ] | all' <<<"$final_release" >/dev/null; then
+              sleep 2
+              continue
+            fi
+
+            api_manifest_digest=$(jq --raw-output \
+              '.assets[] | select(.name == "container-images.json") | .digest' \
+              <<<"$final_release")
+            if [ "$local_manifest_digest" != "$api_manifest_digest" ]; then
+              echo '::error::The staged container manifest digest does not match the verified file.'
+              exit 1
+            fi
+            final_base_inventory=$(jq --compact-output \
+              '[.assets[] |
+                select(.name != "container-images.json") |
+                {name: .name, digest: .digest}
+               ] | sort_by(.name)' <<<"$final_release")
+            final_base_fingerprint=$(printf '%s' "$final_base_inventory" | \
+              sha256sum | awk '{print $1}')
+            if [ "$final_base_fingerprint" != "$BASE_ASSET_FINGERPRINT" ]; then
+              echo '::error::A core or desktop asset changed while the container manifest was staged.'
+              exit 1
+            fi
+            if ! jq --exit-status \
+              --arg tag "$TAG" \
+              '.tag_name == $tag and
+               .prerelease == false and
+               (.draft == true or (.draft == false and .immutable == true))' \
+              <<<"$final_release" >/dev/null; then
+              echo '::error::The release state changed while the container manifest was staged.'
+              exit 1
+            fi
+            final_release_ready=true
+            break
+          done
+          if [ "$final_release_ready" != true ]; then
+            echo '::error::Timed out waiting for the staged container manifest digest to become authoritative.'
+            exit 1
+          fi
+
+          final_inventory=$(jq --compact-output \
+            '[.assets[] | {name: .name, digest: .digest}] | sort_by(.name)' \
+            <<<"$final_release")
+          asset_fingerprint=$(printf '%s' "$final_inventory" | \
+            sha256sum | awk '{print $1}')
+          echo "asset_fingerprint=$asset_fingerprint" >>"$GITHUB_OUTPUT"
+
+  publish_release:
+    name: Publish immutable stable release
+    needs: [preflight, draft_release, docker, verify_staged_release, stage_container_manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: stable-release-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_ID: ${{ needs.draft_release.outputs.release_id }}
+      TAG: ${{ needs.preflight.outputs.tag }}
+      TAG_COMMIT: ${{ needs.preflight.outputs.commit }}
+      ASSET_FINGERPRINT: ${{ needs.stage_container_manifest.outputs.asset_fingerprint }}
+      GHCR_DIGEST: ${{ needs.docker.outputs.ghcr_digest }}
+      DOCKERHUB_DIGEST: ${{ needs.docker.outputs.dockerhub_digest }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Install verified Docker Buildx
+        run: scripts/release/install-buildx.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_REPOSITORY != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
+
+      - name: Verify versioned images and publish or resume the stable release
+        run: |
+          set -euo pipefail
+          ghcr_repository=${GITHUB_REPOSITORY,,}
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          issuer='https://token.actions.githubusercontent.com'
+
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$TAG_COMMIT" ]; then
+            echo '::error::The release tag changed after immutable-source preflight.'
+            exit 1
+          fi
+          if ! [[ "$ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
+             ! [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Verified release or image fingerprints are missing.'
+            exit 1
+          fi
+
+          desktop_version=${TAG#v}
+          expected_assets=$(jq --compact-output --null-input \
+            --arg tag "$TAG" \
+            --arg desktop_version "$desktop_version" \
+            '[
+              "New-API-App.\($desktop_version).exe",
+              "New-API-App.Setup.\($desktop_version).exe",
+              "checksums-electron-windows.txt",
+              "container-images.json",
+              "checksums-linux.txt",
+              "checksums-macos.txt",
+              "checksums-windows.txt",
+              "checksums.txt",
+              "new-api-\($tag)",
+              "new-api-arm64-\($tag)",
+              "new-api-macos-\($tag)",
+              "new-api-\($tag).exe"
+            ] | sort')
+
+          fingerprint_assets() {
+            local inventory
+            inventory=$(jq --compact-output \
+              '[.assets[] | {name: .name, digest: .digest}] | sort_by(.name)')
+            printf '%s' "$inventory" | sha256sum | awk '{print $1}'
+          }
+          validate_release_contract() {
+            local release_json=$1
+            jq --exit-status \
+              --arg tag "$TAG" \
+              --argjson expected_assets "$expected_assets" \
+              --rawfile expected_body "docs/releases/${TAG}.md" \
+              '.tag_name == $tag and
+               .prerelease == false and
+               .body == $expected_body and
+               ([.assets[].name] | sort) == $expected_assets and
+               ([.assets[].digest |
+                 type == "string" and test("^sha256:[0-9a-f]{64}$")
+                ] | all)' \
+              <<<"$release_json" >/dev/null
+          }
+
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          if ! validate_release_contract "$release_json"; then
+            echo '::error::The release no longer matches the verified tag, notes, or asset inventory.'
+            exit 1
+          fi
+          release_fingerprint=$(printf '%s' "$release_json" | fingerprint_assets)
+          if [ "$release_fingerprint" != "$ASSET_FINGERPRINT" ]; then
+            echo '::error::A staged release asset changed after checksum verification.'
+            exit 1
+          fi
+          if jq --exit-status '.draft == true and .immutable != true' \
+            <<<"$release_json" >/dev/null; then
+            release_state=draft
+          elif jq --exit-status '.draft == false and .immutable == true' \
+            <<<"$release_json" >/dev/null; then
+            release_state=public
+          else
+            echo '::error::The release is neither a verified draft nor the exact immutable public release.'
+            exit 1
+          fi
+
+          ghcr_version="ghcr.io/${ghcr_repository}:${TAG}"
+          resolved_ghcr_digest=$(docker buildx imagetools inspect \
+            "$ghcr_version" \
+            --format '{{json .Manifest}}' | jq --raw-output '.digest')
+          if [ "$resolved_ghcr_digest" != "$GHCR_DIGEST" ]; then
+            echo '::error::The publish-once GHCR version tag changed after image verification.'
+            exit 1
+          fi
+          scripts/release/verify-image-index.sh \
+            "ghcr.io/${ghcr_repository}@${resolved_ghcr_digest}" \
+            "$TAG" \
+            "$TAG_COMMIT"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "ghcr.io/${ghcr_repository}@${resolved_ghcr_digest}" >/dev/null
+
+          if [ -n "$DOCKERHUB_REPOSITORY" ]; then
+            if ! [[ "$DOCKERHUB_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::The configured Docker Hub mirror digest is missing.'
+              exit 1
+            fi
+            resolved_dockerhub_digest=$(docker buildx imagetools inspect \
+              "${DOCKERHUB_REPOSITORY}:${TAG}" \
+              --format '{{json .Manifest}}' | jq --raw-output '.digest')
+            if [ "$resolved_dockerhub_digest" != "$DOCKERHUB_DIGEST" ]; then
+              echo '::error::The publish-once Docker Hub version tag changed after verification.'
+              exit 1
+            fi
+            scripts/release/verify-image-index.sh \
+              "${DOCKERHUB_REPOSITORY}@${resolved_dockerhub_digest}" \
+              "$TAG" \
+              "$TAG_COMMIT"
+            cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "${DOCKERHUB_REPOSITORY}@${resolved_dockerhub_digest}" >/dev/null
+          fi
+
+          if [ "$release_state" = draft ]; then
+            current_latest_tag=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')
+            if ! [[ "$current_latest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo '::error::The current latest GitHub Release is not a stable semantic version.'
+              exit 1
+            fi
+            newest_tag=$(printf '%s\n%s\n' "$current_latest_tag" "$TAG" | sort -V | tail -n 1)
+            if [ "$newest_tag" != "$TAG" ]; then
+              echo "::error::Refusing to publish $TAG after newer release $current_latest_tag."
+              exit 1
+            fi
+
+            prepublish_release=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+            if ! validate_release_contract "$prepublish_release" || \
+               ! jq --exit-status '.draft == true and .immutable != true' \
+                 <<<"$prepublish_release" >/dev/null || \
+               [ "$(printf '%s' "$prepublish_release" | fingerprint_assets)" != "$ASSET_FINGERPRINT" ]; then
+              echo '::error::The draft changed immediately before the irreversible publication request.'
+              exit 1
+            fi
+
+            release_publish_confirmed=false
+            for attempt in 1 2 3; do
+              if gh api \
+                --method PATCH \
+                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+                -F draft=false \
+                -F prerelease=false \
+                -f make_latest=true >/dev/null; then
+                release_publish_confirmed=true
+                break
+              fi
+              if current_release=$(gh api \
+                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" 2>/dev/null) && \
+                 validate_release_contract "$current_release" && \
+                 jq --exit-status '.draft == false and .immutable == true' \
+                   <<<"$current_release" >/dev/null; then
+                release_publish_confirmed=true
+                break
+              fi
+              sleep $((attempt * 5))
+            done
+            if [ "$release_publish_confirmed" != true ]; then
+              echo '::error::Unable to confirm immutable publication of the verified draft.'
+              exit 1
+            fi
+          fi
+
+          publication_verified=false
+          for _ in $(seq 1 12); do
+            if published_release=$(gh api \
+                 "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" 2>/dev/null) && \
+               validate_release_contract "$published_release" && \
+               jq --exit-status '.draft == false and .immutable == true' \
+                 <<<"$published_release" >/dev/null; then
+              published_fingerprint=$(printf '%s' "$published_release" | fingerprint_assets)
+              latest_release_tag=$(gh api \
+                "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+              if [ "$published_fingerprint" = "$ASSET_FINGERPRINT" ] && \
+                 [ "$latest_release_tag" = "$TAG" ]; then
+                publication_verified=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$publication_verified" != true ]; then
+            echo '::error::The immutable public release could not be verified after publication.'
+            exit 1
+          fi
+
+          {
+            echo "### ${TAG} stable release completed"
+            echo
+            echo 'All binary checksums, native image startup checks, multi-architecture manifests, exact asset digests, and cosign signatures were verified before publication.'
+            echo 'The global container latest alias was intentionally left unchanged because direct upgrades from v0.1.7-v0.1.14 are not supported.'
+          } >>"$GITHUB_STEP_SUMMARY"

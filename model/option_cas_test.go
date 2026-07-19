@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting"
@@ -354,6 +355,56 @@ func TestPaymentConfigurationPreconditionsIncludeStandaloneLegacyOrders(t *testi
 				"StripeWebhookSecretPreviousExpiresAt": "0",
 			},
 		},
+		{
+			name: "callback origin legacy epay without provider",
+			projection: &TopUp{
+				UserId: 991907, Amount: 1, Money: 1, TradeNo: "legacy-callback-epay-precondition",
+				PaymentMethod: "alipay", PaymentProvider: "",
+				CreateTime: common.GetTimestamp(), Status: common.TopUpStatusPending,
+			},
+			preconditions: &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+			values:        map[string]string{paymentOptionCASTestFirst: "new-callback-origin"},
+		},
+		{
+			name: "callback origin legacy stripe",
+			projection: &TopUp{
+				UserId: 991908, Amount: 1, Money: 1, TradeNo: "legacy-callback-stripe-precondition",
+				PaymentMethod: PaymentMethodStripe, PaymentProvider: PaymentProviderStripe,
+				CreateTime: common.GetTimestamp(), Status: common.TopUpStatusPending,
+			},
+			preconditions: &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+			values:        map[string]string{paymentOptionCASTestFirst: "new-callback-origin"},
+		},
+		{
+			name: "callback origin legacy xorpay",
+			projection: &SubscriptionOrder{
+				UserId: 991909, PlanId: 1, TradeNo: "legacy-callback-xorpay-precondition",
+				PaymentMethod: PaymentMethodXorPayNative, PaymentProvider: PaymentProviderXorPay,
+				CreateTime: common.GetTimestamp(), Status: common.TopUpStatusPending,
+			},
+			preconditions: &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+			values:        map[string]string{paymentOptionCASTestFirst: "new-callback-origin"},
+		},
+		{
+			name: "callback origin recently expired legacy epay",
+			projection: &TopUp{
+				UserId: 991910, Amount: 1, Money: 1, TradeNo: "legacy-callback-recoverable-epay",
+				PaymentMethod: "alipay", PaymentProvider: "",
+				CreateTime: common.GetTimestamp() - 3600, CompleteTime: common.GetTimestamp(), Status: common.TopUpStatusExpired,
+			},
+			preconditions: &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+			values:        map[string]string{paymentOptionCASTestFirst: "new-callback-origin-after-epay-expiry"},
+		},
+		{
+			name: "callback origin recently failed legacy xorpay",
+			projection: &SubscriptionOrder{
+				UserId: 991911, PlanId: 1, TradeNo: "legacy-callback-recoverable-xorpay",
+				PaymentMethod: PaymentMethodXorPayNative, PaymentProvider: PaymentProviderXorPay,
+				CreateTime: common.GetTimestamp() - 3600, CompleteTime: common.GetTimestamp(), Status: common.TopUpStatusFailed,
+			},
+			preconditions: &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+			values:        map[string]string{paymentOptionCASTestFirst: "new-callback-origin-after-xorpay-failure"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			preparePaymentOptionCASTest(t)
@@ -382,6 +433,94 @@ func TestPaymentConfigurationPreconditionsIncludeStandaloneLegacyOrders(t *testi
 	}
 }
 
+func TestCallbackOriginPreconditionAllowsTerminalLegacyOrdersOutsideRecoveryWindow(t *testing.T) {
+	preparePaymentOptionCASTest(t)
+	require.NoError(t, DB.AutoMigrate(&PaymentConfigurationAudit{}, &PaymentOrder{}, &TopUp{}, &SubscriptionOrder{}))
+	outsideWindow := common.GetTimestamp() - int64(PaymentCallbackRecoveryWindow/time.Second) - 1
+	projection := &TopUp{
+		UserId: 991912, Amount: 1, Money: 1, TradeNo: "legacy-callback-outside-recovery-window",
+		PaymentMethod: "alipay", PaymentProvider: "",
+		CreateTime: outsideWindow, CompleteTime: outsideWindow, Status: common.TopUpStatusExpired,
+	}
+	require.NoError(t, DB.Create(projection).Error)
+	t.Cleanup(func() {
+		_ = DB.Delete(projection).Error
+		_ = DB.Session(&gorm.Session{AllowGlobalUpdate: true, SkipHooks: true}).Delete(&PaymentConfigurationAudit{}).Error
+	})
+
+	version, err := UpdatePaymentOptionsAndRevokeCredentialsAuditedWithVersionLockHeld(
+		map[string]string{paymentOptionCASTestFirst: "callback-origin-after-recovery-window"},
+		1, nil, &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+		&PaymentConfigurationAuditInput{AdminID: 46, ActorIP: "203.0.113.14", Reason: "recovery window elapsed"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), version)
+}
+
+func TestCallbackOriginPreconditionRollsBackForRecentCanonicalTerminalOrder(t *testing.T) {
+	preparePaymentOptionCASTest(t)
+	require.NoError(t, DB.AutoMigrate(&PaymentConfigurationAudit{}, &PaymentOrder{}, &TopUp{}, &SubscriptionOrder{}))
+	now := common.GetTimestamp()
+	order := &PaymentOrder{
+		TradeNo: "callback-origin-precondition-recent-failed", UserID: 991913,
+		OrderKind: PaymentOrderKindTopUp, Provider: PaymentProviderEpay, PaymentMethod: "alipay",
+		RequestID: "callback-origin-precondition-recent-failed", ExpectedAmountMinor: 100,
+		Currency: "CNY", RequestedAmount: 1, CreditQuota: 1, Status: PaymentOrderStatusFailed,
+		StartedAt: now - 60, CreatedAt: now - 60, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, DB.Create(order).Error)
+	t.Cleanup(func() {
+		_ = DB.Delete(order).Error
+		_ = DB.Session(&gorm.Session{AllowGlobalUpdate: true, SkipHooks: true}).Delete(&PaymentConfigurationAudit{}).Error
+	})
+
+	version, err := UpdatePaymentOptionsAndRevokeCredentialsAuditedWithVersionLockHeld(
+		map[string]string{paymentOptionCASTestFirst: "must-roll-back-callback-origin"},
+		1, nil, &PaymentConfigurationPreconditions{RequireNoCallbackDependentOrders: true},
+		&PaymentConfigurationAuditInput{AdminID: 47, ActorIP: "203.0.113.15", Reason: "callback migration"},
+	)
+	assert.ErrorIs(t, err, ErrPaymentConfigurationPrecondition)
+	assert.Equal(t, int64(1), version)
+	var optionCount int64
+	require.NoError(t, DB.Model(&Option{}).Where(fmt.Sprintf("%s = ?", optionKeyColumn()), paymentOptionCASTestFirst).Count(&optionCount).Error)
+	assert.Zero(t, optionCount)
+	var auditCount int64
+	require.NoError(t, DB.Model(&PaymentConfigurationAudit{}).Where("admin_id = ?", 47).Count(&auditCount).Error)
+	assert.Zero(t, auditCount)
+}
+
+func TestStripeHistoryPreconditionRollsBackConfigurationMutation(t *testing.T) {
+	preparePaymentOptionCASTest(t)
+	require.NoError(t, DB.AutoMigrate(&PaymentConfigurationAudit{}, &PaymentOrder{}))
+	now := common.GetTimestamp()
+	order := &PaymentOrder{
+		TradeNo: "stripe-history-precondition-fulfilled", UserID: 991914,
+		OrderKind: PaymentOrderKindTopUp, Provider: PaymentProviderStripe, PaymentMethod: PaymentMethodStripe,
+		RequestID: "stripe-history-precondition-fulfilled", ExpectedAmountMinor: 100,
+		Currency: "USD", RequestedAmount: 1, CreditQuota: 1, Status: PaymentOrderStatusFulfilled,
+		CreatedAt: now, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, DB.Create(order).Error)
+	t.Cleanup(func() {
+		_ = DB.Delete(order).Error
+		_ = DB.Session(&gorm.Session{AllowGlobalUpdate: true, SkipHooks: true}).Delete(&PaymentConfigurationAudit{}).Error
+	})
+
+	version, err := UpdatePaymentOptionsAndRevokeCredentialsAuditedWithVersionLockHeld(
+		map[string]string{paymentOptionCASTestFirst: "must-roll-back-stripe-history"},
+		1, nil, &PaymentConfigurationPreconditions{RequireNoStripeHistory: true},
+		&PaymentConfigurationAuditInput{AdminID: 48, ActorIP: "203.0.113.16", Reason: "clear Stripe API credential"},
+	)
+	assert.ErrorIs(t, err, ErrPaymentConfigurationPrecondition)
+	assert.Equal(t, int64(1), version)
+	var optionCount int64
+	require.NoError(t, DB.Model(&Option{}).Where(fmt.Sprintf("%s = ?", optionKeyColumn()), paymentOptionCASTestFirst).Count(&optionCount).Error)
+	assert.Zero(t, optionCount)
+	var auditCount int64
+	require.NoError(t, DB.Model(&PaymentConfigurationAudit{}).Where("admin_id = ?", 48).Count(&auditCount).Error)
+	assert.Zero(t, auditCount)
+}
+
 func TestAuditedCredentialRevocationRequiresMeaningfulReason(t *testing.T) {
 	preparePaymentOptionCASTest(t)
 	require.NoError(t, DB.AutoMigrate(&PaymentConfigurationAudit{}))
@@ -405,13 +544,14 @@ func TestAuditedCredentialRevocationRequiresMeaningfulReason(t *testing.T) {
 	assert.Zero(t, auditCount)
 }
 
-func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToReview(t *testing.T) {
+func TestStripeEmergencyShutdownIsAtomicAndMovesEveryActiveOrderToReview(t *testing.T) {
 	preparePaymentOptionCASTest(t)
 	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
 	require.NoError(t, DB.AutoMigrate(&PaymentConfigurationAudit{}, &PaymentOrder{}, &PaymentEvent{}, &TopUp{}, &SubscriptionOrder{}))
 	require.NoError(t, DB.Session(&gorm.Session{SkipHooks: true}).Where("admin_id = ?", 46).Delete(&PaymentConfigurationAudit{}).Error)
 
 	stripeOptionKeys := []string{
+		"StripeApiSecret", "StripeConfigurationVerifiedFingerprint", "StripeConfigurationVerifiedAt",
 		"StripeWebhookSecret", "StripeWebhookSecretPrevious", "StripeWebhookSecretPreviousExpiresAt", "StripeWebhookCredentialLivemode",
 		"StripeWebhookCredentialGeneration", "StripeWebhookPreviousCredentialGeneration", "StripeWebhookPreviousValidBefore",
 	}
@@ -445,6 +585,8 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 	originalGeneration := setting.StripeWebhookCredentialGeneration
 	originalPreviousGeneration := setting.StripeWebhookPreviousCredentialGeneration
 	originalPreviousValidBefore := setting.StripeWebhookPreviousValidBefore
+	originalFingerprint := setting.StripeConfigurationVerifiedFingerprint
+	originalVerifiedAt := setting.StripeConfigurationVerifiedAt
 	t.Cleanup(func() {
 		setting.StripeApiSecret = originalAPISecret
 		setting.StripeCredentialAccountId = originalAccountID
@@ -456,7 +598,10 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 		setting.StripeWebhookCredentialGeneration = originalGeneration
 		setting.StripeWebhookPreviousCredentialGeneration = originalPreviousGeneration
 		setting.StripeWebhookPreviousValidBefore = originalPreviousValidBefore
+		setting.StripeConfigurationVerifiedFingerprint = originalFingerprint
+		setting.StripeConfigurationVerifiedAt = originalVerifiedAt
 	})
+	now := common.GetTimestamp()
 	setting.StripeApiSecret = "sk_test_preserved_api_credential"
 	setting.StripeCredentialAccountId = "acct_preserved_binding"
 	setting.StripeCredentialLivemode = "test"
@@ -467,8 +612,8 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 	setting.StripeWebhookCredentialGeneration = 1
 	setting.StripeWebhookPreviousCredentialGeneration = 0
 	setting.StripeWebhookPreviousValidBefore = 0
-
-	now := common.GetTimestamp()
+	setting.StripeConfigurationVerifiedFingerprint = "verified-compromised-stripe-checkout"
+	setting.StripeConfigurationVerifiedAt = now
 	newOrder := func(suffix, kind, provider, status string) *PaymentOrder {
 		credentialGeneration := int64(0)
 		if provider == PaymentProviderStripe {
@@ -541,6 +686,9 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 
 	nextVersion, err := UpdatePaymentOptionsAndRevokeCredentialsAuditedWithVersionLockHeld(
 		map[string]string{
+			"StripeApiSecret":                           "",
+			"StripeConfigurationVerifiedFingerprint":    "",
+			"StripeConfigurationVerifiedAt":             "0",
 			"StripeWebhookSecret":                       "",
 			"StripeWebhookSecretPrevious":               "",
 			"StripeWebhookSecretPreviousExpiresAt":      "0",
@@ -553,7 +701,7 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 		[]PaymentCredentialRevocation{{Provider: PaymentProviderStripe, Generation: 1, ValidBefore: now, AllActiveOrders: true}},
 		nil,
 		&PaymentConfigurationAuditInput{
-			AdminID: 46, ActorIP: "203.0.113.46", Reason: "emergency Stripe webhook credential shutdown after exposure",
+			AdminID: 46, ActorIP: "203.0.113.46", Reason: "emergency Stripe API and webhook credential shutdown after exposure",
 		},
 	)
 	require.NoError(t, err)
@@ -597,7 +745,9 @@ func TestStripeWebhookEmergencyRevocationIsAtomicAndMovesEveryActiveOrderToRevie
 	assert.Equal(t, int64(2), setting.StripeWebhookCredentialGeneration)
 	assert.Zero(t, setting.StripeWebhookPreviousCredentialGeneration)
 	assert.Zero(t, setting.StripeWebhookPreviousValidBefore)
-	assert.Equal(t, "sk_test_preserved_api_credential", setting.StripeApiSecret)
+	assert.Empty(t, setting.StripeApiSecret)
+	assert.Empty(t, setting.StripeConfigurationVerifiedFingerprint)
+	assert.Zero(t, setting.StripeConfigurationVerifiedAt)
 	assert.Equal(t, "acct_preserved_binding", setting.StripeCredentialAccountId)
 	assert.Equal(t, "test", setting.StripeCredentialLivemode)
 	require.NoError(t, DB.First(unmatchedEvent, unmatchedEvent.ID).Error)

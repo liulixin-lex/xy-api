@@ -403,7 +403,7 @@ export function RechargeFormCard({
                               paymentCurrency,
                               paymentProvider
                             )
-                          : '—'}
+                          : t('Not available')}
                       </span>
                     )}
                   </div>

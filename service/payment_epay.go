@@ -30,7 +30,10 @@ type epayCredential struct {
 
 const epayDefaultExpirySeconds int64 = 2 * 60 * 60
 
-const epayMaxWebhookParameters = 32
+const (
+	epayMaxWebhookBytes      = 64 << 10
+	epayMaxWebhookParameters = 32
+)
 
 var epayPaymentMethodPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
@@ -149,8 +152,15 @@ func (*epayPaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedPay
 		!operation_setting.EpayPreviousCredentialActive() {
 		return nil, errors.New("epay webhook is not configured")
 	}
+	if len(request.URL.RawQuery) > epayMaxWebhookBytes ||
+		request.ContentLength > epayMaxWebhookBytes {
+		return nil, errors.New("epay callback is too large")
+	}
+	if request.Body != nil {
+		request.Body = http.MaxBytesReader(nil, request.Body, epayMaxWebhookBytes)
+	}
 	if err := request.ParseForm(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid epay callback form: %w", err)
 	}
 	if len(request.Form) > epayMaxWebhookParameters {
 		return nil, errors.New("epay callback contains too many parameters")
@@ -292,8 +302,8 @@ func ValidateExternalPaymentURL(raw string, allowLocalHTTP bool) error {
 }
 
 func isLocalDevelopmentHost(host string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 func formatPaymentMinor(minor int64, exponent int32) string {

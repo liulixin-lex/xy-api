@@ -153,6 +153,78 @@ func TestPaymentStartIdentityExpiryAndEncryptedPayloadCommitAtomically(t *testin
 	assert.Equal(t, PaymentOrderStatusProcessing, rolledBack.Status)
 }
 
+func TestPaymentProviderAuthorityKeysPreserveMaximumStripeObjectIDs(t *testing.T) {
+	truncateTables(t)
+	t.Setenv("PAYMENT_SECRET_KEY", "payment-authority-key-test-key-at-least-32-bytes")
+	now := common.GetTimestamp()
+	order := &PaymentOrder{
+		TradeNo: "PO_STRIPE_MAX_OBJECT_ID", UserID: 991914, OrderKind: PaymentOrderKindTopUp,
+		Provider: PaymentProviderStripe, PaymentMethod: PaymentMethodStripe,
+		RequestID: "stripe_max_object_id", ExpectedAmountMinor: 100, Currency: "USD",
+		RequestedAmount: 1, CreditQuota: 1, Status: PaymentOrderStatusProcessing,
+		CreatedAt: now, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, DB.Create(order).Error)
+
+	rawSessionID := "cs_" + strings.Repeat("s", 252)
+	rawPaymentIntentID := "pi_" + strings.Repeat("p", 252)
+	providerOrderKey := PaymentProviderStripe + ":" + rawSessionID
+	providerPaymentKey := PaymentProviderStripe + ":" + rawPaymentIntentID
+	require.Len(t, rawSessionID, 255)
+	require.Len(t, rawPaymentIntentID, 255)
+	require.LessOrEqual(t, len(providerOrderKey), PaymentProviderAuthorityKeyMaxLength)
+	require.LessOrEqual(t, len(providerPaymentKey), PaymentProviderAuthorityKeyMaxLength)
+	require.NoError(t, SavePaymentOrderStartWithProviderIdentity(
+		order.TradeNo, "hosted_redirect", `{"url":"https://checkout.stripe.com/c/pay/max-id"}`,
+		now+3600, providerOrderKey, providerPaymentKey,
+	))
+
+	var storedOrder PaymentOrder
+	require.NoError(t, DB.First(&storedOrder, order.ID).Error)
+	require.NotNil(t, storedOrder.ProviderOrderKey)
+	require.NotNil(t, storedOrder.ProviderPaymentKey)
+	assert.Equal(t, providerOrderKey, *storedOrder.ProviderOrderKey)
+	assert.Equal(t, providerPaymentKey, *storedOrder.ProviderPaymentKey)
+
+	providerResourceKey := PaymentProviderStripe + ":dp_" + strings.Repeat("d", 252)
+	input := PaymentEventInput{
+		Provider: PaymentProviderStripe, EventKey: "evt_max_object_id", EventType: "manual.review",
+		TradeNo: order.TradeNo, ProviderOrderKey: providerOrderKey,
+		ProviderPaymentKey: providerPaymentKey, ProviderResourceKey: providerResourceKey,
+		ManualReview: true, NormalizedPayload: `{"reason":"boundary"}`,
+	}
+	require.NoError(t, input.validate())
+	event := &PaymentEvent{
+		Provider: input.Provider, EventKey: input.EventKey, EventType: input.EventType,
+		TradeNo: input.TradeNo, ProviderOrderKey: input.ProviderOrderKey,
+		ProviderPaymentKey: input.ProviderPaymentKey, ProviderResourceKey: input.ProviderResourceKey,
+		ManualReview: true, PayloadDigest: PaymentPayloadDigest(input.NormalizedPayload),
+		NormalizedPayload: input.NormalizedPayload, Status: PaymentEventStatusManualReview,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	require.NoError(t, DB.Create(event).Error)
+	var storedEvent PaymentEvent
+	require.NoError(t, DB.First(&storedEvent, event.ID).Error)
+	assert.Equal(t, providerOrderKey, storedEvent.ProviderOrderKey)
+	assert.Equal(t, providerPaymentKey, storedEvent.ProviderPaymentKey)
+	assert.Equal(t, providerResourceKey, storedEvent.ProviderResourceKey)
+
+	tooLong := strings.Repeat("x", PaymentProviderAuthorityKeyMaxLength+1)
+	require.Error(t, SavePaymentOrderStartWithProviderIdentity(
+		order.TradeNo, "hosted_redirect", `{"url":"https://checkout.stripe.com/c/pay/too-long"}`,
+		now+3600, tooLong, "",
+	))
+	for _, mutate := range []func(*PaymentEventInput){
+		func(candidate *PaymentEventInput) { candidate.ProviderOrderKey = tooLong },
+		func(candidate *PaymentEventInput) { candidate.ProviderPaymentKey = tooLong },
+		func(candidate *PaymentEventInput) { candidate.ProviderResourceKey = tooLong },
+	} {
+		candidate := input
+		mutate(&candidate)
+		require.Error(t, candidate.validate())
+	}
+}
+
 func TestPaymentOrderStartPayloadsMigrateAndRewrapBeforePreviousKeyRemoval(t *testing.T) {
 	truncateTables(t)
 	oldKey := "old-payment-start-payload-key-at-least-32-bytes"

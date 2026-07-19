@@ -35,9 +35,10 @@ type PaymentConfigurationAuditInput struct {
 }
 
 type PaymentConfigurationPreconditions struct {
-	RequireNoActiveEpayOrders   bool
-	RequireNoStripeHistory      bool
-	RequireStripeWebhookOverlap bool
+	RequireNoCallbackDependentOrders bool
+	RequireNoActiveEpayOrders        bool
+	RequireNoStripeHistory           bool
+	RequireStripeWebhookOverlap      bool
 }
 
 func (input *PaymentConfigurationAuditInput) validate() error {

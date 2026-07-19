@@ -30,8 +30,8 @@ type PaymentOrder struct {
 	ProviderLivemode             *bool   `json:"-"`
 	QuoteID                      string  `json:"-" gorm:"type:varchar(128)"`
 	RequestID                    string  `json:"request_id" gorm:"type:varchar(128);uniqueIndex:idx_payment_user_request,priority:2"`
-	ProviderOrderKey             *string `json:"provider_order_key,omitempty" gorm:"type:varchar(255);uniqueIndex:idx_payment_orders_provider_order_key"`
-	ProviderPaymentKey           *string `json:"provider_payment_key,omitempty" gorm:"type:varchar(255);uniqueIndex:idx_payment_orders_provider_payment_key"`
+	ProviderOrderKey             *string `json:"provider_order_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_order_key"`
+	ProviderPaymentKey           *string `json:"provider_payment_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_payment_key"`
 	ExpectedAmountMinor          int64   `json:"expected_amount_minor"`
 	PaidAmountMinor              int64   `json:"paid_amount_minor"`
 	Currency                     string  `json:"currency" gorm:"type:varchar(8)"`
@@ -105,9 +105,9 @@ type PaymentEvent struct {
 	EventType                    string `json:"event_type" gorm:"type:varchar(128)"`
 	TradeNo                      string `json:"trade_no" gorm:"type:varchar(128);index"`
 	PaymentOrderID               int64  `json:"payment_order_id,omitempty" gorm:"index"`
-	ProviderOrderKey             string `json:"provider_order_key,omitempty" gorm:"type:varchar(255);index"`
-	ProviderPaymentKey           string `json:"provider_payment_key,omitempty" gorm:"type:varchar(255);index"`
-	ProviderResourceKey          string `json:"provider_resource_key,omitempty" gorm:"type:varchar(255);index"`
+	ProviderOrderKey             string `json:"provider_order_key,omitempty" gorm:"type:varchar(320);index"`
+	ProviderPaymentKey           string `json:"provider_payment_key,omitempty" gorm:"type:varchar(320);index"`
+	ProviderResourceKey          string `json:"provider_resource_key,omitempty" gorm:"type:varchar(320);index"`
 	ProviderCredentialGeneration int64  `json:"-" gorm:"index"`
 	ProviderLivemode             *bool  `json:"provider_livemode,omitempty" gorm:"index"`
 	CustomerID                   string `json:"customer_id,omitempty" gorm:"type:varchar(255)"`
@@ -215,6 +215,17 @@ func (binding *PaymentCustomerBinding) BeforeCreate(_ *gorm.DB) error {
 
 const (
 	paymentTradeNoPrefix = "new-api-ref-"
+
+	// PaymentCallbackRecoveryWindow keeps provider callback origins stable long
+	// enough for delayed Epay and XORPay payment notifications to settle an
+	// order that was already marked failed or expired locally. Thirty days is a
+	// deliberately conservative operational boundary; unresolved orders older
+	// than this require explicit reconciliation instead of silently pinning a
+	// callback origin forever.
+	PaymentCallbackRecoveryWindow = 30 * 24 * time.Hour
+	// PaymentProviderAuthorityKeyMaxLength leaves room for a documented
+	// 255-character provider object ID plus a provider namespace prefix.
+	PaymentProviderAuthorityKeyMaxLength = 320
 
 	PaymentOrderKindTopUp        = "topup"
 	PaymentOrderKindSubscription = "subscription"
@@ -499,13 +510,30 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 		if quote.ConsumedAt != 0 {
 			return ErrPaymentQuoteConsumed
 		}
+		inFlightLimit := PaymentMaxInFlightOrdersPerUserProvider
+		if quote.Provider == PaymentProviderStripe {
+			var user User
+			if err := lockForUpdate(tx).Select("id", "stripe_customer").Where("id = ?", userID).First(&user).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrPaymentUserUnavailable
+				}
+				return err
+			}
+			// Until Stripe has a reusable Customer, every Checkout Session created
+			// with customer_creation=always can mint a different Customer. Keep a
+			// single canonical order in flight so concurrent starts cannot create
+			// mutually conflicting ownership bindings during webhook settlement.
+			if strings.TrimSpace(user.StripeCustomer) == "" {
+				inFlightLimit = 1
+			}
+		}
 		var inFlightCount int64
 		if err := tx.Model(&PaymentOrder{}).
 			Where("user_id = ? AND provider = ? AND status IN ?", userID, quote.Provider, paymentInFlightOrderStatuses()).
 			Count(&inFlightCount).Error; err != nil {
 			return err
 		}
-		if inFlightCount >= PaymentMaxInFlightOrdersPerUserProvider {
+		if inFlightCount >= int64(inFlightLimit) {
 			return ErrPaymentInFlightOrderLimit
 		}
 		tradeNo, err := GeneratePaymentTradeNo()
@@ -721,6 +749,116 @@ func CountPaymentOrdersForProvider(provider string, statuses []string) (int64, e
 	var count int64
 	err := query.Count(&count).Error
 	return count, err
+}
+
+// CountPaymentOrdersDependingOnCallbackOrigin reports canonical and
+// standalone legacy orders that still require the currently configured
+// callback origin. Epay and XORPay embed notify_url when an order is created,
+// so recently failed or expired orders remain callback-dependent during the
+// recovery window. Stripe webhooks are configured independently; only its
+// active browser-return flows depend on this setting.
+func CountPaymentOrdersDependingOnCallbackOrigin(provider string, now int64) (int64, error) {
+	return countPaymentOrdersDependingOnCallbackOriginTx(DB, provider, now)
+}
+
+func countLegacyActivePaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyProvider bool) (int64, error) {
+	return countLegacyPaymentProjectionsTx(tx, provider, includeEmptyProvider, 0)
+}
+
+func countPaymentOrdersDependingOnCallbackOriginTx(tx *gorm.DB, provider string, now int64) (int64, error) {
+	provider = strings.TrimSpace(provider)
+	if tx == nil || now <= 0 ||
+		(provider != PaymentProviderEpay && provider != PaymentProviderStripe && provider != PaymentProviderXorPay) {
+		return 0, errors.New("invalid callback-dependent payment order lookup")
+	}
+	activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
+	query := tx.Model(&PaymentOrder{}).Where("provider = ?", provider)
+	recoveryCutoff := int64(0)
+	if provider == PaymentProviderEpay || provider == PaymentProviderXorPay {
+		recoveryCutoff = now - int64(PaymentCallbackRecoveryWindow/time.Second)
+		if recoveryCutoff <= 0 {
+			recoveryCutoff = 1
+		}
+		query = query.Where(
+			"(status IN ? OR (status IN ? AND started_at > 0 AND (updated_at >= ? OR expires_at >= ? OR created_at >= ?)))",
+			activeStatuses,
+			[]string{PaymentOrderStatusFailed, PaymentOrderStatusExpired},
+			recoveryCutoff, recoveryCutoff, recoveryCutoff,
+		)
+	} else {
+		query = query.Where("status IN ?", activeStatuses)
+	}
+	var canonicalCount int64
+	if err := query.Count(&canonicalCount).Error; err != nil {
+		return 0, err
+	}
+	legacyCount, err := countLegacyPaymentProjectionsTx(tx, provider, provider == PaymentProviderEpay, recoveryCutoff)
+	if err != nil {
+		return 0, err
+	}
+	return canonicalCount + legacyCount, nil
+}
+
+func countLegacyPaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyProvider bool, recoveryCutoff int64) (int64, error) {
+	if tx == nil || strings.TrimSpace(provider) == "" {
+		return 0, errors.New("invalid legacy payment projection lookup")
+	}
+	activeStatuses := []string{common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview}
+	countProjection := func(modelValue interface{}) (int64, error) {
+		if !tx.Migrator().HasTable(modelValue) {
+			return 0, nil
+		}
+		query := tx.Model(modelValue).Where("(payment_order_id IS NULL OR payment_order_id = 0)")
+		if recoveryCutoff > 0 {
+			query = query.Where(
+				"(status IN ? OR (status IN ? AND (complete_time >= ? OR create_time >= ?)))",
+				activeStatuses,
+				[]string{common.TopUpStatusFailed, common.TopUpStatusExpired},
+				recoveryCutoff, recoveryCutoff,
+			)
+		} else {
+			query = query.Where("status IN ?", activeStatuses)
+		}
+		switch provider {
+		case PaymentProviderEpay:
+			if includeEmptyProvider {
+				query = query.Where(
+					"(payment_provider = ? OR (payment_provider = '' AND payment_method <> '' AND payment_method NOT IN ?))",
+					provider,
+					[]string{
+						PaymentMethodStripe, PaymentMethodCreem, PaymentMethodWaffo,
+						PaymentMethodWaffoPancake, PaymentMethodXorPayNative,
+						PaymentMethodXorPayAlipay, PaymentMethodBalance,
+					},
+				)
+			} else {
+				query = query.Where("payment_provider = ?", provider)
+			}
+		case PaymentProviderStripe:
+			query = query.Where("(payment_provider = ? OR payment_method = ?)", provider, PaymentMethodStripe)
+		case PaymentProviderXorPay:
+			query = query.Where(
+				"(payment_provider = ? OR payment_method IN ?)",
+				provider, []string{PaymentMethodXorPayNative, PaymentMethodXorPayAlipay},
+			)
+		default:
+			query = query.Where("payment_provider = ?", provider)
+		}
+		var count int64
+		if err := query.Count(&count).Error; err != nil {
+			return 0, err
+		}
+		return count, nil
+	}
+	topUpCount, err := countProjection(&TopUp{})
+	if err != nil {
+		return 0, err
+	}
+	subscriptionCount, err := countProjection(&SubscriptionOrder{})
+	if err != nil {
+		return 0, err
+	}
+	return topUpCount + subscriptionCount, nil
 }
 
 func CountRecentPaymentOrdersForProvider(provider string, createdSince int64) (int64, error) {
@@ -1064,7 +1202,9 @@ func SavePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, ex
 	}
 	providerOrderKey = strings.TrimSpace(providerOrderKey)
 	providerPaymentKey = strings.TrimSpace(providerPaymentKey)
-	if len(providerOrderKey) > 255 || len(providerPaymentKey) > 255 || expiresAt > 0 && expiresAt <= time.Now().Unix() {
+	if len(providerOrderKey) > PaymentProviderAuthorityKeyMaxLength ||
+		len(providerPaymentKey) > PaymentProviderAuthorityKeyMaxLength ||
+		expiresAt > 0 && expiresAt <= time.Now().Unix() {
 		return errors.New("invalid payment provider start identity")
 	}
 	encryptedPayload, err := EncryptPaymentOrderStartPayload(tradeNo, payload)
@@ -1329,5 +1469,13 @@ func PaymentEventKey(provider, eventType, providerOrderKey, tradeNo, normalized 
 	if normalized == "" {
 		normalized = eventType + ":" + providerOrderKey + ":" + tradeNo
 	}
-	return fmt.Sprintf("%s:%s:%s", eventType, providerOrderKey, PaymentPayloadDigest(normalized))
+	canonical := fmt.Sprintf(
+		"%d:%s%d:%s%d:%s%d:%s%d:%s",
+		len(provider), provider,
+		len(eventType), eventType,
+		len(providerOrderKey), providerOrderKey,
+		len(tradeNo), tradeNo,
+		len(normalized), normalized,
+	)
+	return "event:" + PaymentPayloadDigest(canonical)
 }

@@ -116,7 +116,9 @@ func (in PaymentEventInput) validate() error {
 
 func (in PaymentEventInput) validateIdentity() error {
 	if in.Provider == "" || len(in.Provider) > 32 || in.EventKey == "" || in.EventType == "" || len(in.EventKey) > 255 || len(in.EventType) > 128 ||
-		len(in.TradeNo) > 128 || len(in.ProviderOrderKey) > 255 || len(in.ProviderPaymentKey) > 255 || len(in.ProviderResourceKey) > 255 ||
+		len(in.TradeNo) > 128 || len(in.ProviderOrderKey) > PaymentProviderAuthorityKeyMaxLength ||
+		len(in.ProviderPaymentKey) > PaymentProviderAuthorityKeyMaxLength ||
+		len(in.ProviderResourceKey) > PaymentProviderAuthorityKeyMaxLength ||
 		in.ProviderCredentialGeneration < 0 || in.ProviderCreatedAt < 0 || len(in.ProviderState) > 64 || len(in.CustomerID) > 255 || len(in.Currency) > 8 || len(in.PaymentMethod) > 64 {
 		return errors.New("invalid normalized payment event identity")
 	}
@@ -289,6 +291,7 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 			return finishPaymentEventTx(tx, event.ID, PaymentEventStatusProcessed, "", 0)
 		}
 
+		providerPaymentAuthority := paymentEventRequiresProviderPaymentAuthority(input)
 		order, err := lockPaymentOrderForEventTx(tx, input)
 		if !stripePaidEventModeAllowed(input) {
 			reason := "stripe_test_mode_disabled"
@@ -336,6 +339,15 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 		}
 		if err != nil {
 			if errors.Is(err, ErrPaymentOrderNotFound) {
+				if providerPaymentAuthority && input.ProviderPaymentKey != "" {
+					reason := "provider payment identity is not bound to an order yet"
+					if finishErr := finishPaymentEventTx(tx, event.ID, PaymentEventStatusManualReview, reason, 0); finishErr != nil {
+						return finishErr
+					}
+					result.ManualReview = true
+					postCommitErr = fmt.Errorf("%w: %s", ErrPaymentManualReview, reason)
+					return nil
+				}
 				if finishErr := finishPaymentEventTx(tx, event.ID, PaymentEventStatusFailed, "payment order not found", 0); finishErr != nil {
 					return finishErr
 				}
@@ -349,8 +361,14 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 		if order.Provider != input.Provider {
 			return markPaymentManualReviewForOrderTx(tx, event, order, "provider_mismatch", ErrPaymentProviderMismatch, result, &postCommitErr)
 		}
-		stripeEconomicReversal := order.Provider == PaymentProviderStripe &&
-			(input.Refunded || input.Disputed || input.DisputeResolved)
+		if providerPaymentAuthority && input.ProviderPaymentKey != "" && input.TradeNo != "" && input.TradeNo != order.TradeNo {
+			// Refund and dispute metadata can be edited after the original payment.
+			// The immutable provider payment identity selects the authoritative
+			// order; conflicting metadata must never redirect a reversal to a
+			// different trade number.
+			return markPaymentManualReviewForOrderTx(tx, event, order, "provider_trade_identity_mismatch", ErrPaymentProviderMismatch, result, &postCommitErr)
+		}
+		stripeEconomicReversal := order.Provider == PaymentProviderStripe && providerPaymentAuthority
 		if stripeEconomicReversal && input.ProviderLivemode != nil {
 			if order.ProviderLivemode == nil {
 				if err := tx.Model(&PaymentOrder{}).Where("id = ? AND provider_livemode IS NULL", order.ID).
@@ -410,7 +428,11 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 			return markPaymentManualReviewForOrderTx(tx, event, order, "provider_state_order_conflict", ErrPaymentManualReview, result, &postCommitErr)
 		}
 		if staleProviderState {
-			return finishPaymentEventTx(tx, event.ID, PaymentEventStatusProcessed, "stale provider state ignored", order.ID)
+			// A stale provider state is terminal but must not join the set of
+			// economically applied events. This is especially important when two
+			// Stripe dispute states share the same second-level timestamp: a later
+			// inbox ID must never make the ignored state win aggregation.
+			return finishPaymentEventTx(tx, event.ID, PaymentEventStatusDismissed, "stale provider state ignored", order.ID)
 		}
 
 		if input.Paid {
@@ -645,10 +667,13 @@ func lockPaymentOrderForEventTx(tx *gorm.DB, input PaymentEventInput) (*PaymentO
 	var order PaymentOrder
 	query := lockForUpdate(tx)
 	var err error
-	if strings.TrimSpace(input.TradeNo) != "" {
+	providerPaymentKey := strings.TrimSpace(input.ProviderPaymentKey)
+	if paymentEventRequiresProviderPaymentAuthority(input) && providerPaymentKey != "" {
+		err = query.Where("provider = ? AND provider_payment_key = ?", input.Provider, providerPaymentKey).First(&order).Error
+	} else if strings.TrimSpace(input.TradeNo) != "" {
 		err = query.Where("trade_no = ?", strings.TrimSpace(input.TradeNo)).First(&order).Error
-	} else if strings.TrimSpace(input.ProviderPaymentKey) != "" {
-		err = query.Where("provider_payment_key = ?", strings.TrimSpace(input.ProviderPaymentKey)).First(&order).Error
+	} else if providerPaymentKey != "" {
+		err = query.Where("provider = ? AND provider_payment_key = ?", input.Provider, providerPaymentKey).First(&order).Error
 	} else {
 		return nil, ErrPaymentOrderNotFound
 	}
@@ -659,6 +684,25 @@ func lockPaymentOrderForEventTx(tx *gorm.DB, input PaymentEventInput) (*PaymentO
 		return nil, err
 	}
 	return &order, nil
+}
+
+func paymentEventRequiresProviderPaymentAuthority(input PaymentEventInput) bool {
+	if input.Refunded || input.Disputed || input.DisputeResolved {
+		return true
+	}
+	if input.Provider != PaymentProviderStripe {
+		return false
+	}
+	switch input.EventType {
+	case "charge.refunded", "charge.dispute.created", "charge.dispute.closed":
+		// Incompatible Stripe API-version events deliberately clear their
+		// economic flags and enter manual review. They still carry a trustworthy
+		// PaymentIntent/Charge identity and untrusted mutable metadata, so order
+		// selection must retain the same authority rule as compatible events.
+		return true
+	default:
+		return false
+	}
 }
 
 func bindAndValidateProviderIdentityTx(tx *gorm.DB, order *PaymentOrder, input PaymentEventInput) error {
@@ -1129,14 +1173,12 @@ func reconcilePaymentReversalTx(tx *gorm.DB, event *PaymentEvent, order *Payment
 		}
 		order.RefundedAmountMinor = input.RefundedAmountMinor
 	}
-	if input.Disputed {
-		if input.DisputedAmountMinor <= 0 || input.DisputedAmountMinor > order.ExpectedAmountMinor {
-			return ErrPaymentAmountMismatch
+	if input.Disputed || input.DisputeResolved {
+		disputedAmount, err := paymentDisputedAmountTx(tx, event, order, input)
+		if err != nil {
+			return err
 		}
-		order.DisputedAmountMinor = input.DisputedAmountMinor
-	}
-	if input.DisputeResolved && input.DisputeWon {
-		order.DisputedAmountMinor = 0
+		order.DisputedAmountMinor = disputedAmount
 	}
 	targetAmount := order.RefundedAmountMinor
 	if order.DisputedAmountMinor > order.ExpectedAmountMinor-targetAmount {
@@ -1214,6 +1256,76 @@ func reconcilePaymentReversalTx(tx *gorm.DB, event *PaymentEvent, order *Payment
 		return err
 	}
 	return syncPaymentProjectionStatusTx(tx, order)
+}
+
+// paymentDisputedAmountTx derives the current disputed exposure from the
+// latest processed state of every provider dispute resource. Stripe documents
+// that one payment can receive more than one dispute, so a single latest event
+// must not overwrite or clear the amount still held by another dispute.
+func paymentDisputedAmountTx(tx *gorm.DB, event *PaymentEvent, order *PaymentOrder, input PaymentEventInput) (int64, error) {
+	if tx == nil || event == nil || order == nil {
+		return 0, ErrPaymentEventInvalid
+	}
+	resourceKey := strings.TrimSpace(input.ProviderResourceKey)
+	if resourceKey == "" {
+		if input.Disputed {
+			if input.DisputedAmountMinor <= 0 || input.DisputedAmountMinor > order.ExpectedAmountMinor {
+				return 0, ErrPaymentAmountMismatch
+			}
+			return input.DisputedAmountMinor, nil
+		}
+		if input.DisputeResolved && input.DisputeWon {
+			return 0, nil
+		}
+		return order.DisputedAmountMinor, nil
+	}
+
+	var history []PaymentEvent
+	if err := tx.Select(
+		"id", "provider_resource_key", "provider_created_at", "disputed_amount_minor", "disputed", "dispute_resolved", "dispute_won",
+	).Where(
+		"provider = ? AND payment_order_id = ? AND id <> ? AND status = ? AND provider_resource_key <> ?",
+		input.Provider, order.ID, event.ID, PaymentEventStatusProcessed, "",
+	).Where("disputed = ? OR dispute_resolved = ?", true, true).
+		Order("provider_resource_key asc, provider_created_at desc, id desc").Find(&history).Error; err != nil {
+		return 0, err
+	}
+
+	latest := make(map[string]PaymentEvent, len(history)+1)
+	for _, candidate := range history {
+		key := strings.TrimSpace(candidate.ProviderResourceKey)
+		if key == "" {
+			continue
+		}
+		if _, exists := latest[key]; !exists {
+			latest[key] = candidate
+		}
+	}
+	latest[resourceKey] = PaymentEvent{
+		ProviderResourceKey: resourceKey,
+		DisputedAmountMinor: input.DisputedAmountMinor,
+		Disputed:            input.Disputed,
+		DisputeResolved:     input.DisputeResolved,
+		DisputeWon:          input.DisputeWon,
+	}
+
+	var total int64
+	for _, state := range latest {
+		if state.DisputeResolved && state.DisputeWon {
+			continue
+		}
+		if !state.Disputed {
+			if state.DisputeResolved {
+				return 0, ErrPaymentManualReview
+			}
+			continue
+		}
+		if state.DisputedAmountMinor <= 0 || state.DisputedAmountMinor > order.ExpectedAmountMinor-total {
+			return 0, ErrPaymentAmountMismatch
+		}
+		total += state.DisputedAmountMinor
+	}
+	return total, nil
 }
 
 func legacyExternalRefundWithoutEntitlementResolvedTx(tx *gorm.DB, order *PaymentOrder) (bool, error) {

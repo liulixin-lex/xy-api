@@ -39,6 +39,7 @@ import RiskAcknowledgementModal from '../common/modals/RiskAcknowledgementModal'
 import SecureVerificationModal from '../common/modals/SecureVerificationModal';
 import { useSecureVerification } from '../../hooks/common/useSecureVerification';
 import {
+  getEmergencyCredentialClearSecrets,
   isEmergencyCredentialRevocationReasonValid,
   normalizeEmergencyCredentialRevocationReason,
   resolveEmergencyCredentialRevocationMode,
@@ -334,17 +335,21 @@ const PaymentSetting = () => {
   const requestEmergencyCredentialRevocation = (
     provider,
     replacement = { state: 'none', options: {} },
+    requestedMode = null,
   ) => {
     const previousCredentialStateKeys = {
       epay: 'payment_setting.epay_previous_credential_active',
       stripe: 'payment_setting.stripe_previous_credential_active',
       xorpay: 'payment_setting.xorpay_previous_credential_active',
     };
-    const mode = resolveEmergencyCredentialRevocationMode(
-      provider,
-      replacement.state,
-      Boolean(inputs[previousCredentialStateKeys[provider]]),
-    );
+    const mode =
+      requestedMode === 'stripe_disable_all' && provider === 'stripe'
+        ? requestedMode
+        : resolveEmergencyCredentialRevocationMode(
+            provider,
+            replacement.state,
+            Boolean(inputs[previousCredentialStateKeys[provider]]),
+          );
     if (!mode && replacement.state === 'partial') {
       showError(
         t(
@@ -357,7 +362,7 @@ const PaymentSetting = () => {
       showError(
         t(
           'No active previous {{provider}} credential is available to revoke. Enter a complete replacement identifier and secret to perform an emergency replacement.',
-          { provider: provider === 'epay' ? 'Epay' : 'XORPay' },
+          { provider: provider === 'epay' ? t('易支付') : t('XORPay') },
         ),
       );
       return;
@@ -380,10 +385,14 @@ const PaymentSetting = () => {
     setLoading(true);
     try {
       await withPaymentVerification(async () => {
+        const clearSecrets = getEmergencyCredentialClearSecrets(
+          pendingCredentialRevocation.mode,
+        );
         const response = await API.put(
           '/api/option/payment',
           {
             options: pendingCredentialRevocation.options,
+            ...(clearSecrets.length > 0 ? { clear_secrets: clearSecrets } : {}),
             revoke_previous_credentials: [pendingCredentialRevocation.provider],
             reason: normalizeEmergencyCredentialRevocationReason(
               credentialRevocationReason,
@@ -412,6 +421,12 @@ const PaymentSetting = () => {
           showSuccess(
             t('Stripe webhooks disabled and signing credentials revoked'),
           );
+        } else if (pendingCredentialRevocation.mode === 'stripe_disable_all') {
+          showSuccess(
+            t(
+              'Stripe API and webhook credentials disabled; affected orders quarantined',
+            ),
+          );
         } else {
           showSuccess(t('旧凭据已撤销'));
         }
@@ -430,9 +445,9 @@ const PaymentSetting = () => {
   };
 
   const credentialRevocationProviderLabels = {
-    epay: 'Epay',
+    epay: t('易支付'),
     stripe: t('Stripe webhook'),
-    xorpay: 'XORPay',
+    xorpay: t('XORPay'),
   };
   const pendingCredentialRevocationProvider =
     pendingCredentialRevocation?.provider;
@@ -468,6 +483,14 @@ const PaymentSetting = () => {
     credentialRevocationConfirmText = t('Disable and revoke');
     credentialRevocationWarning = t(
       'Emergency action: all Stripe webhook signing secrets stop validating immediately, Stripe webhooks are disabled, and every unfinished Stripe order moves to manual review. To replace the webhook secret atomically instead, confirm compliance and use the Stripe settings form. Clearing or normally rotating a secret does not perform this emergency revocation.',
+    );
+  } else if (pendingCredentialRevocation?.mode === 'stripe_disable_all') {
+    credentialRevocationTitle = t(
+      'Disable all Stripe credentials immediately?',
+    );
+    credentialRevocationConfirmText = t('Disable all and revoke');
+    credentialRevocationWarning = t(
+      'Emergency shutdown: the Stripe API credential and all webhook signing secrets are cleared locally, every unfinished Stripe order moves to manual review, and durable Stripe history is marked with a credential incident. This does not revoke the API key at Stripe; revoke it in the Stripe Dashboard as well.',
     );
   } else if (pendingCredentialRevocation) {
     credentialRevocationWarning = t(
@@ -518,6 +541,19 @@ const PaymentSetting = () => {
                     </Button>
                     <Button
                       type='danger'
+                      theme='borderless'
+                      onClick={() =>
+                        requestEmergencyCredentialRevocation(
+                          'stripe',
+                          { state: 'none', options: {} },
+                          'stripe_disable_all',
+                        )
+                      }
+                    >
+                      {t('Disable Stripe completely now')}
+                    </Button>
+                    <Button
+                      type='danger'
                       disabled={
                         !inputs[
                           'payment_setting.epay_previous_credential_active'
@@ -527,7 +563,7 @@ const PaymentSetting = () => {
                         requestEmergencyCredentialRevocation('epay')
                       }
                     >
-                      Epay: {t('立即撤销旧凭据')}
+                      {t('易支付')}: {t('立即撤销旧凭据')}
                     </Button>
                     <Button
                       type='danger'
@@ -540,7 +576,7 @@ const PaymentSetting = () => {
                         requestEmergencyCredentialRevocation('xorpay')
                       }
                     >
-                      XORPay: {t('立即撤销旧凭据')}
+                      {t('XORPay')}: {t('立即撤销旧凭据')}
                     </Button>
                   </div>
                 </div>

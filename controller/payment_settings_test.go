@@ -148,6 +148,53 @@ func TestEpayCredentialRotationPreservesThePreviousGeneration(t *testing.T) {
 	assert.Equal(t, "7", values["EpayPreviousCredentialGeneration"])
 	assert.Equal(t, "8", values["EpayCredentialGeneration"])
 	assert.Equal(t, "1800000000", values["EpayPreviousValidBefore"])
+	assert.Equal(t, strconv.FormatInt(1_800_000_000+int64(epayCredentialOverlap/time.Second), 10), values["EpayPreviousExpiresAt"])
+	assert.Greater(t, epayCredentialOverlap, model.PaymentCallbackRecoveryWindow+2*time.Hour)
+}
+
+func TestXorPayCredentialRotationPreservesProviderRetryWindow(t *testing.T) {
+	setupMidjourneyControllerBillingDB(t)
+	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
+	originalAid := setting.XorPayAid
+	originalSecret := setting.XorPayAppSecret
+	originalGeneration := setting.XorPayCredentialGeneration
+	originalPreviousAid := setting.XorPayAidPrevious
+	originalPreviousSecret := setting.XorPayAppSecretPrevious
+	originalPreviousGeneration := setting.XorPayPreviousCredentialGeneration
+	originalPreviousValidBefore := setting.XorPayPreviousValidBefore
+	originalPreviousExpiresAt := setting.XorPayPreviousExpiresAt
+	t.Cleanup(func() {
+		setting.XorPayAid = originalAid
+		setting.XorPayAppSecret = originalSecret
+		setting.XorPayCredentialGeneration = originalGeneration
+		setting.XorPayAidPrevious = originalPreviousAid
+		setting.XorPayAppSecretPrevious = originalPreviousSecret
+		setting.XorPayPreviousCredentialGeneration = originalPreviousGeneration
+		setting.XorPayPreviousValidBefore = originalPreviousValidBefore
+		setting.XorPayPreviousExpiresAt = originalPreviousExpiresAt
+	})
+	setting.XorPayAid = "aid_current_retry_window"
+	setting.XorPayAppSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	setting.XorPayCredentialGeneration = 4
+	setting.XorPayAidPrevious = ""
+	setting.XorPayAppSecretPrevious = ""
+	setting.XorPayPreviousCredentialGeneration = 0
+	setting.XorPayPreviousValidBefore = 0
+	setting.XorPayPreviousExpiresAt = 0
+
+	const now = int64(1_800_000_000)
+	values := map[string]string{
+		"XorPayAid":       "aid_replacement_retry_window",
+		"XorPayAppSecret": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+	}
+	_, err := preparePaymentCredentialRotations(values, nil, now)
+	require.NoError(t, err)
+	assert.Equal(t, setting.XorPayAid, values["XorPayAidPrevious"])
+	assert.Equal(t, setting.XorPayAppSecret, values["XorPayAppSecretPrevious"])
+	assert.Equal(t, "4", values["XorPayPreviousCredentialGeneration"])
+	assert.Equal(t, strconv.FormatInt(now, 10), values["XorPayPreviousValidBefore"])
+	assert.Equal(t, strconv.FormatInt(now+int64(xorPayCredentialOverlap/time.Second), 10), values["XorPayPreviousExpiresAt"])
+	assert.Greater(t, xorPayCredentialOverlap, model.PaymentCallbackRecoveryWindow+24*time.Hour)
 }
 
 func TestEpayEmergencyMigrationCanAtomicallyReplaceEndpointAndCurrentCredential(t *testing.T) {
@@ -665,6 +712,240 @@ func TestStripeAPIKeyCanRotateWithinTheBoundAccountWithActiveOrders(t *testing.T
 		"StripeCredentialLivemode":  "test",
 	}, nil)
 	require.NoError(t, err)
+}
+
+func TestStripeAPISecretCannotBeClearedWithDurableHistory(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalSecret := setting.StripeApiSecret
+	setting.StripeApiSecret = "sk_test_durable_checkout_history"
+	t.Cleanup(func() { setting.StripeApiSecret = originalSecret })
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.PaymentOrder{
+		TradeNo: "payment-settings-stripe-expired-checkout-history", UserID: 990009,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-stripe-expired-checkout-history",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusExpired, CreatedAt: now - 3600, UpdatedAt: now, Version: 1,
+	}).Error)
+
+	values := map[string]string{"StripeApiSecret": ""}
+	err := validateInFlightPaymentConfigurationChanges(values, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "durable Stripe data")
+	assert.True(t, paymentConfigurationPreconditions(values, nil).RequireNoStripeHistory)
+}
+
+func TestStripeAPISecretCanBeClearedWithoutHistory(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalSecret := setting.StripeApiSecret
+	setting.StripeApiSecret = "sk_test_no_checkout_history"
+	t.Cleanup(func() { setting.StripeApiSecret = originalSecret })
+
+	values := map[string]string{"StripeApiSecret": ""}
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+	assert.True(t, paymentConfigurationPreconditions(values, nil).RequireNoStripeHistory)
+}
+
+func TestStripeAPISecretEmergencyClearCanQuarantineHistory(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalSecret := setting.StripeApiSecret
+	setting.StripeApiSecret = "sk_test_emergency_checkout_history"
+	t.Cleanup(func() { setting.StripeApiSecret = originalSecret })
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.PaymentOrder{
+		TradeNo: "payment-settings-stripe-emergency-checkout-history", UserID: 990011,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-stripe-emergency-checkout-history",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusProcessing, CreatedAt: now, UpdatedAt: now, Version: 1,
+	}).Error)
+
+	values := map[string]string{"StripeApiSecret": ""}
+	emergency := map[string]bool{model.PaymentProviderStripe: true}
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, emergency))
+	assert.False(t, paymentConfigurationPreconditions(values, emergency).RequireNoStripeHistory)
+}
+
+func TestStripeEmergencyRevocationCannotReplaceUnboundHistoricalAccount(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalSecret := setting.StripeApiSecret
+	originalAccountID := setting.StripeCredentialAccountId
+	originalMode := setting.StripeCredentialLivemode
+	setting.StripeApiSecret = "sk_test_unbound_historical_account"
+	setting.StripeCredentialAccountId = ""
+	setting.StripeCredentialLivemode = ""
+	t.Cleanup(func() {
+		setting.StripeApiSecret = originalSecret
+		setting.StripeCredentialAccountId = originalAccountID
+		setting.StripeCredentialLivemode = originalMode
+	})
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.PaymentOrder{
+		TradeNo: "payment-settings-stripe-unbound-emergency-replacement", UserID: 990016,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-stripe-unbound-emergency-replacement",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusExpired, CreatedAt: now - 3600, UpdatedAt: now, Version: 1,
+	}).Error)
+
+	values := map[string]string{"StripeApiSecret": "test-stripe-potentially-different-account"}
+	emergency := map[string]bool{model.PaymentProviderStripe: true}
+	err := validateInFlightPaymentConfigurationChanges(values, emergency)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "historical Stripe data")
+	assert.True(t, paymentConfigurationPreconditions(values, emergency).RequireNoStripeHistory)
+}
+
+func TestStripePriceCatalogCanBeDisabledWithActiveOrders(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalPriceID := setting.StripePriceId
+	setting.StripePriceId = "price_active_checkout_catalog"
+	t.Cleanup(func() { setting.StripePriceId = originalPriceID })
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.PaymentOrder{
+		TradeNo: "payment-settings-stripe-active-checkout-catalog", UserID: 990012,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-stripe-active-checkout-catalog",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusManualReview, CreatedAt: now, UpdatedAt: now, Version: 1,
+	}).Error)
+
+	values := map[string]string{"StripePriceId": ""}
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+	preconditions := paymentConfigurationPreconditions(values, nil)
+	assert.False(t, preconditions.RequireNoStripeHistory)
+}
+
+func TestPaymentCallbackOriginCannotChangeWithActiveGatewayOrders(t *testing.T) {
+	for _, test := range []struct {
+		provider string
+		method   string
+		currency string
+	}{
+		{provider: model.PaymentProviderEpay, method: "alipay", currency: "CNY"},
+		{provider: model.PaymentProviderStripe, method: model.PaymentMethodStripe, currency: "USD"},
+		{provider: model.PaymentProviderXorPay, method: model.PaymentMethodXorPayNative, currency: "CNY"},
+	} {
+		t.Run(test.provider, func(t *testing.T) {
+			db := setupMidjourneyControllerBillingDB(t)
+			require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+			originalCallback := operation_setting.CustomCallbackAddress
+			operation_setting.CustomCallbackAddress = "https://payments-old.example.com"
+			t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallback })
+
+			now := time.Now().Unix()
+			require.NoError(t, db.Create(&model.PaymentOrder{
+				TradeNo: "payment-settings-callback-" + test.provider, UserID: 990010,
+				OrderKind: model.PaymentOrderKindTopUp, Provider: test.provider,
+				PaymentMethod: test.method, RequestID: "payment-settings-callback-" + test.provider,
+				ExpectedAmountMinor: 100, Currency: test.currency, RequestedAmount: 1, CreditQuota: 1,
+				Status: model.PaymentOrderStatusProcessing, CreatedAt: now, UpdatedAt: now, Version: 1,
+			}).Error)
+
+			values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
+			err := validateInFlightPaymentConfigurationChanges(values, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.provider)
+			assert.True(t, paymentConfigurationPreconditions(values, nil).RequireNoCallbackDependentOrders)
+		})
+	}
+}
+
+func TestPaymentCallbackOriginCannotChangeDuringLateSettlementRecovery(t *testing.T) {
+	for _, test := range []struct {
+		provider string
+		method   string
+		status   string
+	}{
+		{provider: model.PaymentProviderEpay, method: "alipay", status: model.PaymentOrderStatusFailed},
+		{provider: model.PaymentProviderXorPay, method: model.PaymentMethodXorPayNative, status: model.PaymentOrderStatusExpired},
+	} {
+		t.Run(test.provider, func(t *testing.T) {
+			db := setupMidjourneyControllerBillingDB(t)
+			require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}, &model.TopUp{}, &model.SubscriptionOrder{}))
+			originalCallback := operation_setting.CustomCallbackAddress
+			operation_setting.CustomCallbackAddress = "https://payments-old.example.com"
+			t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallback })
+
+			now := time.Now().Unix()
+			require.NoError(t, db.Create(&model.PaymentOrder{
+				TradeNo: "payment-settings-recoverable-callback-" + test.provider, UserID: 990013,
+				OrderKind: model.PaymentOrderKindTopUp, Provider: test.provider,
+				PaymentMethod: test.method, RequestID: "payment-settings-recoverable-callback-" + test.provider,
+				ExpectedAmountMinor: 100, Currency: "CNY", RequestedAmount: 1, CreditQuota: 1,
+				Status: test.status, StartedAt: now - 3600, ExpiresAt: now - 1,
+				CreatedAt: now - 3600, UpdatedAt: now, Version: 1,
+			}).Error)
+
+			values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
+			err := validateInFlightPaymentConfigurationChanges(values, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), test.provider)
+		})
+	}
+}
+
+func TestPaymentCallbackOriginRecoveryWindowIsFinite(t *testing.T) {
+	for _, provider := range []string{model.PaymentProviderEpay, model.PaymentProviderXorPay} {
+		t.Run(provider, func(t *testing.T) {
+			db := setupMidjourneyControllerBillingDB(t)
+			require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}, &model.TopUp{}, &model.SubscriptionOrder{}))
+			originalCallback := operation_setting.CustomCallbackAddress
+			operation_setting.CustomCallbackAddress = "https://payments-old.example.com"
+			t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallback })
+
+			now := time.Now().Unix()
+			outsideWindow := now - int64(model.PaymentCallbackRecoveryWindow/time.Second) - 1
+			require.NoError(t, db.Create(&model.PaymentOrder{
+				TradeNo: "payment-settings-old-callback-" + provider, UserID: 990014,
+				OrderKind: model.PaymentOrderKindTopUp, Provider: provider,
+				PaymentMethod: "alipay", RequestID: "payment-settings-old-callback-" + provider,
+				ExpectedAmountMinor: 100, Currency: "CNY", RequestedAmount: 1, CreditQuota: 1,
+				Status: model.PaymentOrderStatusExpired, ExpiresAt: outsideWindow,
+				CreatedAt: outsideWindow, UpdatedAt: outsideWindow, Version: 1,
+			}).Error)
+
+			values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
+			require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+		})
+	}
+}
+
+func TestStripeExpiredOrdersDoNotPinCallbackOrigin(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}, &model.TopUp{}, &model.SubscriptionOrder{}))
+	originalCallback := operation_setting.CustomCallbackAddress
+	operation_setting.CustomCallbackAddress = "https://payments-old.example.com"
+	t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallback })
+
+	now := time.Now().Unix()
+	require.NoError(t, db.Create(&model.PaymentOrder{
+		TradeNo: "payment-settings-expired-stripe-return", UserID: 990015,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-expired-stripe-return",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusExpired, ExpiresAt: now - 1, CreatedAt: now - 3600, UpdatedAt: now, Version: 1,
+	}).Error)
+
+	values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+}
+
+func TestPaymentCallbackOriginCanChangeWithoutActiveGatewayOrders(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalCallback := operation_setting.CustomCallbackAddress
+	operation_setting.CustomCallbackAddress = "https://payments-old.example.com"
+	t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallback })
+
+	values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+	assert.True(t, paymentConfigurationPreconditions(values, nil).RequireNoCallbackDependentOrders)
 }
 
 func TestStripeCredentialCannotCrossTestAndLiveModesWithHistoricalData(t *testing.T) {

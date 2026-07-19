@@ -25,9 +25,16 @@ jobs:
           fetch-depth: 0
 
       - name: Validate Gitee target
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
         run: |
+          set -euo pipefail
           if [ -z "$GITEE_OWNER" ] || [ -z "$GITEE_REPO" ]; then
             echo "::error::Set repository variables GITEE_OWNER and GITEE_REPO before syncing to Gitee."
+            exit 1
+          fi
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::Only stable lowercase v semantic-version releases can be synced.'
             exit 1
           fi
 
@@ -37,26 +44,59 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.event.inputs.tag_name }}
         run: |
-          # 获取 release 信息
-          RELEASE_INFO=$(gh release view "$TAG_NAME" --json name,body,tagName,targetCommitish)
+          set -euo pipefail
+          RELEASE_INFO=$(gh release view "$TAG_NAME" \
+            --json name,body,tagName,isDraft,isPrerelease,assets)
+          if ! jq --exit-status \
+            --arg tag "$TAG_NAME" \
+            '.tagName == $tag and
+             .isDraft == false and
+             .isPrerelease == false and
+             ([.assets[].name] as $names |
+               ($names | length) > 0 and
+               ($names | length) == ($names | unique | length) and
+               all($names[]; test("^[^/\\r\\n]+$")))' \
+            <<<"$RELEASE_INFO" >/dev/null; then
+            echo '::error::Only an exact public stable GitHub Release with a safe non-empty asset inventory can be synchronized.'
+            exit 1
+          fi
 
-          RELEASE_NAME=$(echo "$RELEASE_INFO" | jq -r '.name')
-          TARGET_COMMITISH=$(echo "$RELEASE_INFO" | jq -r '.targetCommitish')
+          RELEASE_NAME=$(jq -r '.name' <<<"$RELEASE_INFO")
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME=$TAG_NAME
+          fi
+          if [[ "$RELEASE_NAME" == *$'\n'* || "$RELEASE_NAME" == *$'\r'* ]]; then
+            echo '::error::Release names containing line breaks cannot be synchronized safely.'
+            exit 1
+          fi
 
-          # 使用多行字符串输出
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+          TARGET_COMMITISH=$(git rev-parse "refs/tags/$TAG_NAME^{commit}")
+          if ! [[ "$TARGET_COMMITISH" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Unable to resolve the release tag to an exact commit.'
+            exit 1
+          fi
+          delimiter="release_body_$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+
           {
-            echo "release_name=$RELEASE_NAME"
-            echo "target_commitish=$TARGET_COMMITISH"
-            echo "release_body<<EOF"
-            echo "$RELEASE_INFO" | jq -r '.body'
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+            printf 'release_name=%s\n' "$RELEASE_NAME"
+            printf 'target_commitish=%s\n' "$TARGET_COMMITISH"
+            printf 'release_body<<%s\n' "$delimiter"
+            jq -r '.body' <<<"$RELEASE_INFO"
+            printf '%s\n' "$delimiter"
+          } >>"$GITHUB_OUTPUT"
 
-          # 下载 release 的所有附件
-          gh release download "$TAG_NAME" --dir ./release_assets || echo "No assets to download"
-
-          # 列出下载的文件
-          ls -la ./release_assets/ || echo "No assets directory"
+          asset_count=$(jq '.assets | length' <<<"$RELEASE_INFO")
+          install -d -m 0700 release_assets
+          gh release download "$TAG_NAME" --dir ./release_assets
+          actual_asset_count=$(find release_assets -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$actual_asset_count" -ne "$asset_count" ] || \
+             ! diff -u \
+               <(jq --raw-output '.assets[].name' <<<"$RELEASE_INFO" | sort) \
+               <(find release_assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort); then
+            echo '::error::Downloaded GitHub Release assets do not match the authoritative inventory.'
+            exit 1
+          fi
 
       - name: Create Gitee Release
         id: create_release
@@ -91,6 +131,9 @@ jobs:
 
       - name: Summary
         if: success()
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
         run: |
-          echo "✅ Successfully synced release ${{ github.event.inputs.tag_name }} to Gitee!"
-          echo "🔗 Gitee Release URL: https://gitee.com/${{ env.GITEE_OWNER }}/${{ env.GITEE_REPO }}/releases/tag/${{ github.event.inputs.tag_name }}"
+          printf '✅ Successfully synced release %s to Gitee!\n' "$TAG_NAME"
+          printf '🔗 Gitee Release URL: https://gitee.com/%s/%s/releases/tag/%s\n' \
+            "$GITEE_OWNER" "$GITEE_REPO" "$TAG_NAME"

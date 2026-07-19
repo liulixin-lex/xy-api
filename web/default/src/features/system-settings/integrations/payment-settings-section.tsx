@@ -81,6 +81,7 @@ import { SettingsSection } from '../components/settings-section'
 import {
   buildEmergencyCredentialReplacement,
   EMERGENCY_CREDENTIAL_REVOCATION_REASON_MAX_LENGTH,
+  getEmergencyCredentialClearSecrets,
   isEmergencyCredentialRevocationReasonValid,
   normalizeEmergencyCredentialRevocationReason,
   resolveEmergencyCredentialRevocationMode,
@@ -92,6 +93,7 @@ import { safeNumberFieldProps } from '../utils/numeric-field'
 import { AmountDiscountVisualEditor } from './amount-discount-visual-editor'
 import { AmountOptionsVisualEditor } from './amount-options-visual-editor'
 import { CreemProductsVisualEditor } from './creem-products-visual-editor'
+import { isSecurePaymentCallbackOrigin } from './payment-callback-origin'
 import { PaymentMethodsVisualEditor } from './payment-methods-visual-editor'
 import { resolveStripeTestModeNotice } from './stripe-test-mode-readiness'
 import {
@@ -245,7 +247,7 @@ const paymentSchema = z.object({
       'A dedicated payment callback base address is required for managed payment gateways.'
     )
     .refine(
-      (value) => isSecureHttpUrl(value, true, true),
+      isSecurePaymentCallbackOrigin,
       'Enter only a top-level callback domain, for example https://api.example.com, without any path.'
     ),
   TopupGroupRatio: z.string().superRefine((value, ctx) => {
@@ -381,11 +383,11 @@ function getRevocablePaymentProviderLabel(
 ): string {
   switch (provider) {
     case 'epay':
-      return 'Epay'
+      return t('Epay')
     case 'stripe':
       return t('Stripe webhook')
     case 'xorpay':
-      return 'XORPay'
+      return t('XORPay')
   }
 }
 
@@ -394,6 +396,11 @@ function getEmergencyCredentialRevocationDescription(
   mode: EmergencyCredentialRevocationMode,
   t: (key: string, options?: Record<string, string>) => string
 ): string {
+  if (mode === 'stripe_disable_all') {
+    return t(
+      'Emergency shutdown: the Stripe API credential and all webhook signing secrets are cleared locally, every unfinished Stripe order moves to manual review, and durable Stripe history is marked with a credential incident. This does not revoke the API key at Stripe; revoke it in the Stripe Dashboard as well.'
+    )
+  }
   if (mode === 'replace' && provider !== 'stripe') {
     return t(
       'The entered {{provider}} identifier and secret will be saved atomically. The current and previous credential generations are revoked immediately, and unfinished orders using them move to manual review.',
@@ -429,6 +436,9 @@ function getEmergencyCredentialRevocationTitle(
   if (mode === 'stripe_disable') {
     return t('Disable Stripe webhooks immediately?')
   }
+  if (mode === 'stripe_disable_all') {
+    return t('Disable all Stripe credentials immediately?')
+  }
   return t('Revoke previous {{provider}} credential now?', {
     provider: getRevocablePaymentProviderLabel(provider, t),
   })
@@ -440,6 +450,7 @@ function getEmergencyCredentialRevocationConfirmLabel(
 ): string {
   if (mode === 'replace') return t('Replace and revoke')
   if (mode === 'stripe_disable') return t('Disable and revoke')
+  if (mode === 'stripe_disable_all') return t('Disable all and revoke')
   return t('Revoke immediately')
 }
 
@@ -524,25 +535,47 @@ function EmergencyCredentialRevocationAction(props: {
           </p>
         </div>
       </div>
-      <Button
-        type='button'
-        variant='destructive'
-        size='sm'
-        className='mt-auto w-full shrink-0 whitespace-nowrap sm:w-auto sm:self-end'
-        disabled={
-          props.disabled || partialReplacement || previousCredentialUnavailable
-        }
-        onClick={() => {
-          if (!mode) return
-          props.onRequest({
-            provider: props.provider,
-            mode,
-            options: props.replacement.options,
-          })
-        }}
-      >
-        {actionLabel}
-      </Button>
+      <div className='mt-auto flex w-full flex-col justify-end gap-2 sm:flex-row sm:flex-wrap'>
+        <Button
+          type='button'
+          variant='destructive'
+          size='sm'
+          className='w-full shrink-0 text-center whitespace-normal sm:w-auto'
+          disabled={
+            props.disabled ||
+            partialReplacement ||
+            previousCredentialUnavailable
+          }
+          onClick={() => {
+            if (!mode) return
+            props.onRequest({
+              provider: props.provider,
+              mode,
+              options: props.replacement.options,
+            })
+          }}
+        >
+          {actionLabel}
+        </Button>
+        {props.provider === 'stripe' && (
+          <Button
+            type='button'
+            variant='outline'
+            size='sm'
+            className='border-destructive/60 text-destructive hover:bg-destructive/10 hover:text-destructive w-full text-center whitespace-normal sm:w-auto'
+            disabled={props.disabled}
+            onClick={() =>
+              props.onRequest({
+                provider: 'stripe',
+                mode: 'stripe_disable_all',
+                options: {},
+              })
+            }
+          >
+            {t('Disable Stripe completely now')}
+          </Button>
+        )}
+      </div>
     </div>
   )
 }
@@ -933,6 +966,7 @@ export function PaymentSettingsSection({
       await mutatePaymentSettings(
         {
           options: request.options,
+          clearSecrets: getEmergencyCredentialClearSecrets(request.mode),
           revokePreviousCredentials: [provider],
           reason: normalizedCredentialRevocationReason,
         },
@@ -957,6 +991,10 @@ export function PaymentSettingsSection({
           } else if (provider === 'stripe') {
             form.resetField('StripeWebhookSecret', { defaultValue: '' })
             initialRef.current.StripeWebhookSecret = ''
+            if (request.mode === 'stripe_disable_all') {
+              form.resetField('StripeApiSecret', { defaultValue: '' })
+              initialRef.current.StripeApiSecret = ''
+            }
           }
           setGatewayReadiness(result.data?.readiness ?? null)
           await queryClient.invalidateQueries({ queryKey: ['system-options'] })
@@ -972,6 +1010,12 @@ export function PaymentSettingsSection({
           } else if (request.mode === 'stripe_disable') {
             toast.success(
               t('Stripe webhooks disabled and signing credentials revoked')
+            )
+          } else if (request.mode === 'stripe_disable_all') {
+            toast.success(
+              t(
+                'Stripe API and webhook credentials disabled; affected orders quarantined'
+              )
             )
           } else {
             toast.success(
@@ -1233,7 +1277,10 @@ export function PaymentSettingsSection({
       sanitized.StripeApiSecret &&
       sanitized.StripeApiSecret !== initial.StripeApiSecret
     ) {
-      updates.push({ key: 'StripeApiSecret', value: sanitized.StripeApiSecret })
+      updates.push({
+        key: 'StripeApiSecret',
+        value: sanitized.StripeApiSecret,
+      })
     }
 
     if (
@@ -1265,7 +1312,10 @@ export function PaymentSettingsSection({
     }
 
     if (sanitized.StripeUnitPrice !== initial.StripeUnitPrice) {
-      updates.push({ key: 'StripeUnitPrice', value: sanitized.StripeUnitPrice })
+      updates.push({
+        key: 'StripeUnitPrice',
+        value: sanitized.StripeUnitPrice,
+      })
     }
 
     if (sanitized.StripeMinTopUp !== initial.StripeMinTopUp) {
@@ -1347,7 +1397,10 @@ export function PaymentSettingsSection({
     }
 
     if (sanitized.WaffoMerchantId !== initial.WaffoMerchantId) {
-      updates.push({ key: 'WaffoMerchantId', value: sanitized.WaffoMerchantId })
+      updates.push({
+        key: 'WaffoMerchantId',
+        value: sanitized.WaffoMerchantId,
+      })
     }
 
     if (sanitized.WaffoCurrency !== initial.WaffoCurrency) {
@@ -1371,7 +1424,10 @@ export function PaymentSettingsSection({
     }
 
     if (sanitized.WaffoPublicCert !== initial.WaffoPublicCert) {
-      updates.push({ key: 'WaffoPublicCert', value: sanitized.WaffoPublicCert })
+      updates.push({
+        key: 'WaffoPublicCert',
+        value: sanitized.WaffoPublicCert,
+      })
     }
 
     if (sanitized.WaffoSandboxPublicCert !== initial.WaffoSandboxPublicCert) {
@@ -1386,7 +1442,10 @@ export function PaymentSettingsSection({
     }
 
     if (sanitized.WaffoPrivateKey) {
-      updates.push({ key: 'WaffoPrivateKey', value: sanitized.WaffoPrivateKey })
+      updates.push({
+        key: 'WaffoPrivateKey',
+        value: sanitized.WaffoPrivateKey,
+      })
     }
 
     if (sanitized.WaffoSandboxApiKey) {
@@ -1407,7 +1466,10 @@ export function PaymentSettingsSection({
       normalizeJsonForComparison(sanitized.WaffoPayMethods) !==
       normalizeJsonForComparison(initial.WaffoPayMethods)
     ) {
-      updates.push({ key: 'WaffoPayMethods', value: sanitized.WaffoPayMethods })
+      updates.push({
+        key: 'WaffoPayMethods',
+        value: sanitized.WaffoPayMethods,
+      })
     }
 
     const hasStripeSettingUpdate = updates.some((update) =>
@@ -1935,12 +1997,14 @@ export function PaymentSettingsSection({
               <div className='overflow-x-auto pb-1'>
                 <TabsList className='grid min-w-[51rem] grid-cols-7'>
                   <TabsTrigger value='general'>{t('General')}</TabsTrigger>
-                  <TabsTrigger value='epay'>Epay</TabsTrigger>
+                  <TabsTrigger value='epay'>{t('Epay')}</TabsTrigger>
                   <TabsTrigger value='stripe'>{t('Stripe')}</TabsTrigger>
-                  <TabsTrigger value='xorpay'>XORPay</TabsTrigger>
-                  <TabsTrigger value='creem'>Creem</TabsTrigger>
-                  <TabsTrigger value='waffo-pancake'>Waffo Pancake</TabsTrigger>
-                  <TabsTrigger value='waffo'>Waffo</TabsTrigger>
+                  <TabsTrigger value='xorpay'>{t('XORPay')}</TabsTrigger>
+                  <TabsTrigger value='creem'>{t('Creem')}</TabsTrigger>
+                  <TabsTrigger value='waffo-pancake'>
+                    {t('Waffo Pancake')}
+                  </TabsTrigger>
+                  <TabsTrigger value='waffo'>{t('Waffo')}</TabsTrigger>
                 </TabsList>
               </div>
 
@@ -2746,7 +2810,7 @@ export function PaymentSettingsSection({
               >
                 <div className='space-y-5'>
                   <div>
-                    <h3 className='text-lg font-medium'>XORPay</h3>
+                    <h3 className='text-lg font-medium'>{t('XORPay')}</h3>
                     <p className='text-muted-foreground text-sm'>
                       {t(
                         'Configuration for XORPay one-time payment integration'
