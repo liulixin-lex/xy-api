@@ -107,7 +107,10 @@ jobs:
             echo '::error::GitHub Immutable Releases is not freshly verified for v0.2.0.'
             exit 1
           fi
-          rulesets=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
+          # GitHub omits bypass_actors unless the caller can write the ruleset.
+          # Use the same scoped administration token that verified immutable releases.
+          rulesets=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
           ruleset_ids=$(jq --raw-output \
             '.[] | select(
               .name == "Protect immutable release tags" and
@@ -118,7 +121,8 @@ jobs:
             echo '::error::Expected one active immutable release tag ruleset.'
             exit 1
           fi
-          ruleset=$(gh api "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
+          ruleset=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
           if ! jq --exit-status '
             .target == "tag" and
             .enforcement == "active" and
@@ -888,7 +892,8 @@ jobs:
             echo '::error::GitHub Immutable Releases is disabled.'
             exit 1
           fi
-          rulesets=$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
+          rulesets=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/rulesets?per_page=100")
           ruleset_ids=$(jq --raw-output '
             .[] | select(
               .name == "Protect immutable release tags" and
@@ -899,7 +904,8 @@ jobs:
             echo '::error::The immutable release tag ruleset changed before publication.'
             exit 1
           fi
-          ruleset=$(gh api "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
+          ruleset=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            "/repos/${GITHUB_REPOSITORY}/rulesets/${ruleset_ids}")
           if ! jq --exit-status '
             .bypass_actors == [] and
             .conditions.ref_name.include == ["refs/tags/v*"] and
