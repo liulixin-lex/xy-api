@@ -242,8 +242,7 @@ func (t *pinnedServiceRoundTripper) RoundTrip(request *http.Request) (*http.Resp
 	// The base origin is operator-controlled, while request data is restricted to
 	// its path/query/body. The exact scheme, host, and port are pinned above;
 	// redirects are disabled and DNS is resolved once immediately before dialing.
-	// codeql[go/request-forgery]
-	return t.transport.RoundTrip(request)
+	return t.transport.RoundTrip(request) // lgtm[go/request-forgery]
 }
 
 func (t *pinnedServiceRoundTripper) CloseIdleConnections() {

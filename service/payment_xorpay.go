@@ -441,8 +441,7 @@ func xorPayMD5(value string) string {
 	// breaking provider interoperability. Compensating controls include TLS-only
 	// provider transport, constant-time callback comparison, credential-generation
 	// scoping, exact order/currency/amount checks, and idempotent settlement.
-	// codeql[go/weak-sensitive-data-hashing]
-	digest := md5.Sum([]byte(value))
+	digest := md5.Sum([]byte(value)) // lgtm[go/weak-sensitive-data-hashing]
 	return fmt.Sprintf("%x", digest)
 }
 

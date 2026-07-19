@@ -81,8 +81,7 @@ func DoWorkerRequest(req *WorkerRequest) (*http.Response, error) {
 	httpRequest.Header.Set("Accept", "*/*")
 	// The client pins the operator-configured scheme, host, and port, rejects
 	// redirects, and resolves the configured host immediately before dialing.
-	// codeql[go/request-forgery]
-	return workerClient.Do(httpRequest)
+	return workerClient.Do(httpRequest) // lgtm[go/request-forgery]
 }
 
 func DoDownloadRequest(originUrl string, reason ...string) (*http.Response, error) {
@@ -106,8 +105,7 @@ func DoDownloadRequest(originUrl string, reason ...string) (*http.Response, erro
 		// protection is enabled, the dialer repeats host, port, and resolved-IP
 		// checks immediately before connecting; the disable switch is retained only
 		// for the documented v0.1.6 administrator compatibility contract.
-		// codeql[go/request-forgery]
-		response, err = GetSSRFProtectedHTTPClient().Get(originUrl)
+		response, err = GetSSRFProtectedHTTPClient().Get(originUrl) // lgtm[go/request-forgery]
 	}
 	if err != nil {
 		return nil, err

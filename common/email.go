@@ -200,8 +200,7 @@ func SendEmail(subject string, receiver string, body EmailBody) error {
 	}
 	// EmailBody can only contain context-escaped text or html/template output;
 	// recipients and all header values are parsed or MIME-encoded above.
-	// codeql[go/email-injection]
-	_, err = w.Write(message)
+	_, err = w.Write(message) // lgtm[go/email-injection]
 	if err != nil {
 		return err
 	}

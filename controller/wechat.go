@@ -61,8 +61,7 @@ func getWeChatIdByCodeWithClient(code string, baseURL *url.URL, client *http.Cli
 	req.Header.Set("Authorization", common.WeChatServerToken)
 	// The client pins the operator-configured scheme, host, and port and rejects
 	// redirects, so the user-controlled code cannot change the request origin.
-	// codeql[go/request-forgery]
-	httpResponse, err := client.Do(req)
+	httpResponse, err := client.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return "", err
 	}
