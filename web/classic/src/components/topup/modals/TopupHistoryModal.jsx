@@ -16,15 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
+  Button,
   Modal,
   Table,
   Badge,
   Typography,
-  Toast,
   Empty,
-  Button,
   Input,
   Tag,
 } from '@douyinfe/semi-ui';
@@ -37,14 +36,21 @@ import { IconSearch } from '@douyinfe/semi-icons';
 import { API, timestamp2string } from '../../../helpers';
 import { isAdmin } from '../../../helpers/utils';
 import { useIsMobile } from '../../../hooks/common/useIsMobile';
+import { formatPaymentMinor } from '../payment-utils';
 const { Text } = Typography;
 
 // 状态映射配置
 const STATUS_CONFIG = {
   success: { type: 'success', key: '成功' },
   pending: { type: 'warning', key: '待支付' },
+  processing: { type: 'primary', key: '处理中' },
   failed: { type: 'danger', key: '失败' },
   expired: { type: 'danger', key: '已过期' },
+  manual_review: { type: 'warning', key: '人工复核' },
+  refunded: { type: 'tertiary', key: '已退款' },
+  refund_pending: { type: 'warning', key: '部分退款' },
+  disputed: { type: 'danger', key: '争议中' },
+  debt: { type: 'danger', key: '欠款冻结' },
 };
 
 // 支付方式映射
@@ -52,6 +58,9 @@ const PAYMENT_METHOD_MAP = {
   stripe: 'Stripe',
   creem: 'Creem',
   waffo: 'Waffo',
+  waffo_pancake: 'Waffo Pancake',
+  xorpay_native: 'XORPay 微信支付',
+  xorpay_alipay: 'XORPay 支付宝',
   alipay: '支付宝',
   wxpay: '微信',
 };
@@ -63,28 +72,46 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [keyword, setKeyword] = useState('');
+  const [debouncedKeyword, setDebouncedKeyword] = useState('');
+  const [error, setError] = useState('');
+  const requestRef = useRef({ sequence: 0, controller: null });
   const isMobile = useIsMobile();
 
   const loadTopups = async (currentPage, currentPageSize) => {
+    requestRef.current.controller?.abort?.();
+    const controller = new AbortController();
+    const sequence = requestRef.current.sequence + 1;
+    requestRef.current = { sequence, controller };
     setLoading(true);
+    setError('');
     try {
       const base = isAdmin() ? '/api/user/topup' : '/api/user/topup/self';
       const qs =
         `p=${currentPage}&page_size=${currentPageSize}` +
-        (keyword ? `&keyword=${encodeURIComponent(keyword)}` : '');
+        (debouncedKeyword
+          ? `&keyword=${encodeURIComponent(debouncedKeyword)}`
+          : '');
       const endpoint = `${base}?${qs}`;
-      const res = await API.get(endpoint);
+      const res = await API.get(endpoint, { signal: controller.signal });
+      if (sequence !== requestRef.current.sequence) return;
       const { success, message, data } = res.data;
       if (success) {
         setTopups(data.items || []);
         setTotal(data.total || 0);
       } else {
-        Toast.error({ content: message || t('加载失败') });
+        setTopups([]);
+        setTotal(0);
+        setError(message || t('加载账单失败'));
       }
-    } catch (error) {
-      Toast.error({ content: t('加载账单失败') });
+    } catch (requestError) {
+      if (requestError?.code === 'ERR_CANCELED') return;
+      if (sequence === requestRef.current.sequence) {
+        setTopups([]);
+        setTotal(0);
+        setError(t('加载账单失败'));
+      }
     } finally {
-      setLoading(false);
+      if (sequence === requestRef.current.sequence) setLoading(false);
     }
   };
 
@@ -92,7 +119,16 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
     if (visible) {
       loadTopups(page, pageSize);
     }
-  }, [visible, page, pageSize, keyword]);
+    return () => requestRef.current.controller?.abort?.();
+  }, [visible, page, pageSize, debouncedKeyword]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setDebouncedKeyword(keyword.trim()),
+      300,
+    );
+    return () => window.clearTimeout(timer);
+  }, [keyword]);
 
   const handlePageChange = (currentPage) => {
     setPage(currentPage);
@@ -106,32 +142,6 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
   const handleKeywordChange = (value) => {
     setKeyword(value);
     setPage(1);
-  };
-
-  // 管理员补单
-  const handleAdminComplete = async (tradeNo) => {
-    try {
-      const res = await API.post('/api/user/topup/complete', {
-        trade_no: tradeNo,
-      });
-      const { success, message } = res.data;
-      if (success) {
-        Toast.success({ content: t('补单成功') });
-        await loadTopups(page, pageSize);
-      } else {
-        Toast.error({ content: message || t('补单失败') });
-      }
-    } catch (e) {
-      Toast.error({ content: t('补单失败') });
-    }
-  };
-
-  const confirmAdminComplete = (tradeNo) => {
-    Modal.confirm({
-      title: t('确认补单'),
-      content: t('是否将该订单标记为成功并为用户入账？'),
-      onOk: () => handleAdminComplete(tradeNo),
-    });
   };
 
   // 渲染状态徽章
@@ -152,8 +162,21 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
   };
 
   const isSubscriptionTopup = (record) => {
+    if (record?.order_kind) return record.order_kind === 'subscription';
     const tradeNo = (record?.trade_no || '').toLowerCase();
     return Number(record?.amount || 0) === 0 && tradeNo.startsWith('sub');
+  };
+
+  const formatPayment = (record) => {
+    if (typeof record?.expected_amount_minor !== 'number') {
+      return `¥${Number(record?.money || 0).toFixed(2)}`;
+    }
+    const minor = record.paid_amount_minor || record.expected_amount_minor;
+    return formatPaymentMinor(
+      minor,
+      record.currency,
+      record.payment_provider || record.provider,
+    );
   };
 
   // 检查是否为管理员
@@ -176,6 +199,14 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         dataIndex: 'trade_no',
         key: 'trade_no',
         render: (text) => <Text copyable>{text}</Text>,
+      },
+      {
+        title: t('支付网关'),
+        dataIndex: 'payment_provider',
+        key: 'payment_provider',
+        render: (_, record) => (
+          <Text>{record.payment_provider || record.provider || '-'}</Text>
+        ),
       },
       {
         title: t('支付方式'),
@@ -207,7 +238,9 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         title: t('支付金额'),
         dataIndex: 'money',
         key: 'money',
-        render: (money) => <Text type='danger'>¥{money.toFixed(2)}</Text>,
+        render: (_, record) => (
+          <Text type='danger'>{formatPayment(record)}</Text>
+        ),
       },
       {
         title: t('状态'),
@@ -216,31 +249,6 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         render: renderStatusBadge,
       },
     ];
-
-    // 管理员才显示操作列
-    if (userIsAdmin) {
-      baseColumns.push({
-        title: t('操作'),
-        key: 'action',
-        render: (_, record) => {
-          const actions = [];
-          if (record.status === 'pending') {
-            actions.push(
-              <Button
-                key='complete'
-                size='small'
-                type='primary'
-                theme='outline'
-                onClick={() => confirmAdminComplete(record.trade_no)}
-              >
-                {t('补单')}
-              </Button>,
-            );
-          }
-          return actions.length > 0 ? <>{actions}</> : null;
-        },
-      });
-    }
 
     baseColumns.push({
       title: t('创建时间'),
@@ -264,6 +272,7 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         <Input
           prefix={<IconSearch />}
           placeholder={t('订单号')}
+          aria-label={t('搜索订单号')}
           value={keyword}
           onChange={handleKeywordChange}
           showClear
@@ -285,14 +294,43 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         }}
         size='small'
         empty={
-          <Empty
-            image={<IllustrationNoResult style={{ width: 150, height: 150 }} />}
-            darkModeImage={
-              <IllustrationNoResultDark style={{ width: 150, height: 150 }} />
-            }
-            description={t('暂无充值记录')}
-            style={{ padding: 30 }}
-          />
+          error ? (
+            <Empty
+              image={
+                <IllustrationNoResult style={{ width: 150, height: 150 }} />
+              }
+              darkModeImage={
+                <IllustrationNoResultDark style={{ width: 150, height: 150 }} />
+              }
+              description={
+                <div className='flex flex-col items-center gap-2'>
+                  <Text strong>{t('账单加载失败')}</Text>
+                  <span>{error}</span>
+                  <Button
+                    size='small'
+                    theme='outline'
+                    onClick={() => loadTopups(page, pageSize)}
+                  >
+                    {t('重新加载')}
+                  </Button>
+                </div>
+              }
+              style={{ padding: 30 }}
+            />
+          ) : (
+            <Empty
+              image={
+                <IllustrationNoResult style={{ width: 150, height: 150 }} />
+              }
+              darkModeImage={
+                <IllustrationNoResultDark style={{ width: 150, height: 150 }} />
+              }
+              description={
+                debouncedKeyword ? t('未找到匹配账单') : t('暂无充值记录')
+              }
+              style={{ padding: 30 }}
+            />
+          )
         }
       />
     </Modal>

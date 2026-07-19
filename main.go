@@ -169,6 +169,10 @@ func main() {
 
 	// Initialize HTTP server
 	server := gin.New()
+	if err := router.ConfigureTrustedProxies(server); err != nil {
+		common.FatalLog("failed to configure trusted reverse proxies: " + err.Error())
+		return
+	}
 	server.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
 		common.SysLog(fmt.Sprintf("panic detected: %v", err))
 		c.JSON(http.StatusInternalServerError, gin.H{

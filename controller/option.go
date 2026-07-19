@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -76,16 +78,24 @@ func buildCompletionRatioMetaValue(optionValues map[string]string) string {
 }
 
 func GetOptions(c *gin.Context) {
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+		return
+	}
 	var options []*model.Option
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
 	for k, v := range common.OptionMap {
+		if _, internal := paymentInternalCredentialOptionKeys[k]; internal {
+			continue
+		}
 		value := common.Interface2String(v)
 		isSensitiveKey := strings.HasSuffix(k, "Token") ||
 			strings.HasSuffix(k, "Secret") ||
 			strings.HasSuffix(k, "Key") ||
 			strings.HasSuffix(k, "secret") ||
-			strings.HasSuffix(k, "api_key")
+			strings.HasSuffix(k, "api_key") ||
+			model.IsPaymentSecretOption(k)
 		if isSensitiveKey {
 			continue
 		}
@@ -101,6 +111,17 @@ func GetOptions(c *gin.Context) {
 		}
 	}
 	common.OptionMapRWMutex.Unlock()
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+	previousCredentialStatus := paymentPreviousCredentialStatusLocked()
+	stripeTestModeEnabled := setting.StripeTestModeEnabled()
+	stripeTestModeBlocked := setting.StripeCredentialLivemode == "test" && !stripeTestModeEnabled
+	unlockPaymentConfiguration()
+	options = append(options, previousCredentialStatus.options()...)
+	options = append(options,
+		&model.Option{Key: paymentStripeTestModeEnabledOptionKey, Value: strconv.FormatBool(stripeTestModeEnabled)},
+		&model.Option{Key: paymentStripeTestModeBlockedOptionKey, Value: strconv.FormatBool(stripeTestModeBlocked)},
+		&model.Option{Key: paymentStripeTestModeIsolationRequiredOptionKey, Value: "true"},
+	)
 	options = append(options, &model.Option{
 		Key:   "CompletionRatioMeta",
 		Value: buildCompletionRatioMetaValue(optionValues),
@@ -137,6 +158,10 @@ func UpdateOption(c *gin.Context) {
 	default:
 		option.Value = fmt.Sprintf("%v", option.Value)
 	}
+	if isPaymentAtomicOnlyOptionKey(option.Key) {
+		common.ApiErrorMsg(c, "Payment settings must be changed through the atomic payment settings endpoint")
+		return
+	}
 	switch option.Key {
 	case "QuotaForInviter", "QuotaForInvitee":
 		if isPositiveOptionValue(option.Value.(string)) && !operation_setting.IsPaymentComplianceConfirmed() {
@@ -156,6 +181,15 @@ func UpdateOption(c *gin.Context) {
 		}
 	}
 	switch option.Key {
+	case "WorkerUrl", "WeChatServerAddress":
+		serviceURL := strings.TrimSpace(option.Value.(string))
+		if serviceURL != "" {
+			if err := service.ValidatePinnedServiceBaseURL(serviceURL); err != nil {
+				common.ApiErrorMsg(c, "服务地址必须是有效的 HTTP/HTTPS 基础地址，且不能包含凭据、查询参数或片段")
+				return
+			}
+		}
+		option.Value = serviceURL
 	case "GitHubOAuthEnabled":
 		if option.Value == "true" && common.GitHubClientId == "" {
 			c.JSON(http.StatusOK, gin.H{
@@ -197,12 +231,18 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "WeChatAuthEnabled":
-		if option.Value == "true" && common.WeChatServerAddress == "" {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法启用微信登录，请先填入微信登录相关配置信息！",
-			})
-			return
+		if option.Value == "true" {
+			if common.WeChatServerAddress == "" {
+				c.JSON(http.StatusOK, gin.H{
+					"success": false,
+					"message": "无法启用微信登录，请先填入微信登录相关配置信息！",
+				})
+				return
+			}
+			if err := service.ValidatePinnedServiceBaseURL(common.WeChatServerAddress); err != nil {
+				common.ApiErrorMsg(c, "无法启用微信登录：服务地址必须是有效的 HTTP/HTTPS 基础地址")
+				return
+			}
 		}
 	case "TurnstileCheckEnabled":
 		if option.Value == "true" && common.TurnstileSiteKey == "" {
@@ -338,7 +378,28 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	}
-	err = model.UpdateOption(option.Key, option.Value.(string))
+	if option.Key == "ServerAddress" {
+		if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+			common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+			return
+		}
+		expectedVersion, versionErr := model.CurrentPaymentConfigurationVersion()
+		if versionErr != nil {
+			common.ApiError(c, versionErr)
+			return
+		}
+		unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
+		_, err = model.UpdatePaymentOptionsBulkWithVersionLockHeld(
+			map[string]string{option.Key: option.Value.(string)}, expectedVersion,
+		)
+		unlockPaymentConfiguration()
+		if errors.Is(err, model.ErrPaymentConfigurationVersionConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Payment settings changed concurrently; refresh and retry"})
+			return
+		}
+	} else {
+		err = model.UpdateOption(option.Key, option.Value.(string))
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return

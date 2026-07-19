@@ -137,6 +137,13 @@ func recordLoginAudit(user *model.User, c *gin.Context) {
 func setupLogin(user *model.User, c *gin.Context) {
 	model.UpdateUserLastLoginAt(user.Id)
 	session := sessions.Default(c)
+	// A browser session can be reused to sign in as another account. Never carry
+	// step-up verification or an unfinished passkey challenge across identities.
+	session.Delete(SecureVerificationSessionKey)
+	session.Delete(secureVerificationMethodSessionKey)
+	session.Delete(secureVerificationUserIDSessionKey)
+	session.Delete(PasskeyReadySessionKey)
+	session.Delete(passkeyReadyUserIDSessionKey)
 	session.Set("id", user.Id)
 	session.Set("username", user.Username)
 	session.Set("role", user.Role)
@@ -1096,14 +1103,50 @@ func ManageUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
 		return
 	}
+	if req.Action == "add_quota" {
+		if !authz.Can(c.GetInt("id"), myRole, authz.PaymentOperationsManage) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"message": common.TranslateMessage(c, i18n.MsgAuthInsufficientPrivilege),
+			})
+			return
+		}
+		if c.GetBool("use_access_token") {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"message": "Quota adjustment requires dashboard session authentication",
+			})
+			return
+		}
+		if !c.GetBool("secure_verified") {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"message": "需要安全验证",
+				"code":    "VERIFICATION_REQUIRED",
+			})
+			return
+		}
+	}
 	switch req.Action {
 	case "disable":
 		user.Status = common.UserStatusDisabled
+		user.PaymentFrozen = false
 		if user.Role == common.RoleRootUser {
 			common.ApiErrorI18n(c, i18n.MsgUserCannotDisableRootUser)
 			return
 		}
 	case "enable":
+		if err := model.EnableUserIfNoPaymentFreeze(user.Id); err != nil {
+			if errors.Is(err, model.ErrUserPaymentFreezeOpen) {
+				common.ApiErrorMsg(c, "该用户存在未解决的支付或计费债务，不能手动启用")
+				return
+			}
+			common.ApiError(c, err)
+			return
+		}
+		// The database update above is authoritative; these assignments only
+		// keep the response/audit snapshot consistent with the committed state.
+		user.PaymentFrozen = false
 		user.Status = common.UserStatusEnabled
 	case "delete":
 		if user.Role == common.RoleRootUser {
@@ -1169,10 +1212,17 @@ func ManageUser(c *gin.Context) {
 				"quota": logger.LogQuota(req.Value),
 			})
 		case "override":
+			if req.Value < 0 || req.Value > common.MaxQuota {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
 			oldQuota := user.Quota
 			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
 				common.ApiError(c, err)
 				return
+			}
+			if err := model.InvalidateUserCache(user.Id); err != nil {
+				common.SysLog(fmt.Sprintf("failed to invalidate user quota cache after override for user %d: %s", user.Id, err.Error()))
 			}
 			recordManageAuditFor(c, user.Id, "user.quota_override", map[string]interface{}{
 				"from": logger.LogQuota(oldQuota),
@@ -1207,7 +1257,7 @@ func ManageUser(c *gin.Context) {
 				return
 			}
 		}
-	} else {
+	} else if req.Action != "enable" {
 		if err := user.Update(false); err != nil {
 			common.ApiError(c, err)
 			return
@@ -1217,7 +1267,7 @@ func ManageUser(c *gin.Context) {
 	// 避免在 Redis TTL 过期前仍使用旧状态（尤其是禁用后仍可发起请求的问题）。
 	// InvalidateUserCache 会让下一次 GetUserCache 从数据库重新加载，
 	// InvalidateUserTokensCache 则确保令牌侧的缓存也同步刷新。
-	if req.Action == "disable" || req.Action == "promote" || req.Action == "demote" {
+	if req.Action == "enable" || req.Action == "disable" || req.Action == "promote" || req.Action == "demote" {
 		if err := model.InvalidateUserCache(user.Id); err != nil {
 			common.SysLog(fmt.Sprintf("failed to invalidate user cache for user %d: %s", user.Id, err.Error()))
 		}

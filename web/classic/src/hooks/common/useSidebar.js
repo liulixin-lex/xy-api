@@ -79,6 +79,7 @@ export const mergeAdminConfig = (savedConfig) => {
 export const useSidebar = () => {
   const [statusState] = useContext(StatusContext);
   const [userConfig, setUserConfig] = useState(null);
+  const [permissions, setPermissions] = useState(null);
   const [loading, setLoading] = useState(true);
   const instanceIdRef = useRef(null);
   const hasLoadedOnceRef = useRef(false);
@@ -114,6 +115,9 @@ export const useSidebar = () => {
       }
 
       const res = await API.get('/api/user/self');
+      setPermissions(
+        res.data.success ? (res.data.data.permissions ?? null) : null,
+      );
       if (res.data.success && res.data.data.sidebar_modules) {
         let config;
         // 检查sidebar_modules是字符串还是对象
@@ -144,6 +148,7 @@ export const useSidebar = () => {
         setUserConfig(defaultUserConfig);
       }
     } catch (error) {
+      setPermissions(null);
       // 出错时也生成默认配置，而不是设置为空对象
       const defaultUserConfig = {};
       Object.keys(adminConfig).forEach((sectionKey) => {
@@ -292,6 +297,7 @@ export const useSidebar = () => {
     loading,
     adminConfig,
     userConfig,
+    permissions,
     finalConfig,
     isModuleVisible,
     hasSectionVisibleModules,

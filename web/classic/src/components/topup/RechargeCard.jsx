@@ -50,6 +50,7 @@ import { useMinimumLoadingTime } from '../../hooks/common/useMinimumLoadingTime'
 import { useActualTheme } from '../../context/Theme';
 import { getCurrencyConfig } from '../../helpers/render';
 import SubscriptionPlansCard from './SubscriptionPlansCard';
+import { getSafePaymentIconUrl } from './payment-utils';
 
 const { Text } = Typography;
 
@@ -57,6 +58,7 @@ const RechargeCard = ({
   t,
   enableOnlineTopUp,
   enableStripeTopUp,
+  enableXorPayTopUp,
   enableCreemTopUp,
   creemProducts,
   creemPreTopUp,
@@ -64,7 +66,6 @@ const RechargeCard = ({
   selectedPreset,
   selectPresetAmount,
   formatLargeNumber,
-  priceRatio,
   topUpCount,
   minTopUp,
   renderQuotaWithAmount,
@@ -86,17 +87,23 @@ const RechargeCard = ({
   userState,
   renderQuota,
   statusLoading,
+  topupInfoError,
+  onRetryTopupInfo,
   topupInfo,
   onOpenHistory,
   enableWaffoTopUp,
   enableWaffoPancakeTopUp,
   subscriptionLoading = false,
+  subscriptionError = '',
+  onRetrySubscriptions,
   subscriptionPlans = [],
   billingPreference,
+  billingPreferenceLoading = false,
   onChangeBillingPreference,
   activeSubscriptions = [],
   allSubscriptions = [],
   reloadSubscriptionSelf,
+  reloadUserQuota,
   enableRedemption = true,
 }) => {
   const onlineFormApiRef = useRef(null);
@@ -106,7 +113,11 @@ const RechargeCard = ({
   const actualTheme = useActualTheme();
   const [activeTab, setActiveTab] = useState('topup');
   const shouldShowSubscription =
-    !subscriptionLoading && subscriptionPlans.length > 0;
+    subscriptionLoading ||
+    subscriptionPlans.length > 0 ||
+    activeSubscriptions.length > 0 ||
+    allSubscriptions.length > 0 ||
+    !!subscriptionError;
   const regularPayMethods = payMethods || [];
 
   useEffect(() => {
@@ -230,8 +241,23 @@ const RechargeCard = ({
           <div className='py-8 flex justify-center'>
             <Spin size='large' />
           </div>
+        ) : topupInfoError ? (
+          <Banner
+            type='danger'
+            title={t('充值配置加载失败')}
+            description={
+              <div className='flex flex-col items-start gap-2'>
+                <span>{topupInfoError}</span>
+                <Button size='small' theme='outline' onClick={onRetryTopupInfo}>
+                  {t('重新加载')}
+                </Button>
+              </div>
+            }
+            closeIcon={null}
+          />
         ) : enableOnlineTopUp ||
           enableStripeTopUp ||
+          enableXorPayTopUp ||
           enableCreemTopUp ||
           enableWaffoTopUp ||
           enableWaffoPancakeTopUp ? (
@@ -242,6 +268,7 @@ const RechargeCard = ({
             <div className='space-y-6'>
               {(enableOnlineTopUp ||
                 enableStripeTopUp ||
+                enableXorPayTopUp ||
                 enableWaffoTopUp ||
                 enableWaffoPancakeTopUp) && (
                 <Row gutter={12}>
@@ -250,21 +277,23 @@ const RechargeCard = ({
                       field='topUpCount'
                       label={t('充值数量')}
                       disabled={
-                        !enableOnlineTopUp &&
-                        !enableStripeTopUp &&
-                        !enableWaffoTopUp &&
-                        !enableWaffoPancakeTopUp
+                        paymentLoading ||
+                        (!enableOnlineTopUp &&
+                          !enableStripeTopUp &&
+                          !enableXorPayTopUp &&
+                          !enableWaffoTopUp &&
+                          !enableWaffoPancakeTopUp)
                       }
                       placeholder={
                         t('充值数量，最低 ') + renderQuotaWithAmount(minTopUp)
                       }
                       value={topUpCount}
                       min={minTopUp}
-                      max={999999999}
+                      max={10000}
                       step={1}
                       precision={0}
                       onChange={async (value) => {
-                        if (value && value >= 1) {
+                        if (value && value >= 1 && value <= 10000) {
                           setTopUpCount(value);
                           setSelectedPreset(null);
                           await getAmount(value);
@@ -272,9 +301,12 @@ const RechargeCard = ({
                       }}
                       onBlur={(e) => {
                         const value = parseInt(e.target.value);
-                        if (!value || value < 1) {
-                          setTopUpCount(1);
-                          getAmount(1);
+                        if (!value || value < minTopUp) {
+                          setTopUpCount(minTopUp);
+                          getAmount(minTopUp);
+                        } else if (value > 10000) {
+                          setTopUpCount(10000);
+                          getAmount(10000);
                         }
                       }}
                       formatter={(value) => (value ? `${value}` : '')}
@@ -314,17 +346,24 @@ const RechargeCard = ({
                             const minTopupVal =
                               Number(payMethod.min_topup) || 0;
                             const isStripe = payMethod.type === 'stripe';
+                            const isXorPay = payMethod.provider === 'xorpay';
                             const isWaffo =
                               typeof payMethod.type === 'string' &&
                               payMethod.type.startsWith('waffo:');
                             const isWaffoPancake =
                               payMethod.type === 'waffo_pancake';
+                            const safeIconUrl = getSafePaymentIconUrl(
+                              payMethod.icon,
+                            );
                             const disabled =
+                              paymentLoading ||
                               (!enableOnlineTopUp &&
                                 !isStripe &&
+                                !isXorPay &&
                                 !isWaffo &&
                                 !isWaffoPancake) ||
                               (!enableStripeTopUp && isStripe) ||
+                              (!enableXorPayTopUp && isXorPay) ||
                               (!enableWaffoTopUp && isWaffo) ||
                               (!enableWaffoPancakeTopUp && isWaffoPancake) ||
                               minTopupVal > Number(topUpCount || 0);
@@ -346,10 +385,14 @@ const RechargeCard = ({
                                     <SiWechat size={18} color='#07C160' />
                                   ) : payMethod.type === 'stripe' ? (
                                     <SiStripe size={18} color='#635BFF' />
-                                  ) : payMethod.icon ? (
+                                  ) : safeIconUrl ? (
                                     <img
-                                      src={payMethod.icon}
-                                      alt={payMethod.name}
+                                      src={safeIconUrl}
+                                      alt=''
+                                      aria-hidden='true'
+                                      loading='lazy'
+                                      decoding='async'
+                                      referrerPolicy='no-referrer'
                                       style={{
                                         width: 18,
                                         height: 18,
@@ -411,7 +454,10 @@ const RechargeCard = ({
                 </Row>
               )}
 
-              {(enableOnlineTopUp || enableStripeTopUp || enableWaffoTopUp) && (
+              {(enableOnlineTopUp ||
+                enableStripeTopUp ||
+                enableXorPayTopUp ||
+                enableWaffoTopUp) && (
                 <Form.Slot
                   label={
                     <div className='flex items-center gap-2'>
@@ -441,11 +487,7 @@ const RechargeCard = ({
                         preset.discount ||
                         topupInfo?.discount?.[preset.value] ||
                         1.0;
-                      const originalPrice = preset.value * priceRatio;
-                      const discountedPrice = originalPrice * discount;
                       const hasDiscount = discount < 1.0;
-                      const actualPay = discountedPrice;
-                      const save = originalPrice - discountedPrice;
 
                       // 根据当前货币类型换算显示金额和数量
                       const { symbol, rate, type } = getCurrencyConfig();
@@ -459,21 +501,13 @@ const RechargeCard = ({
                       } catch (e) {}
 
                       let displayValue = preset.value; // 显示的数量
-                      let displayActualPay = actualPay;
-                      let displaySave = save;
 
-                      if (type === 'USD') {
-                        // 数量保持USD，价格从CNY转USD
-                        displayActualPay = actualPay / usdRate;
-                        displaySave = save / usdRate;
-                      } else if (type === 'CNY') {
-                        // 数量转CNY，价格已是CNY
+                      if (type === 'CNY') {
+                        // 数量转 CNY
                         displayValue = preset.value * usdRate;
                       } else if (type === 'CUSTOM') {
-                        // 数量和价格都转自定义货币
+                        // 数量转自定义货币
                         displayValue = preset.value * rate;
-                        displayActualPay = (actualPay / usdRate) * rate;
-                        displaySave = (save / usdRate) * rate;
                       }
 
                       return (
@@ -489,7 +523,26 @@ const RechargeCard = ({
                             width: '100%',
                           }}
                           bodyStyle={{ padding: '12px' }}
+                          role='button'
+                          tabIndex={paymentLoading ? -1 : 0}
+                          aria-disabled={paymentLoading}
+                          aria-pressed={selectedPreset === preset.value}
                           onClick={() => {
+                            if (paymentLoading) return;
+                            selectPresetAmount(preset);
+                            onlineFormApiRef.current?.setValue(
+                              'topUpCount',
+                              preset.value,
+                            );
+                          }}
+                          onKeyDown={(event) => {
+                            if (
+                              paymentLoading ||
+                              !['Enter', ' '].includes(event.key)
+                            ) {
+                              return;
+                            }
+                            event.preventDefault();
                             selectPresetAmount(preset);
                             onlineFormApiRef.current?.setValue(
                               'topUpCount',
@@ -516,19 +569,6 @@ const RechargeCard = ({
                                 </Tag>
                               )}
                             </Typography.Title>
-                            <div
-                              style={{
-                                color: 'var(--semi-color-text-2)',
-                                fontSize: '12px',
-                                margin: '4px 0',
-                              }}
-                            >
-                              {t('实付')} {symbol}
-                              {displayActualPay.toFixed(2)}，
-                              {hasDiscount
-                                ? `${t('节省')} ${symbol}${displaySave.toFixed(2)}`
-                                : `${t('节省')} ${symbol}0.00`}
-                            </div>
                           </div>
                         </Card>
                       );
@@ -545,6 +585,13 @@ const RechargeCard = ({
                       <Card
                         key={index}
                         onClick={() => creemPreTopUp(product)}
+                        onKeyDown={(event) => {
+                          if (!['Enter', ' '].includes(event.key)) return;
+                          event.preventDefault();
+                          creemPreTopUp(product);
+                        }}
+                        role='button'
+                        tabIndex={0}
                         className='cursor-pointer !rounded-2xl transition-all hover:shadow-md border-gray-200 hover:border-gray-300'
                         bodyStyle={{ textAlign: 'center', padding: '16px' }}
                       >
@@ -680,16 +727,20 @@ const RechargeCard = ({
               <SubscriptionPlansCard
                 t={t}
                 loading={subscriptionLoading}
+                error={subscriptionError}
+                onRetry={onRetrySubscriptions}
                 plans={subscriptionPlans}
                 payMethods={payMethods}
                 enableOnlineTopUp={enableOnlineTopUp}
                 enableStripeTopUp={enableStripeTopUp}
                 enableCreemTopUp={enableCreemTopUp}
                 billingPreference={billingPreference}
+                billingPreferenceLoading={billingPreferenceLoading}
                 onChangeBillingPreference={onChangeBillingPreference}
                 activeSubscriptions={activeSubscriptions}
                 allSubscriptions={allSubscriptions}
                 reloadSubscriptionSelf={reloadSubscriptionSelf}
+                reloadUserQuota={reloadUserQuota}
                 withCard={false}
               />
             </div>

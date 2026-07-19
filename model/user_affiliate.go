@@ -45,6 +45,8 @@ type AffiliateRewardRecord struct {
 	Status              string `json:"status" gorm:"type:varchar(16);column:status;index"`
 	AvailableAt         int64  `json:"available_at" gorm:"column:available_at;index"`
 	TransferredQuota    int    `json:"transferred_quota" gorm:"type:int;column:transferred_quota"`
+	ReversedQuota       int    `json:"reversed_quota" gorm:"type:int;column:reversed_quota"`
+	PreReversalStatus   string `json:"-" gorm:"type:varchar(16);column:pre_reversal_status"`
 	TransferredAt       int64  `json:"transferred_at" gorm:"column:transferred_at;index"`
 	CanceledAt          int64  `json:"canceled_at" gorm:"column:canceled_at;index"`
 	CreatedAt           int64  `json:"created_at" gorm:"autoCreateTime;column:created_at"`
@@ -190,14 +192,28 @@ func ResolveInviteRewardPercent(rule string, percent int) int {
 
 func IssueInviteInitialQuota(tx *gorm.DB, user *User) error {
 	if tx == nil {
-		tx = DB
+		return DB.Transaction(func(inner *gorm.DB) error {
+			return issueInviteInitialQuotaTx(inner, user)
+		})
 	}
+	if tx == DB {
+		return DB.Transaction(func(inner *gorm.DB) error {
+			return issueInviteInitialQuotaTx(inner, user)
+		})
+	}
+	return issueInviteInitialQuotaTx(tx, user)
+}
+
+func issueInviteInitialQuotaTx(tx *gorm.DB, user *User) error {
 	if user == nil || user.Id == 0 || user.InviterId == 0 || user.InviteLinkBatchId == 0 {
 		return nil
 	}
 
 	activities := NormalizeInviteRewardActivities(user.InviteRewardRulesSnapshot)
-	quota := CalculateInviteInitialQuota(activities)
+	quota, err := calculateInviteInitialQuotaChecked(activities)
+	if err != nil {
+		return err
+	}
 	if quota <= 0 {
 		return nil
 	}
@@ -224,8 +240,13 @@ func IssueInviteInitialQuota(tx *gorm.DB, user *User) error {
 		return nil
 	}
 
-	if err := tx.Model(&User{}).Where("id = ?", user.Id).Update("quota", gorm.Expr("quota + ?", quota)).Error; err != nil {
-		return err
+	result = tx.Model(&User{}).Where("id = ? AND quota >= ? AND quota <= ?", user.Id, 0, common.MaxQuota-quota).
+		Update("quota", gorm.Expr("quota + ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrQuotaOverflow
 	}
 	user.Quota += quota
 	return nil
@@ -599,29 +620,42 @@ func fillInvitedUserRewardBreakdowns(inviterId int, users []InvitedUser) error {
 }
 
 func splitAffiliateRewardQuota(record AffiliateRewardRecord) (pending int, available int, transferred int, canceled int) {
+	effectiveReward := record.RewardQuota - record.ReversedQuota
+	if effectiveReward < 0 {
+		effectiveReward = 0
+	}
 	switch record.Status {
 	case AffiliateRewardStatusPending:
-		pending = record.RewardQuota
+		pending = effectiveReward
 	case AffiliateRewardStatusTransferred:
 		transferred = record.TransferredQuota
+		if transferred > effectiveReward {
+			transferred = effectiveReward
+		}
 		if transferred <= 0 {
-			transferred = record.RewardQuota
+			transferred = effectiveReward
 		}
 	case AffiliateRewardStatusCanceled:
 		transferred = record.TransferredQuota
 		if transferred < 0 {
 			transferred = 0
 		}
-		if transferred > record.RewardQuota {
-			transferred = record.RewardQuota
+		if transferred > effectiveReward {
+			transferred = effectiveReward
 		}
 		canceled = record.RewardQuota - transferred
 	case AffiliateRewardStatusAvailable, "":
-		available = record.RewardQuota - record.TransferredQuota
+		available = effectiveReward - record.TransferredQuota
 		if available < 0 {
 			available = 0
 		}
 		transferred = record.TransferredQuota
+		if transferred > effectiveReward {
+			transferred = effectiveReward
+		}
+	}
+	if record.ReversedQuota > 0 && record.Status != AffiliateRewardStatusCanceled {
+		canceled += record.ReversedQuota
 	}
 	return pending, available, transferred, canceled
 }
@@ -652,11 +686,17 @@ func CancelAffiliateRewardRecord(recordId int, now int64) error {
 		}
 		if record.Status == AffiliateRewardStatusAvailable || record.Status == "" {
 			if remainingQuota > 0 {
-				if err := tx.Model(&User{}).Where("id = ?", record.InviterId).Updates(map[string]interface{}{
-					"aff_quota":   gorm.Expr("CASE WHEN aff_quota >= ? THEN aff_quota - ? ELSE 0 END", remainingQuota, remainingQuota),
-					"aff_history": gorm.Expr("CASE WHEN aff_history >= ? THEN aff_history - ? ELSE 0 END", remainingQuota, remainingQuota),
-				}).Error; err != nil {
-					return err
+				result := tx.Model(&User{}).
+					Where("id = ? AND aff_quota >= ? AND aff_history >= ?", record.InviterId, remainingQuota, remainingQuota).
+					Updates(map[string]interface{}{
+						"aff_quota":   gorm.Expr("aff_quota - ?", remainingQuota),
+						"aff_history": gorm.Expr("aff_history - ?", remainingQuota),
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return errors.New("affiliate reward balance is inconsistent; cancellation requires manual review")
 				}
 			}
 		}
@@ -693,7 +733,7 @@ func settleAvailableAffiliateRewardsTx(tx *gorm.DB, inviterId int, now int64) (i
 		return 0, nil
 	}
 
-	total := 0
+	total := int64(0)
 	for _, record := range records {
 		result := tx.Model(&AffiliateRewardRecord{}).
 			Where("id = ? AND status = ?", record.Id, AffiliateRewardStatusPending).
@@ -702,20 +742,31 @@ func settleAvailableAffiliateRewardsTx(tx *gorm.DB, inviterId int, now int64) (i
 			return 0, result.Error
 		}
 		if result.RowsAffected == 1 {
-			total += record.RewardQuota
+			effectiveReward := record.RewardQuota - record.ReversedQuota
+			if effectiveReward > 0 {
+				if total > int64(common.MaxQuota)-int64(effectiveReward) {
+					return 0, ErrQuotaOverflow
+				}
+				total += int64(effectiveReward)
+			}
 		}
 	}
 	if total <= 0 {
 		return 0, nil
 	}
-	if err := tx.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]interface{}{
+	result := tx.Model(&User{}).Where("id = ? AND aff_quota <= ? AND aff_history <= ?", inviterId,
+		int64(common.MaxQuota)-total, int64(common.MaxQuota)-total).Updates(map[string]interface{}{
 		"aff_quota":   gorm.Expr("aff_quota + ?", total),
 		"aff_history": gorm.Expr("aff_history + ?", total),
-	}).Error; err != nil {
-		return 0, err
+	})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return 0, ErrQuotaOverflow
 	}
 
-	return total, nil
+	return int(total), nil
 }
 
 func markTransferredAffiliateRewardsTx(tx *gorm.DB, inviterId int, quota int, now int64) error {
@@ -736,7 +787,7 @@ func markTransferredAffiliateRewardsTx(tx *gorm.DB, inviterId int, quota int, no
 		if remaining <= 0 {
 			break
 		}
-		transferable := record.RewardQuota - record.TransferredQuota
+		transferable := record.RewardQuota - record.ReversedQuota - record.TransferredQuota
 		if transferable <= 0 {
 			continue
 		}

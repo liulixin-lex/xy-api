@@ -47,8 +47,21 @@ var auditContentTemplates = map[string]string{
 
 	"redemption.create": "Created ${count} redemption codes named ${name} (${quota} each)",
 
-	"subscription.plan_reset":      "Reset active subscriptions for plan ${plan_id}",
-	"subscription.user_plan_reset": "Reset active plan ${plan_id} subscriptions for user ${target_user_id}",
+	"subscription.plan_reset":                           "Reset active subscriptions for plan ${plan_id}",
+	"subscription.user_plan_reset":                      "Reset active plan ${plan_id} subscriptions for user ${target_user_id}",
+	"billing.reservation.resolve":                       "Resolved billing reservation ${request_id} as ${resolution}",
+	"payment.settings.update":                           "Updated payment settings: ${keys}",
+	"payment.compliance.confirm":                        "Confirmed payment compliance terms ${terms_version}",
+	"payment.order.manual_fulfill":                      "Manually fulfilled payment order ${trade_no}",
+	"payment.order.manual_reject":                       "Rejected payment order ${trade_no} after manual review",
+	"payment.order.manual_void":                         "Voided payment order ${trade_no} after manual review",
+	"payment.order.external_refund_confirmed":           "Confirmed external refund for payment order ${trade_no}",
+	"payment.event.unmatched_dismiss":                   "Dismissed unmatched payment event ${event_id}",
+	"payment.event.unmatched_link":                      "Linked unmatched payment event ${event_id} to ${target_trade_no}",
+	"payment.event.legacy_topup.fulfill":                "Fulfilled legacy top-up event ${event_id} with explicit quota",
+	"payment.event.legacy_topup.external_refund":        "Recorded completed external refund for legacy top-up event ${event_id}",
+	"payment.event.legacy_subscription.external_refund": "Recorded completed external refund for legacy subscription event ${event_id}",
+	"payment.debt.resolve":                              "Resolved payment debt ${debt_id} as ${resolution}",
 }
 
 // auditContentEN 按 action 模板渲染英文兜底文本；未登记的 action 退回 action 本身。

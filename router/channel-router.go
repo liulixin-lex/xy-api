@@ -10,10 +10,13 @@ import (
 )
 
 type permissionRoute struct {
-	method     string
-	path       string
-	permission authz.Permission
-	handler    gin.HandlerFunc
+	method                string
+	path                  string
+	permission            authz.Permission
+	additionalPermissions []authz.Permission
+	secureVerification    bool
+	criticalRateLimit     bool
+	handler               gin.HandlerFunc
 }
 
 func registerChannelRoutes(apiRouter *gin.RouterGroup) {
@@ -29,10 +32,12 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 	)
 
 	for _, route := range channelPermissionRoutes {
-		channelRoute.Handle(route.method, route.path,
-			middleware.RequirePermission(route.permission),
-			route.handler,
-		)
+		handlers := []gin.HandlerFunc{middleware.RequirePermission(route.permission)}
+		for _, permission := range route.additionalPermissions {
+			handlers = append(handlers, middleware.RequirePermission(permission))
+		}
+		handlers = append(handlers, route.handler)
+		channelRoute.Handle(route.method, route.path, handlers...)
 	}
 }
 

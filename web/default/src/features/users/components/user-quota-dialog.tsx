@@ -19,14 +19,21 @@ For commercial licensing, please contact support@quantumnous.com
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
-import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
-import { cn } from '@/lib/utils'
+
+import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Dialog } from '@/components/dialog'
+import {
+  SecureVerificationDialog,
+  useSecureVerification,
+} from '@/features/auth/secure-verification'
+import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
+import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
+import { cn } from '@/lib/utils'
+
 import { adjustUserQuota } from '../api'
+import { executeVerifiedQuotaAdjustment } from '../lib/verified-quota-adjustment'
 import type { QuotaAdjustMode } from '../types'
 
 interface UserQuotaDialogProps {
@@ -42,6 +49,16 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
   const [mode, setMode] = useState<QuotaAdjustMode>('add')
   const [amount, setAmount] = useState('')
   const [loading, setLoading] = useState(false)
+  const {
+    open: verificationOpen,
+    methods: verificationMethods,
+    state: verificationState,
+    executeVerification,
+    cancel: cancelVerification,
+    setCode,
+    switchMethod,
+    withVerification,
+  } = useSecureVerification()
 
   const { meta: currencyMeta } = getCurrencyDisplay()
   const currencyLabel = getCurrencyLabel()
@@ -75,21 +92,30 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     try {
       const value =
         mode === 'override' ? parseQuotaFromDollars(amountValue) : quotaValue
-      const result = await adjustUserQuota({
-        id: props.userId,
-        action: 'add_quota',
-        mode,
-        value: mode === 'override' ? value : Math.abs(value),
+      await executeVerifiedQuotaAdjustment({
+        runWithVerification: withVerification,
+        request: () =>
+          adjustUserQuota({
+            id: props.userId,
+            action: 'add_quota',
+            mode,
+            value: mode === 'override' ? value : Math.abs(value),
+          }),
+        failureMessage: t('Failed to adjust quota'),
+        verification: {
+          title: t('Security verification'),
+          description: t(
+            'Confirm your identity before applying this audited financial resolution.'
+          ),
+        },
+        onSuccess: () => {
+          toast.success(t('Quota adjusted successfully'))
+          setAmount('')
+          setMode('add')
+          props.onOpenChange(false)
+          props.onSuccess()
+        },
       })
-      if (result.success) {
-        toast.success(t('Quota adjusted successfully'))
-        setAmount('')
-        setMode('add')
-        props.onOpenChange(false)
-        props.onSuccess()
-      } else {
-        toast.error(result.message || t('Failed to adjust quota'))
-      }
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : t('Failed to adjust quota'))
     } finally {
@@ -108,76 +134,96 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
     : t('Enter amount in {{currency}}', { currency: currencyLabel })
 
   return (
-    <Dialog
-      open={props.open}
-      onOpenChange={props.onOpenChange}
-      title={t('Adjust Quota')}
-      description={t('Select an operation mode and enter the amount')}
-      contentHeight='auto'
-      bodyClassName='space-y-4'
-      footer={
-        <>
-          <Button variant='outline' onClick={handleCancel}>
-            {t('Cancel')}
-          </Button>
-          <Button onClick={handleConfirm} disabled={loading}>
-            {loading ? t('Processing...') : t('Confirm')}
-          </Button>
-        </>
-      }
-    >
-      <div className='space-y-4'>
-        <div className='text-muted-foreground text-sm'>{getPreviewText()}</div>
+    <>
+      <Dialog
+        open={props.open}
+        onOpenChange={props.onOpenChange}
+        title={t('Adjust Quota')}
+        description={t('Select an operation mode and enter the amount')}
+        contentHeight='auto'
+        bodyClassName='space-y-4'
+        footer={
+          <>
+            <Button variant='outline' onClick={handleCancel}>
+              {t('Cancel')}
+            </Button>
+            <Button onClick={handleConfirm} disabled={loading}>
+              {loading ? t('Processing...') : t('Confirm')}
+            </Button>
+          </>
+        }
+      >
+        <div className='space-y-4'>
+          <div className='text-muted-foreground text-sm'>
+            {getPreviewText()}
+          </div>
 
-        <div className='space-y-2'>
-          <Label>{t('Mode')}</Label>
-          <div className='flex gap-1'>
-            {(['add', 'subtract', 'override'] as const).map((m) => {
-              let modeLabel = t('Override')
-              if (m === 'add') {
-                modeLabel = t('Add')
-              } else if (m === 'subtract') {
-                modeLabel = t('Subtract')
-              }
-              return (
-                <Button
-                  key={m}
-                  type='button'
-                  variant='outline'
-                  size='sm'
-                  className={cn(
-                    mode === m &&
-                      'bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground'
-                  )}
-                  onClick={() => {
-                    setMode(m)
-                    setAmount('')
-                  }}
-                >
-                  {modeLabel}
-                </Button>
-              )
-            })}
+          <div className='space-y-2'>
+            <Label>{t('Mode')}</Label>
+            <div className='flex gap-1'>
+              {(['add', 'subtract', 'override'] as const).map((m) => {
+                let modeLabel = t('Override')
+                if (m === 'add') {
+                  modeLabel = t('Add')
+                } else if (m === 'subtract') {
+                  modeLabel = t('Subtract')
+                }
+                return (
+                  <Button
+                    key={m}
+                    type='button'
+                    variant='outline'
+                    size='sm'
+                    className={cn(
+                      mode === m &&
+                        'bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground'
+                    )}
+                    onClick={() => {
+                      setMode(m)
+                      setAmount('')
+                    }}
+                  >
+                    {modeLabel}
+                  </Button>
+                )
+              })}
+            </div>
+          </div>
+
+          <div className='space-y-2'>
+            <Label>
+              {t('Amount')} ({currencyLabel})
+            </Label>
+            <Input
+              type='number'
+              step={tokensOnly ? 1 : 0.000001}
+              min={mode === 'override' ? undefined : 0}
+              placeholder={placeholder}
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleConfirm()
+              }}
+            />
           </div>
         </div>
-
-        <div className='space-y-2'>
-          <Label>
-            {t('Amount')} ({currencyLabel})
-          </Label>
-          <Input
-            type='number'
-            step={tokensOnly ? 1 : 0.000001}
-            min={mode === 'override' ? undefined : 0}
-            placeholder={placeholder}
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleConfirm()
-            }}
-          />
-        </div>
-      </div>
-    </Dialog>
+      </Dialog>
+      <SecureVerificationDialog
+        open={verificationOpen}
+        onOpenChange={(open) => {
+          if (!open) cancelVerification()
+        }}
+        methods={verificationMethods}
+        state={verificationState}
+        onVerify={(method, code) => {
+          void executeVerification(method, code).catch(() => {
+            // useSecureVerification already reports the failure.
+          })
+        }}
+        onCancel={cancelVerification}
+        onCodeChange={setCode}
+        onMethodChange={switchMethod}
+      />
+    </>
   )
 }

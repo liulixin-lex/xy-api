@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 import type { LinkProps } from '@tanstack/react-router'
 import type { TFunction } from 'i18next'
 
+import type { AuthUser } from '@/stores/auth-store'
+
 /**
  * Base navigation item type
  */
@@ -125,7 +127,7 @@ export type SidebarView = {
   /** Back-navigation descriptor; required for nested views */
   parent: SidebarViewParent
   /** Nav group builder, called per render with the active translator */
-  getNavGroups: (t: TFunction) => NavGroup[]
+  getNavGroups: (t: TFunction, user?: AuthUser | null) => NavGroup[]
 }
 
 /**

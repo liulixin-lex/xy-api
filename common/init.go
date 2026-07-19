@@ -128,6 +128,13 @@ func InitEnv() {
 	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 20)
 	CriticalRateLimitDuration = int64(GetEnvOrDefault("CRITICAL_RATE_LIMIT_DURATION", 20*60))
 
+	PaymentQuoteRateLimitEnable = GetEnvOrDefaultBool("PAYMENT_QUOTE_RATE_LIMIT_ENABLE", true)
+	PaymentQuoteRateLimitNum = GetEnvOrDefault("PAYMENT_QUOTE_RATE_LIMIT", 30)
+	PaymentQuoteRateLimitDuration = int64(GetEnvOrDefault("PAYMENT_QUOTE_RATE_LIMIT_DURATION", 60))
+	PaymentStartRateLimitEnable = GetEnvOrDefaultBool("PAYMENT_START_RATE_LIMIT_ENABLE", true)
+	PaymentStartRateLimitNum = GetEnvOrDefault("PAYMENT_START_RATE_LIMIT", 10)
+	PaymentStartRateLimitDuration = int64(GetEnvOrDefault("PAYMENT_START_RATE_LIMIT_DURATION", 60))
+
 	SearchRateLimitEnable = GetEnvOrDefaultBool("SEARCH_RATE_LIMIT_ENABLE", true)
 	SearchRateLimitNum = GetEnvOrDefault("SEARCH_RATE_LIMIT", 10)
 	SearchRateLimitDuration = int64(GetEnvOrDefault("SEARCH_RATE_LIMIT_DURATION", 60))

@@ -16,8 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { formatTimestampToDate } from '@/lib/format'
 import type { StatusBadgeProps } from '@/components/status-badge'
+import { formatTimestampToDate } from '@/lib/format'
+
 import type { TopupStatus } from '../types'
 
 // ============================================================================
@@ -41,9 +42,37 @@ export const STATUS_CONFIG: Record<TopupStatus, StatusConfig> = {
     variant: 'warning',
     label: 'Pending',
   },
+  processing: {
+    variant: 'info',
+    label: 'Processing',
+  },
+  failed: {
+    variant: 'danger',
+    label: 'Failed',
+  },
   expired: {
     variant: 'danger',
     label: 'Expired',
+  },
+  manual_review: {
+    variant: 'warning',
+    label: 'Manual Review',
+  },
+  refund_pending: {
+    variant: 'warning',
+    label: 'Refund Pending',
+  },
+  refunded: {
+    variant: 'neutral',
+    label: 'Refunded',
+  },
+  disputed: {
+    variant: 'danger',
+    label: 'Disputed',
+  },
+  debt: {
+    variant: 'danger',
+    label: 'Payment Debt',
   },
 }
 
@@ -62,6 +91,19 @@ export const PAYMENT_METHOD_NAMES: Record<string, string> = {
   alipay: 'Alipay',
   wxpay: 'WeChat Pay',
   waffo: 'Waffo',
+  waffo_pancake: 'Waffo Pancake',
+  xorpay: 'XORPay',
+  xorpay_native: 'XORPay WeChat Pay',
+  xorpay_alipay: 'XORPay Alipay',
+}
+
+export const PAYMENT_PROVIDER_NAMES: Record<string, string> = {
+  epay: 'Epay',
+  stripe: 'Stripe',
+  xorpay: 'XORPay',
+  creem: 'Creem',
+  waffo: 'Waffo',
+  waffo_pancake: 'Waffo Pancake',
 }
 
 /**
@@ -73,6 +115,101 @@ export function getPaymentMethodName(
 ): string {
   const name = PAYMENT_METHOD_NAMES[method] || method
   return t ? t(name) : name
+}
+
+export function getPaymentProviderName(
+  provider: string | undefined,
+  t?: (key: string) => string
+): string {
+  const name = provider ? PAYMENT_PROVIDER_NAMES[provider] || provider : '-'
+  return t ? t(name) : name
+}
+
+export function getOrderKindName(
+  orderKind: string | undefined,
+  t?: (key: string) => string
+): string {
+  const name = orderKind === 'subscription' ? 'Subscription' : 'Top-up'
+  return t ? t(name) : name
+}
+
+function usesStripeTwoDecimalMinorUnit(
+  currency: string,
+  provider?: string
+): boolean {
+  return (
+    provider?.toLowerCase() === 'stripe' &&
+    (currency === 'ISK' || currency === 'UGX')
+  )
+}
+
+export function formatPaymentMinorAmount(
+  amountMinor: number,
+  currency = 'USD',
+  provider?: string
+): string {
+  let normalizedCurrency = /^[A-Z]{3}$/.test(currency.toUpperCase())
+    ? currency.toUpperCase()
+    : 'USD'
+  const stripeUsesTwoDecimalMinorUnit = usesStripeTwoDecimalMinorUnit(
+    normalizedCurrency,
+    provider
+  )
+  let formatter: Intl.NumberFormat
+  try {
+    formatter = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: normalizedCurrency,
+      ...(stripeUsesTwoDecimalMinorUnit
+        ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+        : {}),
+    })
+  } catch {
+    normalizedCurrency = 'USD'
+    formatter = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: normalizedCurrency,
+    })
+  }
+  const fractionDigits = stripeUsesTwoDecimalMinorUnit
+    ? 2
+    : (formatter.resolvedOptions().maximumFractionDigits ?? 2)
+  const divisor = 10 ** fractionDigits
+  return formatter.format(
+    (Number.isFinite(amountMinor) ? amountMinor : 0) / divisor
+  )
+}
+
+export function formatPaymentDecimalAmount(
+  amount: string | number,
+  currency = 'USD',
+  provider?: string
+): string {
+  const numericAmount = Number(amount)
+  let normalizedCurrency = /^[A-Z]{3}$/.test(currency.toUpperCase())
+    ? currency.toUpperCase()
+    : 'USD'
+  let formatter: Intl.NumberFormat
+  const stripeUsesTwoDecimalMinorUnit = usesStripeTwoDecimalMinorUnit(
+    normalizedCurrency,
+    provider
+  )
+  try {
+    formatter = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: normalizedCurrency,
+      ...(stripeUsesTwoDecimalMinorUnit
+        ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+        : {}),
+    })
+  } catch {
+    normalizedCurrency = 'USD'
+    formatter = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: normalizedCurrency,
+    })
+  }
+  return formatter.format(Number.isFinite(numericAmount) ? numericAmount : 0)
 }
 
 /**

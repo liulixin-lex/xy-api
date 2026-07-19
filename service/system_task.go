@@ -23,8 +23,11 @@ const (
 
 	// systemTaskSchedulerInterval throttles how often the scheduler/stale-lock
 	// pass runs, independent of how often the runner wakes to claim tasks.
-	systemTaskSchedulerInterval = 15 * time.Second
-	systemTaskStaleLockInterval = 30 * time.Second
+	systemTaskSchedulerInterval  = 15 * time.Second
+	systemTaskStaleLockInterval  = 30 * time.Second
+	paymentOrderExpiryInterval   = time.Minute
+	paymentOrderExpiryBatchSize  = 200
+	paymentQuoteCleanupBatchSize = 500
 )
 
 // SystemTaskHandler executes a claimed task of a specific type. Run owns the
@@ -83,8 +86,55 @@ func (logCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runner
 	runLogCleanupTask(ctx, task, runnerID)
 }
 
+type paymentOrderExpiryHandler struct{}
+
+func (paymentOrderExpiryHandler) Type() string { return model.SystemTaskTypePaymentExpiry }
+
+func (paymentOrderExpiryHandler) Enabled() bool { return true }
+
+func (paymentOrderExpiryHandler) Interval() time.Duration { return paymentOrderExpiryInterval }
+
+func (paymentOrderExpiryHandler) NewPayload() any { return nil }
+
+func (paymentOrderExpiryHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	total := struct {
+		ScannedOrders int   `json:"scanned_orders"`
+		ExpiredOrders int   `json:"expired_orders"`
+		SkippedOrders int   `json:"skipped_orders"`
+		DeletedQuotes int64 `json:"deleted_quotes"`
+	}{}
+	for {
+		batch, err := model.ExpireDuePaymentOrders(ctx, common.GetTimestamp(), paymentOrderExpiryBatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		total.ScannedOrders += batch.Scanned
+		total.ExpiredOrders += batch.Expired
+		total.SkippedOrders += batch.Skipped
+		if batch.Scanned < paymentOrderExpiryBatchSize {
+			break
+		}
+	}
+	for {
+		batch, err := model.CleanupPaymentQuotes(ctx, common.GetTimestamp(), paymentQuoteCleanupBatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		total.DeletedQuotes += batch.Deleted
+		if batch.Scanned < paymentQuoteCleanupBatchSize {
+			break
+		}
+	}
+	if err := model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, total, ""); err != nil {
+		logSystemTaskLockError(ctx, task, err)
+	}
+}
+
 func init() {
 	RegisterSystemTaskHandler(logCleanupHandler{})
+	RegisterSystemTaskHandler(paymentOrderExpiryHandler{})
 }
 
 type LogCleanupPayload struct {

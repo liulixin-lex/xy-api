@@ -27,6 +27,7 @@ import {
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { Info } from 'lucide-react';
+import { buildEmergencyCredentialReplacement } from '../../../helpers/payment-credential-revocation';
 
 export default function SettingsPaymentGateway(props) {
   const { t } = useTranslation();
@@ -40,6 +41,7 @@ export default function SettingsPaymentGateway(props) {
     MinTopUp: 1,
   });
   const formApiRef = useRef(null);
+  const submitInFlightRef = useRef(false);
 
   useEffect(() => {
     if (props.options && formApiRef.current) {
@@ -66,12 +68,59 @@ export default function SettingsPaymentGateway(props) {
     setInputs(values);
   };
 
+  const emergencyReplacement = buildEmergencyCredentialReplacement('epay', {
+    identifier: inputs.EpayId,
+    savedIdentifier: props.options.EpayId,
+    secret: inputs.EpayKey,
+  });
+  const previousCredentialActive = Boolean(
+    props.options['payment_setting.epay_previous_credential_active'],
+  );
+  const incompleteReplacement = emergencyReplacement.state === 'partial';
+  const previousCredentialUnavailable =
+    emergencyReplacement.state === 'none' && !previousCredentialActive;
+  let emergencyDescription = t(
+    'No replacement credentials are entered. This only revokes the active previous {{provider}} credential; the current credential stays unchanged. Unfinished orders bound to the previous credential move to manual review.',
+    { provider: 'Epay' },
+  );
+  let emergencyActionLabel = t('立即撤销旧凭据');
+  if (emergencyReplacement.state === 'complete') {
+    emergencyDescription = t(
+      'The entered {{provider}} identifier and secret will be saved atomically. The current and previous credential generations are revoked immediately, and unfinished orders using them move to manual review.',
+      { provider: 'Epay' },
+    );
+    emergencyActionLabel = t('Emergency replace credentials');
+  } else if (incompleteReplacement) {
+    emergencyDescription = t(
+      'The replacement credential pair is incomplete. Enter both the identifier and secret, or restore the saved identifier before using this emergency action.',
+    );
+  } else if (previousCredentialUnavailable) {
+    emergencyDescription = t(
+      'No active previous {{provider}} credential is available to revoke. Enter a complete replacement identifier and secret to perform an emergency replacement.',
+      { provider: 'Epay' },
+    );
+    emergencyActionLabel = t('No previous credential to revoke');
+  }
+
   const submitPayAddress = async () => {
-    if (props.options.ServerAddress === '') {
-      showError(t('请先填写服务器地址'));
+    if (submitInFlightRef.current) return;
+
+    if (!props.options.CustomCallbackAddress) {
+      showError(t('请先在支付通用设置中填写并保存支付回调安全基址'));
+      return;
+    }
+    const minTopUp = Number(inputs.MinTopUp);
+    if (!Number.isInteger(minTopUp) || minTopUp < 1 || minTopUp > 10000) {
+      showError(t('最低充值数量必须是 1 到 10000 之间的整数'));
+      return;
+    }
+    const unitPrice = Number(inputs.Price);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      showError(t('充值价格必须是大于 0 的数字'));
       return;
     }
 
+    submitInFlightRef.current = true;
     setLoading(true);
     try {
       const options = [
@@ -85,34 +134,40 @@ export default function SettingsPaymentGateway(props) {
         options.push({ key: 'EpayKey', value: inputs.EpayKey });
       }
       if (inputs.Price !== '') {
-        options.push({ key: 'Price', value: inputs.Price.toString() });
+        options.push({ key: 'Price', value: unitPrice });
       }
       if (inputs.MinTopUp !== '') {
-        options.push({ key: 'MinTopUp', value: inputs.MinTopUp.toString() });
+        options.push({ key: 'MinTopUp', value: minTopUp });
       }
 
-      const requestQueue = options.map((opt) =>
-        API.put('/api/option/', {
-          key: opt.key,
-          value: opt.value,
-        }),
-      );
-
-      const results = await Promise.all(requestQueue);
-
-      const errorResults = results.filter((res) => !res.data.success);
-      if (errorResults.length > 0) {
-        errorResults.forEach((res) => {
-          showError(res.data.message);
-        });
-      } else {
-        showSuccess(t('更新成功'));
-        props.refresh && props.refresh();
-      }
+      await props.withPaymentVerification(async () => {
+        const result = await API.put(
+          '/api/option/payment',
+          {
+            options: Object.fromEntries(
+              options.map((item) => [item.key, item.value]),
+            ),
+            expected_version: props.configVersion || 1,
+          },
+          { skipErrorHandler: true },
+        );
+        if (result.data?.success) {
+          showSuccess(t('更新成功'));
+          const nextInputs = { ...inputs, EpayKey: '' };
+          setInputs(nextInputs);
+          formApiRef.current?.setValues(nextInputs);
+          await props.refresh?.(result.data?.data?.version);
+        } else {
+          showError(result.data?.message || t('更新失败'));
+        }
+        return result;
+      });
     } catch (error) {
-      showError(t('更新失败'));
+      showError(error?.response?.data?.message || t('更新失败'));
+    } finally {
+      submitInFlightRef.current = false;
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -126,9 +181,23 @@ export default function SettingsPaymentGateway(props) {
           <Banner
             type='info'
             icon={<Info size={16} />}
-            description={t(
-              '当前仅支持易支付接口，回调地址请在通用设置中配置。',
-            )}
+            description={
+              <div className='space-y-1'>
+                <div>
+                  {t('当前仅支持易支付接口，回调地址请在通用设置中配置。')}
+                </div>
+                <div>
+                  {t('回调地址')}：
+                  <code>
+                    {props.options.CustomCallbackAddress
+                      ? `${removeTrailingSlash(
+                          props.options.CustomCallbackAddress,
+                        )}/api/payment/epay/notify`
+                      : '<CallbackAddress>/api/payment/epay/notify'}
+                  </code>
+                </div>
+              </div>
+            }
             style={{ marginBottom: 16 }}
           />
           <Row gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}>
@@ -152,6 +221,7 @@ export default function SettingsPaymentGateway(props) {
                 label={t('API 密钥')}
                 placeholder={t('敏感信息不会发送到前端显示')}
                 type='password'
+                autoComplete='new-password'
               />
             </Col>
           </Row>
@@ -170,14 +240,51 @@ export default function SettingsPaymentGateway(props) {
             <Col xs={24} sm={24} md={12} lg={12} xl={12}>
               <Form.InputNumber
                 field='MinTopUp'
+                min={1}
+                max={10000}
+                precision={0}
                 label={t('最低充值美元数量')}
                 placeholder={t('例如：2，就是最低充值2$')}
               />
             </Col>
           </Row>
-          <Button onClick={submitPayAddress} style={{ marginTop: 16 }}>
+          <Button
+            onClick={submitPayAddress}
+            loading={loading}
+            style={{ marginTop: 16 }}
+          >
             {t('更新易支付设置')}
           </Button>
+          <div style={{ marginTop: 16 }}>
+            <Banner
+              type='warning'
+              title={
+                emergencyReplacement.state === 'complete'
+                  ? t('Emergency replace credentials')
+                  : t('紧急撤销旧凭据')
+              }
+              description={emergencyDescription}
+              closeIcon={null}
+            />
+            <Button
+              theme='solid'
+              type='danger'
+              disabled={
+                loading ||
+                incompleteReplacement ||
+                previousCredentialUnavailable
+              }
+              onClick={() =>
+                props.requestEmergencyCredentialRevocation?.(
+                  'epay',
+                  emergencyReplacement,
+                )
+              }
+              style={{ marginTop: 8 }}
+            >
+              {emergencyActionLabel}
+            </Button>
+          </div>
         </Form.Section>
       </Form>
     </Spin>

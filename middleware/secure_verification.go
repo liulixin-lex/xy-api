@@ -12,6 +12,7 @@ const (
 	// SecureVerificationSessionKey 安全验证的 session key（与 controller 保持一致）
 	SecureVerificationSessionKey       = "secure_verified_at"
 	secureVerificationMethodSessionKey = "secure_verified_method"
+	secureVerificationUserIDSessionKey = "secure_verified_user_id"
 	// SecureVerificationTimeout 验证有效期（秒）
 	SecureVerificationTimeout = 300 // 5分钟
 )
@@ -59,9 +60,21 @@ func SecureVerificationRequired() gin.HandlerFunc {
 			return
 		}
 
+		verifiedUserID, ok := session.Get(secureVerificationUserIDSessionKey).(int)
+		if !ok || verifiedUserID != userId {
+			clearSecureVerificationSession(session)
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"message": "验证状态与当前用户不匹配，请重新验证",
+				"code":    "VERIFICATION_INVALID",
+			})
+			c.Abort()
+			return
+		}
+
 		// 检查验证是否过期
 		elapsed := time.Now().Unix() - verifiedAt
-		if elapsed >= SecureVerificationTimeout {
+		if elapsed < 0 || elapsed >= SecureVerificationTimeout {
 			// 验证已过期，清除 session
 			clearSecureVerificationSession(session)
 			c.JSON(http.StatusForbidden, gin.H{
@@ -80,6 +93,7 @@ func SecureVerificationRequired() gin.HandlerFunc {
 func clearSecureVerificationSession(session sessions.Session) {
 	session.Delete(SecureVerificationSessionKey)
 	session.Delete(secureVerificationMethodSessionKey)
+	session.Delete(secureVerificationUserIDSessionKey)
 	_ = session.Save()
 }
 
@@ -106,13 +120,22 @@ func OptionalSecureVerification() gin.HandlerFunc {
 
 		verifiedAt, ok := verifiedAtRaw.(int64)
 		if !ok {
+			clearSecureVerificationSession(session)
+			c.Set("secure_verified", false)
+			c.Next()
+			return
+		}
+
+		verifiedUserID, ok := session.Get(secureVerificationUserIDSessionKey).(int)
+		if !ok || verifiedUserID != userId {
+			clearSecureVerificationSession(session)
 			c.Set("secure_verified", false)
 			c.Next()
 			return
 		}
 
 		elapsed := time.Now().Unix() - verifiedAt
-		if elapsed >= SecureVerificationTimeout {
+		if elapsed < 0 || elapsed >= SecureVerificationTimeout {
 			clearSecureVerificationSession(session)
 			c.Set("secure_verified", false)
 			c.Next()

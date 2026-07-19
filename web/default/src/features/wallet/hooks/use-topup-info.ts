@@ -16,12 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import i18next from 'i18next'
 import { useState, useEffect, useCallback } from 'react'
+
 import { getTopupInfo } from '../api'
 import {
   generatePresetAmounts,
   mergePresetAmounts,
   getMinTopupAmount,
+  getPaymentMethodProvider,
 } from '../lib'
 import type {
   TopupInfo,
@@ -54,7 +57,8 @@ function parseJsonArray(data: unknown): unknown[] {
 
 function parsePaymentMethods(
   data: unknown,
-  stripeMinTopup: number
+  stripeMinTopup: number,
+  xorpayMinTopup = 0
 ): PaymentMethod[] {
   return parseJsonArray(data)
     .filter(
@@ -66,18 +70,27 @@ function parsePaymentMethods(
       const normalizedMinTopup = Number.isFinite(rawMinTopup) ? rawMinTopup : 0
       const type = typeof item.type === 'string' ? item.type : ''
 
+      let minTopup = normalizedMinTopup
+      if (type === 'stripe' && minTopup <= 0) minTopup = stripeMinTopup
+      if (type.startsWith('xorpay_') && minTopup <= 0) {
+        minTopup = xorpayMinTopup
+      }
+
       return {
         name: typeof item.name === 'string' ? item.name : '',
         type,
+        provider: getPaymentMethodProvider(type, item.provider),
         color: typeof item.color === 'string' ? item.color : undefined,
         icon: typeof item.icon === 'string' ? item.icon : undefined,
-        min_topup:
-          type === 'stripe' && normalizedMinTopup <= 0
-            ? stripeMinTopup
-            : normalizedMinTopup,
+        currency:
+          typeof item.currency === 'string' &&
+          /^[A-Za-z]{3}$/.test(item.currency)
+            ? item.currency.toUpperCase()
+            : undefined,
+        min_topup: minTopup,
       }
     })
-    .filter((item) => item.name && item.type && item.type !== 'waffo')
+    .filter((item) => item.name && item.type && item.provider !== 'waffo')
 }
 
 function parseWaffoPayMethods(data: unknown): WaffoPayMethod[] {
@@ -166,6 +179,7 @@ export function useTopupInfo() {
   const [topupInfo, setTopupInfo] = useState<TopupInfo | null>(null)
   const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
   const fetchTopupInfo = useCallback(async () => {
     try {
@@ -176,6 +190,7 @@ export function useTopupInfo() {
       if (!response.success || !response.data) {
         // eslint-disable-next-line no-console
         console.error('Failed to fetch topup info:', response.message)
+        setError(i18next.t('Failed to load top-up information'))
         return
       }
 
@@ -183,7 +198,8 @@ export function useTopupInfo() {
         ...response.data,
         pay_methods: parsePaymentMethods(
           response.data.pay_methods,
-          response.data.stripe_min_topup
+          response.data.stripe_min_topup,
+          response.data.xorpay_min_topup
         ),
         amount_options: parseAmountOptions(response.data.amount_options),
         discount: parseDiscountMap(response.data.discount),
@@ -194,6 +210,7 @@ export function useTopupInfo() {
       }
 
       setTopupInfo(processedData)
+      setError(null)
 
       if (processedData.amount_options.length > 0) {
         const customPresets = mergePresetAmounts(
@@ -209,6 +226,7 @@ export function useTopupInfo() {
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error('Failed to fetch topup info:', err)
+      setError(i18next.t('Failed to load top-up information'))
     } finally {
       setLoading(false)
     }
@@ -230,6 +248,7 @@ export function useTopupInfo() {
     topupInfo,
     presetAmounts,
     loading,
+    error,
     refetch: fetchTopupInfo,
   }
 }

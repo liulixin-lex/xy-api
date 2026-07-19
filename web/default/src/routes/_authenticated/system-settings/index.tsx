@@ -18,8 +18,21 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { createFileRoute, redirect } from '@tanstack/react-router'
 
+import {
+  canManagePaymentOperations,
+  canManageSystemSettings,
+} from '@/lib/admin-permissions'
+import { useAuthStore } from '@/stores/auth-store'
+
 export const Route = createFileRoute('/_authenticated/system-settings/')({
   beforeLoad: () => {
+    const user = useAuthStore.getState().auth.user
+    if (!canManageSystemSettings(user) && canManagePaymentOperations(user)) {
+      throw redirect({
+        to: '/system-settings/billing/$section',
+        params: { section: 'payment-operations' },
+      })
+    }
     throw redirect({
       to: '/system-settings/site',
     })

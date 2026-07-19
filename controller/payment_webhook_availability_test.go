@@ -2,7 +2,9 @@ package controller
 
 import (
 	"testing"
+	"time"
 
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/require"
@@ -10,6 +12,7 @@ import (
 
 func confirmPaymentComplianceForTest(t *testing.T) {
 	t.Helper()
+	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
 	paymentSetting := operation_setting.GetPaymentSetting()
 	originalConfirmed := paymentSetting.ComplianceConfirmed
 	originalTermsVersion := paymentSetting.ComplianceTermsVersion
@@ -21,26 +24,85 @@ func confirmPaymentComplianceForTest(t *testing.T) {
 	paymentSetting.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
 }
 
-func TestStripeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestStripeWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.T) {
+	setupMidjourneyControllerBillingDB(t)
 	confirmPaymentComplianceForTest(t)
+	t.Setenv(setting.StripeTestModeEnabledEnv, "")
 	originalAPISecret := setting.StripeApiSecret
 	originalWebhookSecret := setting.StripeWebhookSecret
 	originalPriceID := setting.StripePriceId
+	originalPrevious := setting.StripeWebhookSecretPrevious
+	originalPreviousExpiry := setting.StripeWebhookSecretPreviousExpiresAt
+	originalWebhookMode := setting.StripeWebhookCredentialLivemode
+	originalCredentialMode := setting.StripeCredentialLivemode
+	originalCredentialAccountID := setting.StripeCredentialAccountId
+	originalConnectedAccountID := setting.StripeAccountId
+	originalCurrency := setting.StripeCurrency
+	originalFingerprint := setting.StripeConfigurationVerifiedFingerprint
+	originalVerifiedAt := setting.StripeConfigurationVerifiedAt
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	t.Cleanup(func() {
 		setting.StripeApiSecret = originalAPISecret
 		setting.StripeWebhookSecret = originalWebhookSecret
 		setting.StripePriceId = originalPriceID
+		setting.StripeWebhookSecretPrevious = originalPrevious
+		setting.StripeWebhookSecretPreviousExpiresAt = originalPreviousExpiry
+		setting.StripeWebhookCredentialLivemode = originalWebhookMode
+		setting.StripeCredentialLivemode = originalCredentialMode
+		setting.StripeCredentialAccountId = originalCredentialAccountID
+		setting.StripeAccountId = originalConnectedAccountID
+		setting.StripeCurrency = originalCurrency
+		setting.StripeConfigurationVerifiedFingerprint = originalFingerprint
+		setting.StripeConfigurationVerifiedAt = originalVerifiedAt
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 	})
 
 	setting.StripeWebhookSecret = ""
 	setting.StripeApiSecret = "sk_test_123"
 	setting.StripePriceId = "price_123"
+	setting.StripeCredentialLivemode = "test"
+	setting.StripeCredentialAccountId = "acct_test123"
+	setting.StripeAccountId = ""
+	setting.StripeCurrency = "USD"
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
+	setting.StripeConfigurationVerifiedFingerprint = service.StripeCheckoutConfigurationFingerprint(
+		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
+		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+	)
+	setting.StripeConfigurationVerifiedAt = time.Now().Unix()
+	setting.StripeWebhookCredentialLivemode = ""
 	require.False(t, isStripeWebhookEnabled())
 
 	setting.StripeWebhookSecret = "whsec_test"
+	require.False(t, isStripeWebhookEnabled())
+	require.False(t, isStripeTopUpEnabled())
+	setting.StripeWebhookCredentialLivemode = "test"
 	require.True(t, isStripeWebhookEnabled())
+	require.False(t, isStripeTopUpEnabled())
+	stripeReadiness := paymentGatewayReadinessLocked()["stripe"].(map[string]interface{})
+	require.Equal(t, false, stripeReadiness["test_mode_enabled"])
+	require.Equal(t, true, stripeReadiness["test_mode_blocked"])
+
+	t.Setenv(setting.StripeTestModeEnabledEnv, "true")
+	require.True(t, isStripeTopUpEnabled())
+	stripeReadiness = paymentGatewayReadinessLocked()["stripe"].(map[string]interface{})
+	require.Equal(t, true, stripeReadiness["test_mode_enabled"])
+	require.Equal(t, false, stripeReadiness["test_mode_blocked"])
+
+	operation_setting.CustomCallbackAddress = "https://payments.example.com/base"
+	require.True(t, isStripeWebhookEnabled())
+	require.False(t, isStripeTopUpEnabled())
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 
 	setting.StripePriceId = ""
+	require.True(t, isStripeWebhookEnabled())
+	require.False(t, isStripeTopUpEnabled())
+
+	setting.StripeWebhookSecret = ""
+	setting.StripeWebhookSecretPrevious = "whsec_previous"
+	setting.StripeWebhookSecretPreviousExpiresAt = time.Now().Add(time.Hour).Unix()
+	require.True(t, isStripeWebhookEnabled())
+	setting.StripeWebhookSecretPreviousExpiresAt = time.Now().Add(-time.Hour).Unix()
 	require.False(t, isStripeWebhookEnabled())
 }
 
@@ -142,7 +204,7 @@ func TestWaffoPancakeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.False(t, isWaffoPancakeWebhookEnabled())
 }
 
-func TestEpayWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestEpayWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalPayAddress := operation_setting.PayAddress
 	originalEpayID := operation_setting.EpayId
@@ -165,5 +227,26 @@ func TestEpayWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isEpayWebhookEnabled())
 
 	operation_setting.PayMethods = nil
-	require.False(t, isEpayWebhookEnabled())
+	require.True(t, isEpayWebhookEnabled())
+	require.False(t, isEpayTopUpEnabled())
+
+	operation_setting.PayAddress = ""
+	require.True(t, isEpayWebhookEnabled())
+}
+
+func TestXorPayWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.T) {
+	confirmPaymentComplianceForTest(t)
+	originalAid := setting.XorPayAid
+	originalSecret := setting.XorPayAppSecret
+	originalMethods := setting.XorPayEnabledMethods
+	t.Cleanup(func() {
+		setting.XorPayAid = originalAid
+		setting.XorPayAppSecret = originalSecret
+		setting.XorPayEnabledMethods = originalMethods
+	})
+	setting.XorPayAid = "aid_test"
+	setting.XorPayAppSecret = "xorpay_secret"
+	setting.XorPayEnabledMethods = nil
+	require.True(t, isXorPayWebhookEnabled())
+	require.False(t, isXorPayTopUpEnabled())
 }

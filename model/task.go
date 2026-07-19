@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
+	"math"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -13,6 +15,8 @@ import (
 )
 
 type TaskStatus string
+
+var ErrTaskNotPersisted = errors.New("task is not persisted")
 
 func (t TaskStatus) ToVideoStatus() string {
 	var status string
@@ -101,11 +105,59 @@ type TaskPrivateData struct {
 	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
 	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
-	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
-	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
-	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
-	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
-	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	BillingSource  string `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
+	SubscriptionId int    `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
+	TokenId        int    `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
+	// BillingRequestId links an async task to its durable billing reservation.
+	// It is intentionally kept in private data so old task API responses and
+	// existing task table schemas remain compatible.
+	BillingRequestId string `json:"billing_request_id,omitempty"`
+	// BillingTargetQuota records a settlement intent before the financial
+	// transaction succeeds. It lets a crash-safe reconciler retry an exact
+	// target without guessing from a stale task quota.
+	BillingTargetQuota int `json:"billing_target_quota,omitempty"`
+	// BillingTargetQuotaSet distinguishes an explicit zero-cost terminal result
+	// from legacy rows that have no persisted settlement intent.
+	BillingTargetQuotaSet   bool                `json:"billing_target_quota_set,omitempty"`
+	LegacyBillingFinalized  bool                `json:"legacy_billing_finalized,omitempty"`
+	LegacyBillingOutcome    string              `json:"legacy_billing_outcome,omitempty"`
+	LegacyBillingFinalQuota int                 `json:"legacy_billing_final_quota,omitempty"`
+	NodeName                string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
+	BillingContext          *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+}
+
+// RecordBillingTargetQuota makes a task-scoped settlement target immutable.
+// The task status CAS persists this private-data field with the terminal state,
+// so a process crash before the reservation intent ledger is written remains
+// exactly recoverable. Repeated writers may agree on a target, but must never
+// replace another writer's financial decision.
+func (p *TaskPrivateData) RecordBillingTargetQuota(targetQuota int) error {
+	if p == nil || targetQuota < 0 || int64(targetQuota) > int64(math.MaxInt32) {
+		return errors.New("invalid task billing settlement intent")
+	}
+	if existingTarget, ok := p.BillingTargetQuotaIntent(); ok {
+		if existingTarget == targetQuota {
+			return nil
+		}
+		return ErrBillingReservationConflict
+	}
+	p.BillingTargetQuota = targetQuota
+	p.BillingTargetQuotaSet = true
+	return nil
+}
+
+// BillingTargetQuotaIntent returns the persisted task target. Non-zero legacy
+// values are treated as present even if they predate BillingTargetQuotaSet.
+func (p TaskPrivateData) BillingTargetQuotaIntent() (int, bool) {
+	return p.BillingTargetQuota, p.BillingTargetQuotaSet || p.BillingTargetQuota != 0
+}
+
+func (p *TaskPrivateData) ClearBillingTargetQuota() {
+	if p == nil {
+		return
+	}
+	p.BillingTargetQuota = 0
+	p.BillingTargetQuotaSet = false
 }
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。
@@ -418,7 +470,17 @@ func (Task *Task) Update() error {
 }
 
 func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+	if t == nil || t.ID <= 0 {
+		return ErrTaskNotPersisted
+	}
+	result := DB.Model(&Task{}).Where("id = ?", t.ID).Update("quota", t.Quota)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTaskNotPersisted
+	}
+	return nil
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -427,9 +489,18 @@ func (t *Task) UpdateQuota() error {
 //
 // Uses Model().Select("*").Updates() instead of Save() because GORM's Save
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
-// zero rows, which silently bypasses the CAS guard.
+// zero rows, which silently bypasses the CAS guard. The update operates on a
+// value copy so GORM callbacks cannot mutate a Task snapshot concurrently read
+// by another polling worker.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	if t == nil || t.ID <= 0 {
+		return false, ErrTaskNotPersisted
+	}
+	updatedTask := *t
+	result := DB.Model(&Task{}).
+		Where("id = ? AND status = ?", t.ID, fromStatus).
+		Select("*").
+		Updates(&updatedTask)
 	if result.Error != nil {
 		return false, result.Error
 	}

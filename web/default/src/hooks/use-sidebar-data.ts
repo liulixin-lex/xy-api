@@ -38,7 +38,9 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarData } from '@/components/layout/types'
+import { getSystemSettingsEntryUrl } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -48,6 +50,8 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
+  const currentUser = useAuthStore((state) => state.auth.user)
+  const systemSettingsUrl = getSystemSettingsEntryUrl(currentUser)
 
   return {
     navGroups: [
@@ -156,12 +160,16 @@ export function useSidebarData(): SidebarData {
             icon: ServerCog,
             requiredRole: ROLE.SUPER_ADMIN,
           },
-          {
-            title: t('System Settings'),
-            url: '/system-settings/site',
-            activeUrls: ['/system-settings'],
-            icon: Settings,
-          },
+          ...(systemSettingsUrl
+            ? [
+                {
+                  title: t('System Settings'),
+                  url: systemSettingsUrl,
+                  activeUrls: ['/system-settings'],
+                  icon: Settings,
+                },
+              ]
+            : []),
         ],
       },
     ],

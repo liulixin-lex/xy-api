@@ -1,9 +1,9 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
@@ -22,29 +23,70 @@ type wechatLoginResponse struct {
 	Data    string `json:"data"`
 }
 
+const (
+	maxWeChatLoginCodeBytes     = 1024
+	maxWeChatLoginResponseBytes = 64 * 1024
+)
+
+var weChatServiceClientCache service.PinnedServiceClientCache
+
 func getWeChatIdByCode(code string) (string, error) {
-	if code == "" {
+	if code == "" || len(code) > maxWeChatLoginCodeBytes {
 		return "", errors.New("无效的参数")
 	}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/wechat/user?code=%s", common.WeChatServerAddress, url.QueryEscape(code)), nil)
+	baseURL, client, err := weChatServiceClientCache.Get(common.WeChatServerAddress, 5*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("微信登录服务配置无效: %w", err)
+	}
+	return getWeChatIdByCodeWithClient(code, baseURL, client)
+}
+
+func getWeChatIdByCodeWithClient(code string, baseURL *url.URL, client *http.Client) (string, error) {
+	endpoint, err := url.JoinPath(baseURL.String(), "api", "wechat", "user")
+	if err != nil {
+		return "", errors.New("微信登录服务地址无效")
+	}
+	endpointURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", errors.New("微信登录服务地址无效")
+	}
+	query := endpointURL.Query()
+	query.Set("code", code)
+	endpointURL.RawQuery = query.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, endpointURL.String(), nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Authorization", common.WeChatServerToken)
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
-	httpResponse, err := client.Do(req)
+	// The client pins the operator-configured scheme, host, and port and rejects
+	// redirects, so the user-controlled code cannot change the request origin.
+	httpResponse, err := client.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return "", err
 	}
 	defer httpResponse.Body.Close()
-	var res wechatLoginResponse
-	err = json.NewDecoder(httpResponse.Body).Decode(&res)
+	if httpResponse.StatusCode < http.StatusOK || httpResponse.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("微信登录服务返回异常状态: HTTP %d", httpResponse.StatusCode)
+	}
+	if httpResponse.ContentLength > maxWeChatLoginResponseBytes {
+		return "", errors.New("微信登录服务响应过大")
+	}
+	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, maxWeChatLoginResponseBytes+1))
 	if err != nil {
-		return "", err
+		return "", errors.New("读取微信登录服务响应失败")
+	}
+	if len(body) > maxWeChatLoginResponseBytes {
+		return "", errors.New("微信登录服务响应过大")
+	}
+	var res wechatLoginResponse
+	if err := common.Unmarshal(body, &res); err != nil {
+		return "", errors.New("微信登录服务响应无效")
 	}
 	if !res.Success {
+		if res.Message == "" {
+			return "", errors.New("微信登录验证失败")
+		}
 		return "", errors.New(res.Message)
 	}
 	if res.Data == "" {

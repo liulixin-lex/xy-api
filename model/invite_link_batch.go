@@ -18,6 +18,7 @@ const (
 
 	InviteLinkBatchDescriptionMaxLength = 16 * 1024
 	InviteRewardActivityDetailMaxLength = 255
+	InviteRewardActivityMaxCount        = 50
 )
 
 type InviteRewardActivity struct {
@@ -108,13 +109,24 @@ func CalculateInviteRewardPercents(activities InviteRewardActivities) (firstTopu
 }
 
 func CalculateInviteInitialQuota(activities InviteRewardActivities) int {
-	total := 0
-	for _, activity := range NormalizeInviteRewardActivities(activities) {
-		if activity.Type == InviteRewardRuleInitialQuota {
-			total += activity.Quota
-		}
+	total, err := calculateInviteInitialQuotaChecked(activities)
+	if err != nil {
+		return 0
 	}
 	return total
+}
+
+func calculateInviteInitialQuotaChecked(activities InviteRewardActivities) (int, error) {
+	total := int64(0)
+	for _, activity := range NormalizeInviteRewardActivities(activities) {
+		if activity.Type == InviteRewardRuleInitialQuota {
+			if activity.Quota < 0 || int64(activity.Quota) > int64(common.MaxQuota)-total {
+				return 0, ErrQuotaOverflow
+			}
+			total += int64(activity.Quota)
+		}
+	}
+	return int(total), nil
 }
 
 type InviteLinkBatch struct {
@@ -176,6 +188,9 @@ func (batch InviteLinkBatch) Validate() error {
 		utf8.RuneCountInString(batch.CustomDescription) > InviteLinkBatchDescriptionMaxLength {
 		return errors.New("activity description is too long")
 	}
+	if len(batch.ActivityRules) > InviteRewardActivityMaxCount {
+		return errors.New("too many invite reward activities")
+	}
 	for _, activity := range batch.ActivityRules {
 		if strings.TrimSpace(activity.ActivityDetail) == "" {
 			return errors.New("activity detail is required")
@@ -195,6 +210,9 @@ func (batch InviteLinkBatch) Validate() error {
 		if activity.Percent < 0 || activity.Percent > 100 {
 			return errors.New("activity reward percent must be between 0 and 100")
 		}
+	}
+	if _, err := calculateInviteInitialQuotaChecked(batch.ActivityRules); err != nil {
+		return errors.New("initial quota activities exceed the supported range")
 	}
 	return nil
 }

@@ -11,3 +11,7 @@ func GetCallbackAddress() string {
 	}
 	return operation_setting.CustomCallbackAddress
 }
+
+func GetPaymentCallbackAddress() string {
+	return operation_setting.CustomCallbackAddress
+}

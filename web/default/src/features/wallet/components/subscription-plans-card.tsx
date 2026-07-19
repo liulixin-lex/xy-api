@@ -16,12 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect, useMemo, useCallback } from 'react'
 import { Crown, RefreshCw, Sparkles, Check } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { formatQuota } from '@/lib/format'
-import { cn } from '@/lib/utils'
+
+import {
+  StatusBadge,
+  dotColorMap,
+  textColorMap,
+} from '@/components/status-badge'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
@@ -42,11 +47,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
-  StatusBadge,
-  dotColorMap,
-  textColorMap,
-} from '@/components/status-badge'
-import {
   getPublicPlans,
   getSelfSubscriptionFull,
   updateBillingPreference,
@@ -57,6 +57,10 @@ import type {
   PlanRecord,
   UserSubscriptionRecord,
 } from '@/features/subscriptions/types'
+import { formatQuota } from '@/lib/format'
+import { cn } from '@/lib/utils'
+
+import { formatPaymentDecimalAmount } from '../lib/billing'
 import type { PaymentMethod, TopupInfo } from '../types'
 
 interface SubscriptionPlansCardProps {
@@ -66,10 +70,15 @@ interface SubscriptionPlansCardProps {
   onPurchaseSuccess?: () => void | Promise<void>
 }
 
-function getEpayMethods(payMethods: PaymentMethod[] = []): PaymentMethod[] {
-  return payMethods.filter(
-    (m) => m?.type && m.type !== 'stripe' && m.type !== 'creem'
-  )
+function getSubscriptionPaymentMethods(
+  payMethods: PaymentMethod[] = [],
+  enableEpay: boolean
+): PaymentMethod[] {
+  return payMethods.filter((method) => {
+    if (!method?.type) return false
+    if (method.provider === 'epay') return enableEpay
+    return method.provider === 'xorpay'
+  })
 }
 
 function getBillingPreferenceLabel(
@@ -109,17 +118,29 @@ export function SubscriptionPlansCard({
     useState('subscription_first')
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [plansError, setPlansError] = useState<string | null>(null)
+  const [subscriptionError, setSubscriptionError] = useState<string | null>(
+    null
+  )
+  const [preferenceSaving, setPreferenceSaving] = useState(false)
+  const preferenceSavingRef = useRef(false)
 
   const [purchaseOpen, setPurchaseOpen] = useState(false)
   const [selectedPlan, setSelectedPlan] = useState<PlanRecord | null>(null)
 
-  const enableStripe = !!topupInfo?.enable_stripe_topup
+  const stripeCurrency = topupInfo?.pay_methods
+    ?.find((method) => method.provider === 'stripe')
+    ?.currency?.toUpperCase()
+  const enableStripe =
+    !!topupInfo?.enable_stripe_topup &&
+    (!stripeCurrency || stripeCurrency === 'USD')
   const enableCreem = !!topupInfo?.enable_creem_topup
   const enableWaffoPancake = !!topupInfo?.enable_waffo_pancake_topup
   const enableOnlineTopUp = !!topupInfo?.enable_online_topup
-  const epayMethods = useMemo(
-    () => getEpayMethods(topupInfo?.pay_methods),
-    [topupInfo?.pay_methods]
+  const subscriptionPaymentMethods = useMemo(
+    () =>
+      getSubscriptionPaymentMethods(topupInfo?.pay_methods, enableOnlineTopUp),
+    [enableOnlineTopUp, topupInfo?.pay_methods]
   )
 
   const fetchPlans = useCallback(async () => {
@@ -127,11 +148,15 @@ export function SubscriptionPlansCard({
       const res = await getPublicPlans()
       if (res.success) {
         setPlans(res.data || [])
+        setPlansError(null)
+        return true
       }
+      setPlansError(res.message || t('Failed to load subscription plans'))
     } catch {
-      setPlans([])
+      setPlansError(t('Failed to load subscription plans'))
     }
-  }, [])
+    return false
+  }, [t])
 
   const fetchSelfSubscription = useCallback(async () => {
     try {
@@ -142,11 +167,17 @@ export function SubscriptionPlansCard({
         )
         setActiveSubscriptions(res.data.subscriptions || [])
         setAllSubscriptions(res.data.all_subscriptions || [])
+        setSubscriptionError(null)
+        return true
       }
+      setSubscriptionError(
+        res.message || t('Failed to load subscription status')
+      )
     } catch {
-      // ignore
+      setSubscriptionError(t('Failed to load subscription status'))
     }
-  }, [])
+    return false
+  }, [t])
 
   useEffect(() => {
     const init = async () => {
@@ -160,13 +191,20 @@ export function SubscriptionPlansCard({
   const handleRefresh = async () => {
     setRefreshing(true)
     try {
-      await fetchSelfSubscription()
+      await Promise.all([fetchPlans(), fetchSelfSubscription()])
     } finally {
       setRefreshing(false)
     }
   }
 
+  const handlePurchaseSuccess = useCallback(async () => {
+    await Promise.all([fetchSelfSubscription(), onPurchaseSuccess?.()])
+  }, [fetchSelfSubscription, onPurchaseSuccess])
+
   const handlePreferenceChange = async (pref: string) => {
+    if (preferenceSavingRef.current || pref === billingPreference) return
+    preferenceSavingRef.current = true
+    setPreferenceSaving(true)
     const previous = billingPreference
     setBillingPreference(pref)
     try {
@@ -182,12 +220,16 @@ export function SubscriptionPlansCard({
     } catch {
       toast.error(t('Request failed'))
       setBillingPreference(previous)
+    } finally {
+      preferenceSavingRef.current = false
+      setPreferenceSaving(false)
     }
   }
 
   const hasActive = activeSubscriptions.length > 0
   const hasAny = allSubscriptions.length > 0
-  const isAvailable = loading || plans.length > 0 || hasAny
+  const isAvailable =
+    loading || plans.length > 0 || hasAny || !!plansError || !!subscriptionError
   const disablePref = !hasActive
   const isSubPref =
     billingPreference === 'subscription_first' ||
@@ -242,16 +284,18 @@ export function SubscriptionPlansCard({
         <CardContent className='space-y-4 p-3 sm:p-5'>
           <Skeleton className='h-20 w-full' />
           <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3'>
-            {Array.from({ length: 3 }, (_, i) => `plan-skeleton-${i}`).map((key) => (
-              <Skeleton key={key} className='h-48 w-full' />
-            ))}
+            {Array.from({ length: 3 }, (_, i) => `plan-skeleton-${i}`).map(
+              (key) => (
+                <Skeleton key={key} className='h-48 w-full' />
+              )
+            )}
           </div>
         </CardContent>
       </Card>
     )
   }
 
-  if (plans.length === 0 && !hasAny) {
+  if (plans.length === 0 && !hasAny && !plansError && !subscriptionError) {
     return null
   }
 
@@ -264,6 +308,26 @@ export function SubscriptionPlansCard({
         disableHoverEffect
         contentClassName='space-y-4 sm:space-y-5'
       >
+        {(plansError || subscriptionError) && (
+          <Alert variant='destructive'>
+            <AlertDescription className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+              <span>
+                {plansError && subscriptionError
+                  ? t('Failed to load subscription information')
+                  : plansError || subscriptionError}
+              </span>
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                disabled={refreshing}
+                onClick={() => void handleRefresh()}
+              >
+                {t('Retry')}
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
         {/* My subscriptions & billing preference */}
         <div className='rounded-xl border p-3 sm:p-4'>
           <div className='flex flex-wrap items-center justify-between gap-2.5 sm:gap-3'>
@@ -331,6 +395,7 @@ export function SubscriptionPlansCard({
                 ]}
                 value={displayPref}
                 onValueChange={(v) => v !== null && handlePreferenceChange(v)}
+                disabled={preferenceSaving}
               >
                 <SelectTrigger className='h-8 flex-1 text-xs sm:w-[140px] sm:flex-none'>
                   <SelectValue>
@@ -367,7 +432,8 @@ export function SubscriptionPlansCard({
                 size='icon'
                 className='h-8 w-8'
                 onClick={handleRefresh}
-                disabled={refreshing}
+                disabled={refreshing || preferenceSaving}
+                aria-label={t('Refresh subscription status')}
               >
                 <RefreshCw
                   className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`}
@@ -510,7 +576,10 @@ export function SubscriptionPlansCard({
               const plan = p?.plan
               if (!plan) return null
               const totalAmount = Number(plan.total_amount || 0)
-              const price = Number(plan.price_amount || 0).toFixed(2)
+              const price = formatPaymentDecimalAmount(
+                Number(plan.price_amount || 0),
+                plan.currency || 'USD'
+              )
               const isPopular = index === 0 && plans.length > 1
               const limit = Number(plan.max_purchase_per_user || 0)
               const count = planPurchaseCountMap.get(plan.id) || 0
@@ -562,7 +631,7 @@ export function SubscriptionPlansCard({
 
                     <div className='py-2'>
                       <span className='text-primary text-2xl font-bold'>
-                        ${price}
+                        {price}
                       </span>
                     </div>
 
@@ -627,10 +696,9 @@ export function SubscriptionPlansCard({
         enableStripe={enableStripe}
         enableCreem={enableCreem}
         enableWaffoPancake={enableWaffoPancake}
-        enableOnlineTopUp={enableOnlineTopUp}
-        epayMethods={epayMethods}
+        paymentMethods={subscriptionPaymentMethods}
         userQuota={userQuota}
-        onPurchaseSuccess={onPurchaseSuccess}
+        onPurchaseSuccess={handlePurchaseSuccess}
         purchaseLimit={
           selectedPlan?.plan?.max_purchase_per_user
             ? Number(selectedPlan.plan.max_purchase_per_user)

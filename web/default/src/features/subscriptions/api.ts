@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+
 import type {
   ApiResponse,
   PlanRecord,
@@ -29,6 +30,7 @@ import type {
   SubscriptionPayResponse,
   SubscriptionPayRequest,
   SelfSubscriptionData,
+  StripeInventoryPage,
 } from './types'
 
 // ============================================================================
@@ -228,6 +230,23 @@ export async function updateBillingPreference(
 ): Promise<ApiResponse<{ billing_preference?: string }>> {
   const res = await api.put('/api/subscription/self/preference', {
     billing_preference: preference,
+  })
+  return res.data
+}
+
+export async function getSelfStripeLegacyInventory(
+  page: number,
+  pageSize: number,
+  status = ''
+): Promise<ApiResponse<StripeInventoryPage>> {
+  const res = await api.get('/api/subscription/stripe/inventory', {
+    params: {
+      p: page,
+      page_size: pageSize,
+      status: status || undefined,
+    },
+    skipBusinessError: true,
+    skipErrorHandler: true,
   })
   return res.data
 }

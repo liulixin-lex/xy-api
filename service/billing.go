@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -12,7 +13,20 @@ import (
 const (
 	BillingSourceWallet       = "wallet"
 	BillingSourceSubscription = "subscription"
+
+	billingSettlementStatusSettled   = "settled"
+	billingSettlementStatusPending   = "pending"
+	billingSettlementStatusShortfall = "shortfall"
+	billingSettlementStatusFailed    = "failed"
 )
+
+type billingSettlementLogState struct {
+	Status           string
+	TargetQuota      int
+	ChargedQuota     int
+	OutstandingQuota int
+	FailureCode      string
+}
 
 // PreConsumeBilling 根据用户计费偏好创建 BillingSession 并执行预扣费。
 // 会话存储在 relayInfo.Billing 上，供后续 Settle / Refund 使用。
@@ -29,8 +43,8 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 // SettleBilling — 后结算辅助函数
 // ---------------------------------------------------------------------------
 
-// SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
-// 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
+// SettleBilling 执行计费结算。所有路径都必须通过 durable BillingSession，
+// 避免资金来源与 Token 分步更新形成半结算。
 func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
 	if relayInfo.Billing != nil {
 		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
@@ -69,10 +83,67 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 		return nil
 	}
 
-	// 回退：无 BillingSession 时使用旧路径
-	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
-	if quotaDelta != 0 {
-		return PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+	// A missing session must never fall back to split funding/token updates.
+	// Recreate a zero-history durable lifecycle only when no legacy pre-consume
+	// was recorded; otherwise fail closed for reconciliation.
+	if relayInfo.FinalPreConsumedQuota != 0 {
+		return fmt.Errorf("billing session is missing for pre-consumed quota")
 	}
-	return nil
+	session, apiErr := NewBillingSession(ctx, relayInfo, actualQuota)
+	if apiErr != nil {
+		return apiErr
+	}
+	relayInfo.Billing = session
+	return session.Settle(actualQuota)
+}
+
+func settleBillingForLog(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) (billingSettlementLogState, error) {
+	state := billingSettlementLogState{
+		Status:       billingSettlementStatusSettled,
+		TargetQuota:  actualQuota,
+		ChargedQuota: actualQuota,
+	}
+	err := SettleBilling(ctx, relayInfo, actualQuota)
+	if err == nil {
+		return state, nil
+	}
+
+	state.Status = billingSettlementStatusFailed
+	state.ChargedQuota = relayInfo.FinalPreConsumedQuota
+	if relayInfo.Billing != nil {
+		state.ChargedQuota = relayInfo.Billing.GetPreConsumedQuota()
+	}
+	if reservation, lookupErr := model.GetBillingReservation(relayInfo.RequestId); lookupErr == nil {
+		state.ChargedQuota = reservation.ReservedQuota
+		state.FailureCode = reservation.SettlementFailureCode
+		switch {
+		case reservation.Status == model.BillingReservationStatusSettled:
+			state.Status = billingSettlementStatusSettled
+			state.ChargedQuota = reservation.SettledQuota
+		case reservation.Status == model.BillingReservationStatusReserved && reservation.ShortfallFreezeApplied:
+			state.Status = billingSettlementStatusShortfall
+		case reservation.Status == model.BillingReservationStatusReserved && reservation.SettlementPending:
+			state.Status = billingSettlementStatusPending
+		}
+	}
+	if state.FailureCode == "" {
+		state.FailureCode, _ = model.BillingSettlementFailureCode(err)
+	}
+	if state.TargetQuota > state.ChargedQuota {
+		state.OutstandingQuota = state.TargetQuota - state.ChargedQuota
+	}
+	return state, err
+}
+
+func attachBillingSettlementLogState(other map[string]interface{}, state billingSettlementLogState) {
+	if other == nil || state.Status == billingSettlementStatusSettled {
+		return
+	}
+	other["billing_settlement_status"] = state.Status
+	other["billing_target_quota"] = state.TargetQuota
+	other["billing_charged_quota"] = state.ChargedQuota
+	other["billing_outstanding_quota"] = state.OutstandingQuota
+	if state.FailureCode != "" {
+		other["billing_failure_code"] = state.FailureCode
+	}
 }

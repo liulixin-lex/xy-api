@@ -571,18 +571,16 @@ func RelayTask(c *gin.Context) {
 		logger.LogInfo(c, retryLogStr)
 	}
 
-	// ── 成功：结算 + 日志 + 插入任务 ──
+	// ── 成功：绑定 durable reservation + 插入任务 + 记录提交日志 ──
 	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-			common.SysError("settle task billing error: " + settleErr.Error())
-		}
-		service.LogTaskConsumption(c, relayInfo)
-
 		task := model.InitTask(result.Platform, relayInfo)
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
+		if relayInfo.Billing != nil {
+			task.PrivateData.BillingRequestId = relayInfo.RequestId
+		}
 		task.PrivateData.NodeName = common.NodeName
 		task.PrivateData.BillingContext = &model.TaskBillingContext{
 			ModelPrice:      relayInfo.PriceData.ModelPrice,
@@ -595,9 +593,26 @@ func RelayTask(c *gin.Context) {
 		task.Quota = result.Quota
 		task.Data = result.TaskData
 		task.Action = relayInfo.Action
-		if insertErr := task.Insert(); insertErr != nil {
+		if relayInfo.Billing != nil {
+			// Keep the reservation open until the async task reaches a terminal
+			// state. The transaction binds the task and reconciles any submit-time
+			// adaptor adjustment atomically.
+			if bindErr := model.CreateTaskWithBillingReservation(task, relayInfo.RequestId, result.Quota, relayInfo.TokenKey); bindErr != nil {
+				common.SysError("bind async task billing error: " + bindErr.Error())
+				// The upstream job already exists. If binding fails, close the
+				// reservation with the exact submit-time amount rather than refunding
+				// a job the user has received; stale reconciliation will retry only
+				// if this terminal close also fails.
+				if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+					common.SysError("settle unbound task billing error: " + settleErr.Error())
+				}
+				service.LogTaskConsumption(c, relayInfo)
+				return
+			}
+		} else if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
 		}
+		service.LogTaskConsumption(c, relayInfo)
 	}
 
 	if taskErr != nil {

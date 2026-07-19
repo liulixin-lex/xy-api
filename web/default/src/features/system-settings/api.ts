@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
+import type { RevocablePaymentProvider } from './payment-credential-revocation'
 import type {
   AffiliateRewardSummaryResponse,
   ConfirmPaymentComplianceResponse,
@@ -36,6 +37,22 @@ import type {
   UpstreamRatiosResponse,
 } from './types'
 
+export type PaymentProviderReadiness = boolean | Record<string, unknown>
+
+export interface StripePaymentGatewayReadiness extends Record<string, unknown> {
+  credential_account_id?: string
+  credential_livemode?: 'live' | 'test' | string
+  previous_credential_active?: boolean
+  test_mode_enabled?: boolean
+  test_mode_blocked?: boolean
+  test_mode_isolation_required?: boolean
+}
+
+export interface PaymentGatewayReadiness {
+  [provider: string]: PaymentProviderReadiness | undefined
+  stripe?: StripePaymentGatewayReadiness
+}
+
 export async function getSystemOptions() {
   const res = await api.get<SystemOptionsResponse>('/api/option/')
   return res.data
@@ -49,7 +66,39 @@ export async function updateSystemOption(request: UpdateOptionRequest) {
 export async function confirmPaymentCompliance() {
   const res = await api.post<ConfirmPaymentComplianceResponse>(
     '/api/option/payment_compliance',
-    { confirmed: true }
+    { confirmed: true },
+    {
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    }
+  )
+  return res.data
+}
+
+export async function updatePaymentSettings(request: {
+  options: Record<string, string | number | boolean>
+  clearSecrets?: string[]
+  revokePreviousCredentials?: RevocablePaymentProvider[]
+  reason?: string
+  expectedVersion: number
+}): Promise<{
+  success: boolean
+  message?: string
+  data?: { readiness?: PaymentGatewayReadiness; version?: number }
+}> {
+  const res = await api.put(
+    '/api/option/payment',
+    {
+      options: request.options,
+      clear_secrets: request.clearSecrets,
+      revoke_previous_credentials: request.revokePreviousCredentials,
+      reason: request.reason,
+      expected_version: request.expectedVersion,
+    },
+    {
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    }
   )
   return res.data
 }

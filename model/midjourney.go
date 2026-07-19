@@ -1,5 +1,10 @@
 package model
 
+const (
+	MidjourneyStatusFailure = "FAILURE"
+	MidjourneyStatusSuccess = "SUCCESS"
+)
+
 type Midjourney struct {
 	Id          int    `json:"id"`
 	Code        int    `json:"code"`
@@ -21,8 +26,12 @@ type Midjourney struct {
 	FailReason  string `json:"fail_reason"`
 	ChannelId   int    `json:"channel_id"`
 	Quota       int    `json:"quota"`
+	Group       string `json:"group" gorm:"type:varchar(50)"`
 	Buttons     string `json:"buttons"`
 	Properties  string `json:"properties"`
+	// PrivateData contains the durable billing link and must never be returned
+	// to clients because it can include internal token and subscription data.
+	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 }
 
 // TaskQueryParams 用于包含所有搜索条件的结构体，可以根据需求添加更多字段
@@ -124,6 +133,12 @@ func GetByOnlyMJId(mjId string) *Midjourney {
 	return mj
 }
 
+func FindMidjourneysByUpstreamId(mjId string) ([]*Midjourney, error) {
+	var tasks []*Midjourney
+	err := DB.Where("mj_id = ?", mjId).Order("id asc").Find(&tasks).Error
+	return tasks, err
+}
+
 func GetByMJId(userId int, mjId string) *Midjourney {
 	var mj *Midjourney
 	var err error
@@ -181,6 +196,13 @@ func (midjourney *Midjourney) UpdateWithStatus(fromStatus string) (bool, error) 
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+func (midjourney *Midjourney) IsTerminal() bool {
+	if midjourney == nil {
+		return false
+	}
+	return midjourney.Status == MidjourneyStatusSuccess || midjourney.Status == MidjourneyStatusFailure
 }
 
 func MjBulkUpdate(mjIds []string, params map[string]any) error {

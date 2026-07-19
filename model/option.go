@@ -1,6 +1,10 @@
 package model
 
 import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,11 +17,33 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+const (
+	PaymentConfigurationVersionOptionKey = "payment_setting.config_version"
+	initialPaymentConfigurationVersion   = int64(1)
+)
+
+var (
+	ErrPaymentConfigurationVersionConflict = errors.New("payment configuration version conflict")
+	ErrPaymentConfigurationPrecondition    = errors.New("payment configuration precondition failed")
+)
+var errPaymentOptionsChangedDuringReload = errors.New("payment options changed during reload")
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
+}
+
+func optionKeyColumn() string {
+	if commonKeyCol != "" {
+		return commonKeyCol
+	}
+	if DB != nil && DB.Dialector != nil && DB.Dialector.Name() == "postgres" {
+		return `"key"`
+	}
+	return "`key`"
 }
 
 func AllOption() ([]*Option, error) {
@@ -25,6 +51,13 @@ func AllOption() ([]*Option, error) {
 	var err error
 	err = DB.Find(&options).Error
 	return options, err
+}
+
+func DeleteOptions(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	return DB.Where(fmt.Sprintf("%s IN ?", optionKeyColumn()), keys).Delete(&Option{}).Error
 }
 
 func InitOptionMap() {
@@ -80,15 +113,47 @@ func InitOptionMap() {
 	common.OptionMap["CustomCallbackAddress"] = ""
 	common.OptionMap["EpayId"] = ""
 	common.OptionMap["EpayKey"] = ""
+	common.OptionMap["EpayCurrency"] = operation_setting.EpayCurrency
+	common.OptionMap["EpayCredentialGeneration"] = strconv.FormatInt(operation_setting.EpayCredentialGeneration, 10)
+	common.OptionMap["EpayIdPrevious"] = operation_setting.EpayIdPrevious
+	common.OptionMap["EpayKeyPrevious"] = operation_setting.EpayKeyPrevious
+	common.OptionMap["EpayPreviousCredentialGeneration"] = strconv.FormatInt(operation_setting.EpayPreviousCredentialGeneration, 10)
+	common.OptionMap["EpayPreviousValidBefore"] = strconv.FormatInt(operation_setting.EpayPreviousValidBefore, 10)
+	common.OptionMap["EpayPreviousExpiresAt"] = strconv.FormatInt(operation_setting.EpayPreviousExpiresAt, 10)
 	common.OptionMap["Price"] = strconv.FormatFloat(operation_setting.Price, 'f', -1, 64)
 	common.OptionMap["USDExchangeRate"] = strconv.FormatFloat(operation_setting.USDExchangeRate, 'f', -1, 64)
 	common.OptionMap["MinTopUp"] = strconv.Itoa(operation_setting.MinTopUp)
 	common.OptionMap["StripeMinTopUp"] = strconv.Itoa(setting.StripeMinTopUp)
 	common.OptionMap["StripeApiSecret"] = setting.StripeApiSecret
 	common.OptionMap["StripeWebhookSecret"] = setting.StripeWebhookSecret
+	common.OptionMap["StripeWebhookSecretPrevious"] = setting.StripeWebhookSecretPrevious
+	common.OptionMap["StripeWebhookSecretPreviousExpiresAt"] = strconv.FormatInt(setting.StripeWebhookSecretPreviousExpiresAt, 10)
+	common.OptionMap["StripeWebhookCredentialGeneration"] = strconv.FormatInt(setting.StripeWebhookCredentialGeneration, 10)
+	common.OptionMap["StripeWebhookPreviousCredentialGeneration"] = strconv.FormatInt(setting.StripeWebhookPreviousCredentialGeneration, 10)
+	common.OptionMap["StripeWebhookPreviousValidBefore"] = strconv.FormatInt(setting.StripeWebhookPreviousValidBefore, 10)
 	common.OptionMap["StripePriceId"] = setting.StripePriceId
+	common.OptionMap["StripeCurrency"] = setting.StripeCurrency
+	common.OptionMap["StripeAccountId"] = setting.StripeAccountId
+	common.OptionMap["StripeCredentialAccountId"] = setting.StripeCredentialAccountId
+	common.OptionMap["StripeCredentialLivemode"] = setting.StripeCredentialLivemode
+	common.OptionMap["StripeWebhookCredentialLivemode"] = setting.StripeWebhookCredentialLivemode
+	common.OptionMap["StripeConfigurationVerifiedFingerprint"] = setting.StripeConfigurationVerifiedFingerprint
+	common.OptionMap["StripeConfigurationVerifiedAt"] = strconv.FormatInt(setting.StripeConfigurationVerifiedAt, 10)
 	common.OptionMap["StripeUnitPrice"] = strconv.FormatFloat(setting.StripeUnitPrice, 'f', -1, 64)
 	common.OptionMap["StripePromotionCodesEnabled"] = strconv.FormatBool(setting.StripePromotionCodesEnabled)
+	common.OptionMap["XorPayAid"] = setting.XorPayAid
+	common.OptionMap["XorPayAppSecret"] = setting.XorPayAppSecret
+	common.OptionMap["XorPayCredentialGeneration"] = strconv.FormatInt(setting.XorPayCredentialGeneration, 10)
+	common.OptionMap["XorPayAidPrevious"] = setting.XorPayAidPrevious
+	common.OptionMap["XorPayAppSecretPrevious"] = setting.XorPayAppSecretPrevious
+	common.OptionMap["XorPayPreviousCredentialGeneration"] = strconv.FormatInt(setting.XorPayPreviousCredentialGeneration, 10)
+	common.OptionMap["XorPayPreviousValidBefore"] = strconv.FormatInt(setting.XorPayPreviousValidBefore, 10)
+	common.OptionMap["XorPayPreviousExpiresAt"] = strconv.FormatInt(setting.XorPayPreviousExpiresAt, 10)
+	common.OptionMap["XorPayUnitPrice"] = strconv.FormatFloat(setting.XorPayUnitPrice, 'f', -1, 64)
+	common.OptionMap["XorPayMinTopUp"] = strconv.Itoa(setting.XorPayMinTopUp)
+	common.OptionMap["XorPayCurrency"] = setting.XorPayCurrency
+	common.OptionMap["XorPayEnabledMethods"] = setting.XorPayEnabledMethods2JsonString()
+	common.OptionMap[PaymentConfigurationVersionOptionKey] = strconv.FormatInt(initialPaymentConfigurationVersion, 10)
 	common.OptionMap["CreemApiKey"] = setting.CreemApiKey
 	common.OptionMap["CreemProducts"] = setting.CreemProducts
 	common.OptionMap["CreemTestMode"] = strconv.FormatBool(setting.CreemTestMode)
@@ -187,13 +252,209 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
-	options, _ := AllOption()
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
+	defer unlockPaymentConfiguration()
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := loadOptionsFromDatabaseWithPaymentConfigurationLockHeld(); err != nil {
+			if errors.Is(err, errPaymentOptionsChangedDuringReload) {
+				continue
+			}
+			common.SysLog("failed to load options from database: " + err.Error())
+			return
+		}
+		return
+	}
+	common.SysLog("failed to load options from database: options kept changing during reload")
+}
+
+func loadOptionsFromDatabaseWithPaymentConfigurationLockHeld() error {
+	options, err := AllOption()
+	if err != nil {
+		return fmt.Errorf("load options from database: %w", err)
+	}
+
+	type loadedOption struct {
+		key            string
+		value          string
+		storedValue    string
+		rewrappedValue string
+	}
+	loaded := make([]loadedOption, 0, len(options)+1)
+	versionFound := false
+	hasRewrappedOption := false
 	for _, option := range options {
-		err := updateOptionMap(option.Key, option.Value)
-		if err != nil {
-			common.SysLog("failed to update option map: " + err.Error())
+		value, decryptErr := decryptPaymentOptionValue(option.Key, option.Value)
+		if decryptErr != nil {
+			return fmt.Errorf("decrypt payment option %s: %w", option.Key, decryptErr)
+		}
+		if option.Key == PaymentConfigurationVersionOptionKey {
+			if _, err := parsePaymentConfigurationVersion(value, "stored"); err != nil {
+				return err
+			}
+			versionFound = true
+		}
+		candidate := loadedOption{key: option.Key, value: value, storedValue: option.Value}
+		if IsPaymentSecretOption(option.Key) && paymentOptionNeedsRewrap(option.Value) {
+			encrypted, encryptErr := encryptPaymentOptionValue(option.Key, value)
+			if encryptErr != nil {
+				return fmt.Errorf("rewrap payment option %s: %w", option.Key, encryptErr)
+			}
+			if encrypted != option.Value {
+				candidate.rewrappedValue = encrypted
+				hasRewrappedOption = true
+			}
+		}
+		loaded = append(loaded, candidate)
+	}
+	if !versionFound {
+		loaded = append(loaded, loadedOption{
+			key:   PaymentConfigurationVersionOptionKey,
+			value: strconv.FormatInt(initialPaymentConfigurationVersion, 10),
+		})
+	}
+
+	primary, hasPrimary := primaryPaymentSecretKey()
+	paymentSecretStorageReadiness.RLock()
+	startPayloadRefreshRequired := hasPrimary &&
+		(paymentSecretStorageReadiness.keyID != primary.id || !paymentSecretStorageReadiness.ready)
+	paymentSecretStorageReadiness.RUnlock()
+	if hasRewrappedOption || startPayloadRefreshRequired {
+		if err := DB.Transaction(func(tx *gorm.DB) error {
+			for _, option := range loaded {
+				if option.rewrappedValue == "" {
+					continue
+				}
+				result := tx.Model(&Option{}).
+					Where(fmt.Sprintf("%s = ? AND value = ?", optionKeyColumn()), option.key, option.storedValue).
+					Update("value", option.rewrappedValue)
+				if result.Error != nil {
+					return fmt.Errorf("persist rewrapped payment option %s: %w", option.key, result.Error)
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("%w: %s", errPaymentOptionsChangedDuringReload, option.key)
+				}
+			}
+			if startPayloadRefreshRequired {
+				return rewrapPaymentOrderStartPayloadsTx(tx)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
+
+	// Apply the version marker last. If an option-specific parser rejects a
+	// stored value, the stale local version remains visible and the next sync
+	// retries instead of treating a partial refresh as current.
+	sort.Slice(loaded, func(i, j int) bool {
+		if loaded[i].key == PaymentConfigurationVersionOptionKey {
+			return false
+		}
+		if loaded[j].key == PaymentConfigurationVersionOptionKey {
+			return true
+		}
+		return loaded[i].key < loaded[j].key
+	})
+	for _, option := range loaded {
+		if err := updateOptionMap(option.key, option.value); err != nil {
+			return fmt.Errorf("refresh option %s: %w", option.key, err)
+		}
+	}
+	if hasRewrappedOption || startPayloadRefreshRequired {
+		return refreshPaymentSecretStorageReadiness()
+	}
+	return nil
+}
+
+func parsePaymentConfigurationVersion(value, source string) (int64, error) {
+	version, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || version <= 0 {
+		return 0, fmt.Errorf("invalid %s payment configuration version %q", source, value)
+	}
+	return version, nil
+}
+
+func paymentConfigurationVersionFromDatabase() (int64, error) {
+	if DB == nil {
+		return 0, errors.New("payment configuration database is not initialized")
+	}
+	var option Option
+	result := DB.Select("value").Where(fmt.Sprintf("%s = ?", optionKeyColumn()), PaymentConfigurationVersionOptionKey).Limit(1).Find(&option)
+	if result.Error != nil {
+		return 0, fmt.Errorf("read payment configuration version: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return initialPaymentConfigurationVersion, nil
+	}
+	return parsePaymentConfigurationVersion(option.Value, "stored")
+}
+
+func paymentConfigurationVersionFromOptionMap() (int64, error) {
+	common.OptionMapRWMutex.RLock()
+	value, exists := common.OptionMap[PaymentConfigurationVersionOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+	if !exists {
+		return initialPaymentConfigurationVersion, nil
+	}
+	return parsePaymentConfigurationVersion(value, "local")
+}
+
+func CurrentPaymentConfigurationVersion() (int64, error) {
+	return paymentConfigurationVersionFromOptionMap()
+}
+
+// SyncPaymentConfigurationIfStale refreshes the process-local option snapshot
+// when another application instance has committed a newer configuration
+// version. The second comparison under the process-wide write lock keeps
+// concurrent callers from redundantly reloading or observing a partial local
+// refresh.
+func SyncPaymentConfigurationIfStale() error {
+	databaseVersion, err := paymentConfigurationVersionFromDatabase()
+	if err != nil {
+		return err
+	}
+	localVersion, err := paymentConfigurationVersionFromOptionMap()
+	if err != nil {
+		return err
+	}
+	if databaseVersion == localVersion {
+		return nil
+	}
+
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
+	defer unlockPaymentConfiguration()
+
+	for attempt := 0; attempt < 4; attempt++ {
+		databaseVersion, err = paymentConfigurationVersionFromDatabase()
+		if err != nil {
+			return err
+		}
+		localVersion, err = paymentConfigurationVersionFromOptionMap()
+		if err != nil {
+			return err
+		}
+		if databaseVersion == localVersion {
+			return nil
+		}
+		if err := loadOptionsFromDatabaseWithPaymentConfigurationLockHeld(); err != nil {
+			if errors.Is(err, errPaymentOptionsChangedDuringReload) {
+				continue
+			}
+			return err
+		}
+		databaseVersion, err = paymentConfigurationVersionFromDatabase()
+		if err != nil {
+			return err
+		}
+		localVersion, err = paymentConfigurationVersionFromOptionMap()
+		if err != nil {
+			return err
+		}
+		if databaseVersion == localVersion {
+			return nil
+		}
+	}
+	return errors.New("payment configuration kept changing during synchronization")
 }
 
 func SyncOptions(frequency int) {
@@ -205,17 +466,28 @@ func SyncOptions(frequency int) {
 }
 
 func UpdateOption(key string, value string) error {
+	if key == PaymentConfigurationVersionOptionKey {
+		return errors.New("payment configuration version cannot be updated directly")
+	}
 	// Save to database first
 	option := Option{
 		Key: key,
 	}
 	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
+	if err := DB.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+		return err
+	}
+	storageValue, err := encryptPaymentOptionValue(key, value)
+	if err != nil {
+		return err
+	}
+	option.Value = storageValue
 	// Save is a combination function.
 	// If save value does not contain primary key, it will execute Create,
 	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
+	if err := DB.Save(&option).Error; err != nil {
+		return err
+	}
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }
@@ -226,8 +498,24 @@ func UpdateOption(key string, value string) error {
 // is touched — safe for callers that must commit a set of related options
 // atomically (e.g. payment gateway binding).
 func UpdateOptionsBulk(values map[string]string) error {
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
+	defer unlockPaymentConfiguration()
+	return updateOptionsBulk(values)
+}
+
+// UpdateOptionsBulkWithPaymentConfigurationLockHeld is used only by callers
+// that must validate a provider snapshot and persist it under the same global
+// payment-configuration write lock.
+func UpdateOptionsBulkWithPaymentConfigurationLockHeld(values map[string]string) error {
+	return updateOptionsBulk(values)
+}
+
+func updateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
+	}
+	if _, exists := values[PaymentConfigurationVersionOptionKey]; exists {
+		return errors.New("payment configuration version cannot be updated directly")
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
@@ -235,7 +523,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
 			}
-			option.Value = v
+			storageValue, err := encryptPaymentOptionValue(k, v)
+			if err != nil {
+				return err
+			}
+			option.Value = storageValue
 			if err := tx.Save(&option).Error; err != nil {
 				return err
 			}
@@ -251,6 +543,361 @@ func UpdateOptionsBulk(values map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// UpdatePaymentOptionsBulkWithVersionLockHeld atomically persists a payment
+// configuration snapshot when expectedVersion matches the current durable
+// version. The caller must hold the process-wide payment-configuration write
+// lock so validation, persistence, and the in-memory refresh share one local
+// critical section; the locked version row provides the equivalent guard
+// across multiple application instances.
+func UpdatePaymentOptionsBulkWithVersionLockHeld(values map[string]string, expectedVersion int64) (int64, error) {
+	return updatePaymentOptionsWithVersionLockHeld(values, expectedVersion, nil, nil, nil)
+}
+
+type PaymentCredentialRevocation struct {
+	Provider        string
+	Generation      int64
+	ValidBefore     int64
+	AllActiveOrders bool
+}
+
+func UpdatePaymentOptionsAndRevokeCredentialsWithVersionLockHeld(
+	values map[string]string,
+	expectedVersion int64,
+	revocations []PaymentCredentialRevocation,
+) (int64, error) {
+	return updatePaymentOptionsWithVersionLockHeld(values, expectedVersion, revocations, nil, nil)
+}
+
+func UpdatePaymentOptionsAndRevokeCredentialsAuditedWithVersionLockHeld(
+	values map[string]string,
+	expectedVersion int64,
+	revocations []PaymentCredentialRevocation,
+	preconditions *PaymentConfigurationPreconditions,
+	audit *PaymentConfigurationAuditInput,
+) (int64, error) {
+	return updatePaymentOptionsWithVersionLockHeld(values, expectedVersion, revocations, preconditions, audit)
+}
+
+func updatePaymentOptionsWithVersionLockHeld(
+	values map[string]string,
+	expectedVersion int64,
+	revocations []PaymentCredentialRevocation,
+	preconditions *PaymentConfigurationPreconditions,
+	audit *PaymentConfigurationAuditInput,
+) (int64, error) {
+	if expectedVersion <= 0 {
+		return 0, errors.New("expected payment configuration version must be positive")
+	}
+	if _, exists := values[PaymentConfigurationVersionOptionKey]; exists {
+		return 0, errors.New("payment configuration version cannot be updated directly")
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if audit != nil {
+		// Build the durable evidence from the actual mutation rather than
+		// trusting a caller-provided summary that could omit a changed key or
+		// list a provider that was not revoked.
+		audit.ChangedKeys = append([]string(nil), keys...)
+		revokedProviderSet := make(map[string]struct{}, len(revocations))
+		for _, revocation := range revocations {
+			provider := strings.ToLower(strings.TrimSpace(revocation.Provider))
+			if provider != "" {
+				revokedProviderSet[provider] = struct{}{}
+			}
+		}
+		audit.RevokedProviders = audit.RevokedProviders[:0]
+		for provider := range revokedProviderSet {
+			audit.RevokedProviders = append(audit.RevokedProviders, provider)
+		}
+		sort.Strings(audit.RevokedProviders)
+		if err := audit.validate(); err != nil {
+			return 0, err
+		}
+	}
+
+	currentVersion := int64(0)
+	nextVersion := int64(0)
+	affectedOrderIDs := make(map[int64]struct{})
+	affectedProjectionIDs := make(map[string]struct{})
+	affectedOrders := int64(0)
+	affectedEvents := int64(0)
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		initialVersion := Option{
+			Key:   PaymentConfigurationVersionOptionKey,
+			Value: strconv.FormatInt(initialPaymentConfigurationVersion, 10),
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoNothing: true,
+		}).Create(&initialVersion).Error; err != nil {
+			return err
+		}
+
+		var storedVersion Option
+		if err := lockForUpdate(tx).
+			Where(fmt.Sprintf("%s = ?", optionKeyColumn()), PaymentConfigurationVersionOptionKey).
+			First(&storedVersion).Error; err != nil {
+			return err
+		}
+		parsedVersion, err := strconv.ParseInt(strings.TrimSpace(storedVersion.Value), 10, 64)
+		if err != nil || parsedVersion <= 0 {
+			return fmt.Errorf("invalid stored payment configuration version %q", storedVersion.Value)
+		}
+		currentVersion = parsedVersion
+		if currentVersion != expectedVersion {
+			return ErrPaymentConfigurationVersionConflict
+		}
+		if currentVersion == math.MaxInt64 {
+			return errors.New("payment configuration version is exhausted")
+		}
+		if preconditions != nil {
+			activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
+			if preconditions.RequireNoActiveEpayOrders {
+				var count int64
+				if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", PaymentProviderEpay, activeStatuses).
+					Count(&count).Error; err != nil {
+					return err
+				}
+				legacyCount, err := countLegacyActivePaymentProjectionsTx(tx, PaymentProviderEpay, true)
+				if err != nil {
+					return err
+				}
+				if count+legacyCount > 0 {
+					return fmt.Errorf("%w: PayAddress cannot be changed while Epay payment orders still depend on the current configuration", ErrPaymentConfigurationPrecondition)
+				}
+			}
+			if preconditions.RequireNoStripeHistory {
+				hasHistory, err := hasStripeAccountBoundData(tx)
+				if err != nil {
+					return err
+				}
+				if hasHistory {
+					return fmt.Errorf("%w: Stripe configuration cannot be changed while durable Stripe data exists", ErrPaymentConfigurationPrecondition)
+				}
+			}
+			if preconditions.RequireStripeWebhookOverlap {
+				var count int64
+				if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", PaymentProviderStripe, activeStatuses).
+					Count(&count).Error; err != nil {
+					return err
+				}
+				legacyCount, err := countLegacyActivePaymentProjectionsTx(tx, PaymentProviderStripe, false)
+				if err != nil {
+					return err
+				}
+				if count+legacyCount > 0 {
+					expiresAt, err := strconv.ParseInt(values["StripeWebhookSecretPreviousExpiresAt"], 10, 64)
+					if err != nil || values["StripeWebhookSecret"] == "" || values["StripeWebhookSecretPrevious"] == "" || expiresAt <= common.GetTimestamp() {
+						return fmt.Errorf("%w: Stripe webhook secret rotation requires an active previous-secret overlap while payment orders are in flight", ErrPaymentConfigurationPrecondition)
+					}
+				}
+			}
+		}
+
+		for _, key := range keys {
+			storageValue, err := encryptPaymentOptionValue(key, values[key])
+			if err != nil {
+				return err
+			}
+			option := Option{Key: key, Value: storageValue}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoUpdates: clause.AssignmentColumns([]string{"value"}),
+			}).Create(&option).Error; err != nil {
+				return err
+			}
+		}
+		for _, revocation := range revocations {
+			generationRevocation := (revocation.Provider == PaymentProviderEpay || revocation.Provider == PaymentProviderXorPay) &&
+				revocation.Generation > 0 && !revocation.AllActiveOrders
+			stripeWebhookRevocation := revocation.Provider == PaymentProviderStripe && revocation.Generation > 0
+			if (!generationRevocation && !stripeWebhookRevocation) || revocation.ValidBefore <= 0 {
+				return errors.New("invalid payment credential revocation")
+			}
+			now := common.GetTimestamp()
+			if err := markCanonicalPaymentCredentialIncidentsTx(tx, revocation, now, affectedOrderIDs); err != nil {
+				return err
+			}
+			if tx.Migrator().HasTable(&PaymentEvent{}) {
+				reason := "provider credential generation revoked; event cannot be linked automatically"
+				if stripeWebhookRevocation {
+					reason = "Stripe webhook signing credential revoked; event cannot be linked automatically"
+				}
+				eventUpdate := tx.Model(&PaymentEvent{}).
+					Where("provider = ? AND provider_credential_generation = ? AND payment_order_id = ?",
+						revocation.Provider, revocation.Generation, 0).
+					Where("(status IS NULL OR status NOT IN ?)", []string{PaymentEventStatusProcessed, PaymentEventStatusDismissed, PaymentEventStatusCredentialRevoked}).
+					Where("paid = ? OR refunded = ? OR disputed = ? OR dispute_resolved = ? OR paid_amount_minor > 0 OR refunded_amount_minor > 0 OR disputed_amount_minor > 0",
+						true, true, true, true).
+					Updates(map[string]interface{}{
+						"status": PaymentEventStatusCredentialRevoked, "last_error": reason,
+						"processed_at": now, "updated_at": now,
+					})
+				if eventUpdate.Error != nil {
+					return eventUpdate.Error
+				}
+				affectedEvents += eventUpdate.RowsAffected
+			}
+			if (generationRevocation || revocation.AllActiveOrders) && tx.Migrator().HasTable(&TopUp{}) {
+				query := tx.Model(&TopUp{})
+				if stripeWebhookRevocation {
+					query = query.Where("payment_order_id IS NULL AND status IN ?", []string{
+						common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview,
+					})
+				} else {
+					query = query.Where("payment_order_id IS NULL AND status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
+				}
+				if revocation.Provider == PaymentProviderEpay {
+					query = query.Where("payment_provider = ? OR payment_provider = ''", revocation.Provider)
+				} else {
+					query = query.Where("payment_provider = ?", revocation.Provider)
+				}
+				var projections []TopUp
+				if err := query.Select("id").Find(&projections).Error; err != nil {
+					return err
+				}
+				ids := make([]int, 0, len(projections))
+				for _, projection := range projections {
+					ids = append(ids, projection.Id)
+					affectedProjectionIDs["topup:"+strconv.Itoa(projection.Id)] = struct{}{}
+				}
+				if len(ids) > 0 {
+					if err := tx.Model(&TopUp{}).Where("id IN ?", ids).Update("status", common.TopUpStatusManualReview).Error; err != nil {
+						return err
+					}
+				}
+			}
+			if (generationRevocation || revocation.AllActiveOrders) && tx.Migrator().HasTable(&SubscriptionOrder{}) {
+				query := tx.Model(&SubscriptionOrder{})
+				if stripeWebhookRevocation {
+					query = query.Where("payment_order_id IS NULL AND status IN ?", []string{
+						common.TopUpStatusPending, PaymentOrderStatusProcessing, SubscriptionOrderStatusManualReview,
+					})
+				} else {
+					query = query.Where("payment_order_id IS NULL AND status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
+				}
+				if revocation.Provider == PaymentProviderEpay {
+					query = query.Where("payment_provider = ? OR payment_provider = ''", revocation.Provider)
+				} else {
+					query = query.Where("payment_provider = ?", revocation.Provider)
+				}
+				reason := "provider credential generation revoked; verify payment manually"
+				if stripeWebhookRevocation {
+					reason = "Stripe webhook signing credential revoked; verify payment manually"
+				}
+				var projections []SubscriptionOrder
+				if err := query.Select("id").Find(&projections).Error; err != nil {
+					return err
+				}
+				ids := make([]int, 0, len(projections))
+				for _, projection := range projections {
+					ids = append(ids, projection.Id)
+					affectedProjectionIDs["subscription:"+strconv.Itoa(projection.Id)] = struct{}{}
+				}
+				if len(ids) > 0 {
+					if err := tx.Model(&SubscriptionOrder{}).Where("id IN ?", ids).Updates(map[string]interface{}{
+						"status": SubscriptionOrderStatusManualReview, "review_reason": reason,
+					}).Error; err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		nextVersion = currentVersion + 1
+		affectedOrders = int64(len(affectedOrderIDs) + len(affectedProjectionIDs))
+		if audit != nil {
+			record, err := newPaymentConfigurationAudit(*audit, currentVersion, nextVersion, affectedOrders, affectedEvents)
+			if err != nil {
+				return err
+			}
+			if err := tx.Create(record).Error; err != nil {
+				return err
+			}
+		}
+		result := tx.Model(&Option{}).
+			Where(fmt.Sprintf("%s = ? AND value = ?", optionKeyColumn()), PaymentConfigurationVersionOptionKey, storedVersion.Value).
+			Update("value", strconv.FormatInt(nextVersion, 10))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrPaymentConfigurationVersionConflict
+		}
+		return nil
+	})
+	if err != nil {
+		return currentVersion, err
+	}
+
+	for _, key := range keys {
+		if err := updateOptionMap(key, values[key]); err != nil {
+			reloadErr := loadOptionsFromDatabaseWithPaymentConfigurationLockHeld()
+			if reloadErr != nil {
+				return nextVersion, fmt.Errorf("apply payment option %s: %w; reload committed configuration: %v", key, err, reloadErr)
+			}
+			return nextVersion, fmt.Errorf("apply payment option %s: %w", key, err)
+		}
+	}
+	if err := updateOptionMap(PaymentConfigurationVersionOptionKey, strconv.FormatInt(nextVersion, 10)); err != nil {
+		reloadErr := loadOptionsFromDatabaseWithPaymentConfigurationLockHeld()
+		if reloadErr != nil {
+			return nextVersion, fmt.Errorf("apply payment configuration version: %w; reload committed configuration: %v", err, reloadErr)
+		}
+		return nextVersion, fmt.Errorf("apply payment configuration version: %w", err)
+	}
+	secretStorageChanged := false
+	for _, key := range keys {
+		if IsPaymentSecretOption(key) {
+			secretStorageChanged = true
+			break
+		}
+	}
+	if secretStorageChanged {
+		if err := refreshPaymentSecretStorageReadiness(); err != nil {
+			return nextVersion, fmt.Errorf("refresh payment secret storage readiness: %w", err)
+		}
+	}
+	return nextVersion, nil
+}
+
+func countLegacyActivePaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyProvider bool) (int64, error) {
+	if tx == nil || strings.TrimSpace(provider) == "" {
+		return 0, errors.New("invalid legacy payment projection lookup")
+	}
+	statuses := []string{common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview}
+	countProjection := func(modelValue interface{}) (int64, error) {
+		if !tx.Migrator().HasTable(modelValue) {
+			return 0, nil
+		}
+		query := tx.Model(modelValue).
+			Where("(payment_order_id IS NULL OR payment_order_id = 0) AND status IN ?", statuses)
+		if includeEmptyProvider {
+			query = query.Where("payment_provider = ? OR payment_provider = ''", provider)
+		} else {
+			query = query.Where("payment_provider = ?", provider)
+		}
+		var count int64
+		if err := query.Count(&count).Error; err != nil {
+			return 0, err
+		}
+		return count, nil
+	}
+	topUpCount, err := countProjection(&TopUp{})
+	if err != nil {
+		return 0, err
+	}
+	subscriptionCount, err := countProjection(&SubscriptionOrder{})
+	if err != nil {
+		return 0, err
+	}
+	return topUpCount + subscriptionCount, nil
 }
 
 func updateOptionMap(key string, value string) (err error) {
@@ -398,6 +1045,36 @@ func updateOptionMap(key string, value string) (err error) {
 		operation_setting.EpayId = value
 	case "EpayKey":
 		operation_setting.EpayKey = value
+	case "EpayCurrency":
+		operation_setting.EpayCurrency = strings.ToUpper(strings.TrimSpace(value))
+	case "EpayCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation <= 0 {
+			return errors.New("invalid Epay credential generation")
+		}
+		operation_setting.EpayCredentialGeneration = generation
+	case "EpayIdPrevious":
+		operation_setting.EpayIdPrevious = strings.TrimSpace(value)
+	case "EpayKeyPrevious":
+		operation_setting.EpayKeyPrevious = value
+	case "EpayPreviousCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation < 0 {
+			return errors.New("invalid previous Epay credential generation")
+		}
+		operation_setting.EpayPreviousCredentialGeneration = generation
+	case "EpayPreviousValidBefore":
+		validBefore, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || validBefore < 0 {
+			return errors.New("invalid previous Epay credential boundary")
+		}
+		operation_setting.EpayPreviousValidBefore = validBefore
+	case "EpayPreviousExpiresAt":
+		expiresAt, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || expiresAt < 0 {
+			return errors.New("invalid previous Epay credential expiry")
+		}
+		operation_setting.EpayPreviousExpiresAt = expiresAt
 	case "Price":
 		operation_setting.Price, _ = strconv.ParseFloat(value, 64)
 	case "USDExchangeRate":
@@ -408,14 +1085,106 @@ func updateOptionMap(key string, value string) (err error) {
 		setting.StripeApiSecret = value
 	case "StripeWebhookSecret":
 		setting.StripeWebhookSecret = value
+	case "StripeWebhookSecretPrevious":
+		setting.StripeWebhookSecretPrevious = value
+	case "StripeWebhookSecretPreviousExpiresAt":
+		setting.StripeWebhookSecretPreviousExpiresAt, _ = strconv.ParseInt(value, 10, 64)
+	case "StripeWebhookCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation <= 0 {
+			return errors.New("invalid Stripe webhook credential generation")
+		}
+		setting.StripeWebhookCredentialGeneration = generation
+	case "StripeWebhookPreviousCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation < 0 {
+			return errors.New("invalid previous Stripe webhook credential generation")
+		}
+		setting.StripeWebhookPreviousCredentialGeneration = generation
+	case "StripeWebhookPreviousValidBefore":
+		validBefore, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || validBefore < 0 {
+			return errors.New("invalid previous Stripe webhook credential boundary")
+		}
+		setting.StripeWebhookPreviousValidBefore = validBefore
 	case "StripePriceId":
 		setting.StripePriceId = value
+	case "StripeCurrency":
+		setting.StripeCurrency = strings.ToUpper(strings.TrimSpace(value))
+	case "StripeAccountId":
+		setting.StripeAccountId = strings.TrimSpace(value)
+	case "StripeCredentialAccountId":
+		setting.StripeCredentialAccountId = strings.TrimSpace(value)
+	case "StripeCredentialLivemode":
+		mode := strings.ToLower(strings.TrimSpace(value))
+		if mode != "" && mode != "test" && mode != "live" {
+			return errors.New("invalid Stripe credential livemode")
+		}
+		setting.StripeCredentialLivemode = mode
+	case "StripeWebhookCredentialLivemode":
+		mode := strings.ToLower(strings.TrimSpace(value))
+		if mode != "" && mode != "test" && mode != "live" {
+			return errors.New("invalid Stripe webhook credential livemode")
+		}
+		setting.StripeWebhookCredentialLivemode = mode
+	case "StripeConfigurationVerifiedFingerprint":
+		fingerprint := strings.ToLower(strings.TrimSpace(value))
+		if fingerprint != "" && (len(fingerprint) != 64 || strings.Trim(fingerprint, "0123456789abcdef") != "") {
+			return errors.New("invalid Stripe configuration verification fingerprint")
+		}
+		setting.StripeConfigurationVerifiedFingerprint = fingerprint
+	case "StripeConfigurationVerifiedAt":
+		verifiedAt, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || verifiedAt < 0 {
+			return errors.New("invalid Stripe configuration verification time")
+		}
+		setting.StripeConfigurationVerifiedAt = verifiedAt
 	case "StripeUnitPrice":
 		setting.StripeUnitPrice, _ = strconv.ParseFloat(value, 64)
 	case "StripeMinTopUp":
 		setting.StripeMinTopUp, _ = strconv.Atoi(value)
 	case "StripePromotionCodesEnabled":
 		setting.StripePromotionCodesEnabled = value == "true"
+	case "XorPayAid":
+		setting.XorPayAid = strings.TrimSpace(value)
+	case "XorPayAppSecret":
+		setting.XorPayAppSecret = value
+	case "XorPayCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation <= 0 {
+			return errors.New("invalid XORPay credential generation")
+		}
+		setting.XorPayCredentialGeneration = generation
+	case "XorPayAidPrevious":
+		setting.XorPayAidPrevious = strings.TrimSpace(value)
+	case "XorPayAppSecretPrevious":
+		setting.XorPayAppSecretPrevious = value
+	case "XorPayPreviousCredentialGeneration":
+		generation, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || generation < 0 {
+			return errors.New("invalid previous XORPay credential generation")
+		}
+		setting.XorPayPreviousCredentialGeneration = generation
+	case "XorPayPreviousValidBefore":
+		validBefore, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || validBefore < 0 {
+			return errors.New("invalid previous XORPay credential boundary")
+		}
+		setting.XorPayPreviousValidBefore = validBefore
+	case "XorPayPreviousExpiresAt":
+		expiresAt, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || expiresAt < 0 {
+			return errors.New("invalid previous XORPay credential expiry")
+		}
+		setting.XorPayPreviousExpiresAt = expiresAt
+	case "XorPayUnitPrice":
+		setting.XorPayUnitPrice, _ = strconv.ParseFloat(value, 64)
+	case "XorPayMinTopUp":
+		setting.XorPayMinTopUp, _ = strconv.Atoi(value)
+	case "XorPayCurrency":
+		setting.XorPayCurrency = strings.ToUpper(strings.TrimSpace(value))
+	case "XorPayEnabledMethods":
+		err = setting.UpdateXorPayEnabledMethodsByJsonString(value)
 	case "CreemApiKey":
 		setting.CreemApiKey = value
 	case "CreemProducts":

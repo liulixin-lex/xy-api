@@ -16,12 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { z } from 'zod'
 import { createFileRoute } from '@tanstack/react-router'
+import { z } from 'zod'
+
 import { Wallet } from '@/features/wallet'
 
 const walletSearchSchema = z.object({
   show_history: z.boolean().optional(),
+  payment_result: z
+    .enum(['success', 'cancelled', 'failed', 'pending'])
+    .optional(),
+  pay: z.enum(['success', 'cancelled', 'failed', 'pending']).optional(),
+  trade_no: z.string().max(128).optional(),
 })
 
 export const Route = createFileRoute('/_authenticated/wallet/')({
@@ -30,6 +36,12 @@ export const Route = createFileRoute('/_authenticated/wallet/')({
 })
 
 function RouteComponent() {
-  const { show_history } = Route.useSearch()
-  return <Wallet initialShowHistory={show_history} />
+  const { show_history, payment_result, pay, trade_no } = Route.useSearch()
+  return (
+    <Wallet
+      initialShowHistory={show_history || !!pay}
+      initialPaymentResult={payment_result || pay}
+      initialTradeNo={trade_no}
+    />
+  )
 }

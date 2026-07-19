@@ -86,6 +86,10 @@ When deploying and using New API, we recommend following these security best pra
 Please ensure the following security-related environment variables and settings are properly configured:
 
 - `SESSION_SECRET` - Use a strong random string
+- `PAYMENT_SECRET_KEY` - Use a dedicated random string of at least 32 characters before storing payment gateway credentials; keep it identical on every node
+- `PAYMENT_SECRET_KEY_PREVIOUS` - Set only during an explicit payment-key rotation and remove it after stored credentials have been re-encrypted
+- `PAYMENT_STRIPE_TEST_MODE_ENABLED` - Leave false in every production or shared-data environment; enable only in a sandbox with isolated database, users, quota, webhooks, and Stripe test credentials
+- `TRUSTED_PROXY_CIDRS` - Leave empty unless a known reverse proxy is directly in front of the application; list only that proxy network so audit IPs cannot be forged through forwarded headers
 - `SQL_DSN` - Ensure database connection uses secure configuration
 - `REDIS_CONN_STRING` - If using Redis, ensure secure connection
 

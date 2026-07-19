@@ -379,13 +379,21 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if summary.TotalTokens == 0 {
 		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
-	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
-		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
-	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
-		logger.LogError(ctx, "error settling billing: "+err.Error())
+	settlementState, settlementErr := settleBillingForLog(ctx, relayInfo, summary.Quota)
+	if summary.TotalTokens != 0 {
+		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, settlementState.ChargedQuota)
+		model.UpdateChannelUsedQuota(relayInfo.ChannelId, settlementState.ChargedQuota)
+	}
+	if settlementErr != nil {
+		extraContent = append(extraContent, fmt.Sprintf("结算状态 %s，已扣 %s，待处理 %s",
+			settlementState.Status,
+			logger.FormatQuota(settlementState.ChargedQuota),
+			logger.FormatQuota(settlementState.OutstandingQuota),
+		))
+		logger.LogError(ctx, fmt.Sprintf("billing settlement incomplete request_id=%s status=%s target=%d charged=%d outstanding=%d error=%v",
+			relayInfo.RequestId, settlementState.Status, settlementState.TargetQuota, settlementState.ChargedQuota, settlementState.OutstandingQuota, settlementErr))
 	}
 
 	logModel := summary.ModelName
@@ -473,6 +481,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		InjectTieredBillingInfo(other, relayInfo, tieredResult)
 	}
 
+	attachBillingSettlementLogState(other, settlementState)
 	attachQuotaSaturation(ctx, relayInfo, other)
 
 	model.RecordConsumeLog(ctx, relayInfo.UserId, model.RecordConsumeLogParams{
@@ -481,7 +490,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		CompletionTokens: summary.CompletionTokens,
 		ModelName:        logModel,
 		TokenName:        summary.TokenName,
-		Quota:            summary.Quota,
+		Quota:            settlementState.ChargedQuota,
 		Content:          logContent,
 		TokenId:          relayInfo.TokenId,
 		UseTimeSeconds:   int(summary.UseTimeSeconds),

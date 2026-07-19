@@ -10,10 +10,10 @@ type BillingSettler interface {
 	Settle(actualQuota int) error
 
 	// Refund 退还所有预扣费额度（资金来源 + 令牌），幂等安全。
-	// 通过 gopool 异步执行。如果已经结算或退款则不做任何操作。
+	// 同步持久化执行，返回前确保退款已提交。已结算、已退款或已记录实际用量结算意图时不退款。
 	Refund(c *gin.Context)
 
-	// NeedsRefund 返回会话是否存在需要退还的预扣状态（未结算且未退款）。
+	// NeedsRefund 返回会话是否存在需要退还的预扣状态（未结算、未退款且无待处理实际用量）。
 	NeedsRefund() bool
 
 	// GetPreConsumedQuota 返回实际预扣的额度值（信任用户可能为 0）。

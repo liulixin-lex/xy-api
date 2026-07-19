@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+
 import type {
   RedemptionRequest,
   PaymentRequest,
@@ -31,13 +32,17 @@ import type {
   AffiliateCodeResponse,
   AffiliateTransferResponse,
   BillingHistoryResponse,
-  CompleteOrderRequest,
   CreemPaymentRequest,
   CreemPaymentResponse,
   WaffoPaymentRequest,
   WaffoPaymentResponse,
   WaffoPancakePaymentRequest,
   WaffoPancakePaymentResponse,
+  PaymentQuoteRequest,
+  PaymentQuoteResponse,
+  PaymentStartRequest,
+  PaymentStartResponse,
+  PaymentOrderResponse,
 } from './types'
 
 // ============================================================================
@@ -57,6 +62,60 @@ export function isApiSuccess(response: ApiResponse): boolean {
 export async function getTopupInfo(): Promise<TopupInfoResponse> {
   const res = await api.get('/api/user/topup/info')
   return res.data
+}
+
+/**
+ * Create a short-lived, server-authoritative payment quote.
+ */
+export async function createPaymentQuote(
+  request: PaymentQuoteRequest,
+  signal?: AbortSignal
+): Promise<PaymentQuoteResponse> {
+  const res = await api.post('/api/user/payment/quote', request, {
+    signal,
+    skipBusinessError: true,
+  } as Record<string, unknown>)
+  return res.data
+}
+
+/**
+ * Start a payment from a previously issued quote.
+ */
+export async function startPayment(
+  request: PaymentStartRequest
+): Promise<PaymentStartResponse> {
+  const res = await api.post('/api/user/payment/start', request, {
+    skipBusinessError: true,
+  } as Record<string, unknown>)
+  return res.data
+}
+
+/**
+ * Read the local order state. Provider return pages and QR polling must use
+ * this endpoint instead of trusting query parameters or provider payloads.
+ */
+export async function getPaymentOrder(
+  tradeNo: string,
+  signal?: AbortSignal
+): Promise<PaymentOrderResponse> {
+  const res = await api.get(
+    `/api/user/payment/orders/${encodeURIComponent(tradeNo)}`,
+    {
+      signal,
+      skipBusinessError: true,
+    } as Record<string, unknown>
+  )
+  const response = res.data as PaymentOrderResponse & {
+    data?: PaymentOrderResponse['data'] & { status?: string }
+  }
+  const rawStatus = (
+    response.data as unknown as { status?: string } | undefined
+  )?.status
+  if (!response.data) return response
+  if (rawStatus === 'paid' || rawStatus === 'fulfilled') {
+    response.data.status = 'success'
+  }
+  return response
 }
 
 /**
@@ -192,7 +251,8 @@ export async function transferAffiliateQuota(
 export async function getUserBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
@@ -201,7 +261,9 @@ export async function getUserBillingHistory(
   if (keyword) {
     params.append('keyword', keyword)
   }
-  const res = await api.get(`/api/user/topup/self?${params.toString()}`)
+  const res = await api.get(`/api/user/topup/self?${params.toString()}`, {
+    signal,
+  })
   return res.data
 }
 
@@ -211,7 +273,8 @@ export async function getUserBillingHistory(
 export async function getAllBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
@@ -220,16 +283,6 @@ export async function getAllBillingHistory(
   if (keyword) {
     params.append('keyword', keyword)
   }
-  const res = await api.get(`/api/user/topup?${params.toString()}`)
-  return res.data
-}
-
-/**
- * Complete a pending order (admin only)
- */
-export async function completeOrder(
-  request: CompleteOrderRequest
-): Promise<ApiResponse> {
-  const res = await api.post('/api/user/topup/complete', request)
+  const res = await api.get(`/api/user/topup?${params.toString()}`, { signal })
   return res.data
 }

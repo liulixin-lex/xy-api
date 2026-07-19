@@ -16,11 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Invoice01Icon } from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { SectionPageLayout } from '@/components/layout'
-import { useStatus } from '@/hooks/use-status'
+import { Button } from '@/components/ui/button'
+import { StripeLegacyInventoryDialog } from '@/features/subscriptions/components/dialogs/stripe-legacy-inventory-dialog'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { getSelf } from '@/lib/api'
 
@@ -28,7 +32,9 @@ import { AffiliateRewardsCard } from './components/affiliate-rewards-card'
 import { BillingHistoryDialog } from './components/dialogs/billing-history-dialog'
 import { CreemConfirmDialog } from './components/dialogs/creem-confirm-dialog'
 import { PaymentConfirmDialog } from './components/dialogs/payment-confirm-dialog'
+import { PaymentQrDialog } from './components/dialogs/payment-qr-dialog'
 import { TransferDialog } from './components/dialogs/transfer-dialog'
+import { PaymentResultAlert } from './components/payment-result-alert'
 import { RechargeFormCard } from './components/recharge-form-card'
 import { SubscriptionPlansCard } from './components/subscription-plans-card'
 import { WalletStatsCard } from './components/wallet-stats-card'
@@ -43,7 +49,7 @@ import {
   useWaffoPancakePayment,
 } from './hooks'
 import {
-  getDefaultPaymentType,
+  getDefaultPaymentMethod,
   getMinTopupAmount,
   isWaffoPancakePayment,
 } from './lib'
@@ -52,10 +58,14 @@ import type {
   PaymentMethod,
   PresetAmount,
   CreemProduct,
+  PaymentOrder,
+  PaymentQrStart,
 } from './types'
 
 interface WalletProps {
   initialShowHistory?: boolean
+  initialPaymentResult?: string
+  initialTradeNo?: string
 }
 
 export function Wallet(props: WalletProps) {
@@ -70,15 +80,26 @@ export function Wallet(props: WalletProps) {
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
   const [transferDialogOpen, setTransferDialogOpen] = useState(false)
   const [billingDialogOpen, setBillingDialogOpen] = useState(false)
+  const [stripeInventoryOpen, setStripeInventoryOpen] = useState(false)
   const [redemptionCode, setRedemptionCode] = useState('')
   const [creemDialogOpen, setCreemDialogOpen] = useState(false)
   const [selectedCreemProduct, setSelectedCreemProduct] =
     useState<CreemProduct | null>(null)
   const [showSubscriptionPanel, setShowSubscriptionPanel] = useState(true)
+  const [qrDialogOpen, setQrDialogOpen] = useState(false)
+  const [qrPaymentStart, setQrPaymentStart] = useState<PaymentQrStart | null>(
+    null
+  )
+  const [returnTradeNo, setReturnTradeNo] = useState(props.initialTradeNo || '')
 
-  const { status } = useStatus()
   const { currency } = useSystemConfig()
-  const { topupInfo, presetAmounts, loading: topupLoading } = useTopupInfo()
+  const {
+    topupInfo,
+    presetAmounts,
+    loading: topupLoading,
+    error: topupError,
+    refetch: refetchTopupInfo,
+  } = useTopupInfo()
 
   // Calculate effective exchange rate - when display type is USD, use rate of 1
   const effectiveUsdExchangeRate = useMemo(() => {
@@ -87,10 +108,13 @@ export function Wallet(props: WalletProps) {
       : currency?.usdExchangeRate || 1
   }, [currency?.quotaDisplayType, currency?.usdExchangeRate])
   const {
+    quote,
+    quoteError,
     amount: paymentAmount,
     calculating,
     processing,
-    calculatePaymentAmount,
+    calculatePaymentQuote,
+    schedulePaymentQuote,
     processPayment,
   } = usePayment()
   const {
@@ -128,9 +152,19 @@ export function Wallet(props: WalletProps) {
   useEffect(() => {
     if (props.initialShowHistory) {
       setBillingDialogOpen(true)
-      window.history.replaceState({}, '', window.location.pathname)
+      const url = new URL(window.location.href)
+      url.searchParams.delete('show_history')
+      if (!props.initialTradeNo) {
+        url.searchParams.delete('pay')
+        url.searchParams.delete('payment_result')
+      }
+      window.history.replaceState({}, '', `${url.pathname}${url.search}`)
     }
-  }, [props.initialShowHistory])
+  }, [props.initialShowHistory, props.initialTradeNo])
+
+  useEffect(() => {
+    setReturnTradeNo(props.initialTradeNo || '')
+  }, [props.initialTradeNo])
 
   // Initialize topup amount when topup info is loaded
   useEffect(() => {
@@ -138,29 +172,32 @@ export function Wallet(props: WalletProps) {
       const minTopup = getMinTopupAmount(topupInfo)
       setTopupAmount(minTopup)
 
-      // Calculate initial payment amount with default payment type
-      const defaultPaymentType = getDefaultPaymentType(topupInfo)
-      calculatePaymentAmount(minTopup, defaultPaymentType)
+      const defaultMethod = getDefaultPaymentMethod(topupInfo)
+      if (defaultMethod) {
+        setSelectedPaymentMethod(defaultMethod)
+        schedulePaymentQuote(minTopup, defaultMethod)
+      }
     }
-  }, [topupInfo, topupAmount, calculatePaymentAmount])
+  }, [topupInfo, topupAmount, schedulePaymentQuote])
 
-  // Get current payment type (selected or default)
-  const getCurrentPaymentType = useCallback(() => {
-    return selectedPaymentMethod?.type || getDefaultPaymentType(topupInfo)
+  const getCurrentPaymentMethod = useCallback(() => {
+    return selectedPaymentMethod || getDefaultPaymentMethod(topupInfo)
   }, [selectedPaymentMethod, topupInfo])
 
   // Handle preset selection
   const handleSelectPreset = (preset: PresetAmount) => {
     setTopupAmount(preset.value)
     setSelectedPreset(preset.value)
-    calculatePaymentAmount(preset.value, getCurrentPaymentType())
+    const method = getCurrentPaymentMethod()
+    if (method) schedulePaymentQuote(preset.value, method)
   }
 
   // Handle topup amount change
   const handleTopupAmountChange = (amount: number) => {
     setTopupAmount(amount)
     setSelectedPreset(null)
-    calculatePaymentAmount(amount, getCurrentPaymentType())
+    const method = getCurrentPaymentMethod()
+    if (method) schedulePaymentQuote(amount, method)
   }
 
   // Handle payment method selection
@@ -170,14 +207,14 @@ export function Wallet(props: WalletProps) {
 
     try {
       // Validate minimum topup
-      const minTopup = getMinTopupAmount(topupInfo)
+      const minTopup = method.min_topup || getMinTopupAmount(topupInfo)
       if (topupAmount < minTopup) {
+        toast.error(t('Minimum topup amount: {{amount}}', { amount: minTopup }))
         return
       }
 
-      // Calculate payment amount and show confirmation dialog
-      await calculatePaymentAmount(topupAmount, method.type)
-      setConfirmDialogOpen(true)
+      const nextQuote = await calculatePaymentQuote(topupAmount, method)
+      if (nextQuote) setConfirmDialogOpen(true)
     } finally {
       setPaymentLoading(null)
     }
@@ -185,18 +222,41 @@ export function Wallet(props: WalletProps) {
 
   // Handle payment confirmation
   const handlePaymentConfirm = async () => {
-    if (!selectedPaymentMethod) return
+    if (!selectedPaymentMethod || !quote) return
 
     const isPancake = isWaffoPancakePayment(selectedPaymentMethod.type)
-    const success = isPancake
-      ? await processWaffoPancakePayment(topupAmount)
-      : await processPayment(topupAmount, selectedPaymentMethod.type)
+    if (isPancake) {
+      const success = await processWaffoPancakePayment(topupAmount)
+      if (success) setConfirmDialogOpen(false)
+      return
+    }
 
-    if (success) {
+    const paymentStart = await processPayment(quote)
+    if (paymentStart) {
       setConfirmDialogOpen(false)
-      await fetchUser()
+      if (paymentStart.flow === 'qr') {
+        setQrPaymentStart(paymentStart)
+        setQrDialogOpen(true)
+      } else if (paymentStart.flow === 'pending') {
+        setReturnTradeNo(paymentStart.trade_no)
+      }
     }
   }
+
+  const handlePaymentSettled = useCallback(
+    async (order: PaymentOrder) => {
+      if (order.status === 'success') await fetchUser()
+    },
+    [fetchUser]
+  )
+
+  const dismissPaymentResult = useCallback(() => {
+    setReturnTradeNo('')
+    const url = new URL(window.location.href)
+    url.searchParams.delete('payment_result')
+    url.searchParams.delete('trade_no')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}`)
+  }, [])
 
   // Handle redemption
   const handleRedeem = async () => {
@@ -262,8 +322,32 @@ export function Wallet(props: WalletProps) {
     <>
       <SectionPageLayout>
         <SectionPageLayout.Title>{t('Wallet')}</SectionPageLayout.Title>
+        <SectionPageLayout.Actions>
+          <Button
+            type='button'
+            variant='outline'
+            size='sm'
+            onClick={() => setStripeInventoryOpen(true)}
+          >
+            <HugeiconsIcon
+              icon={Invoice01Icon}
+              strokeWidth={2}
+              data-icon='inline-start'
+            />
+            {t('Legacy Stripe subscriptions')}
+          </Button>
+        </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='mx-auto flex w-full max-w-7xl flex-col gap-4 sm:gap-5'>
+            {returnTradeNo && (
+              <PaymentResultAlert
+                tradeNo={returnTradeNo}
+                resultHint={props.initialPaymentResult}
+                onDismiss={dismissPaymentResult}
+                onSettled={handlePaymentSettled}
+                onOpenHistory={() => setBillingDialogOpen(true)}
+              />
+            )}
             <WalletStatsCard user={user} loading={userLoading} />
 
             <div
@@ -282,7 +366,10 @@ export function Wallet(props: WalletProps) {
                   topupAmount={topupAmount}
                   onTopupAmountChange={handleTopupAmountChange}
                   paymentAmount={paymentAmount}
+                  paymentCurrency={quote?.currency}
+                  paymentProvider={quote?.provider}
                   calculating={calculating}
+                  quoteError={quoteError}
                   onPaymentMethodSelect={handlePaymentMethodSelect}
                   paymentLoading={paymentLoading}
                   redemptionCode={redemptionCode}
@@ -291,7 +378,8 @@ export function Wallet(props: WalletProps) {
                   redeeming={redeeming}
                   topupLink={topupInfo?.topup_link}
                   loading={topupLoading}
-                  priceRatio={(status?.price as number) || 1}
+                  loadError={topupError}
+                  onRetryLoad={() => void refetchTopupInfo()}
                   usdExchangeRate={effectiveUsdExchangeRate}
                   onOpenBilling={() => setBillingDialogOpen(true)}
                   creemProducts={topupInfo?.creem_products}
@@ -334,11 +422,22 @@ export function Wallet(props: WalletProps) {
         onConfirm={handlePaymentConfirm}
         topupAmount={topupAmount}
         paymentAmount={paymentAmount}
+        quote={quote}
+        quoteError={quoteError}
         paymentMethod={selectedPaymentMethod}
         calculating={calculating}
         processing={processing || pancakeProcessing}
         discountRate={getDiscountRate()}
         usdExchangeRate={effectiveUsdExchangeRate}
+      />
+
+      <PaymentQrDialog
+        open={qrDialogOpen}
+        onOpenChange={setQrDialogOpen}
+        paymentStart={qrPaymentStart}
+        quote={quote}
+        onSettled={handlePaymentSettled}
+        onTrackPending={setReturnTradeNo}
       />
 
       <TransferDialog
@@ -352,6 +451,11 @@ export function Wallet(props: WalletProps) {
       <BillingHistoryDialog
         open={billingDialogOpen}
         onOpenChange={setBillingDialogOpen}
+      />
+
+      <StripeLegacyInventoryDialog
+        open={stripeInventoryOpen}
+        onOpenChange={setStripeInventoryOpen}
       />
 
       <CreemConfirmDialog

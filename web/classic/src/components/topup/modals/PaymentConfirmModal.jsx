@@ -18,9 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React from 'react';
-import { Modal, Typography, Card, Skeleton } from '@douyinfe/semi-ui';
+import { Banner, Modal, Typography, Card, Skeleton } from '@douyinfe/semi-ui';
 import { SiAlipay, SiWechat, SiStripe } from 'react-icons/si';
 import { CreditCard } from 'lucide-react';
+import { formatPaymentDecimal, getSafePaymentIconUrl } from '../payment-utils';
 
 const { Text } = Typography;
 
@@ -39,9 +40,15 @@ const PaymentConfirmModal = ({
   // 新增：用于显示折扣明细
   amountNumber,
   discountRate,
+  paymentQuote,
+  paymentQuoteError,
 }) => {
   const hasDiscount =
-    discountRate && discountRate > 0 && discountRate < 1 && amountNumber > 0;
+    !paymentQuote &&
+    discountRate &&
+    discountRate > 0 &&
+    discountRate < 1 &&
+    amountNumber > 0;
   const originalAmount = hasDiscount ? amountNumber / discountRate : 0;
   const discountAmount = hasDiscount ? originalAmount - amountNumber : 0;
   return (
@@ -59,6 +66,7 @@ const PaymentConfirmModal = ({
       size='small'
       centered
       confirmLoading={confirmLoading}
+      okButtonProps={{ disabled: !!paymentQuoteError }}
     >
       <div className='space-y-4'>
         <Card className='!rounded-xl !border-0 bg-slate-50 dark:bg-slate-800'>
@@ -80,7 +88,13 @@ const PaymentConfirmModal = ({
               ) : (
                 <div className='flex items-baseline space-x-2'>
                   <Text strong className='font-bold' style={{ color: 'red' }}>
-                    {renderAmount()}
+                    {paymentQuote
+                      ? formatPaymentDecimal(
+                          paymentQuote.payable_amount,
+                          paymentQuote.currency,
+                          paymentQuote.provider,
+                        )
+                      : renderAmount()}
                   </Text>
                   {hasDiscount && (
                     <Text size='small' className='text-rose-500'>
@@ -120,6 +134,7 @@ const PaymentConfirmModal = ({
                     (method) => method.type === payWay,
                   );
                   if (payMethod) {
+                    const safeIconUrl = getSafePaymentIconUrl(payMethod.icon);
                     return (
                       <>
                         {payMethod.type === 'alipay' ? (
@@ -140,10 +155,14 @@ const PaymentConfirmModal = ({
                             size={16}
                             color='#635BFF'
                           />
-                        ) : payMethod.icon ? (
+                        ) : safeIconUrl ? (
                           <img
-                            src={payMethod.icon}
-                            alt={payMethod.name}
+                            src={safeIconUrl}
+                            alt=''
+                            aria-hidden='true'
+                            loading='lazy'
+                            decoding='async'
+                            referrerPolicy='no-referrer'
                             className='mr-2'
                             style={{
                               width: 16,
@@ -213,6 +232,13 @@ const PaymentConfirmModal = ({
             </div>
           </div>
         </Card>
+        {paymentQuoteError && (
+          <Banner
+            type='danger'
+            description={paymentQuoteError}
+            closeIcon={null}
+          />
+        )}
       </div>
     </Modal>
   );

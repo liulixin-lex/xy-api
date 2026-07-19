@@ -22,6 +22,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(billingReconcileHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -149,6 +150,46 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+// billingReconcileHandler safely recovers stale durable reservations. It only
+// settles/refunds reservations bound to terminal async tasks; ambiguous rows
+// remain held and are marked for review instead of being guessed at.
+type billingReconcileHandler struct{}
+
+func (billingReconcileHandler) Type() string { return model.SystemTaskTypeBillingReconcile }
+
+func billingReservationStaleAge() time.Duration {
+	minutes := common.GetEnvOrDefault("BILLING_RESERVATION_STALE_MINUTES", 5)
+	if minutes < 1 {
+		minutes = 5
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (billingReconcileHandler) Enabled() bool {
+	cutoff := common.GetTimestamp() - int64(billingReservationStaleAge()/time.Second)
+	return model.HasStaleBillingReservations(cutoff)
+}
+
+func (billingReconcileHandler) Interval() time.Duration {
+	minutes := common.GetEnvOrDefault("BILLING_RECONCILE_INTERVAL_MINUTES", 5)
+	if minutes < 1 {
+		minutes = 5
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func (billingReconcileHandler) NewPayload() any { return nil }
+
+func (billingReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	batchSize := common.GetEnvOrDefault("BILLING_RECONCILE_BATCH_SIZE", 100)
+	if batchSize < 1 || batchSize > 1000 {
+		batchSize = 100
+	}
+	cutoff := common.GetTimestamp() - int64(billingReservationStaleAge()/time.Second)
+	summary := model.ReconcileStaleBillingReservations(cutoff, batchSize)
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 

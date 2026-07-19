@@ -116,6 +116,86 @@ func UploadRateLimit() func(c *gin.Context) {
 	return rateLimitFactory(common.UploadRateLimitNum, common.UploadRateLimitDuration, "UP")
 }
 
+const authenticatedUserFixedWindowScript = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+if count <= tonumber(ARGV[2]) then
+  return 1
+end
+return 0
+`
+
+// authenticatedUserRateLimitFactory creates an atomic, fixed-window limiter
+// keyed only by the authenticated user ID and a dedicated operation mark. The
+// database capacity limits remain the authoritative multi-node backstop.
+func authenticatedUserRateLimitFactory(maxRequestNum int, duration int64, mark string) func(c *gin.Context) {
+	if maxRequestNum <= 0 || duration <= 0 {
+		return func(c *gin.Context) {
+			c.Status(http.StatusInternalServerError)
+			c.Abort()
+		}
+	}
+	if common.RedisEnabled {
+		return func(c *gin.Context) {
+			userID := c.GetInt("id")
+			if userID <= 0 {
+				c.Status(http.StatusUnauthorized)
+				c.Abort()
+				return
+			}
+			window := time.Now().Unix() / duration
+			key := fmt.Sprintf("rateLimit:%s:user:%d:window:%d", mark, userID, window)
+			allowed, err := common.RDB.Eval(
+				c.Request.Context(), authenticatedUserFixedWindowScript, []string{key}, duration+1, maxRequestNum,
+			).Int()
+			if err != nil {
+				common.SysError(fmt.Sprintf("authenticated payment rate limit failed: %v", err))
+				c.Status(http.StatusInternalServerError)
+				c.Abort()
+				return
+			}
+			if allowed != 1 {
+				c.Status(http.StatusTooManyRequests)
+				c.Abort()
+			}
+		}
+	}
+	inMemoryRateLimiter.Init(common.RateLimitKeyExpirationDuration)
+	return func(c *gin.Context) {
+		userID := c.GetInt("id")
+		if userID <= 0 {
+			c.Status(http.StatusUnauthorized)
+			c.Abort()
+			return
+		}
+		key := fmt.Sprintf("%s:user:%d", mark, userID)
+		if !inMemoryRateLimiter.Request(key, maxRequestNum, duration) {
+			c.Status(http.StatusTooManyRequests)
+			c.Abort()
+		}
+	}
+}
+
+func PaymentQuoteRateLimit() func(c *gin.Context) {
+	if !common.PaymentQuoteRateLimitEnable {
+		return defNext
+	}
+	return authenticatedUserRateLimitFactory(
+		common.PaymentQuoteRateLimitNum, common.PaymentQuoteRateLimitDuration, "PAYMENT_QUOTE",
+	)
+}
+
+func PaymentStartRateLimit() func(c *gin.Context) {
+	if !common.PaymentStartRateLimitEnable {
+		return defNext
+	}
+	return authenticatedUserRateLimitFactory(
+		common.PaymentStartRateLimitNum, common.PaymentStartRateLimitDuration, "PAYMENT_START",
+	)
+}
+
 // userRateLimitFactory creates a rate limiter keyed by authenticated user ID
 // instead of client IP, making it resistant to proxy rotation attacks.
 // Must be used AFTER authentication middleware (UserAuth).

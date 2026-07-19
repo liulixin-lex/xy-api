@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { useEffect, useState } from 'react';
-import { Layout, TabPane, Tabs } from '@douyinfe/semi-ui';
+import { Banner, Layout, Spin, TabPane, Tabs } from '@douyinfe/semi-ui';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
@@ -49,15 +49,34 @@ import DrawingSetting from '../../components/settings/DrawingSetting';
 import PaymentSetting from '../../components/settings/PaymentSetting';
 import ModelDeploymentSetting from '../../components/settings/ModelDeploymentSetting';
 import PerformanceSetting from '../../components/settings/PerformanceSetting';
+import { useUserPermissions } from '../../hooks/common/useUserPermissions';
+import { canManagePaymentGatewaySettings } from '../../helpers/admin-permissions';
 
 const Setting = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const [tabActiveKey, setTabActiveKey] = useState('1');
+  const [tabActiveKey, setTabActiveKey] = useState(
+    () => new URLSearchParams(location.search).get('tab') || 'operation',
+  );
+  const { permissions, loading: permissionsLoading } = useUserPermissions();
+  const isRootUser = isRoot();
+  const canManagePaymentGateway =
+    isRootUser || canManagePaymentGatewaySettings(permissions);
   let panes = [];
 
-  if (isRoot()) {
+  const paymentPane = {
+    tab: (
+      <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+        <CreditCard size={18} />
+        {t('支付设置')}
+      </span>
+    ),
+    content: <PaymentSetting />,
+    itemKey: 'payment',
+  };
+
+  if (isRootUser) {
     panes.push({
       tab: (
         <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
@@ -98,16 +117,7 @@ const Setting = () => {
       content: <DrawingSetting />,
       itemKey: 'drawing',
     });
-    panes.push({
-      tab: (
-        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-          <CreditCard size={18} />
-          {t('支付设置')}
-        </span>
-      ),
-      content: <PaymentSetting />,
-      itemKey: 'payment',
-    });
+    panes.push(paymentPane);
     panes.push({
       tab: (
         <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
@@ -178,38 +188,68 @@ const Setting = () => {
       content: <OtherSetting />,
       itemKey: 'other',
     });
+  } else if (!permissionsLoading && canManagePaymentGateway) {
+    panes.push(paymentPane);
   }
+  const allowedTabKeys = panes.map((pane) => pane.itemKey).join(',');
   const onChangeTab = (key) => {
     setTabActiveKey(key);
     navigate(`?tab=${key}`);
   };
   useEffect(() => {
+    if (!isRootUser && permissionsLoading) return;
     const searchParams = new URLSearchParams(window.location.search);
-    const tab = searchParams.get('tab');
-    if (tab) {
-      setTabActiveKey(tab);
-    } else {
-      onChangeTab('operation');
+    const requestedTab = searchParams.get('tab');
+    const allowedTabs = allowedTabKeys ? allowedTabKeys.split(',') : [];
+    const nextTab =
+      requestedTab && allowedTabs.includes(requestedTab)
+        ? requestedTab
+        : allowedTabs[0];
+    if (!nextTab) return;
+    setTabActiveKey(nextTab);
+    if (requestedTab !== nextTab) {
+      navigate(`?tab=${nextTab}`, { replace: true });
     }
-  }, [location.search]);
+  }, [
+    allowedTabKeys,
+    isRootUser,
+    location.search,
+    navigate,
+    permissionsLoading,
+  ]);
   return (
     <div className='mt-[60px] px-2'>
-      <Layout>
-        <Layout.Content>
-          <Tabs
-            type='card'
-            collapsible
-            activeKey={tabActiveKey}
-            onChange={(key) => onChangeTab(key)}
-          >
-            {panes.map((pane) => (
-              <TabPane itemKey={pane.itemKey} tab={pane.tab} key={pane.itemKey}>
-                {tabActiveKey === pane.itemKey && pane.content}
-              </TabPane>
-            ))}
-          </Tabs>
-        </Layout.Content>
-      </Layout>
+      <Spin spinning={!isRootUser && permissionsLoading}>
+        <Layout>
+          <Layout.Content>
+            {!permissionsLoading && panes.length === 0 ? (
+              <Banner
+                type='danger'
+                title={t('您无权访问此页面，请联系管理员')}
+                closeIcon={null}
+                fullMode={false}
+              />
+            ) : (
+              <Tabs
+                type='card'
+                collapsible
+                activeKey={tabActiveKey}
+                onChange={(key) => onChangeTab(key)}
+              >
+                {panes.map((pane) => (
+                  <TabPane
+                    itemKey={pane.itemKey}
+                    tab={pane.tab}
+                    key={pane.itemKey}
+                  >
+                    {tabActiveKey === pane.itemKey && pane.content}
+                  </TabPane>
+                ))}
+              </Tabs>
+            )}
+          </Layout.Content>
+        </Layout>
+      </Spin>
     </div>
   );
 };

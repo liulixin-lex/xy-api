@@ -267,6 +267,89 @@ func withSMTPSettings(t *testing.T) {
 	})
 }
 
+func mustRenderTestEmailBody(t *testing.T, source string, data any) EmailBody {
+	t.Helper()
+	body, err := RenderEmailHTMLBody(source, data)
+	require.NoError(t, err)
+	return body
+}
+
+func TestNewEmailTextBodyEscapesMarkupAndPreservesLineBreaks(t *testing.T) {
+	body := NewEmailTextBody("first <script>alert('x')</script>\r\nsecond")
+
+	require.Equal(t, "first &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;<br>\nsecond", body.html)
+}
+
+func TestRenderEmailHTMLBodyEscapesTextAndURLContexts(t *testing.T) {
+	body, err := RenderEmailHTMLBody(
+		`<p>{{.Message}}</p><a href="{{.URL}}">{{.URL}}</a>`,
+		struct {
+			Message string
+			URL     string
+		}{
+			Message: `<img src=x onerror="alert(1)">`,
+			URL:     `javascript:alert(1)`,
+		},
+	)
+	require.NoError(t, err)
+	require.Contains(t, body.html, `<p>&lt;img src=x onerror=&#34;alert(1)&#34;&gt;</p>`)
+	require.Contains(t, body.html, `href="#ZgotmplZ"`)
+	require.NotContains(t, body.html, `<img src=x`)
+}
+
+func TestSendEmailRejectsRecipientHeaderInjectionBeforeConnecting(t *testing.T) {
+	withSMTPSettings(t)
+
+	SMTPServer = "127.0.0.1"
+	SMTPPort = 1
+	SMTPAccount = "sender@example.com"
+	SMTPFrom = "sender@example.com"
+
+	err := SendEmail(
+		"Verification",
+		"receiver@example.com\r\nBcc: victim@example.com",
+		NewEmailTextBody("safe"),
+	)
+	require.ErrorContains(t, err, "invalid email recipient")
+}
+
+func TestSendEmailEncodesHeaderValuesAndPreservesEscapedHTMLTemplate(t *testing.T) {
+	server := newFakeSMTPServerWithSTARTTLSAdvertisement(t, false)
+	defer server.close()
+	withSMTPSettings(t)
+
+	SMTPServer = server.host
+	SMTPPort = server.port
+	SMTPSSLEnabled = false
+	SMTPStartTLSEnabled = false
+	SMTPAccount = ""
+	SMTPFrom = "sender@example.com"
+	SMTPToken = ""
+	SystemName = "Trusted\r\nBcc: victim@example.com"
+	body := mustRenderTestEmailBody(t, `<p>{{.}}</p>`, `<script>alert(1)</script>`)
+
+	err := SendEmail(
+		"Verification\r\nBcc: victim@example.com",
+		"Receiver <receiver@example.com>",
+		body,
+	)
+	require.NoError(t, err)
+
+	select {
+	case message := <-server.messages:
+		header, content, found := strings.Cut(message, "\r\n\r\n")
+		require.True(t, found)
+		require.NotContains(t, header, "\r\nBcc:")
+		require.Contains(t, header, "receiver@example.com")
+		require.Contains(t, header, "Subject: =?UTF-8?")
+		require.Contains(t, header, "From: =?utf-8?")
+		require.Contains(t, content, `<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>`)
+		require.NotContains(t, content, `<script>alert(1)</script>`)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SMTP DATA")
+	}
+}
+
 func TestSendEmailUsesExplicitStartTLSWithInsecureCertificate(t *testing.T) {
 	server := newFakeSMTPServer(t)
 	defer server.close()
@@ -283,7 +366,7 @@ func TestSendEmailUsesExplicitStartTLSWithInsecureCertificate(t *testing.T) {
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -311,7 +394,7 @@ func TestSendEmailExplicitStartTLSRequiresServerSupport(t *testing.T) {
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "STARTTLS")
 }
@@ -332,7 +415,7 @@ func TestSendEmailDoesNotAutoUpgradeWhenStartTLSDisabled(t *testing.T) {
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -364,7 +447,7 @@ func TestSMTPPlainAuthRejectsRemotePlaintextConnection(t *testing.T) {
 	SMTPFrom = "sender@example.com"
 	SMTPToken = "secret"
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", server.host, server.port))
+	conn, err := net.Dial("tcp", net.JoinHostPort(server.host, strconv.Itoa(server.port)))
 	require.NoError(t, err)
 	client, err := smtp.NewClient(conn, SMTPServer)
 	require.NoError(t, err)
@@ -435,7 +518,7 @@ func TestSendEmailSkipsAuthWhenCredentialsAreEmpty(t *testing.T) {
 	SMTPToken = ""
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -468,7 +551,7 @@ func TestSendEmailSkipsAuthWhenCredentialsAreIncomplete(t *testing.T) {
 	SMTPToken = ""
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -502,7 +585,7 @@ func TestSendEmailUsesNTLMWhenServerOnlySupportsNTLM(t *testing.T) {
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -530,7 +613,7 @@ func TestSendEmailUsesNTLMForMicrosoftAccountWhenServerOnlySupportsNTLM(t *testi
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.NoError(t, err)
 
 	select {
@@ -557,7 +640,7 @@ func TestSendEmailExplicitStartTLSRejectsUntrustedCertificateByDefault(t *testin
 	SMTPToken = "secret"
 	SystemName = "New API"
 
-	err := SendEmail("Verification", "receiver@example.com", "<p>123456</p>")
+	err := SendEmail("Verification", "receiver@example.com", mustRenderTestEmailBody(t, "<p>{{.}}</p>", "123456"))
 	require.Error(t, err)
 	require.Contains(t, fmt.Sprint(err), "certificate")
 }

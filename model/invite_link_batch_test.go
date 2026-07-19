@@ -359,6 +359,37 @@ func TestInviteInitialQuotaIssuedOnceAndExcludedFromAffiliateRewards(t *testing.
 	assert.Equal(t, int64(0), affiliateRewardCount)
 }
 
+func TestInviteInitialQuotaBoundsRejectOverflowAndRollbackRecord(t *testing.T) {
+	truncateTables(t)
+	activities := InviteRewardActivities{
+		{ActivityDetail: "A", Type: InviteRewardRuleInitialQuota, Quota: common.MaxQuota},
+		{ActivityDetail: "B", Type: InviteRewardRuleInitialQuota, Quota: 1},
+	}
+	batch := InviteLinkBatch{Code: "overflow-initial-quota", ActivityRules: activities}
+	require.Error(t, batch.Validate())
+	assert.Zero(t, CalculateInviteInitialQuota(activities))
+
+	require.NoError(t, DB.Create(&User{Id: 97, Username: "initial-overflow-inviter", AffCode: "aff97"}).Error)
+	require.NoError(t, DB.Create(&User{Id: 98, Username: "initial-overflow-invitee", AffCode: "aff98", Quota: common.MaxQuota}).Error)
+	user := &User{
+		Id: 98, InviterId: 97, InviteLinkBatchId: 99,
+		InviteRewardRulesSnapshot: InviteRewardActivities{{ActivityDetail: "Signup", Type: InviteRewardRuleInitialQuota, Quota: 1}},
+	}
+	require.ErrorIs(t, IssueInviteInitialQuota(DB, user), ErrQuotaOverflow)
+	var count int64
+	require.NoError(t, DB.Model(&InviteInitialQuotaRecord{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestInviteRewardActivityCountIsBounded(t *testing.T) {
+	activities := make(InviteRewardActivities, InviteRewardActivityMaxCount+1)
+	for i := range activities {
+		activities[i] = InviteRewardActivity{ActivityDetail: "Reward", Type: InviteRewardRuleContinuous, Percent: 1}
+	}
+	batch := InviteLinkBatch{Code: "too-many-reward-rules", ActivityRules: activities}
+	require.Error(t, batch.Validate())
+}
+
 func TestIssueInviteInitialQuotaTreatsConcurrentDuplicateAsAlreadyIssued(t *testing.T) {
 	truncateTables(t)
 

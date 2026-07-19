@@ -50,10 +50,12 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'DeepSeek',
   'Discord',
   'DoubaoVideo',
+  'Epay',
   'FastGPT',
   'Gemini',
   'Gemini Image 4K',
   'GitHub',
+  'Creem',
   'Jimeng',
   'JustSong',
   'LingYiWanWu',
@@ -94,6 +96,8 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'Vertex AI',
   'VolcEngine',
   'Waffo Pancake Dashboard',
+  'Waffo',
+  'Waffo Pancake',
   'Waffo Pancake MoR',
   'WeChat',
   'WeChat Pay',
@@ -101,6 +105,10 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'Webhook URL:',
   'Well-Known URL',
   'Worker URL',
+  'XORPay',
+  'XORPay AID',
+  'XORPay Alipay',
+  'XORPay WeChat Pay',
   'Xinference',
   'Xunfei',
   'Zhipu V4',
@@ -111,6 +119,7 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'my-status',
   'new-api-key-tool',
   'price_xxx',
+  'stripe, epay, xorpay...',
   'whsec_xxx',
 ])
 
@@ -142,7 +151,14 @@ function countLeafKeys(obj) {
   return count
 }
 
-function reorderLikeBase(base, target, fill, extras, missing, currentPath = []) {
+function reorderLikeBase(
+  base,
+  target,
+  fill,
+  extras,
+  missing,
+  currentPath = []
+) {
   // If base is an object, we keep base's key order and recurse.
   if (isPlainObject(base)) {
     const out = {}
@@ -152,10 +168,24 @@ function reorderLikeBase(base, target, fill, extras, missing, currentPath = []) 
     for (const key of Object.keys(base)) {
       const nextPath = [...currentPath, key]
       if (hasOwnEnumerableProperty(t, key)) {
-        out[key] = reorderLikeBase(base[key], t[key], f[key], extras, missing, nextPath)
+        out[key] = reorderLikeBase(
+          base[key],
+          t[key],
+          f[key],
+          extras,
+          missing,
+          nextPath
+        )
       } else {
         missing.push(nextPath.join('.'))
-        out[key] = reorderLikeBase(base[key], undefined, f[key], extras, missing, nextPath)
+        out[key] = reorderLikeBase(
+          base[key],
+          undefined,
+          f[key],
+          extras,
+          missing,
+          nextPath
+        )
       }
     }
 
@@ -212,7 +242,8 @@ function isLikelyUntranslated({ locale, baseValue, value }) {
   if (locale === 'ru') return true
 
   // For fr/vi: still useful but noisier; keep it conservative.
-  if (locale === 'fr' || locale === 'vi') return /\b(the|and|or|to|with|please)\b/i.test(s)
+  if (locale === 'fr' || locale === 'vi')
+    return /\b(the|and|or|to|with|please)\b/i.test(s)
 
   return false
 }
@@ -238,7 +269,9 @@ async function main() {
       const trans = json?.translation ?? {}
       return { locale, score: countLeafKeys(trans) }
     })
-    .sort((a, b) => b.score - a.score || a.locale.localeCompare(b.locale))[0]?.locale
+    .sort(
+      (a, b) => b.score - a.score || a.locale.localeCompare(b.locale)
+    )[0]?.locale
 
   if (!baseLocale) throw new Error('No locale files found.')
 
@@ -293,31 +326,44 @@ async function main() {
     }
 
     if (Object.keys(extras).length > 0) {
-      await fs.writeFile(path.join(extrasDir, `${locale}.extras.json`), stableStringify(extras), 'utf8')
+      await fs.writeFile(
+        path.join(extrasDir, `${locale}.extras.json`),
+        stableStringify(extras),
+        'utf8'
+      )
     } else {
-      await fs.rm(path.join(extrasDir, `${locale}.extras.json`), { force: true })
+      await fs.rm(path.join(extrasDir, `${locale}.extras.json`), {
+        force: true,
+      })
     }
     if (Object.keys(untranslated).length > 0) {
       await fs.writeFile(
         path.join(reportsDir, `${locale}.untranslated.json`),
         stableStringify(untranslated),
-        'utf8',
+        'utf8'
       )
     } else {
-      await fs.rm(path.join(reportsDir, `${locale}.untranslated.json`), { force: true })
+      await fs.rm(path.join(reportsDir, `${locale}.untranslated.json`), {
+        force: true,
+      })
     }
 
     // Rewrite locale file in base order (even for en to normalize formatting)
     await fs.writeFile(full, stableStringify(fixed), 'utf8')
   }
 
-  await fs.writeFile(path.join(reportsDir, '_sync-report.json'), stableStringify(report), 'utf8')
-   
-  console.log(`i18n sync done. Report: ${path.join(reportsDir, '_sync-report.json')}`)
+  await fs.writeFile(
+    path.join(reportsDir, '_sync-report.json'),
+    stableStringify(report),
+    'utf8'
+  )
+
+  console.log(
+    `i18n sync done. Report: ${path.join(reportsDir, '_sync-report.json')}`
+  )
 }
 
 main().catch((err) => {
-   
   console.error(err)
   process.exitCode = 1
 })

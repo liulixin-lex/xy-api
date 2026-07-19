@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useContext, useEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   API,
@@ -31,6 +31,10 @@ import {
   displayAmountToQuota,
 } from '../../../../helpers/quota';
 import { useIsMobile } from '../../../../hooks/common/useIsMobile';
+import { useSecureVerification } from '../../../../hooks/common/useSecureVerification';
+import { UserContext } from '../../../../context/User';
+import { canManagePaymentOperations } from '../../../../helpers/admin-permissions';
+import { executeVerifiedQuotaAdjustment } from '../../../../helpers/verified-quota-adjustment';
 import {
   Button,
   Modal,
@@ -57,11 +61,13 @@ import {
   IconEdit,
 } from '@douyinfe/semi-icons';
 import UserBindingManagementModal from './UserBindingManagementModal';
+import SecureVerificationModal from '../../../common/modals/SecureVerificationModal';
 
 const { Text, Title } = Typography;
 
 const EditUserModal = (props) => {
   const { t } = useTranslation();
+  const [userState] = useContext(UserContext);
   const userId = props.editingUser.id;
   const [loading, setLoading] = useState(true);
   const [adjustModalOpen, setAdjustModalOpen] = useState(false);
@@ -76,6 +82,20 @@ const EditUserModal = (props) => {
   const [showAdjustQuotaRaw, setShowAdjustQuotaRaw] = useState(false);
   const [showQuotaInput, setShowQuotaInput] = useState(false);
   const [inputs, setInputs] = useState(null);
+  const canAdjustQuota = canManagePaymentOperations(
+    userState?.user?.permissions,
+    userState?.user?.role,
+  );
+  const {
+    isModalVisible: verificationVisible,
+    verificationMethods,
+    verificationState,
+    withVerification,
+    executeVerification,
+    cancelVerification,
+    setVerificationCode,
+    switchVerificationMethod,
+  } = useSecureVerification();
 
   const isEdit = Boolean(userId);
 
@@ -177,31 +197,39 @@ const EditUserModal = (props) => {
       return;
     setAdjustLoading(true);
     try {
-      const res = await API.post('/api/user/manage', {
-        id: parseInt(userId),
-        action: 'add_quota',
-        mode: adjustMode,
-        value: adjustMode === 'override' ? quotaVal : Math.abs(quotaVal),
+      await executeVerifiedQuotaAdjustment({
+        withVerification,
+        request: async () => {
+          const res = await API.post('/api/user/manage', {
+            id: parseInt(userId),
+            action: 'add_quota',
+            mode: adjustMode,
+            value: adjustMode === 'override' ? quotaVal : Math.abs(quotaVal),
+          });
+          return res.data;
+        },
+        failureMessage: t('操作失败'),
+        verification: {
+          title: t('安全验证'),
+          description: t('为了保护账户安全，请验证您的身份。'),
+        },
+        onSuccess: async () => {
+          showSuccess(t('调整额度成功'));
+          setAdjustModalOpen(false);
+          setAdjustQuotaLocal('');
+          setAdjustAmountLocal('');
+          const userRes = await API.get(`/api/user/${userId}`);
+          if (userRes.data.success) {
+            const data = userRes.data.data;
+            data.password = '';
+            data.quota_amount = Number(
+              quotaToDisplayAmount(data.quota || 0).toFixed(6),
+            );
+            setInputs({ ...getInitValues(), ...data });
+          }
+          props.refresh();
+        },
       });
-      const { success, message } = res.data;
-      if (success) {
-        showSuccess(t('调整额度成功'));
-        setAdjustModalOpen(false);
-        setAdjustQuotaLocal('');
-        setAdjustAmountLocal('');
-        const userRes = await API.get(`/api/user/${userId}`);
-        if (userRes.data.success) {
-          const data = userRes.data.data;
-          data.password = '';
-          data.quota_amount = Number(
-            quotaToDisplayAmount(data.quota || 0).toFixed(6),
-          );
-          setInputs({ ...getInitValues(), ...data });
-        }
-        props.refresh();
-      } else {
-        showError(message);
-      }
     } catch (e) {
       showError(e.message);
     }
@@ -372,7 +400,7 @@ const EditUserModal = (props) => {
                         />
                       </Col>
 
-                      <Col span={10}>
+                      <Col span={canAdjustQuota ? 10 : 24}>
                         <Form.InputNumber
                           field='quota_amount'
                           label={t('金额')}
@@ -384,16 +412,18 @@ const EditUserModal = (props) => {
                         />
                       </Col>
 
-                      <Col span={14}>
-                        <Form.Slot label={t('调整额度')}>
-                          <Button
-                            icon={<IconEdit />}
-                            onClick={() => setAdjustModalOpen(true)}
-                          >
-                            {t('调整额度')}
-                          </Button>
-                        </Form.Slot>
-                      </Col>
+                      {canAdjustQuota && (
+                        <Col span={14}>
+                          <Form.Slot label={t('调整额度')}>
+                            <Button
+                              icon={<IconEdit />}
+                              onClick={() => setAdjustModalOpen(true)}
+                            >
+                              {t('调整额度')}
+                            </Button>
+                          </Form.Slot>
+                        </Col>
+                      )}
 
                       <Col span={24}>
                         <div
@@ -574,6 +604,21 @@ const EditUserModal = (props) => {
           />
         </div>
       </Modal>
+      <SecureVerificationModal
+        visible={verificationVisible}
+        verificationMethods={verificationMethods}
+        verificationState={verificationState}
+        onVerify={(method, code) => {
+          void executeVerification(method, code).catch(() => {
+            // useSecureVerification already reports the failure.
+          });
+        }}
+        onCancel={cancelVerification}
+        onCodeChange={setVerificationCode}
+        onMethodSwitch={switchVerificationMethod}
+        title={verificationState.title}
+        description={verificationState.description}
+      />
     </>
   );
 };

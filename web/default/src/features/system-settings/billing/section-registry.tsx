@@ -16,7 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { TFunction } from 'i18next'
+
 import { parseCurrencyDisplayType } from '@/lib/currency'
+import type { AuthUser } from '@/stores/auth-store'
 
 import { CheckinSettingsSection } from '../general/checkin-settings-section'
 import { PricingSection } from '../general/pricing-section'
@@ -26,6 +29,8 @@ import { RatioSettingsCard } from '../models/ratio-settings-card'
 import type { BillingSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
 import { AffiliateRewardSettingsSection } from './affiliate-reward-settings-section'
+import { PaymentOperationsSection } from './payment-operations'
+import { canAccessBillingSection } from './permissions'
 
 const getModelDefaults = (settings: BillingSettings) => ({
   ModelPrice: settings.ModelPrice,
@@ -42,7 +47,6 @@ const getModelDefaults = (settings: BillingSettings) => ({
 })
 
 const getGroupDefaults = (settings: BillingSettings) => ({
-  TopupGroupRatio: settings.TopupGroupRatio,
   GroupRatio: settings.GroupRatio,
   UserUsableGroups: settings.UserUsableGroups,
   GroupGroupRatio: settings.GroupGroupRatio,
@@ -133,6 +137,27 @@ const BILLING_SECTIONS = [
     titleKey: 'Payment Gateway',
     build: (settings: BillingSettings) => (
       <PaymentSettingsSection
+        configVersion={settings['payment_setting.config_version']}
+        stripeCredentialAccountId={settings.StripeCredentialAccountId}
+        stripeCredentialLivemode={settings.StripeCredentialLivemode}
+        epayPreviousCredentialActive={
+          settings['payment_setting.epay_previous_credential_active']
+        }
+        stripePreviousCredentialActive={
+          settings['payment_setting.stripe_previous_credential_active']
+        }
+        stripeTestModeEnabled={
+          settings['payment_setting.stripe_test_mode_enabled']
+        }
+        stripeTestModeBlocked={
+          settings['payment_setting.stripe_test_mode_blocked']
+        }
+        stripeTestModeIsolationRequired={
+          settings['payment_setting.stripe_test_mode_isolation_required']
+        }
+        xorPayPreviousCredentialActive={
+          settings['payment_setting.xorpay_previous_credential_active']
+        }
         defaultValues={{
           PayAddress: settings.PayAddress,
           EpayId: settings.EpayId,
@@ -140,15 +165,23 @@ const BILLING_SECTIONS = [
           Price: settings.Price,
           MinTopUp: settings.MinTopUp,
           CustomCallbackAddress: settings.CustomCallbackAddress,
+          TopupGroupRatio: settings.TopupGroupRatio,
           PayMethods: settings.PayMethods,
           AmountOptions: settings['payment_setting.amount_options'],
           AmountDiscount: settings['payment_setting.amount_discount'],
           StripeApiSecret: settings.StripeApiSecret,
           StripeWebhookSecret: settings.StripeWebhookSecret,
           StripePriceId: settings.StripePriceId,
+          StripeAccountId: settings.StripeAccountId,
+          StripeCurrency: settings.StripeCurrency,
           StripeUnitPrice: settings.StripeUnitPrice,
           StripeMinTopUp: settings.StripeMinTopUp,
           StripePromotionCodesEnabled: settings.StripePromotionCodesEnabled,
+          XorPayAid: settings.XorPayAid,
+          XorPayAppSecret: settings.XorPayAppSecret,
+          XorPayUnitPrice: settings.XorPayUnitPrice,
+          XorPayMinTopUp: settings.XorPayMinTopUp,
+          XorPayEnabledMethods: settings.XorPayEnabledMethods,
           CreemApiKey: settings.CreemApiKey,
           CreemWebhookSecret: settings.CreemWebhookSecret,
           CreemTestMode: settings.CreemTestMode,
@@ -187,6 +220,11 @@ const BILLING_SECTIONS = [
         }}
       />
     ),
+  },
+  {
+    id: 'payment-operations',
+    titleKey: 'Payment Operations',
+    build: (_settings: BillingSettings) => <PaymentOperationsSection />,
   },
   {
     id: 'affiliate-rewards',
@@ -231,6 +269,14 @@ const billingRegistry = createSectionRegistry<
 
 export const BILLING_SECTION_IDS = billingRegistry.sectionIds
 export const BILLING_DEFAULT_SECTION = billingRegistry.defaultSection
-export const getBillingSectionNavItems = billingRegistry.getSectionNavItems
+export function getBillingSectionNavItems(
+  t: TFunction,
+  user?: AuthUser | null
+) {
+  return billingRegistry.getSectionNavItems(t).filter((item) => {
+    const section = item.url.slice(item.url.lastIndexOf('/') + 1)
+    return canAccessBillingSection(section, user)
+  })
+}
 export const getBillingSectionContent = billingRegistry.getSectionContent
 export const getBillingSectionMeta = billingRegistry.getSectionMeta

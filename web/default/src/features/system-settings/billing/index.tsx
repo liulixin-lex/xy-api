@@ -25,6 +25,7 @@ import {
 } from './section-registry.tsx'
 
 const defaultBillingSettings: BillingSettings = {
+  ServerAddress: '',
   QuotaForNewUser: 0,
   PreConsumedQuota: 0,
   QuotaForInviter: 0,
@@ -74,12 +75,28 @@ const defaultBillingSettings: BillingSettings = {
   'payment_setting.compliance_confirmed_at': 0,
   'payment_setting.compliance_confirmed_by': 0,
   'payment_setting.compliance_confirmed_ip': '',
+  'payment_setting.config_version': 1,
+  'payment_setting.epay_previous_credential_active': false,
+  'payment_setting.stripe_previous_credential_active': false,
+  'payment_setting.stripe_test_mode_enabled': false,
+  'payment_setting.stripe_test_mode_blocked': false,
+  'payment_setting.stripe_test_mode_isolation_required': true,
+  'payment_setting.xorpay_previous_credential_active': false,
   StripeApiSecret: '',
   StripeWebhookSecret: '',
   StripePriceId: '',
+  StripeAccountId: '',
+  StripeCredentialAccountId: '',
+  StripeCredentialLivemode: '',
+  StripeCurrency: 'USD',
   StripeUnitPrice: 8.0,
   StripeMinTopUp: 1,
   StripePromotionCodesEnabled: false,
+  XorPayAid: '',
+  XorPayAppSecret: '',
+  XorPayUnitPrice: 7.3,
+  XorPayMinTopUp: 1,
+  XorPayEnabledMethods: '[]',
   CreemApiKey: '',
   CreemWebhookSecret: '',
   CreemTestMode: false,
@@ -117,6 +134,7 @@ export function BillingSettings() {
       defaultSection={BILLING_DEFAULT_SECTION}
       getSectionContent={getBillingSectionContent}
       getSectionMeta={getBillingSectionMeta}
+      requiresSettings={(section) => section !== 'payment-operations'}
     />
   )
 }

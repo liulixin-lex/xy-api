@@ -125,6 +125,21 @@ func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID st
 	return task
 }
 
+func buildTaskPollingIndex(tasks ...*model.Task) TaskPollingIndex {
+	index := make(TaskPollingIndex)
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if index[task.ChannelId] == nil {
+			index[task.ChannelId] = make(map[string][]*model.Task)
+		}
+		upstreamID := task.GetUpstreamTaskID()
+		index[task.ChannelId][upstreamID] = append(index[task.ChannelId][upstreamID], task)
+	}
+	return index
+}
+
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
 	truncate(t)
 
@@ -146,10 +161,7 @@ func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
 			first.GetUpstreamTaskID(),
 			second.GetUpstreamTaskID(),
 		},
-	}, map[string]*model.Task{
-		first.GetUpstreamTaskID():  first,
-		second.GetUpstreamTaskID(): second,
-	})
+	}, buildTaskPollingIndex(first, second))
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Equal(t, 1, adaptor.fetchCount())
@@ -176,10 +188,7 @@ func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {
 			first.GetUpstreamTaskID(),
 			second.GetUpstreamTaskID(),
 		},
-	}, map[string]*model.Task{
-		first.GetUpstreamTaskID():  first,
-		second.GetUpstreamTaskID(): second,
-	})
+	}, buildTaskPollingIndex(first, second))
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, adaptor.fetchCount())
@@ -214,12 +223,7 @@ func TestUpdateVideoTasksDefaultSleepDoesNotBlockOtherChannels(t *testing.T) {
 			secondChannelFirst.GetUpstreamTaskID(),
 			secondChannelSecond.GetUpstreamTaskID(),
 		},
-	}, map[string]*model.Task{
-		firstChannelFirst.GetUpstreamTaskID():   firstChannelFirst,
-		firstChannelSecond.GetUpstreamTaskID():  firstChannelSecond,
-		secondChannelFirst.GetUpstreamTaskID():  secondChannelFirst,
-		secondChannelSecond.GetUpstreamTaskID(): secondChannelSecond,
-	})
+	}, buildTaskPollingIndex(firstChannelFirst, firstChannelSecond, secondChannelFirst, secondChannelSecond))
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.ElementsMatch(t, []string{"upstream_a_1", "upstream_b_1"}, adaptor.fetchedTaskIDs())
@@ -263,11 +267,7 @@ func TestUpdateVideoTasksSlowChannelDoesNotBlockOtherChannels(t *testing.T) {
 				fastFirst.GetUpstreamTaskID(),
 				fastSecond.GetUpstreamTaskID(),
 			},
-		}, map[string]*model.Task{
-			slowTask.GetUpstreamTaskID():   slowTask,
-			fastFirst.GetUpstreamTaskID():  fastFirst,
-			fastSecond.GetUpstreamTaskID(): fastSecond,
-		})
+		}, buildTaskPollingIndex(slowTask, fastFirst, fastSecond))
 	})
 
 	select {
@@ -321,13 +321,44 @@ func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {
 			fastFirst.GetUpstreamTaskID(),
 			fastSecond.GetUpstreamTaskID(),
 		},
-	}, map[string]*model.Task{
-		sleepyFirst.GetUpstreamTaskID():  sleepyFirst,
-		sleepySecond.GetUpstreamTaskID(): sleepySecond,
-		fastFirst.GetUpstreamTaskID():    fastFirst,
-		fastSecond.GetUpstreamTaskID():   fastSecond,
-	})
+	}, buildTaskPollingIndex(sleepyFirst, sleepySecond, fastFirst, fastSecond))
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.ElementsMatch(t, []string{"upstream_sleepy_1", "upstream_fast_1", "upstream_fast_2"}, adaptor.fetchedTaskIDs())
+}
+
+func TestUpdateVideoTasksScopesDuplicateUpstreamIDsByChannelAndLocalRow(t *testing.T) {
+	truncate(t)
+
+	const firstChannelID = 401
+	const secondChannelID = 402
+	const sharedUpstreamID = "shared_upstream_task"
+	seedTaskPollingChannel(t, firstChannelID, true)
+	seedTaskPollingChannel(t, secondChannelID, true)
+	first := seedPollingTask(t, firstChannelID, "task_shared_first", sharedUpstreamID)
+	firstDuplicate := seedPollingTask(t, firstChannelID, "task_shared_duplicate", sharedUpstreamID)
+	second := seedPollingTask(t, secondChannelID, "task_shared_second_channel", sharedUpstreamID)
+	for _, task := range []*model.Task{first, firstDuplicate, second} {
+		task.Progress = "10%"
+		require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("progress", task.Progress).Error)
+	}
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	err := UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
+		firstChannelID:  {sharedUpstreamID},
+		secondChannelID: {sharedUpstreamID},
+	}, buildTaskPollingIndex(first, firstDuplicate, second))
+	require.NoError(t, err)
+	assert.Equal(t, 3, adaptor.fetchCount())
+
+	for _, task := range []*model.Task{first, firstDuplicate, second} {
+		var stored model.Task
+		require.NoError(t, model.DB.First(&stored, task.ID).Error)
+		assert.Equal(t, "30%", stored.Progress)
+		assert.Equal(t, task.ChannelId, stored.ChannelId)
+	}
 }

@@ -17,11 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createFileRoute, redirect } from '@tanstack/react-router'
+
 import { BillingSettings } from '@/features/system-settings/billing'
+import { canAccessBillingSection } from '@/features/system-settings/billing/permissions'
 import {
   BILLING_DEFAULT_SECTION,
   BILLING_SECTION_IDS,
 } from '@/features/system-settings/billing/section-registry.tsx'
+import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute(
   '/_authenticated/system-settings/billing/$section'
@@ -33,6 +36,14 @@ export const Route = createFileRoute(
         to: '/system-settings/billing/$section',
         params: { section: BILLING_DEFAULT_SECTION },
       })
+    }
+    if (
+      !canAccessBillingSection(
+        params.section,
+        useAuthStore.getState().auth.user
+      )
+    ) {
+      throw redirect({ to: '/403' })
     }
   },
   component: BillingSettings,

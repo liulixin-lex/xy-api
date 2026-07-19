@@ -21,8 +21,15 @@ import {
   DEFAULT_PRESET_MULTIPLIERS,
   DEFAULT_PAYMENT_TYPE,
   DEFAULT_MIN_TOPUP,
+  MAX_TOPUP_AMOUNT,
 } from '../constants'
-import type { PresetAmount, TopupInfo } from '../types'
+import type {
+  PaymentMethod,
+  PaymentMethodProvider,
+  PaymentProvider,
+  PresetAmount,
+  TopupInfo,
+} from '../types'
 
 // ============================================================================
 // Payment Processing Functions
@@ -31,11 +38,53 @@ import type { PresetAmount, TopupInfo } from '../types'
 /**
  * Check if browser is Safari
  */
-function isSafariBrowser(): boolean {
+function isLoopbackHostname(hostname: string): boolean {
   return (
-    navigator.userAgent.indexOf('Safari') > -1 &&
-    navigator.userAgent.indexOf('Chrome') < 1
+    hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
   )
+}
+
+export function getSafePaymentUrl(value: string): URL | null {
+  if (typeof window === 'undefined') return null
+
+  try {
+    const url = new URL(value, window.location.origin)
+    if (url.username || url.password) return null
+    if (url.protocol === 'https:') return url
+
+    const sameLoopbackOrigin =
+      url.protocol === 'http:' &&
+      isLoopbackHostname(url.hostname) &&
+      isLoopbackHostname(window.location.hostname)
+    return sameLoopbackOrigin ? url : null
+  } catch {
+    return null
+  }
+}
+
+export function navigateToPaymentUrl(value: string): boolean {
+  const url = getSafePaymentUrl(value)
+  if (!url) return false
+  window.location.assign(url.href)
+  return true
+}
+
+export function isSafePaymentQrContent(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 4096) return false
+  if (trimmed.startsWith('weixin://wxpay/')) return true
+  try {
+    const url = new URL(trimmed)
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'qr.alipay.com' &&
+      !url.username &&
+      !url.password &&
+      (!url.port || url.port === '443')
+    )
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -44,15 +93,15 @@ function isSafariBrowser(): boolean {
 export function submitPaymentForm(
   url: string,
   params: Record<string, unknown>
-): void {
-  const form = document.createElement('form')
-  form.action = url
-  form.method = 'POST'
+): boolean {
+  const safeUrl = getSafePaymentUrl(url)
+  if (!safeUrl) return false
 
-  // Don't open in new tab for Safari
-  if (!isSafariBrowser()) {
-    form.target = '_blank'
-  }
+  const form = document.createElement('form')
+  form.action = safeUrl.href
+  form.method = 'POST'
+  form.target = '_self'
+  form.referrerPolicy = 'no-referrer'
 
   // Add form parameters
   Object.entries(params).forEach(([key, value]) => {
@@ -66,6 +115,39 @@ export function submitPaymentForm(
   document.body.appendChild(form)
   form.submit()
   document.body.removeChild(form)
+  return true
+}
+
+export function isPaymentProvider(value: string): value is PaymentProvider {
+  return value === 'epay' || value === 'stripe' || value === 'xorpay'
+}
+
+export function getPaymentMethodProvider(
+  type: string,
+  configuredProvider?: unknown
+): PaymentMethodProvider {
+  if (typeof configuredProvider === 'string') {
+    if (
+      isPaymentProvider(configuredProvider) ||
+      configuredProvider === 'creem' ||
+      configuredProvider === 'waffo' ||
+      configuredProvider === 'waffo_pancake'
+    ) {
+      return configuredProvider
+    }
+  }
+
+  if (type === PAYMENT_TYPES.STRIPE) return 'stripe'
+  if (
+    type === PAYMENT_TYPES.XORPAY_NATIVE ||
+    type === PAYMENT_TYPES.XORPAY_ALIPAY
+  ) {
+    return 'xorpay'
+  }
+  if (type === PAYMENT_TYPES.CREEM) return 'creem'
+  if (type === PAYMENT_TYPES.WAFFO) return 'waffo'
+  if (type === PAYMENT_TYPES.WAFFO_PANCAKE) return 'waffo_pancake'
+  return 'epay'
 }
 
 /**
@@ -73,6 +155,12 @@ export function submitPaymentForm(
  */
 export function isStripePayment(paymentType: string): boolean {
   return paymentType === PAYMENT_TYPES.STRIPE
+}
+
+export function isUnifiedPaymentMethod(
+  method: PaymentMethod
+): method is PaymentMethod & { provider: PaymentProvider } {
+  return isPaymentProvider(method.provider)
 }
 
 /**
@@ -114,6 +202,13 @@ export function getDefaultPaymentType(topupInfo: TopupInfo | null): string {
   return DEFAULT_PAYMENT_TYPE
 }
 
+export function getDefaultPaymentMethod(
+  topupInfo: TopupInfo | null
+): PaymentMethod | null {
+  if (!topupInfo) return null
+  return topupInfo.pay_methods?.[0] ?? null
+}
+
 /**
  * Get minimum topup amount from topup info
  */
@@ -122,12 +217,21 @@ export function getMinTopupAmount(topupInfo: TopupInfo | null): number {
     return DEFAULT_MIN_TOPUP
   }
 
+  const defaultMethodMinimum = Number(topupInfo.pay_methods?.[0]?.min_topup)
+  if (Number.isFinite(defaultMethodMinimum) && defaultMethodMinimum > 0) {
+    return defaultMethodMinimum
+  }
+
   if (topupInfo.enable_online_topup) {
     return topupInfo.min_topup
   }
 
   if (topupInfo.enable_stripe_topup) {
     return topupInfo.stripe_min_topup
+  }
+
+  if (topupInfo.enable_xorpay_topup) {
+    return topupInfo.xorpay_min_topup || DEFAULT_MIN_TOPUP
   }
 
   if (topupInfo.enable_waffo_topup) {
@@ -147,7 +251,12 @@ export function getMinTopupAmount(topupInfo: TopupInfo | null): number {
 export function generatePresetAmounts(minAmount: number): PresetAmount[] {
   return DEFAULT_PRESET_MULTIPLIERS.map((multiplier) => ({
     value: minAmount * multiplier,
-  }))
+  })).filter(
+    (preset) =>
+      Number.isSafeInteger(preset.value) &&
+      preset.value >= minAmount &&
+      preset.value <= MAX_TOPUP_AMOUNT
+  )
 }
 
 /**
@@ -161,8 +270,15 @@ export function mergePresetAmounts(
     return []
   }
 
-  return amountOptions.map((amount) => ({
-    value: amount,
-    discount: discounts[amount] || 1.0,
-  }))
+  return amountOptions
+    .filter(
+      (amount) =>
+        Number.isSafeInteger(amount) &&
+        amount >= 1 &&
+        amount <= MAX_TOPUP_AMOUNT
+    )
+    .map((amount) => ({
+      value: amount,
+      discount: discounts[amount] || 1.0,
+    }))
 }

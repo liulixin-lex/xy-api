@@ -108,6 +108,12 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceSystemSetting: {
 			ActionManage: false,
 		},
+		ResourcePaymentGateway: {
+			ActionManage: false,
+		},
+		ResourcePaymentOperations: {
+			ActionManage: false,
+		},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
 		ResourceChannel: {
@@ -137,6 +143,12 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 			ActionSecretView:     false,
 		},
 		ResourceSystemSetting: {
+			ActionManage: false,
+		},
+		ResourcePaymentGateway: {
+			ActionManage: false,
+		},
+		ResourcePaymentOperations: {
 			ActionManage: false,
 		},
 	}, ExplicitUserPermissions(42))
@@ -233,6 +245,7 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.False(t, capabilities[ResourceChannel][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSecretView])
 	assert.False(t, capabilities[ResourceSystemSetting][ActionManage])
+	assert.False(t, capabilities[ResourcePaymentGateway][ActionManage])
 }
 
 func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
@@ -249,4 +262,30 @@ func TestSystemSettingPermissionRequiresExplicitAdminGrant(t *testing.T) {
 	}))
 
 	assert.True(t, Can(2, common.RoleAdminUser, SystemSettingManage))
+}
+
+func TestPaymentOperationsPermissionIsSeparateAndRootOnlyByDefault(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+
+	assert.True(t, Can(1, common.RoleRootUser, PaymentOperationsManage))
+	assert.False(t, Can(2, common.RoleAdminUser, PaymentOperationsManage))
+
+	require.NoError(t, SetUserPermissions(2, PermissionsMap{
+		ResourcePaymentOperations: {ActionManage: true},
+	}))
+	assert.True(t, Can(2, common.RoleAdminUser, PaymentOperationsManage))
+}
+
+func TestPaymentGatewayPermissionIsSeparateAndRootOnlyByDefault(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+
+	assert.True(t, Can(1, common.RoleRootUser, PaymentGatewayManage))
+	assert.False(t, Can(2, common.RoleAdminUser, PaymentGatewayManage))
+
+	require.NoError(t, SetUserPermissions(2, PermissionsMap{
+		ResourcePaymentGateway: {ActionManage: true},
+	}))
+	assert.True(t, Can(2, common.RoleAdminUser, PaymentGatewayManage))
 }
