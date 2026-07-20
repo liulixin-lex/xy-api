@@ -94,10 +94,20 @@ re-verifying its tag, body, complete asset names and digests, checksums,
 container manifest, signatures, and attestations. It must not recreate a
 draft, upload over an immutable asset, or move a version tag.
 
-GitHub draft Releases must be discovered by enumerating authenticated Release
-list results and requiring exactly one matching tag. The public
+Initial GitHub draft discovery must enumerate authenticated Release list results
+and require exactly one matching tag. An explicit recovery may instead begin
+from a pre-verified fixed Release ID, then use both canonical-tag and detached
+draft enumeration only as uniqueness assertions. The public
 `releases/tags/{tag}` endpoint, tag-based `gh release` asset commands, and
 independent workflow writers are not valid draft coordination mechanisms.
-After discovery, all draft reads and mutations use the fixed Release ID and
-asset IDs, never overwrite an existing asset, and reconcile an uncertain write
-by reading it back instead of blindly retrying the mutation.
+After an ID is obtained, it is the sole identity source for all draft reads and
+mutations. Use asset IDs, never overwrite an existing asset, and reconcile an
+uncertain write by reading it back instead of blindly retrying the mutation.
+
+Every GitHub Release metadata update must send the complete release contract,
+including `tag_name`, `target_commitish`, `name`, `body`, `draft`, `prerelease`,
+and `make_latest`. Never PATCH only the notes or publication flags: GitHub
+removes the pending tag when `tag_name` is omitted. A detached `untagged-*`
+draft blocks duplicate creation and may be repaired only through an explicit,
+fixed-ID recovery that verifies its exact placeholder tag, notes, state, asset
+inventory, and digests before and after restoring the canonical tag.

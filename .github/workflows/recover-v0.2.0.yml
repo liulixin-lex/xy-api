@@ -20,6 +20,7 @@ env:
   TAG: v0.2.0
   TAG_COMMIT: ea3c0ef6cccddcf252f14f03abb11b2b74366233
   RELEASE_ID: '356446756'
+  DETACHED_TAG: untagged-39ecaac0fa083a1449f2
   CORE_RUN_ID: '29706017668'
   CORE_ARTIFACT_ID: '8447988062'
   CORE_ARTIFACT_DIGEST: sha256:208e22ef506a2570b88b0f3f455934e654ec01d2fc192d9253948944c7c962ec
@@ -153,8 +154,11 @@ jobs:
             exit 1
           fi
 
-          release_json=$(scripts/release/github-release-assets.sh \
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          resolved_release=$(scripts/release/github-release-assets.sh \
             resolve "$GITHUB_REPOSITORY" "$TAG")
+          detached_release=$(scripts/release/github-release-assets.sh \
+            resolve-detached "$GITHUB_REPOSITORY" "$TAG")
           core_assets=$(jq --compact-output --null-input --arg tag "$TAG" '[
             "checksums-linux.txt",
             "checksums-macos.txt",
@@ -184,13 +188,13 @@ jobs:
           if ! jq --exit-status \
             --argjson release_id "$RELEASE_ID" \
             --arg tag "$TAG" \
+            --arg detached_tag "$DETACHED_TAG" \
             --arg commit "$TAG_COMMIT" \
             --argjson core_assets "$core_assets" \
             --argjson all_assets "$all_assets" \
             --rawfile legacy_body "release-source/docs/releases/${TAG}.md" \
             --rawfile body "docs/releases/${TAG}.md" \
             '.id == $release_id and
-             .tag_name == $tag and
              .name == $tag and
              (.body == $body or
               ((.draft == true and .immutable != true) and
@@ -199,6 +203,9 @@ jobs:
              (.target_commitish == "main" or
               .target_commitish == $tag or
               .target_commitish == $commit) and
+             ((.tag_name == $tag) or
+              ((.draft == true and .immutable != true) and
+               .tag_name == $detached_tag)) and
              (($core_assets - [.assets[].name]) | length == 0) and
              (((.draft == true and .immutable != true) and
                (([.assets[].name] - $all_assets) | length == 0)) or
@@ -211,6 +218,23 @@ jobs:
                  type == "string" and test("^sha256:[0-9a-f]{64}$")))' \
             <<<"$release_json" >/dev/null; then
             echo '::error::The existing v0.2.0 release is not in a recoverable state.'
+            exit 1
+          fi
+          release_tag=$(jq --raw-output '.tag_name' <<<"$release_json")
+          if [ "$release_tag" = "$TAG" ]; then
+            if [ "$detached_release" != null ] || \
+               [ "$(jq --raw-output '.id' <<<"$resolved_release")" != "$RELEASE_ID" ]; then
+              echo '::error::The canonical v0.2.0 release lookup is ambiguous.'
+              exit 1
+            fi
+          elif [ "$release_tag" = "$DETACHED_TAG" ]; then
+            if [ "$resolved_release" != null ] || \
+               [ "$(jq --raw-output '.id' <<<"$detached_release")" != "$RELEASE_ID" ]; then
+              echo '::error::The detached v0.2.0 draft lookup is ambiguous.'
+              exit 1
+            fi
+          else
+            echo '::error::The fixed v0.2.0 release has an unexpected tag association.'
             exit 1
           fi
 
@@ -476,34 +500,6 @@ jobs:
             sha256sum --check --strict checksums-electron-windows.txt
           )
 
-          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
-          if jq --exit-status \
-            --rawfile body "docs/releases/${TAG}.md" \
-            '.body == $body' <<<"$release_json" >/dev/null; then
-            :
-          elif jq --exit-status \
-            --rawfile body "release-source/docs/releases/${TAG}.md" \
-            '.draft == true and .immutable != true and .body == $body' \
-            <<<"$release_json" >/dev/null; then
-            jq --null-input \
-              --rawfile body "docs/releases/${TAG}.md" \
-              '{body: $body}' |
-              gh api \
-                --method PATCH \
-                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-                --input - >/dev/null
-            release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
-            if ! jq --exit-status \
-              --rawfile body "docs/releases/${TAG}.md" \
-              '.draft == true and .immutable != true and .body == $body' \
-              <<<"$release_json" >/dev/null; then
-              echo '::error::The corrected v0.2.0 release notes were not stored exactly.'
-              exit 1
-            fi
-          else
-            echo '::error::The v0.2.0 release body is neither the legacy draft nor the corrected recovery notes.'
-            exit 1
-          fi
           allowed_assets=$(jq --compact-output --null-input \
             --arg tag "$TAG" \
             --arg desktop_version "$desktop_version" '[
@@ -530,22 +526,147 @@ jobs:
             "new-api-macos-\($tag)",
             "new-api-\($tag).exe"
           ]')
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          initial_asset_inventory=$(jq --compact-output '[.assets[] | {
+            id: .id,
+            name: .name,
+            label: .label,
+            size: .size,
+            digest: .digest,
+            state: .state,
+            content_type: .content_type,
+            created_at: .created_at,
+            updated_at: .updated_at
+          }] | sort_by(.name)' <<<"$release_json")
+          resolved_release=$(scripts/release/github-release-assets.sh \
+            resolve "$GITHUB_REPOSITORY" "$TAG")
+          detached_release=$(scripts/release/github-release-assets.sh \
+            resolve-detached "$GITHUB_REPOSITORY" "$TAG")
           if ! jq --exit-status \
             --argjson release_id "$RELEASE_ID" \
             --arg tag "$TAG" \
+            --arg detached_tag "$DETACHED_TAG" \
+            --arg commit "$TAG_COMMIT" \
+            --argjson allowed "$allowed_assets" \
+            --argjson core "$core_assets" \
+            --rawfile legacy_body "release-source/docs/releases/${TAG}.md" \
+            --rawfile body "docs/releases/${TAG}.md" '
+              .id == $release_id and
+              .name == $tag and
+              .prerelease == false and
+              (.target_commitish == "main" or
+               .target_commitish == $tag or
+               .target_commitish == $commit) and
+              (([.assets[].name] - $allowed) | length == 0) and
+              (($core - [.assets[].name]) | length == 0) and
+              all(.assets[];
+                (.id | type == "number" and . > 0) and
+                .state == "uploaded" and
+                (.size | type == "number" and . > 0) and
+                (.digest |
+                  type == "string" and test("^sha256:[0-9a-f]{64}$"))) and
+              (((.draft == true and .immutable != true) and
+                (.tag_name == $tag or .tag_name == $detached_tag) and
+                (.body == $body or .body == $legacy_body)) or
+               ((.draft == false and .immutable == true) and
+                .tag_name == $tag and .body == $body))' \
+            <<<"$release_json" >/dev/null; then
+            echo '::error::The fixed v0.2.0 release is not safe to reconcile.'
+            exit 1
+          fi
+
+          release_tag=$(jq --raw-output '.tag_name' <<<"$release_json")
+          if [ "$release_tag" = "$TAG" ]; then
+            if [ "$detached_release" != null ] || \
+               [ "$(jq --raw-output '.id' <<<"$resolved_release")" != "$RELEASE_ID" ]; then
+              echo '::error::The canonical v0.2.0 release lookup changed before reconciliation.'
+              exit 1
+            fi
+          elif [ "$release_tag" = "$DETACHED_TAG" ] && \
+               jq --exit-status '.draft == true and .immutable != true' \
+                 <<<"$release_json" >/dev/null; then
+            if [ "$resolved_release" != null ] || \
+               [ "$(jq --raw-output '.id' <<<"$detached_release")" != "$RELEASE_ID" ]; then
+              echo '::error::The detached v0.2.0 draft lookup changed before reconciliation.'
+              exit 1
+            fi
+          else
+            echo '::error::The fixed v0.2.0 release has an unexpected tag association.'
+            exit 1
+          fi
+
+          if jq --exit-status '.draft == true and .immutable != true' \
+            <<<"$release_json" >/dev/null && \
+             ! jq --exit-status \
+               --arg tag "$TAG" \
+               --rawfile body "docs/releases/${TAG}.md" \
+               '.tag_name == $tag and .name == $tag and .body == $body' \
+               <<<"$release_json" >/dev/null; then
+            if ! scripts/release/github-release-assets.sh update-draft \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "$TAG" \
+              "$TAG_COMMIT" \
+              "docs/releases/${TAG}.md" >/dev/null; then
+              echo 'The metadata update response was not confirmed; reconciling by release id without retrying the PATCH.'
+            fi
+            release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          fi
+
+          association_verified=false
+          for _ in $(seq 1 6); do
+            resolved_release=$(scripts/release/github-release-assets.sh \
+              resolve "$GITHUB_REPOSITORY" "$TAG")
+            detached_release=$(scripts/release/github-release-assets.sh \
+              resolve-detached "$GITHUB_REPOSITORY" "$TAG")
+            if [ "$(jq --raw-output '.id' <<<"$resolved_release")" = "$RELEASE_ID" ] && \
+               [ "$detached_release" = null ]; then
+              association_verified=true
+              break
+            fi
+            sleep 2
+          done
+          release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          final_metadata_asset_inventory=$(jq --compact-output '[.assets[] | {
+            id: .id,
+            name: .name,
+            label: .label,
+            size: .size,
+            digest: .digest,
+            state: .state,
+            content_type: .content_type,
+            created_at: .created_at,
+            updated_at: .updated_at
+          }] | sort_by(.name)' <<<"$release_json")
+          if ! jq --exit-status \
+            --argjson release_id "$RELEASE_ID" \
+            --arg tag "$TAG" \
+            --arg commit "$TAG_COMMIT" \
             --argjson allowed "$allowed_assets" \
             --argjson core "$core_assets" \
             --rawfile body "docs/releases/${TAG}.md" '
               .id == $release_id and
               .tag_name == $tag and
+              .name == $tag and
               .body == $body and
               .prerelease == false and
+              (.target_commitish == "main" or
+               .target_commitish == $tag or
+               .target_commitish == $commit) and
               (([.assets[].name] - $allowed) | length == 0) and
               (($core - [.assets[].name]) | length == 0) and
+              all(.assets[];
+                (.id | type == "number" and . > 0) and
+                .state == "uploaded" and
+                (.size | type == "number" and . > 0) and
+                (.digest |
+                  type == "string" and test("^sha256:[0-9a-f]{64}$"))) and
               ((.draft == true and .immutable != true) or
                (.draft == false and .immutable == true))' \
-            <<<"$release_json" >/dev/null; then
-            echo '::error::The draft changed before Electron reconciliation.'
+            <<<"$release_json" >/dev/null || \
+             [ "$association_verified" != true ] || \
+             [ "$initial_asset_inventory" != "$final_metadata_asset_inventory" ]; then
+            echo '::error::The release metadata or asset inventory could not be reconciled safely.'
             exit 1
           fi
 
@@ -654,7 +775,7 @@ jobs:
 
           base_inventory=$(jq --compact-output '[.assets[] |
             select(.name != "container-images.json") |
-            {name: .name, digest: .digest}
+            {id: .id, name: .name, size: .size, digest: .digest, state: .state}
           ] | sort_by(.name)' <<<"$final_release")
           base_asset_fingerprint=$(printf '%s' "$base_inventory" | \
             sha256sum | awk '{print $1}')
@@ -785,7 +906,7 @@ jobs:
           fi
           base_inventory=$(jq --compact-output '[.assets[] |
             select(.name != "container-images.json") |
-            {name: .name, digest: .digest}
+            {id: .id, name: .name, size: .size, digest: .digest, state: .state}
           ] | sort_by(.name)' <<<"$release_json")
           current_base_fingerprint=$(printf '%s' "$base_inventory" | \
             sha256sum | awk '{print $1}')
@@ -844,7 +965,7 @@ jobs:
           fi
           final_base_inventory=$(jq --compact-output '[.assets[] |
             select(.name != "container-images.json") |
-            {name: .name, digest: .digest}
+            {id: .id, name: .name, size: .size, digest: .digest, state: .state}
           ] | sort_by(.name)' <<<"$final_release")
           if [ "$(printf '%s' "$final_base_inventory" | sha256sum | awk '{print $1}')" != \
                "$BASE_ASSET_FINGERPRINT" ]; then
@@ -852,7 +973,7 @@ jobs:
             exit 1
           fi
           final_inventory=$(jq --compact-output '[.assets[] |
-            {name: .name, digest: .digest}
+            {id: .id, name: .name, size: .size, digest: .digest, state: .state}
           ] | sort_by(.name)' <<<"$final_release")
           asset_fingerprint=$(printf '%s' "$final_inventory" | \
             sha256sum | awk '{print $1}')
@@ -1036,7 +1157,7 @@ jobs:
             exit 1
           fi
           release_inventory=$(jq --compact-output '[.assets[] |
-            {name: .name, digest: .digest}
+            {id: .id, name: .name, size: .size, digest: .digest, state: .state}
           ] | sort_by(.name)' <<<"$release_json")
           if [ "$(printf '%s' "$release_inventory" | sha256sum | awk '{print $1}')" != \
                "$ASSET_FINGERPRINT" ]; then
@@ -1144,7 +1265,7 @@ jobs:
             resolved_release=$(scripts/release/github-release-assets.sh \
               resolve "$GITHUB_REPOSITORY" "$TAG")
             prepublish_inventory=$(jq --compact-output '[.assets[] |
-              {name: .name, digest: .digest}
+              {id: .id, name: .name, size: .size, digest: .digest, state: .state}
             ] | sort_by(.name)' <<<"$prepublish_release")
             git fetch --no-tags origin main
             prepublish_remote_tag_commit=$(git ls-remote --tags origin \
@@ -1167,12 +1288,12 @@ jobs:
               exit 1
             fi
 
-            if ! gh api \
-              --method PATCH \
-              "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-              -F draft=false \
-              -F prerelease=false \
-              -f make_latest=true >/dev/null; then
+            if ! scripts/release/github-release-assets.sh publish \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "$TAG" \
+              "$TAG_COMMIT" \
+              "docs/releases/${TAG}.md" >/dev/null; then
               echo 'The publication response was not confirmed; reconciling by release id without retrying the PATCH.'
             fi
           elif ! jq --exit-status '.draft == false and .immutable == true' \
@@ -1190,7 +1311,7 @@ jobs:
                jq --exit-status '.draft == false and .immutable == true' \
                  <<<"$published_release" >/dev/null; then
               published_inventory=$(jq --compact-output '[.assets[] |
-                {name: .name, digest: .digest}
+                {id: .id, name: .name, size: .size, digest: .digest, state: .state}
               ] | sort_by(.name)' <<<"$published_release")
               tag_release_id=$(gh api \
                 "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \

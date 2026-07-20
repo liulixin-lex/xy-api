@@ -75,6 +75,13 @@ jobs:
             bash -n "$release_script"
           done
           shellcheck -x "${release_scripts[@]}"
+          scripts/release/github-release-assets-test.sh
+          if rg -n -- '--method PATCH' \
+            .github/workflows/release.yml \
+            .github/workflows/recover-v0.2.0.yml; then
+            echo '::error::Stable release metadata mutations must use the full-contract release helper.'
+            exit 1
+          fi
 
   backend:
     name: Backend tests
