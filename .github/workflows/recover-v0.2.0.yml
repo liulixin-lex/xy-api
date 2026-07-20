@@ -35,7 +35,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       actions: read
-      contents: read
+      # GitHub only lists draft releases to callers with push access.
+      contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CONFIRM_TAG: ${{ inputs.confirm_tag }}
@@ -635,6 +636,7 @@ jobs:
       tag: v0.2.0
       release_ref: refs/tags/v0.2.0
       release_commit: ea3c0ef6cccddcf252f14f03abb11b2b74366233
+    secrets: inherit
 
   anchor_container:
     name: Anchor verified container digests in the existing draft
@@ -858,7 +860,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
