@@ -16,6 +16,10 @@ on:
       - 'v*'
       - '!v*-*'
 
+concurrency:
+  group: stable-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   RELEASE_REF: ${{ github.ref }}
@@ -525,9 +529,6 @@ jobs:
     needs: [preflight, verify_assets]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: stable-release-${{ needs.preflight.outputs.tag }}
-      cancel-in-progress: false
     permissions:
       contents: write
     outputs:
@@ -1132,16 +1133,22 @@ jobs:
                 '{name:$name,digest:$digest}'
             done | jq --compact-output --slurp 'sort_by(.name)'
           )
-          api_asset_inventory=$(jq --compact-output \
+          api_content_inventory=$(jq --compact-output \
             '[.assets[] |
               select(.name != "container-images.json") |
               {name: .name, digest: .digest}
              ] | sort_by(.name)' \
             <<<"$verified_release")
-          if [ "$local_asset_inventory" != "$api_asset_inventory" ]; then
+          if [ "$local_asset_inventory" != "$api_content_inventory" ]; then
             echo '::error::Release asset digests changed during local checksum verification.'
             exit 1
           fi
+          api_asset_inventory=$(jq --compact-output \
+            '[.assets[] |
+              select(.name != "container-images.json") |
+              {id: .id, name: .name, size: .size, digest: .digest, state: .state}
+             ] | sort_by(.name)' \
+            <<<"$verified_release")
           asset_fingerprint=$(printf '%s' "$api_asset_inventory" | \
             sha256sum | awk '{print $1}')
           if ! [[ "$asset_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
@@ -1155,9 +1162,6 @@ jobs:
     needs: [preflight, draft_release, docker, verify_staged_release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: stable-release-${{ needs.preflight.outputs.tag }}
-      cancel-in-progress: false
     permissions:
       contents: write
     outputs:
@@ -1262,7 +1266,7 @@ jobs:
           base_inventory=$(jq --compact-output \
             '[.assets[] |
               select(.name != "container-images.json") |
-              {name: .name, digest: .digest}
+              {id: .id, name: .name, size: .size, digest: .digest, state: .state}
              ] | sort_by(.name)' <<<"$release_json")
           current_base_fingerprint=$(printf '%s' "$base_inventory" | \
             sha256sum | awk '{print $1}')
@@ -1327,7 +1331,7 @@ jobs:
             final_base_inventory=$(jq --compact-output \
               '[.assets[] |
                 select(.name != "container-images.json") |
-                {name: .name, digest: .digest}
+                {id: .id, name: .name, size: .size, digest: .digest, state: .state}
                ] | sort_by(.name)' <<<"$final_release")
             final_base_fingerprint=$(printf '%s' "$final_base_inventory" | \
               sha256sum | awk '{print $1}')
@@ -1353,7 +1357,9 @@ jobs:
           fi
 
           final_inventory=$(jq --compact-output \
-            '[.assets[] | {name: .name, digest: .digest}] | sort_by(.name)' \
+            '[.assets[] |
+              {id: .id, name: .name, size: .size, digest: .digest, state: .state}
+            ] | sort_by(.name)' \
             <<<"$final_release")
           asset_fingerprint=$(printf '%s' "$final_inventory" | \
             sha256sum | awk '{print $1}')
@@ -1469,18 +1475,27 @@ jobs:
           fingerprint_assets() {
             local inventory
             inventory=$(jq --compact-output \
-              '[.assets[] | {name: .name, digest: .digest}] | sort_by(.name)')
+              '[.assets[] |
+                {id: .id, name: .name, size: .size, digest: .digest, state: .state}
+              ] | sort_by(.name)')
             printf '%s' "$inventory" | sha256sum | awk '{print $1}'
           }
           validate_release_contract() {
             local release_json=$1
             jq --exit-status \
+              --argjson release_id "$RELEASE_ID" \
               --arg tag "$TAG" \
+              --arg commit "$TAG_COMMIT" \
               --argjson expected_assets "$expected_assets" \
               --rawfile expected_body "docs/releases/${TAG}.md" \
-              '.tag_name == $tag and
+              '.id == $release_id and
+               .tag_name == $tag and
+               .name == $tag and
                .prerelease == false and
                .body == $expected_body and
+               (.target_commitish == "main" or
+                .target_commitish == $tag or
+                .target_commitish == $commit) and
                ([.assets[].name] | sort) == $expected_assets and
                ([.assets[].digest |
                  type == "string" and test("^sha256:[0-9a-f]{64}$")
@@ -1581,12 +1596,12 @@ jobs:
               exit 1
             fi
 
-            if ! gh api \
-              --method PATCH \
-              "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-              -F draft=false \
-              -F prerelease=false \
-              -f make_latest=true >/dev/null; then
+            if ! scripts/release/github-release-assets.sh publish \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_ID" \
+              "$TAG" \
+              "$TAG_COMMIT" \
+              "docs/releases/${TAG}.md" >/dev/null; then
               echo 'The publication response was not confirmed; reconciling by release id without retrying the PATCH.'
             fi
           fi
