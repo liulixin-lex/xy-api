@@ -27,6 +27,8 @@ env:
   ELECTRON_ARTIFACT_ID: '8447997895'
   ELECTRON_ARTIFACT_DIGEST: sha256:5f4a17e8f2bde4fcf8098fb3c84f3d04f50fee07a988f9c140353c742ae60a97
   EXPECTED_LATEST_DIGEST: sha256:6c1c40be02e2f52ca98b4545084c4daf60ade81fb4e21e7a51d2fa79447bd0b3
+  DOCKER_WORKFLOW_SHA: fcf3d0d669087e443ee39a20e56790a598ffec49
+  DOCKER_CERTIFICATE_IDENTITY: https://github.com/liulixin-lex/xy-api/.github/workflows/docker-build.yml@fcf3d0d669087e443ee39a20e56790a598ffec49
 
 jobs:
   preflight:
@@ -90,9 +92,17 @@ jobs:
             echo '::error::The remote v0.2.0 tag does not resolve to the expected commit.'
             exit 1
           fi
+          expected_docker_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@${DOCKER_WORKFLOW_SHA}"
+          if ! [[ "$DOCKER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             ! git merge-base --is-ancestor "$DOCKER_WORKFLOW_SHA" origin/main || \
+             [ "$DOCKER_CERTIFICATE_IDENTITY" != "$expected_docker_identity" ]; then
+            echo '::error::The recovery Docker workflow is not pinned to the expected protected main commit.'
+            exit 1
+          fi
           if [ "$(<release-source/VERSION)" != "$TAG" ] || \
              ! cmp -s release-source/VERSION <(printf '%s\n' "$TAG") || \
-             [ ! -s "release-source/docs/releases/${TAG}.md" ]; then
+             [ ! -s "release-source/docs/releases/${TAG}.md" ] || \
+             [ ! -s "docs/releases/${TAG}.md" ]; then
             echo '::error::The immutable release source has an invalid version or release notes.'
             exit 1
           fi
@@ -177,11 +187,14 @@ jobs:
             --arg commit "$TAG_COMMIT" \
             --argjson core_assets "$core_assets" \
             --argjson all_assets "$all_assets" \
-            --rawfile body "release-source/docs/releases/${TAG}.md" \
+            --rawfile legacy_body "release-source/docs/releases/${TAG}.md" \
+            --rawfile body "docs/releases/${TAG}.md" \
             '.id == $release_id and
              .tag_name == $tag and
              .name == $tag and
-             .body == $body and
+             (.body == $body or
+              ((.draft == true and .immutable != true) and
+               .body == $legacy_body)) and
              .prerelease == false and
              (.target_commitish == "main" or
               .target_commitish == $tag or
@@ -464,6 +477,33 @@ jobs:
           )
 
           release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          if jq --exit-status \
+            --rawfile body "docs/releases/${TAG}.md" \
+            '.body == $body' <<<"$release_json" >/dev/null; then
+            :
+          elif jq --exit-status \
+            --rawfile body "release-source/docs/releases/${TAG}.md" \
+            '.draft == true and .immutable != true and .body == $body' \
+            <<<"$release_json" >/dev/null; then
+            jq --null-input \
+              --rawfile body "docs/releases/${TAG}.md" \
+              '{body: $body}' |
+              gh api \
+                --method PATCH \
+                "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+                --input - >/dev/null
+            release_json=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+            if ! jq --exit-status \
+              --rawfile body "docs/releases/${TAG}.md" \
+              '.draft == true and .immutable != true and .body == $body' \
+              <<<"$release_json" >/dev/null; then
+              echo '::error::The corrected v0.2.0 release notes were not stored exactly.'
+              exit 1
+            fi
+          else
+            echo '::error::The v0.2.0 release body is neither the legacy draft nor the corrected recovery notes.'
+            exit 1
+          fi
           allowed_assets=$(jq --compact-output --null-input \
             --arg tag "$TAG" \
             --arg desktop_version "$desktop_version" '[
@@ -495,7 +535,7 @@ jobs:
             --arg tag "$TAG" \
             --argjson allowed "$allowed_assets" \
             --argjson core "$core_assets" \
-            --rawfile body "release-source/docs/releases/${TAG}.md" '
+            --rawfile body "docs/releases/${TAG}.md" '
               .id == $release_id and
               .tag_name == $tag and
               .body == $body and
@@ -631,11 +671,12 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: liulixin-lex/xy-api/.github/workflows/docker-build.yml@v0.2.0
+    uses: liulixin-lex/xy-api/.github/workflows/docker-build.yml@fcf3d0d669087e443ee39a20e56790a598ffec49
     with:
       tag: v0.2.0
       release_ref: refs/tags/v0.2.0
       release_commit: ea3c0ef6cccddcf252f14f03abb11b2b74366233
+      certificate_identity: https://github.com/liulixin-lex/xy-api/.github/workflows/docker-build.yml@fcf3d0d669087e443ee39a20e56790a598ffec49
     secrets: inherit
 
   anchor_container:
@@ -652,6 +693,7 @@ jobs:
       BASE_ASSET_FINGERPRINT: ${{ needs.stage_desktop.outputs.base_asset_fingerprint }}
       GHCR_DIGEST: ${{ needs.docker.outputs.ghcr_digest }}
       DOCKERHUB_DIGEST: ${{ needs.docker.outputs.dockerhub_digest }}
+      ACTUAL_CERTIFICATE_IDENTITY: ${{ needs.docker.outputs.certificate_identity }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
     steps:
       - name: Check out recovery tooling and release notes
@@ -673,6 +715,7 @@ jobs:
           set -euo pipefail
           if ! [[ "$BASE_ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
              ! [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+             [ "$ACTUAL_CERTIFICATE_IDENTITY" != "$DOCKER_CERTIFICATE_IDENTITY" ] || \
              [ -n "$DOCKERHUB_REPOSITORY" ] || \
              [ -n "$DOCKERHUB_DIGEST" ]; then
             echo '::error::The recovery image outputs do not match the v0.2.0 registry contract.'
@@ -680,7 +723,7 @@ jobs:
           fi
 
           ghcr_repository=${GITHUB_REPOSITORY,,}
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          identity="$ACTUAL_CERTIFICATE_IDENTITY"
           issuer='https://token.actions.githubusercontent.com'
           jq --sort-keys --indent 2 --null-input \
             --arg tag "$TAG" \
@@ -726,7 +769,7 @@ jobs:
             --argjson release_id "$RELEASE_ID" \
             --arg tag "$TAG" \
             --argjson base "$base_assets" \
-            --rawfile body "release-source/docs/releases/${TAG}.md" '
+            --rawfile body "docs/releases/${TAG}.md" '
               .id == $release_id and
               .tag_name == $tag and
               .body == $body and
@@ -831,6 +874,7 @@ jobs:
       ASSET_FINGERPRINT: ${{ needs.anchor_container.outputs.asset_fingerprint }}
       GHCR_DIGEST: ${{ needs.docker.outputs.ghcr_digest }}
       DOCKERHUB_DIGEST: ${{ needs.docker.outputs.dockerhub_digest }}
+      ACTUAL_CERTIFICATE_IDENTITY: ${{ needs.docker.outputs.certificate_identity }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
       IMMUTABLE_RELEASES_VERIFIED_TAG: ${{ vars.IMMUTABLE_RELEASES_VERIFIED_TAG }}
     steps:
@@ -874,6 +918,7 @@ jobs:
           set -euo pipefail
           if ! [[ "$ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
              ! [[ "$GHCR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+             [ "$ACTUAL_CERTIFICATE_IDENTITY" != "$DOCKER_CERTIFICATE_IDENTITY" ] || \
              [ -n "$DOCKERHUB_REPOSITORY" ] || \
              [ -n "$DOCKERHUB_DIGEST" ] || \
              [ "$IMMUTABLE_RELEASES_VERIFIED_TAG" != "$TAG" ]; then
@@ -935,7 +980,7 @@ jobs:
           ghcr_repository=${GITHUB_REPOSITORY,,}
           ghcr_tag="ghcr.io/${ghcr_repository}:${TAG}"
           ghcr_reference="ghcr.io/${ghcr_repository}@${GHCR_DIGEST}"
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          identity="$ACTUAL_CERTIFICATE_IDENTITY"
           issuer='https://token.actions.githubusercontent.com'
           resolved_digest=$(docker buildx imagetools inspect "$ghcr_tag" \
             --format '{{json .Manifest}}' | jq --raw-output '.digest')
@@ -972,7 +1017,7 @@ jobs:
               --argjson release_id "$RELEASE_ID" \
               --arg tag "$TAG" \
               --argjson expected "$expected_assets" \
-              --rawfile body "release-source/docs/releases/${TAG}.md" '
+              --rawfile body "docs/releases/${TAG}.md" '
                 .id == $release_id and
                 .tag_name == $tag and
                 .name == $tag and

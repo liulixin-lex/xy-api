@@ -61,15 +61,11 @@ jobs:
           unpinned_references=$(rg -n \
             '^\s*(?:-\s+)?uses:\s*[^#[:space:]]+@(?![0-9a-f]{40}(?:\s|$))' \
             .github --glob '*.yml' --glob '*.yaml' -P || true)
-          unexpected_references=$(printf '%s\n' "$unpinned_references" | rg -v \
-            '^\.github/workflows/recover-v0\.2\.0\.yml:[0-9]+:\s+uses:\s+liulixin-lex/xy-api/\.github/workflows/docker-build\.yml@v0\.2\.0$' || true)
-          if [ -n "$unexpected_references" ]; then
-            printf '%s\n' "$unexpected_references"
+          if [ -n "$unpinned_references" ]; then
+            printf '%s\n' "$unpinned_references"
             echo '::error::Every external GitHub Action must be pinned to a full commit SHA.'
             exit 1
           fi
-          # The fixed self-reusable workflow ref above is a temporary recovery
-          # exception: its tag-bound OIDC identity is the release signing gate.
           mapfile -t release_scripts < <(find scripts/release -maxdepth 1 -type f -name '*.sh' | sort)
           if [ "${#release_scripts[@]}" -eq 0 ]; then
             echo '::error::No release shell scripts were discovered.'
