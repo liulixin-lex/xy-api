@@ -770,6 +770,7 @@ jobs:
       tag: ${{ needs.preflight.outputs.tag }}
       release_ref: ${{ needs.preflight.outputs.release_ref }}
       release_commit: ${{ needs.preflight.outputs.commit }}
+      certificate_identity: https://github.com/${{ github.repository }}/.github/workflows/docker-build.yml@${{ needs.preflight.outputs.release_ref }}
     secrets: inherit
 
   verify_staged_release:

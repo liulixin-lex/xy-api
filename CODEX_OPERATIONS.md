@@ -80,6 +80,14 @@ the release image. A previously published version digest may be resumed only
 when its tag-bound signature and version/commit-bound attestations verify; it
 must never be replaced by a fresh candidate.
 
+Every multi-architecture image build must pass the target operating system and
+architecture explicitly from its native-runner matrix, then run the version and
+startup smoke on that architecture before signing or combining manifests. A
+release recovery may use a later protected workflow commit to repair release
+orchestration only when the build context and provenance remain bound to the
+immutable release tag. The exact workflow commit identity used for keyless
+signing must be verified and recorded in the container manifest asset.
+
 If stable publication completed but the workflow lost its final confirmation,
 a recovery run may resume only the exact immutable public Release after
 re-verifying its tag, body, complete asset names and digests, checksums,

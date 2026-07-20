@@ -1,4 +1,4 @@
-ARG BUILDPLATFORM=linux/amd64
+ARG BUILDPLATFORM
 
 FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS builder
 
@@ -25,9 +25,8 @@ RUN cd classic && VITE_REACT_APP_VERSION=$(cat /build/VERSION) bun --bun run bui
 FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder2
 ENV GO111MODULE=on CGO_ENABLED=0
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-ENV GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64}
+ARG TARGETOS
+ARG TARGETARCH
 ENV GOEXPERIMENT=greenteagc
 
 WORKDIR /build
@@ -38,7 +37,10 @@ RUN go mod download
 COPY . .
 COPY --from=builder /build/web/default/dist ./web/default/dist
 COPY --from=builder-classic /build/web/classic/dist ./web/classic/dist
-RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+RUN test -n "$TARGETOS" && \
+    test -n "$TARGETARCH" && \
+    GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
 
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
