@@ -19,7 +19,7 @@ case "$expected_arch" in
     ;;
 esac
 
-for command_name in curl docker jq; do
+for command_name in curl docker jq od; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "required command is not installed: $command_name" >&2
     exit 1
@@ -28,6 +28,8 @@ done
 
 container_name="new-api-release-smoke-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${expected_arch}-${RANDOM}"
 response_file=$(mktemp)
+binary_file=$(mktemp)
+binary_container_id=""
 container_started=false
 smoke_secret=$(
   printf '%s:%s:%s:%s\n' \
@@ -42,6 +44,9 @@ smoke_secret=$(
 # shellcheck disable=SC2317 # Invoked by the EXIT trap.
 cleanup() {
   exit_code=$?
+  if [ -n "$binary_container_id" ]; then
+    docker rm --force "$binary_container_id" >/dev/null 2>&1 || true
+  fi
   if [ "$container_started" = true ]; then
     if [ "$exit_code" -ne 0 ]; then
       echo "release smoke container logs ($expected_arch):" >&2
@@ -49,7 +54,7 @@ cleanup() {
     fi
     docker rm --force "$container_name" >/dev/null 2>&1 || true
   fi
-  rm -f "$response_file"
+  rm -f "$response_file" "$binary_file"
 }
 trap cleanup EXIT
 
@@ -58,6 +63,23 @@ docker pull --platform "linux/$expected_arch" "$image_reference"
 actual_arch=$(docker image inspect --format '{{.Architecture}}' "$image_reference")
 if [ "$actual_arch" != "$expected_arch" ]; then
   echo "image architecture mismatch: expected $expected_arch, got $actual_arch" >&2
+  exit 1
+fi
+
+binary_container_id=$(docker create --platform "linux/$expected_arch" "$image_reference")
+docker cp "${binary_container_id}:/new-api" "$binary_file" >/dev/null
+docker rm "$binary_container_id" >/dev/null
+binary_container_id=""
+
+elf_signature=$(od -An -tx1 -N6 "$binary_file" | tr -d '[:space:]')
+elf_machine=$(od -An -tx1 -j18 -N2 "$binary_file" | tr -d '[:space:]')
+case "$expected_arch" in
+  amd64) expected_machine=3e00 ;;
+  arm64) expected_machine=b700 ;;
+esac
+if [ "$elf_signature" != 7f454c460201 ] || \
+   [ "$elf_machine" != "$expected_machine" ]; then
+  echo "binary architecture mismatch: expected $expected_arch ELF, signature=$elf_signature machine=$elf_machine" >&2
   exit 1
 fi
 

@@ -15,6 +15,10 @@ on:
         description: Commit resolved by the caller's immutable-source preflight
         required: true
         type: string
+      certificate_identity:
+        description: Exact GitHub Actions workflow identity expected in keyless signatures
+        required: true
+        type: string
     outputs:
       ghcr_digest:
         description: Verified GHCR multi-arch manifest digest
@@ -22,6 +26,9 @@ on:
       dockerhub_digest:
         description: Verified Docker Hub multi-arch manifest digest, when configured
         value: ${{ jobs.publish_version.outputs.dockerhub_digest }}
+      certificate_identity:
+        description: Immutable GitHub Actions workflow identity used for keyless signatures
+        value: ${{ jobs.preflight.outputs.certificate_identity }}
 env:
   RELEASE_TAG: ${{ inputs.tag }}
   RELEASE_REF: ${{ inputs.release_ref }}
@@ -43,7 +50,9 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       ghcr_repository: ${{ steps.release.outputs.ghcr_repository }}
       commit: ${{ steps.release.outputs.commit }}
+      certificate_identity: ${{ steps.release.outputs.certificate_identity }}
     env:
+      CERTIFICATE_IDENTITY: ${{ inputs.certificate_identity }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
@@ -56,6 +65,8 @@ jobs:
 
       - name: Validate tag, source, and optional registry configuration
         id: release
+        env:
+          JOB_CONTEXT: ${{ toJson(job) }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
@@ -70,6 +81,21 @@ jobs:
           fi
           if [ "$RELEASE_REF" != "refs/tags/$tag" ]; then
             echo '::error::Docker releases must resolve from their immutable tag ref.'
+            exit 1
+          fi
+          tag_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${tag}"
+          identity_prefix="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@"
+          identity_ref=${CERTIFICATE_IDENTITY#"$identity_prefix"}
+          if [ "$CERTIFICATE_IDENTITY" != "$tag_identity" ] && \
+             { [ "$identity_ref" = "$CERTIFICATE_IDENTITY" ] || \
+               ! [[ "$identity_ref" =~ ^[0-9a-f]{40}$ ]]; }; then
+            echo '::error::The keyless signing identity must use the release tag or an exact workflow commit SHA.'
+            exit 1
+          fi
+          actual_workflow_ref=$(jq --raw-output '.workflow_ref // empty' <<<"$JOB_CONTEXT")
+          actual_identity="https://github.com/${actual_workflow_ref}"
+          if [ "$actual_identity" != "$CERTIFICATE_IDENTITY" ]; then
+            echo '::error::The expected keyless signing identity does not match the workflow that defines this job.'
             exit 1
           fi
           if ! [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
@@ -97,6 +123,7 @@ jobs:
             echo "tag=$tag"
             echo "ghcr_repository=${GITHUB_REPOSITORY,,}"
             echo "commit=$tag_commit"
+            echo "certificate_identity=$actual_identity"
           } >>"$GITHUB_OUTPUT"
 
   build_single_arch:
@@ -121,6 +148,7 @@ jobs:
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+      CERTIFICATE_IDENTITY: ${{ needs.preflight.outputs.certificate_identity }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
@@ -184,10 +212,22 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILDPLATFORM=${{ matrix.platform }}
+            TARGETOS=linux
+            TARGETARCH=${{ matrix.arch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+
+      - name: Run native startup and version smoke
+        run: |
+          set -euo pipefail
+          scripts/release/smoke-image.sh \
+            "ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}" \
+            "$TAG" \
+            "${{ matrix.arch }}"
 
       - name: Block high and critical candidate vulnerabilities
         run: |
@@ -233,14 +273,6 @@ jobs:
             --no-progress \
             "$candidate"
 
-      - name: Run native startup and version smoke
-        run: |
-          set -euo pipefail
-          scripts/release/smoke-image.sh \
-            "ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}" \
-            "$TAG" \
-            "${{ matrix.arch }}"
-
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
@@ -249,7 +281,7 @@ jobs:
       - name: Sign and verify candidate digest
         run: |
           set -euo pipefail
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          identity="$CERTIFICATE_IDENTITY"
           issuer='https://token.actions.githubusercontent.com'
 
           ghcr_digest="ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}"
@@ -301,6 +333,7 @@ jobs:
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
+      CERTIFICATE_IDENTITY: ${{ needs.preflight.outputs.certificate_identity }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
@@ -349,7 +382,7 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          identity="$CERTIFICATE_IDENTITY"
           issuer='https://token.actions.githubusercontent.com'
           mapfile -t digest_files < <(find candidate-digests \
             -mindepth 1 -maxdepth 1 -type f -name 'candidate-digest-*.txt' | sort)
@@ -478,6 +511,7 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       GHCR_REPOSITORY: ${{ needs.preflight.outputs.ghcr_repository }}
       GHCR_CANDIDATE_DIGEST: ${{ needs.create_candidate_manifest.outputs.ghcr_digest }}
+      CERTIFICATE_IDENTITY: ${{ needs.preflight.outputs.certificate_identity }}
       DOCKERHUB_CANDIDATE_DIGEST: ${{ needs.create_candidate_manifest.outputs.dockerhub_digest }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -520,7 +554,7 @@ jobs:
         id: publish
         run: |
           set -euo pipefail
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-build.yml@refs/tags/${TAG}"
+          identity="$CERTIFICATE_IDENTITY"
           issuer='https://token.actions.githubusercontent.com'
           inspect_error=$(mktemp)
           trap 'rm -f "$inspect_error"' EXIT

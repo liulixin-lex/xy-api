@@ -127,10 +127,22 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILDPLATFORM=${{ matrix.platform }}
+            TARGETOS=linux
+            TARGETARCH=${{ matrix.arch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+
+      - name: Run native startup and version smoke
+        run: |
+          set -euo pipefail
+          scripts/release/smoke-image.sh \
+            "ghcr.io/${GHCR_REPOSITORY}@${{ steps.build.outputs.digest }}" \
+            "${{ steps.version.outputs.value }}" \
+            "${{ matrix.arch }}"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
