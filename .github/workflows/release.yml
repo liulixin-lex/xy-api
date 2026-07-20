@@ -1596,7 +1596,8 @@ jobs:
               exit 1
             fi
 
-            if ! scripts/release/github-release-assets.sh publish \
+            if ! GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" \
+              scripts/release/github-release-assets.sh publish \
               "$GITHUB_REPOSITORY" \
               "$RELEASE_ID" \
               "$TAG" \

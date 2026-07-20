@@ -452,8 +452,14 @@ jobs:
 
       - name: Verify, reconcile, and fingerprint base assets
         id: assets
+        env:
+          RELEASE_METADATA_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "$RELEASE_METADATA_TOKEN" ]; then
+            echo '::error::The scoped release metadata token is unavailable.'
+            exit 1
+          fi
           desktop_version=${TAG#v}
           desktop_assets=(
             "New-API-App.${desktop_version}.exe"
@@ -602,7 +608,8 @@ jobs:
                --rawfile body "docs/releases/${TAG}.md" \
                '.tag_name == $tag and .name == $tag and .body == $body' \
                <<<"$release_json" >/dev/null; then
-            if ! scripts/release/github-release-assets.sh update-draft \
+            if ! GH_TOKEN="$RELEASE_METADATA_TOKEN" \
+              scripts/release/github-release-assets.sh update-draft \
               "$GITHUB_REPOSITORY" \
               "$RELEASE_ID" \
               "$TAG" \
@@ -1288,7 +1295,8 @@ jobs:
               exit 1
             fi
 
-            if ! scripts/release/github-release-assets.sh publish \
+            if ! GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" \
+              scripts/release/github-release-assets.sh publish \
               "$GITHUB_REPOSITORY" \
               "$RELEASE_ID" \
               "$TAG" \

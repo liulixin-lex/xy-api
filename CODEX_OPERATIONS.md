@@ -111,3 +111,9 @@ removes the pending tag when `tag_name` is omitted. A detached `untagged-*`
 draft blocks duplicate creation and may be repaired only through an explicit,
 fixed-ID recovery that verifies its exact placeholder tag, notes, state, asset
 inventory, and digests before and after restoring the canonical tag.
+
+Release metadata requests that carry `tag_name` must use the scoped repository
+token verified by the release policy checks. The automatic workflow token may
+read and upload draft assets, but it must not be relied on to restore or publish
+a protected tag association; if the scoped token is unavailable, fail before
+the metadata mutation.
