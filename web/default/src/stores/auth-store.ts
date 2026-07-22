@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { create } from 'zustand'
+
 import type { AdminCapabilities } from '@/lib/admin-permissions'
 
 export type UserPermissions = {
@@ -47,7 +48,6 @@ export interface AuthUser {
   telegram_id?: string
   linux_do_id?: string
   setting?: Record<string, unknown> | string
-  stripe_customer?: string
   sidebar_modules?: string
   permissions?: UserPermissions
 }

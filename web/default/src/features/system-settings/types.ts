@@ -389,11 +389,14 @@ export type BillingSettings = {
   'payment_setting.stripe_test_mode_enabled': boolean
   'payment_setting.stripe_test_mode_blocked': boolean
   'payment_setting.stripe_test_mode_isolation_required': boolean
+  'payment_setting.stripe_webhook_api_version': string
+  'payment_setting.stripe_webhook_secret_overlap_hours': number
   'payment_setting.xorpay_previous_credential_active': boolean
   StripeApiSecret: string
   StripeWebhookSecret: string
   StripePriceId: string
   StripeAccountId: string
+  StripeCheckoutAllowedHosts: string
   StripeCredentialAccountId: string
   StripeCredentialLivemode: string
   StripeCurrency: string
@@ -423,10 +426,15 @@ export type BillingSettings = {
   WaffoMinTopUp: number
   WaffoNotifyUrl: string
   WaffoReturnUrl: string
+  WaffoWebRedirectHosts: string
+  WaffoAppRedirectSchemes: string
   WaffoPayMethods: string
   WaffoPancakeMerchantID: string
   WaffoPancakePrivateKey: string
   WaffoPancakeReturnURL: string
+  WaffoPancakeUnitPrice: number
+  WaffoPancakeMinTopUp: number
+  WaffoPancakeTestMode: boolean
   // Bound by the operator through the catalog flow in the admin Pancake
   // section (saved via /api/option/waffo-pancake/save).
   WaffoPancakeStoreID: string

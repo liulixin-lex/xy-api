@@ -24,10 +24,15 @@ import {
   removeTrailingSlash,
   showError,
   showSuccess,
+  showWarning,
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { Info } from 'lucide-react';
 import { buildEmergencyCredentialReplacement } from '../../../helpers/payment-credential-revocation';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
 
 export default function SettingsPaymentGateway(props) {
   const { t } = useTranslation();
@@ -152,18 +157,22 @@ export default function SettingsPaymentGateway(props) {
           { skipErrorHandler: true },
         );
         if (result.data?.success) {
-          showSuccess(t('更新成功'));
           const nextInputs = { ...inputs, EpayKey: '' };
           setInputs(nextInputs);
           formApiRef.current?.setValues(nextInputs);
-          await props.refresh?.(result.data?.data?.version);
+          const refreshed = await props.refresh?.(result.data?.data?.version);
+          if (refreshed === false) {
+            showWarning(t('设置已保存，但最新状态刷新失败'));
+          } else {
+            showSuccess(t('更新成功'));
+          }
         } else {
-          showError(result.data?.message || t('更新失败'));
+          throw createPaymentAdminError(result.data, t('更新失败'));
         }
         return result;
       });
     } catch (error) {
-      showError(error?.response?.data?.message || t('更新失败'));
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       submitInFlightRef.current = false;
       setLoading(false);

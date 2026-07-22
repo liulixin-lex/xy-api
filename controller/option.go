@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/stripe/stripe-go/v86"
 
 	"github.com/gin-gonic/gin"
 )
@@ -121,6 +123,8 @@ func GetOptions(c *gin.Context) {
 		&model.Option{Key: paymentStripeTestModeEnabledOptionKey, Value: strconv.FormatBool(stripeTestModeEnabled)},
 		&model.Option{Key: paymentStripeTestModeBlockedOptionKey, Value: strconv.FormatBool(stripeTestModeBlocked)},
 		&model.Option{Key: paymentStripeTestModeIsolationRequiredOptionKey, Value: "true"},
+		&model.Option{Key: paymentStripeWebhookAPIVersionOptionKey, Value: stripe.APIVersion},
+		&model.Option{Key: paymentStripeWebhookSecretOverlapHoursOptionKey, Value: strconv.FormatInt(int64(setting.StripeWebhookSecretOverlap/time.Hour), 10)},
 	)
 	options = append(options, &model.Option{
 		Key:   "CompletionRatioMeta",

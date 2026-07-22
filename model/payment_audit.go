@@ -12,9 +12,12 @@ import (
 
 type PaymentAuditDetail struct {
 	Order                      *PaymentOrder                      `json:"order,omitempty"`
+	LegacyReviewReason         string                             `json:"legacy_review_reason,omitempty"`
 	Events                     []PaymentEventAuditView            `json:"events"`
 	Debts                      []PaymentDebt                      `json:"debts"`
 	Ledger                     []PaymentLedgerEntry               `json:"ledger"`
+	Tasks                      []PaymentTask                      `json:"tasks,omitempty"`
+	LimitReservation           *PaymentLimitReservation           `json:"limit_reservation,omitempty"`
 	CustomerBindings           []PaymentCustomerBinding           `json:"customer_bindings,omitempty"`
 	CustomerBindingRetirements []PaymentCustomerBindingRetirement `json:"customer_binding_retirements,omitempty"`
 	OperationsAudits           []PaymentOperationsAudit           `json:"operations_audits,omitempty"`
@@ -345,6 +348,26 @@ func GetPaymentAuditDetail(tradeNo string) (*PaymentAuditDetail, error) {
 		return nil, err
 	}
 	detail := &PaymentAuditDetail{Order: &order}
+	switch order.OrderKind {
+	case PaymentOrderKindTopUp:
+		var projection TopUp
+		if err := DB.Select("review_reason").
+			Where("payment_order_id = ? OR trade_no = ?", order.ID, order.TradeNo).
+			First(&projection).Error; err == nil {
+			detail.LegacyReviewReason = strings.TrimSpace(projection.ReviewReason)
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	case PaymentOrderKindSubscription:
+		var projection SubscriptionOrder
+		if err := DB.Select("review_reason").
+			Where("payment_order_id = ? OR trade_no = ?", order.ID, order.TradeNo).
+			First(&projection).Error; err == nil {
+			detail.LegacyReviewReason = strings.TrimSpace(projection.ReviewReason)
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+	}
 	var events []PaymentEvent
 	if err := DB.Where("payment_order_id = ? OR trade_no = ?", order.ID, order.TradeNo).
 		Order("id asc").Find(&events).Error; err != nil {
@@ -358,6 +381,15 @@ func GetPaymentAuditDetail(tradeNo string) (*PaymentAuditDetail, error) {
 		return nil, err
 	}
 	if err := DB.Where("payment_order_id = ?", order.ID).Order("id asc").Find(&detail.Ledger).Error; err != nil {
+		return nil, err
+	}
+	if err := DB.Where("payment_order_id = ?", order.ID).Order("id asc").Find(&detail.Tasks).Error; err != nil {
+		return nil, err
+	}
+	var limitReservation PaymentLimitReservation
+	if err := DB.Where("payment_order_id = ?", order.ID).First(&limitReservation).Error; err == nil {
+		detail.LimitReservation = &limitReservation
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
 	if order.Provider == PaymentProviderStripe {

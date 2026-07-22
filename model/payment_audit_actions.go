@@ -411,6 +411,9 @@ func rejectPaymentOrderByAdminTx(tx *gorm.DB, order *PaymentOrder, input Payment
 	order.StatusReason = input.Reason
 	order.UpdatedAt = now
 	order.Version = input.ExpectedVersion + 1
+	if err := releasePaymentLimitReservationTx(tx, order, now); err != nil {
+		return err
+	}
 	if err := syncPaymentProjectionStatusTx(tx, order); err != nil {
 		return err
 	}

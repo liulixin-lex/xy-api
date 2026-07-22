@@ -190,6 +190,7 @@ export interface PaymentAuditListData {
 
 export interface PaymentAuditDetail {
   order?: PaymentOrder
+  legacy_review_reason?: string
   events: PaymentEvent[]
   debts: PaymentDebt[]
   ledger: PaymentLedgerEntry[]
@@ -290,6 +291,46 @@ export interface StripeInventorySyncResult {
   seen: number
   mapped: number
   unmapped: number
+}
+
+export interface PaymentOperationsOverviewCounts {
+  preparing_orders: number
+  awaiting_payment_orders: number
+  confirming_orders: number
+  manual_review_orders: number
+  create_task_backlog: number
+  reconcile_task_backlog: number
+  running_tasks: number
+  retry_waiting_tasks: number
+  expired_task_leases: number
+  oldest_create_task_age_seconds: number
+  unmatched_payment_events: number
+  unprocessed_payment_events: number
+  oldest_unprocessed_event_age_seconds: number
+  active_limit_reservations: number
+  expired_active_limit_reservations: number
+  payment_configuration_version: number
+}
+
+export interface PaymentRuntimeInfo {
+  schema_version: number
+  configuration_version: number
+  configuration_fingerprint: string
+  payment_secret_key_id: string
+  session_secret_fingerprint: string
+  database_type: string
+  redis_enabled: boolean
+  ready: boolean
+  readiness_code?: string
+}
+
+export interface PaymentOperationsOverviewData {
+  operations: PaymentOperationsOverviewCounts
+  runtime: PaymentRuntimeInfo
+  cluster: {
+    ready: boolean
+    code: string
+  }
 }
 
 export interface BillingReservation {

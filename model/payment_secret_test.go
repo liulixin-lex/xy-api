@@ -63,6 +63,31 @@ func TestEncryptedPaymentOptionSupportsExplicitKeyRotation(t *testing.T) {
 	assert.False(t, paymentOptionNeedsRewrap(rewrapped))
 }
 
+func TestPaymentSecretKeyringFingerprintBindsRotationFallbackSlot(t *testing.T) {
+	primaryKey := "payment-keyring-primary-key-at-least-32-bytes"
+	previousKey := "payment-keyring-previous-key-at-least-32-bytes"
+	t.Setenv("PAYMENT_SECRET_KEY", primaryKey)
+	t.Setenv("PAYMENT_SECRET_KEY_PREVIOUS", "")
+
+	withoutPrevious := PaymentSecretKeyringFingerprint()
+	require.Len(t, withoutPrevious, 32)
+	assert.NotContains(t, withoutPrevious, primaryKey)
+	assert.Equal(t, withoutPrevious, PaymentSecretKeyringFingerprint())
+
+	t.Setenv("PAYMENT_SECRET_KEY_PREVIOUS", previousKey)
+	withPrevious := PaymentSecretKeyringFingerprint()
+	require.Len(t, withPrevious, 32)
+	assert.NotEqual(t, withoutPrevious, withPrevious)
+	assert.NotContains(t, withPrevious, primaryKey)
+	assert.NotContains(t, withPrevious, previousKey)
+
+	t.Setenv("PAYMENT_SECRET_KEY_PREVIOUS", "too-short")
+	assert.Empty(t, PaymentSecretKeyringFingerprint())
+
+	t.Setenv("PAYMENT_SECRET_KEY_PREVIOUS", "  "+primaryKey+"  ")
+	assert.Empty(t, PaymentSecretKeyringFingerprint())
+}
+
 func TestPaymentOptionEncryptionTreatsEncryptedPrefixAsPlaintextInput(t *testing.T) {
 	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-master-key-at-least-32-bytes")
 	plaintext := "enc:v2:not-a-stored-ciphertext"
@@ -80,6 +105,25 @@ func TestPaymentOptionEncryptionRejectsMissingDedicatedKey(t *testing.T) {
 	assert.False(t, PaymentSecretEncryptionReady())
 	_, err := encryptPaymentOptionValue("StripeApiSecret", "sk_test_example")
 	assert.Error(t, err)
+}
+
+func TestCompatibilityPaymentCredentialsUseEncryptedOptionStorage(t *testing.T) {
+	t.Setenv("PAYMENT_SECRET_KEY", "compatibility-payment-secret-test-key-0001")
+	for _, key := range []string{
+		"CreemApiKey", "CreemWebhookSecret", "WaffoApiKey", "WaffoPrivateKey",
+		"WaffoSandboxApiKey", "WaffoSandboxPrivateKey", "WaffoPancakePrivateKey",
+	} {
+		t.Run(key, func(t *testing.T) {
+			assert.True(t, IsPaymentSecretOption(key))
+			encrypted, err := encryptPaymentOptionValue(key, "compatibility-secret-value")
+			require.NoError(t, err)
+			assert.True(t, strings.HasPrefix(encrypted, encryptedPaymentOptionPrefixV2))
+			assert.NotContains(t, encrypted, "compatibility-secret-value")
+			decrypted, err := decryptPaymentOptionValue(key, encrypted)
+			require.NoError(t, err)
+			assert.Equal(t, "compatibility-secret-value", decrypted)
+		})
+	}
 }
 
 func TestPaymentOrderStartPayloadEncryptionIsTradeBound(t *testing.T) {

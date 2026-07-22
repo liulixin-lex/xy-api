@@ -85,6 +85,11 @@ func DeleteStaleSystemInstance(nodeName string, now int64) (bool, error) {
 	return result.RowsAffected > 0, result.Error
 }
 
+func DeleteSystemInstance(nodeName string) (bool, error) {
+	result := DB.Where("node_name = ?", nodeName).Delete(&SystemInstance{})
+	return result.RowsAffected > 0, result.Error
+}
+
 func (instance *SystemInstance) ToResponse(now int64) SystemInstanceResponse {
 	status := SystemInstanceStatusOnline
 	if now-instance.LastSeenAt > SystemInstanceStaleAfterSeconds {

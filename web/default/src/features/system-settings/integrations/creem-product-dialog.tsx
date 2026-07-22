@@ -16,11 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect } from 'react'
-import * as z from 'zod'
-import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { useEffect } from 'react'
+import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+import * as z from 'zod'
+
+import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -40,8 +42,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Dialog } from '@/components/dialog'
-import type { CreemProduct } from '@/features/wallet/types'
+
 import { safeNumberFieldProps } from '../utils/numeric-field'
 
 const creemProductDialogSchema = z.object({
@@ -56,14 +57,19 @@ type CreemProductDialogFormValues = z.infer<typeof creemProductDialogSchema>
 
 const CREEM_PRODUCT_FORM_ID = 'creem-product-form'
 
-// Re-export for backwards compatibility
-export type CreemProductData = CreemProduct
+export interface CreemProductData {
+  name: string
+  productId: string
+  price: number
+  quota: number
+  currency: 'USD' | 'EUR'
+}
 
 type CreemProductDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSave: (data: CreemProduct) => void
-  editData?: CreemProduct | null
+  onSave: (data: CreemProductData) => void
+  editData?: CreemProductData | null
 }
 
 export function CreemProductDialog({
@@ -101,7 +107,7 @@ export function CreemProductDialog({
   }, [editData, form, open])
 
   const handleSubmit = (values: CreemProductDialogFormValues) => {
-    const data: CreemProduct = {
+    const data: CreemProductData = {
       name: values.name,
       productId: values.productId,
       price: values.price,

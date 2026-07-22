@@ -16,22 +16,40 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/api'
+import { api, type ApiRequestConfig } from '@/lib/api'
 
-import type {
-  ApiResponse,
-  PlanRecord,
-  PlanPayload,
-  UserSubscriptionRecord,
-  CreateUserSubscriptionRequest,
-  ResetUserSubscriptionsRequest,
-  ResetPlanSubscriptionsRequest,
-  SubscriptionResetResult,
-  SubscriptionPayResponse,
-  SubscriptionPayRequest,
-  SelfSubscriptionData,
-  StripeInventoryPage,
+import {
+  publicPlanRecordSchema,
+  selfSubscriptionDataSchema,
+  type ApiResponse,
+  type PlanRecord,
+  type PlanPayload,
+  type UserSubscriptionRecord,
+  type PublicPlanRecord,
+  type PublicUserSubscriptionRecord,
+  type CreateUserSubscriptionRequest,
+  type ResetUserSubscriptionsRequest,
+  type ResetPlanSubscriptionsRequest,
+  type SubscriptionResetResult,
+  type SubscriptionPayResponse,
+  type SubscriptionPayRequest,
+  type SelfSubscriptionData,
 } from './types'
+
+const SUBSCRIPTION_UI_REQUEST_CONFIG: ApiRequestConfig = {
+  skipBusinessError: true,
+  skipErrorHandler: true,
+}
+
+function parsePublicApiResponse<T>(
+  response: ApiResponse<unknown>,
+  parse: (value: unknown) => T
+): ApiResponse<T> {
+  if (!response.success || response.data === undefined) {
+    return { ...response, data: undefined }
+  }
+  return { ...response, data: parse(response.data) }
+}
 
 // ============================================================================
 // Admin Plan Management
@@ -45,7 +63,11 @@ export async function getAdminPlans(): Promise<ApiResponse<PlanRecord[]>> {
 export async function createPlan(
   data: PlanPayload
 ): Promise<ApiResponse<PlanRecord>> {
-  const res = await api.post('/api/subscription/admin/plans', data)
+  const res = await api.post(
+    '/api/subscription/admin/plans',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
@@ -53,7 +75,11 @@ export async function updatePlan(
   id: number,
   data: PlanPayload
 ): Promise<ApiResponse<PlanRecord>> {
-  const res = await api.put(`/api/subscription/admin/plans/${id}`, data)
+  const res = await api.put(
+    `/api/subscription/admin/plans/${id}`,
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
@@ -138,28 +164,44 @@ export async function resetPlanSubscriptions(
 export async function paySubscriptionStripe(
   data: SubscriptionPayRequest
 ): Promise<SubscriptionPayResponse> {
-  const res = await api.post('/api/subscription/stripe/pay', data)
+  const res = await api.post(
+    '/api/subscription/stripe/pay',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
 export async function paySubscriptionCreem(
   data: SubscriptionPayRequest
 ): Promise<SubscriptionPayResponse> {
-  const res = await api.post('/api/subscription/creem/pay', data)
+  const res = await api.post(
+    '/api/subscription/creem/pay',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
 export async function paySubscriptionWaffoPancake(
   data: SubscriptionPayRequest
 ): Promise<SubscriptionPayResponse> {
-  const res = await api.post('/api/subscription/waffo-pancake/pay', data)
+  const res = await api.post(
+    '/api/subscription/waffo-pancake/pay',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
 export async function paySubscriptionBalance(
   data: SubscriptionPayRequest
 ): Promise<SubscriptionPayResponse> {
-  const res = await api.post('/api/subscription/balance/pay', data)
+  const res = await api.post(
+    '/api/subscription/balance/pay',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 
@@ -195,7 +237,11 @@ export async function listWaffoPancakeSubscriptionProductOptions(): Promise<
 export async function paySubscriptionEpay(
   data: SubscriptionPayRequest & { payment_method: string }
 ): Promise<SubscriptionPayResponse & { url?: string }> {
-  const res = await api.post('/api/subscription/epay/pay', data)
+  const res = await api.post(
+    '/api/subscription/epay/pay',
+    data,
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return {
     ...res.data,
     url: res.data.url || (res as unknown as { url?: string }).url,
@@ -207,47 +253,47 @@ export async function paySubscriptionEpay(
 // ============================================================================
 
 export async function getSelfSubscriptions(): Promise<
-  ApiResponse<UserSubscriptionRecord[]>
+  ApiResponse<PublicUserSubscriptionRecord[]>
 > {
-  const res = await api.get('/api/subscription/self')
-  return res.data
+  const response = await getSelfSubscriptionFull()
+  return {
+    ...response,
+    data: response.data?.subscriptions,
+  }
 }
 
 export async function getSelfSubscriptionFull(): Promise<
   ApiResponse<SelfSubscriptionData>
 > {
-  const res = await api.get('/api/subscription/self')
-  return res.data
+  const res = await api.get(
+    '/api/subscription/self',
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
+  return parsePublicApiResponse(res.data as ApiResponse<unknown>, (value) =>
+    selfSubscriptionDataSchema.parse(value)
+  )
 }
 
-export async function getPublicPlans(): Promise<ApiResponse<PlanRecord[]>> {
-  const res = await api.get('/api/subscription/plans')
-  return res.data
+export async function getPublicPlans(): Promise<
+  ApiResponse<PublicPlanRecord[]>
+> {
+  const res = await api.get(
+    '/api/subscription/plans',
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
+  return parsePublicApiResponse(res.data as ApiResponse<unknown>, (value) =>
+    publicPlanRecordSchema.array().parse(value)
+  )
 }
 
 export async function updateBillingPreference(
   preference: string
 ): Promise<ApiResponse<{ billing_preference?: string }>> {
-  const res = await api.put('/api/subscription/self/preference', {
-    billing_preference: preference,
-  })
-  return res.data
-}
-
-export async function getSelfStripeLegacyInventory(
-  page: number,
-  pageSize: number,
-  status = ''
-): Promise<ApiResponse<StripeInventoryPage>> {
-  const res = await api.get('/api/subscription/stripe/inventory', {
-    params: {
-      p: page,
-      page_size: pageSize,
-      status: status || undefined,
-    },
-    skipBusinessError: true,
-    skipErrorHandler: true,
-  })
+  const res = await api.put(
+    '/api/subscription/self/preference',
+    { billing_preference: preference },
+    SUBSCRIPTION_UI_REQUEST_CONFIG
+  )
   return res.data
 }
 

@@ -30,7 +30,7 @@ export function canAccessBillingSection(
   if (section === 'payment-operations') {
     return canManagePaymentOperations(user)
   }
-  if (section === 'payment') {
+  if (section === 'payment' || section === 'payment-limits') {
     return canManageSystemSettings(user) && canManagePaymentGateway(user)
   }
   return canManageSystemSettings(user)

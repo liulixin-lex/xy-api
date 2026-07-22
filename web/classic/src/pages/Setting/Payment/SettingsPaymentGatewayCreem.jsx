@@ -32,9 +32,14 @@ import {
   Select,
 } from '@douyinfe/semi-ui';
 const { Text } = Typography;
-import { API, showError, showSuccess } from '../../../helpers';
+import { API, showError, showSuccess, showWarning } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, Plus, Trash2 } from 'lucide-react';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
+import RetainedCredentialEmergencyControl from './RetainedCredentialEmergencyControl';
 
 export default function SettingsPaymentGatewayCreem(props) {
   const { t } = useTranslation();
@@ -109,7 +114,6 @@ export default function SettingsPaymentGatewayCreem(props) {
           { skipErrorHandler: true },
         );
         if (response.data?.success) {
-          showSuccess(t('更新成功'));
           const nextInputs = {
             ...inputs,
             CreemApiKey: '',
@@ -117,14 +121,19 @@ export default function SettingsPaymentGatewayCreem(props) {
           };
           setInputs(nextInputs);
           formApiRef.current?.setValues(nextInputs);
-          await props.refresh?.(response.data?.data?.version);
+          const refreshed = await props.refresh?.(response.data?.data?.version);
+          if (refreshed === false) {
+            showWarning(t('设置已保存，但最新状态刷新失败'));
+          } else {
+            showSuccess(t('更新成功'));
+          }
         } else {
-          showError(response.data?.message || t('更新失败'));
+          throw createPaymentAdminError(response.data, t('更新失败'));
         }
         return response;
       });
     } catch (error) {
-      showError(error?.response?.data?.message || t('更新失败'));
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       setLoading(false);
     }
@@ -261,7 +270,7 @@ export default function SettingsPaymentGatewayCreem(props) {
               <>
                 {t('Creem 介绍')}
                 <a href='https://creem.io' target='_blank' rel='noreferrer'>
-                  Creem Official Site
+                  {t('Creem Official Site')}
                 </a>
                 <br />
                 {t('Creem Setting Tips')}
@@ -327,6 +336,23 @@ export default function SettingsPaymentGatewayCreem(props) {
           <Button onClick={submitCreemSetting} style={{ marginTop: 16 }}>
             {t('更新 Creem 设置')}
           </Button>
+
+          <RetainedCredentialEmergencyControl
+            provider='creem'
+            disabled={loading}
+            withPaymentVerification={props.withPaymentVerification}
+            onCompleted={async (result) => {
+              const nextInputs = {
+                ...inputs,
+                CreemApiKey: '',
+                CreemWebhookSecret: '',
+              };
+              setInputs(nextInputs);
+              formApiRef.current?.setValues(nextInputs);
+              return (await props.refresh?.(result.data?.version)) !== false;
+            }}
+            onStale={() => props.refresh?.()}
+          />
         </Form.Section>
       </Form>
 

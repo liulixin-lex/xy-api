@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,7 +36,10 @@ const (
 	epayMaxWebhookParameters = 32
 )
 
-var epayPaymentMethodPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var (
+	epayPaymentMethodPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	externalPaymentHostPattern = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*\.?$`)
+)
 
 func init() {
 	RegisterPaymentProvider(&epayPaymentProvider{})
@@ -82,7 +86,11 @@ func (p *epayPaymentProvider) Create(_ context.Context, order *model.PaymentOrde
 	if err := ValidateExternalPaymentURL(notifyURL.String(), true); err != nil {
 		return nil, err
 	}
-	returnAddress := PaymentReturnURL("/console/topup?payment_result=pending&trade_no=" + url.QueryEscape(order.TradeNo))
+	returnBase, err := firstPartyPaymentReturnURL(order.TradeNo)
+	if err != nil {
+		return nil, err
+	}
+	returnAddress := returnBase + "?payment_result=pending"
 	if err := ValidateExternalPaymentURL(returnAddress, true); err != nil {
 		return nil, err
 	}
@@ -291,12 +299,26 @@ func validateEpayEndpoint(raw string) (string, error) {
 }
 
 func ValidateExternalPaymentURL(raw string, allowLocalHTTP bool) error {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 4096 || strings.ContainsAny(raw, "\r\n\t\\") {
+		return errors.New("invalid external payment URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
 		return errors.New("invalid external payment URL")
 	}
 	if u.Scheme != "https" && !(allowLocalHTTP && u.Scheme == "http" && isLocalDevelopmentHost(u.Hostname())) {
 		return errors.New("external payment URL must use HTTPS")
+	}
+	hostname := strings.ToLower(u.Hostname())
+	if net.ParseIP(strings.TrimSuffix(hostname, ".")) == nil && !externalPaymentHostPattern.MatchString(hostname) {
+		return errors.New("invalid external payment URL host")
+	}
+	if port := u.Port(); port != "" {
+		value, parseErr := strconv.Atoi(port)
+		if parseErr != nil || value < 1 || value > 65535 {
+			return errors.New("invalid external payment URL port")
+		}
 	}
 	return nil
 }

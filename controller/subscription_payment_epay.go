@@ -1,11 +1,12 @@
 package controller
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -25,7 +26,8 @@ func isSubscriptionEpayMethod(method string) bool {
 	}
 	switch method {
 	case model.PaymentMethodStripe, model.PaymentMethodCreem, model.PaymentMethodWaffo,
-		model.PaymentMethodWaffoPancake, model.PaymentMethodXorPayNative, model.PaymentMethodXorPayAlipay:
+		model.PaymentMethodWaffoPancake, model.PaymentMethodXorPayNative, model.PaymentMethodXorPayAlipay,
+		model.PaymentMethodXorPayJSAPI:
 		return false
 	default:
 		return true
@@ -40,20 +42,31 @@ func SubscriptionRequestEpay(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, paymentRequestBodyLimit)
 	var req SubscriptionEpayPayRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
-		common.ApiErrorMsg(c, "参数错误")
+		compatibilityPaymentAPIError(c, "payment_request_invalid", nil)
 		return
 	}
 
 	if !isSubscriptionEpayMethod(req.PaymentMethod) {
-		common.ApiErrorMsg(c, "支付方式不存在")
+		compatibilityPaymentAPIError(c, "payment_method_unavailable", nil)
 		return
 	}
 	start, err := startLegacySubscriptionPayment(c, model.PaymentProviderEpay, req.PaymentMethod, req.PlanId, req.RequestID)
 	if err != nil {
-		common.ApiError(c, err)
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("易支付固定期限权益购买启动失败 user_id=%d plan_id=%d payment_method=%s error=%q", c.GetInt("id"), req.PlanId, req.PaymentMethod, err.Error()))
+		compatibilityPaymentServiceAPIError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "success", "data": start.Fields, "url": start.Action, "order_id": start.TradeNo})
+	if start == nil || strings.TrimSpace(start.TradeNo) == "" {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("易支付固定期限权益购买返回无效本地订单 user_id=%d plan_id=%d", c.GetInt("id"), req.PlanId))
+		compatibilityPaymentAPIError(c, "payment_not_ready", nil)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "success",
+		"data":     gin.H{"trade_no": start.TradeNo},
+		"url":      legacyPaymentFormBridgeURL(start.TradeNo),
+		"order_id": start.TradeNo,
+	})
 }
 
 func SubscriptionEpayNotify(c *gin.Context) {

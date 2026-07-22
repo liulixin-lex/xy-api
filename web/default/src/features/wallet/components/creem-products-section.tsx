@@ -17,15 +17,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
-import { formatNumber } from '@/lib/format'
+
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { formatCreemPrice } from '../lib/format'
-import type { CreemProduct } from '../types'
+import { formatNumber } from '@/lib/format'
+
+import { formatPaymentDecimalAmount } from '../lib/billing'
+import type { PaymentProduct } from '../types'
 
 interface CreemProductsSectionProps {
-  products: CreemProduct[]
-  onProductSelect: (product: CreemProduct) => void
+  products: PaymentProduct[]
+  onProductSelect: (product: PaymentProduct) => void
   loading?: boolean
 }
 
@@ -39,9 +41,11 @@ export function CreemProductsSection({
   if (loading) {
     return (
       <div className='grid grid-cols-2 gap-2 sm:grid-cols-2 sm:gap-3 md:grid-cols-3'>
-        {Array.from({ length: 3 }, (_, i) => `creem-product-skeleton-${i}`).map((key) => (
-          <Skeleton key={key} className='h-24 rounded-lg' />
-        ))}
+        {Array.from({ length: 3 }, (_, i) => `creem-product-skeleton-${i}`).map(
+          (key) => (
+            <Skeleton key={key} className='h-24 rounded-lg' />
+          )
+        )}
       </div>
     )
   }
@@ -54,7 +58,7 @@ export function CreemProductsSection({
     <div className='grid grid-cols-2 gap-2 sm:grid-cols-2 sm:gap-3 md:grid-cols-3'>
       {products.map((product) => (
         <Card
-          key={product.productId}
+          key={product.product_id}
           data-card-hover='false'
           className='cursor-pointer'
           onClick={() => onProductSelect(product)}
@@ -62,10 +66,13 @@ export function CreemProductsSection({
           <CardContent className='p-3 text-center sm:p-4'>
             <div className='mb-2 text-lg font-medium'>{product.name}</div>
             <div className='text-muted-foreground mb-2 text-sm'>
-              {t('Quota')}: {formatNumber(product.quota)}
+              {t('Quota')}: {formatNumber(product.top_up_amount)}
             </div>
             <div className='text-primary text-lg font-semibold'>
-              {formatCreemPrice(product.price, product.currency)}
+              {formatPaymentDecimalAmount(
+                product.payment_amount,
+                product.currency
+              )}
             </div>
           </CardContent>
         </Card>

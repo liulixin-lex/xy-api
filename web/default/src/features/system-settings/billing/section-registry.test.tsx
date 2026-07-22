@@ -103,6 +103,10 @@ describe('billing section permission visibility', () => {
       settingsOnly.some((item) => item.url.endsWith('/payment')),
       false
     )
+    assert.equal(
+      settingsOnly.some((item) => item.url.endsWith('/payment-limits')),
+      false
+    )
     assert.equal(settingsOnly.length, 6)
     assert.deepEqual(getBillingSectionNavItems(t, user(ROLE.ADMIN)), [])
   })
@@ -127,9 +131,16 @@ describe('billing section permission visibility', () => {
       systemSettings: true,
     })
     assert.equal(canAccessBillingSection('payment', delegatedUser), true)
+    assert.equal(canAccessBillingSection('payment-limits', delegatedUser), true)
     assert.equal(
       getBillingSectionNavItems(t, delegatedUser).some((item) =>
         item.url.endsWith('/payment')
+      ),
+      true
+    )
+    assert.equal(
+      getBillingSectionNavItems(t, delegatedUser).some((item) =>
+        item.url.endsWith('/payment-limits')
       ),
       true
     )

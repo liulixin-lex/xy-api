@@ -199,6 +199,213 @@ func TestCompleteSubscriptionOrderVerifiedRejectsAmountMismatch(t *testing.T) {
 	assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, 8103))
 }
 
+func TestRetainedSubscriptionProvidersRequireSignedAmountAndCurrency(t *testing.T) {
+	tests := []struct {
+		name     string
+		userID   int
+		planID   int
+		provider string
+	}{
+		{name: "creem", userID: 8121, planID: 8221, provider: PaymentProviderCreem},
+		{name: "waffo pancake", userID: 8122, planID: 8222, provider: PaymentProviderWaffoPancake},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			seedSubscriptionPaymentUser(t, test.userID, 0)
+			plan := seedSubscriptionPaymentPlan(t, test.planID, 0)
+			order := newPendingSubscriptionPaymentOrder(t, test.userID, plan, "verified-required-"+test.name, test.provider)
+			require.NoError(t, order.Insert())
+
+			err := CompleteSubscriptionOrder(order.TradeNo, "", test.provider, test.provider)
+			require.ErrorIs(t, err, ErrSubscriptionPaymentAmountRequired)
+			stored := GetSubscriptionOrderByTradeNo(order.TradeNo)
+			require.NotNil(t, stored)
+			assert.Equal(t, SubscriptionOrderStatusManualReview, stored.Status)
+			assert.Equal(t, "paid_amount_missing_or_invalid", stored.ReviewReason)
+			assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, test.userID))
+		})
+	}
+}
+
+func TestRetainedSubscriptionCurrencyMismatchRequiresManualReview(t *testing.T) {
+	truncateTables(t)
+	seedSubscriptionPaymentUser(t, 8123, 0)
+	plan := seedSubscriptionPaymentPlan(t, 8223, 0)
+	order := newPendingSubscriptionPaymentOrder(t, 8123, plan, "pancake-subscription-currency-mismatch", PaymentProviderWaffoPancake)
+	require.NoError(t, order.Insert())
+	paidAmountMinor := int64(1000)
+
+	err := CompleteSubscriptionOrderVerified(order.TradeNo, SubscriptionPaymentConfirmation{
+		ExpectedPaymentProvider: PaymentProviderWaffoPancake,
+		ActualPaymentMethod:     PaymentMethodWaffoPancake,
+		PaidAmountMinor:         &paidAmountMinor,
+		Currency:                "EUR",
+		ProviderOrderId:         "pancake_subscription_currency_mismatch",
+	})
+	require.ErrorIs(t, err, ErrSubscriptionPaymentCurrencyMismatch)
+	stored := GetSubscriptionOrderByTradeNo(order.TradeNo)
+	require.NotNil(t, stored)
+	assert.Equal(t, SubscriptionOrderStatusManualReview, stored.Status)
+	assert.Equal(t, "payment_currency_mismatch", stored.ReviewReason)
+	assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, 8123))
+}
+
+func TestRetainedSubscriptionDuplicateCallbackCreatesOneEntitlement(t *testing.T) {
+	truncateTables(t)
+	seedSubscriptionPaymentUser(t, 8124, 0)
+	plan := seedSubscriptionPaymentPlan(t, 8224, 0)
+	order := newPendingSubscriptionPaymentOrder(t, 8124, plan, "creem-subscription-duplicate", PaymentProviderCreem)
+	require.NoError(t, order.Insert())
+	paidAmountMinor := int64(1000)
+	confirmation := SubscriptionPaymentConfirmation{
+		ExpectedPaymentProvider: PaymentProviderCreem,
+		ActualPaymentMethod:     PaymentMethodCreem,
+		PaidAmountMinor:         &paidAmountMinor,
+		Currency:                "USD",
+		ProviderOrderId:         "creem_subscription_duplicate",
+	}
+
+	require.NoError(t, CompleteSubscriptionOrderVerified(order.TradeNo, confirmation))
+	require.NoError(t, CompleteSubscriptionOrderVerified(order.TradeNo, confirmation))
+	assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, 8124))
+	stored := GetSubscriptionOrderByTradeNo(order.TradeNo)
+	require.NotNil(t, stored)
+	assert.Empty(t, stored.ReviewReason)
+}
+
+func TestRetainedSubscriptionPaidCallbackRecoversFailedOrExpiredOrder(t *testing.T) {
+	for index, status := range []string{common.TopUpStatusFailed, common.TopUpStatusExpired} {
+		t.Run(status, func(t *testing.T) {
+			truncateTables(t)
+			userID := 8131 + index
+			planID := 8231 + index
+			seedSubscriptionPaymentUser(t, userID, 0)
+			plan := seedSubscriptionPaymentPlan(t, planID, 0)
+			tradeNo := "creem-subscription-recovery-" + status
+			order := newPendingSubscriptionPaymentOrder(t, userID, plan, tradeNo, PaymentProviderCreem)
+			order.Status = status
+			require.NoError(t, order.Insert())
+			paidAmountMinor := int64(1000)
+
+			require.NoError(t, CompleteSubscriptionOrderVerified(tradeNo, SubscriptionPaymentConfirmation{
+				ExpectedPaymentProvider: PaymentProviderCreem,
+				ActualPaymentMethod:     PaymentMethodCreem,
+				PaidAmountMinor:         &paidAmountMinor,
+				Currency:                "USD",
+				ProviderOrderId:         "creem_subscription_recovery_" + status,
+			}))
+
+			stored := GetSubscriptionOrderByTradeNo(tradeNo)
+			require.NotNil(t, stored)
+			assert.Equal(t, common.TopUpStatusSuccess, stored.Status)
+			assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, userID))
+		})
+	}
+}
+
+func TestRetainedSubscriptionCompletedCallbackConflictPreservesEntitlementAndRecordsReview(t *testing.T) {
+	tests := []struct {
+		name           string
+		slug           string
+		userID         int
+		planID         int
+		mutate         func(*SubscriptionPaymentConfirmation)
+		expectedErr    error
+		expectedReason string
+	}{
+		{
+			name: "amount mismatch", slug: "amount", userID: 8126, planID: 8226,
+			mutate: func(confirmation *SubscriptionPaymentConfirmation) {
+				amount := int64(999)
+				confirmation.PaidAmountMinor = &amount
+			},
+			expectedErr: ErrSubscriptionPaymentAmountMismatch, expectedReason: "completed_callback_amount_mismatch",
+		},
+		{
+			name: "currency mismatch", slug: "currency", userID: 8127, planID: 8227,
+			mutate: func(confirmation *SubscriptionPaymentConfirmation) {
+				confirmation.Currency = "EUR"
+			},
+			expectedErr: ErrSubscriptionPaymentCurrencyMismatch, expectedReason: "completed_callback_currency_mismatch",
+		},
+		{
+			name: "provider order mismatch", slug: "provider-order", userID: 8128, planID: 8228,
+			mutate: func(confirmation *SubscriptionPaymentConfirmation) {
+				confirmation.ProviderOrderId = "different_creem_subscription_order"
+			},
+			expectedErr: ErrSubscriptionOrderManualReview, expectedReason: "completed_callback_provider_order_id_mismatch",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			seedSubscriptionPaymentUser(t, test.userID, 0)
+			plan := seedSubscriptionPaymentPlan(t, test.planID, 0)
+			tradeNo := "completed-subscription-" + test.slug
+			order := newPendingSubscriptionPaymentOrder(t, test.userID, plan, tradeNo, PaymentProviderCreem)
+			require.NoError(t, order.Insert())
+			paidAmountMinor := int64(1000)
+			correct := SubscriptionPaymentConfirmation{
+				ExpectedPaymentProvider: PaymentProviderCreem,
+				ActualPaymentMethod:     PaymentMethodCreem,
+				PaidAmountMinor:         &paidAmountMinor,
+				Currency:                "USD",
+				ProviderOrderId:         "creem_order_" + tradeNo,
+			}
+			require.NoError(t, CompleteSubscriptionOrderVerified(tradeNo, correct))
+			assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, test.userID))
+
+			conflicting := correct
+			test.mutate(&conflicting)
+			err := CompleteSubscriptionOrderVerified(tradeNo, conflicting)
+			require.ErrorIs(t, err, test.expectedErr)
+			assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, test.userID))
+
+			stored := GetSubscriptionOrderByTradeNo(tradeNo)
+			require.NotNil(t, stored)
+			assert.Equal(t, common.TopUpStatusSuccess, stored.Status)
+			assert.Equal(t, test.expectedReason, stored.ReviewReason)
+			assert.Equal(t, correct.ProviderOrderId, stored.ProviderOrderId)
+			topUp := GetTopUpByTradeNo(tradeNo)
+			require.NotNil(t, topUp)
+			assert.Equal(t, common.TopUpStatusSuccess, topUp.Status)
+			assert.Equal(t, test.expectedReason, topUp.ReviewReason)
+
+			require.NoError(t, CompleteSubscriptionOrderVerified(tradeNo, correct))
+			assert.EqualValues(t, 1, countUserSubscriptionsForPaymentGuardTest(t, test.userID))
+			stored = GetSubscriptionOrderByTradeNo(tradeNo)
+			require.NotNil(t, stored)
+			assert.Equal(t, test.expectedReason, stored.ReviewReason)
+		})
+	}
+}
+
+func TestRetainedSubscriptionLegacyPaymentSnapshotRequiresManualReview(t *testing.T) {
+	truncateTables(t)
+	seedSubscriptionPaymentUser(t, 8125, 0)
+	plan := seedSubscriptionPaymentPlan(t, 8225, 0)
+	legacyOrder := newPendingSubscriptionPaymentOrder(t, 8125, plan, "creem-subscription-missing-payment-snapshot", PaymentProviderCreem)
+	legacyOrder.ExpectedAmountMinor = 0
+	legacyOrder.PaymentCurrency = ""
+	require.NoError(t, DB.Create(legacyOrder).Error)
+	paidAmountMinor := int64(1000)
+
+	err := CompleteSubscriptionOrderVerified(legacyOrder.TradeNo, SubscriptionPaymentConfirmation{
+		ExpectedPaymentProvider: PaymentProviderCreem,
+		ActualPaymentMethod:     PaymentMethodCreem,
+		PaidAmountMinor:         &paidAmountMinor,
+		Currency:                "USD",
+		ProviderOrderId:         "creem_subscription_missing_snapshot",
+	})
+	require.ErrorIs(t, err, ErrSubscriptionOrderSnapshotMissing)
+	stored := GetSubscriptionOrderByTradeNo(legacyOrder.TradeNo)
+	require.NotNil(t, stored)
+	assert.Equal(t, SubscriptionOrderStatusManualReview, stored.Status)
+	assert.Equal(t, "missing_payment_snapshot", stored.ReviewReason)
+	assert.Zero(t, countUserSubscriptionsForPaymentGuardTest(t, 8125))
+}
+
 func TestCompleteSubscriptionOrderVerifiedRejectsReusedProviderOrder(t *testing.T) {
 	truncateTables(t)
 	seedSubscriptionPaymentUser(t, 8109, 0)

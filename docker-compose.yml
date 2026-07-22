@@ -3,7 +3,8 @@
 # Quick Start:
 #   1. Copy .env.example to .env and set every variable marked REQUIRED_FOR_COMPOSE
 #      with independent `openssl rand -hex 32` values. Set NEW_API_IMAGE to the
-#      v0.2.0 digest reference from the immutable Release container-images.json.
+#      v0.2.1 digest reference from the immutable Release container-images.json
+#      after the protected release workflow publishes it.
 #   2. Run `docker compose config` and review the resolved image and mounts.
 #   3. Run `docker compose run --rm config-check` to validate secret strength.
 #   4. Run `docker compose up -d`.
@@ -18,15 +19,21 @@
 #
 # ⚠️  IMPORTANT: This file intentionally has no password or secret defaults.
 #     Compose refuses to render until every required value is present and non-empty.
-# ⚠️  v0.2.0 direct upgrades are supported only from v0.1.6 or a clean install.
-#     Do not switch v0.1.7-v0.1.14 deployments directly; back up and follow the v0.2.0 migration guide.
+# ⚠️  v0.2.1 supports clean installs and rehearsed additive upgrades from v0.2.0.
+#     Direct v0.1.6-v0.1.14 production upgrades are not claimed for this release candidate.
+#     The /api/readiness health check is a v0.2.1 runtime contract; do not substitute a v0.2.0 image.
 
 services:
   config-check:
     image: alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
     restart: "no"
     environment:
-      NEW_API_IMAGE: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.0 digest reference from container-images.json}
+      NEW_API_IMAGE: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.1 digest reference from container-images.json}
+      NODE_NAME: ${NODE_NAME:?Set NODE_NAME to a unique stable name for this application replica}
+      PAYMENT_MULTI_NODE_ENABLED: ${PAYMENT_MULTI_NODE_ENABLED:-false}
+      PAYMENT_CLUSTER_ID: ${PAYMENT_CLUSTER_ID:-}
+      PAYMENT_CLUSTER_NODES: ${PAYMENT_CLUSTER_NODES:-}
+      PAYMENT_CLUSTER_MIN_LIVE_NODES: ${PAYMENT_CLUSTER_MIN_LIVE_NODES:-2}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD to an independent openssl rand -hex 32 value}
@@ -63,6 +70,57 @@ services:
           grep -Eq '^ghcr\.io/liulixin-lex/xy-api@sha256:[0-9a-f]{64}$$'; then
           echo 'NEW_API_IMAGE must be the exact GHCR sha256 digest reference recorded in container-images.json' >&2
           exit 1
+        fi
+        if ! printf '%s' "$$NODE_NAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,90}$$'; then
+          echo 'NODE_NAME must be a unique stable 1-91 character replica name using letters, numbers, dot, underscore, or hyphen' >&2
+          exit 1
+        fi
+        case "$$PAYMENT_MULTI_NODE_ENABLED" in
+          true|false) ;;
+          *) echo 'PAYMENT_MULTI_NODE_ENABLED must be true or false' >&2; exit 1 ;;
+        esac
+        if [ "$$PAYMENT_MULTI_NODE_ENABLED" = true ]; then
+          if ! printf '%s' "$$PAYMENT_CLUSTER_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,90}$$'; then
+            echo 'PAYMENT_CLUSTER_ID must be a stable 1-91 character cluster name' >&2
+            exit 1
+          fi
+          if [ -z "$$PAYMENT_CLUSTER_NODES" ] || printf '%s' "$$PAYMENT_CLUSTER_NODES" | grep -Eq '(^,|,$|,,|[[:space:]])'; then
+            echo 'PAYMENT_CLUSTER_NODES must be a comma-separated list of stable NODE_NAME values without spaces' >&2
+            exit 1
+          fi
+          cluster_node_count=0
+          cluster_node_seen=,
+          local_node_expected=false
+          for cluster_node in $$(printf '%s' "$$PAYMENT_CLUSTER_NODES" | tr ',' ' '); do
+            if ! printf '%s' "$$cluster_node" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,90}$$'; then
+              echo "invalid PAYMENT_CLUSTER_NODES member: $$cluster_node" >&2
+              exit 1
+            fi
+            case "$$cluster_node_seen" in
+              *,"$$cluster_node",*) echo "duplicate PAYMENT_CLUSTER_NODES member: $$cluster_node" >&2; exit 1 ;;
+            esac
+            cluster_node_seen="$${cluster_node_seen}$${cluster_node},"
+            cluster_node_count=$$((cluster_node_count + 1))
+            if [ "$$cluster_node" = "$$NODE_NAME" ]; then
+              local_node_expected=true
+            fi
+          done
+          if [ "$$cluster_node_count" -lt 2 ] || [ "$$cluster_node_count" -gt 64 ]; then
+            echo 'PAYMENT_CLUSTER_NODES must contain between 2 and 64 unique nodes' >&2
+            exit 1
+          fi
+          if [ "$$local_node_expected" != true ]; then
+            echo 'PAYMENT_CLUSTER_NODES must include this replica NODE_NAME' >&2
+            exit 1
+          fi
+          case "$$PAYMENT_CLUSTER_MIN_LIVE_NODES" in
+            ''|*[!0-9]*) echo 'PAYMENT_CLUSTER_MIN_LIVE_NODES must be an integer' >&2; exit 1 ;;
+          esac
+          cluster_quorum=$$((cluster_node_count / 2 + 1))
+          if [ "$$PAYMENT_CLUSTER_MIN_LIVE_NODES" -lt "$$cluster_quorum" ] || [ "$$PAYMENT_CLUSTER_MIN_LIVE_NODES" -gt "$$cluster_node_count" ]; then
+            echo 'PAYMENT_CLUSTER_MIN_LIVE_NODES must be a strict majority and no greater than the configured node count' >&2
+            exit 1
+          fi
         fi
         if [ -z "$$POSTGRES_PASSWORD" ] && [ -z "$$MYSQL_ROOT_PASSWORD" ]; then
           echo 'Set the password for the active PostgreSQL or MySQL database service' >&2
@@ -110,7 +168,7 @@ services:
         echo 'Compose production configuration passed fail-closed validation.'
 
   new-api:
-    image: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.0 digest reference from container-images.json}
+    image: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.1 digest reference from container-images.json}
     restart: always
     command: --log-dir /app/logs
     ports:
@@ -128,10 +186,21 @@ services:
       TZ: Asia/Shanghai
       ERROR_LOG_ENABLED: "true" # 是否启用错误日志记录 (Whether to enable error log recording)
       BATCH_UPDATE_ENABLED: "true" # 是否启用批量更新 (Whether to enable batch update)
-      NODE_NAME: new-api-node-1 # 节点名称，用于审计日志中标识节点身份；多节点/容器部署时建议设置 (Node name used in audit logs; recommended when running multiple instances or in containers)
-      # 全新生产安装应在 .env 中设置独立随机值且所有节点一致；v0.1.6 升级必须保留原值
+      # 本 Compose 文件定义一个应用副本。多节点部署必须为每个副本分别注入唯一且稳定的值；
+      # 不要用同一 NODE_NAME 直接 scale 此 service，重复身份会让支付创建安全地停止。
+      # 现有单节点可继续使用 new-api-node-1；多节点时每个副本必须改为不同名称。
+      # This Compose file defines one application replica. Inject a different stable value for every replica;
+      # do not scale this service with one shared NODE_NAME because duplicate identity intentionally fails payment readiness.
+      NODE_NAME: ${NODE_NAME:?Set NODE_NAME to a unique stable name for this application replica}
+      # 单节点保持 false。多节点必须在所有副本使用相同的 cluster ID、节点 allowlist 和最小在线数。
+      # Keep false for a single node. Every multi-node replica must share the same cluster ID, node allowlist, and minimum live count.
+      PAYMENT_MULTI_NODE_ENABLED: ${PAYMENT_MULTI_NODE_ENABLED:-false}
+      PAYMENT_CLUSTER_ID: ${PAYMENT_CLUSTER_ID:-}
+      PAYMENT_CLUSTER_NODES: ${PAYMENT_CLUSTER_NODES:-}
+      PAYMENT_CLUSTER_MIN_LIVE_NODES: ${PAYMENT_CLUSTER_MIN_LIVE_NODES:-2}
+      # 全新生产安装应在 .env 中设置独立随机值且所有节点一致；经支持的 v0.2.0 路径升级时必须保留旧值
       # 若旧环境未设置 CRYPTO_SECRET，后端曾使用 SESSION_SECRET；不要在未清理本应用 Redis 缓存并协调所有节点时引入新值
-      # Clean production installs should use independent random values in .env on every node; v0.1.6 upgrades must preserve the old values
+      # Clean production installs should use independent random values in .env on every node; upgrades through the supported v0.2.0 path must preserve the old values
       # If CRYPTO_SECRET was unset, SESSION_SECRET was the legacy key; do not introduce a new value without clearing this app's Redis cache and coordinating every node
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET to an independent openssl rand -hex 32 value}
       CRYPTO_SECRET: ${CRYPTO_SECRET:?Set CRYPTO_SECRET to an independent openssl rand -hex 32 value}
@@ -164,7 +233,7 @@ services:
     networks:
       - new-api-network
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -Eq '\"success\":[[:space:]]*true' || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/readiness | grep -Eq '\"status\":[[:space:]]*\"ready\"' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

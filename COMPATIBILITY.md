@@ -102,3 +102,29 @@ container rejects weak, placeholder, reused, or invalid rotation keys before
 data services start.
 Run-scoped registry candidate references are release intermediates only; the
 immutable Release manifest digest remains the deployment authority.
+
+## v0.2.1 Source Candidate Boundary
+
+The repository `VERSION` may identify the `v0.2.1` source candidate before a
+tag, release assets, or container image exists. Publication and deployment
+claims begin only after the protected release workflow produces and verifies
+the immutable release artifacts.
+
+The supported candidate scope is a clean installation or an additive upgrade
+from `v0.2.0`, after backup and restore testing. A direct production upgrade
+from `v0.1.6` to `v0.2.1` is not claimed by this release; use the supported
+`v0.1.6` to `v0.2.0` path first, then rehearse the `v0.2.0` to `v0.2.1` step on
+a restored backup. Direct production upgrades from `v0.1.7` through `v0.1.14`
+also remain unclaimed unless separately verified.
+
+The Compose health check uses `/api/readiness`, which is a `v0.2.1` runtime
+contract. Operators must use the verified `v0.2.1` digest from the immutable
+release manifest after publication; a `v0.2.0` image does not implement this
+readiness endpoint and is not a compatible substitute for this Compose file.
+
+The durable asynchronous task flow, opaque continuation contract, and merchant
+limit reservation engine apply to new Epay, Stripe, XORPay, Creem, Waffo, and
+Waffo Pancake orders. Each provider remains an independent gateway group;
+Creem, Waffo, Waffo Pancake, Epay, and Stripe must never be described as XORPay
+routes. Verified legacy callback fallback remains only for pre-existing records
+that do not have a canonical payment order.

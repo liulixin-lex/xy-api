@@ -16,14 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { CheckCircle2, Clock3, Loader2, X, XCircle } from 'lucide-react'
+import { CheckCircle2, Clock3, X, XCircle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
 
 import { usePaymentOrder } from '../hooks/use-payment-order'
-import { formatPaymentMinorAmount, getStatusConfig } from '../lib/billing'
+import { formatPaymentDecimalAmount, getStatusConfig } from '../lib/billing'
 import type { PaymentOrder } from '../types'
 
 interface PaymentResultAlertProps {
@@ -48,27 +49,32 @@ export function PaymentResultAlert(props: PaymentResultAlertProps) {
     enabled: true,
     onSettled: props.onSettled,
   })
-  const statusConfig = order ? getStatusConfig(order.status) : null
-  const succeeded = order?.status === 'success'
+  const statusConfig = order ? getStatusConfig(order.status_code) : null
+  const succeeded = order?.status_code === 'succeeded'
   const pending =
-    !order || order.status === 'pending' || order.status === 'processing'
-  const failed = !!order && !pending && !succeeded
-  const variant = failed || error ? 'destructive' : 'default'
-  let resultHintLabel = t('Returned from payment provider')
+    !order ||
+    order.status_code === 'preparing' ||
+    order.status_code === 'awaiting_payment' ||
+    order.status_code === 'confirming'
+  const variant =
+    error || order?.status_code === 'temporarily_unavailable'
+      ? 'destructive'
+      : 'default'
+  let resultHintLabel = t('Checking your payment')
   if (props.resultHint === 'success') {
-    resultHintLabel = t('Payment provider reported success')
+    resultHintLabel = t('Payment submitted')
   } else if (props.resultHint === 'cancelled') {
     resultHintLabel = t('Payment was cancelled')
   } else if (props.resultHint === 'failed') {
-    resultHintLabel = t('Payment provider reported a failure')
+    resultHintLabel = t('Payment could not be completed')
   } else if (props.resultHint === 'pending') {
-    resultHintLabel = t('Payment is pending')
+    resultHintLabel = t('Payment confirmation is pending')
   }
   let statusIcon = <XCircle className='h-4 w-4' />
   if (succeeded) {
     statusIcon = <CheckCircle2 className='h-4 w-4 text-green-600' />
   } else if (pending && loading) {
-    statusIcon = <Loader2 className='h-4 w-4 animate-spin' />
+    statusIcon = <Spinner aria-label={t('Checking...')} />
   } else if (pending) {
     statusIcon = <Clock3 className='h-4 w-4 text-amber-600' />
   }
@@ -77,7 +83,7 @@ export function PaymentResultAlert(props: PaymentResultAlertProps) {
   let description = (
     <span>
       {t(
-        'The return page is only a hint. The local server is verifying the order.'
+        'Checking the latest order status. Your balance changes only after confirmation.'
       )}
       {` (${resultHintLabel})`}
     </span>
@@ -113,17 +119,13 @@ export function PaymentResultAlert(props: PaymentResultAlertProps) {
       <span>
         {t('Order Number')}: {order.trade_no}
         {' · '}
-        {formatPaymentMinorAmount(
-          order.paid_amount_minor || order.expected_amount_minor,
-          order.currency,
-          order.provider
-        )}
+        {formatPaymentDecimalAmount(order.payment_amount, order.currency)}
       </span>
     )
   }
 
   return (
-    <Alert variant={variant} className='gap-y-2'>
+    <Alert variant={variant} className='gap-y-2' aria-live='polite'>
       {statusIcon}
       <AlertTitle>{title}</AlertTitle>
       <AlertDescription className='min-w-0 break-words'>

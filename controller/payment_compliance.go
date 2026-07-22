@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
@@ -23,7 +22,10 @@ type PaymentComplianceRequest struct {
 
 func requirePaymentCompliance(c *gin.Context) bool {
 	if !isPaymentComplianceConfirmed() {
-		common.ApiErrorI18n(c, i18n.MsgPaymentComplianceRequired)
+		// Compliance is administrator configuration, so public callers receive
+		// only the generic availability contract. The exact state remains in the
+		// administrator settings and audit surfaces.
+		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
 		return false
 	}
 	return true
@@ -31,21 +33,18 @@ func requirePaymentCompliance(c *gin.Context) bool {
 
 func ConfirmPaymentCompliance(c *gin.Context) {
 	if c.GetBool("use_access_token") {
-		c.JSON(http.StatusForbidden, gin.H{
-			"success": false,
-			"message": "This operation requires dashboard session authentication. API access token is not allowed.",
-		})
+		paymentSettingsAPIError(c, http.StatusForbidden, "payment_settings_auth_required", nil)
 		return
 	}
 
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, paymentRequestBodyLimit)
 	var req PaymentComplianceRequest
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
-		common.ApiErrorMsg(c, "参数错误")
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", err)
 		return
 	}
 	if !req.Confirmed {
-		common.ApiErrorMsg(c, "请确认合规声明")
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("payment compliance confirmation is required"))
 		return
 	}
 
@@ -62,21 +61,21 @@ func ConfirmPaymentCompliance(c *gin.Context) {
 	}
 
 	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
-		common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+		paymentSettingsAPIError(c, http.StatusServiceUnavailable, "payment_settings_sync_failed", err)
 		return
 	}
 	expectedVersion, err := model.CurrentPaymentConfigurationVersion()
 	if err != nil {
-		common.ApiError(c, err)
+		paymentSettingsAPIError(c, http.StatusServiceUnavailable, "payment_settings_sync_failed", err)
 		return
 	}
 	unlockPaymentConfiguration := setting.LockPaymentConfigurationForUpdate()
 	defer unlockPaymentConfiguration()
 	if _, err := model.UpdatePaymentOptionsBulkWithVersionLockHeld(updates, expectedVersion); errors.Is(err, model.ErrPaymentConfigurationVersionConflict) {
-		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Payment settings changed concurrently; refresh and retry"})
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_version_conflict", err)
 		return
 	} else if err != nil {
-		common.ApiError(c, err)
+		paymentSettingsAPIError(c, http.StatusInternalServerError, "payment_settings_save_failed", err)
 		return
 	}
 	recordManageAudit(c, "payment.compliance.confirm", map[string]interface{}{

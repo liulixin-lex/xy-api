@@ -26,7 +26,7 @@ validate_repository() {
 
 validate_tag() {
   local tag=$1
-  if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  if [[ ! "$tag" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
     echo "invalid stable release tag: $tag" >&2
     exit 2
   fi
@@ -431,7 +431,7 @@ upload_asset() (
      .immutable != true and
      .prerelease == false and
      (.tag_name |
-       test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+       test("^v0\\.2\\.(0|[1-9][0-9]*)$")) and
      .name == .tag_name and
      (.body | type == "string" and length > 0) and
      ([.assets[].name] | length) == ([.assets[].name] | unique | length) and

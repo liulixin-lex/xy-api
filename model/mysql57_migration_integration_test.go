@@ -1,6 +1,10 @@
 package model
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 
@@ -48,8 +52,10 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 	}
 
 	cleanDB := openDB(t, cleanDSN)
+	cleanPeerDB := openDB(t, cleanDSN)
 	upgradeDB := openDB(t, upgradeDSN)
 	logDB := openDB(t, logDSN)
+	logPeerDB := openDB(t, logDSN)
 	requireEmptySchema(t, cleanDB)
 	requireEmptySchema(t, upgradeDB)
 	requireEmptySchema(t, logDB)
@@ -67,6 +73,16 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 	common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
 	initCol()
 
+	// MySQL named locks are session-scoped. Prove the main and independent log
+	// migration paths both run on the lock-owning connection, exclude a peer,
+	// and release the lock after success and failure.
+	assertMySQLMigrationLockContract(t, cleanDB, cleanPeerDB, func(migrate func(*gorm.DB) error) error {
+		return migrateMySQLDBSafely(cleanDB, migrate)
+	})
+	assertMySQLMigrationLockContract(t, logDB, logPeerDB, func(migrate func(*gorm.DB) error) error {
+		return migrateLOGDBSafelyOn(logDB, common.DatabaseTypeMySQL, migrate)
+	})
+
 	// The capability gate must fail before creating any business table when a
 	// legal MySQL 5.7 switch is changed to an unsafe value.
 	require.NoError(t, cleanDB.Exec("SET GLOBAL innodb_large_prefix=OFF").Error)
@@ -78,7 +94,7 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 	require.NoError(t, cleanDB.Exec("SET GLOBAL innodb_large_prefix=ON").Error)
 
 	DB = cleanDB
-	require.NoError(t, migrateDBOn(cleanDB))
+	require.NoError(t, migrateMySQLDBSafely(cleanDB, migrateDBOn))
 	longIndexTables := []string{
 		"casbin_rule",
 		"passkey_credentials",
@@ -146,7 +162,7 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 		VALUES (42, 7, 12.5, 'MYSQL57_COMPACT_SAMPLE', 'alipay', 'epay', 'pending', 1700000000)
 	`).Error)
 	DB = upgradeDB
-	require.NoError(t, migrateDBOn(upgradeDB))
+	require.NoError(t, migrateMySQLDBSafely(upgradeDB, migrateDBOn))
 	assert.Equal(t, "Dynamic", rowFormat(t, upgradeDB, "subscription_orders"))
 	var tradeNo string
 	require.NoError(t, upgradeDB.Raw(
@@ -162,10 +178,24 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 		"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'subscription_orders' AND COLUMN_NAME IN ('trade_no', 'provider_order_id', 'provider_order_key') AND SUB_PART IS NOT NULL",
 	).Scan(&prefixedIndexes).Error)
 	assert.Zero(t, prefixedIndexes)
-	require.NoError(t, migrateDBOn(upgradeDB), "repeated migration must be idempotent")
+	require.NoError(t, migrateMySQLDBSafely(upgradeDB, migrateDBOn), "repeated migration must be idempotent")
 
 	LOG_DB = logDB
+	logFixtureDB, err := prepareMySQLMigrationDB(logDB, 382, nil)
+	require.NoError(t, err)
+	logFixture := v020LogFixture{
+		Id: 7101, UserId: 101, CreatedAt: 1711000500, Type: LogTypeTopup,
+		Content: "v0.2.0 preserved log", Username: "v020-user", ModelName: "payment",
+		Quota: 125000, ChannelId: 9, TokenId: 301, Group: "premium", Ip: "192.0.2.10",
+		RequestId: "req-v020-log", UpstreamRequestId: "upstream-v020-log", Other: `{"source":"v0.2.0"}`,
+	}
+	require.NoError(t, logFixtureDB.AutoMigrate(&v020LogFixture{}))
+	require.NoError(t, logFixtureDB.Create(&logFixture).Error)
 	require.NoError(t, migrateLOGDB())
+	require.NoError(t, migrateLOGDB(), "repeated independent log migration must be idempotent")
+	var storedLog v020LogFixture
+	require.NoError(t, logDB.First(&storedLog, logFixture.Id).Error)
+	assert.Equal(t, logFixture, storedLog)
 	assert.Equal(t, "Dynamic", rowFormat(t, logDB, "logs"))
 	require.NoError(t, logDB.Raw(
 		"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'logs' AND INDEX_NAME = 'index_username_model_name' AND SUB_PART IS NOT NULL",
@@ -176,7 +206,7 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 		gbk8DB := openDB(t, gbk8DSN)
 		requireEmptySchema(t, gbk8DB)
 		DB = gbk8DB
-		require.NoError(t, migrateDBOn(gbk8DB))
+		require.NoError(t, migrateMySQLDBSafely(gbk8DB, migrateDBOn))
 		assert.Equal(t, "Dynamic", rowFormat(t, gbk8DB, "casbin_rule"))
 		require.NoError(t, gbk8DB.Raw(
 			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ? AND INDEX_NAME <> 'PRIMARY' AND SUB_PART IS NOT NULL",
@@ -184,4 +214,93 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 		).Scan(&prefixedIndexes).Error)
 		assert.Zero(t, prefixedIndexes)
 	}
+}
+
+func assertMySQLMigrationLockContract(
+	t *testing.T,
+	db *gorm.DB,
+	peerDB *gorm.DB,
+	run func(func(*gorm.DB) error) error,
+) {
+	t.Helper()
+	var schema string
+	require.NoError(t, db.Raw("SELECT DATABASE()").Scan(&schema).Error)
+	require.NotEmpty(t, schema)
+	lockName := mysqlMigrationLockName(schema)
+	migrationReady := make(chan error, 1)
+	migrationRelease := make(chan struct{}, 1)
+	migrationDone := make(chan error, 1)
+	t.Cleanup(func() {
+		select {
+		case migrationRelease <- struct{}{}:
+		default:
+		}
+	})
+	go func() {
+		err := run(func(migrationDB *gorm.DB) error {
+			var connectionID int64
+			if err := migrationDB.Raw("SELECT CONNECTION_ID()").Row().Scan(&connectionID); err != nil {
+				migrationReady <- err
+				return err
+			}
+			var ownerConnectionID sql.NullInt64
+			if err := migrationDB.Raw("SELECT IS_USED_LOCK(?)", lockName).Row().Scan(&ownerConnectionID); err != nil {
+				migrationReady <- err
+				return err
+			}
+			if !ownerConnectionID.Valid || ownerConnectionID.Int64 != connectionID {
+				err := fmt.Errorf(
+					"MySQL migration ran on connection %d while lock owner was %v",
+					connectionID, ownerConnectionID,
+				)
+				migrationReady <- err
+				return err
+			}
+			migrationReady <- nil
+			<-migrationRelease
+			return nil
+		})
+		select {
+		case migrationReady <- err:
+		default:
+		}
+		migrationDone <- err
+	}()
+	require.NoError(t, <-migrationReady)
+
+	peerSQLDB, err := peerDB.DB()
+	require.NoError(t, err)
+	peerConnection, err := peerSQLDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer peerConnection.Close()
+	var peerAcquired sql.NullInt64
+	require.NoError(t, peerConnection.QueryRowContext(
+		context.Background(), "SELECT GET_LOCK(?, 0)", lockName,
+	).Scan(&peerAcquired))
+	require.True(t, peerAcquired.Valid)
+	assert.Zero(t, peerAcquired.Int64)
+
+	migrationRelease <- struct{}{}
+	require.NoError(t, <-migrationDone)
+	assertMySQLPeerCanAcquireAndReleaseMigrationLock(t, peerConnection, lockName)
+
+	sentinel := errors.New("deterministic migration callback failure")
+	require.ErrorIs(t, run(func(*gorm.DB) error { return sentinel }), sentinel)
+	assertMySQLPeerCanAcquireAndReleaseMigrationLock(t, peerConnection, lockName)
+}
+
+func assertMySQLPeerCanAcquireAndReleaseMigrationLock(t *testing.T, connection *sql.Conn, lockName string) {
+	t.Helper()
+	var acquired sql.NullInt64
+	require.NoError(t, connection.QueryRowContext(
+		context.Background(), "SELECT GET_LOCK(?, 0)", lockName,
+	).Scan(&acquired))
+	require.True(t, acquired.Valid)
+	assert.Equal(t, int64(1), acquired.Int64)
+	var released sql.NullInt64
+	require.NoError(t, connection.QueryRowContext(
+		context.Background(), "SELECT RELEASE_LOCK(?)", lockName,
+	).Scan(&released))
+	require.True(t, released.Valid)
+	assert.Equal(t, int64(1), released.Int64)
 }

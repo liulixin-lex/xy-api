@@ -58,9 +58,14 @@ const TransferModal = ({
           />
         </div>
         <div>
-          <Typography.Text strong className='block mb-2'>
-            {t('划转额度')} · {t('最低') + renderQuota(getQuotaPerUnit())}
-          </Typography.Text>
+          <div className='mb-2 flex items-center justify-between gap-3'>
+            <Typography.Text strong>{t('划转额度')}</Typography.Text>
+            <Typography.Text type='tertiary'>
+              {t('Minimum {{amount}}', {
+                amount: renderQuota(getQuotaPerUnit()),
+              })}
+            </Typography.Text>
+          </div>
           <InputNumber
             min={getQuotaPerUnit()}
             max={userState?.user?.aff_quota || 0}

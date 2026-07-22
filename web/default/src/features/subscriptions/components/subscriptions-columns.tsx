@@ -26,11 +26,17 @@ import { StatusBadge } from '@/components/status-badge'
 import { TableId } from '@/components/table-id'
 import { formatQuota } from '@/lib/format'
 
-import { formatDuration, formatResetPeriod } from '../lib'
+import {
+  formatDuration,
+  formatResetPeriod,
+  hasLegacyStripePriceMapping,
+} from '../lib'
 import type { PlanRecord } from '../types'
 import { DataTableRowActions } from './data-table-row-actions'
 
-export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
+export function useSubscriptionsColumns(
+  showLegacyStripeMapping: boolean
+): ColumnDef<PlanRecord>[] {
   const { t } = useTranslation()
 
   return useMemo(
@@ -132,19 +138,12 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
       },
       {
         id: 'payment',
-        header: t('Payment Channel'),
+        header: t('Current product mappings'),
         meta: { mobileHidden: true },
         cell: ({ row }) => {
           const plan = row.original.plan
           return (
             <BadgeCell>
-              {plan.stripe_price_id && (
-                <StatusBadge
-                  label={t('Stripe')}
-                  variant='neutral'
-                  copyable={false}
-                />
-              )}
               {plan.creem_product_id && (
                 <StatusBadge
                   label={t('Creem')}
@@ -164,6 +163,24 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         },
         size: 140,
       },
+      ...(showLegacyStripeMapping
+        ? [
+            {
+              id: 'legacy_stripe_mapping',
+              header: t('Legacy data'),
+              meta: { mobileHidden: true },
+              cell: ({ row }) =>
+                hasLegacyStripePriceMapping(row.original) ? (
+                  <StatusBadge
+                    label={t('Legacy Stripe mapping')}
+                    variant='neutral'
+                    copyable={false}
+                  />
+                ) : null,
+              size: 140,
+            } satisfies ColumnDef<PlanRecord>,
+          ]
+        : []),
       {
         id: 'total_amount',
         header: t('Plan Quota'),
@@ -204,6 +221,6 @@ export function useSubscriptionsColumns(): ColumnDef<PlanRecord>[] {
         meta: { pinned: 'right' as const },
       },
     ],
-    [t]
+    [showLegacyStripeMapping, t]
   )
 }

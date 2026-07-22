@@ -7,8 +7,8 @@ VERSION="${VERSION:-$(cat "$ROOT_DIR/VERSION")}"
 ELECTRON_VERSION="${VERSION#v}"
 GO_LDFLAGS="-s -w -X github.com/QuantumNous/new-api/common.Version=${VERSION}"
 
-if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "VERSION must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+if [[ ! "$VERSION" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
+    echo "VERSION must remain on the protected v0.2.x line. Current value: $VERSION"
     exit 1
 fi
 

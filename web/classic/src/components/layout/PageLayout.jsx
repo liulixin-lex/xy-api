@@ -63,7 +63,10 @@ const PageLayout = () => {
     '/pricing',
   ];
 
-  const shouldHideFooter = cardProPages.includes(location.pathname);
+  const isPaymentRoute = location.pathname.startsWith('/payment/');
+
+  const shouldHideFooter =
+    cardProPages.includes(location.pathname) || isPaymentRoute;
 
   const shouldInnerPadding =
     location.pathname.includes('/console') &&
@@ -155,22 +158,24 @@ const PageLayout = () => {
         overflow: isFixedLayout && !isMobile ? 'hidden' : 'visible',
       }}
     >
-      <Header
-        style={{
-          padding: 0,
-          height: 'auto',
-          lineHeight: 'normal',
-          position: 'fixed',
-          width: '100%',
-          top: 0,
-          zIndex: 100,
-        }}
-      >
-        <HeaderBar
-          onMobileMenuToggle={() => setDrawerOpen((prev) => !prev)}
-          drawerOpen={drawerOpen}
-        />
-      </Header>
+      {!isPaymentRoute && (
+        <Header
+          style={{
+            padding: 0,
+            height: 'auto',
+            lineHeight: 'normal',
+            position: 'fixed',
+            width: '100%',
+            top: 0,
+            zIndex: 100,
+          }}
+        >
+          <HeaderBar
+            onMobileMenuToggle={() => setDrawerOpen((prev) => !prev)}
+            drawerOpen={drawerOpen}
+          />
+        </Header>
+      )}
       <Layout
         style={{
           overflow: isFixedLayout && !isMobile ? 'auto' : 'visible',
@@ -212,7 +217,7 @@ const PageLayout = () => {
             minHeight: 0,
           }}
         >
-          <ClassicFrontendDeprecationBanner />
+          {!isPaymentRoute && <ClassicFrontendDeprecationBanner />}
           <Content
             className={isFixedLayout ? undefined : 'public-page-content'}
             style={{

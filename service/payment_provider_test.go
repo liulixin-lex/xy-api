@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,7 +33,7 @@ func (fn paymentRoundTripFunc) RoundTrip(request *http.Request) (*http.Response,
 	return fn(request)
 }
 
-func TestFillSubscriptionQuoteStripeDoesNotApplyTopUpUnitPrice(t *testing.T) {
+func TestFillSubscriptionQuoteConvertsUSDBasePriceToStripeSettlementCurrency(t *testing.T) {
 	require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}))
 	require.NoError(t, model.DB.Exec("DELETE FROM subscription_plans").Error)
 	t.Cleanup(func() { _ = model.DB.Exec("DELETE FROM subscription_plans").Error })
@@ -43,12 +44,12 @@ func TestFillSubscriptionQuoteStripeDoesNotApplyTopUpUnitPrice(t *testing.T) {
 		setting.StripeUnitPrice = originalUnitPrice
 		setting.StripeCurrency = originalCurrency
 	})
-	setting.StripeUnitPrice = 8
-	setting.StripeCurrency = "USD"
+	setting.StripeUnitPrice = 0.92
+	setting.StripeCurrency = "EUR"
 	allowWallet := true
 	plan := &model.SubscriptionPlan{
 		Id:                  980101,
-		Title:               "Fixed USD plan",
+		Title:               "Fixed USD base plan",
 		PriceAmount:         9.99,
 		Currency:            "USD",
 		DurationUnit:        model.SubscriptionDurationMonth,
@@ -62,13 +63,50 @@ func TestFillSubscriptionQuoteStripeDoesNotApplyTopUpUnitPrice(t *testing.T) {
 	quote := &model.PaymentQuote{Provider: model.PaymentProviderStripe}
 	payable, err := fillSubscriptionQuote(quote, plan.Id)
 	require.NoError(t, err)
-	assert.True(t, payable.Equal(decimal.RequireFromString("9.99")))
-	assert.Equal(t, "USD", quote.Currency)
+	assert.True(t, payable.Equal(decimal.RequireFromString("9.1908")))
+	assert.Equal(t, "EUR", quote.Currency)
 	assert.EqualValues(t, plan.Id, quote.RequestedAmount)
 
 	var snapshot model.SubscriptionPlanSnapshot
 	require.NoError(t, common.UnmarshalJsonStr(quote.ProductSnapshot, &snapshot))
 	assert.Equal(t, plan.Id, snapshot.PlanId)
+}
+
+func TestPaymentSubscriptionPricingUsesConfiguredSettlementMultipliers(t *testing.T) {
+	originalStripeUnitPrice, originalStripeCurrency := setting.StripeUnitPrice, setting.StripeCurrency
+	originalEpayPrice, originalEpayCurrency := operation_setting.Price, operation_setting.EpayCurrency
+	originalXorPayUnitPrice, originalXorPayCurrency := setting.XorPayUnitPrice, setting.XorPayCurrency
+	originalPancakeUnitPrice := setting.WaffoPancakeUnitPrice
+	t.Cleanup(func() {
+		setting.StripeUnitPrice, setting.StripeCurrency = originalStripeUnitPrice, originalStripeCurrency
+		operation_setting.Price, operation_setting.EpayCurrency = originalEpayPrice, originalEpayCurrency
+		setting.XorPayUnitPrice, setting.XorPayCurrency = originalXorPayUnitPrice, originalXorPayCurrency
+		setting.WaffoPancakeUnitPrice = originalPancakeUnitPrice
+	})
+
+	setting.StripeUnitPrice, setting.StripeCurrency = 0.92, "EUR"
+	operation_setting.Price, operation_setting.EpayCurrency = 7.2, "CNY"
+	setting.XorPayUnitPrice, setting.XorPayCurrency = 7.1, "CNY"
+	setting.WaffoPancakeUnitPrice = 1.07
+
+	tests := []struct {
+		provider       string
+		wantMultiplier float64
+		wantCurrency   string
+	}{
+		{provider: model.PaymentProviderStripe, wantMultiplier: 0.92, wantCurrency: "EUR"},
+		{provider: model.PaymentProviderEpay, wantMultiplier: 7.2, wantCurrency: "CNY"},
+		{provider: model.PaymentProviderXorPay, wantMultiplier: 7.1, wantCurrency: "CNY"},
+		{provider: model.PaymentProviderWaffoPancake, wantMultiplier: 1.07, wantCurrency: "USD"},
+	}
+	for _, test := range tests {
+		t.Run(test.provider, func(t *testing.T) {
+			multiplier, currency, err := paymentSubscriptionPricing(test.provider, nil)
+			require.NoError(t, err)
+			assert.InDelta(t, test.wantMultiplier, multiplier, 0.000001)
+			assert.Equal(t, test.wantCurrency, currency)
+		})
+	}
 }
 
 func TestEffectivePaymentMethodMinimumCannotBeBypassedByTheClient(t *testing.T) {
@@ -208,6 +246,18 @@ func TestStripeLegacyReturnURLsAreSnapshottedAndRevalidated(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestStripeCanonicalReturnURLsUseFirstPartyCheckout(t *testing.T) {
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	t.Cleanup(func() { operation_setting.CustomCallbackAddress = originalCallbackAddress })
+	operation_setting.CustomCallbackAddress = "https://payments.example.com/"
+
+	order := &model.PaymentOrder{TradeNo: "PO_STRIPE_RETURN", PricingSnapshot: `{"currency":"USD"}`}
+	successURL, cancelURL, err := stripeCheckoutReturnURLs(order)
+	require.NoError(t, err)
+	assert.Equal(t, "https://payments.example.com/payment/PO_STRIPE_RETURN?payment_result=pending", successURL)
+	assert.Equal(t, "https://payments.example.com/payment/PO_STRIPE_RETURN?payment_result=cancelled", cancelURL)
+}
+
 func TestResolveStripeCredentialAccountUsesAuthenticatedBoundedEndpoint(t *testing.T) {
 	t.Setenv(setting.StripeTestModeEnabledEnv, "true")
 	const secret = "sk_test_identity_secret"
@@ -244,7 +294,7 @@ func TestStripeTestConfigurationVerificationFailsClosedByDefault(t *testing.T) {
 
 	_, err = VerifyStripeCheckoutConfiguration(
 		t.Context(), "sk_test_disabled", "acct_platformdisabled", "",
-		"price_disabled", "USD", "test",
+		"price_disabled", "USD", "test", "",
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), setting.StripeTestModeEnabledEnv)
@@ -944,6 +994,59 @@ func TestXorPayLegacyQueryBindsTheCredentialThatFoundTheOrder(t *testing.T) {
 	assert.Equal(t, setting.XorPayPreviousCredentialGeneration, event.ProviderCredentialGeneration)
 }
 
+func TestXorPayQueryReturnsRevokedGenerationWithoutMutatingOrder(t *testing.T) {
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.PaymentOrder{}))
+	keys := []string{
+		model.PaymentConfigurationVersionOptionKey,
+		"XorPayCredentialGeneration", "XorPayPreviousCredentialGeneration",
+		"XorPayPreviousValidBefore", "XorPayPreviousExpiresAt",
+	}
+	require.NoError(t, model.DB.Where("`key` IN ?", keys).Delete(&model.Option{}).Error)
+	require.NoError(t, model.DB.Create([]model.Option{
+		{Key: model.PaymentConfigurationVersionOptionKey, Value: "1"},
+		{Key: "XorPayCredentialGeneration", Value: "24"},
+		{Key: "XorPayPreviousCredentialGeneration", Value: "0"},
+		{Key: "XorPayPreviousValidBefore", Value: "0"},
+		{Key: "XorPayPreviousExpiresAt", Value: "0"},
+	}).Error)
+	t.Cleanup(func() { _ = model.DB.Where("`key` IN ?", keys).Delete(&model.Option{}).Error })
+
+	originalGeneration := setting.XorPayCredentialGeneration
+	originalCurrency := setting.XorPayCurrency
+	setting.XorPayCredentialGeneration = 24
+	setting.XorPayCurrency = "CNY"
+	t.Cleanup(func() {
+		setting.XorPayCredentialGeneration = originalGeneration
+		setting.XorPayCurrency = originalCurrency
+	})
+
+	providerOrderKey := "xorpay:AOID_REVOKED_QUERY"
+	now := time.Now().Unix()
+	order := &model.PaymentOrder{
+		TradeNo: "PO_XORPAY_REVOKED_QUERY", UserID: 993024,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderXorPay,
+		PaymentMethod: model.PaymentMethodXorPayNative, ProviderOrderKey: &providerOrderKey,
+		ProviderCredentialGeneration: 23, ExpectedAmountMinor: 100, Currency: "CNY",
+		RequestID: "xorpay-revoked-query", Status: model.PaymentOrderStatusPending,
+		ExpiresAt: now + 600, CreatedAt: now, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, model.DB.Create(order).Error)
+	t.Cleanup(func() { _ = model.DB.Where("id = ?", order.ID).Delete(&model.PaymentOrder{}).Error })
+
+	var called atomic.Bool
+	provider := &xorPayProvider{client: &http.Client{Transport: paymentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		called.Store(true)
+		return nil, errors.New("unexpected XORPay query")
+	})}}
+	_, err := provider.Query(t.Context(), order)
+	require.ErrorIs(t, err, model.ErrPaymentManualReview)
+	assert.False(t, called.Load())
+	stored, err := model.GetPaymentOrderByTradeNo(order.TradeNo)
+	require.NoError(t, err)
+	assert.Equal(t, model.PaymentOrderStatusPending, stored.Status)
+	assert.Empty(t, stored.StatusReason)
+}
+
 func TestXorPayLegacyQueryDoesNotCrossCredentialGenerationsAfterAmbiguousFailure(t *testing.T) {
 	originalAid, originalSecret := setting.XorPayAid, setting.XorPayAppSecret
 	originalGeneration := setting.XorPayCredentialGeneration
@@ -993,6 +1096,18 @@ func TestXorPayLegacyQueryDoesNotCrossCredentialGenerationsAfterAmbiguousFailure
 	assert.Equal(t, 1, requests)
 }
 
+func TestXorPayQueryTransportErrorDoesNotExposeSignedURL(t *testing.T) {
+	const signature = "signed_query_value_must_not_be_logged"
+	provider := &xorPayProvider{client: &http.Client{Transport: paymentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("transport rejected %s", request.URL.String())
+	})}}
+
+	_, err := provider.queryStatus(t.Context(), "https://xorpay.com/api/query2/aid?order_id=order&sign="+signature)
+	require.EqualError(t, err, "xorpay query request failed")
+	assert.NotContains(t, err.Error(), signature)
+	assert.NotContains(t, err.Error(), "order_id")
+}
+
 func TestXorPayRejectsInvalidProviderConfigurationBeforeNetworkAccess(t *testing.T) {
 	originalSecret := setting.XorPayAppSecret
 	originalAid := setting.XorPayAid
@@ -1028,6 +1143,75 @@ func TestXorPayQRValidationUsesAProviderSpecificAllowlist(t *testing.T) {
 	} {
 		assert.Error(t, validateXorPayQR(setting.XorPayMethodAlipay, value), value)
 	}
+}
+
+func TestXorPayJSAPICreateUsesEncryptedBrowserAuthorization(t *testing.T) {
+	t.Setenv("PAYMENT_SECRET_KEY", "xorpay-jsapi-test-payment-key-at-least-32-bytes")
+	originalAid, originalSecret := setting.XorPayAid, setting.XorPayAppSecret
+	originalGeneration := setting.XorPayCredentialGeneration
+	originalCurrency := setting.XorPayCurrency
+	originalMethods := setting.XorPayEnabledMethods
+	originalCallback := operation_setting.CustomCallbackAddress
+	t.Cleanup(func() {
+		setting.XorPayAid, setting.XorPayAppSecret = originalAid, originalSecret
+		setting.XorPayCredentialGeneration = originalGeneration
+		setting.XorPayCurrency = originalCurrency
+		setting.XorPayEnabledMethods = originalMethods
+		operation_setting.CustomCallbackAddress = originalCallback
+	})
+	setting.XorPayAid, setting.XorPayAppSecret = "aid_jsapi", "xorpay_jsapi_secret_value"
+	setting.XorPayCredentialGeneration = 31
+	setting.XorPayCurrency = "CNY"
+	setting.XorPayEnabledMethods = []string{setting.XorPayMethodJSAPI}
+	operation_setting.CustomCallbackAddress = "https://api.example.com"
+	orderExpiresAt := time.Now().Add(5 * time.Minute).Unix()
+
+	encryptedOpenID, err := model.EncryptPaymentOrderBrowserAuthorization(
+		"PO_XORPAY_JSAPI", "oXorPayUser_0123456789",
+	)
+	require.NoError(t, err)
+	provider := &xorPayProvider{client: &http.Client{Transport: paymentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		require.NoError(t, request.ParseForm())
+		assert.Equal(t, setting.XorPayMethodJSAPI, request.Form.Get("pay_type"))
+		assert.Equal(t, "oXorPayUser_0123456789", request.Form.Get("openid"))
+		expireSeconds, parseErr := strconv.ParseInt(request.Form.Get("expire"), 10, 64)
+		require.NoError(t, parseErr)
+		assert.Greater(t, expireSeconds, int64(0))
+		assert.LessOrEqual(t, expireSeconds, int64(5*time.Minute/time.Second))
+		name := "AI API top-up"
+		expectedSign := xorPayMD5(name + setting.XorPayMethodJSAPI + "1.00" + "PO_XORPAY_JSAPI" +
+			"https://api.example.com/api/xorpay/notify" + setting.XorPayAppSecret)
+		assert.Equal(t, expectedSign, request.Form.Get("sign"))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{
+				"status":"ok","aoid":"AOID_JSAPI","expire_in":600,
+				"info":{"appId":"wx1234567890ABCDEF","timeStamp":"1720000000","nonceStr":"safe_nonce_123","package":"prepay_id=example","signType":"MD5","paySign":"0123456789ABCDEF0123456789ABCDEF"}
+			}`)),
+			Request: request,
+		}, nil
+	})}}
+	start, err := provider.Create(t.Context(), &model.PaymentOrder{
+		TradeNo: "PO_XORPAY_JSAPI", OrderKind: model.PaymentOrderKindTopUp,
+		Provider: model.PaymentProviderXorPay, PaymentMethod: model.PaymentMethodXorPayJSAPI,
+		Currency: "CNY", ExpectedAmountMinor: 100, ProviderCredentialGeneration: 31,
+		BrowserAuthorizationPayload: encryptedOpenID, ExpiresAt: orderExpiresAt,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, PaymentFlowJSAPI, start.Flow)
+	require.NotNil(t, start.JSAPI)
+	assert.Equal(t, "wx1234567890ABCDEF", start.JSAPI.AppID)
+	assert.Empty(t, start.QRContent)
+	assert.Equal(t, orderExpiresAt, start.ExpiresAt)
+}
+
+func TestXorPayJSAPIValidationRejectsIncompleteProviderParameters(t *testing.T) {
+	_, err := validateXorPayJSAPIParameters(xorPayCreateInfo{
+		AppID: "wx1234567890ABCDEF", Timestamp: "not-a-number", NonceStr: "nonce",
+		Package: "prepay_id=example", SignType: "MD5", PaySign: "0123456789ABCDEF0123456789ABCDEF",
+	})
+	assert.Error(t, err)
 }
 
 func TestStripeWebhookVerificationSupportsPreviousSecretAndNormalizesCheckout(t *testing.T) {
@@ -1159,18 +1343,18 @@ func TestStripeCheckoutConfigurationProbeBindsPriceCurrencyPermissionsAndAccount
 
 	fingerprint, err := VerifyStripeCheckoutConfiguration(
 		t.Context(), "sk_test_verified", "acct_platformverified", "acct_connectedverified",
-		"price_verified", "USD", "test",
+		"price_verified", "USD", "test", "checkout.example.com",
 	)
 	require.NoError(t, err)
 	assert.Len(t, fingerprint, 64)
 	assert.Equal(t, fingerprint, StripeCheckoutConfigurationFingerprint(
-		"sk_test_verified", "acct_platformverified", "acct_connectedverified", "price_verified", "USD", "test",
+		"sk_test_verified", "acct_platformverified", "acct_connectedverified", "price_verified", "USD", "test", "checkout.example.com",
 	))
 	assert.EqualValues(t, 1, checkoutProbeCount.Load())
 
 	secondFingerprint, err := VerifyStripeCheckoutConfiguration(
 		t.Context(), "sk_test_verified", "acct_platformverified", "acct_connectedverified",
-		"price_verified", "USD", "test",
+		"price_verified", "USD", "test", "CHECKOUT.EXAMPLE.COM",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, fingerprint, secondFingerprint)
@@ -1178,7 +1362,7 @@ func TestStripeCheckoutConfigurationProbeBindsPriceCurrencyPermissionsAndAccount
 
 	_, err = VerifyStripeCheckoutConfiguration(
 		t.Context(), "sk_test_verified", "acct_platformverified", "acct_connectedverified",
-		"price_verified", "EUR", "test",
+		"price_verified", "EUR", "test", "",
 	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "currency mismatch")
@@ -1186,7 +1370,7 @@ func TestStripeCheckoutConfigurationProbeBindsPriceCurrencyPermissionsAndAccount
 	denyCheckout = true
 	_, err = VerifyStripeCheckoutConfiguration(
 		t.Context(), "rk_test_restricted", "acct_platformverified", "acct_connectedverified",
-		"price_verified", "USD", "test",
+		"price_verified", "USD", "test", "",
 	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot create Checkout Sessions")
@@ -1195,7 +1379,7 @@ func TestStripeCheckoutConfigurationProbeBindsPriceCurrencyPermissionsAndAccount
 	denyPrice = true
 	_, err = VerifyStripeCheckoutConfiguration(
 		t.Context(), "rk_test_price_denied", "acct_platformverified", "acct_connectedverified",
-		"price_verified", "USD", "test",
+		"price_verified", "USD", "test", "",
 	)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot access")

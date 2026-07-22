@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,12 +42,21 @@ type xorPayCredential struct {
 }
 
 type xorPayCreateResponse struct {
-	Status    string `json:"status"`
-	AOID      string `json:"aoid"`
-	ExpiresIn int64  `json:"expires_in"`
-	Info      struct {
-		QR string `json:"qr"`
-	} `json:"info"`
+	Status    string           `json:"status"`
+	AOID      string           `json:"aoid"`
+	ExpiresIn int64            `json:"expires_in"`
+	ExpireIn  int64            `json:"expire_in"`
+	Info      xorPayCreateInfo `json:"info"`
+}
+
+type xorPayCreateInfo struct {
+	QR        string `json:"qr"`
+	AppID     string `json:"appId"`
+	Timestamp string `json:"timeStamp"`
+	NonceStr  string `json:"nonceStr"`
+	Package   string `json:"package"`
+	SignType  string `json:"signType"`
+	PaySign   string `json:"paySign"`
 }
 
 type xorPayQueryResponse struct {
@@ -112,6 +122,21 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 		"order_id":   {order.TradeNo},
 		"notify_url": {notifyURL},
 	}
+	requestStartedAt := time.Now().Unix()
+	if order.ExpiresAt > 0 {
+		remaining := order.ExpiresAt - requestStartedAt
+		if remaining <= 0 {
+			return nil, model.ErrPaymentQuoteExpired
+		}
+		form.Set("expire", strconv.FormatInt(remaining, 10))
+	}
+	if upstreamMethod == setting.XorPayMethodJSAPI {
+		openID, authorizationErr := model.PaymentOrderBrowserAuthorization(order)
+		if authorizationErr != nil {
+			return nil, authorizationErr
+		}
+		form.Set("openid", openID)
+	}
 	form.Set("sign", xorPayMD5(name+upstreamMethod+price+order.TradeNo+notifyURL+credential.secret))
 	endpoint := xorPayBaseURL + "/api/pay/" + url.PathEscape(credential.aid)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
@@ -139,14 +164,38 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 	if !xorPayAidPattern.MatchString(result.AOID) {
 		return nil, fmt.Errorf("%w: xorpay response contains an invalid aoid", ErrPaymentStateUnknown)
 	}
-	if err := validateXorPayQR(upstreamMethod, result.Info.QR); err != nil {
-		return nil, err
+	expiresIn := result.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = result.ExpireIn
 	}
-	if result.ExpiresIn <= 0 || result.ExpiresIn > 24*60*60 {
-		result.ExpiresIn = xorPayDefaultExpiry
+	if expiresIn <= 0 || expiresIn > 24*60*60 {
+		expiresIn = xorPayDefaultExpiry
 	}
-	expiresAt := time.Now().Unix() + result.ExpiresIn
+	responseReceivedAt := time.Now().Unix()
+	expiresAt := responseReceivedAt + expiresIn
+	if order.ExpiresAt > 0 && expiresAt > order.ExpiresAt {
+		expiresAt = order.ExpiresAt
+	}
+	if expiresAt <= responseReceivedAt {
+		return nil, fmt.Errorf("%w: xorpay order was created after the local payment session expired", ErrPaymentStateUnknown)
+	}
 	providerOrderKey := "xorpay:" + result.AOID
+	start := &PaymentStart{ExpiresAt: expiresAt, ProviderOrderKey: providerOrderKey}
+	if upstreamMethod == setting.XorPayMethodJSAPI {
+		parameters, validationErr := validateXorPayJSAPIParameters(result.Info)
+		if validationErr != nil {
+			return nil, fmt.Errorf("%w: invalid xorpay JSAPI payment instructions: %v", ErrPaymentStateUnknown, validationErr)
+		}
+		start.Flow = PaymentFlowJSAPI
+		start.JSAPI = parameters
+		return start, nil
+	}
+	if err := validateXorPayQR(upstreamMethod, result.Info.QR); err != nil {
+		// XORPay has already accepted the merchant order at this point. Treat an
+		// invalid or missing QR as an ambiguous creation result so the worker
+		// queries the existing order instead of blindly creating another one.
+		return nil, fmt.Errorf("%w: invalid xorpay payment instructions: %v", ErrPaymentStateUnknown, err)
+	}
 	return &PaymentStart{
 		Flow: PaymentFlowQR, QRContent: result.Info.QR, ExpiresAt: expiresAt,
 		ProviderOrderKey: providerOrderKey,
@@ -302,9 +351,6 @@ func (p *xorPayProvider) Query(ctx context.Context, order *model.PaymentOrder) (
 			return nil, err
 		}
 		if !available {
-			if err := model.MarkPaymentOrderCredentialGenerationManualReview(order.TradeNo); err != nil && !errors.Is(err, model.ErrPaymentOrderNotFound) {
-				return nil, err
-			}
 			return nil, model.ErrPaymentManualReview
 		}
 	} else if hasProviderOrderIdentity {
@@ -396,7 +442,17 @@ func (p *xorPayProvider) queryStatus(ctx context.Context, endpoint string) (stri
 	request.Header.Set("Accept", "application/json")
 	response, err := p.client.Do(request)
 	if err != nil {
-		return "", err
+		// query2 carries a merchant signature in the URL query. net/http errors
+		// may embed the full request URL, so never return the raw error into the
+		// durable task record or application logs.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return "", errors.New("xorpay query request timed out")
+		}
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			return "", errors.New("xorpay query request timed out")
+		}
+		return "", errors.New("xorpay query request failed")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -451,6 +507,8 @@ func xorPayUpstreamMethod(method string) (string, error) {
 		return setting.XorPayMethodNative, nil
 	case model.PaymentMethodXorPayAlipay:
 		return setting.XorPayMethodAlipay, nil
+	case model.PaymentMethodXorPayJSAPI:
+		return setting.XorPayMethodJSAPI, nil
 	default:
 		return "", fmt.Errorf("unsupported xorpay payment method: %s", method)
 	}
@@ -472,7 +530,7 @@ func xorPayCreateError(status string) error {
 		return fmt.Errorf("%w: xorpay create returned %s", ErrPaymentStateUnknown, status)
 	case "fee_error":
 		return fmt.Errorf("%w: xorpay create returned %s", ErrPaymentStateUnknown, status)
-	case "missing_argument", "aid_not_exist", "pay_type_error", "sign_error", "app_off", "no_contract", "no_alipay_contract", "wechat_api_error", "alipay_api_error":
+	case "missing_argument", "aid_not_exist", "pay_type_error", "sign_error", "app_off", "no_contract", "no_alipay_contract", "wechat_api_error", "alipay_api_error", "invalid_openid":
 		return fmt.Errorf("xorpay create failed: %s", status)
 	case "":
 		return fmt.Errorf("%w: xorpay response is missing status", ErrPaymentStateUnknown)
@@ -497,4 +555,46 @@ func validateXorPayQR(method, value string) error {
 		return errors.New("unexpected xorpay alipay QR URL")
 	}
 	return nil
+}
+
+func validateXorPayJSAPIParameters(info xorPayCreateInfo) (*PaymentJSAPIParameters, error) {
+	appID := strings.TrimSpace(info.AppID)
+	timestamp := strings.TrimSpace(info.Timestamp)
+	nonceStr := strings.TrimSpace(info.NonceStr)
+	packageValue := strings.TrimSpace(info.Package)
+	signType := strings.ToUpper(strings.TrimSpace(info.SignType))
+	paySign := strings.TrimSpace(info.PaySign)
+	if len(appID) != 18 || !strings.HasPrefix(appID, "wx") {
+		return nil, errors.New("invalid app id")
+	}
+	for _, character := range appID[2:] {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' {
+			continue
+		}
+		return nil, errors.New("invalid app id")
+	}
+	if len(timestamp) < 1 || len(timestamp) > 16 {
+		return nil, errors.New("invalid timestamp")
+	}
+	for _, character := range timestamp {
+		if character < '0' || character > '9' {
+			return nil, errors.New("invalid timestamp")
+		}
+	}
+	if nonceStr == "" || len(nonceStr) > 128 || strings.ContainsAny(nonceStr, "\r\n\x00") {
+		return nil, errors.New("invalid nonce")
+	}
+	if !strings.HasPrefix(packageValue, "prepay_id=") || len(packageValue) > 256 || strings.ContainsAny(packageValue, "\r\n\x00") {
+		return nil, errors.New("invalid package")
+	}
+	if signType != "MD5" && signType != "HMAC-SHA256" {
+		return nil, errors.New("invalid sign type")
+	}
+	if len(paySign) < 16 || len(paySign) > 256 || strings.ContainsAny(paySign, "\r\n\x00") {
+		return nil, errors.New("invalid payment signature")
+	}
+	return &PaymentJSAPIParameters{
+		AppID: appID, Timestamp: timestamp, NonceStr: nonceStr, Package: packageValue,
+		SignType: signType, PaySign: paySign,
+	}, nil
 }

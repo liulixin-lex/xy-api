@@ -76,12 +76,18 @@ jobs:
           done
           shellcheck -x "${release_scripts[@]}"
           scripts/release/github-release-assets-test.sh
+          scripts/release/historical-assets-test.sh
           if rg -n -- '--method PATCH' \
             .github/workflows/release.yml \
             .github/workflows/recover-v0.2.0.yml; then
             echo '::error::Stable release metadata mutations must use the full-contract release helper.'
             exit 1
           fi
+
+      - name: Verify preserved v0.1.6 historical assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/release/verify-historical-assets.sh
 
   backend:
     name: Backend tests
@@ -106,8 +112,8 @@ jobs:
       - name: Validate release version format
         run: |
           VERSION=$(< VERSION)
-          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::VERSION must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+          if [[ ! "$VERSION" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::VERSION must remain on the protected v0.2.x line. Current value: $VERSION"
             exit 1
           fi
           if ! cmp -s VERSION <(printf '%s\n' "$VERSION"); then
@@ -161,7 +167,9 @@ jobs:
           printf '%s\n' \
             "MYSQL57_TEST_CLEAN_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_clean?charset=utf8mb4&parseTime=true" \
             "MYSQL57_TEST_UPGRADE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_upgrade?charset=utf8&parseTime=true" \
+            "MYSQL57_TEST_V020_UPGRADE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_v020_upgrade?charset=utf8mb4&parseTime=true" \
             "MYSQL57_TEST_LOG_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_log?charset=utf8mb4&parseTime=true" \
+            "PAYMENT_MYSQL57_TEST_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_payment?charset=utf8mb4&parseTime=true" \
             "MYSQL57_TEST_GBK8_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3307)/new_api_gbk8?charset=gbk&parseTime=true" \
             >>"$GITHUB_ENV"
           docker run --detach \
@@ -203,15 +211,124 @@ jobs:
             'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
               CREATE DATABASE new_api_clean CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
               CREATE DATABASE new_api_upgrade CHARACTER SET utf8 COLLATE utf8_general_ci;
+              CREATE DATABASE new_api_v020_upgrade CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
               CREATE DATABASE new_api_log CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE DATABASE new_api_payment CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
             "'
           docker exec new-api-mysql57-gbk8 sh -c \
             'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
               CREATE DATABASE new_api_gbk8 CHARACTER SET gbk COLLATE gbk_chinese_ci;
             "'
 
-      - name: Verify clean, upgrade, fail-closed, repeat, and log migrations
-        run: go test ./model -run '^TestMySQL57CompactMigrationCompatibility$' -count=1
+      - name: Verify migration and payment concurrency contracts
+        run: |
+          go test ./model \
+            -run '^(TestMySQL57CompactMigrationCompatibility|TestPaymentMySQL57IntegrationContracts|TestV020ToV021MySQL57Migration|TestV020ToV021SQLiteMigration)$' \
+            -count=1
+
+  postgres96-payment:
+    name: PostgreSQL 9.6 payment contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Start PostgreSQL 9.6
+        run: |
+          set -euo pipefail
+          POSTGRES_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          printf '%s\n' \
+            "PAYMENT_POSTGRES96_TEST_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_payment port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_V020_UPGRADE_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_v020_upgrade port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_LOCK_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_migration_lock port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_LOG_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_log port=5432 sslmode=disable TimeZone=UTC" \
+            >>"$GITHUB_ENV"
+          docker run --detach \
+            --name new-api-postgres96 \
+            --publish 5432:5432 \
+            --env POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --env POSTGRES_DB=new_api_payment \
+            postgres@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698
+          for attempt in $(seq 1 90); do
+            if docker exec new-api-postgres96 sh -c \
+              'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d new_api_payment -tAc "SELECT 1" >/dev/null 2>&1'; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs new-api-postgres96
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec new-api-postgres96 sh -c \
+            'PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_v020_upgrade &&
+             PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_migration_lock &&
+             PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_log'
+
+      - name: Verify migration, lock, and payment concurrency contracts
+        run: |
+          go test ./model \
+            -run '^(TestPaymentPostgreSQL96IntegrationContracts|TestPostgreSQL96MigrationLockContracts|TestV020ToV021PostgreSQL96Migration)$' \
+            -count=1
+
+  payment-multinode-runtime:
+    name: Payment multi-node runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698
+        env:
+          POSTGRES_PASSWORD: payment-multinode-postgres-test-password
+          POSTGRES_DB: new_api_multinode
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d new_api_multinode"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 45
+      redis:
+        image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Build runtime with embedded frontend placeholders
+        run: |
+          set -euo pipefail
+          mkdir -p web/default/dist web/classic/dist
+          printf '<!doctype html><html><body>ci placeholder</body></html>' >web/default/dist/index.html
+          printf '<!doctype html><html><body>ci placeholder</body></html>' >web/classic/dist/index.html
+          go build -trimpath -o "$RUNNER_TEMP/new-api-payment-multinode" .
+
+      - name: Verify shared-database and shared-Redis payment readiness
+        env:
+          PAYMENT_MULTINODE_SQL_DSN: postgresql://postgres:payment-multinode-postgres-test-password@127.0.0.1:5432/new_api_multinode?sslmode=disable
+          PAYMENT_MULTINODE_SPLIT_SQL_DSN: postgresql://postgres:payment-multinode-postgres-test-password@127.0.0.1:5432/postgres?sslmode=disable
+          PAYMENT_MULTINODE_REDIS_URL: redis://127.0.0.1:6379/0
+        run: scripts/release/payment-multinode-smoke.sh "$RUNNER_TEMP/new-api-payment-multinode"
 
   frontend-default:
     name: Default frontend build
@@ -306,6 +423,10 @@ jobs:
         working-directory: web/classic
         run: bun test
 
+      - name: Validate payment translations across both themes
+        working-directory: web/classic
+        run: bun run i18n:payment-admin
+
       - name: Build classic frontend
         working-directory: web/classic
         run: VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun --bun run build
@@ -322,7 +443,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(<VERSION)
-          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          if [[ ! "$version" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Invalid repository VERSION: $version"
             exit 1
           fi
@@ -386,7 +507,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(<VERSION)
-          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          if [[ ! "$version" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Invalid repository VERSION: $version"
             exit 1
           fi

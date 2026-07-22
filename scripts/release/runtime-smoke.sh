@@ -25,7 +25,7 @@ production instance.
 
 Useful optional variables:
 
-  RUNTIME_SMOKE_EXPECTED_VERSION=v0.2.0
+  RUNTIME_SMOKE_EXPECTED_VERSION=v0.2.1
   RUNTIME_SMOKE_ALLOW_REMOTE=1              # remote targets must use HTTPS
   RUNTIME_SMOKE_ALLOW_REMOTE_INITIALIZATION=1
   RUNTIME_SMOKE_PAUSE_PERFORMANCE_GATE=1    # initialized disposable targets
@@ -364,7 +364,7 @@ expect_api_success() {
   fi
 }
 
-wait_for_status() {
+wait_for_readiness() {
   local attempt
   local status
   for ((attempt = 0; attempt < ready_timeout; attempt++)); do
@@ -376,9 +376,9 @@ wait_for_status() {
         "${base_curl_proxy_args[@]}" \
         --output "$response_file" \
         --write-out '%{http_code}' \
-        "$base_url/api/status" 2>/dev/null
+        "$base_url/api/readiness" 2>/dev/null
     ); then
-      if [ "$status" = 200 ] && jq --exit-status '.success == true' "$response_file" >/dev/null 2>&1; then
+      if [ "$status" = 200 ] && jq --exit-status '.success == true and .status == "ready"' "$response_file" >/dev/null 2>&1; then
         return
       fi
     fi
@@ -623,7 +623,7 @@ restore_performance_gate() {
 }
 
 log "waiting for $base_url"
-wait_for_status
+wait_for_readiness
 
 http_request public GET /api/status "$response_file"
 expect_http_status "200" "/api/status"
@@ -635,6 +635,14 @@ if [ -n "$expected_version" ] && ! jq --exit-status --arg version "$expected_ver
   fail "/api/status version does not match RUNTIME_SMOKE_EXPECTED_VERSION"
 fi
 log "status contract passed"
+
+http_request public GET /api/readiness "$response_file"
+expect_http_status "200" "/api/readiness"
+expect_api_success "$response_file" "/api/readiness"
+if ! jq --exit-status '.status == "ready"' "$response_file" >/dev/null 2>&1; then
+  fail "/api/readiness did not return the ready contract"
+fi
+log "readiness contract passed"
 
 http_request public GET /api/setup "$response_file"
 expect_http_status "200" "/api/setup"
@@ -940,14 +948,29 @@ http_request session GET /api/user/topup/info "$response_file"
 expect_http_status "200" "top-up information"
 expect_api_success "$response_file" "top-up information"
 if ! jq --exit-status '
-  (.data.pay_methods | type == "array") and
+  (.data.payment_routes | type == "array") and
+  (.data.payment_products | type == "array") and
+  (.data.payment_route_options | type == "array") and
   (.data.payment_compliance_confirmed | type == "boolean") and
-  (.data.enable_online_topup | type == "boolean") and
-  (.data.enable_stripe_topup | type == "boolean") and
-  (.data.enable_xorpay_topup | type == "boolean")
+  (.data.enable_redemption | type == "boolean") and
+  (.data.online_payment_available | type == "boolean") and
+  ([.data | .. | objects | keys[] |
+    select(
+      . == "provider" or
+      . == "payment_provider" or
+      . == "payment_method" or
+      . == "credential_generation" or
+      . == "webhook"
+    )] | length == 0) and
+  (.data | has("pay_methods") | not) and
+  (.data | has("enable_online_topup") | not) and
+  (.data | has("enable_stripe_topup") | not) and
+  (.data | has("enable_xorpay_topup") | not) and
+  (.data | has("xorpay_min_topup") | not)
 ' "$response_file" >/dev/null 2>&1; then
   fail "top-up information did not expose the safe payment capability contract"
 fi
+payment_compliance_confirmed=$(jq -r '.data.payment_compliance_confirmed' "$response_file")
 
 http_request session GET "/api/user/topup/self?p=1&page_size=20" "$response_file"
 expect_http_status "200" "top-up history before safe payment probes"
@@ -957,22 +980,55 @@ topup_total_before=$(jq -r '.data.total' "$response_file")
 http_request session GET /api/subscription/plans "$response_file"
 expect_http_status "200" "subscription plans"
 expect_api_success "$response_file" "subscription plans"
-if ! jq --exit-status '.data | type == "array"' "$response_file" >/dev/null 2>&1; then
-  fail "subscription plans did not return an array contract"
+if ! jq --exit-status '
+  (.data | type == "array") and
+  ([.data | .. | objects | keys[] |
+    select(
+      . == "stripe_price_id" or
+      . == "creem_product_id" or
+      . == "waffo_pancake_product_id" or
+      . == "upgrade_group" or
+      . == "downgrade_group" or
+      . == "enabled" or
+      . == "sort_order"
+    )] | length == 0)
+' "$response_file" >/dev/null 2>&1; then
+  fail "subscription plans did not return the safe public contract"
 fi
 
 http_request session GET /api/subscription/self "$response_file"
 expect_http_status "200" "subscription state before safe payment probes"
 expect_api_success "$response_file" "subscription state before safe payment probes"
-if ! jq --exit-status '(.data.subscriptions | type == "array") and (.data.all_subscriptions | type == "array")' "$response_file" >/dev/null 2>&1; then
-  fail "subscription state did not expose active and historical arrays"
+if ! jq --exit-status '
+  (.data.subscriptions | type == "array") and
+  (.data.all_subscriptions | type == "array") and
+  ([.data | .. | objects | keys[] |
+    select(
+      . == "user_id" or
+      . == "payment_order_id" or
+      . == "source" or
+      . == "upgrade_group" or
+      . == "downgrade_group" or
+      . == "prev_user_group" or
+      . == "amount_used_total" or
+      . == "usage_accounting_version" or
+      . == "quota_reset_version" or
+      . == "created_at" or
+      . == "updated_at"
+    )] | length == 0)
+' "$response_file" >/dev/null 2>&1; then
+  fail "subscription state did not return the safe public contract"
 fi
 subscription_total_before=$(jq -r '.data.all_subscriptions | length' "$response_file")
 
-invalid_quote_payload='{"order_kind":"topup","provider":"runtime-smoke-invalid","payment_method":"invalid","amount":0}'
+invalid_quote_payload='{"order_kind":"topup","route_id":"runtime-smoke-invalid","amount":0}'
 http_request session POST /api/user/payment/quote "$response_file" "$invalid_quote_payload"
 expect_http_status "400" "invalid top-up quote"
-if ! jq --exit-status '.success == false and (.data.quote_id? == null)' "$response_file" >/dev/null 2>&1; then
+if ! jq --exit-status '
+  .success == false and
+  .code == "payment_method_unavailable" and
+  (.data? == null)
+' "$response_file" >/dev/null 2>&1; then
   fail "invalid top-up quote did not fail closed"
 fi
 
@@ -980,14 +1036,22 @@ invalid_start_payload=$(jq --compact-output --null-input --arg request_id "runti
   '{quote_id:"runtime-smoke-missing-quote",request_id:$request_id}')
 http_request session POST /api/user/payment/start "$response_file" "$invalid_start_payload"
 unset invalid_start_payload
-expect_http_status "400" "missing payment quote start"
-if ! jq --exit-status '.success == false' "$response_file" >/dev/null 2>&1; then
+expect_http_status "404" "missing payment quote start"
+if ! jq --exit-status '
+  .success == false and
+  .code == "payment_quote_not_found" and
+  (.data? == null)
+' "$response_file" >/dev/null 2>&1; then
   fail "missing payment quote did not fail closed"
 fi
 
 http_request session GET "/api/user/payment/orders/runtime-smoke-missing-$run_id" "$response_file"
 expect_http_status "404" "missing payment order lookup"
-if ! jq --exit-status '.success == false' "$response_file" >/dev/null 2>&1; then
+if ! jq --exit-status '
+  .success == false and
+  .code == "payment_order_not_found" and
+  (.data? == null)
+' "$response_file" >/dev/null 2>&1; then
   fail "missing payment order did not return the not-found contract"
 fi
 
@@ -996,15 +1060,28 @@ invalid_subscription_payload=$(jq --compact-output --null-input --arg request_id
 http_request session POST /api/subscription/balance/pay "$response_file" "$invalid_subscription_payload"
 unset invalid_subscription_payload
 expect_http_status "200" "invalid subscription balance purchase"
-if ! jq --exit-status '.success == false' "$response_file" >/dev/null 2>&1; then
+if [ "$payment_compliance_confirmed" = true ]; then
+  expected_subscription_error=payment_request_invalid
+else
+  expected_subscription_error=payment_temporarily_unavailable
+fi
+if ! jq --exit-status --arg expected_code "$expected_subscription_error" '
+  .success == false and
+  .code == $expected_code and
+  (.data? == null)
+' "$response_file" >/dev/null 2>&1; then
   fail "invalid subscription balance purchase did not fail closed"
 fi
+unset expected_subscription_error payment_compliance_confirmed
 
 http_request session GET /api/user/self "$response_file"
 expect_http_status "200" "quota after safe payment probes"
 expect_api_success "$response_file" "quota after safe payment probes"
-if ! jq --exit-status --argjson quota "$user_quota_after" --argjson used "$user_used_after" \
-  '.data.quota == $quota and .data.used_quota == $used' "$response_file" >/dev/null 2>&1; then
+if ! jq --exit-status --argjson quota "$user_quota_after" --argjson used "$user_used_after" '
+  .data.quota == $quota and
+  .data.used_quota == $used and
+  (.data | has("stripe_customer") | not)
+' "$response_file" >/dev/null 2>&1; then
   fail "safe payment probes changed user quota"
 fi
 

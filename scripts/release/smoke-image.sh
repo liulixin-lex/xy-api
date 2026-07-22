@@ -122,6 +122,7 @@ if [ -z "$published_port" ]; then
 fi
 
 status_url="http://127.0.0.1:${published_port}/api/status"
+readiness_url="http://127.0.0.1:${published_port}/api/readiness"
 for _ in $(seq 1 120); do
   if [ "$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)" != true ]; then
     echo "container exited before becoming ready" >&2
@@ -140,15 +141,25 @@ for _ in $(seq 1 120); do
       --arg expected_version "$expected_version" \
       '.success == true and .data.version == $expected_version' \
       "$response_file" >/dev/null; then
-      echo "verified $image_reference ($expected_arch, $expected_version) via /api/status"
-      exit 0
+      if curl \
+        --fail \
+        --silent \
+        --show-error \
+        --noproxy '*' \
+        --max-time 5 \
+        "$readiness_url" \
+        --output "$response_file" 2>/dev/null &&
+        jq --exit-status '.success == true and .status == "ready"' "$response_file" >/dev/null; then
+        echo "verified $image_reference ($expected_arch, $expected_version) via /api/status and /api/readiness"
+        exit 0
+      fi
     fi
   fi
 
   sleep 2
 done
 
-echo "image did not return the expected /api/status payload within 240 seconds" >&2
+echo "image did not return the expected /api/status and /api/readiness payloads within 240 seconds" >&2
 if [ -s "$response_file" ]; then
   echo "last response:" >&2
   sed -n '1,40p' "$response_file" >&2

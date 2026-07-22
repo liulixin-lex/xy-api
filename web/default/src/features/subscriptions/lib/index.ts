@@ -24,3 +24,4 @@ export {
   formValuesToPlanPayload,
   type PlanFormValues,
 } from './plan-form'
+export { hasLegacyStripePriceMapping } from './legacy-stripe'

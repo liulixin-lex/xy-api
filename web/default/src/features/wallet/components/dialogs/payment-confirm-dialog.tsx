@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -31,10 +30,15 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Spinner } from '@/components/ui/spinner'
 import { formatLocalCurrencyAmount } from '@/lib/currency'
 
 import { DEFAULT_DISCOUNT_RATE } from '../../constants'
-import { getPaymentIcon } from '../../lib'
+import {
+  getPaymentIcon,
+  getPublicPaymentMethodIconType,
+  getPublicPaymentMethodLabel,
+} from '../../lib'
 import { formatPaymentDecimalAmount } from '../../lib/billing'
 import type { ClientPaymentQuote, PaymentMethod } from '../../types'
 
@@ -71,6 +75,11 @@ export function PaymentConfirmDialog({
   const hasDiscount = discountRate > 0 && discountRate < 1 && paymentAmount > 0
   const originalAmount = hasDiscount ? paymentAmount / discountRate : 0
   const discountAmount = hasDiscount ? originalAmount - paymentAmount : 0
+  const paymentMethodLabel = paymentMethod
+    ? getPublicPaymentMethodLabel(paymentMethod, t)
+    : t('Payment method')
+  const paymentFormatContext =
+    paymentMethod?.public_method === 'card' ? 'card' : undefined
 
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
@@ -111,7 +120,7 @@ export function PaymentConfirmDialog({
                     ? formatPaymentDecimalAmount(
                         quote.payable_amount,
                         quote.currency,
-                        quote.provider
+                        paymentFormatContext
                       )
                     : t('Not available')}
                 </span>
@@ -121,7 +130,7 @@ export function PaymentConfirmDialog({
                       ? formatPaymentDecimalAmount(
                           originalAmount,
                           quote.currency,
-                          quote.provider
+                          paymentFormatContext
                         )
                       : t('Not available')}
                   </span>
@@ -139,7 +148,7 @@ export function PaymentConfirmDialog({
                     ? formatPaymentDecimalAmount(
                         discountAmount,
                         quote.currency,
-                        quote.provider
+                        paymentFormatContext
                       )
                     : t('Not available')}
                 </span>
@@ -154,12 +163,14 @@ export function PaymentConfirmDialog({
               </span>
               <div className='flex items-center gap-2'>
                 {getPaymentIcon(
-                  paymentMethod?.type,
+                  paymentMethod
+                    ? getPublicPaymentMethodIconType(paymentMethod)
+                    : undefined,
                   'h-4 w-4',
-                  paymentMethod?.icon,
-                  paymentMethod?.name
+                  undefined,
+                  paymentMethodLabel
                 )}
-                <span className='font-medium'>{paymentMethod?.name}</span>
+                <span className='font-medium'>{paymentMethodLabel}</span>
               </div>
             </div>
           </div>
@@ -178,8 +189,11 @@ export function PaymentConfirmDialog({
           <AlertDialogAction
             onClick={onConfirm}
             disabled={processing || calculating || !quote || !!quoteError}
+            aria-busy={processing}
           >
-            {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
+            {processing && (
+              <Spinner className='mr-2' aria-label={t('Preparing payment')} />
+            )}
             {t('Confirm Payment')}
           </AlertDialogAction>
         </AlertDialogFooter>

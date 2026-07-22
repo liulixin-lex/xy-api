@@ -16,40 +16,72 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useCallback } from 'react'
 import i18next from 'i18next'
+import { useCallback, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { requestCreemPayment, isApiSuccess } from '../api'
+
+import { createPaymentQuote, isApiSuccess, startPayment } from '../api'
+import { createPaymentError, getPaymentErrorMessage } from '../lib/payment'
+import type { PaymentStart } from '../types'
+
+function createRequestId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
 
 /**
  * Hook for handling Creem payment processing
  */
 export function useCreemPayment() {
   const [processing, setProcessing] = useState(false)
+  const operationRef = useRef<{
+    key: string
+    quoteId: string
+    requestId: string
+  } | null>(null)
 
-  const processCreemPayment = useCallback(async (productId: string) => {
-    setProcessing(true)
-    try {
-      const response = await requestCreemPayment({
-        product_id: productId,
-        payment_method: 'creem',
-      })
-
-      if (isApiSuccess(response) && response.data?.checkout_url) {
-        window.open(response.data.checkout_url, '_blank')
-        toast.success(i18next.t('Redirecting to Creem checkout...'))
-        return true
+  const processCreemPayment = useCallback(
+    async (
+      routeId: string,
+      productId: string
+    ): Promise<PaymentStart | null> => {
+      setProcessing(true)
+      try {
+        const key = `${routeId}:${productId}`
+        if (operationRef.current?.key !== key) {
+          const quoteResponse = await createPaymentQuote({
+            order_kind: 'topup',
+            route_id: routeId,
+            product_id: productId,
+          })
+          if (!isApiSuccess(quoteResponse) || !quoteResponse.data) {
+            throw createPaymentError(quoteResponse)
+          }
+          operationRef.current = {
+            key,
+            quoteId: quoteResponse.data.quote_id,
+            requestId: createRequestId(),
+          }
+        }
+        const response = await startPayment({
+          quote_id: operationRef.current.quoteId,
+          request_id: operationRef.current.requestId,
+        })
+        if (!isApiSuccess(response) || !response.data) {
+          throw createPaymentError(response)
+        }
+        return response.data
+      } catch (error) {
+        toast.error(getPaymentErrorMessage(error, i18next.t.bind(i18next)))
+        return null
+      } finally {
+        setProcessing(false)
       }
-
-      toast.error(response.message || i18next.t('Payment request failed'))
-      return false
-    } catch {
-      toast.error(i18next.t('Payment request failed'))
-      return false
-    } finally {
-      setProcessing(false)
-    }
-  }, [])
+    },
+    []
+  )
 
   return { processing, processCreemPayment }
 }

@@ -25,7 +25,7 @@
     "dayjs": "^1.11.21",
     "oxfmt": "^0.57.0",
     "oxlint": "^1.72.0",
-    "prettier": "^3.8.3",
+    "prettier": "3.8.3",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
@@ -35,9 +35,13 @@
     "sse.js": "^2.8.0"
   },
   "overrides": {
-    "dompurify": "3.4.11",
+    "@hono/node-server": "2.0.11",
+    "dompurify": "3.4.12",
+    "fast-uri": "3.1.4",
     "form-data": "4.0.6",
     "hono": "4.12.31",
+    "js-yaml": "4.3.0",
+    "linkify-it": "5.0.2",
     "minimist": "1.2.8"
   }
 }

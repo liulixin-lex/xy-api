@@ -147,6 +147,9 @@ func main() {
 	// switch are enforced inside the runner and each handler's Enabled().
 	controller.RegisterScheduledSystemTasks()
 	service.StartSystemTaskRunner()
+	// Payment creation and reconciliation are durable per-order tasks. Every
+	// node runs a worker; database leases and fencing select a single executor.
+	service.StartPaymentTaskRunner()
 
 	if os.Getenv("BATCH_UPDATE_ENABLED") == "true" {
 		common.BatchUpdateEnabled = true
@@ -239,6 +242,9 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(fmt.Sprintf("server forced to shutdown: %v", err))
+	}
+	if err := service.UnregisterCurrentSystemInstance(); err != nil {
+		common.SysError(fmt.Sprintf("failed to unregister system instance: %v", err))
 	}
 	// 内存中的看板数据保存入库，避免重启丢失未落库数据 (issue #5679)
 	if common.DataExportEnabled {

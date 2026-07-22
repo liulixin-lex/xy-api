@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -34,7 +35,35 @@ func SetUpLogger(server *gin.Engine) {
 			param.Latency,
 			param.ClientIP,
 			param.Method,
-			param.Path,
+			sanitizeAccessLogPath(param.Path),
 		)
 	}))
+}
+
+func sanitizeAccessLogPath(path string) string {
+	cleanPath := path
+	if queryIndex := strings.IndexByte(cleanPath, '?'); queryIndex >= 0 {
+		cleanPath = cleanPath[:queryIndex]
+	}
+	if paymentCallbackAccessLogPath(cleanPath) {
+		return cleanPath
+	}
+	return path
+}
+
+func paymentCallbackAccessLogPath(path string) bool {
+	switch path {
+	case "/api/payment/wechat/authorize/callback",
+		"/api/payment/epay/notify",
+		"/api/user/epay/notify",
+		"/api/subscription/epay/notify",
+		"/api/subscription/epay/return",
+		"/api/xorpay/notify",
+		"/api/stripe/webhook",
+		"/api/creem/webhook",
+		"/api/waffo/webhook":
+		return true
+	default:
+		return strings.HasPrefix(path, "/api/waffo-pancake/webhook/")
+	}
 }

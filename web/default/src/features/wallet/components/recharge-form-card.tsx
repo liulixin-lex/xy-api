@@ -26,6 +26,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Spinner } from '@/components/ui/spinner'
 import { TitledCard } from '@/components/ui/titled-card'
 import {
   Tooltip,
@@ -41,6 +42,9 @@ import {
   getDiscountLabel,
   getPaymentIcon,
   getMinTopupAmount,
+  getPublicPaymentChannelLabel,
+  getPublicPaymentMethodIconType,
+  getPublicPaymentMethodLabel,
   getSafePaymentUrl,
 } from '../lib'
 import { formatPaymentDecimalAmount } from '../lib/billing'
@@ -48,8 +52,8 @@ import type {
   PaymentMethod,
   PresetAmount,
   TopupInfo,
-  CreemProduct,
-  WaffoPayMethod,
+  PaymentProduct,
+  PaymentRouteOption,
 } from '../types'
 import { CreemProductsSection } from './creem-products-section'
 
@@ -62,7 +66,7 @@ interface RechargeFormCardProps {
   onTopupAmountChange: (amount: number) => void
   paymentAmount: number
   paymentCurrency?: string
-  paymentProvider?: string
+  paymentFormatProvider?: string
   calculating: boolean
   quoteError?: string | null
   onPaymentMethodSelect: (method: PaymentMethod) => void
@@ -77,14 +81,10 @@ interface RechargeFormCardProps {
   onRetryLoad?: () => void
   usdExchangeRate?: number
   onOpenBilling?: () => void
-  creemProducts?: CreemProduct[]
-  enableCreemTopup?: boolean
-  onCreemProductSelect?: (product: CreemProduct) => void
-  enableWaffoTopup?: boolean
-  waffoPayMethods?: WaffoPayMethod[]
-  waffoMinTopup?: number
-  onWaffoMethodSelect?: (method: WaffoPayMethod, index: number) => void
-  enableWaffoPancakeTopup?: boolean
+  paymentProducts?: PaymentProduct[]
+  onPaymentProductSelect?: (product: PaymentProduct) => void
+  paymentRouteOptions?: PaymentRouteOption[]
+  onPaymentRouteOptionSelect?: (option: PaymentRouteOption) => void
 }
 
 export function RechargeFormCard({
@@ -96,7 +96,7 @@ export function RechargeFormCard({
   onTopupAmountChange,
   paymentAmount,
   paymentCurrency,
-  paymentProvider,
+  paymentFormatProvider,
   calculating,
   quoteError,
   onPaymentMethodSelect,
@@ -111,14 +111,10 @@ export function RechargeFormCard({
   onRetryLoad,
   usdExchangeRate = 1,
   onOpenBilling,
-  creemProducts,
-  enableCreemTopup,
-  onCreemProductSelect,
-  enableWaffoTopup,
-  waffoPayMethods,
-  waffoMinTopup,
-  onWaffoMethodSelect,
-  enableWaffoPancakeTopup,
+  paymentProducts,
+  onPaymentProductSelect,
+  paymentRouteOptions,
+  onPaymentRouteOptionSelect,
 }: RechargeFormCardProps) {
   const { t } = useTranslation()
   const [localAmount, setLocalAmount] = useState(topupAmount.toString())
@@ -140,17 +136,22 @@ export function RechargeFormCard({
     )
   }
 
+  const paymentRoutes = topupInfo?.payment_routes || []
+  const standardPaymentMethods = paymentRoutes.filter(
+    (route) =>
+      route.checkout_mode === 'quote' || route.checkout_mode === 'direct'
+  )
+  const optionRoute = paymentRoutes.find(
+    (route) => route.checkout_mode === 'option'
+  )
+  const availableRouteOptions = (paymentRouteOptions || []).filter(
+    (option) => option.route_id === optionRoute?.route_id
+  )
   const hasConfigurableTopup =
-    topupInfo?.enable_online_topup ||
-    topupInfo?.enable_stripe_topup ||
-    topupInfo?.enable_xorpay_topup ||
-    enableWaffoTopup ||
-    enableWaffoPancakeTopup
-  const hasAnyTopup = hasConfigurableTopup || enableCreemTopup
-  const hasStandardPaymentMethods =
-    Array.isArray(topupInfo?.pay_methods) && topupInfo.pay_methods.length > 0
-  const hasWaffoPaymentMethods =
-    Array.isArray(waffoPayMethods) && waffoPayMethods.length > 0
+    standardPaymentMethods.length > 0 || availableRouteOptions.length > 0
+  const hasAnyTopup = hasConfigurableTopup || (paymentProducts?.length || 0) > 0
+  const hasStandardPaymentMethods = standardPaymentMethods.length > 0
+  const hasRouteOptions = availableRouteOptions.length > 0
   const minTopup = getMinTopupAmount(topupInfo)
   const redemptionEnabled = !!topupInfo && topupInfo.enable_redemption !== false
 
@@ -213,7 +214,13 @@ export function RechargeFormCard({
   if (hasStandardPaymentMethods) {
     paymentMethodContent = (
       <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
-        {topupInfo?.pay_methods?.map((method) => {
+        {standardPaymentMethods.map((method) => {
+          const methodLabel = getPublicPaymentMethodLabel(method, t)
+          const channelLabel = getPublicPaymentChannelLabel(
+            method,
+            standardPaymentMethods,
+            t
+          )
           const minTopup = method.min_topup || 0
           const disabled = minTopup > topupAmount
           const disabledReason = disabled
@@ -222,37 +229,41 @@ export function RechargeFormCard({
               })
             : undefined
           const disabledLabel = disabled
-            ? `${t('Minimum:')} ${minTopup}`
+            ? t('Minimum {{amount}}', { amount: minTopup })
             : undefined
           const ariaLabel = disabledReason
-            ? `${method.name}. ${disabledReason}`
-            : method.name
+            ? t('{{method}}. {{reason}}', {
+                method: methodLabel,
+                reason: disabledReason,
+              })
+            : methodLabel
           let paymentIcon = getPaymentIcon(
-            method.type,
+            getPublicPaymentMethodIconType(method),
             'h-4 w-4',
-            method.icon,
-            method.name
+            undefined,
+            methodLabel
           )
-          if (paymentLoading === method.type) {
-            paymentIcon = <Loader2 className='h-4 w-4 animate-spin' />
+          if (paymentLoading === method.route_id) {
+            paymentIcon = <Spinner aria-label={t('Preparing payment')} />
           }
 
           const button = (
             <Button
-              key={method.type}
+              key={method.route_id}
               variant='outline'
               onClick={() => onPaymentMethodSelect(method)}
               disabled={disabled || !!paymentLoading}
               title={disabledReason}
               aria-label={ariaLabel}
+              aria-busy={paymentLoading === method.route_id}
               className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
             >
               {paymentIcon}
               <span className='flex min-w-0 flex-col items-start gap-0.5'>
-                <span className='max-w-full truncate'>{method.name}</span>
-                {disabledLabel && (
+                <span className='max-w-full truncate'>{methodLabel}</span>
+                {(channelLabel || disabledLabel) && (
                   <span className='text-muted-foreground max-w-full truncate text-[11px] leading-4 font-normal'>
-                    {disabledLabel}
+                    {disabledLabel || channelLabel}
                   </span>
                 )}
               </span>
@@ -260,7 +271,7 @@ export function RechargeFormCard({
           )
 
           return disabled ? (
-            <TooltipProvider key={method.type}>
+            <TooltipProvider key={method.route_id}>
               <Tooltip>
                 <TooltipTrigger render={button} />
                 <TooltipContent>{disabledReason}</TooltipContent>
@@ -272,7 +283,7 @@ export function RechargeFormCard({
         })}
       </div>
     )
-  } else if (!hasWaffoPaymentMethods) {
+  } else if (!hasRouteOptions) {
     paymentMethodContent = (
       <Alert>
         <AlertDescription>
@@ -401,7 +412,7 @@ export function RechargeFormCard({
                           ? formatPaymentDecimalAmount(
                               paymentAmount,
                               paymentCurrency,
-                              paymentProvider
+                              paymentFormatProvider
                             )
                           : t('Not available')}
                       </span>
@@ -422,83 +433,87 @@ export function RechargeFormCard({
                 {paymentMethodContent}
               </div>
 
-              {enableWaffoTopup &&
-                hasWaffoPaymentMethods &&
-                onWaffoMethodSelect && (
-                  <div className='space-y-2.5 sm:space-y-3'>
-                    <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
-                      {t('Waffo Payment')}
-                    </Label>
-                    <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
-                      {waffoPayMethods?.map((method, index) => {
-                        const loadingKey = `waffo-${index}`
-                        const waffoMin = waffoMinTopup || 0
-                        const belowMin = waffoMin > topupAmount
-                        const disabledReason = belowMin
-                          ? t('Minimum topup amount: {{amount}}', {
-                              amount: waffoMin,
-                            })
-                          : undefined
-                        const disabledLabel = belowMin
-                          ? `${t('Minimum:')} ${waffoMin}`
-                          : undefined
-                        const ariaLabel = disabledReason
-                          ? `${method.name}. ${disabledReason}`
-                          : method.name
-                        let paymentIcon = getPaymentIcon('waffo')
-                        if (method.icon) {
-                          paymentIcon = (
-                            <img
-                              src={method.icon}
-                              alt={method.name}
-                              className='h-4 w-4 object-contain'
-                            />
-                          )
-                        }
-                        if (paymentLoading === loadingKey) {
-                          paymentIcon = (
-                            <Loader2 className='h-4 w-4 animate-spin' />
-                          )
-                        }
+              {hasRouteOptions && onPaymentRouteOptionSelect && (
+                <div className='space-y-2.5 sm:space-y-3'>
+                  <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
+                    {t('Other payment methods')}
+                  </Label>
+                  <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
+                    {availableRouteOptions.map((option, index) => {
+                      const loadingKey = option.option_id
+                      const optionMin = optionRoute?.min_topup || 0
+                      const belowMin = optionMin > topupAmount
+                      const disabledReason = belowMin
+                        ? t('Minimum topup amount: {{amount}}', {
+                            amount: optionMin,
+                          })
+                        : undefined
+                      const disabledLabel = belowMin
+                        ? t('Minimum {{amount}}', { amount: optionMin })
+                        : undefined
+                      let methodLabel: string = option.public_label
+                      if (option.public_label === 'Card') {
+                        methodLabel = t('Card payment')
+                      } else if (option.public_label === 'Online payment') {
+                        methodLabel =
+                          index === 0
+                            ? t('Online payment')
+                            : t('Alternative online payment {{number}}', {
+                                number: index + 1,
+                              })
+                      }
+                      const ariaLabel = disabledReason
+                        ? t('{{method}}. {{reason}}', {
+                            method: methodLabel,
+                            reason: disabledReason,
+                          })
+                        : methodLabel
+                      let paymentIcon = getPaymentIcon(undefined)
+                      if (paymentLoading === loadingKey) {
+                        paymentIcon = (
+                          <Spinner aria-label={t('Preparing payment')} />
+                        )
+                      }
 
-                        const button = (
-                          <Button
-                            key={method.name}
-                            variant='outline'
-                            onClick={() => onWaffoMethodSelect(method, index)}
-                            disabled={belowMin || !!paymentLoading}
-                            title={disabledReason}
-                            aria-label={ariaLabel}
-                            className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
-                          >
-                            {paymentIcon}
-                            <span className='flex min-w-0 flex-col items-start gap-0.5'>
-                              <span className='max-w-full truncate'>
-                                {method.name}
-                              </span>
-                              {disabledLabel && (
-                                <span className='text-muted-foreground max-w-full truncate text-[11px] leading-4 font-normal'>
-                                  {disabledLabel}
-                                </span>
-                              )}
+                      const button = (
+                        <Button
+                          key={loadingKey}
+                          variant='outline'
+                          onClick={() => onPaymentRouteOptionSelect(option)}
+                          disabled={belowMin || !!paymentLoading}
+                          title={disabledReason}
+                          aria-label={ariaLabel}
+                          aria-busy={paymentLoading === loadingKey}
+                          className='min-h-14 min-w-0 justify-start gap-2 rounded-lg px-3 py-2 text-left'
+                        >
+                          {paymentIcon}
+                          <span className='flex min-w-0 flex-col items-start gap-0.5'>
+                            <span className='max-w-full truncate'>
+                              {methodLabel}
                             </span>
-                          </Button>
-                        )
+                            {disabledLabel && (
+                              <span className='text-muted-foreground max-w-full truncate text-[11px] leading-4 font-normal'>
+                                {disabledLabel}
+                              </span>
+                            )}
+                          </span>
+                        </Button>
+                      )
 
-                        return belowMin ? (
-                          <TooltipProvider key={method.name}>
-                            <Tooltip>
-                              <TooltipTrigger render={button} />
-                              <TooltipContent>{disabledReason}</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                        ) : (
-                          button
-                        )
-                      })}
-                    </div>
+                      return belowMin ? (
+                        <TooltipProvider key={loadingKey}>
+                          <Tooltip>
+                            <TooltipTrigger render={button} />
+                            <TooltipContent>{disabledReason}</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      ) : (
+                        button
+                      )
+                    })}
                   </div>
-                )}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -515,17 +530,16 @@ export function RechargeFormCard({
       )}
 
       {/* Creem Products Section */}
-      {enableCreemTopup &&
-        Array.isArray(creemProducts) &&
-        creemProducts.length > 0 &&
-        onCreemProductSelect && (
+      {Array.isArray(paymentProducts) &&
+        paymentProducts.length > 0 &&
+        onPaymentProductSelect && (
           <div className='space-y-2.5 border-t pt-4 sm:space-y-3 sm:pt-6'>
             <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
-              {t('Creem Payment')}
+              {t('Other payment options')}
             </Label>
             <CreemProductsSection
-              products={creemProducts}
-              onProductSelect={onCreemProductSelect}
+              products={paymentProducts}
+              onProductSelect={onPaymentProductSelect}
             />
           </div>
         )}

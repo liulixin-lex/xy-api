@@ -24,10 +24,13 @@ const (
 	MaxPaymentTopUpAmount    = int64(10_000)
 	MaxPaymentRequestIDBytes = 128
 
-	PaymentFlowFormPost       = "form_post"
-	PaymentFlowHostedRedirect = "hosted_redirect"
-	PaymentFlowQR             = "qr"
-	PaymentFlowPending        = "pending"
+	PaymentFlowFormPost        = "form_post"
+	PaymentFlowHostedRedirect  = "hosted_redirect"
+	PaymentFlowAppRedirect     = "app_redirect"
+	PaymentFlowQR              = "qr"
+	PaymentFlowWeChatAuthorize = "wechat_authorize"
+	PaymentFlowJSAPI           = "jsapi"
+	PaymentFlowPending         = "pending"
 )
 
 var currencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
@@ -38,6 +41,8 @@ type PaymentQuoteRequest struct {
 	PaymentMethod string `json:"payment_method"`
 	Amount        int64  `json:"amount,omitempty"`
 	PlanID        int    `json:"plan_id,omitempty"`
+	ProductID     string `json:"product_id,omitempty"`
+	OptionID      string `json:"option_id,omitempty"`
 	// Legacy Stripe clients may supply trusted return URLs. They are deliberately
 	// not accepted by the unified quote JSON API; compatibility controllers set
 	// them in-process and they are then stored in the immutable quote snapshot.
@@ -64,15 +69,27 @@ type PaymentStartRequest struct {
 }
 
 type PaymentStart struct {
-	Flow               string            `json:"flow"`
-	TradeNo            string            `json:"trade_no"`
-	Action             string            `json:"action,omitempty"`
-	Fields             map[string]string `json:"fields,omitempty"`
-	URL                string            `json:"url,omitempty"`
-	QRContent          string            `json:"qr_content,omitempty"`
-	ExpiresAt          int64             `json:"expires_at"`
-	ProviderOrderKey   string            `json:"-"`
-	ProviderPaymentKey string            `json:"-"`
+	Flow               string                  `json:"flow"`
+	TradeNo            string                  `json:"trade_no"`
+	Action             string                  `json:"action,omitempty"`
+	Fields             map[string]string       `json:"fields,omitempty"`
+	URL                string                  `json:"url,omitempty"`
+	QRContent          string                  `json:"qr_content,omitempty"`
+	JSAPI              *PaymentJSAPIParameters `json:"jsapi,omitempty"`
+	ExpiresAt          int64                   `json:"expires_at"`
+	ProviderOrderKey   string                  `json:"-"`
+	ProviderPaymentKey string                  `json:"-"`
+	Provider           string                  `json:"-"`
+	PaymentMethod      string                  `json:"-"`
+}
+
+type PaymentJSAPIParameters struct {
+	AppID     string `json:"app_id"`
+	Timestamp string `json:"timestamp"`
+	NonceStr  string `json:"nonce_str"`
+	Package   string `json:"package"`
+	SignType  string `json:"sign_type"`
+	PaySign   string `json:"pay_sign"`
 }
 
 type NormalizedPaymentEvent struct {
@@ -178,6 +195,14 @@ type VerifiedPaymentWebhookProcessor interface {
 	ProcessVerifiedWebhook(ctx context.Context, event *NormalizedPaymentEvent) error
 }
 
+// VerifiedPaymentWebhookValidator performs provider authority checks that are
+// free of local persistence side effects. The signature-verified normalized
+// event is already in the durable inbox before this hook runs; settlement then
+// happens before compatibility inventory is updated.
+type VerifiedPaymentWebhookValidator interface {
+	ValidateVerifiedWebhook(ctx context.Context, event *NormalizedPaymentEvent) error
+}
+
 var paymentProviderRegistry = struct {
 	sync.RWMutex
 	providers map[string]PaymentProvider
@@ -210,6 +235,18 @@ func ProcessVerifiedPaymentWebhook(ctx context.Context, providerName string, eve
 		return nil
 	}
 	return processor.ProcessVerifiedWebhook(ctx, event)
+}
+
+func ValidateVerifiedPaymentWebhook(ctx context.Context, providerName string, event *NormalizedPaymentEvent) error {
+	provider, err := GetPaymentProvider(providerName)
+	if err != nil {
+		return err
+	}
+	validator, ok := provider.(VerifiedPaymentWebhookValidator)
+	if !ok {
+		return nil
+	}
+	return validator.ValidateVerifiedWebhook(ctx, event)
 }
 
 func RegisterPaymentProvider(provider PaymentProvider) {
@@ -287,6 +324,7 @@ func ValidatePaymentProviderForCreate(providerName, paymentMethod string) error 
 		verifiedFingerprint := StripeCheckoutConfigurationFingerprint(
 			setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
 			setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+			setting.StripeCheckoutAllowedHosts,
 		)
 		if strings.TrimSpace(setting.StripeApiSecret) == "" || strings.TrimSpace(setting.StripeWebhookSecret) == "" || strings.TrimSpace(setting.StripePriceId) == "" ||
 			strings.TrimSpace(setting.StripeCredentialAccountId) == "" || modeErr != nil || credentialMode != setting.StripeCredentialLivemode ||
@@ -298,6 +336,28 @@ func ValidatePaymentProviderForCreate(providerName, paymentMethod string) error 
 	case model.PaymentProviderXorPay:
 		if strings.TrimSpace(setting.XorPayAid) == "" || strings.TrimSpace(setting.XorPayAppSecret) == "" {
 			return errors.New("xorpay is not configured")
+		}
+	case model.PaymentProviderCreem:
+		if strings.TrimSpace(setting.CreemApiKey) == "" || strings.TrimSpace(setting.CreemWebhookSecret) == "" {
+			return errors.New("creem is not configured")
+		}
+	case model.PaymentProviderWaffo:
+		if !setting.WaffoEnabled || strings.TrimSpace(setting.WaffoMerchantId) == "" {
+			return errors.New("waffo is not configured")
+		}
+		if setting.WaffoSandbox {
+			if strings.TrimSpace(setting.WaffoSandboxApiKey) == "" || strings.TrimSpace(setting.WaffoSandboxPrivateKey) == "" ||
+				strings.TrimSpace(setting.WaffoSandboxPublicCert) == "" {
+				return errors.New("waffo sandbox is not configured")
+			}
+		} else if strings.TrimSpace(setting.WaffoApiKey) == "" || strings.TrimSpace(setting.WaffoPrivateKey) == "" ||
+			strings.TrimSpace(setting.WaffoPublicCert) == "" {
+			return errors.New("waffo is not configured")
+		}
+	case model.PaymentProviderWaffoPancake:
+		if strings.TrimSpace(setting.WaffoPancakeMerchantID) == "" || strings.TrimSpace(setting.WaffoPancakePrivateKey) == "" ||
+			strings.TrimSpace(setting.WaffoPancakeStoreID) == "" {
+			return errors.New("waffo pancake is not configured")
 		}
 	default:
 		return fmt.Errorf("unsupported payment provider: %s", providerName)
@@ -350,15 +410,27 @@ func buildPaymentQuote(userID int, request PaymentQuoteRequest) (*model.PaymentQ
 		ExpiresAt:     now + PaymentQuoteTTLSeconds,
 		CreatedAt:     now,
 	}
-	if request.Provider == model.PaymentProviderStripe {
+	switch request.Provider {
+	case model.PaymentProviderStripe:
 		providerLivemode := setting.StripeCredentialLivemode == "live"
+		quote.ProviderLivemode = &providerLivemode
+	case model.PaymentProviderCreem:
+		providerLivemode := !setting.CreemTestMode
+		quote.ProviderLivemode = &providerLivemode
+	case model.PaymentProviderWaffoPancake:
+		providerLivemode := !setting.WaffoPancakeTestMode
 		quote.ProviderLivemode = &providerLivemode
 	}
 
 	var payable decimal.Decimal
 	switch request.OrderKind {
 	case model.PaymentOrderKindTopUp:
-		payable, err = fillTopUpQuote(quote, request.Amount)
+		if request.Provider == model.PaymentProviderCreem || request.Provider == model.PaymentProviderWaffo ||
+			request.Provider == model.PaymentProviderWaffoPancake {
+			payable, err = fillRetainedTopUpQuote(quote, request)
+		} else {
+			payable, err = fillTopUpQuote(quote, request.Amount)
+		}
 	case model.PaymentOrderKindSubscription:
 		payable, err = fillSubscriptionQuote(quote, request.PlanID)
 	default:
@@ -376,6 +448,15 @@ func buildPaymentQuote(userID int, request PaymentQuoteRequest) (*model.PaymentQ
 		return nil, nil, err
 	}
 	quote.ExpectedAmountMinor = expectedMinor
+	if err := model.CheckPaymentLimitForQuote(quote.Provider, quote.PaymentMethod, quote.Currency, expectedMinor, now); err != nil {
+		return nil, nil, err
+	}
+	quote.ExpiresAt, err = model.BoundPaymentQuoteExpiryForLimit(
+		quote.Provider, quote.PaymentMethod, quote.Currency, now, quote.ExpiresAt,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 	return quote, &PaymentQuoteView{
 		QuoteID:             quote.QuoteID,
 		OrderKind:           quote.OrderKind,
@@ -445,10 +526,6 @@ func fillTopUpQuote(quote *model.PaymentQuote, amount int64) (decimal.Decimal, e
 	if amount < minTopUp {
 		return decimal.Zero, fmt.Errorf("top-up amount cannot be less than %d", minTopUp)
 	}
-	group, err := model.GetUserGroup(quote.UserID, true)
-	if err != nil {
-		return decimal.Zero, err
-	}
 	baseUnits := decimal.NewFromInt(amount)
 	if operation_setting.GetQuotaDisplayType() == operation_setting.QuotaDisplayTypeTokens {
 		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
@@ -460,6 +537,10 @@ func fillTopUpQuote(quote *model.PaymentQuote, amount int64) (decimal.Decimal, e
 	creditQuota, clamp := common.QuotaFromDecimalChecked(baseUnits.Mul(decimal.NewFromFloat(common.QuotaPerUnit)))
 	if clamp != nil || creditQuota <= 0 {
 		return decimal.Zero, errors.New("top-up quota is outside the supported range")
+	}
+	group, err := model.GetUserGroup(quote.UserID, true)
+	if err != nil {
+		return decimal.Zero, err
 	}
 	groupRatio := common.GetTopupGroupRatio(group)
 	if groupRatio == 0 {
@@ -521,7 +602,7 @@ func fillSubscriptionQuote(quote *model.PaymentQuote, planID int) (decimal.Decim
 	if !strings.EqualFold(strings.TrimSpace(plan.Currency), "USD") {
 		return decimal.Zero, errors.New("external payment subscription plans must use USD as the base currency")
 	}
-	unitPrice, currency, err := paymentSubscriptionPricing(quote.Provider)
+	unitPrice, currency, err := paymentSubscriptionPricing(quote.Provider, plan)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -555,6 +636,9 @@ func fillSubscriptionQuote(quote *model.PaymentQuote, planID int) (decimal.Decim
 	quote.Currency = currency
 	quote.PricingSnapshot = string(pricingSnapshot)
 	quote.ProductSnapshot = string(productSnapshot)
+	if err := validateRetainedSubscriptionSnapshot(quote.Provider, planSnapshot); err != nil {
+		return decimal.Zero, err
+	}
 	return payable, nil
 }
 
@@ -566,15 +650,16 @@ func minimumPaymentAmount(provider, currency string) (decimal.Decimal, error) {
 	return decimal.New(1, -exponent), nil
 }
 
-func paymentSubscriptionPricing(provider string) (float64, string, error) {
+func paymentSubscriptionPricing(provider string, plan *model.SubscriptionPlan) (float64, string, error) {
 	var multiplier float64
 	var currency string
 	switch provider {
 	case model.PaymentProviderStripe:
-		// Subscription plan prices are already denominated in USD. Stripe's
-		// top-up unit price is a separate product setting and must never scale a
-		// fixed-term plan price.
-		multiplier = 1
+		// Plans keep one USD base price. The provider unit price converts that
+		// base into the configured Stripe settlement currency, exactly as it does
+		// for a top-up quote; the route currency is not required to equal the
+		// plan's base currency.
+		multiplier = setting.StripeUnitPrice
 		currency = setting.StripeCurrency
 	case model.PaymentProviderEpay:
 		multiplier = operation_setting.Price
@@ -582,6 +667,14 @@ func paymentSubscriptionPricing(provider string) (float64, string, error) {
 	case model.PaymentProviderXorPay:
 		multiplier = setting.XorPayUnitPrice
 		currency = setting.XorPayCurrency
+	case model.PaymentProviderCreem:
+		multiplier = 1
+		if plan != nil {
+			currency = plan.Currency
+		}
+	case model.PaymentProviderWaffoPancake:
+		multiplier = setting.WaffoPancakeUnitPrice
+		currency = "USD"
 	default:
 		return 0, "", fmt.Errorf("unsupported payment provider: %s", provider)
 	}
@@ -592,14 +685,17 @@ func paymentSubscriptionPricing(provider string) (float64, string, error) {
 	if _, ok := common.PaymentCurrencyExponentOK(currency); !ok {
 		return 0, "", fmt.Errorf("invalid %s subscription currency", provider)
 	}
-	if provider == model.PaymentProviderStripe && currency != "USD" {
-		return 0, "", errors.New("stripe subscription currency must be USD")
-	}
 	if provider == model.PaymentProviderEpay && currency != "CNY" {
 		return 0, "", errors.New("epay subscription currency must be CNY")
 	}
 	if provider == model.PaymentProviderXorPay && currency != "CNY" {
 		return 0, "", errors.New("xorpay subscription currency must be CNY")
+	}
+	if provider == model.PaymentProviderCreem && currency != "USD" && currency != "EUR" {
+		return 0, "", errors.New("creem subscription currency must be USD or EUR")
+	}
+	if provider == model.PaymentProviderWaffoPancake && currency != "USD" {
+		return 0, "", errors.New("waffo pancake subscription currency must be USD")
 	}
 	return multiplier, currency, nil
 }
@@ -621,6 +717,17 @@ func paymentProviderPricing(provider string) (int64, float64, string, error) {
 		minTopUp = int64(setting.XorPayMinTopUp)
 		unitPrice = setting.XorPayUnitPrice
 		currency = setting.XorPayCurrency
+	case model.PaymentProviderWaffo:
+		minTopUp = int64(setting.WaffoMinTopUp)
+		unitPrice = setting.WaffoUnitPrice
+		currency = setting.WaffoCurrency
+		if strings.TrimSpace(currency) == "" {
+			currency = "USD"
+		}
+	case model.PaymentProviderWaffoPancake:
+		minTopUp = int64(setting.WaffoPancakeMinTopUp)
+		unitPrice = setting.WaffoPancakeUnitPrice
+		currency = "USD"
 	default:
 		return 0, 0, "", fmt.Errorf("unsupported payment provider: %s", provider)
 	}
@@ -699,6 +806,7 @@ func paymentAmountMinorForProvider(amount decimal.Decimal, provider, currency st
 }
 
 func StartPayment(ctx context.Context, userID int, request PaymentStartRequest) (*PaymentStart, error) {
+	_ = ctx
 	if err := ValidatePaymentRequestID(request.RequestID); err != nil {
 		return nil, err
 	}
@@ -717,53 +825,20 @@ func StartPayment(ctx context.Context, userID int, request PaymentStartRequest) 
 	if err != nil {
 		return nil, err
 	}
-	providerIdentityCanRecover := order.ProviderOrderKey != nil && order.StartPayload == ""
-	if order.ExpiresAt > 0 && order.ExpiresAt <= time.Now().Unix() && !providerIdentityCanRecover {
+	if order.ExpiresAt > 0 && order.ExpiresAt <= time.Now().Unix() && order.ProviderOrderKey == nil {
 		if _, expireErr := model.ExpirePaymentOrderIfDue(userID, order.TradeNo); expireErr != nil {
 			return nil, expireErr
 		}
 		return nil, errors.New("payment order has expired")
 	}
-	if order.StartPayload != "" {
-		if order.Status != model.PaymentOrderStatusPending && order.Status != model.PaymentOrderStatusProcessing {
-			return nil, fmt.Errorf("payment order is no longer startable: %s", order.Status)
-		}
-		var cached PaymentStart
-		plaintext, err := model.DecryptPaymentOrderStartPayload(order.TradeNo, order.StartPayload)
-		if err != nil {
-			return nil, errors.New("invalid stored payment start state")
-		}
-		if err := common.UnmarshalJsonStr(plaintext, &cached); err != nil {
-			return nil, errors.New("invalid stored payment start state")
-		}
-		return &cached, nil
+	if order.Status != model.PaymentOrderStatusPending && order.Status != model.PaymentOrderStatusProcessing {
+		return nil, fmt.Errorf("payment order is no longer startable: %s", order.Status)
 	}
 	provider, err := GetPaymentProvider(order.Provider)
 	if err != nil {
-		_ = model.MarkPaymentOrderFailed(order.TradeNo, "provider unavailable")
 		return nil, err
 	}
-	if order.ProviderOrderKey != nil {
-		if recoverer, ok := provider.(PaymentStartRecoverer); ok {
-			recovered, recoverErr := recoverer.RecoverStart(ctx, order)
-			if recoverErr == nil && recovered != nil {
-				recovered.TradeNo = order.TradeNo
-				payload, marshalErr := common.Marshal(recovered)
-				if marshalErr != nil {
-					return nil, marshalErr
-				}
-				if saveErr := model.SavePaymentOrderStart(order.TradeNo, recovered.Flow, string(payload), recovered.ExpiresAt); saveErr != nil {
-					return nil, saveErr
-				}
-				return recovered, nil
-			}
-		}
-		if _, refreshErr := refreshPaymentProviderState(ctx, order); refreshErr != nil && !errors.Is(refreshErr, model.ErrPaymentManualReview) {
-			return pendingPaymentStart(order), fmt.Errorf("%w: %v", ErrPaymentStateUnknown, refreshErr)
-		}
-		return pendingPaymentStart(order), fmt.Errorf("%w: provider order already exists and its start payload cannot be recovered", ErrPaymentStateUnknown)
-	}
-	if credentialProvider, ok := provider.(PaymentCredentialGenerationProvider); ok {
+	if credentialProvider, ok := provider.(PaymentCredentialGenerationProvider); ok && order.StartPayload == "" {
 		generation := order.ProviderCredentialGeneration
 		if generation > 0 {
 			available, availabilityErr := model.PaymentCredentialGenerationAvailable(order.Provider, generation, order.CreatedAt)
@@ -771,10 +846,11 @@ func StartPayment(ctx context.Context, userID int, request PaymentStartRequest) 
 				return nil, availabilityErr
 			}
 			if !available {
-				if reviewErr := model.MarkPaymentOrderCredentialGenerationManualReview(order.TradeNo); reviewErr != nil {
-					return nil, reviewErr
+				if _, taskErr := model.EnsurePaymentTask(order.ID, model.PaymentTaskOperationCreate, common.GetTimestamp()); taskErr != nil {
+					return nil, taskErr
 				}
-				return nil, model.ErrPaymentManualReview
+				notifyPaymentTaskRunner()
+				return pendingPaymentStart(order), nil
 			}
 		} else {
 			generation = credentialProvider.CredentialGeneration()
@@ -787,60 +863,11 @@ func StartPayment(ctx context.Context, userID int, request PaymentStartRequest) 
 			order.ProviderCredentialGeneration = generation
 		}
 	}
-	claimed, err := model.ClaimPaymentOrderStart(order.TradeNo)
-	if err != nil {
+	if _, err := model.EnsurePaymentTask(order.ID, model.PaymentTaskOperationCreate, common.GetTimestamp()); err != nil {
 		return nil, err
 	}
-	if !claimed {
-		current, lookupErr := model.GetPaymentOrderForUser(userID, order.TradeNo)
-		if lookupErr != nil {
-			return nil, lookupErr
-		}
-		if current.StartPayload != "" {
-			var cached PaymentStart
-			plaintext, err := model.DecryptPaymentOrderStartPayload(current.TradeNo, current.StartPayload)
-			if err != nil {
-				return nil, errors.New("invalid stored payment start state")
-			}
-			if err := common.UnmarshalJsonStr(plaintext, &cached); err != nil {
-				return nil, errors.New("invalid stored payment start state")
-			}
-			return &cached, nil
-		}
-		if current.Status == model.PaymentOrderStatusManualReview {
-			return nil, model.ErrPaymentManualReview
-		}
-		return pendingPaymentStart(current), fmt.Errorf("%w: payment start is already in progress", ErrPaymentStateUnknown)
-	}
-	result, err := provider.Create(ctx, order)
-	if err != nil {
-		if errors.Is(err, model.ErrPaymentManualReview) {
-			if reviewErr := model.MarkPaymentOrderManualReview(order.TradeNo, "payment provider identity requires administrator review"); reviewErr != nil {
-				return nil, reviewErr
-			}
-			return nil, err
-		}
-		// Network ambiguity is provider-specific. Adapters wrap ambiguous errors
-		// with ErrPaymentStateUnknown so the order remains pending for query.
-		if !errors.Is(err, ErrPaymentStateUnknown) {
-			_ = model.MarkPaymentOrderFailed(order.TradeNo, "provider create failed")
-			return nil, err
-		}
-		return pendingPaymentStart(order), err
-	}
-	result.TradeNo = order.TradeNo
-	if result.ExpiresAt == 0 {
-		result.ExpiresAt = order.ExpiresAt
-	}
-	payload, err := common.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-	if err := model.SavePaymentOrderStartWithProviderIdentity(order.TradeNo, result.Flow, string(payload), result.ExpiresAt,
-		result.ProviderOrderKey, result.ProviderPaymentKey); err != nil {
-		return pendingPaymentStart(order), fmt.Errorf("%w: payment provider started but local start state could not be persisted: %v", ErrPaymentStateUnknown, err)
-	}
-	return result, nil
+	notifyPaymentTaskRunner()
+	return pendingPaymentStart(order), nil
 }
 
 func pendingPaymentStart(order *model.PaymentOrder) *PaymentStart {
@@ -855,40 +882,11 @@ func pendingPaymentStart(order *model.PaymentOrder) *PaymentStart {
 }
 
 func RefreshPaymentOrder(ctx context.Context, userID int, tradeNo string) (*model.PaymentOrder, error) {
-	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
-		return nil, fmt.Errorf("failed to synchronize payment configuration: %w", err)
-	}
-	order, err := model.GetPaymentOrderForUser(userID, tradeNo)
-	if err != nil {
-		return nil, err
-	}
-	if order.Status == model.PaymentOrderStatusPending || order.Status == model.PaymentOrderStatusProcessing {
-		claimed, claimErr := model.ClaimPaymentOrderQuery(order.TradeNo, 15*time.Second)
-		if claimErr != nil {
-			return nil, claimErr
-		}
-		if claimed {
-			unlock := setting.LockPaymentConfigurationForRead()
-			_, _ = refreshPaymentProviderState(ctx, order)
-			unlock()
-		}
-	}
+	_ = ctx
+	// User polling is deliberately local-only. Provider queries are performed by
+	// durable reconciliation tasks so browser refreshes and duplicate tabs can
+	// never amplify upstream traffic.
 	return model.ExpirePaymentOrderIfDue(userID, tradeNo)
-}
-
-func refreshPaymentProviderState(ctx context.Context, order *model.PaymentOrder) (*model.PaymentSettlementResult, error) {
-	provider, err := GetPaymentProvider(order.Provider)
-	if err != nil {
-		return nil, err
-	}
-	event, err := provider.Query(ctx, order)
-	if err != nil {
-		return nil, err
-	}
-	if event == nil || (!event.Paid && !event.Failed && !event.Expired && !event.Refunded && !event.Disputed && !event.DisputeResolved && !event.ManualReview) {
-		return nil, nil
-	}
-	return ProcessNormalizedPaymentEvent(event)
 }
 
 var ErrPaymentStateUnknown = errors.New("payment provider state is unknown")
@@ -898,6 +896,42 @@ func ProcessNormalizedPaymentEvent(event *NormalizedPaymentEvent) (*model.Paymen
 		return nil, errors.New("normalized payment event is required")
 	}
 	return model.ProcessPaymentEvent(normalizedPaymentEventInput(event))
+}
+
+func processNormalizedPaymentEventForTask(event *NormalizedPaymentEvent, task *model.PaymentTask,
+	runnerID string) (*model.PaymentSettlementResult, error) {
+	if event == nil {
+		return nil, errors.New("normalized payment event is required")
+	}
+	return model.ProcessPaymentEventForTask(normalizedPaymentEventInput(event), task, runnerID)
+}
+
+func RecordVerifiedPaymentWebhookReceived(event *NormalizedPaymentEvent) error {
+	if event == nil {
+		return errors.New("normalized payment event is required")
+	}
+	return model.RecordPaymentEventReceived(normalizedPaymentEventInput(event))
+}
+
+func RecordVerifiedRetainedPaymentWebhookReceived(event *NormalizedPaymentEvent) error {
+	if event == nil {
+		return errors.New("normalized payment event is required")
+	}
+	return model.RecordRetainedPaymentEventReceived(normalizedPaymentEventInput(event))
+}
+
+func MarkVerifiedRetainedPaymentWebhookProcessed(event *NormalizedPaymentEvent) error {
+	if event == nil {
+		return errors.New("normalized payment event is required")
+	}
+	return model.MarkRetainedPaymentEventProcessed(normalizedPaymentEventInput(event))
+}
+
+func MarkVerifiedPaymentWebhookValidationFailed(event *NormalizedPaymentEvent, reasonCode string) error {
+	if event == nil {
+		return errors.New("normalized payment event is required")
+	}
+	return model.MarkPaymentEventValidationFailed(event.Provider, event.EventKey, reasonCode)
 }
 
 func AdoptLegacyPaymentOrder(event *NormalizedPaymentEvent) (*model.PaymentOrder, error) {

@@ -71,7 +71,9 @@ const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
         value.provider === 'epay' ||
         (value.provider === 'stripe' && value.type === 'stripe') ||
         (value.provider === 'xorpay' &&
-          (value.type === 'xorpay_native' || value.type === 'xorpay_alipay')) ||
+          (value.type === 'xorpay_native' ||
+            value.type === 'xorpay_alipay' ||
+            value.type === 'xorpay_jsapi')) ||
         (value.provider === 'waffo_pancake' && value.type === 'waffo_pancake')
       if (!valid) {
         ctx.addIssue({
@@ -97,6 +99,11 @@ export type PaymentMethodData = {
   icon?: string
   min_topup?: string
   color?: string
+  route_id?: string
+  public_method?: string
+  channel_alias?: string
+  flow?: string
+  [key: string]: unknown
 }
 
 type PaymentMethodDialogProps = {
@@ -112,6 +119,7 @@ const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
   xorpay_alipay: 'SiAlipay',
+  xorpay_jsapi: 'SiWechat',
   xorpay_native: 'SiWechat',
 }
 
@@ -150,15 +158,22 @@ export function PaymentMethodDialog({
     },
     {
       iconName: 'SiWechat',
-      label: `${t('XORPay WeChat Pay')} (xorpay_native)`,
-      name: t('XORPay WeChat Pay'),
+      label: `${t('XORPay WeChat Native')} (xorpay_native)`,
+      name: t('WeChat Pay'),
       provider: 'xorpay' as const,
       value: 'xorpay_native',
     },
     {
+      iconName: 'SiWechat',
+      label: `${t('XORPay WeChat in-app (JSAPI)')} (xorpay_jsapi)`,
+      name: t('WeChat Pay'),
+      provider: 'xorpay' as const,
+      value: 'xorpay_jsapi',
+    },
+    {
       iconName: 'SiAlipay',
       label: `${t('XORPay Alipay')} (xorpay_alipay)`,
-      name: t('XORPay Alipay'),
+      name: t('Alipay'),
       provider: 'xorpay' as const,
       value: 'xorpay_alipay',
     },

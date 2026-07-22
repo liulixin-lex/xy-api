@@ -16,13 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useNavigate } from '@tanstack/react-router'
 import { Crown, CalendarClock, Package } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { Dialog } from '@/components/dialog'
-import { GroupBadge } from '@/components/group-badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,48 +34,39 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
+import { Spinner } from '@/components/ui/spinner'
 import {
   createPaymentQuote,
   isApiSuccess,
   startPayment,
 } from '@/features/wallet/api'
-import { PaymentQrDialog } from '@/features/wallet/components/dialogs/payment-qr-dialog'
-import { PaymentResultAlert } from '@/features/wallet/components/payment-result-alert'
 import { formatPaymentDecimalAmount } from '@/features/wallet/lib/billing'
 import {
+  createPaymentError,
+  getPaymentErrorMessage,
+  getPublicPaymentChannelLabel,
+  getPublicPaymentMethodLabel,
   navigateToPaymentUrl,
   submitPaymentForm,
 } from '@/features/wallet/lib/payment'
 import type {
+  ClientPaymentQuote,
   PaymentMethod,
-  PaymentOrder,
-  PaymentProvider,
-  PaymentQrStart,
-  PaymentQuote,
   PaymentStart,
 } from '@/features/wallet/types'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { formatQuota } from '@/lib/format'
 import { DEFAULT_CURRENCY_CONFIG } from '@/stores/system-config-store'
 
-import {
-  paySubscriptionStripe,
-  paySubscriptionCreem,
-  paySubscriptionEpay,
-  paySubscriptionWaffoPancake,
-  paySubscriptionBalance,
-} from '../../api'
+import { paySubscriptionBalance } from '../../api'
 import { formatDuration, formatResetPeriod } from '../../lib'
-import type { PlanRecord } from '../../types'
+import type { PublicPlanRecord } from '../../types'
 
 interface Props {
   open: boolean
   onOpenChange: (open: boolean) => void
-  plan: PlanRecord | null
-  enableStripe?: boolean
-  enableCreem?: boolean
-  enableWaffoPancake?: boolean
-  paymentMethods?: PaymentMethod[]
+  plan: PublicPlanRecord | null
+  paymentRoutes?: PaymentMethod[]
   purchaseLimit?: number
   purchaseCount?: number
   userQuota?: number
@@ -85,16 +76,13 @@ interface Props {
 export function SubscriptionPurchaseDialog(props: Props) {
   const { t } = useTranslation()
   const { currency } = useSystemConfig()
-  const [paying, setPaying] = useState(false)
+  const navigate = useNavigate()
+  const [paymentLoadingKey, setPaymentLoadingKey] = useState('')
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('')
-  const [qrOpen, setQrOpen] = useState(false)
-  const [qrStart, setQrStart] = useState<PaymentQrStart | null>(null)
-  const [qrQuote, setQrQuote] = useState<PaymentQuote | null>(null)
-  const [pendingTradeNo, setPendingTradeNo] = useState('')
   const paymentInFlightRef = useRef(false)
   const gatewayQuoteRef = useRef<{
     key: string
-    quote: PaymentQuote
+    quote: ClientPaymentQuote
   } | null>(null)
   const gatewayStartRequestRef = useRef<{
     quoteId: string
@@ -106,12 +94,15 @@ export function SubscriptionPurchaseDialog(props: Props) {
   } | null>(null)
 
   useEffect(() => {
-    if (props.open && props.paymentMethods && props.paymentMethods.length > 0) {
-      setSelectedPaymentMethod(props.paymentMethods[0].type)
+    const quoteRoutes = (props.paymentRoutes || []).filter(
+      (method) => method.checkout_mode === 'quote'
+    )
+    if (props.open && quoteRoutes.length > 0) {
+      setSelectedPaymentMethod(quoteRoutes[0].route_id)
     } else if (!props.open) {
       setSelectedPaymentMethod('')
     }
-  }, [props.open, props.paymentMethods])
+  }, [props.open, props.paymentRoutes])
 
   useEffect(() => {
     gatewayQuoteRef.current = null
@@ -124,20 +115,39 @@ export function SubscriptionPurchaseDialog(props: Props) {
 
   const planCurrency = (plan.currency || 'USD').toUpperCase()
   const externalCurrencySupported = planCurrency === 'USD'
-  const hasStripe = props.enableStripe && externalCurrencySupported
-  const hasCreem = props.enableCreem && !!plan.creem_product_id
-  const hasWaffoPancake =
-    props.enableWaffoPancake && !!plan.waffo_pancake_product_id
+  const externalPaymentRouteIDs = new Set(plan.external_payment_route_ids || [])
+  const productRoute = props.paymentRoutes?.find(
+    (method) =>
+      method.checkout_mode === 'product' &&
+      externalPaymentRouteIDs.has(method.route_id)
+  )
+  const directRoute = props.paymentRoutes?.find(
+    (method) =>
+      method.checkout_mode === 'direct' &&
+      externalPaymentRouteIDs.has(method.route_id)
+  )
+  const hasProductCheckout = !!productRoute
+  const hasDirectCheckout = !!directRoute
   const unifiedMethods = externalCurrencySupported
-    ? props.paymentMethods || []
+    ? (props.paymentRoutes || []).filter(
+        (method) => method.checkout_mode === 'quote'
+      )
     : []
   const hasGatewayMethods = unifiedMethods.length > 0
   const hasAnyPayment =
-    hasStripe || hasCreem || hasWaffoPancake || hasGatewayMethods
-  const selectedPaymentMethodLabel =
-    unifiedMethods.find((m) => m.type === selectedPaymentMethod)?.name ||
-    selectedPaymentMethod ||
-    t('Select payment method')
+    hasProductCheckout || hasDirectCheckout || hasGatewayMethods
+  const selectedMethod = unifiedMethods.find(
+    (method) => method.route_id === selectedPaymentMethod
+  )
+  const getMethodLabel = (method: PaymentMethod) => {
+    const methodLabel = getPublicPaymentMethodLabel(method, t)
+    const channelLabel = getPublicPaymentChannelLabel(method, unifiedMethods, t)
+    return channelLabel ? `${methodLabel} · ${channelLabel}` : methodLabel
+  }
+  const selectedPaymentMethodLabel = selectedMethod
+    ? getMethodLabel(selectedMethod)
+    : t('Select payment method')
+  const paying = paymentLoadingKey !== ''
   const totalAmount = Number(plan.total_amount || 0)
   const price = formatPaymentDecimalAmount(
     Number(plan.price_amount || 0),
@@ -161,20 +171,16 @@ export function SubscriptionPurchaseDialog(props: Props) {
     (props.purchaseLimit || 0) > 0 &&
     (props.purchaseCount || 0) >= (props.purchaseLimit || 0)
 
-  const isEndpointUnavailable = (error: unknown) => {
-    if (!error || typeof error !== 'object' || !('response' in error)) {
-      return false
-    }
-    const status = (error as { response?: { status?: unknown } }).response
-      ?.status
-    return status === 404 || status === 405 || status === 501
-  }
-
-  const handlePaymentStart = (paymentStart: PaymentStart) => {
-    if (paymentStart.flow === 'qr') {
-      setQrStart(paymentStart)
-      setQrOpen(true)
+  const handlePaymentStart = async (paymentStart: PaymentStart) => {
+    if (paymentStart.flow === 'qr' || paymentStart.flow === 'pending') {
+      if (!paymentStart.trade_no) {
+        throw new Error('payment_order_missing')
+      }
       props.onOpenChange(false)
+      await navigate({
+        to: '/payment/$tradeNo',
+        params: { tradeNo: paymentStart.trade_no },
+      })
       return true
     }
     if (paymentStart.flow === 'hosted_redirect') {
@@ -183,99 +189,37 @@ export function SubscriptionPurchaseDialog(props: Props) {
       }
       return true
     }
-    if (paymentStart.flow === 'pending') {
-      setPendingTradeNo(paymentStart.trade_no)
-      props.onOpenChange(false)
-      return true
-    }
     if (!submitPaymentForm(paymentStart.action, paymentStart.fields)) {
       throw new Error(t('Invalid payment redirect URL'))
     }
     return true
   }
 
-  const startLegacyGatewayPayment = async (
-    provider: PaymentProvider,
-    paymentMethod: string
-  ) => {
-    if (provider === 'stripe') {
-      const response = await paySubscriptionStripe({ plan_id: plan.id })
-      if (!isApiSuccess(response) || !response.data?.pay_link) {
-        throw new Error(response.message || t('Payment request failed'))
-      }
-      return handlePaymentStart({
-        flow: 'hosted_redirect',
-        trade_no: '',
-        url: response.data.pay_link,
-        expires_at: 0,
-      })
-    }
-    if (provider !== 'epay') {
-      throw new Error(
-        t('This payment gateway requires the unified payment API')
-      )
-    }
-    const response = await paySubscriptionEpay({
-      plan_id: plan.id,
-      payment_method: paymentMethod,
-    })
-    if (!isApiSuccess(response) || !response.url || !response.data) {
-      throw new Error(response.message || t('Payment request failed'))
-    }
-    return handlePaymentStart({
-      flow: 'form_post',
-      trade_no: '',
-      action: response.url,
-      fields: Object.fromEntries(
-        Object.entries(response.data).map(([key, value]) => [
-          key,
-          String(value),
-        ])
-      ),
-      expires_at: 0,
-    })
-  }
-
-  const handlePayGateway = async (
-    provider: PaymentProvider,
-    paymentMethod: string
-  ) => {
+  const handlePayGateway = async (method: PaymentMethod) => {
     if (paymentInFlightRef.current) return
     paymentInFlightRef.current = true
-    setPaying(true)
+    setPaymentLoadingKey(method.route_id)
     try {
-      const quoteKey = `${plan.id}:${provider}:${paymentMethod}`
+      const quoteKey = `${plan.id}:${method.route_id}`
       let paymentQuote = gatewayQuoteRef.current?.quote
       if (
         gatewayQuoteRef.current?.key !== quoteKey ||
         !paymentQuote ||
         paymentQuote.expires_at <= Math.floor(Date.now() / 1000)
       ) {
-        let quoteResponse
-        try {
-          quoteResponse = await createPaymentQuote({
-            order_kind: 'subscription',
-            provider,
-            payment_method: paymentMethod,
-            plan_id: plan.id,
-          })
-        } catch (error) {
-          if (isEndpointUnavailable(error)) {
-            await startLegacyGatewayPayment(provider, paymentMethod)
-            return
-          }
-          throw error
-        }
+        const quoteResponse = await createPaymentQuote({
+          order_kind: 'subscription',
+          route_id: method.route_id,
+          plan_id: plan.id,
+        })
 
         if (!isApiSuccess(quoteResponse) || !quoteResponse.data) {
-          throw new Error(quoteResponse.message || t('Payment quote failed'))
+          throw createPaymentError(quoteResponse)
         }
         paymentQuote = quoteResponse.data
         gatewayQuoteRef.current = { key: quoteKey, quote: paymentQuote }
         gatewayStartRequestRef.current = null
       }
-      setQrQuote(paymentQuote)
-
       if (gatewayStartRequestRef.current?.quoteId !== paymentQuote.quote_id) {
         gatewayStartRequestRef.current = {
           quoteId: paymentQuote.quote_id,
@@ -293,99 +237,36 @@ export function SubscriptionPurchaseDialog(props: Props) {
       if (!isApiSuccess(startResponse) || !startResponse.data) {
         gatewayQuoteRef.current = null
         gatewayStartRequestRef.current = null
-        throw new Error(startResponse.message || t('Payment request failed'))
+        throw createPaymentError(startResponse)
       }
       gatewayQuoteRef.current = null
       gatewayStartRequestRef.current = null
-      toast.success(t('Payment initiated'))
-      handlePaymentStart(startResponse.data)
+      await handlePaymentStart(startResponse.data)
     } catch (error) {
-      toast.error(
-        error instanceof Error && error.message
-          ? error.message
-          : t('Payment request failed')
-      )
+      toast.error(getPaymentErrorMessage(error, t))
     } finally {
       paymentInFlightRef.current = false
-      setPaying(false)
+      setPaymentLoadingKey('')
     }
   }
 
   const handlePayCreem = async () => {
-    if (paymentInFlightRef.current) return
-    paymentInFlightRef.current = true
-    setPaying(true)
-    try {
-      const res = await paySubscriptionCreem({ plan_id: plan.id })
-      if (isApiSuccess(res) && res.data?.checkout_url) {
-        if (!navigateToPaymentUrl(res.data.checkout_url)) {
-          throw new Error(t('Invalid payment redirect URL'))
-        }
-      } else {
-        toast.error(
-          res.message && res.message !== 'success'
-            ? res.message
-            : t('Payment request failed')
-        )
-      }
-    } catch {
-      toast.error(t('Payment request failed'))
-    } finally {
-      paymentInFlightRef.current = false
-      setPaying(false)
-    }
+    if (productRoute) await handlePayGateway(productRoute)
   }
 
-  // In-tab redirect (not window.open) — user-gesture context is lost
-  // across the await, so a popup would be blocked. Same as the wallet hook.
   const handlePayWaffoPancake = async () => {
-    if (paymentInFlightRef.current) return
-    paymentInFlightRef.current = true
-    setPaying(true)
-    try {
-      const res = await paySubscriptionWaffoPancake({ plan_id: plan.id })
-      if (isApiSuccess(res) && res.data?.checkout_url) {
-        toast.success(t('Redirecting to payment page...'))
-        if (!navigateToPaymentUrl(res.data.checkout_url)) {
-          throw new Error(t('Invalid payment redirect URL'))
-        }
-      } else {
-        toast.error(
-          res.message && res.message !== 'success'
-            ? res.message
-            : t('Payment request failed')
-        )
-      }
-    } catch {
-      toast.error(t('Payment request failed'))
-    } finally {
-      paymentInFlightRef.current = false
-      setPaying(false)
-    }
+    if (directRoute) await handlePayGateway(directRoute)
   }
 
   const handlePaySelectedGateway = async () => {
     const method = unifiedMethods.find(
-      (candidate) => candidate.type === selectedPaymentMethod
+      (candidate) => candidate.route_id === selectedPaymentMethod
     )
-    if (
-      !method ||
-      (method.provider !== 'epay' && method.provider !== 'xorpay')
-    ) {
+    if (!method) {
       toast.error(t('Please select a payment method'))
       return
     }
-    await handlePayGateway(method.provider, method.type)
-  }
-
-  const handleQrSettled = async (order: PaymentOrder) => {
-    if (order.status !== 'success') return
-    await props.onPurchaseSuccess?.()
-  }
-
-  const handlePendingSettled = async (order: PaymentOrder) => {
-    if (order.status !== 'success') return
-    await props.onPurchaseSuccess?.()
+    await handlePayGateway(method)
   }
 
   const handlePayBalance = async () => {
@@ -399,7 +280,7 @@ export function SubscriptionPurchaseDialog(props: Props) {
     }
     if (paymentInFlightRef.current) return
     paymentInFlightRef.current = true
-    setPaying(true)
+    setPaymentLoadingKey('balance')
     try {
       if (balanceRequestRef.current?.planId !== plan.id) {
         const randomPart =
@@ -418,266 +299,245 @@ export function SubscriptionPurchaseDialog(props: Props) {
       })
       balanceRequestRef.current = null
       if (res.success) {
-        toast.success(t('Subscription purchased successfully'))
+        toast.success(t('Access purchased successfully'))
         void props.onPurchaseSuccess?.()
         props.onOpenChange(false)
       } else {
-        toast.error(
-          res.message && res.message !== 'success'
-            ? res.message
-            : t('Payment request failed')
-        )
+        toast.error(getPaymentErrorMessage(res, t))
       }
-    } catch {
-      toast.error(t('Payment request failed'))
+    } catch (error) {
+      toast.error(getPaymentErrorMessage(error, t))
     } finally {
       paymentInFlightRef.current = false
-      setPaying(false)
+      setPaymentLoadingKey('')
     }
   }
 
   return (
-    <>
-      <Dialog
-        open={props.open}
-        onOpenChange={props.onOpenChange}
-        title={
-          <>
-            <Crown className='h-5 w-5' />
-            {t('Purchase Subscription')}
-          </>
-        }
-        contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
-        titleClassName='flex items-center gap-2'
-        contentHeight='auto'
-        bodyClassName='space-y-4'
-      >
-        <div className='space-y-3 sm:space-y-4'>
-          <div className='bg-muted/50 space-y-2.5 rounded-lg border p-3 sm:space-y-3 sm:p-4'>
+    <Dialog
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      title={
+        <>
+          <Crown className='h-5 w-5' />
+          {t('Purchase Access')}
+        </>
+      }
+      contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
+      titleClassName='flex items-center gap-2'
+      contentHeight='auto'
+      bodyClassName='space-y-4'
+    >
+      <div className='space-y-3 sm:space-y-4'>
+        <Alert>
+          <AlertDescription>
+            {t(
+              'One-time payment for fixed-term access. It does not renew automatically.'
+            )}
+          </AlertDescription>
+        </Alert>
+
+        <div className='bg-muted/50 space-y-2.5 rounded-lg border p-3 sm:space-y-3 sm:p-4'>
+          <div className='flex justify-between'>
+            <span className='text-muted-foreground text-sm'>
+              {t('Plan Name')}
+            </span>
+            <span className='max-w-[200px] truncate text-sm font-medium'>
+              {plan.title}
+            </span>
+          </div>
+          <div className='flex items-center justify-between'>
+            <span className='text-muted-foreground text-sm'>
+              {t('Validity Period')}
+            </span>
+            <span className='flex items-center gap-1 text-sm'>
+              <CalendarClock className='h-3.5 w-3.5' />
+              {formatDuration(plan, t)}
+            </span>
+          </div>
+          {formatResetPeriod(plan, t) !== t('No Reset') && (
             <div className='flex justify-between'>
               <span className='text-muted-foreground text-sm'>
-                {t('Plan Name')}
+                {t('Reset Period')}
               </span>
-              <span className='max-w-[200px] truncate text-sm font-medium'>
-                {plan.title}
-              </span>
+              <span className='text-sm'>{formatResetPeriod(plan, t)}</span>
             </div>
-            <div className='flex items-center justify-between'>
-              <span className='text-muted-foreground text-sm'>
-                {t('Validity Period')}
-              </span>
-              <span className='flex items-center gap-1 text-sm'>
-                <CalendarClock className='h-3.5 w-3.5' />
-                {formatDuration(plan, t)}
-              </span>
-            </div>
-            {formatResetPeriod(plan, t) !== t('No Reset') && (
-              <div className='flex justify-between'>
-                <span className='text-muted-foreground text-sm'>
-                  {t('Reset Period')}
-                </span>
-                <span className='text-sm'>{formatResetPeriod(plan, t)}</span>
-              </div>
-            )}
-            <div className='flex items-center justify-between'>
-              <span className='text-muted-foreground text-sm'>
-                {t('Plan Quota')}
-              </span>
-              <span className='flex items-center gap-1 text-sm'>
-                <Package className='h-3.5 w-3.5' />
-                {totalAmount > 0 ? formatQuota(totalAmount) : t('Unlimited')}
-              </span>
-            </div>
-            {plan.upgrade_group && (
-              <div className='flex items-center justify-between'>
-                <span className='text-muted-foreground text-sm'>
-                  {t('Upgrade Group')}
-                </span>
-                <GroupBadge group={plan.upgrade_group} />
-              </div>
-            )}
-            <Separator />
-            <div className='flex items-center justify-between'>
-              <span className='text-sm font-medium'>{t('Amount Due')}</span>
-              <span className='text-primary text-lg font-bold'>{price}</span>
-            </div>
+          )}
+          <div className='flex items-center justify-between'>
+            <span className='text-muted-foreground text-sm'>
+              {t('Plan Quota')}
+            </span>
+            <span className='flex items-center gap-1 text-sm'>
+              <Package className='h-3.5 w-3.5' />
+              {totalAmount > 0 ? formatQuota(totalAmount) : t('Unlimited')}
+            </span>
           </div>
+          {plan.includes_expanded_access && (
+            <div className='flex items-center justify-between'>
+              <span className='text-sm'>
+                {t('Includes expanded model access')}
+              </span>
+            </div>
+          )}
+          <Separator />
+          <div className='flex items-center justify-between'>
+            <span className='text-sm font-medium'>{t('Amount Due')}</span>
+            <span className='text-primary text-lg font-bold'>{price}</span>
+          </div>
+        </div>
 
-          {limitReached && (
+        {limitReached && (
+          <Alert variant='destructive'>
+            <AlertDescription>
+              {t('Purchase limit reached')} ({props.purchaseCount}/
+              {props.purchaseLimit})
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {!externalCurrencySupported &&
+          (props.paymentRoutes?.length ?? 0) > 0 && (
             <Alert variant='destructive'>
               <AlertDescription>
-                {t('Purchase limit reached')} ({props.purchaseCount}/
-                {props.purchaseLimit})
+                {t('Online payment is only available for USD access plans.')}
               </AlertDescription>
             </Alert>
           )}
 
-          {!externalCurrencySupported &&
-            (props.enableStripe || (props.paymentMethods?.length ?? 0) > 0) && (
-              <Alert variant='destructive'>
-                <AlertDescription>
-                  {t(
-                    'Online gateway payment is only available for USD subscription plans.'
-                  )}
-                </AlertDescription>
-              </Alert>
-            )}
-
-          <div className='flex flex-col gap-2 rounded-md border p-3'>
-            {balanceCurrencySupported && (
-              <>
-                <div className='flex items-center justify-between gap-2 text-xs'>
-                  <span className='text-muted-foreground'>{t('Required')}</span>
-                  <span>{formatQuota(balanceCost)}</span>
-                </div>
-                <div className='flex items-center justify-between gap-2 text-xs'>
-                  <span className='text-muted-foreground'>
-                    {t('Available')}
-                  </span>
-                  <span>{formatQuota(userQuota)}</span>
-                </div>
-              </>
-            )}
-            {!balanceCurrencySupported && (
-              <Alert variant='destructive'>
-                <AlertDescription>
-                  {t(
-                    'Balance payment is only available for USD plans because account balance is denominated in USD quota.'
-                  )}
-                </AlertDescription>
-              </Alert>
-            )}
-            {balanceCurrencySupported && !planAllowsBalancePay && (
-              <Alert variant='destructive'>
-                <AlertDescription>
-                  {t('This plan does not allow balance redemption')}
-                </AlertDescription>
-              </Alert>
-            )}
-            {balanceCurrencySupported &&
-              planAllowsBalancePay &&
-              insufficientBalance && (
-                <Alert variant='destructive'>
-                  <AlertDescription>
-                    {t('Insufficient balance')}
-                  </AlertDescription>
-                </Alert>
-              )}
-            <Button
-              variant='outline'
-              onClick={handlePayBalance}
-              disabled={
-                paying ||
-                limitReached ||
-                !allowBalancePay ||
-                insufficientBalance
-              }
-            >
-              {t('Pay with Balance')}
-            </Button>
-          </div>
-
-          {hasAnyPayment && (
-            <div className='space-y-3'>
-              <p className='text-muted-foreground text-xs'>
-                {t('Select payment method')}
-              </p>
-              {(hasStripe || hasCreem || hasWaffoPancake) && (
-                <div className='grid grid-cols-2 gap-2 sm:flex'>
-                  {hasStripe && (
-                    <Button
-                      variant='outline'
-                      className='flex-1'
-                      onClick={() => void handlePayGateway('stripe', 'stripe')}
-                      disabled={paying || limitReached}
-                    >
-                      {t('Stripe')}
-                    </Button>
-                  )}
-                  {hasCreem && (
-                    <Button
-                      variant='outline'
-                      className='flex-1'
-                      onClick={handlePayCreem}
-                      disabled={paying || limitReached}
-                    >
-                      {t('Creem')}
-                    </Button>
-                  )}
-                  {hasWaffoPancake && (
-                    <Button
-                      variant='outline'
-                      className='flex-1'
-                      onClick={handlePayWaffoPancake}
-                      disabled={paying || limitReached}
-                    >
-                      Waffo Pancake
-                    </Button>
-                  )}
-                </div>
-              )}
-              {hasGatewayMethods && (
-                <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-2'>
-                  <Select
-                    items={unifiedMethods.map((method) => ({
-                      value: method.type,
-                      label: method.name || method.type,
-                    }))}
-                    value={selectedPaymentMethod}
-                    onValueChange={(value) =>
-                      value !== null && setSelectedPaymentMethod(value)
-                    }
-                    disabled={paying || limitReached}
-                  >
-                    <SelectTrigger className='flex-1'>
-                      <SelectValue>{selectedPaymentMethodLabel}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent alignItemWithTrigger={false}>
-                      <SelectGroup>
-                        {unifiedMethods.map((method) => (
-                          <SelectItem key={method.type} value={method.type}>
-                            {method.name || method.type}
-                          </SelectItem>
-                        ))}
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    onClick={() => void handlePaySelectedGateway()}
-                    disabled={paying || !selectedPaymentMethod || limitReached}
-                  >
-                    {t('Pay')}
-                  </Button>
-                </div>
-              )}
-            </div>
+        <div className='flex flex-col gap-2 rounded-md border p-3'>
+          {balanceCurrencySupported && (
+            <>
+              <div className='flex items-center justify-between gap-2 text-xs'>
+                <span className='text-muted-foreground'>{t('Required')}</span>
+                <span>{formatQuota(balanceCost)}</span>
+              </div>
+              <div className='flex items-center justify-between gap-2 text-xs'>
+                <span className='text-muted-foreground'>{t('Available')}</span>
+                <span>{formatQuota(userQuota)}</span>
+              </div>
+            </>
           )}
+          {!balanceCurrencySupported && (
+            <Alert variant='destructive'>
+              <AlertDescription>
+                {t(
+                  'Balance payment is only available for USD plans because account balance is denominated in USD quota.'
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
+          {balanceCurrencySupported && !planAllowsBalancePay && (
+            <Alert variant='destructive'>
+              <AlertDescription>
+                {t('This plan does not allow balance redemption')}
+              </AlertDescription>
+            </Alert>
+          )}
+          {balanceCurrencySupported &&
+            planAllowsBalancePay &&
+            insufficientBalance && (
+              <Alert variant='destructive'>
+                <AlertDescription>{t('Insufficient balance')}</AlertDescription>
+              </Alert>
+            )}
+          <Button
+            variant='outline'
+            onClick={handlePayBalance}
+            disabled={
+              paying || limitReached || !allowBalancePay || insufficientBalance
+            }
+            aria-busy={paymentLoadingKey === 'balance'}
+          >
+            {paymentLoadingKey === 'balance' && (
+              <Spinner aria-label={t('Preparing payment')} />
+            )}
+            {t('Pay with Balance')}
+          </Button>
         </div>
-      </Dialog>
-      <PaymentQrDialog
-        open={qrOpen}
-        onOpenChange={setQrOpen}
-        paymentStart={qrStart}
-        quote={qrQuote}
-        onSettled={handleQrSettled}
-        onTrackPending={setPendingTradeNo}
-      />
-      <Dialog
-        open={pendingTradeNo !== ''}
-        onOpenChange={(open) => !open && setPendingTradeNo('')}
-        title={t('Payment Status')}
-        contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-lg'
-        contentHeight='auto'
-      >
-        {pendingTradeNo && (
-          <PaymentResultAlert
-            tradeNo={pendingTradeNo}
-            resultHint='pending'
-            onDismiss={() => setPendingTradeNo('')}
-            onSettled={handlePendingSettled}
-          />
+
+        {hasAnyPayment && (
+          <div className='space-y-3'>
+            <p className='text-muted-foreground text-xs'>
+              {t('Select payment method')}
+            </p>
+            {(hasProductCheckout || hasDirectCheckout) && (
+              <div className='grid grid-cols-2 gap-2 sm:flex'>
+                {hasProductCheckout && (
+                  <Button
+                    variant='outline'
+                    className='flex-1'
+                    onClick={handlePayCreem}
+                    disabled={paying || limitReached}
+                    aria-busy={paymentLoadingKey === productRoute?.route_id}
+                  >
+                    {paymentLoadingKey === productRoute?.route_id && (
+                      <Spinner aria-label={t('Preparing payment')} />
+                    )}
+                    {t('Online payment')}
+                  </Button>
+                )}
+                {hasDirectCheckout && (
+                  <Button
+                    variant='outline'
+                    className='flex-1'
+                    onClick={handlePayWaffoPancake}
+                    disabled={paying || limitReached}
+                    aria-busy={paymentLoadingKey === directRoute?.route_id}
+                  >
+                    {paymentLoadingKey === directRoute?.route_id && (
+                      <Spinner aria-label={t('Preparing payment')} />
+                    )}
+                    {t('Alternative online payment {{number}}', {
+                      number: 1,
+                    })}
+                  </Button>
+                )}
+              </div>
+            )}
+            {hasGatewayMethods && (
+              <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-2'>
+                <Select
+                  items={unifiedMethods.map((method) => ({
+                    value: method.route_id,
+                    label: getMethodLabel(method),
+                  }))}
+                  value={selectedPaymentMethod}
+                  onValueChange={(value) =>
+                    value !== null && setSelectedPaymentMethod(value)
+                  }
+                  disabled={paying || limitReached}
+                >
+                  <SelectTrigger className='flex-1'>
+                    <SelectValue>{selectedPaymentMethodLabel}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent alignItemWithTrigger={false}>
+                    <SelectGroup>
+                      {unifiedMethods.map((method) => (
+                        <SelectItem
+                          key={method.route_id}
+                          value={method.route_id}
+                        >
+                          {getMethodLabel(method)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <Button
+                  onClick={() => void handlePaySelectedGateway()}
+                  disabled={paying || !selectedPaymentMethod || limitReached}
+                  aria-busy={paymentLoadingKey === selectedPaymentMethod}
+                >
+                  {paymentLoadingKey === selectedPaymentMethod && (
+                    <Spinner aria-label={t('Preparing payment')} />
+                  )}
+                  {t('Pay')}
+                </Button>
+              </div>
+            )}
+          </div>
         )}
-      </Dialog>
-    </>
+      </div>
+    </Dialog>
   )
 }

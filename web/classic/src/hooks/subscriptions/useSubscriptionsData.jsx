@@ -21,6 +21,7 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { API, showError, showSuccess } from '../../helpers';
 import { useTableCompactMode } from '../common/useTableCompactMode';
+import { hasLegacyStripePriceMapping } from '../../helpers/subscription-stripe';
 
 export const useSubscriptionsData = () => {
   const { t } = useTranslation();
@@ -124,6 +125,7 @@ export const useSubscriptionsData = () => {
   }, []);
 
   const planCount = allPlans.length;
+  const showLegacyStripeMapping = allPlans.some(hasLegacyStripePriceMapping);
   const plans = allPlans.slice(
     Math.max(0, (activePage - 1) * pageSize),
     Math.max(0, (activePage - 1) * pageSize) + pageSize,
@@ -133,6 +135,7 @@ export const useSubscriptionsData = () => {
     // Data state
     plans,
     planCount,
+    showLegacyStripeMapping,
     loading,
 
     // Modal state

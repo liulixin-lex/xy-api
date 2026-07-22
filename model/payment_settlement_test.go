@@ -255,6 +255,7 @@ func TestProviderIdentityAuthorityConflictCommitsManualReview(t *testing.T) {
 
 func TestCreatePaymentOrderFromQuoteRetryReturnsOriginalOrder(t *testing.T) {
 	truncateTables(t)
+	seedPaymentUser(t, 970000, 0)
 	quoteID, err := GeneratePaymentQuoteID()
 	require.NoError(t, err)
 	require.NoError(t, CreatePaymentQuote(&PaymentQuote{
@@ -511,6 +512,14 @@ func TestVerifiedLatePaidTopUpRecoversFailedOrExpiredProjection(t *testing.T) {
 		truncateTables(t)
 		seedPaymentUser(t, 970038, 0)
 		order := createTopUpPaymentOrder(t, 970038, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+		authorizationDigest := strings.Repeat("a", 64)
+		require.NoError(t, DB.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
+			"start_flow": "qr", "start_payload": "encrypted-checkout-state",
+			"browser_authorization_digest":     authorizationDigest,
+			"browser_authorization_payload":    "encrypted-browser-authorization",
+			"browser_authorization_expires_at": time.Now().Add(time.Minute).Unix(),
+			"browser_authorized_at":            time.Now().Unix(),
+		}).Error)
 		failed := PaymentEventInput{
 			Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
 			EventKey: "stripe-async-payment-failed-first", EventType: "checkout.session.async_payment_failed",
@@ -520,6 +529,15 @@ func TestVerifiedLatePaidTopUpRecoversFailedOrExpiredProjection(t *testing.T) {
 		}
 		_, err := ProcessPaymentEvent(failed)
 		require.NoError(t, err)
+		failedOrder, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
+		require.NoError(t, lookupErr)
+		assert.Equal(t, PaymentOrderStatusFailed, failedOrder.Status)
+		assert.Empty(t, failedOrder.StartFlow)
+		assert.Empty(t, failedOrder.StartPayload)
+		assert.Nil(t, failedOrder.BrowserAuthorizationDigest)
+		assert.Empty(t, failedOrder.BrowserAuthorizationPayload)
+		assert.Zero(t, failedOrder.BrowserAuthorizationExpiresAt)
+		assert.Zero(t, failedOrder.BrowserAuthorizedAt)
 
 		paid := paidPaymentEvent(order, "stripe-async-payment-succeeded-late")
 		paid.ProviderOrderKey = failed.ProviderOrderKey

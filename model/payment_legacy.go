@@ -272,7 +272,7 @@ func validateLegacyPaymentProviderAndMethod(storedProvider, storedMethod string,
 func isReservedNonEpayPaymentMethod(method string) bool {
 	switch method {
 	case PaymentMethodStripe, PaymentMethodCreem, PaymentMethodWaffo, PaymentMethodWaffoPancake,
-		PaymentMethodXorPayNative, PaymentMethodXorPayAlipay, PaymentMethodBalance:
+		PaymentMethodXorPayNative, PaymentMethodXorPayAlipay, PaymentMethodXorPayJSAPI, PaymentMethodBalance:
 		return true
 	default:
 		return false

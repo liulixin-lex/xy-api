@@ -54,14 +54,15 @@ import {
 import { SubscriptionPurchaseDialog } from '@/features/subscriptions/components/dialogs/subscription-purchase-dialog'
 import { formatDuration, formatResetPeriod } from '@/features/subscriptions/lib'
 import type {
-  PlanRecord,
-  UserSubscriptionRecord,
+  PublicPlanRecord,
+  PublicUserSubscriptionRecord,
 } from '@/features/subscriptions/types'
 import { formatQuota } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import { formatPaymentDecimalAmount } from '../lib/billing'
-import type { PaymentMethod, TopupInfo } from '../types'
+import { filterPaymentMethodsForBrowser } from '../lib/payment'
+import type { TopupInfo } from '../types'
 
 interface SubscriptionPlansCardProps {
   topupInfo: TopupInfo | null
@@ -70,33 +71,35 @@ interface SubscriptionPlansCardProps {
   onPurchaseSuccess?: () => void | Promise<void>
 }
 
-function getSubscriptionPaymentMethods(
-  payMethods: PaymentMethod[] = [],
-  enableEpay: boolean
-): PaymentMethod[] {
-  return payMethods.filter((method) => {
-    if (!method?.type) return false
-    if (method.provider === 'epay') return enableEpay
-    return method.provider === 'xorpay'
-  })
-}
-
 function getBillingPreferenceLabel(
   preference: string,
   t: (key: string) => string
 ): string {
   switch (preference) {
     case 'subscription_first':
-      return t('Subscription First')
+      return t('Access First')
     case 'wallet_first':
       return t('Wallet First')
     case 'subscription_only':
-      return t('Subscription Only')
+      return t('Access Only')
     case 'wallet_only':
       return t('Wallet Only')
     default:
-      return preference
+      return t('Automatic')
   }
+}
+
+function getBillingPreferenceDisplayLabel(
+  preference: string,
+  disabled: boolean,
+  t: (key: string, values?: Record<string, string | number>) => string
+): string {
+  const label = getBillingPreferenceLabel(preference, t)
+  if (!disabled) return label
+  return t('{{label}} ({{status}})', {
+    label,
+    status: t('No Active'),
+  })
 }
 
 export function SubscriptionPlansCard({
@@ -107,12 +110,12 @@ export function SubscriptionPlansCard({
 }: SubscriptionPlansCardProps) {
   const { t } = useTranslation()
 
-  const [plans, setPlans] = useState<PlanRecord[]>([])
+  const [plans, setPlans] = useState<PublicPlanRecord[]>([])
   const [activeSubscriptions, setActiveSubscriptions] = useState<
-    UserSubscriptionRecord[]
+    PublicUserSubscriptionRecord[]
   >([])
   const [allSubscriptions, setAllSubscriptions] = useState<
-    UserSubscriptionRecord[]
+    PublicUserSubscriptionRecord[]
   >([])
   const [billingPreference, setBillingPreference] =
     useState('subscription_first')
@@ -126,21 +129,13 @@ export function SubscriptionPlansCard({
   const preferenceSavingRef = useRef(false)
 
   const [purchaseOpen, setPurchaseOpen] = useState(false)
-  const [selectedPlan, setSelectedPlan] = useState<PlanRecord | null>(null)
+  const [selectedPlan, setSelectedPlan] = useState<PublicPlanRecord | null>(
+    null
+  )
 
-  const stripeCurrency = topupInfo?.pay_methods
-    ?.find((method) => method.provider === 'stripe')
-    ?.currency?.toUpperCase()
-  const enableStripe =
-    !!topupInfo?.enable_stripe_topup &&
-    (!stripeCurrency || stripeCurrency === 'USD')
-  const enableCreem = !!topupInfo?.enable_creem_topup
-  const enableWaffoPancake = !!topupInfo?.enable_waffo_pancake_topup
-  const enableOnlineTopUp = !!topupInfo?.enable_online_topup
-  const subscriptionPaymentMethods = useMemo(
-    () =>
-      getSubscriptionPaymentMethods(topupInfo?.pay_methods, enableOnlineTopUp),
-    [enableOnlineTopUp, topupInfo?.pay_methods]
+  const subscriptionPaymentRoutes = useMemo(
+    () => filterPaymentMethodsForBrowser(topupInfo?.payment_routes || []),
+    [topupInfo?.payment_routes]
   )
 
   const fetchPlans = useCallback(async () => {
@@ -151,9 +146,9 @@ export function SubscriptionPlansCard({
         setPlansError(null)
         return true
       }
-      setPlansError(res.message || t('Failed to load subscription plans'))
+      setPlansError(t('Failed to load access plans'))
     } catch {
-      setPlansError(t('Failed to load subscription plans'))
+      setPlansError(t('Failed to load access plans'))
     }
     return false
   }, [t])
@@ -170,11 +165,9 @@ export function SubscriptionPlansCard({
         setSubscriptionError(null)
         return true
       }
-      setSubscriptionError(
-        res.message || t('Failed to load subscription status')
-      )
+      setSubscriptionError(t('Failed to load access status'))
     } catch {
-      setSubscriptionError(t('Failed to load subscription status'))
+      setSubscriptionError(t('Failed to load access status'))
     }
     return false
   }, [t])
@@ -214,7 +207,7 @@ export function SubscriptionPlansCard({
         const normalized = res.data?.billing_preference || pref
         setBillingPreference(normalized)
       } else {
-        toast.error(res.message || t('Update failed'))
+        toast.error(t('Update failed'))
         setBillingPreference(previous)
       }
     } catch {
@@ -251,24 +244,14 @@ export function SubscriptionPlansCard({
     onAvailabilityChange?.(isAvailable)
   }, [isAvailable, onAvailabilityChange])
 
-  const planTitleMap = useMemo(() => {
-    const map = new Map<number, string>()
-    for (const p of plans) {
-      if (p?.plan?.id) {
-        map.set(p.plan.id, p.plan.title || '')
-      }
-    }
-    return map
-  }, [plans])
-
-  const getRemainingDays = (sub: UserSubscriptionRecord) => {
+  const getRemainingDays = (sub: PublicUserSubscriptionRecord) => {
     const endTime = sub?.subscription?.end_time || 0
     if (!endTime) return 0
     const now = Date.now() / 1000
     return Math.max(0, Math.ceil((endTime - now) / 86400))
   }
 
-  const getUsagePercent = (sub: UserSubscriptionRecord) => {
+  const getUsagePercent = (sub: PublicUserSubscriptionRecord) => {
     const total = Number(sub?.subscription?.amount_total || 0)
     const used = Number(sub?.subscription?.amount_used || 0)
     if (total <= 0) return 0
@@ -302,8 +285,10 @@ export function SubscriptionPlansCard({
   return (
     <>
       <TitledCard
-        title={t('Subscription Plans')}
-        description={t('Subscribe to a plan for model access')}
+        title={t('Access Plans')}
+        description={t(
+          'Choose fixed-term access. Purchases are one-time and do not renew automatically.'
+        )}
         icon={<Crown className='h-4 w-4' />}
         disableHoverEffect
         contentClassName='space-y-4 sm:space-y-5'
@@ -313,7 +298,7 @@ export function SubscriptionPlansCard({
             <AlertDescription className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
               <span>
                 {plansError && subscriptionError
-                  ? t('Failed to load subscription information')
+                  ? t('Failed to load access information')
                   : plansError || subscriptionError}
               </span>
               <Button
@@ -328,13 +313,11 @@ export function SubscriptionPlansCard({
             </AlertDescription>
           </Alert>
         )}
-        {/* My subscriptions & billing preference */}
+        {/* My access & billing preference */}
         <div className='rounded-xl border p-3 sm:p-4'>
           <div className='flex flex-wrap items-center justify-between gap-2.5 sm:gap-3'>
             <div className='flex min-w-0 flex-wrap items-center gap-2'>
-              <span className='text-sm font-medium'>
-                {t('My Subscriptions')}
-              </span>
+              <span className='text-sm font-medium'>{t('My Access')}</span>
               <span className='flex items-center gap-1.5 text-xs font-medium'>
                 <span
                   className={cn(
@@ -368,11 +351,10 @@ export function SubscriptionPlansCard({
                 items={[
                   {
                     value: 'subscription_first',
-                    label: (
-                      <>
-                        {getBillingPreferenceLabel('subscription_first', t)}
-                        {disablePref ? ` (${t('No Active')})` : ''}
-                      </>
+                    label: getBillingPreferenceDisplayLabel(
+                      'subscription_first',
+                      disablePref,
+                      t
                     ),
                   },
                   {
@@ -381,11 +363,10 @@ export function SubscriptionPlansCard({
                   },
                   {
                     value: 'subscription_only',
-                    label: (
-                      <>
-                        {getBillingPreferenceLabel('subscription_only', t)}
-                        {disablePref ? ` (${t('No Active')})` : ''}
-                      </>
+                    label: getBillingPreferenceDisplayLabel(
+                      'subscription_only',
+                      disablePref,
+                      t
                     ),
                   },
                   {
@@ -408,8 +389,11 @@ export function SubscriptionPlansCard({
                       value='subscription_first'
                       disabled={disablePref}
                     >
-                      {getBillingPreferenceLabel('subscription_first', t)}
-                      {disablePref ? ` (${t('No Active')})` : ''}
+                      {getBillingPreferenceDisplayLabel(
+                        'subscription_first',
+                        disablePref,
+                        t
+                      )}
                     </SelectItem>
                     <SelectItem value='wallet_first'>
                       {getBillingPreferenceLabel('wallet_first', t)}
@@ -418,8 +402,11 @@ export function SubscriptionPlansCard({
                       value='subscription_only'
                       disabled={disablePref}
                     >
-                      {getBillingPreferenceLabel('subscription_only', t)}
-                      {disablePref ? ` (${t('No Active')})` : ''}
+                      {getBillingPreferenceDisplayLabel(
+                        'subscription_only',
+                        disablePref,
+                        t
+                      )}
                     </SelectItem>
                     <SelectItem value='wallet_only'>
                       {getBillingPreferenceLabel('wallet_only', t)}
@@ -433,7 +420,7 @@ export function SubscriptionPlansCard({
                 className='h-8 w-8'
                 onClick={handleRefresh}
                 disabled={refreshing || preferenceSaving}
-                aria-label={t('Refresh subscription status')}
+                aria-label={t('Refresh access status')}
               >
                 <RefreshCw
                   className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`}
@@ -445,12 +432,12 @@ export function SubscriptionPlansCard({
           {disablePref && isSubPref && (
             <p className='text-muted-foreground mt-2 text-xs'>
               {t(
-                'Preference saved as {{pref}}, but no active subscription. Wallet will be used automatically.',
+                'Preference saved as {{pref}}, but no active access. Wallet will be used automatically.',
                 {
                   pref:
                     billingPreference === 'subscription_only'
-                      ? t('Subscription Only')
-                      : t('Subscription First'),
+                      ? t('Access Only')
+                      : t('Access First'),
                 }
               )}
             </p>
@@ -466,8 +453,7 @@ export function SubscriptionPlansCard({
                   const usedAmount = Number(subscription?.amount_used || 0)
                   const remainAmount =
                     totalAmount > 0 ? Math.max(0, totalAmount - usedAmount) : 0
-                  const planTitle =
-                    planTitleMap.get(subscription?.plan_id) || ''
+                  const planTitle = subscription?.plan_title || ''
                   const remainDays = getRemainingDays(sub)
                   const usagePercent = getUsagePercent(sub)
                   const now = Date.now() / 1000
@@ -496,8 +482,13 @@ export function SubscriptionPlansCard({
                         <div className='flex items-center gap-2'>
                           <span className='font-medium'>
                             {planTitle
-                              ? `${planTitle} · ${t('Subscription')} #${subscription?.id}`
-                              : `${t('Subscription')} #${subscription?.id}`}
+                              ? t('{{plan}}, Access #{{id}}', {
+                                  plan: planTitle,
+                                  id: subscription?.id || 0,
+                                })
+                              : t('Access #{{id}}', {
+                                  id: subscription?.id || 0,
+                                })}
                           </span>
                           <StatusBadge
                             label={statusLabel}
@@ -534,13 +525,24 @@ export function SubscriptionPlansCard({
                             <TooltipTrigger
                               render={<span className='cursor-help' />}
                             >
-                              {formatQuota(usedAmount)}/
-                              {formatQuota(totalAmount)} · {t('Remaining')}{' '}
-                              {formatQuota(remainAmount)}
+                              {t(
+                                '{{used}}/{{total}}. Remaining {{remaining}}',
+                                {
+                                  used: formatQuota(usedAmount),
+                                  total: formatQuota(totalAmount),
+                                  remaining: formatQuota(remainAmount),
+                                }
+                              )}
                             </TooltipTrigger>
                             <TooltipContent>
-                              {t('Raw Quota')}: {usedAmount}/{totalAmount} ·{' '}
-                              {t('Remaining')} {remainAmount}
+                              {t(
+                                'Raw quota: {{used}}/{{total}}. Remaining {{remaining}}',
+                                {
+                                  used: usedAmount,
+                                  total: totalAmount,
+                                  remaining: remainAmount,
+                                }
+                              )}
                             </TooltipContent>
                           </Tooltip>
                         ) : (
@@ -548,7 +550,9 @@ export function SubscriptionPlansCard({
                         )}
                         {totalAmount > 0 && (
                           <span className='ml-2'>
-                            {t('Used')} {usagePercent}%
+                            {t('Used {{percent}}%', {
+                              percent: usagePercent,
+                            })}
                           </span>
                         )}
                       </div>
@@ -564,7 +568,7 @@ export function SubscriptionPlansCard({
 
           {!hasAny && (
             <p className='text-muted-foreground mt-2 text-xs'>
-              {t('Subscribe to a plan for model access')}
+              {t('Purchase fixed-term access to available models')}
             </p>
           )}
         </div>
@@ -586,16 +590,24 @@ export function SubscriptionPlansCard({
               const reached = limit > 0 && count >= limit
 
               const benefits = [
-                `${t('Validity Period')}: ${formatDuration(plan, t)}`,
+                t('Validity period: {{value}}', {
+                  value: formatDuration(plan, t),
+                }),
                 formatResetPeriod(plan, t) !== t('No Reset')
-                  ? `${t('Quota Reset')}: ${formatResetPeriod(plan, t)}`
+                  ? t('Quota reset: {{value}}', {
+                      value: formatResetPeriod(plan, t),
+                    })
                   : null,
                 totalAmount > 0
-                  ? `${t('Total Quota')}: ${formatQuota(totalAmount)}`
-                  : `${t('Total Quota')}: ${t('Unlimited')}`,
-                limit > 0 ? `${t('Purchase Limit')}: ${limit}` : null,
-                plan.upgrade_group
-                  ? `${t('Upgrade Group')}: ${plan.upgrade_group}`
+                  ? t('Total quota: {{value}}', {
+                      value: formatQuota(totalAmount),
+                    })
+                  : t('Total quota: {{value}}', { value: t('Unlimited') }),
+                limit > 0
+                  ? t('Purchase limit: {{count}}', { count: limit })
+                  : null,
+                plan.includes_expanded_access
+                  ? t('Includes expanded model access')
                   : null,
               ].filter(Boolean) as string[]
 
@@ -609,7 +621,7 @@ export function SubscriptionPlansCard({
                     <div className='mb-2 flex items-start justify-between gap-3'>
                       <div className='min-w-0'>
                         <h4 className='truncate font-semibold'>
-                          {plan.title || t('Subscription Plans')}
+                          {plan.title || t('Access Plans')}
                         </h4>
                         {plan.subtitle && (
                           <p className='text-muted-foreground truncate text-xs'>
@@ -657,7 +669,10 @@ export function SubscriptionPlansCard({
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          {t('Purchase limit reached')} ({count}/{limit})
+                          {t('Purchase limit reached ({{count}}/{{limit}})', {
+                            count,
+                            limit,
+                          })}
                         </TooltipContent>
                       </Tooltip>
                     ) : (
@@ -669,7 +684,7 @@ export function SubscriptionPlansCard({
                           setPurchaseOpen(true)
                         }}
                       >
-                        {t('Subscribe Now')}
+                        {t('Purchase Access')}
                       </Button>
                     )}
                   </CardContent>
@@ -693,10 +708,7 @@ export function SubscriptionPlansCard({
           }
         }}
         plan={selectedPlan}
-        enableStripe={enableStripe}
-        enableCreem={enableCreem}
-        enableWaffoPancake={enableWaffoPancake}
-        paymentMethods={subscriptionPaymentMethods}
+        paymentRoutes={subscriptionPaymentRoutes}
         userQuota={userQuota}
         onPurchaseSuccess={handlePurchaseSuccess}
         purchaseLimit={

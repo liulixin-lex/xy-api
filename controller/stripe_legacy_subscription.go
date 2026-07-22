@@ -95,25 +95,6 @@ func newStripeLegacySubscriptionView(subscription *model.StripeLegacySubscriptio
 	}
 }
 
-func GetStripeLegacySubscriptionInventory(c *gin.Context) {
-	pageInfo := common.GetPageQuery(c)
-	subscriptions, total, err := model.ListStripeLegacySubscriptions(model.StripeLegacySubscriptionFilter{
-		UserID: c.GetInt("id"),
-		Status: strings.TrimSpace(c.Query("status")),
-	}, pageInfo)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	views := make([]stripeLegacySubscriptionView, 0, len(subscriptions))
-	for _, subscription := range subscriptions {
-		views = append(views, newStripeLegacySubscriptionView(subscription))
-	}
-	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(views)
-	common.ApiSuccess(c, pageInfo)
-}
-
 func AdminListStripeLegacySubscriptionInventory(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	filter := model.StripeLegacySubscriptionFilter{

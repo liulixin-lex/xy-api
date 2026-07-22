@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -42,7 +43,8 @@ func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
 		Amount:        req.Amount,
 	})
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": err.Error()})
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Stripe 报价失败 user_id=%d amount=%d error=%q", c.GetInt("id"), req.Amount, err.Error()))
+		legacyPaymentServiceAPIError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "success", "data": quote.PayableAmount})
@@ -50,33 +52,34 @@ func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
 
 func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 	if req.PaymentMethod != model.PaymentMethodStripe {
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "不支持的支付渠道"})
+		legacyPaymentAPIError(c, "payment_method_unavailable", nil)
 		return
 	}
 	if req.SuccessURL != "" && common.ValidateRedirectURL(req.SuccessURL) != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "支付成功重定向URL不在可信任域名列表中", "data": ""})
+		legacyPaymentAPIErrorStatus(c, http.StatusBadRequest, "payment_redirect_invalid", nil)
 		return
 	}
 
 	if req.CancelURL != "" && common.ValidateRedirectURL(req.CancelURL) != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "支付取消重定向URL不在可信任域名列表中", "data": ""})
+		legacyPaymentAPIErrorStatus(c, http.StatusBadRequest, "payment_redirect_invalid", nil)
 		return
 	}
 
 	start, err := startLegacyTopUpPaymentWithReturnURLs(c, model.PaymentProviderStripe, model.PaymentMethodStripe, req.Amount, req.RequestID, req.SuccessURL, req.CancelURL)
 	if err != nil {
 		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Stripe 创建 Checkout Session 失败 user_id=%d amount=%d error=%q", c.GetInt("id"), req.Amount, err.Error()))
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": err.Error()})
+		legacyPaymentServiceAPIError(c, err)
 		return
 	}
-	if start.Flow != service.PaymentFlowHostedRedirect || start.URL == "" {
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "Stripe 返回了无效的支付链接"})
+	if start == nil || strings.TrimSpace(start.TradeNo) == "" {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("Stripe 返回无效本地订单 user_id=%d", c.GetInt("id")))
+		legacyPaymentAPIError(c, "payment_not_ready", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "success",
 		"data": gin.H{
-			"pay_link": start.URL,
+			"pay_link": legacyPaymentPageURL(start.TradeNo),
 			"trade_no": start.TradeNo,
 		},
 	})
@@ -87,7 +90,7 @@ func RequestStripeAmount(c *gin.Context) {
 	var req StripePayRequest
 	err := c.ShouldBindJSON(&req)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "参数错误"})
+		legacyPaymentAPIError(c, "payment_request_invalid", nil)
 		return
 	}
 	stripeAdaptor.RequestAmount(c, &req)
@@ -98,7 +101,7 @@ func RequestStripePay(c *gin.Context) {
 	var req StripePayRequest
 	err := c.ShouldBindJSON(&req)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "参数错误"})
+		legacyPaymentAPIError(c, "payment_request_invalid", nil)
 		return
 	}
 	stripeAdaptor.RequestPay(c, &req)

@@ -12,7 +12,7 @@ binary=$1
 version=$2
 redis_mode=$3
 
-if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+if [[ ! "$version" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
   echo "invalid standalone smoke version: $version" >&2
   exit 2
 fi

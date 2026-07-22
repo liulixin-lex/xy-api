@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { useEffect, useState, useContext, useRef } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   API,
   showError,
@@ -29,11 +29,14 @@ import {
   copy,
   getQuotaPerUnit,
 } from '../../helpers';
-import { Modal, Toast } from '@douyinfe/semi-ui';
-import { QRCodeSVG } from 'qrcode.react';
+import { Button, Modal, Typography } from '@douyinfe/semi-ui';
 import { useTranslation } from 'react-i18next';
 import { UserContext } from '../../context/User';
 import { StatusContext } from '../../context/Status';
+import {
+  normalizePublicSubscriptionPlans,
+  normalizePublicSubscriptionSelf,
+} from '../../helpers/subscription-public';
 
 import RechargeCard from './RechargeCard';
 import InvitationCard from './InvitationCard';
@@ -44,18 +47,23 @@ import PaymentOrderTracker from './PaymentOrderTracker';
 import { usePaymentOrderPolling } from './use-payment-order';
 import {
   createPaymentRequestId,
+  filterPaymentMethodsForBrowser,
+  getPaymentQuoteRoutePayload,
+  getPaymentRouteId,
+  getPaymentSelectionId,
   getSafePaymentUrl,
-  inferPaymentProvider,
-  isEndpointUnavailable,
-  isSafeQrContent,
-  navigateToPaymentUrl,
+  getSafeUserPaymentError,
   normalizePaymentMethod,
+  normalizePublicPaymentQuote,
+  normalizePublicTopupInfo,
   formatPaymentDecimal,
-  submitPaymentForm,
 } from './payment-utils';
+
+const { Text } = Typography;
 
 const TopUp = () => {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [userState, userDispatch] = useContext(UserContext);
   const [statusState] = useContext(StatusContext);
@@ -67,29 +75,13 @@ const TopUp = () => {
     statusState?.status?.min_topup || 1,
   );
   const [topUpLink, setTopUpLink] = useState('');
-  const [enableOnlineTopUp, setEnableOnlineTopUp] = useState(
-    statusState?.status?.enable_online_topup || false,
-  );
-  const [enableStripeTopUp, setEnableStripeTopUp] = useState(
-    statusState?.status?.enable_stripe_topup || false,
-  );
-  const [enableXorPayTopUp, setEnableXorPayTopUp] = useState(
-    statusState?.status?.enable_xorpay_topup || false,
-  );
   const [statusLoading, setStatusLoading] = useState(true);
 
-  // Creem 相关状态
-  const [creemProducts, setCreemProducts] = useState([]);
-  const [enableCreemTopUp, setEnableCreemTopUp] = useState(false);
+  const [paymentProducts, setPaymentProducts] = useState([]);
   const [creemOpen, setCreemOpen] = useState(false);
-  const [selectedCreemProduct, setSelectedCreemProduct] = useState(null);
+  const [selectedPaymentProduct, setSelectedPaymentProduct] = useState(null);
 
-  // Waffo 相关状态
-  const [enableWaffoTopUp, setEnableWaffoTopUp] = useState(false);
-  const [waffoPayMethods, setWaffoPayMethods] = useState([]);
-  const [waffoMinTopUp, setWaffoMinTopUp] = useState(1);
-  const [enableWaffoPancakeTopUp, setEnableWaffoPancakeTopUp] = useState(false);
-  const [waffoPancakeMinTopUp, setWaffoPancakeMinTopUp] = useState(1);
+  const [paymentRouteOptions, setPaymentRouteOptions] = useState([]);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [open, setOpen] = useState(false);
@@ -100,13 +92,18 @@ const TopUp = () => {
   const [payMethods, setPayMethods] = useState([]);
   const [paymentQuote, setPaymentQuote] = useState(null);
   const [paymentQuoteError, setPaymentQuoteError] = useState('');
-  const [qrPayment, setQrPayment] = useState(null);
   const quoteSequenceRef = useRef(0);
   const quoteAbortRef = useRef(null);
   const paymentSelectionRef = useRef('');
   const paymentSelectionInFlightRef = useRef(false);
   const paymentStartInFlightRef = useRef(false);
   const paymentStartRequestRef = useRef({ quoteId: '', requestId: '' });
+  const productPaymentAttemptRef = useRef({
+    key: '',
+    quoteId: '',
+    requestId: '',
+    expiresAt: 0,
+  });
 
   const affFetchedRef = useRef(false);
 
@@ -139,6 +136,11 @@ const TopUp = () => {
 
   // 充值配置信息
   const [topupInfo, setTopupInfo] = useState({
+    online_payment_available: false,
+    payment_routes: [],
+    payment_products: [],
+    payment_route_options: [],
+    min_topup: 1,
     amount_options: [],
     discount: {},
     enable_redemption: true,
@@ -157,30 +159,33 @@ const TopUp = () => {
   } = usePaymentOrderPolling({
     t,
     onSuccess: async () => {
-      await Promise.all([getUserQuota(), getSubscriptionSelf()]);
-    },
-    onTerminal: async (order) => {
-      if (order.status === 'success') {
-        showSuccess(t('支付成功'));
-      } else {
-        showInfo(t('支付状态已更新') + `: ${t(order.status)}`);
-      }
-      setOpenHistory(true);
+      await Promise.all([
+        getUserQuota({ silent: true }),
+        getSubscriptionSelf(),
+      ]);
     },
   });
 
+  const optionRoute = topupInfo.payment_routes.find(
+    (method) => method.checkout_mode === 'option',
+  );
   const confirmPayMethods = [
     ...payMethods,
-    ...waffoPayMethods.map((method, index) => ({
-      ...method,
-      type: `waffo:${index}`,
-      min_topup: waffoMinTopUp,
-      color: method.color || 'rgba(var(--semi-primary-5), 1)',
-    })),
+    ...paymentRouteOptions
+      .filter((option) => option.route_id === optionRoute?.route_id)
+      .map((option) =>
+        normalizePaymentMethod({
+          ...optionRoute,
+          option_id: option.option_id,
+          public_label: option.public_label,
+        }),
+      ),
   ];
 
   const getPayMethodConfig = (payment) =>
-    confirmPayMethods.find((method) => method.type === payment);
+    confirmPayMethods.find(
+      (method) => getPaymentSelectionId(method) === payment,
+    );
 
   const getPaymentMinTopUp = (payment) => {
     const configuredMinTopUp = Number(getPayMethodConfig(payment)?.min_topup);
@@ -201,12 +206,13 @@ const TopUp = () => {
   };
 
   const requestUnifiedQuote = async (payment, value) => {
-    const method = getPayMethodConfig(payment) || {
-      type: payment,
-      provider: inferPaymentProvider(payment),
-    };
-    const provider = inferPaymentProvider(method.type, method.provider);
-    if (!['epay', 'stripe', 'xorpay'].includes(provider)) return null;
+    const method = getPayMethodConfig(payment);
+    if (
+      !method ||
+      !['quote', 'direct', 'option'].includes(method.checkout_mode)
+    ) {
+      return null;
+    }
 
     quoteAbortRef.current?.abort?.();
     const controller = new AbortController();
@@ -216,53 +222,16 @@ const TopUp = () => {
     setPaymentQuoteError('');
     setAmountLoading(true);
     try {
-      let response;
-      try {
-        response = await API.post(
-          '/api/user/payment/quote',
-          {
-            order_kind: 'topup',
-            provider,
-            payment_method: method.type,
-            amount: Number(value),
-          },
-          { signal: controller.signal },
-        );
-      } catch (error) {
-        if (!isEndpointUnavailable(error) || provider === 'xorpay') throw error;
-        const legacyResponse = await API.post(
-          provider === 'stripe'
-            ? '/api/user/stripe/amount'
-            : '/api/user/amount',
-          { amount: Number(value) },
-        );
-        const legacyAmount = Number(legacyResponse.data?.data);
-        if (
-          !legacyResponse.data?.success &&
-          legacyResponse.data?.message !== 'success'
-        ) {
-          throw new Error(legacyResponse.data?.message || t('获取金额失败'));
-        }
-        response = {
-          data: {
-            success: true,
-            data: {
-              quote_id: `legacy:${provider}:${method.type}:${Date.now()}`,
-              order_kind: 'topup',
-              provider,
-              payment_method: method.type,
-              requested_amount: Number(value),
-              credit_quota: 0,
-              expected_amount_minor: Math.round(legacyAmount * 100),
-              payable_amount: legacyAmount.toFixed(2),
-              currency:
-                method.currency || (provider === 'stripe' ? 'USD' : 'CNY'),
-              expires_at: Math.floor(Date.now() / 1000) + 300,
-              legacy: true,
-            },
-          },
-        };
-      }
+      const response = await API.post(
+        '/api/user/payment/quote',
+        {
+          order_kind: 'topup',
+          ...getPaymentQuoteRoutePayload(method),
+          amount: Number(value),
+          ...(method.option_id ? { option_id: method.option_id } : {}),
+        },
+        { signal: controller.signal, skipErrorHandler: true },
+      );
 
       const quote = response.data?.data;
       if (
@@ -270,21 +239,24 @@ const TopUp = () => {
         !response.data?.success ||
         !quote
       ) {
-        throw new Error(response.data?.message || t('获取金额失败'));
+        throw new Error(t('获取金额失败'));
       }
-      setPaymentQuote(quote);
-      setAmount(Number(quote.payable_amount) || 0);
+      const publicQuote = normalizePublicPaymentQuote(quote, method, value);
+      if (!publicQuote) throw new Error(t('获取金额失败'));
+      setPaymentQuote(publicQuote);
+      setAmount(Number(publicQuote.payable_amount) || 0);
       paymentStartRequestRef.current = {
-        quoteId: quote.quote_id,
+        quoteId: publicQuote.quote_id,
         requestId: createPaymentRequestId(),
       };
-      return quote;
+      return publicQuote;
     } catch (error) {
       if (sequence !== quoteSequenceRef.current) return null;
       if (error?.code === 'ERR_CANCELED') return null;
+      const safeError = getSafeUserPaymentError(error, t, '获取金额失败');
       setPaymentQuote(null);
-      setPaymentQuoteError(error?.message || t('获取金额失败'));
-      throw error;
+      setPaymentQuoteError(safeError);
+      return null;
     } finally {
       if (sequence === quoteSequenceRef.current) {
         setAmountLoading(false);
@@ -295,23 +267,11 @@ const TopUp = () => {
 
   const requestAmountByPayment = async (payment, value) => {
     const method = getPayMethodConfig(payment);
-    const provider = inferPaymentProvider(
-      method?.type || payment,
-      method?.provider,
-    );
-    if (['epay', 'stripe', 'xorpay'].includes(provider)) {
+    if (!method) return null;
+    if (['quote', 'direct', 'option'].includes(method.checkout_mode)) {
       return requestUnifiedQuote(payment, value ?? topUpCount);
     }
-    if (payment === 'stripe') {
-      return getStripeAmount(value);
-    }
-    if (payment === 'waffo_pancake') {
-      return getWaffoPancakeAmount(value);
-    }
-    if (typeof payment === 'string' && payment.startsWith('waffo:')) {
-      return getWaffoAmount(value);
-    }
-    return getAmount(value);
+    return null;
   };
 
   const topUp = async () => {
@@ -321,15 +281,21 @@ const TopUp = () => {
     }
     setIsSubmitting(true);
     try {
-      const res = await API.post('/api/user/topup', {
-        key: redemptionCode,
-      });
+      const res = await API.post(
+        '/api/user/topup',
+        {
+          key: redemptionCode,
+        },
+        { skipErrorHandler: true },
+      );
       const { success, message, data } = res.data;
       if (success) {
         showSuccess(t('兑换成功！'));
         Modal.success({
           title: t('兑换成功！'),
-          content: t('成功兑换额度：') + renderQuota(data),
+          content: t('Redemption successful! Added: {{quota}}', {
+            quota: renderQuota(data),
+          }),
           centered: true,
         });
         if (userState.user) {
@@ -367,35 +333,13 @@ const TopUp = () => {
     if (paymentSelectionInFlightRef.current) return;
 
     const method = getPayMethodConfig(payment);
-    const provider = inferPaymentProvider(
-      method?.type || payment,
-      method?.provider,
-    );
-    if (provider === 'stripe') {
-      if (!enableStripeTopUp) {
-        showError(t('管理员未开启Stripe充值！'));
-        return;
-      }
-    } else if (provider === 'xorpay') {
-      if (!enableXorPayTopUp || !method) {
-        showError(t('管理员未开启在线充值！'));
-        return;
-      }
-    } else if (payment === 'waffo_pancake') {
-      if (!enableWaffoPancakeTopUp) {
-        showError(t('管理员未开启 Waffo Pancake 充值！'));
-        return;
-      }
-    } else if (payment.startsWith('waffo:')) {
-      if (!enableWaffoTopUp) {
-        showError(t('管理员未开启 Waffo 充值！'));
-        return;
-      }
-    } else if (provider === 'epay') {
-      if (!enableOnlineTopUp) {
-        showError(t('管理员未开启在线充值！'));
-        return;
-      }
+    if (!method) {
+      showError(t('当前支付方式暂时不可用，请重新选择'));
+      return;
+    }
+    if (!['quote', 'option', 'direct'].includes(method.checkout_mode)) {
+      showError(t('当前支付方式暂时不可用，请重新选择'));
+      return;
     }
 
     const selectedMinTopUp = getPaymentMinTopUp(payment);
@@ -419,10 +363,16 @@ const TopUp = () => {
     setPaymentLoading(true);
     try {
       const quote = await requestAmountByPayment(payment, topUpCount);
-      if (['epay', 'stripe', 'xorpay'].includes(provider) && !quote) return;
+      if (!quote) {
+        return;
+      }
       if (paymentSelectionRef.current === payment) setOpen(true);
     } catch (error) {
-      showError(error?.message || t('获取金额失败'));
+      showError(
+        error?.response || error?.request
+          ? getSafeUserPaymentError(error, t, '获取金额失败')
+          : error?.message || t('获取金额失败'),
+      );
     } finally {
       paymentSelectionInFlightRef.current = false;
       setPaymentLoading(false);
@@ -430,354 +380,168 @@ const TopUp = () => {
   };
 
   const onlineTopUp = async () => {
-    if (payWay === 'waffo_pancake') {
-      setConfirmLoading(true);
-      try {
-        await waffoPancakeTopUp();
-      } finally {
-        setOpen(false);
-        setConfirmLoading(false);
-      }
-      return;
-    }
-
-    if (payWay.startsWith('waffo:')) {
-      const payMethodIndex = Number(payWay.split(':')[1]);
-      setConfirmLoading(true);
-      try {
-        await waffoTopUp(Number.isFinite(payMethodIndex) ? payMethodIndex : 0);
-      } finally {
-        setOpen(false);
-        setConfirmLoading(false);
-      }
-      return;
-    }
-
     const selectedMethod = getPayMethodConfig(payWay);
-    const selectedProvider = inferPaymentProvider(
-      selectedMethod?.type || payWay,
-      selectedMethod?.provider,
-    );
-    if (
-      ['epay', 'stripe', 'xorpay'].includes(selectedProvider) &&
-      paymentQuote &&
-      !paymentQuote.legacy
-    ) {
-      const quoteMatchesSelection =
-        paymentQuote.provider === selectedProvider &&
-        paymentQuote.payment_method === (selectedMethod?.type || payWay) &&
-        Number(paymentQuote.requested_amount) === Number(topUpCount);
-      if (!quoteMatchesSelection) {
-        showError(t('支付方式或充值数量已变化，请重新获取报价'));
-        invalidatePaymentQuote();
-        setOpen(false);
-        return;
-      }
-      if (paymentQuote.expires_at <= Date.now() / 1000) {
-        showError(t('报价已过期，请重新获取'));
-        setOpen(false);
-        return;
-      }
-      if (paymentStartInFlightRef.current) return;
+    if (!selectedMethod) {
+      showError(t('当前支付方式暂时不可用，请重新选择'));
+      setOpen(false);
+      return;
+    }
 
-      paymentStartInFlightRef.current = true;
-      setConfirmLoading(true);
-      let paymentStarted = false;
-      try {
-        if (
-          paymentStartRequestRef.current.quoteId !== paymentQuote.quote_id ||
-          !paymentStartRequestRef.current.requestId
-        ) {
-          paymentStartRequestRef.current = {
-            quoteId: paymentQuote.quote_id,
-            requestId: createPaymentRequestId(),
-          };
-        }
-        const response = await API.post('/api/user/payment/start', {
+    if (
+      !['quote', 'direct', 'option'].includes(selectedMethod.checkout_mode) ||
+      !paymentQuote
+    ) {
+      showError(t('请重新获取支付报价后再继续'));
+      setOpen(false);
+      return;
+    }
+    const quoteMatchesSelection =
+      paymentQuote.route_id === selectedMethod.route_id &&
+      Number(paymentQuote.top_up_amount) === Number(topUpCount);
+    if (!quoteMatchesSelection) {
+      showError(t('支付方式或充值数量已变化，请重新获取报价'));
+      invalidatePaymentQuote();
+      setOpen(false);
+      return;
+    }
+    if (paymentQuote.expires_at <= Date.now() / 1000) {
+      showError(t('报价已过期，请重新获取'));
+      setOpen(false);
+      return;
+    }
+    if (paymentStartInFlightRef.current) return;
+
+    paymentStartInFlightRef.current = true;
+    setConfirmLoading(true);
+    let paymentStarted = false;
+    try {
+      if (
+        paymentStartRequestRef.current.quoteId !== paymentQuote.quote_id ||
+        !paymentStartRequestRef.current.requestId
+      ) {
+        paymentStartRequestRef.current = {
+          quoteId: paymentQuote.quote_id,
+          requestId: createPaymentRequestId(),
+        };
+      }
+      const response = await API.post(
+        '/api/user/payment/start',
+        {
           quote_id: paymentQuote.quote_id,
           request_id: paymentStartRequestRef.current.requestId,
-        });
-        const start = response.data?.data;
-        if (!response.data?.success || !start) {
-          throw new Error(response.data?.message || t('支付请求失败'));
-        }
-        if (start.flow === 'qr') {
-          if (!isSafeQrContent(start.qr_content)) {
-            throw new Error(t('支付二维码无效'));
-          }
-          setQrPayment(start);
-          trackPayment(start, 'pending');
-        } else if (start.flow === 'pending') {
-          trackPayment(start, 'processing');
-        } else if (start.flow === 'hosted_redirect') {
-          if (!navigateToPaymentUrl(start.url)) {
-            throw new Error(t('支付跳转地址不安全'));
-          }
-        } else if (start.flow === 'form_post') {
-          if (!submitPaymentForm(start.action, start.fields)) {
-            throw new Error(t('支付跳转地址不安全'));
-          }
-        } else {
-          throw new Error(t('支付网关返回了不支持的跳转方式'));
-        }
-        paymentStarted = true;
-      } catch (error) {
-        showError(error?.message || t('支付请求失败'));
-      } finally {
-        if (paymentStarted) setOpen(false);
-        paymentStartInFlightRef.current = false;
-        setConfirmLoading(false);
+        },
+        { skipErrorHandler: true },
+      );
+      const start = response.data?.data;
+      if (!response.data?.success || !start?.trade_no) {
+        throw new Error(t('支付请求失败'));
       }
-      return;
-    }
-
-    if (payWay === 'stripe') {
-      // Stripe 支付处理
-      if (amount === 0) {
-        await getStripeAmount();
-      }
-    } else {
-      // 普通支付处理
-      if (amount === 0) {
-        await getAmount();
-      }
-    }
-
-    if (topUpCount < minTopUp) {
-      showError('充值数量不能小于' + minTopUp);
-      return;
-    }
-    setConfirmLoading(true);
-    try {
-      let res;
-      if (payWay === 'stripe') {
-        // Stripe 支付请求
-        res = await API.post('/api/user/stripe/pay', {
-          amount: parseInt(topUpCount),
-          payment_method: 'stripe',
-        });
-      } else {
-        // 普通支付请求
-        res = await API.post('/api/user/pay', {
-          amount: parseInt(topUpCount),
-          payment_method: payWay,
-        });
-      }
-
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success') {
-          if (payWay === 'stripe') {
-            if (!navigateToPaymentUrl(data.pay_link)) {
-              showError(t('支付跳转地址不安全'));
-            }
-          } else {
-            if (!submitPaymentForm(res.data.url, data)) {
-              showError(t('支付跳转地址不安全'));
-            }
-          }
-        } else {
-          const errorMsg =
-            typeof data === 'string' ? data : message || t('支付失败');
-          showError(errorMsg);
-        }
-      } else {
-        showError(res);
-      }
-    } catch (err) {
-      showError(t('支付请求失败'));
+      navigate(`/payment/${encodeURIComponent(start.trade_no)}`);
+      paymentStarted = true;
+    } catch (error) {
+      showError(
+        error?.response || error?.request
+          ? getSafeUserPaymentError(error, t, '支付请求失败')
+          : error?.message || t('支付请求失败'),
+      );
     } finally {
-      setOpen(false);
+      if (paymentStarted) setOpen(false);
+      paymentStartInFlightRef.current = false;
       setConfirmLoading(false);
     }
   };
 
-  const creemPreTopUp = async (product) => {
-    if (!enableCreemTopUp) {
-      showError(t('管理员未开启 Creem 充值！'));
-      return;
+  const paymentProductPreTopUp = async (product) => {
+    const key = `${product?.route_id || ''}:${product?.product_id || ''}`;
+    if (productPaymentAttemptRef.current.key !== key) {
+      productPaymentAttemptRef.current = {
+        key,
+        quoteId: '',
+        requestId: '',
+        expiresAt: 0,
+      };
     }
-    setSelectedCreemProduct(product);
+    setSelectedPaymentProduct(product);
     setCreemOpen(true);
   };
 
   const onlineCreemTopUp = async () => {
-    if (!selectedCreemProduct) {
+    if (!selectedPaymentProduct) {
       showError(t('请选择产品'));
       return;
     }
-    // Validate product has required fields
-    if (!selectedCreemProduct.productId) {
+    if (!selectedPaymentProduct.product_id) {
       showError(t('产品配置错误，请联系管理员'));
       return;
     }
+    if (!selectedPaymentProduct.route_id) {
+      showError(t('当前支付方式暂时不可用，请重新选择'));
+      return;
+    }
     setConfirmLoading(true);
+    let paymentStarted = false;
     try {
-      const res = await API.post('/api/user/creem/pay', {
-        product_id: selectedCreemProduct.productId,
-        payment_method: 'creem',
-      });
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success') {
-          processCreemCallback(data);
-        } else {
-          const errorMsg =
-            typeof data === 'string' ? data : message || t('支付失败');
-          showError(errorMsg);
+      const key = `${selectedPaymentProduct.route_id}:${selectedPaymentProduct.product_id}`;
+      let attempt = productPaymentAttemptRef.current;
+      if (
+        attempt.key !== key ||
+        !attempt.quoteId ||
+        attempt.expiresAt <= Date.now() / 1000
+      ) {
+        const quoteResponse = await API.post(
+          '/api/user/payment/quote',
+          {
+            order_kind: 'topup',
+            route_id: selectedPaymentProduct.route_id,
+            product_id: selectedPaymentProduct.product_id,
+          },
+          { skipErrorHandler: true },
+        );
+        const quote = quoteResponse.data?.data;
+        if (!quoteResponse.data?.success || !quote?.quote_id) {
+          throw new Error(t('获取金额失败'));
         }
-      } else {
-        showError(res);
+        attempt = {
+          key,
+          quoteId: quote.quote_id,
+          requestId: createPaymentRequestId(),
+          expiresAt: Number(quote.expires_at) || 0,
+        };
+        productPaymentAttemptRef.current = attempt;
       }
+
+      const startResponse = await API.post(
+        '/api/user/payment/start',
+        { quote_id: attempt.quoteId, request_id: attempt.requestId },
+        { skipErrorHandler: true },
+      );
+      const start = startResponse.data?.data;
+      if (!startResponse.data?.success || !start?.trade_no) {
+        throw new Error(t('支付请求失败'));
+      }
+      navigate(`/payment/${encodeURIComponent(start.trade_no)}`);
+      paymentStarted = true;
     } catch (err) {
-      showError(t('支付请求失败'));
+      showError(getSafeUserPaymentError(err, t, '支付请求失败'));
     } finally {
-      setCreemOpen(false);
+      if (paymentStarted) setCreemOpen(false);
       setConfirmLoading(false);
     }
   };
 
-  const waffoTopUp = async (payMethodIndex) => {
+  const getUserQuota = async ({ silent = false } = {}) => {
     try {
-      if (topUpCount < waffoMinTopUp) {
-        showError(t('充值数量不能小于') + waffoMinTopUp);
-        return;
-      }
-      setPaymentLoading(true);
-      const requestBody = {
-        amount: parseInt(topUpCount),
-      };
-      if (payMethodIndex != null) {
-        requestBody.pay_method_index = payMethodIndex;
-      }
-      const res = await API.post('/api/user/waffo/pay', requestBody);
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success' && data?.payment_url) {
-          if (!navigateToPaymentUrl(data.payment_url)) {
-            showError(t('支付跳转地址不安全'));
-          }
-        } else {
-          showError(data || t('支付请求失败'));
-        }
-      } else {
-        showError(res);
-      }
-    } catch (e) {
-      showError(t('支付请求失败'));
-    } finally {
-      setPaymentLoading(false);
-    }
-  };
-
-  const getWaffoAmount = async (value) => {
-    if (value === undefined) {
-      value = topUpCount;
-    }
-    setAmountLoading(true);
-    try {
-      const res = await API.post('/api/user/waffo/amount', {
-        amount: parseInt(value),
+      const res = await API.get('/api/user/self', {
+        skipErrorHandler: true,
       });
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success') {
-          setAmount(parseFloat(data));
-        } else {
-          setAmount(0);
-          Toast.error({ content: '错误：' + data, id: 'getAmount' });
-        }
-      } else {
-        showError(res);
-      }
-    } catch (err) {
-      // amount fetch failed silently
-    } finally {
-      setAmountLoading(false);
-    }
-  };
-
-  const waffoPancakeTopUp = async () => {
-    const minTopUpValue = Number(waffoPancakeMinTopUp || 1);
-    if (topUpCount < minTopUpValue) {
-      showError(t('充值数量不能小于') + minTopUpValue);
-      return;
-    }
-
-    setPaymentLoading(true);
-    try {
-      const res = await API.post('/api/user/waffo-pancake/pay', {
-        amount: parseInt(topUpCount),
-      });
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success') {
-          const checkoutUrl = data?.checkout_url || '';
-          if (checkoutUrl && navigateToPaymentUrl(checkoutUrl)) {
-          } else if (checkoutUrl) {
-            showError(t('支付跳转地址不安全'));
-          } else {
-            showError(t('支付请求失败'));
-          }
-        } else {
-          const errorMsg =
-            typeof data === 'string' ? data : message || t('支付请求失败');
-          showError(errorMsg);
-        }
-      } else {
-        showError(res);
-      }
-    } catch (e) {
-      showError(t('支付请求失败'));
-    } finally {
-      setPaymentLoading(false);
-    }
-  };
-
-  const getWaffoPancakeAmount = async (value) => {
-    if (value === undefined) {
-      value = topUpCount;
-    }
-    setAmountLoading(true);
-    try {
-      const res = await API.post('/api/user/waffo-pancake/amount', {
-        amount: parseInt(value),
-      });
-      if (res !== undefined) {
-        const { message, data } = res.data;
-        if (message === 'success') {
-          setAmount(parseFloat(data));
-        } else {
-          setAmount(0);
-          Toast.error({ content: '错误：' + data, id: 'getAmount' });
-        }
-      } else {
-        showError(res);
-      }
-    } catch (err) {
-      // amount fetch failed silently
-    } finally {
-      setAmountLoading(false);
-    }
-  };
-
-  const processCreemCallback = (data) => {
-    if (!navigateToPaymentUrl(data.checkout_url)) {
-      showError(t('支付跳转地址不安全'));
-    }
-  };
-
-  const getUserQuota = async () => {
-    try {
-      const res = await API.get('/api/user/self');
       const { success, message, data } = res.data;
       if (success) {
         userDispatch({ type: 'login', payload: data });
         return true;
       }
-      showError(message || t('刷新账户信息失败'));
+      if (!silent) showError(message || t('刷新账户信息失败'));
     } catch {
-      showError(t('刷新账户信息失败'));
+      if (!silent) showError(t('刷新账户信息失败'));
     }
     return false;
   };
@@ -786,12 +550,14 @@ const TopUp = () => {
     setSubscriptionLoading(true);
     setSubscriptionPlansError('');
     try {
-      const res = await API.get('/api/subscription/plans');
+      const res = await API.get('/api/subscription/plans', {
+        skipErrorHandler: true,
+      });
       if (res.data?.success) {
-        setSubscriptionPlans(res.data.data || []);
+        setSubscriptionPlans(normalizePublicSubscriptionPlans(res.data.data));
       } else {
         setSubscriptionPlans([]);
-        setSubscriptionPlansError(res.data?.message || t('加载订阅套餐失败'));
+        setSubscriptionPlansError(t('加载订阅套餐失败'));
       }
     } catch (e) {
       setSubscriptionPlans([]);
@@ -804,20 +570,23 @@ const TopUp = () => {
   const getSubscriptionSelf = async () => {
     setSubscriptionSelfError('');
     try {
-      const res = await API.get('/api/subscription/self');
+      const res = await API.get('/api/subscription/self', {
+        skipErrorHandler: true,
+      });
       if (res.data?.success) {
+        const publicData = normalizePublicSubscriptionSelf(res.data.data);
         setBillingPreference(
-          res.data.data?.billing_preference || 'subscription_first',
+          publicData.billing_preference || 'subscription_first',
         );
         // Active subscriptions
-        const activeSubs = res.data.data?.subscriptions || [];
+        const activeSubs = publicData.subscriptions;
         setActiveSubscriptions(activeSubs);
         // All subscriptions (including expired)
-        const allSubs = res.data.data?.all_subscriptions || [];
+        const allSubs = publicData.all_subscriptions;
         setAllSubscriptions(allSubs);
         return true;
       }
-      setSubscriptionSelfError(res.data?.message || t('加载订阅状态失败'));
+      setSubscriptionSelfError(t('加载订阅状态失败'));
     } catch (e) {
       setSubscriptionSelfError(t('加载订阅状态失败'));
     }
@@ -833,16 +602,20 @@ const TopUp = () => {
     const previousPref = billingPreference;
     setBillingPreference(pref);
     try {
-      const res = await API.put('/api/subscription/self/preference', {
-        billing_preference: pref,
-      });
+      const res = await API.put(
+        '/api/subscription/self/preference',
+        {
+          billing_preference: pref,
+        },
+        { skipErrorHandler: true },
+      );
       if (res.data?.success) {
         showSuccess(t('更新成功'));
         const normalizedPref =
           res.data?.data?.billing_preference || pref || previousPref;
         setBillingPreference(normalizedPref);
       } else {
-        showError(res.data?.message || t('更新失败'));
+        showError(t('更新失败'));
         setBillingPreference(previousPref);
       }
     } catch (e) {
@@ -859,158 +632,56 @@ const TopUp = () => {
     setStatusLoading(true);
     setTopupInfoError('');
     try {
-      const res = await API.get('/api/user/topup/info');
-      const { message, data, success } = res.data;
+      const res = await API.get('/api/user/topup/info', {
+        skipErrorHandler: true,
+      });
+      const { data, success } = res.data;
       if (success) {
-        setTopupInfo({
-          amount_options: data.amount_options || [],
-          discount: data.discount || {},
-        });
-
-        // 处理支付方式
-        let payMethods = data.pay_methods || [];
-        try {
-          if (typeof payMethods === 'string') {
-            payMethods = JSON.parse(payMethods);
-          }
-          if (payMethods && payMethods.length > 0) {
-            // 检查name和type是否为空
-            payMethods = payMethods.filter((method) => {
-              return method.name && method.type;
-            });
-            // 如果没有color，则设置默认颜色
-            payMethods = payMethods.map((rawMethod) => {
-              const method = normalizePaymentMethod(rawMethod);
-              // 规范化最小充值数
-              const normalizedMinTopup = Number(method.min_topup);
-              method.min_topup = Number.isFinite(normalizedMinTopup)
-                ? normalizedMinTopup
-                : 0;
-
-              // Stripe 的最小充值从后端字段回填
-              if (
-                method.type === 'stripe' &&
-                (!method.min_topup || method.min_topup <= 0)
-              ) {
-                const stripeMin = Number(data.stripe_min_topup);
-                if (Number.isFinite(stripeMin)) {
-                  method.min_topup = stripeMin;
-                }
-              }
-
-              if (
-                method.provider === 'xorpay' &&
-                (!method.min_topup || method.min_topup <= 0)
-              ) {
-                const xorpayMin = Number(data.xorpay_min_topup);
-                if (Number.isFinite(xorpayMin)) method.min_topup = xorpayMin;
-              }
-
-              if (!method.color) {
-                if (method.type === 'alipay') {
-                  method.color = 'rgba(var(--semi-blue-5), 1)';
-                } else if (method.type === 'wxpay') {
-                  method.color = 'rgba(var(--semi-green-5), 1)';
-                } else if (method.type === 'stripe') {
-                  method.color = 'rgba(var(--semi-purple-5), 1)';
-                } else {
-                  method.color = 'rgba(var(--semi-primary-5), 1)';
-                }
-              }
-              return method;
-            });
-          } else {
-            payMethods = [];
-          }
-
-          // 如果启用了 Stripe 支付，添加到支付方法列表
-          // 这个逻辑现在由后端处理，如果 Stripe 启用，后端会在 pay_methods 中包含它
-
-          setPayMethods(payMethods);
-          const enableStripeTopUp = data.enable_stripe_topup || false;
-          const enableXorPayTopUp = data.enable_xorpay_topup || false;
-          const enableOnlineTopUp = data.enable_online_topup || false;
-          const enableCreemTopUp = data.enable_creem_topup || false;
-          const enableWaffoTopUp = data.enable_waffo_topup || false;
-          const enableWaffoPancakeTopUp =
-            data.enable_waffo_pancake_topup || false;
-          const minTopUpValue = enableOnlineTopUp
-            ? data.min_topup
-            : enableStripeTopUp
-              ? data.stripe_min_topup
-              : enableXorPayTopUp
-                ? data.xorpay_min_topup
-                : enableWaffoTopUp
-                  ? data.waffo_min_topup
-                  : enableWaffoPancakeTopUp
-                    ? data.waffo_pancake_min_topup
-                    : 1;
-          setEnableOnlineTopUp(enableOnlineTopUp);
-          setEnableStripeTopUp(enableStripeTopUp);
-          setEnableXorPayTopUp(enableXorPayTopUp);
-          setEnableCreemTopUp(enableCreemTopUp);
-          setEnableWaffoTopUp(enableWaffoTopUp);
-          setWaffoPayMethods(data.waffo_pay_methods || []);
-          setWaffoMinTopUp(data.waffo_min_topup || 1);
-          setEnableWaffoPancakeTopUp(enableWaffoPancakeTopUp);
-          setWaffoPancakeMinTopUp(data.waffo_pancake_min_topup || 1);
-          setMinTopUp(minTopUpValue);
-          setTopUpCount(minTopUpValue);
-          setTopUpLink(data.topup_link || '');
-          setTopupInfo((prev) => ({
-            ...prev,
-            enable_redemption: data.enable_redemption !== false,
-            payment_compliance_confirmed:
-              data.payment_compliance_confirmed !== false,
-            payment_compliance_terms_version:
-              data.payment_compliance_terms_version || '',
-          }));
-
-          // 设置 Creem 产品
-          try {
-            const products = JSON.parse(data.creem_products || '[]');
-            setCreemProducts(products);
-          } catch (e) {
-            setCreemProducts([]);
-          }
-
-          // 如果没有自定义充值数量选项，根据最小充值金额生成预设充值额度选项
-          if (!data.amount_options || data.amount_options.length === 0) {
-            setPresetAmounts(generatePresetAmounts(minTopUpValue));
-          }
-
-          setAmount(0);
-        } catch (e) {
+        const publicInfo = normalizePublicTopupInfo(data);
+        if (!publicInfo) {
           setPayMethods([]);
           setTopupInfoError(t('充值配置格式无效，请联系管理员'));
+          return;
         }
+        publicInfo.payment_routes = filterPaymentMethodsForBrowser(
+          publicInfo.payment_routes,
+        );
+        const amountRoutes = publicInfo.payment_routes.filter(
+          (method) =>
+            method.checkout_mode === 'quote' ||
+            method.checkout_mode === 'direct',
+        );
+        const routeMinimums = publicInfo.payment_routes
+          .filter((method) => method.checkout_mode !== 'product')
+          .map((method) => Number(method.min_topup))
+          .filter((minimum) => Number.isFinite(minimum) && minimum > 0);
+        const minTopUpValue =
+          routeMinimums.length > 0
+            ? Math.min(...routeMinimums)
+            : publicInfo.min_topup;
 
-        // 如果有自定义充值数量选项，使用它们替换默认的预设选项
-        if (data.amount_options && data.amount_options.length > 0) {
-          const customPresets = data.amount_options
-            .filter(
-              (amount) =>
-                Number.isSafeInteger(Number(amount)) &&
-                Number(amount) >= 1 &&
-                Number(amount) <= 10000,
-            )
-            .map((amount) => ({
-              value: Number(amount),
-              discount: data.discount[amount] || 1.0,
-            }));
-          setPresetAmounts(customPresets);
-        }
+        setTopupInfo(publicInfo);
+        setPayMethods(amountRoutes);
+        setPaymentProducts(publicInfo.payment_products);
+        setPaymentRouteOptions(publicInfo.payment_route_options);
+        setMinTopUp(minTopUpValue);
+        setTopUpCount(minTopUpValue);
+        setTopUpLink(publicInfo.topup_link || '');
+        setPresetAmounts(
+          publicInfo.amount_options.length > 0
+            ? publicInfo.amount_options.map((value) => ({
+                value,
+                discount: publicInfo.discount[value] || 1.0,
+              }))
+            : generatePresetAmounts(minTopUpValue),
+        );
+        setAmount(0);
       } else {
-        const errorMessage =
-          message ||
-          (typeof data === 'string' ? data : '') ||
-          t('获取充值配置失败');
+        const errorMessage = t('获取充值配置失败');
         setTopupInfoError(errorMessage);
-        showError(errorMessage);
       }
     } catch (error) {
-      setTopupInfoError(t('获取充值配置异常'));
-      showError(t('获取充值配置异常'));
+      setTopupInfoError(getSafeUserPaymentError(error, t, '获取充值配置异常'));
     } finally {
       setStatusLoading(false);
     }
@@ -1031,7 +702,11 @@ const TopUp = () => {
   // 划转邀请额度
   const transfer = async () => {
     if (transferAmount < getQuotaPerUnit()) {
-      showError(t('划转金额最低为') + ' ' + renderQuota(getQuotaPerUnit()));
+      showError(
+        t('Minimum transfer amount: {{amount}}', {
+          amount: renderQuota(getQuotaPerUnit()),
+        }),
+      );
       return;
     }
     const res = await API.post(`/api/user/aff_transfer`, {
@@ -1101,13 +776,14 @@ const TopUp = () => {
 
   const renderAmount = () => {
     if (paymentQuote) {
+      const selectedMethod = getPayMethodConfig(payWay);
       return formatPaymentDecimal(
         paymentQuote.payable_amount,
         paymentQuote.currency,
-        paymentQuote.provider,
+        selectedMethod?.public_method === 'card' ? 'card' : undefined,
       );
     }
-    if (payWay && amount > 0) return amount + ' ' + t('元');
+    if (payWay && amount > 0) return formatPaymentDecimal(amount, 'CNY');
     return t('选择支付方式后显示服务端报价');
   };
 
@@ -1117,22 +793,28 @@ const TopUp = () => {
     }
     setAmountLoading(true);
     try {
-      const res = await API.post('/api/user/amount', {
-        amount: parseFloat(value),
-      });
+      const res = await API.post(
+        '/api/user/amount',
+        {
+          amount: parseFloat(value),
+        },
+        { skipErrorHandler: true },
+      );
       if (res !== undefined) {
         const { message, data } = res.data;
         if (message === 'success') {
           setAmount(parseFloat(data));
+          setPaymentQuoteError('');
         } else {
           setAmount(0);
-          Toast.error({ content: '错误：' + data, id: 'getAmount' });
+          setPaymentQuoteError(t('获取金额失败'));
         }
       } else {
-        showError(res);
+        setPaymentQuoteError(t('获取金额失败'));
       }
-    } catch (err) {
-      // amount fetch failed silently
+    } catch (error) {
+      setAmount(0);
+      setPaymentQuoteError(getSafeUserPaymentError(error, t, '获取金额失败'));
     }
     setAmountLoading(false);
   };
@@ -1143,22 +825,28 @@ const TopUp = () => {
     }
     setAmountLoading(true);
     try {
-      const res = await API.post('/api/user/stripe/amount', {
-        amount: parseFloat(value),
-      });
+      const res = await API.post(
+        '/api/user/stripe/amount',
+        {
+          amount: parseFloat(value),
+        },
+        { skipErrorHandler: true },
+      );
       if (res !== undefined) {
         const { message, data } = res.data;
         if (message === 'success') {
           setAmount(parseFloat(data));
+          setPaymentQuoteError('');
         } else {
           setAmount(0);
-          Toast.error({ content: '错误：' + data, id: 'getAmount' });
+          setPaymentQuoteError(t('获取金额失败'));
         }
       } else {
-        showError(res);
+        setPaymentQuoteError(t('获取金额失败'));
       }
-    } catch (err) {
-      // amount fetch failed silently
+    } catch (error) {
+      setAmount(0);
+      setPaymentQuoteError(getSafeUserPaymentError(error, t, '获取金额失败'));
     } finally {
       setAmountLoading(false);
     }
@@ -1195,7 +883,7 @@ const TopUp = () => {
 
   const handleCreemCancel = () => {
     setCreemOpen(false);
-    setSelectedCreemProduct(null);
+    setSelectedPaymentProduct(null);
   };
 
   // 选择预设充值额度
@@ -1261,45 +949,6 @@ const TopUp = () => {
         t={t}
       />
 
-      <Modal
-        title={t('扫码支付')}
-        visible={!!qrPayment}
-        onCancel={() => {
-          setQrPayment(null);
-        }}
-        footer={null}
-        size='small'
-        centered
-      >
-        <div className='flex flex-col items-center gap-4 py-3'>
-          {qrPayment && isSafeQrContent(qrPayment.qr_content) ? (
-            <div
-              className='rounded-xl bg-white p-4'
-              role='img'
-              aria-label={t('支付二维码')}
-            >
-              <QRCodeSVG value={qrPayment.qr_content} size={220} level='M' />
-            </div>
-          ) : (
-            <div className='text-red-500'>{t('支付二维码无效')}</div>
-          )}
-          <div className='text-sm text-gray-500 text-center'>
-            {t('请使用对应的支付应用扫码，到账状态以服务器确认为准')}
-          </div>
-          <div className='text-sm'>
-            {t('订单号')}: {qrPayment?.trade_no || '-'}
-          </div>
-          <div className='text-sm'>
-            {t('支付状态')}:{' '}
-            {t(
-              pendingPayment?.trade_no === qrPayment?.trade_no
-                ? pendingPaymentOrder?.status || 'pending'
-                : 'pending',
-            )}
-          </div>
-        </div>
-      </Modal>
-
       {/* Creem 充值确认模态框 */}
       <Modal
         title={t('确定要充值 $')}
@@ -1311,17 +960,20 @@ const TopUp = () => {
         centered
         confirmLoading={confirmLoading}
       >
-        {selectedCreemProduct && (
+        {selectedPaymentProduct && (
           <>
             <p>
-              {t('产品名称')}：{selectedCreemProduct.name}
+              {t('产品名称')}：{selectedPaymentProduct.name}
             </p>
             <p>
-              {t('价格')}：{selectedCreemProduct.currency === 'EUR' ? '€' : '$'}
-              {selectedCreemProduct.price}
+              {t('价格')}：
+              {new Intl.NumberFormat(undefined, {
+                style: 'currency',
+                currency: selectedPaymentProduct.currency,
+              }).format(Number(selectedPaymentProduct.payment_amount))}
             </p>
             <p>
-              {t('充值额度')}：{selectedCreemProduct.quota}
+              {t('充值额度')}：{selectedPaymentProduct.top_up_amount}
             </p>
             <p>{t('是否确认充值？')}</p>
           </>
@@ -1348,14 +1000,8 @@ const TopUp = () => {
       <div className='grid grid-cols-1 lg:grid-cols-2 gap-6'>
         <RechargeCard
           t={t}
-          enableOnlineTopUp={enableOnlineTopUp}
-          enableStripeTopUp={enableStripeTopUp}
-          enableXorPayTopUp={enableXorPayTopUp}
-          enableCreemTopUp={enableCreemTopUp}
-          creemProducts={creemProducts}
-          creemPreTopUp={creemPreTopUp}
-          enableWaffoTopUp={enableWaffoTopUp}
-          enableWaffoPancakeTopUp={enableWaffoPancakeTopUp}
+          paymentProducts={paymentProducts}
+          paymentProductPreTopUp={paymentProductPreTopUp}
           presetAmounts={presetAmounts}
           selectedPreset={selectedPreset}
           selectPresetAmount={selectPresetAmount}

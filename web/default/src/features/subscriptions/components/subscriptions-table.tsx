@@ -16,17 +16,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+
 import { DataTablePage, useDataTable } from '@/components/data-table'
+
 import { getAdminPlans } from '../api'
+import { hasLegacyStripePriceMapping } from '../lib'
 import { useSubscriptionsColumns } from './subscriptions-columns'
 import { useSubscriptions } from './subscriptions-provider'
 
 export function SubscriptionsTable() {
   const { t } = useTranslation()
-  const columns = useSubscriptionsColumns()
   const { refreshTrigger } = useSubscriptions()
 
   const { data, isLoading } = useQuery({
@@ -39,6 +41,8 @@ export function SubscriptionsTable() {
   })
 
   const plans = useMemo(() => data || [], [data])
+  const showLegacyStripeMapping = plans.some(hasLegacyStripePriceMapping)
+  const columns = useSubscriptionsColumns(showLegacyStripeMapping)
 
   const { table } = useDataTable({
     data: plans,

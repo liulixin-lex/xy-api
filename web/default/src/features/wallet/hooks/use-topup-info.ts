@@ -24,14 +24,18 @@ import {
   generatePresetAmounts,
   mergePresetAmounts,
   getMinTopupAmount,
-  getPaymentMethodProvider,
+  isPublicPaymentRouteId,
+  normalizePaymentChannelAlias,
+  normalizePublicPaymentMethod,
+  filterPaymentMethodsForBrowser,
 } from '../lib'
 import type {
   TopupInfo,
   PresetAmount,
-  CreemProduct,
+  PaymentProduct,
   PaymentMethod,
-  WaffoPayMethod,
+  PaymentRouteOption,
+  PaymentCheckoutMode,
 } from '../types'
 
 // ============================================================================
@@ -55,80 +59,112 @@ function parseJsonArray(data: unknown): unknown[] {
   return []
 }
 
-function parsePaymentMethods(
-  data: unknown,
-  stripeMinTopup: number,
-  xorpayMinTopup = 0
-): PaymentMethod[] {
-  return parseJsonArray(data)
+function parsePaymentRoutes(data: unknown): PaymentMethod[] {
+  const methods = parseJsonArray(data)
     .filter(
       (item): item is Record<string, unknown> =>
         !!item && typeof item === 'object'
     )
-    .map((item) => {
+    .map((item): PaymentMethod | null => {
       const rawMinTopup = Number(item.min_topup)
-      const normalizedMinTopup = Number.isFinite(rawMinTopup) ? rawMinTopup : 0
+      const normalizedMinTopup =
+        Number.isSafeInteger(rawMinTopup) && rawMinTopup > 0 ? rawMinTopup : 0
       const type = typeof item.type === 'string' ? item.type : ''
+      const legacyName = typeof item.name === 'string' ? item.name : ''
+      if (!isPublicPaymentRouteId(item.route_id)) return null
 
-      let minTopup = normalizedMinTopup
-      if (type === 'stripe' && minTopup <= 0) minTopup = stripeMinTopup
-      if (type.startsWith('xorpay_') && minTopup <= 0) {
-        minTopup = xorpayMinTopup
-      }
-
+      const checkoutMode: PaymentCheckoutMode =
+        item.checkout_mode === 'product' ||
+        item.checkout_mode === 'option' ||
+        item.checkout_mode === 'direct'
+          ? item.checkout_mode
+          : 'quote'
+      const currency =
+        typeof item.currency === 'string' && /^[A-Za-z]{3}$/.test(item.currency)
+          ? item.currency.toUpperCase()
+          : undefined
       return {
-        name: typeof item.name === 'string' ? item.name : '',
-        type,
-        provider: getPaymentMethodProvider(type, item.provider),
-        color: typeof item.color === 'string' ? item.color : undefined,
-        icon: typeof item.icon === 'string' ? item.icon : undefined,
-        currency:
-          typeof item.currency === 'string' &&
-          /^[A-Za-z]{3}$/.test(item.currency)
-            ? item.currency.toUpperCase()
-            : undefined,
-        min_topup: minTopup,
+        route_id: item.route_id,
+        public_method: normalizePublicPaymentMethod(
+          item.public_method,
+          type,
+          legacyName
+        ),
+        channel_alias: normalizePaymentChannelAlias(item.channel_alias),
+        checkout_mode: checkoutMode,
+        ...(currency ? { currency } : {}),
+        min_topup: normalizedMinTopup,
       }
     })
-    .filter((item) => item.name && item.type && item.provider !== 'waffo')
+    .filter((item): item is PaymentMethod => item !== null)
+
+  return filterPaymentMethodsForBrowser(methods)
 }
 
-function parseWaffoPayMethods(data: unknown): WaffoPayMethod[] {
+function parsePaymentRouteOptions(data: unknown): PaymentRouteOption[] {
   return parseJsonArray(data)
     .filter(
       (item): item is Record<string, unknown> =>
         !!item && typeof item === 'object'
     )
-    .map((item) => ({
-      name: typeof item.name === 'string' ? item.name : '',
-      icon: typeof item.icon === 'string' ? item.icon : undefined,
-      payMethodType:
-        typeof item.payMethodType === 'string' ? item.payMethodType : undefined,
-      payMethodName:
-        typeof item.payMethodName === 'string' ? item.payMethodName : undefined,
-    }))
-    .filter((item) => item.name)
-}
-
-function parseCreemProducts(data: unknown): CreemProduct[] {
-  return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => {
-      const currency: CreemProduct['currency'] =
-        item.currency === 'EUR' ? 'EUR' : 'USD'
-
+    .map((item): PaymentRouteOption | null => {
+      const optionId =
+        typeof item.option_id === 'string' ? item.option_id.trim() : ''
+      const publicLabel = item.public_label
+      if (!/^option_[a-f0-9]{24}$/.test(optionId)) return null
+      if (!isPublicPaymentRouteId(item.route_id)) return null
+      if (
+        publicLabel !== 'Card' &&
+        publicLabel !== 'Apple Pay' &&
+        publicLabel !== 'Google Pay' &&
+        publicLabel !== 'Online payment'
+      ) {
+        return null
+      }
       return {
-        name: typeof item.name === 'string' ? item.name : '',
-        productId: typeof item.productId === 'string' ? item.productId : '',
-        price: Number(item.price) || 0,
-        quota: Number(item.quota) || 0,
+        option_id: optionId,
+        route_id: item.route_id,
+        public_label: publicLabel,
+      }
+    })
+    .filter((item): item is PaymentRouteOption => item !== null)
+}
+
+function parsePaymentProducts(data: unknown): PaymentProduct[] {
+  return parseJsonArray(data)
+    .filter(
+      (item): item is Record<string, unknown> =>
+        !!item && typeof item === 'object'
+    )
+    .map((item): PaymentProduct | null => {
+      const productId =
+        typeof item.product_id === 'string' ? item.product_id.trim() : ''
+      const name = typeof item.name === 'string' ? item.name.trim() : ''
+      const paymentAmount =
+        typeof item.payment_amount === 'string'
+          ? item.payment_amount.trim()
+          : ''
+      const topUpAmount = Number(item.top_up_amount)
+      const currency =
+        typeof item.currency === 'string' ? item.currency.toUpperCase() : ''
+      if (!/^product_[a-f0-9]{24}$/.test(productId)) return null
+      if (!isPublicPaymentRouteId(item.route_id)) return null
+      if (!name || name.length > 128) return null
+      if (!/^(?:0|[1-9]\d{0,15})(?:\.\d{1,3})?$/.test(paymentAmount)) {
+        return null
+      }
+      if (!Number.isSafeInteger(topUpAmount) || topUpAmount <= 0) return null
+      if (!/^[A-Z]{3}$/.test(currency)) return null
+      return {
+        product_id: productId,
+        route_id: item.route_id,
+        name,
+        payment_amount: paymentAmount,
+        top_up_amount: topUpAmount,
         currency,
       }
     })
-    .filter((item) => item.name && item.productId)
+    .filter((item): item is PaymentProduct => item !== null)
 }
 
 function parseAmountOptions(data: unknown): number[] {
@@ -175,6 +211,48 @@ function parseDiscountMap(data: unknown): Record<number, number> {
   )
 }
 
+function parseOptionalNumber(data: unknown): number | undefined {
+  const value = Number(data)
+  return Number.isFinite(value) ? value : undefined
+}
+
+export function normalizePublicTopupInfo(data: unknown): TopupInfo | null {
+  if (!data || typeof data !== 'object') return null
+  const raw = data as Record<string, unknown>
+  const paymentRoutes = parsePaymentRoutes(
+    raw.payment_routes ?? raw.pay_methods
+  )
+  const paymentProducts = parsePaymentProducts(raw.payment_products)
+  const paymentRouteOptions = parsePaymentRouteOptions(
+    raw.payment_route_options
+  )
+  const minTopup = Number(raw.min_topup)
+
+  return {
+    online_payment_available:
+      raw.online_payment_available === true || paymentRoutes.length > 0,
+    enable_redemption: raw.enable_redemption !== false,
+    payment_compliance_confirmed: raw.payment_compliance_confirmed !== false,
+    payment_compliance_terms_version:
+      typeof raw.payment_compliance_terms_version === 'string'
+        ? raw.payment_compliance_terms_version
+        : undefined,
+    payment_routes: paymentRoutes,
+    payment_products: paymentProducts,
+    payment_route_options: paymentRouteOptions,
+    min_topup: Number.isSafeInteger(minTopup) && minTopup > 0 ? minTopup : 1,
+    amount_options: parseAmountOptions(raw.amount_options),
+    discount: parseDiscountMap(raw.discount),
+    affiliate_continuous_percent: parseOptionalNumber(
+      raw.affiliate_continuous_percent
+    ),
+    affiliate_first_topup_percent: parseOptionalNumber(
+      raw.affiliate_first_topup_percent
+    ),
+    topup_link: typeof raw.topup_link === 'string' ? raw.topup_link : undefined,
+  }
+}
+
 export function useTopupInfo() {
   const [topupInfo, setTopupInfo] = useState<TopupInfo | null>(null)
   const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
@@ -188,25 +266,14 @@ export function useTopupInfo() {
       const response = await getTopupInfo()
 
       if (!response.success || !response.data) {
-        // eslint-disable-next-line no-console
-        console.error('Failed to fetch topup info:', response.message)
         setError(i18next.t('Failed to load top-up information'))
         return
       }
 
-      const processedData: TopupInfo = {
-        ...response.data,
-        pay_methods: parsePaymentMethods(
-          response.data.pay_methods,
-          response.data.stripe_min_topup,
-          response.data.xorpay_min_topup
-        ),
-        amount_options: parseAmountOptions(response.data.amount_options),
-        discount: parseDiscountMap(response.data.discount),
-        creem_products: parseCreemProducts(response.data.creem_products),
-        waffo_pay_methods: parseWaffoPayMethods(
-          response.data.waffo_pay_methods
-        ),
+      const processedData = normalizePublicTopupInfo(response.data)
+      if (!processedData) {
+        setError(i18next.t('Failed to load top-up information'))
+        return
       }
 
       setTopupInfo(processedData)
@@ -223,9 +290,7 @@ export function useTopupInfo() {
         const defaultPresets = generatePresetAmounts(minTopup)
         setPresetAmounts(defaultPresets)
       }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('Failed to fetch topup info:', err)
+    } catch {
       setError(i18next.t('Failed to load top-up information'))
     } finally {
       setLoading(false)

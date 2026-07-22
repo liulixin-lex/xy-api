@@ -18,12 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Badge,
   Button,
   Card,
   Divider,
-  Modal,
   Select,
   Skeleton,
   Space,
@@ -31,12 +31,9 @@ import {
   Tooltip,
   Typography,
 } from '@douyinfe/semi-ui';
-import { QRCodeSVG } from 'qrcode.react';
 import { API, showError, renderQuota } from '../../helpers';
 import { RefreshCw, Sparkles } from 'lucide-react';
 import SubscriptionPurchaseModal from './modals/SubscriptionPurchaseModal';
-import PaymentOrderTracker from './PaymentOrderTracker';
-import { usePaymentOrderPolling } from './use-payment-order';
 import {
   formatSubscriptionDuration,
   formatSubscriptionResetPeriod,
@@ -44,22 +41,21 @@ import {
 import {
   createPaymentRequestId,
   formatPaymentDecimal,
-  inferPaymentProvider,
-  isEndpointUnavailable,
-  isSafeQrContent,
+  getPaymentQuoteRoutePayload,
+  getPaymentRouteId,
+  getSafeUserPaymentError,
   navigateToPaymentUrl,
+  normalizePaymentMethod,
   submitPaymentForm,
+  filterPaymentMethodsForBrowser,
 } from './payment-utils';
 
 const { Text } = Typography;
 
-// 过滤易支付方式
-function getEpayMethods(payMethods = [], enableEpay = false) {
-  return (payMethods || []).filter((method) => {
-    if (!method?.type) return false;
-    const provider = inferPaymentProvider(method.type, method.provider);
-    return provider === 'xorpay' || (provider === 'epay' && enableEpay);
-  });
+function getRouteMethods(paymentRoutes = []) {
+  return filterPaymentMethodsForBrowser(paymentRoutes).filter(
+    (method) => method.checkout_mode === 'quote',
+  );
 }
 
 const SubscriptionPlansCard = ({
@@ -68,26 +64,21 @@ const SubscriptionPlansCard = ({
   error = '',
   onRetry,
   plans = [],
-  payMethods = [],
-  enableOnlineTopUp = false,
-  enableStripeTopUp = false,
-  enableCreemTopUp = false,
+  paymentRoutes = [],
   billingPreference,
   billingPreferenceLoading = false,
   onChangeBillingPreference,
   activeSubscriptions = [],
   allSubscriptions = [],
   reloadSubscriptionSelf,
-  reloadUserQuota,
   withCard = true,
 }) => {
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [selectedPlan, setSelectedPlan] = useState(null);
   const [paying, setPaying] = useState(false);
   const [selectedEpayMethod, setSelectedEpayMethod] = useState('');
   const [refreshing, setRefreshing] = useState(false);
-  const [qrPayment, setQrPayment] = useState(null);
-  const [qrQuote, setQrQuote] = useState(null);
   const payingRef = useRef(false);
   const paymentAttemptRef = useRef({
     key: '',
@@ -95,43 +86,16 @@ const SubscriptionPlansCard = ({
     requestId: '',
   });
 
-  const {
-    payment: pendingPayment,
-    order: pendingPaymentOrder,
-    error: pendingPaymentError,
-    polling: pendingPaymentPolling,
-    refreshing: pendingPaymentRefreshing,
-    trackPayment,
-    refreshPayment: refreshPendingPayment,
-    clearPayment: clearPendingPayment,
-  } = usePaymentOrderPolling({
-    t,
-    onSuccess: async () => {
-      await Promise.all([reloadSubscriptionSelf?.(), reloadUserQuota?.()]);
-    },
-  });
-
-  const epayMethods = useMemo(
-    () => getEpayMethods(payMethods, enableOnlineTopUp),
-    [enableOnlineTopUp, payMethods],
+  const routeMethods = useMemo(
+    () => getRouteMethods(paymentRoutes),
+    [paymentRoutes],
   );
-  const stripeCurrency = useMemo(
-    () =>
-      payMethods
-        .find(
-          (method) =>
-            inferPaymentProvider(method?.type, method?.provider) === 'stripe',
-        )
-        ?.currency?.toUpperCase(),
-    [payMethods],
-  );
-  const stripeSubscriptionEnabled =
-    enableStripeTopUp && (!stripeCurrency || stripeCurrency === 'USD');
-
   const openBuy = (p) => {
     paymentAttemptRef.current = { key: '', quote: null, requestId: '' };
     setSelectedPlan(p);
-    setSelectedEpayMethod(epayMethods?.[0]?.type || '');
+    setSelectedEpayMethod(
+      routeMethods?.[0] ? getPaymentRouteId(routeMethods[0]) : '',
+    );
     setOpen(true);
   };
 
@@ -157,83 +121,51 @@ const SubscriptionPlansCard = ({
     }
   };
 
-  const handlePaymentStart = (start, quote) => {
-    if (start.flow === 'qr') {
-      if (!isSafeQrContent(start.qr_content)) {
-        throw new Error(t('支付二维码无效'));
-      }
-      setQrPayment(start);
-      setQrQuote(quote);
-      trackPayment(start, 'pending');
+  const handlePaymentStart = (start, method) => {
+    const publicStart = {
+      ...start,
+      route_id: start.route_id || method?.route_id,
+      public_method: start.public_method || method?.public_method,
+      channel_alias: start.channel_alias || method?.channel_alias,
+    };
+    if (publicStart.trade_no) {
       closeBuy();
+      navigate(`/payment/${encodeURIComponent(publicStart.trade_no)}`);
       return;
     }
-    if (start.flow === 'pending') {
-      setQrQuote(quote);
-      trackPayment(start, 'processing');
-      closeBuy();
-      return;
-    }
-    if (start.flow === 'hosted_redirect') {
-      if (!navigateToPaymentUrl(start.url)) {
+    const flow =
+      publicStart.flow ||
+      (publicStart.qr_content
+        ? 'qr'
+        : publicStart.url
+          ? 'hosted_redirect'
+          : publicStart.action
+            ? 'form_post'
+            : 'pending');
+    if (flow === 'hosted_redirect') {
+      if (!navigateToPaymentUrl(publicStart.url)) {
         throw new Error(t('支付跳转地址不安全'));
       }
       return;
     }
-    if (start.flow === 'form_post') {
-      if (!submitPaymentForm(start.action, start.fields)) {
+    if (flow === 'form_post') {
+      if (!submitPaymentForm(publicStart.action, publicStart.fields)) {
         throw new Error(t('支付跳转地址不安全'));
       }
       return;
     }
-    throw new Error(t('支付网关返回了不支持的跳转方式'));
+    throw new Error(t('支付服务暂时不可用，请稍后重试'));
   };
 
-  const startLegacyGateway = async (provider, paymentMethod) => {
-    if (provider === 'stripe') {
-      const response = await API.post('/api/subscription/stripe/pay', {
-        plan_id: selectedPlan.plan.id,
-      });
-      if (
-        (!response.data?.success && response.data?.message !== 'success') ||
-        !response.data?.data?.pay_link
-      ) {
-        throw new Error(response.data?.message || t('支付失败'));
-      }
-      handlePaymentStart({
-        flow: 'hosted_redirect',
-        url: response.data.data.pay_link,
-      });
-      return;
-    }
-    if (provider !== 'epay') {
-      throw new Error(t('当前支付网关需要新版统一支付接口'));
-    }
-    const response = await API.post('/api/subscription/epay/pay', {
-      plan_id: selectedPlan.plan.id,
-      payment_method: paymentMethod,
-    });
-    if (
-      (!response.data?.success && response.data?.message !== 'success') ||
-      !response.data?.url
-    ) {
-      throw new Error(response.data?.message || t('支付失败'));
-    }
-    handlePaymentStart({
-      flow: 'form_post',
-      action: response.data.url,
-      fields: response.data.data || {},
-    });
-  };
-
-  const payGateway = async (provider, paymentMethod) => {
+  const payGateway = async (rawMethod) => {
     if (payingRef.current || !selectedPlan?.plan?.id) return;
+    const method = normalizePaymentMethod(rawMethod);
     if ((selectedPlan.plan.currency || 'USD').toUpperCase() !== 'USD') {
-      showError(t('Stripe、易支付和 XORPay 统一支付仅支持 USD 定价的订阅套餐'));
+      showError(t('当前套餐暂不支持所选支付方式'));
       return;
     }
 
-    const attemptKey = `${selectedPlan.plan.id}:${provider}:${paymentMethod}`;
+    const attemptKey = `${selectedPlan.plan.id}:${method.route_id}`;
     payingRef.current = true;
     setPaying(true);
     try {
@@ -242,91 +174,89 @@ const SubscriptionPlansCard = ({
         attempt.quote?.expires_at &&
         attempt.quote.expires_at <= Date.now() / 1000;
       if (attempt.key !== attemptKey || !attempt.quote || quoteExpired) {
-        let quoteResponse;
-        try {
-          quoteResponse = await API.post('/api/user/payment/quote', {
+        const quoteResponse = await API.post(
+          '/api/user/payment/quote',
+          {
             order_kind: 'subscription',
-            provider,
-            payment_method: paymentMethod,
+            ...getPaymentQuoteRoutePayload(method),
             plan_id: selectedPlan.plan.id,
-          });
-        } catch (error) {
-          if (isEndpointUnavailable(error)) {
-            paymentAttemptRef.current = {
-              key: '',
-              quote: null,
-              requestId: '',
-            };
-            await startLegacyGateway(provider, paymentMethod);
-            return;
-          }
-          throw error;
-        }
+          },
+          { skipErrorHandler: true },
+        );
 
         const quote = quoteResponse.data?.data;
         if (!quoteResponse.data?.success || !quote) {
-          throw new Error(quoteResponse.data?.message || t('获取金额失败'));
+          throw new Error(t('获取金额失败'));
         }
         attempt = {
           key: attemptKey,
-          quote,
+          quote: {
+            ...quote,
+            route_id: quote.route_id || method.route_id,
+            public_method: quote.public_method || method.public_method,
+            channel_alias: quote.channel_alias || method.channel_alias,
+          },
           requestId: createPaymentRequestId(),
         };
         paymentAttemptRef.current = attempt;
       }
 
-      const startResponse = await API.post('/api/user/payment/start', {
-        quote_id: attempt.quote.quote_id,
-        request_id: attempt.requestId,
-      });
+      const startResponse = await API.post(
+        '/api/user/payment/start',
+        {
+          quote_id: attempt.quote.quote_id,
+          request_id: attempt.requestId,
+        },
+        { skipErrorHandler: true },
+      );
       const start = startResponse.data?.data;
       if (!startResponse.data?.success || !start) {
-        throw new Error(startResponse.data?.message || t('支付请求失败'));
+        throw new Error(t('支付请求失败'));
       }
-      handlePaymentStart(start, attempt.quote);
+      handlePaymentStart(start, method);
       paymentAttemptRef.current = { key: '', quote: null, requestId: '' };
     } catch (error) {
-      showError(error?.message || t('支付请求失败'));
+      showError(
+        error?.response || error?.request
+          ? getSafeUserPaymentError(error, t, '支付请求失败')
+          : error?.message || t('支付请求失败'),
+      );
     } finally {
       payingRef.current = false;
       setPaying(false);
     }
   };
 
-  const payStripe = async () => payGateway('stripe', 'stripe');
-
   const payCreem = async () => {
-    if (!selectedPlan?.plan?.creem_product_id) {
-      showError(t('该套餐未配置 Creem'));
+    const allowedRouteIDs = new Set(
+      selectedPlan?.plan?.external_payment_route_ids || [],
+    );
+    const productRoute = paymentRoutes.find(
+      (method) =>
+        method.checkout_mode === 'product' &&
+        allowedRouteIDs.has(method.route_id),
+    );
+    if (!productRoute) {
+      showError(t('该套餐暂不支持此在线支付方式'));
       return;
     }
-    if (payingRef.current) return;
-    payingRef.current = true;
-    setPaying(true);
-    try {
-      const res = await API.post('/api/subscription/creem/pay', {
-        plan_id: selectedPlan.plan.id,
-      });
-      if (
-        (res.data?.success || res.data?.message === 'success') &&
-        res.data.data?.checkout_url
-      ) {
-        if (!navigateToPaymentUrl(res.data.data.checkout_url)) {
-          throw new Error(t('支付跳转地址不安全'));
-        }
-      } else {
-        const errorMsg =
-          typeof res.data?.data === 'string'
-            ? res.data.data
-            : res.data?.message || t('支付失败');
-        showError(errorMsg);
-      }
-    } catch (e) {
-      showError(t('支付请求失败'));
-    } finally {
-      payingRef.current = false;
-      setPaying(false);
+    await payGateway(productRoute);
+  };
+
+  const payDirectCheckout = async () => {
+    const allowedRouteIDs = new Set(
+      selectedPlan?.plan?.external_payment_route_ids || [],
+    );
+    const directRoute = paymentRoutes.find(
+      (method) =>
+        method.checkout_mode === 'direct' &&
+        allowedRouteIDs.has(method.route_id),
+    );
+    if (!directRoute) {
+      showError(t('该套餐暂不支持此在线支付方式'));
+      return;
     }
+    await payGateway(directRoute);
   };
 
   const payEpay = async () => {
@@ -334,12 +264,11 @@ const SubscriptionPlansCard = ({
       showError(t('请选择支付方式'));
       return;
     }
-    const method = epayMethods.find(
-      (candidate) => candidate.type === selectedEpayMethod,
+    const method = routeMethods.find(
+      (candidate) => getPaymentRouteId(candidate) === selectedEpayMethod,
     );
     if (!method) return;
-    const provider = inferPaymentProvider(method.type, method.provider);
-    await payGateway(provider, method.type);
+    await payGateway(method);
   };
 
   // 当前订阅信息 - 支持多个订阅
@@ -354,7 +283,9 @@ const SubscriptionPlansCard = ({
       ? 'wallet_first'
       : billingPreference;
   const subscriptionPreferenceLabel =
-    billingPreference === 'subscription_only' ? t('仅用订阅') : t('优先订阅');
+    billingPreference === 'subscription_only'
+      ? t('仅使用权益')
+      : t('优先使用权益');
 
   const planPurchaseCountMap = useMemo(() => {
     const map = new Map();
@@ -365,16 +296,6 @@ const SubscriptionPlansCard = ({
     });
     return map;
   }, [allSubscriptions]);
-
-  const planTitleMap = useMemo(() => {
-    const map = new Map();
-    (plans || []).forEach((p) => {
-      const plan = p?.plan;
-      if (!plan?.id) return;
-      map.set(plan.id, plan.title || '');
-    });
-    return map;
-  }, [plans]);
 
   const getPlanPurchaseCount = (planId) =>
     planPurchaseCountMap.get(planId) || 0;
@@ -440,7 +361,7 @@ const SubscriptionPlansCard = ({
           {error && (
             <Banner
               type='danger'
-              title={t('订阅信息加载失败')}
+              title={t('权益信息加载失败')}
               description={
                 <div className='flex flex-col items-start gap-2'>
                   <span>{error}</span>
@@ -453,22 +374,11 @@ const SubscriptionPlansCard = ({
             />
           )}
 
-          <PaymentOrderTracker
-            t={t}
-            payment={pendingPayment}
-            order={pendingPaymentOrder}
-            error={pendingPaymentError}
-            polling={pendingPaymentPolling}
-            refreshing={pendingPaymentRefreshing}
-            onRefresh={refreshPendingPayment}
-            onDismiss={clearPendingPayment}
-          />
-
           {/* 当前订阅状态 */}
           <Card className='!rounded-xl w-full' bodyStyle={{ padding: '12px' }}>
             <div className='flex items-center justify-between mb-2 gap-3'>
               <div className='flex items-center gap-2 flex-1 min-w-0'>
-                <Text strong>{t('我的订阅')}</Text>
+                <Text strong>{t('我的权益')}</Text>
                 {hasActiveSubscription ? (
                   <Tag
                     color='white'
@@ -501,16 +411,22 @@ const SubscriptionPlansCard = ({
                     {
                       value: 'subscription_first',
                       label: disableSubscriptionPreference
-                        ? `${t('优先订阅')} (${t('无生效')})`
-                        : t('优先订阅'),
+                        ? t('{{preference}}（{{status}}）', {
+                            preference: t('优先使用权益'),
+                            status: t('无生效'),
+                          })
+                        : t('优先使用权益'),
                       disabled: disableSubscriptionPreference,
                     },
                     { value: 'wallet_first', label: t('优先钱包') },
                     {
                       value: 'subscription_only',
                       label: disableSubscriptionPreference
-                        ? `${t('仅用订阅')} (${t('无生效')})`
-                        : t('仅用订阅'),
+                        ? t('{{preference}}（{{status}}）', {
+                            preference: t('仅使用权益'),
+                            status: t('无生效'),
+                          })
+                        : t('仅使用权益'),
                       disabled: disableSubscriptionPreference,
                     },
                     { value: 'wallet_only', label: t('仅用钱包') },
@@ -529,15 +445,16 @@ const SubscriptionPlansCard = ({
                   onClick={handleRefresh}
                   loading={refreshing}
                   disabled={refreshing}
-                  aria-label={t('刷新订阅状态')}
+                  aria-label={t('刷新权益状态')}
                 />
               </div>
             </div>
             {disableSubscriptionPreference && isSubscriptionPreference && (
               <Text type='tertiary' size='small'>
-                {t('已保存偏好为')}
-                {subscriptionPreferenceLabel}
-                {t('，当前无生效订阅，将自动使用钱包')}
+                {t(
+                  '已保存偏好为 {{preference}}，当前无生效权益，将自动使用钱包',
+                  { preference: subscriptionPreferenceLabel },
+                )}
               </Text>
             )}
 
@@ -554,8 +471,7 @@ const SubscriptionPlansCard = ({
                       totalAmount > 0
                         ? Math.max(0, totalAmount - usedAmount)
                         : 0;
-                    const planTitle =
-                      planTitleMap.get(subscription?.plan_id) || '';
+                    const planTitle = subscription?.plan_title || '';
                     const remainDays = getRemainingDays(sub);
                     const usagePercent = getUsagePercent(sub);
                     const now = Date.now() / 1000;
@@ -571,8 +487,13 @@ const SubscriptionPlansCard = ({
                           <div className='flex items-center gap-2'>
                             <span className='font-medium'>
                               {planTitle
-                                ? `${planTitle} · ${t('订阅')} #${subscription?.id}`
-                                : `${t('订阅')} #${subscription?.id}`}
+                                ? t('{{plan}} 权益 #{{id}}', {
+                                    plan: planTitle,
+                                    id: subscription?.id,
+                                  })
+                                : t('权益 #{{id}}', {
+                                    id: subscription?.id,
+                                  })}
                             </span>
                             {isActive ? (
                               <Tag
@@ -595,7 +516,9 @@ const SubscriptionPlansCard = ({
                           </div>
                           {isActive && (
                             <span className='text-gray-500'>
-                              {t('剩余')} {remainDays} {t('天')}
+                              {t('{{count}} days remaining', {
+                                count: remainDays,
+                              })}
                             </span>
                           )}
                         </div>
@@ -621,12 +544,24 @@ const SubscriptionPlansCard = ({
                           {t('总额度')}:{' '}
                           {totalAmount > 0 ? (
                             <Tooltip
-                              content={`${t('原生额度')}：${usedAmount}/${totalAmount} · ${t('剩余')} ${remainAmount}`}
+                              content={t(
+                                'Raw quota: {{used}}/{{total}}. Remaining {{remaining}}',
+                                {
+                                  used: usedAmount,
+                                  total: totalAmount,
+                                  remaining: remainAmount,
+                                },
+                              )}
                             >
                               <span>
-                                {renderQuota(usedAmount)}/
-                                {renderQuota(totalAmount)} · {t('剩余')}{' '}
-                                {renderQuota(remainAmount)}
+                                {t(
+                                  '{{used}}/{{total}}. Remaining {{remaining}}',
+                                  {
+                                    used: renderQuota(usedAmount),
+                                    total: renderQuota(totalAmount),
+                                    remaining: renderQuota(remainAmount),
+                                  },
+                                )}
                               </span>
                             </Tooltip>
                           ) : (
@@ -634,7 +569,9 @@ const SubscriptionPlansCard = ({
                           )}
                           {totalAmount > 0 && (
                             <span className='ml-2'>
-                              {t('已用')} {usagePercent}%
+                              {t('Used {{percent}}%', {
+                                percent: usagePercent,
+                              })}
                             </span>
                           )}
                         </div>
@@ -664,27 +601,38 @@ const SubscriptionPlansCard = ({
                 );
                 const isPopular = index === 0 && plans.length > 1;
                 const limit = Number(plan?.max_purchase_per_user || 0);
-                const limitLabel = limit > 0 ? `${t('限购')} ${limit}` : null;
+                const limitLabel =
+                  limit > 0
+                    ? t('Purchase limit: {{count}}', { count: limit })
+                    : null;
                 const totalLabel =
                   totalAmount > 0
-                    ? `${t('总额度')}: ${renderQuota(totalAmount)}`
-                    : `${t('总额度')}: ${t('不限')}`;
-                const upgradeLabel = plan?.upgrade_group
-                  ? `${t('升级分组')}: ${plan.upgrade_group}`
+                    ? t('Total quota: {{value}}', {
+                        value: renderQuota(totalAmount),
+                      })
+                    : t('Total quota: {{value}}', { value: t('不限') });
+                const upgradeLabel = plan?.includes_expanded_access
+                  ? t('Includes expanded model access')
                   : null;
                 const resetLabel =
                   formatSubscriptionResetPeriod(plan, t) === t('不重置')
                     ? null
-                    : `${t('额度重置')}: ${formatSubscriptionResetPeriod(plan, t)}`;
+                    : t('Quota reset: {{value}}', {
+                        value: formatSubscriptionResetPeriod(plan, t),
+                      });
                 const planBenefits = [
                   {
-                    label: `${t('有效期')}: ${formatSubscriptionDuration(plan, t)}`,
+                    label: t('Validity period: {{value}}', {
+                      value: formatSubscriptionDuration(plan, t),
+                    }),
                   },
                   resetLabel ? { label: resetLabel } : null,
                   totalAmount > 0
                     ? {
                         label: totalLabel,
-                        tooltip: `${t('原生额度')}：${totalAmount}`,
+                        tooltip: t('Raw quota: {{amount}}', {
+                          amount: totalAmount,
+                        }),
                       }
                     : { label: totalLabel },
                   limitLabel ? { label: limitLabel } : null,
@@ -716,7 +664,7 @@ const SubscriptionPlansCard = ({
                           ellipsis={{ rows: 1, showTooltip: true }}
                           style={{ margin: 0 }}
                         >
-                          {plan?.title || t('订阅套餐')}
+                          {plan?.title || t('权益套餐')}
                         </Typography.Title>
                         {plan?.subtitle && (
                           <Text
@@ -776,7 +724,10 @@ const SubscriptionPlansCard = ({
                           const count = getPlanPurchaseCount(p?.plan?.id);
                           const reached = limit > 0 && count >= limit;
                           const tip = reached
-                            ? t('已达到购买上限') + ` (${count}/${limit})`
+                            ? t(
+                                'Purchase limit reached ({{count}}/{{limit}})',
+                                { count, limit },
+                              )
                             : '';
                           const buttonEl = (
                             <Button
@@ -788,7 +739,7 @@ const SubscriptionPlansCard = ({
                                 if (!reached) openBuy(p);
                               }}
                             >
-                              {reached ? t('已达上限') : t('立即订阅')}
+                              {reached ? t('已达上限') : t('立即购买')}
                             </Button>
                           );
                           return reached ? (
@@ -823,52 +774,6 @@ const SubscriptionPlansCard = ({
         <div className='space-y-3'>{cardContent}</div>
       )}
 
-      <Modal
-        title={t('扫码支付')}
-        visible={!!qrPayment}
-        onCancel={() => {
-          setQrPayment(null);
-          setQrQuote(null);
-        }}
-        footer={null}
-        size='small'
-        centered
-      >
-        <div className='flex flex-col items-center gap-4 py-3'>
-          {qrPayment && isSafeQrContent(qrPayment.qr_content) ? (
-            <div
-              className='rounded-xl bg-white p-4'
-              role='img'
-              aria-label={t('支付二维码')}
-            >
-              <QRCodeSVG value={qrPayment.qr_content} size={220} level='M' />
-            </div>
-          ) : (
-            <Text type='danger'>{t('支付二维码无效')}</Text>
-          )}
-          {qrQuote && (
-            <Text strong>
-              {formatPaymentDecimal(
-                qrQuote.payable_amount,
-                qrQuote.currency,
-                qrQuote.provider,
-              )}
-            </Text>
-          )}
-          <Text type='tertiary'>
-            {t('请使用对应的支付应用扫码，到账状态以服务器确认为准')}
-          </Text>
-          <Text>
-            {t('支付状态')}:{' '}
-            {t(
-              pendingPayment?.trade_no === qrPayment?.trade_no
-                ? pendingPaymentOrder?.status || 'pending'
-                : 'pending',
-            )}
-          </Text>
-        </div>
-      </Modal>
-
       {/* 购买确认弹窗 */}
       <SubscriptionPurchaseModal
         t={t}
@@ -878,9 +783,8 @@ const SubscriptionPlansCard = ({
         paying={paying}
         selectedEpayMethod={selectedEpayMethod}
         setSelectedEpayMethod={handleEpayMethodChange}
-        epayMethods={epayMethods}
-        enableStripeTopUp={stripeSubscriptionEnabled}
-        enableCreemTopUp={enableCreemTopUp}
+        paymentRoutes={paymentRoutes}
+        quoteMethods={routeMethods}
         purchaseLimitInfo={
           selectedPlan?.plan?.id
             ? {
@@ -889,9 +793,9 @@ const SubscriptionPlansCard = ({
               }
             : null
         }
-        onPayStripe={payStripe}
-        onPayCreem={payCreem}
-        onPayEpay={payEpay}
+        onPayProductCheckout={payCreem}
+        onPayDirectCheckout={payDirectCheckout}
+        onPayQuote={payEpay}
       />
     </>
   );

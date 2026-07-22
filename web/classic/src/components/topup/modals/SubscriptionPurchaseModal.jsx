@@ -29,10 +29,13 @@ import {
   Tooltip,
 } from '@douyinfe/semi-ui';
 import { Crown, CalendarClock, Package } from 'lucide-react';
-import { SiStripe } from 'react-icons/si';
 import { IconCreditCard } from '@douyinfe/semi-icons';
 import { renderQuota } from '../../../helpers';
-import { formatPaymentDecimal } from '../payment-utils';
+import {
+  formatPaymentDecimal,
+  getPaymentRouteId,
+  getPublicPaymentMethodLabel,
+} from '../payment-utils';
 import {
   formatSubscriptionDuration,
   formatSubscriptionResetPeriod,
@@ -48,13 +51,12 @@ const SubscriptionPurchaseModal = ({
   paying,
   selectedEpayMethod,
   setSelectedEpayMethod,
-  epayMethods = [],
-  enableStripeTopUp = false,
-  enableCreemTopUp = false,
+  paymentRoutes = [],
+  quoteMethods = [],
   purchaseLimitInfo = null,
-  onPayStripe,
-  onPayCreem,
-  onPayEpay,
+  onPayProductCheckout,
+  onPayDirectCheckout,
+  onPayQuote,
 }) => {
   const plan = selectedPlan?.plan;
   const totalAmount = Number(plan?.total_amount || 0);
@@ -62,10 +64,17 @@ const SubscriptionPurchaseModal = ({
   const displayPrice = formatPaymentDecimal(price, plan?.currency || 'USD');
   const planCurrency = (plan?.currency || 'USD').toUpperCase();
   const supportsUnifiedPayment = planCurrency === 'USD';
-  const hasStripe = supportsUnifiedPayment && enableStripeTopUp;
-  const hasCreem = enableCreemTopUp && !!plan?.creem_product_id;
-  const hasEpay = supportsUnifiedPayment && epayMethods.length > 0;
-  const hasAnyPayment = hasStripe || hasCreem || hasEpay;
+  const externalRouteIDs = new Set(plan?.external_payment_route_ids || []);
+  const hasProductCheckout = paymentRoutes.some(
+    (route) =>
+      route.checkout_mode === 'product' && externalRouteIDs.has(route.route_id),
+  );
+  const hasDirectCheckout = paymentRoutes.some(
+    (route) =>
+      route.checkout_mode === 'direct' && externalRouteIDs.has(route.route_id),
+  );
+  const hasQuote = supportsUnifiedPayment && quoteMethods.length > 0;
+  const hasAnyPayment = hasProductCheckout || hasDirectCheckout || hasQuote;
   const purchaseLimit = Number(purchaseLimitInfo?.limit || 0);
   const purchaseCount = Number(purchaseLimitInfo?.count || 0);
   const purchaseLimitReached =
@@ -76,7 +85,7 @@ const SubscriptionPurchaseModal = ({
       title={
         <div className='flex items-center'>
           <Crown className='mr-2' size={18} />
-          {t('购买订阅套餐')}
+          {t('购买固定期限权益')}
         </div>
       }
       visible={visible}
@@ -130,7 +139,11 @@ const SubscriptionPurchaseModal = ({
                 <div className='flex items-center'>
                   <Package size={14} className='mr-1 text-slate-500' />
                   {totalAmount > 0 ? (
-                    <Tooltip content={`${t('原生额度')}：${totalAmount}`}>
+                    <Tooltip
+                      content={t('Raw quota: {{amount}}', {
+                        amount: totalAmount,
+                      })}
+                    >
                       <Text className='text-slate-900 dark:text-slate-100'>
                         {renderQuota(totalAmount)}
                       </Text>
@@ -142,15 +155,10 @@ const SubscriptionPurchaseModal = ({
                   )}
                 </div>
               </div>
-              {plan?.upgrade_group ? (
-                <div className='flex justify-between items-center'>
-                  <Text strong className='text-slate-700 dark:text-slate-200'>
-                    {t('升级分组')}：
-                  </Text>
-                  <Text className='text-slate-900 dark:text-slate-100'>
-                    {plan.upgrade_group}
-                  </Text>
-                </div>
+              {plan?.includes_expanded_access ? (
+                <Text className='text-slate-900 dark:text-slate-100'>
+                  {t('Includes expanded model access')}
+                </Text>
               ) : null}
               <Divider margin={8} />
               <div className='flex justify-between items-center'>
@@ -168,17 +176,29 @@ const SubscriptionPurchaseModal = ({
           {purchaseLimitReached && (
             <Banner
               type='warning'
-              description={`${t('已达到购买上限')} (${purchaseCount}/${purchaseLimit})`}
+              description={t('Purchase limit reached ({{count}}/{{limit}})', {
+                count: purchaseCount,
+                limit: purchaseLimit,
+              })}
               className='!rounded-xl'
               closeIcon={null}
             />
           )}
 
+          <Banner
+            type='info'
+            description={t(
+              '本次购买为一次性付款，将获得固定期限权益，不会自动续费。',
+            )}
+            className='!rounded-xl'
+            closeIcon={null}
+          />
+
           {!supportsUnifiedPayment && (
             <Banner
               type='warning'
               description={t(
-                '当前套餐使用 {{currency}} 定价，Stripe、易支付和 XORPay 统一支付仅支持 USD 套餐；如已配置 Creem，可继续使用 Creem 支付。',
+                '当前套餐使用 {{currency}} 定价，部分在线支付方式暂不可用。',
                 { currency: planCurrency },
               )}
               className='!rounded-xl'
@@ -192,38 +212,36 @@ const SubscriptionPurchaseModal = ({
                 {t('选择支付方式')}：
               </Text>
 
-              {/* Stripe / Creem */}
-              {(hasStripe || hasCreem) && (
+              {(hasProductCheckout || hasDirectCheckout) && (
                 <div className='flex gap-2'>
-                  {hasStripe && (
-                    <Button
-                      theme='light'
-                      className='flex-1'
-                      icon={<SiStripe size={14} color='#635BFF' />}
-                      onClick={onPayStripe}
-                      loading={paying}
-                      disabled={purchaseLimitReached || paying}
-                    >
-                      {t('Stripe')}
-                    </Button>
-                  )}
-                  {hasCreem && (
+                  {hasProductCheckout && (
                     <Button
                       theme='light'
                       className='flex-1'
                       icon={<IconCreditCard />}
-                      onClick={onPayCreem}
+                      onClick={onPayProductCheckout}
                       loading={paying}
                       disabled={purchaseLimitReached || paying}
                     >
-                      {t('Creem')}
+                      {t('在线支付')}
+                    </Button>
+                  )}
+                  {hasDirectCheckout && (
+                    <Button
+                      theme='light'
+                      className='flex-1'
+                      icon={<IconCreditCard />}
+                      onClick={onPayDirectCheckout}
+                      loading={paying}
+                      disabled={purchaseLimitReached || paying}
+                    >
+                      {t('在线支付')}
                     </Button>
                   )}
                 </div>
               )}
 
-              {/* 易支付 */}
-              {hasEpay && (
+              {hasQuote && (
                 <div className='flex gap-2'>
                   <Select
                     value={selectedEpayMethod}
@@ -231,16 +249,16 @@ const SubscriptionPurchaseModal = ({
                     style={{ flex: 1 }}
                     size='default'
                     placeholder={t('选择支付方式')}
-                    optionList={epayMethods.map((m) => ({
-                      value: m.type,
-                      label: m.name || m.type,
+                    optionList={quoteMethods.map((m) => ({
+                      value: getPaymentRouteId(m),
+                      label: getPublicPaymentMethodLabel(m, t, quoteMethods),
                     }))}
                     disabled={purchaseLimitReached || paying}
                   />
                   <Button
                     theme='solid'
                     type='primary'
-                    onClick={onPayEpay}
+                    onClick={onPayQuote}
                     loading={paying}
                     disabled={
                       !selectedEpayMethod || purchaseLimitReached || paying
