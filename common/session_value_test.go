@@ -3,6 +3,7 @@ package common
 import (
 	"encoding/json"
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -47,5 +48,22 @@ func TestSessionValueInt64RejectsUnsafeSerializedValues(t *testing.T) {
 			_, ok := SessionValueInt64(testCase.value)
 			assert.False(t, ok)
 		})
+	}
+}
+
+func TestSessionValueIntChecksBoundsBeforeConversion(t *testing.T) {
+	maximum, ok := SessionValueInt(json.Number(strconv.FormatInt(int64(math.MaxInt), 10)))
+	assert.True(t, ok)
+	assert.Equal(t, math.MaxInt, maximum)
+
+	minimum, ok := SessionValueInt(json.Number(strconv.FormatInt(int64(math.MinInt), 10)))
+	assert.True(t, ok)
+	assert.Equal(t, math.MinInt, minimum)
+
+	if strconv.IntSize == 32 {
+		_, ok = SessionValueInt(int64(math.MaxInt32) + 1)
+		assert.False(t, ok)
+		_, ok = SessionValueInt(int64(math.MinInt32) - 1)
+		assert.False(t, ok)
 	}
 }

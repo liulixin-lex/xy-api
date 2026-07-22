@@ -68,9 +68,8 @@ func SessionValueInt(value any) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	result := int(parsed)
-	if int64(result) != parsed {
+	if parsed < int64(math.MinInt) || parsed > int64(math.MaxInt) {
 		return 0, false
 	}
-	return result, true
+	return int(parsed), true
 }
