@@ -68,8 +68,9 @@ func SessionValueInt(value any) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	if parsed < int64(math.MinInt) || parsed > int64(math.MaxInt) {
+	result, err := strconv.Atoi(strconv.FormatInt(parsed, 10))
+	if err != nil {
 		return 0, false
 	}
-	return int(parsed), true
+	return result, true
 }
