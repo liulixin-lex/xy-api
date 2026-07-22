@@ -567,7 +567,7 @@ func assertV021PaymentMigrationSchema(t *testing.T, db *gorm.DB) {
 
 func createV020PaymentMigrationRows() v020PaymentMigrationRows {
 	livemode := false
-	accessToken := "fixture-access-token-v020"
+	accessToken := "fixture-access-token-v020-000001"
 	topUpOrderID := int64(3001)
 	subscriptionOrderID := int64(3002)
 	providerOrderKey := "xorpay:v020-order-3001"
