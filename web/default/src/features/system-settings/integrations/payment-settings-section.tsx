@@ -17,10 +17,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  CodeIcon,
+  SecurityWarningIcon,
+  ViewIcon,
+} from '@hugeicons/core-free-icons'
+import { HugeiconsIcon } from '@hugeicons/react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Code2, Eye, ShieldAlert } from 'lucide-react'
 import * as React from 'react'
-import { useForm, type Resolver } from 'react-hook-form'
+import {
+  useForm,
+  useFormState,
+  type FieldPath,
+  type Resolver,
+} from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import * as z from 'zod'
@@ -78,6 +88,7 @@ import {
 } from '../components/settings-form-layout'
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
+import { getPaymentAdminErrorMessage } from '../payment-admin-errors'
 import {
   buildEmergencyCredentialReplacement,
   EMERGENCY_CREDENTIAL_REVOCATION_REASON_MAX_LENGTH,
@@ -89,20 +100,30 @@ import {
   type EmergencyCredentialRevocationMode,
   type RevocablePaymentProvider,
 } from '../payment-credential-revocation'
+import type {
+  RetainedCredentialDisableResponse,
+  RetainedPaymentProvider,
+} from '../retained-payment-credential-disable'
 import { safeNumberFieldProps } from '../utils/numeric-field'
 import { AmountDiscountVisualEditor } from './amount-discount-visual-editor'
 import { AmountOptionsVisualEditor } from './amount-options-visual-editor'
 import { CreemProductsVisualEditor } from './creem-products-visual-editor'
 import { isSecurePaymentCallbackOrigin } from './payment-callback-origin'
 import { PaymentMethodsVisualEditor } from './payment-methods-visual-editor'
+import {
+  selectPaymentSettingUpdates,
+  type PaymentSettingsTab,
+} from './payment-settings-scope'
+import { RetainedCredentialEmergencyControl } from './retained-credential-emergency-control'
 import { resolveStripeTestModeNotice } from './stripe-test-mode-readiness'
+import { resolveStripeWebhookContract } from './stripe-webhook-contract'
 import {
   formatJsonForEditor,
   getJsonError,
   normalizeJsonForComparison,
   removeTrailingSlash,
 } from './utils'
-import { saveWaffoPancakeConfig } from './waffo-pancake-api'
+import { saveWaffoPancakeSettings } from './waffo-pancake-api'
 import {
   WaffoPancakeSettingsSection,
   type WaffoPancakeBinding,
@@ -187,7 +208,9 @@ function validatePaymentMethodsJson(value: string): string | null {
       provider === 'epay' ||
       (provider === 'stripe' && paymentType === 'stripe') ||
       (provider === 'xorpay' &&
-        (paymentType === 'xorpay_native' || paymentType === 'xorpay_alipay')) ||
+        (paymentType === 'xorpay_native' ||
+          paymentType === 'xorpay_alipay' ||
+          paymentType === 'xorpay_jsapi')) ||
       (provider === 'waffo_pancake' && paymentType === 'waffo_pancake')
     if (!providerMatchesType) {
       return 'The payment type key does not match the selected provider.'
@@ -312,6 +335,7 @@ const paymentSchema = z.object({
   StripeWebhookSecret: z.string(),
   StripePriceId: z.string(),
   StripeAccountId: z.string(),
+  StripeCheckoutAllowedHosts: z.string(),
   StripeCurrency: z
     .string()
     .regex(/^[A-Za-z]{3}$/, 'Enter a three-letter ISO 4217 currency code.'),
@@ -327,7 +351,10 @@ const paymentSchema = z.object({
       value,
       (parsed) =>
         Array.isArray(parsed) &&
-        parsed.every((method) => method === 'native' || method === 'alipay') &&
+        parsed.every(
+          (method) =>
+            method === 'native' || method === 'alipay' || method === 'jsapi'
+        ) &&
         new Set(parsed).size === parsed.length
     )
     if (error) {
@@ -360,12 +387,116 @@ const paymentSchema = z.object({
   WaffoMinTopUp: z.coerce.number().min(1),
   WaffoNotifyUrl: z.string(),
   WaffoReturnUrl: z.string(),
+  WaffoWebRedirectHosts: z.string(),
+  WaffoAppRedirectSchemes: z.string(),
   WaffoPancakeMerchantID: z.string(),
   WaffoPancakePrivateKey: z.string(),
   WaffoPancakeReturnURL: z.string(),
+  WaffoPancakeUnitPrice: z.coerce.number().positive().max(1_000_000),
+  WaffoPancakeMinTopUp: z.coerce.number().int().min(1).max(10_000),
+  WaffoPancakeTestMode: z.boolean(),
 })
 
 type PaymentFormValues = z.infer<typeof paymentSchema>
+const PAYMENT_FIELDS_BY_TAB = {
+  general: [
+    'CustomCallbackAddress',
+    'TopupGroupRatio',
+    'Price',
+    'MinTopUp',
+    'PayMethods',
+    'AmountOptions',
+    'AmountDiscount',
+  ],
+  epay: ['PayAddress', 'EpayId', 'EpayKey'],
+  stripe: [
+    'StripeApiSecret',
+    'StripeWebhookSecret',
+    'StripePriceId',
+    'StripeAccountId',
+    'StripeCheckoutAllowedHosts',
+    'StripeCurrency',
+    'StripeUnitPrice',
+    'StripeMinTopUp',
+  ],
+  xorpay: [
+    'XorPayAid',
+    'XorPayAppSecret',
+    'XorPayUnitPrice',
+    'XorPayMinTopUp',
+    'XorPayEnabledMethods',
+  ],
+  creem: [
+    'CreemApiKey',
+    'CreemWebhookSecret',
+    'CreemTestMode',
+    'CreemProducts',
+  ],
+  'waffo-pancake': [
+    'WaffoPancakeMerchantID',
+    'WaffoPancakePrivateKey',
+    'WaffoPancakeReturnURL',
+    'WaffoPancakeUnitPrice',
+    'WaffoPancakeMinTopUp',
+    'WaffoPancakeTestMode',
+  ],
+  waffo: [
+    'WaffoEnabled',
+    'WaffoApiKey',
+    'WaffoPrivateKey',
+    'WaffoPublicCert',
+    'WaffoSandboxPublicCert',
+    'WaffoSandboxApiKey',
+    'WaffoSandboxPrivateKey',
+    'WaffoSandbox',
+    'WaffoMerchantId',
+    'WaffoCurrency',
+    'WaffoUnitPrice',
+    'WaffoMinTopUp',
+    'WaffoNotifyUrl',
+    'WaffoReturnUrl',
+    'WaffoWebRedirectHosts',
+    'WaffoAppRedirectSchemes',
+  ],
+} satisfies Record<PaymentSettingsTab, readonly FieldPath<PaymentFormValues>[]>
+
+const PAYMENT_FORM_KEY_BY_OPTION_KEY: Record<string, keyof PaymentFormValues> =
+  {
+    'payment_setting.amount_options': 'AmountOptions',
+    'payment_setting.amount_discount': 'AmountDiscount',
+  }
+
+type WriteOnlyPaymentField =
+  | 'EpayKey'
+  | 'StripeApiSecret'
+  | 'StripeWebhookSecret'
+  | 'XorPayAppSecret'
+  | 'CreemApiKey'
+  | 'CreemWebhookSecret'
+  | 'WaffoApiKey'
+  | 'WaffoPrivateKey'
+  | 'WaffoSandboxApiKey'
+  | 'WaffoSandboxPrivateKey'
+
+const WRITE_ONLY_PAYMENT_FIELDS = new Set<WriteOnlyPaymentField>([
+  'EpayKey',
+  'StripeApiSecret',
+  'StripeWebhookSecret',
+  'XorPayAppSecret',
+  'CreemApiKey',
+  'CreemWebhookSecret',
+  'WaffoApiKey',
+  'WaffoPrivateKey',
+  'WaffoSandboxApiKey',
+  'WaffoSandboxPrivateKey',
+])
+
+function isWriteOnlyPaymentField(
+  key: keyof PaymentFormValues
+): key is WriteOnlyPaymentField {
+  return WRITE_ONLY_PAYMENT_FIELDS.has(key as WriteOnlyPaymentField)
+}
+
 type ClearablePaymentSecret =
   | 'EpayKey'
   | 'StripeApiSecret'
@@ -398,7 +529,7 @@ function getEmergencyCredentialRevocationDescription(
 ): string {
   if (mode === 'stripe_disable_all') {
     return t(
-      'Emergency shutdown: the Stripe API credential and all webhook signing secrets are cleared locally, every unfinished Stripe order moves to manual review, and durable Stripe history is marked with a credential incident. This does not revoke the API key at Stripe; revoke it in the Stripe Dashboard as well.'
+      'Emergency shutdown clears the Stripe API credential and webhook signing secrets only in this system, moves unfinished Stripe orders to manual review, and records a credential incident. It does not revoke the key in Stripe, cancel Checkout Sessions or subscriptions, or issue refunds. Complete those actions separately in the Stripe Dashboard.'
     )
   }
   if (mode === 'replace' && provider !== 'stripe') {
@@ -409,12 +540,12 @@ function getEmergencyCredentialRevocationDescription(
   }
   if (mode === 'replace') {
     return t(
-      'Emergency action: all previously accepted Stripe webhook signing secrets stop validating immediately, and every unfinished Stripe order moves to manual review. If a new whsec is entered in this form, it is saved atomically; otherwise Stripe webhooks are disabled. Clearing or normally rotating a secret does not perform this emergency revocation.'
+      'Emergency action: all previously accepted Stripe webhook signing secrets stop validating immediately, and unfinished Stripe orders move to manual review. A new whsec is saved atomically when provided; otherwise Stripe webhooks are disabled. This local action does not cancel Checkout Sessions or subscriptions, issue refunds, or change keys in the Stripe Dashboard.'
     )
   }
   if (mode === 'stripe_disable') {
     return t(
-      'Emergency action: all Stripe webhook signing secrets stop validating immediately, Stripe webhooks are disabled, and every unfinished Stripe order moves to manual review. To replace the webhook secret atomically instead, confirm compliance and use the Stripe settings form. Clearing or normally rotating a secret does not perform this emergency revocation.'
+      'Emergency action: all Stripe webhook signing secrets stop validating immediately, Stripe webhooks are disabled, and unfinished Stripe orders move to manual review. This local action does not cancel Checkout Sessions or subscriptions, issue refunds, or change keys in the Stripe Dashboard.'
     )
   }
   return t(
@@ -525,7 +656,12 @@ function EmergencyCredentialRevocationAction(props: {
   return (
     <div className='border-destructive/30 bg-destructive/5 flex h-full min-w-0 flex-col gap-4 rounded-lg border p-4'>
       <div className='flex min-w-0 gap-3'>
-        <ShieldAlert className='text-destructive mt-0.5 h-4 w-4 shrink-0' />
+        <HugeiconsIcon
+          icon={SecurityWarningIcon}
+          strokeWidth={2}
+          className='text-destructive mt-0.5 shrink-0'
+          aria-hidden='true'
+        />
         <div className='grid gap-1'>
           <p className='text-destructive text-sm font-medium'>
             {t('Emergency credential revocation')}
@@ -584,6 +720,9 @@ type PaymentBaseFormValues = Omit<
   PaymentFormValues,
   keyof WaffoFormFieldValues | keyof WaffoPancakeSettingsValues
 >
+type SanitizedPaymentValues = PaymentFormValues & {
+  WaffoPayMethods: string
+}
 
 const CURRENT_COMPLIANCE_TERMS_VERSION = 'v1'
 const paymentTabContentClassName = 'mt-6 min-w-0'
@@ -610,6 +749,8 @@ type PaymentSettingsSectionProps = {
   stripeTestModeEnabled: boolean
   stripeTestModeBlocked: boolean
   stripeTestModeIsolationRequired: boolean
+  stripeWebhookAPIVersion: string
+  stripeWebhookSecretOverlapHours: number
   xorPayPreviousCredentialActive: boolean
   defaultValues: PaymentBaseFormValues
   waffoDefaultValues: WaffoSettingsValues
@@ -644,6 +785,8 @@ export function PaymentSettingsSection({
   stripeTestModeEnabled,
   stripeTestModeBlocked,
   stripeTestModeIsolationRequired,
+  stripeWebhookAPIVersion,
+  stripeWebhookSecretOverlapHours,
   xorPayPreviousCredentialActive,
   defaultValues,
   waffoDefaultValues,
@@ -654,6 +797,17 @@ export function PaymentSettingsSection({
 }: PaymentSettingsSectionProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const refreshSystemOptions = React.useCallback(async () => {
+    try {
+      await queryClient.invalidateQueries(
+        { queryKey: ['system-options'] },
+        { throwOnError: true }
+      )
+      return true
+    } catch {
+      return false
+    }
+  }, [queryClient])
   const {
     open: verificationOpen,
     methods: verificationMethods,
@@ -690,6 +844,10 @@ export function PaymentSettingsSection({
   const [creemProductsVisualMode, setCreemProductsVisualMode] =
     React.useState(true)
   const [showComplianceDialog, setShowComplianceDialog] = React.useState(false)
+  const [activeTab, setActiveTab] =
+    React.useState<PaymentSettingsTab>('general')
+  const [savingSection, setSavingSection] =
+    React.useState<PaymentSettingsTab | null>(null)
   const [pendingSecretClear, setPendingSecretClear] =
     React.useState<ClearablePaymentSecret | null>(null)
   const [pendingCredentialRevocation, setPendingCredentialRevocation] =
@@ -698,8 +856,13 @@ export function PaymentSettingsSection({
     React.useState('')
   const [gatewayReadiness, setGatewayReadiness] =
     React.useState<PaymentGatewayReadiness | null>(null)
+  const [retainedCredentialActionPending, setRetainedCredentialActionPending] =
+    React.useState(false)
   const [waffoPayMethods, setWaffoPayMethods] = React.useState<PayMethod[]>(
     () => parseWaffoPayMethods(waffoDefaultValues.WaffoPayMethods)
+  )
+  const waffoPayMethodsSavedRef = React.useRef(
+    parseWaffoPayMethods(waffoDefaultValues.WaffoPayMethods)
   )
   const [waffoPancakeSelection, setWaffoPancakeSelection] =
     React.useState<WaffoPancakeBinding>({
@@ -711,9 +874,19 @@ export function PaymentSettingsSection({
       storeID: waffoPancakeProvisionedStoreID ?? '',
       productID: waffoPancakeProvisionedProductID ?? '',
     })
+  const waffoPancakeSavedBindingRef = React.useRef(waffoPancakeSavedBinding)
 
   React.useEffect(() => {
-    setWaffoPayMethods(parseWaffoPayMethods(waffoDefaultValues.WaffoPayMethods))
+    const methods = parseWaffoPayMethods(waffoDefaultValues.WaffoPayMethods)
+    setWaffoPayMethods((current) => {
+      const hasUnsavedChanges =
+        normalizeJsonForComparison(JSON.stringify(current)) !==
+        normalizeJsonForComparison(
+          JSON.stringify(waffoPayMethodsSavedRef.current)
+        )
+      return hasUnsavedChanges ? current : methods
+    })
+    waffoPayMethodsSavedRef.current = methods
   }, [waffoDefaultValues.WaffoPayMethods])
 
   React.useEffect(() => {
@@ -721,8 +894,15 @@ export function PaymentSettingsSection({
       storeID: waffoPancakeProvisionedStoreID ?? '',
       productID: waffoPancakeProvisionedProductID ?? '',
     }
-    setWaffoPancakeSelection(nextBinding)
+    setWaffoPancakeSelection((current) => {
+      const saved = waffoPancakeSavedBindingRef.current
+      const hasUnsavedChanges =
+        current.storeID !== saved.storeID ||
+        current.productID !== saved.productID
+      return hasUnsavedChanges ? current : nextBinding
+    })
     setWaffoPancakeSavedBinding(nextBinding)
+    waffoPancakeSavedBindingRef.current = nextBinding
   }, [waffoPancakeProvisionedProductID, waffoPancakeProvisionedStoreID])
 
   const complianceStatements = React.useMemo(
@@ -791,9 +971,17 @@ export function PaymentSettingsSection({
           if (!data.success) {
             throw new Error(data.message || t('Failed to confirm compliance'))
           }
-          toast.success(t('Compliance confirmed successfully'))
           setShowComplianceDialog(false)
-          await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+          const refreshed = await refreshSystemOptions()
+          if (refreshed) {
+            toast.success(t('Compliance confirmed successfully'))
+          } else {
+            toast.warning(
+              t(
+                'Compliance was confirmed, but the latest status could not be refreshed.'
+              )
+            )
+          }
           return data
         },
         {
@@ -853,7 +1041,14 @@ export function PaymentSettingsSection({
               queryKey: ['system-options'],
             })
           }
-          throw error
+          throw new Error(
+            getPaymentAdminErrorMessage(
+              error,
+              t,
+              t('Failed to update setting')
+            ),
+            { cause: error }
+          )
         }
       },
       {
@@ -870,7 +1065,10 @@ export function PaymentSettingsSection({
   }
 
   const paymentSettingsPending =
-    paymentSettingsMutation.isPending || verificationOpen
+    paymentSettingsMutation.isPending ||
+    verificationOpen ||
+    savingSection !== null ||
+    retainedCredentialActionPending
   const normalizedCredentialRevocationReason =
     normalizeEmergencyCredentialRevocationReason(credentialRevocationReason)
   const credentialRevocationReasonValid =
@@ -901,8 +1099,9 @@ export function PaymentSettingsSection({
       CreemProducts: formatJsonForEditor(initialFormValues.CreemProducts),
     },
   })
-
-  const { isSubmitting } = form.formState
+  const trackedDirtyFields = useFormState({ control: form.control }).dirtyFields
+  const trackedDirtyFieldsRef = React.useRef(trackedDirtyFields)
+  trackedDirtyFieldsRef.current = trackedDirtyFields
 
   const setPaymentValue = React.useCallback(
     (
@@ -921,6 +1120,63 @@ export function PaymentSettingsSection({
     [form]
   )
 
+  const completeRetainedCredentialDisable = React.useCallback(
+    async (
+      provider: RetainedPaymentProvider,
+      result: RetainedCredentialDisableResponse<{
+        readiness?: PaymentGatewayReadiness
+        version?: number
+      }>
+    ) => {
+      if (provider === 'creem') {
+        form.resetField('CreemApiKey', { defaultValue: '' })
+        form.resetField('CreemWebhookSecret', { defaultValue: '' })
+        initialRef.current.CreemApiKey = ''
+        initialRef.current.CreemWebhookSecret = ''
+      } else if (provider === 'waffo') {
+        const sandbox = form.getValues('WaffoSandbox')
+        form.resetField('WaffoEnabled', { defaultValue: false })
+        form.resetField('WaffoApiKey', { defaultValue: '' })
+        form.resetField('WaffoPrivateKey', { defaultValue: '' })
+        form.resetField('WaffoSandboxApiKey', { defaultValue: '' })
+        form.resetField('WaffoSandboxPrivateKey', { defaultValue: '' })
+        if (sandbox) {
+          form.resetField('WaffoSandboxPublicCert', { defaultValue: '' })
+          initialRef.current.WaffoSandboxPublicCert = ''
+        } else {
+          form.resetField('WaffoPublicCert', { defaultValue: '' })
+          initialRef.current.WaffoPublicCert = ''
+        }
+        initialRef.current.WaffoEnabled = false
+        initialRef.current.WaffoApiKey = ''
+        initialRef.current.WaffoPrivateKey = ''
+        initialRef.current.WaffoSandboxApiKey = ''
+        initialRef.current.WaffoSandboxPrivateKey = ''
+      } else {
+        form.resetField('WaffoPancakePrivateKey', { defaultValue: '' })
+        initialRef.current.WaffoPancakePrivateKey = ''
+        const disabledBinding = {
+          storeID: '',
+          productID: waffoPancakeSavedBindingRef.current.productID,
+        }
+        setWaffoPancakeSelection(disabledBinding)
+        setWaffoPancakeSavedBinding(disabledBinding)
+        waffoPancakeSavedBindingRef.current = disabledBinding
+      }
+
+      const nextVersion = result.data?.version
+      if (
+        Number.isSafeInteger(nextVersion) &&
+        (nextVersion ?? 0) > configVersionRef.current
+      ) {
+        configVersionRef.current = nextVersion as number
+      }
+      setGatewayReadiness(result.data?.readiness ?? null)
+      return refreshSystemOptions()
+    },
+    [form, refreshSystemOptions]
+  )
+
   const clearPaymentSecret = async () => {
     const key = pendingSecretClear
     if (!key || paymentSettingsPending) return
@@ -932,20 +1188,38 @@ export function PaymentSettingsSection({
         },
         async (result) => {
           if (!result.success) {
-            toast.error(result.message || t('Failed to clear saved credential'))
+            toast.error(
+              getPaymentAdminErrorMessage(
+                result,
+                t,
+                t('Failed to clear saved credential')
+              )
+            )
             return
           }
           form.resetField(key, { defaultValue: '' })
           initialRef.current[key] = ''
           setGatewayReadiness(result.data?.readiness ?? null)
-          await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+          const refreshed = await refreshSystemOptions()
           setPendingSecretClear(null)
-          toast.success(t('Saved credential cleared'))
+          if (refreshed) {
+            toast.success(t('Saved credential cleared'))
+          } else {
+            toast.warning(
+              t(
+                'The saved credential was cleared, but the latest status could not be refreshed.'
+              )
+            )
+          }
         }
       )
     } catch (error) {
       toast.error(
-        getApiErrorMessage(error, t('Failed to clear saved credential'))
+        getPaymentAdminErrorMessage(
+          error,
+          t,
+          t('Failed to clear saved credential')
+        )
       )
     }
   }
@@ -973,7 +1247,11 @@ export function PaymentSettingsSection({
         async (result) => {
           if (!result.success) {
             toast.error(
-              result.message || t('Failed to revoke previous credential')
+              getPaymentAdminErrorMessage(
+                result,
+                t,
+                t('Failed to revoke previous credential')
+              )
             )
             return
           }
@@ -997,10 +1275,16 @@ export function PaymentSettingsSection({
             }
           }
           setGatewayReadiness(result.data?.readiness ?? null)
-          await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+          const refreshed = await refreshSystemOptions()
           setPendingCredentialRevocation(null)
           setCredentialRevocationReason('')
-          if (request.mode === 'replace') {
+          if (!refreshed) {
+            toast.warning(
+              t(
+                'The emergency credential action completed, but the latest status could not be refreshed.'
+              )
+            )
+          } else if (request.mode === 'replace') {
             toast.success(
               t(
                 '{{provider}} credentials replaced and compromised generations revoked',
@@ -1034,7 +1318,11 @@ export function PaymentSettingsSection({
       )
     } catch (error) {
       toast.error(
-        getApiErrorMessage(error, t('Failed to revoke previous credential'))
+        getPaymentAdminErrorMessage(
+          error,
+          t,
+          t('Failed to revoke previous credential')
+        )
       )
     }
   }
@@ -1066,14 +1354,14 @@ export function PaymentSettingsSection({
   )
 
   const setXorPayMethodEnabled = React.useCallback(
-    (method: 'native' | 'alipay', enabled: boolean) => {
+    (method: 'native' | 'alipay' | 'jsapi', enabled: boolean) => {
       let current: string[] = []
       try {
         const parsed = JSON.parse(form.getValues('XorPayEnabledMethods'))
         if (Array.isArray(parsed)) {
           current = parsed.filter(
-            (value): value is 'native' | 'alipay' =>
-              value === 'native' || value === 'alipay'
+            (value): value is 'native' | 'alipay' | 'jsapi' =>
+              value === 'native' || value === 'alipay' || value === 'jsapi'
           )
         }
       } catch {
@@ -1090,18 +1378,26 @@ export function PaymentSettingsSection({
   React.useEffect(() => {
     const parsedDefaults = JSON.parse(defaultsSignature) as PaymentFormValues
     initialRef.current = parsedDefaults
-    form.reset({
-      ...parsedDefaults,
-      PayMethods: formatJsonForEditor(parsedDefaults.PayMethods),
-      TopupGroupRatio: formatJsonForEditor(parsedDefaults.TopupGroupRatio),
-      AmountOptions: formatJsonForEditor(parsedDefaults.AmountOptions),
-      AmountDiscount: formatJsonForEditor(parsedDefaults.AmountDiscount),
-      CreemProducts: formatJsonForEditor(parsedDefaults.CreemProducts),
-    })
+    form.reset(
+      {
+        ...parsedDefaults,
+        PayMethods: formatJsonForEditor(parsedDefaults.PayMethods),
+        TopupGroupRatio: formatJsonForEditor(parsedDefaults.TopupGroupRatio),
+        AmountOptions: formatJsonForEditor(parsedDefaults.AmountOptions),
+        AmountDiscount: formatJsonForEditor(parsedDefaults.AmountDiscount),
+        CreemProducts: formatJsonForEditor(parsedDefaults.CreemProducts),
+      },
+      {
+        keepDirtyValues: Object.keys(trackedDirtyFieldsRef.current).length > 0,
+      }
+    )
   }, [defaultsSignature, form])
 
-  const submitPaymentSettings = async (values: PaymentFormValues) => {
-    const sanitized = {
+  const submitPaymentSettings = async (
+    values: PaymentFormValues,
+    section: PaymentSettingsTab
+  ) => {
+    const sanitized: SanitizedPaymentValues = {
       PayAddress: removeTrailingSlash(values.PayAddress),
       EpayId: values.EpayId.trim(),
       EpayKey: values.EpayKey.trim(),
@@ -1116,6 +1412,7 @@ export function PaymentSettingsSection({
       StripeWebhookSecret: values.StripeWebhookSecret.trim(),
       StripePriceId: values.StripePriceId.trim(),
       StripeAccountId: values.StripeAccountId.trim(),
+      StripeCheckoutAllowedHosts: values.StripeCheckoutAllowedHosts.trim(),
       StripeCurrency: values.StripeCurrency.trim().toUpperCase(),
       StripeUnitPrice: values.StripeUnitPrice,
       StripeMinTopUp: values.StripeMinTopUp,
@@ -1137,6 +1434,8 @@ export function PaymentSettingsSection({
       WaffoMinTopUp: values.WaffoMinTopUp,
       WaffoNotifyUrl: values.WaffoNotifyUrl.trim(),
       WaffoReturnUrl: values.WaffoReturnUrl.trim(),
+      WaffoWebRedirectHosts: values.WaffoWebRedirectHosts.trim(),
+      WaffoAppRedirectSchemes: values.WaffoAppRedirectSchemes.trim(),
       WaffoPublicCert: values.WaffoPublicCert.trim(),
       WaffoSandboxPublicCert: values.WaffoSandboxPublicCert.trim(),
       WaffoApiKey: values.WaffoApiKey.trim(),
@@ -1149,6 +1448,9 @@ export function PaymentSettingsSection({
       WaffoPancakeReturnURL: removeTrailingSlash(
         values.WaffoPancakeReturnURL.trim()
       ),
+      WaffoPancakeUnitPrice: values.WaffoPancakeUnitPrice,
+      WaffoPancakeMinTopUp: values.WaffoPancakeMinTopUp,
+      WaffoPancakeTestMode: values.WaffoPancakeTestMode,
     }
 
     const initial = {
@@ -1168,6 +1470,8 @@ export function PaymentSettingsSection({
       StripeWebhookSecret: initialRef.current.StripeWebhookSecret.trim(),
       StripePriceId: initialRef.current.StripePriceId.trim(),
       StripeAccountId: initialRef.current.StripeAccountId.trim(),
+      StripeCheckoutAllowedHosts:
+        initialRef.current.StripeCheckoutAllowedHosts.trim(),
       StripeCurrency: initialRef.current.StripeCurrency.trim().toUpperCase(),
       StripeUnitPrice: initialRef.current.StripeUnitPrice,
       StripeMinTopUp: initialRef.current.StripeMinTopUp,
@@ -1191,20 +1495,24 @@ export function PaymentSettingsSection({
       WaffoMinTopUp: initialRef.current.WaffoMinTopUp,
       WaffoNotifyUrl: initialRef.current.WaffoNotifyUrl.trim(),
       WaffoReturnUrl: initialRef.current.WaffoReturnUrl.trim(),
+      WaffoWebRedirectHosts: initialRef.current.WaffoWebRedirectHosts.trim(),
+      WaffoAppRedirectSchemes:
+        initialRef.current.WaffoAppRedirectSchemes.trim(),
       WaffoPublicCert: initialRef.current.WaffoPublicCert.trim(),
       WaffoSandboxPublicCert: initialRef.current.WaffoSandboxPublicCert.trim(),
       WaffoApiKey: initialRef.current.WaffoApiKey.trim(),
       WaffoPrivateKey: initialRef.current.WaffoPrivateKey.trim(),
       WaffoSandboxApiKey: initialRef.current.WaffoSandboxApiKey.trim(),
       WaffoSandboxPrivateKey: initialRef.current.WaffoSandboxPrivateKey.trim(),
-      WaffoPayMethods: JSON.stringify(
-        parseWaffoPayMethods(waffoDefaultValues.WaffoPayMethods)
-      ),
+      WaffoPayMethods: JSON.stringify(waffoPayMethodsSavedRef.current),
       WaffoPancakeMerchantID: initialRef.current.WaffoPancakeMerchantID.trim(),
       WaffoPancakePrivateKey: initialRef.current.WaffoPancakePrivateKey.trim(),
       WaffoPancakeReturnURL: removeTrailingSlash(
         initialRef.current.WaffoPancakeReturnURL.trim()
       ),
+      WaffoPancakeUnitPrice: initialRef.current.WaffoPancakeUnitPrice,
+      WaffoPancakeMinTopUp: initialRef.current.WaffoPancakeMinTopUp,
+      WaffoPancakeTestMode: initialRef.current.WaffoPancakeTestMode,
     }
 
     const updates: Array<{ key: string; value: string | number | boolean }> = []
@@ -1301,6 +1609,16 @@ export function PaymentSettingsSection({
       updates.push({
         key: 'StripeAccountId',
         value: sanitized.StripeAccountId,
+      })
+    }
+
+    if (
+      sanitized.StripeCheckoutAllowedHosts !==
+      initial.StripeCheckoutAllowedHosts
+    ) {
+      updates.push({
+        key: 'StripeCheckoutAllowedHosts',
+        value: sanitized.StripeCheckoutAllowedHosts,
       })
     }
 
@@ -1423,6 +1741,20 @@ export function PaymentSettingsSection({
       updates.push({ key: 'WaffoReturnUrl', value: sanitized.WaffoReturnUrl })
     }
 
+    if (sanitized.WaffoWebRedirectHosts !== initial.WaffoWebRedirectHosts) {
+      updates.push({
+        key: 'WaffoWebRedirectHosts',
+        value: sanitized.WaffoWebRedirectHosts,
+      })
+    }
+
+    if (sanitized.WaffoAppRedirectSchemes !== initial.WaffoAppRedirectSchemes) {
+      updates.push({
+        key: 'WaffoAppRedirectSchemes',
+        value: sanitized.WaffoAppRedirectSchemes,
+      })
+    }
+
     if (sanitized.WaffoPublicCert !== initial.WaffoPublicCert) {
       updates.push({
         key: 'WaffoPublicCert',
@@ -1476,6 +1808,7 @@ export function PaymentSettingsSection({
       update.key.startsWith('Stripe')
     )
     if (
+      section === 'stripe' &&
       (!stripeCredentialAccountId.trim() || !stripeCredentialLivemode.trim()) &&
       sanitized.StripePriceId !== '' &&
       !hasStripeSettingUpdate
@@ -1488,126 +1821,239 @@ export function PaymentSettingsSection({
     }
 
     const hasWaffoPancakeChanges =
-      sanitized.WaffoPancakeMerchantID !== initial.WaffoPancakeMerchantID ||
-      sanitized.WaffoPancakePrivateKey.length > 0 ||
-      sanitized.WaffoPancakeReturnURL !== initial.WaffoPancakeReturnURL ||
-      waffoPancakeSelection.storeID !== waffoPancakeSavedBinding.storeID ||
-      waffoPancakeSelection.productID !== waffoPancakeSavedBinding.productID
+      section === 'waffo-pancake' &&
+      (sanitized.WaffoPancakeMerchantID !== initial.WaffoPancakeMerchantID ||
+        sanitized.WaffoPancakePrivateKey.length > 0 ||
+        sanitized.WaffoPancakeReturnURL !== initial.WaffoPancakeReturnURL ||
+        sanitized.WaffoPancakeUnitPrice !== initial.WaffoPancakeUnitPrice ||
+        sanitized.WaffoPancakeMinTopUp !== initial.WaffoPancakeMinTopUp ||
+        sanitized.WaffoPancakeTestMode !== initial.WaffoPancakeTestMode ||
+        waffoPancakeSelection.storeID !== waffoPancakeSavedBinding.storeID ||
+        waffoPancakeSelection.productID !== waffoPancakeSavedBinding.productID)
 
-    if (updates.length === 0 && !hasWaffoPancakeChanges) {
+    const hasWaffoPancakeConnectionConfiguration = Boolean(
+      sanitized.WaffoPancakeMerchantID ||
+      sanitized.WaffoPancakePrivateKey ||
+      sanitized.WaffoPancakeReturnURL ||
+      waffoPancakeSelection.storeID ||
+      waffoPancakeSelection.productID
+    )
+
+    const scopedUpdates = selectPaymentSettingUpdates(section, updates)
+
+    if (scopedUpdates.length === 0 && !hasWaffoPancakeChanges) {
       toast.info(t('No changes to save'))
       return
     }
 
-    if (hasWaffoPancakeChanges && !sanitized.WaffoPancakeMerchantID) {
+    if (
+      hasWaffoPancakeChanges &&
+      hasWaffoPancakeConnectionConfiguration &&
+      !sanitized.WaffoPancakeMerchantID
+    ) {
       toast.error(t('Merchant ID is required'))
       return
     }
 
     if (
       hasWaffoPancakeChanges &&
+      hasWaffoPancakeConnectionConfiguration &&
       (!waffoPancakeSelection.storeID || !waffoPancakeSelection.productID)
     ) {
       toast.error(t('Pick or create both a store and a product before saving.'))
       return
     }
 
-    const saveWaffoPancakeChanges = async () => {
-      if (!hasWaffoPancakeChanges) return
+    if (hasWaffoPancakeChanges) {
       try {
-        const body = await saveWaffoPancakeConfig({
-          merchantID: sanitized.WaffoPancakeMerchantID,
-          privateKey: sanitized.WaffoPancakePrivateKey,
-          returnURL: sanitized.WaffoPancakeReturnURL,
-          storeID: waffoPancakeSelection.storeID,
-          productID: waffoPancakeSelection.productID,
-        })
+        await withVerification(
+          async () => {
+            let result: Awaited<ReturnType<typeof saveWaffoPancakeSettings>>
+            try {
+              result = await saveWaffoPancakeSettings({
+                merchantID: sanitized.WaffoPancakeMerchantID,
+                privateKey: sanitized.WaffoPancakePrivateKey,
+                returnURL: sanitized.WaffoPancakeReturnURL,
+                storeID: waffoPancakeSelection.storeID,
+                productID: waffoPancakeSelection.productID,
+                unitPrice: sanitized.WaffoPancakeUnitPrice,
+                minTopUp: sanitized.WaffoPancakeMinTopUp,
+                testMode: sanitized.WaffoPancakeTestMode,
+                expectedVersion: configVersionRef.current,
+              })
+            } catch (error) {
+              if (hasHttpStatus(error, 409)) {
+                await queryClient.invalidateQueries({
+                  queryKey: ['system-options'],
+                })
+              }
+              throw error
+            }
 
-        if (
-          body?.message === 'success' &&
-          typeof body.data === 'object' &&
-          body.data
-        ) {
-          const saved = body.data as { product_id: string; store_id: string }
-          const savedBinding = {
-            storeID: saved.store_id,
-            productID: saved.product_id,
+            if (!result.success || !result.data) {
+              toast.error(
+                getPaymentAdminErrorMessage(
+                  result,
+                  t,
+                  t('Waffo Pancake save failed')
+                )
+              )
+              return result
+            }
+
+            if (
+              Number.isSafeInteger(result.data.version) &&
+              result.data.version > 0
+            ) {
+              configVersionRef.current = result.data.version
+            }
+            setGatewayReadiness(result.data.readiness ?? null)
+            const savedBinding = {
+              storeID: waffoPancakeSelection.storeID,
+              productID: waffoPancakeSelection.productID,
+            }
+            setWaffoPancakeSavedBinding(savedBinding)
+            waffoPancakeSavedBindingRef.current = savedBinding
+            setWaffoPancakeSelection(savedBinding)
+            Object.assign(initialRef.current, {
+              WaffoPancakeMerchantID: sanitized.WaffoPancakeMerchantID,
+              WaffoPancakePrivateKey: '',
+              WaffoPancakeReturnURL: sanitized.WaffoPancakeReturnURL,
+              WaffoPancakeUnitPrice: sanitized.WaffoPancakeUnitPrice,
+              WaffoPancakeMinTopUp: sanitized.WaffoPancakeMinTopUp,
+              WaffoPancakeTestMode: sanitized.WaffoPancakeTestMode,
+            })
+            form.resetField('WaffoPancakeMerchantID', {
+              defaultValue: form.getValues('WaffoPancakeMerchantID'),
+            })
+            form.resetField('WaffoPancakePrivateKey', { defaultValue: '' })
+            form.resetField('WaffoPancakeReturnURL', {
+              defaultValue: form.getValues('WaffoPancakeReturnURL'),
+            })
+            form.resetField('WaffoPancakeUnitPrice', {
+              defaultValue: form.getValues('WaffoPancakeUnitPrice'),
+            })
+            form.resetField('WaffoPancakeMinTopUp', {
+              defaultValue: form.getValues('WaffoPancakeMinTopUp'),
+            })
+            form.resetField('WaffoPancakeTestMode', {
+              defaultValue: form.getValues('WaffoPancakeTestMode'),
+            })
+            const refreshed = await refreshSystemOptions()
+            if (refreshed) {
+              toast.success(t('Waffo Pancake settings saved'))
+            } else {
+              toast.warning(
+                t(
+                  'Waffo Pancake settings were saved, but the latest status could not be refreshed.'
+                )
+              )
+            }
+            return result
+          },
+          {
+            preferredMethod: 'passkey',
+            title: t('Verify payment settings update'),
+            description: t(
+              'Confirm your identity before changing payment credentials or gateway configuration.'
+            ),
           }
-          setWaffoPancakeSavedBinding(savedBinding)
-          setWaffoPancakeSelection(savedBinding)
-          queryClient.invalidateQueries({ queryKey: ['system-options'] })
-          toast.success(t('Waffo Pancake settings saved'))
-          return
-        }
-
-        const reason = typeof body?.data === 'string' ? body.data : undefined
-        toast.error(
-          reason
-            ? `${t('Waffo Pancake save failed')}: ${reason}`
-            : t('Waffo Pancake save failed')
         )
+        return
       } catch (error) {
+        if (hasHttpStatus(error, 409)) {
+          await queryClient.invalidateQueries({ queryKey: ['system-options'] })
+        }
         toast.error(
-          `${t('Waffo Pancake save failed')}: ${getApiErrorMessage(
-            error,
-            t('Request failed')
-          )}`
+          getPaymentAdminErrorMessage(error, t, t('Waffo Pancake save failed'))
         )
+        return
       }
     }
 
-    if (updates.length > 0) {
+    if (scopedUpdates.length > 0) {
       const options = Object.fromEntries(
-        updates.map((update) => [update.key, update.value])
+        scopedUpdates.map((update) => [update.key, update.value])
       )
       try {
         await mutatePaymentSettings({ options }, async (result) => {
           if (!result.success) {
-            toast.error(result.message || t('Failed to update setting'))
+            toast.error(
+              getPaymentAdminErrorMessage(
+                result,
+                t,
+                t('Failed to update setting')
+              )
+            )
             return
           }
-          const savedSecretKeys = updates
-            .map((update) => update.key)
-            .filter(
-              (
-                key
-              ): key is
-                | 'EpayKey'
-                | 'StripeApiSecret'
-                | 'StripeWebhookSecret'
-                | 'XorPayAppSecret' =>
-                key === 'EpayKey' ||
-                key === 'StripeApiSecret' ||
-                key === 'StripeWebhookSecret' ||
-                key === 'XorPayAppSecret'
-            )
-          for (const key of savedSecretKeys) {
-            form.resetField(key, { defaultValue: '' })
-            initialRef.current[key] = ''
+          for (const update of scopedUpdates) {
+            if (update.key === 'WaffoPayMethods') {
+              waffoPayMethodsSavedRef.current = [...waffoPayMethods]
+              Object.assign(initialRef.current, {
+                WaffoPayMethods: sanitized.WaffoPayMethods,
+              })
+              continue
+            }
+            const formKey =
+              PAYMENT_FORM_KEY_BY_OPTION_KEY[update.key] ??
+              (update.key as keyof PaymentFormValues)
+            if (isWriteOnlyPaymentField(formKey)) {
+              form.resetField(formKey, { defaultValue: '' })
+              initialRef.current[formKey] = ''
+              continue
+            }
+            Object.assign(initialRef.current, {
+              [formKey]: sanitized[formKey],
+            })
+            form.resetField(formKey, {
+              defaultValue: form.getValues(formKey),
+            })
           }
           setGatewayReadiness(result.data?.readiness ?? null)
-          await queryClient.invalidateQueries({ queryKey: ['system-options'] })
-          toast.success(t('Setting updated successfully'))
-          await saveWaffoPancakeChanges()
+          const refreshed = await refreshSystemOptions()
+          if (refreshed) {
+            toast.success(t('Payment section saved'))
+          } else {
+            toast.warning(
+              t(
+                'Payment settings were saved, but the latest status could not be refreshed.'
+              )
+            )
+          }
         })
       } catch (error) {
-        toast.error(getApiErrorMessage(error, t('Failed to update setting')))
+        toast.error(
+          getPaymentAdminErrorMessage(error, t, t('Failed to update setting'))
+        )
       }
       return
     }
-
-    await saveWaffoPancakeChanges()
   }
 
-  const onSubmit = async (values: PaymentFormValues) => {
+  const onSubmit = async (
+    values: PaymentFormValues,
+    section: PaymentSettingsTab
+  ) => {
     if (submitInFlightRef.current) return
 
     submitInFlightRef.current = true
+    setSavingSection(section)
     try {
-      await submitPaymentSettings(values)
+      await submitPaymentSettings(values, section)
     } finally {
       submitInFlightRef.current = false
+      setSavingSection(null)
     }
+  }
+
+  const saveCurrentSection = async () => {
+    const section = activeTab
+    const valid = await form.trigger(PAYMENT_FIELDS_BY_TAB[section], {
+      shouldFocus: true,
+    })
+    if (!valid) return
+    await onSubmit(form.getValues(), section)
   }
 
   const currentFormValues = form.watch()
@@ -1649,6 +2095,10 @@ export function PaymentSettingsSection({
   const stripeWebhookUrl = callbackBaseAddress
     ? `${callbackBaseAddress}/api/stripe/webhook`
     : '<CallbackAddress>/api/stripe/webhook'
+  const stripeWebhookContract = resolveStripeWebhookContract(
+    stripeWebhookAPIVersion,
+    stripeWebhookSecretOverlapHours
+  )
   const epayNotifyUrl = callbackBaseAddress
     ? `${callbackBaseAddress}/api/payment/epay/notify`
     : '<CallbackAddress>/api/payment/epay/notify'
@@ -1719,19 +2169,28 @@ export function PaymentSettingsSection({
     WaffoMinTopUp: currentFormValues.WaffoMinTopUp,
     WaffoNotifyUrl: currentFormValues.WaffoNotifyUrl,
     WaffoReturnUrl: currentFormValues.WaffoReturnUrl,
+    WaffoWebRedirectHosts: currentFormValues.WaffoWebRedirectHosts,
+    WaffoAppRedirectSchemes: currentFormValues.WaffoAppRedirectSchemes,
     WaffoPayMethods: JSON.stringify(waffoPayMethods),
   }
   const waffoPancakeValues: WaffoPancakeSettingsValues = {
     WaffoPancakeMerchantID: currentFormValues.WaffoPancakeMerchantID,
     WaffoPancakePrivateKey: currentFormValues.WaffoPancakePrivateKey,
     WaffoPancakeReturnURL: currentFormValues.WaffoPancakeReturnURL,
+    WaffoPancakeUnitPrice: currentFormValues.WaffoPancakeUnitPrice,
+    WaffoPancakeMinTopUp: currentFormValues.WaffoPancakeMinTopUp,
+    WaffoPancakeTestMode: currentFormValues.WaffoPancakeTestMode,
   }
 
   return (
     <SettingsSection title={t('Payment Gateway')}>
       {!complianceConfirmed ? (
         <Alert variant='destructive' className='mb-6'>
-          <ShieldAlert className='h-4 w-4' />
+          <HugeiconsIcon
+            icon={SecurityWarningIcon}
+            strokeWidth={2}
+            aria-hidden='true'
+          />
           <AlertTitle>{t('Compliance confirmation required')}</AlertTitle>
           <AlertDescription>
             <div className='space-y-3'>
@@ -1858,6 +2317,11 @@ export function PaymentSettingsSection({
                     }
                   )
                 : ''}
+              {pendingSecretClear?.startsWith('Stripe')
+                ? ` ${t(
+                    'This changes only this system. It does not revoke Stripe Dashboard keys, cancel Checkout Sessions or subscriptions, or issue refunds.'
+                  )}`
+                : ''}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1977,7 +2441,10 @@ export function PaymentSettingsSection({
 
       <Form {...form}>
         <SettingsForm
-          onSubmit={form.handleSubmit(onSubmit)}
+          onSubmit={(event) => {
+            event.preventDefault()
+            void saveCurrentSection()
+          }}
           className='gap-y-8'
           data-no-autosubmit='true'
         >
@@ -1989,13 +2456,22 @@ export function PaymentSettingsSection({
             )}
           >
             <SettingsPageFormActions
-              onSave={form.handleSubmit(onSubmit)}
-              isSaving={paymentSettingsPending || isSubmitting}
-              saveLabel='Save all settings'
+              onSave={() => void saveCurrentSection()}
+              isSaving={paymentSettingsPending}
+              saveLabel='Save current section'
             />
-            <Tabs defaultValue='general' className='min-w-0'>
+            <Tabs
+              value={activeTab}
+              onValueChange={(value) =>
+                setActiveTab(value as PaymentSettingsTab)
+              }
+              className='min-w-0'
+            >
               <div className='overflow-x-auto pb-1'>
-                <TabsList className='grid min-w-[51rem] grid-cols-7'>
+                <TabsList
+                  className='grid min-w-[51rem] grid-cols-7'
+                  aria-label={t('Payment gateway sections')}
+                >
                   <TabsTrigger value='general'>{t('General')}</TabsTrigger>
                   <TabsTrigger value='epay'>{t('Epay')}</TabsTrigger>
                   <TabsTrigger value='stripe'>{t('Stripe')}</TabsTrigger>
@@ -2007,6 +2483,26 @@ export function PaymentSettingsSection({
                   <TabsTrigger value='waffo'>{t('Waffo')}</TabsTrigger>
                 </TabsList>
               </div>
+              <p className='text-muted-foreground mt-3 text-sm'>
+                {t(
+                  'Only the selected section is saved. Unsaved changes in other tabs are left untouched.'
+                )}
+              </p>
+              <Alert className='mt-4'>
+                <HugeiconsIcon
+                  icon={SecurityWarningIcon}
+                  strokeWidth={2}
+                  aria-hidden='true'
+                />
+                <AlertTitle>
+                  {t('Normal rotation and emergency revocation are different')}
+                </AlertTitle>
+                <AlertDescription>
+                  {t(
+                    'Saving a replacement credential performs a normal rotation and can temporarily retain the previous generation for existing orders and delayed callbacks. Emergency revocation stops trusting affected generations immediately and moves unfinished orders to manual review.'
+                  )}
+                </AlertDescription>
+              </Alert>
 
               <TabsContent
                 value='general'
@@ -2023,7 +2519,11 @@ export function PaymentSettingsSection({
                   </div>
 
                   <Alert>
-                    <ShieldAlert className='h-4 w-4' />
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
                     <AlertTitle>
                       {t('Payment callback security boundary')}
                     </AlertTitle>
@@ -2161,12 +2661,22 @@ export function PaymentSettingsSection({
                           >
                             {payMethodsVisualMode ? (
                               <>
-                                <Code2 className='mr-2 h-3 w-3' />
+                                <HugeiconsIcon
+                                  icon={CodeIcon}
+                                  strokeWidth={2}
+                                  data-icon='inline-start'
+                                  aria-hidden='true'
+                                />
                                 {t('JSON Editor')}
                               </>
                             ) : (
                               <>
-                                <Eye className='mr-2 h-3 w-3' />
+                                <HugeiconsIcon
+                                  icon={ViewIcon}
+                                  strokeWidth={2}
+                                  data-icon='inline-start'
+                                  aria-hidden='true'
+                                />
                                 {t('Visual Editor')}
                               </>
                             )}
@@ -2222,12 +2732,22 @@ export function PaymentSettingsSection({
                             >
                               {amountOptionsVisualMode ? (
                                 <>
-                                  <Code2 className='mr-2 h-3 w-3' />
+                                  <HugeiconsIcon
+                                    icon={CodeIcon}
+                                    strokeWidth={2}
+                                    data-icon='inline-start'
+                                    aria-hidden='true'
+                                  />
                                   {t('JSON Editor')}
                                 </>
                               ) : (
                                 <>
-                                  <Eye className='mr-2 h-3 w-3' />
+                                  <HugeiconsIcon
+                                    icon={ViewIcon}
+                                    strokeWidth={2}
+                                    data-icon='inline-start'
+                                    aria-hidden='true'
+                                  />
                                   {t('Visual Editor')}
                                 </>
                               )}
@@ -2278,12 +2798,22 @@ export function PaymentSettingsSection({
                             >
                               {amountDiscountVisualMode ? (
                                 <>
-                                  <Code2 className='mr-2 h-3 w-3' />
+                                  <HugeiconsIcon
+                                    icon={CodeIcon}
+                                    strokeWidth={2}
+                                    data-icon='inline-start'
+                                    aria-hidden='true'
+                                  />
                                   {t('JSON Editor')}
                                 </>
                               ) : (
                                 <>
-                                  <Eye className='mr-2 h-3 w-3' />
+                                  <HugeiconsIcon
+                                    icon={ViewIcon}
+                                    strokeWidth={2}
+                                    data-icon='inline-start'
+                                    aria-hidden='true'
+                                  />
                                   {t('Visual Editor')}
                                 </>
                               )}
@@ -2327,7 +2857,11 @@ export function PaymentSettingsSection({
                   </div>
 
                   <Alert>
-                    <ShieldAlert className='h-4 w-4' />
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
                     <AlertTitle>{t('Epay safety reminder')}</AlertTitle>
                     <AlertDescription>
                       {t(
@@ -2450,6 +2984,22 @@ export function PaymentSettingsSection({
                     </p>
                   </div>
 
+                  <Alert>
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
+                    <AlertTitle>
+                      {t('Current Stripe checkout is a one-time payment flow')}
+                    </AlertTitle>
+                    <AlertDescription>
+                      {t(
+                        'Unified top-ups and purchases use Stripe Checkout in payment mode. Legacy recurring subscription inventory is separate, read-only, and appears in Payment Operations only when historical records exist.'
+                      )}
+                    </AlertDescription>
+                  </Alert>
+
                   <div className='rounded-md bg-blue-50 p-4 text-sm text-blue-900 dark:bg-blue-950 dark:text-blue-100'>
                     <p className='mb-2 font-medium'>
                       {t('Webhook Configuration:')}
@@ -2462,12 +3012,34 @@ export function PaymentSettingsSection({
                         </code>
                       </li>
                       <li>
-                        {t('Required events:')}{' '}
+                        {t('Required for current one-time Checkout:')}{' '}
                         <code className='rounded bg-blue-100 px-1 py-0.5 text-xs dark:bg-blue-900'>
                           {t(
                             'checkout.session.completed, checkout.session.async_payment_succeeded, checkout.session.async_payment_failed, checkout.session.expired, charge.refunded, charge.dispute.created, charge.dispute.closed'
                           )}
                         </code>
+                      </li>
+                      <li>
+                        {stripeWebhookContract.apiVersion ? (
+                          <>
+                            {t('Endpoint API version:')}{' '}
+                            <code className='rounded bg-blue-100 px-1 py-0.5 text-xs dark:bg-blue-900'>
+                              {stripeWebhookContract.apiVersion}
+                            </code>{' '}
+                            {t(
+                              'Configure this endpoint in Stripe Workbench with the same API version as the server SDK so Stripe sends the payload shape this release validates.'
+                            )}
+                          </>
+                        ) : (
+                          t(
+                            'The server did not report its Stripe webhook API version. Refresh after all application nodes run the same release before configuring the endpoint.'
+                          )
+                        )}
+                      </li>
+                      <li>
+                        {t(
+                          'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Otherwise use "Sync from Stripe" in Payment Operations when you need to refresh that read-only inventory.'
+                        )}
                       </li>
                       <li>
                         {t('Configure at:')}{' '}
@@ -2482,6 +3054,33 @@ export function PaymentSettingsSection({
                       </li>
                     </ul>
                   </div>
+
+                  <Alert>
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
+                    <AlertTitle>
+                      {t('Normal Stripe webhook secret rotation')}
+                    </AlertTitle>
+                    <AlertDescription className='space-y-2'>
+                      <p>
+                        {t(
+                          'First choose Roll secret for this endpoint in Stripe Workbench and copy the new signing secret, then save it in this system. This system keeps the previous secret for {{hours}} hours so delayed webhooks can still be verified, and normal rotation is blocked during that overlap. After the new secret is stable, let the previous secret expire automatically. Use emergency revocation only if you suspect compromise.',
+                          { hours: stripeWebhookContract.overlapHours }
+                        )}
+                      </p>
+                      {stripePreviousCredentialAvailable && (
+                        <p className='font-medium'>
+                          {t(
+                            'A previous signing secret is still within the overlap window of {{hours}} hours. Do not roll or save another normal replacement until it expires.',
+                            { hours: stripeWebhookContract.overlapHours }
+                          )}
+                        </p>
+                      )}
+                    </AlertDescription>
+                  </Alert>
 
                   <div className='grid gap-2 rounded-lg border p-3'>
                     <Label htmlFor='stripe-credential-environment'>
@@ -2503,7 +3102,11 @@ export function PaymentSettingsSection({
 
                   {stripeTestModeNotice?.state === 'blocked' && (
                     <Alert variant='destructive'>
-                      <ShieldAlert aria-hidden='true' />
+                      <HugeiconsIcon
+                        icon={SecurityWarningIcon}
+                        strokeWidth={2}
+                        aria-hidden='true'
+                      />
                       <AlertTitle>
                         {t('Stripe test mode is blocked')}
                       </AlertTitle>
@@ -2517,7 +3120,9 @@ export function PaymentSettingsSection({
 
                   {stripeTestModeNotice?.state === 'enabled' && (
                     <Alert className='border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-50'>
-                      <ShieldAlert
+                      <HugeiconsIcon
+                        icon={SecurityWarningIcon}
+                        strokeWidth={2}
                         className='text-amber-600 dark:text-amber-300'
                         aria-hidden='true'
                       />
@@ -2620,7 +3225,9 @@ export function PaymentSettingsSection({
                       name='StripePriceId'
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>{t('Price ID')}</FormLabel>
+                          <FormLabel>
+                            {t('One-time Checkout Price ID')}
+                          </FormLabel>
                           <FormControl>
                             <Input
                               placeholder={t('price_xxx')}
@@ -2633,7 +3240,9 @@ export function PaymentSettingsSection({
                           </FormControl>
                           <div className='flex flex-wrap items-center justify-between gap-2'>
                             <FormDescription>
-                              {t('Stripe product price ID')}
+                              {t(
+                                'Catalog template for one-time Checkout. It does not create or manage a recurring Stripe subscription.'
+                              )}
                             </FormDescription>
                             {field.value ? (
                               <Button
@@ -2728,6 +3337,34 @@ export function PaymentSettingsSection({
                     />
                   </div>
 
+                  <FormField
+                    control={form.control}
+                    name='StripeCheckoutAllowedHosts'
+                    render={({ field }) => (
+                      <FormItem className='rounded-lg border p-4'>
+                        <FormLabel>
+                          {t('Custom Checkout domain allowlist')}
+                        </FormLabel>
+                        <FormControl>
+                          <Textarea
+                            rows={3}
+                            placeholder='pay.example.com'
+                            autoComplete='off'
+                            spellCheck={false}
+                            className='font-mono text-sm'
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t(
+                            'Optional. Enter exact hostnames only, one per line or separated by commas. Stripe-owned *.stripe.com hosts are always allowed. Wildcards, URLs, ports, IP addresses, localhost, and credentials are rejected.'
+                          )}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
                   <div className='grid gap-6 md:grid-cols-3'>
                     <FormField
                       control={form.control}
@@ -2746,7 +3383,9 @@ export function PaymentSettingsSection({
                             />
                           </FormControl>
                           <FormDescription>
-                            {t('e.g., 8 means 8 local currency per USD')}
+                            {t(
+                              'Positive multiplier that converts the USD base price into the Stripe settlement currency for wallet top-ups and fixed-term purchases.'
+                            )}
                           </FormDescription>
                           <FormMessage />
                         </FormItem>
@@ -2834,7 +3473,11 @@ export function PaymentSettingsSection({
                   )}
 
                   <Alert>
-                    <ShieldAlert className='h-4 w-4' />
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
                     <AlertTitle>{t('XORPay security boundary')}</AlertTitle>
                     <AlertDescription>
                       {t(
@@ -2948,7 +3591,7 @@ export function PaymentSettingsSection({
                     render={() => (
                       <FormItem>
                         <FormLabel>{t('Enabled payment methods')}</FormLabel>
-                        <div className='grid gap-3 sm:grid-cols-2'>
+                        <div className='grid gap-3 lg:grid-cols-3'>
                           <label className='flex items-center gap-3 rounded-lg border p-3 text-sm'>
                             <Checkbox
                               checked={xorPayEnabledMethods.includes('native')}
@@ -2973,16 +3616,44 @@ export function PaymentSettingsSection({
                             />
                             <span>{t('XORPay Alipay')}</span>
                           </label>
+                          <label className='flex items-center gap-3 rounded-lg border p-3 text-sm'>
+                            <Checkbox
+                              checked={xorPayEnabledMethods.includes('jsapi')}
+                              onCheckedChange={(checked) =>
+                                setXorPayMethodEnabled(
+                                  'jsapi',
+                                  checked === true
+                                )
+                              }
+                            />
+                            <span>{t('XORPay WeChat in-app (JSAPI)')}</span>
+                          </label>
                         </div>
                         <FormDescription>
                           {t(
-                            'Only native QR and Alipay face-to-face payments are enabled in this version.'
+                            'Enable only the XORPay products approved and configured for this merchant account.'
                           )}
                         </FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}
                   />
+
+                  <Alert>
+                    <HugeiconsIcon
+                      icon={SecurityWarningIcon}
+                      strokeWidth={2}
+                      aria-hidden='true'
+                    />
+                    <AlertTitle>
+                      {t('WeChat JSAPI requires merchant-side preparation')}
+                    </AlertTitle>
+                    <AlertDescription>
+                      {t(
+                        "Use this method only inside the WeChat browser. Before enabling it, configure this site's HTTPS payment directory in XORPay and confirm the applicable ICP filing and merchant-account requirements. A successful frontend return is not final payment confirmation. Real merchant capability has not been verified in this release."
+                      )}
+                    </AlertDescription>
+                  </Alert>
 
                   <div className='bg-muted/40 rounded-lg border p-4 text-sm'>
                     <p className='font-medium'>{t('Callback URL')}</p>
@@ -3122,12 +3793,22 @@ export function PaymentSettingsSection({
                           >
                             {creemProductsVisualMode ? (
                               <>
-                                <Code2 className='mr-2 h-3 w-3' />
+                                <HugeiconsIcon
+                                  icon={CodeIcon}
+                                  strokeWidth={2}
+                                  data-icon='inline-start'
+                                  aria-hidden='true'
+                                />
                                 {t('JSON Editor')}
                               </>
                             ) : (
                               <>
-                                <Eye className='mr-2 h-3 w-3' />
+                                <HugeiconsIcon
+                                  icon={ViewIcon}
+                                  strokeWidth={2}
+                                  data-icon='inline-start'
+                                  aria-hidden='true'
+                                />
                                 {t('Visual Editor')}
                               </>
                             )}
@@ -3157,6 +3838,15 @@ export function PaymentSettingsSection({
                       </FormItem>
                     )}
                   />
+
+                  <RetainedCredentialEmergencyControl
+                    provider='creem'
+                    disabled={paymentSettingsPending}
+                    withVerification={withVerification}
+                    onCompleted={completeRetainedCredentialDisable}
+                    onStale={refreshSystemOptions}
+                    onPendingChange={setRetainedCredentialActionPending}
+                  />
                 </div>
               </TabsContent>
 
@@ -3171,6 +3861,17 @@ export function PaymentSettingsSection({
                   selectedBinding={waffoPancakeSelection}
                   savedBinding={waffoPancakeSavedBinding}
                   onSelectedBindingChange={setWaffoPancakeSelection}
+                  withVerification={withVerification}
+                  emergencyControl={
+                    <RetainedCredentialEmergencyControl
+                      provider='waffo_pancake'
+                      disabled={paymentSettingsPending}
+                      withVerification={withVerification}
+                      onCompleted={completeRetainedCredentialDisable}
+                      onStale={refreshSystemOptions}
+                      onPendingChange={setRetainedCredentialActionPending}
+                    />
+                  }
                 />
               </TabsContent>
 
@@ -3180,6 +3881,16 @@ export function PaymentSettingsSection({
                   onValueChange={setWaffoValue}
                   payMethods={waffoPayMethods}
                   onPayMethodsChange={setWaffoPayMethods}
+                  emergencyControl={
+                    <RetainedCredentialEmergencyControl
+                      provider='waffo'
+                      disabled={paymentSettingsPending}
+                      withVerification={withVerification}
+                      onCompleted={completeRetainedCredentialDisable}
+                      onStale={refreshSystemOptions}
+                      onPendingChange={setRetainedCredentialActionPending}
+                    />
+                  }
                 />
               </TabsContent>
             </Tabs>

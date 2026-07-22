@@ -41,16 +41,37 @@ func insertAffiliateRewardUser(t *testing.T, user *User) {
 
 func insertAffiliateRewardTopUp(t *testing.T, tradeNo string, userId int, amount int64, paymentProvider string) {
 	t.Helper()
+	creditQuotaSnapshot := int64(0)
+	if paymentProvider == PaymentProviderWaffo || paymentProvider == PaymentProviderWaffoPancake {
+		credit, clamp := common.QuotaFromDecimalChecked(
+			decimal.NewFromInt(amount).Mul(decimal.NewFromFloat(common.QuotaPerUnit)),
+		)
+		require.Nil(t, clamp)
+		require.Positive(t, credit)
+		creditQuotaSnapshot = int64(credit)
+	}
 	require.NoError(t, DB.Create(&TopUp{
-		UserId:          userId,
-		Amount:          amount,
-		Money:           float64(amount),
-		TradeNo:         tradeNo,
-		PaymentMethod:   paymentProvider,
-		PaymentProvider: paymentProvider,
-		Status:          common.TopUpStatusPending,
-		CreateTime:      time.Now().Unix(),
+		UserId:              userId,
+		Amount:              amount,
+		Money:               float64(amount),
+		TradeNo:             tradeNo,
+		PaymentMethod:       paymentProvider,
+		PaymentProvider:     paymentProvider,
+		Currency:            "USD",
+		ExpectedAmountMinor: amount * 100,
+		CreditQuotaSnapshot: creditQuotaSnapshot,
+		Status:              common.TopUpStatusPending,
+		CreateTime:          time.Now().Unix(),
 	}).Error)
+}
+
+func verifiedWaffoTopUpConfirmation(tradeNo string, amount int64) TopUpPaymentConfirmation {
+	paidAmountMinor := amount * 100
+	return TopUpPaymentConfirmation{
+		PaidAmountMinor: &paidAmountMinor,
+		Currency:        "USD",
+		ProviderOrderId: "waffo_order_" + tradeNo,
+	}
 }
 
 func getAffiliateRewardUser(t *testing.T, id int) User {
@@ -139,7 +160,8 @@ func TestRechargeWaffoAppliesContinuousAffiliateRewardOnce(t *testing.T) {
 	})
 	insertAffiliateRewardTopUp(t, "continuous-affiliate", 2, 20, PaymentProviderWaffo)
 
-	require.NoError(t, RechargeWaffo("continuous-affiliate", "127.0.0.1"))
+	confirmation := verifiedWaffoTopUpConfirmation("continuous-affiliate", 20)
+	require.NoError(t, RechargeWaffo("continuous-affiliate", confirmation, "127.0.0.1"))
 
 	inviter := getAffiliateRewardUser(t, 1)
 	assert.Equal(t, 1000, inviter.AffQuota)
@@ -148,7 +170,7 @@ func TestRechargeWaffoAppliesContinuousAffiliateRewardOnce(t *testing.T) {
 	invitee := getAffiliateRewardUser(t, 2)
 	assert.Equal(t, 20000, invitee.Quota)
 
-	require.NoError(t, RechargeWaffo("continuous-affiliate", "127.0.0.1"))
+	require.NoError(t, RechargeWaffo("continuous-affiliate", confirmation, "127.0.0.1"))
 	inviter = getAffiliateRewardUser(t, 1)
 	assert.Equal(t, 1000, inviter.AffQuota)
 	assert.Equal(t, 1000, inviter.AffHistoryQuota)
@@ -402,7 +424,11 @@ func TestFirstTopUpAffiliateRewardIgnoresSubscriptionTopUpRecords(t *testing.T) 
 	}).Error)
 	insertAffiliateRewardTopUp(t, "first-topup-after-subscription", 31, 20, PaymentProviderWaffo)
 
-	require.NoError(t, RechargeWaffo("first-topup-after-subscription", "127.0.0.1"))
+	require.NoError(t, RechargeWaffo(
+		"first-topup-after-subscription",
+		verifiedWaffoTopUpConfirmation("first-topup-after-subscription", 20),
+		"127.0.0.1",
+	))
 
 	inviter := getAffiliateRewardUser(t, 30)
 	assert.Equal(t, 6000, inviter.AffQuota)

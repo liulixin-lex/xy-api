@@ -8,8 +8,12 @@ var (
 	WaffoPancakeMerchantID string
 	WaffoPancakePrivateKey string
 	WaffoPancakeReturnURL  string
-	WaffoPancakeUnitPrice  float64 = 1.0
-	WaffoPancakeMinTopUp   int     = 1
-	WaffoPancakeStoreID    string
-	WaffoPancakeProductID  string
+	// WaffoPancakeTestMode binds newly quoted orders and accepted provider
+	// evidence to the test environment. False preserves the historical
+	// production default.
+	WaffoPancakeTestMode  bool
+	WaffoPancakeUnitPrice float64 = 1.0
+	WaffoPancakeMinTopUp  int     = 1
+	WaffoPancakeStoreID   string
+	WaffoPancakeProductID string
 )

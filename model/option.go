@@ -134,6 +134,7 @@ func InitOptionMap() {
 	common.OptionMap["StripePriceId"] = setting.StripePriceId
 	common.OptionMap["StripeCurrency"] = setting.StripeCurrency
 	common.OptionMap["StripeAccountId"] = setting.StripeAccountId
+	common.OptionMap["StripeCheckoutAllowedHosts"] = setting.StripeCheckoutAllowedHosts
 	common.OptionMap["StripeCredentialAccountId"] = setting.StripeCredentialAccountId
 	common.OptionMap["StripeCredentialLivemode"] = setting.StripeCredentialLivemode
 	common.OptionMap["StripeWebhookCredentialLivemode"] = setting.StripeWebhookCredentialLivemode
@@ -170,6 +171,8 @@ func InitOptionMap() {
 	common.OptionMap["WaffoNotifyUrl"] = setting.WaffoNotifyUrl
 	common.OptionMap["WaffoReturnUrl"] = setting.WaffoReturnUrl
 	common.OptionMap["WaffoSubscriptionReturnUrl"] = setting.WaffoSubscriptionReturnUrl
+	common.OptionMap["WaffoWebRedirectHosts"] = setting.WaffoWebRedirectHosts
+	common.OptionMap["WaffoAppRedirectSchemes"] = setting.WaffoAppRedirectSchemes
 	common.OptionMap["WaffoCurrency"] = setting.WaffoCurrency
 	common.OptionMap["WaffoUnitPrice"] = strconv.FormatFloat(setting.WaffoUnitPrice, 'f', -1, 64)
 	common.OptionMap["WaffoMinTopUp"] = strconv.Itoa(setting.WaffoMinTopUp)
@@ -177,6 +180,7 @@ func InitOptionMap() {
 	common.OptionMap["WaffoPancakeMerchantID"] = setting.WaffoPancakeMerchantID
 	common.OptionMap["WaffoPancakePrivateKey"] = setting.WaffoPancakePrivateKey
 	common.OptionMap["WaffoPancakeReturnURL"] = setting.WaffoPancakeReturnURL
+	common.OptionMap["WaffoPancakeTestMode"] = strconv.FormatBool(setting.WaffoPancakeTestMode)
 	common.OptionMap["WaffoPancakeUnitPrice"] = strconv.FormatFloat(setting.WaffoPancakeUnitPrice, 'f', -1, 64)
 	common.OptionMap["WaffoPancakeMinTopUp"] = strconv.Itoa(setting.WaffoPancakeMinTopUp)
 	common.OptionMap["WaffoPancakeStoreID"] = setting.WaffoPancakeStoreID
@@ -335,7 +339,10 @@ func loadOptionsFromDatabaseWithPaymentConfigurationLockHeld() error {
 				}
 			}
 			if startPayloadRefreshRequired {
-				return rewrapPaymentOrderStartPayloadsTx(tx)
+				if err := rewrapPaymentOrderStartPayloadsTx(tx); err != nil {
+					return err
+				}
+				return rewrapPaymentOrderBrowserAuthorizationsTx(tx)
 			}
 			return nil
 		}); err != nil {
@@ -472,6 +479,11 @@ func validateOptionValueBeforePersistence(key, value string) error {
 	if key == "tool_price_setting.prices" {
 		if err := operation_setting.ValidateToolPricesByJSONString(value); err != nil {
 			return fmt.Errorf("invalid %s: %w", key, err)
+		}
+	}
+	if key == "StripeCheckoutAllowedHosts" {
+		if _, err := setting.NormalizeStripeCheckoutAllowedHosts(value); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -683,36 +695,57 @@ func updatePaymentOptionsWithVersionLockHeld(
 		}
 		if preconditions != nil {
 			activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
+			callbackDependentProviders := append([]string(nil), preconditions.RequireNoCallbackDependentProviderOrders...)
 			if preconditions.RequireNoCallbackDependentOrders {
-				providers := []struct {
-					name string
-				}{
-					{name: PaymentProviderEpay},
-					{name: PaymentProviderStripe},
-					{name: PaymentProviderXorPay},
+				callbackDependentProviders = append(callbackDependentProviders,
+					PaymentProviderEpay, PaymentProviderStripe, PaymentProviderXorPay)
+			}
+			seenCallbackProvider := make(map[string]struct{}, len(callbackDependentProviders))
+			for _, provider := range callbackDependentProviders {
+				provider = strings.TrimSpace(provider)
+				if _, seen := seenCallbackProvider[provider]; seen {
+					continue
 				}
-				for _, provider := range providers {
-					count, err := countPaymentOrdersDependingOnCallbackOriginTx(tx, provider.name, common.GetTimestamp())
-					if err != nil {
-						return err
-					}
-					if count > 0 {
-						return fmt.Errorf("%w: CustomCallbackAddress cannot be changed while %s payment orders still depend on the current callback origin", ErrPaymentConfigurationPrecondition, provider.name)
-					}
+				seenCallbackProvider[provider] = struct{}{}
+				count, err := countPaymentOrdersDependingOnCallbackOriginTx(tx, provider, common.GetTimestamp())
+				if err != nil {
+					return err
+				}
+				if count > 0 {
+					return fmt.Errorf("%w: payment configuration cannot be changed while %s orders still depend on it", ErrPaymentConfigurationPrecondition, provider)
 				}
 			}
+			activeProviders := append([]string(nil), preconditions.RequireNoActiveProviderOrders...)
 			if preconditions.RequireNoActiveEpayOrders {
+				activeProviders = append(activeProviders, PaymentProviderEpay)
+			}
+			seenActiveProvider := make(map[string]struct{}, len(activeProviders))
+			for _, provider := range activeProviders {
+				provider = strings.TrimSpace(provider)
+				if _, seen := seenActiveProvider[provider]; seen {
+					continue
+				}
+				seenActiveProvider[provider] = struct{}{}
+				count, err := countActivePaymentOrdersForProviderTx(tx, provider)
+				if err != nil {
+					return err
+				}
+				if count > 0 {
+					return fmt.Errorf("%w: payment configuration cannot be changed while unfinished %s orders depend on it", ErrPaymentConfigurationPrecondition, provider)
+				}
+			}
+			if preconditions.RequireNoActiveStripeOrdersForHostRemoval {
 				var count int64
-				if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", PaymentProviderEpay, activeStatuses).
+				if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", PaymentProviderStripe, activeStatuses).
 					Count(&count).Error; err != nil {
 					return err
 				}
-				legacyCount, err := countLegacyActivePaymentProjectionsTx(tx, PaymentProviderEpay, true)
+				legacyCount, err := countLegacyActivePaymentProjectionsTx(tx, PaymentProviderStripe, false)
 				if err != nil {
 					return err
 				}
 				if count+legacyCount > 0 {
-					return fmt.Errorf("%w: PayAddress cannot be changed while Epay payment orders still depend on the current configuration", ErrPaymentConfigurationPrecondition)
+					return fmt.Errorf("%w: Stripe custom Checkout hosts cannot be removed while unfinished Stripe payment orders may still depend on them", ErrPaymentConfigurationPrecondition)
 				}
 			}
 			if preconditions.RequireNoStripeHistory {
@@ -760,7 +793,9 @@ func updatePaymentOptionsWithVersionLockHeld(
 			generationRevocation := (revocation.Provider == PaymentProviderEpay || revocation.Provider == PaymentProviderXorPay) &&
 				revocation.Generation > 0 && !revocation.AllActiveOrders
 			stripeWebhookRevocation := revocation.Provider == PaymentProviderStripe && revocation.Generation > 0
-			if (!generationRevocation && !stripeWebhookRevocation) || revocation.ValidBefore <= 0 {
+			currentOnlyDisable := paymentProviderUsesCurrentOnlyCredentials(revocation.Provider) &&
+				revocation.Generation == 0 && revocation.AllActiveOrders
+			if (!generationRevocation && !stripeWebhookRevocation && !currentOnlyDisable) || revocation.ValidBefore <= 0 {
 				return errors.New("invalid payment credential revocation")
 			}
 			now := common.GetTimestamp()
@@ -771,6 +806,8 @@ func updatePaymentOptionsWithVersionLockHeld(
 				reason := "provider credential generation revoked; event cannot be linked automatically"
 				if stripeWebhookRevocation {
 					reason = "Stripe webhook signing credential revoked; event cannot be linked automatically"
+				} else if currentOnlyDisable {
+					reason = "provider current-only credential disabled; event requires manual review"
 				}
 				eventUpdate := tx.Model(&PaymentEvent{}).
 					Where("provider = ? AND provider_credential_generation = ? AND payment_order_id = ?",
@@ -788,13 +825,24 @@ func updatePaymentOptionsWithVersionLockHeld(
 				affectedEvents += eventUpdate.RowsAffected
 			}
 			if (generationRevocation || revocation.AllActiveOrders) && tx.Migrator().HasTable(&TopUp{}) {
-				query := tx.Model(&TopUp{})
+				query := tx.Model(&TopUp{}).Where("(payment_order_id IS NULL OR payment_order_id = 0)")
 				if stripeWebhookRevocation {
-					query = query.Where("payment_order_id IS NULL AND status IN ?", []string{
+					query = query.Where("status IN ?", []string{
 						common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview,
 					})
+				} else if currentOnlyDisable {
+					recoveryCutoff := revocation.ValidBefore - int64(PaymentCallbackRecoveryWindow/time.Second)
+					if recoveryCutoff <= 0 {
+						recoveryCutoff = 1
+					}
+					query = query.Where(
+						"(status IN ? OR (status IN ? AND (complete_time >= ? OR create_time >= ?)))",
+						[]string{common.TopUpStatusPending, PaymentOrderStatusProcessing, common.TopUpStatusManualReview},
+						[]string{common.TopUpStatusFailed, common.TopUpStatusExpired},
+						recoveryCutoff, recoveryCutoff,
+					)
 				} else {
-					query = query.Where("payment_order_id IS NULL AND status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
+					query = query.Where("status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
 				}
 				if revocation.Provider == PaymentProviderEpay {
 					query = query.Where("payment_provider = ? OR payment_provider = ''", revocation.Provider)
@@ -817,13 +865,24 @@ func updatePaymentOptionsWithVersionLockHeld(
 				}
 			}
 			if (generationRevocation || revocation.AllActiveOrders) && tx.Migrator().HasTable(&SubscriptionOrder{}) {
-				query := tx.Model(&SubscriptionOrder{})
+				query := tx.Model(&SubscriptionOrder{}).Where("(payment_order_id IS NULL OR payment_order_id = 0)")
 				if stripeWebhookRevocation {
-					query = query.Where("payment_order_id IS NULL AND status IN ?", []string{
+					query = query.Where("status IN ?", []string{
 						common.TopUpStatusPending, PaymentOrderStatusProcessing, SubscriptionOrderStatusManualReview,
 					})
+				} else if currentOnlyDisable {
+					recoveryCutoff := revocation.ValidBefore - int64(PaymentCallbackRecoveryWindow/time.Second)
+					if recoveryCutoff <= 0 {
+						recoveryCutoff = 1
+					}
+					query = query.Where(
+						"(status IN ? OR (status IN ? AND (complete_time >= ? OR create_time >= ?)))",
+						[]string{common.TopUpStatusPending, PaymentOrderStatusProcessing, SubscriptionOrderStatusManualReview},
+						[]string{common.TopUpStatusFailed, common.TopUpStatusExpired},
+						recoveryCutoff, recoveryCutoff,
+					)
 				} else {
-					query = query.Where("payment_order_id IS NULL AND status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
+					query = query.Where("status = ? AND create_time <= ?", common.TopUpStatusPending, revocation.ValidBefore)
 				}
 				if revocation.Provider == PaymentProviderEpay {
 					query = query.Where("payment_provider = ? OR payment_provider = ''", revocation.Provider)
@@ -833,6 +892,8 @@ func updatePaymentOptionsWithVersionLockHeld(
 				reason := "provider credential generation revoked; verify payment manually"
 				if stripeWebhookRevocation {
 					reason = "Stripe webhook signing credential revoked; verify payment manually"
+				} else if currentOnlyDisable {
+					reason = "provider current-only credential disabled; verify payment manually"
 				}
 				var projections []SubscriptionOrder
 				if err := query.Select("id").Find(&projections).Error; err != nil {
@@ -911,6 +972,12 @@ func updatePaymentOptionsWithVersionLockHeld(
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if key == "StripeCheckoutAllowedHosts" {
+		value, err = setting.NormalizeStripeCheckoutAllowedHosts(value)
+		if err != nil {
+			return err
+		}
+	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
@@ -1123,6 +1190,8 @@ func updateOptionMap(key string, value string) (err error) {
 		setting.StripeCurrency = strings.ToUpper(strings.TrimSpace(value))
 	case "StripeAccountId":
 		setting.StripeAccountId = strings.TrimSpace(value)
+	case "StripeCheckoutAllowedHosts":
+		setting.StripeCheckoutAllowedHosts = value
 	case "StripeCredentialAccountId":
 		setting.StripeCredentialAccountId = strings.TrimSpace(value)
 	case "StripeCredentialLivemode":
@@ -1227,6 +1296,10 @@ func updateOptionMap(key string, value string) (err error) {
 		setting.WaffoReturnUrl = value
 	case "WaffoSubscriptionReturnUrl":
 		setting.WaffoSubscriptionReturnUrl = value
+	case "WaffoWebRedirectHosts":
+		setting.WaffoWebRedirectHosts = value
+	case "WaffoAppRedirectSchemes":
+		setting.WaffoAppRedirectSchemes = value
 	case "WaffoCurrency":
 		setting.WaffoCurrency = value
 	case "WaffoUnitPrice":
@@ -1239,6 +1312,8 @@ func updateOptionMap(key string, value string) (err error) {
 		setting.WaffoPancakePrivateKey = value
 	case "WaffoPancakeReturnURL":
 		setting.WaffoPancakeReturnURL = value
+	case "WaffoPancakeTestMode":
+		setting.WaffoPancakeTestMode = value == "true"
 	case "WaffoPancakeStoreID":
 		setting.WaffoPancakeStoreID = value
 	case "WaffoPancakeProductID":

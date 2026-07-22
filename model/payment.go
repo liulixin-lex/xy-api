@@ -20,50 +20,56 @@ import (
 // TopUp and SubscriptionOrder remain compatibility projections for existing
 // clients and historical data, but settlement must use this immutable snapshot.
 type PaymentOrder struct {
-	ID                           int64   `json:"id" gorm:"primaryKey"`
-	TradeNo                      string  `json:"trade_no" gorm:"uniqueIndex;type:varchar(128)"`
-	UserID                       int     `json:"user_id" gorm:"index;uniqueIndex:idx_payment_user_request,priority:1"`
-	OrderKind                    string  `json:"order_kind" gorm:"type:varchar(32);index"`
-	Provider                     string  `json:"provider" gorm:"type:varchar(32);index"`
-	PaymentMethod                string  `json:"payment_method" gorm:"type:varchar(64)"`
-	ProviderCredentialGeneration int64   `json:"-" gorm:"index"`
-	ProviderLivemode             *bool   `json:"-"`
-	QuoteID                      string  `json:"-" gorm:"type:varchar(128)"`
-	RequestID                    string  `json:"request_id" gorm:"type:varchar(128);uniqueIndex:idx_payment_user_request,priority:2"`
-	ProviderOrderKey             *string `json:"provider_order_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_order_key"`
-	ProviderPaymentKey           *string `json:"provider_payment_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_payment_key"`
-	ExpectedAmountMinor          int64   `json:"expected_amount_minor"`
-	PaidAmountMinor              int64   `json:"paid_amount_minor"`
-	Currency                     string  `json:"currency" gorm:"type:varchar(8)"`
-	RequestedAmount              int64   `json:"requested_amount"`
-	CreditQuota                  int64   `json:"credit_quota"`
-	PricingSnapshot              string  `json:"-" gorm:"type:text"`
-	ProductSnapshot              string  `json:"-" gorm:"type:text"`
-	StartFlow                    string  `json:"-" gorm:"type:varchar(32)"`
-	StartPayload                 string  `json:"-" gorm:"type:text"`
-	StartedAt                    int64   `json:"started_at"`
-	ProviderCheckedAt            int64   `json:"-" gorm:"index"`
-	LegacyRecordType             string  `json:"legacy_record_type,omitempty" gorm:"type:varchar(32)"`
-	LegacyRecordID               int     `json:"legacy_record_id,omitempty" gorm:"index"`
-	Status                       string  `json:"status" gorm:"type:varchar(32);index"`
-	StatusReason                 string  `json:"status_reason,omitempty" gorm:"type:varchar(512)"`
-	CredentialIncident           bool    `json:"credential_incident" gorm:"index"`
-	CredentialIncidentState      string  `json:"credential_incident_state,omitempty" gorm:"type:varchar(32);index"`
-	CredentialIncidentGeneration int64   `json:"credential_incident_generation,omitempty" gorm:"index"`
-	CredentialIncidentReason     string  `json:"credential_incident_reason,omitempty" gorm:"type:varchar(512)"`
-	CredentialIncidentAt         int64   `json:"credential_incident_at,omitempty" gorm:"index"`
-	CredentialIncidentReviewedAt int64   `json:"credential_incident_reviewed_at,omitempty"`
-	CredentialIncidentReviewedBy int     `json:"credential_incident_reviewed_by,omitempty"`
-	CredentialIncidentReviewNote string  `json:"credential_incident_review_note,omitempty" gorm:"type:varchar(512)"`
-	ExpiresAt                    int64   `json:"expires_at" gorm:"index"`
-	SettledAt                    int64   `json:"settled_at"`
-	RefundedAmountMinor          int64   `json:"refunded_amount_minor"`
-	DisputedAmountMinor          int64   `json:"disputed_amount_minor"`
-	ReversedAmountMinor          int64   `json:"reversed_amount_minor"`
-	ReversedQuota                int64   `json:"reversed_quota"`
-	CreatedAt                    int64   `json:"created_at" gorm:"index"`
-	UpdatedAt                    int64   `json:"updated_at"`
-	Version                      int64   `json:"version"`
+	ID                            int64   `json:"id" gorm:"primaryKey"`
+	TradeNo                       string  `json:"trade_no" gorm:"uniqueIndex;type:varchar(128)"`
+	UserID                        int     `json:"user_id" gorm:"index;uniqueIndex:idx_payment_user_request,priority:1"`
+	OrderKind                     string  `json:"order_kind" gorm:"type:varchar(32);index"`
+	Provider                      string  `json:"provider" gorm:"type:varchar(32);index"`
+	PaymentMethod                 string  `json:"payment_method" gorm:"type:varchar(64)"`
+	ConfigurationVersion          int64   `json:"-" gorm:"index"`
+	CreationFenceToken            int64   `json:"-"`
+	ProviderCredentialGeneration  int64   `json:"-" gorm:"index"`
+	ProviderLivemode              *bool   `json:"-"`
+	QuoteID                       string  `json:"-" gorm:"type:varchar(128)"`
+	RequestID                     string  `json:"request_id" gorm:"type:varchar(128);uniqueIndex:idx_payment_user_request,priority:2"`
+	ProviderOrderKey              *string `json:"provider_order_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_order_key"`
+	ProviderPaymentKey            *string `json:"provider_payment_key,omitempty" gorm:"type:varchar(320);uniqueIndex:idx_payment_orders_provider_payment_key"`
+	ExpectedAmountMinor           int64   `json:"expected_amount_minor"`
+	PaidAmountMinor               int64   `json:"paid_amount_minor"`
+	Currency                      string  `json:"currency" gorm:"type:varchar(8)"`
+	RequestedAmount               int64   `json:"requested_amount"`
+	CreditQuota                   int64   `json:"credit_quota"`
+	PricingSnapshot               string  `json:"-" gorm:"type:text"`
+	ProductSnapshot               string  `json:"-" gorm:"type:text"`
+	StartFlow                     string  `json:"-" gorm:"type:varchar(32)"`
+	StartPayload                  string  `json:"-" gorm:"type:text"`
+	BrowserAuthorizationDigest    *string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
+	BrowserAuthorizationPayload   string  `json:"-" gorm:"type:text"`
+	BrowserAuthorizationExpiresAt int64   `json:"-" gorm:"index"`
+	BrowserAuthorizedAt           int64   `json:"-"`
+	StartedAt                     int64   `json:"started_at"`
+	ProviderCheckedAt             int64   `json:"-" gorm:"index"`
+	LegacyRecordType              string  `json:"legacy_record_type,omitempty" gorm:"type:varchar(32)"`
+	LegacyRecordID                int     `json:"legacy_record_id,omitempty" gorm:"index"`
+	Status                        string  `json:"status" gorm:"type:varchar(32);index"`
+	StatusReason                  string  `json:"status_reason,omitempty" gorm:"type:varchar(512)"`
+	CredentialIncident            bool    `json:"credential_incident" gorm:"index"`
+	CredentialIncidentState       string  `json:"credential_incident_state,omitempty" gorm:"type:varchar(32);index"`
+	CredentialIncidentGeneration  int64   `json:"credential_incident_generation,omitempty" gorm:"index"`
+	CredentialIncidentReason      string  `json:"credential_incident_reason,omitempty" gorm:"type:varchar(512)"`
+	CredentialIncidentAt          int64   `json:"credential_incident_at,omitempty" gorm:"index"`
+	CredentialIncidentReviewedAt  int64   `json:"credential_incident_reviewed_at,omitempty"`
+	CredentialIncidentReviewedBy  int     `json:"credential_incident_reviewed_by,omitempty"`
+	CredentialIncidentReviewNote  string  `json:"credential_incident_review_note,omitempty" gorm:"type:varchar(512)"`
+	ExpiresAt                     int64   `json:"expires_at" gorm:"index"`
+	SettledAt                     int64   `json:"settled_at"`
+	RefundedAmountMinor           int64   `json:"refunded_amount_minor"`
+	DisputedAmountMinor           int64   `json:"disputed_amount_minor"`
+	ReversedAmountMinor           int64   `json:"reversed_amount_minor"`
+	ReversedQuota                 int64   `json:"reversed_quota"`
+	CreatedAt                     int64   `json:"created_at" gorm:"index"`
+	UpdatedAt                     int64   `json:"updated_at"`
+	Version                       int64   `json:"version"`
 }
 
 // PaymentQuote is a short-lived, single-use server-side pricing snapshot.
@@ -226,6 +232,14 @@ const (
 	// PaymentProviderAuthorityKeyMaxLength leaves room for a documented
 	// 255-character provider object ID plus a provider namespace prefix.
 	PaymentProviderAuthorityKeyMaxLength = 320
+	// Stripe requires Checkout Session expiration to remain at least 30 minutes
+	// in the future. The local order owns a 40-minute window so the durable
+	// worker has bounded queueing time without allowing Stripe to extend it.
+	PaymentStripeOrderTTLSeconds = int64(40 * 60)
+	// Retained hosted checkouts historically use a 45-minute payment window.
+	// Keep that window server-owned so reservations and background recovery
+	// share the same durable expiry on every node.
+	PaymentRetainedOrderTTLSeconds = int64(45 * 60)
 
 	PaymentOrderKindTopUp        = "topup"
 	PaymentOrderKindSubscription = "subscription"
@@ -312,11 +326,11 @@ func CreatePaymentQuote(quote *PaymentQuote) error {
 	if quote == nil || quote.QuoteID == "" || quote.UserID <= 0 {
 		return errors.New("invalid payment quote")
 	}
-	if quote.Provider == PaymentProviderStripe && quote.ProviderLivemode == nil {
-		return errors.New("Stripe payment quote mode is required")
+	if paymentProviderUsesEnvironmentBinding(quote.Provider) && quote.ProviderLivemode == nil {
+		return fmt.Errorf("%s payment quote mode is required", quote.Provider)
 	}
-	if quote.Provider != PaymentProviderStripe && quote.ProviderLivemode != nil {
-		return errors.New("payment quote mode is only valid for Stripe")
+	if !paymentProviderUsesEnvironmentBinding(quote.Provider) && quote.ProviderLivemode != nil {
+		return errors.New("payment quote mode is only valid for environment-bound providers")
 	}
 	if quote.CreatedAt == 0 {
 		quote.CreatedAt = time.Now().Unix()
@@ -456,11 +470,23 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 		if err := ensurePaymentUserGuardActiveTx(tx, userID); err != nil {
 			return err
 		}
+		var activeUser User
+		if err := lockForUpdate(tx).Select("id").Where("id = ? AND status = ?", userID, common.UserStatusEnabled).First(&activeUser).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrPaymentUserUnavailable
+			}
+			return err
+		}
 		now := time.Now().Unix()
 		// The user guard makes it safe to check the idempotency key before the
 		// quote. This also lets retries return the original order after the quote
 		// has aged out of the short audit-retention window.
-		if err := lockForUpdate(tx).Where("user_id = ? AND request_id = ?", userID, requestID).First(&order).Error; err == nil {
+		// The payment user guard already serializes every order mutation for this
+		// user. Avoid SELECT FOR UPDATE for a missing idempotency key: on MySQL
+		// 5.7, concurrent first orders for different users can otherwise acquire
+		// overlapping next-key gap locks on the empty composite unique index and
+		// deadlock when both transactions insert.
+		if err := tx.Where("user_id = ? AND request_id = ?", userID, requestID).First(&order).Error; err == nil {
 			if order.QuoteID == quoteID {
 				return nil
 			}
@@ -540,42 +566,63 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 		if err != nil {
 			return err
 		}
+		orderExpiresAt := quote.ExpiresAt
+		if quote.Provider == PaymentProviderStripe {
+			orderExpiresAt = now + PaymentStripeOrderTTLSeconds
+		} else if quote.Provider == PaymentProviderCreem || quote.Provider == PaymentProviderWaffo ||
+			quote.Provider == PaymentProviderWaffoPancake {
+			orderExpiresAt = now + PaymentRetainedOrderTTLSeconds
+		}
+		orderExpiresAt, err = boundPaymentOrderExpiryForLimitTx(tx, &quote, now, orderExpiresAt)
+		if err != nil {
+			return err
+		}
 		order = PaymentOrder{
-			TradeNo:             tradeNo,
-			UserID:              userID,
-			OrderKind:           quote.OrderKind,
-			Provider:            quote.Provider,
-			PaymentMethod:       quote.PaymentMethod,
-			ProviderLivemode:    copyPaymentLivemode(quote.ProviderLivemode),
-			QuoteID:             quote.QuoteID,
-			RequestID:           requestID,
-			ExpectedAmountMinor: quote.ExpectedAmountMinor,
-			Currency:            quote.Currency,
-			RequestedAmount:     quote.RequestedAmount,
-			CreditQuota:         quote.CreditQuota,
-			PricingSnapshot:     quote.PricingSnapshot,
-			ProductSnapshot:     quote.ProductSnapshot,
-			Status:              PaymentOrderStatusPending,
-			ExpiresAt:           quote.ExpiresAt,
-			CreatedAt:           now,
-			UpdatedAt:           now,
-			Version:             1,
+			TradeNo:              tradeNo,
+			UserID:               userID,
+			OrderKind:            quote.OrderKind,
+			Provider:             quote.Provider,
+			PaymentMethod:        quote.PaymentMethod,
+			ConfigurationVersion: expectedConfigurationVersion,
+			ProviderLivemode:     copyPaymentLivemode(quote.ProviderLivemode),
+			QuoteID:              quote.QuoteID,
+			RequestID:            requestID,
+			ExpectedAmountMinor:  quote.ExpectedAmountMinor,
+			Currency:             quote.Currency,
+			RequestedAmount:      quote.RequestedAmount,
+			CreditQuota:          quote.CreditQuota,
+			PricingSnapshot:      quote.PricingSnapshot,
+			ProductSnapshot:      quote.ProductSnapshot,
+			Status:               PaymentOrderStatusPending,
+			ExpiresAt:            orderExpiresAt,
+			CreatedAt:            now,
+			UpdatedAt:            now,
+			Version:              1,
 		}
 		if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+		if _, err := ensurePaymentTaskTx(tx, order.ID, PaymentTaskOperationCreate, now); err != nil {
+			return err
+		}
+		if err := reservePaymentLimitTxAt(tx, &order, now); err != nil {
 			return err
 		}
 		if order.OrderKind == PaymentOrderKindTopUp {
 			money := float64(order.ExpectedAmountMinor) / float64(common.PaymentProviderCurrencyMinorUnit(order.Provider, order.Currency))
 			topUp := &TopUp{
-				PaymentOrderId:  &order.ID,
-				UserId:          order.UserID,
-				Amount:          order.RequestedAmount,
-				Money:           money,
-				TradeNo:         order.TradeNo,
-				PaymentMethod:   order.PaymentMethod,
-				PaymentProvider: order.Provider,
-				CreateTime:      now,
-				Status:          common.TopUpStatusPending,
+				PaymentOrderId:      &order.ID,
+				UserId:              order.UserID,
+				Amount:              order.RequestedAmount,
+				Money:               money,
+				TradeNo:             order.TradeNo,
+				PaymentMethod:       order.PaymentMethod,
+				PaymentProvider:     order.Provider,
+				Currency:            order.Currency,
+				ExpectedAmountMinor: order.ExpectedAmountMinor,
+				CreditQuotaSnapshot: order.CreditQuota,
+				CreateTime:          now,
+				Status:              common.TopUpStatusPending,
 			}
 			if err := tx.Create(topUp).Error; err != nil {
 				return err
@@ -701,6 +748,20 @@ func GetPaymentOrderByTradeNo(tradeNo string) (*PaymentOrder, error) {
 	return &order, nil
 }
 
+func GetPaymentOrderByID(id int64) (*PaymentOrder, error) {
+	if id <= 0 {
+		return nil, ErrPaymentOrderNotFound
+	}
+	var order PaymentOrder
+	if err := DB.Where("id = ?", id).First(&order).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrPaymentOrderNotFound
+		}
+		return nil, err
+	}
+	return &order, nil
+}
+
 func GetPaymentOrderForUser(userID int, tradeNo string) (*PaymentOrder, error) {
 	var order PaymentOrder
 	if err := DB.Where("user_id = ? AND trade_no = ?", userID, tradeNo).First(&order).Error; err != nil {
@@ -753,10 +814,10 @@ func CountPaymentOrdersForProvider(provider string, statuses []string) (int64, e
 
 // CountPaymentOrdersDependingOnCallbackOrigin reports canonical and
 // standalone legacy orders that still require the currently configured
-// callback origin. Epay and XORPay embed notify_url when an order is created,
-// so recently failed or expired orders remain callback-dependent during the
-// recovery window. Stripe webhooks are configured independently; only its
-// active browser-return flows depend on this setting.
+// callback origin or another configuration value that is bound at provider
+// creation time. Providers with recoverable callback-delivery windows retain
+// recently started failed or expired orders; Stripe only needs active orders
+// here because its webhook endpoint is configured outside each Checkout.
 func CountPaymentOrdersDependingOnCallbackOrigin(provider string, now int64) (int64, error) {
 	return countPaymentOrdersDependingOnCallbackOriginTx(DB, provider, now)
 }
@@ -765,38 +826,92 @@ func countLegacyActivePaymentProjectionsTx(tx *gorm.DB, provider string, include
 	return countLegacyPaymentProjectionsTx(tx, provider, includeEmptyProvider, 0)
 }
 
-func countPaymentOrdersDependingOnCallbackOriginTx(tx *gorm.DB, provider string, now int64) (int64, error) {
+func CountActivePaymentOrdersForProvider(provider string) (int64, error) {
+	return countActivePaymentOrdersForProviderTx(DB, provider)
+}
+
+func countActivePaymentOrdersForProviderTx(tx *gorm.DB, provider string) (int64, error) {
 	provider = strings.TrimSpace(provider)
-	if tx == nil || now <= 0 ||
-		(provider != PaymentProviderEpay && provider != PaymentProviderStripe && provider != PaymentProviderXorPay) {
-		return 0, errors.New("invalid callback-dependent payment order lookup")
+	if tx == nil || !paymentConfigurationPreconditionProviderSupported(provider) {
+		return 0, errors.New("invalid active payment order lookup")
 	}
 	activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
-	query := tx.Model(&PaymentOrder{}).Where("provider = ?", provider)
-	recoveryCutoff := int64(0)
-	if provider == PaymentProviderEpay || provider == PaymentProviderXorPay {
-		recoveryCutoff = now - int64(PaymentCallbackRecoveryWindow/time.Second)
-		if recoveryCutoff <= 0 {
-			recoveryCutoff = 1
-		}
-		query = query.Where(
-			"(status IN ? OR (status IN ? AND started_at > 0 AND (updated_at >= ? OR expires_at >= ? OR created_at >= ?)))",
-			activeStatuses,
-			[]string{PaymentOrderStatusFailed, PaymentOrderStatusExpired},
-			recoveryCutoff, recoveryCutoff, recoveryCutoff,
-		)
-	} else {
-		query = query.Where("status IN ?", activeStatuses)
+	var canonicalCount int64
+	if err := tx.Model(&PaymentOrder{}).Where("provider = ? AND status IN ?", provider, activeStatuses).
+		Count(&canonicalCount).Error; err != nil {
+		return 0, err
+	}
+	legacyCount, err := countLegacyActivePaymentProjectionsTx(tx, provider, provider == PaymentProviderEpay)
+	if err != nil {
+		return 0, err
+	}
+	return canonicalCount + legacyCount, nil
+}
+
+func paymentConfigurationPreconditionProviderSupported(provider string) bool {
+	switch strings.TrimSpace(provider) {
+	case PaymentProviderEpay, PaymentProviderStripe, PaymentProviderXorPay, PaymentProviderCreem,
+		PaymentProviderWaffo, PaymentProviderWaffoPancake:
+		return true
+	default:
+		return false
+	}
+}
+
+func paymentProviderUsesCurrentOnlyCredentials(provider string) bool {
+	switch strings.TrimSpace(provider) {
+	case PaymentProviderCreem, PaymentProviderWaffo, PaymentProviderWaffoPancake:
+		return true
+	default:
+		return false
+	}
+}
+
+func paymentProviderUsesEnvironmentBinding(provider string) bool {
+	switch strings.TrimSpace(provider) {
+	case PaymentProviderStripe, PaymentProviderCreem, PaymentProviderWaffoPancake:
+		return true
+	default:
+		return false
+	}
+}
+
+func countPaymentOrdersDependingOnCallbackOriginTx(tx *gorm.DB, provider string, now int64) (int64, error) {
+	query, recoveryCutoff, err := paymentOrdersDependingOnConfigurationQueryTx(tx, provider, now)
+	if err != nil {
+		return 0, err
 	}
 	var canonicalCount int64
 	if err := query.Count(&canonicalCount).Error; err != nil {
 		return 0, err
 	}
-	legacyCount, err := countLegacyPaymentProjectionsTx(tx, provider, provider == PaymentProviderEpay, recoveryCutoff)
+	legacyCount, err := countLegacyPaymentProjectionsTx(tx, strings.TrimSpace(provider), strings.TrimSpace(provider) == PaymentProviderEpay, recoveryCutoff)
 	if err != nil {
 		return 0, err
 	}
 	return canonicalCount + legacyCount, nil
+}
+
+func paymentOrdersDependingOnConfigurationQueryTx(tx *gorm.DB, provider string, now int64) (*gorm.DB, int64, error) {
+	provider = strings.TrimSpace(provider)
+	if tx == nil || now <= 0 || !paymentConfigurationPreconditionProviderSupported(provider) {
+		return nil, 0, errors.New("invalid callback-dependent payment order lookup")
+	}
+	activeStatuses := []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing, PaymentOrderStatusManualReview}
+	query := tx.Model(&PaymentOrder{}).Where("provider = ?", provider)
+	if provider == PaymentProviderStripe {
+		return query.Where("status IN ?", activeStatuses), 0, nil
+	}
+	recoveryCutoff := now - int64(PaymentCallbackRecoveryWindow/time.Second)
+	if recoveryCutoff <= 0 {
+		recoveryCutoff = 1
+	}
+	return query.Where(
+		"(status IN ? OR (status IN ? AND started_at > 0 AND (updated_at >= ? OR expires_at >= ? OR created_at >= ?)))",
+		activeStatuses,
+		[]string{PaymentOrderStatusFailed, PaymentOrderStatusExpired},
+		recoveryCutoff, recoveryCutoff, recoveryCutoff,
+	), recoveryCutoff, nil
 }
 
 func countLegacyPaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyProvider bool, recoveryCutoff int64) (int64, error) {
@@ -828,7 +943,7 @@ func countLegacyPaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyP
 					[]string{
 						PaymentMethodStripe, PaymentMethodCreem, PaymentMethodWaffo,
 						PaymentMethodWaffoPancake, PaymentMethodXorPayNative,
-						PaymentMethodXorPayAlipay, PaymentMethodBalance,
+						PaymentMethodXorPayAlipay, PaymentMethodXorPayJSAPI, PaymentMethodBalance,
 					},
 				)
 			} else {
@@ -839,7 +954,7 @@ func countLegacyPaymentProjectionsTx(tx *gorm.DB, provider string, includeEmptyP
 		case PaymentProviderXorPay:
 			query = query.Where(
 				"(payment_provider = ? OR payment_method IN ?)",
-				provider, []string{PaymentMethodXorPayNative, PaymentMethodXorPayAlipay},
+				provider, []string{PaymentMethodXorPayNative, PaymentMethodXorPayAlipay, PaymentMethodXorPayJSAPI},
 			)
 		default:
 			query = query.Where("payment_provider = ?", provider)
@@ -902,8 +1017,17 @@ func BindPaymentOrderCredentialGeneration(tradeNo string, generation, expectedCo
 		if order.ProviderCredentialGeneration != 0 {
 			return errors.New("payment order is already bound to another credential generation")
 		}
-		return tx.Model(&PaymentOrder{}).Where("id = ? AND provider_credential_generation = 0", order.ID).
-			Update("provider_credential_generation", generation).Error
+		updated := tx.Model(&PaymentOrder{}).
+			Where("id = ? AND provider_credential_generation = ? AND status IN ? AND start_payload = ?", order.ID, 0,
+				[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, "").
+			Update("provider_credential_generation", generation)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return errors.New("payment order credential generation binding was superseded")
+		}
+		return nil
 	})
 }
 
@@ -1008,12 +1132,36 @@ func MarkPaymentOrderCredentialGenerationManualReview(tradeNo string) error {
 }
 
 func MarkPaymentOrderManualReview(tradeNo, reason string) error {
+	return markPaymentOrderManualReview(tradeNo, reason, 0, nil, "")
+}
+
+func MarkPaymentOrderManualReviewFenced(tradeNo, reason string, creationFenceToken int64) error {
+	if creationFenceToken <= 0 {
+		return errors.New("payment creation fence is required")
+	}
+	return markPaymentOrderManualReview(tradeNo, reason, creationFenceToken, nil, "")
+}
+
+// MarkPaymentOrderManualReviewForTask changes an order only while the caller
+// still owns the durable task lease. Lease validation and the order mutation
+// share one transaction, preventing a stale reconcile worker from blocking a
+// newer worker that has already observed a successful payment.
+func MarkPaymentOrderManualReviewForTask(tradeNo, reason string, task *PaymentTask, runnerID string) error {
+	return markPaymentOrderManualReview(tradeNo, reason, 0, task, runnerID)
+}
+
+func markPaymentOrderManualReview(tradeNo, reason string, creationFenceToken int64, task *PaymentTask, runnerID string) error {
 	tradeNo = strings.TrimSpace(tradeNo)
 	reason = strings.TrimSpace(reason)
 	if tradeNo == "" || reason == "" || len(reason) > 512 {
 		return ErrPaymentOrderNotFound
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		if task != nil {
+			if err := assertPaymentTaskLeaseTx(tx, task, runnerID); err != nil {
+				return err
+			}
+		}
 		var order PaymentOrder
 		if err := lockForUpdate(tx).Where("trade_no = ?", tradeNo).First(&order).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1024,12 +1172,36 @@ func MarkPaymentOrderManualReview(tradeNo, reason string) error {
 		if order.Status != PaymentOrderStatusPending && order.Status != PaymentOrderStatusProcessing {
 			return nil
 		}
+		if task != nil {
+			if task.PaymentOrderID != order.ID {
+				return ErrPaymentTaskLeaseLost
+			}
+			if task.Operation == PaymentTaskOperationCreate {
+				if task.FenceToken <= 0 || order.CreationFenceToken != task.FenceToken {
+					return ErrPaymentTaskLeaseLost
+				}
+				creationFenceToken = task.FenceToken
+			}
+		}
+		if creationFenceToken > 0 && order.CreationFenceToken != creationFenceToken {
+			return ErrPaymentTaskLeaseLost
+		}
 		now := common.GetTimestamp()
-		if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
+		query := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID)
+		if creationFenceToken > 0 {
+			query = query.Where("creation_fence_token = ?", creationFenceToken)
+		}
+		updated := query.Updates(map[string]interface{}{
 			"status": PaymentOrderStatusManualReview, "status_reason": reason,
-			"start_payload": "", "updated_at": now, "version": gorm.Expr("version + ?", 1),
-		}).Error; err != nil {
-			return err
+			"start_payload": "", "browser_authorization_digest": nil,
+			"browser_authorization_payload": "", "browser_authorization_expires_at": 0,
+			"browser_authorized_at": 0, "updated_at": now, "version": gorm.Expr("version + ?", 1),
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected == 0 && creationFenceToken > 0 {
+			return ErrPaymentTaskLeaseLost
 		}
 		order.Status = PaymentOrderStatusManualReview
 		order.StatusReason = reason
@@ -1197,6 +1369,25 @@ func SavePaymentOrderStart(tradeNo, flow, payload string, expiresAt int64) error
 // same payment intent.
 func SavePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, expiresAt int64,
 	providerOrderKey, providerPaymentKey string) error {
+	return savePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload, expiresAt,
+		providerOrderKey, providerPaymentKey, 0)
+}
+
+// SavePaymentOrderStartWithProviderIdentityFenced is the asynchronous worker
+// variant. The creation fence is advanced whenever another node takes over the
+// durable task; an old worker therefore cannot publish stale QR or redirect
+// data after its lease has expired.
+func SavePaymentOrderStartWithProviderIdentityFenced(tradeNo, flow, payload string, expiresAt int64,
+	providerOrderKey, providerPaymentKey string, creationFenceToken int64) error {
+	if creationFenceToken <= 0 {
+		return errors.New("payment creation fence is required")
+	}
+	return savePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload, expiresAt,
+		providerOrderKey, providerPaymentKey, creationFenceToken)
+}
+
+func savePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, expiresAt int64,
+	providerOrderKey, providerPaymentKey string, creationFenceToken int64) error {
 	if strings.TrimSpace(flow) == "" || strings.TrimSpace(payload) == "" || len(payload) > 32<<10 {
 		return errors.New("invalid payment start snapshot")
 	}
@@ -1226,6 +1417,14 @@ func SavePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, ex
 		if order.Status != PaymentOrderStatusPending && order.Status != PaymentOrderStatusProcessing {
 			return ErrPaymentOrderNotFound
 		}
+		if creationFenceToken > 0 && order.CreationFenceToken != creationFenceToken {
+			return ErrPaymentTaskLeaseLost
+		}
+		if order.ExpiresAt > 0 && expiresAt > order.ExpiresAt {
+			// Provider responses are state, not permission to lengthen the
+			// server-authoritative payment window or its limit reservation.
+			expiresAt = order.ExpiresAt
+		}
 		if err := bindAndValidateProviderIdentityTx(tx, &order, PaymentEventInput{
 			ProviderOrderKey: providerOrderKey, ProviderPaymentKey: providerPaymentKey,
 		}); err != nil {
@@ -1234,14 +1433,27 @@ func SavePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, ex
 		now := time.Now().Unix()
 		updates := map[string]interface{}{
 			"status": PaymentOrderStatusPending, "start_flow": flow,
-			"start_payload": encryptedPayload, "updated_at": now,
+			"start_payload": encryptedPayload, "browser_authorization_digest": nil,
+			"browser_authorization_payload": "", "browser_authorization_expires_at": 0,
+			"browser_authorized_at": 0, "updated_at": now,
 		}
 		if expiresAt > 0 {
 			updates["expires_at"] = expiresAt
 		}
-		if err := tx.Model(&PaymentOrder{}).Where("id = ? AND status IN ?", order.ID,
-			[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}).Updates(updates).Error; err != nil {
-			return err
+		query := tx.Model(&PaymentOrder{}).Where("id = ? AND status IN ?", order.ID,
+			[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing})
+		if creationFenceToken > 0 {
+			query = query.Where("creation_fence_token = ?", creationFenceToken)
+		}
+		updated := query.Updates(updates)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected == 0 && creationFenceToken > 0 {
+			return ErrPaymentTaskLeaseLost
+		}
+		if updated.RowsAffected == 0 {
+			return ErrPaymentOrderNotFound
 		}
 		if expiresAt > 0 && order.OrderKind == PaymentOrderKindSubscription {
 			if err := tx.Model(&SubscriptionOrder{}).
@@ -1251,13 +1463,33 @@ func SavePaymentOrderStartWithProviderIdentity(tradeNo, flow, payload string, ex
 				return err
 			}
 		}
+		if expiresAt > 0 {
+			if err := updatePaymentLimitReservationExpiryTx(tx, order.ID, expiresAt); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
 
 func ExpirePaymentOrderIfDue(userID int, tradeNo string) (*PaymentOrder, error) {
+	return expirePaymentOrderIfDue(userID, tradeNo, nil, "")
+}
+
+// ExpirePaymentOrderIfDueForTask keeps expiry and task ownership atomic for
+// worker-driven order transitions.
+func ExpirePaymentOrderIfDueForTask(userID int, tradeNo string, task *PaymentTask, runnerID string) (*PaymentOrder, error) {
+	return expirePaymentOrderIfDue(userID, tradeNo, task, runnerID)
+}
+
+func expirePaymentOrderIfDue(userID int, tradeNo string, task *PaymentTask, runnerID string) (*PaymentOrder, error) {
 	var order PaymentOrder
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if task != nil {
+			if err := assertPaymentTaskLeaseTx(tx, task, runnerID); err != nil {
+				return err
+			}
+		}
 		if err := lockForUpdate(tx).Where("user_id = ? AND trade_no = ?", userID, tradeNo).First(&order).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrPaymentOrderNotFound
@@ -1347,7 +1579,9 @@ func expirePaymentOrderTx(tx *gorm.DB, order *PaymentOrder, now int64) (bool, er
 			[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, now).
 		Updates(map[string]interface{}{
 			"status": PaymentOrderStatusExpired, "status_reason": statusReason,
-			"start_flow": "", "start_payload": "", "updated_at": now,
+			"start_flow": "", "start_payload": "", "browser_authorization_digest": nil,
+			"browser_authorization_payload": "", "browser_authorization_expires_at": 0,
+			"browser_authorized_at": 0, "updated_at": now,
 			"version": gorm.Expr("version + ?", 1),
 		})
 	if updated.Error != nil {
@@ -1362,6 +1596,9 @@ func expirePaymentOrderTx(tx *gorm.DB, order *PaymentOrder, now int64) (bool, er
 	order.StartPayload = ""
 	order.UpdatedAt = now
 	order.Version++
+	if err := releasePaymentLimitReservationTx(tx, order, now); err != nil {
+		return false, err
+	}
 	if order.OrderKind == PaymentOrderKindTopUp {
 		if err := tx.Model(&TopUp{}).Where("payment_order_id = ? OR trade_no = ?", order.ID, order.TradeNo).
 			Where("status = ?", common.TopUpStatusPending).
@@ -1381,6 +1618,17 @@ func expirePaymentOrderTx(tx *gorm.DB, order *PaymentOrder, now int64) (bool, er
 }
 
 func MarkPaymentOrderFailed(tradeNo, reason string) error {
+	return markPaymentOrderFailed(tradeNo, reason, 0)
+}
+
+func MarkPaymentOrderFailedFenced(tradeNo, reason string, creationFenceToken int64) error {
+	if creationFenceToken <= 0 {
+		return errors.New("payment creation fence is required")
+	}
+	return markPaymentOrderFailed(tradeNo, reason, creationFenceToken)
+}
+
+func markPaymentOrderFailed(tradeNo, reason string, creationFenceToken int64) error {
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var order PaymentOrder
 		if err := lockForUpdate(tx).Where("trade_no = ?", tradeNo).First(&order).Error; err != nil {
@@ -1392,13 +1640,30 @@ func MarkPaymentOrderFailed(tradeNo, reason string) error {
 		if order.Status != PaymentOrderStatusPending && order.Status != PaymentOrderStatusProcessing {
 			return ErrPaymentOrderNotFound
 		}
+		if creationFenceToken > 0 && order.CreationFenceToken != creationFenceToken {
+			return ErrPaymentTaskLeaseLost
+		}
 		order.Status = PaymentOrderStatusFailed
 		order.StatusReason = reason
 		order.UpdatedAt = time.Now().Unix()
 		order.Version++
-		if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
-			"status": order.Status, "status_reason": order.StatusReason, "start_payload": "", "updated_at": order.UpdatedAt, "version": order.Version,
-		}).Error; err != nil {
+		query := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID)
+		if creationFenceToken > 0 {
+			query = query.Where("creation_fence_token = ?", creationFenceToken)
+		}
+		updated := query.Updates(map[string]interface{}{
+			"status": order.Status, "status_reason": order.StatusReason, "start_payload": "",
+			"browser_authorization_digest": nil, "browser_authorization_payload": "",
+			"browser_authorization_expires_at": 0, "browser_authorized_at": 0,
+			"updated_at": order.UpdatedAt, "version": order.Version,
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected == 0 && creationFenceToken > 0 {
+			return ErrPaymentTaskLeaseLost
+		}
+		if err := releasePaymentLimitReservationTx(tx, &order, order.UpdatedAt); err != nil {
 			return err
 		}
 		return syncPaymentProjectionStatusTx(tx, &order)

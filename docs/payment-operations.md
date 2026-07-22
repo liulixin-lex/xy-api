@@ -8,8 +8,9 @@ only when the provider evidence and the local entitlement change are both
 durable, idempotent, and auditable.
 
 This document describes the operational contract for the canonical payment
-flow and the Epay, Stripe, and XORPay gateways. Creem, Waffo Pancake, and Waffo
-remain outside this migration scope.
+flow and the independently configured Epay, Stripe, XORPay, Creem, Waffo, and
+Waffo Pancake gateways. Public brands may repeat across gateway groups, but a
+route is never silently remapped to another provider.
 
 ## Goals
 
@@ -17,7 +18,9 @@ remain outside this migration scope.
 - Price every purchase from an immutable server-side quote.
 - Apply each verified provider event and entitlement change exactly once.
 - Preserve evidence for mismatches, credential incidents, refunds, and disputes.
-- Support SQLite, MySQL, and PostgreSQL upgrades from the v0.1.6 schema.
+- Preserve SQLite, MySQL, and PostgreSQL legacy-schema compatibility for the
+  staged `v0.1.6` to `v0.2.0` to `v0.2.1` path. A direct production
+  `v0.1.6` to `v0.2.1` upgrade remains unclaimed.
 - Give administrators an explicit, audited recovery path instead of requiring
   direct database edits.
 
@@ -28,7 +31,8 @@ The canonical flow is:
 1. The authenticated user requests a short-lived server quote.
 2. The server freezes price, currency, payment method, entitlement, and expiry.
 3. A client request ID consumes the quote and creates one canonical order.
-4. The provider adapter creates or recovers the provider payment.
+4. A durable database task creates or recovers the provider payment outside the
+   browser request lifecycle, using a lease and fencing token.
 5. The signed webhook is normalized into the durable event inbox.
 6. The event, order state, entitlement, projection, ledger, affiliate reward,
    debt, and reversal are committed in one primary-database transaction.
@@ -75,6 +79,9 @@ The public routes are:
   `/api/subscription/epay/return` (display-only, never settlement authority)
 - Stripe: `/api/stripe/webhook`
 - XORPay: `/api/xorpay/notify`
+- Creem: `/api/creem/webhook`
+- Waffo: `/api/waffo/webhook`
+- Waffo Pancake: `/api/waffo-pancake/webhook/{test|prod}`
 
 The reverse proxy must preserve the raw Stripe request body and the
 `Stripe-Signature` header. Apply normal edge-level request limits, but do not
@@ -82,17 +89,41 @@ rewrite form fields or webhook payloads.
 
 ### Multi-node deployments
 
-All nodes must share the primary database, payment encryption keys, and the
-same provider configuration. Payment configuration changes use a database CAS
-version and credential-generation fence; a node that cannot synchronize the
-current version must refuse payment creation or settlement rather than use
-stale credentials.
+All nodes must share a MySQL or PostgreSQL primary database, Redis, payment
+encryption keys, session and crypto keys, callback settings, and the same
+provider configuration. SQLite is single-node only. Payment configuration
+changes use a database CAS version and credential-generation fence; a node
+that cannot synchronize the current version must leave readiness and refuse
+payment creation or settlement rather than use stale credentials.
 
-PostgreSQL master nodes serialize schema migration with a connection-scoped
-advisory lock. This prevents two instances starting against the same empty or
-legacy database from racing while creating payment tables and compatibility
-columns. The lock does not replace the normal requirement to run production
-upgrades from a tested database backup.
+Multi-node payment mode is explicit and fail-closed. Set all of the following
+identically on every replica except `NODE_NAME`:
+
+- `PAYMENT_MULTI_NODE_ENABLED=true`;
+- one stable `PAYMENT_CLUSTER_ID`;
+- `PAYMENT_CLUSTER_NODES`, a comma-separated allowlist of every stable
+  `NODE_NAME` that may join;
+- `PAYMENT_CLUSTER_MIN_LIVE_NODES`, a strict majority of the allowlist and no
+  greater than its size.
+
+Every local `NODE_NAME` must be manually configured and present in the
+allowlist. Unknown or duplicate live names are rejected. Requiring a strict
+majority prevents two disjoint partitions from both serving payment. The
+database live inventory must contain at least the configured minimum and every live member
+must publish matching non-secret cluster, Redis-target, configuration, and key
+fingerprints before any payment task is claimed. This makes an isolated
+wrong-database replica fail closed even before it sees a peer. Use at least
+three allowed replicas with a minimum of two when one-node restart tolerance
+is required; a two-node deployment pauses payments while either node is down.
+
+PostgreSQL and MySQL master nodes serialize schema migration with
+connection-scoped locks. PostgreSQL uses an advisory lock; MySQL uses a
+schema-scoped `GET_LOCK` name. In both cases the migration runs on the same
+dedicated connection that owns the lock and releases it before returning that
+connection to the pool. This prevents two instances starting against the same
+empty or legacy schema from racing while creating payment tables and
+compatibility columns. The lock does not replace the normal requirement to run
+production upgrades from a tested database backup.
 
 ### Trusted reverse proxies
 
@@ -147,11 +178,27 @@ an end-user or public network merely to make a forwarded header appear in logs.
 - One-time top-ups and application subscription entitlements use Stripe-hosted
   Checkout Sessions in `payment` mode. They are not recurring Stripe Billing
   subscriptions.
+- Subscription plans keep their server-authoritative base price in USD. The
+  Stripe unit-price multiplier converts that base amount into the configured
+  Stripe settlement currency for both wallet top-ups and fixed-term plan
+  purchases; it does not change the plan's base-currency contract.
 - The server quote controls the amount. The configured active Stripe Price is
   used to preflight product, currency, account, mode, and read permission; the
   Checkout Session creates server-controlled price data for the exact quote.
 - API credential mode, authenticating account, optional connected account,
   webhook mode, and configuration fingerprint must agree.
+- Stripe-owned `*.stripe.com` Checkout hosts are always accepted. A merchant
+  using a Stripe custom Checkout domain must add each exact DNS hostname to
+  `StripeCheckoutAllowedHosts`; the option is empty by default and is included
+  in both the verified Stripe configuration fingerprint and the multi-node
+  runtime fingerprint. Wildcards, URLs, user information, explicit ports
+  (including `:443`), IP addresses, `localhost`, non-DNS names, and oversized
+  lists are rejected.
+- Checkout creation, URL recovery, and the authenticated `/continue` handoff
+  apply the same host policy. Adding exact hosts is safe while Stripe orders
+  are unfinished. Removing or replacing a configured custom host is blocked
+  until no unfinished Stripe order can depend on it, preventing an existing
+  Checkout Session from becoming unreachable during payment.
 - Before any one-time paid Checkout webhook can grant an entitlement, the
   server re-fetches that exact Session with the currently verified API key and
   connected-account context. Session identity, trade number and metadata,
@@ -229,6 +276,39 @@ changing the Stripe webhook endpoint version.
   remains `state_unknown` and is reconciled by query, webhook, or expiry. Do not
   create a second upstream order with the same business request.
 
+### Creem, Waffo, and Waffo Pancake
+
+- New payments from all three integrations use the canonical quote, local
+  order, limit reservation, durable worker, encrypted continuation, event
+  inbox, and exactly-once settlement path. Provider-specific compatibility
+  endpoints return only the local order needed to enter the first-party
+  checkout page.
+- Public product and payment-option identifiers are opaque. Real Creem product
+  IDs, Waffo option values, Waffo Pancake product IDs, hosted URLs, and provider
+  identity remain server-side.
+- Creem accepts only its exact Checkout host. Waffo HTTPS cashier hosts and App
+  schemes use separate exact-match administrator allowlists. Waffo Pancake
+  accepts only the authenticated SDK Checkout URL shape and keeps its JWT in
+  the encrypted redirect fragment.
+- Waffo uses a deterministic payment request ID and performs repeated inquiry
+  before any create retry. If an existing Waffo order has no recoverable action,
+  it moves to manual review.
+- Creem and Waffo Pancake cannot safely reconstruct an instruction after an
+  ambiguous create response. Those orders move to manual review and are not
+  blindly recreated.
+- Waffo Pancake test and production modes use distinct signing and merchant
+  environments. The saved environment is part of configuration readiness and
+  every new order. The webhook path, signed event mode, provider inquiry mode,
+  current configuration, and order snapshot must agree before settlement; a
+  mismatch is retained for manual review and grants no entitlement.
+- Waffo Pancake's unit-price multiplier converts the server-authoritative USD
+  wallet or fixed-term plan amount into provider settlement currency. Its
+  minimum top-up is a USD wallet-input rule, not a provider-global limit.
+- Signed callbacks try the canonical order first. Verified legacy fallback is
+  retained only for pre-existing records; amount, currency, provider order,
+  buyer/store/environment identity, and immutable entitlement snapshots must
+  match before settlement.
+
 ## Browser Traffic and Secret Exposure
 
 Payment security does not rely on JavaScript obfuscation or hiding network
@@ -251,6 +331,10 @@ safe; revoke and rotate it immediately.
 - Preview and legacy amount endpoints use bounded request bodies and the quote
   rate limit.
 - Each user has bounded active quotes and in-flight provider orders.
+- Merchant policies can enforce per-route single-payment and daily limits in
+  integer minor units. Active orders reserve capacity atomically; paid usage is
+  assigned to the configured merchant day, while failure and expiry release
+  unused capacity.
 - The scheduled payment task expires unattended orders and deletes expired or
   consumed quotes after the audit-retention window in bounded batches.
 - Late verified payment is still retained and settled or reviewed according to
@@ -258,18 +342,27 @@ safe; revoke and rotate it immediately.
 
 ## Credential Incident Response
 
-Emergency revocation is intentionally conservative:
+Emergency handling is intentionally conservative and provider-specific:
 
-1. Atomically replace or remove the compromised credential and revoke its
-   generation.
-2. Pending orders and unmatched monetary events from that generation become
-   terminal review evidence.
-3. Already fulfilled orders keep their economic projection. They are marked as
+1. For Epay, Stripe, and XORPay, normal rotation creates a new credential
+   generation and temporarily retains the previous generation for orders and
+   delayed callbacks created before the cutoff. Emergency revocation is a
+   separate action that immediately stops trusting the selected generation.
+2. Creem, Waffo, and Waffo Pancake currently have one active credential set and
+   no previous-generation overlap. Their emergency action disables the current
+   credentials: Creem clears its API and webhook secrets; Waffo clears the
+   active-environment API key, private key, and callback certificate; Waffo
+   Pancake clears its private key and store binding.
+3. Every emergency action requires an impact preview, a reason, privileged
+   step-up verification, explicit confirmation, configuration-version CAS, and
+   an audit record. Pending, unfinished, and callback-dependent candidate
+   orders and unmatched monetary events become terminal review evidence.
+4. Already fulfilled orders keep their economic projection. They are marked as
    credential incidents but are not automatically reversed.
-4. Review provider dashboards and local event/ledger evidence for the affected
-   generation and time window.
-5. Acknowledge the incident with an investigation note, then resolve it only
-   after refunds, disputes, or manual actions are complete.
+5. Review provider dashboards and local event/ledger evidence for the affected
+   credential and time window. Acknowledge the incident with an investigation
+   note, then resolve it only after refunds, disputes, or manual actions are
+   complete.
 
 Automatically reversing fulfilled orders is unsafe because revocation alone
 cannot prove which earlier signed events were fraudulent. Economic corrections
@@ -315,10 +408,14 @@ was created, and its price exactly matches the legacy amount. Otherwise the
 event remains durable for administrator review or refund; it must never grant
 the current plan silently.
 
+Pre-canonical Creem, Waffo, and Waffo Pancake rows may also lack the original
+entitlement snapshot. A delayed callback for such a row is kept for manual
+review rather than recalculating credit from current mutable settings.
+
 Back up the primary database before upgrading. Validate the migration on a copy
-of production data before a stable release, especially pending Epay orders,
-Stripe legacy subscription inventory, payment customer bindings, and open
-billing reservations.
+of production data before a stable release, especially pending orders from
+every gateway, Stripe legacy subscription inventory, payment customer bindings,
+and open payment-limit or billing reservations.
 
 ## Acceptance Checklist
 
@@ -335,7 +432,15 @@ billing reservations.
   never produce negative or overflowing quota.
 - Credential replacement, overlap, emergency revocation, incident review, and
   Stripe Customer retirement are exercised with administrator step-up.
-- SQLite, MySQL, and PostgreSQL migrations and settlement transactions pass.
+- Run the SQLite migration and payment test suites locally. Dedicated CI jobs
+  exercise MySQL 5.7 and PostgreSQL 9.6 migration/payment contracts when their
+  isolated databases are available; those tests do not by themselves prove a
+  production multi-node deployment.
+- Before production rollout, run the multi-node smoke test against the chosen
+  shared MySQL or PostgreSQL database and shared Redis, then retain evidence for
+  cross-node sessions, restart tolerance, task leasing, fencing, and readiness
+  mismatch rejection. Retain separate database integration-test evidence for
+  concurrent callback event ingestion, settlement, and exactly-once fulfillment.
 - Both frontend themes build and Payment Operations is usable at desktop and
   mobile widths.
 
@@ -344,6 +449,16 @@ billing reservations.
 - Stripe endpoint permission probing cannot prove external webhook delivery;
   complete a test-mode payment and callback exercise before accepting traffic.
 - XORPay cannot recover a lost create-response QR through its public query API.
+- Cluster readiness failures deliberately return a retryable HTTP error before
+  automatic callback processing. XORPay documents bounded notification
+  retries, but arbitrary Epay-compatible gateways do not share one guaranteed
+  retry contract. A prolonged cluster pause can therefore require provider
+  reconciliation or administrator review; callback delivery has not been
+  proven for a specific merchant until exercised through its public ingress.
+- Creem and Waffo Pancake cannot recover a lost create-response hosted
+  instruction without provider evidence, so ambiguous creation requires manual
+  review. Waffo inquiry can recover only when the provider returns a valid
+  order action.
 - Legacy clients that omit request IDs cannot guarantee cross-request
   idempotency; upgrade them to the canonical quote/start API.
 - Production-data-copy validation remains a release gate even when clean and

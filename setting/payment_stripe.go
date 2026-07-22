@@ -23,6 +23,10 @@ var StripeWebhookSecretPreviousExpiresAt int64
 var StripeWebhookCredentialGeneration int64 = 2
 var StripeWebhookPreviousCredentialGeneration int64
 var StripeWebhookPreviousValidBefore int64
+
+// StripePriceId is retained as the persisted option key for compatibility.
+// Its only current meaning is a catalog template used to create a server-
+// quoted one-time Checkout price; it is not a recurring subscription price.
 var StripePriceId = ""
 var StripeUnitPrice = 8.0
 var StripeMinTopUp = 1
@@ -42,8 +46,9 @@ var StripeCredentialLivemode = ""
 var StripeWebhookCredentialLivemode = ""
 
 // StripeConfigurationVerifiedFingerprint proves that the current API key,
-// platform account, optional connected account, Price and currency were
-// successfully probed together. It contains only a one-way digest.
+// platform account, optional connected account, Price, currency, and custom
+// Checkout host policy were successfully probed together. It contains only a
+// one-way digest.
 var StripeConfigurationVerifiedFingerprint = ""
 var StripeConfigurationVerifiedAt int64
 
@@ -61,4 +66,8 @@ func StripeCredentialModeAllowed(mode string) bool {
 
 func StripePreviousWebhookSecretActive() bool {
 	return StripeWebhookSecretPrevious != "" && StripeWebhookSecretPreviousExpiresAt > time.Now().Unix()
+}
+
+func StripeCheckoutPriceTemplateID() string {
+	return StripePriceId
 }

@@ -27,6 +27,7 @@ func isStripeTopUpEnabledLocked() bool {
 	verifiedFingerprint := service.StripeCheckoutConfigurationFingerprint(
 		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
 		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+		setting.StripeCheckoutAllowedHosts,
 	)
 	return verifiedFingerprint != "" && setting.StripeConfigurationVerifiedFingerprint == verifiedFingerprint &&
 		setting.StripeConfigurationVerifiedAt > 0 && strings.TrimSpace(setting.StripeApiSecret) != "" &&
@@ -57,13 +58,19 @@ func isCreemTopUpEnabled() bool {
 }
 
 func isCreemTopUpEnabledLocked() bool {
-	if !isPaymentComplianceConfirmedLocked() {
+	if !isCreemCheckoutEnabledLocked() {
 		return false
 	}
 	products := strings.TrimSpace(setting.CreemProducts)
 	return strings.TrimSpace(setting.CreemApiKey) != "" &&
 		products != "" &&
 		products != "[]"
+}
+
+func isCreemCheckoutEnabledLocked() bool {
+	return isPaymentComplianceConfirmedLocked() && model.PaymentSecretStorageReady() &&
+		strings.TrimSpace(setting.CreemApiKey) != "" &&
+		strings.TrimSpace(setting.CreemWebhookSecret) != ""
 }
 
 func isCreemWebhookConfigured() bool {
@@ -75,9 +82,9 @@ func isCreemWebhookConfiguredLocked() bool {
 }
 
 func isCreemWebhookEnabled() bool {
-	return readPaymentConfiguration(func() bool {
-		return isCreemTopUpEnabledLocked() && isCreemWebhookConfiguredLocked()
-	})
+	// Keep accepting delayed callbacks even when new checkout creation has been
+	// disabled by clearing the API key or product catalog.
+	return readPaymentConfiguration(isCreemWebhookConfiguredLocked)
 }
 
 func isWaffoTopUpEnabled() bool {
@@ -85,14 +92,16 @@ func isWaffoTopUpEnabled() bool {
 }
 
 func isWaffoTopUpEnabledLocked() bool {
-	if !isPaymentComplianceConfirmedLocked() {
+	if !isPaymentComplianceConfirmedLocked() || !model.PaymentSecretStorageReady() {
 		return false
 	}
 	if !setting.WaffoEnabled {
 		return false
 	}
-
-	return isWaffoWebhookConfiguredLocked()
+	if setting.WaffoSandbox {
+		return strings.TrimSpace(setting.WaffoSandboxApiKey) != "" && isWaffoWebhookConfiguredLocked()
+	}
+	return strings.TrimSpace(setting.WaffoApiKey) != "" && isWaffoWebhookConfiguredLocked()
 }
 
 func isWaffoWebhookConfigured() bool {
@@ -101,18 +110,19 @@ func isWaffoWebhookConfigured() bool {
 
 func isWaffoWebhookConfiguredLocked() bool {
 	if setting.WaffoSandbox {
-		return strings.TrimSpace(setting.WaffoSandboxApiKey) != "" &&
-			strings.TrimSpace(setting.WaffoSandboxPrivateKey) != "" &&
+		return strings.TrimSpace(setting.WaffoSandboxPrivateKey) != "" &&
 			strings.TrimSpace(setting.WaffoSandboxPublicCert) != ""
 	}
 
-	return strings.TrimSpace(setting.WaffoApiKey) != "" &&
-		strings.TrimSpace(setting.WaffoPrivateKey) != "" &&
+	return strings.TrimSpace(setting.WaffoPrivateKey) != "" &&
 		strings.TrimSpace(setting.WaffoPublicCert) != ""
 }
 
 func isWaffoWebhookEnabled() bool {
-	return readPaymentConfiguration(isWaffoTopUpEnabledLocked)
+	// Delayed callbacks remain verifiable after operators disable new Waffo
+	// checkout creation or clear the API key. The public certificate verifies
+	// Waffo and the merchant private key signs the required acknowledgement.
+	return readPaymentConfiguration(isWaffoWebhookConfiguredLocked)
 }
 
 func isWaffoPancakeTopUpEnabled() bool {
@@ -120,7 +130,7 @@ func isWaffoPancakeTopUpEnabled() bool {
 }
 
 func isWaffoPancakeTopUpEnabledLocked() bool {
-	if !isPaymentComplianceConfirmedLocked() {
+	if !isPaymentComplianceConfirmedLocked() || !model.PaymentSecretStorageReady() {
 		return false
 	}
 	// Presence-of-credentials = enabled. Webhook public keys ship inside
@@ -131,11 +141,17 @@ func isWaffoPancakeTopUpEnabledLocked() bool {
 }
 
 func isWaffoPancakeWebhookConfigured() bool {
-	return readPaymentConfiguration(isWaffoPancakeTopUpEnabledLocked)
+	return readPaymentConfiguration(isWaffoPancakeWebhookConfiguredLocked)
+}
+
+func isWaffoPancakeWebhookConfiguredLocked() bool {
+	// Pancake webhook verification keys ship with the official SDK. StoreID is
+	// the local merchant-authority boundary checked before settlement.
+	return strings.TrimSpace(setting.WaffoPancakeStoreID) != ""
 }
 
 func isWaffoPancakeWebhookEnabled() bool {
-	return readPaymentConfiguration(isWaffoPancakeTopUpEnabledLocked)
+	return readPaymentConfiguration(isWaffoPancakeWebhookConfiguredLocked)
 }
 
 func isEpayTopUpEnabled() bool {

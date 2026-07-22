@@ -7,9 +7,14 @@ import { pluginReact } from '@rsbuild/plugin-react';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const workspaceNodeModulesDir = path.resolve(__dirname, '../node_modules');
-const workspaceReactDir = path.join(workspaceNodeModulesDir, 'react');
-const workspaceReactDomDir = path.join(workspaceNodeModulesDir, 'react-dom');
+const workspaceReactDir = [
+  path.resolve(__dirname, 'node_modules/react'),
+  path.resolve(__dirname, '../node_modules/react'),
+].find((dir) => fs.existsSync(path.join(dir, 'package.json')));
+const workspaceReactDomDir = [
+  path.resolve(__dirname, 'node_modules/react-dom'),
+  path.resolve(__dirname, '../node_modules/react-dom'),
+].find((dir) => fs.existsSync(path.join(dir, 'package.json')));
 const semiUiDir = path.resolve(
   path.dirname(require.resolve('@douyinfe/semi-ui')),
   '../..',
@@ -24,10 +29,7 @@ const classicDateFnsDir = dateFnsCandidates.find((dir) =>
 if (!classicDateFnsDir) {
   throw new Error('date-fns@2 is required for the classic frontend build');
 }
-if (
-  !fs.existsSync(path.join(workspaceReactDir, 'package.json')) ||
-  !fs.existsSync(path.join(workspaceReactDomDir, 'package.json'))
-) {
+if (!workspaceReactDir || !workspaceReactDomDir) {
   throw new Error(
     'workspace React packages are required for the classic frontend build',
   );

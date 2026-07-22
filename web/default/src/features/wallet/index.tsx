@@ -16,15 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Invoice01Icon } from '@hugeicons/core-free-icons'
-import { HugeiconsIcon } from '@hugeicons/react'
+import { useNavigate } from '@tanstack/react-router'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { SectionPageLayout } from '@/components/layout'
-import { Button } from '@/components/ui/button'
-import { StripeLegacyInventoryDialog } from '@/features/subscriptions/components/dialogs/stripe-legacy-inventory-dialog'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { getSelf } from '@/lib/api'
 
@@ -32,7 +29,6 @@ import { AffiliateRewardsCard } from './components/affiliate-rewards-card'
 import { BillingHistoryDialog } from './components/dialogs/billing-history-dialog'
 import { CreemConfirmDialog } from './components/dialogs/creem-confirm-dialog'
 import { PaymentConfirmDialog } from './components/dialogs/payment-confirm-dialog'
-import { PaymentQrDialog } from './components/dialogs/payment-qr-dialog'
 import { TransferDialog } from './components/dialogs/transfer-dialog'
 import { PaymentResultAlert } from './components/payment-result-alert'
 import { RechargeFormCard } from './components/recharge-form-card'
@@ -46,20 +42,16 @@ import {
   useRedemption,
   useCreemPayment,
   useWaffoPayment,
-  useWaffoPancakePayment,
 } from './hooks'
-import {
-  getDefaultPaymentMethod,
-  getMinTopupAmount,
-  isWaffoPancakePayment,
-} from './lib'
+import { getDefaultPaymentMethod, getMinTopupAmount } from './lib'
 import type {
   UserWalletData,
   PaymentMethod,
   PresetAmount,
-  CreemProduct,
+  PaymentProduct,
+  PaymentRouteOption,
   PaymentOrder,
-  PaymentQrStart,
+  PaymentStart,
 } from './types'
 
 interface WalletProps {
@@ -70,6 +62,7 @@ interface WalletProps {
 
 export function Wallet(props: WalletProps) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const [user, setUser] = useState<UserWalletData | null>(null)
   const [userLoading, setUserLoading] = useState(true)
   const [topupAmount, setTopupAmount] = useState(0)
@@ -80,16 +73,11 @@ export function Wallet(props: WalletProps) {
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
   const [transferDialogOpen, setTransferDialogOpen] = useState(false)
   const [billingDialogOpen, setBillingDialogOpen] = useState(false)
-  const [stripeInventoryOpen, setStripeInventoryOpen] = useState(false)
   const [redemptionCode, setRedemptionCode] = useState('')
   const [creemDialogOpen, setCreemDialogOpen] = useState(false)
-  const [selectedCreemProduct, setSelectedCreemProduct] =
-    useState<CreemProduct | null>(null)
+  const [selectedPaymentProduct, setSelectedPaymentProduct] =
+    useState<PaymentProduct | null>(null)
   const [showSubscriptionPanel, setShowSubscriptionPanel] = useState(true)
-  const [qrDialogOpen, setQrDialogOpen] = useState(false)
-  const [qrPaymentStart, setQrPaymentStart] = useState<PaymentQrStart | null>(
-    null
-  )
   const [returnTradeNo, setReturnTradeNo] = useState(props.initialTradeNo || '')
 
   const { currency } = useSystemConfig()
@@ -126,8 +114,6 @@ export function Wallet(props: WalletProps) {
   const { redeeming, redeemCode } = useRedemption()
   const { processing: creemProcessing, processCreemPayment } = useCreemPayment()
   const { processWaffoPayment } = useWaffoPayment()
-  const { processing: pancakeProcessing, processWaffoPancakePayment } =
-    useWaffoPancakePayment()
 
   // Fetch and refresh user data
   const fetchUser = useCallback(async () => {
@@ -137,9 +123,7 @@ export function Wallet(props: WalletProps) {
       if (response.success && response.data) {
         setUser(response.data as UserWalletData)
       }
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error('Failed to fetch user data:', error)
+    } catch {
     } finally {
       setUserLoading(false)
     }
@@ -203,7 +187,7 @@ export function Wallet(props: WalletProps) {
   // Handle payment method selection
   const handlePaymentMethodSelect = async (method: PaymentMethod) => {
     setSelectedPaymentMethod(method)
-    setPaymentLoading(method.type)
+    setPaymentLoading(method.route_id)
 
     try {
       // Validate minimum topup
@@ -224,28 +208,25 @@ export function Wallet(props: WalletProps) {
   const handlePaymentConfirm = async () => {
     if (!selectedPaymentMethod || !quote) return
 
-    const isPancake = isWaffoPancakePayment(selectedPaymentMethod.type)
-    if (isPancake) {
-      const success = await processWaffoPancakePayment(topupAmount)
-      if (success) setConfirmDialogOpen(false)
-      return
-    }
-
-    const paymentStart = await processPayment(quote)
+    const paymentStart = await processPayment(quote, selectedPaymentMethod)
     if (paymentStart) {
       setConfirmDialogOpen(false)
-      if (paymentStart.flow === 'qr') {
-        setQrPaymentStart(paymentStart)
-        setQrDialogOpen(true)
-      } else if (paymentStart.flow === 'pending') {
-        setReturnTradeNo(paymentStart.trade_no)
+      if (paymentStart.flow === 'qr' || paymentStart.flow === 'pending') {
+        if (!paymentStart.trade_no) {
+          toast.error(t('Payment is temporarily unavailable. Try again.'))
+          return
+        }
+        await navigate({
+          to: '/payment/$tradeNo',
+          params: { tradeNo: paymentStart.trade_no },
+        })
       }
     }
   }
 
   const handlePaymentSettled = useCallback(
     async (order: PaymentOrder) => {
-      if (order.status === 'success') await fetchUser()
+      if (order.status_code === 'succeeded') await fetchUser()
     },
     [fetchUser]
   )
@@ -278,29 +259,50 @@ export function Wallet(props: WalletProps) {
   }
 
   // Handle Creem product selection
-  const handleCreemProductSelect = (product: CreemProduct) => {
-    setSelectedCreemProduct(product)
+  const handlePaymentProductSelect = (product: PaymentProduct) => {
+    setSelectedPaymentProduct(product)
     setCreemDialogOpen(true)
+  }
+
+  const openLocalPaymentOrder = async (paymentStart: PaymentStart | null) => {
+    if (!paymentStart?.trade_no) {
+      if (paymentStart) {
+        toast.error(t('Payment is temporarily unavailable. Try again.'))
+      }
+      return false
+    }
+    await navigate({
+      to: '/payment/$tradeNo',
+      params: { tradeNo: paymentStart.trade_no },
+    })
+    return true
   }
 
   // Handle Creem payment confirmation
   const handleCreemConfirm = async () => {
-    if (!selectedCreemProduct) return
+    if (!selectedPaymentProduct) return
 
-    const success = await processCreemPayment(selectedCreemProduct.productId)
-    if (success) {
+    const paymentStart = await processCreemPayment(
+      selectedPaymentProduct.route_id,
+      selectedPaymentProduct.product_id
+    )
+    if (await openLocalPaymentOrder(paymentStart)) {
       setCreemDialogOpen(false)
-      setSelectedCreemProduct(null)
-      await fetchUser()
+      setSelectedPaymentProduct(null)
     }
   }
 
-  const handleWaffoMethodSelect = async (_method: unknown, index: number) => {
-    const loadingKey = `waffo-${index}`
+  const handlePaymentRouteOptionSelect = async (option: PaymentRouteOption) => {
+    const loadingKey = option.option_id
     setPaymentLoading(loadingKey)
 
     try {
-      await processWaffoPayment(topupAmount, index)
+      const paymentStart = await processWaffoPayment(
+        option.route_id,
+        topupAmount,
+        option.option_id
+      )
+      await openLocalPaymentOrder(paymentStart)
     } finally {
       setPaymentLoading(null)
     }
@@ -322,21 +324,6 @@ export function Wallet(props: WalletProps) {
     <>
       <SectionPageLayout>
         <SectionPageLayout.Title>{t('Wallet')}</SectionPageLayout.Title>
-        <SectionPageLayout.Actions>
-          <Button
-            type='button'
-            variant='outline'
-            size='sm'
-            onClick={() => setStripeInventoryOpen(true)}
-          >
-            <HugeiconsIcon
-              icon={Invoice01Icon}
-              strokeWidth={2}
-              data-icon='inline-start'
-            />
-            {t('Legacy Stripe subscriptions')}
-          </Button>
-        </SectionPageLayout.Actions>
         <SectionPageLayout.Content>
           <div className='mx-auto flex w-full max-w-7xl flex-col gap-4 sm:gap-5'>
             {returnTradeNo && (
@@ -367,7 +354,11 @@ export function Wallet(props: WalletProps) {
                   onTopupAmountChange={handleTopupAmountChange}
                   paymentAmount={paymentAmount}
                   paymentCurrency={quote?.currency}
-                  paymentProvider={quote?.provider}
+                  paymentFormatProvider={
+                    selectedPaymentMethod?.public_method === 'card'
+                      ? 'card'
+                      : undefined
+                  }
                   calculating={calculating}
                   quoteError={quoteError}
                   onPaymentMethodSelect={handlePaymentMethodSelect}
@@ -382,16 +373,10 @@ export function Wallet(props: WalletProps) {
                   onRetryLoad={() => void refetchTopupInfo()}
                   usdExchangeRate={effectiveUsdExchangeRate}
                   onOpenBilling={() => setBillingDialogOpen(true)}
-                  creemProducts={topupInfo?.creem_products}
-                  enableCreemTopup={topupInfo?.enable_creem_topup}
-                  onCreemProductSelect={handleCreemProductSelect}
-                  enableWaffoTopup={topupInfo?.enable_waffo_topup}
-                  waffoPayMethods={topupInfo?.waffo_pay_methods}
-                  waffoMinTopup={topupInfo?.waffo_min_topup}
-                  onWaffoMethodSelect={handleWaffoMethodSelect}
-                  enableWaffoPancakeTopup={
-                    topupInfo?.enable_waffo_pancake_topup
-                  }
+                  paymentProducts={topupInfo?.payment_products}
+                  onPaymentProductSelect={handlePaymentProductSelect}
+                  paymentRouteOptions={topupInfo?.payment_route_options}
+                  onPaymentRouteOptionSelect={handlePaymentRouteOptionSelect}
                 />
               </div>
 
@@ -426,18 +411,9 @@ export function Wallet(props: WalletProps) {
         quoteError={quoteError}
         paymentMethod={selectedPaymentMethod}
         calculating={calculating}
-        processing={processing || pancakeProcessing}
+        processing={processing}
         discountRate={getDiscountRate()}
         usdExchangeRate={effectiveUsdExchangeRate}
-      />
-
-      <PaymentQrDialog
-        open={qrDialogOpen}
-        onOpenChange={setQrDialogOpen}
-        paymentStart={qrPaymentStart}
-        quote={quote}
-        onSettled={handlePaymentSettled}
-        onTrackPending={setReturnTradeNo}
       />
 
       <TransferDialog
@@ -453,16 +429,11 @@ export function Wallet(props: WalletProps) {
         onOpenChange={setBillingDialogOpen}
       />
 
-      <StripeLegacyInventoryDialog
-        open={stripeInventoryOpen}
-        onOpenChange={setStripeInventoryOpen}
-      />
-
       <CreemConfirmDialog
         open={creemDialogOpen}
         onOpenChange={setCreemDialogOpen}
         onConfirm={handleCreemConfirm}
-        product={selectedCreemProduct}
+        product={selectedPaymentProduct}
         processing={creemProcessing}
       />
     </>

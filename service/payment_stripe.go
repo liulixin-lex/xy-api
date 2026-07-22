@@ -30,6 +30,7 @@ const (
 	maxStripeWebhookBytes                = 1 << 20
 	maxStripeVerificationResponseBytes   = 64 << 10
 	stripeCheckoutSessionExpirySafetyGap = 5 * time.Minute
+	stripeCheckoutSessionMaxLifetime     = 24 * time.Hour
 )
 
 var (
@@ -39,6 +40,8 @@ var (
 	stripeConfigurationVerificationHTTPClient = newStripeConfigurationVerificationHTTPClient()
 	stripeLegacyWebhookModeWarn               sync.Once
 	errStripeCheckoutConfirmation             = errors.New("Stripe Checkout Session could not be confirmed against the configured account")
+	errStripeCheckoutWindowTooShort           = errors.New("Stripe Checkout Session cannot be created within the remaining local order window")
+	errStripeCheckoutWindowTooLong            = errors.New("Stripe Checkout Session exceeds Stripe's maximum allowed lifetime")
 )
 
 type stripePaymentProvider struct{}
@@ -165,9 +168,17 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 	if order.ProviderLivemode == nil || *order.ProviderLivemode != credentialLivemode {
 		return nil, errors.New("stripe order credential mode does not match the verified configuration")
 	}
+	// The local order owns the payment deadline. Stripe rejects expires_at less
+	// than 30 minutes in the future, so a queued task with too little remaining
+	// time must fail and require a fresh quote instead of extending the order.
+	expiresAt, err := stripeCheckoutExpiresAt(order.ExpiresAt, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
 	expectedFingerprint := StripeCheckoutConfigurationFingerprint(
 		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
 		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+		setting.StripeCheckoutAllowedHosts,
 	)
 	if expectedFingerprint == "" || setting.StripeConfigurationVerifiedFingerprint != expectedFingerprint {
 		return nil, errors.New("stripe checkout configuration has not been verified")
@@ -184,7 +195,7 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 		return nil, err
 	}
 	accountID := strings.TrimSpace(setting.StripeAccountId)
-	template, err := getStripePriceTemplate(ctx, setting.StripeApiSecret, accountID, setting.StripePriceId, order.Currency)
+	template, err := getStripePriceTemplate(ctx, setting.StripeApiSecret, accountID, setting.StripeCheckoutPriceTemplateID(), order.Currency)
 	if err != nil {
 		return nil, err
 	}
@@ -193,10 +204,6 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 	if err != nil {
 		return nil, err
 	}
-	// Stripe rejects expires_at values that are less than 30 minutes from the
-	// instant the API receives the request. Keep a deterministic margin for
-	// serialization, queueing, network, and clock skew.
-	expiresAt := time.Now().Add(30*time.Minute + stripeCheckoutSessionExpirySafetyGap).Unix()
 	params := &stripe.CheckoutSessionParams{
 		ClientReferenceID: stripe.String(order.TradeNo),
 		SuccessURL:        stripe.String(successURL),
@@ -237,7 +244,7 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 	if session == nil || session.ID == "" || session.URL == "" {
 		return nil, fmt.Errorf("%w: stripe returned an incomplete checkout session", ErrPaymentStateUnknown)
 	}
-	if err := validateStripeCheckoutURL(session.URL); err != nil {
+	if err := ValidateStripeCheckoutURL(session.URL, setting.StripeCheckoutAllowedHosts); err != nil {
 		return nil, err
 	}
 	providerOrderKey := "stripe:" + session.ID
@@ -247,13 +254,29 @@ func (p *stripePaymentProvider) Create(ctx context.Context, order *model.Payment
 	}, nil
 }
 
-func VerifyStripeCheckoutConfiguration(ctx context.Context, secret, credentialAccountID, connectedAccountID, priceID, currency, mode string) (string, error) {
+func stripeCheckoutExpiresAt(orderExpiresAt, now int64) (int64, error) {
+	minimum := now + int64((30*time.Minute+stripeCheckoutSessionExpirySafetyGap)/time.Second)
+	if orderExpiresAt < minimum {
+		return 0, errStripeCheckoutWindowTooShort
+	}
+	maximum := now + int64(stripeCheckoutSessionMaxLifetime/time.Second)
+	if orderExpiresAt > maximum {
+		return 0, errStripeCheckoutWindowTooLong
+	}
+	return orderExpiresAt, nil
+}
+
+func VerifyStripeCheckoutConfiguration(ctx context.Context, secret, credentialAccountID, connectedAccountID, priceID, currency, mode, allowedHosts string) (string, error) {
 	secret = strings.TrimSpace(secret)
 	credentialAccountID = strings.TrimSpace(credentialAccountID)
 	connectedAccountID = strings.TrimSpace(connectedAccountID)
 	priceID = strings.TrimSpace(priceID)
 	currency = strings.ToUpper(strings.TrimSpace(currency))
 	mode = strings.ToLower(strings.TrimSpace(mode))
+	allowedHosts, err := setting.NormalizeStripeCheckoutAllowedHosts(allowedHosts)
+	if err != nil {
+		return "", err
+	}
 	credentialMode, err := stripeCredentialModeForUse(secret)
 	if err != nil {
 		return "", err
@@ -270,26 +293,30 @@ func VerifyStripeCheckoutConfiguration(ctx context.Context, secret, credentialAc
 	if err := verifyStripeCheckoutWritePermission(ctx, secret, connectedAccountID, priceID); err != nil {
 		return "", err
 	}
-	fingerprint := StripeCheckoutConfigurationFingerprint(secret, credentialAccountID, connectedAccountID, priceID, currency, mode)
+	fingerprint := StripeCheckoutConfigurationFingerprint(secret, credentialAccountID, connectedAccountID, priceID, currency, mode, allowedHosts)
 	if fingerprint == "" {
 		return "", errors.New("Stripe checkout configuration fingerprint is invalid")
 	}
 	return fingerprint, nil
 }
 
-func StripeCheckoutConfigurationFingerprint(secret, credentialAccountID, connectedAccountID, priceID, currency, mode string) string {
+func StripeCheckoutConfigurationFingerprint(secret, credentialAccountID, connectedAccountID, priceID, currency, mode, allowedHosts string) string {
 	secret = strings.TrimSpace(secret)
 	credentialAccountID = strings.TrimSpace(credentialAccountID)
 	connectedAccountID = strings.TrimSpace(connectedAccountID)
 	priceID = strings.TrimSpace(priceID)
 	currency = strings.ToUpper(strings.TrimSpace(currency))
 	mode = strings.ToLower(strings.TrimSpace(mode))
+	allowedHosts, err := setting.NormalizeStripeCheckoutAllowedHosts(allowedHosts)
+	if err != nil {
+		return ""
+	}
 	if !validStripeSecret(secret) || !stripeAccountIDPattern.MatchString(credentialAccountID) ||
 		priceID == "" || currency == "" || mode != "test" && mode != "live" {
 		return ""
 	}
 	digest := sha256.New()
-	for _, value := range []string{secret, credentialAccountID, connectedAccountID, priceID, currency, mode} {
+	for _, value := range []string{secret, credentialAccountID, connectedAccountID, priceID, currency, mode, allowedHosts} {
 		_, _ = fmt.Fprintf(digest, "%d:%s|", len(value), value)
 	}
 	return hex.EncodeToString(digest.Sum(nil))
@@ -383,8 +410,12 @@ func stripeCheckoutReturnURLs(order *model.PaymentOrder) (string, string, error)
 			return "", "", err
 		}
 	}
-	successURL := PaymentReturnURL("/console/topup?payment_result=pending&trade_no=" + url.QueryEscape(order.TradeNo))
-	cancelURL := PaymentReturnURL("/console/topup?payment_result=cancelled&trade_no=" + url.QueryEscape(order.TradeNo))
+	firstPartyReturnURL, err := firstPartyPaymentReturnURL(order.TradeNo)
+	if err != nil {
+		return "", "", err
+	}
+	successURL := firstPartyReturnURL + "?payment_result=pending"
+	cancelURL := firstPartyReturnURL + "?payment_result=cancelled"
 	var snapshot stripeReturnURLSnapshot
 	if strings.TrimSpace(order.PricingSnapshot) != "" {
 		if err := common.UnmarshalJsonStr(order.PricingSnapshot, &snapshot); err != nil {
@@ -680,7 +711,7 @@ func (p *stripePaymentProvider) Query(ctx context.Context, order *model.PaymentO
 	session, err := p.getAndValidateCheckoutSession(ctx, contract)
 	if err != nil {
 		if errors.Is(err, errStripeCheckoutConfirmation) {
-			return nil, markStripeCheckoutContractMismatch(order.TradeNo)
+			return nil, stripeCheckoutContractMismatchError()
 		}
 		return nil, err
 	}
@@ -744,7 +775,7 @@ func (p *stripePaymentProvider) RecoverStart(ctx context.Context, order *model.P
 	session, err := p.getAndValidateCheckoutSession(ctx, contract)
 	if err != nil {
 		if errors.Is(err, errStripeCheckoutConfirmation) {
-			return nil, markStripeCheckoutContractMismatch(order.TradeNo)
+			return nil, stripeCheckoutContractMismatchError()
 		}
 		return nil, err
 	}
@@ -753,14 +784,13 @@ func (p *stripePaymentProvider) RecoverStart(ctx context.Context, order *model.P
 		session.ExpiresAt <= time.Now().Unix() || session.URL == "" {
 		return nil, errors.New("stripe checkout session has no recoverable URL")
 	}
-	if err := validateStripeCheckoutURL(session.URL); err != nil {
+	if err := ValidateStripeCheckoutURL(session.URL, setting.StripeCheckoutAllowedHosts); err != nil {
 		return nil, err
 	}
-	expiresAt := order.ExpiresAt
-	if session.ExpiresAt > 0 {
-		expiresAt = session.ExpiresAt
+	if order.ExpiresAt <= time.Now().Unix() {
+		return nil, errors.New("stripe checkout session has no recoverable local payment window")
 	}
-	return &PaymentStart{Flow: PaymentFlowHostedRedirect, URL: session.URL, ExpiresAt: expiresAt}, nil
+	return &PaymentStart{Flow: PaymentFlowHostedRedirect, URL: session.URL, ExpiresAt: order.ExpiresAt}, nil
 }
 
 func (p *stripePaymentProvider) getCheckoutSession(ctx context.Context, sessionID string) (*stripe.CheckoutSession, error) {
@@ -785,12 +815,7 @@ func (p *stripePaymentProvider) getAndValidateCheckoutSession(ctx context.Contex
 	return session, nil
 }
 
-func markStripeCheckoutContractMismatch(tradeNo string) error {
-	if err := model.MarkPaymentOrderManualReview(tradeNo,
-		"Stripe Checkout Session contract does not match this payment order; verify it manually"); err != nil &&
-		!errors.Is(err, model.ErrPaymentOrderNotFound) {
-		return err
-	}
+func stripeCheckoutContractMismatchError() error {
 	return fmt.Errorf("%w: Stripe Checkout Session contract mismatch", model.ErrPaymentManualReview)
 }
 
@@ -848,15 +873,17 @@ func validateStripeCheckoutSessionContract(session *stripe.CheckoutSession, cont
 	return nil
 }
 
-// confirmPaidCheckoutSession binds entitlement-granting webhook events to the
-// account authenticated by the configured Stripe API credential. A webhook
-// signing secret does not itself disclose which direct Stripe account issued
-// it, so signature verification alone cannot detect an accidentally paired
-// secret from another account. Checkout catalog readiness (Price, currency,
-// and its verification fingerprint) gates creation only: changing or disabling
-// that catalog must not prevent an already-paid Session from being confirmed.
-func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, event *NormalizedPaymentEvent) error {
-	if event == nil || !event.Paid || event.Provider != model.PaymentProviderStripe {
+// confirmCheckoutSessionAuthority binds one-time Checkout terminal events to
+// the account authenticated by the configured Stripe API credential. A
+// webhook signing secret does not itself disclose which direct Stripe account
+// issued it, so signature verification alone cannot detect an accidentally
+// paired secret from another account. Checkout catalog readiness (Price,
+// currency, and its verification fingerprint) gates creation only: changing
+// or disabling that catalog must not prevent an existing Session from being
+// authority-checked.
+func (p *stripePaymentProvider) confirmCheckoutSessionAuthority(ctx context.Context, event *NormalizedPaymentEvent) error {
+	if event == nil || event.Provider != model.PaymentProviderStripe ||
+		(!event.Paid && !event.Failed && !event.Expired) {
 		return nil
 	}
 	if event.ProviderLivemode == nil || !strings.HasPrefix(event.ProviderOrderKey, "stripe:cs_") ||
@@ -880,11 +907,11 @@ func (p *stripePaymentProvider) confirmPaidCheckoutSession(ctx context.Context, 
 		AmountMinor:                event.PaidAmountMinor,
 		Currency:                   event.Currency,
 		Livemode:                   credentialMode == "live",
-		RequirePaid:                true,
+		RequirePaid:                event.Paid,
 		ExpectedProviderPaymentKey: event.ProviderPaymentKey,
-		CompareProviderPaymentKey:  true,
+		CompareProviderPaymentKey:  event.Paid,
 		ExpectedCustomerID:         event.CustomerID,
-		CompareCustomerID:          true,
+		CompareCustomerID:          event.Paid,
 	})
 	if err != nil {
 		return errStripeCheckoutConfirmation
@@ -981,13 +1008,25 @@ func stripeCredentialModeForUse(secret string) (string, error) {
 	return mode, nil
 }
 
-func validateStripeCheckoutURL(raw string) error {
+// ValidateStripeCheckoutURL applies the same fail-closed redirect policy during
+// provider creation, recovery, and the authenticated /continue handoff.
+func ValidateStripeCheckoutURL(raw, allowedHosts string) error {
 	if err := ValidateExternalPaymentURL(raw, false); err != nil {
 		return err
 	}
 	u, _ := url.Parse(raw)
+	if u.User != nil || u.Port() != "" {
+		return errors.New("unexpected stripe checkout URL authority")
+	}
 	host := strings.ToLower(u.Hostname())
-	if host != "checkout.stripe.com" && !strings.HasSuffix(host, ".stripe.com") {
+	if strings.HasSuffix(host, ".stripe.com") {
+		return nil
+	}
+	hostSet, err := setting.StripeCheckoutAllowedHostSet(allowedHosts)
+	if err != nil {
+		return errors.New("invalid stripe checkout host policy")
+	}
+	if _, ok := hostSet[host]; !ok {
 		return errors.New("unexpected stripe checkout host")
 	}
 	return nil

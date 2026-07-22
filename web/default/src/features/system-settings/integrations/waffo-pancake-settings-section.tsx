@@ -20,6 +20,7 @@ import * as React from 'react'
 import type { SetStateAction } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -31,19 +32,29 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import type { StartVerificationOptions } from '@/features/auth/secure-verification'
+
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../payment-admin-errors'
 import { removeTrailingSlash } from './utils'
 import {
   type CatalogStore,
-  type PairOrphanError,
+  type PairFailureParams,
   type PairResult,
   createWaffoPancakePair,
   listWaffoPancakeCatalog,
 } from './waffo-pancake-api'
+import { getWaffoPancakePricingError } from './waffo-pancake-pricing'
 
 export type WaffoPancakeSettingsValues = {
   WaffoPancakeMerchantID: string
   WaffoPancakePrivateKey: string
   WaffoPancakeReturnURL: string
+  WaffoPancakeUnitPrice: number
+  WaffoPancakeMinTopUp: number
+  WaffoPancakeTestMode: boolean
 }
 
 export interface WaffoPancakeBinding {
@@ -61,6 +72,11 @@ interface Props {
   selectedBinding: WaffoPancakeBinding
   savedBinding: WaffoPancakeBinding
   onSelectedBindingChange: (value: SetStateAction<WaffoPancakeBinding>) => void
+  withVerification: <T>(
+    apiCall: () => Promise<T>,
+    config?: StartVerificationOptions
+  ) => Promise<T | null>
+  emergencyControl?: React.ReactNode
 }
 
 const PANCAKE_DASHBOARD_URL = 'https://pancake.waffo.ai/merchant/dashboard'
@@ -75,6 +91,8 @@ export function WaffoPancakeSettingsSection({
   selectedBinding,
   savedBinding,
   onSelectedBindingChange,
+  withVerification,
+  emergencyControl,
 }: Props) {
   const { t } = useTranslation()
 
@@ -86,6 +104,10 @@ export function WaffoPancakeSettingsSection({
   const storeID = savedBinding.storeID
   const productID = savedBinding.productID
   const returnURL = values.WaffoPancakeReturnURL
+  const pricingError = getWaffoPancakePricingError(
+    values.WaffoPancakeUnitPrice,
+    values.WaffoPancakeMinTopUp
+  )
 
   const initialRef = React.useRef(defaultValues)
   const defaultsSignature = React.useMemo(
@@ -93,9 +115,6 @@ export function WaffoPancakeSettingsSection({
     [defaultValues]
   )
 
-  // "merchantID|privateKey" of the last verified pair; debounced verify
-  // skips when nothing changed.
-  const lastVerifiedSignature = React.useRef('')
   const fetchSerialRef = React.useRef(0)
 
   // Mount-only — never re-sync from props after the first render. The
@@ -107,7 +126,6 @@ export function WaffoPancakeSettingsSection({
     initialRef.current = parsed
     if (didMountRef.current) return
     didMountRef.current = true
-    lastVerifiedSignature.current = `${parsed.WaffoPancakeMerchantID.trim()}|${parsed.WaffoPancakePrivateKey.trim()}`
   }, [defaultsSignature])
 
   const productsForChosenStore = React.useMemo(() => {
@@ -141,116 +159,80 @@ export function WaffoPancakeSettingsSection({
     return items
   }, [productsForChosenStore, chosenProductID])
 
-  // Verifies typed creds against Pancake (via /catalog) and refreshes the
-  // dropdown options. `preselect` overrides the post-load anchor selection;
-  // omitting it defaults to: saved binding → first store with products.
-  const verifyAndFetchCatalog = React.useCallback(
+  // Refreshes the catalog after step-up verification. `preselect` overrides
+  // the post-load anchor selection; omitting it defaults to the saved binding
+  // or the first store with an available product.
+  const fetchCatalog = React.useCallback(
     async (
       merchantID: string,
       privateKey: string,
       preselect?: { storeID?: string; productID?: string }
     ) => {
       const serial = ++fetchSerialRef.current
-      let stores: CatalogStore[]
+      setPhase('verifying')
       try {
         const body = await listWaffoPancakeCatalog(merchantID, privateKey)
-        if (serial !== fetchSerialRef.current) return
-        if (
-          body?.message === 'success' &&
-          typeof body.data === 'object' &&
-          body.data
-        ) {
-          stores = (body.data as { stores: CatalogStore[] }).stores ?? []
-        } else {
-          const reason = typeof body?.data === 'string' ? body.data : undefined
-          toast.error(
-            reason
-              ? `${t('Credentials verification failed')}: ${reason}`
-              : t(
-                  'Credentials verification failed — double-check Merchant ID and API private key.'
-                )
+        if (serial !== fetchSerialRef.current) return false
+        if (!body.success || !body.data) {
+          const error = createPaymentAdminError(
+            body,
+            t('Credentials verification failed')
           )
-          setPhase('idle')
-          return
+          throw new Error(
+            getPaymentAdminErrorMessage(
+              error,
+              t,
+              t('Credentials verification failed')
+            )
+          )
         }
-      } catch (err) {
-        if (serial !== fetchSerialRef.current) return
-        toast.error(
-          `${t('Credentials verification failed')}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        )
-        setPhase('idle')
-        return
-      }
-      if (serial !== fetchSerialRef.current) return
+        const stores = body.data.stores ?? []
 
-      setCatalog(stores)
-      if (preselect) {
-        onSelectedBindingChange({
-          storeID: preselect.storeID ?? '',
-          productID: preselect.productID ?? '',
-        })
-      } else {
-        // Default anchor: bound product if found, else first product of
-        // the first store with any — saves a click for new operators.
-        const boundStore = stores.find((s) =>
-          s.onetimeProducts.some((p) => p.id === productID)
-        )
-        if (boundStore && productID) {
+        setCatalog(stores)
+        if (preselect) {
           onSelectedBindingChange({
-            storeID: boundStore.id,
-            productID,
+            storeID: preselect.storeID ?? '',
+            productID: preselect.productID ?? '',
           })
         } else {
-          const storeWithProducts = stores.find(
-            (s) => s.onetimeProducts.length > 0
+          const boundStore = stores.find((store) =>
+            store.onetimeProducts.some((product) => product.id === productID)
           )
-          if (storeWithProducts) {
+          if (boundStore && productID) {
             onSelectedBindingChange({
-              storeID: storeWithProducts.id,
-              productID: storeWithProducts.onetimeProducts[0].id,
+              storeID: boundStore.id,
+              productID,
             })
           } else {
-            onSelectedBindingChange({ storeID: '', productID: '' })
+            const storeWithProducts = stores.find(
+              (store) => store.onetimeProducts.length > 0
+            )
+            if (storeWithProducts) {
+              onSelectedBindingChange({
+                storeID: storeWithProducts.id,
+                productID: storeWithProducts.onetimeProducts[0].id,
+              })
+            } else {
+              onSelectedBindingChange({ storeID: '', productID: '' })
+            }
           }
         }
+        return true
+      } catch (error) {
+        if (serial !== fetchSerialRef.current) return false
+        throw new Error(
+          getPaymentAdminErrorMessage(
+            error,
+            t,
+            t('Credentials verification failed')
+          )
+        )
+      } finally {
+        if (serial === fetchSerialRef.current) setPhase('idle')
       }
-      setPhase('idle')
     },
     [onSelectedBindingChange, productID, t]
   )
-
-  const watchedMerchantID = values.WaffoPancakeMerchantID || ''
-  const watchedPrivateKey = values.WaffoPancakePrivateKey || ''
-  React.useEffect(() => {
-    const m = watchedMerchantID.trim()
-    const k = watchedPrivateKey.trim()
-    if (!m || !k) return
-    const signature = `${m}|${k}`
-    if (signature === lastVerifiedSignature.current) return
-    const timer = setTimeout(() => {
-      lastVerifiedSignature.current = signature
-      setPhase('verifying')
-      void verifyAndFetchCatalog(m, k)
-    }, 800)
-    return () => clearTimeout(timer)
-  }, [watchedMerchantID, watchedPrivateKey, verifyAndFetchCatalog])
-
-  // Initial-load verify: GET /api/option/ strips PrivateKey so a returning
-  // admin opens the page with empty key. Send blank creds in the body —
-  // the catalog controller falls back to the persisted OptionMap creds.
-  const initialLoadRef = React.useRef(false)
-  React.useEffect(() => {
-    if (initialLoadRef.current) return
-    if (!defaultValues.WaffoPancakeMerchantID.trim()) return
-    initialLoadRef.current = true
-    const timer = window.setTimeout(() => {
-      setPhase('verifying')
-      void verifyAndFetchCatalog('', '')
-    }, 0)
-    return () => window.clearTimeout(timer)
-  }, [defaultValues.WaffoPancakeMerchantID, verifyAndFetchCatalog])
 
   // Returns typed creds when the operator edited either field; otherwise
   // blanks so the backend falls back to persisted creds. Without this,
@@ -263,6 +245,31 @@ export function WaffoPancakeSettingsSection({
     const edited = formMerchant !== saved || formKey.length > 0
     if (!edited) return { merchantID: '', privateKey: '' }
     return { merchantID: formMerchant, privateKey: formKey }
+  }
+
+  const verifyAndFetchCatalog = async () => {
+    if (!credsReady) {
+      toast.error(
+        t('Fill in both Merchant ID and API Private Key before creating.')
+      )
+      return
+    }
+    const { merchantID, privateKey } = readCreds()
+    try {
+      await withVerification(() => fetchCatalog(merchantID, privateKey), {
+        preferredMethod: 'passkey',
+        title: t('Verify payment settings update'),
+        description: t(
+          'Confirm your identity before changing payment credentials or gateway configuration.'
+        ),
+      })
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t('Credentials verification failed')
+      )
+    }
   }
 
   // The minted product's SuccessURL is pinned to the current Return URL
@@ -287,54 +294,52 @@ export function WaffoPancakeSettingsSection({
         return
       }
     }
-    setCreatingPair(true)
     try {
-      const body = await createWaffoPancakePair({
-        merchantID,
-        privateKey,
-        returnURL: trimmedReturn,
-      })
-      if (
-        body?.message === 'success' &&
-        typeof body.data === 'object' &&
-        body.data
-      ) {
-        const created = body.data as PairResult
-        // Refetch from GraphQL rather than trusting the response body so the
-        // dropdowns reflect authoritative state, then anchor on minted IDs.
-        setPhase('verifying')
-        await verifyAndFetchCatalog(merchantID, privateKey, {
-          storeID: created.store_id,
-          productID: created.product_id,
-        })
-        toast.success(
-          `${t('Store + product created')}: ${created.store_id} / ${created.product_id}`
-        )
-        return
-      }
-      const errData =
-        body && typeof body.data === 'object' && body.data !== null
-          ? (body.data as PairOrphanError)
-          : null
-      if (errData?.orphan_store && errData.store_id) {
-        setPhase('verifying')
-        await verifyAndFetchCatalog(merchantID, privateKey, {
-          storeID: errData.store_id,
-          productID: '',
-        })
-      }
-      const reason =
-        errData?.error ??
-        (typeof body?.data === 'string' ? body.data : undefined)
-      toast.error(
-        reason ? `${t('Creation failed')}: ${reason}` : t('Creation failed')
+      await withVerification(
+        async () => {
+          setCreatingPair(true)
+          try {
+            const body = await createWaffoPancakePair({
+              merchantID,
+              privateKey,
+              returnURL: trimmedReturn,
+            })
+            if (!body.success || !body.data) {
+              const failure = body.params as PairFailureParams | undefined
+              if (failure?.orphan_store && failure.store_id) {
+                await fetchCatalog(merchantID, privateKey, {
+                  storeID: failure.store_id,
+                  productID: '',
+                })
+              }
+              const error = createPaymentAdminError(body, t('Creation failed'))
+              throw new Error(
+                getPaymentAdminErrorMessage(error, t, t('Creation failed'))
+              )
+            }
+            const created = body.data as PairResult
+            await fetchCatalog(merchantID, privateKey, {
+              storeID: created.store_id,
+              productID: created.product_id,
+            })
+            toast.success(
+              `${t('Store + product created')}: ${created.store_id} / ${created.product_id}`
+            )
+            return body
+          } finally {
+            setCreatingPair(false)
+          }
+        },
+        {
+          preferredMethod: 'passkey',
+          title: t('Verify payment settings update'),
+          description: t(
+            'Confirm your identity before changing payment credentials or gateway configuration.'
+          ),
+        }
       )
-    } catch (err) {
-      toast.error(
-        `${t('Creation failed')}: ${err instanceof Error ? err.message : String(err)}`
-      )
-    } finally {
-      setCreatingPair(false)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('Creation failed'))
     }
   }
 
@@ -344,6 +349,8 @@ export function WaffoPancakeSettingsSection({
   // which case the backend falls back to persisted creds. Otherwise we
   // require both fields filled (mixed states would fail signature check).
   const savedMerchantID = (defaultValues.WaffoPancakeMerchantID || '').trim()
+  const watchedMerchantID = values.WaffoPancakeMerchantID || ''
+  const watchedPrivateKey = values.WaffoPancakePrivateKey || ''
   const formMerchantID = watchedMerchantID.trim()
   const formPrivateKey = watchedPrivateKey.trim()
   const credsEdited =
@@ -363,11 +370,11 @@ export function WaffoPancakeSettingsSection({
     )
   } else if (hasCatalog) {
     bindStatusMessage = t(
-      'Mint a fresh pair below — or pick an existing one further down. Click Save when ready.'
+      'Create a new pair below or choose an existing one. Save when the selection is ready.'
     )
   } else {
     bindStatusMessage = t(
-      'No stores on this merchant yet. Set a return URL and click Create to mint your first pair.'
+      'Verify credentials to load stores, or create a new store and product.'
     )
   }
 
@@ -442,9 +449,122 @@ export function WaffoPancakeSettingsSection({
             className='font-mono text-xs'
           />
           <p className='text-muted-foreground text-xs'>
+            {t('Leave this field blank to keep the saved signing private key.')}
+          </p>
+        </div>
+
+        <div className='grid gap-1.5'>
+          <Label>{t('Payment environment')}</Label>
+          <Select
+            items={[
+              { value: 'production', label: t('Production') },
+              { value: 'test', label: t('Test') },
+            ]}
+            value={values.WaffoPancakeTestMode ? 'test' : 'production'}
+            onValueChange={(value) =>
+              onValueChange('WaffoPancakeTestMode', value === 'test')
+            }
+          >
+            <SelectTrigger className='w-full'>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='production'>{t('Production')}</SelectItem>
+              <SelectItem value='test'>{t('Test')}</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className='text-muted-foreground text-xs'>
             {t(
-              'The environment (test vs production) is decided by the key you paste here — use the Test key while integrating, then swap to the Production key when going live.'
+              'Choose the environment that matches the Waffo Pancake merchant account, signing private key, and webhook URL. A mismatch is treated as a payment anomaly and sent to manual review.'
             )}
+          </p>
+        </div>
+
+        <div className='grid gap-1.5'>
+          <Label htmlFor='waffo-pancake-unit-price'>
+            {t('USD base price multiplier')}
+          </Label>
+          <Input
+            id='waffo-pancake-unit-price'
+            type='number'
+            min='0.000001'
+            max='1000000'
+            step='0.01'
+            inputMode='decimal'
+            value={
+              Number.isFinite(values.WaffoPancakeUnitPrice)
+                ? values.WaffoPancakeUnitPrice
+                : ''
+            }
+            onChange={(event) =>
+              onValueChange(
+                'WaffoPancakeUnitPrice',
+                event.target.value === ''
+                  ? Number.NaN
+                  : Number(event.target.value)
+              )
+            }
+            aria-invalid={pricingError === 'unit_price'}
+            aria-describedby='waffo-pancake-unit-price-help'
+          />
+          <p
+            id='waffo-pancake-unit-price-help'
+            className={
+              pricingError === 'unit_price'
+                ? 'text-destructive text-xs'
+                : 'text-muted-foreground text-xs'
+            }
+          >
+            {pricingError === 'unit_price'
+              ? t(
+                  'Enter a multiplier greater than 0 and no more than 1,000,000.'
+                )
+              : t(
+                  'Positive multiplier applied to the USD base price to calculate the settlement amount for wallet top-ups and fixed-term purchases.'
+                )}
+          </p>
+        </div>
+
+        <div className='grid gap-1.5'>
+          <Label htmlFor='waffo-pancake-min-top-up'>
+            {t('Minimum wallet top-up (USD)')}
+          </Label>
+          <Input
+            id='waffo-pancake-min-top-up'
+            type='number'
+            min='1'
+            max='10000'
+            step='1'
+            inputMode='numeric'
+            value={
+              Number.isFinite(values.WaffoPancakeMinTopUp)
+                ? values.WaffoPancakeMinTopUp
+                : ''
+            }
+            onChange={(event) =>
+              onValueChange(
+                'WaffoPancakeMinTopUp',
+                event.target.value === ''
+                  ? Number.NaN
+                  : Number(event.target.value)
+              )
+            }
+            aria-invalid={pricingError === 'min_top_up'}
+            aria-describedby='waffo-pancake-min-top-up-help'
+          />
+          <p
+            id='waffo-pancake-min-top-up-help'
+            className={
+              pricingError === 'min_top_up'
+                ? 'text-destructive text-xs'
+                : 'text-muted-foreground text-xs'
+            }
+          >
+            {pricingError === 'min_top_up'
+              ? t('Enter a whole-dollar minimum between 1 and 10,000.')
+              : t(
+                  'Smallest wallet top-up amount a user can enter, measured in USD. It does not set a minimum for fixed-term purchases.'
+                )}
           </p>
         </div>
 
@@ -464,6 +584,18 @@ export function WaffoPancakeSettingsSection({
               {t('Bind a Pancake store + product')}
             </h4>
             <p className='text-muted-foreground text-xs'>{bindStatusMessage}</p>
+            <Button
+              type='button'
+              variant='outline'
+              className='mt-3 min-h-11'
+              onClick={() => void verifyAndFetchCatalog()}
+              disabled={verifying || creatingPair || !credsReady}
+              aria-busy={verifying}
+            >
+              {verifying
+                ? t('Verifying credentials...')
+                : t('Verify credentials and load catalog')}
+            </Button>
           </div>
 
           {/*
@@ -616,6 +748,7 @@ export function WaffoPancakeSettingsSection({
           </div>
         </div>
       </div>
+      {emergencyControl}
     </div>
   )
 }

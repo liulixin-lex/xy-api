@@ -25,7 +25,6 @@ import {
   Typography,
   Empty,
   Input,
-  Tag,
 } from '@douyinfe/semi-ui';
 import {
   IllustrationNoResult,
@@ -34,35 +33,23 @@ import {
 import { Coins } from 'lucide-react';
 import { IconSearch } from '@douyinfe/semi-icons';
 import { API, timestamp2string } from '../../../helpers';
-import { isAdmin } from '../../../helpers/utils';
 import { useIsMobile } from '../../../hooks/common/useIsMobile';
-import { formatPaymentMinor } from '../payment-utils';
+import {
+  formatPaymentDecimal,
+  getPublicPaymentMethodLabel,
+  normalizePublicTopupRecord,
+  normalizePublicPaymentStatus,
+} from '../payment-utils';
 const { Text } = Typography;
 
 // 状态映射配置
-const STATUS_CONFIG = {
-  success: { type: 'success', key: '成功' },
-  pending: { type: 'warning', key: '待支付' },
-  processing: { type: 'primary', key: '处理中' },
-  failed: { type: 'danger', key: '失败' },
-  expired: { type: 'danger', key: '已过期' },
-  manual_review: { type: 'warning', key: '人工复核' },
-  refunded: { type: 'tertiary', key: '已退款' },
-  refund_pending: { type: 'warning', key: '部分退款' },
-  disputed: { type: 'danger', key: '争议中' },
-  debt: { type: 'danger', key: '欠款冻结' },
-};
-
-// 支付方式映射
-const PAYMENT_METHOD_MAP = {
-  stripe: 'Stripe',
-  creem: 'Creem',
-  waffo: 'Waffo',
-  waffo_pancake: 'Waffo Pancake',
-  xorpay_native: 'XORPay 微信支付',
-  xorpay_alipay: 'XORPay 支付宝',
-  alipay: '支付宝',
-  wxpay: '微信',
+const PUBLIC_STATUS_CONFIG = {
+  preparing: { type: 'primary', key: '支付准备中' },
+  awaiting_payment: { type: 'warning', key: '等待支付' },
+  confirming: { type: 'primary', key: '确认中' },
+  succeeded: { type: 'success', key: '支付成功' },
+  expired: { type: 'warning', key: '已过期' },
+  temporarily_unavailable: { type: 'danger', key: '暂时不可用' },
 };
 
 const TopupHistoryModal = ({ visible, onCancel, t }) => {
@@ -85,23 +72,31 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
     setLoading(true);
     setError('');
     try {
-      const base = isAdmin() ? '/api/user/topup' : '/api/user/topup/self';
+      const base = '/api/user/topup/self';
       const qs =
         `p=${currentPage}&page_size=${currentPageSize}` +
         (debouncedKeyword
           ? `&keyword=${encodeURIComponent(debouncedKeyword)}`
           : '');
       const endpoint = `${base}?${qs}`;
-      const res = await API.get(endpoint, { signal: controller.signal });
+      const res = await API.get(endpoint, {
+        signal: controller.signal,
+        skipErrorHandler: true,
+      });
       if (sequence !== requestRef.current.sequence) return;
-      const { success, message, data } = res.data;
+      const { success, data } = res.data;
       if (success) {
-        setTopups(data.items || []);
+        const safeItems = Array.isArray(data?.items)
+          ? data.items
+              .map(normalizePublicTopupRecord)
+              .filter((item) => item !== null)
+          : [];
+        setTopups(safeItems);
         setTotal(data.total || 0);
       } else {
         setTopups([]);
         setTotal(0);
-        setError(message || t('加载账单失败'));
+        setError(t('加载账单失败'));
       }
     } catch (requestError) {
       if (requestError?.code === 'ERR_CANCELED') return;
@@ -145,8 +140,14 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
   };
 
   // 渲染状态徽章
-  const renderStatusBadge = (status) => {
-    const config = STATUS_CONFIG[status] || { type: 'primary', key: status };
+  const renderStatusBadge = (status, record) => {
+    const publicStatus = normalizePublicPaymentStatus({
+      status_code: record?.status_code,
+      status,
+    });
+    const config =
+      PUBLIC_STATUS_CONFIG[publicStatus] ||
+      PUBLIC_STATUS_CONFIG.temporarily_unavailable;
     return (
       <span className='flex items-center gap-2'>
         <Badge dot type={config.type} />
@@ -156,57 +157,25 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
   };
 
   // 渲染支付方式
-  const renderPaymentMethod = (pm) => {
-    const displayName = PAYMENT_METHOD_MAP[pm];
-    return <Text>{displayName ? t(displayName) : pm || '-'}</Text>;
-  };
-
-  const isSubscriptionTopup = (record) => {
-    if (record?.order_kind) return record.order_kind === 'subscription';
-    const tradeNo = (record?.trade_no || '').toLowerCase();
-    return Number(record?.amount || 0) === 0 && tradeNo.startsWith('sub');
+  const renderPaymentMethod = (pm, record) => {
+    return <Text>{getPublicPaymentMethodLabel(record, t)}</Text>;
   };
 
   const formatPayment = (record) => {
-    if (typeof record?.expected_amount_minor !== 'number') {
-      return `¥${Number(record?.money || 0).toFixed(2)}`;
-    }
-    const minor = record.paid_amount_minor || record.expected_amount_minor;
-    return formatPaymentMinor(
-      minor,
-      record.currency,
-      record.payment_provider || record.provider,
+    return formatPaymentDecimal(
+      record?.payment_amount,
+      record?.currency,
+      record?.public_method,
     );
   };
 
-  // 检查是否为管理员
-  const userIsAdmin = useMemo(() => isAdmin(), []);
-
   const columns = useMemo(() => {
     const baseColumns = [
-      ...(userIsAdmin
-        ? [
-            {
-              title: t('用户ID'),
-              dataIndex: 'user_id',
-              key: 'user_id',
-              render: (userId) => <Text>{userId ?? '-'}</Text>,
-            },
-          ]
-        : []),
       {
         title: t('订单号'),
         dataIndex: 'trade_no',
         key: 'trade_no',
         render: (text) => <Text copyable>{text}</Text>,
-      },
-      {
-        title: t('支付网关'),
-        dataIndex: 'payment_provider',
-        key: 'payment_provider',
-        render: (_, record) => (
-          <Text>{record.payment_provider || record.provider || '-'}</Text>
-        ),
       },
       {
         title: t('支付方式'),
@@ -218,21 +187,12 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         title: t('充值额度'),
         dataIndex: 'amount',
         key: 'amount',
-        render: (amount, record) => {
-          if (isSubscriptionTopup(record)) {
-            return (
-              <Tag color='purple' shape='circle' size='small'>
-                {t('订阅套餐')}
-              </Tag>
-            );
-          }
-          return (
-            <span className='flex items-center gap-1'>
-              <Coins size={16} />
-              <Text>{amount}</Text>
-            </span>
-          );
-        },
+        render: (amount) => (
+          <span className='flex items-center gap-1'>
+            <Coins size={16} />
+            <Text>{amount}</Text>
+          </span>
+        ),
       },
       {
         title: t('支付金额'),
@@ -246,19 +206,19 @@ const TopupHistoryModal = ({ visible, onCancel, t }) => {
         title: t('状态'),
         dataIndex: 'status',
         key: 'status',
-        render: renderStatusBadge,
+        render: (status, record) => renderStatusBadge(status, record),
       },
     ];
 
     baseColumns.push({
       title: t('创建时间'),
-      dataIndex: 'create_time',
-      key: 'create_time',
+      dataIndex: 'created_at',
+      key: 'created_at',
       render: (time) => timestamp2string(time),
     });
 
     return baseColumns;
-  }, [t, userIsAdmin]);
+  }, [t]);
 
   return (
     <Modal

@@ -16,19 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { formatNumber } from '@/lib/format'
-import { Button } from '@/components/ui/button'
+
 import { Dialog } from '@/components/dialog'
-import { formatCreemPrice } from '../../lib/format'
-import type { CreemProduct } from '../../types'
+import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
+import { formatNumber } from '@/lib/format'
+
+import { formatPaymentDecimalAmount } from '../../lib/billing'
+import type { PaymentProduct } from '../../types'
 
 interface CreemConfirmDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onConfirm: () => void
-  product: CreemProduct | null
+  product: PaymentProduct | null
   processing: boolean
 }
 
@@ -47,7 +49,7 @@ export function CreemConfirmDialog({
     <Dialog
       open={open}
       onOpenChange={onOpenChange}
-      title={t('Confirm Creem Purchase')}
+      title={t('Confirm purchase')}
       description={t('Review your purchase details before proceeding.')}
       contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-[425px]'
       footerClassName='grid grid-cols-2 gap-2 sm:flex'
@@ -62,8 +64,12 @@ export function CreemConfirmDialog({
           >
             {t('Cancel')}
           </Button>
-          <Button onClick={onConfirm} disabled={processing}>
-            {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
+          <Button
+            onClick={onConfirm}
+            disabled={processing}
+            aria-busy={processing}
+          >
+            {processing && <Spinner aria-label={t('Preparing payment')} />}
             {t('Confirm Payment')}
           </Button>
         </>
@@ -75,14 +81,19 @@ export function CreemConfirmDialog({
           <span className='font-medium'>{product.name}</span>
         </div>
         <div className='flex items-center justify-between'>
-          <span className='text-muted-foreground'>{t('Price')}</span>
+          <span className='text-muted-foreground'>{t('Amount Due')}</span>
           <span className='text-primary font-medium'>
-            {formatCreemPrice(product.price, product.currency)}
+            {formatPaymentDecimalAmount(
+              product.payment_amount,
+              product.currency
+            )}
           </span>
         </div>
         <div className='flex items-center justify-between'>
           <span className='text-muted-foreground'>{t('Quota')}</span>
-          <span className='font-medium'>{formatNumber(product.quota)}</span>
+          <span className='font-medium'>
+            {formatNumber(product.top_up_amount)}
+          </span>
         </div>
       </div>
     </Dialog>

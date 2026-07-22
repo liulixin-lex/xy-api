@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,6 +30,23 @@ func TestPaymentReturnURLSupportsDefaultAndClassicThemes(t *testing.T) {
 		"https://example.com/console/topup?payment_result=pending&trade_no=PO123",
 		PaymentReturnURL("/console/topup?payment_result=pending&trade_no=PO123"),
 	)
+}
+
+func TestFirstPartyPaymentReturnURLIsThemeIndependent(t *testing.T) {
+	originalTheme := common.GetTheme()
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	t.Cleanup(func() {
+		common.SetTheme(originalTheme)
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
+	})
+	operation_setting.CustomCallbackAddress = "https://payments.example.com/"
+
+	for _, theme := range []string{"default", "classic"} {
+		common.SetTheme(theme)
+		paymentURL, err := firstPartyPaymentReturnURL("PO/return path")
+		require.NoError(t, err)
+		assert.Equal(t, "https://payments.example.com/payment/PO%2Freturn%20path", paymentURL)
+	}
 }
 
 func TestValidatePaymentCallbackOriginRejectsPathsAndInsecureRemoteOrigins(t *testing.T) {
@@ -72,8 +90,14 @@ func TestValidatePaymentCallbackOriginRejectsPathsAndInsecureRemoteOrigins(t *te
 
 func TestValidateExternalPaymentURLAllowsOnlyHTTPSOrLocalHTTP(t *testing.T) {
 	require.NoError(t, ValidateExternalPaymentURL("https://payments.example.com/callback", true))
+	require.NoError(t, ValidateExternalPaymentURL("https://[2606:4700:4700::1111]:443/callback", true))
 	require.NoError(t, ValidateExternalPaymentURL("http://localhost:3000/callback", true))
 	assert.Error(t, ValidateExternalPaymentURL("http://payments.example.com/callback", true))
 	assert.Error(t, ValidateExternalPaymentURL("ftp://localhost/callback", true))
 	assert.Error(t, ValidateExternalPaymentURL("javascript://localhost/callback", true))
+	assert.Error(t, ValidateExternalPaymentURL("https://example.com;script-src/callback", true))
+	assert.Error(t, ValidateExternalPaymentURL("https://exa_mple.com/callback", true))
+	assert.Error(t, ValidateExternalPaymentURL("https://payments.example.com:70000/callback", true))
+	assert.Error(t, ValidateExternalPaymentURL("https://user@payments.example.com/callback", true))
+	assert.Error(t, ValidateExternalPaymentURL("https://payments.example.com/callback#fragment", true))
 }

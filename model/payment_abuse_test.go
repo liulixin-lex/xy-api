@@ -106,6 +106,8 @@ func TestPaymentQuoteCleanupRetainsShortAuditWindow(t *testing.T) {
 func TestPaymentOrderCapacityIsPerUserAndProviderAndRetriesDoNotCount(t *testing.T) {
 	truncateTables(t)
 	const userID = 974104
+	seedPaymentUser(t, userID, 0)
+	seedPaymentUser(t, 974105, 0)
 	now := time.Now().Unix()
 	orders := make([]*PaymentOrder, 0, PaymentMaxInFlightOrdersPerUserProvider)
 	for index := 0; index < PaymentMaxInFlightOrdersPerUserProvider; index++ {
@@ -142,6 +144,7 @@ func TestPaymentOrderCapacityIsPerUserAndProviderAndRetriesDoNotCount(t *testing
 func TestConcurrentEquivalentQuotesWithSameRequestReturnOneOrder(t *testing.T) {
 	truncateTables(t)
 	const userID = 974106
+	seedPaymentUser(t, userID, 0)
 	now := time.Now().Unix()
 	firstQuote := createAbuseTestQuote(t, userID, PaymentProviderEpay, 10, now+3600)
 	secondQuote := createAbuseTestQuote(t, userID, PaymentProviderEpay, 10, now+3601)

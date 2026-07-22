@@ -36,10 +36,16 @@ import {
   removeTrailingSlash,
   showError,
   showSuccess,
+  showWarning,
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, TriangleAlert } from 'lucide-react';
 import { getSafePaymentIconUrl } from '../../../components/topup/payment-utils';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
+import RetainedCredentialEmergencyControl from './RetainedCredentialEmergencyControl';
 
 const { Text } = Typography;
 const toBoolean = (value) => value === true || value === 'true';
@@ -63,6 +69,8 @@ export default function SettingsPaymentGatewayWaffo(props) {
     WaffoMinTopUp: 1,
     WaffoNotifyUrl: '',
     WaffoReturnUrl: '',
+    WaffoWebRedirectHosts: '',
+    WaffoAppRedirectSchemes: '',
   });
   const formApiRef = useRef(null);
   const iconFileInputRef = useRef(null);
@@ -124,6 +132,8 @@ export default function SettingsPaymentGatewayWaffo(props) {
         WaffoMinTopUp: parseInt(props.options.WaffoMinTopUp) || 1,
         WaffoNotifyUrl: props.options.WaffoNotifyUrl || '',
         WaffoReturnUrl: props.options.WaffoReturnUrl || '',
+        WaffoWebRedirectHosts: props.options.WaffoWebRedirectHosts || '',
+        WaffoAppRedirectSchemes: props.options.WaffoAppRedirectSchemes || '',
       };
       setInputs(currentInputs);
       formApiRef.current.setValues(currentInputs);
@@ -172,6 +182,8 @@ export default function SettingsPaymentGatewayWaffo(props) {
         WaffoMinTopUp: minTopUp,
         WaffoNotifyUrl: (inputs.WaffoNotifyUrl || '').trim(),
         WaffoReturnUrl: (inputs.WaffoReturnUrl || '').trim(),
+        WaffoWebRedirectHosts: (inputs.WaffoWebRedirectHosts || '').trim(),
+        WaffoAppRedirectSchemes: (inputs.WaffoAppRedirectSchemes || '').trim(),
         WaffoPayMethods: JSON.stringify(waffoPayMethods),
       };
 
@@ -201,7 +213,6 @@ export default function SettingsPaymentGatewayWaffo(props) {
           { skipErrorHandler: true },
         );
         if (response.data?.success) {
-          showSuccess(t('更新成功'));
           const nextInputs = {
             ...inputs,
             WaffoApiKey: '',
@@ -211,14 +222,19 @@ export default function SettingsPaymentGatewayWaffo(props) {
           };
           setInputs(nextInputs);
           formApiRef.current?.setValues(nextInputs);
-          await props.refresh?.(response.data?.data?.version);
+          const refreshed = await props.refresh?.(response.data?.data?.version);
+          if (refreshed === false) {
+            showWarning(t('设置已保存，但最新状态刷新失败'));
+          } else {
+            showSuccess(t('更新成功'));
+          }
         } else {
-          showError(response.data?.message || t('更新失败'));
+          throw createPaymentAdminError(response.data, t('更新失败'));
         }
         return response;
       });
     } catch (error) {
-      showError(error?.response?.data?.message || t('更新失败'));
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       setLoading(false);
     }
@@ -549,6 +565,34 @@ export default function SettingsPaymentGatewayWaffo(props) {
               />
             </Col>
           </Row>
+
+          <Row
+            gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}
+            style={{ marginTop: 16 }}
+          >
+            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
+              <Form.TextArea
+                field='WaffoWebRedirectHosts'
+                label={t('Additional trusted web checkout hosts')}
+                placeholder='checkout.partner.example'
+                extraText={t(
+                  'One exact HTTPS hostname per line. cashier.waffo.com is always trusted.',
+                )}
+                autosize={{ minRows: 3, maxRows: 6 }}
+              />
+            </Col>
+            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
+              <Form.TextArea
+                field='WaffoAppRedirectSchemes'
+                label={t('Allowed App deep-link schemes')}
+                placeholder='weixin'
+                extraText={t(
+                  'Leave empty to disable App deep links. Add only schemes confirmed by your Waffo payment method, one per line.',
+                )}
+                autosize={{ minRows: 3, maxRows: 6 }}
+              />
+            </Col>
+          </Row>
         </Form.Section>
 
         <Form.Section text={t('支付方式设置')}>
@@ -573,6 +617,30 @@ export default function SettingsPaymentGatewayWaffo(props) {
           <Button onClick={submitWaffoSetting} style={{ marginTop: 16 }}>
             {t('更新 Waffo 设置')}
           </Button>
+
+          <RetainedCredentialEmergencyControl
+            provider='waffo'
+            disabled={loading}
+            withPaymentVerification={props.withPaymentVerification}
+            onCompleted={async (result) => {
+              const certificateField = inputs.WaffoSandbox
+                ? 'WaffoSandboxPublicCert'
+                : 'WaffoPublicCert';
+              const nextInputs = {
+                ...inputs,
+                WaffoEnabled: false,
+                WaffoApiKey: '',
+                WaffoPrivateKey: '',
+                WaffoSandboxApiKey: '',
+                WaffoSandboxPrivateKey: '',
+                [certificateField]: '',
+              };
+              setInputs(nextInputs);
+              formApiRef.current?.setValues(nextInputs);
+              return (await props.refresh?.(result.data?.version)) !== false;
+            }}
+            onStale={() => props.refresh?.()}
+          />
         </Form.Section>
       </Form>
 

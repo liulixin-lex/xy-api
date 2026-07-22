@@ -31,6 +31,13 @@ var paymentSecretOptionKeys = map[string]struct{}{
 	"XorPayAppSecret":             {},
 	"XorPayAidPrevious":           {},
 	"XorPayAppSecretPrevious":     {},
+	"CreemApiKey":                 {},
+	"CreemWebhookSecret":          {},
+	"WaffoApiKey":                 {},
+	"WaffoPrivateKey":             {},
+	"WaffoSandboxApiKey":          {},
+	"WaffoSandboxPrivateKey":      {},
+	"WaffoPancakePrivateKey":      {},
 }
 
 var paymentSecretStorageReadiness = struct {
@@ -50,6 +57,48 @@ func IsPaymentSecretOption(key string) bool {
 func PaymentSecretEncryptionReady() bool {
 	_, ok := primaryPaymentSecretKey()
 	return ok
+}
+
+// PaymentSecretPrimaryKeyID returns a non-secret fingerprint of the active
+// payment encryption key. It is safe to place in administrator-only runtime
+// diagnostics and lets multiple application nodes prove that they can decrypt
+// the same credential and checkout snapshots without exposing the key itself.
+func PaymentSecretPrimaryKeyID() string {
+	key, ok := primaryPaymentSecretKey()
+	if !ok {
+		return ""
+	}
+	return key.id
+}
+
+// PaymentSecretKeyringFingerprint returns an opaque, role-sensitive digest of
+// the active payment data-encryption keyring. It lets application nodes prove
+// that both the primary and explicit rotation fallback are configured
+// consistently without publishing either secret or their individual key IDs.
+// Legacy CRYPTO_SECRET and SESSION_SECRET fallbacks are compared separately by
+// the cluster runtime contract.
+func PaymentSecretKeyringFingerprint() string {
+	primary := strings.TrimSpace(os.Getenv("PAYMENT_SECRET_KEY"))
+	if len(primary) < 32 {
+		return ""
+	}
+	previous := strings.TrimSpace(os.Getenv("PAYMENT_SECRET_KEY_PREVIOUS"))
+	if previous != "" && len(previous) < 32 {
+		return ""
+	}
+	if previous == primary {
+		return ""
+	}
+
+	builder := strings.Builder{}
+	builder.WriteString("primary:")
+	builder.WriteString(makePaymentSecretKey(primary).id)
+	builder.WriteString(";previous:")
+	if previous != "" {
+		builder.WriteString(makePaymentSecretKey(previous).id)
+	}
+	digest := sha256.Sum256([]byte(builder.String()))
+	return fmt.Sprintf("%x", digest[:16])
 }
 
 // PaymentSecretStorageReady additionally verifies that all stored payment
@@ -105,18 +154,30 @@ func refreshPaymentSecretStorageReadiness() error {
 	}
 	if DB.Migrator().HasTable(&PaymentOrder{}) {
 		var orders []PaymentOrder
-		if err := DB.Select("id", "trade_no", "start_payload").
-			Where("status IN ? AND start_payload <> ?", []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, "").
+		if err := DB.Select("id", "trade_no", "start_payload", "browser_authorization_payload").
+			Where("status IN ? AND (start_payload <> ? OR browser_authorization_payload <> ?)",
+				[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, "", "").
 			Find(&orders).Error; err != nil {
 			return err
 		}
 		for _, order := range orders {
-			keyID, encrypted := paymentOptionV2KeyID(order.StartPayload)
-			if !encrypted || keyID != primary.id {
-				return nil
+			if order.StartPayload != "" {
+				keyID, encrypted := paymentOptionV2KeyID(order.StartPayload)
+				if !encrypted || keyID != primary.id {
+					return nil
+				}
+				if _, err := DecryptPaymentOrderStartPayload(order.TradeNo, order.StartPayload); err != nil {
+					return err
+				}
 			}
-			if _, err := DecryptPaymentOrderStartPayload(order.TradeNo, order.StartPayload); err != nil {
-				return err
+			if order.BrowserAuthorizationPayload != "" {
+				keyID, encrypted := paymentOptionV2KeyID(order.BrowserAuthorizationPayload)
+				if !encrypted || keyID != primary.id {
+					return nil
+				}
+				if _, err := DecryptPaymentOrderBrowserAuthorization(order.TradeNo, order.BrowserAuthorizationPayload); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -231,6 +292,22 @@ func DecryptPaymentOrderStartPayload(tradeNo, payload string) (string, error) {
 	return decryptPaymentSensitiveValue("PaymentOrder.StartPayload:"+tradeNo, payload)
 }
 
+func EncryptPaymentOrderBrowserAuthorization(tradeNo, payload string) (string, error) {
+	tradeNo = strings.TrimSpace(tradeNo)
+	if tradeNo == "" || payload == "" {
+		return "", errors.New("invalid payment browser authorization")
+	}
+	return encryptPaymentSensitiveValue("PaymentOrder.BrowserAuthorization:"+tradeNo, payload)
+}
+
+func DecryptPaymentOrderBrowserAuthorization(tradeNo, payload string) (string, error) {
+	tradeNo = strings.TrimSpace(tradeNo)
+	if tradeNo == "" || payload == "" {
+		return "", errors.New("invalid payment browser authorization")
+	}
+	return decryptPaymentSensitiveValue("PaymentOrder.BrowserAuthorization:"+tradeNo, payload)
+}
+
 func rewrapPaymentOrderStartPayloadsTx(tx *gorm.DB) error {
 	if tx == nil || !tx.Migrator().HasTable(&PaymentOrder{}) {
 		return nil
@@ -272,6 +349,57 @@ func rewrapPaymentOrderStartPayloadsTx(tx *gorm.DB) error {
 		}
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: payment order start payload %d", errPaymentOptionsChangedDuringReload, order.ID)
+		}
+	}
+	return nil
+}
+
+func rewrapPaymentOrderBrowserAuthorizationsTx(tx *gorm.DB) error {
+	if tx == nil || !tx.Migrator().HasTable(&PaymentOrder{}) {
+		return nil
+	}
+	if _, ok := primaryPaymentSecretKey(); !ok {
+		return nil
+	}
+	if err := tx.Model(&PaymentOrder{}).
+		Where("status NOT IN ? AND browser_authorization_payload <> ?", []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, "").
+		Updates(map[string]interface{}{
+			"browser_authorization_digest":     nil,
+			"browser_authorization_payload":    "",
+			"browser_authorization_expires_at": 0,
+			"browser_authorized_at":            0,
+		}).Error; err != nil {
+		return err
+	}
+	var orders []PaymentOrder
+	if err := tx.Select("id", "trade_no", "browser_authorization_payload").
+		Where("status IN ? AND browser_authorization_payload <> ?", []string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}, "").
+		Find(&orders).Error; err != nil {
+		return err
+	}
+	primary, _ := primaryPaymentSecretKey()
+	for _, order := range orders {
+		keyID, currentEncryption := paymentOptionV2KeyID(order.BrowserAuthorizationPayload)
+		if currentEncryption && keyID == primary.id {
+			continue
+		}
+		plaintext, err := DecryptPaymentOrderBrowserAuthorization(order.TradeNo, order.BrowserAuthorizationPayload)
+		if err != nil {
+			return fmt.Errorf("decrypt payment browser authorization %d: %w", order.ID, err)
+		}
+		encrypted, err := EncryptPaymentOrderBrowserAuthorization(order.TradeNo, plaintext)
+		if err != nil {
+			return fmt.Errorf("rewrap payment browser authorization %d: %w", order.ID, err)
+		}
+		result := tx.Model(&PaymentOrder{}).
+			Where("id = ? AND browser_authorization_payload = ? AND status IN ?", order.ID, order.BrowserAuthorizationPayload,
+				[]string{PaymentOrderStatusPending, PaymentOrderStatusProcessing}).
+			Update("browser_authorization_payload", encrypted)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: payment browser authorization %d", errPaymentOptionsChangedDuringReload, order.ID)
 		}
 	}
 	return nil

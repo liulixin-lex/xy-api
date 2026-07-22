@@ -22,6 +22,7 @@ import { useTranslation } from 'react-i18next';
 import { SecureVerificationService } from '../../services/secureVerification';
 import { showError, showSuccess } from '../../helpers';
 import { isVerificationRequiredError } from '../../helpers/secureApiCall';
+import { getPaymentAdminErrorMessage } from '../../helpers/payment-admin-errors';
 
 /**
  * 通用安全验证 Hook
@@ -179,11 +180,10 @@ export const useSecureVerification = ({
         return result;
       } catch (error) {
         if (operationClaimed) resetState();
-        showError(
-          error?.response?.data?.message ||
-            error?.message ||
-            t('验证失败，请重试'),
-        );
+        if (error?.code === 'VERIFICATION_CANCELLED') {
+          return null;
+        }
+        showError(getPaymentAdminErrorMessage(error, t, t('验证失败，请重试')));
         onError?.(error);
         throw error;
       } finally {

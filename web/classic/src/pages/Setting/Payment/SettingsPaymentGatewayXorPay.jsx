@@ -26,8 +26,13 @@ import {
   removeTrailingSlash,
   showError,
   showSuccess,
+  showWarning,
 } from '../../../helpers';
 import { buildEmergencyCredentialReplacement } from '../../../helpers/payment-credential-revocation';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
 
 export default function SettingsPaymentGatewayXorPay(props) {
   const { t } = useTranslation();
@@ -135,19 +140,21 @@ export default function SettingsPaymentGatewayXorPay(props) {
           { skipErrorHandler: true },
         );
         if (!response.data?.success) {
-          throw new Error(response.data?.message || t('更新失败'));
+          throw createPaymentAdminError(response.data, t('更新失败'));
         }
-        showSuccess(t('更新成功'));
         const nextInputs = { ...inputs, XorPayAppSecret: '' };
         setInputs(nextInputs);
         formApiRef.current?.setValues(nextInputs);
-        await props.refresh?.(response.data?.data?.version);
+        const refreshed = await props.refresh?.(response.data?.data?.version);
+        if (refreshed === false) {
+          showWarning(t('设置已保存，但最新状态刷新失败'));
+        } else {
+          showSuccess(t('更新成功'));
+        }
         return response;
       });
     } catch (error) {
-      showError(
-        error?.response?.data?.message || error?.message || t('更新失败'),
-      );
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       submitInFlightRef.current = false;
       setLoading(false);
@@ -168,7 +175,7 @@ export default function SettingsPaymentGatewayXorPay(props) {
             type='info'
             icon={<ShieldCheck size={16} />}
             description={t(
-              'XORPay API 地址由服务端固定，密钥不会回显。当前仅支持微信 Native 扫码和支付宝当面付。',
+              'XORPay API 地址由服务端固定，密钥不会回显。当前支持微信 Native 扫码、支付宝当面付，以及显式启用后的微信 JSAPI。',
             )}
             closeIcon={null}
             style={{ marginBottom: 16 }}
@@ -216,8 +223,21 @@ export default function SettingsPaymentGatewayXorPay(props) {
             options={[
               { label: t('微信 Native 扫码'), value: 'native' },
               { label: t('支付宝当面付'), value: 'alipay' },
+              {
+                label: t('微信 JSAPI（仅微信内浏览器）'),
+                value: 'jsapi',
+              },
             ]}
             style={{ marginTop: 16 }}
+          />
+          <Banner
+            type='warning'
+            title={t('微信 JSAPI 必须显式启用')}
+            description={t(
+              '仅在 XORPay 商户已开通 JSAPI、已配置精确的 HTTPS 支付目录，并完成所需的网站或 ICP 备案后启用。该方式仅适用于微信内置浏览器。前端调用成功不代表支付成功，最终结果只能以服务端验签回调或本地订单确认为准。此能力尚未使用真实商户完成验证。',
+            )}
+            closeIcon={null}
+            style={{ marginTop: 12 }}
           />
           <div className='mt-4 text-sm text-gray-500'>
             {t('回调地址')}：

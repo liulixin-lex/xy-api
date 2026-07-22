@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to publish (e.g., v0.2.0)
+        description: Protected v0.2.x release tag to publish (e.g., v0.2.1)
         required: true
         type: string
       confirm_tag:
@@ -13,8 +13,8 @@ on:
         type: string
   push:
     tags:
-      - 'v*'
-      - '!v*-*'
+      - 'v0.2.*'
+      - '!v0.2.*-*'
 
 concurrency:
   group: stable-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -45,6 +45,11 @@ jobs:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
 
+      - name: Verify preserved v0.1.6 historical assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/release/verify-historical-assets.sh
+
       - name: Validate tag, VERSION, and protected release line
         id: release
         run: |
@@ -60,8 +65,8 @@ jobs:
               exit 1
             fi
           fi
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Release version must use lowercase v semver. Current value: $tag"
+          if [[ ! "$tag" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Stable publishing is restricted to the protected v0.2.x line. Current value: $tag"
             exit 1
           fi
           if [ "$RELEASE_REF" != "refs/tags/$tag" ]; then
@@ -173,6 +178,134 @@ jobs:
           ' default/src/i18n/locales/_reports/_sync-report.json >/dev/null
           bun run --cwd classic lint
           (cd classic && bun test)
+
+      - name: Validate payment translations across both themes
+        working-directory: web/classic
+        run: bun run i18n:payment-admin
+
+  payment_database_gate:
+    name: Release payment database contracts
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Start MySQL 5.7 payment databases
+        run: |
+          set -euo pipefail
+          MYSQL_ROOT_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$MYSQL_ROOT_PASSWORD"
+          printf '%s\n' \
+            "MYSQL57_TEST_CLEAN_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_clean?charset=utf8mb4&parseTime=true" \
+            "MYSQL57_TEST_UPGRADE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_upgrade?charset=utf8&parseTime=true" \
+            "MYSQL57_TEST_V020_UPGRADE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_v020_upgrade?charset=utf8mb4&parseTime=true" \
+            "MYSQL57_TEST_LOG_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_log?charset=utf8mb4&parseTime=true" \
+            "PAYMENT_MYSQL57_TEST_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/new_api_payment?charset=utf8mb4&parseTime=true" \
+            "MYSQL57_TEST_GBK8_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3307)/new_api_gbk8?charset=gbk&parseTime=true" \
+            >>"$GITHUB_ENV"
+          docker run --detach \
+            --name new-api-release-mysql57 \
+            --publish 3306:3306 \
+            --env MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
+            mysql@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb \
+            --innodb-default-row-format=COMPACT \
+            --innodb-file-format=Barracuda \
+            --innodb-large-prefix=ON \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci
+          docker run --detach \
+            --name new-api-release-mysql57-gbk8 \
+            --publish 3307:3306 \
+            --env MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
+            mysql@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb \
+            --innodb-page-size=8192 \
+            --innodb-default-row-format=COMPACT \
+            --innodb-file-format=Barracuda \
+            --innodb-large-prefix=ON \
+            --character-set-server=gbk \
+            --collation-server=gbk_chinese_ci
+          for attempt in $(seq 1 90); do
+            if docker exec new-api-release-mysql57 sh -c \
+              'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --skip-column-names -e "SELECT 1" >/dev/null 2>&1' && \
+              docker exec new-api-release-mysql57-gbk8 sh -c \
+              'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --skip-column-names -e "SELECT 1" >/dev/null 2>&1'; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs new-api-release-mysql57
+              docker logs new-api-release-mysql57-gbk8
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec new-api-release-mysql57 sh -c \
+            'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+              CREATE DATABASE new_api_clean CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE DATABASE new_api_upgrade CHARACTER SET utf8 COLLATE utf8_general_ci;
+              CREATE DATABASE new_api_v020_upgrade CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE DATABASE new_api_log CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              CREATE DATABASE new_api_payment CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+            "'
+          docker exec new-api-release-mysql57-gbk8 sh -c \
+            'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+              CREATE DATABASE new_api_gbk8 CHARACTER SET gbk COLLATE gbk_chinese_ci;
+            "'
+
+      - name: Start PostgreSQL 9.6 payment database
+        run: |
+          set -euo pipefail
+          POSTGRES_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          printf '%s\n' \
+            "PAYMENT_POSTGRES96_TEST_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_payment port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_V020_UPGRADE_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_v020_upgrade port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_LOCK_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_migration_lock port=5432 sslmode=disable TimeZone=UTC" \
+            "POSTGRES96_TEST_LOG_DSN=host=127.0.0.1 user=postgres password=${POSTGRES_PASSWORD} dbname=new_api_log port=5432 sslmode=disable TimeZone=UTC" \
+            >>"$GITHUB_ENV"
+          docker run --detach \
+            --name new-api-release-postgres96 \
+            --publish 5432:5432 \
+            --env POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --env POSTGRES_DB=new_api_payment \
+            postgres@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698
+          for attempt in $(seq 1 90); do
+            if docker exec new-api-release-postgres96 sh -c \
+              'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d new_api_payment -tAc "SELECT 1" >/dev/null 2>&1'; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs new-api-release-postgres96
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec new-api-release-postgres96 sh -c \
+            'PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_v020_upgrade &&
+             PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_migration_lock &&
+             PGPASSWORD="$POSTGRES_PASSWORD" createdb -h 127.0.0.1 -U postgres new_api_log'
+
+      - name: Verify migration and payment concurrency contracts
+        run: |
+          set -euo pipefail
+          go test ./model \
+            -run '^(TestMySQL57CompactMigrationCompatibility|TestPaymentMySQL57IntegrationContracts|TestV020ToV021MySQL57Migration|TestV020ToV021SQLiteMigration)$' \
+            -count=1
+          go test ./model \
+            -run '^(TestPaymentPostgreSQL96IntegrationContracts|TestPostgreSQL96MigrationLockContracts|TestV020ToV021PostgreSQL96Migration)$' \
+            -count=1
 
   linux:
     name: Linux release assets
@@ -456,6 +589,60 @@ jobs:
           "$VERSION"
           "$REDIS_MODE"
 
+  payment_multinode_runtime:
+    name: Payment multi-node runtime acceptance
+    needs: [preflight, quality_gate, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698
+        env:
+          POSTGRES_PASSWORD: payment-multinode-postgres-test-password
+          POSTGRES_DB: new_api_multinode
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d new_api_multinode"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 45
+      redis:
+        image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      VERSION: ${{ needs.preflight.outputs.tag }}
+      PAYMENT_MULTINODE_SQL_DSN: postgresql://postgres:payment-multinode-postgres-test-password@127.0.0.1:5432/new_api_multinode?sslmode=disable
+      PAYMENT_MULTINODE_SPLIT_SQL_DSN: postgresql://postgres:payment-multinode-postgres-test-password@127.0.0.1:5432/postgres?sslmode=disable
+      PAYMENT_MULTINODE_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Download Linux release binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-release
+          path: linux-release
+
+      - name: Verify shared-database and shared-Redis payment readiness
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/linux-release/new-api-$VERSION"
+          chmod +x "$binary"
+          scripts/release/payment-multinode-smoke.sh "$binary"
+
   linux_arm64_acceptance:
     name: Native arm64 standalone acceptance
     needs: [preflight, quality_gate, linux]
@@ -495,7 +682,7 @@ jobs:
 
   verify_assets:
     name: Verify complete release asset set
-    needs: [preflight, quality_gate, linux, macos, windows, runtime_acceptance, linux_arm64_acceptance]
+    needs: [preflight, quality_gate, payment_database_gate, linux, macos, windows, runtime_acceptance, payment_multinode_runtime, linux_arm64_acceptance]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

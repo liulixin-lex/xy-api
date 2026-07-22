@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
+import { createPaymentAdminError } from '../../payment-admin-errors'
 import type {
   BillingReservationDetail,
   BillingReservationFilters,
@@ -33,6 +34,7 @@ import type {
   PaymentDebt,
   PaymentOrder,
   PaymentOrderAuditActionRequest,
+  PaymentOperationsOverviewData,
   RetireStripeCustomerBindingRequest,
   RetireStripeCustomerBindingResult,
   ResolveDebtRequest,
@@ -49,6 +51,7 @@ import type {
 
 interface ApiResponse<T> {
   success: boolean
+  code?: string
   message?: string
   data?: T
 }
@@ -60,7 +63,7 @@ const requestConfig = {
 
 function unwrap<T>(response: ApiResponse<T>, fallbackMessage: string): T {
   if (!response.success || response.data === undefined) {
-    throw new Error(response.message || fallbackMessage)
+    throw createPaymentAdminError(response, fallbackMessage)
   }
   return response.data
 }
@@ -88,6 +91,14 @@ export async function listPaymentAudit(
     }
   )
   return unwrap(response.data, 'Failed to load payment audit')
+}
+
+export async function getPaymentOperationsOverview(): Promise<PaymentOperationsOverviewData> {
+  const response = await api.get<ApiResponse<PaymentOperationsOverviewData>>(
+    '/api/option/payment/overview',
+    requestConfig
+  )
+  return unwrap(response.data, 'Failed to load payment overview')
 }
 
 export async function getPaymentAudit(

@@ -125,8 +125,8 @@ func (in PaymentEventInput) validateIdentity() error {
 	if len(in.NormalizedPayload) > maxNormalizedPaymentPayloadBytes {
 		return errors.New("normalized payment event is too large")
 	}
-	if in.Provider != PaymentProviderStripe && in.ProviderLivemode != nil {
-		return errors.New("provider livemode is only valid for Stripe events")
+	if !paymentProviderUsesEnvironmentBinding(in.Provider) && in.ProviderLivemode != nil {
+		return errors.New("provider livemode is only valid for environment-bound events")
 	}
 	return nil
 }
@@ -163,11 +163,41 @@ func ProcessPaymentEvent(input PaymentEventInput) (*PaymentSettlementResult, err
 	return processPaymentEvent(input, 0)
 }
 
+// ProcessPaymentEventForTask applies a provider event only while the durable
+// background task still owns its current lease and fencing token. The task row
+// remains locked in the same transaction as event persistence, settlement and
+// ledger writes, so a reclaimed stale worker cannot mutate the order.
+func ProcessPaymentEventForTask(input PaymentEventInput, task *PaymentTask, runnerID string) (*PaymentSettlementResult, error) {
+	return processPaymentEventWithTaskLease(input, 0, nil, task, runnerID)
+}
+
+func paymentEventFromInput(input PaymentEventInput, payloadDigest string) *PaymentEvent {
+	return &PaymentEvent{
+		Provider: input.Provider, EventKey: input.EventKey, EventType: input.EventType,
+		TradeNo: input.TradeNo, ProviderOrderKey: input.ProviderOrderKey, ProviderPaymentKey: input.ProviderPaymentKey,
+		ProviderResourceKey: input.ProviderResourceKey, ProviderCredentialGeneration: input.ProviderCredentialGeneration,
+		ProviderLivemode:  input.ProviderLivemode,
+		CustomerID:        input.CustomerID,
+		ProviderCreatedAt: input.ProviderCreatedAt, ProviderState: input.ProviderState,
+		PaidAmountMinor: input.PaidAmountMinor, RefundedAmountMinor: input.RefundedAmountMinor,
+		DisputedAmountMinor: input.DisputedAmountMinor, Currency: input.Currency, PaymentMethod: input.PaymentMethod,
+		Paid: input.Paid, Failed: input.Failed, Expired: input.Expired, Refunded: input.Refunded,
+		Disputed: input.Disputed, DisputeResolved: input.DisputeResolved, DisputeWon: input.DisputeWon,
+		PermanentFailure: input.PermanentFailure, ManualReview: input.ManualReview,
+		PayloadDigest: payloadDigest, NormalizedPayload: input.NormalizedPayload,
+	}
+}
+
 func processPaymentEvent(input PaymentEventInput, manualReplayEventID int64) (*PaymentSettlementResult, error) {
 	return processPaymentEventWithReplayAttempts(input, manualReplayEventID, nil)
 }
 
 func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplayEventID int64, expectedAttempts *int) (*PaymentSettlementResult, error) {
+	return processPaymentEventWithTaskLease(input, manualReplayEventID, expectedAttempts, nil, "")
+}
+
+func processPaymentEventWithTaskLease(input PaymentEventInput, manualReplayEventID int64, expectedAttempts *int,
+	task *PaymentTask, runnerID string) (*PaymentSettlementResult, error) {
 	input.normalizeIdentity()
 	if err := input.validate(); err != nil {
 		return nil, err
@@ -177,6 +207,11 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 	payloadDigest := PaymentPayloadDigest(input.NormalizedPayload)
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if task != nil {
+			if err := assertPaymentTaskLeaseTx(tx, task, runnerID); err != nil {
+				return err
+			}
+		}
 		stripeCredentialTransition := input.Provider == PaymentProviderStripe &&
 			(input.Paid || input.Failed || input.Expired || input.Refunded || input.Disputed || input.DisputeResolved || input.ManualReview)
 		credentialFenced := input.Paid && (input.Provider == PaymentProviderEpay || input.Provider == PaymentProviderXorPay) ||
@@ -186,27 +221,7 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 				return err
 			}
 		}
-		event, created, err := UpsertPaymentEvent(tx, &PaymentEvent{
-			Provider:                     input.Provider,
-			EventKey:                     input.EventKey,
-			EventType:                    input.EventType,
-			TradeNo:                      input.TradeNo,
-			ProviderOrderKey:             input.ProviderOrderKey,
-			ProviderPaymentKey:           input.ProviderPaymentKey,
-			ProviderResourceKey:          input.ProviderResourceKey,
-			ProviderCredentialGeneration: input.ProviderCredentialGeneration,
-			ProviderLivemode:             input.ProviderLivemode,
-			CustomerID:                   input.CustomerID,
-			ProviderCreatedAt:            input.ProviderCreatedAt,
-			ProviderState:                input.ProviderState,
-			PaidAmountMinor:              input.PaidAmountMinor, RefundedAmountMinor: input.RefundedAmountMinor,
-			DisputedAmountMinor: input.DisputedAmountMinor, Currency: input.Currency, PaymentMethod: input.PaymentMethod,
-			Paid: input.Paid, Failed: input.Failed, Expired: input.Expired, Refunded: input.Refunded,
-			Disputed: input.Disputed, DisputeResolved: input.DisputeResolved, DisputeWon: input.DisputeWon,
-			PermanentFailure: input.PermanentFailure, ManualReview: input.ManualReview,
-			PayloadDigest:     payloadDigest,
-			NormalizedPayload: input.NormalizedPayload,
-		})
+		event, created, err := UpsertPaymentEvent(tx, paymentEventFromInput(input, payloadDigest))
 		if err != nil {
 			return err
 		}
@@ -367,6 +382,26 @@ func processPaymentEventWithReplayAttempts(input PaymentEventInput, manualReplay
 			// order; conflicting metadata must never redirect a reversal to a
 			// different trade number.
 			return markPaymentManualReviewForOrderTx(tx, event, order, "provider_trade_identity_mismatch", ErrPaymentProviderMismatch, result, &postCommitErr)
+		}
+		environmentBoundStateTransition := input.Paid || input.Failed || input.Expired || input.Refunded ||
+			input.Disputed || input.DisputeResolved || input.ManualReview
+		if (order.Provider == PaymentProviderCreem || order.Provider == PaymentProviderWaffoPancake) && environmentBoundStateTransition {
+			reasonPrefix := "creem"
+			if order.Provider == PaymentProviderWaffoPancake {
+				reasonPrefix = "waffo_pancake"
+			}
+			reason := ""
+			switch {
+			case order.ProviderLivemode == nil:
+				reason = reasonPrefix + "_order_environment_unbound"
+			case input.ProviderLivemode == nil:
+				reason = reasonPrefix + "_payment_environment_unverified"
+			case !paymentLivemodeEqual(order.ProviderLivemode, input.ProviderLivemode):
+				reason = reasonPrefix + "_order_event_environment_mismatch"
+			}
+			if reason != "" {
+				return markPaymentManualReviewForOrderTx(tx, event, order, reason, ErrPaymentManualReview, result, &postCommitErr)
+			}
 		}
 		stripeEconomicReversal := order.Provider == PaymentProviderStripe && providerPaymentAuthority
 		if stripeEconomicReversal && input.ProviderLivemode != nil {
@@ -565,6 +600,55 @@ func rollbackPaymentSettlementSavepoint(tx *gorm.DB, savepoint string, order *Pa
 	return nil
 }
 
+// RecordPaymentEventReceived persists the normalized facts immediately after
+// signature verification and before any provider API confirmation. It checks
+// only bounded identity fields so even a contradictory but signed event has a
+// durable inbox record for later manual review.
+func RecordPaymentEventReceived(input PaymentEventInput) error {
+	input.normalizeIdentity()
+	if err := input.validateIdentity(); err != nil {
+		return err
+	}
+	payloadDigest := PaymentPayloadDigest(input.NormalizedPayload)
+	return DB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := UpsertPaymentEvent(tx, paymentEventFromInput(input, payloadDigest))
+		return err
+	})
+}
+
+// MarkPaymentEventValidationFailed keeps a retryable inbox item when a
+// provider authority confirmation cannot complete. Terminal events are never
+// downgraded by a delayed duplicate delivery.
+func MarkPaymentEventValidationFailed(provider, eventKey, reasonCode string) error {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	eventKey = strings.TrimSpace(eventKey)
+	reasonCode = strings.TrimSpace(reasonCode)
+	if provider == "" || len(provider) > 32 || eventKey == "" || len(eventKey) > 255 || reasonCode == "" || len(reasonCode) > 1024 {
+		return errors.New("invalid payment event validation failure")
+	}
+	result := DB.Model(&PaymentEvent{}).
+		Where("provider = ? AND event_key = ? AND status IN ?", provider, eventKey,
+			[]string{PaymentEventStatusReceived, PaymentEventStatusProcessing, PaymentEventStatusFailed}).
+		Updates(map[string]interface{}{
+			"status": PaymentEventStatusFailed, "review_code": "", "last_error": reasonCode,
+			"attempts": gorm.Expr("attempts + ?", 1), "updated_at": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	var count int64
+	if err := DB.Model(&PaymentEvent{}).Where("provider = ? AND event_key = ?", provider, eventKey).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("payment event not found")
+	}
+	return nil
+}
+
 // RecordPaymentEventManualReview durably retains a verified provider event
 // that cannot be safely mapped to an order. Webhook handlers may acknowledge
 // the provider only after this function commits.
@@ -582,20 +666,7 @@ func RecordPaymentEventManualReview(input PaymentEventInput, reason string) erro
 	}
 	payloadDigest := PaymentPayloadDigest(input.NormalizedPayload)
 	return DB.Transaction(func(tx *gorm.DB) error {
-		event, created, err := UpsertPaymentEvent(tx, &PaymentEvent{
-			Provider: input.Provider, EventKey: input.EventKey, EventType: input.EventType,
-			TradeNo: input.TradeNo, ProviderOrderKey: input.ProviderOrderKey, ProviderPaymentKey: input.ProviderPaymentKey,
-			CustomerID:          input.CustomerID,
-			ProviderResourceKey: input.ProviderResourceKey, ProviderCredentialGeneration: input.ProviderCredentialGeneration,
-			ProviderLivemode:  input.ProviderLivemode,
-			ProviderCreatedAt: input.ProviderCreatedAt, ProviderState: input.ProviderState,
-			PaidAmountMinor: input.PaidAmountMinor, RefundedAmountMinor: input.RefundedAmountMinor,
-			DisputedAmountMinor: input.DisputedAmountMinor, Currency: input.Currency, PaymentMethod: input.PaymentMethod,
-			Paid: input.Paid, Failed: input.Failed, Expired: input.Expired, Refunded: input.Refunded,
-			Disputed: input.Disputed, DisputeResolved: input.DisputeResolved, DisputeWon: input.DisputeWon,
-			PermanentFailure: input.PermanentFailure, ManualReview: input.ManualReview,
-			PayloadDigest: payloadDigest, NormalizedPayload: input.NormalizedPayload,
-		})
+		event, created, err := UpsertPaymentEvent(tx, paymentEventFromInput(input, payloadDigest))
 		if err != nil {
 			return err
 		}
@@ -1016,16 +1087,23 @@ func fulfillPaymentOrderTx(tx *gorm.DB, event *PaymentEvent, order *PaymentOrder
 	order.UpdatedAt = now
 	order.Version++
 	if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
-		"status":               order.Status,
-		"status_reason":        "",
-		"paid_amount_minor":    order.PaidAmountMinor,
-		"settled_at":           order.SettledAt,
-		"provider_order_key":   order.ProviderOrderKey,
-		"provider_payment_key": order.ProviderPaymentKey,
-		"start_payload":        "",
-		"updated_at":           order.UpdatedAt,
-		"version":              order.Version,
+		"status":                           order.Status,
+		"status_reason":                    "",
+		"paid_amount_minor":                order.PaidAmountMinor,
+		"settled_at":                       order.SettledAt,
+		"provider_order_key":               order.ProviderOrderKey,
+		"provider_payment_key":             order.ProviderPaymentKey,
+		"start_payload":                    "",
+		"browser_authorization_digest":     nil,
+		"browser_authorization_payload":    "",
+		"browser_authorization_expires_at": 0,
+		"browser_authorized_at":            0,
+		"updated_at":                       order.UpdatedAt,
+		"version":                          order.Version,
 	}).Error; err != nil {
+		return err
+	}
+	if err := settlePaymentLimitReservationAtTx(tx, order, paymentLimitPaidAtForEvent(event, order, now), now); err != nil {
 		return err
 	}
 	return tx.Model(&PaymentEvent{}).Where("id = ?", event.ID).Update("payment_order_id", order.ID).Error
@@ -1091,8 +1169,24 @@ func failOrExpirePaymentOrderTx(tx *gorm.DB, order *PaymentOrder, input PaymentE
 	}
 	now := common.GetTimestamp()
 	if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
-		"status": status, "status_reason": reason, "updated_at": now, "version": gorm.Expr("version + ?", 1),
+		"status": status, "status_reason": reason,
+		"start_flow": "", "start_payload": "", "browser_authorization_digest": nil,
+		"browser_authorization_payload": "", "browser_authorization_expires_at": 0,
+		"browser_authorized_at": 0, "updated_at": now, "version": gorm.Expr("version + ?", 1),
 	}).Error; err != nil {
+		return err
+	}
+	order.Status = status
+	order.StatusReason = reason
+	order.StartFlow = ""
+	order.StartPayload = ""
+	order.BrowserAuthorizationDigest = nil
+	order.BrowserAuthorizationPayload = ""
+	order.BrowserAuthorizationExpiresAt = 0
+	order.BrowserAuthorizedAt = 0
+	order.UpdatedAt = now
+	order.Version++
+	if err := releasePaymentLimitReservationTx(tx, order, now); err != nil {
 		return err
 	}
 	if order.OrderKind == PaymentOrderKindTopUp {
@@ -1891,7 +1985,10 @@ func createPaymentLedgerEntryTx(tx *gorm.DB, event *PaymentEvent, order *Payment
 func markPaymentManualReviewTx(tx *gorm.DB, event *PaymentEvent, order *PaymentOrder, reason string, reviewErr error, result *PaymentSettlementResult, postCommitErr *error) error {
 	now := common.GetTimestamp()
 	if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
-		"status": PaymentOrderStatusManualReview, "status_reason": reason, "start_payload": "", "updated_at": now, "version": gorm.Expr("version + ?", 1),
+		"status": PaymentOrderStatusManualReview, "status_reason": reason, "start_payload": "",
+		"browser_authorization_digest": nil, "browser_authorization_payload": "",
+		"browser_authorization_expires_at": 0, "browser_authorized_at": 0,
+		"updated_at": now, "version": gorm.Expr("version + ?", 1),
 	}).Error; err != nil {
 		return err
 	}
@@ -1933,7 +2030,10 @@ func markPaymentManualReviewForOrderTx(tx *gorm.DB, event *PaymentEvent, order *
 func markPaymentManualReviewPreservingProjectionTx(tx *gorm.DB, event *PaymentEvent, order *PaymentOrder, reason string, reviewErr error, result *PaymentSettlementResult, postCommitErr *error) error {
 	now := common.GetTimestamp()
 	if err := tx.Model(&PaymentOrder{}).Where("id = ?", order.ID).Updates(map[string]interface{}{
-		"status": PaymentOrderStatusManualReview, "status_reason": reason, "start_payload": "", "updated_at": now, "version": gorm.Expr("version + ?", 1),
+		"status": PaymentOrderStatusManualReview, "status_reason": reason, "start_payload": "",
+		"browser_authorization_digest": nil, "browser_authorization_payload": "",
+		"browser_authorization_expires_at": 0, "browser_authorized_at": 0,
+		"updated_at": now, "version": gorm.Expr("version + ?", 1),
 	}).Error; err != nil {
 		return err
 	}

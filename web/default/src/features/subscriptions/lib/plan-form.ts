@@ -16,9 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { z } from 'zod'
 import type { TFunction } from 'i18next'
+import { z } from 'zod'
+
 import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
+
 import type { SubscriptionPlan, PlanPayload } from '../types'
 
 export function getPlanFormSchema(t: TFunction) {
@@ -45,7 +47,22 @@ export function getPlanFormSchema(t: TFunction) {
     total_amount: z.coerce.number().min(0),
     upgrade_group: z.string().optional(),
     downgrade_group: z.string().optional(),
-    stripe_price_id: z.string().optional(),
+    stripe_price_id: z
+      .string()
+      .trim()
+      .max(
+        128,
+        t(
+          'Use a Stripe Price ID that starts with price_ and contains no more than 128 characters.'
+        )
+      )
+      .refine(
+        (value) => value === '' || value.startsWith('price_'),
+        t(
+          'Use a Stripe Price ID that starts with price_ and contains no more than 128 characters.'
+        )
+      )
+      .optional(),
     creem_product_id: z.string().optional(),
     waffo_pancake_product_id: z.string().optional(),
   })

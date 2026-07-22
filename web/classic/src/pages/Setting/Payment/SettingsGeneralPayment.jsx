@@ -24,10 +24,16 @@ import {
   removeTrailingSlash,
   showError,
   showSuccess,
+  showWarning,
   verifyJSON,
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { isSecurePaymentCallbackOrigin } from '../../../helpers/payment-callback-origin';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
+import PaymentGeneralVisualEditors from './PaymentGeneralVisualEditors';
 
 const isValidTopupGroupRatios = (value) => {
   try {
@@ -85,7 +91,12 @@ export default function SettingsGeneralPayment(props) {
   }, [props.options]);
 
   const handleFormChange = (values) => {
-    setInputs(values);
+    setInputs((current) => ({ ...current, ...values }));
+  };
+
+  const handleVisualEditorChange = (field, value) => {
+    setInputs((current) => ({ ...current, [field]: value }));
+    formApiRef.current?.setValue(field, value);
   };
 
   const submitGeneralSettings = async () => {
@@ -171,16 +182,26 @@ export default function SettingsGeneralPayment(props) {
           { skipErrorHandler: true },
         );
         if (response.data.success) {
-          showSuccess(t('更新成功'));
-          setOriginInputs({ ...inputs });
-          await props.refresh?.(response.data?.data?.version);
+          const savedInputs = {
+            ...inputs,
+            CustomCallbackAddress: callbackBase,
+          };
+          setInputs(savedInputs);
+          setOriginInputs(savedInputs);
+          formApiRef.current?.setValues(savedInputs);
+          const refreshed = await props.refresh?.(response.data?.data?.version);
+          if (refreshed === false) {
+            showWarning(t('设置已保存，但最新状态刷新失败'));
+          } else {
+            showSuccess(t('更新成功'));
+          }
         } else {
-          showError(response.data.message || t('更新失败'));
+          throw createPaymentAdminError(response.data, t('更新失败'));
         }
         return response;
       });
     } catch (error) {
-      showError(error?.response?.data?.message || t('更新失败'));
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       submitInFlightRef.current = false;
       setLoading(false);
@@ -196,7 +217,7 @@ export default function SettingsGeneralPayment(props) {
       >
         <Form.Section text={sectionTitle}>
           <Row gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}>
-            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
+            <Col xs={24} sm={24} md={18} lg={16} xl={14}>
               <Form.Input
                 field='CustomCallbackAddress'
                 label={t('Secure payment callback base')}
@@ -212,56 +233,13 @@ export default function SettingsGeneralPayment(props) {
                 )}
               />
             </Col>
-            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
-              <Form.TextArea
-                field='TopupGroupRatio'
-                label={t('充值分组倍率')}
-                placeholder={t('为一个 JSON 文本，键为组名称，值为倍率')}
-                autosize
-              />
-            </Col>
           </Row>
-          <Row
-            gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}
-            style={{ marginTop: 16 }}
-          >
-            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
-              <Form.TextArea
-                field='PayMethods'
-                label={t('充值方式设置')}
-                placeholder={t('为一个 JSON 文本')}
-                autosize
-              />
-            </Col>
-            <Col xs={24} sm={24} md={12} lg={12} xl={12}>
-              <Form.TextArea
-                field='AmountOptions'
-                label={t('自定义充值数量选项')}
-                placeholder={t(
-                  '为一个 JSON 数组，例如：[10, 20, 50, 100, 200, 500]',
-                )}
-                autosize
-                extraText={t(
-                  '设置用户可选择的充值数量选项，例如：[10, 20, 50, 100, 200, 500]',
-                )}
-              />
-            </Col>
-          </Row>
-          <Row style={{ marginTop: 16 }}>
-            <Col span={24}>
-              <Form.TextArea
-                field='AmountDiscount'
-                label={t('充值金额折扣配置')}
-                placeholder={t(
-                  '为一个 JSON 对象，例如：{"100": 0.95, "200": 0.9, "500": 0.85}',
-                )}
-                autosize
-                extraText={t(
-                  '设置不同充值金额对应的折扣，键为充值金额，值为折扣率，例如：{"100": 0.95, "200": 0.9, "500": 0.85}',
-                )}
-              />
-            </Col>
-          </Row>
+          <div style={{ marginTop: 20 }}>
+            <PaymentGeneralVisualEditors
+              values={inputs}
+              onChange={handleVisualEditorChange}
+            />
+          </div>
           <Button
             onClick={submitGeneralSettings}
             loading={loading}

@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -224,18 +226,31 @@ func InitDB() (err error) {
 
 const postgresMigrationAdvisoryLockKey int64 = 0x4e4150494d494752
 
-// migrateDBSafely serializes PostgreSQL schema changes across application
-// instances. PostgreSQL does not make concurrent CREATE TABLE idempotent: two
-// master nodes starting from the same clean or legacy schema can otherwise
-// race in pg_type before either table becomes visible to the other session.
-// The connection-scoped advisory lock leaves the existing per-statement
-// migration transaction behavior unchanged and is released before the pinned
-// connection returns to the pool.
+const (
+	mysqlMigrationLockWaitSeconds = 10 * 60
+	mysqlMigrationLockPrefix      = "new-api:migrate:"
+)
+
+// migrateDBSafely serializes PostgreSQL and MySQL schema changes across
+// application instances. Both locks are connection-scoped, so the GORM
+// migration session must use the exact dedicated connection that acquired the
+// lock. SQLite remains a single-node database and uses the ordinary migration
+// path.
 func migrateDBSafely() (resultErr error) {
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		return migrateMySQLDBSafely(DB, migrateDBOn)
+	}
 	if !common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
 		return migrateDB()
 	}
-	sqlDB, err := DB.DB()
+	return migratePostgreSQLDBSafely(DB, postgresMigrationAdvisoryLockKey, migrateDBOn)
+}
+
+func migratePostgreSQLDBSafely(db *gorm.DB, lockKey int64, migrate func(*gorm.DB) error) (resultErr error) {
+	if db == nil || migrate == nil {
+		return errors.New("invalid PostgreSQL database migration request")
+	}
+	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
@@ -246,7 +261,7 @@ func migrateDBSafely() (resultErr error) {
 	defer connection.Close()
 
 	lockContext, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	_, err = connection.ExecContext(lockContext, "SELECT pg_advisory_lock($1)", postgresMigrationAdvisoryLockKey)
+	_, err = connection.ExecContext(lockContext, "SELECT pg_advisory_lock($1)", lockKey)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("acquire PostgreSQL database migration lock: %w", err)
@@ -257,7 +272,7 @@ func migrateDBSafely() (resultErr error) {
 		defer unlockCancel()
 		var released bool
 		unlockErr := connection.QueryRowContext(
-			unlockContext, "SELECT pg_advisory_unlock($1)", postgresMigrationAdvisoryLockKey,
+			unlockContext, "SELECT pg_advisory_unlock($1)", lockKey,
 		).Scan(&released)
 		if unlockErr == nil && !released {
 			unlockErr = errors.New("PostgreSQL database migration lock was not held by the migration connection")
@@ -272,27 +287,109 @@ func migrateDBSafely() (resultErr error) {
 		common.SysError("failed to release PostgreSQL database migration lock: " + unlockErr.Error())
 	}()
 
-	migrationDB, err := gorm.Open(postgres.New(postgres.Config{
-		Conn:                 connection,
-		PreferSimpleProtocol: true,
-	}), &gorm.Config{
-		SkipDefaultTransaction:                   DB.SkipDefaultTransaction,
-		NamingStrategy:                           DB.NamingStrategy,
-		Logger:                                   DB.Logger,
-		NowFunc:                                  DB.NowFunc,
-		PrepareStmt:                              false,
-		DisableForeignKeyConstraintWhenMigrating: DB.DisableForeignKeyConstraintWhenMigrating,
-		IgnoreRelationshipsWhenMigrating:         DB.IgnoreRelationshipsWhenMigrating,
-		DisableNestedTransaction:                 DB.DisableNestedTransaction,
-		CreateBatchSize:                          DB.CreateBatchSize,
-		TranslateError:                           DB.TranslateError,
-	})
+	migrationDB, err := gormDBOnDedicatedConnection(db, connection)
 	if err != nil {
 		resultErr = fmt.Errorf("initialize PostgreSQL database migration session: %w", err)
 		return resultErr
 	}
-	resultErr = migrateDBOn(migrationDB)
+	resultErr = migrate(migrationDB)
 	return resultErr
+}
+
+func mysqlMigrationLockName(schema string) string {
+	digest := sha256.Sum256([]byte(schema))
+	return fmt.Sprintf("%s%x", mysqlMigrationLockPrefix, digest[:16])
+}
+
+func migrateMySQLDBSafely(db *gorm.DB, migrate func(*gorm.DB) error) (resultErr error) {
+	if db == nil || migrate == nil {
+		return errors.New("invalid MySQL database migration request")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	connection, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("reserve MySQL database migration connection: %w", err)
+	}
+	defer connection.Close()
+
+	schemaContext, schemaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	var schema string
+	err = connection.QueryRowContext(schemaContext, "SELECT DATABASE()").Scan(&schema)
+	schemaCancel()
+	if err != nil {
+		return fmt.Errorf("read MySQL database migration schema: %w", err)
+	}
+	if strings.TrimSpace(schema) == "" {
+		return errors.New("MySQL database migration requires a selected schema")
+	}
+	lockName := mysqlMigrationLockName(schema)
+	lockContext, lockCancel := context.WithTimeout(context.Background(), time.Duration(mysqlMigrationLockWaitSeconds)*time.Second)
+	var acquired sql.NullInt64
+	err = connection.QueryRowContext(
+		lockContext, "SELECT GET_LOCK(?, ?)", lockName, mysqlMigrationLockWaitSeconds,
+	).Scan(&acquired)
+	lockCancel()
+	if err != nil {
+		return fmt.Errorf("acquire MySQL database migration lock: %w", err)
+	}
+	if !acquired.Valid {
+		return fmt.Errorf("acquire MySQL database migration lock: server returned no result for schema %q", schema)
+	}
+	if acquired.Int64 != 1 {
+		return fmt.Errorf("acquire MySQL database migration lock: timed out waiting for schema %q", schema)
+	}
+
+	defer func() {
+		unlockContext, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer unlockCancel()
+		var released sql.NullInt64
+		unlockErr := connection.QueryRowContext(
+			unlockContext, "SELECT RELEASE_LOCK(?)", lockName,
+		).Scan(&released)
+		if unlockErr == nil && (!released.Valid || released.Int64 != 1) {
+			unlockErr = errors.New("MySQL database migration lock was not held by the migration connection")
+		}
+		if unlockErr == nil {
+			return
+		}
+		if resultErr == nil {
+			resultErr = fmt.Errorf("release MySQL database migration lock: %w", unlockErr)
+			return
+		}
+		common.SysError("failed to release MySQL database migration lock: " + unlockErr.Error())
+	}()
+
+	migrationDB, err := gormDBOnDedicatedConnection(db, connection)
+	if err != nil {
+		resultErr = fmt.Errorf("initialize MySQL database migration session: %w", err)
+		return resultErr
+	}
+	resultErr = migrate(migrationDB)
+	return resultErr
+}
+
+func gormDBOnDedicatedConnection(db *gorm.DB, connection *sql.Conn) (*gorm.DB, error) {
+	if db == nil || connection == nil {
+		return nil, errors.New("invalid dedicated database migration connection")
+	}
+	// Reuse the initialized dialect, callbacks and server capability flags from
+	// the source GORM handle while pinning every query to the exact connection
+	// that owns the advisory/named lock. prepareMySQLMigrationDB then supplies a
+	// reusable statement-cloning session for its table options.
+	migrationDB := db.Session(&gorm.Session{
+		Context: context.Background(),
+		NewDB:   true,
+	})
+	if migrationDB.Error != nil {
+		return nil, migrationDB.Error
+	}
+	migrationDB.Config.ConnPool = connection
+	migrationDB.Config.PrepareStmt = false
+	migrationDB.Statement.ConnPool = connection
+	return migrationDB, nil
 }
 
 func InitLogDB() (err error) {
@@ -381,6 +478,10 @@ func migrateDBOn(db *gorm.DB) error {
 		&PaymentQuote{},
 		&PaymentUserGuard{},
 		&PaymentOrder{},
+		&PaymentTask{},
+		&PaymentLimitPolicy{},
+		&PaymentLimitBucket{},
+		&PaymentLimitReservation{},
 		&PaymentEvent{},
 		&PaymentLedgerEntry{},
 		&PaymentDebt{},
@@ -455,7 +556,11 @@ func prepareMySQLMigrationDB(db *gorm.DB, requiredIndexCharacters int64, existin
 	if err := ensureMySQLLongIndexRowFormatOn(db, existingTables); err != nil {
 		return nil, err
 	}
-	return db.Set("gorm:table_options", "ENGINE=InnoDB ROW_FORMAT=DYNAMIC"), nil
+	// Set returns a chain handle whose statement is intentionally mutable. Wrap
+	// it in a reusable session so each later migration/helper call clones the
+	// statement (including table_options) instead of leaving a prior Table(...)
+	// selection attached to every subsequent AutoMigrate model.
+	return db.Set("gorm:table_options", "ENGINE=InnoDB ROW_FORMAT=DYNAMIC").Session(&gorm.Session{}), nil
 }
 
 func checkMySQLLongIndexCapability(db *gorm.DB, requiredIndexCharacters int64) error {
@@ -636,6 +741,10 @@ func migrateDBFast() error {
 		{&PaymentQuote{}, "PaymentQuote"},
 		{&PaymentUserGuard{}, "PaymentUserGuard"},
 		{&PaymentOrder{}, "PaymentOrder"},
+		{&PaymentTask{}, "PaymentTask"},
+		{&PaymentLimitPolicy{}, "PaymentLimitPolicy"},
+		{&PaymentLimitBucket{}, "PaymentLimitBucket"},
+		{&PaymentLimitReservation{}, "PaymentLimitReservation"},
 		{&PaymentEvent{}, "PaymentEvent"},
 		{&PaymentLedgerEntry{}, "PaymentLedgerEntry"},
 		{&PaymentDebt{}, "PaymentDebt"},
@@ -711,10 +820,28 @@ func migrateLOGDB() error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		return migrateClickHouseLogDB()
 	}
-	migrationDB := LOG_DB
-	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
+	return migrateLOGDBSafelyOn(LOG_DB, common.LogDatabaseType(), migrateLOGDBOn)
+}
+
+func migrateLOGDBSafelyOn(db *gorm.DB, databaseType common.DatabaseType, migrate func(*gorm.DB) error) error {
+	switch databaseType {
+	case common.DatabaseTypeMySQL:
+		return migrateMySQLDBSafely(db, migrate)
+	case common.DatabaseTypePostgreSQL:
+		return migratePostgreSQLDBSafely(db, postgresMigrationAdvisoryLockKey, migrate)
+	default:
+		return migrate(db)
+	}
+}
+
+func migrateLOGDBOn(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("invalid log database migration request")
+	}
+	migrationDB := db
+	if db.Dialector.Name() == "mysql" {
 		var err error
-		migrationDB, err = prepareMySQLMigrationDB(LOG_DB, 382, nil)
+		migrationDB, err = prepareMySQLMigrationDB(db, 382, nil)
 		if err != nil {
 			return err
 		}
@@ -829,6 +956,8 @@ func ensurePaymentProjectionColumnsSQLiteOn(db *gorm.DB) error {
 		name  string
 		ddl   string
 	}{
+		{table: "top_ups", name: "provider_order_key", ddl: "`provider_order_key` varchar(320)"},
+		{table: "payment_orders", name: "browser_authorization_digest", ddl: "`browser_authorization_digest` varchar(64)"},
 		{table: "subscription_orders", name: "provider_order_key", ddl: "`provider_order_key` varchar(320)"},
 		{table: "user_subscriptions", name: "payment_order_id", ddl: "`payment_order_id` bigint"},
 	}

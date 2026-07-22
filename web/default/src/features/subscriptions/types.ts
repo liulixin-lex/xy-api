@@ -44,13 +44,59 @@ export const subscriptionPlanSchema = z.object({
   stripe_price_id: z.string().optional(),
   creem_product_id: z.string().optional(),
   waffo_pancake_product_id: z.string().optional(),
+  external_payment_route_ids: z.array(z.string()).optional(),
 })
 
 export type SubscriptionPlan = z.infer<typeof subscriptionPlanSchema>
 
+export const LEGACY_STRIPE_PRICE_ID_PURPOSE =
+  'legacy_recurring_mapping_only' as const
+
 export interface PlanRecord {
   plan: SubscriptionPlan
+  stripe_price_id_purpose?: typeof LEGACY_STRIPE_PRICE_ID_PURPOSE
 }
+
+const publicSubscriptionPlanInputSchema = z.object({
+  id: z.number(),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  price_amount: z.number(),
+  currency: z.string().default('USD'),
+  duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
+  duration_value: z.number(),
+  custom_seconds: z.number().optional(),
+  quota_reset_period: z.enum(['never', 'daily', 'weekly', 'monthly', 'custom']),
+  quota_reset_custom_seconds: z.number().optional(),
+  allow_balance_pay: z.boolean().optional().default(true),
+  max_purchase_per_user: z.number(),
+  total_amount: z.number(),
+  includes_expanded_access: z.boolean().optional(),
+  external_payment_route_ids: z.array(z.string()).optional(),
+  // Read only during a rolling update from an older backend. The transformed
+  // public object never retains or exposes the internal group identifier.
+  upgrade_group: z.string().optional(),
+})
+
+export const publicSubscriptionPlanSchema =
+  publicSubscriptionPlanInputSchema.transform((value) => {
+    const { upgrade_group: legacyUpgradeGroup, ...plan } = value
+    return {
+      ...plan,
+      includes_expanded_access:
+        plan.includes_expanded_access ?? Boolean(legacyUpgradeGroup?.trim()),
+    }
+  })
+
+export type PublicSubscriptionPlan = z.infer<
+  typeof publicSubscriptionPlanSchema
+>
+
+export const publicPlanRecordSchema = z.object({
+  plan: publicSubscriptionPlanSchema,
+})
+
+export type PublicPlanRecord = z.infer<typeof publicPlanRecordSchema>
 
 // ============================================================================
 // User Subscription Schema & Types
@@ -75,12 +121,37 @@ export interface UserSubscriptionRecord {
   subscription: UserSubscription
 }
 
+export const publicUserSubscriptionSchema = z.object({
+  id: z.number(),
+  plan_id: z.number(),
+  plan_title: z.string().optional().default(''),
+  status: z.string(),
+  start_time: z.number(),
+  end_time: z.number(),
+  amount_total: z.number(),
+  amount_used: z.number(),
+  next_reset_time: z.number().optional().default(0),
+})
+
+export type PublicUserSubscription = z.infer<
+  typeof publicUserSubscriptionSchema
+>
+
+export const publicUserSubscriptionRecordSchema = z.object({
+  subscription: publicUserSubscriptionSchema,
+})
+
+export type PublicUserSubscriptionRecord = z.infer<
+  typeof publicUserSubscriptionRecordSchema
+>
+
 // ============================================================================
 // API Request/Response Types
 // ============================================================================
 
 export interface ApiResponse<T = unknown> {
   success: boolean
+  code?: string
   message?: string
   data?: T
 }
@@ -103,13 +174,10 @@ export interface SubscriptionPayResponse {
     pay_link?: string
     // Waffo Pancake / Creem hosted checkout URL.
     checkout_url?: string
-    // Pancake-only: order metadata + self-service buyer session token,
-    // surfaced for future flows (refund / cancel from new-api's own UI).
+    // Pancake checkout metadata; new-api does not expose buyer session tokens.
     session_id?: string
     expires_at?: number | string
     order_id?: string
-    token?: string
-    token_expires_at?: number | string
   }
   url?: string
 }
@@ -139,11 +207,13 @@ export interface SubscriptionResetResult {
 // Self Subscription Data (user-facing)
 // ============================================================================
 
-export interface SelfSubscriptionData {
-  billing_preference: string
-  subscriptions: UserSubscriptionRecord[]
-  all_subscriptions: UserSubscriptionRecord[]
-}
+export const selfSubscriptionDataSchema = z.object({
+  billing_preference: z.string(),
+  subscriptions: z.array(publicUserSubscriptionRecordSchema),
+  all_subscriptions: z.array(publicUserSubscriptionRecordSchema),
+})
+
+export type SelfSubscriptionData = z.infer<typeof selfSubscriptionDataSchema>
 
 // ============================================================================
 // Read-only Stripe Legacy Subscription Inventory

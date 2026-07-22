@@ -16,6 +16,15 @@ func TestSystemSettingsRoutesUseSystemSettingPermission(t *testing.T) {
 	assertSystemSettingsRoutePermission(t, http.MethodPut, "/option/", controller.UpdateOption)
 	assertPaymentGatewayRoutePermission(t, http.MethodPost, "/option/payment_compliance", controller.ConfirmPaymentCompliance)
 	assertPaymentGatewayRoutePermission(t, http.MethodPut, "/option/payment", controller.UpdatePaymentSettings)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodPost, "/option/waffo-pancake/catalog", true, controller.ListWaffoPancakeCatalog)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodPost, "/option/waffo-pancake/pair", true, controller.CreateWaffoPancakePair)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodPost, "/option/waffo-pancake/save", true, controller.SaveWaffoPancake)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodPost, "/option/waffo-pancake/subscription-product", true, controller.CreateWaffoPancakeSubscriptionProduct)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodGet, "/option/waffo-pancake/subscription-product-options", false, controller.ListWaffoPancakeSubscriptionProductOptions)
+	assertPaymentGatewayScopedRoutePermission(t, http.MethodGet, "/option/payment/credential-revocation-preview", false, controller.GetPaymentCredentialRevocationPreview)
+	assertPaymentOperationsRoutePermission(t, http.MethodGet, "/option/payment/overview", false, controller.GetPaymentOperationsOverview)
+	assertDirectPaymentGatewayRoutePermission(t, http.MethodGet, "/option/payment/limits", false, controller.ListPaymentLimitPolicies)
+	assertDirectPaymentGatewayRoutePermission(t, http.MethodPut, "/option/payment/limits", true, controller.UpdatePaymentLimitPolicy)
 	assertPaymentOperationsRoutePermission(t, http.MethodGet, "/option/payment/audit", false, controller.ListPaymentAudit)
 	assertPaymentOperationsRoutePermission(t, http.MethodGet, "/option/payment/audit/:trade_no", false, controller.GetPaymentAudit)
 	assertPaymentOperationsRoutePermission(t, http.MethodPost, "/option/payment/audit/:trade_no/fulfill", true, controller.ResolveManualPaymentOrder)
@@ -53,6 +62,20 @@ func TestSystemSettingsRoutesUseSystemSettingPermission(t *testing.T) {
 	assertSystemSettingsRoutePermission(t, http.MethodDelete, "/system-info/instances/:node_name", controller.DeleteStaleSystemInstance)
 }
 
+func assertDirectPaymentGatewayRoutePermission(t *testing.T, method string, path string, secureVerification bool, handler any) {
+	t.Helper()
+	for _, route := range systemSettingsPermissionRoutes {
+		if route.method == method && route.path == path {
+			assert.Equal(t, authz.PaymentGatewayManage, route.permission)
+			assert.Empty(t, route.additionalPermissions)
+			assert.Equal(t, secureVerification, route.secureVerification)
+			assert.Equal(t, reflect.ValueOf(handler).Pointer(), reflect.ValueOf(route.handler).Pointer())
+			return
+		}
+	}
+	t.Fatalf("route %s %s not found", method, path)
+}
+
 func assertPaymentOperationsRoutePermission(t *testing.T, method string, path string, secureVerification bool, handler any) {
 	t.Helper()
 	for _, route := range systemSettingsPermissionRoutes {
@@ -68,12 +91,16 @@ func assertPaymentOperationsRoutePermission(t *testing.T, method string, path st
 }
 
 func assertPaymentGatewayRoutePermission(t *testing.T, method string, path string, handler any) {
+	assertPaymentGatewayScopedRoutePermission(t, method, path, true, handler)
+}
+
+func assertPaymentGatewayScopedRoutePermission(t *testing.T, method string, path string, secureVerification bool, handler any) {
 	t.Helper()
 	for _, route := range systemSettingsPermissionRoutes {
 		if route.method == method && route.path == path {
 			assert.Equal(t, authz.SystemSettingManage, route.permission)
 			assert.Equal(t, []authz.Permission{authz.PaymentGatewayManage}, route.additionalPermissions)
-			assert.True(t, route.secureVerification)
+			assert.Equal(t, secureVerification, route.secureVerification)
 			assert.Equal(t, reflect.ValueOf(handler).Pointer(), reflect.ValueOf(route.handler).Pointer())
 			return
 		}

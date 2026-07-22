@@ -55,7 +55,8 @@
     "i18n:extract": "bunx i18next-cli extract",
     "i18n:status": "bunx i18next-cli status",
     "i18n:sync": "bunx i18next-cli sync",
-    "i18n:lint": "bunx i18next-cli lint"
+    "i18n:lint": "bunx i18next-cli lint",
+    "i18n:payment-admin": "node scripts/check-payment-admin-i18n.mjs"
   },
   "eslintConfig": {
     "extends": [
@@ -80,10 +81,10 @@
     "@rsbuild/plugin-react": "^2.0.0",
     "@so1ve/prettier-config": "^3.1.0",
     "autoprefixer": "^10.4.21",
-    "eslint": "8.57.0",
+    "eslint": "8.57.1",
     "eslint-plugin-header": "^3.1.1",
     "eslint-plugin-react-hooks": "^5.2.0",
-    "i18next-cli": "^1.10.3",
+    "i18next-cli": "^1.66.2",
     "postcss": "^8.5.3",
     "prop-types": "^15.8.1",
     "prettier": "catalog:",

@@ -1,6 +1,12 @@
 package controller
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
@@ -13,7 +19,79 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stripe/stripe-go/v86"
 )
+
+func TestPaymentSettingsMutationScopeRejectsMixedModules(t *testing.T) {
+	assert.NoError(t, validatePaymentSettingsMutationScope(map[string]interface{}{
+		"StripeCurrency": "USD",
+		"StripeMinTopUp": 1,
+	}, nil, nil))
+	assert.NoError(t, validatePaymentSettingsMutationScope(map[string]interface{}{
+		"StripeWebhookSecret": "whsec_replacement",
+	}, nil, []string{model.PaymentProviderStripe}))
+	assert.ErrorIs(t, validatePaymentSettingsMutationScope(map[string]interface{}{
+		"EpayId":         "merchant",
+		"StripeCurrency": "USD",
+	}, nil, nil), errPaymentSettingsScopeConflict)
+	assert.ErrorIs(t, validatePaymentSettingsMutationScope(nil, nil, []string{
+		model.PaymentProviderEpay, model.PaymentProviderXorPay,
+	}), errPaymentSettingsScopeConflict)
+	assert.NoError(t, validatePaymentSettingsMutationScope(map[string]interface{}{
+		"WaffoPancakeMerchantID": "MER_AbCdEfGhIjKlMnOpQrStUv",
+		"WaffoPancakePrivateKey": "private",
+		"WaffoPancakeReturnURL":  "https://payments.example.com/return",
+		"WaffoPancakeStoreID":    "STO_AbCdEfGhIjKlMnOpQrStUv",
+		"WaffoPancakeProductID":  "PROD_AbCdEfGhIjKlMnOpQrStUv",
+	}, nil, nil))
+	assert.ErrorIs(t, validatePaymentSettingsMutationScope(map[string]interface{}{
+		"WaffoMerchantId":        "waffo-merchant",
+		"WaffoPancakeMerchantID": "MER_AbCdEfGhIjKlMnOpQrStUv",
+	}, nil, nil), errPaymentSettingsScopeConflict)
+}
+
+func TestUpdatePaymentSettingsReturnsStableScopeErrorWithoutRawMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	payload, err := common.Marshal(paymentSettingsUpdateRequest{
+		Options: map[string]interface{}{
+			"EpayId":         "merchant",
+			"StripeCurrency": "USD",
+		},
+		ExpectedVersion: 1,
+	})
+	require.NoError(t, err)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/option/payment", bytes.NewReader(payload))
+	context.Request.Header.Set("Content-Type", "application/json")
+	UpdatePaymentSettings(context)
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.JSONEq(t, `{"success":false,"code":"payment_settings_scope_conflict"}`, recorder.Body.String())
+	assert.NotContains(t, recorder.Body.String(), "multiple configuration modules")
+}
+
+func TestUpdatePaymentSettingsReturnsStableStripeCheckoutHostError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	payload, err := common.Marshal(paymentSettingsUpdateRequest{
+		Options: map[string]interface{}{
+			"StripeCheckoutAllowedHosts": "*.example.com",
+		},
+		ExpectedVersion: 1,
+	})
+	require.NoError(t, err)
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/option/payment", bytes.NewReader(payload))
+	context.Request.Header.Set("Content-Type", "application/json")
+	UpdatePaymentSettings(context)
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.JSONEq(t, `{"success":false,"code":"payment_settings_stripe_checkout_hosts_invalid"}`, recorder.Body.String())
+	assert.NotContains(t, recorder.Body.String(), "*.example.com")
+}
 
 func TestValidatePaymentSettingRejectsUnsafeProviderBindingsAndDiscounts(t *testing.T) {
 	err := validatePaymentSettingValue("PayMethods", `[{"name":"Fake Stripe","type":"alipay","provider":"stripe"}]`)
@@ -31,6 +109,13 @@ func TestValidatePaymentSettingRejectsUnsafeProviderBindingsAndDiscounts(t *test
 	err = validatePaymentSettingValue("XorPayCurrency", "USD")
 	assert.Error(t, err)
 	require.NoError(t, validatePaymentSettingValue("XorPayCurrency", "CNY"))
+	require.NoError(t, validatePaymentSettingValue("WaffoWebRedirectHosts", "checkout.partner.example\npay.partner.example"))
+	assert.Error(t, validatePaymentSettingValue("WaffoWebRedirectHosts", "https://checkout.partner.example/path"))
+	require.NoError(t, validatePaymentSettingValue("WaffoAppRedirectSchemes", "weixin\nalipays"))
+	assert.Error(t, validatePaymentSettingValue("WaffoAppRedirectSchemes", "javascript"))
+	require.NoError(t, validatePaymentSettingValue("StripeCheckoutAllowedHosts", "checkout.example.com\npay.example.com"))
+	assert.Error(t, validatePaymentSettingValue("StripeCheckoutAllowedHosts", "*.example.com"))
+	assert.Error(t, validatePaymentSettingValue("StripeCheckoutAllowedHosts", "https://checkout.example.com"))
 	assert.Error(t, validatePaymentSettingValue("EpayCurrency", "USD"))
 	require.NoError(t, validatePaymentSettingValue("EpayCurrency", "CNY"))
 	require.NoError(t, validatePaymentSettingValue("ServerAddress", "http://localhost:3000"))
@@ -48,17 +133,121 @@ func TestValidatePaymentSettingRejectsUnsafeProviderBindingsAndDiscounts(t *test
 	require.NoError(t, validatePaymentSettingValue("XorPayAppSecret", "0123456789abcdef0123456789abcdef"))
 }
 
+func TestValidatePaymentSettingRejectsUnsafeCreemProducts(t *testing.T) {
+	validProduct := `[{"productId":"prod_safe","name":"Safe","price":9.99,"currency":"USD","quota":1000}]`
+	require.NoError(t, validatePaymentSettingValue("CreemProducts", validProduct))
+
+	tests := map[string]string{
+		"not an array":           `{}`,
+		"null":                   `null`,
+		"empty public name":      `[{"productId":"prod_empty_name","name":" ","price":1,"currency":"USD","quota":1}]`,
+		"control in public name": `[{"productId":"prod_control_name","name":"Unsafe\nName","price":1,"currency":"USD","quota":1}]`,
+		"oversized public name":  `[{"productId":"prod_long_name","name":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","price":1,"currency":"USD","quota":1}]`,
+		"empty product id":       `[{"productId":" ","name":"Safe","price":1,"currency":"USD","quota":1}]`,
+		"duplicate product id":   `[{"productId":"prod_duplicate","name":"First","price":1,"currency":"USD","quota":1},{"productId":"prod_duplicate","name":"Second","price":2,"currency":"EUR","quota":2}]`,
+		"unsupported currency":   `[{"productId":"prod_jpy","name":"Safe","price":1,"currency":"JPY","quota":1}]`,
+		"zero price":             `[{"productId":"prod_zero_price","name":"Safe","price":0,"currency":"USD","quota":1}]`,
+		"sub-minor price":        `[{"productId":"prod_fraction","name":"Safe","price":0.001,"currency":"USD","quota":1}]`,
+		"negative quota":         `[{"productId":"prod_negative","name":"Safe","price":1,"currency":"USD","quota":-1}]`,
+		"oversized quota":        `[{"productId":"prod_oversized","name":"Safe","price":1,"currency":"USD","quota":2147483648}]`,
+	}
+	for name, products := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Error(t, validatePaymentSettingValue("CreemProducts", products))
+		})
+	}
+}
+
 func TestCompatibilityGatewaySecretsRemainExplicitlyClearable(t *testing.T) {
 	for _, key := range []string{
 		"EpayKey", "StripeApiSecret", "StripeWebhookSecret", "XorPayAppSecret",
 		"CreemApiKey", "CreemWebhookSecret", "WaffoApiKey", "WaffoPrivateKey",
-		"WaffoSandboxApiKey", "WaffoSandboxPrivateKey",
+		"WaffoSandboxApiKey", "WaffoSandboxPrivateKey", "WaffoPancakePrivateKey",
 	} {
 		_, allowed := paymentSettingsAllowedKeys[key]
 		assert.True(t, allowed, key)
 		assert.True(t, isWriteOnlyPaymentSetting(key), key)
 	}
 	assert.False(t, isWriteOnlyPaymentSetting("WaffoPublicCert"))
+}
+
+func TestUpdatePaymentSettingsPersistsWaffoPancakeBindingAtomicallyAndEncrypted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PAYMENT_SECRET_KEY", "waffo-pancake-settings-test-key-00000001")
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.PaymentConfigurationAudit{}, &model.PaymentOrder{}, &model.TopUp{}, &model.SubscriptionOrder{},
+	))
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	require.NoError(t, err)
+	privateKeyPEM := string(pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}))
+
+	originalMerchantID := setting.WaffoPancakeMerchantID
+	originalPrivateKey := setting.WaffoPancakePrivateKey
+	originalReturnURL := setting.WaffoPancakeReturnURL
+	originalStoreID := setting.WaffoPancakeStoreID
+	originalProductID := setting.WaffoPancakeProductID
+	t.Cleanup(func() {
+		setting.WaffoPancakeMerchantID = originalMerchantID
+		setting.WaffoPancakePrivateKey = originalPrivateKey
+		setting.WaffoPancakeReturnURL = originalReturnURL
+		setting.WaffoPancakeStoreID = originalStoreID
+		setting.WaffoPancakeProductID = originalProductID
+	})
+
+	common.OptionMapRWMutex.Lock()
+	optionMapWasNil := common.OptionMap == nil
+	if optionMapWasNil {
+		common.OptionMap = make(map[string]string)
+	}
+	originalVersion, versionExisted := common.OptionMap[model.PaymentConfigurationVersionOptionKey]
+	common.OptionMap[model.PaymentConfigurationVersionOptionKey] = "1"
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		if optionMapWasNil {
+			common.OptionMap = nil
+		} else if versionExisted {
+			common.OptionMap[model.PaymentConfigurationVersionOptionKey] = originalVersion
+		} else {
+			delete(common.OptionMap, model.PaymentConfigurationVersionOptionKey)
+		}
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	payload, err := common.Marshal(paymentSettingsUpdateRequest{
+		Options: map[string]interface{}{
+			"WaffoPancakeMerchantID": "MER_AbCdEfGhIjKlMnOpQrStUv",
+			"WaffoPancakePrivateKey": privateKeyPEM,
+			"WaffoPancakeReturnURL":  "https://payments.example.com/return",
+			"WaffoPancakeStoreID":    "STO_AbCdEfGhIjKlMnOpQrStUv",
+			"WaffoPancakeProductID":  "PROD_AbCdEfGhIjKlMnOpQrStUv",
+		},
+		ExpectedVersion: 1,
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("id", 984031)
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/option/payment", bytes.NewReader(payload))
+	context.Request.Header.Set("Content-Type", "application/json")
+	context.Request.RemoteAddr = "192.0.2.31:1234"
+
+	UpdatePaymentSettings(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), `"success":true`)
+	assert.Contains(t, recorder.Body.String(), `"version":2`)
+	var stored model.Option
+	require.NoError(t, db.Where("key = ?", "WaffoPancakePrivateKey").First(&stored).Error)
+	assert.Contains(t, stored.Value, "enc:v2:")
+	assert.NotContains(t, stored.Value, "BEGIN RSA PRIVATE KEY")
+	assert.Equal(t, "MER_AbCdEfGhIjKlMnOpQrStUv", setting.WaffoPancakeMerchantID)
+	assert.Equal(t, "STO_AbCdEfGhIjKlMnOpQrStUv", setting.WaffoPancakeStoreID)
+	assert.Equal(t, "PROD_AbCdEfGhIjKlMnOpQrStUv", setting.WaffoPancakeProductID)
 }
 
 func TestXorPayAidRotationRequiresDifferentAppSecret(t *testing.T) {
@@ -338,6 +527,8 @@ func TestGetOptionsNeverReturnsRotatedPaymentSecrets(t *testing.T) {
 	assert.Equal(t, "false", optionValues[paymentStripeTestModeEnabledOptionKey])
 	assert.Equal(t, "true", optionValues[paymentStripeTestModeBlockedOptionKey])
 	assert.Equal(t, "true", optionValues[paymentStripeTestModeIsolationRequiredOptionKey])
+	assert.Equal(t, stripe.APIVersion, optionValues[paymentStripeWebhookAPIVersionOptionKey])
+	assert.Equal(t, "24", optionValues[paymentStripeWebhookSecretOverlapHoursOptionKey])
 	assert.Equal(t, "true", optionValues[paymentXorPayPreviousCredentialActiveOptionKey])
 }
 
@@ -596,7 +787,10 @@ func TestPaymentAtomicOnlyOptionKeysPreserveSharedSettingPaths(t *testing.T) {
 	assert.True(t, isPaymentAtomicOnlyOptionKey("TopupGroupRatio"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("EpayKey"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("StripeApiSecret"))
+	assert.True(t, isPaymentAtomicOnlyOptionKey("StripeCheckoutAllowedHosts"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("XorPayAppSecret"))
+	assert.True(t, isPaymentAtomicOnlyOptionKey("WaffoPancakePrivateKey"))
+	assert.True(t, isPaymentAtomicOnlyOptionKey("WaffoPancakeStoreID"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("StripeCredentialAccountId"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("StripeCredentialLivemode"))
 	assert.True(t, isPaymentAtomicOnlyOptionKey("StripeWebhookCredentialLivemode"))
@@ -934,6 +1128,44 @@ func TestStripeExpiredOrdersDoNotPinCallbackOrigin(t *testing.T) {
 
 	values := map[string]string{"CustomCallbackAddress": "https://payments-new.example.com"}
 	require.NoError(t, validateInFlightPaymentConfigurationChanges(values, nil))
+}
+
+func TestStripeCheckoutAllowedHostsCannotBeRemovedWhileOrdersAreActive(t *testing.T) {
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.PaymentOrder{}))
+	originalAllowedHosts := setting.StripeCheckoutAllowedHosts
+	setting.StripeCheckoutAllowedHosts = "checkout.example.net,pay.example.com"
+	t.Cleanup(func() { setting.StripeCheckoutAllowedHosts = originalAllowedHosts })
+
+	now := time.Now().Unix()
+	order := &model.PaymentOrder{
+		TradeNo: "payment-settings-stripe-host-policy", UserID: 990016,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderStripe,
+		PaymentMethod: model.PaymentMethodStripe, RequestID: "payment-settings-stripe-host-policy",
+		ExpectedAmountMinor: 100, Currency: "USD", RequestedAmount: 1, CreditQuota: 1,
+		Status: model.PaymentOrderStatusPending, ExpiresAt: now + 600, CreatedAt: now, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, db.Create(order).Error)
+
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(map[string]string{
+		"StripeCheckoutAllowedHosts": "checkout.example.net,new.example.com,pay.example.com",
+	}, nil))
+	assert.False(t, paymentConfigurationPreconditions(map[string]string{
+		"StripeCheckoutAllowedHosts": "checkout.example.net,new.example.com,pay.example.com",
+	}, nil).RequireNoActiveStripeOrdersForHostRemoval)
+	err := validateInFlightPaymentConfigurationChanges(map[string]string{
+		"StripeCheckoutAllowedHosts": "checkout.example.net",
+	}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot be removed")
+	assert.True(t, paymentConfigurationPreconditions(map[string]string{
+		"StripeCheckoutAllowedHosts": "checkout.example.net",
+	}, nil).RequireNoActiveStripeOrdersForHostRemoval)
+
+	require.NoError(t, db.Model(order).Update("status", model.PaymentOrderStatusExpired).Error)
+	require.NoError(t, validateInFlightPaymentConfigurationChanges(map[string]string{
+		"StripeCheckoutAllowedHosts": "checkout.example.net",
+	}, nil))
 }
 
 func TestPaymentCallbackOriginCanChangeWithoutActiveGatewayOrders(t *testing.T) {

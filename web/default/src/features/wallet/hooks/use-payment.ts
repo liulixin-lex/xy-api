@@ -20,18 +20,11 @@ import i18next from 'i18next'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
-import {
-  calculateAmount,
-  calculateStripeAmount,
-  calculateWaffoPancakeAmount,
-  createPaymentQuote,
-  isApiSuccess,
-  requestPayment,
-  requestStripePayment,
-  startPayment,
-} from '../api'
+import { createPaymentQuote, isApiSuccess, startPayment } from '../api'
 import { MAX_TOPUP_AMOUNT } from '../constants'
 import {
+  createPaymentError,
+  getPaymentErrorMessage,
   getSafePaymentUrl,
   isUnifiedPaymentMethod,
   navigateToPaymentUrl,
@@ -40,20 +33,6 @@ import {
 import type { PaymentMethod, ClientPaymentQuote, PaymentStart } from '../types'
 
 const QUOTE_DEBOUNCE_MS = 300
-const LEGACY_QUOTE_TTL_SECONDS = 5 * 60
-
-function getHttpStatus(error: unknown): number | undefined {
-  if (!error || typeof error !== 'object' || !('response' in error)) {
-    return undefined
-  }
-  const response = (error as { response?: { status?: unknown } }).response
-  return typeof response?.status === 'number' ? response.status : undefined
-}
-
-function isEndpointUnavailable(error: unknown): boolean {
-  const status = getHttpStatus(error)
-  return status === 404 || status === 405 || status === 501
-}
 
 function isRequestCancelled(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false
@@ -68,114 +47,36 @@ function createRequestId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-async function createLegacyQuote(
-  topupAmount: number,
-  method: PaymentMethod,
-  signal?: AbortSignal
-): Promise<ClientPaymentQuote> {
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
-
-  let response
-  if (method.provider === 'stripe') {
-    response = await calculateStripeAmount({ amount: topupAmount })
-  } else if (method.provider === 'waffo_pancake') {
-    response = await calculateWaffoPancakeAmount({ amount: topupAmount })
-  } else {
-    response = await calculateAmount({ amount: topupAmount })
-  }
-
-  if (!isApiSuccess(response) || !response.data) {
-    throw new Error(response.message || i18next.t('Payment quote failed'))
-  }
-
-  const payableAmount = Number.parseFloat(response.data)
-  if (!Number.isFinite(payableAmount) || payableAmount <= 0) {
-    throw new Error(i18next.t('Payment quote is invalid'))
-  }
-
-  const expiresAt = Math.floor(Date.now() / 1000) + LEGACY_QUOTE_TTL_SECONDS
-  return {
-    quote_id: `legacy:${method.provider}:${method.type}:${topupAmount}:${expiresAt}`,
-    order_kind: 'topup',
-    provider: method.provider,
-    payment_method: method.type,
-    requested_amount: topupAmount,
-    credit_quota: 0,
-    expected_amount_minor: Math.round(payableAmount * 100),
-    payable_amount: payableAmount.toFixed(2),
-    currency: method.currency || (method.provider === 'stripe' ? 'USD' : 'CNY'),
-    expires_at: expiresAt,
-    legacy: true,
-  }
-}
-
 async function requestQuote(
   topupAmount: number,
   method: PaymentMethod,
   signal: AbortSignal
 ): Promise<ClientPaymentQuote> {
   if (!isUnifiedPaymentMethod(method)) {
-    return createLegacyQuote(topupAmount, method, signal)
+    throw new Error(i18next.t('This payment method is temporarily unavailable'))
   }
-  try {
-    const response = await createPaymentQuote(
-      {
-        order_kind: 'topup',
-        provider: method.provider,
-        payment_method: method.type,
-        amount: topupAmount,
-      },
-      signal
-    )
+  const response = await createPaymentQuote(
+    {
+      order_kind: 'topup',
+      route_id: method.route_id,
+      amount: topupAmount,
+    },
+    signal
+  )
 
-    if (!isApiSuccess(response) || !response.data) {
-      throw new Error(response.message || i18next.t('Payment quote failed'))
-    }
-    return response.data
-  } catch (error) {
-    if (!isEndpointUnavailable(error) || method.provider === 'xorpay') {
-      throw error
-    }
-    return createLegacyQuote(topupAmount, method, signal)
-  }
-}
-
-async function startLegacyPayment(
-  quote: ClientPaymentQuote
-): Promise<PaymentStart> {
-  const request = {
-    amount: Math.floor(quote.requested_amount),
-    payment_method: quote.payment_method,
-  }
-
-  if (quote.provider === 'stripe') {
-    const response = await requestStripePayment({
-      ...request,
-      payment_method: 'stripe',
-    })
-    if (!isApiSuccess(response) || !response.data?.pay_link) {
-      throw new Error(response.message || i18next.t('Payment request failed'))
-    }
-    return {
-      flow: 'hosted_redirect',
-      trade_no: '',
-      url: response.data.pay_link,
-      expires_at: quote.expires_at,
-    }
-  }
-
-  const response = await requestPayment(request)
-  if (!isApiSuccess(response) || !response.url || !response.data) {
-    throw new Error(response.message || i18next.t('Payment request failed'))
+  if (!isApiSuccess(response) || !response.data) {
+    throw createPaymentError(response)
   }
   return {
-    flow: 'form_post',
-    trade_no: '',
-    action: response.url,
-    fields: Object.fromEntries(
-      Object.entries(response.data).map(([key, value]) => [key, String(value)])
-    ),
-    expires_at: quote.expires_at,
+    quote_id: response.data.quote_id,
+    route_id: response.data.route_id || method.route_id,
+    public_method: response.data.public_method || method.public_method,
+    channel_alias: response.data.channel_alias || method.channel_alias,
+    top_up_amount: response.data.top_up_amount,
+    plan_id: response.data.plan_id,
+    payable_amount: response.data.payable_amount,
+    currency: response.data.currency,
+    expires_at: response.data.expires_at,
   }
 }
 
@@ -224,13 +125,12 @@ export function usePayment() {
         }
         return null
       }
-      if (
-        !isUnifiedPaymentMethod(method) &&
-        method.provider !== 'waffo_pancake'
-      ) {
+      if (!isUnifiedPaymentMethod(method)) {
         if (sequence === requestSequenceRef.current) {
           setQuote(null)
-          setQuoteError(i18next.t('This payment method uses a legacy flow'))
+          setQuoteError(
+            i18next.t('This payment method is temporarily unavailable')
+          )
           setCalculating(false)
         }
         return null
@@ -255,12 +155,8 @@ export function usePayment() {
         ) {
           return null
         }
-        const message =
-          error instanceof Error && error.message
-            ? error.message
-            : i18next.t('Payment quote failed')
         setQuote(null)
-        setQuoteError(message)
+        setQuoteError(getPaymentErrorMessage(error, i18next.t.bind(i18next)))
         return null
       } finally {
         if (sequence === requestSequenceRef.current) {
@@ -300,7 +196,7 @@ export function usePayment() {
   )
 
   const processPayment = useCallback(
-    async (currentQuote: ClientPaymentQuote) => {
+    async (currentQuote: ClientPaymentQuote, method: PaymentMethod) => {
       if (processingRef.current) return null
       if (currentQuote.expires_at <= Math.floor(Date.now() / 1000)) {
         toast.error(
@@ -312,30 +208,25 @@ export function usePayment() {
       processingRef.current = true
       setProcessing(true)
       try {
-        let paymentStart: PaymentStart
-        if (currentQuote.provider === 'waffo_pancake') {
-          throw new Error(i18next.t('This payment method uses a legacy flow'))
+        if (!isUnifiedPaymentMethod(method)) {
+          throw new Error(
+            i18next.t('Payment is temporarily unavailable. Try again.')
+          )
         }
-        if (currentQuote.quote_id.startsWith('legacy:')) {
-          paymentStart = await startLegacyPayment(currentQuote)
-        } else {
-          if (paymentRequestRef.current?.quoteId !== currentQuote.quote_id) {
-            paymentRequestRef.current = {
-              quoteId: currentQuote.quote_id,
-              requestId: createRequestId(),
-            }
+        if (paymentRequestRef.current?.quoteId !== currentQuote.quote_id) {
+          paymentRequestRef.current = {
+            quoteId: currentQuote.quote_id,
+            requestId: createRequestId(),
           }
-          const response = await startPayment({
-            quote_id: currentQuote.quote_id,
-            request_id: paymentRequestRef.current.requestId,
-          })
-          if (!isApiSuccess(response) || !response.data) {
-            throw new Error(
-              response.message || i18next.t('Payment request failed')
-            )
-          }
-          paymentStart = response.data
         }
+        const response = await startPayment({
+          quote_id: currentQuote.quote_id,
+          request_id: paymentRequestRef.current.requestId,
+        })
+        if (!isApiSuccess(response) || !response.data) {
+          throw createPaymentError(response)
+        }
+        const paymentStart: PaymentStart = response.data
 
         if (paymentStart.flow === 'qr') {
           return paymentStart
@@ -345,23 +236,21 @@ export function usePayment() {
         }
         if (paymentStart.flow === 'hosted_redirect') {
           if (!getSafePaymentUrl(paymentStart.url)) {
-            throw new Error(i18next.t('Invalid payment redirect URL'))
+            throw new Error(
+              i18next.t('Payment is temporarily unavailable. Try again.')
+            )
           }
-          toast.success(i18next.t('Redirecting to payment page...'))
           navigateToPaymentUrl(paymentStart.url)
           return paymentStart
         }
         if (!submitPaymentForm(paymentStart.action, paymentStart.fields)) {
-          throw new Error(i18next.t('Invalid payment redirect URL'))
+          throw new Error(
+            i18next.t('Payment is temporarily unavailable. Try again.')
+          )
         }
-        toast.success(i18next.t('Redirecting to payment page...'))
         return paymentStart
       } catch (error) {
-        toast.error(
-          error instanceof Error && error.message
-            ? error.message
-            : i18next.t('Payment request failed')
-        )
+        toast.error(getPaymentErrorMessage(error, i18next.t.bind(i18next)))
         return null
       } finally {
         processingRef.current = false

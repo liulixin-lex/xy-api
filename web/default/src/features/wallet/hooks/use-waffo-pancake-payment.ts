@@ -16,10 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useCallback } from 'react'
 import i18next from 'i18next'
+import { useState, useCallback } from 'react'
 import { toast } from 'sonner'
+
 import { requestWaffoPancakePayment, isApiSuccess } from '../api'
+import { getPaymentErrorMessage, navigateToPaymentUrl } from '../lib/payment'
 
 function getCheckoutUrl(data: unknown): string | null {
   if (!data || typeof data !== 'object') {
@@ -31,31 +33,6 @@ function getCheckoutUrl(data: unknown): string | null {
   }
 
   return null
-}
-
-/**
- * Reject non-navigable schemes (e.g. javascript:, data:) and relative URLs.
- * Only http/https are allowed for backend-provided redirect targets.
- */
-function isSafeHttpCheckoutUrl(value: string): boolean {
-  const trimmed = value.trim()
-  if (!trimmed) {
-    return false
-  }
-  try {
-    const u = new URL(trimmed)
-    return u.protocol === 'http:' || u.protocol === 'https:'
-  } catch {
-    return false
-  }
-}
-
-function getErrorMessage(message: string | undefined, data: unknown): string {
-  if (typeof data === 'string' && data.trim()) {
-    return data
-  }
-
-  return message || i18next.t('Payment request failed')
 }
 
 /**
@@ -80,20 +57,14 @@ export function useWaffoPancakePayment() {
           const checkoutUrl = getCheckoutUrl(response.data)
 
           if (checkoutUrl) {
-            if (!isSafeHttpCheckoutUrl(checkoutUrl)) {
-              toast.error(i18next.t('Invalid payment redirect URL'))
-              return false
-            }
-            toast.success(i18next.t('Redirecting to payment page...'))
-            window.location.href = checkoutUrl
-            return true
+            if (navigateToPaymentUrl(checkoutUrl)) return true
           }
         }
 
-        toast.error(getErrorMessage(response.message, response.data))
+        toast.error(getPaymentErrorMessage(response, i18next.t.bind(i18next)))
         return false
-      } catch {
-        toast.error(i18next.t('Payment request failed'))
+      } catch (error) {
+        toast.error(getPaymentErrorMessage(error, i18next.t.bind(i18next)))
         return false
       } finally {
         setProcessing(false)

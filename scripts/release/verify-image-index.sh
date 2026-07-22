@@ -12,9 +12,9 @@ expected_version=${2:-}
 expected_commit=${3:-}
 
 if [ -n "$expected_version" ]; then
-  if [[ ! "$expected_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+  if [[ ! "$expected_version" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]] ||
      [[ ! "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
-    echo 'expected version/commit must be a stable lowercase v semver and a 40-character lowercase Git commit' >&2
+    echo 'expected version/commit must use the protected v0.2.x line and a 40-character lowercase Git commit' >&2
     exit 2
   fi
 fi

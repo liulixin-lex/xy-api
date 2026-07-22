@@ -3,8 +3,8 @@ name: Build Electron App
 on:
   push:
     tags:
-      - 'v*'  # Triggers on stable version tags like v1.0.0
-      - '!v*-*'  # Ignore pre-release tags like v1.0.0-beta
+      - 'v0.2.*'  # Protected stable release line
+      - '!v0.2.*-*'  # Ignore pre-release tags
 
 env:
   RELEASE_TAG: ${{ github.ref_name }}
@@ -34,8 +34,8 @@ jobs:
       - name: Determine Version
         run: |
           VERSION="$RELEASE_TAG"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Electron release version must use lowercase v semver, for example v0.0.1. Current value: $VERSION"
+          if [[ ! "$VERSION" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Electron publishing is restricted to the protected v0.2.x line. Current value: $VERSION"
             exit 1
           fi
           REPOSITORY_VERSION=$(< VERSION)

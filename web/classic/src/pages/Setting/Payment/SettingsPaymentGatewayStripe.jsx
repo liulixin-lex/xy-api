@@ -24,11 +24,18 @@ import {
   removeTrailingSlash,
   showError,
   showSuccess,
+  showWarning,
 } from '../../../helpers';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, TriangleAlert } from 'lucide-react';
 import { buildEmergencyCredentialReplacement } from '../../../helpers/payment-credential-revocation';
 import { resolveStripeTestModeNotice } from '../../../helpers/stripe-test-mode-readiness';
+import {
+  createPaymentAdminError,
+  getPaymentAdminErrorMessage,
+} from '../../../helpers/payment-admin-errors';
+import { buildStripeCheckoutAllowedHostsUpdate } from './payment-admin-utils';
+import { resolveStripeWebhookContract } from './stripe-webhook-contract';
 
 export default function SettingsPaymentGateway(props) {
   const { t } = useTranslation();
@@ -39,6 +46,7 @@ export default function SettingsPaymentGateway(props) {
     StripeWebhookSecret: '',
     StripePriceId: '',
     StripeAccountId: '',
+    StripeCheckoutAllowedHosts: '',
     StripeCredentialAccountId: '',
     StripeCredentialLivemode: '',
     StripeUnitPrice: 8.0,
@@ -55,6 +63,8 @@ export default function SettingsPaymentGateway(props) {
         StripeWebhookSecret: props.options.StripeWebhookSecret || '',
         StripePriceId: props.options.StripePriceId || '',
         StripeAccountId: props.options.StripeAccountId || '',
+        StripeCheckoutAllowedHosts:
+          props.options.StripeCheckoutAllowedHosts || '',
         StripeCredentialAccountId:
           props.options.StripeCredentialAccountId || '',
         StripeCredentialLivemode: props.options.StripeCredentialLivemode || '',
@@ -87,6 +97,10 @@ export default function SettingsPaymentGateway(props) {
     isolationRequired:
       props.options?.['payment_setting.stripe_test_mode_isolation_required'],
   });
+  const stripeWebhookContract = resolveStripeWebhookContract(
+    props.options?.['payment_setting.stripe_webhook_api_version'],
+    props.options?.['payment_setting.stripe_webhook_secret_overlap_hours'],
+  );
 
   const submitStripeSetting = async () => {
     if (submitInFlightRef.current) return;
@@ -136,6 +150,11 @@ export default function SettingsPaymentGateway(props) {
         key: 'StripeAccountId',
         value: (inputs.StripeAccountId || '').trim(),
       });
+      options.push(
+        buildStripeCheckoutAllowedHostsUpdate(
+          inputs.StripeCheckoutAllowedHosts,
+        ),
+      );
       if (
         inputs.StripeUnitPrice !== undefined &&
         inputs.StripeUnitPrice !== null
@@ -167,7 +186,6 @@ export default function SettingsPaymentGateway(props) {
           { skipErrorHandler: true },
         );
         if (result.data?.success) {
-          showSuccess(t('更新成功'));
           const nextInputs = {
             ...inputs,
             StripeApiSecret: '',
@@ -176,14 +194,19 @@ export default function SettingsPaymentGateway(props) {
           };
           setInputs(nextInputs);
           formApiRef.current?.setValues(nextInputs);
-          await props.refresh?.(result.data?.data?.version);
+          const refreshed = await props.refresh?.(result.data?.data?.version);
+          if (refreshed === false) {
+            showWarning(t('设置已保存，但最新状态刷新失败'));
+          } else {
+            showSuccess(t('更新成功'));
+          }
         } else {
-          showError(result.data?.message || t('更新失败'));
+          throw createPaymentAdminError(result.data, t('更新失败'));
         }
         return result;
       });
     } catch (error) {
-      showError(error?.response?.data?.message || t('更新失败'));
+      showError(getPaymentAdminErrorMessage(error, t, t('更新失败')));
     } finally {
       submitInFlightRef.current = false;
       setLoading(false);
@@ -201,8 +224,13 @@ export default function SettingsPaymentGateway(props) {
           <Banner
             type='info'
             icon={<BookOpen size={16} />}
+            title={t('Current Stripe connection uses one-time Checkout')}
             description={
               <>
+                {t(
+                  'Unified top-ups and fixed-term access purchases create Checkout Sessions in payment mode. They do not create auto-renewing subscriptions. The legacy recurring subscription inventory, when present, is shown separately below.',
+                )}
+                <br />
                 {t('Stripe 密钥、Webhook 等设置请')}
                 <a
                   href='https://dashboard.stripe.com/developers'
@@ -234,15 +262,64 @@ export default function SettingsPaymentGateway(props) {
             type='warning'
             icon={<TriangleAlert size={16} />}
             description={
-              <>
-                {t('Required events:')}{' '}
-                <code>
-                  {t(
-                    'checkout.session.completed, checkout.session.async_payment_succeeded, checkout.session.async_payment_failed, checkout.session.expired, charge.refunded, charge.dispute.created, charge.dispute.closed',
+              <div className='flex flex-col gap-1'>
+                <span>
+                  {t('Required for current one-time Checkout:')}{' '}
+                  <code>
+                    {t(
+                      'checkout.session.completed, checkout.session.async_payment_succeeded, checkout.session.async_payment_failed, checkout.session.expired, charge.refunded, charge.dispute.created, charge.dispute.closed',
+                    )}
+                  </code>
+                </span>
+                <span>
+                  {stripeWebhookContract.apiVersion ? (
+                    <>
+                      {t('Endpoint API version:')}{' '}
+                      <code>{stripeWebhookContract.apiVersion}</code>{' '}
+                      {t(
+                        'Configure this endpoint in Stripe Workbench with the same API version as the server SDK so Stripe sends the payload shape this release validates.',
+                      )}
+                    </>
+                  ) : (
+                    t(
+                      'The server did not report its Stripe webhook API version. Refresh after all application nodes run the same release before configuring the endpoint.',
+                    )
                   )}
-                </code>
-              </>
+                </span>
+                <span>
+                  {t(
+                    'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Otherwise use "Sync from Stripe" in Payment Operations when you need to refresh that read-only inventory.',
+                  )}
+                </span>
+              </div>
             }
+            style={{ marginBottom: 16 }}
+          />
+          <Banner
+            type='info'
+            icon={<BookOpen size={16} />}
+            title={t('Normal Stripe webhook secret rotation')}
+            description={
+              <div className='flex flex-col gap-1'>
+                <span>
+                  {t(
+                    'First choose Roll secret for this endpoint in Stripe Workbench and copy the new signing secret, then save it in this system. This system keeps the previous secret for {{hours}} hours so delayed webhooks can still be verified, and normal rotation is blocked during that overlap. After the new secret is stable, let the previous secret expire automatically. Use emergency revocation only if you suspect compromise.',
+                    { hours: stripeWebhookContract.overlapHours },
+                  )}
+                </span>
+                {props.options?.[
+                  'payment_setting.stripe_previous_credential_active'
+                ] ? (
+                  <strong>
+                    {t(
+                      'A previous signing secret is still within the overlap window of {{hours}} hours. Do not roll or save another normal replacement until it expires.',
+                      { hours: stripeWebhookContract.overlapHours },
+                    )}
+                  </strong>
+                ) : null}
+              </div>
+            }
+            closeIcon={null}
             style={{ marginBottom: 16 }}
           />
           {stripeTestModeNotice?.state === 'blocked' && (
@@ -330,9 +407,11 @@ export default function SettingsPaymentGateway(props) {
             <Col xs={24} sm={24} md={6} lg={6} xl={6}>
               <Form.Input
                 field='StripePriceId'
-                label={t('商品价格 ID')}
+                label={t('One-time Checkout product template Price ID')}
                 placeholder={t('例如：price_xxx')}
-                extraText={t('在 Stripe 后台创建价格后获得')}
+                extraText={t(
+                  'Used only as a product and currency template for server-quoted one-time Checkout. It is not a recurring subscription price.',
+                )}
                 autoComplete='off'
               />
             </Col>
@@ -352,6 +431,23 @@ export default function SettingsPaymentGateway(props) {
             gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}
             style={{ marginTop: 16 }}
           >
+            <Col span={24}>
+              <Form.TextArea
+                field='StripeCheckoutAllowedHosts'
+                label={t('Custom Checkout domain allowlist')}
+                placeholder='pay.example.com'
+                rows={3}
+                maxLength={4096}
+                extraText={t(
+                  'Optional. Enter exact hostnames only, one per line or separated by commas. Stripe-owned *.stripe.com hosts are always allowed. Wildcards, URLs, ports, IP addresses, localhost, and credentials are rejected.',
+                )}
+              />
+            </Col>
+          </Row>
+          <Row
+            gutter={{ xs: 8, sm: 16, md: 24, lg: 24, xl: 24, xxl: 24 }}
+            style={{ marginTop: 16 }}
+          >
             <Col xs={24} sm={24} md={6} lg={6} xl={6}>
               <Form.InputNumber
                 field='StripeUnitPrice'
@@ -361,7 +457,9 @@ export default function SettingsPaymentGateway(props) {
                 placeholder={t(
                   '例如：8，表示每 1 美元额度支付 8 个结算货币单位',
                 )}
-                extraText={t('按 1 美元额度对应的结算货币金额填写')}
+                extraText={t(
+                  'Positive multiplier that converts the USD base price into the Stripe settlement currency for wallet top-ups and fixed-term purchases.',
+                )}
               />
             </Col>
             <Col xs={24} sm={24} md={6} lg={6} xl={6}>
@@ -382,7 +480,7 @@ export default function SettingsPaymentGateway(props) {
                 placeholder='USD'
                 maxLength={3}
                 extraText={t(
-                  '填写三位 ISO 4217 货币代码，例如 USD、EUR、JPY；Stripe 订阅支付仅支持 USD',
+                  'Enter a three-letter ISO 4217 code such as USD, EUR, or JPY. This controls new one-time Checkout orders and does not rewrite legacy subscription history.',
                 )}
               />
             </Col>
@@ -408,6 +506,11 @@ export default function SettingsPaymentGateway(props) {
                 <span>
                   {t(
                     'Emergency action: all previously accepted Stripe webhook signing secrets stop validating immediately, and every unfinished Stripe order moves to manual review. If a new whsec is entered in this form, it is saved atomically; otherwise Stripe webhooks are disabled. Clearing or normally rotating a secret does not perform this emergency revocation.',
+                  )}
+                </span>
+                <span>
+                  {t(
+                    'This local action does not revoke a Stripe Dashboard API key, cancel Checkout Sessions or subscriptions, or issue refunds. Complete those actions separately in Stripe when required.',
                   )}
                 </span>
                 <Button

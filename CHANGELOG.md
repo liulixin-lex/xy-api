@@ -7,6 +7,71 @@ remain the authoritative record for published binaries and images.
 
 - No unreleased changes.
 
+## v0.2.1 - 2026-07-21
+
+### Payments and Billing
+
+- Moved Epay, Stripe, XORPay, Creem, Waffo, and Waffo Pancake payment creation
+  behind durable database tasks with leases, fencing, provider-specific
+  ambiguity recovery, local-only user polling, and reconciliation outside the
+  browser request lifecycle.
+- Added opaque public payment routes, products, and options so all gateway
+  groups can coexist without exposing internal provider identifiers or mapping
+  independent Epay, Stripe, Creem, Waffo, or Waffo Pancake channels to XORPay.
+- Added merchant-configured single-payment and daily limits with integer minor
+  units, timezone-aware day boundaries, active-order reservations, paid usage,
+  expiry release, repair, and atomic multi-node enforcement.
+- Routed new Creem, Waffo, and Waffo Pancake callbacks through canonical event,
+  order, limit, and exactly-once settlement paths while retaining verified
+  legacy fallback. Create-time amount and currency snapshots, upstream-order
+  uniqueness, duplicate-event evidence, and manual review prevent guessed
+  settlement of older incomplete records.
+- Clarified Stripe semantics: current top-up and fixed-term entitlement
+  purchases use one-time Checkout payment mode, while historical recurring
+  subscriptions remain conditional, read-only administrator inventory.
+
+### Checkout and Administration
+
+- Added independent Default and Classic checkout pages with desktop, mobile,
+  WeChat-browser, preparation, waiting, confirmation, success, expiry, and
+  recovery states.
+- Implemented XORPay Alipay face-to-face QR, validated mobile Alipay opening,
+  WeChat Native QR, and one-use encrypted OpenID/JSAPI authorization without
+  treating the browser bridge result as authoritative settlement.
+- Removed internal provider, upstream status, credential generation, raw
+  errors, and legacy Stripe inventory from canonical user payment APIs and
+  views; all hosted URLs and signed form fields now stay behind authenticated
+  no-store continuation endpoints. Compatibility endpoints return only the
+  first-party order needed to enter the same local checkout page.
+- Split administrator payment overview, routes, provider connections, device
+  capabilities, limits, exceptions, rotation, and emergency operations into
+  independently saved sections with single-owner notifications and impact
+  previews.
+- Completed payment and administrator copy for English, Simplified Chinese,
+  Traditional Chinese, French, Japanese, Russian, and Vietnamese in both
+  frontend themes.
+
+### Security and Multi-node Operations
+
+- Added payment-aware readiness, non-secret runtime fingerprints, shared
+  configuration/key checks, database-backed maintenance leases, and fail-closed
+  callback and worker behavior for inconsistent nodes.
+- Preserved signed-event persistence, amount/currency/merchant/credential
+  validation, exactly-once ledger settlement, credential rotation, emergency
+  revocation, audit evidence, and manual-review controls.
+- Added cross-database migration and concurrency coverage for SQLite, MySQL
+  5.7, and PostgreSQL 9.6 payment contracts. Multi-node payment deployment
+  requires shared MySQL or PostgreSQL plus shared Redis; SQLite remains
+  single-node only.
+
+### Verification Boundary
+
+- Repository tests and protocol fixtures verify the implemented contracts.
+  This release does not claim a real merchant charge for any configured
+  payment integration, production XORPay JSAPI authorization, public callback
+  delivery, refund, dispute, or payout unless separately recorded by an
+  operator.
+
 ## v0.2.0 - 2026-07-19
 
 ### Payments and Billing

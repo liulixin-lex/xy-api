@@ -19,9 +19,14 @@ For commercial licensing, please contact support@quantumnous.com
 
 import React from 'react';
 import { Banner, Modal, Typography, Card, Skeleton } from '@douyinfe/semi-ui';
-import { SiAlipay, SiWechat, SiStripe } from 'react-icons/si';
+import { SiAlipay, SiWechat } from 'react-icons/si';
 import { CreditCard } from 'lucide-react';
-import { formatPaymentDecimal, getSafePaymentIconUrl } from '../payment-utils';
+import {
+  formatPaymentDecimal,
+  getPaymentSelectionId,
+  getPublicPaymentMethod,
+  getPublicPaymentMethodLabel,
+} from '../payment-utils';
 
 const { Text } = Typography;
 
@@ -51,6 +56,17 @@ const PaymentConfirmModal = ({
     amountNumber > 0;
   const originalAmount = hasDiscount ? amountNumber / discountRate : 0;
   const discountAmount = hasDiscount ? originalAmount - amountNumber : 0;
+  const payMethod = payMethods.find(
+    (method) => getPaymentSelectionId(method) === payWay,
+  );
+  const publicMethod = getPublicPaymentMethod(payMethod);
+  const paymentMethodLabel = payMethod?.public_label
+    ? payMethod.public_label === 'Card'
+      ? t('银行卡支付')
+      : payMethod.public_label === 'Online payment'
+        ? t('在线支付')
+        : payMethod.public_label
+    : getPublicPaymentMethodLabel(payMethod, t, payMethods);
   return (
     <Modal
       title={
@@ -67,6 +83,8 @@ const PaymentConfirmModal = ({
       centered
       confirmLoading={confirmLoading}
       okButtonProps={{ disabled: !!paymentQuoteError }}
+      okText={t('继续支付')}
+      cancelText={t('取消')}
     >
       <div className='space-y-4'>
         <Card className='!rounded-xl !border-0 bg-slate-50 dark:bg-slate-800'>
@@ -92,7 +110,9 @@ const PaymentConfirmModal = ({
                       ? formatPaymentDecimal(
                           paymentQuote.payable_amount,
                           paymentQuote.currency,
-                          paymentQuote.provider,
+                          payMethod?.public_method === 'card'
+                            ? 'card'
+                            : undefined,
                         )
                       : renderAmount()}
                   </Text>
@@ -111,7 +131,7 @@ const PaymentConfirmModal = ({
                     {t('原价')}：
                   </Text>
                   <Text delete className='text-slate-500 dark:text-slate-400'>
-                    {`${originalAmount.toFixed(2)} ${t('元')}`}
+                    {formatPaymentDecimal(originalAmount, 'CNY')}
                   </Text>
                 </div>
                 <div className='flex justify-between items-center'>
@@ -119,7 +139,7 @@ const PaymentConfirmModal = ({
                     {t('优惠')}：
                   </Text>
                   <Text className='text-emerald-600 dark:text-emerald-400'>
-                    {`- ${discountAmount.toFixed(2)} ${t('元')}`}
+                    {formatPaymentDecimal(-discountAmount, 'CNY')}
                   </Text>
                 </div>
               </>
@@ -129,105 +149,20 @@ const PaymentConfirmModal = ({
                 {t('支付方式')}：
               </Text>
               <div className='flex items-center'>
-                {(() => {
-                  const payMethod = payMethods.find(
-                    (method) => method.type === payWay,
-                  );
-                  if (payMethod) {
-                    const safeIconUrl = getSafePaymentIconUrl(payMethod.icon);
-                    return (
-                      <>
-                        {payMethod.type === 'alipay' ? (
-                          <SiAlipay
-                            className='mr-2'
-                            size={16}
-                            color='#1677FF'
-                          />
-                        ) : payMethod.type === 'wxpay' ? (
-                          <SiWechat
-                            className='mr-2'
-                            size={16}
-                            color='#07C160'
-                          />
-                        ) : payMethod.type === 'stripe' ? (
-                          <SiStripe
-                            className='mr-2'
-                            size={16}
-                            color='#635BFF'
-                          />
-                        ) : safeIconUrl ? (
-                          <img
-                            src={safeIconUrl}
-                            alt=''
-                            aria-hidden='true'
-                            loading='lazy'
-                            decoding='async'
-                            referrerPolicy='no-referrer'
-                            className='mr-2'
-                            style={{
-                              width: 16,
-                              height: 16,
-                              objectFit: 'contain',
-                            }}
-                          />
-                        ) : (
-                          <CreditCard
-                            className='mr-2'
-                            size={16}
-                            color={
-                              payMethod.color || 'var(--semi-color-text-2)'
-                            }
-                          />
-                        )}
-                        <Text className='text-slate-900 dark:text-slate-100'>
-                          {payMethod.name}
-                        </Text>
-                      </>
-                    );
-                  } else {
-                    // 默认充值方式
-                    if (payWay === 'alipay') {
-                      return (
-                        <>
-                          <SiAlipay
-                            className='mr-2'
-                            size={16}
-                            color='#1677FF'
-                          />
-                          <Text className='text-slate-900 dark:text-slate-100'>
-                            {t('支付宝')}
-                          </Text>
-                        </>
-                      );
-                    } else if (payWay === 'stripe') {
-                      return (
-                        <>
-                          <SiStripe
-                            className='mr-2'
-                            size={16}
-                            color='#635BFF'
-                          />
-                          <Text className='text-slate-900 dark:text-slate-100'>
-                            {t('Stripe')}
-                          </Text>
-                        </>
-                      );
-                    } else {
-                      return (
-                        <>
-                          <SiWechat
-                            className='mr-2'
-                            size={16}
-                            color='#07C160'
-                          />
-                          <Text className='text-slate-900 dark:text-slate-100'>
-                            {t('微信')}
-                          </Text>
-                        </>
-                      );
-                    }
-                  }
-                })()}
+                {publicMethod === 'alipay' ? (
+                  <SiAlipay className='mr-2' size={16} color='#1677FF' />
+                ) : publicMethod === 'wechat_pay' ? (
+                  <SiWechat className='mr-2' size={16} color='#07C160' />
+                ) : (
+                  <CreditCard
+                    className='mr-2'
+                    size={16}
+                    color={payMethod?.color || 'var(--semi-color-text-2)'}
+                  />
+                )}
+                <Text className='text-slate-900 dark:text-slate-100'>
+                  {paymentMethodLabel}
+                </Text>
               </div>
             </div>
           </div>

@@ -40,6 +40,12 @@ import {
 } from '@douyinfe/semi-icons';
 import { Clock, RefreshCw } from 'lucide-react';
 import { API, showError, showSuccess } from '../../../../helpers';
+import { getSubscriptionPlanAdminErrorMessage } from '../../../../helpers/payment-admin-errors';
+import {
+  hasLegacyStripePriceMapping,
+  isValidLegacyStripePriceID,
+  normalizeLegacyStripePriceID,
+} from '../../../../helpers/subscription-stripe';
 import {
   quotaToDisplayAmount,
   displayAmountToQuota,
@@ -78,6 +84,7 @@ const AddEditSubscriptionModal = ({
   const isMobile = useIsMobile();
   const formApiRef = useRef(null);
   const isEdit = editingPlan?.plan?.id !== undefined;
+  const showLegacyStripeMapping = hasLegacyStripePriceMapping(editingPlan);
   const formKey = isEdit ? `edit-${editingPlan?.plan?.id}` : 'create';
 
   const getInitValues = () => ({
@@ -164,32 +171,33 @@ const AddEditSubscriptionModal = ({
           max_purchase_per_user: Number(values.max_purchase_per_user || 0),
           total_amount: displayAmountToQuota(values.total_amount),
           upgrade_group: values.upgrade_group || '',
+          stripe_price_id: normalizeLegacyStripePriceID(values.stripe_price_id),
         },
       };
+      const requestConfig = { skipErrorHandler: true };
       if (editingPlan?.plan?.id) {
         const res = await API.put(
           `/api/subscription/admin/plans/${editingPlan.plan.id}`,
           payload,
+          requestConfig,
         );
-        if (res.data?.success) {
-          showSuccess(t('更新成功'));
-          handleClose();
-          refresh?.();
-        } else {
-          showError(res.data?.message || t('更新失败'));
-        }
+        if (!res.data?.success) throw res.data;
+        showSuccess(t('更新成功'));
+        handleClose();
+        refresh?.();
       } else {
-        const res = await API.post('/api/subscription/admin/plans', payload);
-        if (res.data?.success) {
-          showSuccess(t('创建成功'));
-          handleClose();
-          refresh?.();
-        } else {
-          showError(res.data?.message || t('创建失败'));
-        }
+        const res = await API.post(
+          '/api/subscription/admin/plans',
+          payload,
+          requestConfig,
+        );
+        if (!res.data?.success) throw res.data;
+        showSuccess(t('创建成功'));
+        handleClose();
+        refresh?.();
       }
     } catch (e) {
-      showError(t('请求失败'));
+      showError(getSubscriptionPlanAdminErrorMessage(e, t));
     } finally {
       setLoading(false);
     }
@@ -501,7 +509,7 @@ const AddEditSubscriptionModal = ({
                   </Row>
                 </Card>
 
-                {/* 第三方支付配置 */}
+                {/* Current external product mappings */}
                 <Card className='!rounded-2xl shadow-sm border-0 mb-4'>
                   <div className='flex items-center mb-2'>
                     <Avatar
@@ -513,24 +521,17 @@ const AddEditSubscriptionModal = ({
                     </Avatar>
                     <div>
                       <Text className='text-lg font-medium'>
-                        {t('第三方支付配置')}
+                        {t('Current external product mappings')}
                       </Text>
                       <div className='text-xs text-gray-600'>
-                        {t('Stripe/Creem 商品ID（可选）')}
+                        {t(
+                          'Product IDs in this section apply only to their matching current payment integrations.',
+                        )}
                       </div>
                     </div>
                   </div>
 
                   <Row gutter={12}>
-                    <Col span={24}>
-                      <Form.Input
-                        field='stripe_price_id'
-                        label='Stripe PriceId'
-                        placeholder='price_...'
-                        showClear
-                      />
-                    </Col>
-
                     <Col span={24}>
                       <Form.Input
                         field='creem_product_id'
@@ -541,6 +542,50 @@ const AddEditSubscriptionModal = ({
                     </Col>
                   </Row>
                 </Card>
+
+                {showLegacyStripeMapping && (
+                  <Card className='!rounded-2xl shadow-sm border-0 mb-4'>
+                    <div className='flex items-center mb-2'>
+                      <Avatar
+                        size='small'
+                        color='orange'
+                        className='mr-2 shadow-md'
+                      >
+                        <RefreshCw size={16} />
+                      </Avatar>
+                      <div>
+                        <Text className='text-lg font-medium'>
+                          {t('Legacy Stripe recurring subscription mapping')}
+                        </Text>
+                        <div className='text-xs text-gray-600'>
+                          {t(
+                            'Read-only inventory mapping only. This Price ID does not control current one-time Checkout, create automatic renewals, cancel subscriptions, or issue refunds.',
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <Form.Input
+                      field='stripe_price_id'
+                      label={t('Legacy Stripe Price ID')}
+                      placeholder='price_...'
+                      maxLength={128}
+                      showClear
+                      rules={[
+                        {
+                          validator: (rule, value) =>
+                            isValidLegacyStripePriceID(value)
+                              ? Promise.resolve()
+                              : Promise.reject(
+                                  t(
+                                    'Use a Stripe Price ID that starts with price_ and contains no more than 128 characters.',
+                                  ),
+                                ),
+                        },
+                      ]}
+                    />
+                  </Card>
+                )}
               </div>
             )}
           </Form>

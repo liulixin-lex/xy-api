@@ -16,29 +16,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useCallback } from 'react'
 import i18next from 'i18next'
+import { useCallback, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { requestWaffoPayment, isApiSuccess } from '../api'
 
-function getPaymentUrl(data: unknown): string | null {
-  if (!data || typeof data !== 'object') {
-    return null
+import { createPaymentQuote, isApiSuccess, startPayment } from '../api'
+import { createPaymentError, getPaymentErrorMessage } from '../lib/payment'
+import type { PaymentStart } from '../types'
+
+function createRequestId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
   }
-
-  if ('payment_url' in data && typeof data.payment_url === 'string') {
-    return data.payment_url
-  }
-
-  return null
-}
-
-function getErrorMessage(message: string | undefined, data: unknown): string {
-  if (typeof data === 'string' && data.trim()) {
-    return data
-  }
-
-  return message || i18next.t('Payment request failed')
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 /**
@@ -46,32 +36,50 @@ function getErrorMessage(message: string | undefined, data: unknown): string {
  */
 export function useWaffoPayment() {
   const [processing, setProcessing] = useState(false)
+  const operationRef = useRef<{
+    key: string
+    quoteId: string
+    requestId: string
+  } | null>(null)
 
   const processWaffoPayment = useCallback(
-    async (topupAmount: number, payMethodIndex?: number) => {
+    async (
+      routeId: string,
+      topupAmount: number,
+      optionId: string
+    ): Promise<PaymentStart | null> => {
       setProcessing(true)
 
       try {
-        const response = await requestWaffoPayment({
-          amount: Math.floor(topupAmount),
-          pay_method_index: payMethodIndex,
-        })
-
-        if (isApiSuccess(response)) {
-          const paymentUrl = getPaymentUrl(response.data)
-
-          if (paymentUrl) {
-            window.open(paymentUrl, '_blank')
-            toast.success(i18next.t('Redirecting to payment page...'))
-            return true
+        const key = `${routeId}:${topupAmount}:${optionId}`
+        if (operationRef.current?.key !== key) {
+          const quoteResponse = await createPaymentQuote({
+            order_kind: 'topup',
+            route_id: routeId,
+            amount: Math.floor(topupAmount),
+            option_id: optionId,
+          })
+          if (!isApiSuccess(quoteResponse) || !quoteResponse.data) {
+            throw createPaymentError(quoteResponse)
+          }
+          operationRef.current = {
+            key,
+            quoteId: quoteResponse.data.quote_id,
+            requestId: createRequestId(),
           }
         }
 
-        toast.error(getErrorMessage(response.message, response.data))
-        return false
-      } catch {
-        toast.error(i18next.t('Payment request failed'))
-        return false
+        const response = await startPayment({
+          quote_id: operationRef.current.quoteId,
+          request_id: operationRef.current.requestId,
+        })
+        if (!isApiSuccess(response) || !response.data) {
+          throw createPaymentError(response)
+        }
+        return response.data
+      } catch (error) {
+        toast.error(getPaymentErrorMessage(error, i18next.t.bind(i18next)))
+        return null
       } finally {
         setProcessing(false)
       }

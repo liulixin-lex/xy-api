@@ -362,12 +362,22 @@ func ListStripeCustomerBindingsForAdmin(userID int) ([]PaymentCustomerBinding, [
 }
 
 func markCanonicalPaymentCredentialIncidentsTx(tx *gorm.DB, revocation PaymentCredentialRevocation, now int64, affected map[int64]struct{}) error {
-	if tx == nil || revocation.Provider == "" || revocation.Generation <= 0 || revocation.ValidBefore <= 0 || now <= 0 {
+	currentOnlyDisable := paymentProviderUsesCurrentOnlyCredentials(revocation.Provider) &&
+		revocation.Generation == 0 && revocation.AllActiveOrders
+	if tx == nil || revocation.Provider == "" || (!currentOnlyDisable && revocation.Generation <= 0) || revocation.ValidBefore <= 0 || now <= 0 {
 		return errors.New("invalid payment credential incident request")
 	}
-	query := lockForUpdate(tx).Where("provider = ?", revocation.Provider).
-		Where("provider_credential_generation = ? OR (provider_credential_generation = 0 AND created_at <= ?)",
+	query := lockForUpdate(tx).Where("provider = ?", revocation.Provider)
+	if currentOnlyDisable {
+		dependentQuery, _, err := paymentOrdersDependingOnConfigurationQueryTx(tx, revocation.Provider, revocation.ValidBefore)
+		if err != nil {
+			return err
+		}
+		query = lockForUpdate(dependentQuery)
+	} else {
+		query = query.Where("provider_credential_generation = ? OR (provider_credential_generation = 0 AND created_at <= ?)",
 			revocation.Generation, revocation.ValidBefore)
+	}
 	var orders []PaymentOrder
 	if err := query.Find(&orders).Error; err != nil {
 		return err
@@ -396,14 +406,14 @@ func markCanonicalPaymentCredentialIncidentsTx(tx *gorm.DB, revocation PaymentCr
 				}
 			}
 		}
-		if revocation.AllActiveOrders {
-			var activeOrders []PaymentOrder
-			if err := lockForUpdate(tx).Where("provider = ? AND status IN ?", PaymentProviderStripe, paymentInFlightOrderStatuses()).Find(&activeOrders).Error; err != nil {
-				return err
-			}
-			for _, order := range activeOrders {
-				orderByID[order.ID] = order
-			}
+	}
+	if revocation.AllActiveOrders && !currentOnlyDisable {
+		var activeOrders []PaymentOrder
+		if err := lockForUpdate(tx).Where("provider = ? AND status IN ?", revocation.Provider, paymentInFlightOrderStatuses()).Find(&activeOrders).Error; err != nil {
+			return err
+		}
+		for _, order := range activeOrders {
+			orderByID[order.ID] = order
 		}
 	}
 	orders = orders[:0]
@@ -413,6 +423,8 @@ func markCanonicalPaymentCredentialIncidentsTx(tx *gorm.DB, revocation PaymentCr
 	reason := "provider credential generation revoked; review payment evidence"
 	if revocation.Provider == PaymentProviderStripe {
 		reason = "Stripe webhook signing credential revoked; review payment evidence"
+	} else if currentOnlyDisable {
+		reason = "provider current-only credential disabled; no overlap generation exists; review dependent payment evidence"
 	}
 	activeStatuses := map[string]struct{}{
 		PaymentOrderStatusPending: {}, PaymentOrderStatusProcessing: {}, PaymentOrderStatusManualReview: {},
@@ -425,7 +437,7 @@ func markCanonicalPaymentCredentialIncidentsTx(tx *gorm.DB, revocation PaymentCr
 		affected[order.ID] = struct{}{}
 		incidentGeneration := revocation.Generation
 		incidentReason := reason
-		if order.ProviderCredentialGeneration == 0 {
+		if order.ProviderCredentialGeneration == 0 && !currentOnlyDisable {
 			incidentGeneration = 0
 			incidentReason += "; legacy order credential generation is ambiguous"
 		}
@@ -441,11 +453,15 @@ func markCanonicalPaymentCredentialIncidentsTx(tx *gorm.DB, revocation PaymentCr
 			"credential_incident_reviewed_by": 0, "credential_incident_review_note": "",
 			"updated_at": now, "version": gorm.Expr("version + ?", 1),
 		}
-		if _, active := activeStatuses[order.Status]; active {
+		if _, active := activeStatuses[order.Status]; active || currentOnlyDisable {
 			updates["status"] = PaymentOrderStatusManualReview
 			updates["status_reason"] = incidentReason
 			updates["start_flow"] = ""
 			updates["start_payload"] = ""
+			updates["browser_authorization_digest"] = nil
+			updates["browser_authorization_payload"] = ""
+			updates["browser_authorization_expires_at"] = 0
+			updates["browser_authorized_at"] = 0
 			order.Status = PaymentOrderStatusManualReview
 			order.StatusReason = incidentReason
 			order.StartFlow = ""

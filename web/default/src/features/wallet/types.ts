@@ -25,50 +25,62 @@ For commercial licensing, please contact support@quantumnous.com
  */
 export interface ApiResponse<T = unknown> {
   success?: boolean
+  code?: string
   message?: string
+  params?: Record<string, unknown>
   data?: T
 }
 
 export type PaymentProvider = 'epay' | 'stripe' | 'xorpay'
 export type LegacyPaymentProvider = 'creem' | 'waffo' | 'waffo_pancake'
 export type PaymentMethodProvider = PaymentProvider | LegacyPaymentProvider
+/** Stable public capability code. Unknown safe values render generically. */
+export type PublicPaymentMethod = string
 export type PaymentOrderKind = 'topup' | 'subscription'
-export type PaymentOrderStatus =
-  | 'pending'
-  | 'processing'
-  | 'success'
-  | 'failed'
+export type PublicPaymentStatusCode =
+  | 'preparing'
+  | 'awaiting_payment'
+  | 'confirming'
+  | 'succeeded'
   | 'expired'
-  | 'manual_review'
-  | 'refund_pending'
-  | 'refunded'
-  | 'disputed'
-  | 'debt'
+  | 'temporarily_unavailable'
 
-export interface PaymentQuoteRequest {
+interface PaymentQuoteRequestBase {
   order_kind: PaymentOrderKind
-  provider: PaymentProvider
-  payment_method: string
   amount?: number
   plan_id?: number
+  product_id?: string
+  option_id?: string
 }
+
+export type PaymentQuoteRequest = PaymentQuoteRequestBase &
+  (
+    | {
+        route_id: string
+        provider?: never
+        payment_method?: never
+      }
+    | {
+        route_id?: never
+        provider: PaymentProvider
+        payment_method: string
+      }
+  )
 
 export interface PaymentQuote {
   quote_id: string
-  order_kind: PaymentOrderKind
-  provider: PaymentProvider
-  payment_method: string
-  requested_amount: number
-  credit_quota: number
-  expected_amount_minor: number
+  route_id: string
+  public_method: PublicPaymentMethod
+  channel_alias?: string
+  top_up_amount?: number
+  plan_id?: number
   payable_amount: string
   currency: string
   expires_at: number
 }
 
 /** UI quote also represents preserved legacy checkout flows during migration. */
-export type ClientPaymentQuote = Omit<PaymentQuote, 'provider'> & {
-  provider: PaymentMethodProvider
+export type ClientPaymentQuote = PaymentQuote & {
   legacy?: boolean
 }
 
@@ -108,23 +120,47 @@ export type PaymentStart =
   | PaymentQrStart
   | PaymentPendingStart
 
-export interface PaymentOrder {
-  trade_no: string
-  order_kind: PaymentOrderKind
-  provider: PaymentProvider
-  payment_method: string
-  status: PaymentOrderStatus
-  requested_amount: number
-  credit_quota: number
-  expected_amount_minor: number
-  paid_amount_minor: number
-  currency: string
-  expires_at: number
-  settled_at?: number
-  status_reason?: string
+export type PaymentCheckoutFlow =
+  | 'pending'
+  | 'qr'
+  | 'hosted_redirect'
+  | 'form_post'
+  | 'wechat_authorize'
+  | 'jsapi'
+
+export interface PaymentJSAPIParameters {
+  app_id: string
+  timestamp: string
+  nonce_str: string
+  package: string
+  sign_type: 'MD5' | 'HMAC-SHA256'
+  pay_sign: string
 }
 
-export type PaymentQuoteResponse = ApiResponse<PaymentQuote>
+export interface PaymentCheckout {
+  flow: PaymentCheckoutFlow
+  qr_content?: string
+  continue_url?: string
+  jsapi?: PaymentJSAPIParameters
+  expires_at: number
+}
+
+export interface PaymentOrder {
+  trade_no: string
+  route_id: string
+  public_method: PublicPaymentMethod
+  channel_alias?: string
+  status_code: PublicPaymentStatusCode
+  payment_amount: string
+  top_up_amount?: number
+  plan_id?: number
+  currency: string
+  expires_at: number
+  completed_at?: number
+  checkout?: PaymentCheckout
+}
+
+export type PaymentQuoteResponse = ApiResponse<ClientPaymentQuote>
 export type PaymentStartResponse = ApiResponse<PaymentStart>
 export type PaymentOrderResponse = ApiResponse<PaymentOrder>
 
@@ -150,51 +186,51 @@ export type WaffoPancakePaymentResponse = ApiResponse<
       session_id?: string
       expires_at?: number | string
       order_id?: string
-      // Self-service session token + expiry — surfaced by the backend so
-      // future flows (refund / cancel from new-api's own UI) can use them
-      // without re-issuing checkout. Not consumed by the current handler.
-      token?: string
-      token_expires_at?: number | string
+      // new-api intentionally does not expose the provider buyer session token.
     }
   | string
 >
 
 /**
- * Creem product configuration
+ * Public fixed-price payment product.
  */
-export interface CreemProduct {
+export interface PaymentProduct {
+  /** Opaque selection token resolved only against the current server catalog. */
+  product_id: string
+  /** Public route that owns this product. */
+  route_id: string
   /** Product display name */
   name: string
-  /** Creem product ID */
-  productId: string
-  /** Product price */
-  price: number
-  /** Quota amount to credit */
-  quota: number
-  /** Currency (USD or EUR) */
-  currency: 'USD' | 'EUR'
+  /** Server-authoritative fixed-point amount. */
+  payment_amount: string
+  /** Amount credited to the wallet. */
+  top_up_amount: number
+  /** ISO 4217 currency. */
+  currency: string
 }
 
 /**
  * Creem payment request
  */
 export interface CreemPaymentRequest {
-  /** Creem product ID */
+  /** Opaque product selection token. */
   product_id: string
-  /** Payment method identifier */
-  payment_method: 'creem'
 }
+
+export type PaymentCheckoutMode = 'quote' | 'product' | 'option' | 'direct'
 
 /**
  * Payment method configuration
  */
 export interface PaymentMethod {
-  /** Display name of payment method */
-  name: string
-  /** Payment method type identifier */
-  type: string
-  /** Explicit gateway owner. UI dispatch must not infer by exclusion. */
-  provider: PaymentMethodProvider
+  /** Stable public route identifier used for UI selection and quote creation. */
+  route_id: string
+  /** Public payment brand; never exposes the internal gateway. */
+  public_method: PublicPaymentMethod
+  /** Stable public capability code, translated by the frontend. */
+  channel_alias?: string
+  /** Public checkout capability; no gateway identity is exposed. */
+  checkout_mode: PaymentCheckoutMode
   /** Legacy optional color for UI display */
   color?: string
   /** Minimum topup amount for this payment method */
@@ -206,37 +242,31 @@ export interface PaymentMethod {
 }
 
 /**
- * Waffo payment method configuration
+ * Public selectable option within a retained checkout route.
  */
-export interface WaffoPayMethod {
-  /** Display name of payment method */
-  name: string
-  /** Optional icon path */
-  icon?: string
-  /** Waffo pay method type */
-  payMethodType?: string
-  /** Waffo pay method name */
-  payMethodName?: string
+export interface PaymentRouteOption {
+  /** Opaque selection token resolved only against the current server catalog. */
+  option_id: string
+  /** Public route that owns this option. */
+  route_id: string
+  /** Server-vetted user-facing label. */
+  public_label: 'Card' | 'Apple Pay' | 'Google Pay' | 'Online payment'
 }
 
 /**
  * Topup configuration information
  */
 export interface TopupInfo {
-  /** Whether online topup is enabled */
-  enable_online_topup: boolean
-  /** Whether Stripe topup is enabled */
-  enable_stripe_topup: boolean
-  /** Whether XORPay is available for new payments */
-  enable_xorpay_topup?: boolean
-  /** Available payment methods */
-  pay_methods: PaymentMethod[]
+  /** Whether at least one public online payment route is available */
+  online_payment_available?: boolean
+  /** Available public payment routes. */
+  payment_routes: PaymentMethod[]
+  /** Fixed-price products owned by product checkout routes. */
+  payment_products: PaymentProduct[]
+  /** Selectable options owned by option checkout routes. */
+  payment_route_options: PaymentRouteOption[]
   /** Minimum topup amount for online topup */
   min_topup: number
-  /** Minimum topup amount for Stripe */
-  stripe_min_topup: number
-  /** Minimum topup amount for XORPay */
-  xorpay_min_topup?: number
   /** Preset amount options */
   amount_options: number[]
   /** Discount rates by amount */
@@ -247,20 +277,6 @@ export interface TopupInfo {
   affiliate_first_topup_percent?: number
   /** Optional topup link for purchasing codes */
   topup_link?: string
-  /** Whether Creem topup is enabled */
-  enable_creem_topup?: boolean
-  /** Available Creem products */
-  creem_products?: CreemProduct[]
-  /** Whether Waffo topup is enabled */
-  enable_waffo_topup?: boolean
-  /** Available Waffo payment methods */
-  waffo_pay_methods?: WaffoPayMethod[]
-  /** Minimum topup amount for Waffo */
-  waffo_min_topup?: number
-  /** Whether Waffo Pancake topup is enabled */
-  enable_waffo_pancake_topup?: boolean
-  /** Minimum topup amount for Waffo Pancake */
-  waffo_pancake_min_topup?: number
   /** Whether redemption code usage is enabled */
   enable_redemption?: boolean
   /** Whether compliance confirmation has been completed */
@@ -303,8 +319,8 @@ export interface PaymentRequest {
 export interface WaffoPaymentRequest {
   /** Topup amount */
   amount: number
-  /** Optional server-side Waffo payment method index */
-  pay_method_index?: number
+  /** Opaque option selection token. */
+  option_id?: string
 }
 
 /**
@@ -358,7 +374,7 @@ export interface UserWalletData {
 /**
  * Topup record status
  */
-export type TopupStatus = PaymentOrderStatus
+export type BillingRecordStatus = PublicPaymentStatusCode
 
 /**
  * Topup billing record
@@ -366,44 +382,25 @@ export type TopupStatus = PaymentOrderStatus
 export interface TopupRecord {
   /** Record ID */
   id: number
-  /** User ID */
-  user_id: number
   /** Topup amount (quota) */
   amount: number
-  /** Payment amount (actual money paid) */
-  money: number
+  /** Server-authoritative payment amount as a fixed-point decimal string */
+  payment_amount: string
   /** Trade/order number */
   trade_no: string
-  /** Payment method type */
-  payment_method: string
-  /** Explicit payment gateway for new records */
-  payment_provider?: PaymentMethodProvider
-  /** Alias used by the unified payment order projection */
-  provider?: PaymentMethodProvider
-  /** User-visible order purpose */
-  order_kind?: PaymentOrderKind
+  /** Stable public route for user-facing records. */
+  route_id?: string
+  /** Public payment brand for user-facing records. */
+  public_method?: PublicPaymentMethod
+  /** Stable public capability code; never render an unknown value directly. */
+  channel_alias?: string
   /** ISO 4217 currency code for actual payment */
   currency?: string
-  /** Canonical quota credited by this order */
-  credit_quota?: number
-  /** Canonical expected payment amount in the currency's minor unit */
-  expected_amount_minor?: number
-  /** Actual settled payment amount in the currency's minor unit */
-  paid_amount_minor?: number
-  /** Cumulative amount reported refunded by the provider */
-  refunded_amount_minor?: number
-  /** Cumulative amount currently disputed at the provider */
-  disputed_amount_minor?: number
-  /** Cumulative amount whose entitlement has been reversed */
-  reversed_amount_minor?: number
-  /** Safe, user-facing status explanation */
-  status_reason?: string
   /** Creation timestamp */
-  create_time: number
+  created_at: number
   /** Completion timestamp */
-  complete_time?: number
-  /** Payment status */
-  status: TopupStatus
+  completed_at?: number
+  status_code?: PublicPaymentStatusCode
 }
 
 /**

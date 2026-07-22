@@ -20,15 +20,18 @@ import i18next from 'i18next'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { getPaymentOrder, isApiSuccess } from '../api'
-import type { PaymentOrder, PaymentOrderStatus } from '../types'
+import { getPaymentErrorMessage } from '../lib/payment'
+import type { PaymentOrder, PublicPaymentStatusCode } from '../types'
 
 const POLL_INTERVAL_MS = 2_000
 const FALLBACK_POLL_DURATION_MS = 15 * 60 * 1000
 
 export type PaymentPollingStopReason = 'expired' | 'network' | 'timeout'
 
-export function isPaymentOrderTerminal(status: PaymentOrderStatus): boolean {
-  return !['pending', 'processing'].includes(status)
+export function isPaymentOrderTerminal(
+  status: PublicPaymentStatusCode
+): boolean {
+  return !['preparing', 'awaiting_payment', 'confirming'].includes(status)
 }
 
 interface UsePaymentOrderOptions {
@@ -64,14 +67,14 @@ export function usePaymentOrder(options: UsePaymentOrderOptions) {
     try {
       const response = await getPaymentOrder(options.tradeNo, controller.signal)
       if (!isApiSuccess(response) || !response.data) {
-        setError(response.message || i18next.t('Failed to load payment status'))
+        setError(getPaymentErrorMessage(response, i18next.t.bind(i18next)))
         return null
       }
       orderRef.current = response.data
       setOrder(response.data)
       setError(null)
       if (
-        isPaymentOrderTerminal(response.data.status) &&
+        isPaymentOrderTerminal(response.data.status_code) &&
         settledTradeNoRef.current !== response.data.trade_no
       ) {
         settledTradeNoRef.current = response.data.trade_no
@@ -85,7 +88,7 @@ export function usePaymentOrder(options: UsePaymentOrderOptions) {
         'code' in requestError &&
         requestError.code === 'ERR_CANCELED'
       if (!cancelled) {
-        setError(i18next.t('Failed to load payment status'))
+        setError(getPaymentErrorMessage(requestError, i18next.t.bind(i18next)))
       }
       return null
     } finally {
@@ -122,7 +125,10 @@ export function usePaymentOrder(options: UsePaymentOrderOptions) {
         : Date.now() + FALLBACK_POLL_DURATION_MS
     const poll = async () => {
       const nextOrder = await refresh()
-      if (stopped || (nextOrder && isPaymentOrderTerminal(nextOrder.status))) {
+      if (
+        stopped ||
+        (nextOrder && isPaymentOrderTerminal(nextOrder.status_code))
+      ) {
         return
       }
 

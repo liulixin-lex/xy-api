@@ -38,6 +38,11 @@ import {
   PaymentMethodDialog,
   type PaymentMethodData,
 } from './payment-method-dialog'
+import {
+  getPaymentMethodIdentity,
+  mergePaymentMethodEdit,
+  normalizePaymentMethod,
+} from './payment-methods-visual-editor-utils'
 
 type PaymentMethodsVisualEditorProps = {
   value: string
@@ -50,51 +55,8 @@ const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
   xorpay_alipay: 'SiAlipay',
+  xorpay_jsapi: 'SiWechat',
   xorpay_native: 'SiWechat',
-}
-
-function inferProvider(type: string): PaymentMethodData['provider'] {
-  if (type === 'stripe') return 'stripe'
-  if (type.startsWith('xorpay_')) return 'xorpay'
-  if (type === 'waffo_pancake') return 'waffo_pancake'
-  return 'epay'
-}
-
-function normalizePaymentMethod(item: unknown): PaymentMethodData | null {
-  if (
-    !item ||
-    typeof item !== 'object' ||
-    !('name' in item) ||
-    !('type' in item) ||
-    typeof item.name !== 'string' ||
-    typeof item.type !== 'string'
-  ) {
-    return null
-  }
-
-  const providerValues = ['epay', 'stripe', 'xorpay', 'waffo_pancake']
-  const provider =
-    'provider' in item &&
-    typeof item.provider === 'string' &&
-    providerValues.includes(item.provider)
-      ? (item.provider as PaymentMethodData['provider'])
-      : inferProvider(item.type)
-  const method: PaymentMethodData = {
-    name: item.name,
-    type: item.type,
-    provider,
-  }
-  if ('icon' in item && typeof item.icon === 'string') method.icon = item.icon
-  if ('color' in item && typeof item.color === 'string') {
-    method.color = item.color
-  }
-  if (
-    'min_topup' in item &&
-    (typeof item.min_topup === 'string' || typeof item.min_topup === 'number')
-  ) {
-    method.min_topup = String(item.min_topup)
-  }
-  return method
 }
 
 function getDefaultIconName(type: string) {
@@ -140,19 +102,28 @@ export function PaymentMethodsVisualEditor({
       },
     },
     {
-      name: t('XORPay WeChat Pay'),
+      name: t('XORPay WeChat Native'),
       template: {
         icon: getDefaultIconName('xorpay_native'),
-        name: t('XORPay WeChat Pay'),
+        name: t('WeChat Pay'),
         provider: 'xorpay' as const,
         type: 'xorpay_native',
+      },
+    },
+    {
+      name: t('XORPay WeChat in-app (JSAPI)'),
+      template: {
+        icon: getDefaultIconName('xorpay_jsapi'),
+        name: t('WeChat Pay'),
+        provider: 'xorpay' as const,
+        type: 'xorpay_jsapi',
       },
     },
     {
       name: t('XORPay Alipay'),
       template: {
         icon: getDefaultIconName('xorpay_alipay'),
-        name: t('XORPay Alipay'),
+        name: t('Alipay'),
         provider: 'xorpay' as const,
         type: 'xorpay_alipay',
       },
@@ -218,11 +189,15 @@ export function PaymentMethodsVisualEditor({
     const editIndex = editData
       ? updatedArray.findIndex(
           (method) =>
-            method.name === editData.name && method.type === editData.type
+            method.name === editData.name &&
+            getPaymentMethodIdentity(method) ===
+              getPaymentMethodIdentity(editData)
         )
       : -1
     const duplicate = updatedArray.some(
-      (method, index) => index !== editIndex && method.type === data.type
+      (method, index) =>
+        index !== editIndex &&
+        getPaymentMethodIdentity(method) === getPaymentMethodIdentity(data)
     )
     if (duplicate) {
       toast.error(t('Payment type keys must be unique'))
@@ -231,7 +206,10 @@ export function PaymentMethodsVisualEditor({
 
     if (editData) {
       if (editIndex !== -1) {
-        updatedArray[editIndex] = data
+        updatedArray[editIndex] = mergePaymentMethodEdit(
+          updatedArray[editIndex],
+          data
+        )
       } else {
         updatedArray.push(data)
       }
@@ -285,7 +263,10 @@ export function PaymentMethodsVisualEditor({
     const normalized = parsed
       .map(normalizePaymentMethod)
       .filter((item): item is PaymentMethodData => item !== null)
-    const exists = normalized.some((item) => item.type === template.type)
+    const exists = normalized.some(
+      (item) =>
+        getPaymentMethodIdentity(item) === getPaymentMethodIdentity(template)
+    )
 
     if (!exists) {
       normalized.push(template)

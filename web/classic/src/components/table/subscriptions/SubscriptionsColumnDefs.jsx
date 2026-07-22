@@ -31,6 +31,7 @@ import {
 } from '@douyinfe/semi-ui';
 import { renderQuota } from '../../../helpers';
 import { convertUSDToCurrency } from '../../../helpers/render';
+import { hasLegacyStripePriceMapping } from '../../../helpers/subscription-stripe';
 
 const { Text } = Typography;
 
@@ -203,17 +204,11 @@ const renderResetPeriod = (text, record, t) => {
 };
 
 const renderPaymentConfig = (text, record, t, enableEpay) => {
-  const hasStripe = !!record?.plan?.stripe_price_id;
   const hasCreem = !!record?.plan?.creem_product_id;
   const hasEpay = !!enableEpay;
 
   return (
     <Space spacing={4}>
-      {hasStripe && (
-        <Tag color='violet' shape='circle'>
-          Stripe
-        </Tag>
-      )}
       {hasCreem && (
         <Tag color='cyan' shape='circle'>
           Creem
@@ -227,6 +222,13 @@ const renderPaymentConfig = (text, record, t, enableEpay) => {
     </Space>
   );
 };
+
+const renderLegacyStripeMapping = (record, t) =>
+  hasLegacyStripePriceMapping(record) ? (
+    <Tag color='violet' shape='circle'>
+      {t('Legacy Stripe mapping')}
+    </Tag>
+  ) : null;
 
 const renderOperations = (
   text,
@@ -294,6 +296,7 @@ export const getSubscriptionsColumns = ({
   openEdit,
   setPlanEnabled,
   enableEpay,
+  showLegacyStripeMapping,
   complianceConfirmed = true,
 }) => {
   return [
@@ -348,6 +351,15 @@ export const getSubscriptionsColumns = ({
       render: (text, record) =>
         renderPaymentConfig(text, record, t, enableEpay),
     },
+    ...(showLegacyStripeMapping
+      ? [
+          {
+            title: t('Legacy data'),
+            width: 160,
+            render: (text, record) => renderLegacyStripeMapping(record, t),
+          },
+        ]
+      : []),
     {
       title: t('总额度'),
       width: 100,

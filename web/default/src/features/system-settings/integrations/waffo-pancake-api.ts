@@ -18,7 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
-// Catalog / pair / save admin endpoints. Match
+import type { PaymentGatewayReadiness } from '../api'
+
+// Catalog / pair admin endpoints. Match
 // controller/topup_waffo_pancake.go: empty body creds make the backend
 // fall back to persisted OptionMap values, so returning admins don't
 // have to re-paste the private key (stripped from GET /api/option/).
@@ -44,29 +46,57 @@ export interface PairResult {
   product_name: string
 }
 
-export interface PairOrphanError {
-  error?: string
+export interface PairFailureParams {
   orphan_store?: boolean
   store_id?: string
   store_name?: string
 }
 
 interface BackendBody<T> {
-  message?: string
-  data?: T | string
+  success: boolean
+  code?: string
+  params?: PairFailureParams
+  data?: T
 }
 
 export type CatalogResponse = BackendBody<{ stores: CatalogStore[] }>
 export type PairResponse = BackendBody<PairResult>
-export type SaveResponse = BackendBody<{ product_id: string; store_id: string }>
+export type SaveResponse = BackendBody<{
+  store_id: string
+  product_id: string
+  test_mode: boolean
+  environment?: 'test' | 'prod' | string
+  unit_price: number
+  min_top_up: number
+  version: number
+  readiness?: PaymentGatewayReadiness
+}>
+
+export interface WaffoPancakeSaveInput {
+  merchantID: string
+  privateKey: string
+  returnURL: string
+  storeID: string
+  productID: string
+  unitPrice: number
+  minTopUp: number
+  testMode: boolean
+  expectedVersion: number
+}
+
+const requestConfig = {
+  skipBusinessError: true,
+  skipErrorHandler: true,
+} as const
 
 export async function listWaffoPancakeCatalog(
   merchantID: string,
   privateKey: string
 ): Promise<CatalogResponse> {
-  const res = await api.get<CatalogResponse>(
+  const res = await api.post<CatalogResponse>(
     '/api/option/waffo-pancake/catalog',
-    { params: { merchant_id: merchantID, private_key: privateKey } }
+    { merchant_id: merchantID, private_key: privateKey },
+    requestConfig
   )
   return res.data
 }
@@ -76,27 +106,39 @@ export async function createWaffoPancakePair(params: {
   privateKey: string
   returnURL: string
 }): Promise<PairResponse> {
-  const res = await api.post<PairResponse>('/api/option/waffo-pancake/pair', {
-    merchant_id: params.merchantID,
-    private_key: params.privateKey,
-    return_url: params.returnURL,
-  })
+  const res = await api.post<PairResponse>(
+    '/api/option/waffo-pancake/pair',
+    {
+      merchant_id: params.merchantID,
+      private_key: params.privateKey,
+      return_url: params.returnURL,
+    },
+    requestConfig
+  )
   return res.data
 }
 
-export async function saveWaffoPancakeConfig(params: {
-  merchantID: string
-  privateKey: string
-  returnURL: string
-  storeID: string
-  productID: string
-}): Promise<SaveResponse> {
-  const res = await api.post<SaveResponse>('/api/option/waffo-pancake/save', {
-    merchant_id: params.merchantID,
-    private_key: params.privateKey,
-    return_url: params.returnURL,
-    store_id: params.storeID,
-    product_id: params.productID,
-  })
+export function buildWaffoPancakeSavePayload(input: WaffoPancakeSaveInput) {
+  return {
+    merchant_id: input.merchantID,
+    private_key: input.privateKey,
+    return_url: input.returnURL,
+    store_id: input.storeID,
+    product_id: input.productID,
+    unit_price: input.unitPrice,
+    min_top_up: input.minTopUp,
+    test_mode: input.testMode,
+    expected_version: input.expectedVersion,
+  }
+}
+
+export async function saveWaffoPancakeSettings(
+  input: WaffoPancakeSaveInput
+): Promise<SaveResponse> {
+  const res = await api.post<SaveResponse>(
+    '/api/option/waffo-pancake/save',
+    buildWaffoPancakeSavePayload(input),
+    requestConfig
+  )
   return res.data
 }

@@ -36,6 +36,8 @@ const (
 	SubscriptionResetCustom  = "custom"
 )
 
+const SubscriptionPlanStripePriceIDPurposeLegacyRecurring = "legacy_recurring_mapping_only"
+
 var (
 	ErrSubscriptionOrderNotFound           = errors.New("subscription order not found")
 	ErrSubscriptionOrderStatusInvalid      = errors.New("subscription order status invalid")
@@ -44,6 +46,7 @@ var (
 	ErrSubscriptionPaymentAmountRequired   = errors.New("verified payment amount is required")
 	ErrSubscriptionPaymentAmountMismatch   = errors.New("subscription payment amount mismatch")
 	ErrSubscriptionPaymentCurrencyMismatch = errors.New("subscription payment currency mismatch")
+	ErrSubscriptionProviderOrderRequired   = errors.New("subscription provider order id is required")
 	ErrSubscriptionPurchaseLimit           = errors.New("已达到该套餐购买上限")
 	ErrSubscriptionBillingInProgress       = errors.New("subscription has an unfinished billing reservation")
 )
@@ -187,6 +190,9 @@ type SubscriptionPlan struct {
 	// Allow falling back to wallet balance after subscription quota is exhausted (empty = true)
 	AllowWalletOverflow *bool `json:"allow_wallet_overflow"`
 
+	// StripePriceId belongs only to the legacy recurring subscription inventory.
+	// Unified entitlement purchases use Checkout mode=payment with a server-
+	// quoted one-time price and must never interpret this field as auto-renewal.
 	StripePriceId         string `json:"stripe_price_id" gorm:"type:varchar(128);default:''"`
 	CreemProductId        string `json:"creem_product_id" gorm:"type:varchar(128);default:''"`
 	WaffoPancakeProductId string `json:"waffo_pancake_product_id" gorm:"type:varchar(128);default:''"`
@@ -289,11 +295,16 @@ type SubscriptionPlanSnapshot struct {
 	QuotaResetPeriod        string `json:"quota_reset_period"`
 	QuotaResetCustomSeconds int64  `json:"quota_reset_custom_seconds"`
 	AllowWalletOverflow     bool   `json:"allow_wallet_overflow"`
+	// Provider products are immutable private worker inputs. Public DTOs never
+	// expose these values, but a later plan edit must not change an existing
+	// order's upstream product.
+	CreemProductId        string `json:"creem_product_id,omitempty"`
+	WaffoPancakeProductId string `json:"waffo_pancake_product_id,omitempty"`
 }
 
 // SubscriptionPaymentConfirmation contains only normalized, signed provider
-// facts. PaidAmountMinor is required for providers whose callback exposes an
-// amount (currently Epay and Stripe).
+// facts. PaidAmountMinor is required for every provider whose callback exposes
+// an authoritative amount, including retained Creem/Waffo integrations.
 type SubscriptionPaymentConfirmation struct {
 	ProviderPayload         string
 	ExpectedPaymentProvider string
@@ -318,6 +329,10 @@ func validSubscriptionCurrency(currency string) bool {
 func ValidateSubscriptionPlan(plan *SubscriptionPlan) error {
 	if plan == nil {
 		return errors.New("套餐不存在")
+	}
+	plan.StripePriceId = strings.TrimSpace(plan.StripePriceId)
+	if plan.StripePriceId != "" && (!strings.HasPrefix(plan.StripePriceId, "price_") || len(plan.StripePriceId) > 128) {
+		return errors.New("旧 Stripe 循环订阅 Price ID 必须以 price_ 开头且不超过 128 个字符")
 	}
 	if math.IsNaN(plan.PriceAmount) || math.IsInf(plan.PriceAmount, 0) || plan.PriceAmount < 0 || plan.PriceAmount > 9999 {
 		return errors.New("套餐价格必须是 0 到 9999 之间的有限数值")
@@ -412,6 +427,8 @@ func NewSubscriptionPlanSnapshot(plan *SubscriptionPlan) (*SubscriptionPlanSnaps
 		QuotaResetPeriod:        NormalizeResetPeriod(plan.QuotaResetPeriod),
 		QuotaResetCustomSeconds: plan.QuotaResetCustomSeconds,
 		AllowWalletOverflow:     *plan.AllowWalletOverflow,
+		CreemProductId:          strings.TrimSpace(plan.CreemProductId),
+		WaffoPancakeProductId:   strings.TrimSpace(plan.WaffoPancakeProductId),
 	}, nil
 }
 
@@ -444,6 +461,8 @@ func (s *SubscriptionPlanSnapshot) SubscriptionPlan() (*SubscriptionPlan, error)
 		QuotaResetPeriod:        NormalizeResetPeriod(s.QuotaResetPeriod),
 		QuotaResetCustomSeconds: s.QuotaResetCustomSeconds,
 		AllowWalletOverflow:     &allowWalletOverflow,
+		CreemProductId:          strings.TrimSpace(s.CreemProductId),
+		WaffoPancakeProductId:   strings.TrimSpace(s.WaffoPancakeProductId),
 	}
 	if err := ValidateSubscriptionPlan(plan); err != nil {
 		return nil, ErrSubscriptionOrderSnapshotMissing
@@ -1057,10 +1076,9 @@ func createUserSubscriptionFromPlanTx(tx *gorm.DB, userId int, plan *Subscriptio
 	return sub, nil
 }
 
-// CompleteSubscriptionOrder is kept for providers whose current callback
-// contract does not expose a verifiable amount. Epay and Stripe must call
-// CompleteSubscriptionOrderVerified so their signed amount and currency are
-// checked against the immutable order snapshot.
+// CompleteSubscriptionOrder is kept only for providers whose callback
+// contract does not expose a verifiable amount. Providers with signed amount
+// and currency facts must call CompleteSubscriptionOrderVerified.
 func CompleteSubscriptionOrder(tradeNo string, providerPayload string, expectedPaymentProvider string, actualPaymentMethod string) error {
 	return completeSubscriptionOrder(tradeNo, SubscriptionPaymentConfirmation{
 		ProviderPayload:         providerPayload,
@@ -1073,6 +1091,34 @@ func CompleteSubscriptionOrderVerified(tradeNo string, confirmation Subscription
 	return completeSubscriptionOrder(tradeNo, confirmation)
 }
 
+func markCompletedSubscriptionCallbackReviewTx(tx *gorm.DB, order *SubscriptionOrder, reason string) error {
+	if tx == nil || order == nil || strings.TrimSpace(reason) == "" {
+		return errors.New("invalid completed subscription callback review update")
+	}
+	// A completed entitlement remains economically final. Preserve the first
+	// conflicting duplicate classification without changing success status or
+	// allowing a later correct duplicate to erase the incident evidence.
+	if strings.TrimSpace(order.ReviewReason) != "" {
+		return nil
+	}
+	result := tx.Model(&SubscriptionOrder{}).
+		Where("id = ? AND status = ?", order.Id, common.TopUpStatusSuccess).
+		Update("review_reason", reason)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrSubscriptionOrderStatusInvalid
+	}
+	if err := tx.Model(&TopUp{}).
+		Where("trade_no = ? AND (review_reason = ? OR review_reason IS NULL)", order.TradeNo, "").
+		Update("review_reason", reason).Error; err != nil {
+		return err
+	}
+	order.ReviewReason = reason
+	return nil
+}
+
 func completeSubscriptionOrder(tradeNo string, confirmation SubscriptionPaymentConfirmation) error {
 	if tradeNo == "" {
 		return errors.New("tradeNo is empty")
@@ -1080,7 +1126,11 @@ func completeSubscriptionOrder(tradeNo string, confirmation SubscriptionPaymentC
 	if len(confirmation.ProviderPayload) > maxSubscriptionProviderPayloadBytes {
 		return errors.New("支付网关响应过大")
 	}
-	if len(strings.TrimSpace(confirmation.ProviderOrderId)) > 255 || len(strings.TrimSpace(confirmation.ActualPaymentMethod)) > 50 {
+	confirmation.ExpectedPaymentProvider = strings.TrimSpace(confirmation.ExpectedPaymentProvider)
+	confirmation.ProviderOrderId = strings.TrimSpace(confirmation.ProviderOrderId)
+	confirmation.ActualPaymentMethod = strings.TrimSpace(confirmation.ActualPaymentMethod)
+	confirmation.Currency = strings.ToUpper(strings.TrimSpace(confirmation.Currency))
+	if len(confirmation.ProviderOrderId) > 255 || len(confirmation.ActualPaymentMethod) > 50 {
 		return errors.New("支付网关标识超出范围")
 	}
 	refCol := "`trade_no`"
@@ -1098,22 +1148,82 @@ func completeSubscriptionOrder(tradeNo string, confirmation SubscriptionPaymentC
 		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(&order).Error; err != nil {
 			return ErrSubscriptionOrderNotFound
 		}
-		if confirmation.ExpectedPaymentProvider != "" && order.PaymentProvider != confirmation.ExpectedPaymentProvider {
-			return ErrPaymentMethodMismatch
-		}
-		if order.Status == common.TopUpStatusSuccess {
-			return nil
-		}
-		if order.Status == SubscriptionOrderStatusManualReview {
-			return ErrSubscriptionOrderManualReview
-		}
-		if order.Status != common.TopUpStatusPending {
-			return ErrSubscriptionOrderStatusInvalid
-		}
+		requiresLegacyProviderVerification := order.PaymentProvider == PaymentProviderCreem ||
+			order.PaymentProvider == PaymentProviderWaffo ||
+			order.PaymentProvider == PaymentProviderWaffoPancake
+		requiresVerifiedAmount := order.PaymentProvider == PaymentProviderEpay ||
+			order.PaymentProvider == PaymentProviderStripe ||
+			requiresLegacyProviderVerification
 		var confirmationProviderOrderKey *string
 		if confirmation.ProviderOrderId != "" {
 			key := order.PaymentProvider + ":" + confirmation.ProviderOrderId
 			confirmationProviderOrderKey = &key
+		}
+		if order.Status == common.TopUpStatusSuccess {
+			markCompletedReview := func(reason string, reviewErr error) error {
+				if err := markCompletedSubscriptionCallbackReviewTx(tx, &order, reason); err != nil {
+					return err
+				}
+				manualReviewErr = reviewErr
+				return nil
+			}
+			if confirmation.ExpectedPaymentProvider != "" && order.PaymentProvider != confirmation.ExpectedPaymentProvider {
+				return markCompletedReview("completed_callback_provider_mismatch", ErrSubscriptionOrderManualReview)
+			}
+			expectedCurrency := strings.ToUpper(strings.TrimSpace(order.PaymentCurrency))
+			if requiresVerifiedAmount && (order.ExpectedAmountMinor <= 0 || !validSubscriptionCurrency(expectedCurrency)) {
+				return markCompletedReview("completed_callback_snapshot_missing", ErrSubscriptionOrderSnapshotMissing)
+			}
+			if requiresVerifiedAmount && (confirmation.PaidAmountMinor == nil || *confirmation.PaidAmountMinor <= 0) {
+				return markCompletedReview("completed_callback_amount_missing_or_invalid", ErrSubscriptionPaymentAmountRequired)
+			}
+			if confirmation.PaidAmountMinor != nil && *confirmation.PaidAmountMinor != order.ExpectedAmountMinor {
+				return markCompletedReview("completed_callback_amount_mismatch", ErrSubscriptionPaymentAmountMismatch)
+			}
+			if confirmation.PaidAmountMinor != nil && (confirmation.Currency == "" || confirmation.Currency != expectedCurrency) {
+				return markCompletedReview("completed_callback_currency_mismatch", ErrSubscriptionPaymentCurrencyMismatch)
+			}
+			if requiresLegacyProviderVerification && confirmation.ProviderOrderId == "" {
+				return markCompletedReview("completed_callback_provider_order_id_missing_or_invalid", ErrSubscriptionProviderOrderRequired)
+			}
+			if requiresLegacyProviderVerification && (strings.TrimSpace(order.ProviderOrderId) == "" || order.ProviderOrderKey == nil) {
+				return markCompletedReview("completed_callback_provider_order_snapshot_missing", ErrSubscriptionOrderManualReview)
+			}
+			if order.ProviderOrderId != "" || order.ProviderOrderKey != nil {
+				if confirmation.ProviderOrderId == "" || strings.TrimSpace(order.ProviderOrderId) != confirmation.ProviderOrderId ||
+					order.ProviderOrderKey == nil || confirmationProviderOrderKey == nil ||
+					strings.TrimSpace(*order.ProviderOrderKey) != *confirmationProviderOrderKey {
+					return markCompletedReview("completed_callback_provider_order_id_mismatch", ErrSubscriptionOrderManualReview)
+				}
+			}
+			if confirmationProviderOrderKey != nil {
+				var duplicateCount int64
+				if err := tx.Model(&SubscriptionOrder{}).
+					Where("id <> ? AND payment_provider = ? AND (provider_order_key = ? OR provider_order_id = ?)",
+						order.Id, order.PaymentProvider, *confirmationProviderOrderKey, confirmation.ProviderOrderId).
+					Count(&duplicateCount).Error; err != nil {
+					return err
+				}
+				if duplicateCount > 0 {
+					return markCompletedReview("completed_callback_provider_order_reused", ErrSubscriptionOrderManualReview)
+				}
+			}
+			if confirmation.ActualPaymentMethod != "" && order.PaymentMethod != "" &&
+				strings.TrimSpace(order.PaymentMethod) != confirmation.ActualPaymentMethod {
+				return markCompletedReview("completed_callback_payment_method_mismatch", ErrSubscriptionOrderManualReview)
+			}
+			return nil
+		}
+		if confirmation.ExpectedPaymentProvider != "" && order.PaymentProvider != confirmation.ExpectedPaymentProvider {
+			return ErrPaymentMethodMismatch
+		}
+		if order.Status == SubscriptionOrderStatusManualReview {
+			return ErrSubscriptionOrderManualReview
+		}
+		if order.Status != common.TopUpStatusPending &&
+			order.Status != common.TopUpStatusFailed &&
+			order.Status != common.TopUpStatusExpired {
+			return ErrSubscriptionOrderStatusInvalid
 		}
 
 		markManualReview := func(reason string, reviewErr error) error {
@@ -1123,9 +1233,8 @@ func completeSubscriptionOrder(tradeNo string, confirmation SubscriptionPaymentC
 			if confirmation.ProviderPayload != "" {
 				order.ProviderPayload = confirmation.ProviderPayload
 			}
-			if confirmation.ProviderOrderId != "" {
+			if confirmation.ProviderOrderId != "" && order.ProviderOrderId == "" && order.ProviderOrderKey == nil {
 				order.ProviderOrderId = confirmation.ProviderOrderId
-				order.ProviderOrderKey = confirmationProviderOrderKey
 			}
 			if err := tx.Save(&order).Error; err != nil {
 				return err
@@ -1142,19 +1251,28 @@ func completeSubscriptionOrder(tradeNo string, confirmation SubscriptionPaymentC
 		if err != nil {
 			return markManualReview("missing_or_invalid_plan_snapshot", ErrSubscriptionOrderSnapshotMissing)
 		}
-		requiresVerifiedAmount := order.PaymentProvider == PaymentProviderEpay || order.PaymentProvider == PaymentProviderStripe
-		if requiresVerifiedAmount && confirmation.PaidAmountMinor == nil {
+		if requiresLegacyProviderVerification &&
+			(order.ExpectedAmountMinor <= 0 || !validSubscriptionCurrency(strings.ToUpper(strings.TrimSpace(order.PaymentCurrency)))) {
+			return markManualReview("missing_payment_snapshot", ErrSubscriptionOrderSnapshotMissing)
+		}
+		if requiresVerifiedAmount && (confirmation.PaidAmountMinor == nil || *confirmation.PaidAmountMinor <= 0) {
+			if requiresLegacyProviderVerification {
+				return markManualReview("paid_amount_missing_or_invalid", ErrSubscriptionPaymentAmountRequired)
+			}
 			return ErrSubscriptionPaymentAmountRequired
 		}
 		if confirmation.PaidAmountMinor != nil && *confirmation.PaidAmountMinor != order.ExpectedAmountMinor {
 			return markManualReview("paid_amount_mismatch", ErrSubscriptionPaymentAmountMismatch)
 		}
 		if confirmation.PaidAmountMinor != nil {
-			actualCurrency := strings.ToUpper(strings.TrimSpace(confirmation.Currency))
+			actualCurrency := confirmation.Currency
 			expectedCurrency := strings.ToUpper(strings.TrimSpace(order.PaymentCurrency))
 			if actualCurrency == "" || expectedCurrency == "" || actualCurrency != expectedCurrency {
 				return markManualReview("payment_currency_mismatch", ErrSubscriptionPaymentCurrencyMismatch)
 			}
+		}
+		if requiresLegacyProviderVerification && strings.TrimSpace(confirmation.ProviderOrderId) == "" {
+			return markManualReview("provider_order_id_missing_or_invalid", ErrSubscriptionProviderOrderRequired)
 		}
 		if order.ProviderOrderId != "" || order.ProviderOrderKey != nil {
 			if confirmation.ProviderOrderId == "" || order.ProviderOrderId != confirmation.ProviderOrderId ||

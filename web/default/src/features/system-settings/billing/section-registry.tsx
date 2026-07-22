@@ -24,6 +24,7 @@ import type { AuthUser } from '@/stores/auth-store'
 import { CheckinSettingsSection } from '../general/checkin-settings-section'
 import { PricingSection } from '../general/pricing-section'
 import { QuotaSettingsSection } from '../general/quota-settings-section'
+import { PaymentLimitsSection } from '../integrations/payment-limits-section'
 import { PaymentSettingsSection } from '../integrations/payment-settings-section'
 import { RatioSettingsCard } from '../models/ratio-settings-card'
 import type { BillingSettings } from '../types'
@@ -155,6 +156,12 @@ const BILLING_SECTIONS = [
         stripeTestModeIsolationRequired={
           settings['payment_setting.stripe_test_mode_isolation_required']
         }
+        stripeWebhookAPIVersion={
+          settings['payment_setting.stripe_webhook_api_version']
+        }
+        stripeWebhookSecretOverlapHours={
+          settings['payment_setting.stripe_webhook_secret_overlap_hours']
+        }
         xorPayPreviousCredentialActive={
           settings['payment_setting.xorpay_previous_credential_active']
         }
@@ -173,6 +180,7 @@ const BILLING_SECTIONS = [
           StripeWebhookSecret: settings.StripeWebhookSecret,
           StripePriceId: settings.StripePriceId,
           StripeAccountId: settings.StripeAccountId,
+          StripeCheckoutAllowedHosts: settings.StripeCheckoutAllowedHosts,
           StripeCurrency: settings.StripeCurrency,
           StripeUnitPrice: settings.StripeUnitPrice,
           StripeMinTopUp: settings.StripeMinTopUp,
@@ -202,12 +210,17 @@ const BILLING_SECTIONS = [
           WaffoMinTopUp: settings.WaffoMinTopUp ?? 1,
           WaffoNotifyUrl: settings.WaffoNotifyUrl ?? '',
           WaffoReturnUrl: settings.WaffoReturnUrl ?? '',
+          WaffoWebRedirectHosts: settings.WaffoWebRedirectHosts ?? '',
+          WaffoAppRedirectSchemes: settings.WaffoAppRedirectSchemes ?? '',
           WaffoPayMethods: settings.WaffoPayMethods ?? '[]',
         }}
         waffoPancakeDefaultValues={{
           WaffoPancakeMerchantID: settings.WaffoPancakeMerchantID ?? '',
           WaffoPancakePrivateKey: settings.WaffoPancakePrivateKey ?? '',
           WaffoPancakeReturnURL: settings.WaffoPancakeReturnURL ?? '',
+          WaffoPancakeUnitPrice: settings.WaffoPancakeUnitPrice ?? 1,
+          WaffoPancakeMinTopUp: settings.WaffoPancakeMinTopUp ?? 1,
+          WaffoPancakeTestMode: settings.WaffoPancakeTestMode ?? false,
         }}
         waffoPancakeProvisionedStoreID={settings.WaffoPancakeStoreID ?? ''}
         waffoPancakeProvisionedProductID={settings.WaffoPancakeProductID ?? ''}
@@ -220,6 +233,11 @@ const BILLING_SECTIONS = [
         }}
       />
     ),
+  },
+  {
+    id: 'payment-limits',
+    titleKey: 'Payment Limits',
+    build: (_settings: BillingSettings) => <PaymentLimitsSection />,
   },
   {
     id: 'payment-operations',

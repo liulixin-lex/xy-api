@@ -21,10 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
 import { getApiErrorMessage } from '@/lib/api-error'
-import {
-  extractVerificationInfo,
-  isVerificationRequiredError,
-} from '@/lib/secure-verification'
+import { isVerificationRequiredError } from '@/lib/secure-verification'
 
 import { checkVerificationMethods, verify } from '../api'
 import type {
@@ -219,8 +216,6 @@ export function useSecureVerification(
         return await apiCall()
       } catch (error) {
         if (isVerificationRequiredError(error)) {
-          const info = extractVerificationInfo(error)
-          toast.info(info.message)
           await startVerification(apiCall, config)
           return null
         }

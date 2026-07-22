@@ -64,7 +64,7 @@ func configureStripeAccountConfirmationTest(t *testing.T, handler http.HandlerFu
 	setting.StripeWebhookCredentialGeneration = 2
 	setting.StripeConfigurationVerifiedFingerprint = StripeCheckoutConfigurationFingerprint(
 		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
-		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode, setting.StripeCheckoutAllowedHosts,
 	)
 	setting.StripeConfigurationVerifiedAt = time.Now().Unix()
 	return &stripePaymentProvider{}
@@ -118,7 +118,7 @@ func stripeCheckoutContractOrder() *model.PaymentOrder {
 		TradeNo: "PO_STRIPE_ACCOUNT_BOUND", Provider: model.PaymentProviderStripe,
 		PaymentMethod: model.PaymentMethodStripe, ProviderOrderKey: &providerOrderKey,
 		ProviderLivemode: &livemode, ExpectedAmountMinor: 800, Currency: "USD",
-		Status: model.PaymentOrderStatusPending,
+		Status: model.PaymentOrderStatusPending, ExpiresAt: time.Now().Add(40 * time.Minute).Unix(),
 	}
 }
 
@@ -131,7 +131,7 @@ func TestStripePaidCheckoutConfirmationBindsConfiguredAccount(t *testing.T) {
 		_, _ = w.Write([]byte(stripeCheckoutConfirmationPayload(nil)))
 	})
 
-	require.NoError(t, provider.confirmPaidCheckoutSession(t.Context(), confirmedStripeEvent()))
+	require.NoError(t, provider.confirmCheckoutSessionAuthority(t.Context(), confirmedStripeEvent()))
 }
 
 func TestStripePaidCheckoutConfirmationSurvivesCatalogDisable(t *testing.T) {
@@ -146,7 +146,53 @@ func TestStripePaidCheckoutConfirmationSurvivesCatalogDisable(t *testing.T) {
 	setting.StripeConfigurationVerifiedFingerprint = ""
 	setting.StripeConfigurationVerifiedAt = 0
 
-	require.NoError(t, provider.confirmPaidCheckoutSession(t.Context(), confirmedStripeEvent()))
+	require.NoError(t, provider.confirmCheckoutSessionAuthority(t.Context(), confirmedStripeEvent()))
+}
+
+func TestStripeFailedCheckoutWebhookRequiresConfiguredAccountAuthority(t *testing.T) {
+	tests := []struct {
+		name      string
+		overrides map[string]string
+		wantError bool
+	}{
+		{
+			name: "matching account session",
+			overrides: map[string]string{
+				"status": "complete", "payment_status": "unpaid", "payment_intent": "", "customer": "",
+			},
+		},
+		{
+			name: "different account session contract",
+			overrides: map[string]string{
+				"client_reference_id": "PO_OTHER_ACCOUNT", "metadata_trade_no": "PO_OTHER_ACCOUNT",
+				"status": "complete", "payment_status": "unpaid", "payment_intent": "", "customer": "",
+			},
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := configureStripeAccountConfirmationTest(t, func(w http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, "/v1/checkout/sessions/cs_test_account_bound", request.URL.Path)
+				assert.Equal(t, setting.StripeAccountId, request.Header.Get("Stripe-Account"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(stripeCheckoutConfirmationPayload(test.overrides)))
+			})
+			livemode := false
+			event := &NormalizedPaymentEvent{
+				Provider: model.PaymentProviderStripe, EventType: string(stripe.EventTypeCheckoutSessionAsyncPaymentFailed),
+				TradeNo: "PO_STRIPE_ACCOUNT_BOUND", ProviderOrderKey: "stripe:cs_test_account_bound",
+				ProviderLivemode: &livemode, PaidAmountMinor: 800, Currency: "USD", Failed: true,
+				VerifiedPayload: []byte(`{"verified":true}`),
+			}
+			err := provider.ValidateVerifiedWebhook(t.Context(), event)
+			if test.wantError {
+				assert.ErrorIs(t, err, errStripeCheckoutConfirmation)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestStripeSignedTestPaymentIsRetainedAfterTestModeIsDisabled(t *testing.T) {
@@ -216,7 +262,7 @@ func TestStripeSignedTestPaymentIsRetainedAfterTestModeIsDisabled(t *testing.T) 
 	event, err := provider.VerifyWebhook(request)
 	require.NoError(t, err)
 	require.True(t, event.Paid)
-	require.NoError(t, provider.ProcessVerifiedWebhook(t.Context(), event))
+	require.NoError(t, provider.ValidateVerifiedWebhook(t.Context(), event))
 
 	result, err := ProcessNormalizedPaymentEvent(event)
 	require.ErrorIs(t, err, model.ErrPaymentManualReview)
@@ -236,8 +282,9 @@ func TestStripeSignedTestPaymentIsRetainedAfterTestModeIsDisabled(t *testing.T) 
 	assert.Zero(t, ledgerCount)
 }
 
-func TestStripeCreateKeepsExpiryAboveProviderMinimum(t *testing.T) {
+func TestStripeCreateUsesServerAuthoritativeOrderExpiry(t *testing.T) {
 	var sentExpiresAt int64
+	var checkoutRequests int
 	provider := configureStripeAccountConfirmationTest(t, func(w http.ResponseWriter, request *http.Request) {
 		assert.Equal(t, setting.StripeAccountId, request.Header.Get("Stripe-Account"))
 		w.Header().Set("Content-Type", "application/json")
@@ -246,6 +293,10 @@ func TestStripeCreateKeepsExpiryAboveProviderMinimum(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":"price_confirmation","object":"price","active":true,"currency":"usd","product":"prod_confirmation"}`))
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/checkout/sessions":
 			require.NoError(t, request.ParseForm())
+			checkoutRequests++
+			assert.Equal(t, "payment:PO_STRIPE_EXPIRY_MARGIN", request.Header.Get("Idempotency-Key"))
+			assert.Equal(t, string(stripe.CheckoutSessionModePayment), request.Form.Get("mode"))
+			assert.Empty(t, request.Form.Get("subscription_data"))
 			var err error
 			sentExpiresAt, err = strconv.ParseInt(request.Form.Get("expires_at"), 10, 64)
 			require.NoError(t, err)
@@ -271,16 +322,43 @@ func TestStripeCreateKeepsExpiryAboveProviderMinimum(t *testing.T) {
 	}).Error)
 
 	livemode := false
-	now := time.Now()
-	start, err := provider.Create(t.Context(), &model.PaymentOrder{
+	orderExpiresAt := time.Now().Add(40 * time.Minute).Unix()
+	order := &model.PaymentOrder{
 		TradeNo: "PO_STRIPE_EXPIRY_MARGIN", UserID: userID, OrderKind: model.PaymentOrderKindTopUp,
 		Provider: model.PaymentProviderStripe, PaymentMethod: model.PaymentMethodStripe,
 		ExpectedAmountMinor: 800, Currency: "USD", ProviderLivemode: &livemode,
-	})
+		ExpiresAt: orderExpiresAt,
+	}
+	start, err := provider.Create(t.Context(), order)
 	require.NoError(t, err)
 	assert.Equal(t, sentExpiresAt, start.ExpiresAt)
-	assert.GreaterOrEqual(t, sentExpiresAt, now.Add(34*time.Minute).Unix())
-	assert.LessOrEqual(t, sentExpiresAt, time.Now().Add(36*time.Minute).Unix())
+	assert.Equal(t, orderExpiresAt, sentExpiresAt)
+
+	// An ambiguous network result is retried with the same Checkout parameters
+	// and idempotency key, so Stripe returns the original Session instead of
+	// creating a second charge attempt.
+	retried, err := provider.Create(t.Context(), order)
+	require.NoError(t, err)
+	assert.Equal(t, start.ProviderOrderKey, retried.ProviderOrderKey)
+	assert.Equal(t, start.URL, retried.URL)
+	assert.Equal(t, 2, checkoutRequests)
+}
+
+func TestStripeCheckoutExpiryEnforcesStripeWindow(t *testing.T) {
+	const now = int64(1_900_000_000)
+	minimum := now + int64((30*time.Minute+stripeCheckoutSessionExpirySafetyGap)/time.Second)
+	maximum := now + int64(stripeCheckoutSessionMaxLifetime/time.Second)
+
+	expiresAt, err := stripeCheckoutExpiresAt(minimum, now)
+	require.NoError(t, err)
+	assert.Equal(t, minimum, expiresAt)
+	expiresAt, err = stripeCheckoutExpiresAt(maximum, now)
+	require.NoError(t, err)
+	assert.Equal(t, maximum, expiresAt)
+	_, err = stripeCheckoutExpiresAt(minimum-1, now)
+	assert.ErrorIs(t, err, errStripeCheckoutWindowTooShort)
+	_, err = stripeCheckoutExpiresAt(maximum+1, now)
+	assert.ErrorIs(t, err, errStripeCheckoutWindowTooLong)
 }
 
 func TestStripePaidCheckoutConfirmationRejectsCrossAccountSession(t *testing.T) {
@@ -290,7 +368,7 @@ func TestStripePaidCheckoutConfirmationRejectsCrossAccountSession(t *testing.T) 
 		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","code":"resource_missing","param":"id"}}`))
 	})
 
-	err := provider.confirmPaidCheckoutSession(t.Context(), confirmedStripeEvent())
+	err := provider.confirmCheckoutSessionAuthority(t.Context(), confirmedStripeEvent())
 	assert.ErrorIs(t, err, errStripeCheckoutConfirmation)
 }
 
@@ -316,7 +394,7 @@ func TestStripePaidCheckoutConfirmationRejectsAuthorityMismatches(t *testing.T) 
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(stripeCheckoutConfirmationPayload(test.overrides)))
 			})
-			err := provider.confirmPaidCheckoutSession(t.Context(), confirmedStripeEvent())
+			err := provider.confirmCheckoutSessionAuthority(t.Context(), confirmedStripeEvent())
 			assert.ErrorIs(t, err, errStripeCheckoutConfirmation)
 		})
 	}
@@ -330,7 +408,7 @@ func TestStripePaidCheckoutConfirmationDoesNotQueryInventoryOnlyEvents(t *testin
 	event := confirmedStripeEvent()
 	event.Paid = false
 
-	require.NoError(t, provider.confirmPaidCheckoutSession(t.Context(), event))
+	require.NoError(t, provider.confirmCheckoutSessionAuthority(t.Context(), event))
 	assert.False(t, requested)
 }
 
@@ -398,14 +476,15 @@ func TestStripeRecoverStartRequiresOpenUnpaidCanonicalSession(t *testing.T) {
 		})))
 	})
 
-	start, err := provider.RecoverStart(t.Context(), stripeCheckoutContractOrder())
+	order := stripeCheckoutContractOrder()
+	start, err := provider.RecoverStart(t.Context(), order)
 	require.NoError(t, err)
 	assert.Equal(t, PaymentFlowHostedRedirect, start.Flow)
 	assert.Equal(t, "https://checkout.stripe.com/c/pay/account-bound", start.URL)
-	assert.Greater(t, start.ExpiresAt, time.Now().Unix())
+	assert.Equal(t, order.ExpiresAt, start.ExpiresAt)
 }
 
-func TestStripeRecoverStartPersistsContractMismatchForManualReview(t *testing.T) {
+func TestStripeRecoverStartReturnsContractMismatchWithoutMutatingOrder(t *testing.T) {
 	require.NoError(t, model.DB.AutoMigrate(&model.PaymentOrder{}))
 	const tradeNo = "PO_STRIPE_RECOVER_CONTRACT_MISMATCH"
 	model.DB.Where("trade_no = ?", tradeNo).Delete(&model.PaymentOrder{})
@@ -434,8 +513,8 @@ func TestStripeRecoverStartPersistsContractMismatchForManualReview(t *testing.T)
 	require.ErrorIs(t, err, model.ErrPaymentManualReview)
 	stored, err := model.GetPaymentOrderByTradeNo(tradeNo)
 	require.NoError(t, err)
-	assert.Equal(t, model.PaymentOrderStatusManualReview, stored.Status)
-	assert.Contains(t, stored.StatusReason, "Checkout Session contract")
+	assert.Equal(t, model.PaymentOrderStatusPending, stored.Status)
+	assert.Empty(t, stored.StatusReason)
 	assert.Empty(t, stored.StartPayload)
 }
 

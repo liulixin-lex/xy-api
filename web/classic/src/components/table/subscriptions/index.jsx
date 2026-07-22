@@ -97,7 +97,9 @@ const SubscriptionsPage = () => {
             </div>
             <Banner
               type='info'
-              description={t('Stripe/Creem 需在第三方平台创建商品并填入 ID')}
+              description={t(
+                'Current product mappings are used only by their matching payment integrations.',
+              )}
               closeIcon={null}
               // Mobile: banner below; Desktop: banner right
               className='!rounded-lg order-2 md:order-1'

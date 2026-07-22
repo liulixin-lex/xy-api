@@ -67,7 +67,7 @@ func TestStripeWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing
 	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 	setting.StripeConfigurationVerifiedFingerprint = service.StripeCheckoutConfigurationFingerprint(
 		setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
-		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+		setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode, setting.StripeCheckoutAllowedHosts,
 	)
 	setting.StripeConfigurationVerifiedAt = time.Now().Unix()
 	setting.StripeWebhookCredentialLivemode = ""
@@ -107,6 +107,7 @@ func TestStripeWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing
 }
 
 func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+	setupMidjourneyControllerBillingDB(t)
 	confirmPaymentComplianceForTest(t)
 	originalAPIKey := setting.CreemApiKey
 	originalProducts := setting.CreemProducts
@@ -121,15 +122,29 @@ func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	setting.CreemApiKey = "creem_api_key"
 	setting.CreemProducts = `[{"productId":"prod_123"}]`
 	require.False(t, isCreemWebhookEnabled())
+	require.False(t, isCreemTopUpEnabled())
 
 	setting.CreemWebhookSecret = "creem_secret"
 	require.True(t, isCreemWebhookEnabled())
+	require.True(t, isCreemTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "")
+	require.True(t, isCreemWebhookEnabled())
+	require.False(t, isCreemTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
+	require.True(t, isCreemTopUpEnabled())
 
 	setting.CreemProducts = "[]"
-	require.False(t, isCreemWebhookEnabled())
+	require.True(t, isCreemWebhookEnabled())
+	require.False(t, isCreemTopUpEnabled())
+
+	setting.CreemProducts = `[{"productId":"prod_123"}]`
+	setting.CreemApiKey = ""
+	require.True(t, isCreemWebhookEnabled())
+	require.False(t, isCreemTopUpEnabled())
 }
 
-func TestWaffoWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestWaffoWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.T) {
+	setupMidjourneyControllerBillingDB(t)
 	confirmPaymentComplianceForTest(t)
 	originalEnabled := setting.WaffoEnabled
 	originalSandbox := setting.WaffoSandbox
@@ -155,53 +170,105 @@ func TestWaffoWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	setting.WaffoApiKey = ""
 	setting.WaffoPrivateKey = "private"
 	setting.WaffoPublicCert = "public"
-	require.False(t, isWaffoWebhookEnabled())
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
 
 	setting.WaffoApiKey = "api"
 	require.True(t, isWaffoWebhookEnabled())
+	require.True(t, isWaffoTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "")
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
+	require.True(t, isWaffoTopUpEnabled())
 
 	setting.WaffoEnabled = false
-	require.False(t, isWaffoWebhookEnabled())
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
+
+	setting.WaffoApiKey = ""
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
 
 	setting.WaffoEnabled = true
 	setting.WaffoSandbox = true
 	setting.WaffoSandboxApiKey = ""
 	setting.WaffoSandboxPrivateKey = "sandbox_private"
 	setting.WaffoSandboxPublicCert = "sandbox_public"
-	require.False(t, isWaffoWebhookEnabled())
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
 
 	setting.WaffoSandboxApiKey = "sandbox_api"
 	require.True(t, isWaffoWebhookEnabled())
+	require.True(t, isWaffoTopUpEnabled())
+	setting.WaffoEnabled = false
+	setting.WaffoSandboxApiKey = ""
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
+	operation_setting.GetPaymentSetting().ComplianceConfirmed = false
+	require.True(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
 }
 
-func TestWaffoPancakeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestWaffoPancakeWebhookRequiresTrustedStoreNotCheckoutCredentials(t *testing.T) {
+	setupMidjourneyControllerBillingDB(t)
 	confirmPaymentComplianceForTest(t)
 	originalMerchantID := setting.WaffoPancakeMerchantID
 	originalPrivateKey := setting.WaffoPancakePrivateKey
 	originalProductID := setting.WaffoPancakeProductID
+	originalStoreID := setting.WaffoPancakeStoreID
 	t.Cleanup(func() {
 		setting.WaffoPancakeMerchantID = originalMerchantID
 		setting.WaffoPancakePrivateKey = originalPrivateKey
 		setting.WaffoPancakeProductID = originalProductID
+		setting.WaffoPancakeStoreID = originalStoreID
 	})
 
-	// Presence of all three credentials enables the gateway. Webhook public
-	// keys are bundled in the SDK and there is no separate Enabled toggle —
-	// clear any of the three fields to disable.
+	// Verification keys ship in the SDK, while StoreID binds a valid Waffo
+	// signature to this merchant before settlement.
+	setting.WaffoPancakeStoreID = ""
 	setting.WaffoPancakeMerchantID = ""
 	setting.WaffoPancakePrivateKey = "private"
 	setting.WaffoPancakeProductID = "product"
 	require.False(t, isWaffoPancakeWebhookEnabled())
 
-	setting.WaffoPancakeMerchantID = "merchant"
+	setting.WaffoPancakeStoreID = "STO_AbCdEfGhIjKlMnOpQrStUv"
 	require.True(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
 
+	setting.WaffoPancakeMerchantID = "merchant"
 	setting.WaffoPancakeProductID = ""
-	require.False(t, isWaffoPancakeWebhookEnabled())
+	require.True(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
 
 	setting.WaffoPancakeProductID = "product"
 	setting.WaffoPancakePrivateKey = ""
+	require.True(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
+	setting.WaffoPancakePrivateKey = "private"
+	require.True(t, isWaffoPancakeTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "")
+	require.True(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
+	t.Setenv("PAYMENT_SECRET_KEY", "test-payment-secret-key-at-least-32-bytes")
+	require.True(t, isWaffoPancakeTopUpEnabled())
+	operation_setting.GetPaymentSetting().ComplianceConfirmed = false
+	require.True(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
+
+	setting.WaffoPancakeStoreID = ""
 	require.False(t, isWaffoPancakeWebhookEnabled())
+}
+
+func TestWaffoPancakeWebhookStoreAuthorityIsExact(t *testing.T) {
+	originalStoreID := setting.WaffoPancakeStoreID
+	t.Cleanup(func() { setting.WaffoPancakeStoreID = originalStoreID })
+	setting.WaffoPancakeStoreID = "STO_AbCdEfGhIjKlMnOpQrStUv"
+
+	require.True(t, trustedWaffoPancakeWebhookStore("STO_AbCdEfGhIjKlMnOpQrStUv"))
+	require.False(t, trustedWaffoPancakeWebhookStore("STO_ZzYyXxWwVvUuTtSsRrQqPp"))
+	require.False(t, trustedWaffoPancakeWebhookStore("sto_AbCdEfGhIjKlMnOpQrStUv"))
+	require.False(t, trustedWaffoPancakeWebhookStore(""))
 }
 
 func TestEpayWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.T) {

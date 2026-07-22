@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -53,15 +54,22 @@ func insertSubscriptionOrderForPaymentGuardTest(t *testing.T, tradeNo string, us
 
 func insertTopUpForPaymentGuardTest(t *testing.T, tradeNo string, userID int, paymentProvider string) {
 	t.Helper()
+	creditQuotaSnapshot := int64(0)
+	if paymentProvider == PaymentProviderWaffo || paymentProvider == PaymentProviderWaffoPancake {
+		creditQuotaSnapshot = 2
+	}
 	topUp := &TopUp{
-		UserId:          userID,
-		Amount:          2,
-		Money:           9.99,
-		TradeNo:         tradeNo,
-		PaymentMethod:   paymentProvider,
-		PaymentProvider: paymentProvider,
-		Status:          common.TopUpStatusPending,
-		CreateTime:      time.Now().Unix(),
+		UserId:              userID,
+		Amount:              2,
+		Money:               9.99,
+		TradeNo:             tradeNo,
+		PaymentMethod:       paymentProvider,
+		PaymentProvider:     paymentProvider,
+		Currency:            "USD",
+		ExpectedAmountMinor: 999,
+		CreditQuotaSnapshot: creditQuotaSnapshot,
+		Status:              common.TopUpStatusPending,
+		CreateTime:          time.Now().Unix(),
 	}
 	require.NoError(t, topUp.Insert())
 }
@@ -93,13 +101,168 @@ func TestRechargeWaffoPancake_RejectsMismatchedPaymentMethod(t *testing.T) {
 	insertUserForPaymentGuardTest(t, 101, 0)
 	insertTopUpForPaymentGuardTest(t, "waffo-pancake-guard", 101, PaymentProviderStripe)
 
-	err := RechargeWaffoPancake("waffo-pancake-guard")
+	paidAmountMinor := int64(999)
+	err := RechargeWaffoPancake("waffo-pancake-guard", TopUpPaymentConfirmation{
+		PaidAmountMinor: &paidAmountMinor,
+		Currency:        "USD",
+		ProviderOrderId: "pancake_order_guard",
+	})
 	require.Error(t, err)
 
 	topUp := GetTopUpByTradeNo("waffo-pancake-guard")
 	require.NotNil(t, topUp)
 	assert.Equal(t, common.TopUpStatusPending, topUp.Status)
 	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
+}
+
+func TestRechargeCreemIsIdempotentAndDoesNotTrustCallbackIdentity(t *testing.T) {
+	truncateTables(t)
+	user := &User{
+		Id: 102, Username: "creem_callback_identity", Email: "",
+		Status: common.UserStatusEnabled, Quota: 0,
+	}
+	require.NoError(t, DB.Create(user).Error)
+	insertTopUpForPaymentGuardTest(t, "creem-idempotent", user.Id, PaymentProviderCreem)
+
+	paidAmountMinor := int64(999)
+	confirmation := TopUpPaymentConfirmation{
+		PaidAmountMinor: &paidAmountMinor,
+		Currency:        "USD",
+		ProviderOrderId: "creem_order_idempotent",
+	}
+	require.NoError(t, RechargeCreem("creem-idempotent", confirmation, "127.0.0.1"))
+	var afterFirst User
+	require.NoError(t, DB.First(&afterFirst, user.Id).Error)
+	assert.Empty(t, afterFirst.Email)
+	assert.Positive(t, afterFirst.Quota)
+
+	require.NoError(t, RechargeCreem("creem-idempotent", confirmation, "127.0.0.1"))
+	var afterSecond User
+	require.NoError(t, DB.First(&afterSecond, user.Id).Error)
+	assert.Equal(t, afterFirst.Quota, afterSecond.Quota)
+	assert.Empty(t, afterSecond.Email)
+	assert.Equal(t, common.TopUpStatusSuccess, getTopUpStatusForPaymentGuardTest(t, "creem-idempotent"))
+}
+
+func TestRechargeCreemQuarantinesInvalidCreditQuota(t *testing.T) {
+	for _, amount := range []int64{-1, int64(common.MaxQuota) + 1} {
+		t.Run(fmt.Sprintf("amount_%d", amount), func(t *testing.T) {
+			truncateTables(t)
+			const userID = 103
+			tradeNo := fmt.Sprintf("creem-invalid-credit-%d", amount)
+			insertUserForPaymentGuardTest(t, userID, 0)
+			insertTopUpForPaymentGuardTest(t, tradeNo, userID, PaymentProviderCreem)
+			require.NoError(t, DB.Model(&TopUp{}).Where("trade_no = ?", tradeNo).Update("amount", amount).Error)
+
+			paidAmountMinor := int64(999)
+			err := RechargeCreem(tradeNo, TopUpPaymentConfirmation{
+				PaidAmountMinor: &paidAmountMinor,
+				Currency:        "USD",
+				ProviderOrderId: "creem_invalid_credit_order",
+			}, "127.0.0.1")
+
+			require.ErrorIs(t, err, ErrTopUpPaymentManualReview)
+			assert.Zero(t, getUserQuotaForPaymentGuardTest(t, userID))
+			topUp := GetTopUpByTradeNo(tradeNo)
+			require.NotNil(t, topUp)
+			assert.Equal(t, common.TopUpStatusManualReview, topUp.Status)
+			assert.Equal(t, "invalid_credit_quota", topUp.ReviewReason)
+		})
+	}
+}
+
+func TestRetainedTopUpSettlementQuarantinesUnsafeCreditSnapshot(t *testing.T) {
+	for _, provider := range []string{PaymentProviderWaffo, PaymentProviderWaffoPancake} {
+		for _, snapshot := range []int64{0, int64(common.MaxQuota) + 1} {
+			t.Run(fmt.Sprintf("%s/snapshot_%d", provider, snapshot), func(t *testing.T) {
+				truncateTables(t)
+				const userID = 104
+				tradeNo := fmt.Sprintf("%s-unsafe-credit-%d", provider, snapshot)
+				insertUserForPaymentGuardTest(t, userID, 0)
+				require.NoError(t, DB.Create(&TopUp{
+					UserId: userID, Amount: 2, Money: 9.99, TradeNo: tradeNo,
+					PaymentMethod: provider, PaymentProvider: provider,
+					Currency: "USD", ExpectedAmountMinor: 999, CreditQuotaSnapshot: snapshot,
+					Status: common.TopUpStatusPending, CreateTime: time.Now().Unix(),
+				}).Error)
+
+				paidAmountMinor := int64(999)
+				confirmation := TopUpPaymentConfirmation{
+					PaidAmountMinor: &paidAmountMinor,
+					Currency:        "USD",
+					ProviderOrderId: provider + "_quota_overflow_order",
+				}
+				var err error
+				if provider == PaymentProviderWaffo {
+					err = RechargeWaffo(tradeNo, confirmation, "127.0.0.1")
+				} else {
+					err = RechargeWaffoPancake(tradeNo, confirmation)
+				}
+
+				require.ErrorIs(t, err, ErrTopUpPaymentManualReview)
+				assert.Zero(t, getUserQuotaForPaymentGuardTest(t, userID))
+				topUp := GetTopUpByTradeNo(tradeNo)
+				require.NotNil(t, topUp)
+				assert.Equal(t, common.TopUpStatusManualReview, topUp.Status)
+				assert.Equal(t, "invalid_credit_quota", topUp.ReviewReason)
+			})
+		}
+	}
+}
+
+func TestRetainedTopUpSettlementUsesPersistedCreditSnapshot(t *testing.T) {
+	originalQuotaPerUnit := common.QuotaPerUnit
+	t.Cleanup(func() { common.QuotaPerUnit = originalQuotaPerUnit })
+
+	for _, provider := range []string{PaymentProviderWaffo, PaymentProviderWaffoPancake} {
+		t.Run(provider, func(t *testing.T) {
+			truncateTables(t)
+			const userID = 105
+			tradeNo := provider + "-persisted-credit"
+			insertUserForPaymentGuardTest(t, userID, 0)
+			common.QuotaPerUnit = 2
+			require.NoError(t, (&TopUp{
+				UserId: userID, Amount: 3, Money: 9.99, TradeNo: tradeNo,
+				PaymentMethod: provider, PaymentProvider: provider,
+				Currency: "USD", ExpectedAmountMinor: 999, CreditQuotaSnapshot: 6,
+				Status: common.TopUpStatusPending, CreateTime: time.Now().Unix(),
+			}).Insert())
+
+			common.QuotaPerUnit = 999_999
+			paidAmountMinor := int64(999)
+			confirmation := TopUpPaymentConfirmation{
+				PaidAmountMinor: &paidAmountMinor,
+				Currency:        "USD",
+				ProviderOrderId: provider + "_persisted_credit_order",
+			}
+			var err error
+			if provider == PaymentProviderWaffo {
+				err = RechargeWaffo(tradeNo, confirmation, "127.0.0.1")
+			} else {
+				err = RechargeWaffoPancake(tradeNo, confirmation)
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, 6, getUserQuotaForPaymentGuardTest(t, userID))
+		})
+	}
+}
+
+func TestRetainedTopUpInsertRequiresCreditSnapshot(t *testing.T) {
+	truncateTables(t)
+	err := (&TopUp{
+		UserId: 106, Amount: 1, Money: 1, TradeNo: "waffo-missing-credit-snapshot",
+		PaymentMethod: PaymentProviderWaffo, PaymentProvider: PaymentProviderWaffo,
+		Currency: "USD", ExpectedAmountMinor: 100,
+		Status: common.TopUpStatusPending, CreateTime: time.Now().Unix(),
+	}).Insert()
+	require.ErrorIs(t, err, ErrTopUpPaymentSnapshotMissing)
+}
+
+func TestTopUpCreditQuotaSnapshotIsNotSerialized(t *testing.T) {
+	payload, err := common.Marshal(&TopUp{CreditQuotaSnapshot: 123})
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), "credit_quota_snapshot")
 }
 
 func TestUpdatePendingTopUpStatus_RejectsMismatchedPaymentProvider(t *testing.T) {

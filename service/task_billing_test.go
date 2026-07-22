@@ -41,18 +41,31 @@ func TestMain(m *testing.M) {
 	common.LogConsumeEnabled = true
 
 	if err := db.AutoMigrate(
+		&model.Option{},
 		&model.Task{},
 		&model.User{},
 		&model.Token{},
 		&model.Log{},
 		&model.Channel{},
 		&model.TopUp{},
+		&model.PaymentQuote{},
+		&model.PaymentUserGuard{},
+		&model.PaymentOrder{},
+		&model.PaymentTask{},
+		&model.PaymentLimitPolicy{},
+		&model.PaymentLimitBucket{},
+		&model.PaymentLimitReservation{},
+		&model.PaymentEvent{},
+		&model.PaymentLedgerEntry{},
+		&model.PaymentDebt{},
+		&model.SubscriptionOrder{},
 		&model.UserSubscription{},
 		&model.BillingReservation{},
 		&model.QuotaLedgerEntry{},
 		&model.SubscriptionPreConsumeRecord{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.SystemInstance{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
@@ -73,12 +86,24 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM logs")
 		model.DB.Exec("DELETE FROM channels")
 		model.DB.Exec("DELETE FROM top_ups")
+		model.DB.Exec("DELETE FROM payment_ledger_entries")
+		model.DB.Exec("DELETE FROM payment_events")
+		model.DB.Exec("DELETE FROM payment_debts")
+		model.DB.Exec("DELETE FROM payment_limit_reservations")
+		model.DB.Exec("DELETE FROM payment_limit_buckets")
+		model.DB.Exec("DELETE FROM payment_limit_policies")
+		model.DB.Exec("DELETE FROM payment_tasks")
+		model.DB.Exec("DELETE FROM payment_orders")
+		model.DB.Exec("DELETE FROM payment_quotes")
+		model.DB.Exec("DELETE FROM payment_user_guards")
+		model.DB.Exec("DELETE FROM subscription_orders")
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM subscription_pre_consume_records")
 		model.DB.Exec("DELETE FROM quota_ledger_entries")
 		model.DB.Exec("DELETE FROM billing_reservations")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		model.DB.Exec("DELETE FROM system_instances")
 	})
 }
 

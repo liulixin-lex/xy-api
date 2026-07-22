@@ -50,6 +50,10 @@ func TestMain(m *testing.M) {
 		&PaymentQuote{},
 		&PaymentUserGuard{},
 		&PaymentOrder{},
+		&PaymentTask{},
+		&PaymentLimitPolicy{},
+		&PaymentLimitBucket{},
+		&PaymentLimitReservation{},
 		&PaymentEvent{},
 		&PaymentLedgerEntry{},
 		&PaymentDebt{},
@@ -120,6 +124,10 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM stripe_legacy_invoices")
 		DB.Exec("DELETE FROM stripe_legacy_subscriptions")
 		DB.Exec("DELETE FROM payment_orders")
+		DB.Exec("DELETE FROM payment_tasks")
+		DB.Exec("DELETE FROM payment_limit_reservations")
+		DB.Exec("DELETE FROM payment_limit_buckets")
+		DB.Exec("DELETE FROM payment_limit_policies")
 		DB.Exec("DELETE FROM payment_quotes")
 		DB.Exec("DELETE FROM payment_user_guards")
 		DB.Exec("DELETE FROM quota_ledger_entries")

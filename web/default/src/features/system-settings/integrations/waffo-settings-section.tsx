@@ -16,19 +16,27 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type ChangeEvent, useRef, type SetStateAction, useState } from 'react'
 import { Plus } from 'lucide-react'
+import {
+  type ChangeEvent,
+  type ReactNode,
+  useRef,
+  type SetStateAction,
+  useState,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+
+import { StaticDataTable } from '@/components/data-table/static/static-data-table'
+import { StaticRowActions } from '@/components/data-table/static/static-row-actions'
+import { Dialog } from '@/components/dialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Textarea } from '@/components/ui/textarea'
-import { StaticDataTable } from '@/components/data-table/static/static-data-table'
-import { StaticRowActions } from '@/components/data-table/static/static-row-actions'
-import { Dialog } from '@/components/dialog'
+
 import { SettingsSwitchField } from '../components/settings-form-layout'
 
 export interface WaffoSettingsValues {
@@ -46,6 +54,8 @@ export interface WaffoSettingsValues {
   WaffoMinTopUp: number
   WaffoNotifyUrl: string
   WaffoReturnUrl: string
+  WaffoWebRedirectHosts: string
+  WaffoAppRedirectSchemes: string
   WaffoPayMethods: string
 }
 
@@ -66,6 +76,7 @@ interface Props {
   ) => void
   payMethods: PayMethod[]
   onPayMethodsChange: (value: SetStateAction<PayMethod[]>) => void
+  emergencyControl?: ReactNode
 }
 
 export function WaffoSettingsSection({
@@ -73,6 +84,7 @@ export function WaffoSettingsSection({
   onValueChange,
   payMethods,
   onPayMethodsChange,
+  emergencyControl,
 }: Props) {
   const { t } = useTranslation()
   const iconFileInputRef = useRef<HTMLInputElement | null>(null)
@@ -98,8 +110,9 @@ export function WaffoSettingsSection({
   }
 
   const saveMethod = () => {
-    if (!methodForm.name.trim())
-      {return toast.error(t('Payment method name is required'))}
+    if (!methodForm.name.trim()) {
+      return toast.error(t('Payment method name is required'))
+    }
     if (editingIdx === -1) {
       onPayMethodsChange((prev) => [...prev, methodForm])
     } else {
@@ -129,8 +142,7 @@ export function WaffoSettingsSection({
     reader.addEventListener('load', () => {
       setMethodForm((previous) => ({
         ...previous,
-        icon:
-          typeof reader.result === 'string' ? reader.result : '',
+        icon: typeof reader.result === 'string' ? reader.result : '',
       }))
     })
     reader.readAsDataURL(file)
@@ -315,6 +327,43 @@ export function WaffoSettingsSection({
           </div>
         </div>
 
+        <div className='grid gap-4 sm:grid-cols-2'>
+          <div className='grid gap-1.5'>
+            <Label>{t('Additional trusted web checkout hosts')}</Label>
+            <Textarea
+              rows={3}
+              placeholder='checkout.partner.example'
+              value={values.WaffoWebRedirectHosts}
+              onChange={(event) =>
+                onValueChange('WaffoWebRedirectHosts', event.target.value)
+              }
+              className='font-mono text-xs'
+            />
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'One exact HTTPS hostname per line. cashier.waffo.com is always trusted.'
+              )}
+            </p>
+          </div>
+          <div className='grid gap-1.5'>
+            <Label>{t('Allowed App deep-link schemes')}</Label>
+            <Textarea
+              rows={3}
+              placeholder='weixin'
+              value={values.WaffoAppRedirectSchemes}
+              onChange={(event) =>
+                onValueChange('WaffoAppRedirectSchemes', event.target.value)
+              }
+              className='font-mono text-xs'
+            />
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'Leave empty to disable App deep links. Add only schemes confirmed by your Waffo payment method, one per line.'
+              )}
+            </p>
+          </div>
+        </div>
+
         <Separator />
 
         <div className='flex items-center justify-between'>
@@ -380,6 +429,8 @@ export function WaffoSettingsSection({
             },
           ]}
         />
+
+        {emergencyControl}
       </div>
 
       <Dialog

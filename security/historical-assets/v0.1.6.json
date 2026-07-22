@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-22T04:13:42Z",
+  "repository": "liulixin-lex/xy-api",
+  "tag": {
+    "name": "v0.1.6",
+    "object_type": "commit",
+    "commit": "2014e1d596a482beb10b1943aa292e1fa991f636"
+  },
+  "github_release": {
+    "id": 350393426,
+    "node_id": "RE_kwDOTGE2PM4U4pRS",
+    "tag_name": "v0.1.6",
+    "target_commitish": "main",
+    "name": "v0.1.6",
+    "body": null,
+    "draft": false,
+    "prerelease": false,
+    "immutable": false,
+    "created_at": "2026-07-07T14:42:29Z",
+    "updated_at": "2026-07-07T14:53:47Z",
+    "published_at": "2026-07-07T14:51:56Z",
+    "author": {
+      "id": 41898282,
+      "login": "github-actions[bot]",
+      "type": "Bot"
+    },
+    "assets": [
+      {
+        "id": 469272469,
+        "name": "New-API-App.0.1.6.exe",
+        "label": "New-API-App 0.1.6.exe",
+        "size": 127137501,
+        "digest": "sha256:ff2c6f1a5bca2d77c98bfd943a5ee314d6f2dab9854e34e3a1b4574ebeeba816",
+        "state": "uploaded",
+        "content_type": "application/x-msdos-program",
+        "created_at": "2026-07-07T14:53:39Z",
+        "updated_at": "2026-07-07T14:53:47Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469272468,
+        "name": "New-API-App.Setup.0.1.6.exe",
+        "label": "New-API-App Setup 0.1.6.exe",
+        "size": 127361530,
+        "digest": "sha256:a065200530f156c0b8e893d1a6c5a90e22acc1aecb3260e63b97c2cb540ac079",
+        "state": "uploaded",
+        "content_type": "application/x-msdos-program",
+        "created_at": "2026-07-07T14:53:39Z",
+        "updated_at": "2026-07-07T14:53:46Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270812,
+        "name": "checksums-linux.txt",
+        "label": "",
+        "size": 168,
+        "digest": "sha256:78af2b0e1ebe1ecc10245893519c668b99e09407d80c3592a07430c2460cad55",
+        "state": "uploaded",
+        "content_type": "text/plain",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:47Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270810,
+        "name": "checksums-macos.txt",
+        "label": "",
+        "size": 87,
+        "digest": "sha256:58e1771f1925a2f496df169a6861cfe256cc62f0e0d245d99c5f0f7c37aff5b7",
+        "state": "uploaded",
+        "content_type": "text/plain",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:47Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270809,
+        "name": "checksums-windows.txt",
+        "label": "",
+        "size": 85,
+        "digest": "sha256:ee1af7ed0b812e7d136fe5964b5cd1ab987c6c8f89efb83984d15763e3b67900",
+        "state": "uploaded",
+        "content_type": "text/plain",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:47Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270817,
+        "name": "new-api-arm64-v0.1.6",
+        "label": "",
+        "size": 135921929,
+        "digest": "sha256:6c2a29af553895abcf2ce1f8811289f154b27f22574e95faf7d894cfabd11946",
+        "state": "uploaded",
+        "content_type": "application/octet-stream",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:54Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270820,
+        "name": "new-api-macos-v0.1.6",
+        "label": "",
+        "size": 159504434,
+        "digest": "sha256:4036c938c7c65d8517f6054ade6c4cf2bd53216e2437c5c3336515c9abdfaa8a",
+        "state": "uploaded",
+        "content_type": "application/octet-stream",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:55Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270814,
+        "name": "new-api-v0.1.6",
+        "label": "",
+        "size": 139149577,
+        "digest": "sha256:3c2b25de4899b8a69a8cc3bcb2fac3dbef95a8e28863acc3a978be86c4df74d6",
+        "state": "uploaded",
+        "content_type": "application/octet-stream",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:54Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      },
+      {
+        "id": 469270821,
+        "name": "new-api-v0.1.6.exe",
+        "label": "",
+        "size": 141064192,
+        "digest": "sha256:7c31b5c4a35d3f386a9b3b4c7f14a8e7efff940e7d86e0ad14b79577414002dc",
+        "state": "uploaded",
+        "content_type": "application/x-msdos-program",
+        "created_at": "2026-07-07T14:51:47Z",
+        "updated_at": "2026-07-07T14:51:53Z",
+        "uploader": {
+          "id": 41898282,
+          "login": "github-actions[bot]",
+          "type": "Bot"
+        }
+      }
+    ]
+  },
+  "container": {
+    "registry": "ghcr.io",
+    "repository": "liulixin-lex/xy-api",
+    "tag": "v0.1.6",
+    "reference": "ghcr.io/liulixin-lex/xy-api:v0.1.6",
+    "index": {
+      "media_type": "application/vnd.oci.image.index.v1+json",
+      "digest": "sha256:3716e86001bb40bb92e485ae1c3b34ebb0a6225c9f7d9a1609e13e84dacca6f9",
+      "size": 1609,
+      "manifests": [
+        {
+          "media_type": "application/vnd.oci.image.manifest.v1+json",
+          "digest": "sha256:b397970c52ee16865108dc8e872c49ca10278cf60559f23092183f6a1a2debdd",
+          "size": 1244,
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64",
+            "variant": null
+          },
+          "annotations": {}
+        },
+        {
+          "media_type": "application/vnd.oci.image.manifest.v1+json",
+          "digest": "sha256:0d92c286684b1387569190215a3455486b54ca34d005b60e8c0b9df61c33214f",
+          "size": 839,
+          "platform": {
+            "os": "unknown",
+            "architecture": "unknown",
+            "variant": null
+          },
+          "annotations": {
+            "vnd.docker.reference.digest": "sha256:b397970c52ee16865108dc8e872c49ca10278cf60559f23092183f6a1a2debdd",
+            "vnd.docker.reference.type": "attestation-manifest"
+          }
+        },
+        {
+          "media_type": "application/vnd.oci.image.manifest.v1+json",
+          "digest": "sha256:632fb94ecc9f768717e2cf261d2b905d5873bb1b405d78fcc850a74381403149",
+          "size": 1244,
+          "platform": {
+            "os": "linux",
+            "architecture": "arm64",
+            "variant": null
+          },
+          "annotations": {}
+        },
+        {
+          "media_type": "application/vnd.oci.image.manifest.v1+json",
+          "digest": "sha256:9848c8bfc4328b83577b743d466243fda91340bd7a1c8e5ac2c9b0ea9e318a67",
+          "size": 839,
+          "platform": {
+            "os": "unknown",
+            "architecture": "unknown",
+            "variant": null
+          },
+          "annotations": {
+            "vnd.docker.reference.digest": "sha256:632fb94ecc9f768717e2cf261d2b905d5873bb1b405d78fcc850a74381403149",
+            "vnd.docker.reference.type": "attestation-manifest"
+          }
+        }
+      ]
+    }
+  }
+}

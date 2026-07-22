@@ -20,20 +20,27 @@ type StripeLegacySyncResult struct {
 	Unmapped int `json:"unmapped"`
 }
 
-// ProcessVerifiedWebhook updates the recurring-subscription inventory after
-// the Stripe signature, account, and livemode checks have succeeded. This path
-// intentionally never invokes local subscription fulfillment or cancellation.
-func (p *stripePaymentProvider) ProcessVerifiedWebhook(ctx context.Context, event *NormalizedPaymentEvent) error {
+// ValidateVerifiedWebhook confirms one-time Checkout Session terminal events
+// against the configured Stripe account without mutating local inventory.
+func (p *stripePaymentProvider) ValidateVerifiedWebhook(ctx context.Context, event *NormalizedPaymentEvent) error {
 	if event == nil || event.Provider != model.PaymentProviderStripe || len(event.VerifiedPayload) == 0 {
 		return nil
 	}
-	if event.Paid {
+	if event.Paid || event.Failed || event.Expired {
 		unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
-		err := p.confirmPaidCheckoutSession(ctx, event)
+		err := p.confirmCheckoutSessionAuthority(ctx, event)
 		unlockPaymentConfiguration()
-		if err != nil {
-			return err
-		}
+		return err
+	}
+	return nil
+}
+
+// ProcessVerifiedWebhook updates recurring-subscription inventory only after
+// the canonical event has been durably persisted or settled. It intentionally
+// never invokes local subscription fulfillment or cancellation.
+func (p *stripePaymentProvider) ProcessVerifiedWebhook(_ context.Context, event *NormalizedPaymentEvent) error {
+	if event == nil || event.Provider != model.PaymentProviderStripe || len(event.VerifiedPayload) == 0 {
+		return nil
 	}
 	var stripeEvent stripe.Event
 	if err := common.Unmarshal(event.VerifiedPayload, &stripeEvent); err != nil {

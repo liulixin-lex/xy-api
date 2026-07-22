@@ -60,6 +60,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
+import { getSubscriptionPlanAdminErrorMessage } from '@/features/system-settings/payment-admin-errors'
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
 
 import {
@@ -72,6 +73,7 @@ import {
 import { getDurationUnitOptions, getResetPeriodOptions } from '../constants'
 import {
   getPlanFormSchema,
+  hasLegacyStripePriceMapping,
   PLAN_FORM_DEFAULTS,
   planToFormValues,
   formValuesToPlanPayload,
@@ -93,6 +95,7 @@ export function SubscriptionsMutateDrawer({
 }: Props) {
   const { t } = useTranslation()
   const isEdit = !!currentRow?.plan?.id
+  const showLegacyStripeMapping = hasLegacyStripePriceMapping(currentRow)
   const { triggerRefresh } = useSubscriptions()
   const { meta: currencyMeta } = getCurrencyDisplay()
   const tokensOnly = currencyMeta.kind === 'tokens'
@@ -158,21 +161,19 @@ export function SubscriptionsMutateDrawer({
       const payload = formValuesToPlanPayload(values)
       if (isEdit && currentRow?.plan?.id) {
         const res = await updatePlan(currentRow.plan.id, payload)
-        if (res.success) {
-          toast.success(t('Update succeeded'))
-          onOpenChange(false)
-          triggerRefresh()
-        }
+        if (!res.success) throw res
+        toast.success(t('Update succeeded'))
+        onOpenChange(false)
+        triggerRefresh()
       } else {
         const res = await createPlan(payload)
-        if (res.success) {
-          toast.success(t('Create succeeded'))
-          onOpenChange(false)
-          triggerRefresh()
-        }
+        if (!res.success) throw res
+        toast.success(t('Create succeeded'))
+        onOpenChange(false)
+        triggerRefresh()
       }
-    } catch {
-      toast.error(t('Request failed'))
+    } catch (error) {
+      toast.error(getSubscriptionPlanAdminErrorMessage(error, t))
     } finally {
       setIsSubmitting(false)
     }
@@ -742,22 +743,13 @@ export function SubscriptionsMutateDrawer({
             <SideDrawerSection>
               <h3 className='flex items-center gap-2 text-sm font-medium'>
                 <CreditCard className='h-4 w-4' />
-                {t('Third-party Payment Config')}
+                {t('Current external product mappings')}
               </h3>
-
-              <FormField
-                control={form.control}
-                name='stripe_price_id'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Stripe product price ID')}</FormLabel>
-                    <FormControl>
-                      <Input {...field} placeholder='price_...' />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
+              <p className='text-muted-foreground text-sm'>
+                {t(
+                  'Product IDs in this section apply only to their matching current payment integrations.'
                 )}
-              />
+              </p>
 
               <FormField
                 control={form.control}
@@ -792,7 +784,7 @@ export function SubscriptionsMutateDrawer({
                   }
                   return (
                     <FormItem>
-                      <FormLabel>Waffo Pancake Product ID</FormLabel>
+                      <FormLabel>{t('Waffo Pancake Product ID')}</FormLabel>
                       <div className='flex gap-2'>
                         <Select
                           items={items}
@@ -836,6 +828,38 @@ export function SubscriptionsMutateDrawer({
                 }}
               />
             </SideDrawerSection>
+
+            {showLegacyStripeMapping ? (
+              <SideDrawerSection>
+                <h3 className='flex items-center gap-2 text-sm font-medium'>
+                  <RefreshCw className='h-4 w-4' />
+                  {t('Legacy Stripe recurring subscription mapping')}
+                </h3>
+                <FormField
+                  control={form.control}
+                  name='stripe_price_id'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Legacy Stripe Price ID')}</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder='price_...'
+                          maxLength={128}
+                          autoComplete='off'
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Read-only inventory mapping only. This Price ID does not control current one-time Checkout, create automatic renewals, cancel subscriptions, or issue refunds.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </SideDrawerSection>
+            ) : null}
           </form>
         </Form>
         <SheetFooter className={sideDrawerFooterClassName()}>

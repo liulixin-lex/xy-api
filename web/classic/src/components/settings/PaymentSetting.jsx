@@ -33,7 +33,17 @@ import SettingsPaymentGatewayStripe from '../../pages/Setting/Payment/SettingsPa
 import SettingsPaymentGatewayXorPay from '../../pages/Setting/Payment/SettingsPaymentGatewayXorPay';
 import SettingsPaymentGatewayCreem from '../../pages/Setting/Payment/SettingsPaymentGatewayCreem';
 import SettingsPaymentGatewayWaffo from '../../pages/Setting/Payment/SettingsPaymentGatewayWaffo';
-import { API, showError, showSuccess, toBoolean } from '../../helpers';
+import SettingsPaymentGatewayWaffoPancake from '../../pages/Setting/Payment/SettingsPaymentGatewayWaffoPancake';
+import PaymentOverviewPanel from '../../pages/Setting/Payment/PaymentOverviewPanel';
+import PaymentLimitsPanel from '../../pages/Setting/Payment/PaymentLimitsPanel';
+import StripeLegacyInventoryPanel from '../../pages/Setting/Payment/StripeLegacyInventoryPanel';
+import {
+  API,
+  showError,
+  showSuccess,
+  showWarning,
+  toBoolean,
+} from '../../helpers';
 import { useTranslation } from 'react-i18next';
 import RiskAcknowledgementModal from '../common/modals/RiskAcknowledgementModal';
 import SecureVerificationModal from '../common/modals/SecureVerificationModal';
@@ -75,6 +85,7 @@ const PaymentSetting = () => {
     StripeWebhookSecret: '',
     StripePriceId: '',
     StripeAccountId: '',
+    StripeCheckoutAllowedHosts: '',
     StripeCredentialAccountId: '',
     StripeCredentialLivemode: '',
     StripeUnitPrice: 8.0,
@@ -86,6 +97,9 @@ const PaymentSetting = () => {
     XorPayUnitPrice: 7.3,
     XorPayMinTopUp: 1,
     XorPayEnabledMethods: [],
+    WaffoPancakeUnitPrice: 1,
+    WaffoPancakeMinTopUp: 1,
+    WaffoPancakeTestMode: false,
 
     'payment_setting.compliance_confirmed': false,
     'payment_setting.compliance_terms_version': '',
@@ -162,7 +176,7 @@ const PaymentSetting = () => {
       CURRENT_COMPLIANCE_TERMS_VERSION;
 
   const getOptions = useCallback(async () => {
-    const res = await API.get('/api/option/');
+    const res = await API.get('/api/option/', { skipErrorHandler: true });
     const { success, message, data } = res.data;
     if (success) {
       let newInputs = {};
@@ -208,6 +222,7 @@ const PaymentSetting = () => {
           case 'payment_setting.stripe_test_mode_enabled':
           case 'payment_setting.stripe_test_mode_blocked':
           case 'payment_setting.stripe_test_mode_isolation_required':
+          case 'WaffoPancakeTestMode':
             newInputs[item.key] = toBoolean(item.value);
             break;
           case 'payment_setting.compliance_confirmed_at':
@@ -226,6 +241,8 @@ const PaymentSetting = () => {
           case 'StripeMinTopUp':
           case 'XorPayUnitPrice':
           case 'XorPayMinTopUp':
+          case 'WaffoPancakeUnitPrice':
+          case 'WaffoPancakeMinTopUp':
             newInputs[item.key] = parseFloat(item.value);
             break;
           case 'XorPayEnabledMethods':
@@ -254,12 +271,12 @@ const PaymentSetting = () => {
         ),
       }));
     } else {
-      showError(t(message));
+      throw new Error(t(message || '刷新失败'));
     }
   }, [t]);
 
-  const onRefresh = useCallback(
-    async (nextConfigVersion) => {
+  const refreshPaymentOptions = useCallback(
+    async (nextConfigVersion, notifyError) => {
       if (nextConfigVersion !== undefined) {
         setInputs((prev) => ({
           ...prev,
@@ -272,8 +289,12 @@ const PaymentSetting = () => {
       try {
         setLoading(true);
         await getOptions();
+        return true;
       } catch (error) {
-        showError(t('刷新失败'));
+        if (notifyError) {
+          showError(error?.message || t('刷新失败'));
+        }
+        return false;
       } finally {
         setLoading(false);
       }
@@ -281,25 +302,37 @@ const PaymentSetting = () => {
     [getOptions, t],
   );
 
+  const onRefresh = useCallback(
+    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion, true),
+    [refreshPaymentOptions],
+  );
+
+  const refreshAfterSave = useCallback(
+    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion, false),
+    [refreshPaymentOptions],
+  );
+
   const withPaymentVerification = useCallback(
-    (apiCall) => {
+    (apiCall, verificationOptions = {}) => {
       const guardedCall = async () => {
         try {
           return await apiCall();
         } catch (error) {
           if (error?.response?.status === 409) {
-            await onRefresh();
+            await refreshAfterSave();
           }
           throw error;
         }
       };
       return withVerification(guardedCall, {
         preferredMethod: 'passkey',
-        title: t('验证支付设置变更'),
-        description: t('修改支付凭据或网关配置前，请先确认身份。'),
+        title: verificationOptions.title || t('验证支付设置变更'),
+        description:
+          verificationOptions.description ||
+          t('修改支付凭据或网关配置前，请先确认身份。'),
       });
     },
-    [onRefresh, t, withVerification],
+    [refreshAfterSave, t, withVerification],
   );
 
   useEffect(() => {
@@ -318,9 +351,13 @@ const PaymentSetting = () => {
         if (!res.data.success) {
           throw new Error(res.data.message || t('确认失败'));
         }
-        showSuccess(t('合规声明确认成功'));
         setComplianceVisible(false);
-        await onRefresh();
+        const refreshed = await refreshAfterSave();
+        if (refreshed) {
+          showSuccess(t('合规声明确认成功'));
+        } else {
+          showWarning(t('已确认合规声明，但最新支付设置状态刷新失败'));
+        }
         return res;
       });
     } catch (error) {
@@ -410,29 +447,33 @@ const PaymentSetting = () => {
           credentialRevocationProviderLabels[
             pendingCredentialRevocation.provider
           ] || pendingCredentialRevocation.provider;
-        if (pendingCredentialRevocation.mode === 'replace') {
-          showSuccess(
-            t(
-              '{{provider}} credentials replaced and compromised generations revoked',
-              { provider: providerLabel },
-            ),
-          );
-        } else if (pendingCredentialRevocation.mode === 'stripe_disable') {
-          showSuccess(
-            t('Stripe webhooks disabled and signing credentials revoked'),
-          );
-        } else if (pendingCredentialRevocation.mode === 'stripe_disable_all') {
-          showSuccess(
-            t(
-              'Stripe API and webhook credentials disabled; affected orders quarantined',
-            ),
-          );
-        } else {
-          showSuccess(t('旧凭据已撤销'));
-        }
         setPendingCredentialRevocation(null);
         setCredentialRevocationReason('');
-        await onRefresh(response.data?.data?.version);
+        const refreshed = await refreshAfterSave(response.data?.data?.version);
+        let successMessage = t('旧凭据已撤销');
+        if (pendingCredentialRevocation.mode === 'replace') {
+          successMessage = t(
+            '{{provider}} credentials replaced and compromised generations revoked',
+            { provider: providerLabel },
+          );
+        } else if (pendingCredentialRevocation.mode === 'stripe_disable') {
+          successMessage = t(
+            'Stripe webhooks disabled and signing credentials revoked',
+          );
+        } else if (pendingCredentialRevocation.mode === 'stripe_disable_all') {
+          successMessage = t(
+            'Stripe API and webhook credentials disabled; affected orders quarantined',
+          );
+        }
+        if (refreshed) {
+          showSuccess(successMessage);
+        } else {
+          showWarning(
+            t('{{action}}，但最新支付设置状态刷新失败', {
+              action: successMessage,
+            }),
+          );
+        }
         return response;
       });
     } catch (error) {
@@ -470,7 +511,7 @@ const PaymentSetting = () => {
     credentialRevocationConfirmText = t('Replace and revoke');
     if (pendingCredentialRevocationProvider === 'stripe') {
       credentialRevocationWarning = t(
-        'Emergency action: all previously accepted Stripe webhook signing secrets stop validating immediately, and every unfinished Stripe order moves to manual review. If a new whsec is entered in this form, it is saved atomically; otherwise Stripe webhooks are disabled. Clearing or normally rotating a secret does not perform this emergency revocation.',
+        'Emergency action: all previously accepted Stripe webhook signing secrets stop validating in this system immediately, and every unfinished Stripe order moves to manual review. If a new whsec is entered, it is saved atomically; otherwise local Stripe webhooks are disabled. This does not revoke Stripe Dashboard API keys, cancel Checkout Sessions or subscriptions, or issue refunds.',
       );
     } else {
       credentialRevocationWarning = t(
@@ -482,7 +523,7 @@ const PaymentSetting = () => {
     credentialRevocationTitle = t('Disable Stripe webhooks immediately?');
     credentialRevocationConfirmText = t('Disable and revoke');
     credentialRevocationWarning = t(
-      'Emergency action: all Stripe webhook signing secrets stop validating immediately, Stripe webhooks are disabled, and every unfinished Stripe order moves to manual review. To replace the webhook secret atomically instead, confirm compliance and use the Stripe settings form. Clearing or normally rotating a secret does not perform this emergency revocation.',
+      'Emergency action: all Stripe webhook signing secrets stop validating in this system immediately, local Stripe webhooks are disabled, and every unfinished Stripe order moves to manual review. Stripe Checkout Sessions and subscriptions are not canceled, no refunds are issued, and Stripe Dashboard credentials remain active until you change them there.',
     );
   } else if (pendingCredentialRevocation?.mode === 'stripe_disable_all') {
     credentialRevocationTitle = t(
@@ -490,7 +531,7 @@ const PaymentSetting = () => {
     );
     credentialRevocationConfirmText = t('Disable all and revoke');
     credentialRevocationWarning = t(
-      'Emergency shutdown: the Stripe API credential and all webhook signing secrets are cleared locally, every unfinished Stripe order moves to manual review, and durable Stripe history is marked with a credential incident. This does not revoke the API key at Stripe; revoke it in the Stripe Dashboard as well.',
+      'Emergency shutdown: the Stripe API credential and all webhook signing secrets are cleared only from this system, every unfinished Stripe order moves to manual review, and durable Stripe history is marked with a credential incident. This does not revoke the API key in Stripe, cancel Checkout Sessions or subscriptions, or issue refunds. Complete those actions separately in the Stripe Dashboard when required.',
     );
   } else if (pendingCredentialRevocation) {
     credentialRevocationWarning = t(
@@ -603,86 +644,127 @@ const PaymentSetting = () => {
               fullMode={false}
             />
           )}
-          <fieldset
-            disabled={!complianceConfirmed}
-            style={{
-              border: 0,
-              margin: 0,
-              minWidth: 0,
-              padding: 0,
-              opacity: complianceConfirmed ? 1 : 0.4,
-            }}
+          <Tabs
+            type='card'
+            defaultActiveKey='overview'
+            contentStyle={{ paddingTop: 24 }}
           >
-            <Tabs
-              type='card'
-              defaultActiveKey='general'
-              contentStyle={{ paddingTop: 24 }}
+            <Tabs.TabPane tab={t('支付概览')} itemKey='overview'>
+              <PaymentOverviewPanel />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('通用设置')}
+              itemKey='general'
+              disabled={!complianceConfirmed}
             >
-              <Tabs.TabPane tab={t('通用设置')} itemKey='general'>
-                <SettingsGeneralPayment
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-              <Tabs.TabPane tab={t('易支付设置')} itemKey='epay'>
-                <SettingsPaymentGateway
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  requestEmergencyCredentialRevocation={
-                    requestEmergencyCredentialRevocation
-                  }
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-              <Tabs.TabPane tab={t('Stripe 设置')} itemKey='stripe'>
-                <SettingsPaymentGatewayStripe
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  requestEmergencyCredentialRevocation={
-                    requestEmergencyCredentialRevocation
-                  }
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-              <Tabs.TabPane tab='XORPay' itemKey='xorpay'>
-                <SettingsPaymentGatewayXorPay
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  requestEmergencyCredentialRevocation={
-                    requestEmergencyCredentialRevocation
-                  }
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-              <Tabs.TabPane tab={t('Creem 设置')} itemKey='creem'>
-                <SettingsPaymentGatewayCreem
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-              <Tabs.TabPane tab={t('Waffo 设置')} itemKey='waffo'>
-                <SettingsPaymentGatewayWaffo
-                  options={inputs}
-                  configVersion={paymentConfigVersion}
-                  refresh={onRefresh}
-                  withPaymentVerification={withPaymentVerification}
-                  hideSectionTitle
-                />
-              </Tabs.TabPane>
-            </Tabs>
-          </fieldset>
+              <SettingsGeneralPayment
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('易支付设置')}
+              itemKey='epay'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGateway
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                requestEmergencyCredentialRevocation={
+                  requestEmergencyCredentialRevocation
+                }
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('Stripe 设置')}
+              itemKey='stripe'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGatewayStripe
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                requestEmergencyCredentialRevocation={
+                  requestEmergencyCredentialRevocation
+                }
+                hideSectionTitle
+              />
+              <StripeLegacyInventoryPanel
+                withPaymentVerification={withPaymentVerification}
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab='XORPay'
+              itemKey='xorpay'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGatewayXorPay
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                requestEmergencyCredentialRevocation={
+                  requestEmergencyCredentialRevocation
+                }
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('Creem 设置')}
+              itemKey='creem'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGatewayCreem
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('Waffo Pancake 设置')}
+              itemKey='waffo-pancake'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGatewayWaffoPancake
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('Waffo 设置')}
+              itemKey='waffo'
+              disabled={!complianceConfirmed}
+            >
+              <SettingsPaymentGatewayWaffo
+                options={inputs}
+                configVersion={paymentConfigVersion}
+                refresh={refreshAfterSave}
+                withPaymentVerification={withPaymentVerification}
+                hideSectionTitle
+              />
+            </Tabs.TabPane>
+            <Tabs.TabPane
+              tab={t('支付限额')}
+              itemKey='limits'
+              disabled={!complianceConfirmed}
+            >
+              <PaymentLimitsPanel
+                withPaymentVerification={withPaymentVerification}
+              />
+            </Tabs.TabPane>
+          </Tabs>
         </Card>
         <Modal
           visible={pendingCredentialRevocation !== null}

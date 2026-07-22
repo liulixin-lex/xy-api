@@ -17,23 +17,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Banner, Button, Space, Typography } from '@douyinfe/semi-ui';
 import { isPaymentOrderPending } from './use-payment-order';
+import { getPublicPaymentMethodLabel } from './payment-utils';
 
 const { Text } = Typography;
 
 const STATUS_CONFIG = {
-  pending: { type: 'warning', label: '待支付' },
-  processing: { type: 'info', label: '处理中' },
-  success: { type: 'success', label: '支付成功' },
-  failed: { type: 'danger', label: '支付失败' },
+  preparing: { type: 'info', label: '支付准备中' },
+  awaiting_payment: { type: 'warning', label: '等待支付' },
+  confirming: { type: 'info', label: '确认中' },
+  succeeded: { type: 'success', label: '支付成功' },
   expired: { type: 'warning', label: '已过期' },
-  manual_review: { type: 'warning', label: '人工复核' },
-  refunded: { type: 'info', label: '已退款' },
-  refund_pending: { type: 'warning', label: '退款处理中' },
-  disputed: { type: 'danger', label: '争议中' },
-  debt: { type: 'danger', label: '欠款冻结' },
+  temporarily_unavailable: { type: 'danger', label: '暂时不可用' },
 };
 
 const PaymentOrderTracker = ({
@@ -47,14 +44,38 @@ const PaymentOrderTracker = ({
   onOpenHistory,
   onDismiss,
 }) => {
-  if (!payment?.trade_no) return null;
-
-  const status = order?.status || 'processing';
+  const [remainingSeconds, setRemainingSeconds] = useState(0);
+  const status = order?.status_code || 'preparing';
   const config = STATUS_CONFIG[status] || {
-    type: 'info',
-    label: status,
+    type: 'danger',
+    label: '暂时不可用',
   };
   const pending = isPaymentOrderPending(status);
+  const expiresAt = Number(order?.expires_at || payment?.expires_at || 0);
+  const paymentMethodLabel = getPublicPaymentMethodLabel(
+    order?.public_method ? order : payment,
+    t,
+  );
+
+  useEffect(() => {
+    if (!expiresAt || !pending) {
+      setRemainingSeconds(0);
+      return undefined;
+    }
+    const updateRemaining = () => {
+      setRemainingSeconds(
+        Math.max(0, Math.ceil(expiresAt - Date.now() / 1000)),
+      );
+    };
+    updateRemaining();
+    const timer = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(timer);
+  }, [expiresAt, pending]);
+
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = String(remainingSeconds % 60).padStart(2, '0');
+
+  if (!payment?.trade_no) return null;
 
   return (
     <Banner
@@ -67,13 +88,18 @@ const PaymentOrderTracker = ({
           <div className='flex flex-wrap items-center gap-x-2 gap-y-1'>
             <Text type='tertiary'>{t('订单号')}:</Text>
             <Text copyable>{payment.trade_no}</Text>
+            <Text type='tertiary'>{t('支付方式')}:</Text>
+            <Text>{paymentMethodLabel}</Text>
             <Text type='tertiary'>{t('支付状态')}:</Text>
             <Text>{t(config.label)}</Text>
           </div>
+          {pending && expiresAt > 0 && (
+            <Text type='tertiary'>
+              {t('剩余时间 {{minutes}}:{{seconds}}', { minutes, seconds })}
+            </Text>
+          )}
           {error ? (
             <Text type='danger'>{error}</Text>
-          ) : order?.status_reason ? (
-            <Text type='tertiary'>{t(order.status_reason)}</Text>
           ) : pending ? (
             <Text type='tertiary'>
               {polling

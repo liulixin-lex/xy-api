@@ -213,6 +213,19 @@ export function PaymentAuditDetailSheet(props: {
                   </Alert>
                 )}
 
+                {detailQuery.data?.legacy_review_reason ? (
+                  <Alert variant='destructive'>
+                    <AlertDescription className='grid gap-1'>
+                      <span className='font-medium'>
+                        {t('Legacy callback review evidence')}
+                      </span>
+                      <code className='break-all'>
+                        {detailQuery.data.legacy_review_reason}
+                      </code>
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
+
                 {order.credential_incident_state && (
                   <DetailSection title={t('Payment Credential Incident')}>
                     <Alert

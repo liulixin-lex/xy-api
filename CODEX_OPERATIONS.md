@@ -55,6 +55,19 @@ backup and migration plan.
   baseline and must never be modified or replaced. The Git tag is protected by
   repository rules; retain recorded checksums and image digests because the
   historical assets and image tags predate platform-enforced immutability.
+- `security/historical-assets/v0.1.6.json` records the exact tag commit,
+  GitHub Release identity and stable metadata, every asset API digest and size,
+  and the GHCR index, amd64, arm64, and attestation manifest digests. CI and
+  every stable-release preflight run `scripts/release/verify-historical-assets.sh`
+  read-only and must fail when GitHub or GHCR is unavailable; this check must
+  never repair, replace, or republish historical artifacts.
+- The preservation gate intentionally excludes mutable observation fields such
+  as asset download counts. It trusts GitHub's server-computed asset digest
+  field instead of downloading the roughly gigabyte-scale historical binaries,
+  while GHCR index and child manifest bodies are downloaded and hashed. It does
+  not re-download container layers, so the manifest digest chain proves their
+  recorded identity but the gate does not claim a fresh full-image pull or
+  runtime smoke test.
 - The `v0.2` line starts from the exact `v0.1.6` commit.
 - Repository-governance work must not alter runtime source or deployment
   defaults.

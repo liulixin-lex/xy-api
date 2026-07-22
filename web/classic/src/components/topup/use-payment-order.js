@@ -19,23 +19,22 @@ For commercial licensing, please contact support@quantumnous.com
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { API } from '../../helpers';
+import {
+  getSafeUserPaymentError,
+  normalizePublicPaymentOrder,
+  normalizePublicPaymentStatus,
+} from './payment-utils';
 
 const DEFAULT_ORDER_LIFETIME_SECONDS = 15 * 60;
 const MAX_NETWORK_FAILURES = 3;
-const PENDING_STATUSES = new Set(['pending', 'processing']);
+const PENDING_STATUSES = new Set([
+  'preparing',
+  'awaiting_payment',
+  'confirming',
+]);
 
 export function isPaymentOrderPending(status) {
   return PENDING_STATUSES.has(status);
-}
-
-function normalizeOrder(order) {
-  if (!order) return null;
-  return {
-    ...order,
-    status: ['paid', 'fulfilled'].includes(order.status)
-      ? 'success'
-      : order.status,
-  };
 }
 
 export function usePaymentOrderPolling({ t, onSuccess, onTerminal }) {
@@ -56,16 +55,21 @@ export function usePaymentOrderPolling({ t, onSuccess, onTerminal }) {
 
     const expiresAt = Number(nextPayment?.expires_at || 0);
     setPayment({
-      ...nextPayment,
       trade_no: tradeNo,
       expires_at: Number.isFinite(expiresAt) ? expiresAt : 0,
     });
     setOrder({
       trade_no: tradeNo,
       expires_at: Number.isFinite(expiresAt) ? expiresAt : 0,
-      status:
-        initialStatus ||
-        (nextPayment?.flow === 'pending' ? 'processing' : 'pending'),
+      status_code:
+        (initialStatus
+          ? normalizePublicPaymentStatus({ status_code: initialStatus })
+          : '') ||
+        (nextPayment?.status_code
+          ? normalizePublicPaymentStatus(nextPayment)
+          : nextPayment?.flow === 'pending'
+            ? 'preparing'
+            : 'awaiting_payment'),
     });
     setError('');
     setPolling(true);
@@ -107,12 +111,12 @@ export function usePaymentOrderPolling({ t, onSuccess, onTerminal }) {
     };
 
     const notifyTerminal = async (nextOrder) => {
-      const notificationKey = `${nextOrder.trade_no}:${nextOrder.status}`;
+      const notificationKey = `${nextOrder.trade_no}:${nextOrder.status_code}`;
       if (notifiedStatusRef.current === notificationKey) return;
       notifiedStatusRef.current = notificationKey;
 
       try {
-        if (nextOrder.status === 'success') {
+        if (nextOrder.status_code === 'succeeded') {
           await callbacksRef.current.onSuccess?.(nextOrder);
         }
         await callbacksRef.current.onTerminal?.(nextOrder);
@@ -129,24 +133,37 @@ export function usePaymentOrderPolling({ t, onSuccess, onTerminal }) {
       try {
         const response = await API.get(
           `/api/user/payment/orders/${encodeURIComponent(payment.trade_no)}`,
-          { signal: controller.signal },
+          { signal: controller.signal, skipErrorHandler: true },
         );
         if (stopped) return;
 
         if (!response.data?.success || !response.data?.data) {
-          setError(response.data?.message || t('支付状态查询失败，请手动刷新'));
+          setError(t('支付状态查询失败，请手动刷新'));
           setPolling(false);
           setRefreshing(false);
           return;
         }
 
-        const nextOrder = normalizeOrder(response.data.data);
+        const nextOrder = normalizePublicPaymentOrder(response.data.data);
+        if (!nextOrder) {
+          setError(t('支付状态查询失败，请手动刷新'));
+          setPolling(false);
+          setRefreshing(false);
+          return;
+        }
         networkFailures = 0;
         setOrder(nextOrder);
+        setPayment((current) => ({
+          ...current,
+          route_id: nextOrder.route_id || current?.route_id,
+          public_method: nextOrder.public_method || current?.public_method,
+          channel_alias: nextOrder.channel_alias || current?.channel_alias,
+          expires_at: Number(nextOrder.expires_at || current?.expires_at || 0),
+        }));
         setError('');
         setRefreshing(false);
 
-        if (!isPaymentOrderPending(nextOrder.status)) {
+        if (!isPaymentOrderPending(nextOrder.status_code)) {
           setPolling(false);
           await notifyTerminal(nextOrder);
           return;
@@ -170,8 +187,11 @@ export function usePaymentOrderPolling({ t, onSuccess, onTerminal }) {
         setRefreshing(false);
         if (requestError?.response) {
           setError(
-            requestError.response.data?.message ||
-              t('支付状态查询失败，请手动刷新'),
+            getSafeUserPaymentError(
+              requestError,
+              t,
+              '支付状态查询失败，请手动刷新',
+            ),
           );
           setPolling(false);
           return;

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -21,14 +22,16 @@ import (
 )
 
 var (
-	paymentCurrencyPattern  = regexp.MustCompile(`^[A-Z]{3}$`)
-	xorPaySettingAidPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	paymentCurrencyPattern          = regexp.MustCompile(`^[A-Z]{3}$`)
+	xorPaySettingAidPattern         = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	errPaymentSettingsScopeConflict = errors.New("payment settings request spans multiple configuration modules")
 )
 
 type paymentSettingsUpdateRequest struct {
 	Options                   map[string]interface{} `json:"options"`
 	ClearSecrets              []string               `json:"clear_secrets,omitempty"`
 	RevokePreviousCredentials []string               `json:"revoke_previous_credentials,omitempty"`
+	DisableCurrentCredentials []string               `json:"disable_current_credentials,omitempty"`
 	Reason                    string                 `json:"reason,omitempty"`
 	ExpectedVersion           int64                  `json:"expected_version"`
 }
@@ -43,6 +46,8 @@ const (
 	paymentStripeTestModeEnabledOptionKey                 = "payment_setting.stripe_test_mode_enabled"
 	paymentStripeTestModeBlockedOptionKey                 = "payment_setting.stripe_test_mode_blocked"
 	paymentStripeTestModeIsolationRequiredOptionKey       = "payment_setting.stripe_test_mode_isolation_required"
+	paymentStripeWebhookAPIVersionOptionKey               = "payment_setting.stripe_webhook_api_version"
+	paymentStripeWebhookSecretOverlapHoursOptionKey       = "payment_setting.stripe_webhook_secret_overlap_hours"
 	paymentXorPayPreviousCredentialActiveOptionKey        = "payment_setting.xorpay_previous_credential_active"
 )
 
@@ -74,6 +79,8 @@ var paymentInternalCredentialOptionKeys = map[string]struct{}{
 	paymentStripeTestModeEnabledOptionKey:           {},
 	paymentStripeTestModeBlockedOptionKey:           {},
 	paymentStripeTestModeIsolationRequiredOptionKey: {},
+	paymentStripeWebhookAPIVersionOptionKey:         {},
+	paymentStripeWebhookSecretOverlapHoursOptionKey: {},
 	paymentXorPayPreviousCredentialActiveOptionKey:  {},
 	"EpayCredentialGeneration":                      {}, "EpayIdPrevious": {}, "EpayKeyPrevious": {},
 	"EpayPreviousCredentialGeneration": {}, "EpayPreviousValidBefore": {}, "EpayPreviousExpiresAt": {},
@@ -90,13 +97,79 @@ var paymentSettingsAllowedKeys = map[string]struct{}{
 	"CustomCallbackAddress": {}, "PayMethods": {}, "payment_setting.amount_options": {}, "payment_setting.amount_discount": {},
 	"StripeApiSecret": {}, "StripeWebhookSecret": {}, "StripePriceId": {},
 	"StripeUnitPrice": {}, "StripeMinTopUp": {}, "StripePromotionCodesEnabled": {}, "StripeCurrency": {}, "StripeAccountId": {},
-	"XorPayAid": {}, "XorPayAppSecret": {}, "XorPayUnitPrice": {}, "XorPayMinTopUp": {}, "XorPayCurrency": {}, "XorPayEnabledMethods": {},
+	"StripeCheckoutAllowedHosts": {},
+	"XorPayAid":                  {}, "XorPayAppSecret": {}, "XorPayUnitPrice": {}, "XorPayMinTopUp": {}, "XorPayCurrency": {}, "XorPayEnabledMethods": {},
 	// Compatibility-only settings are accepted atomically but are not otherwise
 	// changed by the Epay/Stripe/XORPay hardening work.
 	"CreemApiKey": {}, "CreemWebhookSecret": {}, "CreemTestMode": {}, "CreemProducts": {},
 	"WaffoEnabled": {}, "WaffoApiKey": {}, "WaffoPrivateKey": {}, "WaffoPublicCert": {}, "WaffoSandboxPublicCert": {},
 	"WaffoSandboxApiKey": {}, "WaffoSandboxPrivateKey": {}, "WaffoSandbox": {}, "WaffoMerchantId": {}, "WaffoCurrency": {},
 	"WaffoUnitPrice": {}, "WaffoMinTopUp": {}, "WaffoNotifyUrl": {}, "WaffoReturnUrl": {}, "WaffoPayMethods": {},
+	"WaffoWebRedirectHosts": {}, "WaffoAppRedirectSchemes": {},
+	"WaffoPancakeMerchantID": {}, "WaffoPancakePrivateKey": {}, "WaffoPancakeReturnURL": {},
+	"WaffoPancakeTestMode": {}, "WaffoPancakeUnitPrice": {}, "WaffoPancakeMinTopUp": {}, "WaffoPancakeStoreID": {}, "WaffoPancakeProductID": {},
+}
+
+func paymentSettingMutationScope(key string) string {
+	switch key {
+	case "ServerAddress", "TopupGroupRatio", "Price", "MinTopUp", "CustomCallbackAddress", "PayMethods",
+		"payment_setting.amount_options", "payment_setting.amount_discount":
+		return "general"
+	case "PayAddress", "EpayId", "EpayKey", "EpayCurrency":
+		return model.PaymentProviderEpay
+	}
+	if strings.HasPrefix(key, "WaffoPancake") {
+		return model.PaymentProviderWaffoPancake
+	}
+	for _, prefix := range []string{"Stripe", "XorPay", "Creem", "Waffo"} {
+		if strings.HasPrefix(key, prefix) {
+			return strings.ToLower(prefix)
+		}
+	}
+	return ""
+}
+
+// validatePaymentSettingsMutationScope enforces one independently saved
+// configuration module per request. Emergency replacement may include new
+// credentials for the same provider, but it can never be combined with a
+// different provider, general settings, or a second revocation.
+func validatePaymentSettingsMutationScope(options map[string]interface{}, clearSecrets, revokeProviders []string) error {
+	scopes := make(map[string]struct{}, 2)
+	addKey := func(key string) {
+		if scope := paymentSettingMutationScope(strings.TrimSpace(key)); scope != "" {
+			scopes[scope] = struct{}{}
+		}
+	}
+	for key := range options {
+		addKey(key)
+	}
+	for _, key := range clearSecrets {
+		addKey(key)
+	}
+	if len(revokeProviders) > 1 {
+		return errPaymentSettingsScopeConflict
+	}
+	for _, provider := range revokeProviders {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == model.PaymentProviderEpay || provider == model.PaymentProviderStripe || provider == model.PaymentProviderXorPay ||
+			provider == model.PaymentProviderCreem || provider == model.PaymentProviderWaffo || provider == model.PaymentProviderWaffoPancake {
+			scopes[provider] = struct{}{}
+		}
+	}
+	if len(scopes) > 1 {
+		return errPaymentSettingsScopeConflict
+	}
+	return nil
+}
+
+func paymentSettingsAPIError(c *gin.Context, status int, code string, diagnostic error) {
+	if diagnostic != nil {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf(
+			"payment settings request rejected admin_id=%d code=%s error=%q",
+			c.GetInt("id"), code, diagnostic.Error(),
+		))
+	}
+	paymentAPIErrorWithCode(c, status, code, "", nil)
 }
 
 // ServerAddress remains a shared site setting. Payment callbacks and return
@@ -118,39 +191,86 @@ func isPaymentAtomicOnlyOptionKey(key string) bool {
 
 func UpdatePaymentSettings(c *gin.Context) {
 	if c.GetBool("use_access_token") {
-		common.ApiErrorMsg(c, "Payment settings require dashboard session authentication")
-		return
-	}
-	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
-		common.ApiErrorMsg(c, "Failed to synchronize payment configuration")
+		paymentSettingsAPIError(c, http.StatusForbidden, "payment_settings_auth_required", nil)
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPaymentSettingsRequestBytes)
 	var request paymentSettingsUpdateRequest
 	if err := common.DecodeJson(c.Request.Body, &request); err != nil ||
 		request.ExpectedVersion <= 0 ||
-		(len(request.Options) == 0 && len(request.ClearSecrets) == 0 && len(request.RevokePreviousCredentials) == 0) ||
+		(len(request.Options) == 0 && len(request.ClearSecrets) == 0 && len(request.RevokePreviousCredentials) == 0 && len(request.DisableCurrentCredentials) == 0) ||
 		len(request.Options) > len(paymentSettingsAllowedKeys) || len(request.ClearSecrets) > len(paymentSettingsAllowedKeys) ||
-		len(request.RevokePreviousCredentials) > 3 {
-		common.ApiErrorMsg(c, "Invalid payment settings request")
+		len(request.RevokePreviousCredentials) > 3 || len(request.DisableCurrentCredentials) > 1 ||
+		len(request.RevokePreviousCredentials) > 0 && len(request.DisableCurrentCredentials) > 0 {
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("invalid request shape"))
+		return
+	}
+	emergencyProviders := append(append([]string(nil), request.RevokePreviousCredentials...), request.DisableCurrentCredentials...)
+	if err := validatePaymentSettingsMutationScope(request.Options, request.ClearSecrets, emergencyProviders); err != nil {
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_scope_conflict", err)
+		return
+	}
+	if len(request.DisableCurrentCredentials) > 0 && (len(request.Options) > 0 || len(request.ClearSecrets) > 0) {
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_scope_conflict", errors.New("current-only credential disable must be a dedicated operation"))
+		return
+	}
+	revokePrevious := make(map[string]bool, len(request.RevokePreviousCredentials)+len(request.DisableCurrentCredentials))
+	for _, rawProvider := range request.RevokePreviousCredentials {
+		provider := strings.ToLower(strings.TrimSpace(rawProvider))
+		if (provider != model.PaymentProviderEpay && provider != model.PaymentProviderStripe && provider != model.PaymentProviderXorPay) || revokePrevious[provider] {
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("invalid previous payment credential revocation request"))
+			return
+		}
+		revokePrevious[provider] = true
+	}
+	disableCurrent := make(map[string]bool, len(request.DisableCurrentCredentials))
+	for _, rawProvider := range request.DisableCurrentCredentials {
+		provider := strings.ToLower(strings.TrimSpace(rawProvider))
+		if (provider != model.PaymentProviderCreem && provider != model.PaymentProviderWaffo && provider != model.PaymentProviderWaffoPancake) || disableCurrent[provider] {
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("invalid current-only payment credential disable request"))
+			return
+		}
+		disableCurrent[provider] = true
+		revokePrevious[provider] = true
+	}
+	if rawValue, exists := request.Options["StripeCheckoutAllowedHosts"]; exists {
+		value, valueErr := paymentOptionString(rawValue)
+		if valueErr != nil {
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_stripe_checkout_hosts_invalid", valueErr)
+			return
+		}
+		if _, normalizeErr := setting.NormalizeStripeCheckoutAllowedHosts(value); normalizeErr != nil {
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_stripe_checkout_hosts_invalid", normalizeErr)
+			return
+		}
+	}
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		paymentSettingsAPIError(c, http.StatusServiceUnavailable, "payment_settings_sync_failed", err)
 		return
 	}
 	values := make(map[string]string, len(request.Options)+len(request.ClearSecrets))
 	for key, rawValue := range request.Options {
 		if _, ok := paymentSettingsAllowedKeys[key]; !ok {
-			common.ApiErrorMsg(c, "Unsupported payment setting: "+key)
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", fmt.Errorf("unsupported payment setting %q", key))
 			return
 		}
 		value, err := paymentOptionString(rawValue)
 		if err != nil {
-			common.ApiErrorMsg(c, fmt.Sprintf("Invalid value for %s", key))
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", fmt.Errorf("invalid value for %s: %w", key, err))
 			return
+		}
+		if key == "StripeCheckoutAllowedHosts" {
+			value, err = setting.NormalizeStripeCheckoutAllowedHosts(value)
+			if err != nil {
+				paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_stripe_checkout_hosts_invalid", err)
+				return
+			}
 		}
 		if isWriteOnlyPaymentSetting(key) && strings.TrimSpace(value) == "" && key != "StripeWebhookSecretPrevious" {
 			continue
 		}
 		if err := validatePaymentSettingValue(key, value); err != nil {
-			common.ApiErrorMsg(c, err.Error())
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", err)
 			return
 		}
 		values[key] = value
@@ -160,28 +280,48 @@ func UpdatePaymentSettings(c *gin.Context) {
 		key := strings.TrimSpace(rawKey)
 		_, allowed := paymentSettingsAllowedKeys[key]
 		if _, duplicate := seenClears[key]; duplicate || !allowed || !isWriteOnlyPaymentSetting(key) {
-			common.ApiErrorMsg(c, "Invalid payment secret clear request")
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("invalid payment secret clear request"))
 			return
 		}
 		if _, alsoUpdated := request.Options[key]; alsoUpdated {
-			common.ApiErrorMsg(c, "A payment secret cannot be updated and cleared in the same request")
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("payment secret update and clear conflict"))
 			return
 		}
 		seenClears[key] = struct{}{}
 		values[key] = ""
 	}
-	revokePrevious := make(map[string]bool, len(request.RevokePreviousCredentials))
-	for _, rawProvider := range request.RevokePreviousCredentials {
-		provider := strings.ToLower(strings.TrimSpace(rawProvider))
-		if (provider != model.PaymentProviderEpay && provider != model.PaymentProviderStripe && provider != model.PaymentProviderXorPay) || revokePrevious[provider] {
-			common.ApiErrorMsg(c, "Invalid previous payment credential revocation request")
+	if disableCurrent[model.PaymentProviderCreem] {
+		values["CreemApiKey"] = ""
+		values["CreemWebhookSecret"] = ""
+	}
+	if disableCurrent[model.PaymentProviderWaffo] {
+		values["WaffoEnabled"] = "false"
+		unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+		waffoSandbox := setting.WaffoSandbox
+		unlockPaymentConfiguration()
+		if waffoSandbox {
+			values["WaffoSandboxApiKey"] = ""
+			values["WaffoSandboxPrivateKey"] = ""
+			values["WaffoSandboxPublicCert"] = ""
+		} else {
+			values["WaffoApiKey"] = ""
+			values["WaffoPrivateKey"] = ""
+			values["WaffoPublicCert"] = ""
+		}
+	}
+	if disableCurrent[model.PaymentProviderWaffoPancake] {
+		values["WaffoPancakePrivateKey"] = ""
+		values["WaffoPancakeStoreID"] = ""
+	}
+	if !disableCurrent[model.PaymentProviderWaffoPancake] {
+		if err := validateWaffoPancakeSettingsMutation(values); err != nil {
+			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", err)
 			return
 		}
-		revokePrevious[provider] = true
 	}
 	request.Reason = strings.TrimSpace(request.Reason)
 	if len(request.Reason) > 512 || len(revokePrevious) > 0 && len(request.Reason) < 8 {
-		common.ApiErrorMsg(c, "Payment credential revocation reason must contain 8 to 512 characters")
+		paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", errors.New("payment credential revocation reason length is invalid"))
 		return
 	}
 	if len(values) == 0 && len(revokePrevious) == 0 {
@@ -193,14 +333,14 @@ func UpdatePaymentSettings(c *gin.Context) {
 	}
 	for key, value := range values {
 		if model.IsPaymentSecretOption(key) && value != "" && !model.PaymentSecretEncryptionReady() {
-			common.ApiErrorMsg(c, "PAYMENT_SECRET_KEY must be configured before saving payment credentials")
+			paymentSettingsAPIError(c, http.StatusServiceUnavailable, "payment_settings_secret_storage_unavailable", errors.New("payment secret encryption is unavailable"))
 			return
 		}
 	}
 	stripeCheckoutSettingsTouched := false
 	for key := range values {
 		switch key {
-		case "StripeApiSecret", "StripePriceId", "StripeCurrency", "StripeAccountId":
+		case "StripeApiSecret", "StripePriceId", "StripeCurrency", "StripeAccountId", "StripeCheckoutAllowedHosts":
 			stripeCheckoutSettingsTouched = true
 		}
 		if stripeCheckoutSettingsTouched {
@@ -217,6 +357,7 @@ func UpdatePaymentSettings(c *gin.Context) {
 	stripeConnectedAccountID := setting.StripeAccountId
 	stripeCredentialAccountID := setting.StripeCredentialAccountId
 	stripeCredentialMode := setting.StripeCredentialLivemode
+	stripeCheckoutAllowedHosts := setting.StripeCheckoutAllowedHosts
 	unlockPaymentConfiguration()
 	if next, exists := values["StripeApiSecret"]; exists {
 		stripeSecret = next
@@ -230,21 +371,24 @@ func UpdatePaymentSettings(c *gin.Context) {
 	if next, exists := values["StripeAccountId"]; exists {
 		stripeConnectedAccountID = next
 	}
+	if next, exists := values["StripeCheckoutAllowedHosts"]; exists {
+		stripeCheckoutAllowedHosts = next
+	}
 	stripeIdentityIncomplete := strings.TrimSpace(stripeCredentialAccountID) == "" || strings.TrimSpace(stripeCredentialMode) == ""
 	if stripeAPISecretChanged || stripeCheckoutSettingsTouched && stripeIdentityIncomplete {
 		if strings.TrimSpace(stripeSecret) != "" {
 			credentialMode, modeErr := service.StripeCredentialMode(stripeSecret)
 			if modeErr != nil {
-				common.ApiErrorMsg(c, "Failed to determine the Stripe API credential mode")
+				paymentSettingsAPIError(c, http.StatusUnprocessableEntity, "payment_settings_stripe_verification_failed", modeErr)
 				return
 			}
 			if !setting.StripeCredentialModeAllowed(credentialMode) {
-				common.ApiErrorMsg(c, "Stripe test mode is disabled; enable it only in an isolated sandbox environment")
+				paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_stripe_test_mode_disabled", errors.New("Stripe test mode is disabled"))
 				return
 			}
 			accountID, resolveErr := service.ResolveStripeCredentialAccount(c.Request.Context(), stripeSecret)
 			if resolveErr != nil {
-				common.ApiErrorMsg(c, "Failed to verify the Stripe API credential and account binding")
+				paymentSettingsAPIError(c, http.StatusUnprocessableEntity, "payment_settings_stripe_verification_failed", resolveErr)
 				return
 			}
 			resolvedStripeAccountID = accountID
@@ -254,7 +398,7 @@ func UpdatePaymentSettings(c *gin.Context) {
 		}
 	}
 	if err := validateStripeSandboxSettingsMutation(values, stripeCredentialMode); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_stripe_test_mode_disabled", err)
 		return
 	}
 	if stripeCheckoutSettingsTouched {
@@ -266,10 +410,10 @@ func UpdatePaymentSettings(c *gin.Context) {
 		} else {
 			fingerprint, verifyErr := service.VerifyStripeCheckoutConfiguration(
 				c.Request.Context(), stripeSecret, stripeCredentialAccountID, stripeConnectedAccountID,
-				stripePriceID, stripeCurrency, stripeCredentialMode,
+				stripePriceID, stripeCurrency, stripeCredentialMode, stripeCheckoutAllowedHosts,
 			)
 			if verifyErr != nil {
-				common.ApiErrorMsg(c, "Failed to verify Stripe Price, Checkout permissions, currency, and account binding")
+				paymentSettingsAPIError(c, http.StatusUnprocessableEntity, "payment_settings_stripe_verification_failed", verifyErr)
 				return
 			}
 			values["StripeConfigurationVerifiedFingerprint"] = fingerprint
@@ -284,11 +428,11 @@ func UpdatePaymentSettings(c *gin.Context) {
 	}
 	revocations, err := preparePaymentCredentialRotations(values, revokePrevious, time.Now().Unix())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_rotation_blocked", err)
 		return
 	}
 	if err := validateInFlightPaymentConfigurationChanges(values, revokePrevious); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_change_blocked", err)
 		return
 	}
 	keys := make([]string, 0, len(values))
@@ -310,22 +454,20 @@ func UpdatePaymentSettings(c *gin.Context) {
 		},
 	)
 	if errors.Is(err, model.ErrPaymentConfigurationVersionConflict) {
-		c.JSON(http.StatusConflict, gin.H{
-			"success": false,
-			"message": "Payment settings changed in another session. Refresh before saving again.",
-		})
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_version_conflict", err)
 		return
 	}
 	if errors.Is(err, model.ErrPaymentConfigurationPrecondition) {
-		common.ApiErrorMsg(c, strings.TrimPrefix(err.Error(), model.ErrPaymentConfigurationPrecondition.Error()+": "))
+		paymentSettingsAPIError(c, http.StatusConflict, "payment_settings_change_blocked", err)
 		return
 	}
 	if err != nil {
-		common.ApiErrorMsg(c, "Failed to save payment settings")
+		paymentSettingsAPIError(c, http.StatusInternalServerError, "payment_settings_save_failed", err)
 		return
 	}
 	recordManageAudit(c, "payment.settings.update", map[string]interface{}{
-		"keys": keys, "revoked_previous_credentials": revokedProviders, "reason": request.Reason,
+		"keys": keys, "revoked_previous_credentials": request.RevokePreviousCredentials,
+		"disabled_current_credentials": request.DisableCurrentCredentials, "reason": request.Reason,
 	})
 	common.ApiSuccess(c, gin.H{"readiness": paymentGatewayReadinessLocked(), "version": nextVersion})
 }
@@ -342,6 +484,56 @@ func validateStripeSandboxSettingsMutation(values map[string]string, credentialM
 	return nil
 }
 
+const (
+	retainedConfigurationDependencyActive   = "active"
+	retainedConfigurationDependencyRecovery = "recovery"
+)
+
+type retainedPaymentConfigurationGuard struct {
+	provider   string
+	key        string
+	dependency string
+}
+
+func retainedPaymentConfigurationGuards(values map[string]string, emergencyRevocations map[string]bool) []retainedPaymentConfigurationGuard {
+	guards := make([]retainedPaymentConfigurationGuard, 0, 12)
+	appendIfChanged := func(provider, key, current, dependency string) {
+		if emergencyRevocations[provider] {
+			return
+		}
+		if next, exists := values[key]; exists && next != current {
+			guards = append(guards, retainedPaymentConfigurationGuard{
+				provider: provider, key: key, dependency: dependency,
+			})
+		}
+	}
+
+	appendIfChanged(model.PaymentProviderCreem, "CreemApiKey", setting.CreemApiKey, retainedConfigurationDependencyActive)
+	appendIfChanged(model.PaymentProviderCreem, "CreemWebhookSecret", setting.CreemWebhookSecret, retainedConfigurationDependencyRecovery)
+	appendIfChanged(model.PaymentProviderCreem, "CreemTestMode", strconv.FormatBool(setting.CreemTestMode), retainedConfigurationDependencyRecovery)
+
+	appendIfChanged(model.PaymentProviderWaffo, "WaffoMerchantId", setting.WaffoMerchantId, retainedConfigurationDependencyActive)
+	appendIfChanged(model.PaymentProviderWaffo, "WaffoSandbox", strconv.FormatBool(setting.WaffoSandbox), retainedConfigurationDependencyRecovery)
+	appendIfChanged(model.PaymentProviderWaffo, "WaffoNotifyUrl", setting.WaffoNotifyUrl, retainedConfigurationDependencyRecovery)
+	appendIfChanged(model.PaymentProviderWaffo, "WaffoReturnUrl", setting.WaffoReturnUrl, retainedConfigurationDependencyActive)
+	if setting.WaffoSandbox {
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoSandboxApiKey", setting.WaffoSandboxApiKey, retainedConfigurationDependencyRecovery)
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoSandboxPrivateKey", setting.WaffoSandboxPrivateKey, retainedConfigurationDependencyRecovery)
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoSandboxPublicCert", setting.WaffoSandboxPublicCert, retainedConfigurationDependencyRecovery)
+	} else {
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoApiKey", setting.WaffoApiKey, retainedConfigurationDependencyRecovery)
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoPrivateKey", setting.WaffoPrivateKey, retainedConfigurationDependencyRecovery)
+		appendIfChanged(model.PaymentProviderWaffo, "WaffoPublicCert", setting.WaffoPublicCert, retainedConfigurationDependencyRecovery)
+	}
+
+	appendIfChanged(model.PaymentProviderWaffoPancake, "WaffoPancakeMerchantID", setting.WaffoPancakeMerchantID, retainedConfigurationDependencyActive)
+	appendIfChanged(model.PaymentProviderWaffoPancake, "WaffoPancakePrivateKey", setting.WaffoPancakePrivateKey, retainedConfigurationDependencyActive)
+	appendIfChanged(model.PaymentProviderWaffoPancake, "WaffoPancakeReturnURL", setting.WaffoPancakeReturnURL, retainedConfigurationDependencyActive)
+	appendIfChanged(model.PaymentProviderWaffoPancake, "WaffoPancakeTestMode", strconv.FormatBool(setting.WaffoPancakeTestMode), retainedConfigurationDependencyRecovery)
+	appendIfChanged(model.PaymentProviderWaffoPancake, "WaffoPancakeStoreID", setting.WaffoPancakeStoreID, retainedConfigurationDependencyRecovery)
+	return guards
+}
+
 func paymentConfigurationPreconditions(values map[string]string, emergencyRevocations map[string]bool) *model.PaymentConfigurationPreconditions {
 	preconditions := &model.PaymentConfigurationPreconditions{}
 	nextStripeAPISecret, stripeAPISecretSupplied := values["StripeApiSecret"]
@@ -349,6 +541,10 @@ func paymentConfigurationPreconditions(values map[string]string, emergencyRevoca
 		strings.TrimSpace(nextStripeAPISecret) == "" && strings.TrimSpace(setting.StripeApiSecret) != ""
 	if next, exists := values["CustomCallbackAddress"]; exists && next != operation_setting.CustomCallbackAddress {
 		preconditions.RequireNoCallbackDependentOrders = true
+		preconditions.RequireNoCallbackDependentProviderOrders = append(
+			preconditions.RequireNoCallbackDependentProviderOrders,
+			model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake,
+		)
 	}
 	if next, exists := values["PayAddress"]; exists && next != operation_setting.PayAddress &&
 		!epayEmergencyMigrationReplacesCurrent(values, emergencyRevocations) {
@@ -361,6 +557,10 @@ func paymentConfigurationPreconditions(values map[string]string, emergencyRevoca
 		if next, exists := values["StripeCredentialAccountId"]; exists && next != current {
 			preconditions.RequireNoStripeHistory = true
 		}
+	}
+	if next, exists := values["StripeCheckoutAllowedHosts"]; exists && next != setting.StripeCheckoutAllowedHosts {
+		removesTrustedHost, err := stripeCheckoutAllowedHostsRemoveCurrent(setting.StripeCheckoutAllowedHosts, next)
+		preconditions.RequireNoActiveStripeOrdersForHostRemoval = err != nil || removesTrustedHost
 	}
 	if current := strings.TrimSpace(setting.StripeCredentialLivemode); current != "" {
 		if next, exists := values["StripeCredentialLivemode"]; exists && next != current {
@@ -381,6 +581,15 @@ func paymentConfigurationPreconditions(values map[string]string, emergencyRevoca
 		preconditions.RequireStripeWebhookOverlap = true
 		if next == "" {
 			preconditions.RequireNoStripeHistory = true
+		}
+	}
+	for _, guard := range retainedPaymentConfigurationGuards(values, emergencyRevocations) {
+		if guard.dependency == retainedConfigurationDependencyRecovery {
+			preconditions.RequireNoCallbackDependentProviderOrders = append(
+				preconditions.RequireNoCallbackDependentProviderOrders, guard.provider,
+			)
+		} else {
+			preconditions.RequireNoActiveProviderOrders = append(preconditions.RequireNoActiveProviderOrders, guard.provider)
 		}
 	}
 	return preconditions
@@ -608,6 +817,50 @@ func preparePaymentCredentialRotations(values map[string]string, revokePrevious 
 		values["XorPayPreviousValidBefore"] = "0"
 		values["XorPayPreviousExpiresAt"] = "0"
 	}
+
+	if revokePrevious[model.PaymentProviderCreem] {
+		if strings.TrimSpace(setting.CreemApiKey) == "" && strings.TrimSpace(setting.CreemWebhookSecret) == "" {
+			return nil, errors.New("no current Creem credential is available to disable")
+		}
+		values["CreemApiKey"] = ""
+		values["CreemWebhookSecret"] = ""
+		revocations = append(revocations, model.PaymentCredentialRevocation{
+			Provider: model.PaymentProviderCreem, Generation: 0, ValidBefore: now, AllActiveOrders: true,
+		})
+	}
+	if revokePrevious[model.PaymentProviderWaffo] {
+		if setting.WaffoSandbox {
+			if strings.TrimSpace(setting.WaffoSandboxApiKey) == "" && strings.TrimSpace(setting.WaffoSandboxPrivateKey) == "" &&
+				strings.TrimSpace(setting.WaffoSandboxPublicCert) == "" {
+				return nil, errors.New("no current Waffo sandbox credential is available to disable")
+			}
+			values["WaffoSandboxApiKey"] = ""
+			values["WaffoSandboxPrivateKey"] = ""
+			values["WaffoSandboxPublicCert"] = ""
+		} else {
+			if strings.TrimSpace(setting.WaffoApiKey) == "" && strings.TrimSpace(setting.WaffoPrivateKey) == "" &&
+				strings.TrimSpace(setting.WaffoPublicCert) == "" {
+				return nil, errors.New("no current Waffo production credential is available to disable")
+			}
+			values["WaffoApiKey"] = ""
+			values["WaffoPrivateKey"] = ""
+			values["WaffoPublicCert"] = ""
+		}
+		values["WaffoEnabled"] = "false"
+		revocations = append(revocations, model.PaymentCredentialRevocation{
+			Provider: model.PaymentProviderWaffo, Generation: 0, ValidBefore: now, AllActiveOrders: true,
+		})
+	}
+	if revokePrevious[model.PaymentProviderWaffoPancake] {
+		if strings.TrimSpace(setting.WaffoPancakePrivateKey) == "" && strings.TrimSpace(setting.WaffoPancakeStoreID) == "" {
+			return nil, errors.New("no current Waffo Pancake credential is available to disable")
+		}
+		values["WaffoPancakePrivateKey"] = ""
+		values["WaffoPancakeStoreID"] = ""
+		revocations = append(revocations, model.PaymentCredentialRevocation{
+			Provider: model.PaymentProviderWaffoPancake, Generation: 0, ValidBefore: now, AllActiveOrders: true,
+		})
+	}
 	return revocations, nil
 }
 
@@ -617,13 +870,46 @@ func validateInFlightPaymentConfigurationChanges(values map[string]string, emerg
 	stripeEmergencyAPIClear := emergencyRevocations[model.PaymentProviderStripe] && stripeAPISecretSupplied &&
 		strings.TrimSpace(nextStripeAPISecret) == "" && strings.TrimSpace(setting.StripeApiSecret) != ""
 	if next, exists := values["CustomCallbackAddress"]; exists && next != operation_setting.CustomCallbackAddress {
-		for _, provider := range []string{model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderXorPay} {
+		for _, provider := range []string{
+			model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderXorPay,
+			model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake,
+		} {
 			count, err := model.CountPaymentOrdersDependingOnCallbackOrigin(provider, time.Now().Unix())
 			if err != nil {
 				return err
 			}
 			if count > 0 {
 				return fmt.Errorf("CustomCallbackAddress cannot be changed while %s payment orders still depend on the current callback origin", provider)
+			}
+		}
+	}
+	for _, guard := range retainedPaymentConfigurationGuards(values, emergencyRevocations) {
+		var count int64
+		var err error
+		if guard.dependency == retainedConfigurationDependencyRecovery {
+			count, err = model.CountPaymentOrdersDependingOnCallbackOrigin(guard.provider, time.Now().Unix())
+		} else {
+			count, err = model.CountActivePaymentOrdersForProvider(guard.provider)
+		}
+		if err != nil {
+			return err
+		}
+		if count > 0 {
+			return fmt.Errorf("%s cannot be changed while %s payment orders still depend on the current configuration", guard.key, guard.provider)
+		}
+	}
+	if next, exists := values["StripeCheckoutAllowedHosts"]; exists && next != setting.StripeCheckoutAllowedHosts {
+		removesTrustedHost, err := stripeCheckoutAllowedHostsRemoveCurrent(setting.StripeCheckoutAllowedHosts, next)
+		if err != nil {
+			return err
+		}
+		if removesTrustedHost {
+			count, countErr := model.CountPaymentOrdersForProvider(model.PaymentProviderStripe, activeStatuses)
+			if countErr != nil {
+				return countErr
+			}
+			if count > 0 {
+				return errors.New("Stripe custom Checkout hosts cannot be removed while unfinished Stripe payment orders may still depend on them")
 			}
 		}
 	}
@@ -735,6 +1021,23 @@ func validateInFlightPaymentConfigurationChanges(values map[string]string, emerg
 	return nil
 }
 
+func stripeCheckoutAllowedHostsRemoveCurrent(current, next string) (bool, error) {
+	currentHosts, err := setting.StripeCheckoutAllowedHostSet(current)
+	if err != nil {
+		return false, err
+	}
+	nextHosts, err := setting.StripeCheckoutAllowedHostSet(next)
+	if err != nil {
+		return false, err
+	}
+	for host := range currentHosts {
+		if _, retained := nextHosts[host]; !retained {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func epayEmergencyMigrationReplacesCurrent(values map[string]string, emergencyRevocations map[string]bool) bool {
 	if !emergencyRevocations[model.PaymentProviderEpay] || strings.TrimSpace(operation_setting.EpayId) == "" ||
 		strings.TrimSpace(operation_setting.EpayKey) == "" || operation_setting.EpayCredentialGeneration <= 0 {
@@ -771,7 +1074,8 @@ func paymentOptionString(value interface{}) (string, error) {
 func isWriteOnlyPaymentSetting(key string) bool {
 	switch key {
 	case "EpayKey", "StripeApiSecret", "StripeWebhookSecret", "StripeWebhookSecretPrevious", "XorPayAppSecret",
-		"CreemApiKey", "CreemWebhookSecret", "WaffoApiKey", "WaffoPrivateKey", "WaffoSandboxApiKey", "WaffoSandboxPrivateKey":
+		"CreemApiKey", "CreemWebhookSecret", "WaffoApiKey", "WaffoPrivateKey", "WaffoSandboxApiKey", "WaffoSandboxPrivateKey",
+		"WaffoPancakePrivateKey":
 		return true
 	default:
 		return false
@@ -792,6 +1096,11 @@ func validatePaymentSettingValue(key, value string) error {
 			return nil
 		}
 		return service.ValidatePaymentCallbackOrigin(value, true)
+	case "WaffoPancakeReturnURL":
+		if value == "" {
+			return nil
+		}
+		return validatePaymentAdminURL(value, false)
 	case "EpayId":
 		if value == "" || len(value) > 128 {
 			return errors.New("Epay merchant ID is invalid")
@@ -811,12 +1120,12 @@ func validatePaymentSettingValue(key, value string) error {
 		if (key == "EpayCurrency" || key == "XorPayCurrency") && currency != "CNY" {
 			return fmt.Errorf("%s must be CNY because the provider protocol has no currency field", key)
 		}
-	case "Price", "StripeUnitPrice", "XorPayUnitPrice", "WaffoUnitPrice":
+	case "Price", "StripeUnitPrice", "XorPayUnitPrice", "WaffoUnitPrice", "WaffoPancakeUnitPrice":
 		parsed, err := strconv.ParseFloat(value, 64)
 		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 || parsed > 1_000_000 {
 			return fmt.Errorf("%s must be a positive finite number", key)
 		}
-	case "MinTopUp", "StripeMinTopUp", "XorPayMinTopUp", "WaffoMinTopUp":
+	case "MinTopUp", "StripeMinTopUp", "XorPayMinTopUp", "WaffoMinTopUp", "WaffoPancakeMinTopUp":
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 || parsed > int(service.MaxPaymentTopUpAmount) {
 			return fmt.Errorf("%s is outside the supported range", key)
@@ -845,11 +1154,14 @@ func validatePaymentSettingValue(key, value string) error {
 		if value != "" && (!strings.HasPrefix(value, "acct_") || len(value) > 128) {
 			return errors.New("Stripe account ID is invalid")
 		}
+	case "StripeCheckoutAllowedHosts":
+		_, err := setting.NormalizeStripeCheckoutAllowedHosts(value)
+		return err
 	case "StripePromotionCodesEnabled":
 		if value != "false" {
 			return errors.New("Stripe promotion codes are disabled for server-quoted payments")
 		}
-	case "CreemTestMode", "WaffoEnabled", "WaffoSandbox":
+	case "CreemTestMode", "WaffoEnabled", "WaffoSandbox", "WaffoPancakeTestMode":
 		if value != "true" && value != "false" {
 			return fmt.Errorf("%s must be boolean", key)
 		}
@@ -863,12 +1175,12 @@ func validatePaymentSettingValue(key, value string) error {
 		}
 	case "XorPayEnabledMethods":
 		var methods []string
-		if err := common.UnmarshalJsonStr(value, &methods); err != nil || len(methods) > 2 {
+		if err := common.UnmarshalJsonStr(value, &methods); err != nil || len(methods) > 3 {
 			return errors.New("XORPay enabled methods are invalid")
 		}
 		seen := map[string]struct{}{}
 		for _, method := range methods {
-			if method != setting.XorPayMethodNative && method != setting.XorPayMethodAlipay {
+			if method != setting.XorPayMethodNative && method != setting.XorPayMethodAlipay && method != setting.XorPayMethodJSAPI {
 				return errors.New("XORPay enabled methods are invalid")
 			}
 			if _, exists := seen[method]; exists {
@@ -910,10 +1222,22 @@ func validatePaymentSettingValue(key, value string) error {
 				return errors.New("Top-up group ratio is outside the supported range")
 			}
 		}
-	case "CreemProducts", "WaffoPayMethods":
+	case "CreemProducts":
+		if _, err := parseValidatedCreemProducts(value); err != nil {
+			return err
+		}
+	case "WaffoPayMethods":
 		var decoded interface{}
 		if err := common.UnmarshalJsonStr(value, &decoded); err != nil {
 			return fmt.Errorf("%s must be valid JSON", key)
+		}
+	case "WaffoWebRedirectHosts":
+		if _, err := service.ParseWaffoWebRedirectHosts(value); err != nil {
+			return err
+		}
+	case "WaffoAppRedirectSchemes":
+		if _, err := service.ParseWaffoAppRedirectSchemes(value); err != nil {
+			return err
 		}
 	default:
 		if len(value) > 8192 {
@@ -921,6 +1245,45 @@ func validatePaymentSettingValue(key, value string) error {
 		}
 	}
 	return nil
+}
+
+func validateWaffoPancakeSettingsMutation(values map[string]string) error {
+	touched := false
+	for key := range values {
+		if strings.HasPrefix(key, "WaffoPancake") {
+			touched = true
+			break
+		}
+	}
+	if !touched {
+		return nil
+	}
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+	merchantID := setting.WaffoPancakeMerchantID
+	privateKey := setting.WaffoPancakePrivateKey
+	returnURL := setting.WaffoPancakeReturnURL
+	storeID := setting.WaffoPancakeStoreID
+	productID := setting.WaffoPancakeProductID
+	unlockPaymentConfiguration()
+	if next, ok := values["WaffoPancakeMerchantID"]; ok {
+		merchantID = next
+	}
+	if next, ok := values["WaffoPancakePrivateKey"]; ok {
+		privateKey = next
+	}
+	if next, ok := values["WaffoPancakeReturnURL"]; ok {
+		returnURL = next
+	}
+	if next, ok := values["WaffoPancakeStoreID"]; ok {
+		storeID = next
+	}
+	if next, ok := values["WaffoPancakeProductID"]; ok {
+		productID = next
+	}
+	if strings.TrimSpace(privateKey) == "" {
+		return nil
+	}
+	return service.ValidateWaffoPancakeConfig(merchantID, privateKey, returnURL, storeID, productID)
 }
 
 func validatePaymentAdminURL(raw string, allowLocal bool) error {
@@ -938,6 +1301,24 @@ func validatePaymentAdminURL(raw string, allowLocal bool) error {
 func paymentGatewayReadinessLocked() map[string]interface{} {
 	encryptionReady := model.PaymentSecretStorageReady()
 	previousCredentials := paymentPreviousCredentialStatusLocked()
+	creemEnvironment := "prod"
+	if setting.CreemTestMode {
+		creemEnvironment = "test"
+	}
+	waffoEnvironment := "prod"
+	waffoCredentialConfigured := strings.TrimSpace(setting.WaffoApiKey) != "" && isWaffoWebhookConfiguredLocked()
+	if setting.WaffoSandbox {
+		waffoEnvironment = "sandbox"
+		waffoCredentialConfigured = strings.TrimSpace(setting.WaffoSandboxApiKey) != "" && isWaffoWebhookConfiguredLocked()
+	}
+	pancakeEnvironment := "prod"
+	if setting.WaffoPancakeTestMode {
+		pancakeEnvironment = "test"
+	}
+	pancakeConfigured := strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" &&
+		strings.TrimSpace(setting.WaffoPancakePrivateKey) != "" &&
+		strings.TrimSpace(setting.WaffoPancakeStoreID) != "" &&
+		strings.TrimSpace(setting.WaffoPancakeProductID) != ""
 	return map[string]interface{}{
 		"epay": map[string]interface{}{
 			"ready": isEpayTopUpEnabledLocked(), "configured": isEpayWebhookConfiguredLocked(), "secrets_encrypted": encryptionReady,
@@ -960,6 +1341,37 @@ func paymentGatewayReadinessLocked() map[string]interface{} {
 				setting.XorPayPreviousCredentialActive(),
 			"secrets_encrypted":          encryptionReady,
 			"previous_credential_active": previousCredentials.xorPay,
+		},
+		"creem": map[string]interface{}{
+			"ready":                       isCreemTopUpEnabledLocked(),
+			"configured":                  strings.TrimSpace(setting.CreemApiKey) != "" && strings.TrimSpace(setting.CreemWebhookSecret) != "",
+			"webhook_configured":          isCreemWebhookConfiguredLocked(),
+			"environment":                 creemEnvironment,
+			"credential_model":            "current_only",
+			"emergency_disable_supported": true,
+			"secrets_encrypted":           encryptionReady,
+		},
+		"waffo": map[string]interface{}{
+			"ready":                       isWaffoTopUpEnabledLocked(),
+			"configured":                  strings.TrimSpace(setting.WaffoMerchantId) != "" && waffoCredentialConfigured,
+			"webhook_configured":          isWaffoWebhookConfiguredLocked(),
+			"enabled":                     setting.WaffoEnabled,
+			"environment":                 waffoEnvironment,
+			"credential_model":            "current_only",
+			"emergency_disable_supported": true,
+			"secrets_encrypted":           encryptionReady,
+		},
+		"waffo_pancake": map[string]interface{}{
+			"ready":                       isWaffoPancakeTopUpEnabledLocked(),
+			"configured":                  pancakeConfigured,
+			"webhook_configured":          isWaffoPancakeWebhookConfiguredLocked(),
+			"test_mode":                   setting.WaffoPancakeTestMode,
+			"environment":                 pancakeEnvironment,
+			"unit_price":                  setting.WaffoPancakeUnitPrice,
+			"min_top_up":                  setting.WaffoPancakeMinTopUp,
+			"credential_model":            "current_only",
+			"emergency_disable_supported": true,
+			"secrets_encrypted":           encryptionReady,
 		},
 	}
 }

@@ -19,6 +19,13 @@ For commercial licensing, please contact support@quantumnous.com
 import { api } from '@/lib/api'
 
 import type { RevocablePaymentProvider } from './payment-credential-revocation'
+import {
+  buildRetainedCredentialDisablePayload,
+  buildRetainedCredentialDisablePreviewParams,
+  type RetainedCredentialDisablePreview,
+  type RetainedCredentialDisableResponse,
+  type RetainedPaymentProvider,
+} from './retained-payment-credential-disable'
 import type {
   AffiliateRewardSummaryResponse,
   ConfirmPaymentComplianceResponse,
@@ -83,6 +90,7 @@ export async function updatePaymentSettings(request: {
   expectedVersion: number
 }): Promise<{
   success: boolean
+  code?: string
   message?: string
   data?: { readiness?: PaymentGatewayReadiness; version?: number }
 }> {
@@ -95,6 +103,47 @@ export async function updatePaymentSettings(request: {
       reason: request.reason,
       expected_version: request.expectedVersion,
     },
+    {
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    }
+  )
+  return res.data
+}
+
+export async function getRetainedCredentialDisablePreview(
+  provider: RetainedPaymentProvider
+): Promise<
+  RetainedCredentialDisableResponse<RetainedCredentialDisablePreview>
+> {
+  const res = await api.get(
+    '/api/option/payment/credential-revocation-preview',
+    {
+      params: buildRetainedCredentialDisablePreviewParams(provider),
+      skipBusinessError: true,
+      skipErrorHandler: true,
+    }
+  )
+  return res.data
+}
+
+export async function disableRetainedPaymentCredential(request: {
+  provider: RetainedPaymentProvider
+  reason: string
+  expectedVersion: number
+}): Promise<
+  RetainedCredentialDisableResponse<{
+    readiness?: PaymentGatewayReadiness
+    version?: number
+  }>
+> {
+  const res = await api.put(
+    '/api/option/payment',
+    buildRetainedCredentialDisablePayload(
+      request.provider,
+      request.reason,
+      request.expectedVersion
+    ),
     {
       skipBusinessError: true,
       skipErrorHandler: true,

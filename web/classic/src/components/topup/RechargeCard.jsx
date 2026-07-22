@@ -35,7 +35,7 @@ import {
   Tabs,
   TabPane,
 } from '@douyinfe/semi-ui';
-import { SiAlipay, SiWechat, SiStripe } from 'react-icons/si';
+import { SiAlipay, SiWechat } from 'react-icons/si';
 import {
   CreditCard,
   Coins,
@@ -47,21 +47,20 @@ import {
 } from 'lucide-react';
 import { IconGift } from '@douyinfe/semi-icons';
 import { useMinimumLoadingTime } from '../../hooks/common/useMinimumLoadingTime';
-import { useActualTheme } from '../../context/Theme';
 import { getCurrencyConfig } from '../../helpers/render';
 import SubscriptionPlansCard from './SubscriptionPlansCard';
-import { getSafePaymentIconUrl } from './payment-utils';
+import {
+  getPaymentSelectionId,
+  getPublicPaymentMethod,
+  getPublicPaymentMethodLabel,
+} from './payment-utils';
 
 const { Text } = Typography;
 
 const RechargeCard = ({
   t,
-  enableOnlineTopUp,
-  enableStripeTopUp,
-  enableXorPayTopUp,
-  enableCreemTopUp,
-  creemProducts,
-  creemPreTopUp,
+  paymentProducts,
+  paymentProductPreTopUp,
   presetAmounts,
   selectedPreset,
   selectPresetAmount,
@@ -91,8 +90,6 @@ const RechargeCard = ({
   onRetryTopupInfo,
   topupInfo,
   onOpenHistory,
-  enableWaffoTopUp,
-  enableWaffoPancakeTopUp,
   subscriptionLoading = false,
   subscriptionError = '',
   onRetrySubscriptions,
@@ -110,7 +107,6 @@ const RechargeCard = ({
   const redeemFormApiRef = useRef(null);
   const initialTabSetRef = useRef(false);
   const showAmountSkeleton = useMinimumLoadingTime(amountLoading);
-  const actualTheme = useActualTheme();
   const [activeTab, setActiveTab] = useState('topup');
   const shouldShowSubscription =
     subscriptionLoading ||
@@ -119,6 +115,8 @@ const RechargeCard = ({
     allSubscriptions.length > 0 ||
     !!subscriptionError;
   const regularPayMethods = payMethods || [];
+  const hasAmountPayments = regularPayMethods.length > 0;
+  const hasPaymentProducts = (paymentProducts || []).length > 0;
 
   useEffect(() => {
     if (initialTabSetRef.current) return;
@@ -255,38 +253,22 @@ const RechargeCard = ({
             }
             closeIcon={null}
           />
-        ) : enableOnlineTopUp ||
-          enableStripeTopUp ||
-          enableXorPayTopUp ||
-          enableCreemTopUp ||
-          enableWaffoTopUp ||
-          enableWaffoPancakeTopUp ? (
+        ) : hasAmountPayments || hasPaymentProducts ? (
           <Form
             getFormApi={(api) => (onlineFormApiRef.current = api)}
             initValues={{ topUpCount: topUpCount }}
           >
             <div className='space-y-6'>
-              {(enableOnlineTopUp ||
-                enableStripeTopUp ||
-                enableXorPayTopUp ||
-                enableWaffoTopUp ||
-                enableWaffoPancakeTopUp) && (
+              {hasAmountPayments && (
                 <Row gutter={12}>
                   <Col xs={24} sm={24} md={24} lg={10} xl={10}>
                     <Form.InputNumber
                       field='topUpCount'
                       label={t('充值数量')}
-                      disabled={
-                        paymentLoading ||
-                        (!enableOnlineTopUp &&
-                          !enableStripeTopUp &&
-                          !enableXorPayTopUp &&
-                          !enableWaffoTopUp &&
-                          !enableWaffoPancakeTopUp)
-                      }
-                      placeholder={
-                        t('充值数量，最低 ') + renderQuotaWithAmount(minTopUp)
-                      }
+                      disabled={paymentLoading || !hasAmountPayments}
+                      placeholder={t('Minimum {{amount}}', {
+                        amount: renderQuotaWithAmount(minTopUp),
+                      })}
                       value={topUpCount}
                       min={minTopUp}
                       max={10000}
@@ -345,74 +327,38 @@ const RechargeCard = ({
                           {regularPayMethods.map((payMethod) => {
                             const minTopupVal =
                               Number(payMethod.min_topup) || 0;
-                            const isStripe = payMethod.type === 'stripe';
-                            const isXorPay = payMethod.provider === 'xorpay';
-                            const isWaffo =
-                              typeof payMethod.type === 'string' &&
-                              payMethod.type.startsWith('waffo:');
-                            const isWaffoPancake =
-                              payMethod.type === 'waffo_pancake';
-                            const safeIconUrl = getSafePaymentIconUrl(
-                              payMethod.icon,
-                            );
+                            const routeId = getPaymentSelectionId(payMethod);
+                            const publicMethod =
+                              getPublicPaymentMethod(payMethod);
+                            const displayName = payMethod.public_label
+                              ? payMethod.public_label === 'Card'
+                                ? t('银行卡支付')
+                                : payMethod.public_label === 'Online payment'
+                                  ? t('在线支付')
+                                  : payMethod.public_label
+                              : getPublicPaymentMethodLabel(
+                                  payMethod,
+                                  t,
+                                  regularPayMethods,
+                                );
                             const disabled =
                               paymentLoading ||
-                              (!enableOnlineTopUp &&
-                                !isStripe &&
-                                !isXorPay &&
-                                !isWaffo &&
-                                !isWaffoPancake) ||
-                              (!enableStripeTopUp && isStripe) ||
-                              (!enableXorPayTopUp && isXorPay) ||
-                              (!enableWaffoTopUp && isWaffo) ||
-                              (!enableWaffoPancakeTopUp && isWaffoPancake) ||
                               minTopupVal > Number(topUpCount || 0);
 
                             const buttonEl = (
                               <Button
-                                key={payMethod.type}
+                                key={routeId}
                                 theme='outline'
                                 type='tertiary'
-                                onClick={() => preTopUp(payMethod.type)}
+                                onClick={() => preTopUp(routeId)}
                                 disabled={disabled}
-                                loading={
-                                  paymentLoading && payWay === payMethod.type
-                                }
+                                loading={paymentLoading && payWay === routeId}
+                                aria-label={displayName}
                                 icon={
-                                  payMethod.type === 'alipay' ? (
+                                  publicMethod === 'alipay' ? (
                                     <SiAlipay size={18} color='#1677FF' />
-                                  ) : payMethod.type === 'wxpay' ? (
+                                  ) : publicMethod === 'wechat_pay' ? (
                                     <SiWechat size={18} color='#07C160' />
-                                  ) : payMethod.type === 'stripe' ? (
-                                    <SiStripe size={18} color='#635BFF' />
-                                  ) : safeIconUrl ? (
-                                    <img
-                                      src={safeIconUrl}
-                                      alt=''
-                                      aria-hidden='true'
-                                      loading='lazy'
-                                      decoding='async'
-                                      referrerPolicy='no-referrer'
-                                      style={{
-                                        width: 18,
-                                        height: 18,
-                                        objectFit: 'contain',
-                                      }}
-                                    />
-                                  ) : payMethod.type === 'waffo_pancake' ? (
-                                    <img
-                                      src={
-                                        actualTheme === 'dark'
-                                          ? '/waffo-logo-dark.svg'
-                                          : '/waffo-logo-light.svg'
-                                      }
-                                      alt='Waffo'
-                                      style={{
-                                        width: 18,
-                                        height: 18,
-                                        objectFit: 'contain',
-                                      }}
-                                    />
                                   ) : (
                                     <CreditCard
                                       size={18}
@@ -425,24 +371,25 @@ const RechargeCard = ({
                                 }
                                 className='!rounded-lg !px-4 !py-2'
                               >
-                                {payMethod.name}
+                                {displayName}
                               </Button>
                             );
 
                             return disabled &&
                               minTopupVal > Number(topUpCount || 0) ? (
                               <Tooltip
-                                content={
-                                  t('此支付方式最低充值金额为') +
-                                  ' ' +
-                                  minTopupVal
-                                }
-                                key={payMethod.type}
+                                content={t(
+                                  '此支付方式最低充值金额为 {{amount}}',
+                                  {
+                                    amount: minTopupVal,
+                                  },
+                                )}
+                                key={routeId}
                               >
                                 {buttonEl}
                               </Tooltip>
                             ) : (
-                              <React.Fragment key={payMethod.type}>
+                              <React.Fragment key={routeId}>
                                 {buttonEl}
                               </React.Fragment>
                             );
@@ -454,10 +401,7 @@ const RechargeCard = ({
                 </Row>
               )}
 
-              {(enableOnlineTopUp ||
-                enableStripeTopUp ||
-                enableXorPayTopUp ||
-                enableWaffoTopUp) && (
+              {hasAmountPayments && (
                 <Form.Slot
                   label={
                     <div className='flex items-center gap-2'>
@@ -474,7 +418,10 @@ const RechargeCard = ({
                               fontWeight: 'normal',
                             }}
                           >
-                            (1 $ = {rate.toFixed(2)} {symbol})
+                            {t('(1 USD = {{rate}} {{symbol}})', {
+                              rate: rate.toFixed(2),
+                              symbol,
+                            })}
                           </span>
                         );
                       })()}
@@ -577,18 +524,17 @@ const RechargeCard = ({
                 </Form.Slot>
               )}
 
-              {/* Creem 充值区域 */}
-              {enableCreemTopUp && creemProducts.length > 0 && (
-                <Form.Slot label={t('Creem 充值')}>
+              {hasPaymentProducts && (
+                <Form.Slot label={t('在线支付')}>
                   <div className='grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3'>
-                    {creemProducts.map((product, index) => (
+                    {paymentProducts.map((product) => (
                       <Card
-                        key={index}
-                        onClick={() => creemPreTopUp(product)}
+                        key={product.product_id}
+                        onClick={() => paymentProductPreTopUp(product)}
                         onKeyDown={(event) => {
                           if (!['Enter', ' '].includes(event.key)) return;
                           event.preventDefault();
-                          creemPreTopUp(product);
+                          paymentProductPreTopUp(product);
                         }}
                         role='button'
                         tabIndex={0}
@@ -599,11 +545,13 @@ const RechargeCard = ({
                           {product.name}
                         </div>
                         <div className='text-sm text-gray-600 mb-2'>
-                          {t('充值额度')}: {product.quota}
+                          {t('充值额度')}: {product.top_up_amount}
                         </div>
                         <div className='text-lg font-semibold text-blue-600'>
-                          {product.currency === 'EUR' ? '€' : '$'}
-                          {product.price}
+                          {new Intl.NumberFormat(undefined, {
+                            style: 'currency',
+                            currency: product.currency,
+                          }).format(Number(product.payment_amount))}
                         </div>
                       </Card>
                     ))}
@@ -718,7 +666,7 @@ const RechargeCard = ({
             tab={
               <div className='flex items-center gap-2'>
                 <Sparkles size={16} />
-                {t('订阅套餐')}
+                {t('固定期限权益')}
               </div>
             }
             itemKey='subscription'
@@ -730,10 +678,7 @@ const RechargeCard = ({
                 error={subscriptionError}
                 onRetry={onRetrySubscriptions}
                 plans={subscriptionPlans}
-                payMethods={payMethods}
-                enableOnlineTopUp={enableOnlineTopUp}
-                enableStripeTopUp={enableStripeTopUp}
-                enableCreemTopUp={enableCreemTopUp}
+                paymentRoutes={topupInfo.payment_routes}
                 billingPreference={billingPreference}
                 billingPreferenceLoading={billingPreferenceLoading}
                 onChangeBillingPreference={onChangeBillingPreference}

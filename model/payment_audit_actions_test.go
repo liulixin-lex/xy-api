@@ -11,6 +11,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestPaymentAuditDetailIncludesLegacyReviewReason(t *testing.T) {
+	t.Run("topup projection", func(t *testing.T) {
+		truncateTables(t)
+		seedPaymentUser(t, 973120, 0)
+		order := createTopUpPaymentOrder(t, 973120, PaymentProviderEpay, "alipay", 1000, 500)
+		reason := "completed_callback_amount_mismatch"
+		require.NoError(t, DB.Model(&TopUp{}).Where("payment_order_id = ?", order.ID).
+			Update("review_reason", reason).Error)
+
+		detail, err := GetPaymentAuditDetail(order.TradeNo)
+		require.NoError(t, err)
+		assert.Equal(t, reason, detail.LegacyReviewReason)
+	})
+
+	t.Run("subscription projection", func(t *testing.T) {
+		truncateTables(t)
+		seedPaymentUser(t, 973121, 0)
+		plan := &SubscriptionPlan{
+			Id: 983121, Title: "Audit detail plan", PriceAmount: 10, Currency: "USD",
+			DurationUnit: SubscriptionDurationDay, DurationValue: 1, Enabled: true,
+			TotalAmount: 100, QuotaResetPeriod: SubscriptionResetNever,
+		}
+		require.NoError(t, DB.Create(plan).Error)
+		order := createSubscriptionPaymentOrder(t, 973121, plan, 1000)
+		reason := "completed_callback_provider_order_id_mismatch"
+		require.NoError(t, DB.Model(&SubscriptionOrder{}).Where("payment_order_id = ?", order.ID).
+			Update("review_reason", reason).Error)
+
+		detail, err := GetPaymentAuditDetail(order.TradeNo)
+		require.NoError(t, err)
+		assert.Equal(t, reason, detail.LegacyReviewReason)
+	})
+}
+
 func TestPaymentAdminOrderActionsWriteOneDurableOperationsAudit(t *testing.T) {
 	tests := []struct {
 		name           string

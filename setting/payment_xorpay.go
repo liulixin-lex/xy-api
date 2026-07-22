@@ -11,6 +11,7 @@ import (
 const (
 	XorPayMethodNative = "native"
 	XorPayMethodAlipay = "alipay"
+	XorPayMethodJSAPI  = "jsapi"
 )
 
 var XorPayAid = ""
@@ -49,7 +50,7 @@ func UpdateXorPayEnabledMethodsByJsonString(value string) error {
 	normalized := make([]string, 0, len(methods))
 	for _, method := range methods {
 		method = strings.ToLower(strings.TrimSpace(method))
-		if method != XorPayMethodNative && method != XorPayMethodAlipay {
+		if method != XorPayMethodNative && method != XorPayMethodAlipay && method != XorPayMethodJSAPI {
 			return fmt.Errorf("unsupported XORPay method: %s", method)
 		}
 		if _, ok := seen[method]; ok {

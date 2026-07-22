@@ -115,7 +115,9 @@ export function TransferDialog({
             className='font-mono text-lg'
           />
           <p className='text-muted-foreground text-xs'>
-            {t('Minimum:')} {formatQuota(QUOTA_PER_DOLLAR)}
+            {t('Minimum {{amount}}', {
+              amount: formatQuota(QUOTA_PER_DOLLAR),
+            })}
           </p>
         </div>
       </div>

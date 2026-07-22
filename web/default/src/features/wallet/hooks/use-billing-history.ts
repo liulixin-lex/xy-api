@@ -18,15 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import i18next from 'i18next'
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { toast } from 'sonner'
 
-import { useIsAdmin } from '@/hooks/use-admin'
-
-import {
-  getUserBillingHistory,
-  getAllBillingHistory,
-  isApiSuccess,
-} from '../api'
+import { getUserBillingHistory, isApiSuccess } from '../api'
 import type { TopupRecord } from '../types'
 
 // ============================================================================
@@ -44,8 +37,6 @@ interface UseBillingHistoryOptions {
 
 export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
   const { initialPage = 1, initialPageSize = 10, enabled = true } = options
-  const isAdmin = useIsAdmin()
-
   const [records, setRecords] = useState<TopupRecord[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(initialPage)
@@ -71,29 +62,20 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     requestRef.current = controller
     setLoading(true)
     try {
-      const response = isAdmin
-        ? await getAllBillingHistory(
-            page,
-            pageSize,
-            debouncedKeyword,
-            controller.signal
-          )
-        : await getUserBillingHistory(
-            page,
-            pageSize,
-            debouncedKeyword,
-            controller.signal
-          )
+      const response = await getUserBillingHistory(
+        page,
+        pageSize,
+        debouncedKeyword,
+        controller.signal
+      )
 
       if (isApiSuccess(response) && response.data) {
         setRecords(response.data.items || [])
         setTotal(response.data.total || 0)
         setError(null)
       } else {
-        const message =
-          response.message || i18next.t('Failed to load billing history')
+        const message = i18next.t('Failed to load billing history')
         setError(message)
-        toast.error(message)
       }
     } catch (error) {
       if (
@@ -104,18 +86,15 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
       ) {
         return
       }
-      // eslint-disable-next-line no-console
-      console.error('Failed to fetch billing history:', error)
       const message = i18next.t('Failed to load billing history')
       setError(message)
-      toast.error(message)
     } finally {
       if (requestRef.current === controller) {
         requestRef.current = null
         setLoading(false)
       }
     }
-  }, [debouncedKeyword, enabled, isAdmin, page, pageSize])
+  }, [debouncedKeyword, enabled, page, pageSize])
 
   /**
    * Change page
@@ -157,7 +136,6 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     keyword,
     loading,
     error,
-    isAdmin,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,

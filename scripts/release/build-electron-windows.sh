@@ -8,7 +8,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 version=$1
-if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+if [[ ! "$version" =~ ^v0\.2\.(0|[1-9][0-9]*)$ ]]; then
   echo "invalid Electron release version: $version" >&2
   exit 2
 fi

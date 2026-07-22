@@ -467,13 +467,16 @@ func TestLegacyPaymentRowsFromPreCanonicalSchemaMigrateAndHandleUnsafeTopUp(t *t
 	})
 	require.NoError(t, ensurePaymentProjectionColumnsSQLite())
 	require.NoError(t, ensureUserPaymentFrozenColumnOn(DB))
+	assert.True(t, DB.Migrator().HasColumn("top_ups", "provider_order_key"))
 	assert.True(t, DB.Migrator().HasColumn("subscription_orders", "provider_order_key"))
 	assert.True(t, DB.Migrator().HasColumn("user_subscriptions", "payment_order_id"))
 	require.NoError(t, db.AutoMigrate(
 		&Option{}, &User{}, &PaymentUserGuard{}, &PaymentOrder{}, &PaymentEvent{}, &PaymentLedgerEntry{},
 		&PaymentDebt{}, &PaymentCustomerBinding{}, &PaymentOperationsAudit{}, &AffiliateRewardRecord{},
+		&PaymentTask{}, &PaymentLimitPolicy{}, &PaymentLimitBucket{}, &PaymentLimitReservation{},
 		&SubscriptionPlan{}, &UserSubscription{}, &TopUp{}, &SubscriptionOrder{},
 	))
+	assert.True(t, DB.Migrator().HasColumn(&TopUp{}, "CreditQuotaSnapshot"))
 	var migratedLegacyUser User
 	require.NoError(t, DB.First(&migratedLegacyUser, 975129).Error)
 	assert.False(t, migratedLegacyUser.PaymentFrozen)
@@ -503,6 +506,7 @@ func TestLegacyPaymentRowsFromPreCanonicalSchemaMigrateAndHandleUnsafeTopUp(t *t
 	require.NoError(t, DB.Where("trade_no = ?", "LEGACY_SCHEMA_TOPUP").First(&migratedTopUp).Error)
 	assert.Empty(t, migratedTopUp.PaymentProvider)
 	assert.Nil(t, migratedTopUp.PaymentOrderId)
+	assert.Zero(t, migratedTopUp.CreditQuotaSnapshot)
 	var migratedSubscription SubscriptionOrder
 	require.NoError(t, DB.Where("trade_no = ?", "LEGACY_SCHEMA_SUBSCRIPTION").First(&migratedSubscription).Error)
 	assert.Empty(t, migratedSubscription.PaymentProvider)

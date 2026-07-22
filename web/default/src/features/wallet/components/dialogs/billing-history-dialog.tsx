@@ -23,6 +23,12 @@ import { Dialog } from '@/components/dialog'
 import { StatusBadge } from '@/components/status-badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -40,13 +46,10 @@ import { formatCurrencyFromUSD } from '@/lib/currency'
 import { useBillingHistory } from '../../hooks/use-billing-history'
 import {
   getStatusConfig,
-  getPaymentMethodName,
-  getPaymentProviderName,
-  getOrderKindName,
   formatPaymentDecimalAmount,
-  formatPaymentMinorAmount,
   formatTimestamp,
 } from '../../lib/billing'
+import { getPublicPaymentRecordMethodName } from '../../lib/payment'
 
 interface BillingHistoryDialogProps {
   open: boolean
@@ -66,7 +69,6 @@ export function BillingHistoryDialog({
     keyword,
     loading,
     error,
-    isAdmin,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,
@@ -90,8 +92,15 @@ export function BillingHistoryDialog({
         {/* Search and Filter Bar */}
         <div className='flex items-center gap-2'>
           <div className='relative flex-1'>
-            <Search className='text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2' />
+            <Label htmlFor='billing-history-search' className='sr-only'>
+              {t('Search by order number')}
+            </Label>
+            <Search
+              className='text-muted-foreground absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2'
+              aria-hidden='true'
+            />
             <Input
+              id='billing-history-search'
               placeholder={t('Search by order number...')}
               value={keyword}
               onChange={(e) => handleSearch(e.target.value)}
@@ -172,22 +181,24 @@ export function BillingHistoryDialog({
             if (error && records.length === 0) return null
             if (records.length === 0) {
               return (
-                <div className='text-muted-foreground flex min-h-40 flex-col items-center justify-center py-10 text-center'>
-                  <p className='text-sm font-medium'>
-                    {t('No billing records found')}
-                  </p>
-                  <p className='mt-1 text-xs'>
-                    {keyword
-                      ? t('Try adjusting your search')
-                      : t('Your transaction history will appear here')}
-                  </p>
-                </div>
+                <Empty className='min-h-40 border-0 py-10'>
+                  <EmptyHeader>
+                    <EmptyTitle>{t('No billing records found')}</EmptyTitle>
+                    <EmptyDescription>
+                      {keyword
+                        ? t('Try adjusting your search')
+                        : t('Your transaction history will appear here')}
+                    </EmptyDescription>
+                  </EmptyHeader>
+                </Empty>
               )
             }
             return (
               <div className='space-y-3'>
                 {records.map((record) => {
-                  const statusConfig = getStatusConfig(record.status)
+                  const statusConfig = getStatusConfig(
+                    record.status_code || 'temporarily_unavailable'
+                  )
                   return (
                     <div
                       key={record.id}
@@ -213,17 +224,9 @@ export function BillingHistoryDialog({
                                 <Copy className='h-3 w-3' />
                               )}
                             </Button>
-                            {isAdmin && record.user_id != null && (
-                              <StatusBadge
-                                label={`${t('User ID')}: ${record.user_id}`}
-                                variant='neutral'
-                                size='sm'
-                                copyText={String(record.user_id)}
-                              />
-                            )}
                           </div>
                           <div className='text-muted-foreground text-xs'>
-                            {formatTimestamp(record.create_time)}
+                            {formatTimestamp(record.created_at)}
                           </div>
                         </div>
                         <StatusBadge
@@ -235,32 +238,16 @@ export function BillingHistoryDialog({
                       </div>
 
                       {/* Details Grid */}
-                      <div className='mt-3 grid grid-cols-2 gap-3 sm:mt-4 sm:grid-cols-4 sm:gap-4'>
-                        <div className='space-y-1'>
-                          <Label className='text-muted-foreground text-xs'>
-                            {t('Order Type')}
-                          </Label>
-                          <div className='text-sm font-medium'>
-                            {getOrderKindName(record.order_kind, t)}
-                          </div>
-                        </div>
-                        <div className='space-y-1'>
-                          <Label className='text-muted-foreground text-xs'>
-                            {t('Payment Provider')}
-                          </Label>
-                          <div className='text-sm font-medium'>
-                            {getPaymentProviderName(
-                              record.payment_provider || record.provider,
-                              t
-                            )}
-                          </div>
-                        </div>
+                      <div className='mt-3 grid grid-cols-2 gap-3 sm:mt-4 sm:grid-cols-3 sm:gap-4'>
                         <div className='space-y-1'>
                           <Label className='text-muted-foreground text-xs'>
                             {t('Payment Method')}
                           </Label>
                           <div className='text-sm font-medium'>
-                            {getPaymentMethodName(record.payment_method, t)}
+                            {getPublicPaymentRecordMethodName(
+                              record.public_method,
+                              t
+                            )}
                           </div>
                         </div>
                         <div className='space-y-1'>
@@ -268,14 +255,11 @@ export function BillingHistoryDialog({
                             {t('Amount')}
                           </Label>
                           <div className='text-sm font-semibold'>
-                            {formatCurrencyFromUSD(
-                              record.credit_quota ?? record.amount,
-                              {
-                                digitsLarge: 2,
-                                digitsSmall: 2,
-                                abbreviate: false,
-                              }
-                            )}
+                            {formatCurrencyFromUSD(record.amount, {
+                              digitsLarge: 2,
+                              digitsSmall: 2,
+                              abbreviate: false,
+                            })}
                           </div>
                         </div>
                         <div className='space-y-1'>
@@ -283,27 +267,13 @@ export function BillingHistoryDialog({
                             {t('Payment')}
                           </Label>
                           <div className='text-sm font-semibold text-red-600'>
-                            {typeof record.expected_amount_minor === 'number'
-                              ? formatPaymentMinorAmount(
-                                  record.paid_amount_minor ||
-                                    record.expected_amount_minor,
-                                  record.currency,
-                                  record.payment_provider || record.provider
-                                )
-                              : formatPaymentDecimalAmount(
-                                  record.money,
-                                  record.currency || 'CNY',
-                                  record.payment_provider || record.provider
-                                )}
+                            {formatPaymentDecimalAmount(
+                              record.payment_amount,
+                              record.currency || 'CNY'
+                            )}
                           </div>
                         </div>
                       </div>
-
-                      {isAdmin && record.status_reason && (
-                        <p className='text-muted-foreground mt-3 text-xs'>
-                          {record.status_reason}
-                        </p>
-                      )}
                     </div>
                   )
                 })}
@@ -316,8 +286,11 @@ export function BillingHistoryDialog({
         {!loading && records.length > 0 && (
           <div className='flex flex-col items-center gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between'>
             <div className='text-muted-foreground text-xs sm:text-sm'>
-              {t('Showing')} {(page - 1) * pageSize + 1}-
-              {Math.min(page * pageSize, total)} {t('of')} {total}
+              {t('Showing {{start}}-{{end}} of {{total}}', {
+                start: (page - 1) * pageSize + 1,
+                end: Math.min(page * pageSize, total),
+                total,
+              })}
             </div>
             <div className='flex items-center gap-2'>
               <Button

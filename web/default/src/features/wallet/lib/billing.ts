@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { StatusBadgeProps } from '@/components/status-badge'
 import { formatTimestampToDate } from '@/lib/format'
 
-import type { TopupStatus } from '../types'
+import type { BillingRecordStatus } from '../types'
 
 // ============================================================================
 // Billing Utility Functions
@@ -33,96 +33,38 @@ interface StatusConfig {
 /**
  * Status badge configuration
  */
-export const STATUS_CONFIG: Record<TopupStatus, StatusConfig> = {
-  success: {
-    variant: 'success',
-    label: 'Success',
-  },
-  pending: {
+export const STATUS_CONFIG: Record<BillingRecordStatus, StatusConfig> = {
+  preparing: {
     variant: 'warning',
-    label: 'Pending',
+    label: 'Preparing payment',
   },
-  processing: {
+  awaiting_payment: {
+    variant: 'warning',
+    label: 'Waiting for payment',
+  },
+  confirming: {
     variant: 'info',
-    label: 'Processing',
+    label: 'Confirming payment',
   },
-  failed: {
+  succeeded: {
+    variant: 'success',
+    label: 'Payment completed',
+  },
+  temporarily_unavailable: {
     variant: 'danger',
-    label: 'Failed',
+    label: 'Payment temporarily unavailable',
   },
   expired: {
     variant: 'danger',
     label: 'Expired',
-  },
-  manual_review: {
-    variant: 'warning',
-    label: 'Manual Review',
-  },
-  refund_pending: {
-    variant: 'warning',
-    label: 'Refund Pending',
-  },
-  refunded: {
-    variant: 'neutral',
-    label: 'Refunded',
-  },
-  disputed: {
-    variant: 'danger',
-    label: 'Disputed',
-  },
-  debt: {
-    variant: 'danger',
-    label: 'Payment Debt',
   },
 }
 
 /**
  * Get status badge configuration
  */
-export function getStatusConfig(status: TopupStatus): StatusConfig {
-  return STATUS_CONFIG[status] || STATUS_CONFIG.pending
-}
-
-/**
- * Payment method display names
- */
-export const PAYMENT_METHOD_NAMES: Record<string, string> = {
-  stripe: 'Stripe',
-  alipay: 'Alipay',
-  wxpay: 'WeChat Pay',
-  waffo: 'Waffo',
-  waffo_pancake: 'Waffo Pancake',
-  xorpay: 'XORPay',
-  xorpay_native: 'XORPay WeChat Pay',
-  xorpay_alipay: 'XORPay Alipay',
-}
-
-export const PAYMENT_PROVIDER_NAMES: Record<string, string> = {
-  epay: 'Epay',
-  stripe: 'Stripe',
-  xorpay: 'XORPay',
-  creem: 'Creem',
-  waffo: 'Waffo',
-  waffo_pancake: 'Waffo Pancake',
-}
-
-/**
- * Get payment method display name
- */
-export function getPaymentMethodName(
-  method: string,
-  t?: (key: string) => string
-): string {
-  const name = PAYMENT_METHOD_NAMES[method] || method
-  return t ? t(name) : name
-}
-
-export function getPaymentProviderName(
-  provider: string | undefined,
-  t?: (key: string) => string
-): string {
-  const name = provider ? PAYMENT_PROVIDER_NAMES[provider] || provider : '-'
-  return t ? t(name) : name
+export function getStatusConfig(status: BillingRecordStatus): StatusConfig {
+  return STATUS_CONFIG[status] || STATUS_CONFIG.temporarily_unavailable
 }
 
 export function getOrderKindName(
