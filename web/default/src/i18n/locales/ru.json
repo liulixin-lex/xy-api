@@ -886,7 +886,6 @@
     "Checking connection": "Проверка подключения",
     "Checking name...": "Проверяю имя...",
     "Checking payment status": "Проверка статуса платежа",
-    "Checking the latest order status. Your balance changes only after confirmation.": "Проверяем актуальный статус заказа. Баланс изменится только после подтверждения.",
     "Checking updates...": "Проверка обновлений...",
     "Checking your payment": "Проверяем платёж",
     "Checking...": "Проверка…",
@@ -4660,7 +4659,6 @@
     "Saving...": "Сохранение...",
     "Scan QR Code": "Сканировать QR-код",
     "Scan the code with the selected payment app.": "Отсканируйте код выбранным платёжным приложением.",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "Отсканируйте код выбранным платёжным приложением. Баланс пополняется только после подтверждения сервером.",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "Отсканируйте QR-код, откройте официальный аккаунт и ответьте «验证码», чтобы получить код подтверждения.",
     "Scan the QR code with WeChat to bind your account": "Отсканируйте QR-код с помощью WeChat, чтобы привязать свою учетную запись",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "Отсканируйте этот QR-код с помощью вашего приложения-аутентификатора (Google Authenticator, Microsoft Authenticator и т.д.)",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom",
     "支付回调安全基址为必填项": "Безопасная база платежных callback-адресов обязательна.",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Этот адрес используется для общего отображения сайта и больше не служит адресом callback или возврата для управляемых платежных шлюзов."
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Этот адрес используется для общего отображения сайта и больше не служит адресом callback или возврата для управляемых платежных шлюзов.",
+    "Checking the latest order status.": "Проверяем актуальный статус заказа."
   }
 }

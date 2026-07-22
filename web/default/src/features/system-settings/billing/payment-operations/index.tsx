@@ -63,18 +63,25 @@ export function PaymentOperationsSection() {
   return (
     <PaymentOperationVerificationContext.Provider value={verificationContext}>
       <Tabs value={tab} onValueChange={setTab} className='gap-4'>
-        <div className='overflow-x-auto'>
+        <div className='-mx-1 [scrollbar-width:none] overflow-x-auto px-1 [&::-webkit-scrollbar]:hidden'>
           <TabsList
             variant='line'
-            className='w-max min-w-full justify-start'
+            className='h-auto min-h-11 w-max min-w-full snap-x snap-mandatory justify-start'
             aria-label={t('Payment operations views')}
           >
-            <TabsTrigger value='overview'>{t('Payment Overview')}</TabsTrigger>
-            <TabsTrigger value='audit'>{t('Payment Audit')}</TabsTrigger>
-            <TabsTrigger value='reservations'>
+            <TabsTrigger className='min-h-11 snap-start px-3' value='overview'>
+              {t('Payment Overview')}
+            </TabsTrigger>
+            <TabsTrigger className='min-h-11 snap-start px-3' value='audit'>
+              {t('Payment Audit')}
+            </TabsTrigger>
+            <TabsTrigger
+              className='min-h-11 snap-start px-3'
+              value='reservations'
+            >
               {t('Billing Reservations')}
             </TabsTrigger>
-            <TabsTrigger value='stripe'>
+            <TabsTrigger className='min-h-11 snap-start px-3' value='stripe'>
               {t('Stripe Legacy Inventory')}
             </TabsTrigger>
           </TabsList>

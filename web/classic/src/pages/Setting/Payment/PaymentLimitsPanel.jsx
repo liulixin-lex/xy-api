@@ -330,7 +330,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
     <div className='flex flex-col gap-4'>
       <div>
         <h3 className='m-0 text-lg font-semibold'>{t('Payment Limits')}</h3>
-        <p className='mt-1 mb-0 text-sm text-gray-500'>
+        <p className='mt-1 mb-0 text-sm text-semi-color-text-2'>
           {t(
             'Configure merchant capacity per gateway, payment method, currency, and merchant day.',
           )}
@@ -358,7 +358,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
           {t('Use current XORPay WeChat JSAPI merchant reference')}
         </Button>
       </div>
-      <p className='m-0 text-sm text-gray-500'>
+      <p className='m-0 text-sm text-semi-color-text-2'>
         {t(
           'These presets reflect the currently supplied merchant materials and are not universal XORPay limits. Official Alipay PC, WAP, and Alipay JSAPI reference limits remain disabled because those products are not connected.',
         )}
@@ -368,7 +368,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
         title={t('Future official Alipay products (not enabled)')}
         bodyStyle={{ padding: 16 }}
       >
-        <p className='mt-0 text-sm text-gray-500'>
+        <p className='mt-0 text-sm text-semi-color-text-2'>
           {t(
             'Read-only merchant material for future official Alipay products. These products are not connected and cannot be selected.',
           )}
@@ -377,7 +377,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
           {futureOfficialAlipayProducts.map((product) => (
             <div
               key={product}
-              className='grid gap-3 rounded-lg bg-gray-50 p-3 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto] sm:items-center dark:bg-white/5'
+              className='grid gap-3 rounded-lg bg-semi-color-fill-0 p-3 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto] sm:items-center'
             >
               <div className='text-sm font-medium'>{product}</div>
               <Tag color='grey'>{t('Not enabled')}</Tag>
@@ -392,7 +392,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
             </div>
           ))}
         </div>
-        <p className='mb-0 text-sm text-gray-500'>
+        <p className='mb-0 text-sm text-semi-color-text-2'>
           {t(
             'These reference values are not XORPay Alipay face-to-face limits and are not system-wide defaults.',
           )}
@@ -412,7 +412,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
         }
         bodyStyle={{ padding: 16 }}
       >
-        <p className='mt-0 text-sm text-gray-500'>
+        <p className='mt-0 text-sm text-semi-color-text-2'>
           {t(
             'Set zero to leave the single-payment or daily cap unlimited. Amounts are entered in the selected currency, then stored as integer minor units.',
           )}
@@ -515,7 +515,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
           <div className='flex items-center justify-between gap-4 rounded-lg border px-4 py-3 md:col-span-2 xl:col-span-3'>
             <div id='classic-payment-limit-enabled-description'>
               <div className='font-medium'>{t('Enforce this policy')}</div>
-              <div className='mt-1 text-sm text-gray-500'>
+              <div className='mt-1 text-sm text-semi-color-text-2'>
                 {t(
                   'Disabled policies stay saved but do not reserve or reject payment capacity.',
                 )}
@@ -564,7 +564,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
 
       <Spin spinning={loading}>
         {!loadError && limits.length === 0 ? (
-          <div className='rounded-xl border border-dashed px-5 py-10 text-center text-sm text-gray-500'>
+          <div className='rounded-xl border border-dashed px-5 py-10 text-center text-sm text-semi-color-text-2'>
             {t('No payment limit policies have been configured yet.')}
           </div>
         ) : (
@@ -607,14 +607,14 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
                   }
                   bodyStyle={{ padding: 16 }}
                 >
-                  <div className='mb-4 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500'>
+                  <div className='mb-4 flex flex-wrap gap-x-3 gap-y-1 text-xs text-semi-color-text-2'>
                     <span>{limit.currency}</span>
                     <span>{limit.timezone}</span>
                     <span>{limit.day_key}</span>
                   </div>
                   <div className='grid grid-cols-2 gap-4 text-sm'>
                     <div>
-                      <div className='text-gray-500'>
+                      <div className='text-semi-color-text-2'>
                         {t('Single-payment limit')}
                       </div>
                       <div className='mt-1 font-medium tabular-nums'>
@@ -624,7 +624,9 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
                       </div>
                     </div>
                     <div>
-                      <div className='text-gray-500'>{t('Daily limit')}</div>
+                      <div className='text-semi-color-text-2'>
+                        {t('Daily limit')}
+                      </div>
                       <div className='mt-1 font-medium tabular-nums'>
                         {daily === '0'
                           ? t('Unlimited')
@@ -632,13 +634,15 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
                       </div>
                     </div>
                     <div>
-                      <div className='text-gray-500'>{t('Paid today')}</div>
+                      <div className='text-semi-color-text-2'>
+                        {t('Paid today')}
+                      </div>
                       <div className='mt-1 font-medium tabular-nums'>
                         {paid} {limit.currency}
                       </div>
                     </div>
                     <div>
-                      <div className='text-gray-500'>
+                      <div className='text-semi-color-text-2'>
                         {t('Active reservations')}
                       </div>
                       <div className='mt-1 font-medium tabular-nums'>
@@ -653,7 +657,7 @@ const PaymentLimitsPanel = ({ withPaymentVerification }) => {
                         showInfo
                         aria-label={t('Daily payment capacity used')}
                       />
-                      <div className='mt-1 text-xs text-gray-500'>
+                      <div className='mt-1 text-xs text-semi-color-text-2'>
                         {t('{{percent}}% of daily capacity used', {
                           percent: new Intl.NumberFormat(i18n.language, {
                             maximumFractionDigits: 1,

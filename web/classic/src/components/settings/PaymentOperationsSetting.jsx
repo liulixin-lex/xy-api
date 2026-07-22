@@ -56,6 +56,9 @@ const PaymentOperationsSetting = () => {
           type='card'
           defaultActiveKey='overview'
           contentStyle={{ paddingTop: 24 }}
+          collapsible
+          keepDOM
+          lazyRender
         >
           <Tabs.TabPane tab={t('支付概览')} itemKey='overview'>
             <PaymentOverviewPanel />

@@ -60,8 +60,77 @@ export interface PaymentGatewayReadiness {
   stripe?: StripePaymentGatewayReadiness
 }
 
+/**
+ * Stable metadata returned by the atomic payment-settings endpoint when a
+ * single option is rejected.  The backend deliberately keeps the diagnostic
+ * out of the response; the field key is enough for the admin form to focus
+ * the right control without exposing provider internals.
+ */
+export type PaymentSettingsErrorParams = {
+  field?: unknown
+  [key: string]: unknown
+}
+
+export type PaymentSettingsResponse<
+  T = {
+    readiness?: PaymentGatewayReadiness
+    version?: number
+  },
+> = {
+  success: boolean
+  code?: string
+  message?: string
+  params?: PaymentSettingsErrorParams
+  data?: T
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/**
+ * Read the structured payment error payload from either a direct business
+ * response or an Axios error.  Keeping this at the API boundary prevents
+ * individual settings controls from making subtly different assumptions
+ * about how the response was wrapped by the transport layer.
+ */
+export function getPaymentSettingsErrorParams(
+  value: unknown
+): PaymentSettingsErrorParams | undefined {
+  const queue: unknown[] = [value]
+  const visited = new Set<object>()
+
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (!isRecord(current) || visited.has(current)) continue
+    visited.add(current)
+
+    const params = current.params
+    if (isRecord(params)) {
+      return params as PaymentSettingsErrorParams
+    }
+
+    const response = current.response
+    if (isRecord(response)) queue.push(response.data)
+    if ('data' in current) queue.push(current.data)
+    if ('cause' in current) queue.push(current.cause)
+  }
+
+  return undefined
+}
+
+export function getPaymentSettingsErrorField(value: unknown): string | null {
+  const field = getPaymentSettingsErrorParams(value)?.field
+  return typeof field === 'string' && field.trim() ? field.trim() : null
+}
+
 export async function getSystemOptions() {
-  const res = await api.get<SystemOptionsResponse>('/api/option/')
+  const res = await api.get<SystemOptionsResponse>('/api/option/', {
+    // Settings pages render their own retryable failure state. Suppress the
+    // global transport toast so one failed load does not produce duplicate or
+    // generic ERR_BAD_REQUEST-style notifications.
+    skipErrorHandler: true,
+  })
   return res.data
 }
 
@@ -89,13 +158,8 @@ export async function updatePaymentSettings(request: {
   revokePreviousCredentials?: RevocablePaymentProvider[]
   reason?: string
   expectedVersion: number
-}): Promise<{
-  success: boolean
-  code?: string
-  message?: string
-  data?: { readiness?: PaymentGatewayReadiness; version?: number }
-}> {
-  const res = await api.put(
+}): Promise<PaymentSettingsResponse> {
+  const res = await api.put<PaymentSettingsResponse>(
     '/api/option/payment',
     {
       options: request.options,

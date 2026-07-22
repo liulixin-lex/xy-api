@@ -82,9 +82,7 @@ export function PaymentResultAlert(props: PaymentResultAlertProps) {
     order && statusConfig ? t(statusConfig.label) : t('Checking payment status')
   let description = (
     <span>
-      {t(
-        'Checking the latest order status. Your balance changes only after confirmation.'
-      )}
+      {t('Checking the latest order status.')}
       {` (${resultHintLabel})`}
     </span>
   )

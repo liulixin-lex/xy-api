@@ -20,11 +20,13 @@ import { useParams } from '@tanstack/react-router'
 import { useMemo, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
 import { SectionPageLayout } from '@/components/layout'
 
 import { useSystemOptions, getOptionValue } from '../hooks/use-system-options'
 import type { SystemOption } from '../types'
 import { SettingsPageProvider } from './settings-page-context'
+import { getSettingsPageLoadState } from './settings-page-state'
 
 type SettingsPageProps<
   TSettings extends Record<string, string | number | boolean | unknown[]>,
@@ -115,8 +117,16 @@ export function SettingsPage<
   const params = useParams({ from: routePath as any })
   const activeSection = (params?.section ?? defaultSection) as TSectionId
   const settingsRequired = requiresSettings?.(activeSection) ?? true
-  const { data, isLoading } = useSystemOptions(settingsRequired)
+  const { data, isLoading, isFetching, isError, refetch } =
+    useSystemOptions(settingsRequired)
   const sectionMeta = getSectionMeta(activeSection)
+  const loadState = getSettingsPageLoadState({
+    settingsRequired,
+    isLoading,
+    isFetching,
+    isError,
+    hasOptions: data?.success === true && Array.isArray(data.data),
+  })
 
   const settings = useMemo(() => {
     const baseSettings = getOptionValue(
@@ -128,12 +138,25 @@ export function SettingsPage<
       : baseSettings
   }, [data?.data, defaultSettings, resolveSettings])
 
-  if (settingsRequired && isLoading) {
+  if (loadState === 'loading') {
     return (
       <SettingsPageFrame title={t(sectionMeta.titleKey)}>
         <div className='text-muted-foreground flex min-h-40 items-center justify-center text-sm'>
           {t(loadingMessage)}
         </div>
+      </SettingsPageFrame>
+    )
+  }
+
+  if (loadState === 'error') {
+    return (
+      <SettingsPageFrame title={t(sectionMeta.titleKey)}>
+        <ErrorState
+          className='min-h-40'
+          title={t('Loading failed')}
+          description={t('Please try again later.')}
+          onRetry={() => void refetch()}
+        />
       </SettingsPageFrame>
     )
   }

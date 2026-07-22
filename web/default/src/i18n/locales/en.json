@@ -886,7 +886,6 @@
     "Checking connection": "Checking connection",
     "Checking name...": "Checking name...",
     "Checking payment status": "Checking payment status",
-    "Checking the latest order status. Your balance changes only after confirmation.": "Checking the latest order status. Your balance changes only after confirmation.",
     "Checking updates...": "Checking updates...",
     "Checking your payment": "Checking your payment",
     "Checking...": "Checking...",
@@ -4660,7 +4659,6 @@
     "Saving...": "Saving...",
     "Scan QR Code": "Scan QR Code",
     "Scan the code with the selected payment app.": "Scan the code with the selected payment app.",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "Scan the code with the selected payment app. Balance is added only after server confirmation.",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "Scan the QR code to follow the official account and send the message “验证码” to receive your verification code.",
     "Scan the QR code with WeChat to bind your account": "Scan the QR code with WeChat to bind your account",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom",
     "支付回调安全基址为必填项": "The secure payment callback base is required.",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "This address is used for general site display and is no longer used as the callback or return address for managed payment gateways."
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "This address is used for general site display and is no longer used as the callback or return address for managed payment gateways.",
+    "Checking the latest order status.": "Checking the latest order status."
   }
 }

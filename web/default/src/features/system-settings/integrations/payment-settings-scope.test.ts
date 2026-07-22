@@ -9,7 +9,10 @@ License, or (at your option) any later version.
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { selectPaymentSettingUpdates } from './payment-settings-scope'
+import {
+  getPaymentSettingsTabForOptionKey,
+  selectPaymentSettingUpdates,
+} from './payment-settings-scope'
 
 const CHANGES = [
   { key: 'CustomCallbackAddress', value: 'https://pay.example.com' },
@@ -39,5 +42,20 @@ describe('payment settings section save scope', () => {
     assert.deepEqual(selectPaymentSettingUpdates('general', CHANGES), [
       { key: 'CustomCallbackAddress', value: 'https://pay.example.com' },
     ])
+  })
+
+  test('maps backend option keys to the tab that owns the field', () => {
+    const cases = [
+      ['payment_setting.amount_discount', 'general'],
+      ['EpayCurrency', 'epay'],
+      ['StripeCheckoutAllowedHosts', 'stripe'],
+      ['XorPayCurrency', 'xorpay'],
+      ['WaffoPancakeStoreID', 'waffo-pancake'],
+      ['WaffoCurrency', 'waffo'],
+    ] as const
+    for (const [key, expected] of cases) {
+      assert.equal(getPaymentSettingsTabForOptionKey(key), expected)
+    }
+    assert.equal(getPaymentSettingsTabForOptionKey('unknown'), null)
   })
 })

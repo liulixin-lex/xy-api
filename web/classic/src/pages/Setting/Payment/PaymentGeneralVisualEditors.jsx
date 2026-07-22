@@ -169,7 +169,9 @@ function EditorPanel({ title, description, value, onChange, error, children }) {
     <section style={panelStyle} aria-label={title}>
       <div className='mb-4'>
         <h3 className='m-0 text-base font-semibold'>{title}</h3>
-        <p className='mt-1 mb-0 text-sm text-gray-500'>{description}</p>
+        <p className='mt-1 mb-0 text-sm text-semi-color-text-2'>
+          {description}
+        </p>
       </div>
       {!error && children}
       <AdvancedJsonEditor
@@ -289,7 +291,7 @@ export function PaymentMethodsEditor({ value, onChange }) {
                 />
               </div>
               {methods.length === 0 ? (
-                <div className='rounded-lg border border-dashed p-4 text-center text-sm text-gray-500'>
+                <div className='rounded-lg border border-dashed p-4 text-center text-sm text-semi-color-text-2'>
                   {t('No payment methods configured for this gateway.')}
                 </div>
               ) : (
@@ -297,14 +299,14 @@ export function PaymentMethodsEditor({ value, onChange }) {
                   {methods.map(({ method, index }) => (
                     <div
                       key={`${provider}-${method.type}-${index}`}
-                      className='flex items-center justify-between gap-3 rounded-lg bg-gray-50 p-3 dark:bg-white/5'
+                      className='flex items-center justify-between gap-3 rounded-lg bg-semi-color-fill-0 p-3'
                     >
                       <div className='min-w-0'>
                         <div className='truncate text-sm font-medium'>
                           {method.name}
                         </div>
                         <div className='mt-1 flex flex-wrap items-center gap-2'>
-                          <code className='text-xs text-gray-500'>
+                          <code className='text-xs text-semi-color-text-2'>
                             {method.type}
                           </code>
                           {method.min_topup && (
@@ -528,7 +530,7 @@ export function TopupGroupRatioEditor({ value, onChange }) {
       error={parsed.error}
     >
       {entries.length === 0 ? (
-        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-gray-500'>
+        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-semi-color-text-2'>
           {t(
             'No group ratios configured. Add at least one group before saving.',
           )}
@@ -538,7 +540,7 @@ export function TopupGroupRatioEditor({ value, onChange }) {
           {entries.map(([group, ratio]) => (
             <div
               key={group}
-              className='flex flex-col gap-3 rounded-lg bg-gray-50 p-3 sm:flex-row sm:items-center dark:bg-white/5'
+              className='flex flex-col gap-3 rounded-lg bg-semi-color-fill-0 p-3 sm:flex-row sm:items-center'
             >
               <div className='min-w-0 flex-1 truncate text-sm font-medium'>
                 {group}
@@ -668,7 +670,7 @@ export function AmountOptionsEditor({ value, onChange }) {
       error={parsed.error}
     >
       {parsed.amounts.length === 0 ? (
-        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-gray-500'>
+        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-semi-color-text-2'>
           {t('No amount options configured. Add amounts below to get started.')}
         </div>
       ) : (
@@ -676,7 +678,7 @@ export function AmountOptionsEditor({ value, onChange }) {
           {parsed.amounts.map((amount) => (
             <div
               key={amount}
-              className='flex items-center gap-1 rounded-full bg-gray-100 py-1 pr-1 pl-3 dark:bg-white/10'
+              className='flex items-center gap-1 rounded-full bg-semi-color-fill-1 py-1 pr-1 pl-3'
             >
               <span className='text-sm tabular-nums'>
                 {formatter.format(amount)}
@@ -812,7 +814,7 @@ export function AmountDiscountEditor({ value, onChange }) {
       error={parsed.error}
     >
       {entries.length === 0 ? (
-        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-gray-500'>
+        <div className='rounded-lg border border-dashed p-5 text-center text-sm text-semi-color-text-2'>
           {t(
             'No discount tiers configured. Full price applies to every amount.',
           )}
@@ -822,7 +824,7 @@ export function AmountDiscountEditor({ value, onChange }) {
           {entries.map(([amount, rate]) => (
             <div
               key={amount}
-              className='flex flex-col gap-3 rounded-lg bg-gray-50 p-3 sm:flex-row sm:items-center dark:bg-white/5'
+              className='flex flex-col gap-3 rounded-lg bg-semi-color-fill-0 p-3 sm:flex-row sm:items-center'
             >
               <div className='min-w-0 flex-1'>
                 <div className='text-sm font-medium tabular-nums'>

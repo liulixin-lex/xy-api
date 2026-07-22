@@ -886,7 +886,6 @@
     "Checking connection": "檢查連接",
     "Checking name...": "正在檢查名稱...",
     "Checking payment status": "正在檢查付款狀態",
-    "Checking the latest order status. Your balance changes only after confirmation.": "正在檢查最新訂單狀態，確認後餘額才會更新。",
     "Checking updates...": "檢查更新中...",
     "Checking your payment": "正在檢查付款",
     "Checking...": "正在檢查…",
@@ -4660,7 +4659,6 @@
     "Saving...": "正在儲存...",
     "Scan QR Code": "掃描二維碼",
     "Scan the code with the selected payment app.": "請使用所選付款應用程式掃描 QR Code。",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "請使用所選付款 App 掃碼。僅在伺服器確認後才會增加餘額。",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "掃描二維碼關注官方賬號，回覆「驗證碼」以接收您的驗證碼。",
     "Scan the QR code with WeChat to bind your account": "使用微信掃描二維碼連結您的用戶",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "使用您的身份驗證器套用（Google Authenticator、Microsoft Authenticator 等）掃描此二維碼",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "智譜 V4",
     "Zoom": "縮放",
     "支付回调安全基址为必填项": "支付回調安全基址為必填項",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "此地址用於站點通用顯示，不再作為受管支付網關的回調或返回地址。"
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "此地址用於站點通用顯示，不再作為受管支付網關的回調或返回地址。",
+    "Checking the latest order status.": "正在檢查最新訂單狀態。"
   }
 }

@@ -886,7 +886,6 @@
     "Checking connection": "Vérification de la connexion",
     "Checking name...": "Vérification du nom...",
     "Checking payment status": "Vérification du paiement",
-    "Checking the latest order status. Your balance changes only after confirmation.": "Vérification du dernier état de la commande. Votre solde ne change qu’après confirmation.",
     "Checking updates...": "Vérification des mises à jour...",
     "Checking your payment": "Vérification du paiement",
     "Checking...": "Vérification…",
@@ -4660,7 +4659,6 @@
     "Saving...": "Enregistrement en cours...",
     "Scan QR Code": "Scanner le code QR",
     "Scan the code with the selected payment app.": "Scannez le code avec l'application de paiement sélectionnée.",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "Scannez le code avec l'application de paiement choisie. Le solde n'est crédité qu'après confirmation du serveur.",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "Scannez le code QR pour suivre le compte officiel et répondez par « 验证码 » pour recevoir votre code de vérification.",
     "Scan the QR code with WeChat to bind your account": "Scannez le code QR avec WeChat pour lier votre compte",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "Scannez ce code QR avec votre application d'authentification (Google Authenticator, Microsoft Authenticator, etc.)",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom",
     "支付回调安全基址为必填项": "La base sécurisée des callbacks de paiement est obligatoire.",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Cette adresse sert à l’affichage général du site et n’est plus utilisée comme adresse de callback ou de retour des passerelles gérées."
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Cette adresse sert à l’affichage général du site et n’est plus utilisée comme adresse de callback ou de retour des passerelles gérées.",
+    "Checking the latest order status.": "Vérification du dernier état de la commande."
   }
 }

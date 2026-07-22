@@ -7,6 +7,31 @@ remain the authoritative record for published binaries and images.
 
 - No unreleased changes.
 
+## v0.2.2 - 2026-07-22
+
+### Payment experience
+
+- Hardened payment settings against stale or failed configuration loads, kept
+  field-level validation attached to the relevant control, and made payment
+  operations loading, empty, unavailable, and retry states explicit.
+- Refined Default and Classic payment administration for small screens without
+  reducing operational detail. Classic provider panels now load on demand so
+  hidden optional integrations cannot fail the whole settings page.
+- Stabilized checkout branding while system information and logos load,
+  improved WeChat action contrast, and stopped expiry timers after terminal
+  order states.
+- Removed the user-facing balance-confirmation explanation from payment result
+  copy while preserving server-authoritative settlement behavior.
+
+### Compatibility and verification
+
+- Kept payment provider, callback, ledger, credential, idempotency, database,
+  and multi-node contracts unchanged; this release has no database migration.
+- Verified both frontend themes with browser regression fixtures across desktop,
+  mobile, light, dark, loading, success, empty, and failure states.
+- Preserved exact-version publication and the existing global container
+  `latest` policy.
+
 ## v0.2.1 - 2026-07-21
 
 ### Payments and Billing

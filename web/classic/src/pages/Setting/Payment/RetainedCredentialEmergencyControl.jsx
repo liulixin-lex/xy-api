@@ -234,12 +234,12 @@ export default function RetainedCredentialEmergencyControl(props) {
 
   return (
     <section
-      className='mt-6 border-t border-solid border-gray-200 pt-5 dark:border-gray-700'
+      className='mt-6 border-t border-solid border-semi-color-border pt-5'
       aria-label={t('Advanced and emergency')}
     >
       <div className='mb-3'>
         <Text strong>{t('Advanced and emergency')}</Text>
-        <p className='mt-1 mb-0 max-w-3xl text-sm text-gray-500'>
+        <p className='mt-1 mb-0 max-w-3xl text-sm text-semi-color-text-2'>
           {t(
             'You can replace these credentials through normal save only when no dependent orders still require the current credentials.',
           )}
@@ -302,7 +302,7 @@ export default function RetainedCredentialEmergencyControl(props) {
 
           {previewLoading ? (
             <div
-              className='rounded border border-solid border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-800'
+              className='rounded border border-solid border-semi-color-border bg-semi-color-fill-0 p-4 text-sm text-semi-color-text-2'
               role='status'
               aria-live='polite'
             >
@@ -328,20 +328,17 @@ export default function RetainedCredentialEmergencyControl(props) {
               closeIcon={null}
             />
           ) : preview && impact ? (
-            <div className='rounded border border-solid border-gray-200 p-4 dark:border-gray-700'>
+            <div className='rounded border border-solid border-semi-color-border p-4'>
               <Text strong>{t('Affected order preview')}</Text>
-              <p className='mt-1 mb-3 text-xs text-gray-500'>
+              <p className='mt-1 mb-3 text-xs text-semi-color-text-2'>
                 {t('Preview generated at {{time}}', {
                   time: new Date(preview.generated_at * 1000).toLocaleString(),
                 })}
               </p>
               <dl className='m-0 grid grid-cols-1 gap-3 sm:grid-cols-2'>
                 {impactItems.map(([label, value]) => (
-                  <div
-                    key={label}
-                    className='rounded bg-gray-50 p-3 dark:bg-gray-800'
-                  >
-                    <dt className='text-xs text-gray-500'>{label}</dt>
+                  <div key={label} className='rounded bg-semi-color-fill-0 p-3'>
+                    <dt className='text-xs text-semi-color-text-2'>{label}</dt>
                     <dd className='mt-1 ml-0 text-lg font-semibold tabular-nums'>
                       {Number(value).toLocaleString()}
                     </dd>
@@ -372,8 +369,8 @@ export default function RetainedCredentialEmergencyControl(props) {
             <span
               className={
                 reason.length > 0 && !reasonValid
-                  ? 'text-red-500'
-                  : 'text-gray-500'
+                  ? 'text-semi-color-danger'
+                  : 'text-semi-color-text-2'
               }
             >
               {reason.length > 0 && !reasonValid
@@ -382,7 +379,7 @@ export default function RetainedCredentialEmergencyControl(props) {
                     'Enter 8 to 512 characters explaining the credential incident and response.',
                   )}
             </span>
-            <span className='text-gray-500 tabular-nums'>
+            <span className='text-semi-color-text-2 tabular-nums'>
               {reason.length} / 512
             </span>
           </div>

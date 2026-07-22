@@ -239,7 +239,7 @@ export default function SettingsPaymentGatewayXorPay(props) {
             closeIcon={null}
             style={{ marginTop: 12 }}
           />
-          <div className='mt-4 text-sm text-gray-500'>
+          <div className='mt-4 text-sm text-semi-color-text-2'>
             {t('回调地址')}：
             <code>
               {props.options.CustomCallbackAddress

@@ -22,7 +22,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -44,8 +44,11 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { cn } from '@/lib/utils'
 
+import { getPaymentAdminErrorMessage } from '../../payment-admin-errors'
 import { listPaymentAudit } from './api'
+import { getPaymentAuditCollectionState } from './collection-state'
 import { LegacySubscriptionResolutionDialog } from './legacy-subscription-resolution-dialog'
 import { LegacyTopUpResolutionDialog } from './legacy-topup-resolution-dialog'
 import { UnmatchedPaymentEventActionDialog } from './payment-action-dialogs'
@@ -114,6 +117,16 @@ export function PaymentAuditPanel() {
   const total = auditQuery.data?.total ?? 0
   const unmatchedTotal = auditQuery.data?.unmatched_total ?? 0
   const auditDataStale = auditQuery.isFetching || auditQuery.isPlaceholderData
+  const orderState = getPaymentAuditCollectionState({
+    isLoading: auditQuery.isLoading,
+    isError: auditQuery.isError,
+    itemCount: orders.length,
+  })
+  const unmatchedState = getPaymentAuditCollectionState({
+    isLoading: auditQuery.isLoading,
+    isError: auditQuery.isError,
+    itemCount: unmatchedEvents.length,
+  })
 
   useEffect(() => {
     if (!auditQuery.data) return
@@ -283,7 +296,30 @@ export function PaymentAuditPanel() {
         </CardContent>
       </Card>
 
-      <Card className='gap-0 py-0'>
+      {auditQuery.isError && (
+        <Alert variant='destructive'>
+          <AlertTitle>{t('Failed to load payment audit')}</AlertTitle>
+          <AlertDescription className='flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center'>
+            <span>
+              {getPaymentAdminErrorMessage(
+                auditQuery.error,
+                t,
+                t('Failed to load payment audit')
+              )}
+            </span>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              onClick={() => void auditQuery.refetch()}
+            >
+              {t('Retry')}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <Card className={cn('gap-0 py-0', auditQuery.isError && 'hidden')}>
         <CardHeader className='border-b py-4'>
           <CardTitle>{t('Orders Requiring Attention')}</CardTitle>
           <CardDescription>
@@ -294,32 +330,19 @@ export function PaymentAuditPanel() {
                 )}
           </CardDescription>
         </CardHeader>
-        {auditQuery.isLoading && (
+        {orderState === 'loading' && (
           <div className='grid gap-2 p-4'>
             {Array.from({ length: 5 }, (_, index) => index).map((key) => (
               <Skeleton key={key} className='h-12 w-full' />
             ))}
           </div>
         )}
-        {!auditQuery.isLoading && auditQuery.isError && (
-          <div className='p-4'>
-            <Alert variant='destructive'>
-              <AlertDescription>
-                {auditQuery.error instanceof Error
-                  ? auditQuery.error.message
-                  : t('Failed to load payment audit')}
-              </AlertDescription>
-            </Alert>
+        {orderState === 'empty' && (
+          <div className='text-muted-foreground p-10 text-center text-sm'>
+            {t('No payment orders match these filters.')}
           </div>
         )}
-        {!auditQuery.isLoading &&
-          !auditQuery.isError &&
-          orders.length === 0 && (
-            <div className='text-muted-foreground p-10 text-center text-sm'>
-              {t('No payment orders match these filters.')}
-            </div>
-          )}
-        {!auditQuery.isLoading && !auditQuery.isError && orders.length > 0 && (
+        {orderState === 'ready' && (
           <Table>
             <TableHeader>
               <TableRow>
@@ -408,16 +431,18 @@ export function PaymentAuditPanel() {
             </TableBody>
           </Table>
         )}
-        <TablePagination
-          page={page}
-          pageSize={PAGE_SIZE}
-          total={total}
-          disabled={auditQuery.isFetching}
-          onPageChange={setPage}
-        />
+        {(orderState === 'empty' || orderState === 'ready') && (
+          <TablePagination
+            page={page}
+            pageSize={PAGE_SIZE}
+            total={total}
+            disabled={auditQuery.isFetching}
+            onPageChange={setPage}
+          />
+        )}
       </Card>
 
-      <Card className='gap-0 py-0'>
+      <Card className={cn('gap-0 py-0', auditQuery.isError && 'hidden')}>
         <CardHeader className='border-b py-4'>
           <CardTitle>{t('Unmatched Callback Events')}</CardTitle>
           <CardDescription>
@@ -426,16 +451,27 @@ export function PaymentAuditPanel() {
             )}
           </CardDescription>
           <CardAction>
-            <span className='text-muted-foreground text-xs tabular-nums'>
-              {unmatchedTotal}
-            </span>
+            {unmatchedState === 'loading' && <Skeleton className='h-4 w-8' />}
+            {unmatchedState !== 'loading' && unmatchedState !== 'error' && (
+              <span className='text-muted-foreground text-xs tabular-nums'>
+                {unmatchedTotal}
+              </span>
+            )}
           </CardAction>
         </CardHeader>
-        {unmatchedEvents.length === 0 ? (
+        {unmatchedState === 'loading' && (
+          <div className='grid gap-2 p-4'>
+            {Array.from({ length: 5 }, (_, index) => index).map((key) => (
+              <Skeleton key={key} className='h-12 w-full' />
+            ))}
+          </div>
+        )}
+        {unmatchedState === 'empty' && (
           <div className='text-muted-foreground p-8 text-center text-sm'>
             {t('No unmatched callback events.')}
           </div>
-        ) : (
+        )}
+        {unmatchedState === 'ready' && (
           <Table>
             <TableHeader>
               <TableRow>
@@ -555,7 +591,10 @@ export function PaymentAuditPanel() {
                               size='sm'
                               disabled={auditDataStale}
                               onClick={() =>
-                                setUnmatchedAction({ event, action: 'link' })
+                                setUnmatchedAction({
+                                  event,
+                                  action: 'link',
+                                })
                               }
                             >
                               {t('Link')}
@@ -590,13 +629,15 @@ export function PaymentAuditPanel() {
             </TableBody>
           </Table>
         )}
-        <TablePagination
-          page={unmatchedPage}
-          pageSize={UNMATCHED_PAGE_SIZE}
-          total={unmatchedTotal}
-          disabled={auditQuery.isFetching}
-          onPageChange={setUnmatchedPage}
-        />
+        {(unmatchedState === 'empty' || unmatchedState === 'ready') && (
+          <TablePagination
+            page={unmatchedPage}
+            pageSize={UNMATCHED_PAGE_SIZE}
+            total={unmatchedTotal}
+            disabled={auditQuery.isFetching}
+            onPageChange={setUnmatchedPage}
+          />
+        )}
       </Card>
 
       <PaymentAuditDetailSheet

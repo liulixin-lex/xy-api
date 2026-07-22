@@ -52,6 +52,7 @@ import {
   normalizeEmergencyCredentialRevocationReason,
   resolveEmergencyCredentialRevocationMode,
 } from '../../helpers/payment-credential-revocation';
+import { getPaymentAdminErrorMessage } from '../../helpers/payment-admin-errors';
 
 const CURRENT_COMPLIANCE_TERMS_VERSION = 'v1';
 const PAYMENT_CONFIG_VERSION_KEY = 'payment_setting.config_version';
@@ -112,7 +113,9 @@ const PaymentSetting = () => {
     [PAYMENT_CONFIG_VERSION_KEY]: DEFAULT_PAYMENT_CONFIG_VERSION,
   });
 
-  let [loading, setLoading] = useState(false);
+  let [loading, setLoading] = useState(true);
+  const [optionsReady, setOptionsReady] = useState(false);
+  const [optionsLoadError, setOptionsLoadError] = useState('');
   const [complianceVisible, setComplianceVisible] = useState(false);
   const [pendingCredentialRevocation, setPendingCredentialRevocation] =
     useState(null);
@@ -274,7 +277,7 @@ const PaymentSetting = () => {
   }, [t]);
 
   const refreshPaymentOptions = useCallback(
-    async (nextConfigVersion, notifyError) => {
+    async (nextConfigVersion) => {
       if (nextConfigVersion !== undefined) {
         setInputs((prev) => ({
           ...prev,
@@ -286,12 +289,17 @@ const PaymentSetting = () => {
       }
       try {
         setLoading(true);
+        setOptionsLoadError('');
         await getOptions();
+        setOptionsReady(true);
         return true;
       } catch (error) {
-        if (notifyError) {
-          showError(error?.message || t('刷新失败'));
-        }
+        const errorMessage = getPaymentAdminErrorMessage(
+          error,
+          t,
+          t('刷新失败'),
+        );
+        setOptionsLoadError(errorMessage);
         return false;
       } finally {
         setLoading(false);
@@ -301,12 +309,12 @@ const PaymentSetting = () => {
   );
 
   const onRefresh = useCallback(
-    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion, true),
+    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion),
     [refreshPaymentOptions],
   );
 
   const refreshAfterSave = useCallback(
-    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion, false),
+    (nextConfigVersion) => refreshPaymentOptions(nextConfigVersion),
     [refreshPaymentOptions],
   );
 
@@ -546,7 +554,27 @@ const PaymentSetting = () => {
     <>
       <Spin spinning={loading} size='large'>
         <Card style={{ marginTop: '10px' }}>
-          {!complianceConfirmed ? (
+          {optionsLoadError ? (
+            <Banner
+              className='payment-settings-load-error-banner'
+              type='danger'
+              title={t('刷新失败')}
+              description={
+                <div className='flex min-w-0 flex-col items-start gap-2'>
+                  <span className='max-w-full break-words'>
+                    {optionsLoadError}
+                  </span>
+                  <Button onClick={() => onRefresh()} disabled={loading}>
+                    {t('重试')}
+                  </Button>
+                </div>
+              }
+              closeIcon={null}
+              style={{ marginBottom: 0 }}
+              fullMode={false}
+            />
+          ) : null}
+          {!optionsLoadError && optionsReady && !complianceConfirmed ? (
             <Banner
               type='warning'
               title={t('需要确认合规声明')}
@@ -591,32 +619,30 @@ const PaymentSetting = () => {
                     >
                       {t('Disable Stripe completely now')}
                     </Button>
-                    <Button
-                      type='danger'
-                      disabled={
-                        !inputs[
-                          'payment_setting.epay_previous_credential_active'
-                        ]
-                      }
-                      onClick={() =>
-                        requestEmergencyCredentialRevocation('epay')
-                      }
-                    >
-                      {t('易支付')}: {t('立即撤销旧凭据')}
-                    </Button>
-                    <Button
-                      type='danger'
-                      disabled={
-                        !inputs[
-                          'payment_setting.xorpay_previous_credential_active'
-                        ]
-                      }
-                      onClick={() =>
-                        requestEmergencyCredentialRevocation('xorpay')
-                      }
-                    >
-                      {t('XORPay')}: {t('立即撤销旧凭据')}
-                    </Button>
+                    {inputs[
+                      'payment_setting.epay_previous_credential_active'
+                    ] ? (
+                      <Button
+                        type='danger'
+                        onClick={() =>
+                          requestEmergencyCredentialRevocation('epay')
+                        }
+                      >
+                        {t('易支付')}: {t('立即撤销旧凭据')}
+                      </Button>
+                    ) : null}
+                    {inputs[
+                      'payment_setting.xorpay_previous_credential_active'
+                    ] ? (
+                      <Button
+                        type='danger'
+                        onClick={() =>
+                          requestEmergencyCredentialRevocation('xorpay')
+                        }
+                      >
+                        {t('XORPay')}: {t('立即撤销旧凭据')}
+                      </Button>
+                    ) : null}
                   </div>
                 </div>
               }
@@ -624,7 +650,7 @@ const PaymentSetting = () => {
               style={{ marginBottom: 16 }}
               fullMode={false}
             />
-          ) : (
+          ) : !optionsLoadError && optionsReady ? (
             <Banner
               type='success'
               title={t('合规声明已确认')}
@@ -641,122 +667,127 @@ const PaymentSetting = () => {
               style={{ marginBottom: 16 }}
               fullMode={false}
             />
-          )}
-          <Tabs
-            type='card'
-            defaultActiveKey='general'
-            contentStyle={{ paddingTop: 24 }}
-          >
-            <Tabs.TabPane
-              tab={t('通用设置')}
-              itemKey='general'
-              disabled={!complianceConfirmed}
+          ) : null}
+          {!optionsLoadError && optionsReady ? (
+            <Tabs
+              type='card'
+              defaultActiveKey='general'
+              contentStyle={{ paddingTop: 24 }}
+              collapsible
+              keepDOM
+              lazyRender
             >
-              <SettingsGeneralPayment
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('易支付设置')}
-              itemKey='epay'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGateway
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                requestEmergencyCredentialRevocation={
-                  requestEmergencyCredentialRevocation
-                }
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('Stripe 设置')}
-              itemKey='stripe'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGatewayStripe
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                requestEmergencyCredentialRevocation={
-                  requestEmergencyCredentialRevocation
-                }
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab='XORPay'
-              itemKey='xorpay'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGatewayXorPay
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                requestEmergencyCredentialRevocation={
-                  requestEmergencyCredentialRevocation
-                }
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('Creem 设置')}
-              itemKey='creem'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGatewayCreem
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('Waffo Pancake 设置')}
-              itemKey='waffo-pancake'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGatewayWaffoPancake
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('Waffo 设置')}
-              itemKey='waffo'
-              disabled={!complianceConfirmed}
-            >
-              <SettingsPaymentGatewayWaffo
-                options={inputs}
-                configVersion={paymentConfigVersion}
-                refresh={refreshAfterSave}
-                withPaymentVerification={withPaymentVerification}
-                hideSectionTitle
-              />
-            </Tabs.TabPane>
-            <Tabs.TabPane
-              tab={t('支付限额')}
-              itemKey='limits'
-              disabled={!complianceConfirmed}
-            >
-              <PaymentLimitsPanel
-                withPaymentVerification={withPaymentVerification}
-              />
-            </Tabs.TabPane>
-          </Tabs>
+              <Tabs.TabPane
+                tab={t('通用设置')}
+                itemKey='general'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsGeneralPayment
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('易支付设置')}
+                itemKey='epay'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGateway
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  requestEmergencyCredentialRevocation={
+                    requestEmergencyCredentialRevocation
+                  }
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('Stripe 设置')}
+                itemKey='stripe'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGatewayStripe
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  requestEmergencyCredentialRevocation={
+                    requestEmergencyCredentialRevocation
+                  }
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab='XORPay'
+                itemKey='xorpay'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGatewayXorPay
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  requestEmergencyCredentialRevocation={
+                    requestEmergencyCredentialRevocation
+                  }
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('Creem 设置')}
+                itemKey='creem'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGatewayCreem
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('Waffo Pancake 设置')}
+                itemKey='waffo-pancake'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGatewayWaffoPancake
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('Waffo 设置')}
+                itemKey='waffo'
+                disabled={!complianceConfirmed}
+              >
+                <SettingsPaymentGatewayWaffo
+                  options={inputs}
+                  configVersion={paymentConfigVersion}
+                  refresh={refreshAfterSave}
+                  withPaymentVerification={withPaymentVerification}
+                  hideSectionTitle
+                />
+              </Tabs.TabPane>
+              <Tabs.TabPane
+                tab={t('支付限额')}
+                itemKey='limits'
+                disabled={!complianceConfirmed}
+              >
+                <PaymentLimitsPanel
+                  withPaymentVerification={withPaymentVerification}
+                />
+              </Tabs.TabPane>
+            </Tabs>
+          ) : null}
         </Card>
         <Modal
           visible={pendingCredentialRevocation !== null}
@@ -798,8 +829,8 @@ const PaymentSetting = () => {
                 className={
                   credentialRevocationReason.length > 0 &&
                   !credentialRevocationReasonValid
-                    ? 'text-red-500'
-                    : 'text-gray-500'
+                    ? 'text-semi-color-danger'
+                    : 'text-semi-color-text-2'
                 }
               >
                 {credentialRevocationReason.length > 0 &&
@@ -809,7 +840,7 @@ const PaymentSetting = () => {
                       'Enter 8 to 512 characters explaining the credential incident and response.',
                     )}
               </span>
-              <span className='text-gray-500 tabular-nums'>
+              <span className='text-semi-color-text-2 tabular-nums'>
                 {credentialRevocationReason.length} / 512
               </span>
             </div>
