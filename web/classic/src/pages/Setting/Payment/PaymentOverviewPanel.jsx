@@ -117,7 +117,7 @@ const PaymentOverviewPanel = () => {
 
   if (loading && !overview) {
     return (
-      <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+      <div className='grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4'>
         {Array.from({ length: 4 }, (_, index) => (
           <Skeleton
             key={`payment-overview-skeleton-${index}`}
@@ -162,7 +162,7 @@ const PaymentOverviewPanel = () => {
       <div className='flex items-center justify-between gap-3'>
         <div>
           <h3 className='m-0 text-lg font-semibold'>{t('Payment Overview')}</h3>
-          <p className='mt-1 mb-0 text-sm text-gray-500'>
+          <p className='mt-1 mb-0 text-sm text-semi-color-text-2'>
             {t(
               'Operational status for payment orders, workers, callbacks, limits, and cluster readiness.',
             )}
@@ -190,6 +190,7 @@ const PaymentOverviewPanel = () => {
 
       {!cluster?.ready && (
         <Banner
+          className='payment-overview-readiness-banner'
           type='danger'
           title={t('New payment creation is paused')}
           description={t(
@@ -200,39 +201,49 @@ const PaymentOverviewPanel = () => {
         />
       )}
 
-      <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+      <div className='grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4'>
         {cards.map(({ title, value, description, icon: Icon }) => (
-          <Card key={title} bodyStyle={{ padding: 16 }}>
-            <div className='flex items-start justify-between gap-3'>
+          <Card key={title} bodyStyle={{ padding: 12 }}>
+            <div className='flex min-w-0 items-start justify-between gap-2'>
               <div className='min-w-0'>
-                <div className='text-sm font-medium'>{title}</div>
+                <div className='text-xs leading-snug font-medium sm:text-sm'>
+                  {title}
+                </div>
                 <div className='mt-2 text-2xl font-semibold tabular-nums'>
                   {value}
                 </div>
               </div>
-              <Icon size={18} className='shrink-0 text-gray-500' />
+              <Icon size={16} className='shrink-0 text-semi-color-text-2' />
             </div>
-            <p className='mt-3 mb-0 text-xs text-gray-500'>{description}</p>
+            <p className='mt-2 mb-0 text-[11px] leading-4 text-semi-color-text-2 sm:text-xs'>
+              {description}
+            </p>
           </Card>
         ))}
       </div>
 
       <Card bodyStyle={{ padding: 16 }}>
-        <div className='grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2 xl:grid-cols-4'>
+        <div className='grid grid-cols-2 gap-x-4 gap-y-4 text-sm sm:gap-x-6 xl:grid-cols-4'>
           <div className='min-w-0'>
-            <div className='text-gray-500'>{t('Reconciliation backlog')}</div>
+            <div className='text-semi-color-text-2'>
+              {t('Reconciliation backlog')}
+            </div>
             <strong className='mt-1 block tabular-nums'>
               {formatter.format(operations?.reconcile_task_backlog || 0)}
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>{t('Running payment tasks')}</div>
+            <div className='text-semi-color-text-2'>
+              {t('Running payment tasks')}
+            </div>
             <strong className='mt-1 block tabular-nums'>
               {formatter.format(operations?.running_tasks || 0)}
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>{t('Unprocessed callbacks')}</div>
+            <div className='text-semi-color-text-2'>
+              {t('Unprocessed callbacks')}
+            </div>
             <strong className='mt-1 block tabular-nums'>
               {t('{{count}} pending, oldest {{age}}', {
                 count: formatter.format(
@@ -246,7 +257,7 @@ const PaymentOverviewPanel = () => {
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>
+            <div className='text-semi-color-text-2'>
               {t('Active limit reservations')}
             </div>
             <strong className='mt-1 block tabular-nums'>
@@ -254,13 +265,13 @@ const PaymentOverviewPanel = () => {
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>{t('Database')}</div>
+            <div className='text-semi-color-text-2'>{t('Database')}</div>
             <strong className='mt-1 block'>
               {runtime?.database_type || t('Not available')}
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>{t('Shared Redis')}</div>
+            <div className='text-semi-color-text-2'>{t('Shared Redis')}</div>
             <div className='mt-1'>
               <Tag color={runtime?.redis_enabled ? 'green' : 'grey'}>
                 {runtime?.redis_enabled ? t('Enabled') : t('Disabled')}
@@ -268,7 +279,7 @@ const PaymentOverviewPanel = () => {
             </div>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>
+            <div className='text-semi-color-text-2'>
               {t('Payment configuration version')}
             </div>
             <strong className='mt-1 block tabular-nums'>
@@ -276,7 +287,7 @@ const PaymentOverviewPanel = () => {
             </strong>
           </div>
           <div className='min-w-0'>
-            <div className='text-gray-500'>
+            <div className='text-semi-color-text-2'>
               {t('Expired active limit reservations')}
             </div>
             <strong className='mt-1 block tabular-nums'>

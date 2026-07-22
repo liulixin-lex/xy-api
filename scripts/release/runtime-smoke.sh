@@ -25,7 +25,7 @@ production instance.
 
 Useful optional variables:
 
-  RUNTIME_SMOKE_EXPECTED_VERSION=v0.2.1
+  RUNTIME_SMOKE_EXPECTED_VERSION=v0.2.2
   RUNTIME_SMOKE_ALLOW_REMOTE=1              # remote targets must use HTTPS
   RUNTIME_SMOKE_ALLOW_REMOTE_INITIALIZATION=1
   RUNTIME_SMOKE_PAUSE_PERFORMANCE_GATE=1    # initialized disposable targets

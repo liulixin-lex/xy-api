@@ -326,7 +326,7 @@ function CheckoutPanel({
         </p>
         {authorizationURL ? (
           <Button
-            className='mt-6 min-h-11 min-w-44 bg-[#07c160] text-white hover:bg-[#06ad56]'
+            className='mt-6 min-h-11 min-w-44 bg-[#05783e] text-white hover:bg-[#046b37]'
             onClick={() => window.location.assign(authorizationURL.href)}
           >
             {t('Continue in WeChat')}
@@ -426,7 +426,7 @@ function CheckoutPanel({
               )}
         </p>
         <Button
-          className='mt-6 min-h-11 min-w-44 bg-[#07c160] text-white hover:bg-[#06ad56]'
+          className='mt-6 min-h-11 min-w-44 bg-[#05783e] text-white hover:bg-[#046b37]'
           onClick={invokePayment}
           disabled={jsapiState === 'opening' || jsapiState === 'submitted'}
           aria-busy={jsapiState === 'opening'}
@@ -622,7 +622,12 @@ function CheckoutPanel({
 
 export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
   const { t } = useTranslation()
-  const { systemName, logo } = useSystemConfig()
+  const {
+    systemName,
+    logo,
+    loading: systemConfigLoading,
+    logoLoaded,
+  } = useSystemConfig()
   const [logoFailed, setLogoFailed] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const environment = useMemo(() => detectPaymentBrowserEnvironment(), [])
@@ -646,6 +651,7 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
   }, [logo])
 
   useEffect(() => {
+    if (systemConfigLoading) return
     const previousTitle = document.title
     const metaTitle = document.querySelector(
       'meta[name="title"]'
@@ -660,14 +666,25 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
         metaTitle.setAttribute('content', previousMetaTitle)
       }
     }
-  }, [systemName, t])
+  }, [systemConfigLoading, systemName, t])
 
   const expiresAt = order?.checkout?.expires_at || order?.expires_at || 0
+  const orderStatus = order?.status_code
   useEffect(() => {
-    if (!expiresAt) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    if (
+      !expiresAt ||
+      !orderStatus ||
+      !['preparing', 'awaiting_payment', 'confirming'].includes(orderStatus)
+    ) {
+      return
+    }
+    const timer = window.setInterval(() => {
+      const currentTime = Date.now()
+      setNow(currentTime)
+      if (currentTime / 1000 >= expiresAt) window.clearInterval(timer)
+    }, 1_000)
     return () => window.clearInterval(timer)
-  }, [expiresAt])
+  }, [expiresAt, orderStatus])
 
   const remainingSeconds = expiresAt
     ? Math.max(0, Math.floor(expiresAt - now / 1000))
@@ -777,16 +794,25 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
           {t('Back to Wallet')}
         </Button>
         <div className='flex min-w-0 items-center gap-2'>
-          {logo && !logoFailed && (
-            <img
-              src={logo}
-              alt=''
-              className='size-7 rounded-md object-contain'
-              referrerPolicy='no-referrer'
-              onError={() => setLogoFailed(true)}
-            />
+          {systemConfigLoading ? (
+            <>
+              <Skeleton className='size-7 rounded-md' />
+              <Skeleton className='h-4 w-24' />
+            </>
+          ) : (
+            <>
+              {logo && logoLoaded && !logoFailed && (
+                <img
+                  src={logo}
+                  alt=''
+                  className='size-7 rounded-md object-contain'
+                  referrerPolicy='no-referrer'
+                  onError={() => setLogoFailed(true)}
+                />
+              )}
+              <span className='truncate text-sm font-medium'>{systemName}</span>
+            </>
           )}
-          <span className='truncate text-sm font-medium'>{systemName}</span>
         </div>
       </div>
 
@@ -904,26 +930,28 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
                 </div>
               </div>
 
-              {(error || pollingStoppedReason) && order && (
-                <Alert variant='destructive'>
-                  <AlertDescription className='grid gap-3'>
-                    <p>
-                      {t(
-                        'Automatic status updates are paused. Refresh to continue.'
-                      )}
-                    </p>
-                    <Button
-                      className='min-h-11 justify-self-start'
-                      size='sm'
-                      variant='outline'
-                      onClick={handleRefresh}
-                      disabled={loading}
-                    >
-                      {t('Refresh status')}
-                    </Button>
-                  </AlertDescription>
-                </Alert>
-              )}
+              {(error || pollingStoppedReason) &&
+                order &&
+                displayedStatus !== 'expired' && (
+                  <Alert variant='destructive'>
+                    <AlertDescription className='grid gap-3'>
+                      <p>
+                        {t(
+                          'Automatic status updates are paused. Refresh to continue.'
+                        )}
+                      </p>
+                      <Button
+                        className='min-h-11 justify-self-start'
+                        size='sm'
+                        variant='outline'
+                        onClick={handleRefresh}
+                        disabled={loading}
+                      >
+                        {t('Refresh status')}
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                )}
             </aside>
           </div>
         </CardContent>

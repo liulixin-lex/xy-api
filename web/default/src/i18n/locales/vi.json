@@ -886,7 +886,6 @@
     "Checking connection": "Đang kiểm tra kết nối",
     "Checking name...": "Đang kiểm tra tên...",
     "Checking payment status": "Đang kiểm tra trạng thái thanh toán",
-    "Checking the latest order status. Your balance changes only after confirmation.": "Đang kiểm tra trạng thái đơn hàng mới nhất. Số dư chỉ thay đổi sau khi xác nhận.",
     "Checking updates...": "Đang kiểm tra cập nhật...",
     "Checking your payment": "Đang kiểm tra thanh toán",
     "Checking...": "Đang kiểm tra…",
@@ -4660,7 +4659,6 @@
     "Saving...": "Đang lưu...",
     "Scan QR Code": "Quét mã QR",
     "Scan the code with the selected payment app.": "Quét mã bằng ứng dụng thanh toán đã chọn.",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "Quét mã bằng ứng dụng thanh toán đã chọn. Số dư chỉ được cộng sau khi máy chủ xác nhận.",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "Quét mã QR để theo dõi tài khoản chính thức, trả lời « 验证码 » để nhận mã xác minh.",
     "Scan the QR code with WeChat to bind your account": "Quét mã QR bằng WeChat để liên kết tài khoản của bạn",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "Quét mã QR này bằng ứng dụng xác thực của bạn (Google Authenticator, Microsoft Authenticator, v.v.)",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom",
     "支付回调安全基址为必填项": "Cơ sở callback thanh toán an toàn là bắt buộc.",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Địa chỉ này dùng để hiển thị chung trên trang và không còn được dùng làm địa chỉ callback hoặc quay lại cho cổng thanh toán được quản lý."
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "Địa chỉ này dùng để hiển thị chung trên trang và không còn được dùng làm địa chỉ callback hoặc quay lại cho cổng thanh toán được quản lý.",
+    "Checking the latest order status.": "Đang kiểm tra trạng thái đơn hàng mới nhất."
   }
 }

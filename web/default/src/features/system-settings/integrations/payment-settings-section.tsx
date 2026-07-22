@@ -78,6 +78,7 @@ import { cn } from '@/lib/utils'
 
 import {
   confirmPaymentCompliance,
+  getPaymentSettingsErrorField,
   updatePaymentSettings,
   type PaymentGatewayReadiness,
 } from '../api'
@@ -116,6 +117,7 @@ import {
   validatePaymentMethodCollection,
 } from './payment-methods-visual-editor-utils'
 import {
+  getPaymentSettingsTabForOptionKey,
   selectPaymentSettingUpdates,
   type PaymentSettingsTab,
 } from './payment-settings-scope'
@@ -485,6 +487,20 @@ const PAYMENT_FORM_KEY_BY_OPTION_KEY: Record<string, keyof PaymentFormValues> =
     'payment_setting.amount_options': 'AmountOptions',
     'payment_setting.amount_discount': 'AmountDiscount',
   }
+
+const PAYMENT_FORM_FIELD_NAMES: ReadonlySet<string> = new Set(
+  Object.values(PAYMENT_FIELDS_BY_TAB).flat()
+)
+
+function resolvePaymentFormField(
+  optionKey: string
+): FieldPath<PaymentFormValues> | null {
+  const mapped = PAYMENT_FORM_KEY_BY_OPTION_KEY[optionKey]
+  if (mapped) return mapped
+  return PAYMENT_FORM_FIELD_NAMES.has(optionKey)
+    ? (optionKey as FieldPath<PaymentFormValues>)
+    : null
+}
 
 type WriteOnlyPaymentField =
   | 'EpayKey'
@@ -1116,6 +1132,55 @@ export function PaymentSettingsSection({
       CreemProducts: formatJsonForEditor(initialFormValues.CreemProducts),
     },
   })
+
+  const showPaymentSettingsError = React.useCallback(
+    (error: unknown) => {
+      const field = getPaymentSettingsErrorField(error)
+      const formField = field ? resolvePaymentFormField(field) : null
+      const tab = field ? getPaymentSettingsTabForOptionKey(field) : null
+
+      if (tab && tab !== activeTab) {
+        setActiveTab(tab)
+      }
+
+      if (formField) {
+        const message = getPaymentAdminErrorMessage(
+          error,
+          t,
+          t('Failed to update setting')
+        )
+        form.setError(formField, {
+          type: 'server',
+          message,
+        })
+
+        // A field in another tab is not mounted until the tab switch commits.
+        // Defer focus by two frames so the control is present and the browser
+        // can scroll it into view without jumping the settings shell.
+        if (typeof window !== 'undefined') {
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              form.setFocus(formField)
+              const element = document.querySelector<HTMLElement>(
+                `[name="${formField}"]`
+              )
+              if (element instanceof HTMLElement) {
+                element.scrollIntoView({ block: 'center', behavior: 'smooth' })
+              }
+            })
+          })
+        }
+      }
+
+      // The payment request opts out of the global Axios toast. Keep this as
+      // the single notification for both HTTP and business-level failures.
+      toast.error(
+        getPaymentAdminErrorMessage(error, t, t('Failed to update setting'))
+      )
+    },
+    [activeTab, form, t]
+  )
+
   const trackedDirtyFields = useFormState({ control: form.control }).dirtyFields
   const trackedDirtyFieldsRef = React.useRef(trackedDirtyFields)
   trackedDirtyFieldsRef.current = trackedDirtyFields
@@ -1995,13 +2060,7 @@ export function PaymentSettingsSection({
       try {
         await mutatePaymentSettings({ options }, async (result) => {
           if (!result.success) {
-            toast.error(
-              getPaymentAdminErrorMessage(
-                result,
-                t,
-                t('Failed to update setting')
-              )
-            )
+            showPaymentSettingsError(result)
             return
           }
           for (const update of scopedUpdates) {
@@ -2040,9 +2099,7 @@ export function PaymentSettingsSection({
           }
         })
       } catch (error) {
-        toast.error(
-          getPaymentAdminErrorMessage(error, t, t('Failed to update setting'))
-        )
+        showPaymentSettingsError(error)
       }
       return
     }
@@ -2198,6 +2255,8 @@ export function PaymentSettingsSection({
     WaffoPancakeMinTopUp: currentFormValues.WaffoPancakeMinTopUp,
     WaffoPancakeTestMode: currentFormValues.WaffoPancakeTestMode,
   }
+  const showCredentialRotationWarning =
+    activeTab === 'epay' || activeTab === 'stripe' || activeTab === 'xorpay'
 
   return (
     <SettingsSection title={t('Payment Gateway')}>
@@ -2251,14 +2310,16 @@ export function PaymentSettingsSection({
       )}
 
       {!complianceConfirmed && (
-        <div className='mb-6 grid gap-3 lg:grid-cols-3'>
-          <EmergencyCredentialRevocationAction
-            provider='epay'
-            replacement={noEmergencyCredentialReplacement}
-            previousCredentialActive={epayPreviousCredentialAvailable}
-            disabled={paymentSettingsPending}
-            onRequest={requestEmergencyCredentialRevocation}
-          />
+        <div className='mb-6 grid gap-3 lg:grid-cols-2'>
+          {epayPreviousCredentialAvailable && (
+            <EmergencyCredentialRevocationAction
+              provider='epay'
+              replacement={noEmergencyCredentialReplacement}
+              previousCredentialActive
+              disabled={paymentSettingsPending}
+              onRequest={requestEmergencyCredentialRevocation}
+            />
+          )}
           <EmergencyCredentialRevocationAction
             provider='stripe'
             replacement={noEmergencyCredentialReplacement}
@@ -2266,13 +2327,15 @@ export function PaymentSettingsSection({
             disabled={paymentSettingsPending}
             onRequest={requestEmergencyCredentialRevocation}
           />
-          <EmergencyCredentialRevocationAction
-            provider='xorpay'
-            replacement={noEmergencyCredentialReplacement}
-            previousCredentialActive={xorPayPreviousCredentialAvailable}
-            disabled={paymentSettingsPending}
-            onRequest={requestEmergencyCredentialRevocation}
-          />
+          {xorPayPreviousCredentialAvailable && (
+            <EmergencyCredentialRevocationAction
+              provider='xorpay'
+              replacement={noEmergencyCredentialReplacement}
+              previousCredentialActive
+              disabled={paymentSettingsPending}
+              onRequest={requestEmergencyCredentialRevocation}
+            />
+          )}
         </div>
       )}
 
@@ -2505,21 +2568,25 @@ export function PaymentSettingsSection({
                   'Only the selected section is saved. Unsaved changes in other tabs are left untouched.'
                 )}
               </p>
-              <Alert className='mt-4'>
-                <HugeiconsIcon
-                  icon={SecurityWarningIcon}
-                  strokeWidth={2}
-                  aria-hidden='true'
-                />
-                <AlertTitle>
-                  {t('Normal rotation and emergency revocation are different')}
-                </AlertTitle>
-                <AlertDescription>
-                  {t(
-                    'Saving a replacement credential performs a normal rotation and can temporarily retain the previous generation for existing orders and delayed callbacks. Emergency revocation stops trusting affected generations immediately and moves unfinished orders to manual review.'
-                  )}
-                </AlertDescription>
-              </Alert>
+              {showCredentialRotationWarning && (
+                <Alert className='mt-4'>
+                  <HugeiconsIcon
+                    icon={SecurityWarningIcon}
+                    strokeWidth={2}
+                    aria-hidden='true'
+                  />
+                  <AlertTitle>
+                    {t(
+                      'Normal rotation and emergency revocation are different'
+                    )}
+                  </AlertTitle>
+                  <AlertDescription>
+                    {t(
+                      'Saving a replacement credential performs a normal rotation and can temporarily retain the previous generation for existing orders and delayed callbacks. Emergency revocation stops trusting affected generations immediately and moves unfinished orders to manual review.'
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
 
               <TabsContent
                 value='general'

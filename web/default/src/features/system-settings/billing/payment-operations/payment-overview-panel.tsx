@@ -19,13 +19,7 @@ import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 
 import {
@@ -72,9 +66,9 @@ export function PaymentOverviewPanel() {
 
   if (overviewQuery.isLoading) {
     return (
-      <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+      <div className='grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4'>
         {Array.from({ length: 4 }, (_, index) => (
-          <Skeleton key={index} className='h-32 rounded-xl' />
+          <Skeleton key={index} className='h-32 rounded-xl sm:h-36' />
         ))}
       </div>
     )
@@ -191,31 +185,35 @@ export function PaymentOverviewPanel() {
         </Alert>
       )}
 
-      <div className='grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+      <div className='grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4'>
         {cards.map((card) => (
-          <Card key={card.title} size='sm'>
-            <CardHeader className='grid-cols-[1fr_auto] border-b'>
-              <div>
-                <CardTitle>{card.title}</CardTitle>
-                <CardDescription>{card.description}</CardDescription>
+          <Card key={card.title} size='sm' className='min-w-0'>
+            <CardContent className='grid h-full min-h-28 content-between gap-3'>
+              <div className='flex min-w-0 items-start justify-between gap-2'>
+                <p className='text-xs leading-snug font-medium sm:text-sm'>
+                  {card.title}
+                </p>
+                <HugeiconsIcon
+                  icon={card.icon}
+                  strokeWidth={2}
+                  className='text-muted-foreground size-4 shrink-0'
+                  aria-hidden='true'
+                />
               </div>
-              <HugeiconsIcon
-                icon={card.icon}
-                strokeWidth={2}
-                className='text-muted-foreground'
-                aria-hidden='true'
-              />
-            </CardHeader>
-            <CardContent>
-              <p className='text-2xl font-semibold tracking-tight tabular-nums'>
-                {card.value}
-              </p>
+              <div className='min-w-0'>
+                <p className='text-2xl font-semibold tracking-tight tabular-nums'>
+                  {card.value}
+                </p>
+                <p className='text-muted-foreground mt-1 text-[11px] leading-4 sm:text-xs'>
+                  {card.description}
+                </p>
+              </div>
             </CardContent>
           </Card>
         ))}
       </div>
 
-      <dl className='grid gap-x-6 gap-y-4 rounded-lg border px-4 py-4 text-sm sm:grid-cols-2 xl:grid-cols-4'>
+      <dl className='grid grid-cols-2 gap-x-4 gap-y-4 rounded-lg border px-4 py-4 text-sm sm:gap-x-6 xl:grid-cols-4'>
         <div>
           <dt className='text-muted-foreground'>
             {t('Reconciliation backlog')}

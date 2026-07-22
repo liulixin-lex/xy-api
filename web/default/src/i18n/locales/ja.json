@@ -886,7 +886,6 @@
     "Checking connection": "接続を確認しています",
     "Checking name...": "名前をチェック中...",
     "Checking payment status": "支払い状態を確認中",
-    "Checking the latest order status. Your balance changes only after confirmation.": "最新の注文状態を確認しています。確認後にのみ残高が更新されます。",
     "Checking updates...": "更新を確認中...",
     "Checking your payment": "支払いを確認しています",
     "Checking...": "確認中…",
@@ -4660,7 +4659,6 @@
     "Saving...": "保存中...",
     "Scan QR Code": "QRコードをスキャン",
     "Scan the code with the selected payment app.": "選択した決済アプリでコードを読み取ってください。",
-    "Scan the code with the selected payment app. Balance is added only after server confirmation.": "選択した決済アプリでコードを読み取ってください。残高はサーバー確認後のみ加算されます。",
     "Scan the QR code to follow the official account and reply with “验证码” to receive your verification code.": "公式アカウントのQRコードを読み取り、「验证码」と返信して認証コードを受け取ってください。",
     "Scan the QR code with WeChat to bind your account": "WeChatでQRコードをスキャンしてアカウントをバインド",
     "Scan this QR code with your authenticator app (Google Authenticator, Microsoft Authenticator, etc.)": "このQRコードを認証アプリ（Google Authenticator、Microsoft Authenticatorなど）でスキャンしてください。",
@@ -6183,6 +6181,7 @@
     "Zhipu V4": "Zhipu V 4",
     "Zoom": "ズーム",
     "支付回调安全基址为必填项": "安全な決済コールバック基点は必須です。",
-    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "このアドレスはサイトの一般表示に使用され、管理対象決済ゲートウェイのコールバック先や戻り先には使用されません。"
+    "该地址用于站点通用展示，不再作为受管支付网关的回调或返回地址。": "このアドレスはサイトの一般表示に使用され、管理対象決済ゲートウェイのコールバック先や戻り先には使用されません。",
+    "Checking the latest order status.": "最新の注文状態を確認しています。"
   }
 }

@@ -1,0 +1,81 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/liulixin-lex/xy-api/blob/v0.2.2/security/vex/v0.2.2.openvex.json",
+  "author": "xy-api maintainers",
+  "timestamp": "2026-07-22T12:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2025-62155"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "The in-process protected fetch client validates every redirect and every direct connection-time resolved IP. TestProtectedFetchClientRejectsRedirectToPrivateAddress and the protected dialer rebinding tests lock this backport; configured HTTP proxies and external Workers remain explicit operator trust boundaries."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-25591"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Token search escapes literal underscores, rejects abusive percent patterns, rate-limits authenticated callers, caps pages at 100 records, caps offsets, and counts through a bounded derived query. TestSearchUserTokensEscapesWildcardsAndCapsResultPages locks the backport."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-25802"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "The Default renderer passes generated HTML through DOMPurify before its HTML sink. The Classic preview uses a sandbox containing only allow-same-origin; MarkdownRenderer.test.jsx locks out script, form, popup, and top-navigation permissions."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-33655"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Resolved-domain IP filtering is enabled by default and the in-process webhook, Bark, Gotify, and download paths use the protected direct client for connection-time validation. The default-setting and private-rebinding tests lock this backport; configured proxies and Workers are operator trust boundaries."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-41432"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Stripe callbacks fail closed without an active signing secret, require a retrieved paid Checkout Session with exact account, mode, trade, amount, currency, PaymentIntent, and customer binding, and settle only the provider-bound canonical order. Provider and account-confirmation regression tests lock the backport."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-42339"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/quantumnous/new-api@v0.2.2"
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "The SSRF address policy rejects 0.0.0.0/8, unspecified, loopback, link-local, CGNAT, benchmarking, multicast, reserved, IPv4-mapped, and corresponding IPv6 special-purpose ranges. TestSSRFProtectionRejectsLiteralPrivateAndReservedIPs locks each reported bypass family."
+    }
+  ]
+}

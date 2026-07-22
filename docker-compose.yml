@@ -3,7 +3,7 @@
 # Quick Start:
 #   1. Copy .env.example to .env and set every variable marked REQUIRED_FOR_COMPOSE
 #      with independent `openssl rand -hex 32` values. Set NEW_API_IMAGE to the
-#      v0.2.1 digest reference from the immutable Release container-images.json
+#      v0.2.2 digest reference from the immutable Release container-images.json
 #      after the protected release workflow publishes it.
 #   2. Run `docker compose config` and review the resolved image and mounts.
 #   3. Run `docker compose run --rm config-check` to validate secret strength.
@@ -19,16 +19,17 @@
 #
 # ⚠️  IMPORTANT: This file intentionally has no password or secret defaults.
 #     Compose refuses to render until every required value is present and non-empty.
-# ⚠️  v0.2.1 supports clean installs and rehearsed additive upgrades from v0.2.0.
-#     Direct v0.1.6-v0.1.14 production upgrades are not claimed for this release candidate.
-#     The /api/readiness health check is a v0.2.1 runtime contract; do not substitute a v0.2.0 image.
+# ⚠️  v0.2.2 supports clean installs and rehearsed upgrades from v0.2.1.
+#     Earlier installations must follow the staged v0.1.6 -> v0.2.0 -> v0.2.1 path.
+#     Direct v0.1.7-v0.1.14 production upgrades are not claimed for this release candidate.
+#     The /api/readiness health check remains required; do not substitute a v0.2.0 image.
 
 services:
   config-check:
     image: alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
     restart: "no"
     environment:
-      NEW_API_IMAGE: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.1 digest reference from container-images.json}
+      NEW_API_IMAGE: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.2 digest reference from container-images.json}
       NODE_NAME: ${NODE_NAME:?Set NODE_NAME to a unique stable name for this application replica}
       PAYMENT_MULTI_NODE_ENABLED: ${PAYMENT_MULTI_NODE_ENABLED:-false}
       PAYMENT_CLUSTER_ID: ${PAYMENT_CLUSTER_ID:-}
@@ -168,7 +169,7 @@ services:
         echo 'Compose production configuration passed fail-closed validation.'
 
   new-api:
-    image: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.1 digest reference from container-images.json}
+    image: ${NEW_API_IMAGE:?Set NEW_API_IMAGE to the verified v0.2.2 digest reference from container-images.json}
     restart: always
     command: --log-dir /app/logs
     ports:

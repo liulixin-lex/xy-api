@@ -20,6 +20,31 @@ export type PaymentSettingUpdate = {
   value: string | number | boolean
 }
 
+export function getPaymentSettingsTabForOptionKey(
+  value: string
+): PaymentSettingsTab | null {
+  const key = value.trim()
+  if (!key) return null
+  if (
+    key === 'ServerAddress' ||
+    key === 'TopupGroupRatio' ||
+    key === 'Price' ||
+    key === 'MinTopUp' ||
+    key === 'CustomCallbackAddress' ||
+    key === 'PayMethods' ||
+    key.startsWith('payment_setting.')
+  ) {
+    return 'general'
+  }
+  if (key === 'PayAddress' || key.startsWith('Epay')) return 'epay'
+  if (key.startsWith('Stripe')) return 'stripe'
+  if (key.startsWith('XorPay')) return 'xorpay'
+  if (key.startsWith('Creem')) return 'creem'
+  if (key.startsWith('WaffoPancake')) return 'waffo-pancake'
+  if (key.startsWith('Waffo')) return 'waffo'
+  return null
+}
+
 const PAYMENT_OPTION_KEYS_BY_TAB: Record<
   Exclude<PaymentSettingsTab, 'waffo-pancake'>,
   ReadonlySet<string>

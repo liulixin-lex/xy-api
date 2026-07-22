@@ -541,7 +541,7 @@ export default function SettingsPaymentGatewayWaffoPancake(props) {
                   <Radio value='production'>{t('Production')}</Radio>
                   <Radio value='test'>{t('Test')}</Radio>
                 </RadioGroup>
-                <span className='text-xs text-gray-500'>
+                <span className='text-xs text-semi-color-text-2'>
                   {t(
                     'The selected environment must match the merchant account, signing private key, and the matching webhook URL shown above.',
                   )}
@@ -627,7 +627,7 @@ export default function SettingsPaymentGatewayWaffoPancake(props) {
             </label>
           </div>
 
-          <p className='mt-3 mb-0 text-sm text-gray-500'>
+          <p className='mt-3 mb-0 text-sm text-semi-color-text-2'>
             {t(
               'The selected store and product power wallet top-ups. Subscription plans keep their own product bindings.',
             )}

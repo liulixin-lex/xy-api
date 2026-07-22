@@ -205,7 +205,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
       <div className='mt-6'>
         <Card>
           <Spin spinning>
-            <div className='flex min-h-32 items-center justify-center text-sm text-gray-500'>
+            <div className='flex min-h-32 items-center justify-center text-sm text-semi-color-text-2'>
               {t('Loading Stripe legacy inventory...')}
             </div>
           </Spin>
@@ -302,7 +302,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
         }
         bodyStyle={{ padding: 0 }}
       >
-        <div className='border-b px-4 py-3 text-sm text-gray-500'>
+        <div className='border-b px-4 py-3 text-sm text-semi-color-text-2'>
           {t(
             'Synchronizing reads legacy subscription state from Stripe. It does not change renewals, issue refunds, or change local access.',
           )}
@@ -311,7 +311,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
           <div className='overflow-x-auto'>
             <table className='w-full min-w-[1020px] border-collapse text-sm'>
               <thead>
-                <tr className='border-b text-left text-gray-500'>
+                <tr className='border-b text-left text-semi-color-text-2'>
                   <th className='px-4 py-3 font-medium'>
                     {t('Stripe Subscription ID')}
                   </th>
@@ -348,7 +348,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
                       >
                         {item.mapping_status || '-'}
                       </Tag>
-                      <div className='mt-1 text-xs text-gray-500'>
+                      <div className='mt-1 text-xs text-semi-color-text-2'>
                         {item.user_id ? `#${item.user_id}` : t('User unmapped')}
                         {' · '}
                         {item.subscription_plan_id
@@ -404,7 +404,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
           </div>
         </Spin>
         <div className='flex items-center justify-between gap-3 px-4 py-3'>
-          <span className='text-sm text-gray-500'>
+          <span className='text-sm text-semi-color-text-2'>
             {t('{{count}} legacy Stripe records', {
               count: Number(inventory.total || 0),
             })}
@@ -455,9 +455,9 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
             )}
             closeIcon={null}
           />
-          <dl className='m-0 grid gap-3 rounded border border-solid border-gray-200 p-3 text-sm dark:border-gray-700'>
+          <dl className='m-0 grid gap-3 rounded border border-solid border-semi-color-border p-3 text-sm'>
             <div>
-              <dt className='text-xs text-gray-500'>
+              <dt className='text-xs text-semi-color-text-2'>
                 {t('Stripe Subscription ID')}
               </dt>
               <dd className='mt-1 ml-0 truncate font-mono'>
@@ -465,7 +465,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
               </dd>
             </div>
             <div>
-              <dt className='text-xs text-gray-500'>
+              <dt className='text-xs text-semi-color-text-2'>
                 {t('Current period ends')}
               </dt>
               <dd className='mt-1 ml-0'>
@@ -498,8 +498,8 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
               className={
                 cancellationReasonByteLength > 0 &&
                 !isStripeCancellationReasonValid(cancellationReason)
-                  ? 'text-red-500'
-                  : 'text-gray-500'
+                  ? 'text-semi-color-danger'
+                  : 'text-semi-color-text-2'
               }
             >
               {cancellationReasonByteLength > 0 &&
@@ -507,7 +507,7 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
                 ? t('Reason must be between 8 and 512 UTF-8 bytes')
                 : t('This reason is stored in the payment operations audit.')}
             </span>
-            <span className='text-gray-500 tabular-nums'>
+            <span className='text-semi-color-text-2 tabular-nums'>
               {cancellationReasonByteLength} / 512
             </span>
           </div>

@@ -128,3 +128,22 @@ Waffo Pancake orders. Each provider remains an independent gateway group;
 Creem, Waffo, Waffo Pancake, Epay, and Stripe must never be described as XORPay
 routes. Verified legacy callback fallback remains only for pre-existing records
 that do not have a canonical payment order.
+
+## v0.2.2 Source Candidate Boundary
+
+`v0.2.2` is a frontend reliability and accessibility update on top of the
+published `v0.2.1` payment contracts. It adds no database migration and does
+not change provider requests, callback verification, order state, ledger
+settlement, credential storage, merchant limits, or multi-node readiness.
+
+The supported candidate scope is a clean installation or an upgrade from
+`v0.2.1` after the normal backup and restore rehearsal. Earlier installations
+must follow the staged `v0.1.6` to `v0.2.0` to `v0.2.1` path before applying
+`v0.2.2`; direct production upgrades from `v0.1.7` through `v0.1.14` remain
+unclaimed.
+
+The repository may identify a `v0.2.2` source candidate before immutable
+artifacts exist. Deployment claims begin only after the protected release
+workflow verifies the exact version tag, assets, image manifest, attestations,
+signatures, and runtime smoke. The global container `latest` alias remains on
+its existing digest unless the release policy is changed separately.

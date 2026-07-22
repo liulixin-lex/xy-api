@@ -78,6 +78,25 @@ body {
   right: 8px;
 }
 
+.payment-overview-readiness-banner .semi-banner-content-body,
+.payment-settings-load-error-banner .semi-banner-content-body {
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.payment-overview-readiness-banner .semi-banner-title,
+.payment-overview-readiness-banner .semi-banner-description,
+.payment-settings-load-error-banner .semi-banner-title,
+.payment-settings-load-error-banner .semi-banner-description {
+  width: 100%;
+}
+
+.payment-settings-load-error-banner .semi-banner-description {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 767px) {
   .classic-frontend-deprecation-banner {
     padding: 8px 8px 0;
@@ -87,6 +106,18 @@ body {
     align-items: flex-start;
     flex-direction: column;
     padding-right: 24px;
+  }
+
+  .classic-frontend-deprecation-banner .semi-banner-content-body {
+    min-width: 0;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .classic-frontend-deprecation-banner .semi-banner-title,
+  .classic-frontend-deprecation-banner .semi-banner-description {
+    width: 100%;
   }
 }
 

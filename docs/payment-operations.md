@@ -21,8 +21,8 @@ remapped to another provider.
 - Apply each verified provider event and entitlement change exactly once.
 - Preserve evidence for mismatches, credential incidents, refunds, and disputes.
 - Preserve SQLite, MySQL, and PostgreSQL legacy-schema compatibility for the
-  staged `v0.1.6` to `v0.2.0` to `v0.2.1` path. A direct production
-  `v0.1.6` to `v0.2.1` upgrade remains unclaimed.
+  staged `v0.1.6` to `v0.2.0` to `v0.2.1` to `v0.2.2` path. A direct
+  production upgrade from `v0.1.6` to `v0.2.2` remains unclaimed.
 - Give administrators an explicit, audited recovery path instead of requiring
   direct database edits.
 
