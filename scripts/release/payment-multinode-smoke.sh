@@ -28,7 +28,11 @@ binary=$1
 sql_dsn=${PAYMENT_MULTINODE_SQL_DSN:-}
 split_sql_dsn=${PAYMENT_MULTINODE_SPLIT_SQL_DSN:-}
 redis_url=${PAYMENT_MULTINODE_REDIS_URL:-}
-base_port=${PAYMENT_MULTINODE_BASE_PORT:-39100}
+# Keep the default listeners below Linux's normal ephemeral-port range. A
+# long-running smoke starts some probes several minutes after the first nodes;
+# using an ephemeral port there lets an unrelated runner connection claim the
+# later listener and turn a healthy cluster check into a bind failure.
+base_port=${PAYMENT_MULTINODE_BASE_PORT:-19100}
 
 if [ ! -x "$binary" ]; then
   echo "payment multi-node smoke failed: binary is not executable: $binary" >&2

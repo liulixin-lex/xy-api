@@ -27,6 +27,8 @@ remain the authoritative record for published binaries and images.
 
 - Kept payment provider, callback, ledger, credential, idempotency, database,
   and multi-node contracts unchanged; this release has no database migration.
+- Moved the multi-node smoke listeners out of the runner ephemeral-port range
+  so release validation cannot collide with unrelated outbound connections.
 - Verified both frontend themes with browser regression fixtures across desktop,
   mobile, light, dark, loading, success, empty, and failure states.
 - Preserved exact-version publication and the existing global container
