@@ -25,6 +25,7 @@ const (
 	paymentMaintenanceInterval   = 30 * time.Second
 	paymentMaintenanceBatchSize  = 200
 	paymentCreateRecoveryMisses  = 2
+	paymentXorPayRecoveryMisses  = 3
 )
 
 var (
@@ -157,7 +158,8 @@ func runPaymentCreateTask(ctx context.Context, task *model.PaymentTask, runnerID
 	if err != nil {
 		return retryPaymentTask(task, runnerID, task.Phase, "configuration_unavailable", err)
 	}
-	if order.ConfigurationVersion > 0 && order.ConfigurationVersion != configurationVersion {
+	providerCallCrossed := task.Phase == model.PaymentTaskPhaseProviderCallStarted || order.ProviderOrderKey != nil
+	if !providerCallCrossed && order.ConfigurationVersion > 0 && order.ConfigurationVersion != configurationVersion {
 		reason := "payment configuration changed before provider creation"
 		if markErr := model.MarkPaymentOrderFailedFenced(order.TradeNo, reason, task.FenceToken); markErr != nil {
 			return markErr
@@ -178,12 +180,19 @@ func runPaymentCreateTask(ctx context.Context, task *model.PaymentTask, runnerID
 	switch provider.(type) {
 	case *epayPaymentProvider, *stripePaymentProvider, *xorPayProvider,
 		*creemPaymentProvider, *waffoPaymentProvider, *waffoPancakePaymentProvider:
-		if err := ValidatePaymentProviderForCreate(order.Provider, order.PaymentMethod); err != nil {
-			return failPaymentCreateTask(order, task, runnerID, "provider_configuration_invalid", err)
+		if !providerCallCrossed {
+			if err := ValidatePaymentProviderForCreate(order.Provider, order.PaymentMethod); err != nil {
+				return failPaymentCreateTask(order, task, runnerID, "provider_configuration_invalid", err)
+			}
 		}
 	}
 	if credentialProvider, ok := provider.(PaymentCredentialGenerationProvider); ok {
 		if order.ProviderCredentialGeneration == 0 {
+			if providerCallCrossed {
+				reason := "payment provider credential generation is unknown after creation started"
+				return finishPaymentTaskManualReview(order, task, runnerID,
+					"credential_generation_unknown", reason, reason)
+			}
 			generation := credentialProvider.CredentialGeneration()
 			if generation <= 0 {
 				return failPaymentCreateTask(order, task, runnerID, "credential_unavailable",
@@ -239,6 +248,20 @@ func runPaymentCreateTask(ctx context.Context, task *model.PaymentTask, runnerID
 				"provider_identity_review", reason, err.Error())
 		}
 		if errors.Is(err, ErrPaymentStateUnknown) {
+			if result != nil && strings.TrimSpace(result.ProviderOrderKey) != "" {
+				// The provider has already returned a durable identity. Persist a
+				// non-actionable encrypted start marker and reconcile that exact
+				// order until it settles or expires; never issue another create.
+				result.Flow = PaymentFlowPending
+				result.Action = ""
+				result.Fields = nil
+				result.URL = ""
+				result.QRContent = ""
+				result.JSAPI = nil
+				result.CreationUncertain = true
+				result.RecoveryReason = err.Error()
+				return commitPaymentStart(order, result, task, runnerID)
+			}
 			if order.Provider == model.PaymentProviderCreem || order.Provider == model.PaymentProviderWaffoPancake {
 				return finishUnrecoverableRetainedCreate(order, task, runnerID,
 					"provider_create_uncertain", err.Error())
@@ -362,6 +385,10 @@ func recoverPaymentStart(ctx context.Context, provider PaymentProvider, order *m
 		}
 		return model.FinishPaymentTask(task, runnerID, status, code, "")
 	}
+	if order.Provider == model.PaymentProviderXorPay && event.EventType == "query:new" {
+		return retryPaymentTask(task, runnerID, model.PaymentTaskPhaseProviderCallStarted,
+			"provider_create_uncertain", errors.New("xorpay order exists but payment instructions are not recoverable"))
+	}
 	reason := "provider order exists but payment instructions cannot be recovered"
 	return finishPaymentTaskManualReview(order, task, runnerID,
 		"payment_instructions_unrecoverable", reason, reason)
@@ -385,16 +412,19 @@ func recoverAmbiguousXorPayCreate(ctx context.Context, provider PaymentProvider,
 	case "not_exist":
 		misses := task.RecoveryMisses + 1
 		phase := model.PaymentTaskPhaseProviderCallStarted
-		if misses >= paymentCreateRecoveryMisses {
+		if misses >= paymentXorPayRecoveryMisses {
 			phase = model.PaymentTaskPhaseReady
 			misses = 0
 		}
-		return model.RetryPaymentTask(task, runnerID, common.GetTimestamp()+3, phase,
+		return model.RetryPaymentTask(task, runnerID, common.GetTimestamp()+10, phase,
 			"provider_order_not_found", "xorpay did not find the order during create recovery", misses)
 	case "new":
-		reason := "provider order exists but its payment instructions cannot be recovered"
-		return finishPaymentTaskManualReview(order, task, runnerID,
-			"payment_instructions_unrecoverable", reason, reason)
+		// A provider-side order exists, so replaying Create is unsafe even though
+		// query2 cannot recover its QR. Keep the durable task active until a paid,
+		// failed or expired provider state arrives; the local expiry path releases
+		// the reservation without ever granting an entitlement.
+		return retryPaymentTask(task, runnerID, model.PaymentTaskPhaseProviderCallStarted,
+			"provider_create_uncertain", errors.New("xorpay order exists but payment instructions are not recoverable"))
 	case "payed", "success", "expire", "fee_error":
 		if _, processErr := processNormalizedPaymentEventForTask(event, task, runnerID); processErr != nil &&
 			!errors.Is(processErr, model.ErrPaymentManualReview) {
@@ -435,7 +465,13 @@ func commitPaymentStart(order *model.PaymentOrder, result *PaymentStart, task *m
 	if err := ensurePaymentReconcileTask(stored); err != nil {
 		return retryPaymentTask(task, runnerID, task.Phase, "reconcile_enqueue_failed", err)
 	}
-	return model.FinishPaymentTask(task, runnerID, model.PaymentTaskStatusSucceeded, "", "")
+	code := ""
+	detail := ""
+	if result.CreationUncertain {
+		code = "provider_create_uncertain"
+		detail = result.RecoveryReason
+	}
+	return model.FinishPaymentTask(task, runnerID, model.PaymentTaskStatusSucceeded, code, detail)
 }
 
 func ensurePaymentReconcileTask(order *model.PaymentOrder) error {

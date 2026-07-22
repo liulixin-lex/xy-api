@@ -43,6 +43,7 @@ import {
 import { formatPaymentDecimalAmount } from '@/features/wallet/lib/billing'
 import {
   createPaymentError,
+  filterEligibleSubscriptionQuoteMethods,
   getPaymentErrorMessage,
   getPublicPaymentChannelLabel,
   getPublicPaymentMethodLabel,
@@ -94,15 +95,20 @@ export function SubscriptionPurchaseDialog(props: Props) {
   } | null>(null)
 
   useEffect(() => {
-    const quoteRoutes = (props.paymentRoutes || []).filter(
-      (method) => method.checkout_mode === 'quote'
+    const quoteRoutes = filterEligibleSubscriptionQuoteMethods(
+      props.paymentRoutes || [],
+      props.plan?.plan.external_payment_route_ids
     )
-    if (props.open && quoteRoutes.length > 0) {
-      setSelectedPaymentMethod(quoteRoutes[0].route_id)
-    } else if (!props.open) {
+    if (props.open) {
+      setSelectedPaymentMethod(quoteRoutes[0]?.route_id || '')
+    } else {
       setSelectedPaymentMethod('')
     }
-  }, [props.open, props.paymentRoutes])
+  }, [
+    props.open,
+    props.paymentRoutes,
+    props.plan?.plan.external_payment_route_ids,
+  ])
 
   useEffect(() => {
     gatewayQuoteRef.current = null
@@ -113,8 +119,6 @@ export function SubscriptionPurchaseDialog(props: Props) {
   const plan = props.plan?.plan
   if (!plan) return null
 
-  const planCurrency = (plan.currency || 'USD').toUpperCase()
-  const externalCurrencySupported = planCurrency === 'USD'
   const externalPaymentRouteIDs = new Set(plan.external_payment_route_ids || [])
   const productRoute = props.paymentRoutes?.find(
     (method) =>
@@ -128,11 +132,10 @@ export function SubscriptionPurchaseDialog(props: Props) {
   )
   const hasProductCheckout = !!productRoute
   const hasDirectCheckout = !!directRoute
-  const unifiedMethods = externalCurrencySupported
-    ? (props.paymentRoutes || []).filter(
-        (method) => method.checkout_mode === 'quote'
-      )
-    : []
+  const unifiedMethods = filterEligibleSubscriptionQuoteMethods(
+    props.paymentRoutes || [],
+    plan.external_payment_route_ids
+  )
   const hasGatewayMethods = unifiedMethods.length > 0
   const hasAnyPayment =
     hasProductCheckout || hasDirectCheckout || hasGatewayMethods
@@ -394,15 +397,6 @@ export function SubscriptionPurchaseDialog(props: Props) {
             </AlertDescription>
           </Alert>
         )}
-
-        {!externalCurrencySupported &&
-          (props.paymentRoutes?.length ?? 0) > 0 && (
-            <Alert variant='destructive'>
-              <AlertDescription>
-                {t('Online payment is only available for USD access plans.')}
-              </AlertDescription>
-            </Alert>
-          )}
 
         <div className='flex flex-col gap-2 rounded-md border p-3'>
           {balanceCurrencySupported && (

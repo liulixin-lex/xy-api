@@ -138,6 +138,7 @@ const TopUp = () => {
   const [topupInfo, setTopupInfo] = useState({
     online_payment_available: false,
     payment_routes: [],
+    subscription_payment_routes: [],
     payment_products: [],
     payment_route_options: [],
     min_topup: 1,

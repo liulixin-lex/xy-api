@@ -11,22 +11,45 @@ import (
 
 func registerSystemSettingsRoutes(apiRouter *gin.RouterGroup) {
 	for _, route := range systemSettingsPermissionRoutes {
+		permissionDeniedCode := systemSettingsPermissionDeniedCode(route)
 		handlers := []gin.HandlerFunc{
 			middleware.AdminAuth(),
-			middleware.RequirePermission(route.permission),
+			middleware.RequirePermissionWithCode(route.permission, permissionDeniedCode),
 		}
 		for _, permission := range route.additionalPermissions {
-			handlers = append(handlers, middleware.RequirePermission(permission))
+			handlers = append(handlers, middleware.RequirePermissionWithCode(permission, permissionDeniedCode))
 		}
 		if route.criticalRateLimit {
 			handlers = append(handlers, middleware.CriticalRateLimit())
 		}
 		if route.secureVerification {
+			authRequiredCode := "dashboard_session_required"
+			if permissionDeniedCode == "payment_settings_permission_denied" {
+				authRequiredCode = "payment_settings_auth_required"
+			} else if permissionDeniedCode == "payment_operations_permission_denied" {
+				authRequiredCode = "payment_operations_auth_required"
+			}
+			handlers = append(handlers, middleware.DashboardSessionRequired(authRequiredCode))
 			handlers = append(handlers, middleware.SecureVerificationRequired())
 		}
 		handlers = append(handlers, route.handler)
 		apiRouter.Handle(route.method, route.path, handlers...)
 	}
+}
+
+func systemSettingsPermissionDeniedCode(route permissionRoute) string {
+	if route.permission == authz.PaymentOperationsManage {
+		return "payment_operations_permission_denied"
+	}
+	if route.permission == authz.PaymentGatewayManage {
+		return "payment_settings_permission_denied"
+	}
+	for _, permission := range route.additionalPermissions {
+		if permission == authz.PaymentGatewayManage {
+			return "payment_settings_permission_denied"
+		}
+	}
+	return "permission_denied"
 }
 
 var systemSettingsPermissionRoutes = []permissionRoute{
@@ -59,6 +82,7 @@ var systemSettingsPermissionRoutes = []permissionRoute{
 	{method: http.MethodPost, path: "/user/topup/complete", permission: authz.PaymentOperationsManage, secureVerification: true, handler: controller.AdminCompleteTopUp},
 	{method: http.MethodGet, path: "/subscription/admin/stripe/inventory", permission: authz.PaymentOperationsManage, handler: controller.AdminListStripeLegacySubscriptionInventory},
 	{method: http.MethodPost, path: "/subscription/admin/stripe/inventory/sync", permission: authz.PaymentOperationsManage, secureVerification: true, criticalRateLimit: true, handler: controller.AdminSyncStripeLegacySubscriptionInventory},
+	{method: http.MethodPost, path: "/subscription/admin/stripe/inventory/:id/cancel-at-period-end", permission: authz.PaymentOperationsManage, secureVerification: true, criticalRateLimit: true, handler: controller.AdminCancelStripeLegacySubscriptionAtPeriodEnd},
 	{method: http.MethodPost, path: "/option/payment_compliance", permission: authz.SystemSettingManage, additionalPermissions: []authz.Permission{authz.PaymentGatewayManage}, secureVerification: true, handler: controller.ConfirmPaymentCompliance},
 	{method: http.MethodGet, path: "/option/affiliate_rewards", permission: authz.SystemSettingManage, handler: controller.GetAdminAffiliateRewards},
 	{method: http.MethodGet, path: "/option/invite_link_batches", permission: authz.SystemSettingManage, handler: controller.ListInviteLinkBatches},

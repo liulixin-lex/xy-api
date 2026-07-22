@@ -222,6 +222,9 @@ export function normalizePublicTopupInfo(data: unknown): TopupInfo | null {
   const paymentRoutes = parsePaymentRoutes(
     raw.payment_routes ?? raw.pay_methods
   )
+  const subscriptionPaymentRoutes = parsePaymentRoutes(
+    raw.subscription_payment_routes ?? raw.payment_routes ?? raw.pay_methods
+  )
   const paymentProducts = parsePaymentProducts(raw.payment_products)
   const paymentRouteOptions = parsePaymentRouteOptions(
     raw.payment_route_options
@@ -238,6 +241,7 @@ export function normalizePublicTopupInfo(data: unknown): TopupInfo | null {
         ? raw.payment_compliance_terms_version
         : undefined,
     payment_routes: paymentRoutes,
+    subscription_payment_routes: subscriptionPaymentRoutes,
     payment_products: paymentProducts,
     payment_route_options: paymentRouteOptions,
     min_topup: Number.isSafeInteger(minTopup) && minTopup > 0 ? minTopup : 1,

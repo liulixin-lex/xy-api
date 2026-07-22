@@ -82,6 +82,7 @@ export function BillingReservationPanel() {
   const reservationsQuery = useQuery({
     queryKey: ['billing-reservations', filters, page, PAGE_SIZE],
     queryFn: () => listBillingReservations(filters, page, PAGE_SIZE),
+    meta: { skipGlobalError: true },
   })
   const reservations = reservationsQuery.data?.reservations ?? []
   const total = reservationsQuery.data?.total ?? 0

@@ -216,7 +216,7 @@ export const selfSubscriptionDataSchema = z.object({
 export type SelfSubscriptionData = z.infer<typeof selfSubscriptionDataSchema>
 
 // ============================================================================
-// Read-only Stripe Legacy Subscription Inventory
+// Stripe Legacy Subscription Inventory
 // ============================================================================
 
 export interface StripeLegacySubscription {
@@ -256,6 +256,7 @@ export interface StripeLegacySubscription {
   state_observed_at: number
   last_synced_at: number
   sync_source: string
+  expected_updated_at: number
 }
 
 export interface StripeInventoryPage {

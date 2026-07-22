@@ -40,6 +40,7 @@ import {
 } from '../../helpers/subscriptionFormat';
 import {
   createPaymentRequestId,
+  filterEligibleSubscriptionQuoteMethods,
   formatPaymentDecimal,
   getPaymentQuoteRoutePayload,
   getPaymentRouteId,
@@ -90,11 +91,23 @@ const SubscriptionPlansCard = ({
     () => getRouteMethods(paymentRoutes),
     [paymentRoutes],
   );
+  const eligibleQuoteMethods = useMemo(
+    () =>
+      filterEligibleSubscriptionQuoteMethods(
+        routeMethods,
+        selectedPlan?.plan?.external_payment_route_ids,
+      ),
+    [routeMethods, selectedPlan?.plan?.external_payment_route_ids],
+  );
   const openBuy = (p) => {
     paymentAttemptRef.current = { key: '', quote: null, requestId: '' };
     setSelectedPlan(p);
+    const eligibleMethods = filterEligibleSubscriptionQuoteMethods(
+      routeMethods,
+      p?.plan?.external_payment_route_ids,
+    );
     setSelectedEpayMethod(
-      routeMethods?.[0] ? getPaymentRouteId(routeMethods[0]) : '',
+      eligibleMethods[0] ? getPaymentRouteId(eligibleMethods[0]) : '',
     );
     setOpen(true);
   };
@@ -264,7 +277,7 @@ const SubscriptionPlansCard = ({
       showError(t('请选择支付方式'));
       return;
     }
-    const method = routeMethods.find(
+    const method = eligibleQuoteMethods.find(
       (candidate) => getPaymentRouteId(candidate) === selectedEpayMethod,
     );
     if (!method) return;
@@ -784,7 +797,7 @@ const SubscriptionPlansCard = ({
         selectedEpayMethod={selectedEpayMethod}
         setSelectedEpayMethod={handleEpayMethodChange}
         paymentRoutes={paymentRoutes}
-        quoteMethods={routeMethods}
+        quoteMethods={eligibleQuoteMethods}
         purchaseLimitInfo={
           selectedPlan?.plan?.id
             ? {

@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
+
 import type { ApiResponse, PasskeyOptionsPayload, PasskeyStatus } from './types'
 
 export async function getPasskeyStatus(): Promise<ApiResponse<PasskeyStatus>> {
@@ -71,7 +72,9 @@ export async function beginPasskeyVerification(): Promise<
   ApiResponse<PasskeyOptionsPayload>
 > {
   const res = await api.post<ApiResponse<PasskeyOptionsPayload>>(
-    '/api/user/passkey/verify/begin'
+    '/api/user/passkey/verify/begin',
+    undefined,
+    { skipBusinessError: true, skipErrorHandler: true }
   )
   return res.data
 }
@@ -81,7 +84,8 @@ export async function finishPasskeyVerification(
 ): Promise<ApiResponse> {
   const res = await api.post<ApiResponse>(
     '/api/user/passkey/verify/finish',
-    payload
+    payload,
+    { skipBusinessError: true, skipErrorHandler: true }
   )
   return res.data
 }

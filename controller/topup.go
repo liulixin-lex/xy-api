@@ -48,25 +48,129 @@ type publicTopUpRouteOptionView struct {
 	PublicLabel string `json:"public_label"`
 }
 
+// selectPublicTopUpRoutesForUser keeps provider fallback internal while an
+// ordinary user sees one choice for each Alipay/WeChat brand. Selection happens
+// after provider readiness checks, so an unavailable first provider cannot hide
+// a later healthy route. WeChat browser checkout is preferred only where JSAPI
+// can actually run; outside WeChat those routes are omitted.
+func selectPublicTopUpRoutesForUser(routes []publicTopUpRouteView, userAgent string) []publicTopUpRouteView {
+	preferredWeChatRouteID := ""
+	isWeChatBrowser := strings.Contains(strings.ToLower(userAgent), "micromessenger")
+	for _, route := range routes {
+		if route.PublicMethod != "wechat_pay" {
+			continue
+		}
+		isJSAPI := route.ChannelAlias == "wechat_browser" || route.ChannelAlias == "jsapi"
+		if isWeChatBrowser {
+			if isJSAPI {
+				preferredWeChatRouteID = route.RouteID
+				break
+			}
+			if preferredWeChatRouteID == "" {
+				preferredWeChatRouteID = route.RouteID
+			}
+			continue
+		}
+		if !isJSAPI && preferredWeChatRouteID == "" {
+			preferredWeChatRouteID = route.RouteID
+		}
+	}
+
+	selected := make([]publicTopUpRouteView, 0, len(routes))
+	alipaySelected := false
+	for _, route := range routes {
+		switch route.PublicMethod {
+		case "alipay":
+			if alipaySelected {
+				continue
+			}
+			alipaySelected = true
+		case "wechat_pay":
+			if route.RouteID != preferredWeChatRouteID {
+				continue
+			}
+		}
+		selected = append(selected, route)
+	}
+	return selected
+}
+
 func GetTopUpInfo(c *gin.Context) {
-	publicRoutes, err := service.PublicPaymentRoutes()
-	if err != nil {
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
 		logger.LogWarn(c.Request.Context(), fmt.Sprintf("用户支付方式同步失败 user_id=%d error=%q", c.GetInt("id"), err.Error()))
 		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
 		return
 	}
 	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
 	defer unlockPaymentConfiguration()
+	publicRoutes, err := service.PublicPaymentRoutesLocked()
+	if err != nil {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("用户支付方式同步失败 user_id=%d error=%q", c.GetInt("id"), err.Error()))
+		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
+		return
+	}
 	complianceConfirmed := isPaymentComplianceConfirmedLocked()
 	credentialStorageReady := model.PaymentSecretStorageReady()
 	enableEpay := credentialStorageReady && isEpayTopUpEnabledLocked()
 	enableStripe := credentialStorageReady && isStripeTopUpEnabledLocked()
 	enableXorPay := credentialStorageReady && isXorPayTopUpEnabledLocked()
+	enableCreem := credentialStorageReady && isCreemTopUpEnabledLocked()
+	enableWaffo := credentialStorageReady && isWaffoTopUpEnabledLocked()
+	enableWaffoPancake := credentialStorageReady && isWaffoPancakeTopUpEnabledLocked()
+	var creemProducts []CreemProduct
+	if enableCreem {
+		var parseErr error
+		creemProducts, parseErr = parseValidatedCreemProducts(setting.CreemProducts)
+		if parseErr != nil {
+			enableCreem = false
+			logger.LogWarn(c.Request.Context(), fmt.Sprintf("固定产品支付配置无效 user_id=%d error=%q", c.GetInt("id"), parseErr.Error()))
+		}
+	}
 
 	paymentRoutes := make([]publicTopUpRouteView, 0, len(publicRoutes)+3)
+	subscriptionPaymentRoutes := make([]publicTopUpRouteView, 0, len(publicRoutes))
 	paymentProducts := make([]publicTopUpProductView, 0)
 	paymentRouteOptions := make([]publicTopUpRouteOptionView, 0)
+	catalogRoutesByID := make(map[string]service.PublicPaymentRoute, len(publicRoutes))
 	for _, route := range publicRoutes {
+		if service.ValidatePaymentRouteForOrderKind(
+			route.Provider, route.PaymentMethod, model.PaymentOrderKindSubscription,
+		) == nil {
+			subscriptionCheckoutMode := publicCheckoutModeQuote
+			subscriptionCurrency := route.Currency
+			subscriptionEligible := true
+			switch route.Provider {
+			case model.PaymentProviderEpay:
+				subscriptionCurrency = "CNY"
+			case model.PaymentProviderStripe:
+				subscriptionCurrency = strings.ToUpper(setting.StripeCurrency)
+			case model.PaymentProviderXorPay:
+				subscriptionCurrency = strings.ToUpper(setting.XorPayCurrency)
+			case model.PaymentProviderCreem:
+				subscriptionEligible = route.PaymentMethod == model.PaymentMethodCreem
+				subscriptionCheckoutMode = publicCheckoutModeProduct
+			case model.PaymentProviderWaffoPancake:
+				subscriptionEligible = route.PaymentMethod == model.PaymentMethodWaffoPancake
+				subscriptionCheckoutMode = publicCheckoutModeDirect
+				subscriptionCurrency = "USD"
+			default:
+				// Waffo's option checkout has no subscription pricing contract.
+				subscriptionEligible = false
+			}
+			if subscriptionEligible {
+				subscriptionPaymentRoutes = append(subscriptionPaymentRoutes, publicTopUpRouteView{
+					RouteID: route.RouteID, PublicMethod: route.PublicMethod, ChannelAlias: route.ChannelAlias,
+					CheckoutMode: subscriptionCheckoutMode, Currency: subscriptionCurrency,
+				})
+			}
+		}
+		if service.ValidatePaymentRouteForOrderKind(
+			route.Provider, route.PaymentMethod, model.PaymentOrderKindTopUp,
+		) != nil {
+			continue
+		}
+
+		checkoutMode := publicCheckoutModeQuote
 		switch route.Provider {
 		case model.PaymentProviderEpay:
 			if !enableEpay {
@@ -95,6 +199,23 @@ func GetTopUpInfo(c *gin.Context) {
 				continue
 			}
 			route.Currency = strings.ToUpper(setting.XorPayCurrency)
+		case model.PaymentProviderCreem:
+			if !enableCreem || route.PaymentMethod != model.PaymentMethodCreem {
+				continue
+			}
+			checkoutMode = publicCheckoutModeProduct
+		case model.PaymentProviderWaffo:
+			if !enableWaffo || route.PaymentMethod != model.PaymentMethodWaffo {
+				continue
+			}
+			checkoutMode = publicCheckoutModeOption
+			route.Currency = strings.ToUpper(strings.TrimSpace(getWaffoCurrency()))
+		case model.PaymentProviderWaffoPancake:
+			if !enableWaffoPancake || route.PaymentMethod != model.PaymentMethodWaffoPancake {
+				continue
+			}
+			checkoutMode = publicCheckoutModeDirect
+			route.Currency = "USD"
 		default:
 			continue
 		}
@@ -106,96 +227,56 @@ func GetTopUpInfo(c *gin.Context) {
 			RouteID:      route.RouteID,
 			PublicMethod: route.PublicMethod,
 			ChannelAlias: route.ChannelAlias,
-			CheckoutMode: publicCheckoutModeQuote,
+			CheckoutMode: checkoutMode,
 			Currency:     route.Currency,
 			MinimumTopUp: minimumTopUp,
 		})
+		catalogRoutesByID[route.RouteID] = route
 	}
 	if !complianceConfirmed {
 		paymentRoutes = []publicTopUpRouteView{}
+		subscriptionPaymentRoutes = []publicTopUpRouteView{}
+	} else {
+		paymentRoutes = selectPublicTopUpRoutesForUser(paymentRoutes, c.Request.UserAgent())
+		subscriptionPaymentRoutes = selectPublicTopUpRoutesForUser(subscriptionPaymentRoutes, c.Request.UserAgent())
+	}
+	activeCatalogRoutes := make(map[string]service.PublicPaymentRoute, len(paymentRoutes))
+	for _, routeView := range paymentRoutes {
+		route, exists := catalogRoutesByID[routeView.RouteID]
+		if !exists {
+			continue
+		}
+		activeCatalogRoutes[route.Provider+"\x00"+route.PaymentMethod] = route
 	}
 
-	// Retained checkout integrations receive public routes, but their product
-	// and option selectors use separate opaque token namespaces. Real product
-	// IDs, gateway method values and configuration indexes never cross this
-	// response boundary.
-	enableCreem := complianceConfirmed && isCreemTopUpEnabledLocked()
-	if enableCreem {
-		products, parseErr := parseValidatedCreemProducts(setting.CreemProducts)
-		if parseErr != nil {
-			logger.LogWarn(c.Request.Context(), fmt.Sprintf("固定产品支付配置无效 user_id=%d error=%q", c.GetInt("id"), parseErr.Error()))
-		} else {
-			routeID := operation_setting.PublicPaymentRouteID(model.PaymentProviderCreem, model.PaymentMethodCreem)
-			paymentRoutes = append(paymentRoutes, publicTopUpRouteView{
-				RouteID:      routeID,
-				PublicMethod: "online_payment",
-				ChannelAlias: "product_checkout",
-				CheckoutMode: publicCheckoutModeProduct,
-			})
-			for _, product := range products {
-				amountMinor, amountErr := model.ProviderPaymentAmountToMinor(
-					product.Price,
+	// Retained product and option selectors can only attach to an active route
+	// from the canonical PayMethods catalog. Real provider IDs and configuration
+	// indexes remain behind separate opaque selector namespaces.
+	if route, ok := activeCatalogRoutes[model.PaymentProviderCreem+"\x00"+model.PaymentMethodCreem]; ok {
+		for _, product := range creemProducts {
+			amountMinor, amountErr := model.ProviderPaymentAmountToMinor(
+				product.Price,
+				model.PaymentProviderCreem,
+				product.Currency,
+			)
+			if amountErr != nil || amountMinor <= 0 {
+				continue
+			}
+			paymentProducts = append(paymentProducts, publicTopUpProductView{
+				ProductID: service.PublicRetainedProductID(
 					model.PaymentProviderCreem,
-					product.Currency,
-				)
-				if amountErr != nil || amountMinor <= 0 {
-					continue
-				}
-				paymentProducts = append(paymentProducts, publicTopUpProductView{
-					ProductID: service.PublicRetainedProductID(
-						model.PaymentProviderCreem,
-						product.ProductId,
-					),
-					RouteID:       routeID,
-					Name:          service.PublicPaymentLabel(product.Name, "Online payment"),
-					PaymentAmount: formatPublicPaymentAmount(amountMinor, product.Price, model.PaymentProviderCreem, product.Currency),
-					Currency:      product.Currency,
-					TopUpAmount:   product.Quota,
-				})
-			}
+					product.ProductId,
+				),
+				RouteID:       route.RouteID,
+				Name:          service.PublicPaymentLabel(product.Name, "Online payment"),
+				PaymentAmount: formatPublicPaymentAmount(amountMinor, product.Price, model.PaymentProviderCreem, product.Currency),
+				Currency:      product.Currency,
+				TopUpAmount:   product.Quota,
+			})
 		}
 	}
 
-	enableWaffoPancake := complianceConfirmed && isWaffoPancakeTopUpEnabledLocked()
-	if enableWaffoPancake {
-		routeID := operation_setting.PublicPaymentRouteID(model.PaymentProviderWaffoPancake, model.PaymentMethodWaffoPancake)
-		publicMethod := "online_payment"
-		channelAlias := "hosted_checkout"
-		for _, route := range publicRoutes {
-			if route.Provider == model.PaymentProviderWaffoPancake && route.PaymentMethod == model.PaymentMethodWaffoPancake {
-				routeID = route.RouteID
-				publicMethod = route.PublicMethod
-				channelAlias = route.ChannelAlias
-				break
-			}
-		}
-		minimumTopUp := int64(setting.WaffoPancakeMinTopUp)
-		if minimum, minimumErr := service.EffectivePaymentMethodMinimum(
-			model.PaymentProviderWaffoPancake,
-			model.PaymentMethodWaffoPancake,
-		); minimumErr == nil {
-			minimumTopUp = minimum
-		}
-		paymentRoutes = append(paymentRoutes, publicTopUpRouteView{
-			RouteID:      routeID,
-			PublicMethod: publicMethod,
-			ChannelAlias: channelAlias,
-			CheckoutMode: publicCheckoutModeDirect,
-			Currency:     "USD",
-			MinimumTopUp: minimumTopUp,
-		})
-	}
-	enableWaffo := complianceConfirmed && isWaffoTopUpEnabledLocked()
-	if enableWaffo {
-		routeID := operation_setting.PublicPaymentRouteID(model.PaymentProviderWaffo, model.PaymentMethodWaffo)
-		paymentRoutes = append(paymentRoutes, publicTopUpRouteView{
-			RouteID:      routeID,
-			PublicMethod: "online_payment",
-			ChannelAlias: "payment_options",
-			CheckoutMode: publicCheckoutModeOption,
-			Currency:     strings.ToUpper(strings.TrimSpace(getWaffoCurrency())),
-			MinimumTopUp: int64(setting.WaffoMinTopUp),
-		})
+	if route, ok := activeCatalogRoutes[model.PaymentProviderWaffo+"\x00"+model.PaymentMethodWaffo]; ok {
 		for _, method := range setting.GetWaffoPayMethods() {
 			optionID := service.PublicRetainedOptionID(
 				model.PaymentProviderWaffo,
@@ -206,7 +287,7 @@ func GetTopUpInfo(c *gin.Context) {
 			}
 			paymentRouteOptions = append(paymentRouteOptions, publicTopUpRouteOptionView{
 				OptionID:    optionID,
-				RouteID:     routeID,
+				RouteID:     route.RouteID,
 				PublicLabel: publicWaffoPayMethodLabel(method.PayMethodType, method.PayMethodName),
 			})
 		}
@@ -218,6 +299,7 @@ func GetTopUpInfo(c *gin.Context) {
 		"payment_compliance_confirmed":     complianceConfirmed,
 		"payment_compliance_terms_version": operation_setting.CurrentComplianceTermsVersion,
 		"payment_routes":                   paymentRoutes,
+		"subscription_payment_routes":      subscriptionPaymentRoutes,
 		"payment_products":                 paymentProducts,
 		"payment_route_options":            paymentRouteOptions,
 		"min_topup":                        operation_setting.MinTopUp,

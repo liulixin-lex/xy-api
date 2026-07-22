@@ -19,7 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { buildLegacySubscriptionResolutionRequest } from './legacy-subscription-resolution'
+import {
+  buildLegacySubscriptionResolutionRequest,
+  isStripeLegacyRecurringCheckoutReview,
+} from './legacy-subscription-resolution'
 import type { PaymentEvent } from './types'
 
 const event = {
@@ -29,6 +32,22 @@ const event = {
 } as PaymentEvent
 
 describe('legacy subscription terminal resolution form', () => {
+  test('distinguishes the Stripe recurring Checkout review explanation', () => {
+    assert.equal(
+      isStripeLegacyRecurringCheckoutReview({
+        review_code: 'stripe_legacy_recurring_checkout_paid',
+      }),
+      true
+    )
+    assert.equal(
+      isStripeLegacyRecurringCheckoutReview({
+        review_code: 'legacy_subscription_contract_unavailable',
+      }),
+      false
+    )
+    assert.equal(isStripeLegacyRecurringCheckoutReview(null), false)
+  })
+
   test('builds only the external refund contract', () => {
     assert.deepEqual(
       buildLegacySubscriptionResolutionRequest(
@@ -42,6 +61,27 @@ describe('legacy subscription terminal resolution form', () => {
         resolution: 'external_refund',
         provider_refund_reference: 'refund-subscription-23',
         reason: 'Provider confirms that the full payment was refunded.',
+      }
+    )
+  })
+
+  test('uses the same server-authorized contract for Stripe review events', () => {
+    assert.deepEqual(
+      buildLegacySubscriptionResolutionRequest(
+        {
+          ...event,
+          provider: 'stripe',
+          review_code: 'stripe_legacy_recurring_checkout_paid',
+        },
+        're_123456789',
+        'Stripe shows the full refund as completed for this Checkout.'
+      ),
+      {
+        event_id: 23,
+        expected_event_attempts: 4,
+        resolution: 'external_refund',
+        provider_refund_reference: 're_123456789',
+        reason: 'Stripe shows the full refund as completed for this Checkout.',
       }
     )
   })

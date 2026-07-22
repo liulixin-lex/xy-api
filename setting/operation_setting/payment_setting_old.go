@@ -25,7 +25,13 @@ var paymentMethodAllowedFields = map[string]struct{}{
 	"route_id": {}, "public_method": {}, "channel_alias": {},
 }
 
-const maxConfiguredPaymentMethodMinimum = 10_000
+const (
+	// Older releases allowed 20 explicit entries and then appended as many as
+	// seven provider routes at runtime. The canonical catalog keeps that exact
+	// worst-case capacity so upgrading a full legacy catalog cannot drop a route.
+	maxConfiguredPaymentMethods       = 27
+	maxConfiguredPaymentMethodMinimum = 10_000
+)
 
 var PayAddress = ""
 var CustomCallbackAddress = ""
@@ -35,29 +41,36 @@ var Price = 7.3
 var MinTopUp = 1
 var USDExchangeRate = 7.3
 
-var PayMethods = []map[string]string{
-	{
-		"name":     "支付宝",
-		"icon":     "SiAlipay",
-		"type":     "alipay",
-		"provider": "epay",
-		"flow":     "form_post",
-	},
-	{
-		"name":     "微信",
-		"icon":     "SiWechat",
-		"type":     "wxpay",
-		"provider": "epay",
-		"flow":     "form_post",
-	},
-	{
-		"name":      "自定义1",
-		"icon":      "LuCreditCard",
-		"type":      "custom1",
-		"provider":  "epay",
-		"flow":      "form_post",
-		"min_topup": "50",
-	},
+var PayMethods = DefaultPayMethods()
+
+// DefaultPayMethods returns a fresh copy so startup migrations can persist the
+// legacy in-memory defaults without sharing mutable maps with the live option
+// snapshot.
+func DefaultPayMethods() []map[string]string {
+	return []map[string]string{
+		{
+			"name":     "支付宝",
+			"icon":     "SiAlipay",
+			"type":     "alipay",
+			"provider": "epay",
+			"flow":     "form_post",
+		},
+		{
+			"name":     "微信",
+			"icon":     "SiWechat",
+			"type":     "wxpay",
+			"provider": "epay",
+			"flow":     "form_post",
+		},
+		{
+			"name":      "自定义1",
+			"icon":      "LuCreditCard",
+			"type":      "custom1",
+			"provider":  "epay",
+			"flow":      "form_post",
+			"min_topup": "50",
+		},
+	}
 }
 
 func UpdatePayMethodsByJsonString(jsonString string) error {
@@ -74,7 +87,7 @@ func ParsePayMethodsByJsonString(jsonString string) ([]map[string]string, error)
 	if err := common.UnmarshalJsonStr(jsonString, &parsed); err != nil {
 		return nil, err
 	}
-	if len(parsed) > 20 {
+	if len(parsed) > maxConfiguredPaymentMethods {
 		return nil, fmt.Errorf("too many payment methods")
 	}
 	seenMethods := make(map[string]struct{}, len(parsed))
@@ -110,6 +123,16 @@ func ParsePayMethodsByJsonString(jsonString string) ([]map[string]string, error)
 		case "stripe":
 			if methodType != "stripe" {
 				return nil, fmt.Errorf("stripe payment method must use type stripe")
+			}
+			flow = "hosted_redirect"
+		case "creem":
+			if methodType != "creem" {
+				return nil, fmt.Errorf("Creem payment method must use type creem")
+			}
+			flow = "hosted_redirect"
+		case "waffo":
+			if methodType != "waffo" {
+				return nil, fmt.Errorf("Waffo payment method must use type waffo")
 			}
 			flow = "hosted_redirect"
 		case "xorpay":
@@ -208,6 +231,8 @@ func DefaultPublicPaymentMethod(provider, paymentMethod string) string {
 		return "wechat_pay"
 	case provider == "stripe":
 		return "card"
+	case provider == "creem" || provider == "waffo":
+		return "online_payment"
 	case provider == "waffo_pancake":
 		return "online_payment"
 	default:
@@ -228,6 +253,10 @@ func DefaultPaymentChannelAlias(provider, paymentMethod string) string {
 		}
 	case "stripe":
 		return "checkout"
+	case "creem":
+		return "product_checkout"
+	case "waffo":
+		return "payment_options"
 	case "waffo_pancake":
 		return "hosted_checkout"
 	case "epay":

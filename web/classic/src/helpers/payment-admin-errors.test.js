@@ -31,6 +31,154 @@ import {
 const t = (key) => `translated:${key}`;
 
 describe('classic payment administrator errors', () => {
+  test('prefers the backend business code over Axios transport codes', () => {
+    const error = {
+      code: 'ERR_BAD_REQUEST',
+      message: 'Request failed with status code 403',
+      response: {
+        data: {
+          code: 'payment_settings_auth_required',
+          message: 'backend permission detail',
+        },
+      },
+    };
+
+    assert.equal(
+      getPaymentAdminErrorCode(error),
+      'payment_settings_auth_required',
+    );
+    const message = getPaymentAdminErrorMessage(error, t, 'fallback');
+    assert.match(
+      message,
+      /translated:You are not authorized to change payment settings/,
+    );
+    assert.doesNotMatch(
+      message,
+      /ERR_BAD_REQUEST|403|backend permission detail/,
+    );
+  });
+
+  test('does not surface Axios transport text when the response has no business code', () => {
+    const error = {
+      code: 'ERR_BAD_REQUEST',
+      message: 'Request failed with status code 400',
+      response: { data: {} },
+    };
+
+    assert.equal(getPaymentAdminErrorCode(error), null);
+    assert.equal(
+      getPaymentAdminErrorMessage(error, t, 'translated:fallback'),
+      'translated:fallback',
+    );
+  });
+
+  test('maps Stripe cancellation failures without exposing provider diagnostics', () => {
+    const cases = [
+      'stripe_inventory_cancel_invalid',
+      'stripe_inventory_subscription_not_found',
+      'stripe_inventory_cancel_conflict',
+      'stripe_inventory_cancel_not_configured',
+      'stripe_inventory_cancel_account_mismatch',
+      'stripe_inventory_cancel_mode_mismatch',
+      'stripe_inventory_cancel_unavailable',
+      'payment_operations_auth_required',
+    ];
+    for (const code of cases) {
+      const message = getPaymentAdminErrorMessage(
+        {
+          response: {
+            data: {
+              code,
+              message: 'sk_live secret and raw Stripe response detail',
+            },
+          },
+        },
+        t,
+        'fallback',
+      );
+      assert.match(message, /^translated:/);
+      assert.match(message, new RegExp(`\\(${code}\\)$`));
+      assert.doesNotMatch(message, /sk_live|raw Stripe response|fallback/);
+    }
+  });
+
+  test('ignores a transport message nested in the Axios response body', () => {
+    const error = {
+      code: 'ERR_BAD_REQUEST',
+      response: {
+        data: { message: 'Request failed with status code 400' },
+      },
+    };
+
+    assert.equal(
+      getPaymentAdminErrorMessage(error, t, 'translated:fallback'),
+      'translated:fallback',
+    );
+  });
+
+  test('maps scoped permission codes instead of showing a transport error', () => {
+    const error = {
+      code: 'ERR_BAD_REQUEST',
+      response: {
+        status: 403,
+        data: { code: 'payment_operations_permission_denied' },
+      },
+    };
+
+    assert.equal(
+      getPaymentAdminErrorCode(error),
+      'payment_operations_permission_denied',
+    );
+    const message = getPaymentAdminErrorMessage(error, t, 'fallback');
+    assert.match(
+      message,
+      /translated:You do not have permission to perform this payment administration action/,
+    );
+    assert.doesNotMatch(message, /ERR_BAD_REQUEST|403/);
+  });
+
+  test('finds a nested business code when an adapter wraps the response', () => {
+    const error = {
+      code: 'ERR_BAD_REQUEST',
+      response: { data: { data: { code: 'payment_settings_field_invalid' } } },
+    };
+
+    assert.equal(
+      getPaymentAdminErrorCode(error),
+      'payment_settings_field_invalid',
+    );
+    assert.match(
+      getPaymentAdminErrorMessage(error, t, 'fallback'),
+      /translated:One or more payment settings fields are invalid/,
+    );
+  });
+
+  test('preserves the backend code when creating an error from Axios', () => {
+    const error = createPaymentAdminError(
+      {
+        code: 'ERR_BAD_REQUEST',
+        response: {
+          status: 403,
+          data: {
+            code: 'payment_settings_permission_denied',
+            message: 'raw permission detail',
+          },
+        },
+      },
+      'fallback',
+    );
+
+    assert.equal(
+      getPaymentAdminErrorCode(error),
+      'payment_settings_permission_denied',
+    );
+    assert.equal(error.response.status, 403);
+    assert.doesNotMatch(
+      getPaymentAdminErrorMessage(error, t, 'fallback'),
+      /raw permission detail|ERR_BAD_REQUEST|403/,
+    );
+  });
+
   test('translates stable codes and exposes them only as administrator diagnostics', () => {
     const error = createPaymentAdminError(
       { code: 'payment_limit_timezone_locked' },

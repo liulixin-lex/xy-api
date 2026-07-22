@@ -111,6 +111,11 @@ import { CreemProductsVisualEditor } from './creem-products-visual-editor'
 import { isSecurePaymentCallbackOrigin } from './payment-callback-origin'
 import { PaymentMethodsVisualEditor } from './payment-methods-visual-editor'
 import {
+  isPaymentMethodProviderTypeValid,
+  MAX_CONFIGURED_PAYMENT_METHODS,
+  validatePaymentMethodCollection,
+} from './payment-methods-visual-editor-utils'
+import {
   selectPaymentSettingUpdates,
   type PaymentSettingsTab,
 } from './payment-settings-scope'
@@ -165,6 +170,8 @@ function isSecureHttpUrl(
 
 function inferPaymentProvider(type: string): string {
   if (type === 'stripe') return 'stripe'
+  if (type === 'creem') return 'creem'
+  if (type === 'waffo') return 'waffo'
   if (type.startsWith('xorpay_')) return 'xorpay'
   if (type === 'waffo_pancake') return 'waffo_pancake'
   return 'epay'
@@ -176,8 +183,10 @@ function validatePaymentMethodsJson(value: string): string | null {
   if (!value.trim()) return null
 
   const parsed = JSON.parse(value) as unknown[]
-  if (parsed.length > 20) return 'No more than 20 payment methods are allowed'
-  const types = new Set<string>()
+  if (parsed.length > MAX_CONFIGURED_PAYMENT_METHODS) {
+    return 'No more than 27 payment methods are allowed'
+  }
+  const normalizedMethods = []
   for (const item of parsed) {
     if (!item || typeof item !== 'object') return 'Invalid payment method entry'
     const method = item as Record<string, unknown>
@@ -194,27 +203,28 @@ function validatePaymentMethodsJson(value: string): string | null {
       return 'Use 1 to 64 letters, numbers, underscores, or hyphens.'
     }
     const paymentType = method.type.trim()
-    if (types.has(paymentType)) return 'Payment type keys must be unique'
-    types.add(paymentType)
 
     const provider =
       typeof method.provider === 'string'
-        ? method.provider
+        ? method.provider.trim().toLowerCase()
         : inferPaymentProvider(paymentType)
-    if (!['epay', 'stripe', 'xorpay', 'waffo_pancake'].includes(provider)) {
+    if (
+      !['epay', 'stripe', 'xorpay', 'creem', 'waffo', 'waffo_pancake'].includes(
+        provider
+      )
+    ) {
       return 'Unsupported payment provider'
     }
-    const providerMatchesType =
-      provider === 'epay' ||
-      (provider === 'stripe' && paymentType === 'stripe') ||
-      (provider === 'xorpay' &&
-        (paymentType === 'xorpay_native' ||
-          paymentType === 'xorpay_alipay' ||
-          paymentType === 'xorpay_jsapi')) ||
-      (provider === 'waffo_pancake' && paymentType === 'waffo_pancake')
-    if (!providerMatchesType) {
+    if (!isPaymentMethodProviderTypeValid(provider, paymentType)) {
       return 'The payment type key does not match the selected provider.'
     }
+    const normalizedPaymentType =
+      provider === 'epay' ? paymentType : paymentType.toLowerCase()
+    normalizedMethods.push({
+      name: method.name.trim(),
+      type: normalizedPaymentType,
+      provider,
+    })
     if (
       (typeof method.icon === 'string' && method.icon.length > 64) ||
       (typeof method.color === 'string' && method.color.length > 64)
@@ -232,6 +242,12 @@ function validatePaymentMethodsJson(value: string): string | null {
       }
     }
   }
+  if (
+    validatePaymentMethodCollection(normalizedMethods) ===
+    'duplicate_payment_method'
+  ) {
+    return 'Payment type keys must be unique'
+  }
   return null
 }
 
@@ -239,15 +255,19 @@ function normalizePaymentMethodsJson(value: string): string {
   if (!value.trim()) return '[]'
   const parsed = JSON.parse(value) as Array<Record<string, unknown>>
   return JSON.stringify(
-    parsed.map((method) => ({
-      ...method,
-      name: String(method.name || '').trim(),
-      type: String(method.type || '').trim(),
-      provider:
+    parsed.map((method) => {
+      const rawType = String(method.type || '').trim()
+      const provider =
         typeof method.provider === 'string'
-          ? method.provider.trim()
-          : inferPaymentProvider(String(method.type || '').trim()),
-    }))
+          ? method.provider.trim().toLowerCase()
+          : inferPaymentProvider(rawType)
+      return {
+        ...method,
+        name: String(method.name || '').trim(),
+        type: provider === 'epay' ? rawType : rawType.toLowerCase(),
+        provider,
+      }
+    })
   )
 }
 
@@ -999,6 +1019,7 @@ export function PaymentSettingsSection({
 
   const paymentSettingsMutation = useMutation({
     mutationFn: updatePaymentSettings,
+    meta: { skipGlobalError: true },
   })
 
   React.useEffect(() => {
@@ -1041,14 +1062,10 @@ export function PaymentSettingsSection({
               queryKey: ['system-options'],
             })
           }
-          throw new Error(
-            getPaymentAdminErrorMessage(
-              error,
-              t,
-              t('Failed to update setting')
-            ),
-            { cause: error }
-          )
+          // Keep the original Axios response intact. The verification hook
+          // needs the HTTP status and business code to open the step-up dialog.
+          // The outer submit handler owns the final user-facing notification.
+          throw error
         }
       },
       {
@@ -2995,7 +3012,7 @@ export function PaymentSettingsSection({
                     </AlertTitle>
                     <AlertDescription>
                       {t(
-                        'Unified top-ups and purchases use Stripe Checkout in payment mode. Legacy recurring subscription inventory is separate, read-only, and appears in Payment Operations only when historical records exist.'
+                        'Unified top-ups and purchases use Stripe Checkout in payment mode. Legacy recurring subscription observations are separate; Payment Operations can refresh them and, after verification, schedule renewal cancellation at period end without changing local access.'
                       )}
                     </AlertDescription>
                   </Alert>
@@ -3038,7 +3055,7 @@ export function PaymentSettingsSection({
                       </li>
                       <li>
                         {t(
-                          'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Otherwise use "Sync from Stripe" in Payment Operations when you need to refresh that read-only inventory.'
+                          'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Use "Sync from Stripe" in Payment Operations to refresh observations; scheduling cancellation at period end is a separate verified action.'
                         )}
                       </li>
                       <li>

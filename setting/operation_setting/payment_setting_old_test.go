@@ -30,6 +30,21 @@ func TestParsePayMethodsRejectsReservedTypesOnEpay(t *testing.T) {
 	}
 }
 
+func TestParsePayMethodsPreservesHistoricalCustomEpayTypes(t *testing.T) {
+	methods, err := ParsePayMethodsByJsonString(`[
+		{"name":"Legacy product checkout","type":"creem","provider":"epay"},
+		{"name":"Legacy payment options","type":"waffo","provider":"epay"}
+	]`)
+	require.NoError(t, err)
+	require.Len(t, methods, 2)
+	assert.Equal(t, "epay", methods[0]["provider"])
+	assert.Equal(t, "creem", methods[0]["type"])
+	assert.Equal(t, "form_post", methods[0]["flow"])
+	assert.Equal(t, "epay", methods[1]["provider"])
+	assert.Equal(t, "waffo", methods[1]["type"])
+	assert.Equal(t, "form_post", methods[1]["flow"])
+}
+
 func TestParsePayMethodsUsesProviderAndExactEpayTypeAsIdentity(t *testing.T) {
 	assert.NotEqual(t, paymentMethodIdentityKey("epay", "alipay"), paymentMethodIdentityKey("xorpay", "alipay"))
 
@@ -65,6 +80,21 @@ func TestParsePayMethodsAddsOpaqueStablePublicAliases(t *testing.T) {
 	assert.NotContains(t, routeID, "alipay")
 	assert.Equal(t, "alipay", first[0]["public_method"])
 	assert.Equal(t, "qr", first[0]["channel_alias"])
+}
+
+func TestParsePayMethodsSupportsEveryCatalogManagedHostedProvider(t *testing.T) {
+	methods, err := ParsePayMethodsByJsonString(`[
+		{"name":"Product checkout","type":"creem","provider":"creem"},
+		{"name":"Payment options","type":"waffo","provider":"waffo"}
+	]`)
+	require.NoError(t, err)
+	require.Len(t, methods, 2)
+	assert.Equal(t, "hosted_redirect", methods[0]["flow"])
+	assert.Equal(t, "online_payment", methods[0]["public_method"])
+	assert.Equal(t, "product_checkout", methods[0]["channel_alias"])
+	assert.Equal(t, "hosted_redirect", methods[1]["flow"])
+	assert.Equal(t, "online_payment", methods[1]["public_method"])
+	assert.Equal(t, "payment_options", methods[1]["channel_alias"])
 }
 
 func TestParsePayMethodsRejectsLeakingOrDuplicatePublicRouteIdentifiers(t *testing.T) {

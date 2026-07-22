@@ -22,6 +22,7 @@ import { describe, test } from 'node:test';
 
 import {
   detectPaymentBrowserEnvironment,
+  filterEligibleSubscriptionQuoteMethods,
   filterPaymentMethodsForBrowser,
   getPaymentQuoteRoutePayload,
   getPaymentRouteId,
@@ -29,6 +30,7 @@ import {
   getSafePaymentContinueUrl,
   getSafeWeChatAuthorizationUrl,
   getSafeUserPaymentError,
+  isSafeQrContent,
   isSafeJSAPIParameters,
   isPaymentReturnCancelled,
   normalizePaymentMethod,
@@ -45,6 +47,55 @@ const t = (key, values = {}) =>
   );
 
 describe('classic public payment presentation', () => {
+  test('accepts only trusted XORPay and Alipay QR destinations', () => {
+    const allowed = [
+      'weixin://wxpay/bizpayurl?pr=safe_token-123_ABC',
+      'weixin://wxpay/bizpayurl?p%72=safe%5Ftoken',
+      'https://qr.alipay.com/example',
+      'http://ipay.yltg.com.cn/pay/safe_token',
+      'https://IPAY.YLTG.COM.CN/pay/safe_token',
+      `https://ipay.yltg.com.cn/${'a'.repeat(2048)}`,
+    ];
+    const rejected = [
+      'weixin://wxpay/example',
+      'weixin://wxpay/bizpayurl',
+      'weixin://wxpay/bizpayurl?pr=',
+      'weixin://wxpay/bizpayurl?pr=safe.token',
+      'weixin://wxpay/bizpayurl?pr=first&pr=second',
+      'weixin://wxpay/bizpayurl?pr=safe&next=other',
+      `weixin://wxpay/bizpayurl?pr=${'a'.repeat(513)}`,
+      'weixin://WXPAY/bizpayurl?pr=safe_token',
+      'weixin://user@wxpay/bizpayurl?pr=safe_token',
+      'alipays://platformapi/startapp',
+      'javascript:alert(1)',
+      'https://evil.ipay.yltg.com.cn/pay/example',
+      'https://ipay.yltg.com.cn.evil.example/pay/example',
+      'https://user:pass@ipay.yltg.com.cn/pay/example',
+      'https://ipay.yltg.com.cn:8443/pay/example',
+      'https://ipay.yltg.com.cn:443/pay/example',
+      'https://ipay.yltg.com.cn/pay/example#fragment',
+      'https://ipay.yltg.com.cn/pay/example?token=safe',
+      'https://ipay.yltg.com.cn//pay/example',
+      'https://ipay.yltg.com.cn/pay/../example',
+      'https://ipay.yltg.com.cn/pay/example/..',
+      'https://ipay.yltg.com.cn/pay/%2e%2e/example',
+      `https://ipay.yltg.com.cn/${'a'.repeat(2049)}`,
+      'https://qr.alipay.com.evil.example/example',
+      'https://user:pass@qr.alipay.com/example',
+      'https://qr.alipay.com:8443/example',
+      'https://qr.alipay.com/example?token=safe',
+      'https://qr.alipay.com//evil.example',
+      'https://qr.alipay.com/https://evil.example',
+      'https://qr.alipay.com/../redirect',
+      'https://qr.alipay.com/%2F%2Fevil.example',
+      'https://qr.alipay.com/%2e%2e/redirect',
+      ' https://ipay.yltg.com.cn/pay/example',
+    ];
+
+    for (const value of allowed) assert.equal(isSafeQrContent(value), true);
+    for (const value of rejected) assert.equal(isSafeQrContent(value), false);
+  });
+
   test('treats only an explicit provider cancellation return as cancelled', () => {
     assert.equal(isPaymentReturnCancelled('?payment_result=cancelled'), true);
     assert.equal(isPaymentReturnCancelled('?payment_result=pending'), false);
@@ -55,7 +106,7 @@ describe('classic public payment presentation', () => {
     );
   });
 
-  test('selects the correct WeChat route for each browser environment', () => {
+  test('selects one public brand route for each browser environment', () => {
     const methods = [
       {
         route_id: 'wechat_native',
@@ -71,6 +122,16 @@ describe('classic public payment presentation', () => {
         route_id: 'alipay_qr',
         public_method: 'alipay',
         channel_alias: 'qr',
+      },
+      {
+        route_id: 'wechat_native_backup',
+        public_method: 'wechat_pay',
+        channel_alias: 'qr',
+      },
+      {
+        route_id: 'alipay_redirect_backup',
+        public_method: 'alipay',
+        channel_alias: 'redirect',
       },
     ];
 
@@ -98,6 +159,40 @@ describe('classic public payment presentation', () => {
       ),
       ['wechat_native'],
     );
+  });
+
+  test('shows and selects only subscription quote routes declared eligible', () => {
+    const methods = [
+      {
+        route_id: 'quote_allowed',
+        public_method: 'alipay',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'quote_unlisted',
+        public_method: 'wechat_pay',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'direct_allowed',
+        public_method: 'online_payment',
+        checkout_mode: 'direct',
+      },
+    ];
+
+    const eligible = filterEligibleSubscriptionQuoteMethods(methods, [
+      'quote_allowed',
+      'direct_allowed',
+    ]);
+    assert.deepEqual(
+      eligible.map((method) => method.route_id),
+      ['quote_allowed'],
+    );
+    assert.equal(eligible[0]?.route_id || '', 'quote_allowed');
+
+    const unavailable = filterEligibleSubscriptionQuoteMethods(methods, []);
+    assert.deepEqual(unavailable, []);
+    assert.equal(unavailable[0]?.route_id || '', '');
   });
 
   test('prefers server route ids and keeps legacy fallbacks opaque', () => {
@@ -151,6 +246,14 @@ describe('classic public payment presentation', () => {
           provider: 'creem',
         },
       ],
+      subscription_payment_routes: [
+        {
+          route_id: 'pay_abcdef0123456789abcdef01',
+          public_method: 'online_payment',
+          checkout_mode: 'direct',
+          provider: 'waffo_pancake',
+        },
+      ],
       payment_products: [
         {
           product_id: 'product_0123456789abcdef01234567',
@@ -172,6 +275,10 @@ describe('classic public payment presentation', () => {
       ],
       min_topup: 1,
     });
+    assert.equal(
+      info.subscription_payment_routes[0].route_id,
+      'pay_abcdef0123456789abcdef01',
+    );
     for (const value of [order, record, info]) {
       const serialized = JSON.stringify(value);
       assert.doesNotMatch(
@@ -181,7 +288,7 @@ describe('classic public payment presentation', () => {
     }
   });
 
-  test('uses safe public labels for same-brand routes', () => {
+  test('keeps compatibility labels free of provider names', () => {
     const methods = [
       {
         route_id: 'alipay_primary',
@@ -202,6 +309,51 @@ describe('classic public payment presentation', () => {
       getPublicPaymentMethodLabel(methods[1], t, methods),
       '支付宝（网页支付）',
     );
+  });
+
+  test('maps legacy provider method labels to generic online payment copy', () => {
+    const providerNames = [
+      'creem',
+      'waffo',
+      'waffo_pancake',
+      'stripe',
+      'epay',
+      'xorpay',
+    ];
+    for (const [index, providerName] of providerNames.entries()) {
+      const order = normalizePublicPaymentOrder({
+        trade_no: 'PO_LEGACY',
+        public_method: providerName,
+        payment_amount: '9.99',
+        currency: 'USD',
+        status_code: 'awaiting_payment',
+      });
+      const record = normalizePublicTopupRecord({
+        id: 1,
+        trade_no: 'PO_LEGACY',
+        public_method: providerName,
+        payment_amount: '9.99',
+        currency: 'USD',
+        status_code: 'succeeded',
+      });
+      const info = normalizePublicTopupInfo({
+        payment_routes: [
+          {
+            route_id: `pay_${String(index).padStart(24, '0')}`,
+            public_method: providerName,
+          },
+        ],
+      });
+
+      assert.equal(order.public_method, 'payment');
+      assert.equal(record.public_method, 'payment');
+      assert.equal(info.payment_routes[0].public_method, 'payment');
+      assert.equal(getPublicPaymentMethodLabel(order, t), '在线支付');
+      assert.doesNotMatch(
+        JSON.stringify({ order, record, info }),
+        new RegExp(providerName, 'i'),
+      );
+    }
   });
 
   test('never reflects upstream error text into user messages', () => {

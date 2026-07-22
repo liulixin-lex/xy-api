@@ -47,6 +47,18 @@ describe('classic payment operations permission helper', () => {
       true,
     );
   });
+
+  test('keeps gateway and operations access independent', () => {
+    const operationsOnly = {
+      admin_permissions: { payment_operations: { manage: true } },
+    };
+    const gatewayOnly = permissions(true, true);
+
+    assert.equal(canManagePaymentGatewaySettings(operationsOnly), false);
+    assert.equal(canManagePaymentOperations(operationsOnly, 10), true);
+    assert.equal(canManagePaymentGatewaySettings(gatewayOnly), true);
+    assert.equal(canManagePaymentOperations(gatewayOnly, 10), false);
+  });
 });
 
 describe('classic payment gateway permission helper', () => {

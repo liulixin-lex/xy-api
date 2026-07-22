@@ -38,7 +38,7 @@ func validUserInfo(username string, role int) bool {
 // values and Redis user snapshots can outlive an admin status change or a
 // payment-debt freeze, so they must never be used as the authorization source.
 func loadCurrentUser(id any) (*model.User, error) {
-	userID, ok := id.(int)
+	userID, ok := common.SessionValueInt(id)
 	if !ok || userID <= 0 || model.DB == nil {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -177,9 +177,10 @@ func authHelper(c *gin.Context, minRole int) {
 		return
 	}
 	if user.Role < minRole {
-		c.JSON(http.StatusOK, gin.H{
+		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"message": common.TranslateMessage(c, i18n.MsgAuthInsufficientPrivilege),
+			"code":    "permission_denied",
 		})
 		c.Abort()
 		return
@@ -232,6 +233,10 @@ func RootAuth() func(c *gin.Context) {
 }
 
 func RequirePermission(permission authz.Permission) func(c *gin.Context) {
+	return RequirePermissionWithCode(permission, "permission_denied")
+}
+
+func RequirePermissionWithCode(permission authz.Permission, code string) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		role := c.GetInt("role")
 		userID := c.GetInt("id")
@@ -242,6 +247,25 @@ func RequirePermission(permission authz.Permission) func(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,
 			"message": common.TranslateMessage(c, i18n.MsgAuthInsufficientPrivilege),
+			"code":    code,
+		})
+		c.Abort()
+	}
+}
+
+// DashboardSessionRequired rejects access-token authentication before a
+// step-up challenge. Access tokens cannot carry the signed browser session in
+// which 2FA or Passkey verification is recorded.
+func DashboardSessionRequired(code string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !c.GetBool("use_access_token") {
+			c.Next()
+			return
+		}
+		c.JSON(http.StatusForbidden, gin.H{
+			"success": false,
+			"message": common.TranslateMessage(c, i18n.MsgAuthNotLoggedIn),
+			"code":    code,
 		})
 		c.Abort()
 	}

@@ -239,6 +239,17 @@ func buildUnmatchedPaymentEventAuditViews(events []PaymentEvent) ([]PaymentEvent
 			views = append(views, view)
 			continue
 		}
+		if event.ReviewCode == PaymentReviewCodeStripeLegacyRecurringCheckoutPaid {
+			_, userExists := usersByID[subscription.UserId]
+			if hasSubscription && !hasTopUp && !hasOrder && userExists &&
+				validateStripeLegacyRecurringSubscriptionRefundEvidence(event, &subscription) == nil &&
+				validateStripeLegacyRecurringResolutionInventoryTx(DB, event, &subscription) == nil {
+				view.LegacyKind = PaymentOrderKindSubscription
+				view.AvailableActions = []string{PaymentUnmatchedAvailableActionResolveLegacySubscription}
+			}
+			views = append(views, view)
+			continue
+		}
 		if event.ReviewCode == PaymentReviewCodeEventKeyPayloadConflict {
 			view.AvailableActions = []string{PaymentUnmatchedEventActionDismiss}
 			views = append(views, view)

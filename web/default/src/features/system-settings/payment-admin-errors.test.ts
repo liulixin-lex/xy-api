@@ -41,6 +41,7 @@ describe('payment administrator errors', () => {
       getPaymentAdminErrorCode(error),
       'payment_settings_version_conflict'
     )
+    assert.equal(error.skipGlobalError, true)
     const message = getPaymentAdminErrorMessage(error, t, 'fallback')
     assert.match(message, /^translated:/)
     assert.match(message, /payment_settings_version_conflict/)
@@ -59,6 +60,54 @@ describe('payment administrator errors', () => {
     const message = getPaymentAdminErrorMessage(error, t, 'fallback')
     assert.match(message, /payment_settings_secret_storage_unavailable/)
     assert.doesNotMatch(message, /encryption key path/)
+  })
+
+  test('distinguishes a missing payment operations migration', () => {
+    const message = getPaymentAdminErrorMessage(
+      {
+        response: {
+          data: {
+            code: 'payment_operations_schema_not_ready',
+            message: 'raw database migration diagnostic',
+          },
+        },
+      },
+      t,
+      'fallback'
+    )
+    assert.match(message, /database migration/)
+    assert.match(message, /payment_operations_schema_not_ready/)
+    assert.doesNotMatch(message, /raw database|fallback/)
+  })
+
+  test('maps Stripe cancellation failures without exposing provider diagnostics', () => {
+    const cases = [
+      'stripe_inventory_cancel_invalid',
+      'stripe_inventory_subscription_not_found',
+      'stripe_inventory_cancel_conflict',
+      'stripe_inventory_cancel_not_configured',
+      'stripe_inventory_cancel_account_mismatch',
+      'stripe_inventory_cancel_mode_mismatch',
+      'stripe_inventory_cancel_unavailable',
+      'payment_operations_auth_required',
+    ]
+    for (const code of cases) {
+      const message = getPaymentAdminErrorMessage(
+        {
+          response: {
+            data: {
+              code,
+              message: 'sk_live secret and raw Stripe response detail',
+            },
+          },
+        },
+        t,
+        'fallback'
+      )
+      assert.match(message, /^translated:/)
+      assert.match(message, new RegExp(`\\(${code}\\)$`))
+      assert.doesNotMatch(message, /sk_live|raw Stripe response|fallback/)
+    }
   })
 
   test('translates invalid Stripe custom Checkout host policy safely', () => {

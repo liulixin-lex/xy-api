@@ -80,7 +80,7 @@ export function StripeInventoryDetailSheet(props: {
               <Alert>
                 <AlertDescription>
                   {t(
-                    'This is a read-only observation record. It never grants, renews, cancels, or revokes local subscription entitlement.'
+                    'This observation record never changes local access. A separately verified cancellation can only stop future Stripe renewal at the period end.'
                   )}
                 </AlertDescription>
               </Alert>

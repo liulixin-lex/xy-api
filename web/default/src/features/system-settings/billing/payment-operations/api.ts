@@ -23,10 +23,11 @@ import type {
   BillingReservationDetail,
   BillingReservationFilters,
   BillingReservationPage,
+  CancelStripeLegacySubscriptionRequest,
+  CancelStripeLegacySubscriptionResult,
   ConfirmExternalRefundRequest,
   DismissUnmatchedPaymentEventRequest,
   LinkUnmatchedPaymentEventRequest,
-  ManualFulfillRequest,
   PaymentAuditDetail,
   PaymentAuditFilters,
   PaymentAuditListData,
@@ -38,7 +39,7 @@ import type {
   RetireStripeCustomerBindingRequest,
   RetireStripeCustomerBindingResult,
   ResolveDebtRequest,
-  ResolveLegacyEpaySubscriptionRequest,
+  ResolveLegacySubscriptionRequest,
   ResolveLegacyEpayTopUpRequest,
   ResolveBillingReservationRequest,
   ResolveBillingReservationResult,
@@ -59,6 +60,7 @@ interface ApiResponse<T> {
 const requestConfig = {
   skipBusinessError: true,
   skipErrorHandler: true,
+  skipGlobalError: true,
 } as const
 
 function unwrap<T>(response: ApiResponse<T>, fallbackMessage: string): T {
@@ -66,6 +68,134 @@ function unwrap<T>(response: ApiResponse<T>, fallbackMessage: string): T {
     throw createPaymentAdminError(response, fallbackMessage)
   }
   return response.data
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function readCount(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return null
+  }
+  return value
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function readPossiblyEmptyString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null
+}
+
+function normalizePaymentOperationsOverview(
+  value: unknown
+): PaymentOperationsOverviewData {
+  if (!isRecord(value)) {
+    throw createPaymentAdminError(
+      {
+        code: 'payment_overview_schema_invalid',
+        message: 'Payment overview response is incomplete.',
+      },
+      'Payment overview response is incomplete'
+    )
+  }
+
+  const operations = value.operations
+  const runtime = value.runtime
+  const cluster = value.cluster
+  if (!isRecord(operations) || !isRecord(runtime) || !isRecord(cluster)) {
+    throw createPaymentAdminError(
+      {
+        code: 'payment_overview_schema_invalid',
+        message: 'Payment overview response is incompatible.',
+      },
+      'Payment overview response is incompatible'
+    )
+  }
+
+  const countKeys = [
+    'preparing_orders',
+    'awaiting_payment_orders',
+    'confirming_orders',
+    'manual_review_orders',
+    'create_task_backlog',
+    'reconcile_task_backlog',
+    'running_tasks',
+    'retry_waiting_tasks',
+    'expired_task_leases',
+    'oldest_create_task_age_seconds',
+    'unmatched_payment_events',
+    'unprocessed_payment_events',
+    'oldest_unprocessed_event_age_seconds',
+    'active_limit_reservations',
+    'expired_active_limit_reservations',
+    'payment_configuration_version',
+  ] as const
+  const normalizedCounts = Object.fromEntries(
+    countKeys.map((key) => [key, readCount(operations[key])])
+  ) as Record<(typeof countKeys)[number], number | null>
+  if (countKeys.some((key) => normalizedCounts[key] === null)) {
+    throw createPaymentAdminError(
+      {
+        code: 'payment_overview_schema_invalid',
+        message: 'Payment overview counters are invalid.',
+      },
+      'Payment overview counters are invalid'
+    )
+  }
+
+  const databaseType = readString(runtime.database_type)
+  const configurationFingerprint = readPossiblyEmptyString(
+    runtime.configuration_fingerprint
+  )
+  const paymentSecretKeyID = readPossiblyEmptyString(
+    runtime.payment_secret_key_id
+  )
+  const sessionSecretFingerprint = readPossiblyEmptyString(
+    runtime.session_secret_fingerprint
+  )
+  const readinessCode = runtime.readiness_code
+  const clusterCode = readString(cluster.code)
+  if (
+    !databaseType ||
+    configurationFingerprint === null ||
+    paymentSecretKeyID === null ||
+    sessionSecretFingerprint === null ||
+    typeof runtime.redis_enabled !== 'boolean' ||
+    typeof runtime.ready !== 'boolean' ||
+    typeof cluster.ready !== 'boolean' ||
+    !clusterCode
+  ) {
+    throw createPaymentAdminError(
+      {
+        code: 'payment_overview_schema_invalid',
+        message: 'Payment overview runtime information is invalid.',
+      },
+      'Payment overview runtime information is invalid'
+    )
+  }
+
+  return {
+    operations: normalizedCounts as PaymentOperationsOverviewData['operations'],
+    runtime: {
+      schema_version: readCount(runtime.schema_version) ?? 1,
+      configuration_version: readCount(runtime.configuration_version) ?? 0,
+      configuration_fingerprint: configurationFingerprint,
+      payment_secret_key_id: paymentSecretKeyID,
+      session_secret_fingerprint: sessionSecretFingerprint,
+      database_type: databaseType,
+      redis_enabled: runtime.redis_enabled,
+      ready: runtime.ready,
+      readiness_code:
+        typeof readinessCode === 'string' ? readinessCode : undefined,
+    },
+    cluster: {
+      ready: cluster.ready,
+      code: clusterCode,
+    },
+  }
 }
 
 export async function listPaymentAudit(
@@ -98,7 +228,9 @@ export async function getPaymentOperationsOverview(): Promise<PaymentOperationsO
     '/api/option/payment/overview',
     requestConfig
   )
-  return unwrap(response.data, 'Failed to load payment overview')
+  return normalizePaymentOperationsOverview(
+    unwrap(response.data, 'Failed to load payment overview')
+  )
 }
 
 export async function getPaymentAudit(
@@ -109,17 +241,6 @@ export async function getPaymentAudit(
     requestConfig
   )
   return unwrap(response.data, 'Failed to load payment audit detail')
-}
-
-export async function fulfillManualPayment(
-  request: ManualFulfillRequest
-): Promise<PaymentOrder> {
-  const response = await api.post<ApiResponse<PaymentOrder>>(
-    `/api/option/payment/audit/${encodeURIComponent(request.trade_no)}/fulfill`,
-    request,
-    requestConfig
-  )
-  return unwrap(response.data, 'Failed to fulfill payment order')
 }
 
 async function applyPaymentOrderAuditAction(
@@ -246,8 +367,8 @@ export async function resolveLegacyEpayTopUp(
   return unwrap(response.data, 'Failed to resolve legacy Epay top-up')
 }
 
-export async function resolveLegacyEpaySubscription(
-  request: ResolveLegacyEpaySubscriptionRequest
+export async function resolveLegacySubscription(
+  request: ResolveLegacySubscriptionRequest
 ): Promise<UnmatchedPaymentEventActionResult> {
   const response = await api.post<
     ApiResponse<UnmatchedPaymentEventActionResult>
@@ -256,7 +377,10 @@ export async function resolveLegacyEpaySubscription(
     request,
     requestConfig
   )
-  return unwrap(response.data, 'Failed to resolve legacy Epay subscription')
+  return unwrap(
+    response.data,
+    'Failed to record the legacy subscription external refund.'
+  )
 }
 
 export async function resolvePaymentDebt(
@@ -300,6 +424,22 @@ export async function syncAdminStripeInventory(): Promise<StripeInventorySyncRes
     requestConfig
   )
   return unwrap(response.data, 'Failed to sync Stripe subscription inventory')
+}
+
+export async function cancelAdminStripeSubscriptionAtPeriodEnd(
+  request: CancelStripeLegacySubscriptionRequest
+): Promise<CancelStripeLegacySubscriptionResult> {
+  const response = await api.post<
+    ApiResponse<CancelStripeLegacySubscriptionResult>
+  >(
+    `/api/subscription/admin/stripe/inventory/${request.inventory_id}/cancel-at-period-end`,
+    request,
+    requestConfig
+  )
+  return unwrap(
+    response.data,
+    'Failed to schedule Stripe subscription cancellation'
+  )
 }
 
 export async function listBillingReservations(

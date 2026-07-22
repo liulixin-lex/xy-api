@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -27,7 +26,6 @@ import {
   type StartVerificationOptions,
 } from '@/features/auth/secure-verification'
 
-import { listAdminStripeInventory } from './api'
 import { BillingReservationPanel } from './billing-reservation-panel'
 import { PaymentAuditPanel } from './payment-audit-panel'
 import { PaymentOverviewPanel } from './payment-overview-panel'
@@ -40,26 +38,6 @@ import {
 export function PaymentOperationsSection() {
   const { t } = useTranslation()
   const [tab, setTab] = useState('overview')
-  const stripeInventoryPresenceQuery = useQuery({
-    queryKey: ['stripe-legacy-inventory', 'admin', 'presence'],
-    queryFn: () =>
-      listAdminStripeInventory(
-        {
-          status: '',
-          mappingStatus: '',
-          userId: '',
-          customerId: '',
-          subscriptionId: '',
-        },
-        1,
-        1
-      ),
-    staleTime: 30_000,
-  })
-  const hasStripeLegacyInventory =
-    (stripeInventoryPresenceQuery.data?.total ?? 0) > 0
-  const activeTab =
-    tab === 'stripe' && !hasStripeLegacyInventory ? 'overview' : tab
   const {
     open: verificationOpen,
     methods: verificationMethods,
@@ -84,7 +62,7 @@ export function PaymentOperationsSection() {
 
   return (
     <PaymentOperationVerificationContext.Provider value={verificationContext}>
-      <Tabs value={activeTab} onValueChange={setTab} className='gap-4'>
+      <Tabs value={tab} onValueChange={setTab} className='gap-4'>
         <div className='overflow-x-auto'>
           <TabsList
             variant='line'
@@ -96,11 +74,9 @@ export function PaymentOperationsSection() {
             <TabsTrigger value='reservations'>
               {t('Billing Reservations')}
             </TabsTrigger>
-            {hasStripeLegacyInventory && (
-              <TabsTrigger value='stripe'>
-                {t('Stripe Legacy Inventory')}
-              </TabsTrigger>
-            )}
+            <TabsTrigger value='stripe'>
+              {t('Stripe Legacy Inventory')}
+            </TabsTrigger>
           </TabsList>
         </div>
         <TabsContent value='overview'>
@@ -112,11 +88,9 @@ export function PaymentOperationsSection() {
         <TabsContent value='reservations'>
           <BillingReservationPanel />
         </TabsContent>
-        {hasStripeLegacyInventory && (
-          <TabsContent value='stripe'>
-            <StripeInventoryPanel />
-          </TabsContent>
-        )}
+        <TabsContent value='stripe'>
+          <StripeInventoryPanel />
+        </TabsContent>
       </Tabs>
 
       <SecureVerificationDialog

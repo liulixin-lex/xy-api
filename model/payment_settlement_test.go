@@ -1655,7 +1655,7 @@ func TestMultipleStripeDisputesAggregateByResource(t *testing.T) {
 	assert.Equal(t, PaymentOrderStatusFulfilled, stored.Status)
 }
 
-func TestAdminCanAuditablyFulfillManualPaymentOrder(t *testing.T) {
+func TestAdminCannotSynthesizePaidEvidenceForManualPaymentOrder(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 970012, 0)
 	order := createTopUpPaymentOrder(t, 970012, PaymentProviderEpay, "alipay", 7300, 5000)
@@ -1667,23 +1667,24 @@ func TestAdminCanAuditablyFulfillManualPaymentOrder(t *testing.T) {
 	manualOrder, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
 	require.NoError(t, lookupErr)
 
-	result, err := ResolveManualPaymentOrderByAdmin(order.TradeNo, manualOrder.Version, 1, "192.0.2.1", "verified against the provider dashboard")
-	require.NoError(t, err)
-	require.NotNil(t, result.Order)
+	_, err = ResolveManualPaymentOrderByAdmin(order.TradeNo, manualOrder.Version, 1, "192.0.2.1", "verified against the provider dashboard")
+	require.ErrorIs(t, err, ErrPaymentAuditConflict)
 	var user User
 	require.NoError(t, DB.First(&user, 970012).Error)
-	assert.Equal(t, 5000, user.Quota)
+	assert.Zero(t, user.Quota)
 	resolved, lookupErr := GetPaymentOrderByTradeNo(order.TradeNo)
 	require.NoError(t, lookupErr)
-	assert.Equal(t, PaymentOrderStatusFulfilled, resolved.Status)
+	assert.Equal(t, PaymentOrderStatusManualReview, resolved.Status)
 	var topUp TopUp
 	require.NoError(t, DB.Where("payment_order_id = ?", order.ID).First(&topUp).Error)
-	assert.Equal(t, common.TopUpStatusSuccess, topUp.Status)
-	var fulfillAudit PaymentOperationsAudit
-	require.NoError(t, DB.Where("action = ? AND payment_order_id = ?", PaymentOperationsActionAdminFulfill, order.ID).
-		First(&fulfillAudit).Error)
-	assert.Equal(t, "192.0.2.1", fulfillAudit.ActorIP)
-	assert.Equal(t, "verified against the provider dashboard", fulfillAudit.Reason)
+	assert.Equal(t, common.TopUpStatusManualReview, topUp.Status)
+	var adminPaidEvents, fulfillAudits int64
+	require.NoError(t, DB.Model(&PaymentEvent{}).Where("provider = ? AND payment_order_id = ? AND paid = ?", "admin", order.ID, true).
+		Count(&adminPaidEvents).Error)
+	require.NoError(t, DB.Model(&PaymentOperationsAudit{}).Where("action = ? AND payment_order_id = ?", PaymentOperationsActionAdminFulfill, order.ID).
+		Count(&fulfillAudits).Error)
+	assert.Zero(t, adminPaidEvents)
+	assert.Zero(t, fulfillAudits)
 }
 
 func TestDelayedDisputeCreatedCannotReverseNewerClosedState(t *testing.T) {

@@ -17,15 +17,67 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import { API, showError } from '../helpers';
+import i18next from 'i18next';
+
+import { API } from '../helpers';
 import {
   prepareCredentialRequestOptions,
   buildAssertionResult,
   isPasskeySupported,
 } from '../helpers/passkey';
 
+const secureVerificationErrorKeys = {
+  secure_verification_auth_required:
+    'Sign in again before completing security verification.',
+  secure_verification_request_invalid:
+    'The security verification request is invalid. Try again.',
+  secure_verification_user_unavailable:
+    'Security verification is temporarily unavailable. Try again.',
+  secure_verification_account_disabled:
+    'This account cannot complete security verification.',
+  secure_verification_method_unavailable:
+    'This verification method is unavailable. Choose another method or try again.',
+  secure_verification_not_configured:
+    'Enable Two-factor Authentication or Passkey before continuing.',
+  secure_verification_code_required:
+    'Please enter the verification code or backup code.',
+  secure_verification_passkey_state_invalid:
+    'Passkey verification expired or is invalid. Start again.',
+  secure_verification_passkey_required:
+    'Complete Passkey verification before continuing.',
+  secure_verification_session_unavailable:
+    'Security verification could not be saved. Try again.',
+  secure_verification_method_invalid:
+    'This security verification method is not supported.',
+  secure_verification_failed:
+    'The verification code or backup code is incorrect.',
+};
+
+const secureVerificationResponseFromError = (error) => {
+  const data = error?.response?.data;
+  return data && typeof data === 'object' ? data : undefined;
+};
+
+const createSecureVerificationError = (response, fallbackKey, cause) => {
+  const code =
+    typeof response?.code === 'string' && response.code.trim()
+      ? response.code.trim()
+      : undefined;
+  const error = new Error(
+    i18next.t(secureVerificationErrorKeys[code] || fallbackKey),
+  );
+  error.name = 'SecureVerificationError';
+  error.secureVerification = true;
+  if (code) error.code = code;
+  if (cause !== undefined) error.cause = cause;
+  return error;
+};
+
 const createVerificationCancelledError = () => {
-  const error = new Error('Verification cancelled');
+  const error = createSecureVerificationError(
+    undefined,
+    'Passkey verification was cancelled.',
+  );
   error.code = 'VERIFICATION_CANCELLED';
   return error;
 };
@@ -78,21 +130,36 @@ export class SecureVerificationService {
    */
   static async verify2FA(code) {
     if (!code?.trim()) {
-      throw new Error('请输入验证码或备用码');
+      throw createSecureVerificationError(
+        undefined,
+        'Please enter the verification code or backup code.',
+      );
     }
 
-    // 调用通用验证 API，验证成功后后端会设置 session
-    const verifyResponse = await API.post(
-      '/api/verify',
-      {
-        method: '2fa',
-        code: code.trim(),
-      },
-      { skipErrorHandler: true },
-    );
+    try {
+      // 调用通用验证 API，验证成功后后端会设置 session
+      const verifyResponse = await API.post(
+        '/api/verify',
+        {
+          method: '2fa',
+          code: code.trim(),
+        },
+        { skipBusinessError: true, skipErrorHandler: true },
+      );
 
-    if (!verifyResponse.data?.success) {
-      throw new Error(verifyResponse.data?.message || '验证失败');
+      if (!verifyResponse.data?.success) {
+        throw createSecureVerificationError(
+          verifyResponse.data,
+          'Verification failed',
+        );
+      }
+    } catch (error) {
+      if (error?.secureVerification) throw error;
+      throw createSecureVerificationError(
+        secureVerificationResponseFromError(error),
+        'Verification failed',
+        error,
+      );
     }
 
     // 验证成功，session 已在后端设置
@@ -111,7 +178,10 @@ export class SecureVerificationService {
         { skipErrorHandler: true },
       );
       if (!beginResponse.data?.success) {
-        throw new Error(beginResponse.data?.message || '开始验证失败');
+        throw createSecureVerificationError(
+          beginResponse.data,
+          'Passkey verification could not be started. Try again.',
+        );
       }
 
       // 准备WebAuthn选项
@@ -127,6 +197,12 @@ export class SecureVerificationService {
 
       // 构建验证结果
       const assertionResult = buildAssertionResult(credential);
+      if (!assertionResult) {
+        throw createSecureVerificationError(
+          undefined,
+          'Passkey verification could not be completed. Try again.',
+        );
+      }
 
       // 完成验证
       const finishResponse = await API.post(
@@ -135,7 +211,10 @@ export class SecureVerificationService {
         { skipErrorHandler: true },
       );
       if (!finishResponse.data?.success) {
-        throw new Error(finishResponse.data?.message || '验证失败');
+        throw createSecureVerificationError(
+          finishResponse.data,
+          'Passkey verification failed. Try again.',
+        );
       }
 
       // 调用通用验证 API 设置 session（Passkey 验证已完成）
@@ -148,18 +227,29 @@ export class SecureVerificationService {
       );
 
       if (!verifyResponse.data?.success) {
-        throw new Error(verifyResponse.data?.message || '验证失败');
+        throw createSecureVerificationError(
+          verifyResponse.data,
+          'Security verification could not be completed. Try again.',
+        );
       }
 
       // 验证成功，session 已在后端设置
     } catch (error) {
-      if (error.name === 'NotAllowedError') {
+      if (error?.secureVerification) throw error;
+      if (error?.name === 'NotAllowedError') {
         throw createVerificationCancelledError();
-      } else if (error.name === 'InvalidStateError') {
-        throw new Error('Passkey 验证状态无效');
-      } else {
-        throw error;
+      } else if (error?.name === 'InvalidStateError') {
+        throw createSecureVerificationError(
+          undefined,
+          'Passkey verification is not available in the current state.',
+          error,
+        );
       }
+      throw createSecureVerificationError(
+        secureVerificationResponseFromError(error),
+        'Passkey verification failed. Try again.',
+        error,
+      );
     }
   }
 
@@ -176,7 +266,10 @@ export class SecureVerificationService {
       case 'passkey':
         return await this.verifyPasskey();
       default:
-        throw new Error(`不支持的验证方式: ${method}`);
+        throw createSecureVerificationError(
+          undefined,
+          'This security verification method is not supported.',
+        );
     }
   }
 }

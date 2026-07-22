@@ -52,7 +52,6 @@ func TestPaymentAdminOrderActionsWriteOneDurableOperationsAudit(t *testing.T) {
 		auditAction    string
 		expectedStatus string
 	}{
-		{name: "fulfill", action: PaymentAdminActionFulfill, auditAction: PaymentOperationsActionAdminFulfill, expectedStatus: PaymentOrderStatusFulfilled},
 		{name: "reject", action: PaymentAdminActionReject, auditAction: PaymentOperationsActionAdminReject, expectedStatus: PaymentOrderStatusFailed},
 		{name: "void", action: PaymentAdminActionVoid, auditAction: PaymentOperationsActionAdminVoid, expectedStatus: PaymentOrderStatusFailed},
 		{name: "external refund", action: PaymentAdminActionExternalRefundConfirmed, auditAction: PaymentOperationsActionAdminExternalRefund, expectedStatus: PaymentOrderStatusRefunded},
@@ -76,6 +75,7 @@ func TestPaymentAdminOrderActionsWriteOneDurableOperationsAudit(t *testing.T) {
 			}
 			if test.action == PaymentAdminActionExternalRefundConfirmed {
 				input.RefundedAmountMinor = order.ExpectedAmountMinor
+				input.ProviderRefundReference = "refund-audit-" + fmt.Sprint(index)
 			}
 			result, err := ResolvePaymentOrderByAdmin(input)
 			require.NoError(t, err)
@@ -92,6 +92,9 @@ func TestPaymentAdminOrderActionsWriteOneDurableOperationsAudit(t *testing.T) {
 			require.NoError(t, common.UnmarshalJsonStr(audit.Metadata, &metadata))
 			assert.Equal(t, order.TradeNo, metadata["trade_no"])
 			assert.NotEmpty(t, metadata["admin_event_key"])
+			if test.action == PaymentAdminActionExternalRefundConfirmed {
+				assert.Equal(t, input.ProviderRefundReference, metadata["provider_refund_reference"])
+			}
 
 			duplicate, err := ResolvePaymentOrderByAdmin(input)
 			require.NoError(t, err)
@@ -196,9 +199,10 @@ func TestExternalRefundWithoutEntitlementDoesNotDeductUnrelatedQuota(t *testing.
 
 	input := PaymentAdminOrderActionInput{
 		TradeNo: order.TradeNo, ExpectedVersion: order.Version, AdminID: 2, ActorIP: "192.0.2.2",
-		Action:              PaymentAdminActionExternalRefundConfirmed,
-		Reason:              "provider dashboard confirms the full external refund",
-		RefundedAmountMinor: order.ExpectedAmountMinor,
+		Action:                  PaymentAdminActionExternalRefundConfirmed,
+		Reason:                  "provider dashboard confirms the full external refund",
+		RefundedAmountMinor:     order.ExpectedAmountMinor,
+		ProviderRefundReference: "epay-refund-no-entitlement-001",
 	}
 	result, err := ResolvePaymentOrderByAdmin(input)
 	require.NoError(t, err)
@@ -224,6 +228,50 @@ func TestExternalRefundWithoutEntitlementDoesNotDeductUnrelatedQuota(t *testing.
 	assert.Zero(t, ledger.QuotaDelta)
 }
 
+func TestExternalRefundRequiresOneAuditableProviderReferencePerProvider(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 973020, 0)
+	seedPaymentUser(t, 973021, 0)
+	first := createTopUpPaymentOrder(t, 973020, PaymentProviderEpay, "alipay", 1000, 500)
+	second := createTopUpPaymentOrder(t, 973021, PaymentProviderEpay, "alipay", 1000, 500)
+	for _, order := range []*PaymentOrder{first, second} {
+		require.NoError(t, DB.Model(&PaymentOrder{}).Where("id = ?", order.ID).
+			Updates(map[string]interface{}{"status": PaymentOrderStatusManualReview, "status_reason": "requires review"}).Error)
+		require.NoError(t, DB.Model(&TopUp{}).Where("payment_order_id = ?", order.ID).
+			Update("status", common.TopUpStatusManualReview).Error)
+	}
+
+	withoutReference := PaymentAdminOrderActionInput{
+		TradeNo: first.TradeNo, ExpectedVersion: first.Version, AdminID: 20, ActorIP: "192.0.2.20",
+		Action: PaymentAdminActionExternalRefundConfirmed, Reason: "provider dashboard confirms the external refund",
+		RefundedAmountMinor: first.ExpectedAmountMinor,
+	}
+	_, err := ResolvePaymentOrderByAdmin(withoutReference)
+	assert.ErrorIs(t, err, ErrPaymentAuditInvalid)
+
+	firstRefund := withoutReference
+	firstRefund.ProviderRefundReference = "shared-provider-refund-reference"
+	_, err = ResolvePaymentOrderByAdmin(firstRefund)
+	require.NoError(t, err)
+
+	secondRefund := firstRefund
+	secondRefund.TradeNo = second.TradeNo
+	secondRefund.ExpectedVersion = second.Version
+	secondRefund.AdminID = 21
+	secondRefund.ActorIP = "192.0.2.21"
+	_, err = ResolvePaymentOrderByAdmin(secondRefund)
+	assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+
+	var stored PaymentOrder
+	require.NoError(t, DB.First(&stored, second.ID).Error)
+	assert.Equal(t, PaymentOrderStatusManualReview, stored.Status)
+	var refundEvents int64
+	require.NoError(t, DB.Model(&PaymentEvent{}).
+		Where("provider = ? AND provider_resource_key = ?", "admin", PaymentProviderEpay+":refund:"+firstRefund.ProviderRefundReference).
+		Count(&refundEvents).Error)
+	assert.EqualValues(t, 1, refundEvents)
+}
+
 func TestExternalRefundAfterEntitlementUsesCompleteReversal(t *testing.T) {
 	truncateTables(t)
 	seedPaymentUser(t, 973003, 50)
@@ -238,9 +286,10 @@ func TestExternalRefundAfterEntitlementUsesCompleteReversal(t *testing.T) {
 
 	partial, err := ResolvePaymentOrderByAdmin(PaymentAdminOrderActionInput{
 		TradeNo: current.TradeNo, ExpectedVersion: current.Version, AdminID: 3, ActorIP: "192.0.2.3",
-		Action:              PaymentAdminActionExternalRefundConfirmed,
-		Reason:              "partial refund completed and verified in Stripe dashboard",
-		RefundedAmountMinor: 400,
+		Action:                  PaymentAdminActionExternalRefundConfirmed,
+		Reason:                  "partial refund completed and verified in Stripe dashboard",
+		RefundedAmountMinor:     400,
+		ProviderRefundReference: "re_partial_admin_refund",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, PaymentOrderStatusRefundPending, partial.Order.Status)
@@ -253,9 +302,10 @@ func TestExternalRefundAfterEntitlementUsesCompleteReversal(t *testing.T) {
 	require.NoError(t, err)
 	result, err := ResolvePaymentOrderByAdmin(PaymentAdminOrderActionInput{
 		TradeNo: current.TradeNo, ExpectedVersion: current.Version, AdminID: 3, ActorIP: "192.0.2.3",
-		Action:              PaymentAdminActionExternalRefundConfirmed,
-		Reason:              "remaining refund completed and verified in Stripe dashboard",
-		RefundedAmountMinor: current.ExpectedAmountMinor,
+		Action:                  PaymentAdminActionExternalRefundConfirmed,
+		Reason:                  "remaining refund completed and verified in Stripe dashboard",
+		RefundedAmountMinor:     current.ExpectedAmountMinor,
+		ProviderRefundReference: "re_remaining_admin_refund",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, PaymentOrderStatusRefunded, result.Order.Status)
@@ -316,6 +366,76 @@ func TestDismissUnmatchedPaymentEventIsTerminalAndIdempotent(t *testing.T) {
 	require.Len(t, events, 1)
 	assert.EqualValues(t, 1, total)
 	assert.Equal(t, PaymentEventStatusDismissed, events[0].Status)
+}
+
+func TestStripeLegacyRecurringReviewCannotUseGenericUnmatchedActions(t *testing.T) {
+	truncateTables(t)
+	seedPaymentUser(t, 973190, 0)
+	seedStripeCustomerBinding(t, 973190, "cus_legacy_recurring_review")
+	order := createTopUpPaymentOrder(t, 973190, PaymentProviderStripe, PaymentMethodStripe, 1000, 1000)
+	providerOrderKey := "stripe:cs_legacy_recurring_review"
+	legacyOrder := &SubscriptionOrder{
+		UserId: 973190, PlanId: 983190, Money: 10, TradeNo: "legacy-recurring-review-actions",
+		ExpectedAmountMinor: 1000, PaymentCurrency: "USD", ProviderOrderId: "cs_legacy_recurring_review",
+		ProviderOrderKey: &providerOrderKey, PaymentProvider: PaymentProviderStripe, PaymentMethod: PaymentMethodStripe,
+		Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp() - 100,
+	}
+	require.NoError(t, DB.Create(legacyOrder).Error)
+	userID, planID := legacyOrder.UserId, legacyOrder.PlanId
+	require.NoError(t, DB.Create(&StripeLegacySubscription{
+		StripeSubscriptionID: "sub_legacy_recurring_review", StripeCustomerID: "cus_legacy_recurring_review",
+		CheckoutSessionID: "cs_legacy_recurring_review", TradeNo: legacyOrder.TradeNo,
+		UserID: &userID, SubscriptionPlanID: &planID, MappingStatus: StripeLegacyMappingMapped,
+		Status: "active", CancelAtPeriodEnd: true, Livemode: true,
+	}).Error)
+	payload := common.GetJsonString(map[string]interface{}{
+		"session_id": "cs_legacy_recurring_review", "trade_no": legacyOrder.TradeNo,
+		"amount_total": 1000, "currency": "usd", "payment_status": "paid", "status": "complete",
+		"mode": "subscription", "subscription_id": "sub_legacy_recurring_review",
+		"data_digest": PaymentPayloadDigest("legacy recurring review raw object"),
+	})
+	input := PaymentEventInput{
+		Provider: PaymentProviderStripe, ProviderCredentialGeneration: 1,
+		EventKey: "stripe-legacy-recurring-review-actions", EventType: "checkout.session.completed",
+		ProviderLivemode: livePaymentModeForTest(), TradeNo: "legacy-recurring-review-actions",
+		ProviderOrderKey: "stripe:cs_legacy_recurring_review", ProviderResourceKey: "stripe:sub_legacy_recurring_review",
+		CustomerID: "cus_legacy_recurring_review", PaidAmountMinor: 1000, Currency: "USD",
+		PaymentMethod: PaymentMethodStripe, ManualReview: true,
+		ProviderState: PaymentProviderStateStripeLegacyRecurringCheckoutPaid, NormalizedPayload: payload,
+	}
+	require.NoError(t, RecordPaymentEventManualReview(input, "verified recurring Checkout requires classified review"))
+	var event PaymentEvent
+	require.NoError(t, DB.Where("provider = ? AND event_key = ?", PaymentProviderStripe, input.EventKey).First(&event).Error)
+	require.NoError(t, DB.Model(&PaymentEvent{}).Where("id = ?", event.ID).
+		Update("review_code", PaymentReviewCodeStripeLegacyRecurringCheckoutPaid).Error)
+	views, _, err := ListUnmatchedPaymentEventViewsPage(0, 50)
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	assert.Equal(t, PaymentReviewCodeStripeLegacyRecurringCheckoutPaid, views[0].ReviewCode)
+	assert.Equal(t, []string{PaymentUnmatchedAvailableActionResolveLegacySubscription}, views[0].AvailableActions)
+
+	for _, test := range []struct {
+		name            string
+		action          string
+		targetTradeNo   string
+		expectedVersion int64
+	}{
+		{name: "dismiss", action: PaymentUnmatchedEventActionDismiss},
+		{name: "link", action: PaymentUnmatchedEventActionLink, targetTradeNo: order.TradeNo, expectedVersion: order.Version},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ResolveUnmatchedPaymentEventByAdmin(PaymentUnmatchedEventActionInput{
+				EventID: event.ID, ExpectedEventAttempts: event.Attempts, AdminID: 973190,
+				ActorIP: "192.0.2.190", Action: test.action, Reason: "classified recurring review cannot use generic action",
+				TargetTradeNo: test.targetTradeNo, ExpectedOrderVersion: test.expectedVersion,
+			})
+			assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+			var stored PaymentEvent
+			require.NoError(t, DB.First(&stored, event.ID).Error)
+			assert.Equal(t, PaymentEventStatusManualReview, stored.Status)
+			assert.Equal(t, PaymentReviewCodeStripeLegacyRecurringCheckoutPaid, stored.ReviewCode)
+		})
+	}
 }
 
 func TestLinkUnmatchedStripePaymentBindsCustomerAndFulfillsExactlyOnce(t *testing.T) {
@@ -620,9 +740,10 @@ func TestExternalSubscriptionRefundRequiresFullAmount(t *testing.T) {
 	order := createSubscriptionPaymentOrder(t, 973006, plan, 1000)
 	_, err := ResolvePaymentOrderByAdmin(PaymentAdminOrderActionInput{
 		TradeNo: order.TradeNo, ExpectedVersion: order.Version, AdminID: 7, ActorIP: "192.0.2.7",
-		Action:              PaymentAdminActionExternalRefundConfirmed,
-		Reason:              "provider reports a partial subscription refund for review",
-		RefundedAmountMinor: 500,
+		Action:                  PaymentAdminActionExternalRefundConfirmed,
+		Reason:                  "provider reports a partial subscription refund for review",
+		RefundedAmountMinor:     500,
+		ProviderRefundReference: "subscription-partial-refund",
 	})
 	assert.ErrorIs(t, err, ErrPaymentAuditInvalid)
 }

@@ -8,6 +8,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,13 +54,27 @@ func TestPublicSubscriptionPlanOmitsProviderInventory(t *testing.T) {
 		UpgradeGroup: "internal-premium", DowngradeGroup: "internal-default",
 	}
 	plan.NormalizeDefaults()
+	publicRoutes := []service.PublicPaymentRoute{
+		{
+			RouteID: "card_checkout", Provider: model.PaymentProviderStripe,
+			PaymentMethod: model.PaymentMethodStripe,
+		},
+		{
+			RouteID: "online_product", Provider: model.PaymentProviderCreem,
+			PaymentMethod: model.PaymentMethodCreem,
+		},
+		{
+			RouteID: "premium_checkout", Provider: model.PaymentProviderWaffoPancake,
+			PaymentMethod: model.PaymentMethodWaffoPancake,
+		},
+	}
 
-	payload, err := common.Marshal(PublicSubscriptionPlanDTO{Plan: publicSubscriptionPlan(plan)})
+	payload, err := common.Marshal(PublicSubscriptionPlanDTO{Plan: publicSubscriptionPlan(plan, publicRoutes)})
 	require.NoError(t, err)
 	serialized := string(payload)
 	assert.Contains(t, serialized, `"title":"Thirty days"`)
 	assert.Contains(t, serialized, `"includes_expanded_access":true`)
-	assert.Contains(t, serialized, `"external_payment_route_ids":["pay_`)
+	assert.Contains(t, serialized, `"external_payment_route_ids":["card_checkout","online_product","premium_checkout"]`)
 	assert.NotContains(t, serialized, `"external_payment_channels"`)
 	assert.NotContains(t, serialized, `"creem"`)
 	assert.NotContains(t, serialized, `"waffo_pancake"`)
@@ -72,6 +89,154 @@ func TestPublicSubscriptionPlanOmitsProviderInventory(t *testing.T) {
 	assert.NotContains(t, serialized, "price_recurring_private")
 	assert.NotContains(t, serialized, "creem_product_id")
 	assert.NotContains(t, serialized, "waffo_pancake_product_id")
+}
+
+func TestPublicSubscriptionPlanProjectsOnlyEligibleRoutesAcrossCheckoutKinds(t *testing.T) {
+	eligibleRoutes := []service.PublicPaymentRoute{
+		{
+			RouteID: "redirect_checkout", Provider: model.PaymentProviderEpay,
+			PaymentMethod: "alipay",
+		},
+		{
+			RouteID: "online_product", Provider: model.PaymentProviderCreem,
+			PaymentMethod: model.PaymentMethodCreem,
+		},
+		{
+			RouteID: "premium_checkout", Provider: model.PaymentProviderWaffoPancake,
+			PaymentMethod: model.PaymentMethodWaffoPancake,
+		},
+	}
+
+	withoutEligibleRoutes := publicSubscriptionPlan(model.SubscriptionPlan{Id: 1}, nil)
+	assert.Empty(t, withoutEligibleRoutes.ExternalPaymentRouteIDs)
+
+	projected := publicSubscriptionPlan(model.SubscriptionPlan{Id: 2}, eligibleRoutes)
+	assert.Equal(t, []string{"redirect_checkout", "online_product", "premium_checkout"}, projected.ExternalPaymentRouteIDs)
+}
+
+func TestGetSubscriptionPlansUsesCanonicalCustomRouteID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupMidjourneyControllerBillingDB(t)
+	require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}))
+	confirmPaymentComplianceForTest(t)
+	t.Setenv("PAYMENT_SECRET_KEY", "subscription-route-contract-key-0123456789")
+
+	originalMethods := operation_setting.PayMethods
+	originalMerchantID := setting.WaffoPancakeMerchantID
+	originalPrivateKey := setting.WaffoPancakePrivateKey
+	originalStoreID := setting.WaffoPancakeStoreID
+	originalProductID := setting.WaffoPancakeProductID
+	originalUnitPrice := setting.WaffoPancakeUnitPrice
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	t.Cleanup(func() {
+		operation_setting.PayMethods = originalMethods
+		setting.WaffoPancakeMerchantID = originalMerchantID
+		setting.WaffoPancakePrivateKey = originalPrivateKey
+		setting.WaffoPancakeStoreID = originalStoreID
+		setting.WaffoPancakeProductID = originalProductID
+		setting.WaffoPancakeUnitPrice = originalUnitPrice
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
+	})
+
+	operation_setting.PayMethods = []map[string]string{{
+		"name": "Hosted payment", "type": model.PaymentMethodWaffoPancake,
+		"provider": model.PaymentProviderWaffoPancake, "route_id": "premium_plan_checkout",
+		"public_method": "online_payment", "channel_alias": "alternative_checkout",
+	}}
+	setting.WaffoPancakeMerchantID = "subscription-merchant"
+	setting.WaffoPancakePrivateKey = "subscription-private-key"
+	setting.WaffoPancakeStoreID = "subscription-store"
+	setting.WaffoPancakeProductID = ""
+	setting.WaffoPancakeUnitPrice = 1
+	operation_setting.CustomCallbackAddress = "https://api.example.com"
+
+	plan := model.SubscriptionPlan{
+		Title: "Canonical route plan", PriceAmount: 10, Currency: "USD",
+		DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1,
+		TotalAmount: 1000, WaffoPancakeProductId: "provider_private_product",
+		Enabled: true,
+	}
+	require.NoError(t, db.Create(&plan).Error)
+
+	planRecorder := httptest.NewRecorder()
+	planContext, _ := gin.CreateTestContext(planRecorder)
+	planContext.Set("id", 982005)
+	planContext.Request = httptest.NewRequest(http.MethodGet, "/api/subscription/plans", nil)
+	GetSubscriptionPlans(planContext)
+
+	require.Equal(t, http.StatusOK, planRecorder.Code)
+	var planResponse struct {
+		Success bool                        `json:"success"`
+		Data    []PublicSubscriptionPlanDTO `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(planRecorder.Body.Bytes(), &planResponse))
+	require.True(t, planResponse.Success)
+	require.Len(t, planResponse.Data, 1)
+	assert.Equal(t, []string{"premium_plan_checkout"}, planResponse.Data[0].Plan.ExternalPaymentRouteIDs)
+	assert.NotContains(t, planRecorder.Body.String(), "provider_private_product")
+	assert.NotContains(t, strings.ToLower(planRecorder.Body.String()), model.PaymentProviderWaffoPancake)
+
+	resolved, err := service.ResolvePublicPaymentRoute("premium_plan_checkout")
+	require.NoError(t, err)
+	assert.Equal(t, model.PaymentProviderWaffoPancake, resolved.Provider)
+	assert.Equal(t, model.PaymentMethodWaffoPancake, resolved.PaymentMethod)
+
+	topUpRecorder := httptest.NewRecorder()
+	topUpContext, _ := gin.CreateTestContext(topUpRecorder)
+	topUpContext.Set("id", 982005)
+	topUpContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/topup", nil)
+	GetTopUpInfo(topUpContext)
+
+	require.Equal(t, http.StatusOK, topUpRecorder.Code)
+	var topUpResponse struct {
+		Success bool `json:"success"`
+		Data    struct {
+			PaymentRoutes             []publicTopUpRouteView `json:"payment_routes"`
+			SubscriptionPaymentRoutes []publicTopUpRouteView `json:"subscription_payment_routes"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(topUpRecorder.Body.Bytes(), &topUpResponse))
+	require.True(t, topUpResponse.Success)
+	assert.Empty(t, topUpResponse.Data.PaymentRoutes)
+	require.Len(t, topUpResponse.Data.SubscriptionPaymentRoutes, 1)
+	assert.Equal(t, "premium_plan_checkout", topUpResponse.Data.SubscriptionPaymentRoutes[0].RouteID)
+
+	setting.WaffoPancakeUnitPrice = 0.0001
+	notReadyRecorder := httptest.NewRecorder()
+	notReadyContext, _ := gin.CreateTestContext(notReadyRecorder)
+	notReadyContext.Set("id", 982005)
+	notReadyContext.Request = httptest.NewRequest(http.MethodGet, "/api/subscription/plans", nil)
+	GetSubscriptionPlans(notReadyContext)
+
+	require.Equal(t, http.StatusOK, notReadyRecorder.Code)
+	var notReadyResponse struct {
+		Success bool                        `json:"success"`
+		Data    []PublicSubscriptionPlanDTO `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(notReadyRecorder.Body.Bytes(), &notReadyResponse))
+	require.True(t, notReadyResponse.Success)
+	require.Len(t, notReadyResponse.Data, 1)
+	assert.Empty(t, notReadyResponse.Data[0].Plan.ExternalPaymentRouteIDs)
+
+	setting.WaffoPancakeUnitPrice = 1
+	require.NoError(t, db.Model(&model.SubscriptionPlan{}).Where("id = ?", plan.Id).Update(
+		"waffo_pancake_product_id", "",
+	).Error)
+	missingProductRecorder := httptest.NewRecorder()
+	missingProductContext, _ := gin.CreateTestContext(missingProductRecorder)
+	missingProductContext.Set("id", 982005)
+	missingProductContext.Request = httptest.NewRequest(http.MethodGet, "/api/subscription/plans", nil)
+	GetSubscriptionPlans(missingProductContext)
+
+	require.Equal(t, http.StatusOK, missingProductRecorder.Code)
+	var missingProductResponse struct {
+		Success bool                        `json:"success"`
+		Data    []PublicSubscriptionPlanDTO `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(missingProductRecorder.Body.Bytes(), &missingProductResponse))
+	require.True(t, missingProductResponse.Success)
+	require.Len(t, missingProductResponse.Data, 1)
+	assert.Empty(t, missingProductResponse.Data[0].Plan.ExternalPaymentRouteIDs)
 }
 
 func TestPublicSubscriptionSelfSerializationOmitsInternalModelFields(t *testing.T) {

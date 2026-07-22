@@ -41,7 +41,6 @@ import {
   acknowledgePaymentCredentialIncident,
   confirmExternalPaymentRefund,
   dismissUnmatchedPaymentEvent,
-  fulfillManualPayment,
   linkUnmatchedPaymentEvent,
   rejectPaymentOrder,
   resolvePaymentCredentialIncident,
@@ -51,8 +50,10 @@ import {
   voidPaymentOrder,
 } from './api'
 import {
+  PAYMENT_PROVIDER_REFERENCE_MAX_BYTES,
   isExternalRefundAmountValid,
   isPaymentAuditReasonValid,
+  isPaymentProviderReferenceValid,
   isPaymentTradeNoValid,
   parsePositiveSafeInteger,
 } from './payment-action-validation'
@@ -85,142 +86,6 @@ async function refreshAfterFinancialAction(
   }
 }
 
-export function ManualFulfillDialog(props: {
-  order: PaymentOrder | null
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onCompleted: () => void | Promise<void>
-}) {
-  const { t } = useTranslation()
-  const { runWithVerification, verificationOpen } =
-    usePaymentOperationVerification()
-  const [reason, setReason] = useState('')
-  const trimmedReason = reason.trim()
-  const reasonValid = isPaymentAuditReasonValid(reason)
-  const mutation = useMutation({
-    mutationFn: async () => {
-      const order = props.order
-      if (!order || !reasonValid) return null
-      return runWithVerification(
-        async () => {
-          const result = await fulfillManualPayment({
-            trade_no: order.trade_no,
-            expected_version: order.version,
-            reason: trimmedReason,
-          })
-          toast.success(t('Payment order fulfilled'))
-          setReason('')
-          props.onOpenChange(false)
-          await refreshAfterFinancialAction(
-            props.onCompleted,
-            t(
-              'The action completed, but the latest data could not be loaded. Refresh manually.'
-            )
-          )
-          return result
-        },
-        {
-          preferredMethod: 'passkey',
-          title: t('Verify manual payment fulfillment'),
-          description: t(
-            'Confirm your identity before granting the purchased quota or subscription entitlement.'
-          ),
-        }
-      )
-    },
-    onError: (error) => {
-      toast.error(
-        getApiErrorMessage(error, t('Failed to fulfill payment order'))
-      )
-    },
-  })
-  const operationPending = mutation.isPending || verificationOpen
-  const handleOpenChange = (open: boolean) => {
-    if (operationPending) return
-    if (!open) setReason('')
-    props.onOpenChange(open)
-  }
-
-  return (
-    <Dialog open={props.open} onOpenChange={handleOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{t('Manually fulfill payment')}</DialogTitle>
-          <DialogDescription>
-            {t(
-              'Use this only after independently verifying the provider payment. The current order version is checked again before fulfillment.'
-            )}
-          </DialogDescription>
-        </DialogHeader>
-        <Alert variant='destructive'>
-          <AlertDescription>
-            {t(
-              'This credits the purchased quota or subscription entitlement and cannot be safely undone from this screen.'
-            )}
-          </AlertDescription>
-        </Alert>
-        <div className='grid gap-3 rounded-lg border p-3 text-sm'>
-          <div className='flex items-center justify-between gap-4'>
-            <span className='text-muted-foreground'>{t('Trade Number')}</span>
-            <code className='truncate'>{props.order?.trade_no || '-'}</code>
-          </div>
-          <div className='flex items-center justify-between gap-4'>
-            <span className='text-muted-foreground'>
-              {t('Expected Amount')}
-            </span>
-            <span className='tabular-nums'>
-              {props.order
-                ? formatMinorAmount(
-                    props.order.expected_amount_minor,
-                    props.order.currency,
-                    props.order.provider
-                  )
-                : '-'}
-            </span>
-          </div>
-        </div>
-        <div className='grid gap-2'>
-          <Label htmlFor='manual-payment-reason'>
-            {t('Verification reason')}
-          </Label>
-          <Textarea
-            id='manual-payment-reason'
-            value={reason}
-            minLength={8}
-            maxLength={512}
-            className='min-h-24'
-            placeholder={t(
-              'Describe what was verified, where it was verified, and why fulfillment is safe.'
-            )}
-            onChange={(event) => setReason(event.target.value)}
-          />
-          <p className='text-muted-foreground text-xs'>
-            {t('Use 8 to 512 UTF-8 bytes.')}
-          </p>
-        </div>
-        <DialogFooter>
-          <Button
-            type='button'
-            variant='outline'
-            disabled={operationPending}
-            onClick={() => handleOpenChange(false)}
-          >
-            {t('Cancel')}
-          </Button>
-          <Button
-            type='button'
-            variant='destructive'
-            disabled={operationPending || !props.order || !reasonValid}
-            onClick={() => mutation.mutate()}
-          >
-            {mutation.isPending ? t('Fulfilling...') : t('Confirm fulfillment')}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function PaymentOrderActionDialog(props: {
   order: PaymentOrder | null
   action: PaymentOrderAction | null
@@ -233,6 +98,7 @@ export function PaymentOrderActionDialog(props: {
     usePaymentOperationVerification()
   const [reason, setReason] = useState('')
   const [refundedAmountMinor, setRefundedAmountMinor] = useState('')
+  const [providerRefundReference, setProviderRefundReference] = useState('')
   const trimmedReason = reason.trim()
   const parsedRefundedAmount = parsePositiveSafeInteger(refundedAmountMinor)
   const reasonValid = isPaymentAuditReasonValid(reason)
@@ -242,10 +108,14 @@ export function PaymentOrderActionDialog(props: {
       props.order &&
       isExternalRefundAmountValid(props.order, parsedRefundedAmount)
     )
+  const refundReferenceValid =
+    props.action !== 'external-refund' ||
+    isPaymentProviderReferenceValid(providerRefundReference)
 
   useEffect(() => {
     if (!props.open) return
     setReason('')
+    setProviderRefundReference('')
     setRefundedAmountMinor(
       props.action === 'external-refund' && props.order
         ? String(props.order.expected_amount_minor)
@@ -286,7 +156,15 @@ export function PaymentOrderActionDialog(props: {
     mutationFn: async () => {
       const order = props.order
       const action = props.action
-      if (!order || !action || !reasonValid || !refundValid) return null
+      if (
+        !order ||
+        !action ||
+        !reasonValid ||
+        !refundValid ||
+        !refundReferenceValid
+      ) {
+        return null
+      }
       return runWithVerification(
         async () => {
           const request = {
@@ -303,6 +181,7 @@ export function PaymentOrderActionDialog(props: {
             result = await confirmExternalPaymentRefund({
               ...request,
               refunded_amount_minor: parsedRefundedAmount as number,
+              provider_refund_reference: providerRefundReference.trim(),
             })
           }
           toast.success(successMessage)
@@ -334,6 +213,7 @@ export function PaymentOrderActionDialog(props: {
     if (!open) {
       setReason('')
       setRefundedAmountMinor('')
+      setProviderRefundReference('')
     }
     props.onOpenChange(open)
   }
@@ -373,29 +253,51 @@ export function PaymentOrderActionDialog(props: {
           </div>
         </dl>
         {props.action === 'external-refund' && (
-          <div className='grid gap-2'>
-            <Label htmlFor='external-refund-amount-minor'>
-              {t('Cumulative refunded amount in minor units')}
-            </Label>
-            <Input
-              id='external-refund-amount-minor'
-              value={refundedAmountMinor}
-              inputMode='numeric'
-              autoComplete='off'
-              placeholder={t('Enter a positive whole-number amount')}
-              onChange={(event) => setRefundedAmountMinor(event.target.value)}
-            />
-            <p className='text-muted-foreground text-xs'>
-              {props.order
-                ? t(
-                    'Enter the provider total after refund: greater than {{current}} and no more than {{maximum}} minor units.',
-                    {
-                      current: props.order.refunded_amount_minor,
-                      maximum: props.order.expected_amount_minor,
-                    }
-                  )
-                : ''}
-            </p>
+          <div className='grid gap-4'>
+            <div className='grid gap-2'>
+              <Label htmlFor='external-refund-amount-minor'>
+                {t('Cumulative refunded amount in minor units')}
+              </Label>
+              <Input
+                id='external-refund-amount-minor'
+                value={refundedAmountMinor}
+                inputMode='numeric'
+                autoComplete='off'
+                placeholder={t('Enter a positive whole-number amount')}
+                onChange={(event) => setRefundedAmountMinor(event.target.value)}
+              />
+              <p className='text-muted-foreground text-xs'>
+                {props.order
+                  ? t(
+                      'Enter the provider total after refund: greater than {{current}} and no more than {{maximum}} minor units.',
+                      {
+                        current: props.order.refunded_amount_minor,
+                        maximum: props.order.expected_amount_minor,
+                      }
+                    )
+                  : ''}
+              </p>
+            </div>
+            <div className='grid gap-2'>
+              <Label htmlFor='external-refund-reference'>
+                {t('Provider refund reference')}
+              </Label>
+              <Input
+                id='external-refund-reference'
+                value={providerRefundReference}
+                maxLength={PAYMENT_PROVIDER_REFERENCE_MAX_BYTES}
+                autoComplete='off'
+                onChange={(event) =>
+                  setProviderRefundReference(event.target.value)
+                }
+              />
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Required. Copy the completed refund reference from the provider record. Use 1 to {{maximum}} UTF-8 bytes.',
+                  { maximum: PAYMENT_PROVIDER_REFERENCE_MAX_BYTES }
+                )}
+              </p>
+            </div>
           </div>
         )}
         <div className='grid gap-2'>
@@ -434,7 +336,8 @@ export function PaymentOrderActionDialog(props: {
               !props.order ||
               !props.action ||
               !reasonValid ||
-              !refundValid
+              !refundValid ||
+              !refundReferenceValid
             }
             onClick={() => mutation.mutate()}
           >

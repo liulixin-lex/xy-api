@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -236,6 +237,41 @@ func TestUserAuthUsesCurrentDatabaseIdentityInsteadOfSessionSnapshot(t *testing.
 	assert.JSONEq(t, fmt.Sprintf(`{"id":%d,"role":%d,"group":"current-group"}`, user.Id, common.RoleCommonUser), recorder.Body.String())
 }
 
+func TestUserAuthAcceptsSupportedSerializedSessionUserIDs(t *testing.T) {
+	db := withAuthDatabase(t)
+	user := &model.User{
+		Username: "serialized-session-user",
+		Password: "test-password",
+		Role:     common.RoleCommonUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+	}
+	require.NoError(t, db.Create(user).Error)
+
+	for _, testCase := range []struct {
+		name string
+		id   any
+	}{
+		{name: "decimal string", id: fmt.Sprintf("%d", user.Id)},
+		{name: "JSON float", id: float64(user.Id)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			sessionValues := staleSessionValues(user.Id)
+			sessionValues["id"] = testCase.id
+
+			recorder, handlerCalled := performSessionAuthRequest(t, user, sessionValues, UserAuth())
+
+			require.True(t, handlerCalled)
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), fmt.Sprintf(`"id":%d`, user.Id))
+		})
+	}
+
+	loaded, err := loadCurrentUser(json.Number(fmt.Sprintf("%d", user.Id)))
+	require.NoError(t, err)
+	assert.Equal(t, user.Id, loaded.Id)
+}
+
 func TestAdminAuthRejectsStaleElevatedSessionRole(t *testing.T) {
 	db := withAuthDatabase(t)
 	user := &model.User{
@@ -249,9 +285,34 @@ func TestAdminAuthRejectsStaleElevatedSessionRole(t *testing.T) {
 
 	recorder, handlerCalled := performSessionAuthRequest(t, user, staleSessionValues(user.Id), AdminAuth())
 
-	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
 	assert.False(t, handlerCalled)
 	assert.Contains(t, recorder.Body.String(), `"success":false`)
+	assert.Contains(t, recorder.Body.String(), `"code":"permission_denied"`)
+}
+
+func TestDashboardSessionRequiredRejectsAccessTokenBeforeStepUp(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	handlerCalled := false
+	router.POST(
+		"/protected",
+		func(c *gin.Context) {
+			c.Set("use_access_token", true)
+		},
+		DashboardSessionRequired("payment_settings_auth_required"),
+		func(c *gin.Context) {
+			handlerCalled = true
+			c.Status(http.StatusNoContent)
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/protected", nil))
+
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+	assert.False(t, handlerCalled)
+	assert.Contains(t, recorder.Body.String(), `"code":"payment_settings_auth_required"`)
 }
 
 func TestAccessTokenAuthRejectsPaymentFrozenUser(t *testing.T) {

@@ -678,7 +678,10 @@ const RechargeCard = ({
                 error={subscriptionError}
                 onRetry={onRetrySubscriptions}
                 plans={subscriptionPlans}
-                paymentRoutes={topupInfo.payment_routes}
+                paymentRoutes={
+                  topupInfo.subscription_payment_routes ||
+                  topupInfo.payment_routes
+                }
                 billingPreference={billingPreference}
                 billingPreferenceLoading={billingPreferenceLoading}
                 onChangeBillingPreference={onChangeBillingPreference}

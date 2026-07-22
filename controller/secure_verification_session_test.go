@@ -3,6 +3,7 @@ package controller
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestConsumePasskeyReadyRejectsAnotherUsersMarker(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/verify", nil))
 
 	require.Equal(t, http.StatusNoContent, recorder.Code)
-	require.NoError(t, consumeErr)
+	assert.ErrorIs(t, consumeErr, errPasskeyReadyStateInvalid)
 	assert.False(t, verified)
 	assert.True(t, readyStateCleared)
 }
@@ -97,8 +98,32 @@ func TestConsumePasskeyReadyRejectsFutureMarker(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/verify", nil))
 
 	require.Equal(t, http.StatusNoContent, recorder.Code)
-	require.NoError(t, consumeErr)
+	assert.ErrorIs(t, consumeErr, errPasskeyReadyStateInvalid)
 	assert.False(t, verified)
+}
+
+func TestConsumePasskeyReadyAcceptsSerializedNumericSessionValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("serialized-passkey-ready-test"))))
+
+	verified := false
+	var consumeErr error
+	router.GET("/verify", func(c *gin.Context) {
+		c.Set("id", 57)
+		session := sessions.Default(c)
+		session.Set(PasskeyReadySessionKey, strconv.FormatInt(time.Now().Unix(), 10))
+		session.Set(passkeyReadyUserIDSessionKey, "57")
+		verified, consumeErr = consumePasskeyReady(c)
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/verify", nil))
+
+	require.Equal(t, http.StatusNoContent, recorder.Code)
+	require.NoError(t, consumeErr)
+	assert.True(t, verified)
 }
 
 func TestUniversalVerifyRejectsOversizedInputBeforeUserLookup(t *testing.T) {
@@ -121,9 +146,9 @@ func TestUniversalVerifyRejectsOversizedInputBeforeUserLookup(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
 
-			require.Equal(t, http.StatusOK, recorder.Code)
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
 			assert.Contains(t, recorder.Body.String(), `"success":false`)
-			assert.Contains(t, recorder.Body.String(), "参数错误")
+			assert.Contains(t, recorder.Body.String(), `"code":"secure_verification_request_invalid"`)
 		})
 	}
 }
@@ -167,4 +192,33 @@ func TestSetupLoginClearsSecureVerificationMarkers(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	assert.True(t, markersCleared)
 	assert.Equal(t, user.Id, loggedInUserID)
+}
+
+func TestGetSessionUserAcceptsSerializedNumericUserID(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	user := &model.User{
+		Username: "serialized-passkey-session-user",
+		Role:     common.RoleCommonUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+	}
+	require.NoError(t, db.Create(user).Error)
+
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("serialized-passkey-user-test"))))
+	var loadedUser *model.User
+	var loadErr error
+	router.GET("/user", func(c *gin.Context) {
+		sessions.Default(c).Set("id", strconv.Itoa(user.Id))
+		loadedUser, loadErr = getSessionUser(c)
+		c.Status(http.StatusNoContent)
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/user", nil))
+
+	require.Equal(t, http.StatusNoContent, recorder.Code)
+	require.NoError(t, loadErr)
+	require.NotNil(t, loadedUser)
+	assert.Equal(t, user.Id, loadedUser.Id)
 }

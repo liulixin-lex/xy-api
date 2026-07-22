@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -91,6 +92,23 @@ func TestUpdatePaymentSettingsReturnsStableStripeCheckoutHostError(t *testing.T)
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.JSONEq(t, `{"success":false,"code":"payment_settings_stripe_checkout_hosts_invalid"}`, recorder.Body.String())
 	assert.NotContains(t, recorder.Body.String(), "*.example.com")
+}
+
+func TestPaymentSettingsFieldErrorReturnsFieldWithoutDiagnostic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/option/payment", nil)
+
+	paymentSettingsFieldAPIError(context, "XorPayCurrency", errors.New("provider diagnostic must stay in server logs"))
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.JSONEq(t, `{
+		"success":false,
+		"code":"payment_settings_field_invalid",
+		"params":{"field":"XorPayCurrency"}
+	}`, recorder.Body.String())
+	assert.NotContains(t, recorder.Body.String(), "provider diagnostic")
 }
 
 func TestValidatePaymentSettingRejectsUnsafeProviderBindingsAndDiscounts(t *testing.T) {
@@ -803,6 +821,7 @@ func TestPaymentAtomicOnlyOptionKeysPreserveSharedSettingPaths(t *testing.T) {
 	_, previousWebhookSecretClientWritable := paymentSettingsAllowedKeys["StripeWebhookSecretPrevious"]
 	assert.False(t, previousWebhookSecretClientWritable)
 	assert.True(t, isPaymentAtomicOnlyOptionKey(model.PaymentConfigurationVersionOptionKey))
+	assert.True(t, isPaymentAtomicOnlyOptionKey(model.PaymentRouteCatalogVersionOptionKey))
 	assert.False(t, isPaymentAtomicOnlyOptionKey("SystemName"))
 }
 

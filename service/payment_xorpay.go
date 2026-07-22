@@ -29,7 +29,12 @@ const (
 	xorPayDefaultExpiry        = int64(7200)
 )
 
-var xorPayAidPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+var (
+	xorPayAidPattern           = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	xorPayHostedPathPattern    = regexp.MustCompile(`^/[A-Za-z0-9._~/-]+$`)
+	xorPayAlipayPathPattern    = regexp.MustCompile(`^/[A-Za-z0-9._~-]+$`)
+	xorPayWeChatQRTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`)
+)
 
 type xorPayProvider struct {
 	client *http.Client
@@ -42,11 +47,76 @@ type xorPayCredential struct {
 }
 
 type xorPayCreateResponse struct {
-	Status    string           `json:"status"`
-	AOID      string           `json:"aoid"`
-	ExpiresIn int64            `json:"expires_in"`
-	ExpireIn  int64            `json:"expire_in"`
-	Info      xorPayCreateInfo `json:"info"`
+	Status    string                 `json:"status"`
+	AOID      string                 `json:"aoid"`
+	ExpiresIn xorPayExpirationSecond `json:"expires_in"`
+	ExpireIn  xorPayExpirationSecond `json:"expire_in"`
+	Info      xorPayCreateInfo       `json:"info"`
+}
+
+// xorPayExpirationSecond accepts the two shapes observed in XORPay's real
+// create response: a JSON number and a quoted decimal integer. It deliberately
+// retains invalid values instead of aborting the whole response decode so a
+// valid AOID and payment instruction can still be fenced and persisted. The
+// local order expiry remains the authority when this optional provider hint is
+// missing or malformed.
+type xorPayExpirationSecond struct {
+	value   int64
+	present bool
+	valid   bool
+}
+
+func (seconds *xorPayExpirationSecond) UnmarshalJSON(data []byte) error {
+	seconds.present = true
+	value := strings.TrimSpace(string(data))
+	if value == "null" {
+		seconds.present = false
+		return nil
+	}
+	if value == "" {
+		return nil
+	}
+	if strings.HasPrefix(value, `"`) {
+		var decoded string
+		if err := common.Unmarshal(data, &decoded); err != nil {
+			return nil
+		}
+		value = strings.TrimSpace(decoded)
+	}
+	if value == "" || len(value) > 19 {
+		return nil
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return nil
+		}
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 || parsed > 24*60*60 {
+		return nil
+	}
+	seconds.value = parsed
+	seconds.valid = true
+	return nil
+}
+
+func xorPayExpirationSeconds(primary, legacy xorPayExpirationSecond) (int64, error) {
+	if primary.present && !primary.valid {
+		return xorPayDefaultExpiry, errors.New("invalid expires_in")
+	}
+	if legacy.present && !legacy.valid {
+		return xorPayDefaultExpiry, errors.New("invalid expire_in")
+	}
+	if primary.valid && legacy.valid && primary.value != legacy.value {
+		return xorPayDefaultExpiry, errors.New("conflicting expires_in and expire_in")
+	}
+	if primary.valid {
+		return primary.value, nil
+	}
+	if legacy.valid {
+		return legacy.value, nil
+	}
+	return xorPayDefaultExpiry, nil
 }
 
 type xorPayCreateInfo struct {
@@ -164,12 +234,12 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 	if !xorPayAidPattern.MatchString(result.AOID) {
 		return nil, fmt.Errorf("%w: xorpay response contains an invalid aoid", ErrPaymentStateUnknown)
 	}
-	expiresIn := result.ExpiresIn
-	if expiresIn <= 0 {
-		expiresIn = result.ExpireIn
-	}
-	if expiresIn <= 0 || expiresIn > 24*60*60 {
-		expiresIn = xorPayDefaultExpiry
+	expiresIn, expirationErr := xorPayExpirationSeconds(result.ExpiresIn, result.ExpireIn)
+	if expirationErr != nil {
+		// The local order is the expiration authority. Keep a successfully
+		// created provider order usable with a bounded fallback, while recording
+		// only the contract category (never the response body or QR content).
+		common.SysError("xorpay create response expiration contract changed: " + expirationErr.Error())
 	}
 	responseReceivedAt := time.Now().Unix()
 	expiresAt := responseReceivedAt + expiresIn
@@ -184,7 +254,7 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 	if upstreamMethod == setting.XorPayMethodJSAPI {
 		parameters, validationErr := validateXorPayJSAPIParameters(result.Info)
 		if validationErr != nil {
-			return nil, fmt.Errorf("%w: invalid xorpay JSAPI payment instructions: %v", ErrPaymentStateUnknown, validationErr)
+			return start, fmt.Errorf("%w: invalid xorpay JSAPI payment instructions: %v", ErrPaymentStateUnknown, validationErr)
 		}
 		start.Flow = PaymentFlowJSAPI
 		start.JSAPI = parameters
@@ -194,7 +264,7 @@ func (p *xorPayProvider) Create(ctx context.Context, order *model.PaymentOrder) 
 		// XORPay has already accepted the merchant order at this point. Treat an
 		// invalid or missing QR as an ambiguous creation result so the worker
 		// queries the existing order instead of blindly creating another one.
-		return nil, fmt.Errorf("%w: invalid xorpay payment instructions: %v", ErrPaymentStateUnknown, err)
+		return start, fmt.Errorf("%w: invalid xorpay payment instructions: %v", ErrPaymentStateUnknown, err)
 	}
 	return &PaymentStart{
 		Flow: PaymentFlowQR, QRContent: result.Info.QR, ExpiresAt: expiresAt,
@@ -540,21 +610,61 @@ func xorPayCreateError(status string) error {
 }
 
 func validateXorPayQR(method, value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 4096 {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 4096 || strings.ContainsAny(value, "#\\\r\n\x00") {
 		return errors.New("invalid xorpay QR content")
 	}
+	u, err := url.ParseRequestURI(value)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Fragment != "" || u.Port() != "" || u.Host == "" ||
+		strings.ContainsAny(u.Path, "\\\r\n\x00") || strings.ContainsAny(u.RawQuery, "\\\r\n\x00") {
+		return errors.New("invalid xorpay QR URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	trustedHostedPage := host == "ipay.yltg.com.cn" && strings.EqualFold(u.Host, "ipay.yltg.com.cn") &&
+		(u.Scheme == "http" || u.Scheme == "https") && len(u.Path) >= 2 && len(u.Path) <= 2049 &&
+		xorPayHostedPathPattern.MatchString(u.Path) &&
+		!strings.HasPrefix(u.Path, "//") && !strings.Contains(u.Path, "/../") && !strings.HasSuffix(u.Path, "/..")
+	if trustedHostedPage {
+		if u.RawQuery != "" {
+			return errors.New("xorpay hosted QR URL must not contain a query")
+		}
+		switch method {
+		case setting.XorPayMethodNative:
+			return nil
+		case setting.XorPayMethodAlipay:
+			if u.Scheme == "https" {
+				return nil
+			}
+			return errors.New("xorpay alipay hosted QR URL must use HTTPS")
+		default:
+			return errors.New("unexpected xorpay QR method")
+		}
+	}
 	if method == setting.XorPayMethodNative {
-		if !strings.HasPrefix(value, "weixin://wxpay/") {
+		if u.Scheme != "weixin" || u.Host != "wxpay" || u.Path != "/bizpayurl" {
 			return errors.New("unexpected xorpay native QR scheme")
+		}
+		query, queryErr := url.ParseQuery(u.RawQuery)
+		if queryErr != nil || len(query) != 1 {
+			return errors.New("invalid xorpay native QR query")
+		}
+		tokens, ok := query["pr"]
+		if !ok || len(tokens) != 1 || !xorPayWeChatQRTokenPattern.MatchString(tokens[0]) {
+			return errors.New("invalid xorpay native QR token")
 		}
 		return nil
 	}
-	u, err := url.Parse(value)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || strings.ToLower(u.Hostname()) != "qr.alipay.com" {
+	if method != setting.XorPayMethodAlipay {
+		return errors.New("unexpected xorpay QR method")
+	}
+	if host == "qr.alipay.com" && strings.EqualFold(u.Host, "qr.alipay.com") && u.Scheme == "https" &&
+		len(u.Path) >= 2 && len(u.Path) <= 2049 && xorPayAlipayPathPattern.MatchString(u.Path) &&
+		u.RawQuery == "" {
+		return nil
+	}
+	if u.Scheme != "https" {
 		return errors.New("unexpected xorpay alipay QR URL")
 	}
-	return nil
+	return errors.New("untrusted xorpay alipay QR host")
 }
 
 func validateXorPayJSAPIParameters(info xorPayCreateInfo) (*PaymentJSAPIParameters, error) {

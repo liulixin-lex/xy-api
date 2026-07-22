@@ -51,14 +51,18 @@ export function isRoot() {
 }
 
 export function getSystemName() {
-  let system_name = localStorage.getItem('system_name');
-  if (!system_name) return 'New API';
-  return system_name;
+  const systemName = localStorage.getItem('system_name')?.trim();
+  if (!systemName || ['undefined', 'null'].includes(systemName.toLowerCase())) {
+    return 'New API';
+  }
+  return systemName;
 }
 
 export function getLogo() {
-  let logo = localStorage.getItem('logo');
-  if (!logo) return '/logo.png';
+  const logo = localStorage.getItem('logo')?.trim();
+  if (!logo || ['undefined', 'null'].includes(logo.toLowerCase())) {
+    return '/logo.png';
+  }
   return logo;
 }
 

@@ -33,6 +33,7 @@ func configureRetainedTopUpHandlerTest(t *testing.T) {
 	originalWaffoPublicCert := setting.WaffoPublicCert
 	originalWaffoMerchantID := setting.WaffoMerchantId
 	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	originalPayMethods := operation_setting.PayMethods
 	originalMerchantID := setting.WaffoPancakeMerchantID
 	originalPrivateKey := setting.WaffoPancakePrivateKey
 	originalProductID := setting.WaffoPancakeProductID
@@ -48,6 +49,11 @@ func configureRetainedTopUpHandlerTest(t *testing.T) {
 	setting.WaffoPancakePrivateKey = "test-private-key"
 	setting.WaffoPancakeProductID = "PROD_test"
 	setting.WaffoPancakeStoreID = "STO_test"
+	operation_setting.PayMethods = []map[string]string{
+		{"name": "Waffo", "type": model.PaymentMethodWaffo, "provider": model.PaymentProviderWaffo},
+		{"name": "Pancake", "type": model.PaymentMethodWaffoPancake, "provider": model.PaymentProviderWaffoPancake},
+		{"name": "Creem", "type": model.PaymentMethodCreem, "provider": model.PaymentProviderCreem},
+	}
 	require.NoError(t, service.ReportCurrentSystemInstance())
 	t.Cleanup(func() {
 		setting.WaffoEnabled = originalWaffoEnabled
@@ -61,6 +67,7 @@ func configureRetainedTopUpHandlerTest(t *testing.T) {
 		setting.WaffoPancakePrivateKey = originalPrivateKey
 		setting.WaffoPancakeProductID = originalProductID
 		setting.WaffoPancakeStoreID = originalStoreID
+		operation_setting.PayMethods = originalPayMethods
 	})
 }
 
@@ -273,16 +280,21 @@ func TestCreemPayRejectsMissingUserWithoutCreatingOrder(t *testing.T) {
 	originalWebhookSecret := setting.CreemWebhookSecret
 	originalProducts := setting.CreemProducts
 	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	originalPayMethods := operation_setting.PayMethods
 	setting.CreemApiKey = "creem-test-api-key"
 	setting.CreemWebhookSecret = "creem-test-webhook-secret"
 	setting.CreemProducts = `[{"productId":"product_missing_user","name":"Test","price":1,"currency":"USD","quota":100}]`
 	operation_setting.CustomCallbackAddress = "https://payments.example.com"
+	operation_setting.PayMethods = []map[string]string{{
+		"name": "Creem", "type": model.PaymentMethodCreem, "provider": model.PaymentProviderCreem,
+	}}
 	require.NoError(t, service.ReportCurrentSystemInstance())
 	t.Cleanup(func() {
 		setting.CreemApiKey = originalAPIKey
 		setting.CreemWebhookSecret = originalWebhookSecret
 		setting.CreemProducts = originalProducts
 		operation_setting.CustomCallbackAddress = originalCallbackAddress
+		operation_setting.PayMethods = originalPayMethods
 	})
 
 	recorder := httptest.NewRecorder()

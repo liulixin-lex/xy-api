@@ -20,11 +20,61 @@ type StripeLegacySyncResult struct {
 	Unmapped int `json:"unmapped"`
 }
 
-// ValidateVerifiedWebhook confirms one-time Checkout Session terminal events
-// against the configured Stripe account without mutating local inventory.
+type StripeLegacySubscriptionCancellationInput struct {
+	InventoryID       int64
+	ExpectedUpdatedAt int64
+	AdminID           int
+	ActorIP           string
+	Reason            string
+}
+
+type StripeLegacySubscriptionCancellationResult struct {
+	Subscription *model.StripeLegacySubscription `json:"subscription"`
+	Duplicate    bool                            `json:"duplicate"`
+}
+
+var (
+	ErrStripeLegacySyncNotConfigured            = errors.New("Stripe legacy inventory sync is not configured")
+	ErrStripeLegacySyncModeMismatch             = errors.New("Stripe legacy inventory sync mode mismatch")
+	ErrStripeLegacySyncUnavailable              = errors.New("Stripe legacy inventory sync is unavailable")
+	ErrStripeLegacyCancellationNotConfigured    = errors.New("Stripe legacy subscription cancellation is not configured")
+	ErrStripeLegacyCancellationIdentityMismatch = errors.New("Stripe legacy subscription cancellation identity mismatch")
+	ErrStripeLegacyCancellationModeMismatch     = errors.New("Stripe legacy subscription cancellation mode mismatch")
+	ErrStripeLegacyCancellationUnavailable      = errors.New("Stripe legacy subscription cancellation is unavailable")
+)
+
+type stripeLegacySubscriptionAPI interface {
+	RetrieveAccount(ctx context.Context, accountID string) (*stripe.Account, error)
+	UpdateSubscription(ctx context.Context, subscriptionID string, params *stripe.SubscriptionUpdateParams) (*stripe.Subscription, error)
+}
+
+type stripeLegacySubscriptionAPIFactory func(secret string) stripeLegacySubscriptionAPI
+
+type stripeLegacySubscriptionClient struct {
+	client *stripe.Client
+}
+
+func (client stripeLegacySubscriptionClient) RetrieveAccount(ctx context.Context, accountID string) (*stripe.Account, error) {
+	params := &stripe.AccountRetrieveParams{}
+	setStripeAccount(params, accountID)
+	return client.client.V1Accounts.Retrieve(ctx, params)
+}
+
+func (client stripeLegacySubscriptionClient) UpdateSubscription(ctx context.Context, subscriptionID string, params *stripe.SubscriptionUpdateParams) (*stripe.Subscription, error) {
+	return client.client.V1Subscriptions.Update(ctx, subscriptionID, params)
+}
+
+// ValidateVerifiedWebhook confirms Checkout Session payment evidence against
+// the configured Stripe account without mutating local inventory.
 func (p *stripePaymentProvider) ValidateVerifiedWebhook(ctx context.Context, event *NormalizedPaymentEvent) error {
 	if event == nil || event.Provider != model.PaymentProviderStripe || len(event.VerifiedPayload) == 0 {
 		return nil
+	}
+	if event.ProviderState == model.PaymentProviderStateStripeLegacyRecurringCheckoutPaid {
+		unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+		err := p.confirmLegacyRecurringCheckoutAuthority(ctx, event)
+		unlockPaymentConfiguration()
+		return err
 	}
 	if event.Paid || event.Failed || event.Expired {
 		unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
@@ -122,7 +172,7 @@ func stripeLegacySubscriptionSnapshot(subscription *stripe.Subscription, event s
 		StateObservedAt:     event.Created,
 		Livemode:            event.Livemode,
 	}
-	if len(event.Data.Raw) > 0 {
+	if event.Data != nil && len(event.Data.Raw) > 0 {
 		snapshot.LastStripePayloadDigest = model.PaymentPayloadDigest(string(event.Data.Raw))
 	}
 	if subscription == nil {
@@ -194,7 +244,7 @@ func stripeLegacyInvoiceSnapshot(invoice *stripe.Invoice, event stripe.Event) mo
 		StateObservedAt:     event.Created,
 		Livemode:            event.Livemode,
 	}
-	if len(event.Data.Raw) > 0 {
+	if event.Data != nil && len(event.Data.Raw) > 0 {
 		snapshot.LastStripePayloadDigest = model.PaymentPayloadDigest(string(event.Data.Raw))
 	}
 	if invoice == nil {
@@ -210,7 +260,7 @@ func stripeLegacyInvoiceSnapshot(invoice *stripe.Invoice, event stripe.Event) mo
 	// Stripe API versions before the invoice parent migration exposed a
 	// top-level subscription field. The SDK's custom ID unmarshaler lets us
 	// retain compatibility with those signed historical webhook payloads.
-	if snapshot.StripeSubscriptionID == "" {
+	if snapshot.StripeSubscriptionID == "" && event.Data != nil && len(event.Data.Raw) > 0 {
 		var legacy struct {
 			Subscription *stripe.Subscription `json:"subscription"`
 		}
@@ -236,15 +286,18 @@ func stripeLegacyInvoiceSnapshot(invoice *stripe.Invoice, event stripe.Event) mo
 // It writes only the local compatibility inventory and never changes Stripe or
 // local user entitlements.
 func SyncStripeLegacySubscriptions(ctx context.Context) (*StripeLegacySyncResult, error) {
+	if err := model.EnsureStripeLegacyInventorySchema(); err != nil {
+		return nil, err
+	}
 	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
-		return nil, fmt.Errorf("failed to synchronize payment configuration: %w", err)
+		return nil, fmt.Errorf("%w: failed to synchronize payment configuration: %v", ErrStripeLegacySyncUnavailable, err)
 	}
 	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
 	apiSecret := setting.StripeApiSecret
 	accountID := strings.TrimSpace(setting.StripeAccountId)
 	unlockPaymentConfiguration()
 	if !validStripeSecret(apiSecret) {
-		return nil, errors.New("invalid Stripe API secret")
+		return nil, fmt.Errorf("%w: invalid Stripe API secret", ErrStripeLegacySyncNotConfigured)
 	}
 	client := stripe.NewClient(apiSecret)
 	params := &stripe.SubscriptionListParams{
@@ -257,18 +310,18 @@ func SyncStripeLegacySubscriptions(ctx context.Context) (*StripeLegacySyncResult
 	list := client.V1Subscriptions.List(ctx, params)
 	for subscription, err := range list.All(ctx) {
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("%w: Stripe subscription list failed: %v", ErrStripeLegacySyncUnavailable, err)
 		}
 		if subscription == nil {
 			continue
 		}
 		if expected, known := stripeExpectedLiveMode(apiSecret); known && subscription.Livemode != expected {
-			return result, errors.New("Stripe subscription livemode mismatch")
+			return result, fmt.Errorf("%w: Stripe subscription livemode mismatch", ErrStripeLegacySyncModeMismatch)
 		}
 		event := stripe.Event{Created: observedAt, Livemode: subscription.Livemode}
 		inventory, err := model.UpsertStripeLegacySubscription(stripeLegacySubscriptionSnapshot(subscription, event, model.StripeLegacySyncSourceAPI, true))
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("%w: failed to persist Stripe subscription inventory: %v", ErrStripeLegacySyncUnavailable, err)
 		}
 		result.Seen++
 		if inventory.MappingStatus == model.StripeLegacyMappingMapped {
@@ -278,4 +331,136 @@ func SyncStripeLegacySubscriptions(ctx context.Context) (*StripeLegacySyncResult
 		}
 	}
 	return result, nil
+}
+
+// CancelStripeLegacySubscriptionAtPeriodEnd schedules a verified legacy
+// recurring subscription to stop at the end of its current Stripe period. It
+// does not refund, expire, extend, or otherwise mutate local entitlements.
+func CancelStripeLegacySubscriptionAtPeriodEnd(ctx context.Context, input StripeLegacySubscriptionCancellationInput) (*StripeLegacySubscriptionCancellationResult, error) {
+	return cancelStripeLegacySubscriptionAtPeriodEnd(ctx, input, func(secret string) stripeLegacySubscriptionAPI {
+		return stripeLegacySubscriptionClient{client: stripe.NewClient(secret)}
+	})
+}
+
+func cancelStripeLegacySubscriptionAtPeriodEnd(ctx context.Context, input StripeLegacySubscriptionCancellationInput, apiFactory stripeLegacySubscriptionAPIFactory) (*StripeLegacySubscriptionCancellationResult, error) {
+	input.ActorIP = strings.TrimSpace(input.ActorIP)
+	input.Reason = strings.TrimSpace(input.Reason)
+	if apiFactory == nil || input.InventoryID <= 0 || input.ExpectedUpdatedAt <= 0 || input.AdminID <= 0 ||
+		input.ActorIP == "" || len(input.ActorIP) > 64 || len(input.Reason) < 8 || len(input.Reason) > 512 {
+		return nil, model.ErrStripeLegacySubscriptionCancelInvalid
+	}
+	if err := model.EnsureStripeLegacyInventorySchema(); err != nil {
+		return nil, err
+	}
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		return nil, fmt.Errorf("%w: payment configuration synchronization failed", ErrStripeLegacyCancellationUnavailable)
+	}
+	inventory, err := model.GetStripeLegacySubscriptionByID(input.InventoryID)
+	if err != nil {
+		return nil, err
+	}
+	retry, err := model.FindStripeLegacySubscriptionCancellationRetry(
+		input.InventoryID, input.ExpectedUpdatedAt, input.AdminID, input.Reason,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if retry != nil {
+		return &StripeLegacySubscriptionCancellationResult{
+			Subscription: retry.Subscription,
+			Duplicate:    true,
+		}, nil
+	}
+	if inventory.UpdatedAt != input.ExpectedUpdatedAt {
+		if !inventory.CancelAtPeriodEnd {
+			return nil, fmt.Errorf("%w: inventory snapshot changed", model.ErrStripeLegacySubscriptionCancelConflict)
+		}
+		audited, auditErr := model.HasStripeLegacySubscriptionCancellationAudit(input.InventoryID)
+		if auditErr != nil {
+			return nil, auditErr
+		}
+		if audited {
+			return nil, fmt.Errorf("%w: cancellation was already audited for another inventory snapshot", model.ErrStripeLegacySubscriptionCancelConflict)
+		}
+	}
+	if inventory.Status == "canceled" || inventory.Status == "incomplete_expired" || inventory.EndedAt > 0 {
+		return nil, fmt.Errorf("%w: subscription is already terminal", model.ErrStripeLegacySubscriptionCancelConflict)
+	}
+	if _, err := model.GetStripeLegacySubscriptionByStripeID(inventory.StripeSubscriptionID); err != nil {
+		return nil, fmt.Errorf("%w: inventory subscription identity is invalid", model.ErrStripeLegacySubscriptionCancelConflict)
+	}
+
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
+	apiSecret := strings.TrimSpace(setting.StripeApiSecret)
+	credentialAccountID := strings.TrimSpace(setting.StripeCredentialAccountId)
+	connectedAccountID := strings.TrimSpace(setting.StripeAccountId)
+	configuredMode := strings.ToLower(strings.TrimSpace(setting.StripeCredentialLivemode))
+	unlockPaymentConfiguration()
+	credentialMode, err := StripeCredentialMode(apiSecret)
+	if err != nil || !setting.StripeCredentialModeAllowed(credentialMode) || configuredMode != credentialMode ||
+		!stripeAccountIDPattern.MatchString(credentialAccountID) ||
+		connectedAccountID != "" && !stripeAccountIDPattern.MatchString(connectedAccountID) {
+		return nil, ErrStripeLegacyCancellationNotConfigured
+	}
+	expectedLivemode := credentialMode == "live"
+	if inventory.Livemode != expectedLivemode {
+		return nil, ErrStripeLegacyCancellationModeMismatch
+	}
+	api := apiFactory(apiSecret)
+	if api == nil {
+		return nil, ErrStripeLegacyCancellationUnavailable
+	}
+
+	expectedAccountID := credentialAccountID
+	if connectedAccountID != "" {
+		expectedAccountID = connectedAccountID
+	}
+	account, err := api.RetrieveAccount(ctx, connectedAccountID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: Stripe account verification failed", ErrStripeLegacyCancellationUnavailable)
+	}
+	if account == nil || strings.TrimSpace(account.ID) != expectedAccountID {
+		return nil, ErrStripeLegacyCancellationIdentityMismatch
+	}
+
+	params := &stripe.SubscriptionUpdateParams{CancelAtPeriodEnd: stripe.Bool(true)}
+	requestDigest := model.PaymentPayloadDigest(fmt.Sprintf("%d\x00%s", input.AdminID, input.Reason))
+	params.SetIdempotencyKey(fmt.Sprintf("legacy-sub-cancel:%d:%d:%s", inventory.ID, input.ExpectedUpdatedAt, requestDigest[:16]))
+	setStripeAccount(params, connectedAccountID)
+	updated, err := api.UpdateSubscription(ctx, inventory.StripeSubscriptionID, params)
+	if err != nil {
+		return nil, fmt.Errorf("%w: Stripe subscription update failed", ErrStripeLegacyCancellationUnavailable)
+	}
+	if updated == nil || strings.TrimSpace(updated.ID) != inventory.StripeSubscriptionID {
+		return nil, ErrStripeLegacyCancellationIdentityMismatch
+	}
+	if updated.Livemode != expectedLivemode || updated.Livemode != inventory.Livemode {
+		return nil, ErrStripeLegacyCancellationModeMismatch
+	}
+	if inventory.StripeCustomerID != "" && (updated.Customer == nil || strings.TrimSpace(updated.Customer.ID) != inventory.StripeCustomerID) {
+		return nil, ErrStripeLegacyCancellationIdentityMismatch
+	}
+	if !updated.CancelAtPeriodEnd {
+		return nil, fmt.Errorf("%w: Stripe did not schedule cancellation", ErrStripeLegacyCancellationUnavailable)
+	}
+
+	observedAt := time.Now().Unix()
+	snapshot := stripeLegacySubscriptionSnapshot(updated, stripe.Event{Created: observedAt, Livemode: updated.Livemode}, model.StripeLegacySyncSourceAPI, true)
+	persisted, err := model.PersistStripeLegacySubscriptionCancellation(model.StripeLegacySubscriptionCancellationInput{
+		InventoryID: input.InventoryID, ExpectedUpdatedAt: input.ExpectedUpdatedAt,
+		AdminID: input.AdminID, ActorIP: input.ActorIP, Reason: input.Reason,
+		AccountID: expectedAccountID, CredentialMode: credentialMode, Snapshot: snapshot,
+	})
+	if err != nil {
+		if errors.Is(err, model.ErrStripeLegacySubscriptionCancelInvalid) ||
+			errors.Is(err, model.ErrStripeLegacySubscriptionNotFound) ||
+			errors.Is(err, model.ErrStripeLegacySubscriptionCancelConflict) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: local cancellation snapshot persistence failed", ErrStripeLegacyCancellationUnavailable)
+	}
+	return &StripeLegacySubscriptionCancellationResult{
+		Subscription: persisted.Subscription,
+		Duplicate:    persisted.Duplicate,
+	}, nil
 }

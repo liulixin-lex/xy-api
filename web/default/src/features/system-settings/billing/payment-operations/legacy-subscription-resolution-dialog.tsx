@@ -36,8 +36,11 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 
-import { resolveLegacyEpaySubscription } from './api'
-import { buildLegacySubscriptionResolutionRequest } from './legacy-subscription-resolution'
+import { resolveLegacySubscription } from './api'
+import {
+  buildLegacySubscriptionResolutionRequest,
+  isStripeLegacyRecurringCheckoutReview,
+} from './legacy-subscription-resolution'
 import {
   PAYMENT_PROVIDER_REFERENCE_MAX_BYTES,
   isPaymentAuditReasonValid,
@@ -68,6 +71,9 @@ export function LegacySubscriptionResolutionDialog(props: {
     providerRefundReference,
     reason
   )
+  const isStripeRecurringCheckout = isStripeLegacyRecurringCheckoutReview(
+    props.event
+  )
 
   useEffect(() => {
     if (!props.open) return
@@ -80,8 +86,12 @@ export function LegacySubscriptionResolutionDialog(props: {
       if (!request) return null
       return runWithVerification(
         async () => {
-          const result = await resolveLegacyEpaySubscription(request)
-          toast.success(t('Legacy subscription external refund recorded'))
+          const result = await resolveLegacySubscription(request)
+          toast.success(
+            t(
+              'Completed external refund recorded. No subscription access was granted.'
+            )
+          )
           props.onOpenChange(false)
           try {
             await props.onCompleted()
@@ -96,9 +106,9 @@ export function LegacySubscriptionResolutionDialog(props: {
         },
         {
           preferredMethod: 'passkey',
-          title: t('Verify legacy subscription external refund'),
+          title: t('Verify completed external refund record'),
           description: t(
-            'Confirm your identity before applying this audited financial resolution.'
+            'Confirm your identity before recording this permanent financial outcome.'
           ),
         }
       )
@@ -107,7 +117,7 @@ export function LegacySubscriptionResolutionDialog(props: {
       toast.error(
         getApiErrorMessage(
           error,
-          t('Failed to resolve legacy Epay subscription')
+          t('Failed to record the legacy subscription external refund.')
         )
       )
       props.onOpenChange(false)
@@ -135,19 +145,23 @@ export function LegacySubscriptionResolutionDialog(props: {
         aria-busy={operationPending}
       >
         <DialogHeader>
-          <DialogTitle>{t('Resolve legacy Epay subscription')}</DialogTitle>
+          <DialogTitle>{t('Record completed external refund')}</DialogTitle>
           <DialogDescription>
-            {t(
-              'This paid legacy subscription cannot be fulfilled because its original plan contract is no longer available. The only safe terminal outcome is a provider refund already completed outside this system.'
-            )}
+            {isStripeRecurringCheckout
+              ? t(
+                  'This historical recurring Stripe Checkout was paid, but subscription access was not safely created. Record only a full refund already completed in Stripe; this system will close the payment without granting access.'
+                )
+              : t(
+                  'This paid legacy subscription cannot be fulfilled because its original plan contract is no longer available. Record only a full refund already completed by the payment provider; this system will close the payment without granting access.'
+                )}
           </DialogDescription>
         </DialogHeader>
 
         <Alert variant='destructive'>
-          <AlertTitle>{t('Permanent financial action')}</AlertTitle>
+          <AlertTitle>{t('This does not issue a refund')}</AlertTitle>
           <AlertDescription>
             {t(
-              'This action never grants the current or changed subscription plan. It only records a completed external refund and closes the legacy payment.'
+              'Continue only after the payment provider has completed the full refund. This system records the evidence, closes the legacy payment, and grants no subscription access.'
             )}
           </AlertDescription>
         </Alert>
@@ -249,7 +263,7 @@ export function LegacySubscriptionResolutionDialog(props: {
             aria-invalid={reason.length > 0 && !reasonValid}
             aria-describedby='legacy-subscription-resolution-reason-help'
             placeholder={t(
-              'Record the provider refund evidence and why this legacy subscription must close without granting a plan.'
+              'Document where the provider shows the completed full refund and why this legacy payment must close without access.'
             )}
             onChange={(event) => setReason(event.target.value)}
           />
@@ -283,7 +297,7 @@ export function LegacySubscriptionResolutionDialog(props: {
           >
             {mutation.isPending
               ? t('Applying...')
-              : t('Confirm external refund')}
+              : t('Record completed refund')}
           </Button>
         </DialogFooter>
       </DialogContent>

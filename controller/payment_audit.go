@@ -81,10 +81,11 @@ type paymentDebtResolutionRequest struct {
 }
 
 type manualPaymentResolutionRequest struct {
-	TradeNo             string `json:"trade_no"`
-	ExpectedVersion     int64  `json:"expected_version"`
-	Reason              string `json:"reason"`
-	RefundedAmountMinor int64  `json:"refunded_amount_minor"`
+	TradeNo                 string `json:"trade_no"`
+	ExpectedVersion         int64  `json:"expected_version"`
+	Reason                  string `json:"reason"`
+	RefundedAmountMinor     int64  `json:"refunded_amount_minor"`
+	ProviderRefundReference string `json:"provider_refund_reference"`
 }
 
 func ResolveManualPaymentOrder(c *gin.Context) {
@@ -213,6 +214,7 @@ func resolvePaymentOrderAuditAction(c *gin.Context, action string) {
 	result, err := model.ResolvePaymentOrderByAdmin(model.PaymentAdminOrderActionInput{
 		TradeNo: tradeNo, ExpectedVersion: request.ExpectedVersion, AdminID: c.GetInt("id"),
 		ActorIP: c.ClientIP(), Action: action, Reason: request.Reason, RefundedAmountMinor: request.RefundedAmountMinor,
+		ProviderRefundReference: request.ProviderRefundReference,
 	})
 	if err != nil {
 		writePaymentAuditActionError(c, err)
@@ -226,6 +228,7 @@ func resolvePaymentOrderAuditAction(c *gin.Context, action string) {
 		recordManageAudit(c, auditAction, map[string]interface{}{
 			"trade_no": tradeNo, "expected_version": request.ExpectedVersion,
 			"reason": strings.TrimSpace(request.Reason), "refunded_amount_minor": request.RefundedAmountMinor,
+			"provider_refund_reference": strings.TrimSpace(request.ProviderRefundReference),
 		})
 	} else {
 		markAuditLogged(c)

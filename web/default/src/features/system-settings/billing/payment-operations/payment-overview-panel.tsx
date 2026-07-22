@@ -28,7 +28,10 @@ import {
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 
-import { getPaymentAdminErrorMessage } from '../../payment-admin-errors'
+import {
+  getPaymentAdminErrorCode,
+  getPaymentAdminErrorMessage,
+} from '../../payment-admin-errors'
 import { getPaymentOperationsOverview } from './api'
 
 const CLUSTER_MESSAGE_KEYS: Record<string, string> = {
@@ -64,6 +67,7 @@ export function PaymentOverviewPanel() {
     queryKey: ['payment-operations-overview'],
     queryFn: getPaymentOperationsOverview,
     refetchInterval: 30_000,
+    meta: { skipGlobalError: true },
   })
 
   if (overviewQuery.isLoading) {
@@ -77,9 +81,18 @@ export function PaymentOverviewPanel() {
   }
 
   if (overviewQuery.isError || !overviewQuery.data) {
+    const errorCode = getPaymentAdminErrorCode(overviewQuery.error)
+    const migrationRequired =
+      errorCode === 'payment_operations_schema_not_ready'
+    let errorTitle = t('Payment overview is unavailable')
+    if (migrationRequired) {
+      errorTitle = t('Payment operations need a database migration')
+    } else if (errorCode === 'payment_overview_schema_invalid') {
+      errorTitle = t('Payment overview needs a server update')
+    }
     return (
       <Alert variant='destructive'>
-        <AlertTitle>{t('Payment overview is unavailable')}</AlertTitle>
+        <AlertTitle>{errorTitle}</AlertTitle>
         <AlertDescription className='flex flex-wrap items-center justify-between gap-3'>
           <span className='grid gap-1'>
             <span>

@@ -34,9 +34,7 @@ import SettingsPaymentGatewayXorPay from '../../pages/Setting/Payment/SettingsPa
 import SettingsPaymentGatewayCreem from '../../pages/Setting/Payment/SettingsPaymentGatewayCreem';
 import SettingsPaymentGatewayWaffo from '../../pages/Setting/Payment/SettingsPaymentGatewayWaffo';
 import SettingsPaymentGatewayWaffoPancake from '../../pages/Setting/Payment/SettingsPaymentGatewayWaffoPancake';
-import PaymentOverviewPanel from '../../pages/Setting/Payment/PaymentOverviewPanel';
 import PaymentLimitsPanel from '../../pages/Setting/Payment/PaymentLimitsPanel';
-import StripeLegacyInventoryPanel from '../../pages/Setting/Payment/StripeLegacyInventoryPanel';
 import {
   API,
   showError,
@@ -646,12 +644,9 @@ const PaymentSetting = () => {
           )}
           <Tabs
             type='card'
-            defaultActiveKey='overview'
+            defaultActiveKey='general'
             contentStyle={{ paddingTop: 24 }}
           >
-            <Tabs.TabPane tab={t('支付概览')} itemKey='overview'>
-              <PaymentOverviewPanel />
-            </Tabs.TabPane>
             <Tabs.TabPane
               tab={t('通用设置')}
               itemKey='general'
@@ -695,9 +690,6 @@ const PaymentSetting = () => {
                   requestEmergencyCredentialRevocation
                 }
                 hideSectionTitle
-              />
-              <StripeLegacyInventoryPanel
-                withPaymentVerification={withPaymentVerification}
               />
             </Tabs.TabPane>
             <Tabs.TabPane

@@ -21,8 +21,11 @@ import { describe, test } from 'node:test'
 
 import {
   getPaymentMethodIdentity,
+  MAX_CONFIGURED_PAYMENT_METHODS,
   mergePaymentMethodEdit,
   normalizePaymentMethod,
+  removePaymentMethodByIdentity,
+  validatePaymentMethodCollection,
 } from './payment-methods-visual-editor-utils'
 
 describe('payment methods visual editor', () => {
@@ -77,6 +80,80 @@ describe('payment methods visual editor', () => {
     assert.notEqual(
       getPaymentMethodIdentity(changed),
       getPaymentMethodIdentity(existing)
+    )
+  })
+
+  test('matches the backend provider identity and 27-entry compatibility limit', () => {
+    const historical = normalizePaymentMethod({
+      name: 'Legacy product checkout',
+      type: 'creem',
+      provider: 'epay',
+    })
+    const canonical = normalizePaymentMethod({
+      name: 'Online payment',
+      type: 'creem',
+      provider: 'creem',
+    })
+    assert.ok(historical)
+    assert.ok(canonical)
+    assert.notEqual(
+      getPaymentMethodIdentity(historical),
+      getPaymentMethodIdentity(canonical)
+    )
+    assert.equal(validatePaymentMethodCollection([historical, canonical]), null)
+    assert.equal(
+      validatePaymentMethodCollection([historical, historical]),
+      'duplicate_payment_method'
+    )
+
+    const maximum = Array.from(
+      { length: MAX_CONFIGURED_PAYMENT_METHODS },
+      (_, index) => ({
+        type: `custom_${index}`,
+        provider: 'epay' as const,
+      })
+    )
+    assert.equal(validatePaymentMethodCollection(maximum), null)
+    assert.equal(
+      validatePaymentMethodCollection([
+        ...maximum,
+        {
+          type: 'custom_28',
+          provider: 'epay',
+        },
+      ]),
+      'too_many_payment_methods'
+    )
+  })
+
+  test('deletes only the selected provider identity when names and types overlap', () => {
+    const historical = {
+      name: 'Online payment',
+      type: 'creem',
+      provider: 'epay',
+      legacy_flag: true,
+    }
+    const canonical = {
+      name: 'Online payment',
+      type: 'creem',
+      provider: 'creem',
+      route_id: 'online_primary',
+    }
+    const invalidEntry = { future_configuration: true }
+
+    assert.deepEqual(
+      removePaymentMethodByIdentity(
+        [historical, canonical, invalidEntry],
+        canonical
+      ),
+      [historical, invalidEntry]
+    )
+    assert.deepEqual(
+      removePaymentMethodByIdentity(
+        [historical, canonical, invalidEntry],
+        historical
+      ),
+      [canonical, invalidEntry]
     )
   })
 })

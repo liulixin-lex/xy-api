@@ -54,6 +54,17 @@ type paymentCredentialRevocationPreviewView struct {
 	Impact               *model.PaymentCredentialRevocationImpact `json:"impact"`
 }
 
+type paymentOperationsOverviewResponse struct {
+	Operations *model.PaymentOperationsOverview `json:"operations"`
+	Runtime    service.PaymentRuntimeInfo       `json:"runtime"`
+	Cluster    paymentClusterOverviewView       `json:"cluster"`
+}
+
+type paymentClusterOverviewView struct {
+	Ready bool   `json:"ready"`
+	Code  string `json:"code"`
+}
+
 func publicPaymentLimitUsage(usage *model.PaymentLimitUsage) *paymentLimitUsageView {
 	if usage == nil {
 		return nil
@@ -93,16 +104,20 @@ func GetPaymentOperationsOverview(c *gin.Context) {
 	overview, err := model.GetPaymentOperationsOverview(common.GetTimestamp())
 	if err != nil {
 		logger.LogWarn(c.Request.Context(), "failed to load payment operations overview: "+err.Error())
+		if errors.Is(err, model.ErrPaymentOperationsSchemaNotReady) {
+			paymentAPIErrorWithCode(c, http.StatusServiceUnavailable, "payment_operations_schema_not_ready", "", nil)
+			return
+		}
 		paymentAPIErrorWithCode(c, http.StatusServiceUnavailable, "payment_overview_unavailable", "", nil)
 		return
 	}
 	clusterErr := service.EnsurePaymentClusterReady()
-	common.ApiSuccess(c, gin.H{
-		"operations": overview,
-		"runtime":    service.CurrentPaymentRuntimeInfo(),
-		"cluster": gin.H{
-			"ready": clusterErr == nil,
-			"code":  service.PaymentClusterReadinessCode(clusterErr),
+	common.ApiSuccess(c, paymentOperationsOverviewResponse{
+		Operations: overview,
+		Runtime:    service.CurrentPaymentRuntimeInfo(),
+		Cluster: paymentClusterOverviewView{
+			Ready: clusterErr == nil,
+			Code:  service.PaymentClusterReadinessCode(clusterErr),
 		},
 	})
 }

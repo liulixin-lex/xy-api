@@ -47,6 +47,7 @@ func TestSystemSettingsRoutesUseSystemSettingPermission(t *testing.T) {
 	assertPaymentOperationsRoutePermission(t, http.MethodPost, "/user/topup/complete", true, controller.AdminCompleteTopUp)
 	assertPaymentOperationsRoutePermission(t, http.MethodGet, "/subscription/admin/stripe/inventory", false, controller.AdminListStripeLegacySubscriptionInventory)
 	assertPaymentOperationsRateLimitedRoute(t, http.MethodPost, "/subscription/admin/stripe/inventory/sync", controller.AdminSyncStripeLegacySubscriptionInventory)
+	assertPaymentOperationsRateLimitedRoute(t, http.MethodPost, "/subscription/admin/stripe/inventory/:id/cancel-at-period-end", controller.AdminCancelStripeLegacySubscriptionAtPeriodEnd)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/option/affiliate_rewards", controller.GetAdminAffiliateRewards)
 	assertSystemSettingsRoutePermission(t, http.MethodGet, "/option/invite_link_batches", controller.ListInviteLinkBatches)
 	assertSystemSettingsRoutePermission(t, http.MethodPost, "/option/invite_link_batches", controller.CreateInviteLinkBatch)

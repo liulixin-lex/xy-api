@@ -37,13 +37,14 @@ var (
 )
 
 type PaymentAdminOrderActionInput struct {
-	TradeNo             string
-	ExpectedVersion     int64
-	AdminID             int
-	ActorIP             string
-	Action              string
-	Reason              string
-	RefundedAmountMinor int64
+	TradeNo                 string
+	ExpectedVersion         int64
+	AdminID                 int
+	ActorIP                 string
+	Action                  string
+	Reason                  string
+	RefundedAmountMinor     int64
+	ProviderRefundReference string
 }
 
 type PaymentUnmatchedEventActionInput struct {
@@ -68,6 +69,7 @@ func ResolvePaymentOrderByAdmin(input PaymentAdminOrderActionInput) (*PaymentSet
 	input.Action = strings.ToLower(strings.TrimSpace(input.Action))
 	input.Reason = strings.TrimSpace(input.Reason)
 	input.ActorIP = strings.TrimSpace(input.ActorIP)
+	input.ProviderRefundReference = strings.TrimSpace(input.ProviderRefundReference)
 	if input.TradeNo == "" || len(input.TradeNo) > 128 || input.ExpectedVersion <= 0 || input.AdminID <= 0 ||
 		input.ActorIP == "" || len(input.ActorIP) > 64 || len(input.Reason) < 8 || len(input.Reason) > 512 {
 		return nil, ErrPaymentAuditInvalid
@@ -76,7 +78,11 @@ func ResolvePaymentOrderByAdmin(input PaymentAdminOrderActionInput) (*PaymentSet
 		input.Action != PaymentAdminActionVoid && input.Action != PaymentAdminActionExternalRefundConfirmed {
 		return nil, ErrPaymentAuditInvalid
 	}
-	if input.Action == PaymentAdminActionExternalRefundConfirmed && input.RefundedAmountMinor <= 0 {
+	if input.Action == PaymentAdminActionExternalRefundConfirmed &&
+		(input.RefundedAmountMinor <= 0 || !validPaymentProviderReference(input.ProviderRefundReference)) {
+		return nil, ErrPaymentAuditInvalid
+	}
+	if input.Action != PaymentAdminActionExternalRefundConfirmed && input.ProviderRefundReference != "" {
 		return nil, ErrPaymentAuditInvalid
 	}
 
@@ -97,6 +103,9 @@ func ResolvePaymentOrderByAdmin(input PaymentAdminOrderActionInput) (*PaymentSet
 			return err
 		}
 		eventKey := paymentAdminOrderEventKey(input.Action, order.ID, input.ExpectedVersion)
+		if input.Action == PaymentAdminActionExternalRefundConfirmed {
+			eventKey = paymentExternalRefundEventKey(order.Provider, input.ProviderRefundReference)
+		}
 		duplicate, err := processedAdminActionRetryTx(tx, eventKey, PaymentPayloadDigest(payload))
 		if err != nil {
 			return err
@@ -171,7 +180,8 @@ func ResolveUnmatchedPaymentEventByAdmin(input PaymentUnmatchedEventActionInput)
 		}
 		result.Event = &event
 		if event.ReviewCode == PaymentReviewCodeLegacyTopUpQuotaSnapshotMissing ||
-			event.ReviewCode == PaymentReviewCodeLegacySubscriptionContractUnavailable {
+			event.ReviewCode == PaymentReviewCodeLegacySubscriptionContractUnavailable ||
+			event.ReviewCode == PaymentReviewCodeStripeLegacyRecurringCheckoutPaid {
 			return fmt.Errorf("%w: payment event requires its classified legacy resolution", ErrPaymentAuditConflict)
 		}
 		if input.Action == PaymentUnmatchedEventActionDismiss {
@@ -214,6 +224,7 @@ func paymentAdminActionPayload(input PaymentAdminOrderActionInput, order *Paymen
 	}
 	if input.Action == PaymentAdminActionExternalRefundConfirmed {
 		payload["refunded_amount_minor"] = input.RefundedAmountMinor
+		payload["provider_refund_reference"] = input.ProviderRefundReference
 	}
 	encoded, err := common.Marshal(payload)
 	return string(encoded), err
@@ -241,6 +252,7 @@ func createPaymentOrderActionOperationsAuditTx(tx *gorm.DB, order *PaymentOrder,
 	}
 	if input.Action == PaymentAdminActionExternalRefundConfirmed {
 		metadata["refunded_amount_minor"] = input.RefundedAmountMinor
+		metadata["provider_refund_reference"] = input.ProviderRefundReference
 	}
 	return createPaymentOperationsAuditTx(tx, PaymentOperationsAudit{
 		Action: action, AdminID: input.AdminID, ActorIP: input.ActorIP,
@@ -270,6 +282,12 @@ func paymentUnmatchedActionPayload(input PaymentUnmatchedEventActionInput, event
 
 func paymentAdminOrderEventKey(action string, orderID, expectedVersion int64) string {
 	return "order_" + action + ":" + strconv.FormatInt(orderID, 10) + ":v" + strconv.FormatInt(expectedVersion, 10)
+}
+
+func paymentExternalRefundEventKey(provider, reference string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	reference = strings.TrimSpace(reference)
+	return "provider_external_refund:" + PaymentPayloadDigest(provider+"\x00"+reference)
 }
 
 func processedAdminActionRetryTx(tx *gorm.DB, eventKey, payloadDigest string) (bool, error) {
@@ -312,65 +330,15 @@ func createAdminPaymentEventTx(tx *gorm.DB, eventKey, eventType, payload string,
 }
 
 func fulfillPaymentOrderByAdminTx(tx *gorm.DB, order *PaymentOrder, input PaymentAdminOrderActionInput, payload, eventKey string, result *PaymentSettlementResult) error {
-	if err := validateStripeAdminFulfillmentModeTx(tx, order); err != nil {
-		return err
-	}
-	granted, err := paymentEntitlementGrantedTx(tx, order)
-	if err != nil {
-		return err
-	}
-	if order.Status != PaymentOrderStatusManualReview || granted || order.RefundedAmountMinor != 0 ||
-		order.DisputedAmountMinor != 0 || order.ReversedAmountMinor != 0 || order.ReversedQuota != 0 {
-		return fmt.Errorf("%w: payment order cannot be manually fulfilled", ErrPaymentAuditConflict)
-	}
-	event, err := createAdminPaymentEventTx(tx, eventKey, PaymentOperationsActionAdminFulfill, payload, order)
-	if err != nil {
-		return err
-	}
-	event.Paid = true
-	event.PaidAmountMinor = order.ExpectedAmountMinor
-	if err := tx.Model(&PaymentEvent{}).Where("id = ?", event.ID).Updates(map[string]interface{}{
-		"paid": true, "paid_amount_minor": order.ExpectedAmountMinor,
-	}).Error; err != nil {
-		return err
-	}
-	order.Status = PaymentOrderStatusPending
-	if err := fulfillPaymentOrderTx(tx, event, order, PaymentEventInput{
-		Provider: order.Provider, EventKey: event.EventKey, EventType: event.EventType, TradeNo: order.TradeNo,
-		PaidAmountMinor: order.ExpectedAmountMinor, Currency: order.Currency, PaymentMethod: order.PaymentMethod,
-		Paid: true, NormalizedPayload: payload,
-	}, result); err != nil {
-		return paymentAuditSettlementConflict(err, "manual fulfillment failed")
-	}
-	if err := createPaymentLedgerEntryTx(tx, event, order, PaymentLedgerEntryAdminFulfill,
-		order.ExpectedAmountMinor, 0, "payment manually fulfilled by administrator"); err != nil {
-		return err
-	}
-	return finishPaymentEventTx(tx, event.ID, PaymentEventStatusProcessed, "", order.ID)
-}
-
-func validateStripeAdminFulfillmentModeTx(tx *gorm.DB, order *PaymentOrder) error {
-	if tx == nil || order == nil {
+	if tx == nil || order == nil || result == nil {
 		return ErrPaymentAuditInvalid
 	}
-	if order.Provider != PaymentProviderStripe {
-		return nil
-	}
-	if order.ProviderLivemode == nil {
-		return fmt.Errorf("%w: Stripe order mode is not frozen", ErrPaymentAuditConflict)
-	}
-	var paidEvents []PaymentEvent
-	if err := tx.Select("provider_livemode").
-		Where("provider = ? AND payment_order_id = ? AND paid = ?", PaymentProviderStripe, order.ID, true).
-		Find(&paidEvents).Error; err != nil {
-		return err
-	}
-	for _, event := range paidEvents {
-		if event.ProviderLivemode == nil || !paymentLivemodeEqual(order.ProviderLivemode, event.ProviderLivemode) {
-			return fmt.Errorf("%w: Stripe order and verified payment modes do not match", ErrPaymentAuditConflict)
-		}
-	}
-	return nil
+	// An administrator statement is not provider payment evidence. Keep this
+	// compatibility action routable so old clients receive a stable conflict,
+	// but never synthesize a paid event or grant an entitlement. Verified paid
+	// events are settled through the provider callback/query pipeline or the
+	// audited unmatched-event linking flow.
+	return fmt.Errorf("%w: manual fulfillment requires an intact verified provider event", ErrPaymentAuditConflict)
 }
 
 func rejectPaymentOrderByAdminTx(tx *gorm.DB, order *PaymentOrder, input PaymentAdminOrderActionInput, payload, eventKey string, result *PaymentSettlementResult) error {
@@ -447,8 +415,10 @@ func confirmExternalPaymentRefundTx(tx *gorm.DB, order *PaymentOrder, input Paym
 	}
 	event.Refunded = true
 	event.RefundedAmountMinor = input.RefundedAmountMinor
+	event.ProviderResourceKey = order.Provider + ":refund:" + input.ProviderRefundReference
 	if err := tx.Model(&PaymentEvent{}).Where("id = ?", event.ID).Updates(map[string]interface{}{
 		"refunded": true, "refunded_amount_minor": input.RefundedAmountMinor,
+		"provider_resource_key": event.ProviderResourceKey,
 	}).Error; err != nil {
 		return err
 	}

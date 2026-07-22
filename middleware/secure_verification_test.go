@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +13,39 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSecureVerificationRequiredAcceptsSerializedNumericSessionValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(sessions.Sessions("session", cookie.NewStore([]byte("secure-verification-serialized-values"))))
+	router.GET("/verify", func(c *gin.Context) {
+		session := sessions.Default(c)
+		session.Set(SecureVerificationSessionKey, strconv.FormatInt(time.Now().Unix(), 10))
+		session.Set(secureVerificationMethodSessionKey, "passkey")
+		session.Set(secureVerificationUserIDSessionKey, "19")
+		require.NoError(t, session.Save())
+		c.Status(http.StatusNoContent)
+	})
+	router.GET(
+		"/protected",
+		func(c *gin.Context) { c.Set("id", 19) },
+		SecureVerificationRequired(),
+		func(c *gin.Context) { c.Status(http.StatusNoContent) },
+	)
+
+	verifyRecorder := httptest.NewRecorder()
+	router.ServeHTTP(verifyRecorder, httptest.NewRequest(http.MethodGet, "/verify", nil))
+	require.Equal(t, http.StatusNoContent, verifyRecorder.Code)
+
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	for _, sessionCookie := range verifyRecorder.Result().Cookies() {
+		request.AddCookie(sessionCookie)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNoContent, recorder.Code, "unexpected response: %s", recorder.Body.String())
+}
 
 func TestSecureVerificationRequiredAllowsSessionBoundToCurrentUser(t *testing.T) {
 	gin.SetMode(gin.TestMode)

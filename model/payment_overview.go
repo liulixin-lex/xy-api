@@ -1,6 +1,13 @@
 package model
 
-import "github.com/QuantumNous/new-api/common"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+var ErrPaymentOperationsSchemaNotReady = errors.New("payment operations schema is not ready")
 
 // PaymentOperationsOverview is a compact administrator-only health snapshot.
 // It contains counts and ages only; order identifiers and provider diagnostics
@@ -27,6 +34,36 @@ type PaymentOperationsOverview struct {
 func GetPaymentOperationsOverview(now int64) (*PaymentOperationsOverview, error) {
 	if now <= 0 {
 		now = common.GetTimestamp()
+	}
+	if DB == nil {
+		return nil, errors.New("payment operations database is unavailable")
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return nil, fmt.Errorf("open payment operations database: %w", err)
+	}
+	if err := sqlDB.Ping(); err != nil {
+		return nil, fmt.Errorf("ping payment operations database: %w", err)
+	}
+	requiredSchema := []struct {
+		model   any
+		columns []string
+	}{
+		{model: &PaymentOrder{}, columns: []string{"status", "start_payload"}},
+		{model: &PaymentTask{}, columns: []string{"operation", "status", "lease_until", "created_at"}},
+		{model: &PaymentEvent{}, columns: []string{"payment_order_id", "status", "created_at"}},
+		{model: &PaymentLimitReservation{}, columns: []string{"status", "expires_at"}},
+		{model: &Option{}, columns: []string{"key", "value"}},
+	}
+	for _, requirement := range requiredSchema {
+		if !DB.Migrator().HasTable(requirement.model) {
+			return nil, ErrPaymentOperationsSchemaNotReady
+		}
+		for _, column := range requirement.columns {
+			if !DB.Migrator().HasColumn(requirement.model, column) {
+				return nil, ErrPaymentOperationsSchemaNotReady
+			}
+		}
 	}
 	overview := &PaymentOperationsOverview{}
 	counts := []struct {

@@ -535,17 +535,31 @@ func (*stripePaymentProvider) VerifyWebhook(request *http.Request) (*NormalizedP
 		normalized.PaidAmountMinor = session.AmountTotal
 		normalized.Currency = strings.ToUpper(string(session.Currency))
 		normalized.PaymentMethod = model.PaymentMethodStripe
+		subscriptionID := ""
+		if session.Subscription != nil {
+			subscriptionID = strings.TrimSpace(session.Subscription.ID)
+		}
 		// Historical recurring Checkout Sessions are inventory-only. Renewals and
 		// recurring lifecycle events must never enter the one-time settlement path.
-		if !isRecurringSession {
+		// A verified first payment is quarantined for operator reconciliation rather
+		// than being silently acknowledged or granting an entitlement from mutable
+		// current-plan data.
+		if isRecurringSession {
+			paidCompletion := (event.Type == stripe.EventTypeCheckoutSessionCompleted ||
+				event.Type == stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded) &&
+				session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid
+			if paidCompletion {
+				normalized.ProviderState = model.PaymentProviderStateStripeLegacyRecurringCheckoutPaid
+				normalized.ProviderResourceKey = "stripe:" + subscriptionID
+				// A zero-total trial or promotion did not collect money. It remains
+				// inventory-only and must not enter the operator refund workflow.
+				normalized.ManualReview = session.AmountTotal > 0
+			}
+		} else {
 			normalized.Paid = (event.Type == stripe.EventTypeCheckoutSessionCompleted || event.Type == stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded) && session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid
 			normalized.Failed = event.Type == stripe.EventTypeCheckoutSessionAsyncPaymentFailed
 			normalized.Expired = event.Type == stripe.EventTypeCheckoutSessionExpired
 			normalized.PermanentFailure = normalized.Failed || normalized.Expired
-		}
-		subscriptionID := ""
-		if session.Subscription != nil {
-			subscriptionID = session.Subscription.ID
 		}
 		normalized.NormalizedPayload = common.GetJsonString(map[string]interface{}{
 			"event_id":        event.ID,
@@ -917,6 +931,75 @@ func (p *stripePaymentProvider) confirmCheckoutSessionAuthority(ctx context.Cont
 		return errStripeCheckoutConfirmation
 	}
 	if *event.ProviderLivemode != session.Livemode {
+		return errStripeCheckoutConfirmation
+	}
+	return nil
+}
+
+// confirmLegacyRecurringCheckoutAuthority verifies the immutable Checkout
+// identity against the Stripe account selected by the configured API
+// credential. Successful verification only permits a durable manual-review
+// classification; it never makes a recurring Checkout eligible for automatic
+// local fulfillment.
+func (p *stripePaymentProvider) confirmLegacyRecurringCheckoutAuthority(ctx context.Context, event *NormalizedPaymentEvent) error {
+	if event == nil || event.Provider != model.PaymentProviderStripe ||
+		event.ProviderState != model.PaymentProviderStateStripeLegacyRecurringCheckoutPaid {
+		return nil
+	}
+	if (event.EventType != string(stripe.EventTypeCheckoutSessionCompleted) &&
+		event.EventType != string(stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded)) ||
+		event.Paid || event.Failed || event.Expired || event.Refunded || event.Disputed || event.DisputeResolved {
+		return errStripeCheckoutConfirmation
+	}
+	if event.ProviderLivemode == nil || !strings.HasPrefix(event.ProviderOrderKey, "stripe:cs_") ||
+		!strings.HasPrefix(event.ProviderResourceKey, "stripe:sub_") || event.PaidAmountMinor < 0 ||
+		strings.TrimSpace(event.Currency) == "" || event.PaymentMethod != model.PaymentMethodStripe ||
+		!strings.HasPrefix(event.CustomerID, "cus_") || event.ManualReview != (event.PaidAmountMinor > 0) {
+		return errStripeCheckoutConfirmation
+	}
+	credentialMode, err := StripeCredentialMode(setting.StripeApiSecret)
+	if err != nil || credentialMode != setting.StripeCredentialLivemode ||
+		credentialMode != setting.StripeWebhookCredentialLivemode {
+		return errStripeCheckoutConfirmation
+	}
+	session, err := p.getCheckoutSession(ctx, strings.TrimPrefix(event.ProviderOrderKey, "stripe:"))
+	if err != nil || validateStripeLegacyRecurringCheckoutSession(session, event, credentialMode == "live") != nil {
+		return errStripeCheckoutConfirmation
+	}
+	return nil
+}
+
+func validateStripeLegacyRecurringCheckoutSession(session *stripe.CheckoutSession, event *NormalizedPaymentEvent, expectedLivemode bool) error {
+	if session == nil || event == nil || session.Subscription == nil {
+		return errStripeCheckoutConfirmation
+	}
+	clientTradeNo := strings.TrimSpace(session.ClientReferenceID)
+	metadataTradeNo := strings.TrimSpace(session.Metadata["trade_no"])
+	if clientTradeNo != "" && metadataTradeNo != "" && clientTradeNo != metadataTradeNo {
+		return errStripeCheckoutConfirmation
+	}
+	if clientTradeNo == "" {
+		clientTradeNo = metadataTradeNo
+	}
+	customerID := ""
+	if session.Customer != nil {
+		customerID = strings.TrimSpace(session.Customer.ID)
+	}
+	subscriptionID := strings.TrimSpace(session.Subscription.ID)
+	providerPaymentKey := ""
+	if session.PaymentIntent != nil && strings.TrimSpace(session.PaymentIntent.ID) != "" {
+		providerPaymentKey = "stripe:" + strings.TrimSpace(session.PaymentIntent.ID)
+	}
+	if session.ID != strings.TrimPrefix(event.ProviderOrderKey, "stripe:") ||
+		clientTradeNo != strings.TrimSpace(event.TradeNo) ||
+		session.Mode != stripe.CheckoutSessionModeSubscription ||
+		session.Status != stripe.CheckoutSessionStatusComplete ||
+		session.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid ||
+		session.AmountTotal != event.PaidAmountMinor ||
+		!strings.EqualFold(string(session.Currency), event.Currency) ||
+		session.Livemode != expectedLivemode || session.Livemode != *event.ProviderLivemode ||
+		"stripe:"+subscriptionID != event.ProviderResourceKey || customerID != event.CustomerID ||
+		providerPaymentKey != event.ProviderPaymentKey {
 		return errStripeCheckoutConfirmation
 	}
 	return nil

@@ -300,6 +300,18 @@ func processPaymentEventWithTaskLease(input PaymentEventInput, manualReplayEvent
 			return err
 		}
 
+		if input.Provider == PaymentProviderStripe && input.ManualReview &&
+			input.ProviderState == PaymentProviderStateStripeLegacyRecurringCheckoutPaid {
+			const reason = "verified legacy Stripe recurring Checkout payment requires operator reconciliation"
+			if err := finishPaymentEventWithReviewCodeTx(tx, event.ID, PaymentEventStatusManualReview,
+				PaymentReviewCodeStripeLegacyRecurringCheckoutPaid, reason, 0); err != nil {
+				return err
+			}
+			result.ManualReview = true
+			postCommitErr = fmt.Errorf("%w: %s", ErrPaymentManualReview, reason)
+			return nil
+		}
+
 		// Unsupported Stripe event types are still acknowledged after signature
 		// verification and inbox persistence; they carry no state transition.
 		if !input.Paid && !input.Failed && !input.Expired && !input.Refunded && !input.Disputed && !input.DisputeResolved && !input.ManualReview {

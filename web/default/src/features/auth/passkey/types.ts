@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 export interface ApiResponse<T = unknown> {
   success: boolean
+  code?: string
   message?: string
   data?: T
 }

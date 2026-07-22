@@ -47,10 +47,14 @@ import RatioSetting from '../../components/settings/RatioSetting';
 import ChatsSetting from '../../components/settings/ChatsSetting';
 import DrawingSetting from '../../components/settings/DrawingSetting';
 import PaymentSetting from '../../components/settings/PaymentSetting';
+import PaymentOperationsSetting from '../../components/settings/PaymentOperationsSetting';
 import ModelDeploymentSetting from '../../components/settings/ModelDeploymentSetting';
 import PerformanceSetting from '../../components/settings/PerformanceSetting';
 import { useUserPermissions } from '../../hooks/common/useUserPermissions';
-import { canManagePaymentGatewaySettings } from '../../helpers/admin-permissions';
+import {
+  canManagePaymentGatewaySettings,
+  canManagePaymentOperations,
+} from '../../helpers/admin-permissions';
 
 const Setting = () => {
   const { t } = useTranslation();
@@ -63,17 +67,31 @@ const Setting = () => {
   const isRootUser = isRoot();
   const canManagePaymentGateway =
     isRootUser || canManagePaymentGatewaySettings(permissions);
+  const canManagePaymentOperationsPane =
+    isRootUser ||
+    (!permissionsLoading && canManagePaymentOperations(permissions));
   let panes = [];
 
-  const paymentPane = {
+  const paymentGatewayPane = {
     tab: (
       <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
         <CreditCard size={18} />
-        {t('支付设置')}
+        {t('支付网关')}
       </span>
     ),
     content: <PaymentSetting />,
-    itemKey: 'payment',
+    itemKey: 'payment-gateway',
+  };
+
+  const paymentOperationsPane = {
+    tab: (
+      <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+        <Activity size={18} />
+        {t('支付运营')}
+      </span>
+    ),
+    content: <PaymentOperationsSetting />,
+    itemKey: 'payment-operations',
   };
 
   if (isRootUser) {
@@ -117,7 +135,8 @@ const Setting = () => {
       content: <DrawingSetting />,
       itemKey: 'drawing',
     });
-    panes.push(paymentPane);
+    panes.push(paymentGatewayPane);
+    panes.push(paymentOperationsPane);
     panes.push({
       tab: (
         <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
@@ -188,8 +207,9 @@ const Setting = () => {
       content: <OtherSetting />,
       itemKey: 'other',
     });
-  } else if (!permissionsLoading && canManagePaymentGateway) {
-    panes.push(paymentPane);
+  } else if (!permissionsLoading) {
+    if (canManagePaymentGateway) panes.push(paymentGatewayPane);
+    if (canManagePaymentOperationsPane) panes.push(paymentOperationsPane);
   }
   const allowedTabKeys = panes.map((pane) => pane.itemKey).join(',');
   const onChangeTab = (key) => {
@@ -200,10 +220,12 @@ const Setting = () => {
     if (!isRootUser && permissionsLoading) return;
     const searchParams = new URLSearchParams(window.location.search);
     const requestedTab = searchParams.get('tab');
+    const normalizedRequestedTab =
+      requestedTab === 'payment' ? 'payment-gateway' : requestedTab;
     const allowedTabs = allowedTabKeys ? allowedTabKeys.split(',') : [];
     const nextTab =
-      requestedTab && allowedTabs.includes(requestedTab)
-        ? requestedTab
+      normalizedRequestedTab && allowedTabs.includes(normalizedRequestedTab)
+        ? normalizedRequestedTab
         : allowedTabs[0];
     if (!nextTab) return;
     setTabActiveKey(nextTab);

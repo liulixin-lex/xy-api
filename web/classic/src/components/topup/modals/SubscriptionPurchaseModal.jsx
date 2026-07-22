@@ -32,6 +32,7 @@ import { Crown, CalendarClock, Package } from 'lucide-react';
 import { IconCreditCard } from '@douyinfe/semi-icons';
 import { renderQuota } from '../../../helpers';
 import {
+  filterEligibleSubscriptionQuoteMethods,
   formatPaymentDecimal,
   getPaymentRouteId,
   getPublicPaymentMethodLabel,
@@ -62,8 +63,6 @@ const SubscriptionPurchaseModal = ({
   const totalAmount = Number(plan?.total_amount || 0);
   const price = plan ? Number(plan.price_amount || 0) : 0;
   const displayPrice = formatPaymentDecimal(price, plan?.currency || 'USD');
-  const planCurrency = (plan?.currency || 'USD').toUpperCase();
-  const supportsUnifiedPayment = planCurrency === 'USD';
   const externalRouteIDs = new Set(plan?.external_payment_route_ids || []);
   const hasProductCheckout = paymentRoutes.some(
     (route) =>
@@ -73,7 +72,11 @@ const SubscriptionPurchaseModal = ({
     (route) =>
       route.checkout_mode === 'direct' && externalRouteIDs.has(route.route_id),
   );
-  const hasQuote = supportsUnifiedPayment && quoteMethods.length > 0;
+  const eligibleQuoteMethods = filterEligibleSubscriptionQuoteMethods(
+    quoteMethods,
+    plan?.external_payment_route_ids,
+  );
+  const hasQuote = eligibleQuoteMethods.length > 0;
   const hasAnyPayment = hasProductCheckout || hasDirectCheckout || hasQuote;
   const purchaseLimit = Number(purchaseLimitInfo?.limit || 0);
   const purchaseCount = Number(purchaseLimitInfo?.count || 0);
@@ -194,18 +197,6 @@ const SubscriptionPurchaseModal = ({
             closeIcon={null}
           />
 
-          {!supportsUnifiedPayment && (
-            <Banner
-              type='warning'
-              description={t(
-                '当前套餐使用 {{currency}} 定价，部分在线支付方式暂不可用。',
-                { currency: planCurrency },
-              )}
-              className='!rounded-xl'
-              closeIcon={null}
-            />
-          )}
-
           {hasAnyPayment ? (
             <div className='space-y-3'>
               <Text size='small' type='tertiary'>
@@ -249,9 +240,13 @@ const SubscriptionPurchaseModal = ({
                     style={{ flex: 1 }}
                     size='default'
                     placeholder={t('选择支付方式')}
-                    optionList={quoteMethods.map((m) => ({
+                    optionList={eligibleQuoteMethods.map((m) => ({
                       value: getPaymentRouteId(m),
-                      label: getPublicPaymentMethodLabel(m, t, quoteMethods),
+                      label: getPublicPaymentMethodLabel(
+                        m,
+                        t,
+                        eligibleQuoteMethods,
+                      ),
                     }))}
                     disabled={purchaseLimitReached || paying}
                   />
@@ -272,11 +267,7 @@ const SubscriptionPurchaseModal = ({
           ) : (
             <Banner
               type='info'
-              description={
-                supportsUnifiedPayment
-                  ? t('管理员未开启在线支付功能，请联系管理员配置。')
-                  : t('当前套餐没有可用的兼容支付方式，请联系管理员。')
-              }
+              description={t('当前套餐没有可用的兼容支付方式，请联系管理员。')}
               className='!rounded-xl'
               closeIcon={null}
             />

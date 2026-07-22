@@ -16,10 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import * as z from 'zod'
-import type { Resolver } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
+import type { Resolver } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
+import * as z from 'zod'
+
 import {
   Form,
   FormControl,
@@ -39,6 +40,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { DEFAULT_LOGO, DEFAULT_SYSTEM_NAME } from '@/lib/constants'
+import { useSystemConfigStore } from '@/stores/system-config-store'
+
 import { FormDirtyIndicator } from '../components/form-dirty-indicator'
 import { FormNavigationGuard } from '../components/form-navigation-guard'
 import {
@@ -134,6 +138,8 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
         const otherEntries = entries.filter(([key]) => key !== 'theme.frontend')
 
         let allSucceeded = true
+        let savedSystemName = false
+        let savedLogo = false
         for (const [key, value] of otherEntries) {
           let v = normalizeValue(value)
           if (key === 'ServerAddress') {
@@ -145,7 +151,21 @@ export function SystemInfoSection({ defaultValues }: SystemInfoSectionProps) {
           })
           if (!res.success) {
             allSucceeded = false
+          } else if (key === 'SystemName') {
+            savedSystemName = true
+          } else if (key === 'Logo') {
+            savedLogo = true
           }
+        }
+        if (savedSystemName || savedLogo) {
+          useSystemConfigStore.getState().setConfig({
+            ...(savedSystemName
+              ? {
+                  systemName: _data.SystemName?.trim() || DEFAULT_SYSTEM_NAME,
+                }
+              : {}),
+            ...(savedLogo ? { logo: _data.Logo?.trim() || DEFAULT_LOGO } : {}),
+          })
         }
         if (themeEntry && !allSucceeded) {
           // Theme was not submitted; keep form state consistent with backend.

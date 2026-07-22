@@ -1,9 +1,9 @@
 package passkey
 
 import (
-	"encoding/json"
 	"errors"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 	webauthn "github.com/go-webauthn/webauthn/webauthn"
@@ -17,7 +17,7 @@ func SaveSessionData(c *gin.Context, key string, data *webauthn.SessionData) err
 		session.Delete(key)
 		return session.Save()
 	}
-	payload, err := json.Marshal(data)
+	payload, err := common.Marshal(data)
 	if err != nil {
 		return err
 	}
@@ -32,15 +32,17 @@ func PopSessionData(c *gin.Context, key string) (*webauthn.SessionData, error) {
 		return nil, errSessionNotFound
 	}
 	session.Delete(key)
-	_ = session.Save()
+	if err := session.Save(); err != nil {
+		return nil, err
+	}
 	var data webauthn.SessionData
 	switch value := raw.(type) {
 	case string:
-		if err := json.Unmarshal([]byte(value), &data); err != nil {
+		if err := common.UnmarshalJsonStr(value, &data); err != nil {
 			return nil, err
 		}
 	case []byte:
-		if err := json.Unmarshal(value, &data); err != nil {
+		if err := common.Unmarshal(value, &data); err != nil {
 			return nil, err
 		}
 	default:
