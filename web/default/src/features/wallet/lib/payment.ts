@@ -178,7 +178,7 @@ export function filterPaymentMethodsForBrowser(
       .map((method) => method.public_method)
   )
 
-  return methods.filter((method) => {
+  const environmentRoutes = methods.filter((method) => {
     if (method.public_method !== 'wechat_pay') return true
 
     const isJSAPI =
@@ -190,32 +190,81 @@ export function filterPaymentMethodsForBrowser(
       method.channel_alias === 'qr' || method.channel_alias === 'native'
     return !(isNative && wechatJSAPIGroups.has(method.public_method))
   })
+
+  const selectedBrands = new Set<string>()
+  return environmentRoutes.filter((method) => {
+    if (
+      method.public_method !== 'alipay' &&
+      method.public_method !== 'wechat_pay'
+    ) {
+      return true
+    }
+    if (selectedBrands.has(method.public_method)) return false
+    selectedBrands.add(method.public_method)
+    return true
+  })
 }
 
 export function isSafePaymentQrContent(value: string): boolean {
   const trimmed = value.trim()
-  if (!trimmed || trimmed.length > 4096) return false
-  if (trimmed.startsWith('weixin://wxpay/')) return true
-  try {
-    const url = new URL(trimmed)
-    return (
-      url.protocol === 'https:' &&
-      url.hostname.toLowerCase() === 'qr.alipay.com' &&
-      !url.username &&
-      !url.password &&
-      (!url.port || url.port === '443')
-    )
-  } catch {
+  if (!trimmed || value !== trimmed || trimmed.length > 4096) return false
+  if (
+    hasForbiddenPaymentControlCharacters(trimmed) ||
+    trimmed.includes('\\') ||
+    trimmed.includes('#')
+  ) {
     return false
   }
+
+  if (trimmed.startsWith('weixin://')) {
+    try {
+      const url = new URL(trimmed)
+      const queryEntries = [...url.searchParams.entries()]
+      return (
+        trimmed.startsWith('weixin://wxpay/bizpayurl?') &&
+        url.protocol === 'weixin:' &&
+        url.host === 'wxpay' &&
+        !url.username &&
+        !url.password &&
+        !url.port &&
+        !url.hash &&
+        url.pathname === '/bizpayurl' &&
+        queryEntries.length === 1 &&
+        queryEntries[0][0] === 'pr' &&
+        /^[A-Za-z0-9_-]{1,512}$/.test(queryEntries[0][1])
+      )
+    } catch {
+      return false
+    }
+  }
+
+  const hostedMatch = /^(https?):\/\/([^/?#]+)(\/[^?#]*)$/.exec(trimmed)
+  if (hostedMatch?.[2].toLowerCase() === 'ipay.yltg.com.cn') {
+    const path = hostedMatch[3]
+    return (
+      path.length >= 2 &&
+      path.length <= 2049 &&
+      /^\/[A-Za-z0-9._~/-]+$/.test(path) &&
+      !path.startsWith('//') &&
+      !path.includes('/../') &&
+      !path.endsWith('/..')
+    )
+  }
+
+  const alipayMatch = /^https:\/\/([^/?#]+)(\/[^?#]+)$/.exec(trimmed)
+  if (alipayMatch?.[1].toLowerCase() !== 'qr.alipay.com') return false
+  const path = alipayMatch[2]
+  return (
+    path.length >= 2 && path.length <= 2049 && /^\/[A-Za-z0-9._~-]+$/.test(path)
+  )
 }
 
 function hasForbiddenPaymentControlCharacters(value: string): boolean {
-  return (
-    value.includes('\u0000') ||
-    value.includes('\u000A') ||
-    value.includes('\u000D')
-  )
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true
+  }
+  return false
 }
 
 export function isSafePaymentJSAPIParameters(
@@ -589,6 +638,17 @@ export function isStripePayment(paymentType: string): boolean {
 
 export function isUnifiedPaymentMethod(method: PaymentMethod): boolean {
   return method.checkout_mode === 'quote' || method.checkout_mode === 'direct'
+}
+
+export function filterEligibleSubscriptionQuoteMethods(
+  methods: PaymentMethod[],
+  eligibleRouteIDs: readonly string[] | undefined
+): PaymentMethod[] {
+  const eligibleRoutes = new Set(eligibleRouteIDs || [])
+  return methods.filter(
+    (method) =>
+      method.checkout_mode === 'quote' && eligibleRoutes.has(method.route_id)
+  )
 }
 
 /**

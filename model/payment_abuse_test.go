@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,14 +16,80 @@ import (
 )
 
 func TestGeneratePaymentTradeNoPreservesProtectedLegacyReferencePrefix(t *testing.T) {
-	first, err := GeneratePaymentTradeNo()
+	fixedTime := time.Date(2026, time.July, 22, 10, 11, 12, 0, time.UTC)
+	first, err := generatePaymentTradeNo(fixedTime, bytes.NewReader(make([]byte, 10)))
 	require.NoError(t, err)
-	second, err := GeneratePaymentTradeNo()
+	second, err := generatePaymentTradeNo(fixedTime.Add(time.Second), bytes.NewReader(make([]byte, 10)))
 	require.NoError(t, err)
 
-	assert.True(t, strings.HasPrefix(first, paymentTradeNoPrefix))
-	assert.Len(t, first, len(paymentTradeNoPrefix)+32)
-	assert.NotEqual(t, first, second)
+	assert.Equal(t, "new-api-ref-20260722T101112Z-0000000000000000", first)
+	assert.Len(t, first, len(paymentTradeNoPrefix)+33)
+	assert.Less(t, first, second, "the UTC timestamp keeps new references time-sortable")
+	for _, character := range strings.TrimPrefix(first, paymentTradeNoPrefix) {
+		assert.True(t,
+			character >= '0' && character <= '9' || character >= 'A' && character <= 'Z' || character == '-',
+			"unexpected trade number character %q", character,
+		)
+	}
+}
+
+func TestGeneratePaymentTradeNoIsConcurrencySafe(t *testing.T) {
+	const count = 16
+	fixedTime := time.Date(2026, time.July, 22, 10, 11, 12, 0, time.UTC)
+	tradeNumbers := make(chan string, count)
+	errorsByGenerator := make(chan error, count)
+	var waitGroup sync.WaitGroup
+	for index := 0; index < count; index++ {
+		waitGroup.Add(1)
+		go func(entropyByte byte) {
+			defer waitGroup.Done()
+			tradeNo, err := generatePaymentTradeNo(
+				fixedTime,
+				bytes.NewReader(bytes.Repeat([]byte{entropyByte}, 10)),
+			)
+			if err != nil {
+				errorsByGenerator <- err
+				return
+			}
+			tradeNumbers <- tradeNo
+		}(byte(index + 1))
+	}
+	waitGroup.Wait()
+	close(tradeNumbers)
+	close(errorsByGenerator)
+
+	for err := range errorsByGenerator {
+		require.NoError(t, err)
+	}
+	seen := make(map[string]struct{}, count)
+	for tradeNo := range tradeNumbers {
+		assert.Len(t, tradeNo, len(paymentTradeNoPrefix)+33)
+		assert.True(t, strings.HasPrefix(tradeNo, paymentTradeNoPrefix+"20260722T101112Z-"))
+		_, duplicate := seen[tradeNo]
+		assert.False(t, duplicate, "duplicate concurrent trade number %q", tradeNo)
+		seen[tradeNo] = struct{}{}
+	}
+	assert.Len(t, seen, count)
+}
+
+func TestCreatePaymentOrderRetriesTradeNumberCollision(t *testing.T) {
+	truncateTables(t)
+	const collision = "new-api-ref-20260722T101112Z-0000000000000000"
+	const unique = "new-api-ref-20260722T101112Z-0000000000000001"
+	require.NoError(t, DB.Create(&PaymentOrder{TradeNo: collision, UserID: 980001, RequestID: "existing"}).Error)
+
+	generated := []string{collision, unique}
+	index := 0
+	order := &PaymentOrder{UserID: 980002, RequestID: "new"}
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return createPaymentOrderWithUniqueTradeNoTx(tx, order, func() (string, error) {
+			tradeNo := generated[index]
+			index++
+			return tradeNo, nil
+		})
+	}))
+	assert.Equal(t, unique, order.TradeNo)
+	assert.NotZero(t, order.ID)
 }
 
 func createAbuseTestQuote(t *testing.T, userID int, provider string, amount int64, expiresAt int64) *PaymentQuote {

@@ -38,6 +38,8 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 
+import { isPaymentMethodProviderTypeValid } from './payment-methods-visual-editor-utils'
+
 const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
   z
     .object({
@@ -54,7 +56,14 @@ const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
           /^[A-Za-z0-9_-]{1,64}$/,
           t('Use 1 to 64 letters, numbers, underscores, or hyphens.')
         ),
-      provider: z.enum(['epay', 'stripe', 'xorpay', 'waffo_pancake']),
+      provider: z.enum([
+        'epay',
+        'stripe',
+        'xorpay',
+        'creem',
+        'waffo',
+        'waffo_pancake',
+      ]),
       icon: z.string().trim().max(64, t('Icon name is too long')).optional(),
       min_topup: z
         .string()
@@ -67,15 +76,7 @@ const createPaymentMethodDialogSchema = (t: (key: string) => string) =>
         }, t('Minimum top-up must be a positive whole number between 1 and 10000')),
     })
     .superRefine((value, ctx) => {
-      const valid =
-        value.provider === 'epay' ||
-        (value.provider === 'stripe' && value.type === 'stripe') ||
-        (value.provider === 'xorpay' &&
-          (value.type === 'xorpay_native' ||
-            value.type === 'xorpay_alipay' ||
-            value.type === 'xorpay_jsapi')) ||
-        (value.provider === 'waffo_pancake' && value.type === 'waffo_pancake')
-      if (!valid) {
+      if (!isPaymentMethodProviderTypeValid(value.provider, value.type)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['type'],
@@ -95,7 +96,7 @@ const PAYMENT_METHOD_FORM_ID = 'payment-method-form'
 export type PaymentMethodData = {
   name: string
   type: string
-  provider: 'epay' | 'stripe' | 'xorpay' | 'waffo_pancake'
+  provider: 'epay' | 'stripe' | 'xorpay' | 'creem' | 'waffo' | 'waffo_pancake'
   icon?: string
   min_topup?: string
   color?: string
@@ -115,7 +116,9 @@ type PaymentMethodDialogProps = {
 
 const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   alipay: 'SiAlipay',
+  creem: 'LuCreditCard',
   stripe: 'SiStripe',
+  waffo: 'LuCreditCard',
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
   xorpay_alipay: 'SiAlipay',
@@ -157,6 +160,20 @@ export function PaymentMethodDialog({
       value: 'stripe',
     },
     {
+      iconName: 'LuCreditCard',
+      label: `${t('Creem')} (creem)`,
+      name: t('Online payment'),
+      provider: 'creem' as const,
+      value: 'creem',
+    },
+    {
+      iconName: 'LuCreditCard',
+      label: `${t('Waffo')} (waffo)`,
+      name: t('Online payment'),
+      provider: 'waffo' as const,
+      value: 'waffo',
+    },
+    {
       iconName: 'SiWechat',
       label: `${t('XORPay WeChat Native')} (xorpay_native)`,
       name: t('WeChat Pay'),
@@ -191,6 +208,8 @@ export function PaymentMethodDialog({
     { label: 'Epay', value: 'epay' },
     { label: 'Stripe', value: 'stripe' },
     { label: 'XORPay', value: 'xorpay' },
+    { label: 'Creem', value: 'creem' },
+    { label: 'Waffo', value: 'waffo' },
     { label: 'Waffo Pancake', value: 'waffo_pancake' },
   ]
 

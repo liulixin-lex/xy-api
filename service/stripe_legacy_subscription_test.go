@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,35 @@ var (
 	stripeLegacyInventoryTestMigrateOnce sync.Once
 	stripeLegacyInventoryTestMigrateErr  error
 )
+
+type stripeLegacyCancellationFakeAPI struct {
+	account               *stripe.Account
+	subscription          *stripe.Subscription
+	accountErr            error
+	updateErr             error
+	retrievedAccountID    string
+	updatedSubscriptionID string
+	updateParams          *stripe.SubscriptionUpdateParams
+	updateParamsHistory   []*stripe.SubscriptionUpdateParams
+	updateFn              func(context.Context, string, *stripe.SubscriptionUpdateParams) (*stripe.Subscription, error)
+	updateCalls           int
+}
+
+func (fake *stripeLegacyCancellationFakeAPI) RetrieveAccount(_ context.Context, accountID string) (*stripe.Account, error) {
+	fake.retrievedAccountID = accountID
+	return fake.account, fake.accountErr
+}
+
+func (fake *stripeLegacyCancellationFakeAPI) UpdateSubscription(ctx context.Context, subscriptionID string, params *stripe.SubscriptionUpdateParams) (*stripe.Subscription, error) {
+	fake.updateCalls++
+	fake.updatedSubscriptionID = subscriptionID
+	fake.updateParams = params
+	fake.updateParamsHistory = append(fake.updateParamsHistory, params)
+	if fake.updateFn != nil {
+		return fake.updateFn(ctx, subscriptionID, params)
+	}
+	return fake.subscription, fake.updateErr
+}
 
 func prepareStripeLegacyInventoryTest(t *testing.T) {
 	t.Helper()
@@ -60,6 +90,8 @@ updated_at bigint
 			&model.Option{},
 			&model.SubscriptionOrder{},
 			&model.PaymentOrder{},
+			&model.PaymentEvent{},
+			&model.UserSubscription{},
 			&model.StripeLegacySubscription{},
 			&model.StripeLegacyInvoice{},
 		)
@@ -70,6 +102,7 @@ updated_at bigint
 	require.NoError(t, model.DB.Exec("DELETE FROM subscription_orders").Error)
 	require.NoError(t, model.DB.Exec("DELETE FROM subscription_plans").Error)
 	require.NoError(t, model.DB.Exec("DELETE FROM user_subscriptions").Error)
+	require.NoError(t, model.DB.Exec("DELETE FROM payment_events").Error)
 	require.NoError(t, model.DB.Exec("DELETE FROM payment_orders").Error)
 	t.Cleanup(func() {
 		model.DB.Exec("DELETE FROM stripe_legacy_invoices")
@@ -77,6 +110,7 @@ updated_at bigint
 		model.DB.Exec("DELETE FROM subscription_orders")
 		model.DB.Exec("DELETE FROM subscription_plans")
 		model.DB.Exec("DELETE FROM user_subscriptions")
+		model.DB.Exec("DELETE FROM payment_events")
 		model.DB.Exec("DELETE FROM payment_orders")
 		model.DB.Exec("DELETE FROM users")
 	})
@@ -116,7 +150,53 @@ func verifiedStripeInventoryEvent(t *testing.T, payload []byte) *NormalizedPayme
 	return event
 }
 
-func TestStripeRecurringCheckoutIsInventoryOnlyAndBindsLocalOrder(t *testing.T) {
+func TestStripeLegacySubscriptionSnapshotAllowsNilEventData(t *testing.T) {
+	snapshot := stripeLegacySubscriptionSnapshot(&stripe.Subscription{
+		ID:       "sub_api_snapshot",
+		Livemode: false,
+		Status:   stripe.SubscriptionStatusActive,
+	}, stripe.Event{
+		Created:  1_721_304_000,
+		Livemode: false,
+	}, model.StripeLegacySyncSourceAPI, true)
+
+	assert.Equal(t, "sub_api_snapshot", snapshot.StripeSubscriptionID)
+	assert.Equal(t, int64(1_721_304_000), snapshot.StateObservedAt)
+	assert.Empty(t, snapshot.LastStripePayloadDigest)
+}
+
+func TestStripeLegacyInvoiceSnapshotAllowsNilEventData(t *testing.T) {
+	snapshot := stripeLegacyInvoiceSnapshot(&stripe.Invoice{
+		ID:       "in_api_snapshot",
+		Livemode: false,
+		Status:   stripe.InvoiceStatusOpen,
+	}, stripe.Event{
+		Created:  1_721_304_001,
+		Livemode: false,
+	})
+
+	assert.Equal(t, "in_api_snapshot", snapshot.StripeInvoiceID)
+	assert.Equal(t, int64(1_721_304_001), snapshot.StateObservedAt)
+	assert.Empty(t, snapshot.LastStripePayloadDigest)
+	assert.Empty(t, snapshot.StripeSubscriptionID)
+}
+
+func TestStripeRecurringCheckoutPaidIsAuthorityConfirmedAndQuarantined(t *testing.T) {
+	requested := false
+	configureStripeAccountConfirmationTest(t, func(w http.ResponseWriter, request *http.Request) {
+		requested = true
+		assert.Equal(t, "/v1/checkout/sessions/cs_recurring_checkout", request.URL.Path)
+		assert.Empty(t, request.Header.Get("Stripe-Account"))
+		assert.True(t, strings.HasPrefix(request.Header.Get("Authorization"), "Bearer sk_test_inventory"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"cs_recurring_checkout","object":"checkout.session","livemode":false,
+			"mode":"subscription","subscription":"sub_recurring_checkout",
+			"client_reference_id":"legacy-recurring-trade","customer":"cus_recurring_checkout",
+			"amount_total":1000,"currency":"usd","payment_status":"paid","status":"complete",
+			"metadata":{"trade_no":"legacy-recurring-trade"}}
+		`))
+	})
 	prepareStripeLegacyInventoryTest(t)
 	user := &model.User{Id: 992001, Username: "stripe_recurring_checkout", StripeCustomer: "cus_recurring_checkout"}
 	plan := &model.SubscriptionPlan{Id: 992002, Title: "Recurring legacy", Currency: "USD", PriceAmount: 10, Enabled: true}
@@ -140,8 +220,18 @@ func TestStripeRecurringCheckoutIsInventoryOnlyAndBindsLocalOrder(t *testing.T) 
 	assert.False(t, event.Paid)
 	assert.False(t, event.Failed)
 	assert.False(t, event.Expired)
+	assert.True(t, event.ManualReview)
+	assert.Equal(t, model.PaymentProviderStateStripeLegacyRecurringCheckoutPaid, event.ProviderState)
+	assert.Equal(t, "stripe:sub_recurring_checkout", event.ProviderResourceKey)
+	require.NoError(t, RecordVerifiedPaymentWebhookReceived(event))
 	require.NoError(t, ValidateVerifiedPaymentWebhook(t.Context(), model.PaymentProviderStripe, event))
-	_, err := model.GetStripeLegacySubscriptionByStripeID("sub_recurring_checkout")
+	assert.True(t, requested)
+	settlement, err := ProcessNormalizedPaymentEvent(event)
+	require.ErrorIs(t, err, model.ErrPaymentManualReview)
+	require.NotNil(t, settlement)
+	assert.True(t, settlement.ManualReview)
+	assert.Nil(t, settlement.Order)
+	_, err = model.GetStripeLegacySubscriptionByStripeID("sub_recurring_checkout")
 	assert.Error(t, err)
 	require.NoError(t, ProcessVerifiedPaymentWebhook(t.Context(), model.PaymentProviderStripe, event))
 
@@ -153,6 +243,91 @@ func TestStripeRecurringCheckoutIsInventoryOnlyAndBindsLocalOrder(t *testing.T) 
 	require.NotNil(t, inventory.SubscriptionPlanID)
 	assert.Equal(t, user.Id, *inventory.UserID)
 	assert.Equal(t, plan.Id, *inventory.SubscriptionPlanID)
+	var storedEvent model.PaymentEvent
+	require.NoError(t, model.DB.Where("provider = ? AND event_key = ?", model.PaymentProviderStripe, "evt_recurring_checkout").First(&storedEvent).Error)
+	assert.Equal(t, model.PaymentEventStatusManualReview, storedEvent.Status)
+	assert.Equal(t, model.PaymentReviewCodeStripeLegacyRecurringCheckoutPaid, storedEvent.ReviewCode)
+	assert.Zero(t, storedEvent.PaymentOrderID)
+	var storedOrder model.SubscriptionOrder
+	require.NoError(t, model.DB.Where("trade_no = ?", "legacy-recurring-trade").First(&storedOrder).Error)
+	assert.Equal(t, common.TopUpStatusPending, storedOrder.Status)
+	var entitlementCount int64
+	require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("user_id = ?", user.Id).Count(&entitlementCount).Error)
+	assert.Zero(t, entitlementCount)
+}
+
+func TestStripeZeroTotalRecurringCheckoutIsAuthorityConfirmedInventoryOnly(t *testing.T) {
+	requested := false
+	configureStripeAccountConfirmationTest(t, func(w http.ResponseWriter, request *http.Request) {
+		requested = true
+		assert.Equal(t, "/v1/checkout/sessions/cs_recurring_trial", request.URL.Path)
+		assert.Empty(t, request.Header.Get("Stripe-Account"))
+		assert.True(t, strings.HasPrefix(request.Header.Get("Authorization"), "Bearer sk_test_inventory"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"cs_recurring_trial","object":"checkout.session","livemode":false,
+			"mode":"subscription","subscription":"sub_recurring_trial",
+			"client_reference_id":"legacy-recurring-trial","customer":"cus_recurring_trial",
+			"amount_total":0,"currency":"usd","payment_status":"paid","status":"complete",
+			"metadata":{"trade_no":"legacy-recurring-trial"}}
+		`))
+	})
+	prepareStripeLegacyInventoryTest(t)
+	user := &model.User{Id: 992011, Username: "stripe_trial", StripeCustomer: "cus_recurring_trial"}
+	plan := &model.SubscriptionPlan{Id: 992012, Title: "Recurring trial", Currency: "USD", PriceAmount: 0, Enabled: true}
+	require.NoError(t, model.DB.Create(user).Error)
+	require.NoError(t, model.DB.Create(plan).Error)
+	require.NoError(t, model.DB.Create(&model.SubscriptionOrder{
+		UserId: user.Id, PlanId: plan.Id, Money: 0, TradeNo: "legacy-recurring-trial",
+		PaymentMethod: model.PaymentMethodStripe, PaymentProvider: model.PaymentProviderStripe,
+		Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp() - 100,
+	}).Error)
+
+	payload := []byte(fmt.Sprintf(`{
+		"id":"evt_recurring_trial","object":"event","api_version":%q,
+		"created":1721304150,"livemode":false,"type":"checkout.session.completed",
+		"data":{"object":{"id":"cs_recurring_trial","object":"checkout.session",
+			"mode":"subscription","subscription":"sub_recurring_trial",
+			"client_reference_id":"legacy-recurring-trial","customer":"cus_recurring_trial",
+			"amount_total":0,"currency":"usd","payment_status":"paid","status":"complete",
+			"metadata":{"trade_no":"legacy-recurring-trial"}}}
+	}`, stripe.APIVersion))
+	event := verifiedStripeInventoryEvent(t, payload)
+	assert.False(t, event.Paid)
+	assert.False(t, event.ManualReview)
+	assert.Zero(t, event.PaidAmountMinor)
+	assert.Equal(t, model.PaymentProviderStateStripeLegacyRecurringCheckoutPaid, event.ProviderState)
+	assert.Equal(t, "stripe:sub_recurring_trial", event.ProviderResourceKey)
+	require.NoError(t, RecordVerifiedPaymentWebhookReceived(event))
+	require.NoError(t, ValidateVerifiedPaymentWebhook(t.Context(), model.PaymentProviderStripe, event))
+	assert.True(t, requested)
+	settlement, err := ProcessNormalizedPaymentEvent(event)
+	require.NoError(t, err)
+	require.NotNil(t, settlement)
+	assert.False(t, settlement.ManualReview)
+	assert.Nil(t, settlement.Order)
+	require.NoError(t, ProcessVerifiedPaymentWebhook(t.Context(), model.PaymentProviderStripe, event))
+
+	inventory, err := model.GetStripeLegacySubscriptionByStripeID("sub_recurring_trial")
+	require.NoError(t, err)
+	assert.Equal(t, "cs_recurring_trial", inventory.CheckoutSessionID)
+	assert.Equal(t, "legacy-recurring-trial", inventory.TradeNo)
+	assert.Equal(t, "cus_recurring_trial", inventory.StripeCustomerID)
+	var storedEvent model.PaymentEvent
+	require.NoError(t, model.DB.Where("provider = ? AND event_key = ?", model.PaymentProviderStripe,
+		"evt_recurring_trial").First(&storedEvent).Error)
+	assert.Equal(t, model.PaymentEventStatusProcessed, storedEvent.Status)
+	assert.Empty(t, storedEvent.ReviewCode)
+	assert.Zero(t, storedEvent.PaymentOrderID)
+	var canonicalCount, entitlementCount int64
+	require.NoError(t, model.DB.Model(&model.PaymentOrder{}).Where("trade_no = ?", "legacy-recurring-trial").Count(&canonicalCount).Error)
+	require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("user_id = ?", user.Id).Count(&entitlementCount).Error)
+	assert.Zero(t, canonicalCount)
+	assert.Zero(t, entitlementCount)
+	var storedLegacy model.SubscriptionOrder
+	require.NoError(t, model.DB.Where("trade_no = ?", "legacy-recurring-trial").First(&storedLegacy).Error)
+	assert.Equal(t, common.TopUpStatusPending, storedLegacy.Status)
+	assert.Nil(t, storedLegacy.PaymentOrderId)
 }
 
 func TestStripeSubscriptionAndInvoiceWebhooksUpdateInventoryOnly(t *testing.T) {
@@ -332,4 +507,220 @@ func TestSyncStripeLegacySubscriptionsRefreshesRemotePaymentConfiguration(t *tes
 	common.OptionMapRWMutex.RLock()
 	assert.Equal(t, "2", common.OptionMap[model.PaymentConfigurationVersionOptionKey])
 	common.OptionMapRWMutex.RUnlock()
+}
+
+func TestCancelStripeLegacySubscriptionAtPeriodEndVerifiesIdentityAndPersistsAudit(t *testing.T) {
+	prepareStripeLegacyInventoryTest(t)
+	t.Setenv(setting.StripeTestModeEnabledEnv, "true")
+	require.NoError(t, model.DB.AutoMigrate(&model.PaymentOperationsAudit{}))
+	require.NoError(t, model.DB.Exec(
+		"DELETE FROM payment_operations_audits WHERE action = ?",
+		model.PaymentOperationsActionStripeLegacySubscriptionCancel,
+	).Error)
+	t.Cleanup(func() {
+		_ = model.DB.Exec(
+			"DELETE FROM payment_operations_audits WHERE action = ?",
+			model.PaymentOperationsActionStripeLegacySubscriptionCancel,
+		).Error
+	})
+	originalCredentialAccountID := setting.StripeCredentialAccountId
+	originalCredentialMode := setting.StripeCredentialLivemode
+	t.Cleanup(func() {
+		setting.StripeCredentialAccountId = originalCredentialAccountID
+		setting.StripeCredentialLivemode = originalCredentialMode
+	})
+	setting.StripeCredentialAccountId = "acct_inventorydirect"
+	setting.StripeCredentialLivemode = "test"
+
+	now := common.GetTimestamp()
+	inventory, err := model.UpsertStripeLegacySubscription(model.StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_service_cancel",
+		StripeCustomerID:     "cus_service_cancel",
+		Status:               "active",
+		StateObservedAt:      now,
+		FullState:            true,
+		SyncSource:           model.StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+	fake := &stripeLegacyCancellationFakeAPI{
+		account: &stripe.Account{ID: "acct_inventorydirect"},
+		subscription: &stripe.Subscription{
+			ID:                "sub_service_cancel",
+			Customer:          &stripe.Customer{ID: "cus_service_cancel"},
+			Status:            stripe.SubscriptionStatusActive,
+			CancelAtPeriodEnd: true,
+			CancelAt:          now + 3600,
+			Livemode:          false,
+		},
+	}
+	result, err := cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: inventory.UpdatedAt,
+		AdminID: 992900, ActorIP: "127.0.0.1", Reason: "stop legacy automatic renewal",
+	}, func(secret string) stripeLegacySubscriptionAPI {
+		assert.Equal(t, "sk_test_inventory", secret)
+		return fake
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Subscription)
+	assert.True(t, result.Subscription.CancelAtPeriodEnd)
+	assert.False(t, result.Duplicate)
+	assert.Empty(t, fake.retrievedAccountID)
+	assert.Equal(t, "sub_service_cancel", fake.updatedSubscriptionID)
+	assert.Equal(t, 1, fake.updateCalls)
+	require.NotNil(t, fake.updateParams)
+	require.NotNil(t, fake.updateParams.CancelAtPeriodEnd)
+	assert.True(t, *fake.updateParams.CancelAtPeriodEnd)
+	require.NotNil(t, fake.updateParams.IdempotencyKey)
+	assert.Contains(t, *fake.updateParams.IdempotencyKey, "legacy-sub-cancel:")
+	assert.Nil(t, fake.updateParams.StripeAccount)
+
+	var auditCount int64
+	require.NoError(t, model.DB.Model(&model.PaymentOperationsAudit{}).Where(
+		"action = ? AND subject_id = ?",
+		model.PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).Count(&auditCount).Error)
+	assert.EqualValues(t, 1, auditCount)
+
+	retry, err := cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: inventory.UpdatedAt,
+		AdminID: 992900, ActorIP: "127.0.0.1", Reason: "stop legacy automatic renewal",
+	}, func(string) stripeLegacySubscriptionAPI { return fake })
+	require.NoError(t, err)
+	assert.True(t, retry.Duplicate)
+	assert.Equal(t, 1, fake.updateCalls)
+}
+
+func TestCancelStripeLegacySubscriptionAtPeriodEndRecoversAfterLostResponseAndWebhook(t *testing.T) {
+	prepareStripeLegacyInventoryTest(t)
+	t.Setenv(setting.StripeTestModeEnabledEnv, "true")
+	require.NoError(t, model.DB.AutoMigrate(&model.PaymentOperationsAudit{}))
+	require.NoError(t, model.DB.Exec(
+		"DELETE FROM payment_operations_audits WHERE action = ?",
+		model.PaymentOperationsActionStripeLegacySubscriptionCancel,
+	).Error)
+	t.Cleanup(func() {
+		_ = model.DB.Exec(
+			"DELETE FROM payment_operations_audits WHERE action = ?",
+			model.PaymentOperationsActionStripeLegacySubscriptionCancel,
+		).Error
+	})
+	originalCredentialAccountID := setting.StripeCredentialAccountId
+	originalCredentialMode := setting.StripeCredentialLivemode
+	t.Cleanup(func() {
+		setting.StripeCredentialAccountId = originalCredentialAccountID
+		setting.StripeCredentialLivemode = originalCredentialMode
+	})
+	setting.StripeCredentialAccountId = "acct_inventoryrecovery"
+	setting.StripeCredentialLivemode = "test"
+
+	now := common.GetTimestamp()
+	inventory, err := model.UpsertStripeLegacySubscription(model.StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_service_cancel_recovery",
+		StripeCustomerID:     "cus_service_cancel_recovery",
+		Status:               "active",
+		StateObservedAt:      now,
+		FullState:            true,
+		SyncSource:           model.StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+	expectedUpdatedAt := inventory.UpdatedAt
+	reason := strings.Repeat("x", 512)
+	fake := &stripeLegacyCancellationFakeAPI{
+		account: &stripe.Account{ID: "acct_inventoryrecovery"},
+	}
+	fake.updateFn = func(_ context.Context, _ string, _ *stripe.SubscriptionUpdateParams) (*stripe.Subscription, error) {
+		if fake.updateCalls == 1 {
+			_, upsertErr := model.UpsertStripeLegacySubscription(model.StripeLegacySubscriptionSnapshot{
+				StripeSubscriptionID: "sub_service_cancel_recovery",
+				StripeCustomerID:     "cus_service_cancel_recovery",
+				Status:               "active",
+				CancelAtPeriodEnd:    true,
+				CancelAt:             now + 3600,
+				StateObservedAt:      now + 1,
+				FullState:            true,
+				SyncSource:           model.StripeLegacySyncSourceWebhook,
+			})
+			if upsertErr != nil {
+				return nil, upsertErr
+			}
+			return nil, errors.New("connection reset after Stripe accepted the update")
+		}
+		return &stripe.Subscription{
+			ID:                "sub_service_cancel_recovery",
+			Customer:          &stripe.Customer{ID: "cus_service_cancel_recovery"},
+			Status:            stripe.SubscriptionStatusActive,
+			CancelAtPeriodEnd: true,
+			CancelAt:          now + 3600,
+			Livemode:          false,
+		}, nil
+	}
+	input := StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: expectedUpdatedAt,
+		AdminID: 992902, ActorIP: "127.0.0.1", Reason: reason,
+	}
+
+	_, err = cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), input, func(string) stripeLegacySubscriptionAPI { return fake })
+	assert.ErrorIs(t, err, ErrStripeLegacyCancellationUnavailable)
+	var auditCount int64
+	require.NoError(t, model.DB.Model(&model.PaymentOperationsAudit{}).Where(
+		"action = ? AND subject_id = ?",
+		model.PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).Count(&auditCount).Error)
+	assert.Zero(t, auditCount)
+	recoveredInventory, err := model.GetStripeLegacySubscriptionByID(inventory.ID)
+	require.NoError(t, err)
+	assert.NotEqual(t, expectedUpdatedAt, recoveredInventory.UpdatedAt)
+	assert.True(t, recoveredInventory.CancelAtPeriodEnd)
+
+	result, err := cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), input, func(string) stripeLegacySubscriptionAPI { return fake })
+	require.NoError(t, err)
+	require.NotNil(t, result.Subscription)
+	assert.False(t, result.Duplicate)
+	assert.True(t, result.Subscription.CancelAtPeriodEnd)
+	assert.Equal(t, 2, fake.updateCalls)
+	require.Len(t, fake.updateParamsHistory, 2)
+	require.NotNil(t, fake.updateParamsHistory[0].IdempotencyKey)
+	require.NotNil(t, fake.updateParamsHistory[1].IdempotencyKey)
+	assert.Equal(t, *fake.updateParamsHistory[0].IdempotencyKey, *fake.updateParamsHistory[1].IdempotencyKey)
+	require.NoError(t, model.DB.Model(&model.PaymentOperationsAudit{}).Where(
+		"action = ? AND subject_id = ?",
+		model.PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).Count(&auditCount).Error)
+	assert.EqualValues(t, 1, auditCount)
+
+	retry, err := cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), input, func(string) stripeLegacySubscriptionAPI { return fake })
+	require.NoError(t, err)
+	assert.True(t, retry.Duplicate)
+	assert.Equal(t, 2, fake.updateCalls)
+}
+
+func TestCancelStripeLegacySubscriptionAtPeriodEndRejectsAccountMismatchBeforeUpdate(t *testing.T) {
+	prepareStripeLegacyInventoryTest(t)
+	t.Setenv(setting.StripeTestModeEnabledEnv, "true")
+	originalCredentialAccountID := setting.StripeCredentialAccountId
+	originalCredentialMode := setting.StripeCredentialLivemode
+	t.Cleanup(func() {
+		setting.StripeCredentialAccountId = originalCredentialAccountID
+		setting.StripeCredentialLivemode = originalCredentialMode
+	})
+	setting.StripeCredentialAccountId = "acct_expectedinventory"
+	setting.StripeCredentialLivemode = "test"
+
+	inventory, err := model.UpsertStripeLegacySubscription(model.StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_service_identity_mismatch",
+		StripeCustomerID:     "cus_service_identity_mismatch",
+		Status:               "active",
+		StateObservedAt:      common.GetTimestamp(),
+		FullState:            true,
+		SyncSource:           model.StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+	fake := &stripeLegacyCancellationFakeAPI{account: &stripe.Account{ID: "acct_unexpectedinventory"}}
+	_, err = cancelStripeLegacySubscriptionAtPeriodEnd(t.Context(), StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: inventory.UpdatedAt,
+		AdminID: 992901, ActorIP: "127.0.0.1", Reason: "stop legacy automatic renewal",
+	}, func(string) stripeLegacySubscriptionAPI { return fake })
+	assert.ErrorIs(t, err, ErrStripeLegacyCancellationIdentityMismatch)
+	assert.Empty(t, fake.updatedSubscriptionID)
+	assert.Nil(t, fake.updateParams)
 }

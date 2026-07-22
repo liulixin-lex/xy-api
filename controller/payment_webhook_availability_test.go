@@ -112,15 +112,18 @@ func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	originalAPIKey := setting.CreemApiKey
 	originalProducts := setting.CreemProducts
 	originalWebhookSecret := setting.CreemWebhookSecret
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	t.Cleanup(func() {
 		setting.CreemApiKey = originalAPIKey
 		setting.CreemProducts = originalProducts
 		setting.CreemWebhookSecret = originalWebhookSecret
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 	})
 
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 	setting.CreemWebhookSecret = ""
 	setting.CreemApiKey = "creem_api_key"
-	setting.CreemProducts = `[{"productId":"prod_123"}]`
+	setting.CreemProducts = `[{"productId":"prod_123","name":"Starter","price":9.99,"currency":"USD","quota":1000}]`
 	require.False(t, isCreemWebhookEnabled())
 	require.False(t, isCreemTopUpEnabled())
 
@@ -137,7 +140,7 @@ func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isCreemWebhookEnabled())
 	require.False(t, isCreemTopUpEnabled())
 
-	setting.CreemProducts = `[{"productId":"prod_123"}]`
+	setting.CreemProducts = `[{"productId":"prod_123","name":"Starter","price":9.99,"currency":"USD","quota":1000}]`
 	setting.CreemApiKey = ""
 	require.True(t, isCreemWebhookEnabled())
 	require.False(t, isCreemTopUpEnabled())
@@ -154,6 +157,10 @@ func TestWaffoWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.
 	originalSandboxAPIKey := setting.WaffoSandboxApiKey
 	originalSandboxPrivateKey := setting.WaffoSandboxPrivateKey
 	originalSandboxPublicCert := setting.WaffoSandboxPublicCert
+	originalUnitPrice := setting.WaffoUnitPrice
+	originalMinimum := setting.WaffoMinTopUp
+	originalCurrency := setting.WaffoCurrency
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	t.Cleanup(func() {
 		setting.WaffoEnabled = originalEnabled
 		setting.WaffoSandbox = originalSandbox
@@ -163,8 +170,16 @@ func TestWaffoWebhookRemainsEnabledWhenNewCheckoutCreationIsDisabled(t *testing.
 		setting.WaffoSandboxApiKey = originalSandboxAPIKey
 		setting.WaffoSandboxPrivateKey = originalSandboxPrivateKey
 		setting.WaffoSandboxPublicCert = originalSandboxPublicCert
+		setting.WaffoUnitPrice = originalUnitPrice
+		setting.WaffoMinTopUp = originalMinimum
+		setting.WaffoCurrency = originalCurrency
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 	})
 
+	setting.WaffoUnitPrice = 1
+	setting.WaffoMinTopUp = 1
+	setting.WaffoCurrency = "USD"
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 	setting.WaffoEnabled = true
 	setting.WaffoSandbox = false
 	setting.WaffoApiKey = ""
@@ -217,13 +232,22 @@ func TestWaffoPancakeWebhookRequiresTrustedStoreNotCheckoutCredentials(t *testin
 	originalPrivateKey := setting.WaffoPancakePrivateKey
 	originalProductID := setting.WaffoPancakeProductID
 	originalStoreID := setting.WaffoPancakeStoreID
+	originalUnitPrice := setting.WaffoPancakeUnitPrice
+	originalMinimum := setting.WaffoPancakeMinTopUp
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	t.Cleanup(func() {
 		setting.WaffoPancakeMerchantID = originalMerchantID
 		setting.WaffoPancakePrivateKey = originalPrivateKey
 		setting.WaffoPancakeProductID = originalProductID
 		setting.WaffoPancakeStoreID = originalStoreID
+		setting.WaffoPancakeUnitPrice = originalUnitPrice
+		setting.WaffoPancakeMinTopUp = originalMinimum
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 	})
 
+	setting.WaffoPancakeUnitPrice = 1
+	setting.WaffoPancakeMinTopUp = 1
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 	// Verification keys ship in the SDK, while StoreID binds a valid Waffo
 	// signature to this merchant before settlement.
 	setting.WaffoPancakeStoreID = ""

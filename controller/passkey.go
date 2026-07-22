@@ -516,7 +516,7 @@ func getSessionUser(c *gin.Context) (*model.User, error) {
 	if idRaw == nil {
 		return nil, errors.New("未登录")
 	}
-	id, ok := idRaw.(int)
+	id, ok := common.SessionValueInt(idRaw)
 	if !ok {
 		return nil, errors.New("无效的会话信息")
 	}
@@ -570,17 +570,41 @@ func requirePasskeyDeleteVerification(c *gin.Context, userID int) bool {
 
 func requireSecureVerificationMethod(c *gin.Context, method string) bool {
 	session := sessions.Default(c)
-	verifiedAt, ok := session.Get(SecureVerificationSessionKey).(int64)
-	if !ok || time.Now().Unix()-verifiedAt >= SecureVerificationTimeout {
+	verifiedAtRaw := session.Get(SecureVerificationSessionKey)
+	if verifiedAtRaw == nil {
+		secureVerificationAPIError(c, http.StatusForbidden, "VERIFICATION_REQUIRED", "请先完成安全验证", nil)
+		return false
+	}
+	verifiedAt, timestampValid := common.SessionValueInt64(verifiedAtRaw)
+	verifiedUserID, userValid := common.SessionValueInt(session.Get(secureVerificationUserIDSessionKey))
+	if !timestampValid || verifiedAt <= 0 || !userValid || verifiedUserID != c.GetInt("id") {
 		session.Delete(SecureVerificationSessionKey)
 		session.Delete(secureVerificationMethodSessionKey)
-		_ = session.Save()
-		common.ApiErrorMsg(c, "请先完成安全验证")
+		session.Delete(secureVerificationUserIDSessionKey)
+		if err := session.Save(); err != nil {
+			secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_session_unavailable", "暂时无法保存安全验证状态", err)
+		} else {
+			secureVerificationAPIError(c, http.StatusForbidden, "VERIFICATION_INVALID", "安全验证状态无效，请重新验证", nil)
+		}
+		return false
+	}
+	elapsed := time.Now().Unix() - verifiedAt
+	if elapsed < 0 || elapsed >= SecureVerificationTimeout {
+		session.Delete(SecureVerificationSessionKey)
+		session.Delete(secureVerificationMethodSessionKey)
+		session.Delete(secureVerificationUserIDSessionKey)
+		if err := session.Save(); err != nil {
+			secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_session_unavailable", "暂时无法保存安全验证状态", err)
+		} else if elapsed < 0 {
+			secureVerificationAPIError(c, http.StatusForbidden, "VERIFICATION_INVALID", "安全验证状态无效，请重新验证", nil)
+		} else {
+			secureVerificationAPIError(c, http.StatusForbidden, "VERIFICATION_EXPIRED", "安全验证已过期，请重新验证", nil)
+		}
 		return false
 	}
 
 	if verifiedMethod, ok := session.Get(secureVerificationMethodSessionKey).(string); !ok || verifiedMethod != method {
-		common.ApiErrorMsg(c, "请先完成对应的安全验证")
+		secureVerificationAPIError(c, http.StatusForbidden, "VERIFICATION_REQUIRED", "请先完成对应的安全验证", nil)
 		return false
 	}
 

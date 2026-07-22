@@ -46,7 +46,6 @@ import {
 import { getPaymentAudit } from './api'
 import {
   CredentialIncidentActionDialog,
-  ManualFulfillDialog,
   PaymentOrderActionDialog,
   ResolveDebtDialog,
   StripeCustomerBindingRetirementDialog,
@@ -99,7 +98,6 @@ export function PaymentAuditDetailSheet(props: {
   onDataChanged: () => void | Promise<void>
 }) {
   const { t } = useTranslation()
-  const [manualFulfillOpen, setManualFulfillOpen] = useState(false)
   const [orderAction, setOrderAction] = useState<
     'reject' | 'void' | 'external-refund' | null
   >(null)
@@ -113,6 +111,7 @@ export function PaymentAuditDetailSheet(props: {
     queryKey: ['payment-audit-detail', props.tradeNo],
     queryFn: () => getPaymentAudit(props.tradeNo || ''),
     enabled: Boolean(props.tradeNo),
+    meta: { skipGlobalError: true },
   })
   const order = detailQuery.data?.order
   const events = detailQuery.data?.events ?? []
@@ -419,15 +418,6 @@ export function PaymentAuditDetailSheet(props: {
                             {t('Reject')}
                           </Button>
                         </>
-                      )}
-                      {order.status === 'manual_review' && (
-                        <Button
-                          type='button'
-                          variant='destructive'
-                          onClick={() => setManualFulfillOpen(true)}
-                        >
-                          {t('Manually fulfill payment')}
-                        </Button>
                       )}
                     </div>
                   )}
@@ -751,12 +741,6 @@ export function PaymentAuditDetailSheet(props: {
         </SheetContent>
       </Sheet>
 
-      <ManualFulfillDialog
-        order={order || null}
-        open={manualFulfillOpen}
-        onOpenChange={setManualFulfillOpen}
-        onCompleted={handleDataChanged}
-      />
       <PaymentOrderActionDialog
         order={order || null}
         action={orderAction}

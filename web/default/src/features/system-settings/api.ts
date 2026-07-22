@@ -77,6 +77,7 @@ export async function confirmPaymentCompliance() {
     {
       skipBusinessError: true,
       skipErrorHandler: true,
+      skipGlobalError: true,
     }
   )
   return res.data
@@ -106,6 +107,7 @@ export async function updatePaymentSettings(request: {
     {
       skipBusinessError: true,
       skipErrorHandler: true,
+      skipGlobalError: true,
     }
   )
   return res.data

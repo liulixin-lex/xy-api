@@ -21,16 +21,22 @@ import {
   isPaymentProviderReferenceValid,
 } from './payment-action-validation'
 import { isPaymentEventActionAvailable } from './status'
-import type {
-  PaymentEvent,
-  ResolveLegacyEpaySubscriptionRequest,
-} from './types'
+import type { PaymentEvent, ResolveLegacySubscriptionRequest } from './types'
+
+export const STRIPE_LEGACY_RECURRING_CHECKOUT_REVIEW_CODE =
+  'stripe_legacy_recurring_checkout_paid'
+
+export function isStripeLegacyRecurringCheckoutReview(
+  event: Pick<PaymentEvent, 'review_code'> | null
+): boolean {
+  return event?.review_code === STRIPE_LEGACY_RECURRING_CHECKOUT_REVIEW_CODE
+}
 
 export function buildLegacySubscriptionResolutionRequest(
   event: PaymentEvent | null,
   providerRefundReference: string,
   reason: string
-): ResolveLegacyEpaySubscriptionRequest | null {
+): ResolveLegacySubscriptionRequest | null {
   if (
     !event ||
     !isPaymentEventActionAvailable(event, 'resolve_legacy_subscription') ||

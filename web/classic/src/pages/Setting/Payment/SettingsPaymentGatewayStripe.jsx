@@ -228,7 +228,7 @@ export default function SettingsPaymentGateway(props) {
             description={
               <>
                 {t(
-                  'Unified top-ups and fixed-term access purchases create Checkout Sessions in payment mode. They do not create auto-renewing subscriptions. The legacy recurring subscription inventory, when present, is shown separately below.',
+                  'Unified top-ups and fixed-term access purchases create Checkout Sessions in payment mode. They do not create auto-renewing subscriptions. Any legacy recurring subscription inventory is shown separately in Payment Operations.',
                 )}
                 <br />
                 {t('Stripe 密钥、Webhook 等设置请')}
@@ -288,7 +288,7 @@ export default function SettingsPaymentGateway(props) {
                 </span>
                 <span>
                   {t(
-                    'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Otherwise use "Sync from Stripe" in Payment Operations when you need to refresh that read-only inventory.',
+                    'If legacy recurring inventory exists, also enable customer.subscription.* and invoice.* events. Use "Sync from Stripe" in Payment Operations to refresh observations; scheduling cancellation at period end is a separate verified action.',
                   )}
                 </span>
               </div>

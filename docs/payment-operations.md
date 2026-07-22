@@ -9,8 +9,10 @@ durable, idempotent, and auditable.
 
 This document describes the operational contract for the canonical payment
 flow and the independently configured Epay, Stripe, XORPay, Creem, Waffo, and
-Waffo Pancake gateways. Public brands may repeat across gateway groups, but a
-route is never silently remapped to another provider.
+Waffo Pancake gateways. More than one internal route may remain available for
+compatibility or failover, but the public projection exposes only one Alipay
+choice and one browser-appropriate WeChat Pay choice. A route is never silently
+remapped to another provider.
 
 ## Goals
 
@@ -247,6 +249,23 @@ an end-user or public network merely to make a forwarded header appear in logs.
 - Retire a deleted Stripe Customer only through Payment Operations. Retirement
   preserves immutable ownership evidence so callbacks for older Checkout
   Sessions remain verifiable while new checkouts can bind a new Customer.
+- New purchases use one-time Checkout payment mode. Historical recurring
+  subscriptions are an observation inventory and never extend local
+  entitlement from renewal events. A positive-total paid legacy recurring
+  Checkout is retained under its dedicated review classification and can be
+  closed only after the inventory proves that future renewal is scheduled to
+  stop or is already terminal and an administrator confirms a completed
+  external full refund. The terminal transaction verifies the Session,
+  subscription, trade, customer, amount, currency, mode, credential generation,
+  and historical pending order, then records a refunded canonical order and
+  zero-entitlement receipt/refund ledgers. Zero-total trial or promotion
+  Checkouts remain inventory-only and are not eligible for that refund action.
+  A Payment Operations administrator may
+  schedule one verified legacy subscription to cancel at period end only after
+  browser step-up verification. The action verifies the configured Stripe
+  account and livemode, customer and subscription identity, uses a stable
+  idempotency key, stores the authoritative Stripe response with the operator
+  reason, and does not refund or mutate local quota.
 
 The repository pins `stripe-go` in `go.mod`; that SDK release carries its API
 version. Upgrade it through a reviewed dependency change, add the new release
@@ -275,6 +294,17 @@ changing the Stripe webhook endpoint version.
   recover QR content after the create response is lost. In that case the order
   remains `state_unknown` and is reconciled by query, webhook, or expiry. Do not
   create a second upstream order with the same business request.
+- XORPay creation accepts both integer and quoted-decimal expiration hints. A
+  malformed, empty, negative, overflowing, conflicting, or excessive hint is
+  logged as a response-contract change and bounded by the local order expiry;
+  it never discards an otherwise valid provider identity and payment
+  instruction.
+- Native WeChat protocol URLs, exact HTTPS Alipay QR URLs, and the exact
+  `ipay.yltg.com.cn` XORPay-hosted payment origin are validated separately.
+  The observed HTTP hosted-page contract is accepted only for WeChat Native;
+  Alipay hosted pages must use HTTPS. Userinfo, ports, fragments, deceptive
+  subdomains, dangerous schemes, and external redirect targets are rejected
+  before instructions are persisted or rendered.
 
 ### Creem, Waffo, and Waffo Pancake
 
@@ -431,7 +461,8 @@ and open payment-limit or billing reservations.
 - Refund and dispute tests reverse only previously granted entitlement and
   never produce negative or overflowing quota.
 - Credential replacement, overlap, emergency revocation, incident review, and
-  Stripe Customer retirement are exercised with administrator step-up.
+  Stripe Customer retirement and legacy subscription end-of-period cancellation
+  are exercised with administrator step-up.
 - Run the SQLite migration and payment test suites locally. Dedicated CI jobs
   exercise MySQL 5.7 and PostgreSQL 9.6 migration/payment contracts when their
   isolated databases are available; those tests do not by themselves prove a
@@ -448,6 +479,10 @@ and open payment-limit or billing reservations.
 
 - Stripe endpoint permission probing cannot prove external webhook delivery;
   complete a test-mode payment and callback exercise before accepting traffic.
+- Historical Stripe subscriptions are not converted into locally renewing
+  entitlements. Operators must review the inventory and explicitly schedule
+  each still-recurring legacy subscription for end-of-period cancellation; the
+  application does not perform an unapproved bulk cancellation.
 - XORPay cannot recover a lost create-response QR through its public query API.
 - Cluster readiness failures deliberately return a retryable HTTP error before
   automatic callback processing. XORPay documents bounded notification

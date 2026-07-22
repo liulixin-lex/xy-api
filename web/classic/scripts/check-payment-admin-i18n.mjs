@@ -183,10 +183,6 @@ const publicThemeParityKeys = [
   ['剩余时间', 'Time remaining'],
   ['{{minutes}} 分 {{seconds}} 秒', '{{minutes}} min {{seconds}} sec'],
   [
-    '本站将在确认支付结果后更新您的余额或权益。',
-    'Payment status is confirmed by this site before your balance or access changes.',
-  ],
-  [
     '如需联系客服，请保留此订单编号。',
     'Keep the order number when contacting support about this payment.',
   ],

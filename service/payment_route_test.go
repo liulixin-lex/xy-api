@@ -14,11 +14,17 @@ import (
 func TestPublicPaymentRoutesAllowSameBrandAcrossGateways(t *testing.T) {
 	originalMethods := operation_setting.PayMethods
 	originalEnabledMethods := setting.XorPayEnabledMethods
+	originalPayAddress, originalEpayID, originalEpayKey := operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey
+	originalXorPayAid, originalXorPaySecret := setting.XorPayAid, setting.XorPayAppSecret
 	t.Cleanup(func() {
 		operation_setting.PayMethods = originalMethods
 		setting.XorPayEnabledMethods = originalEnabledMethods
+		operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = originalPayAddress, originalEpayID, originalEpayKey
+		setting.XorPayAid, setting.XorPayAppSecret = originalXorPayAid, originalXorPaySecret
 	})
-	setting.XorPayEnabledMethods = nil
+	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://payments.example.com", "merchant", "secret"
+	setting.XorPayAid, setting.XorPayAppSecret = "aid", "secret"
+	setting.XorPayEnabledMethods = []string{setting.XorPayMethodAlipay}
 	operation_setting.PayMethods = []map[string]string{
 		{
 			"type": "Alipay", "provider": model.PaymentProviderEpay,
@@ -38,14 +44,17 @@ func TestPublicPaymentRoutesAllowSameBrandAcrossGateways(t *testing.T) {
 	assert.NotEqual(t, routes[0].RouteID, routes[1].RouteID)
 }
 
-func TestPublicPaymentRoutesKeepConfiguredCustomAndHostedChannels(t *testing.T) {
+func TestPublicPaymentRoutesUseOnlyConfiguredCatalogEntries(t *testing.T) {
 	originalMethods := operation_setting.PayMethods
 	originalEnabledMethods := setting.XorPayEnabledMethods
+	originalPayAddress, originalEpayID, originalEpayKey := operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey
 	t.Cleanup(func() {
 		operation_setting.PayMethods = originalMethods
 		setting.XorPayEnabledMethods = originalEnabledMethods
+		operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = originalPayAddress, originalEpayID, originalEpayKey
 	})
 	setting.XorPayEnabledMethods = nil
+	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://payments.example.com", "merchant", "secret"
 	operation_setting.PayMethods = []map[string]string{
 		{"type": "regional_card", "provider": model.PaymentProviderEpay, "public_method": "regional_card", "channel_alias": "redirect"},
 	}
@@ -60,22 +69,26 @@ func TestPublicPaymentRoutesKeepConfiguredCustomAndHostedChannels(t *testing.T) 
 			assert.Equal(t, "regional_card", route.PublicMethod)
 		case route.Provider == model.PaymentProviderStripe:
 			stripeFound = true
-			assert.Equal(t, "card", route.PublicMethod)
-			assert.Equal(t, "checkout", route.ChannelAlias)
 		}
 	}
 	assert.True(t, customFound)
-	assert.True(t, stripeFound)
+	assert.False(t, stripeFound, "a configured provider must not auto-publish a second catalog entry")
 }
 
 func TestPublicPaymentRoutesHonorConfiguredWaffoPancakeRoute(t *testing.T) {
 	originalMethods := operation_setting.PayMethods
 	originalEnabledMethods := setting.XorPayEnabledMethods
+	originalMerchantID, originalPrivateKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	originalStoreID, originalProductID := setting.WaffoPancakeStoreID, setting.WaffoPancakeProductID
 	t.Cleanup(func() {
 		operation_setting.PayMethods = originalMethods
 		setting.XorPayEnabledMethods = originalEnabledMethods
+		setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = originalMerchantID, originalPrivateKey
+		setting.WaffoPancakeStoreID, setting.WaffoPancakeProductID = originalStoreID, originalProductID
 	})
 	setting.XorPayEnabledMethods = nil
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = "merchant", "private-key"
+	setting.WaffoPancakeStoreID, setting.WaffoPancakeProductID = "store", ""
 	operation_setting.PayMethods = []map[string]string{
 		{
 			"name": "Hosted payment", "type": model.PaymentMethodWaffoPancake,
@@ -93,10 +106,38 @@ func TestPublicPaymentRoutesHonorConfiguredWaffoPancakeRoute(t *testing.T) {
 		}
 	}
 	require.Len(t, pancakeRoutes, 1)
+	assert.Empty(t, setting.WaffoPancakeProductID, "subscription-only routes must not require the global top-up product")
 	assert.Equal(t, "premium_checkout", pancakeRoutes[0].RouteID)
 	assert.Equal(t, "online_payment", pancakeRoutes[0].PublicMethod)
 	assert.Equal(t, "alternative_checkout", pancakeRoutes[0].ChannelAlias)
 	assert.Equal(t, "17", pancakeRoutes[0].MinimumTopUp)
+}
+
+func TestPublicPaymentRoutesRequireCatalogAndEnabledProviderCapability(t *testing.T) {
+	originalMethods := operation_setting.PayMethods
+	originalEnabledMethods := setting.XorPayEnabledMethods
+	originalAid, originalSecret := setting.XorPayAid, setting.XorPayAppSecret
+	t.Cleanup(func() {
+		operation_setting.PayMethods = originalMethods
+		setting.XorPayEnabledMethods = originalEnabledMethods
+		setting.XorPayAid, setting.XorPayAppSecret = originalAid, originalSecret
+	})
+
+	setting.XorPayAid, setting.XorPayAppSecret = "aid", "secret"
+	operation_setting.PayMethods = []map[string]string{{
+		"type": model.PaymentMethodXorPayNative, "provider": model.PaymentProviderXorPay,
+		"route_id": "wechat_primary", "public_method": "wechat_pay", "channel_alias": "qr",
+	}}
+	setting.XorPayEnabledMethods = nil
+	assert.Empty(t, publicPaymentRoutesLocked(), "a disabled provider method must not remain user-selectable")
+
+	setting.XorPayEnabledMethods = []string{setting.XorPayMethodNative}
+	routes := publicPaymentRoutesLocked()
+	require.Len(t, routes, 1)
+	assert.Equal(t, "wechat_primary", routes[0].RouteID)
+
+	operation_setting.PayMethods = nil
+	assert.Empty(t, publicPaymentRoutesLocked(), "provider settings must not auto-generate a public route")
 }
 
 func TestPublicPaymentRouteJSONNeverContainsInternalGatewayIdentifiers(t *testing.T) {
@@ -154,4 +195,48 @@ func TestPublicPaymentLabelHidesSeparatedProviderIdentifiers(t *testing.T) {
 	}
 	assert.Equal(t, "Prepayment package", PublicPaymentLabel("Prepayment package", "Online payment"))
 	assert.Equal(t, "Online payment", PublicPaymentLabel("XOR Pay", "Stripe.com"))
+}
+
+func TestSubscriptionQuoteTermsForPlanEnforceTheRouteSpecificContract(t *testing.T) {
+	originalUnitPrice := setting.WaffoPancakeUnitPrice
+	t.Cleanup(func() {
+		setting.WaffoPancakeUnitPrice = originalUnitPrice
+	})
+	setting.WaffoPancakeUnitPrice = 1
+
+	validPlan := model.SubscriptionPlan{
+		Id: 31, Title: "Hosted access", PriceAmount: 10, Currency: "USD",
+		DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1,
+		TotalAmount: 1000, WaffoPancakeProductId: "private_product", Enabled: true,
+	}
+	validPlan.NormalizeDefaults()
+	terms, err := subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &validPlan)
+	require.NoError(t, err)
+	assert.Equal(t, "10", terms.payable.String())
+	assert.Equal(t, float64(1), terms.unitPrice)
+	assert.Equal(t, "USD", terms.currency)
+	assert.Equal(t, "private_product", terms.planSnapshot.WaffoPancakeProductId)
+
+	missingProduct := validPlan
+	missingProduct.WaffoPancakeProductId = ""
+	_, err = subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &missingProduct)
+	assert.EqualError(t, err, "Waffo Pancake product is not configured for this plan")
+
+	freePlan := validPlan
+	freePlan.PriceAmount = 0
+	_, err = subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &freePlan)
+	assert.EqualError(t, err, "套餐金额过低")
+
+	nonUSDPlan := validPlan
+	nonUSDPlan.Currency = "EUR"
+	_, err = subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &nonUSDPlan)
+	assert.EqualError(t, err, "external payment subscription plans must use USD as the base currency")
+
+	setting.WaffoPancakeUnitPrice = 0.0001
+	_, err = subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &validPlan)
+	assert.EqualError(t, err, "payment amount is too low")
+
+	setting.WaffoPancakeUnitPrice = 0
+	_, err = subscriptionQuoteTermsForPlan(model.PaymentProviderWaffoPancake, &validPlan)
+	assert.EqualError(t, err, "invalid waffo_pancake subscription pricing configuration")
 }

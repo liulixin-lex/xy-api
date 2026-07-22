@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { StripeLegacySubscription } from '@/features/subscriptions/types'
+
 export interface PaymentOrder {
   id: number
   trade_no: string
@@ -205,12 +207,6 @@ export interface PaymentAuditFilters {
   tradeNo: string
 }
 
-export interface ManualFulfillRequest {
-  trade_no: string
-  expected_version: number
-  reason: string
-}
-
 export interface PaymentOrderAuditActionRequest {
   trade_no: string
   expected_version: number
@@ -233,6 +229,7 @@ export interface RetireStripeCustomerBindingResult {
 
 export interface ConfirmExternalRefundRequest extends PaymentOrderAuditActionRequest {
   refunded_amount_minor: number
+  provider_refund_reference: string
 }
 
 export interface DismissUnmatchedPaymentEventRequest {
@@ -255,7 +252,8 @@ export interface ResolveLegacyEpayTopUpRequest extends RetryLegacyEpayPaymentEve
   provider_refund_reference: string
 }
 
-export interface ResolveLegacyEpaySubscriptionRequest extends RetryLegacyEpayPaymentEventRequest {
+export interface ResolveLegacySubscriptionRequest extends DismissUnmatchedPaymentEventRequest {
+  expected_event_attempts: number
   resolution: 'external_refund'
   provider_refund_reference: string
 }
@@ -291,6 +289,17 @@ export interface StripeInventorySyncResult {
   seen: number
   mapped: number
   unmapped: number
+}
+
+export interface CancelStripeLegacySubscriptionRequest {
+  inventory_id: number
+  expected_updated_at: number
+  reason: string
+}
+
+export interface CancelStripeLegacySubscriptionResult {
+  subscription: StripeLegacySubscription
+  duplicate: boolean
 }
 
 export interface PaymentOperationsOverviewCounts {

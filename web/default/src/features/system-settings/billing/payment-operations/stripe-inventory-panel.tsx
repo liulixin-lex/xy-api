@@ -61,6 +61,8 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { listAdminStripeInventory, syncAdminStripeInventory } from './api'
 import { formatMinorAmount, formatUnixTime } from './status'
 import { MappingStatusBadge, StripeStatusBadge } from './status-badges'
+import { StripeInventoryCancelDialog } from './stripe-inventory-cancel-dialog'
+import { canScheduleStripeSubscriptionCancellation } from './stripe-inventory-cancellation'
 import { StripeInventoryDetailSheet } from './stripe-inventory-detail-sheet'
 import { TablePagination } from './table-pagination'
 import type { StripeInventoryFilters, StripeLegacySubscription } from './types'
@@ -86,9 +88,12 @@ export function StripeInventoryPanel() {
   const [syncDialogOpen, setSyncDialogOpen] = useState(false)
   const [selectedItem, setSelectedItem] =
     useState<StripeLegacySubscription | null>(null)
+  const [cancellationItem, setCancellationItem] =
+    useState<StripeLegacySubscription | null>(null)
   const inventoryQuery = useQuery({
     queryKey: ['stripe-legacy-inventory', 'admin', filters, page, PAGE_SIZE],
     queryFn: () => listAdminStripeInventory(filters, page, PAGE_SIZE),
+    meta: { skipGlobalError: true },
   })
   const syncMutation = useMutation({
     mutationFn: () =>
@@ -151,10 +156,10 @@ export function StripeInventoryPanel() {
   return (
     <div className='grid gap-4'>
       <Alert>
-        <AlertTitle>{t('Read-only Stripe inventory')}</AlertTitle>
+        <AlertTitle>{t('Legacy Stripe subscription controls')}</AlertTitle>
         <AlertDescription>
           {t(
-            'Inventory sync observes legacy recurring subscriptions only. It never grants, renews, cancels, or revokes local subscription entitlement.'
+            'Inventory sync only observes legacy recurring subscriptions. Verified cancellation can stop a future Stripe renewal but never grants, renews, refunds, or revokes local access.'
           )}
         </AlertDescription>
       </Alert>
@@ -371,11 +376,21 @@ export function StripeInventoryPanel() {
         {!inventoryQuery.isLoading && inventoryQuery.isError && (
           <div className='p-4'>
             <Alert variant='destructive'>
-              <AlertDescription>
-                {getApiErrorMessage(
-                  inventoryQuery.error,
-                  t('Failed to load Stripe subscription inventory')
-                )}
+              <AlertDescription className='flex flex-wrap items-center justify-between gap-3'>
+                <span>
+                  {getApiErrorMessage(
+                    inventoryQuery.error,
+                    t('Failed to load Stripe subscription inventory')
+                  )}
+                </span>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='outline'
+                  onClick={() => void inventoryQuery.refetch()}
+                >
+                  {t('Retry')}
+                </Button>
               </AlertDescription>
             </Alert>
           </div>
@@ -484,14 +499,34 @@ export function StripeInventoryPanel() {
                       </div>
                     </TableCell>
                     <TableCell className='text-right'>
-                      <Button
-                        type='button'
-                        variant='outline'
-                        size='sm'
-                        onClick={() => setSelectedItem(item)}
-                      >
-                        {t('View Details')}
-                      </Button>
+                      <div className='flex flex-wrap justify-end gap-2'>
+                        <Button
+                          type='button'
+                          variant='outline'
+                          size='sm'
+                          onClick={() => setSelectedItem(item)}
+                        >
+                          {t('View Details')}
+                        </Button>
+                        <Button
+                          type='button'
+                          variant='outline'
+                          size='sm'
+                          disabled={
+                            !canScheduleStripeSubscriptionCancellation(item)
+                          }
+                          title={
+                            canScheduleStripeSubscriptionCancellation(item)
+                              ? t('Cancel renewal at period end')
+                              : t(
+                                  'Cancellation is unavailable for this subscription snapshot'
+                                )
+                          }
+                          onClick={() => setCancellationItem(item)}
+                        >
+                          {t('Cancel renewal')}
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -513,7 +548,7 @@ export function StripeInventoryPanel() {
             <AlertDialogTitle>{t('Sync Stripe inventory?')}</AlertDialogTitle>
             <AlertDialogDescription>
               {t(
-                'This fetches recurring subscription observations from Stripe and updates the read-only inventory. It does not change local entitlements.'
+                'This fetches recurring subscription observations from Stripe and updates the inventory. It does not change Stripe renewals or local access.'
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -538,6 +573,18 @@ export function StripeInventoryPanel() {
         onOpenChange={(open) => {
           if (!open) setSelectedItem(null)
         }}
+      />
+
+      <StripeInventoryCancelDialog
+        item={cancellationItem}
+        onOpenChange={(open) => {
+          if (!open) setCancellationItem(null)
+        }}
+        onCompleted={() =>
+          queryClient.invalidateQueries({
+            queryKey: ['stripe-legacy-inventory'],
+          })
+        }
       />
     </div>
   )

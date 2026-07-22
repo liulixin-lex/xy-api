@@ -9,6 +9,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -84,10 +86,18 @@ type SubscriptionBalancePayRequest struct {
 // ---- User APIs ----
 
 func GetSubscriptionPlans(c *gin.Context) {
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("subscription payment configuration sync failed user_id=%d error=%q", c.GetInt("id"), err.Error()))
+		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
+		return
+	}
+	unlockPaymentConfiguration := setting.LockPaymentConfigurationForRead()
 	if !operation_setting.IsPaymentComplianceConfirmed() {
+		unlockPaymentConfiguration()
 		common.ApiSuccess(c, []PublicSubscriptionPlanDTO{})
 		return
 	}
+	unlockPaymentConfiguration()
 
 	var plans []model.SubscriptionPlan
 	if err := model.DB.Where("enabled = ?", true).Order("sort_order desc, id desc").Find(&plans).Error; err != nil {
@@ -95,13 +105,38 @@ func GetSubscriptionPlans(c *gin.Context) {
 		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
 		return
 	}
+	if err := model.SyncPaymentConfigurationIfStale(); err != nil {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("subscription payment configuration resync failed user_id=%d error=%q", c.GetInt("id"), err.Error()))
+		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
+		return
+	}
+	unlockPaymentConfiguration = setting.LockPaymentConfigurationForRead()
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		unlockPaymentConfiguration()
+		common.ApiSuccess(c, []PublicSubscriptionPlanDTO{})
+		return
+	}
+	publicRoutes, err := service.PublicPaymentRoutesLocked()
+	if err != nil {
+		unlockPaymentConfiguration()
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("subscription payment route projection failed user_id=%d error=%q", c.GetInt("id"), err.Error()))
+		compatibilityPaymentAPIError(c, "payment_temporarily_unavailable", nil)
+		return
+	}
 	result := make([]PublicSubscriptionPlanDTO, 0, len(plans))
 	for _, p := range plans {
 		p.NormalizeDefaults()
+		eligibleRoutes := make([]service.PublicPaymentRoute, 0, len(publicRoutes))
+		for _, route := range publicRoutes {
+			if service.ValidateSubscriptionPlanForPaymentRoute(route.Provider, route.PaymentMethod, &p) == nil {
+				eligibleRoutes = append(eligibleRoutes, route)
+			}
+		}
 		result = append(result, PublicSubscriptionPlanDTO{
-			Plan: publicSubscriptionPlan(p),
+			Plan: publicSubscriptionPlan(p, eligibleRoutes),
 		})
 	}
+	unlockPaymentConfiguration()
 	common.ApiSuccess(c, result)
 }
 
@@ -239,17 +274,10 @@ func AdminListSubscriptionPlans(c *gin.Context) {
 	common.ApiSuccess(c, result)
 }
 
-func publicSubscriptionPlan(plan model.SubscriptionPlan) PublicSubscriptionPlan {
-	externalPaymentRouteIDs := make([]string, 0, 2)
-	if strings.TrimSpace(plan.CreemProductId) != "" {
-		externalPaymentRouteIDs = append(externalPaymentRouteIDs,
-			operation_setting.PublicPaymentRouteID(model.PaymentProviderCreem, model.PaymentMethodCreem),
-		)
-	}
-	if strings.TrimSpace(plan.WaffoPancakeProductId) != "" {
-		externalPaymentRouteIDs = append(externalPaymentRouteIDs,
-			operation_setting.PublicPaymentRouteID(model.PaymentProviderWaffoPancake, model.PaymentMethodWaffoPancake),
-		)
+func publicSubscriptionPlan(plan model.SubscriptionPlan, eligibleRoutes []service.PublicPaymentRoute) PublicSubscriptionPlan {
+	externalPaymentRouteIDs := make([]string, 0, len(eligibleRoutes))
+	for _, route := range eligibleRoutes {
+		externalPaymentRouteIDs = append(externalPaymentRouteIDs, route.RouteID)
 	}
 	return PublicSubscriptionPlan{
 		ID:                      plan.Id,

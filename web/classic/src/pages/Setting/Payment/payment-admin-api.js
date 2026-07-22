@@ -94,3 +94,15 @@ export const syncStripeLegacyInventory = async () => {
     'Failed to sync Stripe subscription inventory',
   );
 };
+
+export const cancelStripeLegacySubscriptionAtPeriodEnd = async (request) => {
+  const response = await API.post(
+    `/api/subscription/admin/stripe/inventory/${request.inventory_id}/cancel-at-period-end`,
+    request,
+    paymentAdminRequestConfig,
+  );
+  return unwrapPaymentAdminResponse(
+    response.data,
+    'Failed to schedule Stripe subscription cancellation',
+  );
+};

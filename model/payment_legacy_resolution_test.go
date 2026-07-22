@@ -159,6 +159,87 @@ func TestResolveLegacyTopUpExternalRefundNeverGrantsEntitlement(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPaymentAuditInvalid)
 }
 
+func TestExternalRefundReferenceCannotBeReusedAcrossResolutionFlows(t *testing.T) {
+	truncateTables(t)
+	const providerRefundReference = "shared-cross-flow-provider-refund"
+
+	seedPaymentUser(t, 976020, 0)
+	canonicalOrder := createTopUpPaymentOrder(t, 976020, PaymentProviderEpay, "alipay", 1200, 600)
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("id = ?", canonicalOrder.ID).
+		Updates(map[string]interface{}{"status": PaymentOrderStatusManualReview, "status_reason": "requires review"}).Error)
+	require.NoError(t, DB.Model(&TopUp{}).Where("payment_order_id = ?", canonicalOrder.ID).
+		Update("status", common.TopUpStatusManualReview).Error)
+
+	_, err := ResolvePaymentOrderByAdmin(PaymentAdminOrderActionInput{
+		TradeNo: canonicalOrder.TradeNo, ExpectedVersion: canonicalOrder.Version,
+		AdminID: 120, ActorIP: "192.0.2.120", Action: PaymentAdminActionExternalRefundConfirmed,
+		Reason:              "provider dashboard confirms the canonical external refund completed",
+		RefundedAmountMinor: canonicalOrder.ExpectedAmountMinor, ProviderRefundReference: providerRefundReference,
+	})
+	require.NoError(t, err)
+
+	legacyTopUp, _, legacyEvent := createLegacyTopUpReviewEvent(t, 976021, "LEGACY_SHARED_REFUND", 12, 1200)
+	_, err = ResolveLegacyTopUpPaymentEventByAdmin(PaymentLegacyTopUpResolutionInput{
+		EventID: legacyEvent.ID, ExpectedEventAttempts: legacyEvent.Attempts,
+		AdminID: 121, ActorIP: "192.0.2.121", Resolution: PaymentLegacyTopUpResolutionExternalRefund,
+		ProviderRefundReference: providerRefundReference,
+		Reason:                  "the same provider refund reference must not settle another payment",
+	})
+	assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+
+	var storedLegacyEvent PaymentEvent
+	require.NoError(t, DB.First(&storedLegacyEvent, legacyEvent.ID).Error)
+	assert.Equal(t, PaymentEventStatusManualReview, storedLegacyEvent.Status)
+	assert.Zero(t, storedLegacyEvent.PaymentOrderID)
+	var storedLegacyTopUp TopUp
+	require.NoError(t, DB.First(&storedLegacyTopUp, legacyTopUp.Id).Error)
+	assert.Nil(t, storedLegacyTopUp.PaymentOrderId)
+	assert.Equal(t, common.TopUpStatusPending, storedLegacyTopUp.Status)
+	var legacyOrderCount int64
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", legacyTopUp.TradeNo).Count(&legacyOrderCount).Error)
+	assert.Zero(t, legacyOrderCount)
+	var legacyUser User
+	require.NoError(t, DB.First(&legacyUser, legacyTopUp.UserId).Error)
+	assert.Zero(t, legacyUser.Quota)
+
+	seedPaymentUser(t, 976022, 0)
+	legacySubscription := &SubscriptionOrder{
+		UserId: 976022, PlanId: 986022, Money: 12, TradeNo: "LEGACY_SUB_SHARED_REFUND",
+		PaymentMethod: "alipay", Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp() - 100,
+	}
+	require.NoError(t, DB.Create(legacySubscription).Error)
+	legacySubscriptionPaid := legacyEpayPaidInput(legacySubscription.TradeNo, 1200, "alipay")
+	legacySubscriptionPaid.ProviderPaymentKey = "epay:g1:subscription_shared_refund"
+	_, err = ProcessPaymentEvent(legacySubscriptionPaid)
+	require.ErrorIs(t, err, ErrPaymentManualReview)
+	var legacySubscriptionEvent PaymentEvent
+	require.NoError(t, DB.Where("provider = ? AND event_key = ?", legacySubscriptionPaid.Provider,
+		legacySubscriptionPaid.EventKey).First(&legacySubscriptionEvent).Error)
+	require.Equal(t, PaymentReviewCodeLegacySubscriptionContractUnavailable, legacySubscriptionEvent.ReviewCode)
+	_, err = ResolveLegacySubscriptionPaymentEventByAdmin(PaymentLegacySubscriptionResolutionInput{
+		EventID: legacySubscriptionEvent.ID, ExpectedEventAttempts: legacySubscriptionEvent.Attempts,
+		AdminID: 122, ActorIP: "192.0.2.122", Resolution: PaymentLegacyTopUpResolutionExternalRefund,
+		ProviderRefundReference: providerRefundReference,
+		Reason:                  "the same provider refund reference must not settle a legacy subscription",
+	})
+	assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+	require.NoError(t, DB.First(&legacySubscriptionEvent, legacySubscriptionEvent.ID).Error)
+	assert.Equal(t, PaymentEventStatusManualReview, legacySubscriptionEvent.Status)
+	assert.Zero(t, legacySubscriptionEvent.PaymentOrderID)
+	require.NoError(t, DB.First(legacySubscription, legacySubscription.Id).Error)
+	assert.Nil(t, legacySubscription.PaymentOrderId)
+	var legacySubscriptionOrderCount int64
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", legacySubscription.TradeNo).
+		Count(&legacySubscriptionOrderCount).Error)
+	assert.Zero(t, legacySubscriptionOrderCount)
+
+	var refundEventCount int64
+	require.NoError(t, DB.Model(&PaymentEvent{}).
+		Where("provider = ? AND provider_resource_key = ?", "admin", PaymentProviderEpay+":refund:"+providerRefundReference).
+		Count(&refundEventCount).Error)
+	assert.EqualValues(t, 1, refundEventCount)
+}
+
 func TestResolveLegacyTopUpRollsBackAllEffectsWhenAuditInsertFails(t *testing.T) {
 	truncateTables(t)
 	topUp, _, event := createLegacyTopUpReviewEvent(t, 976003, "LEGACY_TOPUP_AUDIT_ROLLBACK", 10, 1000)
@@ -306,6 +387,198 @@ func TestResolveLegacySubscriptionExternalRefundClosesUnreconstructablePayment(t
 	changed.ProviderRefundReference = "epay-sub-refund-002"
 	_, err = ResolveLegacySubscriptionPaymentEventByAdmin(changed)
 	assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+}
+
+func createStripeLegacyRecurringRefundReview(t *testing.T, userID int, suffix string, paidMinor int64) (*SubscriptionOrder, *PaymentEvent) {
+	t.Helper()
+	seedPaymentUser(t, userID, 0)
+	customerID := "cus_legacy_refund_" + suffix
+	seedStripeCustomerBinding(t, userID, customerID)
+	tradeNo := "STRIPE_LEGACY_REFUND_" + suffix
+	sessionID := "cs_legacy_refund_" + suffix
+	subscriptionID := "sub_legacy_refund_" + suffix
+	providerOrderKey := PaymentProviderStripe + ":" + sessionID
+	legacy := &SubscriptionOrder{
+		UserId: userID, PlanId: userID + 1000, Money: float64(paidMinor) / 100, TradeNo: tradeNo,
+		ExpectedAmountMinor: paidMinor, PaymentCurrency: "USD", ProviderOrderId: sessionID,
+		ProviderOrderKey: &providerOrderKey, PaymentMethod: PaymentMethodStripe, PaymentProvider: PaymentProviderStripe,
+		Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp() - 100,
+	}
+	require.NoError(t, DB.Create(legacy).Error)
+	inventoryUserID, inventoryPlanID := legacy.UserId, legacy.PlanId
+	require.NoError(t, DB.Create(&StripeLegacySubscription{
+		StripeSubscriptionID: subscriptionID, StripeCustomerID: customerID, CheckoutSessionID: sessionID,
+		TradeNo: tradeNo, UserID: &inventoryUserID, SubscriptionPlanID: &inventoryPlanID,
+		MappingStatus: StripeLegacyMappingMapped, Status: "active", CancelAtPeriodEnd: true, Livemode: true,
+	}).Error)
+	payload := common.GetJsonString(map[string]interface{}{
+		"session_id": sessionID, "trade_no": tradeNo, "amount_total": paidMinor, "currency": "usd",
+		"payment_status": "paid", "status": "complete", "mode": "subscription",
+		"subscription_id": subscriptionID, "data_digest": PaymentPayloadDigest("stripe recurring object " + suffix),
+	})
+	input := PaymentEventInput{
+		Provider: PaymentProviderStripe, EventKey: "evt_legacy_refund_" + suffix,
+		EventType: "checkout.session.completed", TradeNo: tradeNo,
+		ProviderOrderKey: providerOrderKey, ProviderResourceKey: PaymentProviderStripe + ":" + subscriptionID,
+		ProviderCredentialGeneration: 1, ProviderLivemode: livePaymentModeForTest(),
+		ProviderCreatedAt: common.GetTimestamp() - 90, ProviderState: PaymentProviderStateStripeLegacyRecurringCheckoutPaid,
+		CustomerID: customerID, PaidAmountMinor: paidMinor, Currency: "USD", PaymentMethod: PaymentMethodStripe,
+		ManualReview: true, NormalizedPayload: payload,
+	}
+	require.NoError(t, RecordPaymentEventManualReview(input, "verified recurring Checkout requires external refund review"))
+	var event PaymentEvent
+	require.NoError(t, DB.Where("provider = ? AND event_key = ?", PaymentProviderStripe, input.EventKey).First(&event).Error)
+	require.NoError(t, DB.Model(&PaymentEvent{}).Where("id = ?", event.ID).
+		Update("review_code", PaymentReviewCodeStripeLegacyRecurringCheckoutPaid).Error)
+	require.NoError(t, DB.First(&event, event.ID).Error)
+	return legacy, &event
+}
+
+func TestResolveStripeLegacyRecurringCheckoutExternalRefundIsStrictlyIdempotent(t *testing.T) {
+	truncateTables(t)
+	legacy, event := createStripeLegacyRecurringRefundReview(t, 976040, "success", 1250)
+	views, total, err := ListUnmatchedPaymentEventViewsPage(0, 50)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	require.Len(t, views, 1)
+	assert.Equal(t, PaymentOrderKindSubscription, views[0].LegacyKind)
+	assert.Equal(t, []string{PaymentUnmatchedAvailableActionResolveLegacySubscription}, views[0].AvailableActions)
+
+	input := PaymentLegacySubscriptionResolutionInput{
+		EventID: event.ID, ExpectedEventAttempts: event.Attempts, AdminID: 140, ActorIP: "192.0.2.140",
+		Resolution: PaymentLegacyTopUpResolutionExternalRefund, ProviderRefundReference: "re_success_001",
+		Reason: "Stripe dashboard confirms the recurring Checkout charge was fully refunded",
+	}
+	result, err := ResolveLegacySubscriptionPaymentEventByAdmin(input)
+	require.NoError(t, err)
+	require.NotNil(t, result.Order)
+	assert.False(t, result.Duplicate)
+	assert.Equal(t, PaymentProviderStripe, result.Order.Provider)
+	assert.Equal(t, PaymentOrderStatusRefunded, result.Order.Status)
+	assert.Equal(t, event.ProviderCredentialGeneration, result.Order.ProviderCredentialGeneration)
+	require.NotNil(t, result.Order.ProviderLivemode)
+	assert.True(t, *result.Order.ProviderLivemode)
+	assert.Equal(t, event.ProviderOrderKey, *result.Order.ProviderOrderKey)
+	assert.Equal(t, event.PaidAmountMinor, result.Order.RefundedAmountMinor)
+	assert.Zero(t, result.Order.PaidAmountMinor)
+	assert.Zero(t, result.Order.SettledAt)
+
+	var storedLegacy SubscriptionOrder
+	require.NoError(t, DB.First(&storedLegacy, legacy.Id).Error)
+	require.NotNil(t, storedLegacy.PaymentOrderId)
+	assert.Equal(t, result.Order.ID, *storedLegacy.PaymentOrderId)
+	assert.Equal(t, common.TopUpStatusRefunded, storedLegacy.Status)
+	assert.Positive(t, storedLegacy.CompleteTime)
+	var user User
+	require.NoError(t, DB.First(&user, legacy.UserId).Error)
+	assert.Zero(t, user.Quota)
+	var entitlementCount, grantLedgerCount, receiptCount, refundCount int64
+	require.NoError(t, DB.Model(&UserSubscription{}).Where("user_id = ?", legacy.UserId).Count(&entitlementCount).Error)
+	require.NoError(t, DB.Model(&PaymentLedgerEntry{}).Where("payment_order_id = ? AND entry_type = ?", result.Order.ID,
+		PaymentLedgerEntrySubscriptionGranted).Count(&grantLedgerCount).Error)
+	require.NoError(t, DB.Model(&PaymentLedgerEntry{}).Where("payment_order_id = ? AND entry_type = ?", result.Order.ID,
+		PaymentLedgerEntryLegacyPaymentReceived).Count(&receiptCount).Error)
+	require.NoError(t, DB.Model(&PaymentLedgerEntry{}).Where("payment_order_id = ? AND entry_type = ?", result.Order.ID,
+		PaymentLedgerEntryAdminExternalRefund).Count(&refundCount).Error)
+	assert.Zero(t, entitlementCount)
+	assert.Zero(t, grantLedgerCount)
+	assert.EqualValues(t, 1, receiptCount)
+	assert.EqualValues(t, 1, refundCount)
+	var adminEvent PaymentEvent
+	require.NoError(t, DB.Where("provider = ? AND provider_resource_key = ?", "admin",
+		PaymentProviderStripe+":refund:"+input.ProviderRefundReference).First(&adminEvent).Error)
+	assert.True(t, adminEvent.Refunded)
+	assert.Equal(t, event.PaidAmountMinor, adminEvent.RefundedAmountMinor)
+
+	duplicate, err := ResolveLegacySubscriptionPaymentEventByAdmin(input)
+	require.NoError(t, err)
+	assert.True(t, duplicate.Duplicate)
+	assert.Equal(t, result.Order.ID, duplicate.Order.ID)
+	var orderCount, ledgerCount, auditCount int64
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", legacy.TradeNo).Count(&orderCount).Error)
+	require.NoError(t, DB.Model(&PaymentLedgerEntry{}).Where("payment_order_id = ?", result.Order.ID).Count(&ledgerCount).Error)
+	require.NoError(t, DB.Model(&PaymentOperationsAudit{}).Where("action = ? AND subject_id = ?",
+		PaymentOperationsActionLegacySubscriptionRefund, event.ID).Count(&auditCount).Error)
+	assert.EqualValues(t, 1, orderCount)
+	assert.EqualValues(t, 2, ledgerCount)
+	assert.EqualValues(t, 1, auditCount)
+}
+
+func TestResolveStripeLegacyRecurringCheckoutRefundRejectsChangedContract(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *SubscriptionOrder, *PaymentEvent)
+	}{
+		{name: "provider", mutate: func(t *testing.T, legacy *SubscriptionOrder, _ *PaymentEvent) {
+			require.NoError(t, DB.Model(&SubscriptionOrder{}).Where("id = ?", legacy.Id).
+				Update("payment_provider", PaymentProviderEpay).Error)
+		}},
+		{name: "amount", mutate: func(t *testing.T, legacy *SubscriptionOrder, _ *PaymentEvent) {
+			require.NoError(t, DB.Model(&SubscriptionOrder{}).Where("id = ?", legacy.Id).Update("money", 13.75).Error)
+		}},
+		{name: "Checkout Session identity", mutate: func(t *testing.T, legacy *SubscriptionOrder, _ *PaymentEvent) {
+			require.NoError(t, DB.Model(&SubscriptionOrder{}).Where("id = ?", legacy.Id).
+				Updates(map[string]interface{}{"provider_order_id": "cs_other", "provider_order_key": "stripe:cs_other"}).Error)
+		}},
+		{name: "subscription can still renew", mutate: func(t *testing.T, _ *SubscriptionOrder, event *PaymentEvent) {
+			subscriptionID := strings.TrimPrefix(event.ProviderResourceKey, PaymentProviderStripe+":")
+			require.NoError(t, DB.Model(&StripeLegacySubscription{}).Where("stripe_subscription_id = ?", subscriptionID).
+				Updates(map[string]interface{}{"cancel_at_period_end": false, "ended_at": 0, "status": "active"}).Error)
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			legacy, event := createStripeLegacyRecurringRefundReview(t, 976050+index, fmt.Sprintf("changed_%d", index), 1250)
+			test.mutate(t, legacy, event)
+			_, err := ResolveLegacySubscriptionPaymentEventByAdmin(PaymentLegacySubscriptionResolutionInput{
+				EventID: event.ID, ExpectedEventAttempts: event.Attempts, AdminID: 150 + index,
+				ActorIP: fmt.Sprintf("192.0.2.%d", 150+index), Resolution: PaymentLegacyTopUpResolutionExternalRefund,
+				ProviderRefundReference: fmt.Sprintf("re_changed_%03d", index),
+				Reason:                  "changed provider evidence must not create a refunded canonical order",
+			})
+			assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+			var orderCount, entitlementCount int64
+			require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", legacy.TradeNo).Count(&orderCount).Error)
+			require.NoError(t, DB.Model(&UserSubscription{}).Where("user_id = ?", legacy.UserId).Count(&entitlementCount).Error)
+			assert.Zero(t, orderCount)
+			assert.Zero(t, entitlementCount)
+			var stored SubscriptionOrder
+			require.NoError(t, DB.First(&stored, legacy.Id).Error)
+			assert.Nil(t, stored.PaymentOrderId)
+			assert.Equal(t, common.TopUpStatusPending, stored.Status)
+		})
+	}
+}
+
+func TestResolveStripeLegacyRecurringCheckoutRefundReferenceCannotBeReused(t *testing.T) {
+	truncateTables(t)
+	firstLegacy, firstEvent := createStripeLegacyRecurringRefundReview(t, 976060, "reference_first", 1000)
+	secondLegacy, secondEvent := createStripeLegacyRecurringRefundReview(t, 976061, "reference_second", 1000)
+	const refundReference = "re_shared_legacy_recurring_001"
+	_, err := ResolveLegacySubscriptionPaymentEventByAdmin(PaymentLegacySubscriptionResolutionInput{
+		EventID: firstEvent.ID, ExpectedEventAttempts: firstEvent.Attempts, AdminID: 160, ActorIP: "192.0.2.160",
+		Resolution: PaymentLegacyTopUpResolutionExternalRefund, ProviderRefundReference: refundReference,
+		Reason: "first Stripe recurring Checkout external refund is confirmed in the provider dashboard",
+	})
+	require.NoError(t, err)
+	_, err = ResolveLegacySubscriptionPaymentEventByAdmin(PaymentLegacySubscriptionResolutionInput{
+		EventID: secondEvent.ID, ExpectedEventAttempts: secondEvent.Attempts, AdminID: 161, ActorIP: "192.0.2.161",
+		Resolution: PaymentLegacyTopUpResolutionExternalRefund, ProviderRefundReference: refundReference,
+		Reason: "a provider refund reference cannot be applied to a second recurring Checkout",
+	})
+	assert.ErrorIs(t, err, ErrPaymentAuditConflict)
+	var firstOrderCount, secondOrderCount, secondEntitlementCount int64
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", firstLegacy.TradeNo).Count(&firstOrderCount).Error)
+	require.NoError(t, DB.Model(&PaymentOrder{}).Where("trade_no = ?", secondLegacy.TradeNo).Count(&secondOrderCount).Error)
+	require.NoError(t, DB.Model(&UserSubscription{}).Where("user_id = ?", secondLegacy.UserId).Count(&secondEntitlementCount).Error)
+	assert.EqualValues(t, 1, firstOrderCount)
+	assert.Zero(t, secondOrderCount)
+	assert.Zero(t, secondEntitlementCount)
+	var storedSecond SubscriptionOrder
+	require.NoError(t, DB.First(&storedSecond, secondLegacy.Id).Error)
+	assert.Nil(t, storedSecond.PaymentOrderId)
+	assert.Equal(t, common.TopUpStatusPending, storedSecond.Status)
 }
 
 func TestLegacySubscriptionRefundRejectsChangedProviderOrderIdentity(t *testing.T) {

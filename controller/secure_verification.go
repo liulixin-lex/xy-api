@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
@@ -30,6 +32,8 @@ const (
 	secureVerificationCodeMaxLength    = 128
 )
 
+var errPasskeyReadyStateInvalid = errors.New("invalid Passkey verification state")
+
 type UniversalVerifyRequest struct {
 	Method string `json:"method"` // "2fa" 或 "passkey"
 	Code   string `json:"code,omitempty"`
@@ -40,52 +44,71 @@ type VerificationStatusResponse struct {
 	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
+func secureVerificationAPIError(c *gin.Context, status int, code, message string, diagnostic error) {
+	if diagnostic != nil {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf(
+			"secure verification rejected user_id=%d code=%s error=%q",
+			c.GetInt("id"), code, diagnostic.Error(),
+		))
+	}
+	c.JSON(status, gin.H{
+		"success": false,
+		"code":    code,
+		"message": message,
+	})
+}
+
 // UniversalVerify 通用验证接口
 // 支持 2FA 和 Passkey 验证，验证成功后在 session 中记录时间戳
 func UniversalVerify(c *gin.Context) {
 	userId := c.GetInt("id")
 	if userId == 0 {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "未登录",
-		})
+		secureVerificationAPIError(c, http.StatusUnauthorized, "secure_verification_auth_required", "请先登录", nil)
 		return
 	}
 
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, secureVerificationRequestBodyLimit)
 	var req UniversalVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiError(c, fmt.Errorf("参数错误: %v", err))
+		secureVerificationAPIError(c, http.StatusBadRequest, "secure_verification_request_invalid", "安全验证请求无效", err)
 		return
 	}
 	req.Method = strings.ToLower(strings.TrimSpace(req.Method))
 	req.Code = strings.TrimSpace(req.Code)
 	if len(req.Method) > 16 || len(req.Code) > secureVerificationCodeMaxLength {
-		common.ApiError(c, fmt.Errorf("参数错误"))
+		secureVerificationAPIError(c, http.StatusBadRequest, "secure_verification_request_invalid", "安全验证请求无效", nil)
 		return
 	}
 
 	// 获取用户信息
 	user := &model.User{Id: userId}
 	if err := user.FillUserById(); err != nil {
-		common.ApiError(c, fmt.Errorf("获取用户信息失败: %v", err))
+		secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_user_unavailable", "暂时无法完成安全验证", err)
 		return
 	}
 
 	if user.Status != common.UserStatusEnabled {
-		common.ApiError(c, fmt.Errorf("该用户已被禁用"))
+		secureVerificationAPIError(c, http.StatusForbidden, "secure_verification_account_disabled", "当前账号无法完成安全验证", nil)
 		return
 	}
 
 	// 检查用户的验证方式
-	twoFA, _ := model.GetTwoFAByUserId(userId)
+	twoFA, twoFAErr := model.GetTwoFAByUserId(userId)
+	if twoFAErr != nil {
+		secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_method_unavailable", "暂时无法读取安全验证方式", twoFAErr)
+		return
+	}
 	has2FA := twoFA != nil && twoFA.IsEnabled
 
 	passkey, passkeyErr := model.GetPasskeyByUserID(userId)
+	if passkeyErr != nil && !errors.Is(passkeyErr, model.ErrPasskeyNotFound) {
+		secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_method_unavailable", "暂时无法读取安全验证方式", passkeyErr)
+		return
+	}
 	hasPasskey := passkeyErr == nil && passkey != nil
 
 	if !has2FA && !hasPasskey {
-		common.ApiError(c, fmt.Errorf("用户未启用2FA或Passkey"))
+		secureVerificationAPIError(c, http.StatusConflict, "secure_verification_not_configured", "请先启用 2FA 或 Passkey", nil)
 		return
 	}
 
@@ -97,11 +120,11 @@ func UniversalVerify(c *gin.Context) {
 	switch req.Method {
 	case "2fa":
 		if !has2FA {
-			common.ApiError(c, fmt.Errorf("用户未启用2FA"))
+			secureVerificationAPIError(c, http.StatusConflict, "secure_verification_method_unavailable", "当前账号未启用 2FA", nil)
 			return
 		}
 		if req.Code == "" {
-			common.ApiError(c, fmt.Errorf("验证码不能为空"))
+			secureVerificationAPIError(c, http.StatusBadRequest, "secure_verification_code_required", "请输入验证码", nil)
 			return
 		}
 		verified = validateTwoFactorAuth(twoFA, req.Code)
@@ -109,35 +132,39 @@ func UniversalVerify(c *gin.Context) {
 
 	case "passkey":
 		if !hasPasskey {
-			common.ApiError(c, fmt.Errorf("用户未启用Passkey"))
+			secureVerificationAPIError(c, http.StatusConflict, "secure_verification_method_unavailable", "当前账号未启用 Passkey", nil)
 			return
 		}
 		// Passkey branch only trusts the short-lived marker written by PasskeyVerifyFinish.
 		verified, err = consumePasskeyReady(c)
 		if err != nil {
-			common.ApiError(c, fmt.Errorf("Passkey 验证状态异常: %v", err))
+			if errors.Is(err, errPasskeyReadyStateInvalid) {
+				secureVerificationAPIError(c, http.StatusForbidden, "secure_verification_passkey_state_invalid", "Passkey 验证状态无效，请重新验证", err)
+			} else {
+				secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_session_unavailable", "暂时无法保存安全验证状态", err)
+			}
 			return
 		}
 		if !verified {
-			common.ApiError(c, fmt.Errorf("请先完成 Passkey 验证"))
+			secureVerificationAPIError(c, http.StatusForbidden, "secure_verification_passkey_required", "请先完成 Passkey 验证", nil)
 			return
 		}
 		verifyMethod = "Passkey"
 
 	default:
-		common.ApiError(c, fmt.Errorf("不支持的验证方式: %s", req.Method))
+		secureVerificationAPIError(c, http.StatusBadRequest, "secure_verification_method_invalid", "不支持此安全验证方式", nil)
 		return
 	}
 
 	if !verified {
-		common.ApiError(c, fmt.Errorf("验证失败，请检查验证码"))
+		secureVerificationAPIError(c, http.StatusForbidden, "secure_verification_failed", "验证失败，请检查验证码", nil)
 		return
 	}
 
 	// 验证成功，在 session 中记录时间戳
 	now, err := setSecureVerificationSession(c, req.Method)
 	if err != nil {
-		common.ApiError(c, fmt.Errorf("保存验证状态失败: %v", err))
+		secureVerificationAPIError(c, http.StatusServiceUnavailable, "secure_verification_session_unavailable", "暂时无法保存安全验证状态", err)
 		return
 	}
 
@@ -175,21 +202,23 @@ func consumePasskeyReady(c *gin.Context) (bool, error) {
 		return false, nil
 	}
 
-	readyAt, ok := readyAtRaw.(int64)
-	if !ok {
+	readyAt, ok := common.SessionValueInt64(readyAtRaw)
+	if !ok || readyAt <= 0 {
 		session.Delete(PasskeyReadySessionKey)
 		session.Delete(passkeyReadyUserIDSessionKey)
-		_ = session.Save()
-		return false, fmt.Errorf("无效的 Passkey 验证状态")
+		if err := session.Save(); err != nil {
+			return false, err
+		}
+		return false, errPasskeyReadyStateInvalid
 	}
-	readyUserID, ok := session.Get(passkeyReadyUserIDSessionKey).(int)
+	readyUserID, ok := common.SessionValueInt(session.Get(passkeyReadyUserIDSessionKey))
 	if !ok || readyUserID != c.GetInt("id") {
 		session.Delete(PasskeyReadySessionKey)
 		session.Delete(passkeyReadyUserIDSessionKey)
 		if err := session.Save(); err != nil {
 			return false, err
 		}
-		return false, nil
+		return false, errPasskeyReadyStateInvalid
 	}
 	session.Delete(PasskeyReadySessionKey)
 	session.Delete(passkeyReadyUserIDSessionKey)
@@ -198,7 +227,10 @@ func consumePasskeyReady(c *gin.Context) (bool, error) {
 	}
 	// Expired ready markers cannot be reused.
 	elapsed := time.Now().Unix() - readyAt
-	if elapsed < 0 || elapsed >= PasskeyReadyTimeout {
+	if elapsed < 0 {
+		return false, errPasskeyReadyStateInvalid
+	}
+	if elapsed >= PasskeyReadyTimeout {
 		return false, nil
 	}
 	return true, nil

@@ -2,11 +2,33 @@ package operation_setting
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPayMethodsStorageJSONIsASCIIAndRoundTripsUnicodeLabels(t *testing.T) {
+	methods := []map[string]string{{
+		"name": "支付宝💳", "type": "alipay", "provider": "epay", "flow": "form_post",
+	}}
+
+	stored, err := PayMethodsStorageJSON(methods)
+	require.NoError(t, err)
+	assert.NotContains(t, stored, "支付宝")
+	assert.Contains(t, stored, `\u652f\u4ed8\u5b9d`)
+	assert.Contains(t, stored, `\ud83d\udcb3`)
+	for _, character := range stored {
+		assert.LessOrEqual(t, character, rune(127))
+	}
+
+	parsed, err := ParsePayMethodsByJsonString(stored)
+	require.NoError(t, err)
+	require.Len(t, parsed, 1)
+	assert.Equal(t, "支付宝💳", parsed[0]["name"])
+	assert.True(t, strings.HasPrefix(parsed[0]["route_id"], "pay_"))
+}
 
 func TestParsePayMethodsRejectsUnknownFields(t *testing.T) {
 	_, err := ParsePayMethodsByJsonString(`[{"name":"Alipay","type":"alipay","provider":"epay","secret":"must-not-be-exposed"}]`)
@@ -28,6 +50,21 @@ func TestParsePayMethodsRejectsReservedTypesOnEpay(t *testing.T) {
 		))
 		assert.Error(t, err)
 	}
+}
+
+func TestParsePayMethodsPreservesHistoricalCustomEpayTypes(t *testing.T) {
+	methods, err := ParsePayMethodsByJsonString(`[
+		{"name":"Legacy product checkout","type":"creem","provider":"epay"},
+		{"name":"Legacy payment options","type":"waffo","provider":"epay"}
+	]`)
+	require.NoError(t, err)
+	require.Len(t, methods, 2)
+	assert.Equal(t, "epay", methods[0]["provider"])
+	assert.Equal(t, "creem", methods[0]["type"])
+	assert.Equal(t, "form_post", methods[0]["flow"])
+	assert.Equal(t, "epay", methods[1]["provider"])
+	assert.Equal(t, "waffo", methods[1]["type"])
+	assert.Equal(t, "form_post", methods[1]["flow"])
 }
 
 func TestParsePayMethodsUsesProviderAndExactEpayTypeAsIdentity(t *testing.T) {
@@ -65,6 +102,21 @@ func TestParsePayMethodsAddsOpaqueStablePublicAliases(t *testing.T) {
 	assert.NotContains(t, routeID, "alipay")
 	assert.Equal(t, "alipay", first[0]["public_method"])
 	assert.Equal(t, "qr", first[0]["channel_alias"])
+}
+
+func TestParsePayMethodsSupportsEveryCatalogManagedHostedProvider(t *testing.T) {
+	methods, err := ParsePayMethodsByJsonString(`[
+		{"name":"Product checkout","type":"creem","provider":"creem"},
+		{"name":"Payment options","type":"waffo","provider":"waffo"}
+	]`)
+	require.NoError(t, err)
+	require.Len(t, methods, 2)
+	assert.Equal(t, "hosted_redirect", methods[0]["flow"])
+	assert.Equal(t, "online_payment", methods[0]["public_method"])
+	assert.Equal(t, "product_checkout", methods[0]["channel_alias"])
+	assert.Equal(t, "hosted_redirect", methods[1]["flow"])
+	assert.Equal(t, "online_payment", methods[1]["public_method"])
+	assert.Equal(t, "payment_options", methods[1]["channel_alias"])
 }
 
 func TestParsePayMethodsRejectsLeakingOrDuplicatePublicRouteIdentifiers(t *testing.T) {

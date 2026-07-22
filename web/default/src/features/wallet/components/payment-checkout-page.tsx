@@ -25,7 +25,6 @@ import {
   InformationCircleIcon,
   LinkSquare02Icon,
   QrCodeIcon,
-  Shield01Icon,
   SmartPhone01Icon,
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
@@ -624,6 +623,7 @@ function CheckoutPanel({
 export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
   const { t } = useTranslation()
   const { systemName, logo } = useSystemConfig()
+  const [logoFailed, setLogoFailed] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const environment = useMemo(() => detectPaymentBrowserEnvironment(), [])
   const returnedCancelled = useMemo(
@@ -640,6 +640,27 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
     refresh,
     resumePolling,
   } = usePaymentOrder({ tradeNo, enabled: !!tradeNo })
+
+  useEffect(() => {
+    setLogoFailed(false)
+  }, [logo])
+
+  useEffect(() => {
+    const previousTitle = document.title
+    const metaTitle = document.querySelector(
+      'meta[name="title"]'
+    ) as HTMLMetaElement | null
+    const previousMetaTitle = metaTitle?.content
+    const title = `${systemName} - ${t('Secure payment')}`
+    document.title = title
+    metaTitle?.setAttribute('content', title)
+    return () => {
+      document.title = previousTitle
+      if (metaTitle && previousMetaTitle !== undefined) {
+        metaTitle.setAttribute('content', previousMetaTitle)
+      }
+    }
+  }, [systemName, t])
 
   const expiresAt = order?.checkout?.expires_at || order?.expires_at || 0
   useEffect(() => {
@@ -676,6 +697,7 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
   }
 
   const handleRefresh = () => {
+    if (loading) return
     if (pollingStoppedReason) resumePolling()
     else void refresh()
   }
@@ -755,12 +777,13 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
           {t('Back to Wallet')}
         </Button>
         <div className='flex min-w-0 items-center gap-2'>
-          {logo && (
+          {logo && !logoFailed && (
             <img
               src={logo}
               alt=''
               className='size-7 rounded-md object-contain'
               referrerPolicy='no-referrer'
+              onError={() => setLogoFailed(true)}
             />
           )}
           <span className='truncate text-sm font-medium'>{systemName}</span>
@@ -867,18 +890,6 @@ export function PaymentCheckoutPage({ tradeNo }: PaymentCheckoutPageProps) {
               <Separator />
 
               <div className='grid gap-3 text-sm'>
-                <div className='flex items-start gap-2'>
-                  <HugeiconsIcon
-                    icon={Shield01Icon}
-                    strokeWidth={2}
-                    className='mt-0.5 size-4 shrink-0 text-green-600'
-                  />
-                  <p className='text-muted-foreground'>
-                    {t(
-                      'Payment status is confirmed by this site before your balance or access changes.'
-                    )}
-                  </p>
-                </div>
                 <div className='flex items-start gap-2'>
                   <HugeiconsIcon
                     icon={InformationCircleIcon}

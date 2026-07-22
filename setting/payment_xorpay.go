@@ -42,16 +42,28 @@ func XorPayEnabledMethods2JsonString() string {
 }
 
 func UpdateXorPayEnabledMethodsByJsonString(value string) error {
+	methods, err := ParseXorPayEnabledMethods(value)
+	if err != nil {
+		return err
+	}
+	XorPayEnabledMethods = methods
+	return nil
+}
+
+// ParseXorPayEnabledMethods validates a stored provider capability snapshot
+// without mutating process-global settings. Startup compatibility migrations
+// use it before committing any catalog changes.
+func ParseXorPayEnabledMethods(value string) ([]string, error) {
 	var methods []string
 	if err := common.UnmarshalJsonStr(value, &methods); err != nil {
-		return err
+		return nil, err
 	}
 	seen := make(map[string]struct{}, len(methods))
 	normalized := make([]string, 0, len(methods))
 	for _, method := range methods {
 		method = strings.ToLower(strings.TrimSpace(method))
 		if method != XorPayMethodNative && method != XorPayMethodAlipay && method != XorPayMethodJSAPI {
-			return fmt.Errorf("unsupported XORPay method: %s", method)
+			return nil, fmt.Errorf("unsupported XORPay method: %s", method)
 		}
 		if _, ok := seen[method]; ok {
 			continue
@@ -59,8 +71,7 @@ func UpdateXorPayEnabledMethodsByJsonString(value string) error {
 		seen[method] = struct{}{}
 		normalized = append(normalized, method)
 	}
-	XorPayEnabledMethods = normalized
-	return nil
+	return normalized, nil
 }
 
 func IsXorPayMethodEnabled(method string) bool {

@@ -29,6 +29,7 @@ import { formatPaymentDecimalAmount, formatPaymentMinorAmount } from './billing'
 import {
   createLegacyPaymentRouteId,
   detectPaymentBrowserEnvironment,
+  filterEligibleSubscriptionQuoteMethods,
   filterPaymentMethodsForBrowser,
   generatePresetAmounts,
   getEffectivePaymentStatus,
@@ -94,7 +95,7 @@ describe('payment security helpers', () => {
     )
   })
 
-  test('selects the correct WeChat route for each browser environment', () => {
+  test('selects one public brand route for each browser environment', () => {
     const methods: PaymentMethod[] = [
       {
         route_id: 'wechat_native',
@@ -112,6 +113,18 @@ describe('payment security helpers', () => {
         route_id: 'alipay_qr',
         public_method: 'alipay',
         channel_alias: 'qr',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'wechat_native_backup',
+        public_method: 'wechat_pay',
+        channel_alias: 'qr',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'alipay_redirect_backup',
+        public_method: 'alipay',
+        channel_alias: 'redirect',
         checkout_mode: 'quote',
       },
     ]
@@ -176,28 +189,56 @@ describe('payment security helpers', () => {
   })
 
   test('allows only the XORPay QR destinations accepted by the server', () => {
-    assert.equal(isSafePaymentQrContent('weixin://wxpay/example'), true)
-    assert.equal(isSafePaymentQrContent('https://qr.alipay.com/example'), true)
-    assert.equal(
-      isSafePaymentQrContent('alipays://platformapi/startapp'),
-      false
-    )
-    assert.equal(isSafePaymentQrContent('weixin://example'), false)
-    assert.equal(isSafePaymentQrContent('https://xorpay.com/qr/example'), false)
-    assert.equal(
-      isSafePaymentQrContent('https://qr.alipay.com.evil.example/'),
-      false
-    )
-    assert.equal(
-      isSafePaymentQrContent('https://user:pass@qr.alipay.com/example'),
-      false
-    )
-    assert.equal(
-      isSafePaymentQrContent('https://qr.alipay.com:8443/example'),
-      false
-    )
-    assert.equal(isSafePaymentQrContent('javascript:alert(1)'), false)
-    assert.equal(isSafePaymentQrContent('data:text/html,test'), false)
+    const allowed = [
+      'weixin://wxpay/bizpayurl?pr=safe_token-123_ABC',
+      'weixin://wxpay/bizpayurl?p%72=safe%5Ftoken',
+      'https://qr.alipay.com/example',
+      'http://ipay.yltg.com.cn/pay/safe_token',
+      'https://IPAY.YLTG.COM.CN/pay/safe_token',
+      `https://ipay.yltg.com.cn/${'a'.repeat(2048)}`,
+    ]
+    const rejected = [
+      'weixin://wxpay/example',
+      'weixin://wxpay/bizpayurl',
+      'weixin://wxpay/bizpayurl?pr=',
+      'weixin://wxpay/bizpayurl?pr=safe.token',
+      'weixin://wxpay/bizpayurl?pr=first&pr=second',
+      'weixin://wxpay/bizpayurl?pr=safe&next=other',
+      `weixin://wxpay/bizpayurl?pr=${'a'.repeat(513)}`,
+      'weixin://WXPAY/bizpayurl?pr=safe_token',
+      'weixin://user@wxpay/bizpayurl?pr=safe_token',
+      'alipays://platformapi/startapp',
+      'https://xorpay.com/qr/example',
+      'https://qr.alipay.com.evil.example/example',
+      'https://user:pass@qr.alipay.com/example',
+      'https://qr.alipay.com:8443/example',
+      'https://qr.alipay.com/example?token=safe',
+      'https://qr.alipay.com//evil.example',
+      'https://qr.alipay.com/https://evil.example',
+      'https://qr.alipay.com/../redirect',
+      'https://qr.alipay.com/%2F%2Fevil.example',
+      'https://qr.alipay.com/%2e%2e/redirect',
+      'https://ipay.yltg.com.cn:443/pay/example',
+      'https://ipay.yltg.com.cn/pay/example?token=safe',
+      'https://ipay.yltg.com.cn/pay/example#fragment',
+      'https://ipay.yltg.com.cn//pay/example',
+      'https://ipay.yltg.com.cn/pay/../example',
+      'https://ipay.yltg.com.cn/pay/example/..',
+      'https://ipay.yltg.com.cn/pay/%2e%2e/example',
+      `https://ipay.yltg.com.cn/${'a'.repeat(2049)}`,
+      'https://evil.ipay.yltg.com.cn/pay/example',
+      'https://ipay.yltg.com.cn.evil.example/pay',
+      ' https://ipay.yltg.com.cn/pay/example',
+      'javascript:alert(1)',
+      'data:text/html,test',
+    ]
+
+    for (const value of allowed) {
+      assert.equal(isSafePaymentQrContent(value), true, value)
+    }
+    for (const value of rejected) {
+      assert.equal(isSafePaymentQrContent(value), false, value)
+    }
   })
 
   test('accepts only the same-origin payment continuation endpoint', () => {
@@ -329,6 +370,15 @@ describe('public payment presentation', () => {
           type: 'creem',
         },
       ],
+      subscription_payment_routes: [
+        {
+          route_id: 'pay_abcdef0123456789abcdef01',
+          public_method: 'online_payment',
+          channel_alias: 'hosted_checkout',
+          checkout_mode: 'direct',
+          provider: 'waffo_pancake',
+        },
+      ],
       payment_products: [
         {
           product_id: 'product_0123456789abcdef01234567',
@@ -362,6 +412,13 @@ describe('public payment presentation', () => {
       public_method: 'online_payment',
       channel_alias: 'product_checkout',
       checkout_mode: 'product',
+      min_topup: 0,
+    })
+    assert.deepEqual(info.subscription_payment_routes?.[0], {
+      route_id: 'pay_abcdef0123456789abcdef01',
+      public_method: 'online_payment',
+      channel_alias: 'hosted_checkout',
+      checkout_mode: 'direct',
       min_topup: 0,
     })
     assert.deepEqual(info.payment_products[0], {
@@ -574,7 +631,42 @@ describe('public payment presentation', () => {
     )
   })
 
-  test('labels duplicate public brands as recommended and backup channels', () => {
+  test('shows and selects only subscription quote routes declared eligible', () => {
+    const methods: PaymentMethod[] = [
+      {
+        route_id: 'quote_allowed',
+        public_method: 'alipay',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'quote_unlisted',
+        public_method: 'wechat_pay',
+        checkout_mode: 'quote',
+      },
+      {
+        route_id: 'direct_allowed',
+        public_method: 'online_payment',
+        checkout_mode: 'direct',
+      },
+    ]
+
+    const eligible = filterEligibleSubscriptionQuoteMethods(methods, [
+      'quote_allowed',
+      'direct_allowed',
+    ])
+    assert.deepEqual(
+      eligible.map((method) => method.route_id),
+      ['quote_allowed']
+    )
+    assert.equal(eligible[0]?.route_id ?? '', 'quote_allowed')
+
+    const unavailable = filterEligibleSubscriptionQuoteMethods(methods, [])
+    const unavailableSelection = unavailable[0]?.route_id ?? ''
+    assert.deepEqual(unavailable, [])
+    assert.equal(unavailableSelection, '')
+  })
+
+  test('keeps compatibility channel labels free of provider names', () => {
     const methods: PaymentMethod[] = [
       {
         route_id: 'route_primary',

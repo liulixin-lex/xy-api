@@ -107,6 +107,7 @@ export function PaymentAuditPanel() {
         UNMATCHED_PAGE_SIZE
       ),
     placeholderData: (previousData) => previousData,
+    meta: { skipGlobalError: true },
   })
   const orders = auditQuery.data?.orders ?? []
   const unmatchedEvents = auditQuery.data?.unmatched_events ?? []
@@ -421,7 +422,7 @@ export function PaymentAuditPanel() {
           <CardTitle>{t('Unmatched Callback Events')}</CardTitle>
           <CardDescription>
             {t(
-              'Only actions authorized by the server are shown. Legacy Epay top-ups without a quota snapshot require an explicit quota or confirmed refund; legacy subscriptions with a changed plan can only record a confirmed external refund.'
+              'Only actions authorized by the server are shown. Legacy Epay top-ups without a quota snapshot require an explicit quota or confirmed refund; classified legacy subscriptions can only record a full refund already completed by the payment provider.'
             )}
           </CardDescription>
           <CardAction>
@@ -544,7 +545,7 @@ export function PaymentAuditPanel() {
                                 setLegacySubscriptionResolutionEvent(event)
                               }
                             >
-                              {t('Resolve legacy subscription')}
+                              {t('Record completed refund')}
                             </Button>
                           )}
                           {canLink && (

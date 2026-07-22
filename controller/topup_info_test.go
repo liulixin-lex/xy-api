@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"math"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -82,33 +83,72 @@ func TestGetTopUpInfoUsesSeparateOpaqueRetainedSelectors(t *testing.T) {
 	originalCreemAPIKey := setting.CreemApiKey
 	originalCreemWebhookSecret := setting.CreemWebhookSecret
 	originalCreemProducts := setting.CreemProducts
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	originalWaffoEnabled := setting.WaffoEnabled
 	originalWaffoSandbox := setting.WaffoSandbox
+	originalWaffoMerchantID := setting.WaffoMerchantId
 	originalWaffoAPIKey := setting.WaffoApiKey
 	originalWaffoPrivateKey := setting.WaffoPrivateKey
 	originalWaffoPublicCert := setting.WaffoPublicCert
+	originalWaffoUnitPrice := setting.WaffoUnitPrice
+	originalWaffoMinimum := setting.WaffoMinTopUp
+	originalWaffoCurrency := setting.WaffoCurrency
+	originalPayMethods := operation_setting.PayMethods
 	t.Cleanup(func() {
 		setting.CreemApiKey = originalCreemAPIKey
 		setting.CreemWebhookSecret = originalCreemWebhookSecret
 		setting.CreemProducts = originalCreemProducts
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 		setting.WaffoEnabled = originalWaffoEnabled
 		setting.WaffoSandbox = originalWaffoSandbox
+		setting.WaffoMerchantId = originalWaffoMerchantID
 		setting.WaffoApiKey = originalWaffoAPIKey
 		setting.WaffoPrivateKey = originalWaffoPrivateKey
 		setting.WaffoPublicCert = originalWaffoPublicCert
+		setting.WaffoUnitPrice = originalWaffoUnitPrice
+		setting.WaffoMinTopUp = originalWaffoMinimum
+		setting.WaffoCurrency = originalWaffoCurrency
+		operation_setting.PayMethods = originalPayMethods
 	})
 
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 	setting.CreemApiKey = "creem-test-api-key"
 	setting.CreemWebhookSecret = "creem-test-webhook-secret"
 	setting.CreemProducts = `[{"productId":"prod_private_catalog_id","name":"Creem Starter","price":9.99,"currency":"USD","quota":1000}]`
 	setting.WaffoEnabled = true
 	setting.WaffoSandbox = false
+	setting.WaffoMerchantId = "test-merchant-id"
 	setting.WaffoApiKey = "test-api-key"
 	setting.WaffoPrivateKey = "test-private-key"
 	setting.WaffoPublicCert = "test-public-cert"
+	setting.WaffoUnitPrice = 1
+	setting.WaffoMinTopUp = 1
+	setting.WaffoCurrency = "USD"
+	operation_setting.PayMethods = nil
 
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("GET", "/api/user/topup", nil)
+	GetTopUpInfo(context)
+
+	require.Equal(t, 200, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), `"checkout_mode":"product"`)
+	assert.NotContains(t, recorder.Body.String(), `"checkout_mode":"option"`)
+	assert.NotContains(t, recorder.Body.String(), `"product_id":"product_`)
+	assert.NotContains(t, recorder.Body.String(), `"option_id":"option_`)
+
+	operation_setting.PayMethods = []map[string]string{
+		{
+			"name": "Product checkout", "type": model.PaymentMethodCreem, "provider": model.PaymentProviderCreem,
+			"route_id": "product_checkout", "public_method": "online_payment", "channel_alias": "product_checkout",
+		},
+		{
+			"name": "Payment options", "type": model.PaymentMethodWaffo, "provider": model.PaymentProviderWaffo,
+			"route_id": "payment_options", "public_method": "online_payment", "channel_alias": "payment_options",
+		},
+	}
+	recorder = httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(recorder)
 	context.Request = httptest.NewRequest("GET", "/api/user/topup", nil)
 	GetTopUpInfo(context)
 
@@ -138,13 +178,17 @@ func TestGetTopUpInfoHonorsConfiguredWaffoPancakePublicRoute(t *testing.T) {
 	originalMerchantID := setting.WaffoPancakeMerchantID
 	originalPrivateKey := setting.WaffoPancakePrivateKey
 	originalProductID := setting.WaffoPancakeProductID
+	originalStoreID := setting.WaffoPancakeStoreID
 	originalMinimum := setting.WaffoPancakeMinTopUp
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
 	t.Cleanup(func() {
 		operation_setting.PayMethods = originalMethods
 		setting.WaffoPancakeMerchantID = originalMerchantID
 		setting.WaffoPancakePrivateKey = originalPrivateKey
 		setting.WaffoPancakeProductID = originalProductID
+		setting.WaffoPancakeStoreID = originalStoreID
 		setting.WaffoPancakeMinTopUp = originalMinimum
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
 	})
 
 	operation_setting.PayMethods = []map[string]string{
@@ -158,7 +202,9 @@ func TestGetTopUpInfoHonorsConfiguredWaffoPancakePublicRoute(t *testing.T) {
 	setting.WaffoPancakeMerchantID = "pancake-merchant"
 	setting.WaffoPancakePrivateKey = "pancake-private-key"
 	setting.WaffoPancakeProductID = "pancake-product"
+	setting.WaffoPancakeStoreID = "pancake-store"
 	setting.WaffoPancakeMinTopUp = 5
+	operation_setting.CustomCallbackAddress = "https://payments.example.com"
 
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
@@ -169,12 +215,14 @@ func TestGetTopUpInfoHonorsConfiguredWaffoPancakePublicRoute(t *testing.T) {
 	var response struct {
 		Success bool `json:"success"`
 		Data    struct {
-			PaymentRoutes []publicTopUpRouteView `json:"payment_routes"`
+			PaymentRoutes             []publicTopUpRouteView `json:"payment_routes"`
+			SubscriptionPaymentRoutes []publicTopUpRouteView `json:"subscription_payment_routes"`
 		} `json:"data"`
 	}
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	require.True(t, response.Success)
 	require.Len(t, response.Data.PaymentRoutes, 1)
+	require.Len(t, response.Data.SubscriptionPaymentRoutes, 1)
 	route := response.Data.PaymentRoutes[0]
 	assert.Equal(t, "premium_checkout", route.RouteID)
 	assert.Equal(t, "online_payment", route.PublicMethod)
@@ -183,6 +231,100 @@ func TestGetTopUpInfoHonorsConfiguredWaffoPancakePublicRoute(t *testing.T) {
 	assert.Equal(t, "USD", route.Currency)
 	assert.EqualValues(t, 17, route.MinimumTopUp)
 	assert.NotContains(t, strings.ToLower(recorder.Body.String()), "waffo")
+
+	setting.WaffoPancakeProductID = ""
+	withoutTopUpProduct := httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(withoutTopUpProduct)
+	context.Request = httptest.NewRequest("GET", "/api/user/topup", nil)
+	GetTopUpInfo(context)
+
+	require.Equal(t, 200, withoutTopUpProduct.Code)
+	var withoutProductResponse struct {
+		Success bool `json:"success"`
+		Data    struct {
+			PaymentRoutes             []publicTopUpRouteView `json:"payment_routes"`
+			SubscriptionPaymentRoutes []publicTopUpRouteView `json:"subscription_payment_routes"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(withoutTopUpProduct.Body.Bytes(), &withoutProductResponse))
+	require.True(t, withoutProductResponse.Success)
+	assert.Empty(t, withoutProductResponse.Data.PaymentRoutes, "top-ups stay hidden until the global top-up product is configured")
+	require.Len(t, withoutProductResponse.Data.SubscriptionPaymentRoutes, 1, "a plan-specific product can still use the shared subscription route")
+	assert.Equal(t, "premium_checkout", withoutProductResponse.Data.SubscriptionPaymentRoutes[0].RouteID)
+}
+
+func TestGetTopUpInfoPublishesOnlyRoutesReadyForQuoteCreation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PAYMENT_SECRET_KEY", "topup-info-route-readiness-key-0123456789")
+	setupMidjourneyControllerBillingDB(t)
+	confirmPaymentComplianceForTest(t)
+
+	originalPayAddress := operation_setting.PayAddress
+	originalCallbackAddress := operation_setting.CustomCallbackAddress
+	originalEpayID := operation_setting.EpayId
+	originalEpayKey := operation_setting.EpayKey
+	originalCurrency := operation_setting.EpayCurrency
+	originalPrice := operation_setting.Price
+	originalMinimum := operation_setting.MinTopUp
+	originalMethods := operation_setting.PayMethods
+	t.Cleanup(func() {
+		operation_setting.PayAddress = originalPayAddress
+		operation_setting.CustomCallbackAddress = originalCallbackAddress
+		operation_setting.EpayId = originalEpayID
+		operation_setting.EpayKey = originalEpayKey
+		operation_setting.EpayCurrency = originalCurrency
+		operation_setting.Price = originalPrice
+		operation_setting.MinTopUp = originalMinimum
+		operation_setting.PayMethods = originalMethods
+	})
+
+	operation_setting.PayAddress = "https://gateway.example.com"
+	operation_setting.EpayId = "merchant"
+	operation_setting.EpayKey = "payment-secret"
+	operation_setting.MinTopUp = 1
+	operation_setting.PayMethods = []map[string]string{{
+		"name": "Alipay", "type": "alipay", "provider": model.PaymentProviderEpay,
+		"route_id": "alipay_primary", "public_method": "alipay", "channel_alias": "qr",
+	}}
+
+	tests := []struct {
+		name       string
+		callback   string
+		currency   string
+		unitPrice  float64
+		wantRoutes int
+	}{
+		{name: "ready", callback: "https://payments.example.com", currency: "CNY", unitPrice: 7.2, wantRoutes: 1},
+		{name: "missing callback", callback: "", currency: "CNY", unitPrice: 7.2},
+		{name: "wrong currency", callback: "https://payments.example.com", currency: "USD", unitPrice: 7.2},
+		{name: "zero unit price", callback: "https://payments.example.com", currency: "CNY", unitPrice: 0},
+		{name: "non finite unit price", callback: "https://payments.example.com", currency: "CNY", unitPrice: math.NaN()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operation_setting.CustomCallbackAddress = test.callback
+			operation_setting.EpayCurrency = test.currency
+			operation_setting.Price = test.unitPrice
+
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest("GET", "/api/user/topup", nil)
+			GetTopUpInfo(context)
+
+			require.Equal(t, 200, recorder.Code)
+			var response struct {
+				Success bool `json:"success"`
+				Data    struct {
+					PaymentRoutes             []publicTopUpRouteView `json:"payment_routes"`
+					SubscriptionPaymentRoutes []publicTopUpRouteView `json:"subscription_payment_routes"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success)
+			assert.Len(t, response.Data.PaymentRoutes, test.wantRoutes)
+			assert.Len(t, response.Data.SubscriptionPaymentRoutes, test.wantRoutes)
+		})
+	}
 }
 
 func TestGetTopUpInfoHidesEveryPaymentSelectionUntilComplianceConfirmed(t *testing.T) {
@@ -256,6 +398,7 @@ func TestGetTopUpInfoHidesEveryPaymentSelectionUntilComplianceConfirmed(t *testi
 		Data    struct {
 			OnlinePaymentAvailable bool                         `json:"online_payment_available"`
 			PaymentRoutes          []publicTopUpRouteView       `json:"payment_routes"`
+			SubscriptionRoutes     []publicTopUpRouteView       `json:"subscription_payment_routes"`
 			PaymentProducts        []publicTopUpProductView     `json:"payment_products"`
 			PaymentRouteOptions    []publicTopUpRouteOptionView `json:"payment_route_options"`
 		} `json:"data"`
@@ -264,6 +407,7 @@ func TestGetTopUpInfoHidesEveryPaymentSelectionUntilComplianceConfirmed(t *testi
 	assert.True(t, response.Success)
 	assert.False(t, response.Data.OnlinePaymentAvailable)
 	assert.Empty(t, response.Data.PaymentRoutes)
+	assert.Empty(t, response.Data.SubscriptionRoutes)
 	assert.Empty(t, response.Data.PaymentProducts)
 	assert.Empty(t, response.Data.PaymentRouteOptions)
 }

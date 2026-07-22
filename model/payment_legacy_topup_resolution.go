@@ -363,8 +363,10 @@ func refundLegacyTopUpResolutionTx(tx *gorm.DB, providerEvent, adminEvent *Payme
 	}
 	adminEvent.Refunded = true
 	adminEvent.RefundedAmountMinor = order.ExpectedAmountMinor
+	adminEvent.ProviderResourceKey = order.Provider + ":refund:" + input.ProviderRefundReference
 	if err := tx.Model(&PaymentEvent{}).Where("id = ?", adminEvent.ID).Updates(map[string]interface{}{
 		"refunded": true, "refunded_amount_minor": order.ExpectedAmountMinor,
+		"provider_resource_key": adminEvent.ProviderResourceKey,
 	}).Error; err != nil {
 		return err
 	}
@@ -571,6 +573,9 @@ func validPaymentProviderReference(reference string) bool {
 }
 
 func legacyTopUpResolutionAdminEventKey(input PaymentLegacyTopUpResolutionInput) string {
+	if input.Resolution == PaymentLegacyTopUpResolutionExternalRefund {
+		return paymentExternalRefundEventKey(PaymentProviderEpay, input.ProviderRefundReference)
+	}
 	return "legacy_topup_" + input.Resolution + ":" + strconv.FormatInt(input.EventID, 10) +
 		":a" + strconv.Itoa(input.ExpectedEventAttempts)
 }

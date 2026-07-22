@@ -21,6 +21,8 @@ export const PAYMENT_PROVIDER_ORDER = [
   'epay',
   'xorpay',
   'stripe',
+  'creem',
+  'waffo',
   'waffo_pancake',
 ];
 
@@ -28,10 +30,13 @@ export const PAYMENT_PROVIDER_LABELS = {
   epay: 'Epay',
   xorpay: 'XORPay',
   stripe: 'Stripe',
+  creem: 'Creem',
+  waffo: 'Waffo',
   waffo_pancake: 'Waffo Pancake',
 };
 
 const PAYMENT_METHOD_TYPE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_CONFIGURED_PAYMENT_METHODS = 27;
 const ALLOWED_PROVIDERS = new Set(PAYMENT_PROVIDER_ORDER);
 const EPAY_RESERVED_TYPES = new Set([
   'stripe',
@@ -56,6 +61,16 @@ const PAYMENT_TYPE_DEFAULTS = {
     name: 'Stripe',
     type: 'stripe',
     icon: 'SiStripe',
+  },
+  creem: {
+    name: 'Online payment',
+    type: 'creem',
+    icon: 'LuCreditCard',
+  },
+  waffo: {
+    name: 'Online payment',
+    type: 'waffo',
+    icon: 'LuCreditCard',
   },
   waffo_pancake: {
     name: 'Waffo Pancake',
@@ -93,6 +108,22 @@ export const PAYMENT_TYPE_OPTIONS = {
       icon: 'SiStripe',
     },
   ],
+  creem: [
+    {
+      labelKey: 'Creem',
+      name: 'Online payment',
+      type: 'creem',
+      icon: 'LuCreditCard',
+    },
+  ],
+  waffo: [
+    {
+      labelKey: 'Waffo',
+      name: 'Online payment',
+      type: 'waffo',
+      icon: 'LuCreditCard',
+    },
+  ],
   waffo_pancake: [
     {
       labelKey: 'Waffo Pancake',
@@ -116,6 +147,8 @@ function parseJson(value, fallback) {
 
 function inferPaymentProvider(type) {
   if (type === 'stripe') return 'stripe';
+  if (type === 'creem') return 'creem';
+  if (type === 'waffo') return 'waffo';
   if (type === 'waffo_pancake') return 'waffo_pancake';
   if (type.startsWith('xorpay_')) return 'xorpay';
   return 'epay';
@@ -197,6 +230,8 @@ export function validatePaymentMethodDraft(draft, methods, editIndex = -1) {
   if (
     (provider === 'epay' && EPAY_RESERVED_TYPES.has(type)) ||
     (provider === 'stripe' && type !== 'stripe') ||
+    (provider === 'creem' && type !== 'creem') ||
+    (provider === 'waffo' && type !== 'waffo') ||
     (provider === 'xorpay' &&
       !['xorpay_alipay', 'xorpay_native', 'xorpay_jsapi'].includes(type)) ||
     (provider === 'waffo_pancake' && type !== 'waffo_pancake')
@@ -218,7 +253,7 @@ export function validatePaymentMethodDraft(draft, methods, editIndex = -1) {
   ) {
     return 'duplicate_payment_method';
   }
-  if (editIndex < 0 && methods.length >= 20) {
+  if (editIndex < 0 && methods.length >= MAX_CONFIGURED_PAYMENT_METHODS) {
     return 'too_many_payment_methods';
   }
   return null;

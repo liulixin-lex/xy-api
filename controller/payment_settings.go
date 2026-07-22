@@ -74,6 +74,7 @@ func (status paymentPreviousCredentialStatus) options() []*model.Option {
 }
 
 var paymentInternalCredentialOptionKeys = map[string]struct{}{
+	model.PaymentRouteCatalogVersionOptionKey:       {},
 	paymentEpayPreviousCredentialActiveOptionKey:    {},
 	paymentStripePreviousCredentialActiveOptionKey:  {},
 	paymentStripeTestModeEnabledOptionKey:           {},
@@ -163,13 +164,23 @@ func validatePaymentSettingsMutationScope(options map[string]interface{}, clearS
 }
 
 func paymentSettingsAPIError(c *gin.Context, status int, code string, diagnostic error) {
+	paymentSettingsAPIErrorWithParams(c, status, code, nil, diagnostic)
+}
+
+func paymentSettingsAPIErrorWithParams(c *gin.Context, status int, code string, params gin.H, diagnostic error) {
 	if diagnostic != nil {
 		logger.LogWarn(c.Request.Context(), fmt.Sprintf(
 			"payment settings request rejected admin_id=%d code=%s error=%q",
 			c.GetInt("id"), code, diagnostic.Error(),
 		))
 	}
-	paymentAPIErrorWithCode(c, status, code, "", nil)
+	paymentAPIErrorWithCode(c, status, code, "", params)
+}
+
+func paymentSettingsFieldAPIError(c *gin.Context, field string, diagnostic error) {
+	paymentSettingsAPIErrorWithParams(c, http.StatusBadRequest, "payment_settings_field_invalid", gin.H{
+		"field": field,
+	}, diagnostic)
 }
 
 // ServerAddress remains a shared site setting. Payment callbacks and return
@@ -177,7 +188,8 @@ func paymentSettingsAPIError(c *gin.Context, status int, code string, diagnostic
 // CustomCallbackAddress instead. Pricing ratios and every other payment-owned
 // key must use the atomic, step-up-protected endpoint.
 func isPaymentAtomicOnlyOptionKey(key string) bool {
-	if key == "StripeCredentialAccountId" || key == "StripeCredentialLivemode" || key == model.PaymentConfigurationVersionOptionKey {
+	if key == "StripeCredentialAccountId" || key == "StripeCredentialLivemode" ||
+		key == model.PaymentConfigurationVersionOptionKey || key == model.PaymentRouteCatalogVersionOptionKey {
 		return true
 	}
 	if _, internal := paymentInternalCredentialOptionKeys[key]; internal {
@@ -256,7 +268,7 @@ func UpdatePaymentSettings(c *gin.Context) {
 		}
 		value, err := paymentOptionString(rawValue)
 		if err != nil {
-			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", fmt.Errorf("invalid value for %s: %w", key, err))
+			paymentSettingsFieldAPIError(c, key, fmt.Errorf("invalid value for %s: %w", key, err))
 			return
 		}
 		if key == "StripeCheckoutAllowedHosts" {
@@ -270,7 +282,7 @@ func UpdatePaymentSettings(c *gin.Context) {
 			continue
 		}
 		if err := validatePaymentSettingValue(key, value); err != nil {
-			paymentSettingsAPIError(c, http.StatusBadRequest, "payment_settings_invalid", err)
+			paymentSettingsFieldAPIError(c, key, err)
 			return
 		}
 		values[key] = value

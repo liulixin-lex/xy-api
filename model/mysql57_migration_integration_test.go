@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -207,6 +208,14 @@ func TestMySQL57CompactMigrationCompatibility(t *testing.T) {
 		requireEmptySchema(t, gbk8DB)
 		DB = gbk8DB
 		require.NoError(t, migrateMySQLDBSafely(gbk8DB, migrateDBOn))
+		var storedPayMethods Option
+		require.NoError(t, gbk8DB.Where(&Option{Key: "PayMethods"}).First(&storedPayMethods).Error)
+		assert.NotContains(t, storedPayMethods.Value, "支付宝")
+		assert.Contains(t, storedPayMethods.Value, `\u652f\u4ed8\u5b9d`)
+		parsedPayMethods, err := operation_setting.ParsePayMethodsByJsonString(storedPayMethods.Value)
+		require.NoError(t, err)
+		require.NotEmpty(t, parsedPayMethods)
+		assert.Equal(t, "支付宝", parsedPayMethods[0]["name"])
 		assert.Equal(t, "Dynamic", rowFormat(t, gbk8DB, "casbin_rule"))
 		require.NoError(t, gbk8DB.Raw(
 			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ? AND INDEX_NAME <> 'PRIMARY' AND SUB_PART IS NOT NULL",

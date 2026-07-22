@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -16,6 +17,38 @@ import (
 
 type manualReviewQueryPaymentProvider struct {
 	sawConfigurationReadLockContext bool
+}
+
+type xorPayMigrationRecoveryProvider struct {
+	createCalls int
+	queryCalls  int
+}
+
+func (*xorPayMigrationRecoveryProvider) Name() string {
+	return model.PaymentProviderXorPay
+}
+
+func (*xorPayMigrationRecoveryProvider) ValidateMethod(string) error { return nil }
+
+func (provider *xorPayMigrationRecoveryProvider) Create(context.Context, *model.PaymentOrder) (*PaymentStart, error) {
+	provider.createCalls++
+	return nil, errors.New("unexpected create call")
+}
+
+func (*xorPayMigrationRecoveryProvider) VerifyWebhook(*http.Request) (*NormalizedPaymentEvent, error) {
+	return nil, errors.New("unexpected webhook call")
+}
+
+func (provider *xorPayMigrationRecoveryProvider) Query(_ context.Context, order *model.PaymentOrder) (*NormalizedPaymentEvent, error) {
+	provider.queryCalls++
+	return &NormalizedPaymentEvent{
+		Provider:      model.PaymentProviderXorPay,
+		EventKey:      "query2:" + order.TradeNo + ":new",
+		EventType:     "query2:new",
+		TradeNo:       order.TradeNo,
+		Currency:      order.Currency,
+		PaymentMethod: order.PaymentMethod,
+	}, nil
 }
 
 func (*manualReviewQueryPaymentProvider) Name() string {
@@ -90,6 +123,89 @@ func TestPaymentTaskClaimPassDoesNotLeaseWorkWhenExpectedClusterMemberIsMissing(
 	assert.Empty(t, stored.LeaseOwner)
 	assert.Zero(t, stored.Attempts)
 	assert.Zero(t, stored.FenceToken)
+}
+
+func TestCreateTaskRecoversProviderCallAfterConfigurationMigration(t *testing.T) {
+	t.Setenv("PAYMENT_SECRET_KEY", "payment-create-migration-recovery-key-0001")
+	require.NoError(t, model.DB.AutoMigrate(
+		&model.Option{}, &model.PaymentOrder{}, &model.PaymentTask{}, &model.SystemInstance{},
+	))
+	model.InitOptionMap()
+	require.NoError(t, model.DB.Exec("DELETE FROM payment_tasks").Error)
+	require.NoError(t, model.DB.Exec("DELETE FROM payment_orders").Error)
+	require.NoError(t, model.DB.Exec("DELETE FROM system_instances").Error)
+	require.NoError(t, ReportCurrentSystemInstance())
+
+	originalProvider, err := GetPaymentProvider(model.PaymentProviderXorPay)
+	require.NoError(t, err)
+	provider := &xorPayMigrationRecoveryProvider{}
+	RegisterPaymentProvider(provider)
+	t.Cleanup(func() { RegisterPaymentProvider(originalProvider) })
+
+	configurationVersion, err := model.CurrentPaymentConfigurationVersion()
+	require.NoError(t, err)
+	require.Greater(t, configurationVersion, int64(0))
+	var originalVersionOption model.Option
+	versionLookup := model.DB.Where("key = ?", model.PaymentConfigurationVersionOptionKey).
+		Limit(1).Find(&originalVersionOption)
+	require.NoError(t, versionLookup.Error)
+	versionOptionExisted := versionLookup.RowsAffected > 0
+	t.Cleanup(func() {
+		if versionOptionExisted {
+			_ = model.DB.Model(&model.Option{}).
+				Where("key = ?", model.PaymentConfigurationVersionOptionKey).
+				Update("value", originalVersionOption.Value).Error
+		} else {
+			_ = model.DB.Where("key = ?", model.PaymentConfigurationVersionOptionKey).
+				Delete(&model.Option{}).Error
+		}
+		model.InitOptionMap()
+	})
+	if versionOptionExisted {
+		require.NoError(t, model.DB.Model(&model.Option{}).
+			Where("key = ?", model.PaymentConfigurationVersionOptionKey).
+			Update("value", strconv.FormatInt(configurationVersion, 10)).Error)
+	} else {
+		require.NoError(t, model.DB.Create(&model.Option{
+			Key:   model.PaymentConfigurationVersionOptionKey,
+			Value: strconv.FormatInt(configurationVersion, 10),
+		}).Error)
+	}
+	now := common.GetTimestamp()
+	order := &model.PaymentOrder{
+		TradeNo: "PO_XORPAY_MIGRATION_RECOVERY", UserID: 988003,
+		OrderKind: model.PaymentOrderKindTopUp, Provider: model.PaymentProviderXorPay,
+		PaymentMethod: model.PaymentMethodXorPayNative, ConfigurationVersion: configurationVersion,
+		ProviderCredentialGeneration: 1, RequestID: "xorpay-migration-recovery",
+		ExpectedAmountMinor: 100, Currency: "CNY", Status: model.PaymentOrderStatusPending,
+		ExpiresAt: now + int64(time.Hour/time.Second), CreatedAt: now, UpdatedAt: now, Version: 1,
+	}
+	require.NoError(t, model.DB.Create(order).Error)
+	task, err := model.EnsurePaymentTask(order.ID, model.PaymentTaskOperationCreate, now)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(task).Updates(map[string]any{
+		"phase": model.PaymentTaskPhaseProviderCallStarted,
+	}).Error)
+
+	require.NoError(t, model.DB.Model(&model.Option{}).
+		Where("key = ?", model.PaymentConfigurationVersionOptionKey).
+		Update("value", strconv.FormatInt(configurationVersion+1, 10)).Error)
+
+	claimed, err := model.ClaimDuePaymentTasks(t.Context(), "migration-recovery-runner", now, paymentTaskLeaseDuration, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NoError(t, runPaymentCreateTask(t.Context(), claimed[0], "migration-recovery-runner"))
+
+	assert.Zero(t, provider.createCalls)
+	assert.Equal(t, 1, provider.queryCalls)
+	storedOrder, err := model.GetPaymentOrderByID(order.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.PaymentOrderStatusPending, storedOrder.Status)
+	storedTask, err := model.GetPaymentTaskForOrder(order.ID, model.PaymentTaskOperationCreate)
+	require.NoError(t, err)
+	assert.Equal(t, model.PaymentTaskStatusRetryWait, storedTask.Status)
+	assert.Equal(t, model.PaymentTaskPhaseProviderCallStarted, storedTask.Phase)
+	assert.Equal(t, "provider_create_uncertain", storedTask.LastErrorCode)
 }
 
 func TestReconcileManualReviewErrorStopsRetriesUnderConfigurationSnapshot(t *testing.T) {

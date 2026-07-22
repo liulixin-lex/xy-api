@@ -2,10 +2,12 @@ package model
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -220,7 +222,9 @@ func (binding *PaymentCustomerBinding) BeforeCreate(_ *gorm.DB) error {
 }
 
 const (
-	paymentTradeNoPrefix = "new-api-ref-"
+	paymentTradeNoPrefix         = "new-api-ref-"
+	paymentTradeNoAlphabet       = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	paymentTradeNoCreateAttempts = 5
 
 	// PaymentCallbackRecoveryWindow keeps provider callback origins stable long
 	// enough for delayed Epay and XORPay payment notifications to settle an
@@ -263,6 +267,14 @@ const (
 	PaymentEventStatusFailed            = "failed"
 	PaymentEventStatusCredentialRevoked = "credential_revoked"
 
+	// A paid subscription-mode Checkout Session can only come from the retired
+	// recurring Stripe flow. It is authoritative payment evidence, but the local
+	// entitlement contract is not safe to reconstruct automatically after an
+	// upgrade, so both the provider state and review classification remain
+	// explicit and durable.
+	PaymentProviderStateStripeLegacyRecurringCheckoutPaid = "stripe_legacy_recurring_checkout_paid"
+	PaymentReviewCodeStripeLegacyRecurringCheckoutPaid    = PaymentProviderStateStripeLegacyRecurringCheckoutPaid
+
 	PaymentLedgerEntryCredit               = "credit"
 	PaymentLedgerEntryRefundReversal       = "refund_reversal"
 	PaymentLedgerEntryDisputeReversal      = "dispute_reversal"
@@ -304,14 +316,84 @@ var (
 	ErrPaymentActiveQuoteLimit    = errors.New("too many active payment quotes")
 	ErrPaymentInFlightOrderLimit  = errors.New("too many in-flight payment orders for this provider")
 	ErrPaymentUserUnavailable     = errors.New("payment user is no longer available")
+	ErrPaymentTradeNoCollision    = errors.New("payment trade number collision limit reached")
 )
 
 func GeneratePaymentTradeNo() (string, error) {
-	key, err := common.GenerateRandomCharsKey(32)
-	if err != nil {
+	return generatePaymentTradeNo(time.Now().UTC(), rand.Reader)
+}
+
+func generatePaymentTradeNo(now time.Time, entropy io.Reader) (string, error) {
+	if entropy == nil {
+		return "", errors.New("payment trade number entropy is unavailable")
+	}
+	random := make([]byte, 10)
+	if _, err := io.ReadFull(entropy, random); err != nil {
 		return "", err
 	}
-	return paymentTradeNoPrefix + key, nil
+	suffix := make([]byte, 0, 16)
+	var bits uint32
+	var bitCount uint
+	for _, value := range random {
+		bits = bits<<8 | uint32(value)
+		bitCount += 8
+		for bitCount >= 5 {
+			bitCount -= 5
+			suffix = append(suffix, paymentTradeNoAlphabet[(bits>>bitCount)&31])
+		}
+		if bitCount == 0 {
+			bits = 0
+		} else {
+			bits &= (1 << bitCount) - 1
+		}
+	}
+	if len(suffix) != 16 {
+		return "", errors.New("invalid payment trade number entropy length")
+	}
+	return paymentTradeNoPrefix + now.UTC().Format("20060102T150405Z") + "-" + string(suffix), nil
+}
+
+func createPaymentOrderWithUniqueTradeNoTx(tx *gorm.DB, order *PaymentOrder, generator func() (string, error)) error {
+	if tx == nil || order == nil || generator == nil || strings.TrimSpace(order.TradeNo) != "" {
+		return errors.New("invalid payment order trade number creation")
+	}
+	const savepoint = "payment_trade_no_create"
+	for attempt := 0; attempt < paymentTradeNoCreateAttempts; attempt++ {
+		tradeNo, err := generator()
+		if err != nil {
+			return err
+		}
+		var existingCount int64
+		if err := tx.Model(&PaymentOrder{}).Where("trade_no = ?", tradeNo).Count(&existingCount).Error; err != nil {
+			return err
+		}
+		if existingCount > 0 {
+			continue
+		}
+		order.ID = 0
+		order.TradeNo = tradeNo
+		if err := tx.SavePoint(savepoint).Error; err != nil {
+			return err
+		}
+		createErr := tx.Create(order).Error
+		if createErr == nil {
+			return nil
+		}
+		if rollbackErr := tx.RollbackTo(savepoint).Error; rollbackErr != nil {
+			return fmt.Errorf("create payment order: %w; rollback savepoint: %v", createErr, rollbackErr)
+		}
+		order.ID = 0
+		var collisionCount int64
+		if err := tx.Model(&PaymentOrder{}).Where("trade_no = ?", tradeNo).Count(&collisionCount).Error; err != nil {
+			return err
+		}
+		if collisionCount == 0 {
+			return createErr
+		}
+		order.TradeNo = ""
+	}
+	order.TradeNo = ""
+	return ErrPaymentTradeNoCollision
 }
 
 func GeneratePaymentQuoteID() (string, error) {
@@ -562,10 +644,6 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 		if inFlightCount >= int64(inFlightLimit) {
 			return ErrPaymentInFlightOrderLimit
 		}
-		tradeNo, err := GeneratePaymentTradeNo()
-		if err != nil {
-			return err
-		}
 		orderExpiresAt := quote.ExpiresAt
 		if quote.Provider == PaymentProviderStripe {
 			orderExpiresAt = now + PaymentStripeOrderTTLSeconds
@@ -573,12 +651,13 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 			quote.Provider == PaymentProviderWaffoPancake {
 			orderExpiresAt = now + PaymentRetainedOrderTTLSeconds
 		}
+		var err error
 		orderExpiresAt, err = boundPaymentOrderExpiryForLimitTx(tx, &quote, now, orderExpiresAt)
 		if err != nil {
 			return err
 		}
 		order = PaymentOrder{
-			TradeNo:              tradeNo,
+			TradeNo:              "",
 			UserID:               userID,
 			OrderKind:            quote.OrderKind,
 			Provider:             quote.Provider,
@@ -599,7 +678,7 @@ func createPaymentOrderFromQuote(userID int, quoteID, requestID string, expected
 			UpdatedAt:            now,
 			Version:              1,
 		}
-		if err := tx.Create(&order).Error; err != nil {
+		if err := createPaymentOrderWithUniqueTradeNoTx(tx, &order, GeneratePaymentTradeNo); err != nil {
 			return err
 		}
 		if _, err := ensurePaymentTaskTx(tx, order.ID, PaymentTaskOperationCreate, now); err != nil {

@@ -8,6 +8,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestPaymentOperationsOverviewReportsSchemaNotReady(t *testing.T) {
+	truncateTables(t)
+	require.NoError(t, DB.Migrator().DropTable(&PaymentTask{}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.AutoMigrate(&PaymentTask{}))
+	})
+
+	overview, err := GetPaymentOperationsOverview(time.Now().Unix())
+
+	assert.Nil(t, overview)
+	assert.ErrorIs(t, err, ErrPaymentOperationsSchemaNotReady)
+}
+
 func TestPaymentOperationsOverviewReportsActionableBacklog(t *testing.T) {
 	truncateTables(t)
 	now := time.Now().Unix()

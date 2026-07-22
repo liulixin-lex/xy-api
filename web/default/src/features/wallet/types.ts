@@ -261,6 +261,8 @@ export interface TopupInfo {
   online_payment_available?: boolean
   /** Available public payment routes. */
   payment_routes: PaymentMethod[]
+  /** Routes whose shared gateway capability can price subscription plans. */
+  subscription_payment_routes?: PaymentMethod[]
   /** Fixed-price products owned by product checkout routes. */
   payment_products: PaymentProduct[]
   /** Selectable options owned by option checkout routes. */

@@ -26,7 +26,10 @@ import { useSidebarCollapsed } from '../../hooks/common/useSidebarCollapsed';
 import { useSidebar } from '../../hooks/common/useSidebar';
 import { useMinimumLoadingTime } from '../../hooks/common/useMinimumLoadingTime';
 import { isAdmin, isRoot, showError } from '../../helpers';
-import { canManagePaymentGatewaySettings } from '../../helpers/admin-permissions';
+import {
+  canManagePaymentGatewaySettings,
+  canManagePaymentOperations,
+} from '../../helpers/admin-permissions';
 import SkeletonWrapper from './components/SkeletonWrapper';
 
 import { Nav, Divider, Button } from '@douyinfe/semi-ui';
@@ -70,7 +73,9 @@ const SiderBar = ({ onNavigate = () => {} }) => {
   const location = useLocation();
   const [routerMapState, setRouterMapState] = useState(routerMap);
   const canOpenPaymentSettings =
-    isRoot() || canManagePaymentGatewaySettings(permissions);
+    isRoot() ||
+    canManagePaymentGatewaySettings(permissions) ||
+    canManagePaymentOperations(permissions);
 
   const workspaceItems = useMemo(() => {
     const items = [

@@ -39,6 +39,14 @@ func PublicPaymentRoutes() ([]PublicPaymentRoute, error) {
 	}
 	unlock := setting.LockPaymentConfigurationForRead()
 	defer unlock()
+	return PublicPaymentRoutesLocked()
+}
+
+// PublicPaymentRoutesLocked returns the canonical route catalog from the
+// caller's existing payment-configuration read snapshot. Controllers that
+// also project readiness use this form so aliases and readiness cannot come
+// from two different configuration versions.
+func PublicPaymentRoutesLocked() ([]PublicPaymentRoute, error) {
 	routes := publicPaymentRoutesLocked()
 	if err := validatePublicPaymentRoutes(routes); err != nil {
 		return nil, err
@@ -47,10 +55,9 @@ func PublicPaymentRoutes() ([]PublicPaymentRoute, error) {
 }
 
 // validatePublicPaymentRoutes keeps a configured public alias from shadowing
-// another canonical route. ParsePayMethodsByJsonString rejects duplicates that
-// are present in the saved list, but Stripe and XORPay may also contribute
-// implicit compatibility routes. The final merged snapshot therefore needs an
-// independent uniqueness check before a user-supplied route_id is resolved.
+// another canonical route. The independent boundary check protects route
+// resolution even if an in-memory snapshot did not pass through the settings
+// parser that normally validates the durable PayMethods catalog.
 func validatePublicPaymentRoutes(routes []PublicPaymentRoute) error {
 	seen := make(map[string]string, len(routes))
 	for _, route := range routes {
@@ -127,15 +134,15 @@ func PublicPaymentRouteForOrder(provider, paymentMethod string) PublicPaymentRou
 }
 
 func publicPaymentRoutesLocked() []PublicPaymentRoute {
-	routes := make([]PublicPaymentRoute, 0, len(operation_setting.PayMethods)+5)
-	seen := make(map[string]struct{}, len(operation_setting.PayMethods)+5)
+	routes := make([]PublicPaymentRoute, 0, len(operation_setting.PayMethods))
+	seen := make(map[string]struct{}, len(operation_setting.PayMethods))
 	appendRoute := func(provider, paymentMethod string, configured map[string]string) {
 		provider = strings.ToLower(strings.TrimSpace(provider))
 		if provider == "" {
 			provider = model.PaymentProviderEpay
 		}
 		paymentMethod = NormalizePaymentMethod(provider, paymentMethod)
-		if paymentMethod == "" {
+		if paymentMethod == "" || !publicPaymentRouteProviderEnabled(provider, paymentMethod) {
 			return
 		}
 		identity := provider + "\x00" + paymentMethod
@@ -153,33 +160,79 @@ func publicPaymentRoutesLocked() []PublicPaymentRoute {
 		}
 		switch strings.ToLower(strings.TrimSpace(provider)) {
 		case model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderXorPay,
-			model.PaymentProviderWaffoPancake:
+			model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake:
 			appendRoute(provider, configured["type"], configured)
 		}
 	}
-	appendRoute(model.PaymentProviderStripe, model.PaymentMethodStripe, nil)
-	appendRoute(model.PaymentProviderCreem, model.PaymentMethodCreem, map[string]string{
-		"public_method": "online_payment", "channel_alias": "product_checkout",
-	})
-	appendRoute(model.PaymentProviderWaffo, model.PaymentMethodWaffo, map[string]string{
-		"public_method": "online_payment", "channel_alias": "payment_options",
-	})
-	appendRoute(model.PaymentProviderWaffoPancake, model.PaymentMethodWaffoPancake, map[string]string{
-		"public_method": "online_payment", "channel_alias": "hosted_checkout",
-	})
-
-	// XORPay historically did not require entries in PayMethods. Keep those
-	// deployments compatible while still exposing only public route aliases.
-	if setting.IsXorPayMethodEnabled(setting.XorPayMethodNative) {
-		appendRoute(model.PaymentProviderXorPay, model.PaymentMethodXorPayNative, nil)
-	}
-	if setting.IsXorPayMethodEnabled(setting.XorPayMethodAlipay) {
-		appendRoute(model.PaymentProviderXorPay, model.PaymentMethodXorPayAlipay, nil)
-	}
-	if setting.IsXorPayMethodEnabled(setting.XorPayMethodJSAPI) {
-		appendRoute(model.PaymentProviderXorPay, model.PaymentMethodXorPayJSAPI, nil)
-	}
 	return routes
+}
+
+func publicPaymentRouteConfiguredLocked(provider, paymentMethod string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	paymentMethod = NormalizePaymentMethod(provider, paymentMethod)
+	for _, configured := range operation_setting.PayMethods {
+		configuredProvider := strings.ToLower(strings.TrimSpace(configured["provider"]))
+		if configuredProvider == "" {
+			configuredProvider = model.PaymentProviderEpay
+		}
+		if configuredProvider == provider && NormalizePaymentMethod(configuredProvider, configured["type"]) == paymentMethod {
+			return true
+		}
+	}
+	return false
+}
+
+// publicPaymentRouteProviderEnabled intersects the public catalog owned by
+// PayMethods with the provider capability owned by each gateway's settings.
+// Neither side can publish a route on its own: removing a catalog entry hides
+// it, while disabling or clearing a provider prevents a stale entry from being
+// offered to users. Historical orders use PublicPaymentRouteForOrder and do
+// not depend on this live availability decision.
+func publicPaymentRouteProviderEnabled(provider, paymentMethod string) bool {
+	switch provider {
+	case model.PaymentProviderEpay:
+		return strings.TrimSpace(operation_setting.PayAddress) != "" &&
+			strings.TrimSpace(operation_setting.EpayId) != "" && strings.TrimSpace(operation_setting.EpayKey) != ""
+	case model.PaymentProviderStripe:
+		if paymentMethod != model.PaymentMethodStripe {
+			return false
+		}
+		mode, err := StripeCredentialMode(setting.StripeApiSecret)
+		if err != nil || !setting.StripeCredentialModeAllowed(mode) || mode != setting.StripeCredentialLivemode ||
+			setting.StripeWebhookCredentialLivemode != setting.StripeCredentialLivemode {
+			return false
+		}
+		fingerprint := StripeCheckoutConfigurationFingerprint(
+			setting.StripeApiSecret, setting.StripeCredentialAccountId, setting.StripeAccountId,
+			setting.StripePriceId, setting.StripeCurrency, setting.StripeCredentialLivemode,
+			setting.StripeCheckoutAllowedHosts,
+		)
+		return strings.TrimSpace(setting.StripeWebhookSecret) != "" && strings.TrimSpace(setting.StripePriceId) != "" &&
+			strings.TrimSpace(setting.StripeCredentialAccountId) != "" && fingerprint != "" &&
+			setting.StripeConfigurationVerifiedFingerprint == fingerprint && setting.StripeConfigurationVerifiedAt > 0
+	case model.PaymentProviderXorPay:
+		method, err := xorPayUpstreamMethod(paymentMethod)
+		return err == nil && setting.IsXorPayMethodEnabled(method) &&
+			strings.TrimSpace(setting.XorPayAid) != "" && strings.TrimSpace(setting.XorPayAppSecret) != ""
+	case model.PaymentProviderCreem:
+		return paymentMethod == model.PaymentMethodCreem && strings.TrimSpace(setting.CreemApiKey) != "" &&
+			strings.TrimSpace(setting.CreemWebhookSecret) != ""
+	case model.PaymentProviderWaffo:
+		if paymentMethod != model.PaymentMethodWaffo || !setting.WaffoEnabled || strings.TrimSpace(setting.WaffoMerchantId) == "" {
+			return false
+		}
+		if setting.WaffoSandbox {
+			return strings.TrimSpace(setting.WaffoSandboxApiKey) != "" && strings.TrimSpace(setting.WaffoSandboxPrivateKey) != "" &&
+				strings.TrimSpace(setting.WaffoSandboxPublicCert) != ""
+		}
+		return strings.TrimSpace(setting.WaffoApiKey) != "" && strings.TrimSpace(setting.WaffoPrivateKey) != "" &&
+			strings.TrimSpace(setting.WaffoPublicCert) != ""
+	case model.PaymentProviderWaffoPancake:
+		return paymentMethod == model.PaymentMethodWaffoPancake && strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" &&
+			strings.TrimSpace(setting.WaffoPancakePrivateKey) != "" && strings.TrimSpace(setting.WaffoPancakeStoreID) != ""
+	default:
+		return false
+	}
 }
 
 func publicPaymentRouteFromValues(provider, paymentMethod string, configured map[string]string) PublicPaymentRoute {

@@ -17,25 +17,69 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
+const transportErrorCodes = new Set([
+  'ERR_BAD_REQUEST',
+  'ERR_BAD_RESPONSE',
+  'ERR_CANCELED',
+  'ERR_NETWORK',
+  'ERR_FR_TOO_MANY_REDIRECTS',
+  'ECONNABORTED',
+]);
+
+const isTransportErrorCode = (value) =>
+  typeof value === 'string' &&
+  (transportErrorCodes.has(value.trim()) || value.trim().startsWith('ERR_'));
+
+const isTransportErrorMessage = (value) =>
+  typeof value === 'string' &&
+  (/^Request failed with status code \d+$/i.test(value.trim()) ||
+    isTransportErrorCode(value.trim()));
+
 export const getPaymentAdminErrorCode = (value) => {
   if (!value || typeof value !== 'object') return null;
-  const candidates = [value.code, value.data?.code, value.response?.data?.code];
+  // Axios stores a transport code (for example ERR_BAD_REQUEST) on the
+  // outer error while the backend business code lives in response.data. The
+  // business code must win so a 403/400 never erases the actionable reason.
+  const candidates = [
+    value.response?.data?.code,
+    value.response?.data?.data?.code,
+    value.data?.code,
+    value.data?.data?.code,
+    value.code,
+  ];
   const code = candidates.find(
-    (candidate) => typeof candidate === 'string' && candidate.trim(),
+    (candidate) =>
+      typeof candidate === 'string' &&
+      candidate.trim() &&
+      !isTransportErrorCode(candidate),
   );
-  return typeof code === 'string' ? code.trim() : null;
+  if (typeof code === 'string') return code.trim();
+  if (value.cause && value.cause !== value) {
+    return getPaymentAdminErrorCode(value.cause);
+  }
+  return null;
 };
 
 export const createPaymentAdminError = (response, fallback) => {
-  const error = new Error(response?.message || fallback);
-  if (response?.code) error.code = response.code;
+  const payload = response?.response?.data || response?.data || response;
+  const error = new Error(payload?.message || fallback);
+  const code = getPaymentAdminErrorCode(payload);
+  if (code) error.code = code;
+  if (response?.response) error.response = response.response;
   return error;
 };
 
 export const getPaymentAdminErrorMessage = (error, t, fallback) => {
   const code = getPaymentAdminErrorCode(error);
   if (!code) {
-    return error?.response?.data?.message || error?.message || fallback;
+    const responseMessage = error?.response?.data?.message;
+    if (responseMessage && !isTransportErrorMessage(responseMessage)) {
+      return responseMessage;
+    }
+    if (error?.message && !isTransportErrorMessage(error.message)) {
+      return error.message;
+    }
+    return fallback;
   }
 
   let message = t(
@@ -47,6 +91,88 @@ export const getPaymentAdminErrorMessage = (error, t, fallback) => {
     message = t('Current payment limit usage could not be loaded. Try again.');
   } else if (code === 'payment_overview_unavailable') {
     message = t('Payment overview could not be loaded. Try again.');
+  } else if (code === 'payment_operations_schema_not_ready') {
+    message = t(
+      'Payment operations data is not ready. Complete the database migration, then retry.',
+    );
+  } else if (code === 'stripe_inventory_filter_invalid') {
+    message = t(
+      'Stripe legacy inventory filters are invalid. Review the filter values and try again.',
+    );
+  } else if (code === 'stripe_inventory_schema_not_ready') {
+    message = t(
+      'Stripe legacy inventory is not ready. Complete the database migration, then retry.',
+    );
+  } else if (code === 'stripe_inventory_unavailable') {
+    message = t('Stripe legacy inventory is unavailable. Try again.');
+  } else if (code === 'stripe_inventory_sync_not_configured') {
+    message = t(
+      'Stripe legacy inventory sync is not configured for this account.',
+    );
+  } else if (code === 'stripe_inventory_sync_mode_mismatch') {
+    message = t(
+      'Stripe legacy inventory sync uses a different mode than the configured account.',
+    );
+  } else if (code === 'stripe_inventory_sync_unavailable') {
+    message = t(
+      'Stripe legacy inventory sync is temporarily unavailable. Try again later.',
+    );
+  } else if (code === 'stripe_inventory_cancel_invalid') {
+    message = t(
+      'The Stripe cancellation request is invalid. Review the reason and refresh the inventory.',
+    );
+  } else if (code === 'stripe_inventory_subscription_not_found') {
+    message = t(
+      'This Stripe subscription is no longer in the inventory. Refresh before continuing.',
+    );
+  } else if (code === 'stripe_inventory_cancel_conflict') {
+    message = t(
+      'This Stripe subscription changed after it was loaded. Refresh the inventory before retrying.',
+    );
+  } else if (code === 'stripe_inventory_cancel_not_configured') {
+    message = t(
+      'The current Stripe credentials cannot manage legacy subscription cancellations.',
+    );
+  } else if (code === 'stripe_inventory_cancel_account_mismatch') {
+    message = t(
+      'This legacy subscription belongs to a different Stripe account than the configured credentials.',
+    );
+  } else if (code === 'stripe_inventory_cancel_mode_mismatch') {
+    message = t(
+      'This legacy subscription uses a different Stripe test or live mode than the configured credentials.',
+    );
+  } else if (code === 'stripe_inventory_cancel_unavailable') {
+    message = t(
+      'Stripe could not schedule this cancellation. The subscription was not marked as canceled locally.',
+    );
+  } else if (code === 'payment_operations_auth_required') {
+    message = t(
+      'Use an authenticated administrator browser session for this payment operation.',
+    );
+  } else if (
+    code === 'permission_denied' ||
+    code === 'payment_settings_permission_denied' ||
+    code === 'payment_operations_permission_denied'
+  ) {
+    message = t(
+      'You do not have permission to perform this payment administration action.',
+    );
+  } else if (code === 'payment_settings_field_invalid') {
+    message = t(
+      'One or more payment settings fields are invalid. Review the highlighted fields and try again.',
+    );
+  } else if (code === 'VERIFICATION_REQUIRED') {
+    message = t('Additional security verification is required to continue.');
+  } else if (code === 'VERIFICATION_EXPIRED') {
+    message = t('Your security verification expired. Verify again and retry.');
+  } else if (code === 'VERIFICATION_INVALID') {
+    message = t(
+      'Security verification failed. Verify your identity and retry.',
+    );
+  } else if (code === 'payment_cluster_unready') {
+    message = t(
+      'Payment services are not ready across the application nodes. Try again later.',
+    );
   } else if (code === 'payment_limit_invalid') {
     message = t(
       'The payment limit settings are invalid. Review the method, currency, amounts, and time zone.',

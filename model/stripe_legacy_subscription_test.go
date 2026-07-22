@@ -2,10 +2,148 @@ package model
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPersistStripeLegacySubscriptionCancellationStoresSnapshotAndAuditOnce(t *testing.T) {
+	truncateTables(t)
+	now := time.Now().Unix()
+	inventory, err := UpsertStripeLegacySubscription(StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_cancel_at_period_end",
+		StripeCustomerID:     "cus_cancel_at_period_end",
+		Status:               "active",
+		StateObservedAt:      now,
+		FullState:            true,
+		SyncSource:           StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+
+	input := StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: inventory.UpdatedAt,
+		AdminID: 991900, ActorIP: "127.0.0.1", Reason: "stop unsafe recurring renewal",
+		AccountID: "acct_cancelmigration", CredentialMode: "test",
+		Snapshot: StripeLegacySubscriptionSnapshot{
+			StripeSubscriptionID: "sub_cancel_at_period_end",
+			StripeCustomerID:     "cus_cancel_at_period_end",
+			Status:               "active",
+			CancelAtPeriodEnd:    true,
+			CancelAt:             now + 3600,
+			CurrentPeriodEnd:     now + 3600,
+			StateObservedAt:      now + 1,
+			FullState:            true,
+			SyncSource:           StripeLegacySyncSourceAPI,
+		},
+	}
+	result, err := PersistStripeLegacySubscriptionCancellation(input)
+	require.NoError(t, err)
+	require.NotNil(t, result.Subscription)
+	assert.False(t, result.Duplicate)
+	assert.True(t, result.Subscription.CancelAtPeriodEnd)
+	assert.Equal(t, now+3600, result.Subscription.CancelAt)
+
+	var audit PaymentOperationsAudit
+	require.NoError(t, DB.Where(
+		"action = ? AND subject_id = ?",
+		PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).First(&audit).Error)
+	assert.Equal(t, 991900, audit.AdminID)
+	assert.Equal(t, input.ExpectedUpdatedAt, audit.ExpectedVersion)
+	assert.NotContains(t, audit.Metadata, "sk_test")
+
+	duplicate, err := PersistStripeLegacySubscriptionCancellation(input)
+	require.NoError(t, err)
+	assert.True(t, duplicate.Duplicate)
+	var auditCount int64
+	require.NoError(t, DB.Model(&PaymentOperationsAudit{}).Where(
+		"action = ? AND subject_id = ?",
+		PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).Count(&auditCount).Error)
+	assert.EqualValues(t, 1, auditCount)
+
+	var entitlementCount int64
+	require.NoError(t, DB.Model(&UserSubscription{}).Count(&entitlementCount).Error)
+	assert.Zero(t, entitlementCount)
+}
+
+func TestPersistStripeLegacySubscriptionCancellationAuditsAdvancedWebhookStateWithoutOverwrite(t *testing.T) {
+	truncateTables(t)
+	now := time.Now().Unix()
+	inventory, err := UpsertStripeLegacySubscription(StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_cancel_race",
+		StripeCustomerID:     "cus_cancel_race",
+		Status:               "active",
+		StateObservedAt:      now,
+		FullState:            true,
+		SyncSource:           StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+	expectedUpdatedAt := inventory.UpdatedAt
+	remoteObservedAt := now + 1
+	advancedObservedAt := remoteObservedAt + 10
+	require.NoError(t, DB.Model(&StripeLegacySubscription{}).Where("id = ?", inventory.ID).UpdateColumns(map[string]interface{}{
+		"status":               "past_due",
+		"cancel_at_period_end": true,
+		"cancel_at":            now + 7200,
+		"state_observed_at":    advancedObservedAt,
+		"updated_at":           expectedUpdatedAt + 5,
+	}).Error)
+
+	result, err := PersistStripeLegacySubscriptionCancellation(StripeLegacySubscriptionCancellationInput{
+		InventoryID: inventory.ID, ExpectedUpdatedAt: expectedUpdatedAt,
+		AdminID: 991901, ActorIP: "127.0.0.1", Reason: "stop recurring renewal after sync race",
+		AccountID: "acct_cancelrace", CredentialMode: "test",
+		Snapshot: StripeLegacySubscriptionSnapshot{
+			StripeSubscriptionID: "sub_cancel_race",
+			StripeCustomerID:     "cus_cancel_race",
+			Status:               "active",
+			CancelAtPeriodEnd:    true,
+			CancelAt:             now + 3600,
+			StateObservedAt:      remoteObservedAt,
+			FullState:            true,
+			SyncSource:           StripeLegacySyncSourceAPI,
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Subscription)
+	assert.False(t, result.Duplicate)
+	assert.Equal(t, "past_due", result.Subscription.Status)
+	assert.Equal(t, advancedObservedAt, result.Subscription.StateObservedAt)
+	assert.Equal(t, now+7200, result.Subscription.CancelAt)
+
+	var audit PaymentOperationsAudit
+	require.NoError(t, DB.Where(
+		"action = ? AND subject_id = ?",
+		PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID,
+	).First(&audit).Error)
+	assert.Contains(t, audit.Metadata, `"inventory_advanced":true`)
+}
+
+func TestStripeLegacySubscriptionUpdatedAtIsMonotonicVersion(t *testing.T) {
+	truncateTables(t)
+	inventory, err := UpsertStripeLegacySubscription(StripeLegacySubscriptionSnapshot{
+		StripeSubscriptionID: "sub_monotonic_version",
+		StripeCustomerID:     "cus_monotonic_version",
+		Status:               "active",
+		StateObservedAt:      time.Now().Unix(),
+		FullState:            true,
+		SyncSource:           StripeLegacySyncSourceAPI,
+	})
+	require.NoError(t, err)
+
+	futureVersion := time.Now().Unix() + 60
+	require.NoError(t, DB.Exec(
+		"UPDATE stripe_legacy_subscriptions SET updated_at = ? WHERE id = ?",
+		futureVersion, inventory.ID,
+	).Error)
+	require.NoError(t, DB.First(inventory, inventory.ID).Error)
+	inventory.Status = "past_due"
+	require.NoError(t, DB.Save(inventory).Error)
+
+	assert.Equal(t, futureVersion+1, inventory.UpdatedAt)
+}
 
 func TestUpsertStripeLegacySubscriptionMapsCustomerAndPrice(t *testing.T) {
 	truncateTables(t)

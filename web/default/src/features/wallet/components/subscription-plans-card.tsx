@@ -134,8 +134,13 @@ export function SubscriptionPlansCard({
   )
 
   const subscriptionPaymentRoutes = useMemo(
-    () => filterPaymentMethodsForBrowser(topupInfo?.payment_routes || []),
-    [topupInfo?.payment_routes]
+    () =>
+      filterPaymentMethodsForBrowser(
+        topupInfo?.subscription_payment_routes ||
+          topupInfo?.payment_routes ||
+          []
+      ),
+    [topupInfo?.subscription_payment_routes, topupInfo?.payment_routes]
   )
 
   const fetchPlans = useCallback(async () => {

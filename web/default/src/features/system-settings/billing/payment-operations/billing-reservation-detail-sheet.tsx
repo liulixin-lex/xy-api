@@ -134,6 +134,7 @@ export function BillingReservationDetailSheet(props: {
     queryKey: ['billing-reservation-detail', props.requestId],
     queryFn: () => getBillingReservation(props.requestId || ''),
     enabled: Boolean(props.requestId),
+    meta: { skipGlobalError: true },
   })
   const reservation = detailQuery.data?.reservation
   const ledger = detailQuery.data?.ledger ?? []

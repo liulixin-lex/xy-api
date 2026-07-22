@@ -531,7 +531,7 @@ func migrateDBOn(db *gorm.DB) error {
 			return err
 		}
 	}
-	return nil
+	return migrateLegacyPaymentRouteCatalogOn(db)
 }
 
 // prepareMySQLMigrationDB verifies the server's real InnoDB key capacity before
@@ -811,6 +811,9 @@ func migrateDBFast() error {
 		if err := migrationDB.AutoMigrate(&SubscriptionPlan{}); err != nil {
 			return err
 		}
+	}
+	if err := migrateLegacyPaymentRouteCatalogOn(migrationDB); err != nil {
+		return err
 	}
 	common.SysLog("database migrated")
 	return nil

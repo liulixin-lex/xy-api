@@ -43,7 +43,6 @@ export function isPaymentReturnCancelled(search) {
 
 const PUBLIC_ROUTE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const INTERNAL_PROVIDER_PATTERN = /(xorpay|epay|stripe|creem|waffo)/i;
-const INTERNAL_GATEWAY_PATTERN = /(xorpay|epay|stripe)/i;
 
 function normalizeToken(value) {
   return String(value || '')
@@ -83,7 +82,7 @@ export function getPublicPaymentMethod(method) {
   const configured = normalizeToken(method?.public_method);
   if (
     PUBLIC_ROUTE_PATTERN.test(configured) &&
-    !INTERNAL_GATEWAY_PATTERN.test(configured)
+    !INTERNAL_PROVIDER_PATTERN.test(configured)
   ) {
     return configured;
   }
@@ -151,9 +150,6 @@ const PUBLIC_METHOD_LABELS = {
   alipay: '支付宝',
   wechat_pay: '微信支付',
   card: '银行卡支付',
-  creem: 'Creem',
-  waffo: 'Waffo',
-  waffo_pancake: 'Waffo Pancake',
   payment: '在线支付',
 };
 
@@ -530,6 +526,13 @@ export function normalizePublicTopupInfo(value) {
   )
     .filter((method) => getConfiguredRouteId(method))
     .map(normalizePaymentMethod);
+  const subscriptionPaymentRoutes = parsePublicArray(
+    value.subscription_payment_routes ??
+      value.payment_routes ??
+      value.pay_methods,
+  )
+    .filter((method) => getConfiguredRouteId(method))
+    .map(normalizePaymentMethod);
   const paymentProducts = parsePublicArray(value.payment_products)
     .map((product) => {
       const productId = String(product?.product_id || '').trim();
@@ -604,6 +607,7 @@ export function normalizePublicTopupInfo(value) {
         ? value.payment_compliance_terms_version
         : '',
     payment_routes: paymentRoutes,
+    subscription_payment_routes: subscriptionPaymentRoutes,
     payment_products: paymentProducts,
     payment_route_options: paymentRouteOptions,
     min_topup: Number.isSafeInteger(minTopup) && minTopup > 0 ? minTopup : 1,
@@ -748,7 +752,7 @@ export function filterPaymentMethodsForBrowser(
       .map((method) => method.public_method),
   );
 
-  return normalizedMethods.filter((method) => {
+  const environmentRoutes = normalizedMethods.filter((method) => {
     if (method.public_method !== 'wechat_pay') return true;
 
     const isJSAPI = ['wechat_browser', 'jsapi'].includes(method.channel_alias);
@@ -757,6 +761,26 @@ export function filterPaymentMethodsForBrowser(
     const isNative = ['qr', 'native'].includes(method.channel_alias);
     return !(isNative && wechatJSAPIGroups.has(method.public_method));
   });
+
+  const selectedBrands = new Set();
+  return environmentRoutes.filter((method) => {
+    if (!['alipay', 'wechat_pay'].includes(method.public_method)) return true;
+    if (selectedBrands.has(method.public_method)) return false;
+    selectedBrands.add(method.public_method);
+    return true;
+  });
+}
+
+export function filterEligibleSubscriptionQuoteMethods(
+  methods = [],
+  eligibleRouteIDs = [],
+) {
+  const eligibleRoutes = new Set(eligibleRouteIDs);
+  return methods.filter(
+    (method) =>
+      method.checkout_mode === 'quote' &&
+      eligibleRoutes.has(getPaymentRouteId(method)),
+  );
 }
 
 export function getSafePaymentIconUrl(value) {
@@ -821,20 +845,63 @@ export function isEndpointUnavailable(error) {
 
 export function isSafeQrContent(value) {
   const trimmed = (value || '').trim();
-  if (!trimmed || trimmed.length > 4096) return false;
-  if (trimmed.startsWith('weixin://wxpay/')) return true;
-  try {
-    const url = new URL(trimmed);
-    return (
-      url.protocol === 'https:' &&
-      url.hostname.toLowerCase() === 'qr.alipay.com' &&
-      !url.username &&
-      !url.password &&
-      (!url.port || url.port === '443')
-    );
-  } catch {
+  if (!trimmed || value !== trimmed || trimmed.length > 4096) return false;
+  if (
+    hasForbiddenPaymentControlCharacters(trimmed) ||
+    trimmed.includes('\\') ||
+    trimmed.includes('#')
+  ) {
     return false;
   }
+  if (trimmed.startsWith('weixin://')) {
+    try {
+      const url = new URL(trimmed);
+      const queryEntries = Array.from(url.searchParams.entries());
+      return (
+        trimmed.startsWith('weixin://wxpay/bizpayurl?') &&
+        url.protocol === 'weixin:' &&
+        url.host === 'wxpay' &&
+        !url.username &&
+        !url.password &&
+        !url.port &&
+        !url.hash &&
+        url.pathname === '/bizpayurl' &&
+        queryEntries.length === 1 &&
+        queryEntries[0][0] === 'pr' &&
+        /^[A-Za-z0-9_-]{1,512}$/.test(queryEntries[0][1])
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  const hostedMatch = /^(https?):\/\/([^/?#]+)(\/[^?#]*)$/.exec(trimmed);
+  if (hostedMatch?.[2].toLowerCase() === 'ipay.yltg.com.cn') {
+    const path = hostedMatch[3];
+    return (
+      path.length >= 2 &&
+      path.length <= 2049 &&
+      /^\/[A-Za-z0-9._~/-]+$/.test(path) &&
+      !path.startsWith('//') &&
+      !path.includes('/../') &&
+      !path.endsWith('/..')
+    );
+  }
+
+  const alipayMatch = /^https:\/\/([^/?#]+)(\/[^?#]+)$/.exec(trimmed);
+  if (alipayMatch?.[1].toLowerCase() !== 'qr.alipay.com') return false;
+  const path = alipayMatch[2];
+  return (
+    path.length >= 2 && path.length <= 2049 && /^\/[A-Za-z0-9._~-]+$/.test(path)
+  );
+}
+
+function hasForbiddenPaymentControlCharacters(value) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
 }
 
 function getCurrencyFormatter(currency, provider) {

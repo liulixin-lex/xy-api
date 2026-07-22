@@ -33,7 +33,6 @@ import {
   Clock3,
   Copy,
   ExternalLink,
-  Info,
   LoaderCircle,
   QrCode,
   RefreshCw,
@@ -45,7 +44,9 @@ import { QRCodeSVG } from 'qrcode.react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 
+import { API } from '../../helpers/api';
 import { copy, getLogo, getSystemName } from '../../helpers';
+import { setStatusData } from '../../helpers/data';
 import { usePaymentOrderPolling } from '../../components/topup/use-payment-order';
 import {
   detectPaymentBrowserEnvironment,
@@ -572,18 +573,13 @@ const Payment = () => {
     () => isPaymentReturnCancelled(window.location.search),
     [],
   );
-  const configuredSystemName = getSystemName();
-  const systemName =
-    configuredSystemName &&
-    !['undefined', 'null'].includes(configuredSystemName.toLowerCase())
-      ? configuredSystemName
-      : 'New API';
-  const configuredLogo = getLogo();
-  const logo =
-    configuredLogo &&
-    !['undefined', 'null'].includes(configuredLogo.toLowerCase())
-      ? configuredLogo
-      : '/logo.png';
+  const [brand, setBrand] = useState(() => ({
+    systemName: getSystemName(),
+    logo: getLogo(),
+  }));
+  const [logoFailed, setLogoFailed] = useState(false);
+  const systemName = brand.systemName;
+  const logo = brand.logo;
   const {
     order,
     error,
@@ -593,6 +589,47 @@ const Payment = () => {
     refreshPayment,
     clearPayment,
   } = usePaymentOrderPolling({ t });
+
+  useEffect(() => {
+    let active = true;
+    API.get('/api/status', { skipErrorHandler: true, disableDuplicate: true })
+      .then((response) => {
+        const data = response.data?.data || response.data;
+        if (!active || !data || typeof data !== 'object') return;
+        setStatusData(data);
+        const nextSystemName = String(data.system_name || '').trim();
+        const nextLogo = String(data.logo || '').trim();
+        setBrand({
+          systemName: nextSystemName || getSystemName(),
+          logo: nextLogo || getLogo(),
+        });
+      })
+      .catch(() => {
+        // Cached branding remains usable when the status endpoint is unavailable.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    setLogoFailed(false);
+  }, [logo]);
+
+  useEffect(() => {
+    const previousTitle = document.title;
+    const metaTitle = document.querySelector('meta[name="title"]');
+    const previousMetaTitle = metaTitle?.getAttribute('content');
+    const title = `${systemName} - ${t('安全支付')}`;
+    document.title = title;
+    metaTitle?.setAttribute('content', title);
+    return () => {
+      document.title = previousTitle;
+      if (metaTitle && previousMetaTitle !== null) {
+        metaTitle.setAttribute('content', previousMetaTitle);
+      }
+    };
+  }, [systemName, t]);
 
   useEffect(() => {
     if (validTradeNo) {
@@ -664,8 +701,13 @@ const Payment = () => {
             {t('返回钱包')}
           </Button>
           <div className='payment-checkout-brand' aria-label={systemName}>
-            {logo ? (
-              <img src={logo} alt='' referrerPolicy='no-referrer' />
+            {logo && !logoFailed ? (
+              <img
+                src={logo}
+                alt=''
+                referrerPolicy='no-referrer'
+                onError={() => setLogoFailed(true)}
+              />
             ) : null}
             <span>{systemName}</span>
           </div>
@@ -783,21 +825,6 @@ const Payment = () => {
               </dl>
 
               <div className='payment-checkout-divider' />
-
-              <div className='payment-checkout-assurance'>
-                <div>
-                  <ShieldCheck size={17} aria-hidden='true' />
-                  <Text type='tertiary'>
-                    {t('本站将在确认支付结果后更新您的余额或权益。')}
-                  </Text>
-                </div>
-                <div>
-                  <Info size={17} aria-hidden='true' />
-                  <Text type='tertiary'>
-                    {t('如需联系客服，请保留此订单编号。')}
-                  </Text>
-                </div>
-              </div>
 
               {loadedOrder && error ? (
                 <Banner

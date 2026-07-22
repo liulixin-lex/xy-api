@@ -54,6 +54,12 @@ func PublicPaymentCheckout(order *model.PaymentOrder) (*PublicPaymentCheckoutVie
 		if strings.TrimSpace(start.QRContent) == "" || len(start.QRContent) > 4096 {
 			return nil, errors.New("invalid stored payment QR state")
 		}
+		if order.Provider == model.PaymentProviderXorPay {
+			method, methodErr := xorPayUpstreamMethod(order.PaymentMethod)
+			if methodErr != nil || validateXorPayQR(method, start.QRContent) != nil {
+				return nil, errors.New("invalid stored payment QR state")
+			}
+		}
 		view.QRContent = start.QRContent
 	case PaymentFlowHostedRedirect, PaymentFlowAppRedirect, PaymentFlowFormPost:
 		// App redirects use the same first-party browser instruction as hosted

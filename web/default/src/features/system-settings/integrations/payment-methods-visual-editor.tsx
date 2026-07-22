@@ -42,6 +42,8 @@ import {
   getPaymentMethodIdentity,
   mergePaymentMethodEdit,
   normalizePaymentMethod,
+  removePaymentMethodByIdentity,
+  validatePaymentMethodCollection,
 } from './payment-methods-visual-editor-utils'
 
 type PaymentMethodsVisualEditorProps = {
@@ -51,7 +53,9 @@ type PaymentMethodsVisualEditorProps = {
 
 const PAYMENT_TYPE_ICON_NAMES: Record<string, string> = {
   alipay: 'SiAlipay',
+  creem: 'LuCreditCard',
   stripe: 'SiStripe',
+  waffo: 'LuCreditCard',
   waffo_pancake: 'LuCreditCard',
   wxpay: 'SiWechat',
   xorpay_alipay: 'SiAlipay',
@@ -99,6 +103,24 @@ export function PaymentMethodsVisualEditor({
         name: 'Stripe',
         provider: 'stripe' as const,
         type: 'stripe',
+      },
+    },
+    {
+      name: t('Creem'),
+      template: {
+        icon: getDefaultIconName('creem'),
+        name: t('Online payment'),
+        provider: 'creem' as const,
+        type: 'creem',
+      },
+    },
+    {
+      name: t('Waffo'),
+      template: {
+        icon: getDefaultIconName('waffo'),
+        name: t('Online payment'),
+        provider: 'waffo' as const,
+        type: 'waffo',
       },
     },
     {
@@ -194,16 +216,6 @@ export function PaymentMethodsVisualEditor({
               getPaymentMethodIdentity(editData)
         )
       : -1
-    const duplicate = updatedArray.some(
-      (method, index) =>
-        index !== editIndex &&
-        getPaymentMethodIdentity(method) === getPaymentMethodIdentity(data)
-    )
-    if (duplicate) {
-      toast.error(t('Payment type keys must be unique'))
-      return false
-    }
-
     if (editData) {
       if (editIndex !== -1) {
         updatedArray[editIndex] = mergePaymentMethodEdit(
@@ -217,6 +229,16 @@ export function PaymentMethodsVisualEditor({
       updatedArray.push(data)
     }
 
+    const collectionError = validatePaymentMethodCollection(updatedArray)
+    if (collectionError === 'duplicate_payment_method') {
+      toast.error(t('Payment type keys must be unique'))
+      return false
+    }
+    if (collectionError === 'too_many_payment_methods') {
+      toast.error(t('No more than 27 payment methods are allowed'))
+      return false
+    }
+
     onChange(JSON.stringify(updatedArray, null, 2))
     return true
   }
@@ -228,17 +250,7 @@ export function PaymentMethodsVisualEditor({
       silent: true,
     })
 
-    const updatedArray = parsed.filter(
-      (item) =>
-        !(
-          typeof item === 'object' &&
-          item !== null &&
-          'name' in item &&
-          'type' in item &&
-          item.name === method.name &&
-          item.type === method.type
-        )
-    )
+    const updatedArray = removePaymentMethodByIdentity(parsed, method)
 
     onChange(JSON.stringify(updatedArray, null, 2))
   }
@@ -270,6 +282,13 @@ export function PaymentMethodsVisualEditor({
 
     if (!exists) {
       normalized.push(template)
+      if (
+        validatePaymentMethodCollection(normalized) ===
+        'too_many_payment_methods'
+      ) {
+        toast.error(t('No more than 27 payment methods are allowed'))
+        return
+      }
       onChange(JSON.stringify(normalized, null, 2))
     } else {
       toast.error(t('Payment type keys must be unique'))

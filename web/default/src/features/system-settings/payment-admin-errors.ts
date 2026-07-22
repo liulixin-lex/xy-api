@@ -22,31 +22,52 @@ import { getApiErrorMessage } from '@/lib/api-error'
 
 type PaymentAdminErrorSource = {
   code?: unknown
-  data?: { code?: unknown }
-  response?: { data?: { code?: unknown } }
+  data?: { code?: unknown; data?: { code?: unknown } }
+  response?: { data?: { code?: unknown; data?: { code?: unknown } } }
+  cause?: unknown
 }
 
 export function getPaymentAdminErrorCode(value: unknown): string | null {
   if (!value || typeof value !== 'object') return null
   const source = value as PaymentAdminErrorSource
+  const responseCode = source.response?.data?.code
+  const responseDataCode = source.response?.data?.data?.code
+  const businessCode = source.data?.code
+  const nestedBusinessCode = source.data?.data?.code
+
+  // Axios exposes transport identifiers such as ERR_BAD_REQUEST on `code`.
+  // Prefer the server's business code so verification, permission, and
+  // configuration errors are not collapsed into a generic transport error.
   const candidates = [
+    responseCode,
+    responseDataCode,
+    businessCode,
+    nestedBusinessCode,
     source.code,
-    source.data?.code,
-    source.response?.data?.code,
   ]
   const code = candidates.find(
-    (candidate) => typeof candidate === 'string' && candidate.trim()
+    (candidate) =>
+      typeof candidate === 'string' &&
+      candidate.trim() &&
+      !candidate.startsWith('ERR_')
   )
-  return typeof code === 'string' ? code.trim() : null
+  if (typeof code === 'string') return code.trim()
+
+  if (source.cause && source.cause !== value) {
+    return getPaymentAdminErrorCode(source.cause)
+  }
+  return null
 }
 
 export function createPaymentAdminError(
   response: { code?: string; message?: string },
   fallback: string
-): Error & { code?: string } {
+): Error & { code?: string; skipGlobalError: true } {
   const error = new Error(response.message || fallback) as Error & {
     code?: string
+    skipGlobalError: true
   }
+  error.skipGlobalError = true
   if (response.code) error.code = response.code
   return error
 }
@@ -67,6 +88,14 @@ export function getPaymentAdminErrorMessage(
     message = t('Current payment limit usage could not be loaded. Try again.')
   } else if (code === 'payment_overview_unavailable') {
     message = t('Payment overview could not be loaded. Try again.')
+  } else if (code === 'payment_overview_schema_invalid') {
+    message = t(
+      'Payment overview data is from an incompatible or incomplete server version. Refresh after the server is updated.'
+    )
+  } else if (code === 'payment_operations_schema_not_ready') {
+    message = t(
+      'Payment operations need a database migration before operational data can be loaded.'
+    )
   } else if (code === 'payment_limit_invalid') {
     message = t(
       'The payment limit settings are invalid. Review the method, currency, amounts, and time zone.'
@@ -85,6 +114,58 @@ export function getPaymentAdminErrorMessage(
     )
   } else if (code === 'payment_settings_auth_required') {
     message = t('You are not authorized to change payment settings.')
+  } else if (code === 'VERIFICATION_REQUIRED') {
+    message = t('Additional security verification is required to continue.')
+  } else if (code === 'VERIFICATION_EXPIRED') {
+    message = t('Your security verification expired. Verify again and retry.')
+  } else if (code === 'VERIFICATION_INVALID') {
+    message = t('Security verification failed. Verify your identity and retry.')
+  } else if (code === 'payment_settings_permission_denied') {
+    message = t('You do not have permission to change payment settings.')
+  } else if (code === 'payment_operations_permission_denied') {
+    message = t(
+      'You do not have permission to perform this payment administration action.'
+    )
+  } else if (code === 'payment_operations_auth_required') {
+    message = t(
+      'Use an authenticated administrator browser session for this payment operation.'
+    )
+  } else if (code === 'stripe_inventory_cancel_invalid') {
+    message = t(
+      'The Stripe cancellation request is invalid. Review the reason and refresh the inventory.'
+    )
+  } else if (code === 'stripe_inventory_subscription_not_found') {
+    message = t(
+      'This Stripe subscription is no longer in the inventory. Refresh before continuing.'
+    )
+  } else if (code === 'stripe_inventory_cancel_conflict') {
+    message = t(
+      'This Stripe subscription changed after it was loaded. Refresh the inventory before retrying.'
+    )
+  } else if (code === 'stripe_inventory_cancel_not_configured') {
+    message = t(
+      'The current Stripe credentials cannot manage legacy subscription cancellations.'
+    )
+  } else if (code === 'stripe_inventory_cancel_account_mismatch') {
+    message = t(
+      'This legacy subscription belongs to a different Stripe account than the configured credentials.'
+    )
+  } else if (code === 'stripe_inventory_cancel_mode_mismatch') {
+    message = t(
+      'This legacy subscription uses a different Stripe test or live mode than the configured credentials.'
+    )
+  } else if (code === 'stripe_inventory_cancel_unavailable') {
+    message = t(
+      'Stripe could not schedule this cancellation. The subscription was not marked as canceled locally.'
+    )
+  } else if (code === 'payment_cluster_unready') {
+    message = t(
+      'Payment services are not ready across the application nodes. Try again later.'
+    )
+  } else if (code === 'payment_settings_field_invalid') {
+    message = t(
+      'One or more payment settings are invalid. Review the highlighted fields.'
+    )
   } else if (code === 'payment_settings_sync_failed') {
     message = t(
       'Payment settings could not be synchronized across the application.'

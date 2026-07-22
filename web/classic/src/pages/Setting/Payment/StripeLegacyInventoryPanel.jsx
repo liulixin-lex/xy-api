@@ -18,15 +18,30 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { Banner, Button, Card, Pagination, Spin, Tag } from '@douyinfe/semi-ui';
+import {
+  Banner,
+  Button,
+  Card,
+  Modal,
+  Pagination,
+  Spin,
+  Tag,
+  TextArea,
+} from '@douyinfe/semi-ui';
 import { RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { showError, showSuccess, showWarning } from '../../../helpers';
+import { getPaymentAdminErrorMessage } from '../../../helpers/payment-admin-errors';
 import {
+  cancelStripeLegacySubscriptionAtPeriodEnd,
   listStripeLegacyInventory,
   syncStripeLegacyInventory,
 } from './payment-admin-api';
+import {
+  canScheduleStripeSubscriptionCancellation,
+  isStripeCancellationReasonValid,
+} from './stripe-legacy-cancellation';
 
 const PAGE_SIZE = 20;
 
@@ -36,26 +51,41 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  const [presenceError, setPresenceError] = useState(false);
+  const [inventoryError, setInventoryError] = useState('');
+  const [cancellationItem, setCancellationItem] = useState(null);
+  const [cancellationReason, setCancellationReason] = useState('');
+  const [cancellationPending, setCancellationPending] = useState(false);
+  const cancellationReasonByteLength = new TextEncoder().encode(
+    cancellationReason.trim(),
+  ).length;
 
-  const loadInventory = useCallback(async (nextPage = 1) => {
-    setLoading(true);
-    try {
-      const data = await listStripeLegacyInventory({
-        page: nextPage,
-        pageSize: PAGE_SIZE,
-      });
-      setInventory(data);
-      setPage(nextPage);
-      setPresenceError(false);
-      return true;
-    } catch {
-      setPresenceError(true);
-      return false;
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const loadInventory = useCallback(
+    async (nextPage = 1) => {
+      setLoading(true);
+      try {
+        const data = await listStripeLegacyInventory({
+          page: nextPage,
+          pageSize: PAGE_SIZE,
+        });
+        setInventory(data);
+        setPage(nextPage);
+        setInventoryError('');
+        return true;
+      } catch (error) {
+        setInventoryError(
+          getPaymentAdminErrorMessage(
+            error,
+            t,
+            t('Stripe legacy inventory is unavailable. Try again.'),
+          ),
+        );
+        return false;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [t],
+  );
 
   useEffect(() => {
     void loadInventory(1);
@@ -90,20 +120,105 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
       });
     } catch (error) {
       showError(
-        error?.message || t('Failed to sync Stripe subscription inventory'),
+        getPaymentAdminErrorMessage(
+          error,
+          t,
+          t(
+            'Stripe legacy inventory sync is temporarily unavailable. Try again later.',
+          ),
+        ),
       );
     } finally {
       setSyncing(false);
     }
   };
 
-  if (loading && !inventory) return null;
+  const closeCancellationDialog = () => {
+    if (cancellationPending) return;
+    setCancellationItem(null);
+    setCancellationReason('');
+  };
 
-  if (presenceError && !inventory) {
+  const scheduleCancellation = async () => {
+    if (
+      cancellationPending ||
+      !canScheduleStripeSubscriptionCancellation(cancellationItem) ||
+      !isStripeCancellationReasonValid(cancellationReason)
+    ) {
+      return;
+    }
+    const item = cancellationItem;
+    const reason = cancellationReason.trim();
+    setCancellationPending(true);
+    try {
+      await withPaymentVerification(async () => {
+        let result;
+        try {
+          result = await cancelStripeLegacySubscriptionAtPeriodEnd({
+            inventory_id: item.id,
+            expected_updated_at: item.expected_updated_at,
+            reason,
+          });
+        } catch (error) {
+          const code = error?.response?.data?.code || error?.code;
+          if (
+            code === 'stripe_inventory_cancel_conflict' ||
+            code === 'stripe_inventory_subscription_not_found'
+          ) {
+            void loadInventory(page);
+          }
+          throw error;
+        }
+        setCancellationItem(null);
+        setCancellationReason('');
+        const refreshed = await loadInventory(page);
+        if (refreshed) {
+          showSuccess(
+            result.duplicate
+              ? t('Stripe cancellation was already scheduled')
+              : t('Stripe cancellation scheduled for the period end'),
+          );
+        } else {
+          showWarning(
+            t(
+              'Stripe accepted the cancellation, but the refreshed inventory could not be loaded.',
+            ),
+          );
+        }
+        return result;
+      });
+    } catch (error) {
+      showError(
+        getPaymentAdminErrorMessage(
+          error,
+          t,
+          t('Failed to schedule Stripe subscription cancellation'),
+        ),
+      );
+    } finally {
+      setCancellationPending(false);
+    }
+  };
+
+  if (loading && !inventory) {
+    return (
+      <div className='mt-6'>
+        <Card>
+          <Spin spinning>
+            <div className='flex min-h-32 items-center justify-center text-sm text-gray-500'>
+              {t('Loading Stripe legacy inventory...')}
+            </div>
+          </Spin>
+        </Card>
+      </div>
+    );
+  }
+
+  if (inventoryError && !inventory) {
     return (
       <Banner
         type='warning'
-        title={t('Legacy Stripe history could not be checked')}
+        title={inventoryError}
         description={
           <div className='flex flex-wrap items-center justify-between gap-3'>
             <span>
@@ -120,7 +235,33 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
     );
   }
 
-  if (!inventory || Number(inventory.total || 0) <= 0) return null;
+  if (!inventory || Number(inventory.total || 0) <= 0) {
+    return (
+      <div className='mt-6'>
+        <Banner
+          type='info'
+          title={t('No legacy Stripe subscriptions found')}
+          description={
+            <div className='flex flex-wrap items-center justify-between gap-3'>
+              <span>
+                {t(
+                  'No recurring Stripe subscriptions are currently recorded. Sync from Stripe to refresh the inventory.',
+                )}
+              </span>
+              <Button
+                icon={<RefreshCw size={16} />}
+                loading={syncing}
+                onClick={() => void syncInventory()}
+              >
+                {t('Sync from Stripe')}
+              </Button>
+            </div>
+          }
+          closeIcon={null}
+        />
+      </div>
+    );
+  }
 
   const items = Array.isArray(inventory.items) ? inventory.items : [];
   const dateFormatter = new Intl.DateTimeFormat(i18n.language, {
@@ -130,11 +271,21 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
 
   return (
     <div className='mt-6 flex flex-col gap-4'>
+      {inventoryError ? (
+        <Banner
+          type='warning'
+          title={inventoryError}
+          description={t(
+            'The last successful operational snapshot remains visible.',
+          )}
+          closeIcon={null}
+        />
+      ) : null}
       <Banner
         type='warning'
-        title={t('Read-only Stripe legacy subscription history')}
+        title={t('Legacy Stripe subscription controls')}
         description={t(
-          'This inventory observes old recurring Stripe subscriptions only. It does not grant, renew, cancel, or revoke local access. Current unified Stripe top-ups and fixed-term access purchases use one-time Checkout and do not auto-renew.',
+          'Inventory sync only observes legacy recurring subscriptions. Verified cancellation can stop a future Stripe renewal but never grants, renews, refunds, or revokes local access.',
         )}
         closeIcon={null}
       />
@@ -153,12 +304,12 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
       >
         <div className='border-b px-4 py-3 text-sm text-gray-500'>
           {t(
-            'Synchronizing reads legacy subscription state from Stripe. It does not cancel subscriptions, close Checkout Sessions, issue refunds, or revoke Stripe API keys.',
+            'Synchronizing reads legacy subscription state from Stripe. It does not change renewals, issue refunds, or change local access.',
           )}
         </div>
         <Spin spinning={loading}>
           <div className='overflow-x-auto'>
-            <table className='w-full min-w-[900px] border-collapse text-sm'>
+            <table className='w-full min-w-[1020px] border-collapse text-sm'>
               <thead>
                 <tr className='border-b text-left text-gray-500'>
                   <th className='px-4 py-3 font-medium'>
@@ -174,6 +325,9 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
                   </th>
                   <th className='px-4 py-3 font-medium'>
                     {t('Last observed')}
+                  </th>
+                  <th className='px-4 py-3 text-right font-medium'>
+                    {t('Actions')}
                   </th>
                 </tr>
               </thead>
@@ -220,6 +374,29 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
                         ? dateFormatter.format(item.state_observed_at * 1000)
                         : '—'}
                     </td>
+                    <td className='px-4 py-3 text-right'>
+                      <Button
+                        size='small'
+                        theme='outline'
+                        type='danger'
+                        disabled={
+                          !canScheduleStripeSubscriptionCancellation(item)
+                        }
+                        title={
+                          canScheduleStripeSubscriptionCancellation(item)
+                            ? t('Cancel renewal at period end')
+                            : t(
+                                'Cancellation is unavailable for this subscription snapshot',
+                              )
+                        }
+                        onClick={() => {
+                          setCancellationItem(item);
+                          setCancellationReason('');
+                        }}
+                      >
+                        {t('Cancel renewal')}
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -241,6 +418,101 @@ const StripeLegacyInventoryPanel = ({ withPaymentVerification }) => {
           />
         </div>
       </Card>
+
+      <Modal
+        visible={Boolean(cancellationItem)}
+        title={t('Cancel Stripe renewal at period end?')}
+        centered
+        maskClosable={false}
+        confirmLoading={cancellationPending}
+        okType='danger'
+        okText={
+          cancellationPending
+            ? t('Scheduling cancellation...')
+            : t('Cancel at period end')
+        }
+        cancelText={t('Keep subscription active')}
+        okButtonProps={{
+          disabled:
+            cancellationPending ||
+            !canScheduleStripeSubscriptionCancellation(cancellationItem) ||
+            !isStripeCancellationReasonValid(cancellationReason),
+        }}
+        onOk={() => void scheduleCancellation()}
+        onCancel={closeCancellationDialog}
+      >
+        <div className='flex flex-col gap-4'>
+          <p className='m-0'>
+            {t(
+              'Stripe will stop renewing this legacy subscription after its current billing period.',
+            )}
+          </p>
+          <Banner
+            type='warning'
+            title={t('Stripe renewal only')}
+            description={t(
+              'This changes Stripe renewal state only. It does not issue a refund or change local access.',
+            )}
+            closeIcon={null}
+          />
+          <dl className='m-0 grid gap-3 rounded border border-solid border-gray-200 p-3 text-sm dark:border-gray-700'>
+            <div>
+              <dt className='text-xs text-gray-500'>
+                {t('Stripe Subscription ID')}
+              </dt>
+              <dd className='mt-1 ml-0 truncate font-mono'>
+                {cancellationItem?.stripe_subscription_id || '-'}
+              </dd>
+            </div>
+            <div>
+              <dt className='text-xs text-gray-500'>
+                {t('Current period ends')}
+              </dt>
+              <dd className='mt-1 ml-0'>
+                {cancellationItem?.current_period_end
+                  ? dateFormatter.format(
+                      cancellationItem.current_period_end * 1000,
+                    )
+                  : '—'}
+              </dd>
+            </div>
+          </dl>
+          <label
+            className='text-sm font-medium'
+            htmlFor='classic-stripe-cancellation-reason'
+          >
+            {t('Cancellation reason')}
+          </label>
+          <TextArea
+            id='classic-stripe-cancellation-reason'
+            value={cancellationReason}
+            autosize={{ minRows: 3, maxRows: 6 }}
+            disabled={cancellationPending}
+            placeholder={t(
+              'Explain why this legacy renewal should stop (8-512 UTF-8 bytes)',
+            )}
+            onChange={setCancellationReason}
+          />
+          <div className='flex flex-wrap justify-between gap-2 text-xs'>
+            <span
+              className={
+                cancellationReasonByteLength > 0 &&
+                !isStripeCancellationReasonValid(cancellationReason)
+                  ? 'text-red-500'
+                  : 'text-gray-500'
+              }
+            >
+              {cancellationReasonByteLength > 0 &&
+              !isStripeCancellationReasonValid(cancellationReason)
+                ? t('Reason must be between 8 and 512 UTF-8 bytes')
+                : t('This reason is stored in the payment operations audit.')}
+            </span>
+            <span className='text-gray-500 tabular-nums'>
+              {cancellationReasonByteLength} / 512
+            </span>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 };

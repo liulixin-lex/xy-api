@@ -70,6 +70,38 @@ describe('classic payment general visual editor data', () => {
     );
   });
 
+  test('preserves historical Epay types and the 27-entry compatibility limit', () => {
+    const methods = [
+      { name: 'Legacy product checkout', type: 'creem', provider: 'epay' },
+      { name: 'Online payment', type: 'creem', provider: 'creem' },
+      { name: 'Legacy payment options', type: 'waffo', provider: 'epay' },
+      { name: 'Payment options', type: 'waffo', provider: 'waffo' },
+    ];
+    methods.forEach((method, index) => {
+      assert.equal(validatePaymentMethodDraft(method, methods, index), null);
+    });
+
+    const maximum = Array.from({ length: 27 }, (_, index) => ({
+      name: `Method ${index}`,
+      type: `custom_${index}`,
+      provider: 'epay',
+    }));
+    assert.equal(
+      validatePaymentMethodDraft(
+        { name: 'Method 28', type: 'custom_28', provider: 'epay' },
+        maximum.slice(0, 26),
+      ),
+      null,
+    );
+    assert.equal(
+      validatePaymentMethodDraft(
+        { name: 'Method 28', type: 'custom_28', provider: 'epay' },
+        maximum,
+      ),
+      'too_many_payment_methods',
+    );
+  });
+
   test('preserves opaque public aliases when editing presentation fields', () => {
     const methods = [
       {

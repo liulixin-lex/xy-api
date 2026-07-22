@@ -54,6 +54,8 @@ const PROVIDER_COLORS = {
   epay: 'blue',
   xorpay: 'cyan',
   stripe: 'violet',
+  creem: 'green',
+  waffo: 'light-blue',
   waffo_pancake: 'amber',
 };
 
@@ -84,6 +86,10 @@ function getPaymentTypeLabel(type, t) {
       return t('XORPay WeChat in-app (JSAPI)');
     case 'stripe':
       return t('Stripe one-time Checkout');
+    case 'creem':
+      return t('Creem');
+    case 'waffo':
+      return t('Waffo');
     case 'waffo_pancake':
       return 'Waffo Pancake';
     default:
@@ -108,7 +114,7 @@ function getPaymentDraftError(code, t) {
     case 'duplicate_payment_method':
       return t('This provider already has the same payment type key.');
     case 'too_many_payment_methods':
-      return t('No more than 20 payment methods can be configured.');
+      return t('No more than 27 payment methods can be configured.');
     default:
       return '';
   }

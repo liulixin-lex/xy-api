@@ -232,3 +232,39 @@ func TestCurrentOnlyCredentialDisablePreviewSupportsRetainedProviders(t *testing
 		})
 	}
 }
+
+func TestPaymentOperationsOverviewReturnsStableSchemaError(t *testing.T) {
+	setupModelListControllerTestDB(t)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/option/payment/overview", nil)
+
+	GetPaymentOperationsOverview(context)
+
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.JSONEq(t, `{"success":false,"code":"payment_operations_schema_not_ready"}`, recorder.Body.String())
+	assert.NotContains(t, recorder.Body.String(), "no such table")
+}
+
+func TestPaymentOperationsOverviewReturnsCompleteEmptySnapshot(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.Option{},
+		&model.PaymentOrder{},
+		&model.PaymentTask{},
+		&model.PaymentEvent{},
+		&model.PaymentLimitReservation{},
+		&model.SystemInstance{},
+	))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/option/payment/overview", nil)
+
+	GetPaymentOperationsOverview(context)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), `"operations":{`)
+	assert.Contains(t, recorder.Body.String(), `"runtime":{`)
+	assert.Contains(t, recorder.Body.String(), `"cluster":{`)
+	assert.Contains(t, recorder.Body.String(), `"preparing_orders":0`)
+}

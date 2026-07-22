@@ -81,6 +81,12 @@ type PaymentStart struct {
 	ProviderPaymentKey string                  `json:"-"`
 	Provider           string                  `json:"-"`
 	PaymentMethod      string                  `json:"-"`
+	// CreationUncertain is encrypted inside PaymentOrder.StartPayload and is
+	// never projected to the public checkout response. It records that the
+	// provider accepted a durable order identity but did not return usable
+	// browser instructions, so reconciliation must query rather than create.
+	CreationUncertain bool   `json:"creation_uncertain,omitempty"`
+	RecoveryReason    string `json:"recovery_reason,omitempty"`
 }
 
 type PaymentJSAPIParameters struct {
@@ -314,6 +320,9 @@ func ValidatePaymentProviderForCreate(providerName, paymentMethod string) error 
 	if err := provider.ValidateMethod(paymentMethod); err != nil {
 		return err
 	}
+	if !publicPaymentRouteConfiguredLocked(providerName, paymentMethod) {
+		return ErrPublicPaymentRouteNotFound
+	}
 	switch providerName {
 	case model.PaymentProviderEpay:
 		if strings.TrimSpace(operation_setting.PayAddress) == "" || strings.TrimSpace(operation_setting.EpayId) == "" || strings.TrimSpace(operation_setting.EpayKey) == "" {
@@ -365,6 +374,57 @@ func ValidatePaymentProviderForCreate(providerName, paymentMethod string) error 
 	return nil
 }
 
+// ValidatePaymentRouteForOrderKind keeps the public route projection aligned
+// with the same provider, callback, catalog, and pricing gates enforced when a
+// quote is created. Callers read it while holding the payment configuration
+// snapshot lock so a route cannot be advertised from a mixed configuration.
+func ValidatePaymentRouteForOrderKind(providerName, paymentMethod, orderKind string) error {
+	if err := ValidatePaymentProviderForCreate(providerName, paymentMethod); err != nil {
+		return err
+	}
+	return ValidatePaymentPricingForOrderKind(providerName, orderKind)
+}
+
+// ValidateSubscriptionPlanForPaymentRoute applies the exact provider and plan
+// contract used by subscription quote creation. Callers that project public
+// routes must hold the payment-configuration read lock so every provider
+// setting is read from the same snapshot as the route catalog.
+func ValidateSubscriptionPlanForPaymentRoute(providerName, paymentMethod string, plan *model.SubscriptionPlan) error {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	paymentMethod = NormalizePaymentMethod(providerName, paymentMethod)
+	if err := ValidatePaymentRouteForOrderKind(providerName, paymentMethod, model.PaymentOrderKindSubscription); err != nil {
+		return err
+	}
+	_, err := subscriptionQuoteTermsForPlan(providerName, plan)
+	return err
+}
+
+// ValidatePaymentPricingForOrderKind is the shared non-mutating pricing gate
+// used by both gateway readiness and quote creation. Product-priced Creem
+// top-ups and plans keep their selector-specific validation at quote time.
+func ValidatePaymentPricingForOrderKind(providerName, orderKind string) error {
+	switch orderKind {
+	case model.PaymentOrderKindTopUp:
+		// Creem top-ups use a selected fixed product rather than the shared
+		// unit-price model. Product validation remains at the selector boundary.
+		if providerName == model.PaymentProviderCreem {
+			return nil
+		}
+		_, _, _, err := paymentProviderPricing(providerName)
+		return err
+	case model.PaymentOrderKindSubscription:
+		// A Creem plan supplies its own USD/EUR currency. The plan-specific
+		// product and price contract is validated when the quote is built.
+		if providerName == model.PaymentProviderCreem {
+			return nil
+		}
+		_, _, err := paymentSubscriptionPricing(providerName, nil)
+		return err
+	default:
+		return errors.New("invalid payment order kind")
+	}
+}
+
 func CreatePaymentQuote(ctx context.Context, userID int, request PaymentQuoteRequest) (*PaymentQuoteView, error) {
 	_ = ctx
 	quote, view, err := buildPaymentQuote(userID, request)
@@ -392,7 +452,7 @@ func buildPaymentQuote(userID int, request PaymentQuoteRequest) (*model.PaymentQ
 	request.OrderKind = strings.ToLower(strings.TrimSpace(request.OrderKind))
 	request.Provider = strings.ToLower(strings.TrimSpace(request.Provider))
 	request.PaymentMethod = NormalizePaymentMethod(request.Provider, request.PaymentMethod)
-	if err := ValidatePaymentProviderForCreate(request.Provider, request.PaymentMethod); err != nil {
+	if err := ValidatePaymentRouteForOrderKind(request.Provider, request.PaymentMethod, request.OrderKind); err != nil {
 		return nil, nil, err
 	}
 
@@ -588,6 +648,47 @@ func fillTopUpQuote(quote *model.PaymentQuote, amount int64) (decimal.Decimal, e
 	return payable, nil
 }
 
+type subscriptionQuoteTerms struct {
+	payable      decimal.Decimal
+	unitPrice    float64
+	currency     string
+	planSnapshot *model.SubscriptionPlanSnapshot
+}
+
+func subscriptionQuoteTermsForPlan(provider string, plan *model.SubscriptionPlan) (*subscriptionQuoteTerms, error) {
+	if plan == nil {
+		return nil, errors.New("subscription plan is required")
+	}
+	if err := model.ValidateSubscriptionPlanForExternalPayment(plan); err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(plan.Currency), "USD") {
+		return nil, errors.New("external payment subscription plans must use USD as the base currency")
+	}
+	unitPrice, currency, err := paymentSubscriptionPricing(provider, plan)
+	if err != nil {
+		return nil, err
+	}
+	payable := decimal.NewFromFloat(plan.PriceAmount).Mul(decimal.NewFromFloat(unitPrice))
+	minimum, err := minimumPaymentAmount(provider, currency)
+	if err != nil {
+		return nil, err
+	}
+	if payable.LessThan(minimum) {
+		return nil, errors.New("payment amount is too low")
+	}
+	planSnapshot, err := model.NewSubscriptionPlanSnapshot(plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRetainedSubscriptionSnapshot(provider, planSnapshot); err != nil {
+		return nil, err
+	}
+	return &subscriptionQuoteTerms{
+		payable: payable, unitPrice: unitPrice, currency: currency, planSnapshot: planSnapshot,
+	}, nil
+}
+
 func fillSubscriptionQuote(quote *model.PaymentQuote, planID int) (decimal.Decimal, error) {
 	if planID <= 0 {
 		return decimal.Zero, errors.New("invalid subscription plan")
@@ -596,50 +697,29 @@ func fillSubscriptionQuote(quote *model.PaymentQuote, planID int) (decimal.Decim
 	if err != nil {
 		return decimal.Zero, err
 	}
-	if err := model.ValidateSubscriptionPlanForExternalPayment(plan); err != nil {
-		return decimal.Zero, err
-	}
-	if !strings.EqualFold(strings.TrimSpace(plan.Currency), "USD") {
-		return decimal.Zero, errors.New("external payment subscription plans must use USD as the base currency")
-	}
-	unitPrice, currency, err := paymentSubscriptionPricing(quote.Provider, plan)
+	terms, err := subscriptionQuoteTermsForPlan(quote.Provider, plan)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	payable := decimal.NewFromFloat(plan.PriceAmount).Mul(decimal.NewFromFloat(unitPrice))
-	minimum, err := minimumPaymentAmount(quote.Provider, currency)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	if payable.LessThan(minimum) {
-		return decimal.Zero, errors.New("payment amount is too low")
-	}
-	planSnapshot, err := model.NewSubscriptionPlanSnapshot(plan)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	productSnapshot, err := common.Marshal(planSnapshot)
+	productSnapshot, err := common.Marshal(terms.planSnapshot)
 	if err != nil {
 		return decimal.Zero, err
 	}
 	pricingSnapshot, err := common.Marshal(map[string]interface{}{
 		"base_price":    decimal.NewFromFloat(plan.PriceAmount).String(),
 		"base_currency": strings.ToUpper(strings.TrimSpace(plan.Currency)),
-		"unit_price":    decimal.NewFromFloat(unitPrice).String(),
-		"currency":      currency,
+		"unit_price":    decimal.NewFromFloat(terms.unitPrice).String(),
+		"currency":      terms.currency,
 	})
 	if err != nil {
 		return decimal.Zero, err
 	}
 	quote.RequestedAmount = int64(planID)
 	quote.CreditQuota = plan.TotalAmount
-	quote.Currency = currency
+	quote.Currency = terms.currency
 	quote.PricingSnapshot = string(pricingSnapshot)
 	quote.ProductSnapshot = string(productSnapshot)
-	if err := validateRetainedSubscriptionSnapshot(quote.Provider, planSnapshot); err != nil {
-		return decimal.Zero, err
-	}
-	return payable, nil
+	return terms.payable, nil
 }
 
 func minimumPaymentAmount(provider, currency string) (decimal.Decimal, error) {

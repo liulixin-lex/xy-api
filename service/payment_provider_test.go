@@ -848,7 +848,7 @@ func TestXorPayStartRetryUsesTheOrderBoundPreviousCredential(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"status":"ok","aoid":"AOID_RETRY_PREVIOUS","expires_in":600,"info":{"qr":"weixin://wxpay/example"}}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok","aoid":"AOID_RETRY_PREVIOUS","expires_in":600,"info":{"qr":"weixin://wxpay/bizpayurl?pr=safe_retry_token"}}`)),
 			Request:    request,
 		}, nil
 	})}}
@@ -1131,18 +1131,145 @@ func TestXorPayRejectsInvalidProviderConfigurationBeforeNetworkAccess(t *testing
 }
 
 func TestXorPayQRValidationUsesAProviderSpecificAllowlist(t *testing.T) {
-	require.NoError(t, validateXorPayQR(setting.XorPayMethodNative, "weixin://wxpay/example"))
-	require.NoError(t, validateXorPayQR(setting.XorPayMethodAlipay, "https://qr.alipay.com/example"))
+	for _, test := range []struct {
+		method string
+		value  string
+	}{
+		{setting.XorPayMethodNative, "weixin://wxpay/bizpayurl?pr=safe_token"},
+		{setting.XorPayMethodNative, "http://ipay.yltg.com.cn/pay/safe_token"},
+		{setting.XorPayMethodNative, "https://ipay.yltg.com.cn/pay/safe_token"},
+		{setting.XorPayMethodAlipay, "https://qr.alipay.com/safe_token"},
+		{setting.XorPayMethodAlipay, "https://ipay.yltg.com.cn/pay/safe_token"},
+	} {
+		require.NoError(t, validateXorPayQR(test.method, test.value), test.value)
+	}
 
 	for _, value := range []string{
 		"weixin://example",
+		"javascript:alert(1)",
 		"https://xorpay.com/qr/example",
 		"https://qr.alipay.com.evil.example/",
+		"https://evil.ipay.yltg.com.cn/pay/example",
+		"https://ipay.yltg.com.cn.evil.example/pay/example",
+		"https://ipay.yltg.com.cn./pay/example",
 		"https://user:pass@qr.alipay.com/example",
+		"https://user:pass@ipay.yltg.com.cn/pay/example",
 		"https://qr.alipay.com:8443/example",
+		"https://qr.alipay.com/safe_token?redirect=https%3A%2F%2Fevil.example",
+		"https://qr.alipay.com//evil.example",
+		"https://qr.alipay.com/https://evil.example",
+		"https://qr.alipay.com/../redirect",
+		"https://qr.alipay.com/%2F%2Fevil.example",
+		"https://qr.alipay.com/%2e%2e/redirect",
+		"https://ipay.yltg.com.cn:8443/pay/example",
+		"https://ipay.yltg.com.cn:443/pay/example",
+		"https://ipay.yltg.com.cn/pay/example#fragment",
+		"https://ipay.yltg.com.cn/pay/example?redirect=https%3A%2F%2Fevil.example",
+		"https://ipay.yltg.com.cn/pay/example?%2572edirect=safe_token",
+		"https://ipay.yltg.com.cn/pay/example?next=%2F%2Fevil.example",
+		"https://ipay.yltg.com.cn/pay/example?token=%252F%252Fevil.example",
+		"https://ipay.yltg.com.cn/pay/example?token=%250d%250aLocation%253A%2520https%253A%252F%252Fevil.example",
+		"https://ipay.yltg.com.cn/pay/example?token=safe_token",
+		"https://ipay.yltg.com.cn/pay/example?token=javascript%3Aalert%281%29",
+		"https://ipay.yltg.com.cn/pay/example?token=data%3Atext%2Fhtml%2Cunsafe",
+		"https://ipay.yltg.com.cn/pay/example?url%5B%5D=safe_token",
+		"https://ipay.yltg.com.cn/pay/example?token=%zz",
+		"https://ipay.yltg.com.cn/https://evil.example",
+		"https://ipay.yltg.com.cn/pay/../redirect",
+		" https://ipay.yltg.com.cn/pay/example",
+		"https://ipay.yltg.com.cn/pay/example\\evil",
+		"weixin://wxpay/bizpayurl?pr=safe_token&redirect=https%3A%2F%2Fevil.example",
+		"weixin://wxpay/bizpayurl?pr=javascript%3Aalert%281%29",
+		"weixin://wxpay/other?pr=safe_token",
 	} {
+		assert.Error(t, validateXorPayQR(setting.XorPayMethodNative, value), value)
 		assert.Error(t, validateXorPayQR(setting.XorPayMethodAlipay, value), value)
 	}
+	require.Error(t, validateXorPayQR("unknown", "https://qr.alipay.com/safe_token"))
+	require.Error(t, validateXorPayQR(setting.XorPayMethodAlipay, "http://ipay.yltg.com.cn/pay/safe_token"))
+	require.Error(t, validateXorPayQR("unknown", "https://ipay.yltg.com.cn/pay/safe_token"))
+}
+
+func TestXorPayExpirationAcceptsNumbersAndNumericStrings(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		want        int64
+		wantWarning bool
+	}{
+		{name: "number", payload: `{"expires_in":300}`, want: 300},
+		{name: "numeric string", payload: `{"expires_in":"300"}`, want: 300},
+		{name: "legacy numeric string", payload: `{"expire_in":"301"}`, want: 301},
+		{name: "matching aliases", payload: `{"expires_in":"302","expire_in":302}`, want: 302},
+		{name: "missing", payload: `{}`, want: xorPayDefaultExpiry},
+		{name: "null", payload: `{"expires_in":null}`, want: xorPayDefaultExpiry},
+		{name: "empty", payload: `{"expires_in":""}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "non numeric", payload: `{"expires_in":"five"}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "fraction", payload: `{"expires_in":1.5}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "negative", payload: `{"expires_in":-1}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "zero", payload: `{"expires_in":0}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "too large", payload: `{"expires_in":86401}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "overflow", payload: `{"expires_in":"9223372036854775808"}`, want: xorPayDefaultExpiry, wantWarning: true},
+		{name: "conflict", payload: `{"expires_in":300,"expire_in":301}`, want: xorPayDefaultExpiry, wantWarning: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var response xorPayCreateResponse
+			require.NoError(t, common.UnmarshalJsonStr(test.payload, &response))
+			got, warning := xorPayExpirationSeconds(response.ExpiresIn, response.ExpireIn)
+			assert.Equal(t, test.want, got)
+			if test.wantWarning {
+				assert.Error(t, warning)
+			} else {
+				assert.NoError(t, warning)
+			}
+		})
+	}
+}
+
+func TestXorPayCreateAcceptsRealStringExpiryAndHostedQR(t *testing.T) {
+	originalAid, originalSecret := setting.XorPayAid, setting.XorPayAppSecret
+	originalGeneration := setting.XorPayCredentialGeneration
+	originalCurrency := setting.XorPayCurrency
+	originalMethods := setting.XorPayEnabledMethods
+	originalCallback := operation_setting.CustomCallbackAddress
+	t.Cleanup(func() {
+		setting.XorPayAid, setting.XorPayAppSecret = originalAid, originalSecret
+		setting.XorPayCredentialGeneration = originalGeneration
+		setting.XorPayCurrency = originalCurrency
+		setting.XorPayEnabledMethods = originalMethods
+		operation_setting.CustomCallbackAddress = originalCallback
+	})
+	setting.XorPayAid = "aid_real_contract"
+	setting.XorPayAppSecret = "xorpay_real_contract_secret"
+	setting.XorPayCredentialGeneration = 42
+	setting.XorPayCurrency = "CNY"
+	setting.XorPayEnabledMethods = []string{setting.XorPayMethodNative}
+	operation_setting.CustomCallbackAddress = "https://api.example.com"
+
+	provider := &xorPayProvider{client: &http.Client{Transport: paymentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"status":"ok","aoid":"AOID_REAL_42","expires_in":"300","info":{"qr":"http://ipay.yltg.com.cn/pay/safe_token"}}`,
+			)),
+			Request: request,
+		}, nil
+	})}}
+	now := time.Now().Unix()
+	start, err := provider.Create(t.Context(), &model.PaymentOrder{
+		TradeNo: "PO_XORPAY_REAL_CONTRACT", OrderKind: model.PaymentOrderKindTopUp,
+		Provider: model.PaymentProviderXorPay, PaymentMethod: model.PaymentMethodXorPayNative,
+		Currency: "CNY", ExpectedAmountMinor: 100, ProviderCredentialGeneration: 42,
+		ExpiresAt: now + 600,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, PaymentFlowQR, start.Flow)
+	assert.Equal(t, "http://ipay.yltg.com.cn/pay/safe_token", start.QRContent)
+	assert.Equal(t, "xorpay:AOID_REAL_42", start.ProviderOrderKey)
+	assert.GreaterOrEqual(t, start.ExpiresAt, now+299)
+	assert.LessOrEqual(t, start.ExpiresAt, now+301)
 }
 
 func TestXorPayJSAPICreateUsesEncryptedBrowserAuthorization(t *testing.T) {

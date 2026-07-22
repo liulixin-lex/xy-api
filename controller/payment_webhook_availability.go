@@ -37,7 +37,8 @@ func isStripeTopUpEnabledLocked() bool {
 		strings.TrimSpace(setting.StripeCredentialAccountId) != "" &&
 		(setting.StripeCredentialLivemode == "test" || setting.StripeCredentialLivemode == "live") &&
 		setting.StripeCredentialModeAllowed(setting.StripeCredentialLivemode) &&
-		setting.StripeWebhookCredentialLivemode == setting.StripeCredentialLivemode
+		setting.StripeWebhookCredentialLivemode == setting.StripeCredentialLivemode &&
+		service.ValidatePaymentPricingForOrderKind(model.PaymentProviderStripe, model.PaymentOrderKindTopUp) == nil
 }
 
 func isStripeWebhookConfigured() bool {
@@ -62,13 +63,16 @@ func isCreemTopUpEnabledLocked() bool {
 		return false
 	}
 	products := strings.TrimSpace(setting.CreemProducts)
-	return strings.TrimSpace(setting.CreemApiKey) != "" &&
-		products != "" &&
-		products != "[]"
+	if strings.TrimSpace(setting.CreemApiKey) == "" || products == "" || products == "[]" {
+		return false
+	}
+	parsed, err := parseValidatedCreemProducts(products)
+	return err == nil && len(parsed) > 0
 }
 
 func isCreemCheckoutEnabledLocked() bool {
 	return isPaymentComplianceConfirmedLocked() && model.PaymentSecretStorageReady() &&
+		service.ValidatePaymentCallbackOrigin(operation_setting.CustomCallbackAddress, true) == nil &&
 		strings.TrimSpace(setting.CreemApiKey) != "" &&
 		strings.TrimSpace(setting.CreemWebhookSecret) != ""
 }
@@ -93,6 +97,10 @@ func isWaffoTopUpEnabled() bool {
 
 func isWaffoTopUpEnabledLocked() bool {
 	if !isPaymentComplianceConfirmedLocked() || !model.PaymentSecretStorageReady() {
+		return false
+	}
+	if service.ValidatePaymentCallbackOrigin(operation_setting.CustomCallbackAddress, true) != nil ||
+		service.ValidatePaymentPricingForOrderKind(model.PaymentProviderWaffo, model.PaymentOrderKindTopUp) != nil {
 		return false
 	}
 	if !setting.WaffoEnabled {
@@ -133,11 +141,16 @@ func isWaffoPancakeTopUpEnabledLocked() bool {
 	if !isPaymentComplianceConfirmedLocked() || !model.PaymentSecretStorageReady() {
 		return false
 	}
+	if service.ValidatePaymentCallbackOrigin(operation_setting.CustomCallbackAddress, true) != nil ||
+		service.ValidatePaymentPricingForOrderKind(model.PaymentProviderWaffoPancake, model.PaymentOrderKindTopUp) != nil {
+		return false
+	}
 	// Presence-of-credentials = enabled. Webhook public keys ship inside
 	// the SDK; mode (test/prod) is read from each event.
 	return strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" &&
 		strings.TrimSpace(setting.WaffoPancakePrivateKey) != "" &&
-		strings.TrimSpace(setting.WaffoPancakeProductID) != ""
+		strings.TrimSpace(setting.WaffoPancakeProductID) != "" &&
+		strings.TrimSpace(setting.WaffoPancakeStoreID) != ""
 }
 
 func isWaffoPancakeWebhookConfigured() bool {
@@ -168,7 +181,8 @@ func isEpayTopUpEnabledLocked() bool {
 	return strings.TrimSpace(operation_setting.EpayId) != "" && strings.TrimSpace(operation_setting.EpayKey) != "" &&
 		strings.TrimSpace(operation_setting.CustomCallbackAddress) != "" &&
 		strings.TrimSpace(operation_setting.PayAddress) != "" && len(operation_setting.PayMethods) > 0 &&
-		strings.EqualFold(strings.TrimSpace(operation_setting.EpayCurrency), "CNY")
+		strings.EqualFold(strings.TrimSpace(operation_setting.EpayCurrency), "CNY") &&
+		service.ValidatePaymentPricingForOrderKind(model.PaymentProviderEpay, model.PaymentOrderKindTopUp) == nil
 }
 
 func isEpayWebhookConfigured() bool {
@@ -199,7 +213,8 @@ func isXorPayTopUpEnabledLocked() bool {
 		strings.TrimSpace(setting.XorPayAppSecret) != "" &&
 		strings.TrimSpace(operation_setting.CustomCallbackAddress) != "" &&
 		strings.EqualFold(strings.TrimSpace(setting.XorPayCurrency), "CNY") &&
-		len(setting.XorPayEnabledMethods) > 0
+		len(setting.XorPayEnabledMethods) > 0 &&
+		service.ValidatePaymentPricingForOrderKind(model.PaymentProviderXorPay, model.PaymentOrderKindTopUp) == nil
 }
 
 func isXorPayWebhookEnabled() bool {

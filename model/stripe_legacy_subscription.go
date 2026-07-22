@@ -21,11 +21,53 @@ const (
 	StripeLegacyMappingAmbiguousUser = "ambiguous_user"
 	StripeLegacyMappingAmbiguousPlan = "ambiguous_plan"
 
-	StripeLegacySyncSourceWebhook  = "webhook"
-	StripeLegacySyncSourceAPI      = "api_sync"
-	StripeLegacySyncSourceCheckout = "checkout"
-	maxStripeLegacyPriceIDs        = 100
+	StripeLegacySyncSourceWebhook                         = "webhook"
+	StripeLegacySyncSourceAPI                             = "api_sync"
+	StripeLegacySyncSourceCheckout                        = "checkout"
+	PaymentOperationsActionStripeLegacySubscriptionCancel = "payment.stripe_legacy_subscription_cancel_at_period_end"
+	maxStripeLegacyPriceIDs                               = 100
 )
+
+var (
+	ErrStripeLegacyInventorySchemaNotReady    = errors.New("Stripe legacy inventory schema is not ready")
+	ErrStripeLegacyInventoryFilterInvalid     = errors.New("Stripe legacy inventory filter is invalid")
+	ErrStripeLegacySubscriptionNotFound       = errors.New("Stripe legacy subscription not found")
+	ErrStripeLegacySubscriptionCancelInvalid  = errors.New("Stripe legacy subscription cancellation is invalid")
+	ErrStripeLegacySubscriptionCancelConflict = errors.New("Stripe legacy subscription cancellation conflicted")
+)
+
+type StripeLegacySubscriptionCancellationInput struct {
+	InventoryID       int64
+	ExpectedUpdatedAt int64
+	AdminID           int
+	ActorIP           string
+	Reason            string
+	AccountID         string
+	CredentialMode    string
+	Snapshot          StripeLegacySubscriptionSnapshot
+}
+
+type StripeLegacySubscriptionCancellationResult struct {
+	Subscription *StripeLegacySubscription
+	Duplicate    bool
+}
+
+func EnsureStripeLegacyInventorySchema() error {
+	if DB == nil {
+		return errors.New("Stripe legacy inventory database is unavailable")
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return err
+	}
+	if err := sqlDB.Ping(); err != nil {
+		return err
+	}
+	if !DB.Migrator().HasTable(&StripeLegacySubscription{}) {
+		return ErrStripeLegacyInventorySchemaNotReady
+	}
+	return nil
+}
 
 // StripeLegacySubscription is a read-only local inventory of recurring Stripe
 // subscriptions. It is deliberately separate from UserSubscription: observing
@@ -74,7 +116,7 @@ type StripeLegacySubscription struct {
 	LastSyncedAt            int64  `json:"last_synced_at"`
 	SyncSource              string `json:"sync_source" gorm:"type:varchar(32)"`
 	CreatedAt               int64  `json:"created_at"`
-	UpdatedAt               int64  `json:"updated_at"`
+	UpdatedAt               int64  `json:"updated_at" gorm:"autoUpdateTime:false"`
 }
 
 func (s *StripeLegacySubscription) BeforeCreate(_ *gorm.DB) error {
@@ -87,7 +129,11 @@ func (s *StripeLegacySubscription) BeforeCreate(_ *gorm.DB) error {
 }
 
 func (s *StripeLegacySubscription) BeforeUpdate(_ *gorm.DB) error {
-	s.UpdatedAt = time.Now().Unix()
+	now := time.Now().Unix()
+	if now <= s.UpdatedAt {
+		now = s.UpdatedAt + 1
+	}
+	s.UpdatedAt = now
 	return nil
 }
 
@@ -355,6 +401,170 @@ func UpsertStripeLegacySubscription(snapshot StripeLegacySubscriptionSnapshot) (
 		return nil, err
 	}
 	return &result, nil
+}
+
+func GetStripeLegacySubscriptionByID(inventoryID int64) (*StripeLegacySubscription, error) {
+	if inventoryID <= 0 {
+		return nil, ErrStripeLegacySubscriptionCancelInvalid
+	}
+	var inventory StripeLegacySubscription
+	if err := DB.First(&inventory, inventoryID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrStripeLegacySubscriptionNotFound
+		}
+		return nil, err
+	}
+	return &inventory, nil
+}
+
+// FindStripeLegacySubscriptionCancellationRetry recognizes an already
+// committed operator request before another provider call is attempted. The
+// immutable audit row is the idempotency evidence; a changed administrator or
+// reason is a conflict rather than a new cancellation request.
+func FindStripeLegacySubscriptionCancellationRetry(inventoryID, expectedUpdatedAt int64, adminID int, reason string) (*StripeLegacySubscriptionCancellationResult, error) {
+	reason = strings.TrimSpace(reason)
+	if inventoryID <= 0 || expectedUpdatedAt <= 0 || adminID <= 0 || len(reason) < 8 || len(reason) > 512 {
+		return nil, ErrStripeLegacySubscriptionCancelInvalid
+	}
+	var audit PaymentOperationsAudit
+	query := DB.Where(
+		"action = ? AND subject_id = ? AND expected_version = ?",
+		PaymentOperationsActionStripeLegacySubscriptionCancel, inventoryID, expectedUpdatedAt,
+	).Limit(1).Find(&audit)
+	if query.Error != nil {
+		return nil, query.Error
+	}
+	if query.RowsAffected == 0 {
+		return nil, nil
+	}
+	if audit.AdminID != adminID || audit.Reason != reason {
+		return nil, fmt.Errorf("%w: administrator retry payload changed", ErrStripeLegacySubscriptionCancelConflict)
+	}
+	inventory, err := GetStripeLegacySubscriptionByID(inventoryID)
+	if err != nil {
+		return nil, err
+	}
+	return &StripeLegacySubscriptionCancellationResult{Subscription: inventory, Duplicate: true}, nil
+}
+
+// HasStripeLegacySubscriptionCancellationAudit distinguishes recovery after a
+// lost provider response from a stale request against an already-audited
+// cancellation. It never treats the mutable inventory flag alone as proof of
+// which administrator initiated an earlier provider-side change.
+func HasStripeLegacySubscriptionCancellationAudit(inventoryID int64) (bool, error) {
+	if inventoryID <= 0 {
+		return false, ErrStripeLegacySubscriptionCancelInvalid
+	}
+	var count int64
+	err := DB.Model(&PaymentOperationsAudit{}).Where(
+		"action = ? AND subject_id = ?",
+		PaymentOperationsActionStripeLegacySubscriptionCancel, inventoryID,
+	).Count(&count).Error
+	return count > 0, err
+}
+
+// PersistStripeLegacySubscriptionCancellation stores the authoritative Stripe
+// response and its privileged operator audit in one primary-database
+// transaction. It never modifies local entitlement or quota projections.
+func PersistStripeLegacySubscriptionCancellation(input StripeLegacySubscriptionCancellationInput) (*StripeLegacySubscriptionCancellationResult, error) {
+	input.ActorIP = strings.TrimSpace(input.ActorIP)
+	input.Reason = strings.TrimSpace(input.Reason)
+	input.AccountID = strings.TrimSpace(input.AccountID)
+	input.CredentialMode = strings.ToLower(strings.TrimSpace(input.CredentialMode))
+	if input.InventoryID <= 0 || input.ExpectedUpdatedAt <= 0 || input.AdminID <= 0 ||
+		input.ActorIP == "" || len(input.ActorIP) > 64 || len(input.Reason) < 8 || len(input.Reason) > 512 ||
+		(input.CredentialMode != "test" && input.CredentialMode != "live") {
+		return nil, ErrStripeLegacySubscriptionCancelInvalid
+	}
+	if _, err := normalizeStripeInventoryID(input.AccountID, "acct_", 128); err != nil {
+		return nil, ErrStripeLegacySubscriptionCancelInvalid
+	}
+	if err := validateStripeLegacySubscriptionSnapshot(&input.Snapshot); err != nil ||
+		!input.Snapshot.FullState || !input.Snapshot.CancelAtPeriodEnd {
+		return nil, ErrStripeLegacySubscriptionCancelInvalid
+	}
+
+	result := &StripeLegacySubscriptionCancellationResult{}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var inventory StripeLegacySubscription
+		if err := lockForUpdate(tx).First(&inventory, input.InventoryID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrStripeLegacySubscriptionNotFound
+			}
+			return err
+		}
+
+		var existingAudit PaymentOperationsAudit
+		auditQuery := tx.Where(
+			"action = ? AND subject_id = ? AND expected_version = ?",
+			PaymentOperationsActionStripeLegacySubscriptionCancel, inventory.ID, input.ExpectedUpdatedAt,
+		).Limit(1).Find(&existingAudit)
+		if auditQuery.Error != nil {
+			return auditQuery.Error
+		}
+		if auditQuery.RowsAffected == 1 {
+			if existingAudit.AdminID != input.AdminID || existingAudit.Reason != input.Reason {
+				return fmt.Errorf("%w: administrator retry payload changed", ErrStripeLegacySubscriptionCancelConflict)
+			}
+			result.Subscription = &inventory
+			result.Duplicate = true
+			return nil
+		}
+
+		if inventory.StripeSubscriptionID != input.Snapshot.StripeSubscriptionID ||
+			inventory.Livemode != input.Snapshot.Livemode ||
+			inventory.StripeCustomerID != "" && inventory.StripeCustomerID != input.Snapshot.StripeCustomerID {
+			return fmt.Errorf("%w: Stripe subscription identity changed", ErrStripeLegacySubscriptionCancelConflict)
+		}
+		inventoryAdvanced := inventory.UpdatedAt != input.ExpectedUpdatedAt || inventory.StateObservedAt > input.Snapshot.StateObservedAt
+		if inventoryAdvanced {
+			if !inventory.CancelAtPeriodEnd {
+				return fmt.Errorf("%w: inventory snapshot changed", ErrStripeLegacySubscriptionCancelConflict)
+			}
+		} else {
+			mergeStripeLegacySubscriptionSnapshot(&inventory, input.Snapshot)
+			if !inventory.CancelAtPeriodEnd {
+				return fmt.Errorf("%w: Stripe response did not schedule cancellation", ErrStripeLegacySubscriptionCancelConflict)
+			}
+			if err := resolveStripeLegacyMappingTx(tx, &inventory, input.Snapshot.MetadataUserID, input.Snapshot.MetadataPlanID, false); err != nil {
+				return err
+			}
+			if err := tx.Save(&inventory).Error; err != nil {
+				return err
+			}
+		}
+		userID := 0
+		if inventory.UserID != nil {
+			userID = *inventory.UserID
+		}
+		if err := createPaymentOperationsAuditTx(tx, PaymentOperationsAudit{
+			Action:          PaymentOperationsActionStripeLegacySubscriptionCancel,
+			AdminID:         input.AdminID,
+			ActorIP:         input.ActorIP,
+			UserID:          userID,
+			SubjectID:       inventory.ID,
+			Provider:        PaymentProviderStripe,
+			ExpectedVersion: input.ExpectedUpdatedAt,
+			Reason:          input.Reason,
+		}, map[string]interface{}{
+			"stripe_subscription_id": inventory.StripeSubscriptionID,
+			"stripe_account_id":      input.AccountID,
+			"credential_mode":        input.CredentialMode,
+			"cancel_at_period_end":   inventory.CancelAtPeriodEnd,
+			"cancel_at":              inventory.CancelAt,
+			"current_period_end":     inventory.CurrentPeriodEnd,
+			"status":                 inventory.Status,
+			"inventory_advanced":     inventoryAdvanced,
+		}); err != nil {
+			return err
+		}
+		result.Subscription = &inventory
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func mergeStripeLegacySubscriptionSnapshot(inventory *StripeLegacySubscription, snapshot StripeLegacySubscriptionSnapshot) {
@@ -720,6 +930,9 @@ func ListStripeLegacySubscriptions(filter StripeLegacySubscriptionFilter, pageIn
 	if pageInfo == nil {
 		return nil, 0, errors.New("page information is required")
 	}
+	if err := EnsureStripeLegacyInventorySchema(); err != nil {
+		return nil, 0, err
+	}
 	query := DB.Model(&StripeLegacySubscription{})
 	if filter.UserID > 0 {
 		query = query.Where("user_id = ?", filter.UserID)
@@ -736,14 +949,14 @@ func ListStripeLegacySubscriptions(filter StripeLegacySubscriptionFilter, pageIn
 	if rawCustomerID := strings.TrimSpace(filter.CustomerID); rawCustomerID != "" {
 		customerID := normalizeStripeOptionalID(rawCustomerID, "cus_", 128)
 		if customerID == "" {
-			return nil, 0, errors.New("invalid Stripe customer ID")
+			return nil, 0, fmt.Errorf("%w: invalid Stripe customer ID", ErrStripeLegacyInventoryFilterInvalid)
 		}
 		query = query.Where("stripe_customer_id = ?", customerID)
 	}
 	if rawSubscriptionID := strings.TrimSpace(filter.SubscriptionID); rawSubscriptionID != "" {
 		subscriptionID := normalizeStripeOptionalID(rawSubscriptionID, "sub_", 128)
 		if subscriptionID == "" {
-			return nil, 0, errors.New("invalid Stripe subscription ID")
+			return nil, 0, fmt.Errorf("%w: invalid Stripe subscription ID", ErrStripeLegacyInventoryFilterInvalid)
 		}
 		query = query.Where("stripe_subscription_id = ?", subscriptionID)
 	}

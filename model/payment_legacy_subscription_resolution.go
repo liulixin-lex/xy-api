@@ -53,12 +53,18 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 			return err
 		}
 		result.Event = &providerEvent
+		if providerEvent.Provider == PaymentProviderStripe {
+			if normalized, err := normalizeStripeInventoryID(input.ProviderRefundReference, "re_", 128); err != nil ||
+				normalized != input.ProviderRefundReference || len(normalized) <= len("re_") {
+				return ErrPaymentAuditInvalid
+			}
+		}
 
 		payload, err := legacySubscriptionResolutionPayload(input, &providerEvent)
 		if err != nil {
 			return err
 		}
-		adminEventKey := legacySubscriptionResolutionAdminEventKey(input)
+		adminEventKey := legacySubscriptionResolutionAdminEventKey(input, &providerEvent)
 		duplicate, err := processedAdminActionRetryTx(tx, adminEventKey, PaymentPayloadDigest(payload))
 		if err != nil {
 			return err
@@ -72,9 +78,11 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 			result.Duplicate = true
 			return nil
 		}
+		reviewCode := providerEvent.ReviewCode
 		if providerEvent.Status != PaymentEventStatusManualReview || providerEvent.PaymentOrderID != 0 ||
 			providerEvent.Attempts != input.ExpectedEventAttempts ||
-			providerEvent.ReviewCode != PaymentReviewCodeLegacySubscriptionContractUnavailable {
+			(reviewCode != PaymentReviewCodeLegacySubscriptionContractUnavailable &&
+				reviewCode != PaymentReviewCodeStripeLegacyRecurringCheckoutPaid) {
 			return fmt.Errorf("%w: legacy subscription event state changed", ErrPaymentAuditConflict)
 		}
 		subscription, err := lockLegacySubscriptionResolutionContractTx(tx, &providerEvent)
@@ -85,6 +93,11 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 		if err != nil {
 			return err
 		}
+		if providerEvent.Provider == PaymentProviderStripe {
+			if _, err := bindStripeCustomerTx(tx, order, providerEvent.CustomerID); err != nil {
+				return fmt.Errorf("%w: Stripe customer ownership changed", ErrPaymentAuditConflict)
+			}
+		}
 		result.Order = order
 		adminEvent, err := createAdminPaymentEventTx(tx, adminEventKey, PaymentOperationsActionLegacySubscriptionRefund, payload, order)
 		if err != nil {
@@ -92,7 +105,7 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 		}
 		claimed := tx.Model(&PaymentEvent{}).
 			Where("id = ? AND status = ? AND payment_order_id = ? AND attempts = ? AND review_code = ?", providerEvent.ID,
-				PaymentEventStatusManualReview, 0, input.ExpectedEventAttempts, PaymentReviewCodeLegacySubscriptionContractUnavailable).
+				PaymentEventStatusManualReview, 0, input.ExpectedEventAttempts, reviewCode).
 			Updates(map[string]interface{}{
 				"status": PaymentEventStatusProcessing, "review_code": "", "last_error": "",
 				"attempts": input.ExpectedEventAttempts + 1, "updated_at": common.GetTimestamp(),
@@ -125,7 +138,7 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 		metadata := legacySubscriptionResolutionAuditMetadata(input, &providerEvent, adminEvent, order, subscription)
 		return createPaymentOperationsAuditTx(tx, PaymentOperationsAudit{
 			Action: PaymentOperationsActionLegacySubscriptionRefund, AdminID: input.AdminID, ActorIP: input.ActorIP,
-			PaymentOrderID: order.ID, UserID: order.UserID, SubjectID: providerEvent.ID, Provider: PaymentProviderEpay,
+			PaymentOrderID: order.ID, UserID: order.UserID, SubjectID: providerEvent.ID, Provider: providerEvent.Provider,
 			ExpectedVersion: int64(input.ExpectedEventAttempts), Reason: input.Reason,
 		}, metadata)
 	})
@@ -136,10 +149,12 @@ func ResolveLegacySubscriptionPaymentEventByAdmin(input PaymentLegacySubscriptio
 }
 
 func lockLegacySubscriptionResolutionContractTx(tx *gorm.DB, event *PaymentEvent) (*SubscriptionOrder, error) {
-	if tx == nil || event == nil || event.ReviewCode != PaymentReviewCodeLegacySubscriptionContractUnavailable {
+	if tx == nil || event == nil ||
+		(event.ReviewCode != PaymentReviewCodeLegacySubscriptionContractUnavailable &&
+			event.ReviewCode != PaymentReviewCodeStripeLegacyRecurringCheckoutPaid) {
 		return nil, fmt.Errorf("%w: payment event is not classified as a legacy subscription contract incident", ErrPaymentAuditConflict)
 	}
-	if err := validateLegacyEpayEventEvidence(event); err != nil {
+	if err := validateLegacySubscriptionResolutionEventEvidence(event); err != nil {
 		return nil, err
 	}
 	var existingOrder PaymentOrder
@@ -161,8 +176,13 @@ func lockLegacySubscriptionResolutionContractTx(tx *gorm.DB, event *PaymentEvent
 		}
 		return nil, err
 	}
-	if err := validateLegacySubscriptionRefundEvidence(event, &subscription); err != nil {
+	if err := validateLegacySubscriptionResolutionEvidence(event, &subscription); err != nil {
 		return nil, err
+	}
+	if event.Provider == PaymentProviderStripe {
+		if err := validateStripeLegacyRecurringResolutionInventoryTx(tx, event, &subscription); err != nil {
+			return nil, err
+		}
 	}
 	var user User
 	if err := lockForUpdate(tx).Select("id").Where("id = ?", subscription.UserId).First(&user).Error; err != nil {
@@ -172,6 +192,34 @@ func lockLegacySubscriptionResolutionContractTx(tx *gorm.DB, event *PaymentEvent
 		return nil, err
 	}
 	return &subscription, nil
+}
+
+func validateLegacySubscriptionResolutionEventEvidence(event *PaymentEvent) error {
+	if event == nil {
+		return fmt.Errorf("%w: legacy subscription event evidence is missing", ErrPaymentAuditConflict)
+	}
+	switch event.ReviewCode {
+	case PaymentReviewCodeLegacySubscriptionContractUnavailable:
+		return validateLegacyEpayEventEvidence(event)
+	case PaymentReviewCodeStripeLegacyRecurringCheckoutPaid:
+		return validateStripeLegacyRecurringCheckoutEventEvidence(event)
+	default:
+		return fmt.Errorf("%w: legacy subscription review classification changed", ErrPaymentAuditConflict)
+	}
+}
+
+func validateLegacySubscriptionResolutionEvidence(event *PaymentEvent, subscription *SubscriptionOrder) error {
+	if event == nil {
+		return fmt.Errorf("%w: legacy subscription event evidence is missing", ErrPaymentAuditConflict)
+	}
+	switch event.ReviewCode {
+	case PaymentReviewCodeLegacySubscriptionContractUnavailable:
+		return validateLegacySubscriptionRefundEvidence(event, subscription)
+	case PaymentReviewCodeStripeLegacyRecurringCheckoutPaid:
+		return validateStripeLegacyRecurringSubscriptionRefundEvidence(event, subscription)
+	default:
+		return fmt.Errorf("%w: legacy subscription review classification changed", ErrPaymentAuditConflict)
+	}
 }
 
 func validateLegacySubscriptionRefundEvidence(event *PaymentEvent, subscription *SubscriptionOrder) error {
@@ -207,6 +255,137 @@ func validateLegacySubscriptionRefundEvidence(event *PaymentEvent, subscription 
 	return nil
 }
 
+func validateStripeLegacyRecurringCheckoutEventEvidence(event *PaymentEvent) error {
+	if event == nil || event.Provider != PaymentProviderStripe ||
+		(event.EventType != "checkout.session.completed" && event.EventType != "checkout.session.async_payment_succeeded") ||
+		event.ProviderState != PaymentProviderStateStripeLegacyRecurringCheckoutPaid || !event.ManualReview ||
+		event.Paid || event.Failed || event.Expired || event.Refunded || event.Disputed || event.DisputeResolved ||
+		event.PermanentFailure || event.PaidAmountMinor <= 0 || event.ProviderCredentialGeneration <= 0 ||
+		event.ProviderLivemode == nil || event.PaymentMethod != PaymentMethodStripe ||
+		strings.TrimSpace(event.TradeNo) == "" || event.TradeNo != strings.TrimSpace(event.TradeNo) ||
+		strings.TrimSpace(event.NormalizedPayload) == "" || event.PayloadDigest != PaymentPayloadDigest(event.NormalizedPayload) {
+		return fmt.Errorf("%w: event is not an intact verified legacy Stripe recurring Checkout payment", ErrPaymentAuditConflict)
+	}
+	if _, ok := common.PaymentProviderCurrencyExponentOK(PaymentProviderStripe, event.Currency); !ok ||
+		event.Currency != strings.ToUpper(strings.TrimSpace(event.Currency)) {
+		return fmt.Errorf("%w: legacy Stripe recurring Checkout currency is invalid", ErrPaymentAuditConflict)
+	}
+	sessionID := strings.TrimPrefix(event.ProviderOrderKey, PaymentProviderStripe+":")
+	if normalized, err := normalizeStripeInventoryID(sessionID, "cs_", 128); err != nil ||
+		event.ProviderOrderKey != PaymentProviderStripe+":"+normalized || len(normalized) <= len("cs_") {
+		return fmt.Errorf("%w: legacy Stripe Checkout Session identity is invalid", ErrPaymentAuditConflict)
+	}
+	subscriptionID := strings.TrimPrefix(event.ProviderResourceKey, PaymentProviderStripe+":")
+	if normalized, err := normalizeStripeInventoryID(subscriptionID, "sub_", 128); err != nil ||
+		event.ProviderResourceKey != PaymentProviderStripe+":"+normalized || len(normalized) <= len("sub_") {
+		return fmt.Errorf("%w: legacy Stripe subscription identity is invalid", ErrPaymentAuditConflict)
+	}
+	if normalized, err := normalizeStripeInventoryID(event.CustomerID, "cus_", 64); err != nil ||
+		normalized != event.CustomerID || len(normalized) <= len("cus_") {
+		return fmt.Errorf("%w: legacy Stripe customer identity is invalid", ErrPaymentAuditConflict)
+	}
+	if event.ProviderPaymentKey != "" {
+		paymentID := strings.TrimPrefix(event.ProviderPaymentKey, PaymentProviderStripe+":")
+		if normalized, err := normalizeStripeInventoryID(paymentID, "pi_", 128); err != nil ||
+			event.ProviderPaymentKey != PaymentProviderStripe+":"+normalized || len(normalized) <= len("pi_") {
+			return fmt.Errorf("%w: legacy Stripe payment identity is invalid", ErrPaymentAuditConflict)
+		}
+	}
+	var payload struct {
+		SessionID      string `json:"session_id"`
+		TradeNo        string `json:"trade_no"`
+		AmountTotal    int64  `json:"amount_total"`
+		Currency       string `json:"currency"`
+		PaymentStatus  string `json:"payment_status"`
+		Status         string `json:"status"`
+		Mode           string `json:"mode"`
+		SubscriptionID string `json:"subscription_id"`
+		DataDigest     string `json:"data_digest"`
+	}
+	if err := common.UnmarshalJsonStr(event.NormalizedPayload, &payload); err != nil ||
+		payload.SessionID != sessionID || payload.SubscriptionID != subscriptionID ||
+		payload.TradeNo != event.TradeNo || payload.AmountTotal != event.PaidAmountMinor ||
+		!strings.EqualFold(payload.Currency, event.Currency) || payload.PaymentStatus != "paid" ||
+		payload.Status != "complete" || payload.Mode != "subscription" || len(strings.TrimSpace(payload.DataDigest)) != 64 {
+		return fmt.Errorf("%w: legacy Stripe recurring Checkout normalized evidence changed", ErrPaymentAuditConflict)
+	}
+	for _, char := range strings.TrimSpace(payload.DataDigest) {
+		if char < '0' || char > '9' && char < 'a' || char > 'f' {
+			return fmt.Errorf("%w: legacy Stripe recurring Checkout payload digest is invalid", ErrPaymentAuditConflict)
+		}
+	}
+	if err := paymentEventInputFromStoredEvent(event).validate(); err != nil {
+		return fmt.Errorf("%w: stored legacy Stripe recurring Checkout event is invalid", ErrPaymentAuditConflict)
+	}
+	return nil
+}
+
+func validateStripeLegacyRecurringSubscriptionRefundEvidence(event *PaymentEvent, subscription *SubscriptionOrder) error {
+	if err := validateStripeLegacyRecurringCheckoutEventEvidence(event); err != nil {
+		return err
+	}
+	if subscription == nil || subscription.PaymentOrderId != nil || subscription.Id <= 0 ||
+		subscription.UserId <= 0 || subscription.PlanId <= 0 || subscription.CreateTime <= 0 ||
+		subscription.CompleteTime != 0 || subscription.Status != common.TopUpStatusPending ||
+		strings.TrimSpace(subscription.TradeNo) != event.TradeNo ||
+		strings.ToLower(strings.TrimSpace(subscription.PaymentProvider)) != PaymentProviderStripe ||
+		strings.ToLower(strings.TrimSpace(subscription.PaymentMethod)) != PaymentMethodStripe {
+		return fmt.Errorf("%w: legacy Stripe subscription projection is not safely refundable", ErrPaymentAuditConflict)
+	}
+	if subscription.ProviderOrderKey != nil && strings.TrimSpace(*subscription.ProviderOrderKey) != event.ProviderOrderKey {
+		return fmt.Errorf("%w: legacy Stripe subscription Checkout Session identity changed", ErrPaymentAuditConflict)
+	}
+	if providerOrderID := strings.TrimSpace(subscription.ProviderOrderId); providerOrderID != "" &&
+		event.ProviderOrderKey != PaymentProviderStripe+":"+providerOrderID {
+		return fmt.Errorf("%w: legacy Stripe subscription Checkout Session identity changed", ErrPaymentAuditConflict)
+	}
+	exponent, ok := common.PaymentProviderCurrencyExponentOK(PaymentProviderStripe, event.Currency)
+	minor, err := legacyPaymentMoneyMinorExact(subscription.Money, exponent, math.MaxInt64)
+	if !ok || err != nil || minor != event.PaidAmountMinor {
+		return fmt.Errorf("%w: legacy Stripe subscription amount no longer matches", ErrPaymentAuditConflict)
+	}
+	if subscription.ExpectedAmountMinor > 0 && subscription.ExpectedAmountMinor != event.PaidAmountMinor {
+		return fmt.Errorf("%w: initialized legacy Stripe subscription amount conflicts with the provider event", ErrPaymentAuditConflict)
+	}
+	if currency := strings.ToUpper(strings.TrimSpace(subscription.PaymentCurrency)); currency != "" && currency != event.Currency {
+		return fmt.Errorf("%w: initialized legacy Stripe subscription currency conflicts with the provider event", ErrPaymentAuditConflict)
+	}
+	if strings.TrimSpace(subscription.PlanSnapshot) != "" {
+		snapshot, err := subscription.planSnapshot()
+		if err != nil || strings.ToUpper(strings.TrimSpace(snapshot.Currency)) != event.Currency {
+			return fmt.Errorf("%w: initialized legacy Stripe subscription snapshot conflicts with the provider event", ErrPaymentAuditConflict)
+		}
+	}
+	return nil
+}
+
+func validateStripeLegacyRecurringResolutionInventoryTx(tx *gorm.DB, event *PaymentEvent, subscription *SubscriptionOrder) error {
+	if tx == nil || event == nil || subscription == nil {
+		return ErrPaymentAuditInvalid
+	}
+	var inventory StripeLegacySubscription
+	subscriptionID := strings.TrimPrefix(event.ProviderResourceKey, PaymentProviderStripe+":")
+	if err := lockForUpdate(tx).Where("stripe_subscription_id = ?", subscriptionID).First(&inventory).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("%w: legacy Stripe subscription inventory is missing", ErrPaymentAuditConflict)
+		}
+		return err
+	}
+	sessionID := strings.TrimPrefix(event.ProviderOrderKey, PaymentProviderStripe+":")
+	if inventory.CheckoutSessionID != sessionID || inventory.TradeNo != event.TradeNo ||
+		inventory.StripeCustomerID != event.CustomerID || event.ProviderLivemode == nil ||
+		inventory.Livemode != *event.ProviderLivemode || strings.TrimSpace(inventory.ReviewReason) != "" ||
+		inventory.UserID != nil && *inventory.UserID != subscription.UserId ||
+		inventory.SubscriptionPlanID != nil && *inventory.SubscriptionPlanID != subscription.PlanId {
+		return fmt.Errorf("%w: legacy Stripe subscription inventory identity changed", ErrPaymentAuditConflict)
+	}
+	status := strings.ToLower(strings.TrimSpace(inventory.Status))
+	if !inventory.CancelAtPeriodEnd && inventory.EndedAt <= 0 && status != "canceled" && status != "incomplete_expired" {
+		return fmt.Errorf("%w: legacy Stripe subscription can still renew", ErrPaymentAuditConflict)
+	}
+	return nil
+}
+
 func createLegacySubscriptionResolutionOrderTx(tx *gorm.DB, input PaymentLegacySubscriptionResolutionInput,
 	event *PaymentEvent, subscription *SubscriptionOrder) (*PaymentOrder, error) {
 	pricingSnapshot, err := legacySubscriptionResolutionPricingSnapshot(input, event, subscription)
@@ -216,9 +395,10 @@ func createLegacySubscriptionResolutionOrderTx(tx *gorm.DB, input PaymentLegacyS
 	now := common.GetTimestamp()
 	order := &PaymentOrder{
 		TradeNo: event.TradeNo, UserID: subscription.UserId, OrderKind: PaymentOrderKindSubscription,
-		Provider: PaymentProviderEpay, PaymentMethod: event.PaymentMethod,
+		Provider: event.Provider, PaymentMethod: event.PaymentMethod,
 		ProviderCredentialGeneration: event.ProviderCredentialGeneration,
-		RequestID:                    legacyPaymentRequestID(PaymentProviderEpay, event.TradeNo),
+		ProviderLivemode:             copyPaymentLivemode(event.ProviderLivemode),
+		RequestID:                    legacyPaymentRequestID(event.Provider, event.TradeNo),
 		ExpectedAmountMinor:          event.PaidAmountMinor, Currency: event.Currency,
 		RequestedAmount: int64(subscription.PlanId), PricingSnapshot: pricingSnapshot,
 		LegacyRecordType: PaymentOrderKindSubscription, LegacyRecordID: subscription.Id,
@@ -231,7 +411,7 @@ func createLegacySubscriptionResolutionOrderTx(tx *gorm.DB, input PaymentLegacyS
 		return nil, err
 	}
 	subscription.PaymentOrderId = &order.ID
-	subscription.PaymentProvider = PaymentProviderEpay
+	subscription.PaymentProvider = event.Provider
 	return order, nil
 }
 
@@ -243,8 +423,10 @@ func refundLegacySubscriptionResolutionTx(tx *gorm.DB, providerEvent, adminEvent
 	}
 	adminEvent.Refunded = true
 	adminEvent.RefundedAmountMinor = order.ExpectedAmountMinor
+	adminEvent.ProviderResourceKey = order.Provider + ":refund:" + input.ProviderRefundReference
 	if err := tx.Model(&PaymentEvent{}).Where("id = ?", adminEvent.ID).Updates(map[string]interface{}{
 		"refunded": true, "refunded_amount_minor": order.ExpectedAmountMinor,
+		"provider_resource_key": adminEvent.ProviderResourceKey,
 	}).Error; err != nil {
 		return err
 	}
@@ -281,13 +463,26 @@ func validateCompletedLegacySubscriptionResolutionTx(tx *gorm.DB, input PaymentL
 		providerEvent.PaymentOrderID <= 0 || providerEvent.Attempts != input.ExpectedEventAttempts+1 {
 		return nil, fmt.Errorf("%w: completed legacy subscription resolution is inconsistent", ErrPaymentAuditConflict)
 	}
+	if providerEvent.Provider != PaymentProviderEpay && providerEvent.Provider != PaymentProviderStripe {
+		return nil, fmt.Errorf("%w: completed legacy subscription provider is inconsistent", ErrPaymentAuditConflict)
+	}
+	completedEvidence := *providerEvent
+	if providerEvent.Provider == PaymentProviderEpay {
+		completedEvidence.ReviewCode = PaymentReviewCodeLegacySubscriptionContractUnavailable
+	} else {
+		completedEvidence.ReviewCode = PaymentReviewCodeStripeLegacyRecurringCheckoutPaid
+	}
+	if err := validateLegacySubscriptionResolutionEventEvidence(&completedEvidence); err != nil {
+		return nil, err
+	}
 	var adminEvent PaymentEvent
 	if err := lockForUpdate(tx).Where("provider = ? AND event_key = ?", "admin", adminEventKey).First(&adminEvent).Error; err != nil {
 		return nil, err
 	}
 	if adminEvent.Status != PaymentEventStatusProcessed || adminEvent.PaymentOrderID != providerEvent.PaymentOrderID ||
 		adminEvent.PayloadDigest != PaymentPayloadDigest(payload) || !adminEvent.Refunded ||
-		adminEvent.RefundedAmountMinor != providerEvent.PaidAmountMinor {
+		adminEvent.RefundedAmountMinor != providerEvent.PaidAmountMinor ||
+		adminEvent.ProviderResourceKey != providerEvent.Provider+":refund:"+input.ProviderRefundReference {
 		return nil, fmt.Errorf("%w: completed legacy subscription administrator event is inconsistent", ErrPaymentAuditConflict)
 	}
 	var order PaymentOrder
@@ -298,20 +493,23 @@ func validateCompletedLegacySubscriptionResolutionTx(tx *gorm.DB, input PaymentL
 	if err := lockForUpdate(tx).Where("payment_order_id = ? AND trade_no = ?", order.ID, providerEvent.TradeNo).First(&subscription).Error; err != nil {
 		return nil, err
 	}
-	if order.Provider != PaymentProviderEpay || order.OrderKind != PaymentOrderKindSubscription ||
+	if order.Provider != providerEvent.Provider || order.OrderKind != PaymentOrderKindSubscription ||
 		order.TradeNo != providerEvent.TradeNo || order.UserID != subscription.UserId ||
 		order.LegacyRecordType != PaymentOrderKindSubscription || order.LegacyRecordID != subscription.Id ||
 		order.ProviderCredentialGeneration != providerEvent.ProviderCredentialGeneration ||
+		!paymentLivemodeEqual(order.ProviderLivemode, providerEvent.ProviderLivemode) ||
 		order.ExpectedAmountMinor != providerEvent.PaidAmountMinor || order.Currency != providerEvent.Currency ||
 		order.PaymentMethod != providerEvent.PaymentMethod || order.RequestedAmount != int64(subscription.PlanId) ||
-		order.RequestID != legacyPaymentRequestID(PaymentProviderEpay, providerEvent.TradeNo) ||
+		order.RequestID != legacyPaymentRequestID(providerEvent.Provider, providerEvent.TradeNo) ||
 		order.Status != PaymentOrderStatusRefunded || order.CreditQuota != 0 || order.PaidAmountMinor != 0 ||
 		order.RefundedAmountMinor != order.ExpectedAmountMinor || order.SettledAt != 0 ||
-		subscription.Status != common.TopUpStatusRefunded {
+		subscription.Status != common.TopUpStatusRefunded || subscription.PaymentProvider != providerEvent.Provider ||
+		subscription.PaymentMethod != providerEvent.PaymentMethod || subscription.CompleteTime <= 0 {
 		return nil, fmt.Errorf("%w: completed legacy subscription order contract is inconsistent", ErrPaymentAuditConflict)
 	}
 	if order.ProviderOrderKey == nil || *order.ProviderOrderKey != providerEvent.ProviderOrderKey ||
-		providerEvent.ProviderPaymentKey != "" && (order.ProviderPaymentKey == nil || *order.ProviderPaymentKey != providerEvent.ProviderPaymentKey) {
+		(providerEvent.ProviderPaymentKey == "" && order.ProviderPaymentKey != nil) ||
+		(providerEvent.ProviderPaymentKey != "" && (order.ProviderPaymentKey == nil || *order.ProviderPaymentKey != providerEvent.ProviderPaymentKey)) {
 		return nil, fmt.Errorf("%w: completed legacy subscription provider identity is inconsistent", ErrPaymentAuditConflict)
 	}
 	pricingSnapshot, err := legacySubscriptionResolutionPricingSnapshot(input, providerEvent, &subscription)
@@ -352,7 +550,7 @@ func validateCompletedLegacySubscriptionResolutionTx(tx *gorm.DB, input PaymentL
 	}
 	audit := audits[0]
 	if audit.AdminID != input.AdminID || audit.ActorIP != input.ActorIP || audit.PaymentOrderID != order.ID ||
-		audit.UserID != order.UserID || audit.Provider != PaymentProviderEpay || audit.Reason != input.Reason ||
+		audit.UserID != order.UserID || audit.Provider != providerEvent.Provider || audit.Reason != input.Reason ||
 		audit.Metadata != string(metadataBytes) {
 		return nil, fmt.Errorf("%w: legacy subscription operations audit payload changed", ErrPaymentAuditConflict)
 	}
@@ -367,6 +565,9 @@ func legacySubscriptionResolutionPayload(input PaymentLegacySubscriptionResoluti
 		"provider_refund_reference": input.ProviderRefundReference,
 		"provider":                  event.Provider, "provider_event_key": event.EventKey,
 		"provider_payload_digest": event.PayloadDigest, "trade_no": event.TradeNo,
+		"provider_order_key": event.ProviderOrderKey, "provider_payment_key": event.ProviderPaymentKey,
+		"provider_resource_key": event.ProviderResourceKey, "provider_customer_id": event.CustomerID,
+		"provider_livemode": event.ProviderLivemode, "provider_credential_generation": event.ProviderCredentialGeneration,
 	})
 	return string(encoded), err
 }
@@ -381,6 +582,8 @@ func legacySubscriptionResolutionPricingSnapshot(input PaymentLegacySubscription
 		"paid_amount_minor": event.PaidAmountMinor, "currency": event.Currency, "payment_method": event.PaymentMethod,
 		"provider_event_id": event.ID, "provider_event_key": event.EventKey, "provider_payload_digest": event.PayloadDigest,
 		"provider_order_key": event.ProviderOrderKey, "provider_payment_key": event.ProviderPaymentKey,
+		"provider_resource_key": event.ProviderResourceKey, "provider_customer_id": event.CustomerID,
+		"provider_livemode":              event.ProviderLivemode,
 		"provider_credential_generation": event.ProviderCredentialGeneration,
 		"provider_refund_reference":      input.ProviderRefundReference,
 	})
@@ -394,6 +597,8 @@ func legacySubscriptionResolutionAuditMetadata(input PaymentLegacySubscriptionRe
 		"provider_event_id": providerEvent.ID, "provider_event_key": providerEvent.EventKey,
 		"provider_payload_digest": providerEvent.PayloadDigest, "provider_event_attempts": providerEvent.Attempts,
 		"provider_order_key": providerEvent.ProviderOrderKey, "provider_payment_key": providerEvent.ProviderPaymentKey,
+		"provider_resource_key": providerEvent.ProviderResourceKey, "provider_customer_id": providerEvent.CustomerID,
+		"provider_livemode":              providerEvent.ProviderLivemode,
 		"provider_credential_generation": providerEvent.ProviderCredentialGeneration,
 		"trade_no":                       providerEvent.TradeNo, "payment_order_id": order.ID, "payment_order_status": order.Status,
 		"legacy_subscription_id": subscription.Id, "legacy_plan_id": subscription.PlanId, "legacy_money": subscription.Money,
@@ -403,7 +608,14 @@ func legacySubscriptionResolutionAuditMetadata(input PaymentLegacySubscriptionRe
 	}
 }
 
-func legacySubscriptionResolutionAdminEventKey(input PaymentLegacySubscriptionResolutionInput) string {
+func legacySubscriptionResolutionAdminEventKey(input PaymentLegacySubscriptionResolutionInput, event *PaymentEvent) string {
+	if input.Resolution == PaymentLegacyTopUpResolutionExternalRefund {
+		provider := ""
+		if event != nil {
+			provider = event.Provider
+		}
+		return paymentExternalRefundEventKey(provider, input.ProviderRefundReference)
+	}
 	return "legacy_subscription_external_refund:" + strconv.FormatInt(input.EventID, 10) +
 		":a" + strconv.Itoa(input.ExpectedEventAttempts)
 }
