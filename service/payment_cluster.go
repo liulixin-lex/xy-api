@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -193,8 +194,7 @@ func paymentRuntimeConfigurationFingerprint() string {
 		builder.WriteByte(':')
 		builder.WriteString(strconv.Itoa(multiNodeConfiguration.MinimumLiveNodes))
 	}
-	digest := sha256.Sum256([]byte(builder.String()))
-	return fmt.Sprintf("%x", digest[:16])
+	return paymentRuntimeFingerprint(builder.String(), "new-api-payment-runtime-configuration-v1", 16)
 }
 
 func currentPaymentMultiNodeConfiguration() (paymentMultiNodeConfiguration, error) {
@@ -251,16 +251,21 @@ func paymentRuntimeIdentifierFingerprint(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("%x", digest[:16])
+	return paymentRuntimeFingerprint(value, "new-api-payment-runtime-identifier-v1", 16)
 }
 
 func paymentRuntimeSecretFingerprint(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("%x", digest[:8])
+	return paymentRuntimeFingerprint(value, "new-api-payment-runtime-secret-v1", 8)
+}
+
+func paymentRuntimeFingerprint(value, domain string, size int) string {
+	mac := hmac.New(sha256.New, []byte(domain))
+	_, _ = mac.Write([]byte(value))
+	digest := mac.Sum(nil)
+	return fmt.Sprintf("%x", digest[:size])
 }
 
 func paymentClusterRedisMembershipKey(configuration paymentMultiNodeConfiguration) string {

@@ -28,6 +28,17 @@
     "electron": "39.8.5",
     "electron-builder": "^26.7.0"
   },
+  "overrides": {
+    "minimatch@3": {
+      "brace-expansion": "1.1.16"
+    },
+    "minimatch@5": {
+      "brace-expansion": "2.1.2"
+    },
+    "minimatch@9": {
+      "brace-expansion": "2.1.2"
+    }
+  },
   "build": {
     "appId": "com.newapi.desktop",
     "productName": "New-API-App",

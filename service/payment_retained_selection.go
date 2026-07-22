@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -29,6 +30,8 @@ func publicRetainedSelectionID(kind, integration, identity string) string {
 	if integration == "" || identity == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(kind + "\x00" + integration + "\x00" + identity))
+	mac := hmac.New(sha256.New, []byte("new-api-public-payment-selection-v1"))
+	_, _ = mac.Write([]byte(kind + "\x00" + integration + "\x00" + identity))
+	digest := mac.Sum(nil)
 	return kind + "_" + hex.EncodeToString(digest[:12])
 }

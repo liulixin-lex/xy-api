@@ -3,6 +3,7 @@ package model
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -97,7 +98,9 @@ func PaymentSecretKeyringFingerprint() string {
 	if previous != "" {
 		builder.WriteString(makePaymentSecretKey(previous).id)
 	}
-	digest := sha256.Sum256([]byte(builder.String()))
+	mac := hmac.New(sha256.New, []byte("new-api-payment-keyring-fingerprint-v1"))
+	_, _ = mac.Write([]byte(builder.String()))
+	digest := mac.Sum(nil)
 	return fmt.Sprintf("%x", digest[:16])
 }
 
