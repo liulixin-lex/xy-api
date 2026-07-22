@@ -489,6 +489,20 @@ func validateOptionValueBeforePersistence(key, value string) error {
 	return nil
 }
 
+func paymentOptionStorageValue(key, value string) (string, error) {
+	if key == "PayMethods" {
+		methods, err := operation_setting.ParsePayMethodsByJsonString(value)
+		if err != nil {
+			return "", err
+		}
+		value, err = operation_setting.PayMethodsStorageJSON(methods)
+		if err != nil {
+			return "", err
+		}
+	}
+	return encryptPaymentOptionValue(key, value)
+}
+
 func UpdateOption(key string, value string) error {
 	if key == PaymentConfigurationVersionOptionKey {
 		return errors.New("payment configuration version cannot be updated directly")
@@ -504,7 +518,7 @@ func UpdateOption(key string, value string) error {
 	if err := DB.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
 		return err
 	}
-	storageValue, err := encryptPaymentOptionValue(key, value)
+	storageValue, err := paymentOptionStorageValue(key, value)
 	if err != nil {
 		return err
 	}
@@ -555,7 +569,7 @@ func updateOptionsBulk(values map[string]string) error {
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
 			}
-			storageValue, err := encryptPaymentOptionValue(k, v)
+			storageValue, err := paymentOptionStorageValue(k, v)
 			if err != nil {
 				return err
 			}
@@ -777,7 +791,7 @@ func updatePaymentOptionsWithVersionLockHeld(
 		}
 
 		for _, key := range keys {
-			storageValue, err := encryptPaymentOptionValue(key, values[key])
+			storageValue, err := paymentOptionStorageValue(key, values[key])
 			if err != nil {
 				return err
 			}

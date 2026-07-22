@@ -29,6 +29,8 @@ func TestMigrateLegacyPaymentRouteCatalogPersistsImplicitRoutesOnce(t *testing.T
 
 	var payMethods Option
 	require.NoError(t, db.Where(&Option{Key: "PayMethods"}).First(&payMethods).Error)
+	assert.NotContains(t, payMethods.Value, "支付宝")
+	assert.Contains(t, payMethods.Value, `\u652f\u4ed8\u5b9d`)
 	parsed, err := operation_setting.ParsePayMethodsByJsonString(payMethods.Value)
 	require.NoError(t, err)
 	identities := make(map[string]struct{}, len(parsed))

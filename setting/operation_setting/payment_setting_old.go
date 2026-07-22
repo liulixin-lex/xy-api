@@ -330,11 +330,39 @@ func ContainsInternalPaymentProviderName(value string) bool {
 }
 
 func PayMethods2JsonString() string {
-	jsonBytes, err := common.Marshal(PayMethods)
+	jsonString, err := PayMethodsStorageJSON(PayMethods)
 	if err != nil {
 		return "[]"
 	}
-	return string(jsonBytes)
+	return jsonString
+}
+
+// PayMethodsStorageJSON keeps the catalog valid JSON while escaping every
+// non-ASCII rune. The ASCII-only representation round-trips to the same public
+// labels and remains writable through legacy MySQL connections that use GBK,
+// Big5, or another non-UTF-8 Chinese-capable charset.
+func PayMethodsStorageJSON(methods []map[string]string) (string, error) {
+	jsonBytes, err := common.Marshal(methods)
+	if err != nil {
+		return "", err
+	}
+	var storage strings.Builder
+	storage.Grow(len(jsonBytes))
+	for _, character := range string(jsonBytes) {
+		if character <= unicode.MaxASCII {
+			storage.WriteRune(character)
+			continue
+		}
+		if character <= 0xffff {
+			_, _ = fmt.Fprintf(&storage, `\u%04x`, character)
+			continue
+		}
+		value := character - 0x10000
+		high := 0xd800 + value>>10
+		low := 0xdc00 + value&0x3ff
+		_, _ = fmt.Fprintf(&storage, `\u%04x\u%04x`, high, low)
+	}
+	return storage.String(), nil
 }
 
 func ContainsPayMethod(method string) bool {

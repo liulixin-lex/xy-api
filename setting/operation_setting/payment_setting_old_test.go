@@ -2,11 +2,33 @@ package operation_setting
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPayMethodsStorageJSONIsASCIIAndRoundTripsUnicodeLabels(t *testing.T) {
+	methods := []map[string]string{{
+		"name": "支付宝💳", "type": "alipay", "provider": "epay", "flow": "form_post",
+	}}
+
+	stored, err := PayMethodsStorageJSON(methods)
+	require.NoError(t, err)
+	assert.NotContains(t, stored, "支付宝")
+	assert.Contains(t, stored, `\u652f\u4ed8\u5b9d`)
+	assert.Contains(t, stored, `\ud83d\udcb3`)
+	for _, character := range stored {
+		assert.LessOrEqual(t, character, rune(127))
+	}
+
+	parsed, err := ParsePayMethodsByJsonString(stored)
+	require.NoError(t, err)
+	require.Len(t, parsed, 1)
+	assert.Equal(t, "支付宝💳", parsed[0]["name"])
+	assert.True(t, strings.HasPrefix(parsed[0]["route_id"], "pay_"))
+}
 
 func TestParsePayMethodsRejectsUnknownFields(t *testing.T) {
 	_, err := ParsePayMethodsByJsonString(`[{"name":"Alipay","type":"alipay","provider":"epay","secret":"must-not-be-exposed"}]`)

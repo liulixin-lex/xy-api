@@ -128,7 +128,7 @@ func migrateLegacyPaymentRouteCatalogOn(db *gorm.DB) error {
 		if err != nil {
 			return fmt.Errorf("merge legacy payment routes into PayMethods: %w", err)
 		}
-		encodedMethods, err := common.Marshal(canonical)
+		encodedMethods, err := operation_setting.PayMethodsStorageJSON(canonical)
 		if err != nil {
 			return fmt.Errorf("encode migrated PayMethods: %w", err)
 		}
@@ -138,7 +138,7 @@ func migrateLegacyPaymentRouteCatalogOn(db *gorm.DB) error {
 		committedVersion = currentVersion + 1
 
 		for _, option := range []Option{
-			{Key: "PayMethods", Value: string(encodedMethods)},
+			{Key: "PayMethods", Value: encodedMethods},
 			{Key: PaymentRouteCatalogVersionOptionKey, Value: strconv.FormatInt(currentPaymentRouteCatalogVersion, 10)},
 		} {
 			if err := tx.Clauses(clause.OnConflict{
