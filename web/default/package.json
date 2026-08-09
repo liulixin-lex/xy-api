@@ -44,7 +44,7 @@
     "clsx": "catalog:",
     "cmdk": "^1.1.1",
     "dayjs": "catalog:",
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.13",
     "i18next": "^26.3.4",
     "i18next-browser-languagedetector": "^8.2.1",
     "input-otp": "^1.4.2",
@@ -97,7 +97,7 @@
   },
   "overrides": {
     "brace-expansion": "2.1.1",
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.13",
     "fast-uri": "3.1.4",
     "form-data": "4.0.6",
     "hono": "4.12.31",
